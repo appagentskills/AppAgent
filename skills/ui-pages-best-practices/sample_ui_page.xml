@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<record_update table="sys_ui_page">
+    <sys_ui_page action="INSERT_OR_UPDATE">
+        <name>sample_dashboard</name>
+        <description>Sample UI Page demonstrating best practices</description>
+        <direct>true</direct>
+        <endpoint/>
+        <html><![CDATA[
+<style>
+/* CSS Variables for theming */
+:root {
+    --app-primary: #0066cc;
+    --app-secondary: #6c757d;
+    --app-success: #28a745;
+    --app-danger: #dc3545;
+    --app-bg: #f8f9fa;
+    --app-card-bg: #ffffff;
+    --app-border: #dee2e6;
+    --app-text: #212529;
+    --app-text-muted: #6c757d;
+}
+
+/* Container */
+.sample-app {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+    background: var(--app-bg);
+    min-height: 100vh;
+}
+
+/* Header */
+.sample-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--app-border);
+}
+
+.sample-title {
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--app-text);
+    margin: 0;
+}
+
+/* Cards */
+.sample-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.sample-card {
+    background: var(--app-card-bg);
+    border: 1px solid var(--app-border);
+    border-radius: 8px;
+    padding: 20px;
+    transition: box-shadow 0.2s ease;
+}
+
+.sample-card:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.sample-card-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--app-text);
+    margin: 0 0 8px 0;
+}
+
+.sample-card-value {
+    font-size: 32px;
+    font-weight: 700;
+    color: var(--app-primary);
+}
+
+/* Buttons */
+.sample-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.sample-btn-primary {
+    background: var(--app-primary);
+    color: white;
+}
+
+.sample-btn-primary:hover {
+    background: #0056b3;
+}
+
+/* Loading state */
+.sample-loading {
+    display: none;
+    text-align: center;
+    padding: 40px;
+    color: var(--app-text-muted);
+}
+
+.sample-loading.visible {
+    display: block;
+}
+
+/* Error message */
+.sample-error {
+    display: none;
+    padding: 12px 16px;
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    border-radius: 6px;
+    color: var(--app-danger);
+    margin-bottom: 16px;
+}
+
+.sample-error.visible {
+    display: block;
+}
+</style>
+
+<div class="sample-app">
+    <div class="sample-header">
+        <h1 class="sample-title">Dashboard</h1>
+        <button class="sample-btn sample-btn-primary" onclick="sampleApp.refresh()">
+            Refresh Data
+        </button>
+    </div>
+
+    <div class="sample-error" id="sample-error"></div>
+    <div class="sample-loading" id="sample-loading">Loading...</div>
+
+    <div class="sample-cards" id="sample-cards">
+        <div class="sample-card">
+            <h3 class="sample-card-title">Open Incidents</h3>
+            <div class="sample-card-value" id="card-incidents">--</div>
+        </div>
+        <div class="sample-card">
+            <h3 class="sample-card-title">Active Changes</h3>
+            <div class="sample-card-value" id="card-changes">--</div>
+        </div>
+        <div class="sample-card">
+            <h3 class="sample-card-title">Pending Requests</h3>
+            <div class="sample-card-value" id="card-requests">--</div>
+        </div>
+    </div>
+</div>
+]]></html>
+        <client_script><![CDATA[
+(function() {
+    'use strict';
+
+    window.sessionToken = "$[gs.getSessionToken()]";
+
+    window.sampleApp = {
+        init: function() {
+            this.loadData();
+        },
+
+        showLoading: function(show) {
+            var el = document.getElementById('sample-loading');
+            if (el) el.classList.toggle('visible', show);
+        },
+
+        showError: function(message) {
+            var el = document.getElementById('sample-error');
+            if (el) {
+                el.textContent = message;
+                el.classList.add('visible');
+            }
+        },
+
+        hideError: function() {
+            var el = document.getElementById('sample-error');
+            if (el) el.classList.remove('visible');
+        },
+
+        updateCard: function(id, value) {
+            var el = document.getElementById(id);
+            if (el) el.textContent = value;
+        },
+
+        loadData: async function() {
+            var self = this;
+            self.hideError();
+            self.showLoading(true);
+
+            try {
+                var incidents = await self.getCount('incident', 'active=true');
+                var changes = await self.getCount('change_request', 'active=true');
+                var requests = await self.getCount('sc_request', 'active=true');
+
+                self.updateCard('card-incidents', incidents);
+                self.updateCard('card-changes', changes);
+                self.updateCard('card-requests', requests);
+            } catch (e) {
+                self.showError('Failed to load data: ' + e.message);
+                console.error('Load error:', e);
+            } finally {
+                self.showLoading(false);
+            }
+        },
+
+        getCount: async function(table, query) {
+            window.sessionToken = "$[gs.getSessionToken()]";
+            var response = await fetch('/api/now/stats/' + table + '?sysparm_query=' + encodeURIComponent(query) + '&sysparm_count=true', {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json',
+                    'X-UserToken': window.sessionToken
+                }
+            });
+            var data = await response.json();
+            return data.result.stats.count;
+        },
+
+        refresh: function() {
+            this.loadData();
+        }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function() {
+            sampleApp.init();
+        });
+    } else {
+        sampleApp.init();
+    }
+})();
+]]></client_script>
+        <processing_script/>
+        <sys_class_name>sys_ui_page</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-01-15 10:00:00</sys_created_on>
+        <sys_id>a1b2c3d4e5f600a8b9c0d1e2f3a4b5c6</sys_id>
+        <sys_mod_count>1</sys_mod_count>
+        <sys_name>sample_dashboard</sys_name>
+        <sys_package display_value="Global" source="global">global</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Global">global</sys_scope>
+        <sys_update_name>sys_ui_page_a1b2c3d4e5f600a8b9c0d1e2f3a4b5c6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-01-27 16:36:39</sys_updated_on>
+    </sys_ui_page>
+    <sys_es_latest_script action="INSERT_OR_UPDATE">
+        <id>a1b2c3d4e5f600a8b9c0d1e2f3a4b5c6</id>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-01-27 16:36:38</sys_created_on>
+        <sys_id>343c554083f6b610d737e480ceaad38c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-01-27 16:36:38</sys_updated_on>
+        <table>sys_ui_page</table>
+        <use_es_latest>true</use_es_latest>
+    </sys_es_latest_script>
+</record_update>

@@ -1,0 +1,26 @@
+# Environment variables
+.env
+.env.*
+
+# Auth cache
+.auth/
+
+# Node modules
+node_modules/
+
+# Backup files
+*.backup.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Certificates/Keys
+*.pem
+*.key
+*.p12
+*.pfx
