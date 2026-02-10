@@ -525,7 +525,7 @@ Deleting your data:
 
 ## About
 
-Version: v0.1
+Version: v0.2
 
 License: Private and Commercial use. Internal modification permitted. Distribution and resale prohibited. All rights reserved. See [LICENSE](LICENSE) for details.
 
