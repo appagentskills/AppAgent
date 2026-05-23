@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AppAgent Documentation</title>
+    <meta name="description" content="AppAgent — an AI Agent for your ServiceNow instance. Documentation and reference.">
+    <link rel="stylesheet" href="docs.css">
+</head>
+<body>
+    <header class="site-header">
+        <div class="site-header-inner">
+            <a class="site-brand" href="./">AppAgent</a>
+            <button type="button" class="outline-toggle" id="outline-toggle" aria-label="Open table of contents" aria-expanded="false" aria-controls="docs-outline">
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                    <path fill="currentColor" d="M3 6h18v2H3V6Zm0 5h18v2H3v-2Zm0 5h18v2H3v-2Z"/>
+                </svg>
+            </button>
+        </div>
+    </header>
+    <div class="outline-backdrop" id="outline-backdrop" hidden></div>
+
+    <main class="docs-content">
+        <div class="docs-layout">
+            <div class="docs-main" id="docs-main">
+                <p class="docs-loading">Loading documentation…</p>
+            </div>
+            <aside id="docs-outline-container"></aside>
+        </div>
+    </main>
+
+    <footer class="site-footer">
+        <p>AppAgent — Chrome extension documentation.</p>
+    </footer>
+
+    <script src="docs-renderer.js"></script>
+    <script src="docs.js"></script>
+</body>
+</html>

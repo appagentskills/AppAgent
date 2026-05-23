@@ -1,22 +1,18 @@
 # AppAgent
 
-**Build and maintain ServiceNow apps using an Agent.**
+**Build and maintain ServiceNow apps using an Agent. As a Chrome extension.**
 
-AppAgent is your development partner for ServiceNow. It can create and maintain apps, and run tests for them. It does the testing by filling forms and taking screenshots. No technical knowledge required. Can even be used from a mobile device.
+AppAgent is your development partner for ServiceNow. It can create and maintain apps, and run tests for them. It does the testing by filling forms and taking screenshots. No technical knowledge required.
 
 You bring your own API key (BYOK) and that's it! It's compatible with OpenAI, OpenRouter, Claude API, and even Claude Code plans (contact us privately).
 
-It is a web app that stores all of the chat in your browser (does not even leave your browser). It only interacts with your ServiceNow instance and your model API provider.
-
-This first Preview version is meant to work on PDI instances for freelancers.
+It is a Chrome extension that stores all of the chat in your browser (does not even leave your browser). It only interacts with your ServiceNow instance and your model API provider.
 
 ![AppAgent Example](AppAgentExample.png)
 
 It uses fewer tokens than Claude Code, as it leans heavily on API cache, tools caching and tool chaining (Out of the Box).
 
-You can add skills to it, it has an integrated browser, and it has mechanical undo buttons for all the changes it does to your instance.
-
-It is just one XML file that contains one UI Page record.
+You can add skills to it, it has browser control via tabs, and it has mechanical undo buttons for all the changes it does to your instance.
 
 > **Note:** For now, AppAgent is intended for use in development instances only.
 
@@ -29,37 +25,44 @@ Please fill this form and we will reach out: [Contact Us Form](https://forms.gle
 | Feature | What It Does |
 |---------|--------------|
 | **Bring Your Own Model** | Choose from Claude, GPT, Gemini, Grok, and more |
+| **Sign in with Claude** | OAuth flow — use your existing Claude Code Personal or Enterprise plan, no API key needed |
 | **Images & PDFs** | Attach screenshots, diagrams, or documents for the Agent to analyze |
 | **Code Editing** | Reads and modifies scripts with full version tracking |
-| **Integrated Browser** | Tests its own work: Navigates pages, clicks, fills forms, takes screenshots |
+| **Browser Control** | Tests its own work: Navigates tabs, clicks, fills forms, takes screenshots |
 | **Live Dashboards** | Creates widgets that pull real-time data from your instance |
 | **Agent Skills** | Build your own skills to extend the Agent's capabilities |
+| **Skill Actions** | Skills can surface one-click buttons on the home page that trigger preset workflows |
+| **Live Progress** | See what the Agent is doing in real time — mutating progress pills with running/stuck/done/error states |
+| **Workspaces** | Per-chat file scratchpad — clone GitHub repos, read, write, edit, diff, and switch branches. Multi-repo per chat, with cross-chat ownership protection |
+| **Integrated Git & GitHub Push** | The Agent can pull from / push to GitHub, raise branches, and open pull requests directly from the chat — no terminal, no IDE |
+| **Smart Documents** | Persistent, versioned markdown the Agent can edit and reference across chats |
+| **Multi-Instance** | Connect multiple ServiceNow instances; the Agent can see and act on all of them from one chat |
+| **Pause & Interrupt** | Pause or send a new message mid-stream — the in-flight call aborts immediately |
+| **Web Search** | Free, keyless web lookups via Google and DuckDuckGo |
 | **Mechanical Undo** | Every change tracked, one-click rollback |
 | **Export to XML** | Export all changes for deployment to other instances |
 | **Tool Permissions** | Built-in security, control what the Agent can do on the instance |
 | **Open Standards** | Compatible with [OpenRouter](https://openrouter.ai) and [AgentSkills.io](https://agentskills.io) |
 | **Model Caching** | Reduces cost by up to 10x through prompt caching |
 | **Smart Context** | Only loads needed parts of large files. Won't overload the model |
-| **Zero Dependencies** | No libraries, no XML files, no instance dependency |
+| **Zero Dependencies** | No libraries, no frameworks, pure vanilla JS |
 
 ## How It Works
 
 ```
 ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
 │              │      │              │      │              │
-│    Your      │◀────▶│    Model     │      │  ServiceNow  │
-│   Browser    │      │   (Claude,   │      │   Instance   │
+│   Chrome     │◀────▶│    Model     │      │  ServiceNow  │
+│  Extension   │      │   (Claude,   │      │   Instance   │
 │              │      │   GPT, etc)  │      │              │
 │  [AppAgent]  │      └──────────────┘      │              │
 │              │◀──────────────────────────▶│              │
 └──────────────┘                            └──────────────┘
 ```
 
-AppAgent is a web app with a built-in agent loop. You describe what you want → The Agent asks the model → Executes tools in the browser → Accesses ServiceNow with your current user permissions. The Agent talks directly to model API providers, on-premises or online.
+AppAgent is a Chrome extension with a built-in agent loop. You describe what you want → The Agent asks the model → Executes tools in the browser → Accesses ServiceNow with your current user permissions. The Agent talks directly to model API providers, on-premises or online.
 
 ## How AppAgent Compares
-
-*As of February 2026*
 
 | | AppAgent | Claude Code | Cursor | Base44 |
 |---|---|---|---|---|
@@ -70,11 +73,21 @@ AppAgent is a web app with a built-in agent loop. You describe what you want →
 | **Builds apps** | ✓ | ✓ | ✓ | ✓ |
 | **Browser control for testing** | ✓ | ✗ | ✗ | ✗ |
 | **Takes screenshots** | ✓ | ✗ | ✗ | ✗ |
-| **Background tasks** | Roadmap | ✗ | ✓ | ✗ |
+| **Background tasks** | ✓ (via Skill Actions) | ✗ | ✓ | ✗ |
+| **Parallel agents** | Roadmap | ✗ | ✓ | ✗ |
 | **Mechanical undo** | ✓ | ✗ | ✗ | ✗ |
 | **Images & PDFs** | ✓ | ✓ | ✓ | Limited |
 | **Smart Dashboards** | ✓ | ✗ | ✗ | ✓ |
 | **Extensible Skills** | ✓ | ✓ | ✗ | ✗ |
+| **Skill Actions (one-click buttons)** | ✓ | ✗ | ✗ | ✗ |
+| **Live Progress Pills** | ✓ | ✗ | ✗ | ✗ |
+| **Multi-instance support** | ✓ | ✗ | ✗ | ✗ |
+| **Per-chat Workspaces** | ✓ | ✗ | ✗ | ✗ |
+| **Integrated git** | ✓ | ✓ (CLI) | ✓ (IDE) | ✗ |
+| **Push to GitHub from chat** | ✓ | ✓ (CLI) | Limited | ✗ |
+| **Smart Documents** | ✓ | ✗ | ✗ | ✗ |
+| **Pause / Interrupt mid-stream** | ✓ | ✓ | Limited | ✗ |
+| **Web Search** | ✓ | ✓ | ✓ | ✗ |
 | **Tool Permissions** | ✓ | ✓ | Limited | ✗ |
 | **Export changes** | ✓ XML | ✓ | ✓ | ✓ |
 | **Bring your own model** | ✓ | ✗ | ✓ | ✗ |
@@ -84,18 +97,12 @@ AppAgent is a web app with a built-in agent loop. You describe what you want →
 
 *Base44 cannot build ServiceNow apps, but is included for users familiar with its experience.*
 
-## No Dev Environment Required
+## Setup
 
-Unlike traditional development tools, AppAgent runs entirely in your browser. No IDE, no server, no local setup, no source code access needed. Just import one UI Page and start building.
-
-## 5-Minute Setup
-
-1. **Deploy** - Import `app_agent.xml` as a UI Page in your ServiceNow instance
-2. **Get an API Key** - Sign up at [OpenRouter](https://openrouter.ai) (or use Anthropic/OpenAI directly)
-3. **Configure** - Paste your API key in Settings
-4. **Start Building** - Describe what you want to create
-
-Already have a Claude Code subscription? You can use it with AppAgent through our proxy.
+1. **Install** — Install the AppAgent extension from the Chrome Web Store (or load unpacked for development)
+2. **Get an API Key** — Sign up at [OpenRouter](https://openrouter.ai), use Anthropic/OpenAI directly, or connect your Claude Code subscription (Enterprise or Personal)
+3. **Configure** — Open the extension, paste your API key in Settings
+4. **Start Building** — Navigate to your ServiceNow instance and start chatting
 
 ## Examples
 
@@ -106,7 +113,7 @@ AppAgent will create the table, add the fields, build a form and list layout, an
 AppAgent will scan for security gaps, inactive admin accounts, stale records, and configuration best practices, then give you a report with recommendations.
 
 ### "Test this page and report any issues you find"
-AppAgent will open the page in its browser, fill forms, click buttons, take screenshots, and compile a report of everything it finds.
+AppAgent will open the page in a browser tab, fill forms, click buttons, take screenshots, and compile a report of everything it finds.
 
 ### "There's a bug in this form, can you fix it?"
 AppAgent will open the form, inspect the scripts behind it, identify the bug, fix the code, and show you exactly what changed. One click to undo if needed.
@@ -127,7 +134,7 @@ AppAgent will create a notification rule that triggers on P1 incidents and sends
 
 ## The Vision
 
-Right now Opus 4.6 is great, but still needs some babysitting.
+Right now Opus 4.7 is great, but still needs some babysitting.
 
 We will keep pushing the limits of what the AI Models are capable of for each generation, and keep going up the abstraction stack, until we are stuck.
 
@@ -135,14 +142,14 @@ GPT-4 => Code completion
 GPT-4o => Writes a standalone file
 Sonnet 3.5 => Edits a file in a codebase
 Opus 4.5 => Writes a complete feature
-Opus 4.6 => ... (we are still testing)
+Opus 4.6 => Maintains an app end-to-end
+Opus 4.7 => ... (we are still testing)
 
 ---
 
 ## Roadmap
 
-- Web search
-- Background agents
+- Parallel agents
 - RAG
 - Specs and test cases
 
@@ -165,4 +172,3 @@ If you have any bugs, you can open an issue or contact us directly. We only offe
 ## License
 
 Private and Commercial use. Internal modification permitted. Distribution and resale prohibited.
-All rights reserved.

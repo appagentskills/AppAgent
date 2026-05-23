@@ -1,0 +1,49 @@
+{
+    "manifest_version": 3,
+    "name": "AppAgent for ServiceNow",
+    "version": "1.0.6",
+    "description": "AI Agent for ServiceNow - natural language interaction with the platform",
+    "permissions": [
+        "storage",
+        "activeTab",
+        "tabs",
+        "scripting",
+        "cookies",
+        "declarativeNetRequest",
+        "sidePanel",
+        "notifications",
+        "alarms",
+        "power"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "icons": {
+        "128": "icons/AppAgentIconStarOnly_128.png"
+    },
+    "action": {
+        "default_title": "Open AppAgent",
+        "default_icon": {
+            "128": "icons/AppAgentIconStarOnly_128.png"
+        }
+    },
+    "side_panel": {
+        "default_path": "app.html"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "declarative_net_request": {
+        "rule_resources": [
+            {
+                "id": "ruleset_1",
+                "enabled": true,
+                "path": "rules.json"
+            }
+        ]
+    },
+    "sandbox": {
+        "pages": ["sandbox.html", "widget-sandbox.html"]
+    },
+    "content_scripts": []
+}

@@ -1,0 +1,181 @@
+/* ═══════════════════════════════════════════════════════════
+   DESIGN TOKENS — Theme System
+   Change these values to re-theme the entire application.
+   ═══════════════════════════════════════════════════════════ */
+:root {
+    /* ─── Color Palette ─── */
+
+    /* Primary - Blue */
+    --primary: #293E6B;
+    --primary-hover: #1e2f52;
+    --primary-light: #e8f0fa;
+    --primary-lighter: #f4f7fc;
+
+    /* Secondary - Gray */
+    --secondary: #6b7280;
+    --secondary-hover: #4b5563;
+    --secondary-light: #f3f4f6;
+    --secondary-lighter: #f9fafb;
+
+    /* Accent - Teal/Cyan */
+    --accent: #0891b2;
+    --accent-hover: #0e7490;
+    --accent-light: #ecfeff;
+    --accent-lighter: #f0fdfa;
+
+    /* Success - Green */
+    --success: #059669;
+    --success-hover: #047857;
+    --success-light: #d1fae5;
+    --success-lighter: #ecfdf5;
+
+    /* Warning - Amber */
+    --warning: #d97706;
+    --warning-hover: #b45309;
+    --warning-dark: #92400e;
+    --warning-light: #fef3c7;
+    --warning-lighter: #fffbeb;
+    --warning-bg: #fffbeb;
+    --warning-text: #92400e;
+
+    /* Info - Blue */
+    --info: #3b82f6;
+    --info-light: #dbeafe;
+
+    /* Danger - Red */
+    --danger: #dc2626;
+    --danger-hover: #b91c1c;
+    --danger-light: #fee2e2;
+    --danger-lighter: #fef2f2;
+
+    /* Borders */
+    --border: #e5e7eb;
+    --border-dark: #d1d5db;
+    --border-light: #f0f0f0;
+    --secondary-border: #e5e7eb;
+    --secondary-border-dark: #d1d5db;
+
+    /* Text */
+    --text-primary: #1f2937;
+    --text-secondary: #6b7280;
+    --text-muted: #9ca3af;
+    --text-heading: #111827;
+    --text-inverse: #fff;
+    --text-link: #2563eb;
+
+    /* Backgrounds */
+    --bg-white: #fff;
+    --bg-light: #f9fafb;
+    --bg-dark: #1e1e1e;
+    --bg-hover: #f3f4f6;
+    --bg-code: #f5f5f5;
+    --bg-overlay: rgba(0,0,0,0.4);
+    --bg-tooltip: #1f2937;
+    --bg-primary: #f4f7fc;
+    --bg-secondary: #f3f4f6;
+    --bg-main: #fff;
+
+    /* Code */
+    --code-text: #e83e8c;
+
+    /* Functional */
+    --icon-color: #6b7280;
+    --disabled-bg: #f3f4f6;
+    --disabled-text: #9ca3af;
+
+    /* ─── Spacing Scale (4px base) ─── */
+    --space-0: 0;
+    --space-1: 2px;
+    --space-2: 4px;
+    --space-3: 6px;
+    --space-4: 8px;
+    --space-5: 10px;
+    --space-6: 12px;
+    --space-7: 14px;
+    --space-8: 16px;
+    --space-9: 20px;
+    --space-10: 24px;
+    --space-11: 32px;
+    --space-12: 40px;
+    --space-13: 48px;
+
+    /* ─── Typography ─── */
+    --text-2xs: 8px;
+    --text-xs: 9px;
+    --text-sm: 10px;
+    --text-caption: 11px;
+    --text-body-sm: 12px;
+    --text-body: 13px;
+    --text-body-lg: 14px;
+    --text-lg: 15px;
+    --text-xl: 16px;
+    --text-2xl: 18px;
+    --text-3xl: 20px;
+
+    --leading-tight: 1.3;
+    --leading-normal: 1.4;
+    --leading-relaxed: 1.5;
+    --leading-loose: 1.6;
+
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace;
+
+    --font-medium: 500;
+    --font-semibold: 600;
+
+    /* ─── Border Radius ─── */
+    --radius-xs: 2px;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --radius-xl: 12px;
+    --radius-2xl: 16px;
+    --radius-full: 50%;
+    --radius-bubble: 18px 4px 18px 18px;
+    --radius-pill: 20px;
+    --radius-input: 28px;
+
+    /* ─── Box Shadows ─── */
+    --shadow-xs: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+    --shadow-md: 0 2px 8px rgba(0,0,0,0.1);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,0.15);
+    --shadow-xl: 0 8px 32px rgba(0,0,0,0.2);
+    --shadow-focus: 0 0 0 2px var(--primary-light);
+    --shadow-inset: inset 0 8px 8px -8px rgba(0,0,0,0.15);
+
+    /* ─── Transitions ─── */
+    --transition-fast: 0.15s ease;
+    --transition-normal: 0.2s ease;
+    --transition-slow: 0.3s ease;
+
+    /* ─── Layout ─── */
+    --sidebar-width: 60px;
+    --sidebar-expanded: 260px;
+    --header-height: 48px;
+
+    /* ─── Syntax Highlighting ─── */
+    --sh-keyword: #d73a49;
+    --sh-string: #032f62;
+    --sh-number: #005cc5;
+    --sh-comment: #6a737d;
+    --sh-bool: #6f42c1;
+
+    /* ─── Diff Colors ─── */
+    --diff-add-bg: rgba(34, 197, 94, 0.12);
+    --diff-add-bg-hover: rgba(34, 197, 94, 0.2);
+    --diff-add-text: #166534;
+    --diff-add-word: rgba(34, 197, 94, 0.4);
+    --diff-add-word-text: #14532d;
+    --diff-remove-bg: rgba(239, 68, 68, 0.12);
+    --diff-remove-bg-hover: rgba(239, 68, 68, 0.2);
+    --diff-remove-text: #991b1b;
+    --diff-remove-word: rgba(239, 68, 68, 0.4);
+    --diff-remove-word-text: #7f1d1d;
+
+    /* ─── Console (dark bg) ─── */
+    --console-error: #ff6b6b;
+    --console-warn: #ffd93d;
+    --console-log: #69db7c;
+    --console-network: #74c0fc;
+}

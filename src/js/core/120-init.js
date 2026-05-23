@@ -1,0 +1,731 @@
+async function init() {
+    // If inside an iframe, try to redirect to standalone page
+    // This works for platform iframes (gsft_main) but fails for sandboxed
+    // iframes (integrated browser) which then continue normally
+    if (window.self !== window.top) {
+        try {
+            window.top.location.href = window.location.pathname;
+            return;
+        } catch (e) {
+            // Sandboxed iframe (e.g., integrated browser) - continue normally
+        }
+    }
+
+    // Check for standalone dashboard mode (?standalone=dashboard)
+    var urlParams = new URLSearchParams(window.location.search);
+    var standaloneMode = urlParams.get('standalone');
+    if (standaloneMode === 'dashboard') {
+        document.body.classList.add('standalone-dashboard');
+    }
+
+    // Show reload buttons (always present in extension)
+    var _reloadBtn = document.getElementById('ext-reload-btn');
+    if (_reloadBtn) _reloadBtn.style.display = '';
+    var _homeReloadBtn = document.getElementById('home-ext-reload-btn');
+    if (_homeReloadBtn) _homeReloadBtn.style.display = '';
+
+    // Side panel vs. full-tab layout
+    if (urlParams.get('mode') !== 'tab') {
+        document.body.classList.add('sidepanel-mode');
+        var _expandBtn = document.getElementById('ext-expand-btn');
+        if (_expandBtn) _expandBtn.style.display = '';
+        var _homeExpandBtn = document.getElementById('home-ext-expand-btn');
+        if (_homeExpandBtn) _homeExpandBtn.style.display = '';
+    } else {
+        setBrowserControlsVisibility(true);
+    }
+
+    // ===========================================
+    // PHASE 1: Synchronous localStorage + Icons (instant UI)
+    // ===========================================
+
+    // Read savedView once and reuse throughout init()
+    var savedView = appStorage.getItem('currentView');
+    if (document.body.classList.contains('standalone-dashboard')) {
+        savedView = 'dashboard';
+    }
+
+    // Load localStorage preferences first (synchronous)
+    loadLocalScopeOverride();
+    loadVersionSidebarState();
+
+    var savedShowApiStats = appStorage.getItem('showApiStats');
+    if (savedShowApiStats !== null) showApiStats = savedShowApiStats === 'true';
+    var statsCheckbox = document.getElementById('show-api-stats');
+    if (statsCheckbox) statsCheckbox.checked = showApiStats;
+
+    var savedCompactToolCalls = appStorage.getItem('compactToolCalls');
+    if (savedCompactToolCalls !== null) compactToolCalls = savedCompactToolCalls === 'true';
+    var compactCheckbox = document.getElementById('compact-tool-calls');
+    if (compactCheckbox) compactCheckbox.checked = compactToolCalls;
+
+    var savedScreenshotMethod = appStorage.getItem('screenshotMethod');
+    if (savedScreenshotMethod) screenshotMethod = savedScreenshotMethod;
+
+    // Load and apply theme (before any rendering to avoid flash)
+    var savedTheme = appStorage.getItem('appTheme');
+    if (savedTheme) appTheme = savedTheme;
+    applyTheme();
+
+    // Restore sidebar state (default collapsed) - no animation on initial load
+    var savedSidebarState = appStorage.getItem('sidebarCollapsed');
+    sidebarCollapsed = savedSidebarState === 'true';
+    var sidebar = document.getElementById('sidebar');
+    if (sidebar) {
+        if (sidebarCollapsed) sidebar.classList.remove('expanded');
+        updateSidebarToggleIcon();
+        requestAnimationFrame(function() {
+            requestAnimationFrame(function() {
+                sidebar.classList.remove('no-transition');
+            });
+        });
+    }
+
+    // Setup credits display click handler and initialize with cached value
+    var creditsDisplay = document.getElementById('credits-display');
+    var homeCreditsDisplay = document.getElementById('home-credits-display');
+    var cachedCreditsVal = appStorage.getItem('cachedCredits');
+    if (creditsDisplay) {
+        creditsDisplay.onclick = fetchCredits;
+        if (cachedCreditsVal) creditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>$' + cachedCreditsVal;
+    }
+    if (homeCreditsDisplay) {
+        homeCreditsDisplay.onclick = fetchCredits;
+        if (cachedCreditsVal) {
+            homeCreditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>$' + cachedCreditsVal;
+            homeCreditsDisplay.style.display = '';
+        }
+    }
+
+    // Initialize UI icons immediately
+    var settingsBtns = document.querySelectorAll('.settings-btn');
+    settingsBtns.forEach(function(btn) { btn.innerHTML = UI_ICONS.settings; });
+    // Initialize header toggle-sidebar-btn icons (expand panel)
+    var toggleSidebarBtns = document.querySelectorAll('.toggle-sidebar-btn');
+    toggleSidebarBtns.forEach(function(btn) { btn.innerHTML = UI_ICONS.panelLeftOpen; });
+
+    // Initialize icons not in HTML (dynamic elements)
+    var floatingMenuIcon = document.getElementById('floating-menu-icon');
+    var versionSidebarOpen = document.getElementById('version-sidebar-open');
+    var versionSidebarClose = document.getElementById('version-sidebar-close');
+    var browseIcon = document.getElementById('browse-icon');
+    if (floatingMenuIcon) floatingMenuIcon.innerHTML = UI_ICONS.menu;
+    if (versionSidebarOpen) versionSidebarOpen.innerHTML = UI_ICONS.menu;
+    if (versionSidebarClose) versionSidebarClose.innerHTML = UI_ICONS.close;
+    if (browseIcon) browseIcon.innerHTML = UI_ICONS.panelLeftOpen;
+    var homeBrowseIcon = document.getElementById('home-browse-icon');
+    if (homeBrowseIcon) homeBrowseIcon.innerHTML = UI_ICONS.panelLeftOpen;
+    
+    // Restore history section state
+    var savedHistoryState = appStorage.getItem('historyExpanded');
+    historyExpanded = savedHistoryState !== 'false'; // Default to expanded
+    var chatList = document.getElementById('chat-list');
+    var historyBtn = document.getElementById('history-toggle-btn');
+    if (chatList && !historyExpanded) chatList.classList.add('collapsed');
+    if (historyBtn && historyExpanded) historyBtn.classList.add('expanded');
+    
+    // Initialize input button icons
+    var pauseIcon = document.getElementById('pause-icon');
+    var sendIcon = document.getElementById('send-icon');
+    var retryIcon = document.getElementById('retry-icon');
+    var continueIcon = document.getElementById('continue-icon');
+    var attachIcon = document.getElementById('attach-icon');
+    var newChatIcon = document.querySelector('.new-chat-icon');
+    var homeAttachIcon = document.getElementById('home-attach-icon');
+    var homeSendIcon = document.getElementById('home-send-icon');
+    if (pauseIcon) pauseIcon.innerHTML = UI_ICONS.pause;
+    if (sendIcon) sendIcon.innerHTML = UI_ICONS.send;
+    if (retryIcon) retryIcon.innerHTML = UI_ICONS.retry;
+    if (continueIcon) continueIcon.innerHTML = UI_ICONS.play;
+    if (attachIcon) attachIcon.innerHTML = UI_ICONS.attach;
+    if (newChatIcon) newChatIcon.innerHTML = UI_ICONS.compose;
+    if (homeAttachIcon) homeAttachIcon.innerHTML = UI_ICONS.attach;
+    if (homeSendIcon) homeSendIcon.innerHTML = UI_ICONS.send;
+    
+    var ssPreviewDownloadBtn = document.getElementById('screenshot-preview-download-btn');
+    var ssPreviewCloseBtn = document.getElementById('screenshot-preview-close-btn');
+    if (ssPreviewDownloadBtn) ssPreviewDownloadBtn.innerHTML = UI_ICONS.download;
+    if (ssPreviewCloseBtn) ssPreviewCloseBtn.innerHTML = UI_ICONS.close;
+
+    // Initialize header rename button icon
+    var headerRenameBtn = document.getElementById('header-rename-btn');
+    if (headerRenameBtn) headerRenameBtn.innerHTML = UI_ICONS.edit;
+
+    // Initialize settings panel icons
+    var sectionIconModel = document.getElementById('section-icon-model');
+    var sectionIconScope = document.getElementById('section-icon-scope');
+    var sectionIconPermissions = document.getElementById('section-icon-permissions');
+    var sectionIconDisplay = document.getElementById('section-icon-display');
+    var sectionIconCache = document.getElementById('section-icon-cache');
+    var sectionIconData = document.getElementById('section-icon-data');
+    var dataIconExport = document.getElementById('data-icon-export');
+    var dataIconImport = document.getElementById('data-icon-import');
+    var dataIconDelete = document.getElementById('data-icon-delete');
+    if (sectionIconModel) sectionIconModel.innerHTML = UI_ICONS.model;
+    if (sectionIconScope) sectionIconScope.innerHTML = UI_ICONS.scope;
+    if (sectionIconPermissions) sectionIconPermissions.innerHTML = UI_ICONS.shield;
+    if (sectionIconDisplay) sectionIconDisplay.innerHTML = UI_ICONS.display;
+    if (sectionIconCache) sectionIconCache.innerHTML = UI_ICONS.cache;
+    if (sectionIconData) sectionIconData.innerHTML = UI_ICONS.database;
+    if (dataIconExport) dataIconExport.innerHTML = UI_ICONS.download;
+    if (dataIconImport) dataIconImport.innerHTML = UI_ICONS.upload;
+    if (dataIconDelete) dataIconDelete.innerHTML = UI_ICONS.trash;
+
+    // Initialize image attachment event listeners (paste, drag & drop)
+    initImageAttachmentListeners();
+
+    // Initialize cache token limit input
+    var cacheTokenInput = document.getElementById('cache-token-limit');
+    if (cacheTokenInput) cacheTokenInput.value = Math.round(cacheTokenLimit / 1000);
+    
+    // Setup and update storage indicator
+    updateStorageIndicator();
+    
+    // Setup keyboard shortcut for ⌘K to focus search
+    document.addEventListener('keydown', function(e) {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+            e.preventDefault();
+            var searchInput = document.getElementById('chat-search-input');
+            var sidebar = document.getElementById('sidebar');
+            if (searchInput) {
+                // Expand sidebar if collapsed
+                if (sidebar && !sidebar.classList.contains('expanded')) {
+                    toggleSidebar();
+                }
+                searchInput.focus();
+            }
+        }
+    });
+
+    // Global Escape handler — closes the topmost overlay/modal
+    document.addEventListener('keydown', function(e) {
+        if (e.key !== 'Escape') return;
+        // Order: highest z-index first
+        if (document.getElementById('widget-fullscreen-overlay')) { closeWidgetFullscreen(); return; }
+        if (document.getElementById('widget-edit-overlay')) { closeWidgetCodeEdit(); return; }
+        if (document.getElementById('widget-modal-overlay')) { closeWidgetModal(); return; }
+        if (document.getElementById('widget-history-modal-overlay')) { closeWidgetHistory(); return; }
+        var modal = document.getElementById('modal-overlay');
+        if (modal && modal.classList.contains('show')) { closeModal(); return; }
+    });
+
+    // Restore impersonation state
+    impersonateOriginalUserSysId = appStorage.getItem('impersonateOriginalUserSysId') || null;
+
+    // Extension never auto-opens the browser panel — hide URL input on load
+    var urlInput = document.getElementById('browser-url-input');
+    if (urlInput) urlInput.style.display = 'none';
+    
+    if (messageInput) messageInput.focus();
+    
+    // Initialize skills button icon
+    var skillsBtn = document.getElementById('skills-btn');
+    if (skillsBtn) {
+        var skillsIcon = skillsBtn.querySelector('.skills-icon');
+        if (skillsIcon) skillsIcon.innerHTML = UI_ICONS.skill;
+    }
+    // Initialize dashboard button icon
+    var dashboardBtn = document.getElementById('dashboard-btn');
+    if (dashboardBtn) {
+        var dashboardIcon = dashboardBtn.querySelector('.skills-icon');
+        if (dashboardIcon) dashboardIcon.innerHTML = UI_ICONS.widget;
+    }
+    document.querySelectorAll('.skills-back-btn .back-icon').forEach(function(el) { el.innerHTML = UI_ICONS.back; });
+    document.querySelectorAll('.skills-action-btn .action-icon').forEach(function(el) {
+        var btn = el.parentElement;
+        if (!btn) return;
+        var text = btn.textContent || '';
+        if (text.indexOf('Import') !== -1) el.innerHTML = UI_ICONS.upload;
+        else if (text.indexOf('Export') !== -1) el.innerHTML = UI_ICONS.download;
+        else if (text.indexOf('New') !== -1 || text.indexOf('Add') !== -1) el.innerHTML = UI_ICONS.plus;
+        else if (text.indexOf('Delete') !== -1) el.innerHTML = UI_ICONS.trash;
+        else if (text.indexOf('Save') !== -1) el.innerHTML = UI_ICONS.save;
+        else if (text.indexOf('Download') !== -1) el.innerHTML = UI_ICONS.download;
+        else if (text.indexOf('Refresh') !== -1 || text.indexOf('Regenerate') !== -1) el.innerHTML = UI_ICONS.refresh;
+        else if (text.indexOf('Headers') !== -1) el.innerHTML = UI_ICONS.menu;
+        else if (text.indexOf('Standalone') !== -1) el.innerHTML = UI_ICONS.externalLink;
+        else if (text.indexOf('More') !== -1) el.innerHTML = UI_ICONS.moreHorizontal;
+    });
+    // Initialize dropdown menu icons
+    var moreStandaloneIcon = document.getElementById('more-standalone-icon');
+    var moreHeadersIcon = document.getElementById('more-headers-icon');
+    var moreRefreshIcon = document.getElementById('more-refresh-icon');
+    var moreImportIcon = document.getElementById('more-import-icon');
+    var moreExportIcon = document.getElementById('more-export-icon');
+    if (moreStandaloneIcon) moreStandaloneIcon.innerHTML = UI_ICONS.externalLink;
+    if (moreHeadersIcon) moreHeadersIcon.innerHTML = UI_ICONS.menu;
+    if (moreRefreshIcon) moreRefreshIcon.innerHTML = UI_ICONS.refresh;
+    if (moreImportIcon) moreImportIcon.innerHTML = UI_ICONS.upload;
+    if (moreExportIcon) moreExportIcon.innerHTML = UI_ICONS.download;
+
+    // Show input area now that icons are initialized
+    var inputArea = document.getElementById('input-area');
+    if (inputArea) inputArea.style.visibility = 'visible';
+    // Panel visibility is handled by inline script after panels are defined
+
+    // ===========================================
+    // PHASE 2: IndexedDB async loading
+    // ===========================================
+    await loadChatsFromStorage();
+    await loadApiProviders();
+    await loadProviderFromStorage();
+    await loadToolPermissions();
+    await loadCacheTokenLimit();
+    await loadCustomSystemPrompt();
+    await loadHooksSettings();
+    await loadSkillsFromStorage();
+    await loadActiveSkills();
+    await importEmbeddedSkills();
+    await loadDashboardWidgets();
+    await loadAllDocuments();
+    await loadAllActionStates(); // restore in-flight action states from IDB
+    cleanupStaleWorkspaces(); // remove old-format workspace metas with no files
+    setSetting('defaultWorkspaceRepo', null); // migration: remove stale default pointer
+    refreshWorkspaceContext(); // async, no await — non-blocking
+    updateWorkspaceHeaderStatus(); // show local state immediately
+    syncAndUpdateWorkspaceHeader(); // then sync with remote in background
+
+    // Restore pending images and text from IndexedDB
+    await restorePendingImagesFromSession();
+    await restorePendingTextsFromStorage();
+
+    // Now render UI that depends on IndexedDB data
+    renderChatList();
+    renderAllActionPlacements(); // render action buttons in home/header/chat/sidebar
+    populateProviderDropdown();
+    updateModelDisplay();
+    renderToolPermissions();
+
+    // Deep-link to a specific chat via ?chat= parameter (used by side panel expand)
+    var deepLinkChatId = urlParams.get('chat');
+
+    // Restore last viewed chat or start new chat
+    var willShowNonChatView = savedView === 'dashboard' || savedView === 'skills' || savedView === 'home' || savedView === 'documents' || !savedView;
+    var lastChatId = deepLinkChatId || appStorage.getItem('lastChatId');
+    var isNewChat = false;
+    if (lastChatId && chats[lastChatId]) {
+        if (willShowNonChatView) {
+            currentChatId = lastChatId;
+            isNewChat = !chats[lastChatId].messages || chats[lastChatId].messages.length === 0;
+        } else {
+            selectChat(lastChatId);
+            isNewChat = !chats[lastChatId].messages || chats[lastChatId].messages.length === 0;
+        }
+    } else {
+        currentChatId = generateId();
+        chats[currentChatId] = { id: currentChatId, title: 'New Chat', messages: [], createdAt: Date.now(), isTemporary: true };
+        appStorage.setItem('lastChatId', currentChatId);
+        versionHistory = [];
+        clearUpdateSet();
+        if (!willShowNonChatView) {
+            renderChatList();
+            renderMessages();
+            renderVersionSidebar();
+            updateInputPosition();
+            updateChatTitleHeader();
+        }
+        isNewChat = true;
+    }
+
+    // Show/hide version sidebar based on chat state
+    if (isNewChat || !chats[currentChatId] || !chats[currentChatId].messages || chats[currentChatId].messages.length === 0) {
+        var versionSidebar = document.getElementById('version-sidebar');
+        var openBtn = document.getElementById('version-sidebar-open');
+        if (versionSidebar) versionSidebar.classList.remove('visible');
+        if (openBtn) openBtn.classList.add('visible');
+    } else {
+        updateVersionSidebarVisibility();
+    }
+
+    // Restore scroll position for current chat (no animation)
+    var savedScrollPos = appStorage.getItem('scrollPos_' + currentChatId);
+    if (savedScrollPos) {
+        var messagesContainer = document.getElementById('messages');
+        if (messagesContainer) {
+            messagesContainer.scrollTop = parseInt(savedScrollPos, 10);
+        }
+    }
+
+    // Restore pending input text for current chat (per-chat from IndexedDB)
+    var messageInput = document.getElementById('message-input');
+    if (messageInput && chatPendingTexts[currentChatId]) {
+        messageInput.value = chatPendingTexts[currentChatId];
+        autoResizeTextarea(messageInput);
+    }
+
+    // Update context indicator after restoring input
+    updateContextIndicator();
+
+    // ===========================================
+    // PHASE 3: Restore view state (uses savedView from top of init)
+    // ===========================================
+    var savedSkillId = appStorage.getItem('currentEditingSkill');
+    if (savedView === 'skill-editor' && savedSkillId && skills[savedSkillId]) {
+        // Restore skill editor with the specific skill
+        currentView = 'skills';
+        hideAllPanels();
+        var skillsPanel = document.getElementById('skills-panel');
+        if (skillsPanel) skillsPanel.style.display = 'flex';
+        openSkillEditor(savedSkillId);
+        updateAllButtonStates();
+    } else if (savedView === 'dashboard') {
+        openDashboardView();
+    } else if (savedView === 'skills') {
+        openSkillsView();
+    } else if (savedView === 'docs') {
+        openDocsView();
+    } else if (savedView === 'settings-page') {
+        openSettingsPageView();
+    } else if (savedView === 'history') {
+        openHistoryView();
+    } else if (savedView === 'documents') {
+        openDocumentsView();
+    } else if (savedView === 'chat') {
+        // Show browser controls for chat view
+        currentView = 'chat';
+        showChatView();
+        updateAllButtonStates();
+    } else if (savedView === 'home' || !savedView) {
+        // Default to home for first-time users
+        openHomeView();
+    }
+
+    // Deep-link to a specific widget via ?widget= parameter
+    var deepLinkWidgetId = urlParams.get('widget');
+    if (deepLinkWidgetId) {
+        var dlWidget = getWidgetById(deepLinkWidgetId) || (dashboardWidgets && dashboardWidgets[deepLinkWidgetId]);
+        if (dlWidget && dlWidget.html) {
+            document.body.innerHTML = '';
+            document.body.style.margin = '0';
+            var wf = document.createElement('iframe');
+            wf.style.cssText = 'width:100%;height:100vh;border:none;display:block;';
+            document.body.appendChild(wf);
+            writeWidgetHtml(wf, dlWidget.html);
+            return;
+        }
+    }
+
+    // Mark initial load complete - subsequent pushHistoryState calls will use pushState instead of replaceState
+    isInitialLoad = false;
+
+    // Initialize Claude OAuth button
+    initClaudeOAuth();
+
+    // Fetch credits last (external API call shouldn't block UI initialization)
+    fetchCredits();
+}
+
+function toggleSkillsView() {
+    // If already open, do nothing (behave like clicking on a chat)
+    if (currentView === 'skills') return;
+    openSkillsView();
+}
+
+function openSkillsView() {
+    currentView = 'skills';
+    appStorage.setItem('currentView', 'skills');
+    appStorage.removeItem('currentEditingSkill');
+    currentEditingSkill = null;
+    hideAllPanels();
+    var skillsPanel = document.getElementById('skills-panel');
+    var listPanel = document.getElementById('skills-list-panel');
+    var editorPanel = document.getElementById('skill-editor-panel');
+    // Reset inner panels to show list, hide editor
+    if (listPanel) listPanel.style.display = 'flex';
+    if (editorPanel) editorPanel.style.display = 'none';
+    if (skillsPanel) { skillsPanel.style.display = 'flex'; renderSkillsList(); }
+    updateAllButtonStates();
+    renderChatList(); // Update sidebar to deselect chat
+    // Push browser history state
+    pushHistoryState('skills', null);
+}
+
+function closeSkillsView() {
+    currentView = 'chat';
+    appStorage.setItem('currentView', 'chat');
+    currentEditingSkill = null;
+    var skillsPanel = document.getElementById('skills-panel');
+    showChatView();
+    if (skillsPanel) skillsPanel.style.display = 'none';
+    updateSkillsButtonState();
+    updateDashboardButtonState();
+    // Re-render messages if returning to a streaming chat to sync UI state
+    if (activeStreamingChatId && currentChatId === activeStreamingChatId) {
+        renderMessages();
+    }
+}
+
+function updateSkillsButtonState() {
+    var skillsPanel = document.getElementById('skills-panel');
+    var btn = document.getElementById('skills-btn');
+    var isOpen = skillsPanel && skillsPanel.style.display === 'flex';
+    if (btn) btn.classList.toggle('active', isOpen);
+}
+
+async function renderSkillsList() {
+    var container = document.getElementById('skills-list');
+    if (!container) return;
+    var skillList = Object.values(skills);
+    if (skillList.length === 0) {
+        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>No skills yet</p><p class="skills-empty-hint">Create skills to give your AI agent specialized knowledge.</p></div>';
+        return;
+    }
+    var html = '';
+    skillList.sort(function(a, b) { return (a.name || a.id || '').localeCompare(b.name || b.id || ''); });
+    
+    // Fetch assets for all skills
+    var skillAssets = {};
+    for (var i = 0; i < skillList.length; i++) {
+        skillAssets[skillList[i].id] = await getSkillAssets(skillList[i].id);
+    }
+    
+    skillList.forEach(function(skill) {
+        var isActive = !!activeSkills[skill.id];
+        var activeClass = isActive ? ' skill-item-active' : '';
+        var activeBadge = isActive ? '<span class="skill-active-badge">Active</span>' : '';
+        var displayName = skill.name || skill.id || 'Untitled';
+        var descSnippet = skill.description ? '<div class="skill-item-desc">' + escapeHtml(skill.description) + '</div>' : '';
+        
+        // Show attachments
+        var assets = skillAssets[skill.id] || [];
+        var attachmentsHtml = '';
+        if (assets.length > 0) {
+            attachmentsHtml = '<div class="skill-item-attachments">';
+            assets.forEach(function(asset) {
+                var icon = asset.type === 'xml' ? UI_ICONS.file : (asset.type === 'js' ? UI_ICONS.code : UI_ICONS.skill);
+                var typeClass = asset.type === 'js' ? 'js' : asset.type;
+                attachmentsHtml += '<span class="skill-attachment-badge ' + typeClass + '" title="' + escapeHtml(asset.filename) + '">' + icon + escapeHtml(asset.filename) + '</span>';
+            });
+            attachmentsHtml += '</div>';
+        }
+        
+        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeHtml(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeHtml(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + activeBadge + '</div>' + descSnippet + attachmentsHtml + '</div>';
+    });
+    container.innerHTML = html;
+}
+
+async function openSkillEditor(skillId) {
+    var skill = skillId ? skills[skillId] : null;
+    currentEditingSkill = skill ? skill.id : null;
+    // Persist skill editor state for page reload
+    if (skill) {
+        appStorage.setItem('currentEditingSkill', skill.id);
+        appStorage.setItem('currentView', 'skill-editor');
+    }
+    var editorPanel = document.getElementById('skill-editor-panel');
+    var listPanel = document.getElementById('skills-list-panel');
+    if (listPanel) listPanel.style.display = 'none';
+    if (editorPanel) editorPanel.style.display = 'flex';
+    var nameInput = document.getElementById('skill-name-input');
+    var descInput = document.getElementById('skill-description-input');
+    var bodyInput = document.getElementById('skill-body-input');
+    var editorTitle = document.getElementById('skill-editor-title');
+    var deleteBtn = document.getElementById('skill-delete-btn');
+    var activateBtn = document.getElementById('skill-activate-btn');
+    var downloadBtn = document.getElementById('skill-download-btn');
+    var assetsContainer = document.getElementById('skill-assets-container');
+    
+    var bodyView = document.getElementById('skill-body-view');
+    var bodyEditBtn = document.getElementById('skill-body-edit-btn');
+    skillBodyEditMode = false;
+    
+    var editAiBtn = document.getElementById('skill-edit-ai-btn');
+    
+    if (skill) {
+        if (editorTitle) editorTitle.textContent = 'Edit Skill';
+        if (nameInput) nameInput.value = skill.name || skill.id || '';
+        if (descInput) descInput.value = skill.description || '';
+        if (bodyInput) bodyInput.value = skill.body || '';
+        if (deleteBtn) deleteBtn.style.display = 'inline-flex';
+        if (activateBtn) activateBtn.style.display = 'inline-flex';
+        if (downloadBtn) downloadBtn.style.display = 'inline-flex';
+        if (editAiBtn) editAiBtn.style.display = 'inline-flex';
+        if (assetsContainer) assetsContainer.style.display = 'flex';
+        updateActivateButton();
+        await renderSkillAssets();
+    } else {
+        if (editorTitle) editorTitle.textContent = 'New Skill';
+        if (nameInput) nameInput.value = '';
+        if (descInput) descInput.value = '';
+        if (bodyInput) bodyInput.value = '';
+        if (deleteBtn) deleteBtn.style.display = 'none';
+        if (activateBtn) activateBtn.style.display = 'none';
+        if (downloadBtn) downloadBtn.style.display = 'none';
+        if (editAiBtn) editAiBtn.style.display = 'none';
+        if (assetsContainer) assetsContainer.style.display = 'none';
+    }
+    renderSkillBodyView();
+    renderSkillActionsEditor();
+    if (nameInput) nameInput.focus();
+    
+    // Push browser history state for skill editor
+    if (skill) {
+        pushHistoryState('skill-editor', null, skill.id);
+    }
+}
+
+var skillBodyEditMode = false;
+
+function renderSkillBodyView() {
+    var bodyView = document.getElementById('skill-body-view');
+    var bodyInput = document.getElementById('skill-body-input');
+    var bodyEditBtn = document.getElementById('skill-body-edit-btn');
+    if (!bodyView || !bodyInput || !bodyEditBtn) return;
+    
+    var content = bodyInput.value || '';
+    
+    if (skillBodyEditMode) {
+        bodyView.style.display = 'none';
+        bodyInput.style.display = 'block';
+        bodyEditBtn.innerHTML = UI_ICONS.eye;
+        bodyEditBtn.title = 'View';
+    } else {
+        bodyInput.style.display = 'none';
+        bodyView.style.display = 'block';
+        bodyEditBtn.innerHTML = UI_ICONS.edit;
+        bodyEditBtn.title = 'Edit';
+        
+        if (content.trim()) {
+            bodyView.innerHTML = '<div class="markdown-body">' + formatContent(content) + '</div>';
+        } else {
+            bodyView.innerHTML = '<div class="skill-body-empty">No content yet. Click Edit to add instructions.</div>';
+        }
+    }
+}
+
+function toggleSkillBodyEdit() {
+    var bodyInput = document.getElementById('skill-body-input');
+    var bodyView = document.getElementById('skill-body-view');
+    
+    // If switching from edit to view, sync the content
+    if (skillBodyEditMode && bodyInput) {
+        // Content is already in bodyInput, just re-render
+    }
+    
+    skillBodyEditMode = !skillBodyEditMode;
+    renderSkillBodyView();
+    
+    if (skillBodyEditMode && bodyInput) {
+        bodyInput.focus();
+    }
+}
+
+function updateActivateButton() {
+    var btn = document.getElementById('skill-activate-btn');
+    if (!btn || !currentEditingSkill) return;
+    var isActive = !!activeSkills[currentEditingSkill];
+    btn.innerHTML = isActive ? '<span class="action-icon">' + UI_ICONS.close + '</span>Deactivate' : '<span class="action-icon">' + UI_ICONS.play + '</span>Activate';
+    btn.className = isActive ? 'skills-action-btn' : 'skills-action-btn success';
+}
+
+async function toggleSkillActivation() {
+    if (!currentEditingSkill) return;
+    var btn = document.getElementById('skill-activate-btn');
+    var isActive = !!activeSkills[currentEditingSkill];
+    
+    // Show spinner inside button
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="action-icon">' + UI_ICONS.spinner + '</span>' + (isActive ? 'Deactivating...' : 'Activating...');
+    }
+    
+    try {
+        var result = isActive ? await deactivateSkill(currentEditingSkill) : await activateSkill(currentEditingSkill);
+        showSnackbar(result.message || (result.success ? 'Done' : result.error), result.success ? 'success' : 'error');
+    } catch (e) {
+        console.error('Skill activation error:', e);
+        showSnackbar('Error: ' + e.message, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+        updateActivateButton();
+        if (typeof renderAllActionPlacements === 'function') renderAllActionPlacements();
+    }
+}
+
+function showOverlaySpinner(text) {
+    hideOverlaySpinner();
+    var overlay = document.createElement('div');
+    overlay.id = 'overlay-spinner';
+    overlay.className = 'overlay-spinner';
+    overlay.innerHTML = '<div class="overlay-spinner-content"><div class="spinner"></div><span>' + escapeHtml(text || 'Loading...') + '</span></div>';
+    document.body.appendChild(overlay);
+}
+
+function hideOverlaySpinner() {
+    var spinner = document.getElementById('overlay-spinner');
+    if (spinner) spinner.remove();
+}
+
+async function renderSkillAssets() {
+    var container = document.getElementById('skill-assets-list');
+    if (!container || !currentEditingSkill) return;
+    var assets = await getSkillAssets(currentEditingSkill);
+    var skill = skills[currentEditingSkill];
+    
+    var html = '';
+    
+    // Always show SKILL.md first (virtual file from skill content)
+    if (skill) {
+        var skillMdContent = skillToMarkdown(skill);
+        var dropdownId = 'artifact-dropdown-skillmd';
+        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillMd()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')viewSkillMd()" role="button" tabindex="0" aria-label="View skill definition">';
+        html += '<div class="sn-artifact-icon sn-icon-md">' + UI_ICONS.skill + '</div>';
+        html += '<div class="sn-artifact-content">';
+        html += '<div class="sn-artifact-name">SKILL.md</div>';
+        html += '<div class="sn-artifact-meta">Skill Definition</div>';
+        html += '</div>';
+        html += '<div class="sn-artifact-actions">';
+        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="More options" aria-haspopup="true">···</button>';
+        html += '<div class="sn-dropdown" id="' + dropdownId + '">';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>';
+        html += '</div>';
+        html += '</div>';
+        html += '</div>';
+    }
+    
+    // Show attached assets
+    assets.forEach(function(asset, idx) {
+        var icon = asset.type === 'xml' ? UI_ICONS.file : (asset.type === 'js' ? UI_ICONS.code : UI_ICONS.skill);
+        var iconClass = asset.type === 'xml' ? 'xml' : (asset.type === 'js' ? 'js' : 'md');
+        var typeLabel = asset.type === 'js' ? 'JS Tool' : asset.type.toUpperCase();
+        var dropdownId = 'artifact-dropdown-' + idx;
+        // Escape for JS string context (not HTML entities)
+        var jsFilename = asset.filename.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        
+        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillAsset(\'' + jsFilename + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')viewSkillAsset(\'' + jsFilename + '\')" role="button" tabindex="0" aria-label="View asset: ' + escapeHtml(asset.filename) + '">';
+        html += '<div class="sn-artifact-icon sn-icon-' + iconClass + '">' + icon + '</div>';
+        html += '<div class="sn-artifact-content">';
+        html += '<div class="sn-artifact-name">' + escapeHtml(asset.filename) + '</div>';
+        html += '<div class="sn-artifact-meta">' + typeLabel + '</div>';
+        html += '</div>';
+        html += '<div class="sn-artifact-actions">';
+        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="More options" aria-haspopup="true">···</button>';
+        html += '<div class="sn-dropdown" id="' + dropdownId + '">';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); renameSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>Rename</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>';
+        html += '<div class="sn-dropdown-divider"></div>';
+        html += '<button class="sn-dropdown-item danger" onclick="event.stopPropagation(); closeDropdowns(); removeSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>Remove</button>';
+        html += '</div>';
+        html += '</div>';
+        html += '</div>';
+    });
+    
+    if (!html) {
+        html = '<div class="skill-artifacts-empty">No artifacts yet</div>';
+    }
+    
+    // Add description text under the artifacts list
+    html += '<div class="skill-artifacts-help">';
+    html += '<p>Artifacts you can add:</p>';
+    html += '<ul>';
+    html += '<li><strong>XML files (.xml)</strong> – Deployed when skill is activated</li>';
+    html += '<li><strong>JS files (.js)</strong> – Custom tools the agent can use</li>';
+    html += '<li><strong>Markdown files (.md)</strong> – Context for the AI</li>';
+    html += '</ul>';
+    html += '<a href="#" onclick="event.preventDefault(); addSampleTool()">Add a sample tool</a>';
+    html += '</div>';
+    
+    container.innerHTML = html;
+}

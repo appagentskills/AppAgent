@@ -11,6 +11,9 @@ node_modules/
 # Backup files
 *.backup.*
 
+# Build output
+dist/
+
 # OS files
 .DS_Store
 Thumbs.db

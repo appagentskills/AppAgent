@@ -1,0 +1,73 @@
+name: Deploy docs to GitHub Pages
+
+# Fires when a version tag (v*) is pushed — never on plain branch pushes.
+# The Pages source must be set to "GitHub Actions" (Settings → Pages → Source).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to deploy docs for (e.g. v1.0.4)"
+        required: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deploy at a time; don't cancel an in-flight deploy if a new
+# release lands right after.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag and check out at that ref
+        id: tag
+        run: |
+          # inputs.tag wins for manual dispatch; otherwise github.ref_name is the tag.
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ]; then echo "No tag available" >&2; exit 1; fi
+          VERSION="${TAG#v}"  # strip leading v if present
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Deploying docs for tag $TAG (version $VERSION)"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Substitute __VERSION__ in docs
+        run: sed -i "s/__VERSION__/${{ steps.tag.outputs.version }}/g" docs/documentation.md
+
+      - name: Stage README and hero image inside docs/
+        run: |
+          cp README.md docs/README.md
+          cp AppAgentExample.png docs/AppAgentExample.png
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          # Auto-enable Pages on first run instead of failing with "Not Found".
+          enablement: true
+
+      - name: Upload docs/ as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

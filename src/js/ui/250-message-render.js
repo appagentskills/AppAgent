@@ -1,0 +1,1579 @@
+// Check if a message role is an attachment type
+function isAttachmentRole(role) {
+    return role === 'screenshot' || role === 'pdf' || role === 'file';
+}
+
+// Render just the inner content of a single attachment (no group wrapper)
+function renderAttachmentContent(msg, index) {
+    if (msg.role === 'screenshot') {
+        var screenshotName = msg.name || msg.description || 'Capture';
+        // Resolve base64: try msg directly, fallback to chat.screenshots map
+        var base64 = msg.base64;
+        if (!base64 && msg.screenshot_id) {
+            var ssChat = chats[currentChatId];
+            if (ssChat && ssChat.screenshots && ssChat.screenshots[msg.screenshot_id]) {
+                base64 = ssChat.screenshots[msg.screenshot_id].base64;
+            }
+        }
+        var h = '<div class="message screenshot" id="msg-' + index + '">';
+        h += '<div class="screenshot-container">';
+        h += '<div class="screenshot-header" title="' + escapeHtml(screenshotName) + '"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + escapeHtml(screenshotName) + '</div>';
+        if (base64) {
+            h += '<img class="screenshot-thumbnail" src="' + base64 + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeHtml(screenshotName).replace(/'/g, "\\'") + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeHtml(msg.url || '').replace(/'/g, "\\'") + '\')" />';
+        } else {
+            h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">Screenshot unavailable</div>';
+        }
+        h += '</div></div>';
+        return h;
+    } else if (msg.role === 'pdf') {
+        var pdfName = msg.name || msg.description || 'Document';
+        var h = '<div class="message screenshot" id="msg-' + index + '">';
+        h += '<div class="screenshot-container pdf-attachment-container">';
+        h += '<div class="screenshot-header"><span class="screenshot-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span> PDF: ' + escapeHtml(pdfName) + '</div>';
+        h += '<div class="pdf-attachment-preview" onclick="openPdfFromMessage(' + index + ')">';
+        h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;opacity:0.5;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
+        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">Click to preview</span>';
+        h += '</div>';
+        h += '</div></div>';
+        return h;
+    } else if (msg.role === 'file') {
+        var fileName = msg.name || 'File';
+        var fileExt = fileName.split('.').pop().toUpperCase();
+        var fileSize = msg.size ? ' (' + formatFileSize(msg.size) + ')' : '';
+        var h = '<div class="message screenshot" id="msg-' + index + '">';
+        h += '<div class="screenshot-container file-attachment-container">';
+        h += '<div class="screenshot-header"><span class="screenshot-icon" style="color:var(--success);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span> ' + escapeHtml(fileExt) + ': ' + escapeHtml(fileName) + fileSize + '</div>';
+        h += '<div class="file-attachment-preview" onclick="openFileFromMessage(' + index + ')">';
+        h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;opacity:0.5;color:var(--success);"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
+        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">Click to preview</span>';
+        h += '</div>';
+        h += '</div></div>';
+        return h;
+    }
+    return '';
+}
+
+// Find the previous/next attachment (skip everything except user messages which break groups)
+function findAdjacentForAttachmentGroup(messages, index, direction) {
+    var i = index + direction;
+    while (i >= 0 && i < messages.length) {
+        var role = messages[i].role;
+        // User messages break the group
+        if (role === 'user') {
+            return { role: 'user' }; // Return a non-attachment to break group
+        }
+        // Found another attachment - group continues
+        if (isAttachmentRole(role)) {
+            return messages[i];
+        }
+        // Skip everything else (assistant, tool, approval, etc.)
+        i += direction;
+    }
+    return null;
+}
+
+function renderMessages() {
+    // Skip DOM rebuilds during silent hook runs (prevents flash)
+    if (_silentHookRunning) return;
+
+    // B-B1: widget chat mode (the dashboard widget editor running inline) reuses
+    // the #messages container via renderWidgetInChat. If a background agent loop
+    // for the same chat (or widget chat mode opened *over* a streaming chat)
+    // calls renderMessages, it would clobber the widget editor UI mid-edit.
+    // Skip the rebuild while widget mode is active — closeWidgetChatMode triggers
+    // a normal render when the user exits.
+    if (typeof currentEditingWidget !== 'undefined' && currentEditingWidget) return;
+
+    // Shadow the global `isRunning`: treat as streaming only if THIS chat is the
+    // active streaming chat. The global flag is true whenever ANY chat is streaming,
+    // including background action chats — but for rendering, we only care about the
+    // chat the user is currently viewing. Without this scope, switching to a chat
+    // while a background action streams would hide that chat's final assistant
+    // message (because branches like `!(isRunning && block.isLastBlock)` falsely
+    // assumed the visible chat was still streaming).
+    var isRunning = window.isRunning && activeStreamingChatId === currentChatId;
+
+    var container = document.getElementById('messages');
+    var chat = chats[currentChatId];
+
+    // Update context indicator
+    updateContextIndicator();
+
+    updateInputPosition();
+    
+    if (!container) return; // Guard against null container
+
+    if (!chat || chat.messages.length === 0) {
+        container.innerHTML = '';
+        // Show empty state in input area
+        var inputArea = document.getElementById('input-area');
+        if (inputArea && !inputArea.querySelector('.empty-state')) {
+            var emptyDiv = document.createElement('div');
+            emptyDiv.className = 'empty-state';
+            emptyDiv.textContent = 'Start a conversation';
+            inputArea.insertBefore(emptyDiv, inputArea.firstChild);
+        }
+        return;
+    } else {
+        // Remove empty state from input area if present
+        var inputArea = document.getElementById('input-area');
+        if (inputArea) {
+            var existingEmpty = inputArea.querySelector('.empty-state');
+            if (existingEmpty) existingEmpty.remove();
+        }
+    }
+    
+    // Find user message indices to know where to insert inline changes
+    var userMsgIndices = [];
+    chat.messages.forEach(function(msg, idx) {
+        if (msg.role === 'user') userMsgIndices.push(idx);
+    });
+    
+    // In compact mode, collect everything grouped by response block (between user messages)
+    var responseBlocks = [];
+    var matchedApprovalIndices = {}; // Track which approvals are matched to tool calls
+    var lastUserMsgIdx = -1;
+    if (compactToolCalls) {
+        // Find the last user message index to determine the "last" response block
+        for (var i = chat.messages.length - 1; i >= 0; i--) {
+            if (chat.messages[i].role === 'user' && !(chat.messages[i].isHookMessage && !hooksEnabled.showHookMessages)) {
+                lastUserMsgIdx = i;
+                break;
+            }
+        }
+        
+        // Group everything by response block
+        var currentBlock = null;
+        chat.messages.forEach(function(msg, msgIdx) {
+            if (msg.role === 'user' && !(msg.isHookMessage && !hooksEnabled.showHookMessages)) {
+                // Start a new block after each user message
+                if (currentBlock) {
+                    responseBlocks.push(currentBlock);
+                }
+                currentBlock = {
+                    userMsgIdx: msgIdx,
+                    toolCalls: [],
+                    toolResults: [],
+                    metrics: [],
+                    assistantMsgs: [],
+                    timeline: [], // Chronological list of thinking and tool calls
+                    isStreaming: false,
+                    lastToolName: null,
+                    lastStatusMessage: null, // Human-friendly status message from last tool call
+                    firstAssistantIdx: -1,
+                    pendingApprovals: [],
+                    hasFinalAnswer: false // True when agent has sent final answer (not streaming)
+                };
+            } else if (msg.role === 'assistant' && currentBlock) {
+                // Skip assistant responses to hook messages (don't add to block)
+                var isHookResponse = false;
+                if (!hooksEnabled.showHookMessages) {
+                    for (var pi = msgIdx - 1; pi >= 0; pi--) {
+                        if (chat.messages[pi].role === 'user') { 
+                            if (chat.messages[pi].isHookMessage) isHookResponse = true;
+                            break; 
+                        }
+                    }
+                }
+                if (isHookResponse) return; // Skip this message entirely
+                if (currentBlock.firstAssistantIdx === -1) currentBlock.firstAssistantIdx = msgIdx;
+                if (msg.isStreaming) currentBlock.isStreaming = true;
+                if (msg.metrics) currentBlock.metrics.push(msg.metrics);
+                currentBlock.assistantMsgs.push({ msg: msg, msgIdx: msgIdx });
+                // Check if this is a final answer (content without tool_calls and not streaming)
+                if (msg.content && !msg.tool_calls && !msg.isStreaming) {
+                    currentBlock.hasFinalAnswer = true;
+                }
+                // Add thinking to timeline
+                if (msg.thinking) {
+                    currentBlock.timeline.push({ type: 'thinking', thinking: msg.thinking, msgIdx: msgIdx });
+                }
+                // Add intermediate content to timeline ONLY if this message also has tool_calls
+                // (meaning it's truly intermediate, not the final answer)
+                if (msg.content && msg.content.trim() && msg.tool_calls) {
+                    currentBlock.timeline.push({ type: 'content', content: msg.content, msgIdx: msgIdx });
+                    currentBlock.lastIntermediateContent = msg.content; // Track for display outside collapsible
+                }
+                if (msg.tool_calls) {
+                    var hasSetChatTitleCompleted = false;
+                    msg.tool_calls.forEach(function(tc, tcIdx) {
+                        // Check if set_chat_title tool call has completed (has a result)
+                        if (tc.function.name === 'set_chat_title') {
+                            for (var ri = msgIdx + 1; ri < chat.messages.length; ri++) {
+                                var rm = chat.messages[ri];
+                                if (rm.role === 'tool' && rm.tool_call_id === tc.id) {
+                                    hasSetChatTitleCompleted = true;
+                                    break;
+                                }
+                                if (rm.role === 'user') break;
+                            }
+                            if (!showApiStats) return; // Skip adding to timeline but still tracked completion
+                        }
+                        // Find the result for this tool call
+                        var resultContent = '';
+                        var hasResult = false;
+                        var resultMsgIdx = -1;
+                        for (var ri = msgIdx + 1; ri < chat.messages.length; ri++) {
+                            var rm = chat.messages[ri];
+                            if (rm.role === 'tool' && rm.tool_call_id === tc.id) {
+                                resultContent = typeof rm.content === 'string' ? rm.content : JSON.stringify(rm.content);
+                                hasResult = true;
+                                resultMsgIdx = ri;
+                                break;
+                            }
+                            if (rm.role === 'user') break;
+                        }
+                        // Find pending approval for this tool call (match by toolCallId only to avoid
+                        // one approval matching multiple tool calls with the same name)
+                        var approval = null;
+                        for (var ai = msgIdx + 1; ai < chat.messages.length; ai++) {
+                            var am = chat.messages[ai];
+                            if (am.role === 'approval' && am.toolCallId === tc.id) {
+                                approval = { msg: am, approvalIdx: ai, tcIdx: tcIdx, msgIdx: msgIdx };
+                                matchedApprovalIndices[ai] = true;
+                                break;
+                            }
+                            if (am.role === 'user') break;
+                        }
+                        // Check if this is an html_widget tool
+                        var isWidget = tc.function.name === 'html_widget';
+                        var toolItem = { tc: tc, result: resultContent, hasResult: hasResult, msgIdx: msgIdx, resultMsgIdx: resultMsgIdx, tcIdx: tcIdx, approval: approval, isWidget: isWidget };
+                        currentBlock.toolCalls.push(toolItem);
+                        // Add tool call to timeline
+                        currentBlock.timeline.push({ type: 'tool', item: toolItem });
+                        if (approval && approval.msg.status === 'pending') {
+                            currentBlock.pendingApprovals.push({ tc: tc, approval: approval, tcIdx: tcIdx, msgIdx: msgIdx, args: tc.function.arguments });
+                        }
+                        currentBlock.lastToolName = TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name;
+                        // Extract status_message for display in collapsible header (works with partial JSON during streaming)
+                        var blockStatusMsg = extractStatusMessage(tc.function.arguments);
+                        if (blockStatusMsg) {
+                            currentBlock.lastStatusMessage = blockStatusMsg;
+                        }
+                    });
+                    // If the only tool call was set_chat_title and it completed, mark as final answer
+                    if (hasSetChatTitleCompleted && msg.tool_calls.length === 1 && msg.tool_calls[0].function.name === 'set_chat_title') {
+                        currentBlock.hasFinalAnswer = true;
+                    }
+                }
+                // Add metrics to timeline after this message's tool calls (so it shows in correct location)
+                if (msg.metrics && showApiStats) {
+                    currentBlock.timeline.push({ type: 'metrics', metrics: msg.metrics, msgIdx: msgIdx });
+                }
+            } else if (msg.role === 'tool' && currentBlock) {
+                // Skip tool results for hook responses
+                if (!hooksEnabled.showHookMessages) {
+                    // Find the assistant message that made this tool call
+                    for (var ti = msgIdx - 1; ti >= 0; ti--) {
+                        if (chat.messages[ti].role === 'assistant' && chat.messages[ti].tool_calls) {
+                            // Check if this assistant message was a hook response
+                            for (var pi = ti - 1; pi >= 0; pi--) {
+                                if (chat.messages[pi].role === 'user') {
+                                    if (chat.messages[pi].isHookMessage) return; // Skip this tool result
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                currentBlock.toolResults.push({ msg: msg, msgIdx: msgIdx });
+            }
+        });
+        // Push the last block
+        if (currentBlock) {
+            responseBlocks.push(currentBlock);
+        }
+
+        // Add unmatched pending approvals to the last block (e.g., from programmatic tool calls)
+        var lastBlock = responseBlocks[responseBlocks.length - 1];
+        if (lastBlock) {
+            chat.messages.forEach(function(msg, msgIdx) {
+                if (msg.role === 'approval' && msg.status === 'pending' && !matchedApprovalIndices[msgIdx]) {
+                    lastBlock.pendingApprovals.push({
+                        tc: { function: { name: msg.actualToolName || msg.toolName } },
+                        approval: { msg: msg, approvalIdx: msgIdx },
+                        args: JSON.stringify(msg.args) // formatJsonPretty expects a JSON string
+                    });
+                }
+            });
+        }
+    }
+
+    // Map response blocks by their userMsgIdx for quick lookup
+    var blocksByUserIdx = {};
+    responseBlocks.forEach(function(block, blockIdx) {
+        block.isLastBlock = (blockIdx === responseBlocks.length - 1);
+        blocksByUserIdx[block.userMsgIdx] = block;
+    });
+    
+    // Save scroll position before DOM rebuild - widgets will temporarily lose height
+    var savedScrollTop = container.scrollTop;
+    var wasAtBottom = isNearBottom(container);
+
+    // Save collapsed state of attachment groups so re-render doesn't re-expand them
+    var closedAttachmentGroups = {};
+    container.querySelectorAll('details.attachments-details').forEach(function(d) {
+        if (!d.open) closedAttachmentGroups[d.dataset.groupIdx] = true;
+    });
+    var closedWidgetGroups = {};
+    container.querySelectorAll('details.widgets-details').forEach(function(d) {
+        if (!d.open) closedWidgetGroups[d.dataset.widgetGroupIdx] = true;
+    });
+
+    // Track attachments already rendered as part of a group
+    var processedAttachments = {};
+
+    var mappedHtml = chat.messages.map(function(msg, index) {
+        var html = '';
+
+        // Check for attachment grouping (screenshot, pdf, file should wrap together)
+        // Skip hidden messages (tool, approval, browser_context) when checking adjacency
+        var isAttachment = isAttachmentRole(msg.role);
+
+        // If this attachment was already rendered as part of a group, return hidden placeholder
+        if (isAttachment && processedAttachments[index]) {
+            return '<div class="message ' + msg.role + '" id="msg-' + index + '" style="display:none;"></div>';
+        }
+
+        var prevVisibleMsg = findAdjacentForAttachmentGroup(chat.messages, index, -1);
+        var prevIsAttachment = prevVisibleMsg && isAttachmentRole(prevVisibleMsg.role);
+
+        // Render entire attachment group at the first attachment's position
+        // This prevents non-attachment messages between group members from being nested inside the wrapper
+        if (isAttachment && !prevIsAttachment) {
+            // Collect all attachments in this group
+            var groupIndices = [index];
+            var j = index + 1;
+            while (j < chat.messages.length) {
+                if (chat.messages[j].role === 'user') break;
+                if (isAttachmentRole(chat.messages[j].role)) groupIndices.push(j);
+                j++;
+            }
+            var attachCount = groupIndices.length;
+            var groupLabel = 'Screenshots' + (attachCount > 1 ? ' (' + attachCount + ')' : '');
+            var groupOpen = closedAttachmentGroups[index] ? '' : ' open';
+            html += '<details class="attachments-details" data-group-idx="' + index + '"' + groupOpen + '><summary class="attachments-summary"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + groupLabel + '</summary><div class="attachments-row">';
+            // Render all attachments in the group and close the wrapper
+            for (var gi = 0; gi < groupIndices.length; gi++) {
+                html += renderAttachmentContent(chat.messages[groupIndices[gi]], groupIndices[gi]);
+                if (gi > 0) processedAttachments[groupIndices[gi]] = true;
+            }
+            html += '</div></details>';
+            return html;
+        }
+
+        // Check if this is the last message before a user message (or end of chat)
+        // If so, render inline changes for the previous user's request
+        var isLastBeforeNextUser = false;
+        var prevUserMsgIdx = -1;
+        for (var i = userMsgIndices.length - 1; i >= 0; i--) {
+            if (userMsgIndices[i] < index) {
+                prevUserMsgIdx = userMsgIndices[i];
+                var nextUserIdx = userMsgIndices[i + 1] || chat.messages.length;
+                if (index === nextUserIdx - 1) {
+                    isLastBeforeNextUser = true;
+                }
+                break;
+            }
+        }
+        
+        if (msg.role === 'user') {
+            // Hide hook messages unless showHookMessages is enabled
+            if (msg.isHookMessage && !hooksEnabled.showHookMessages) {
+                return '<div class="message user" id="msg-' + index + '" style="display:none;"></div>';
+            }
+            // Before rendering user message, check if we need to show changes from previous block
+            // If the message was cached (long paste), show a collapsed scrollable preview with an expand toggle.
+            var userBodyHtml;
+            if (msg.cachedContentId) {
+                var sizeKB = Math.round((msg.content || '').length / 1024);
+                var lines = (msg.content || '').split('\n').length;
+                var expanded = !!userMsgExpandedState[(currentChatId || '_') + ':' + index];
+                var badge = '<div class="user-cached-badge" title="This long message is cached. The agent reads it via cached_content_read/search/outline (content_id: ' + msg.cachedContentId + ').">' + UI_ICONS.cache + ' Cached · ' + sizeKB + 'KB · ' + lines + ' lines</div>';
+                var toggleLabel = expanded ? 'Collapse' : 'Expand';
+                var toggleClass = 'user-cached-toggle' + (expanded ? ' expanded' : '');
+                var toggleBtn = '<button class="' + toggleClass + '" onclick="toggleUserMsgExpanded(' + index + ')" title="' + toggleLabel + ' full message">' + UI_ICONS.chevronDown + ' ' + toggleLabel + '</button>';
+                var bodyClass = 'user-text user-text-cached' + (expanded ? ' expanded' : '');
+                userBodyHtml = badge + '<div class="' + bodyClass + '">' + escapeHtml(msg.content) + '</div>' + toggleBtn;
+            } else {
+                userBodyHtml = '<span class="user-text">' + escapeHtml(msg.content) + '</span>';
+            }
+            return '<div class="message user" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="Edit and branch">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="Copy message">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
+        } else if (msg.role === 'assistant') {
+            // Hide assistant responses to hook messages unless showHookMessages is enabled
+            if (!hooksEnabled.showHookMessages) {
+                var prevUserMsg = null;
+                for (var pi = index - 1; pi >= 0; pi--) {
+                    if (chat.messages[pi].role === 'user') { prevUserMsg = chat.messages[pi]; break; }
+                }
+                if (prevUserMsg && prevUserMsg.isHookMessage) {
+                    return '<div class="message assistant" id="msg-' + index + '" style="display:none;"></div>';
+                }
+            }
+            
+            // Compact mode: render collapsible area with thinking + tools at the TOP on first assistant msg
+            if (compactToolCalls) {
+                // Find the response block for this assistant message
+                var blockUserIdx = -1;
+                for (var bi = index - 1; bi >= 0; bi--) {
+                    if (chat.messages[bi].role === 'user' && !(chat.messages[bi].isHookMessage && !hooksEnabled.showHookMessages)) {
+                        blockUserIdx = bi;
+                        break;
+                    }
+                }
+                var block = blocksByUserIdx[blockUserIdx];
+                
+                // Check if this is the first assistant message in the block
+                var isFirstAssistant = block && block.firstAssistantIdx === index;
+                
+                // Check if this is the last assistant message with content (final answer)
+                // First try: last assistant message with content but NO tool_calls (pure content response)
+                // Fallback: last assistant message with content (even if it also has tool_calls)
+                var isLastAssistant = false;
+                var lastAssistantIdx = -1;
+                var lastAssistantWithContentIdx = -1;
+                if (block) {
+                    for (var lai = block.assistantMsgs.length - 1; lai >= 0; lai--) {
+                        var amsg = block.assistantMsgs[lai].msg;
+                        // Track last assistant with any content
+                        if ((amsg.content || amsg.isStreaming) && lastAssistantWithContentIdx === -1) {
+                            lastAssistantWithContentIdx = block.assistantMsgs[lai].msgIdx;
+                        }
+                        // Prefer one with content but NO tool_calls (pure content response)
+                        if ((amsg.content || amsg.isStreaming) && !amsg.tool_calls) {
+                            lastAssistantIdx = block.assistantMsgs[lai].msgIdx;
+                            break;
+                        }
+                    }
+                    // If no pure content message found, use the last with any content
+                    if (lastAssistantIdx === -1) lastAssistantIdx = lastAssistantWithContentIdx;
+                    isLastAssistant = (index === lastAssistantIdx);
+                }
+                
+                var isIntermediate = !isFirstAssistant && !isLastAssistant;
+                // In compact mode, intermediate assistants never render content (tools go on first,
+                // content on last). Hide them to prevent empty divs creating gaps.
+                if (isIntermediate) {
+                    return '<div class="message assistant" id="msg-' + index + '" style="display:none;"></div>';
+                }
+                // During streaming, non-first assistant content is in #streaming-text, not message divs
+                if (isRunning && !isFirstAssistant && block && block.isStreaming) {
+                    return '<div class="message assistant" id="msg-' + index + '" style="display:none;"></div>';
+                }
+                var html = '<div class="message assistant" id="msg-' + index + '">';
+                
+                // On FIRST assistant message, render the collapsible area with thinking + all tools
+                // Also show when streaming (even if timeline is empty) so user sees immediate feedback
+                if (isFirstAssistant && block && (block.timeline.length > 0 || block.isStreaming)) {
+                    // Use stored state to preserve expanded state during streaming updates
+                    // Fall back to DOM check for backwards compatibility, then default to collapsed
+                    // B2: read with the same chatId-scoped key the toggle handler writes.
+                    var compactKey = (currentChatId || '_') + ':' + index;
+                    var isExpanded = compactAreaExpandedState[compactKey];
+                    if (isExpanded === undefined) {
+                        var compactAreaEl = document.querySelector('#msg-' + index + ' .compact-tools-area');
+                        isExpanded = compactAreaEl ? compactAreaEl.open : false;
+                    }
+                    // Show tool count only when agent has finished (hasFinalAnswer), otherwise show status message or tool name
+                    // Non-last blocks are always done (conversation moved past them, e.g. after message injection)
+                    var agentDone = !block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming);
+                    // Pre-tool-call placeholder: when the model is still streaming with no
+                    // status_message and no tool name yet, three concurrent chats would all
+                    // show the same generic 'Processing...' — looks like a leak even though
+                    // each panel is reading its own block. Pick a phase-specific label so
+                    // the user can tell what stage each chat is in.
+                    var streamingPlaceholder;
+                    if (block.timeline.some(function(t) { return t.type === 'thinking'; })) {
+                        streamingPlaceholder = 'Thinking…';
+                    } else {
+                        streamingPlaceholder = 'Awaiting response…';
+                    }
+                    var statusText = agentDone ? (block.toolCalls.length + ' tool call' + (block.toolCalls.length > 1 ? 's' : '')) : (block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
+                    var spinnerClass = agentDone ? '' : ' streaming';
+
+                    html += '<details class="compact-tools-area' + spinnerClass + '"' + (isExpanded ? ' open' : '') + ' ontoggle="toggleCompactAreaState(' + index + ', this)">';
+                    html += '<summary class="compact-tools-summary">';
+                    if (agentDone) {
+                        html += '<span class="compact-tools-icon">' + UI_ICONS.tool + '</span>';
+                    } else {
+                        html += '<span class="compact-tools-spinner"></span>';
+                    }
+                    html += '<span class="compact-tools-status">' + escapeHtml(statusText) + '</span>';
+                    html += '<span class="compact-tools-chevron">' + UI_ICONS.chevronDown + '</span>';
+                    html += '</summary>';
+                    html += '<div class="compact-tools-content">';
+                    
+                    // Render timeline items in chronological order (thinking interleaved with tools)
+                    // Use EXACT same rendering as non-compact mode
+                    block.timeline.forEach(function(timelineItem, tlIdx) {
+                        if (timelineItem.type === 'thinking') {
+                            // B2: scope thinking expand-state by chatId to avoid cross-chat collisions.
+                            // The onclick handler still receives `thinkingKey` (msgIdx-tlIdx) and prepends chatId.
+                            var thinkingKey = index + '-' + tlIdx;
+                            var thinkingFullKey = (currentChatId || '_') + ':' + thinkingKey;
+                            var thinkingExpanded = thinkingExpandedState[thinkingFullKey];
+                            if (thinkingExpanded === undefined) {
+                                var thinkingEl = document.querySelector('#msg-' + index + ' .thinking[data-tl-idx="' + tlIdx + '"]');
+                                thinkingExpanded = thinkingEl ? thinkingEl.open : false;
+                            }
+                            html += '<details class="thinking" data-tl-idx="' + tlIdx + '"' + (thinkingExpanded ? ' open' : '') + ' ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
+                            html += '<summary><span class="thinking-status">Thought process</span></summary>';
+                            html += '<div class="thinking-content">' + escapeHtml(timelineItem.thinking) + '</div></details>';
+                        } else if (timelineItem.type === 'content') {
+                            // Show intermediate content in their chronological location
+                            // Skip last assistant content (shown in its own message div after screenshots)
+                            if (timelineItem.msgIdx !== lastAssistantIdx) {
+                                html += '<div class="message-content">' + formatContent(timelineItem.content) + '</div>';
+                            }
+                        } else if (timelineItem.type === 'tool') {
+                            var item = timelineItem.item;
+                            var tc = item.tc;
+                            var tcKey = 'tc-' + item.msgIdx + '-' + item.tcIdx;
+                            var tcEl = document.getElementById(tcKey);
+                            var tcOpen = tcEl ? tcEl.open : false;
+                            var tcFullHeight = false;
+
+                            // Extract status_message from tool arguments (works with partial JSON during streaming)
+                            var compactStatusMessage = extractStatusMessage(tc.function.arguments);
+
+                            html += '<details class="tool-call' + (item.hasResult ? ' has-result' : '') + '" id="' + tcKey + '"' + (tcOpen ? ' open' : '') + ' onclick="toggleToolCallExpanded(' + item.msgIdx + ', ' + item.tcIdx + ', this)">';
+                            html += '<summary>';
+                            if (compactStatusMessage) {
+                                html += '<span class="tool-status-message">' + escapeHtml(compactStatusMessage) + '</span>';
+                            }
+                            html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                            if (item.hasResult) {
+                                html += '<span class="tool-result-badge">' + UI_ICONS.check + '</span>';
+                            }
+                            html += '</summary>';
+                            var argsCopyId = storeRawCopy(tc.function.arguments);
+                            html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
+                            html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                            html += '<pre class="tool-args">' + formatJsonPretty(tc.function.arguments) + '</pre>';
+                            html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+
+                            // Render tool result inline within the same panel
+                            if (item.hasResult) {
+                                var resultContent = formatJsonPretty(item.result);
+                                var resultCopyId = storeRawCopy(item.result);
+                                html += '<div class="tool-result-section"><div class="tool-result-wrapper" data-copy-id="' + resultCopyId + '">';
+                                html += '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                                html += '<pre>' + resultContent + '</pre>';
+                                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></div>';
+                            }
+                            html += '</details>';
+                        } else if (timelineItem.type === 'metrics') {
+                            // Render metrics in chronological location
+                            html += formatMetrics(timelineItem.metrics);
+                        }
+                    });
+                    
+                    html += '</div></details>';
+
+                    // Render widgets OUTSIDE the collapsible in a grouped container
+                    var blockWidgetHtml = '';
+                    block.toolCalls.forEach(function(item) {
+                        if (item.hasResult && item.resultMsgIdx >= 0) {
+                            blockWidgetHtml += getWidgetHtmlForMessage(item.resultMsgIdx);
+                        }
+                    });
+                    if (blockWidgetHtml) {
+                        var wCount = (blockWidgetHtml.match(/class="widget-inline/g) || []).length;
+                        var wLabel = 'Widgets' + (wCount > 1 ? ' (' + wCount + ')' : '');
+                        var wGroupOpen = closedWidgetGroups[index] ? '' : ' open';
+                        html += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + wGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + wLabel + '</summary><div class="widgets-container">' + blockWidgetHtml + '</div></details>';
+                    }
+                    
+                    // Intermediate content is always shown inside the collapsible timeline
+                    // to prevent text appearing between the tools area and screenshots
+                    
+                }
+                
+                // During streaming, content for the current block goes to #streaming-text (not message divs)
+                // Old completed blocks always render their content normally
+                if (msg.content && !msg.isStreaming && isLastAssistant && !(isRunning && block && block.isLastBlock)) {
+                    html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+                }
+                
+                // Add metrics for non-tool messages
+                if (msg.metrics && showApiStats && (!block || block.toolCalls.length === 0)) {
+                    html += formatMetrics(msg.metrics);
+                }
+                
+                // Show Copy Answer when agent is done
+                // Non-last blocks are always done (conversation moved past them)
+                var agentDone = block && (!block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming));
+                if (isLastAssistant && agentDone && prevUserMsgIdx >= 0) {
+                    html += renderInlineChanges(prevUserMsgIdx);
+                    html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' Copy Answer</button></div>';
+                }
+                
+                html += '</div>';
+                return html;
+            }
+            
+            // Standard mode (non-compact)
+            var html = '<div class="message assistant" id="msg-' + index + '">';
+            if (msg.thinking || msg.isStreaming) {
+                var isStreaming = msg.isStreaming === true;
+                var hasThinking = msg.thinking && msg.thinking.length > 0;
+                var isCollapsed = msg.thinkingCollapsed === true && !isStreaming;
+                var openAttr = isCollapsed ? '' : 'open';
+                var statusClass = isStreaming ? 'active' : (isCollapsed ? 'collapsed' : '');
+                var statusText = isStreaming ? (hasThinking ? 'Thinking...' : 'Processing...') : (isCollapsed ? 'Thought process (click to expand)' : 'Thought process');
+                var contentClass = isStreaming ? 'thinking-content streaming' : 'thinking-content';
+                var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming ? '<span class="processing-indicator">Waiting for model response...</span>' : '');
+                html += '<details class="thinking ' + statusClass + '" ' + openAttr + '>' +
+                    '<summary><span class="thinking-status">' + statusText + '</span>' +
+                    (isStreaming ? '<span class="thinking-indicator"></span>' : '') +
+                    '</summary>' +
+                    '<div class="' + contentClass + '">' + thinkingContent + '</div></details>';
+            }
+            if (msg.content && !msg.isStreaming && !isRunning) {
+                html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+            }
+            if (msg.tool_calls) {
+                // Standard mode: render each tool call separately
+                msg.tool_calls.forEach(function(tc, tcIdx) {
+                    // Hide set_chat_title tool calls unless showing API stats
+                    if (tc.function.name === 'set_chat_title' && !showApiStats) {
+                        return; // Skip rendering this tool call
+                    }
+                    var tcKey = 'tc-' + index + '-' + tcIdx;
+                    // Check if user explicitly toggled this tool call
+                    var hasExplicitPref = msg.toolCallsExpanded && msg.toolCallsExpanded.hasOwnProperty(tcIdx);
+                    var tcOpen;
+                    if (hasExplicitPref) {
+                        // Respect user's explicit choice
+                        tcOpen = msg.toolCallsExpanded[tcIdx];
+                    } else {
+                        // Default: closed (only open during streaming via updateStreamingMessage)
+                        tcOpen = false;
+                    }
+                    
+                    // Find associated approval message for this tool call
+                    var approval = null;
+                    var tcToolName = tc.function.name;
+                    var tcDisplayName = TOOL_DISPLAY_NAMES[tcToolName] || tcToolName;
+                    // For servicenow_api or iframe_tool, also get the action-specific display name
+                    var tcActionDisplayName = null;
+                    // Extract status_message (works with partial JSON during streaming)
+                    var tcStatusMessage = extractStatusMessage(tc.function.arguments);
+                    try {
+                        var tcArgs = JSON.parse(tc.function.arguments);
+                        if (tcToolName === 'servicenow_api' && tcArgs.method) {
+                            tcActionDisplayName = TOOL_DISPLAY_NAMES['servicenow_api:' + tcArgs.method];
+                        } else if (tcToolName === 'iframe_tool' && tcArgs.action) {
+                            tcActionDisplayName = TOOL_DISPLAY_NAMES['iframe_tool:' + tcArgs.action];
+                        }
+                    } catch (e) {
+                        // Ignore JSON parse errors during streaming (incomplete JSON)
+                    }
+                    for (var ai = index + 1; ai < chat.messages.length; ai++) {
+                        var am = chat.messages[ai];
+                        if (am.role === 'approval') {
+                            // Match by toolCallId if available, otherwise by tool name (both original, display, and action-specific display name)
+                            if (am.toolCallId === tc.id || 
+                                (!am.toolCallId && (am.toolName === tcToolName || am.toolName === tcDisplayName || (tcActionDisplayName && am.toolName === tcActionDisplayName)))) {
+                                approval = { msg: am, index: ai };
+                                break;
+                            }
+                        }
+                        if (am.role === 'user') break;
+                    }
+                    
+                    var statusClass = approval ? (approval.msg.status === 'allowed' || approval.msg.status === 'always_allowed' || approval.msg.status === 'session_allowed' ? ' approved' : (approval.msg.status === 'denied' ? ' denied' : (approval.msg.status === 'pending' ? ' pending' : ''))) : '';
+                    var needsApproval = approval && approval.msg.status === 'pending';
+                    if (needsApproval) tcOpen = true;
+                    
+                    // Check for full-height expanded state
+                    var tcFullHeight = msg.toolCallsFullHeight && msg.toolCallsFullHeight[tcIdx];
+                    var expandedClass = tcFullHeight ? ' expanded' : '';
+                    
+                    html += '<details class="tool-call' + statusClass + expandedClass + '" id="' + tcKey + '" onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)"' + (tcOpen ? ' open' : '') + '>';
+                    html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                    if (tcStatusMessage) {
+                        html += '<span class="tool-status-message">' + escapeHtml(tcStatusMessage) + '</span>';
+                    }
+                    if (approval) {
+                        var statusLabel = approval.msg.status === 'pending' ? 'Pending' : (approval.msg.status === 'allowed' ? 'Allowed' : (approval.msg.status === 'always_allowed' ? 'Always' : (approval.msg.status === 'session_allowed' ? 'Session' : 'Denied')));
+                        html += '<span class="tool-status ' + approval.msg.status + '">' + statusLabel + '</span>';
+                    }
+                    html += '</summary>';
+                    var copyId = storeRawCopy(tc.function.arguments);
+                    html += '<div class="tool-args-wrapper" data-copy-id="' + copyId + '">';
+                    html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (tcFullHeight ? 'Collapse' : 'Expand') + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
+                    html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + formatJsonPretty(tc.function.arguments) + '</pre>';
+                    html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+                    html += '</details>';
+                });
+            }
+            // Add metrics display if available and setting enabled
+            if (msg.metrics && showApiStats) {
+                html += formatMetrics(msg.metrics);
+            }
+            
+            // Add inline changes if this is the last message before next user message or end of chat
+            if (isLastBeforeNextUser && prevUserMsgIdx >= 0) {
+                html += renderInlineChanges(prevUserMsgIdx);
+                // Add copy button once at end of complete response
+                html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' Copy Answer</button></div>';
+            }
+            
+            html += '</div>';
+            return html;
+        } else if (msg.role === 'tool') {
+            // Hide tool results in compact mode (they're shown inline with tool calls)
+            if (compactToolCalls) {
+                return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
+            }
+            // Hide set_chat_title tool results unless showing API stats
+            if (msg.name === 'set_chat_title' && !showApiStats) {
+                return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
+            }
+            var content = typeof msg.content === 'string' ? formatJsonPretty(msg.content) : formatJsonValue(msg.content, 0);
+            var contentHtml = content;
+            if (window.currentSearchHighlight) {
+                contentHtml = applySearchHighlight(contentHtml, window.currentSearchHighlight);
+            }
+            // Check DOM state for tool result expansion
+            var toolResultEl = document.querySelector('#msg-' + index + ' .tool-result');
+            var toolResultOpen = msg.expanded === true || (toolResultEl && toolResultEl.open);
+            var toolResultFullHeight = msg.fullHeight === true;
+            var rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
+            var resultCopyId = storeRawCopy(rawContent);
+            var toolHtml = '<div class="message tool" id="msg-' + index + '"><details class="tool-result' + (toolResultFullHeight ? ' expanded' : '') + '" onclick="toggleToolResultExpanded(' + index + ', this)"' + (toolResultOpen ? ' open' : '') + '>' +
+                '<summary><span class="tool-label">' + getToolIcon(msg.name) + ' ' + (TOOL_DISPLAY_NAMES[msg.name] || msg.name) + ' result</span></summary>' +
+                '<div class="tool-result-wrapper" data-copy-id="' + resultCopyId + '">' +
+                '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (toolResultFullHeight ? 'Collapse' : 'Expand') + '">' + (toolResultFullHeight ? '⤡' : '⤢') + '</button>' +
+                '<pre' + (toolResultFullHeight ? ' class="expanded"' : '') + '>' + contentHtml + '</pre>' +
+                '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>' +
+            '</details>';
+            
+            // Add widgets in a grouped container (matches html_widget results and tools like js_eval/skill tools that create widgets internally)
+            var msgWidgetHtml = getWidgetHtmlForMessage(index);
+            if (msgWidgetHtml) {
+                var mwCount = (msgWidgetHtml.match(/class="widget-inline/g) || []).length;
+                var mwLabel = 'Widgets' + (mwCount > 1 ? ' (' + mwCount + ')' : '');
+                var mwGroupOpen = closedWidgetGroups[index] ? '' : ' open';
+                toolHtml += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + mwGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + mwLabel + '</summary><div class="widgets-container">' + msgWidgetHtml + '</div></details>';
+            }
+            
+            // Add inline changes if this is the last message before next user message or end of chat
+            if (isLastBeforeNextUser && prevUserMsgIdx >= 0) {
+                toolHtml += renderInlineChanges(prevUserMsgIdx);
+            }
+            
+            toolHtml += '</div>';
+            return toolHtml;
+        } else if (msg.role === 'approval') {
+            // Approval messages are rendered inline with tool calls via pendingApprovals
+            return '<div class="message approval" id="msg-' + index + '" style="display:none;"></div>';
+        } else if (msg.role === 'prompt_user') {
+            return renderPromptUserMessage(msg, index);
+        } else if (msg.role === 'action_button') {
+            return renderInlineActionButton(msg, index);
+        } else if (msg.role === 'browser_context' || msg.role === 'context') {
+            // Context messages are hidden from UI - they're only for API context
+            // But we still need the ID for scrolling to work correctly
+            return '<div class="message browser-context" id="msg-' + index + '" style="display:none;"></div>';
+        }
+        return '';
+    }).join('');
+
+    // During streaming, keep #streaming-text in the DOM to preserve its scroll position.
+    // All other content goes inside a #messages-inner wrapper - a single innerHTML swap.
+    var existingStreamingEl = isRunning ? document.getElementById('streaming-text') : null;
+
+    // Preserve live widget iframes across innerHTML rebuild using moveBefore().
+    // moveBefore() (Chrome 124+, Firefox 131+) is the ONLY DOM API that moves
+    // nodes without resetting iframe content. appendChild/replaceChild/insertBefore
+    // all destroy iframe state per HTML spec.
+    // We park widgets on document.body (hidden) so both container.innerHTML and
+    // inner.innerHTML paths are safe, then moveBefore them back to their placeholders.
+    var savedWidgets = {};
+    var canMoveBefore = typeof Element.prototype.moveBefore === 'function';
+    if (canMoveBefore) {
+        var searchRoot = container.querySelector('#messages-inner') || container;
+        var liveWidgets = searchRoot.querySelectorAll('.widget-inline[data-widget-id]');
+        liveWidgets.forEach(function(wi) {
+            var wid = wi.getAttribute('data-widget-id');
+            if (wid && wi.querySelector('iframe.widget-iframe')) {
+                wi.style.display = 'none';
+                document.body.moveBefore(wi, null); // park on body — iframe stays alive
+                savedWidgets[wid] = wi;
+            }
+        });
+    }
+
+    if (existingStreamingEl) {
+        var inner = container.querySelector('#messages-inner');
+        if (!inner) {
+            inner = document.createElement('div');
+            inner.id = 'messages-inner';
+            var child = container.firstChild;
+            while (child) {
+                var next = child.nextSibling;
+                if (child !== existingStreamingEl) child.remove();
+                child = next;
+            }
+            container.insertBefore(inner, existingStreamingEl);
+        }
+        inner.innerHTML = mappedHtml;
+    } else {
+        container.innerHTML = mappedHtml;
+        if (isRunning) {
+            container.appendChild(createStreamingTextEl());
+        }
+    }
+
+    // Move preserved widgets back from body to their placeholder positions
+    var savedWidgetIds = Object.keys(savedWidgets);
+    if (savedWidgetIds.length > 0) {
+        var rebuildRoot = container.querySelector('#messages-inner') || container;
+        for (var swi = 0; swi < savedWidgetIds.length; swi++) {
+            var swid = savedWidgetIds[swi];
+            var placeholder = rebuildRoot.querySelector('.widget-inline[data-widget-id="' + swid + '"]');
+            if (placeholder && canMoveBefore) {
+                savedWidgets[swid].style.display = '';
+                placeholder.parentNode.moveBefore(savedWidgets[swid], placeholder);
+                placeholder.remove();
+            } else {
+                savedWidgets[swid].querySelectorAll('.widget-iframe').forEach(function(iframe) {
+                    if (iframe.__widgetCleanup) iframe.__widgetCleanup();
+                });
+                savedWidgets[swid].remove();
+            }
+        }
+    }
+
+    // Scope post-render queries to the rebuilt content area only
+    contentRoot = container.querySelector('#messages-inner') || container;
+
+    // Set up sticky observers for any expanded tool panels
+    contentRoot.querySelectorAll('details.tool-call.expanded, details.tool-result.expanded').forEach(function(details) {
+        setupStickyObserver(details);
+    });
+
+    // Click-to-fullscreen for widget thumbnails inside .widgets-container
+    contentRoot.querySelectorAll('.widgets-container .widget-inline').forEach(function(wi) {
+        wi.addEventListener('click', function(e) {
+            if (e.target.closest('.widget-controls')) return;
+            var wid = wi.getAttribute('data-widget-id');
+            if (wid) openWidgetFullscreen(wid);
+        });
+    });
+
+    // Set up scroll shadow for attachments rows and widget rows (right fade when more content is hidden)
+    contentRoot.querySelectorAll('.attachments-row, .widgets-container').forEach(function(row) {
+        function updateShadow() {
+            var hasOverflow = row.scrollWidth > row.clientWidth + 1;
+            var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
+            row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
+        }
+        updateShadow();
+        row.addEventListener('scroll', updateShadow);
+    });
+    
+    // Render a "queued" user bubble at the very end if the user typed a message during
+    // streaming. This makes their message visible immediately rather than disappearing
+    // until the agent loop flushes it.
+    renderQueuedUserBubble(container);
+
+    // Update version sidebar to show user messages list
+    updateVersionSidebarVisibility();
+    renderVersionSidebar();
+    
+    // Initialize only NEW widgets (preserved ones already have iframes, so hasChildNodes() is true)
+    initializeWidgetsInView();
+    renderWidgetSidebar();
+
+    // Initialize display template checklists (update summaries after innerHTML)
+    initDisplayChecklists();
+
+    // Restore scroll position after widgets are rendered
+    var streamingEl = document.getElementById('streaming-text');
+    if (streamingEl) {
+        // During streaming: #streaming-text was never removed from DOM, scroll is intact
+        // Just restore outer container position and update height constraint
+        container.scrollTop = savedScrollTop;
+        updateStreamingContainerHeight();
+    } else if (wasAtBottom || isFollowingScroll) {
+        container.scrollTop = container.scrollHeight;
+    } else {
+        container.scrollTop = savedScrollTop;
+    }
+}
+
+function updateStreamingMessage(index, msg, streamingChatId) {
+    // If we navigated away from the streaming chat, skip DOM updates but let streaming continue
+    if (streamingChatId && currentChatId !== streamingChatId) {
+        return; // Streaming continues in background, data is saved to correct chat
+    }
+
+    // If skills view is open, skip DOM updates (elements are hidden)
+    if (currentView === 'skills') {
+        return; // Streaming continues in background
+    }
+
+    // Skip DOM updates during silent hook runs
+    if (_silentHookRunning) return;
+    
+    var msgEl = document.getElementById('msg-' + index);
+    if (!msgEl) {
+        // Only re-render if we're still on the same chat
+        if (!streamingChatId || currentChatId === streamingChatId) {
+            renderMessages();
+        }
+        return;
+    }
+
+    // Optimization: try to do incremental update for tool call arguments during streaming
+    // This avoids rebuilding the entire HTML when only the tool args are changing
+    if (msg.isStreaming && msg.tool_calls && msg.tool_calls.length > 0) {
+        var lastTcIdx = msg.tool_calls.length - 1;
+        var lastTc = msg.tool_calls[lastTcIdx];
+        var tcKey = 'tc-' + index + '-' + lastTcIdx;
+        var existingTcEl = document.getElementById(tcKey);
+
+        // If the tool call element already exists, just update the args text and status message
+        if (existingTcEl) {
+            var argsEl = existingTcEl.querySelector('.tool-args');
+            if (argsEl) {
+                var argsText = lastTc.function.arguments || '';
+                // Show streaming placeholder if args are empty (API sends args in one chunk at the end)
+                if (argsText.length === 0) {
+                    argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
+                } else {
+                    argsEl.textContent = argsText;
+                }
+
+                // Update status message in header if present (extract from partial JSON)
+                var streamingStatusMsg = extractStatusMessage(argsText);
+                var statusMsgEl = existingTcEl.querySelector('.tool-status-message');
+                if (streamingStatusMsg) {
+                    if (statusMsgEl) {
+                        statusMsgEl.textContent = streamingStatusMsg;
+                    } else {
+                        // Create status message element if it doesn't exist
+                        var summaryEl = existingTcEl.querySelector('summary');
+                        if (summaryEl) {
+                            var newStatusEl = document.createElement('span');
+                            newStatusEl.className = 'tool-status-message';
+                            newStatusEl.textContent = streamingStatusMsg;
+                            // Insert after tool-name span
+                            var toolNameEl = summaryEl.querySelector('.tool-name');
+                            if (toolNameEl && toolNameEl.nextSibling) {
+                                summaryEl.insertBefore(newStatusEl, toolNameEl.nextSibling);
+                            } else {
+                                summaryEl.appendChild(newStatusEl);
+                            }
+                        }
+                    }
+                }
+
+                // Also update compact mode collapsible header if present.
+                // Pick the LAST streaming compact area in the DOM — if a chat ever
+                // has multiple streaming blocks (e.g. message-injected mid-tool-call),
+                // we want the most recent one, not the first.
+                var streamingCompactStatusEls = document.querySelectorAll('.compact-tools-area.streaming .compact-tools-status');
+                var compactStatusEl = streamingCompactStatusEls.length ? streamingCompactStatusEls[streamingCompactStatusEls.length - 1] : null;
+                if (compactStatusEl && streamingStatusMsg) {
+                    compactStatusEl.textContent = streamingStatusMsg;
+                }
+
+                scrollToBottomIfAllowed();
+                return; // Skip full rebuild
+            }
+        }
+    }
+
+    var html = '';
+    var isStreaming = msg.isStreaming === true;
+    var hasThinking = msg.thinking && msg.thinking.length > 0;
+    var hasContent = msg.content && msg.content.length > 0;
+    var hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
+    
+    // In compact mode, do incremental content update to prevent flashing
+    if (compactToolCalls) {
+        // During streaming in compact mode, try incremental updates to avoid spinner freeze
+        if (isStreaming) {
+            var compactArea = msgEl.querySelector('.compact-tools-area');
+
+            // If compact area doesn't exist in this message, the compact area is on the
+            // first assistant message. This message's div is hidden during streaming.
+            // Update streaming text and the first assistant's compact area directly - never call renderMessages().
+            if (!compactArea) {
+                if (hasContent) {
+                    updateStreamingText(msg, index);
+                }
+                // Update the first assistant's compact area status text directly
+                if (hasToolCalls || hasThinking) {
+                    // Same scoping rule as above: prefer the LAST streaming compact area.
+                    var streamingCompactStatusEls2 = document.querySelectorAll('.compact-tools-area.streaming .compact-tools-status');
+                    var compactStatusEl = streamingCompactStatusEls2.length ? streamingCompactStatusEls2[streamingCompactStatusEls2.length - 1] : null;
+                    if (compactStatusEl) {
+                        var lastTc = hasToolCalls ? msg.tool_calls[msg.tool_calls.length - 1] : null;
+                        var statusMsg = lastTc ? (extractStatusMessage(lastTc.function.arguments) || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) : 'Thinking...';
+                        compactStatusEl.textContent = statusMsg;
+                    } else {
+                        // No compact area spinner yet - need one full rebuild, then incremental
+                        renderMessages();
+                        return;
+                    }
+                }
+                scrollToBottomIfAllowed();
+                return;
+            }
+
+            // Handle thinking-only streaming (no tool calls yet)
+            if (compactArea && !hasToolCalls) {
+                // Update thinking content inside the compact area
+                var thinkingEl = compactArea.querySelector('.thinking-content');
+                if (hasThinking) {
+                    if (thinkingEl) {
+                        // Update existing thinking element
+                        thinkingEl.textContent = msg.thinking;
+                    } else {
+                        // Create thinking element if it doesn't exist yet
+                        var compactContent = compactArea.querySelector('.compact-tools-content');
+                        if (compactContent) {
+                            var thinkingKey = index + '-0';
+                            var thinkingHtml = '<details class="thinking" data-tl-idx="0" open ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
+                            thinkingHtml += '<summary><span class="thinking-status">Thought process</span></summary>';
+                            thinkingHtml += '<div class="thinking-content">' + escapeHtml(msg.thinking) + '</div></details>';
+                            compactContent.insertAdjacentHTML('beforeend', thinkingHtml);
+                        }
+                    }
+                }
+                // All streaming content goes to #streaming-text
+                if (hasContent) {
+                    updateStreamingText(msg, index);
+                }
+                scrollToBottomIfAllowed();
+                return; // Skip full rebuild - spinner continues spinning
+            }
+
+            // Incremental update: update status text and tool args without rebuilding DOM
+            if (compactArea && hasToolCalls) {
+                // Also update thinking if present (may continue streaming alongside tool calls)
+                if (hasThinking) {
+                    var thinkingEl = compactArea.querySelector('.thinking-content');
+                    if (thinkingEl) {
+                        thinkingEl.textContent = msg.thinking;
+                    } else {
+                        // Create thinking element if it doesn't exist yet
+                        var compactContentForThinking = compactArea.querySelector('.compact-tools-content');
+                        if (compactContentForThinking) {
+                            var thinkingKey = index + '-0';
+                            var thinkingHtml = '<details class="thinking" data-tl-idx="0" open ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
+                            thinkingHtml += '<summary><span class="thinking-status">Thought process</span></summary>';
+                            thinkingHtml += '<div class="thinking-content">' + escapeHtml(msg.thinking) + '</div></details>';
+                            compactContentForThinking.insertAdjacentHTML('afterbegin', thinkingHtml);
+                        }
+                    }
+                }
+
+                // All streaming content goes to #streaming-text
+                if (hasContent) {
+                    updateStreamingText(msg, index);
+                }
+
+                var lastTc = msg.tool_calls[msg.tool_calls.length - 1];
+                var lastTcIdx = msg.tool_calls.length - 1;
+                var tcKey = 'tc-' + index + '-' + lastTcIdx;
+                var tcEl = document.getElementById(tcKey);
+
+                // Update the collapsible header status
+                var statusEl = compactArea.querySelector('.compact-tools-status');
+                if (statusEl) {
+                    var streamingStatusMsg = extractStatusMessage(lastTc.function.arguments);
+                    var newStatus = streamingStatusMsg || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name || 'Processing...';
+                    statusEl.textContent = newStatus;
+                }
+
+                // If tool call element exists, update its args
+                if (tcEl) {
+                    var argsEl = tcEl.querySelector('.tool-args');
+                    if (argsEl) {
+                        var argsText = lastTc.function.arguments || '';
+                        if (argsText.length === 0) {
+                            argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
+                        } else {
+                            argsEl.textContent = argsText;
+                        }
+                    }
+
+                    // Update status message in tool call header
+                    var tcStatusMsg = extractStatusMessage(lastTc.function.arguments);
+                    var tcStatusEl = tcEl.querySelector('.tool-status-message');
+                    if (tcStatusMsg) {
+                        if (tcStatusEl) {
+                            tcStatusEl.textContent = tcStatusMsg;
+                        } else {
+                            var summaryEl = tcEl.querySelector('summary');
+                            if (summaryEl) {
+                                var newStatusEl = document.createElement('span');
+                                newStatusEl.className = 'tool-status-message';
+                                newStatusEl.textContent = tcStatusMsg;
+                                var toolNameEl = summaryEl.querySelector('.tool-name');
+                                if (toolNameEl && toolNameEl.nextSibling) {
+                                    summaryEl.insertBefore(newStatusEl, toolNameEl.nextSibling);
+                                } else {
+                                    summaryEl.appendChild(newStatusEl);
+                                }
+                            }
+                        }
+                    }
+
+                    scrollToBottomIfAllowed();
+                    return; // Skip full rebuild
+                }
+
+                // Tool call element doesn't exist yet - add it incrementally to avoid spinner freeze
+                var compactContent = compactArea.querySelector('.compact-tools-content');
+                if (compactContent) {
+                    var tcStatusMsg = extractStatusMessage(lastTc.function.arguments);
+                    var statusMsgHtml = tcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(tcStatusMsg) + '</span>' : '';
+                    var newTcHtml = '<details class="tool-call" id="' + tcKey + '" open onclick="toggleToolCallExpanded(' + index + ', ' + lastTcIdx + ', this)">';
+                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(lastTc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) + '</span>' + statusMsgHtml + '</summary>';
+                    newTcHtml += '<div class="tool-args-wrapper">';
+                    newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                    var argsText = lastTc.function.arguments || '';
+                    if (argsText.length === 0) {
+                        newTcHtml += '<pre class="tool-args"><span class="tool-args-streaming">Generating arguments...</span></pre>';
+                    } else {
+                        newTcHtml += '<pre class="tool-args">' + escapeHtml(argsText) + '</pre>';
+                    }
+                    newTcHtml += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+                    newTcHtml += '</details>';
+
+                    // Insert the new tool call at the end of the content
+                    compactContent.insertAdjacentHTML('beforeend', newTcHtml);
+                    scrollToBottomIfAllowed();
+                    return; // Skip full rebuild
+                }
+
+                // compactContent not found - just scroll and return, never rebuild during streaming
+                scrollToBottomIfAllowed();
+                return;
+            }
+
+            // compactArea exists but no tool calls - just return to prevent spinner restart
+            scrollToBottomIfAllowed();
+            return;
+        }
+        // Try incremental update for content (non-streaming)
+        // During streaming (isRunning), content goes to #streaming-text, not message divs
+        if (hasContent && !isRunning) {
+            var existingContent = msgEl.querySelector('.message-content');
+            if (existingContent) {
+                existingContent.innerHTML = formatContent(msg.content);
+                scrollToBottomIfAllowed();
+                return;
+            }
+            html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+        }
+    } else {
+        // Standard mode (non-compact)
+        if (msg.thinking || msg.isStreaming) {
+            var isCollapsed = msg.thinkingCollapsed === true && !isStreaming;
+            var openAttr = isCollapsed ? '' : 'open';
+            var statusClass = isStreaming ? 'active' : (isCollapsed ? 'collapsed' : '');
+            var statusText;
+            if (isStreaming) {
+                if (hasThinking) statusText = 'Thinking...';
+                else if (hasToolCalls) statusText = 'Preparing tool call...';
+                else statusText = 'Waiting for response...';
+            } else {
+                statusText = isCollapsed ? 'Thought process (click to expand)' : 'Thought process';
+            }
+            var contentClass = isStreaming ? 'thinking-content streaming' : 'thinking-content';
+            var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming && !hasToolCalls ? '<span class="processing-indicator"><span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right: var(--space-4);"></span>Model is processing...</span>' : '');
+            var showThinkingIndicator = isStreaming && !hasToolCalls;
+            html += '<details class="thinking ' + statusClass + '" ' + openAttr + '>' +
+                '<summary><span class="thinking-status">' + statusText + '</span>' +
+                (showThinkingIndicator ? '<span class="thinking-indicator"></span>' : '') +
+                '</summary>' +
+                '<div class="' + contentClass + '">' + thinkingContent + '</div></details>';
+        }
+        if (msg.content && !msg.isStreaming && !isRunning) {
+            html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+        }
+        if (msg.content && msg.isStreaming) {
+            updateStreamingText(msg, index);
+        }
+        if (msg.tool_calls) {
+            // Standard mode: render each tool call separately
+            msg.tool_calls.forEach(function(tc, tcIdx) {
+                var tcKey = 'tc-' + index + '-' + tcIdx;
+                var tcEl = document.getElementById(tcKey);
+                // Check if user explicitly toggled this tool call
+                var hasExplicitPref = msg.toolCallsExpanded && msg.toolCallsExpanded.hasOwnProperty(tcIdx);
+                var tcOpen;
+                if (hasExplicitPref) {
+                    // Respect user's explicit choice
+                    tcOpen = msg.toolCallsExpanded[tcIdx];
+                } else if (tcEl) {
+                    // Use current DOM state
+                    tcOpen = tcEl.open;
+                } else {
+                    // Default: open during streaming, closed otherwise
+                    tcOpen = msg.isStreaming;
+                }
+                // Check for full-height expanded state
+                var tcFullHeight = msg.toolCallsFullHeight && msg.toolCallsFullHeight[tcIdx];
+                var expandedClass = tcFullHeight ? ' expanded' : '';
+                
+                // Add streaming class to tool call if it's the last one and we're streaming
+                var isLastToolCall = tcIdx === msg.tool_calls.length - 1;
+                var streamingClass = (msg.isStreaming && isLastToolCall) ? ' streaming' : '';
+                html += '<details class="tool-call' + expandedClass + streamingClass + '" id="' + tcKey + '" onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)"' + (tcOpen ? ' open' : '') + '>';
+                // Extract status message from tool arguments (works with partial JSON during streaming)
+                var streamingTcStatusMsg = extractStatusMessage(tc.function.arguments);
+                // Add spinner to summary if this tool call is streaming
+                var toolSpinner = (msg.isStreaming && isLastToolCall) ? '<span class="tool-streaming-indicator"></span>' : '';
+                var statusMsgHtml = streamingTcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(streamingTcStatusMsg) + '</span>' : '';
+                html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
+                var argsCopyId = storeRawCopy(tc.function.arguments);
+                html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
+                html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (tcFullHeight ? 'Collapse' : 'Expand') + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
+                var argsHtml = formatJsonPretty(tc.function.arguments);
+                if (window.currentSearchHighlight) {
+                    argsHtml = applySearchHighlight(argsHtml, window.currentSearchHighlight);
+                }
+                html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + argsHtml + '</pre>';
+                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></details>';
+            });
+        }
+    }
+
+    // Preserve scroll position if user has scrolled away - browser may auto-scroll when details elements expand
+    var container = document.getElementById('messages');
+    var savedScrollTop = (!isFollowingScroll && container) ? container.scrollTop : null;
+    
+    msgEl.innerHTML = html;
+    
+    // Restore scroll position if user had scrolled away (prevents browser auto-scroll on details expansion)
+    if (savedScrollTop !== null && container) {
+        container.scrollTop = savedScrollTop;
+    }
+    
+    // Set up sticky observers for any expanded tool panels
+    msgEl.querySelectorAll('details.tool-call.expanded').forEach(function(details) {
+        setupStickyObserver(details);
+    });
+    
+    scrollToBottomIfAllowed();
+}
+
+function highlightJS(code) {
+    var esc = function(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    };
+    var tokens = [];
+    var i = 0;
+    while (i < code.length) {
+        // Single-line comment
+        if (code[i] === '/' && code[i+1] === '/') {
+            var end = code.indexOf('\n', i);
+            if (end === -1) end = code.length;
+            tokens.push('<span class="sh-comment">' + esc(code.slice(i, end)) + '</span>');
+            i = end;
+        }
+        // Multi-line comment
+        else if (code[i] === '/' && code[i+1] === '*') {
+            var end = code.indexOf('*/', i + 2);
+            if (end === -1) end = code.length; else end += 2;
+            tokens.push('<span class="sh-comment">' + esc(code.slice(i, end)) + '</span>');
+            i = end;
+        }
+        // String (double quote)
+        else if (code[i] === '"') {
+            var j = i + 1;
+            while (j < code.length && code[j] !== '"') { if (code[j] === '\\') j++; j++; }
+            tokens.push('<span class="sh-string">' + esc(code.slice(i, j + 1)) + '</span>');
+            i = j + 1;
+        }
+        // String (single quote)
+        else if (code[i] === "'") {
+            var j = i + 1;
+            while (j < code.length && code[j] !== "'") { if (code[j] === '\\') j++; j++; }
+            tokens.push('<span class="sh-string">' + esc(code.slice(i, j + 1)) + '</span>');
+            i = j + 1;
+        }
+        // Template literal
+        else if (code[i] === '`') {
+            var j = i + 1;
+            while (j < code.length && code[j] !== '`') { if (code[j] === '\\') j++; j++; }
+            tokens.push('<span class="sh-string">' + esc(code.slice(i, j + 1)) + '</span>');
+            i = j + 1;
+        }
+        // Number
+        else if (/[0-9]/.test(code[i]) && (i === 0 || !/[a-zA-Z_$]/.test(code[i-1]))) {
+            var j = i;
+            while (j < code.length && /[0-9.xXa-fA-F]/.test(code[j])) j++;
+            tokens.push('<span class="sh-number">' + esc(code.slice(i, j)) + '</span>');
+            i = j;
+        }
+        // Word (keyword, identifier, etc)
+        else if (/[a-zA-Z_$]/.test(code[i])) {
+            var j = i;
+            while (j < code.length && /[a-zA-Z0-9_$]/.test(code[j])) j++;
+            var word = code.slice(i, j);
+            var keywords = ['var','let','const','function','return','if','else','for','while','do','switch','case','break','continue','new','this','class','extends','import','export','default','try','catch','finally','throw','async','await','yield','typeof','instanceof','in','of','delete','void','null','undefined','true','false'];
+            if (keywords.indexOf(word) !== -1) {
+                tokens.push('<span class="sh-keyword">' + word + '</span>');
+            } else {
+                tokens.push(word);
+            }
+            i = j;
+        }
+        // Other characters (preserve whitespace and special chars)
+        else {
+            tokens.push(esc(code[i]));
+            i++;
+        }
+    }
+    return tokens.join('');
+}
+
+function formatContent(content) {
+    // Extract document placeholders BEFORE escaping
+    var documentBlocks = [];
+    var html = content.replace(/<!--document:(doc_\w+)-->/g, function(match, docId) {
+        var rendered = typeof renderDocumentPlaceholder === 'function' ? renderDocumentPlaceholder(docId) : '<div class="sdoc-error">Document: ' + docId + '</div>';
+        documentBlocks.push(rendered);
+        return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
+    });
+
+    // Extract display template placeholders BEFORE escaping
+    var displayBlocks = [];
+    html = html.replace(/<!--display:(dsp_\w+)-->/g, function(match, displayId) {
+        var rendered = renderDisplayPlaceholder(displayId);
+        displayBlocks.push(rendered);
+        return '%%DISPLAY' + (displayBlocks.length - 1) + '%%';
+    });
+
+    // Extract code blocks BEFORE escaping
+    var codeBlocks = [];
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(match, lang, code) {
+        var codeCopyId = storeRawCopy(code);
+        var isJS = !lang || lang === 'js' || lang === 'javascript';
+        var highlightedCode = isJS ? highlightJS(code) : escapeHtml(code);
+        var blockHtml = '<div class="code-block-wrapper" data-copy-id="' + codeCopyId + '">' +
+            '<button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="Expand">⤢</button>' +
+            '<pre class="code-block collapsed"><code>' + highlightedCode + '</code></pre>' +
+            '<button class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+        codeBlocks.push(blockHtml);
+        return '%%CODEBLOCK' + (codeBlocks.length - 1) + '%%';
+    });
+    
+    // Now escape the rest of the HTML
+    html = escapeHtml(html);
+    
+    // Inline code
+    html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+    
+    // Bold
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+    // Markdown links [text](url) — supports http(s) and chrome-extension:// URLs
+    html = html.replace(/\[([^\]]+)\]\(((?:https?|chrome-extension):\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+    // Headers (process in order from most # to fewest)
+    html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
+    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+    html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+    
+    // Process line by line for tables, lists, and blockquotes
+    var lines = html.split('\n');
+    var out = [];
+    var inTable = false;
+    var inList = false;
+    var inBlockquote = false;
+
+    for (var i = 0; i < lines.length; i++) {
+        var ln = lines[i];
+        var trimmedLn = ln.trim();
+
+        // Check if this is a list item (starts with - or number.)
+        var isListItem = /^- .+/.test(trimmedLn) || /^\d+\. .+/.test(trimmedLn);
+        // Check if this is a blockquote line. NOTE: > has already been escaped to &gt; above.
+        // Match `&gt;` followed by either whitespace or end-of-line (so a bare `>` line is
+        // treated as an empty blockquote paragraph separator).
+        var isBlockquote = /^&gt;(\s|$)/.test(trimmedLn);
+        // Check next non-empty line for list/blockquote continuation.
+        var nextIsListItem = false;
+        var nextIsBlockquote = false;
+        for (var j = i + 1; j < lines.length; j++) {
+            var nextTrimmed = lines[j].trim();
+            if (nextTrimmed === '') continue;
+            nextIsListItem = /^- .+/.test(nextTrimmed) || /^\d+\. .+/.test(nextTrimmed);
+            nextIsBlockquote = /^&gt;(\s|$)/.test(nextTrimmed);
+            break;
+        }
+
+        if (ln.match(/^\|.+\|$/)) {
+            if (inList) { out.push('</ul>'); inList = false; }
+            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+            if (!inTable) {
+                while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
+                inTable = true;
+                out.push('<table class="md-table">');
+            }
+            if (ln.match(/^\|[\s\-:|]+\|$/)) continue;
+            var cells = ln.split('|').slice(1, -1);
+            out.push('<tr>' + cells.map(function(c) { return '<td>' + c.trim() + '</td>'; }).join('') + '</tr>');
+        } else if (isBlockquote) {
+            if (inTable) { out.push('</table>'); inTable = false; }
+            if (inList) { out.push('</ul>'); inList = false; }
+            if (!inBlockquote) { out.push('<blockquote class="md-blockquote">'); inBlockquote = true; }
+            // Strip the leading `&gt;` plus optional single space; everything after is
+            // pushed as a normal line so the paragraph pass below wraps it.
+            var bqContent = trimmedLn.replace(/^&gt;\s?/, '');
+            out.push(bqContent);
+        } else if (isListItem) {
+            if (inTable) { out.push('</table>'); inTable = false; }
+            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+            if (!inList) { out.push('<ul>'); inList = true; }
+            // Convert to li tag
+            var liContent = trimmedLn.replace(/^- /, '').replace(/^\d+\. /, '');
+            out.push('<li>' + liContent + '</li>');
+        } else if (trimmedLn === '' && inList && nextIsListItem) {
+            // Empty line between list items - keep list open
+            continue;
+        } else if (trimmedLn === '' && inBlockquote && nextIsBlockquote) {
+            // Empty line within a blockquote - keep blockquote open and emit
+            // an empty line so the paragraph pass starts a new paragraph inside.
+            out.push('');
+            continue;
+        } else if (trimmedLn === '') {
+            // Skip empty lines entirely - they cause spacing issues
+            continue;
+        } else {
+            if (inTable) { out.push('</table>'); inTable = false; }
+            if (inList) { out.push('</ul>'); inList = false; }
+            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+            out.push(ln);
+        }
+    }
+    if (inTable) out.push('</table>');
+    if (inList) out.push('</ul>');
+    if (inBlockquote) out.push('</blockquote>');
+    
+    // Join and clean up - remove newlines between list items
+    html = out.join('\n');
+    html = html.replace(/<\/li>\s*\n\s*<li>/g, '</li><li>');
+    html = html.replace(/<ul>\s*\n\s*<li>/g, '<ul><li>');
+    html = html.replace(/<\/li>\s*\n\s*<\/ul>/g, '</li></ul>');
+    
+    // Process remaining content - group consecutive non-block lines into paragraphs
+    var finalLines = html.split('\n');
+    var result = [];
+    var paragraphBuffer = [];
+    
+    function flushParagraph() {
+        if (paragraphBuffer.length > 0) {
+            var content = paragraphBuffer.join('<br>').trim();
+            if (content && content !== '<br>') {
+                result.push('<span class="md-paragraph">' + content + '</span>');
+            }
+            paragraphBuffer = [];
+        }
+    }
+    
+    for (var i = 0; i < finalLines.length; i++) {
+        var line = finalLines[i];
+        var trimmed = line.trim();
+        
+        // Check if this is a block element (including table parts, list items, blockquotes)
+        if (trimmed.match(/^<(h[234]|pre|table|tbody|tr|td|th|ul|ol|li|div|blockquote|\/)/) || trimmed.match(/^%%(DOCUMENT|DISPLAY)\d+%%$/)) {
+            flushParagraph();
+            result.push(trimmed);
+        } else if (trimmed === '') {
+            // Empty line - flush paragraph if we have content
+            if (paragraphBuffer.length > 0) {
+                flushParagraph();
+            }
+        } else {
+            paragraphBuffer.push(trimmed);
+        }
+    }
+    flushParagraph();
+    
+    html = result.join('');
+    
+    // Aggressive cleanup of spacing issues (BEFORE restoring code blocks)
+    html = html.replace(/>\s+</g, '><');
+    // Remove empty paragraphs (with optional whitespace/br inside)
+    html = html.replace(/<span class="md-paragraph">(\s|<br>)*<\/span>/g, '');
+    // Remove multiple consecutive br tags (keep just one if needed)
+    html = html.replace(/(<br>\s*){2,}/g, '<br>');
+    // Remove anything between closing header and opening table/list/blockquote
+    html = html.replace(/(<\/h[234]>)(\s|<br>|<span[^>]*>(\s|<br>)*<\/span>)*(<table|<ul|<ol|<blockquote)/g, '$1$4');
+    // Remove br/empty content right before any block element
+    html = html.replace(/(\s|<br>|<span class="md-paragraph">(\s|<br>)*<\/span>)+(<table|<ul|<ol|<h[234]|<div|<pre|<blockquote)/g, '$3');
+    // Remove br tags right after block elements
+    html = html.replace(/(<\/table>|<\/ul>|<\/ol>|<\/h[234]>|<\/div>|<\/pre>|<\/blockquote>)(\s|<br>)+/g, '$1');
+    
+    // Restore code blocks AFTER cleanup to preserve their whitespace
+    for (var i = 0; i < codeBlocks.length; i++) {
+        html = html.replace('%%CODEBLOCK' + i + '%%', codeBlocks[i]);
+    }
+
+    // Restore display template blocks
+    for (var i = 0; i < displayBlocks.length; i++) {
+        html = html.replace('%%DISPLAY' + i + '%%', displayBlocks[i]);
+    }
+
+    // Restore document blocks
+    for (var i = 0; i < documentBlocks.length; i++) {
+        html = html.replace('%%DOCUMENT' + i + '%%', documentBlocks[i]);
+    }
+    
+    // Apply search highlighting if active
+    if (window.currentSearchHighlight) {
+        html = applySearchHighlight(html, window.currentSearchHighlight);
+    }
+    
+    return html;
+}
+
+// Render a transient "queued" user bubble at the bottom of the chat for the message
+// the user typed during streaming. The bubble is purely visual — the actual message
+// lives in pendingInjectionsByChatId until flushPendingInjection moves it into the
+// real chat history. This avoids the previous "message disappears" UX.
+function renderQueuedUserBubble(container) {
+    if (!container) return;
+    // Always remove any previous queued bubble first — idempotent.
+    var existing = container.querySelector('.message.user.queued');
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+
+    if (!currentChatId) return;
+    var entry = pendingInjectionsByChatId[currentChatId];
+    if (!entry) return;
+    var text = entry.text || '';
+    var images = entry.images || [];
+    if (!text && (!images || images.length === 0)) return;
+
+    var bubble = document.createElement('div');
+    bubble.className = 'message user queued';
+    bubble.title = 'Queued — will be sent as soon as the current step finishes.';
+    var inner = '<div class="message-content">';
+    inner += '<div class="queued-badge">' + (UI_ICONS && UI_ICONS.clock ? UI_ICONS.clock : '⏳') + ' Queued</div>';
+    if (text) {
+        inner += '<span class="user-text">' + escapeHtml(text) + '</span>';
+    }
+    if (images && images.length > 0) {
+        inner += '<div class="queued-attachments">' + images.length + ' attachment' + (images.length === 1 ? '' : 's') + '</div>';
+    }
+    inner += '</div>';
+    bubble.innerHTML = inner;
+
+    // Append at the very end of the messages container.
+    var inner2 = container.querySelector('#messages-inner') || container;
+    inner2.appendChild(bubble);
+}

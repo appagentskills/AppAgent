@@ -1,0 +1,8 @@
+{
+  "name": "appagent",
+  "description": "AppAgent Chrome extension build tools",
+  "scripts": {
+    "build": "node build/build.js",
+    "docs": "node build/serve-docs.js"
+  }
+}

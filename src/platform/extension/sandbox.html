@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html><head></head><body><script>
+// AppAgent Extension - Sandboxed Execution Environment
+// Listed in manifest "sandbox" section => relaxed CSP (allows inline scripts + eval)
+// No chrome.* API access - communicates only via postMessage
+
+window._pendingCalls = {};
+window._callId = 0;
+
+// Bridge: executeTool calls proxy to parent
+window.executeTool = function(name, args) {
+    return new Promise(function(resolve, reject) {
+        var id = ++window._callId;
+        window._pendingCalls[id] = { resolve: resolve, reject: reject };
+        window.parent.postMessage({ type: 'sandboxToolCall', id: id, name: name, args: args }, '*');
+    });
+};
+
+window.addEventListener('message', function(e) {
+    if (e.source !== window.parent) return;
+    // Tool result from parent
+    if (e.data && e.data.type === 'sandboxToolResult' && window._pendingCalls[e.data.id]) {
+        var cb = window._pendingCalls[e.data.id];
+        delete window._pendingCalls[e.data.id];
+        if (e.data.error) cb.reject(new Error(e.data.error));
+        else cb.resolve(e.data.result);
+    }
+    // Execute code from parent
+    if (e.data && e.data.type === 'sandboxExec') {
+        (async function() {
+            try {
+                // Inject globals from parent context
+                if (e.data.globals) {
+                    Object.keys(e.data.globals).forEach(function(k) { window[k] = e.data.globals[k]; });
+                }
+                var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+                var fn = new AsyncFunction(e.data.code);
+                var result = await fn();
+                window.parent.postMessage({ type: 'sandboxDone', result: result }, '*');
+            } catch(err) {
+                window.parent.postMessage({ type: 'sandboxDone', error: err.message || String(err) }, '*');
+            }
+        })();
+    }
+});
+
+// Signal ready to parent
+window.parent.postMessage({ type: 'sandboxReady' }, '*');
+</script></body></html>

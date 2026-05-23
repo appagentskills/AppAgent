@@ -1,0 +1,29 @@
+/* Tool Approval Prompt - Collapsible */
+.tool-approval-prompt { background: var(--warning-lighter); border: 1px solid var(--warning); border-radius: var(--radius-lg); margin: var(--space-6) 0; }
+.tool-approval-prompt.approved { border-color: var(--success); background: var(--success-lighter); }
+.tool-approval-prompt.denied { border-color: var(--danger); background: var(--danger-lighter); }
+.tool-approval-header { padding: var(--space-5) var(--space-7); background: var(--warning-light); font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--warning-hover); border-radius: var(--radius-lg); cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--space-3); }
+.tool-approval-header::-webkit-details-marker { display: none; }
+.tool-approval-header::before { content: '▶'; font-size: var(--text-sm); transition: transform var(--transition-normal); }
+.tool-approval-prompt[open] .tool-approval-header { border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
+.tool-approval-prompt[open] .tool-approval-header::before { transform: rotate(90deg); }
+.tool-approval-prompt.approved .tool-approval-header { background: var(--success-light); color: var(--success-hover); }
+.tool-approval-prompt.denied .tool-approval-header { background: var(--danger-light); color: var(--danger-hover); }
+.tool-approval-body { padding: var(--space-6) var(--space-7); }
+.tool-approval-name { font-size: var(--text-body-lg); font-weight: var(--font-semibold); color: var(--text-primary); margin-bottom: var(--space-4); font-family: monospace; }
+.tool-approval-args { background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--space-5); font-size: var(--text-caption); max-height: 150px; overflow-y: auto; margin: 0; white-space: pre-wrap; word-break: break-all; }
+.tool-approval-actions { padding: var(--space-5) var(--space-7); background: var(--warning-lighter); display: flex; gap: var(--space-4); justify-content: flex-end; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+.tool-approval-btn { padding: var(--space-4) var(--space-8); border: 1px solid var(--secondary-border-dark); border-radius: var(--radius-md); font-size: var(--text-body); font-weight: var(--font-medium); cursor: pointer; background: var(--bg-white); color: var(--text-primary); display: inline-flex; align-items: center; gap: var(--space-3); transition: all var(--transition-fast); }
+.tool-approval-btn:hover { background: var(--secondary-light); }
+.tool-approval-btn .ui-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.tool-approval-btn.allow { border-color: var(--success); }
+.tool-approval-btn.allow:hover { background: var(--success-lighter); }
+.tool-approval-btn.session { border-color: var(--secondary); }
+.tool-approval-btn.session:hover { background: var(--secondary-light); }
+.tool-approval-btn.auto { border-color: var(--primary); }
+.tool-approval-btn.auto:hover { background: var(--primary-lighter); }
+.tool-approval-btn.deny { border-color: var(--danger); }
+.tool-approval-btn.deny:hover { background: var(--danger-lighter); }
+.tool-approval-status { font-size: var(--text-body-sm); font-weight: var(--font-medium); padding: var(--space-2) var(--space-6); border-radius: var(--radius-sm); }
+.tool-approval-status.allowed { color: var(--success-hover); background: var(--success-light); }
+.tool-approval-status.denied { color: var(--danger-hover); background: var(--danger-light); }

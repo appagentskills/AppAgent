@@ -1,0 +1,6 @@
+/* Main area */
+.main { flex: 1; display: flex; flex-direction: column; transition: width 0.3s ease; position: relative; min-width: 0; overflow: hidden; }
+.floating-sidebar-toggle { display: none; position: fixed; top: var(--space-4); left: var(--space-4); z-index: 100; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-3) var(--space-5); cursor: pointer; font-size: var(--text-xl); box-shadow: var(--shadow-sm); }
+.floating-sidebar-toggle:hover { background: var(--bg-hover); }
+.main-wrapper { display: flex; flex: 1; overflow: hidden; }
+

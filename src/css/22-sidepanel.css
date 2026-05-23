@@ -1,0 +1,34 @@
+/* Side panel mode — extension running as Chrome side panel (~350-500px wide) */
+/* Most layout is handled by the existing mobile breakpoint (max-width: 480px) */
+/* since the side panel viewport IS the panel width. */
+/* This file only adds sidepanel-specific overrides. */
+
+/* Ensure mobile sidebar behavior even at wider side panel widths (up to 500px) */
+body.sidepanel-mode .sidebar { position: fixed !important; left: 0; top: 0; bottom: 0; width: 280px !important; min-width: 280px !important; border: none !important; overflow: hidden; z-index: 1000; transform: translateX(-100%); transition: transform 0.3s ease !important; }
+body.sidepanel-mode .sidebar.expanded { transform: translateX(0); border-right: 1px solid var(--secondary-border) !important; overflow: visible; }
+body.sidepanel-mode .sidebar.no-transition { transition: none !important; }
+body.sidepanel-mode .floating-sidebar-toggle { display: none !important; }
+body.sidepanel-mode .toggle-sidebar-btn { display: flex !important; }
+
+/* Hide browser controls — active tab IS the browser */
+body.sidepanel-mode .browser-controls { display: none !important; }
+
+/* Active tab indicator */
+body.sidepanel-mode .ext-active-tab { display: inline-flex; align-items: center; gap: var(--space-2); font-size: 11px; color: var(--primary); background: var(--primary-lighter); border: 1px solid var(--primary-light); padding: var(--space-1) var(--space-3); border-radius: var(--radius-xl); max-width: 200px; overflow: hidden; white-space: nowrap; }
+body.sidepanel-mode .ext-active-tab .ext-status-dot { background: var(--primary); }
+body.sidepanel-mode #active-tab-url { overflow: hidden; text-overflow: ellipsis; }
+
+/* Model name — compact in sidepanel mode */
+body.sidepanel-mode .model-name { font-size: var(--text-caption); padding: var(--space-1) var(--space-3); max-width: 160px; overflow: hidden; }
+
+/* --- Expand / Side Panel toggle buttons --- */
+.ext-panel-btn { background: none; border: 1px solid var(--border); border-radius: var(--radius-md); cursor: pointer; padding: var(--space-2) var(--space-3); color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; transition: all var(--transition-fast); }
+.ext-panel-btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--text-muted); }
+.ext-panel-btn .ui-icon { width: 16px; height: 16px; }
+
+/* Expand button — accent color in side panel mode */
+body.sidepanel-mode .ext-expand-btn { color: var(--primary); border-color: var(--primary-light); background: var(--primary-lighter); }
+body.sidepanel-mode .ext-expand-btn:hover { background: var(--primary-light); color: var(--primary-hover); }
+
+/* Hide active tab indicator when NOT in side panel mode */
+body:not(.sidepanel-mode) .ext-active-tab { display: none !important; }

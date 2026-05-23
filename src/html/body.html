@@ -1,0 +1,410 @@
+<body>
+<a href="#main-area" class="skip-link" style="position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden;z-index:9999;">Skip to main content</a>
+<div class="container" id="container">
+    <button class="floating-sidebar-toggle" id="floating-sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar"><span id="floating-menu-icon" aria-hidden="true"></span></button>
+    <nav class="sidebar expanded no-transition" id="sidebar" aria-label="Main navigation">
+        <div class="sidebar-header">
+            <div class="sidebar-toggle-row">
+                <div class="sidebar-search-wrapper">
+                    <span class="sidebar-search-icon" id="sidebar-search-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></span>
+                    <input type="text" id="chat-search-input" class="sidebar-search-input" placeholder="Search" oninput="handleGlobalSearch(event)" aria-label="Search chats" />
+                    <button class="sidebar-search-clear" id="chat-search-clear" onclick="clearGlobalSearch()" title="Clear search" aria-label="Clear search"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                </div>
+                <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" onclick="toggleSidebar()" title="Collapse sidebar" aria-label="Toggle sidebar">
+                </button>
+            </div>
+            <div class="sidebar-actions-row" id="sidebar-actions-row"></div>
+            <button class="sidebar-nav-btn" id="new-chat-nav-btn" onclick="toggleHomeView()" data-tooltip="New Chat">
+                <span class="sidebar-nav-icon" id="new-chat-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.375-9.375z"/></svg></span>
+                <span>New Chat</span>
+                <span class="chat-pending-dot" id="home-pending-dot" style="display:none" title="Has pending draft"></span>
+            </button>
+            <button class="sidebar-nav-btn" id="dashboard-btn" onclick="toggleDashboardView()" data-tooltip="Dashboard">
+                <span class="sidebar-nav-icon" id="dashboard-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/><circle cx="6" cy="6" r="1" fill="currentColor"/></svg></span>
+                <span>Smart Dashboard</span>
+            </button>
+            <button class="sidebar-nav-btn" id="skills-btn" onclick="toggleSkillsView()" data-tooltip="Skills">
+                <span class="sidebar-nav-icon" id="skills-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></span>
+                <span>Skills</span>
+            </button>
+            <button class="sidebar-nav-btn" id="settings-page-btn" onclick="toggleSettingsView()" data-tooltip="Settings">
+                <span class="sidebar-nav-icon" id="settings-page-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></span>
+                <span>Settings</span>
+            </button>
+            <button class="sidebar-nav-btn" id="documents-btn" onclick="toggleDocumentsView()" data-tooltip="Documents">
+                <span class="sidebar-nav-icon" id="documents-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
+                <span>Documents</span>
+            </button>
+            <button class="sidebar-nav-btn" id="docs-btn" onclick="toggleDocsView()" data-tooltip="Docs">
+                <span class="sidebar-nav-icon" id="docs-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+                <span>Documentation</span>
+            </button>
+            <div class="sidebar-history-row" id="history-toggle-btn">
+                <button class="sidebar-nav-btn sidebar-history-btn" onclick="toggleHistoryView()" data-tooltip="History">
+                    <span class="sidebar-nav-icon" id="history-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+                    <span>History</span>
+                </button>
+                <button class="sidebar-history-toggle" id="history-chevron-btn" onclick="event.stopPropagation(); toggleHistorySection()" title="Expand/Collapse" aria-label="Expand or collapse history" aria-expanded="true">
+                    <span class="sidebar-history-chevron" id="history-chevron" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
+                </button>
+            </div>
+        </div>
+        <div class="chat-list" id="chat-list"></div>
+        <div class="sidebar-footer" style="padding: var(--space-6) var(--space-8);border-top:1px solid var(--secondary-border);font-size:var(--text-sm);color:var(--text-muted);text-align:center;">
+            <div><strong>v__VERSION__</strong> · Commercial no distribute</div>
+        </div>
+    </nav>
+    <div class="settings-panel" id="settings-panel">
+        <div class="settings-panel-header">
+            <span class="settings-panel-title">Settings</span>
+            <button class="settings-close-btn" onclick="closeSettingsPanel()" title="Close" aria-label="Close settings">&#215;</button>
+        </div>
+        <div class="settings-section">
+            <div class="settings-section-title"><span class="section-icon" id="section-icon-model"></span>Model</div>
+            <div id="settings-provider-container"></div>
+        </div>
+        <div class="settings-section">
+            <div class="settings-section-title"><span class="section-icon" id="section-icon-scope"></span>App Scope</div>
+            <div id="settings-scope-container"></div>
+        </div>
+        <div class="settings-section">
+            <div class="settings-section-title"><span class="section-icon" id="section-icon-permissions"></span>Tool Permissions</div>
+            <div class="tool-permissions-list" id="tool-permissions-list"></div>
+        </div>
+        <div class="settings-section">
+            <div class="settings-section-title"><span class="section-icon" id="section-icon-display"></span>Display</div>
+            <label class="settings-checkbox">
+                <input type="checkbox" id="show-api-stats" checked="checked" onchange="toggleApiStats()"/>
+                <span>Show API call statistics</span>
+            </label>
+            <label class="settings-checkbox">
+                <input type="checkbox" id="compact-tool-calls" checked="checked" onchange="toggleCompactToolCalls()"/>
+                <span>Compact tool calls (collapse all in one area)</span>
+            </label>
+            <label class="settings-checkbox">
+                <input type="checkbox" id="keep-awake-checkbox" checked="checked" onchange="toggleKeepAwake(this.checked)"/>
+                <span>Keep display awake after 5 minutes of inactivity</span>
+            </label>
+        </div>
+        <div class="settings-section">
+            <div class="settings-section-title"><span class="section-icon" id="section-icon-data"></span>Data Management</div>
+            <div class="data-management-buttons">
+                <button class="data-btn export-btn" onclick="exportAllData()"><span class="data-icon" id="data-icon-export"></span>Export Data</button>
+                <button class="data-btn import-btn" onclick="importAllData()"><span class="data-icon" id="data-icon-import"></span>Import Data</button>
+                <button class="data-btn delete-btn" onclick="deleteAllData()"><span class="data-icon" id="data-icon-delete"></span>Delete All Data</button>
+            </div>
+        </div>
+    </div>
+    <div class="main-wrapper">
+        <main class="main" id="main-area" role="main" style="display:none;">
+            <div class="main-header">
+                <button class="toggle-sidebar-btn" id="toggle-sidebar-btn" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Expand sidebar"></button>
+                <div class="header-title-group">
+                    <span class="header-chat-title" id="header-chat-title"></span>
+                    <button class="header-rename-btn" id="header-rename-btn" onclick="renameCurrentChat()" title="Rename chat" aria-label="Rename chat"></button>
+                </div>
+                <div class="header-controls">
+                    <div class="header-actions" id="header-actions"></div>
+                    <span class="ext-status ext-sn-status" id="ext-sn-status" style="display:none" title="ServiceNow connection"></span>
+                    <span class="ext-status ext-active-tab" id="active-tab-indicator" style="display:none" title="Active tab"><span class="ext-status-dot"></span><span id="active-tab-url">No active tab</span></span>
+                    <button class="ext-panel-btn ext-expand-btn" id="ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+                    <div class="browser-controls" id="browser-controls" style="display:none">
+                        <input type="text" id="browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl()" aria-label="Enter URL path" />
+                    </div>
+                    <span class="ws-header-status" id="ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="credits-display" id="credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" aria-hidden="true"></span>...</span>
+                    <span class="storage-display" id="storage-display" onclick="updateStorageIndicator()" onkeydown="if(event.key==='Enter'||event.key===' ')updateStorageIndicator()" title="Local storage remaining" style="display:none" role="button" tabindex="0" aria-label="Storage remaining, click to refresh"><span class="storage-icon" aria-hidden="true"></span>...</span>
+                    <span class="model-name" id="model-name" style="display:none" onclick="handleModelNameClick()" role="button" tabindex="0"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><span class="model-login-icon" id="model-login-icon" style="display:none"></span></span>
+                    <button type="button" class="open-browser-btn" id="open-browser-btn" onclick="openBrowserWithUrl()" title="Open Sidebar" style="display:none" aria-label="Open Sidebar"><span class="btn-icon" id="browse-icon"></span></button>
+                    <button class="ext-panel-btn ext-reload-btn" id="ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+                    <div class="jobs-badge-wrapper" id="jobs-badge-wrapper">
+                        <button type="button" class="jobs-badge" id="jobs-badge" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
+                        <div class="jobs-dropdown" id="jobs-dropdown" style="display:none"></div>
+                    </div>
+                    <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" aria-label="Open settings"></button>
+                </div>
+            </div>
+            <div class="chat-content-wrapper">
+                <div class="messages" id="messages" role="log" aria-label="Chat messages" aria-live="polite"></div>
+                <!-- Floating open button for sidebar -->
+                <button class="version-sidebar-open" id="version-sidebar-open" onclick="openVersionSidebar()" title="Open panel" aria-label="Open version history panel"></button>
+                <!-- Version History Sidebar (inline with messages) -->
+                <div class="version-sidebar" id="version-sidebar">
+                    <button class="version-sidebar-close" id="version-sidebar-close" onclick="closeVersionSidebar()" title="Close panel" aria-label="Close version history panel"></button>
+                    <div class="version-history-list" id="version-history-list" role="list" aria-label="Version history">
+                        <div class="version-empty">No changes tracked yet</div>
+                    </div>
+                </div>
+            </div>
+            <div class="input-area" id="input-area" style="visibility:hidden;">
+                <div class="pending-images-container" id="pending-images-container" style="display:none;"></div>
+                <div class="chat-actions-row" id="chat-actions-row"></div>
+                <div class="input-container">
+                    <textarea id="message-input" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>
+                    <div class="context-indicator" id="context-indicator" title="Summarize and start a new chat" onclick="summarizeAndStartNewChat()" onkeydown="if(event.key==='Enter'||event.key===' ')summarizeAndStartNewChat()" style="cursor:pointer;" role="button" tabindex="0" aria-label="Summarize and start new chat">
+                        <svg class="context-circle" viewBox="0 0 36 36">
+                            <path class="context-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                            <path class="context-fill" id="context-fill" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                        </svg>
+                    </div>
+                    <button id="pause-btn" onclick="togglePause()" aria-label="Pause or resume"><span class="btn-icon" id="pause-icon" aria-hidden="true"></span>Pause</button>
+                    <button id="continue-btn" onclick="continueAgent()" aria-label="Continue interrupted run"><span class="btn-icon" id="continue-icon" aria-hidden="true"></span>Continue</button>
+                    <button id="retry-btn" onclick="retryLastCall()" aria-label="Retry last action"><span class="btn-icon" id="retry-icon" aria-hidden="true"></span>Retry</button>
+                    <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span id="attach-icon" aria-hidden="true"></span></button>
+                    <input type="file" id="image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />
+                    <button id="send-btn" onclick="sendMessage()" aria-label="Send message"><span id="send-icon" aria-hidden="true"></span></button>
+                </div>
+            </div>
+        </main>
+        <div class="skills-panel" id="skills-panel" style="display:none;">
+            <div class="skills-list-panel" id="skills-list-panel">
+                <div class="skills-header">
+                    <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="skills-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                    <span class="skills-title">Agent Skills</span>
+                    <div class="skills-actions">
+                        <span class="skills-action-wrapper">
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-import-dropdown')" title="Import Skills" aria-haspopup="true"><span class="action-icon"></span>Import<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <div class="sn-dropdown" id="skills-import-dropdown">
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>From Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromJsonFile()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>From JSON File…</button>
+                            </div>
+                        </span>
+                        <span class="skills-action-wrapper">
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-export-dropdown')" title="Export All Skills" aria-haspopup="true"><span class="action-icon"></span>Export<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <div class="sn-dropdown" id="skills-export-dropdown">
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>To Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToJson()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>To JSON File</button>
+                            </div>
+                        </span>
+                        <button class="skills-action-btn primary" onclick="openSkillEditor()" title="Add New Skill"><span class="action-icon"></span>New Skill</button>
+                    </div>
+                </div>
+                <div class="skills-list" id="skills-list"></div>
+            </div>
+            <div class="skill-editor-panel" id="skill-editor-panel" style="display:none;">
+                <div class="skills-header">
+                    <button class="skills-back-btn" onclick="closeSkillEditor()" title="Back to Skills" aria-label="Back to Skills"><span class="back-icon" aria-hidden="true"></span></button>
+                    <span class="skills-title" id="skill-editor-title">New Skill</span>
+                    <div class="skills-actions">
+                        <button class="skills-action-btn" id="skill-edit-ai-btn" onclick="editSkillWithAgent()" title="Edit with Agent" style="display:none;"><span class="action-icon" id="skill-ai-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 1l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7z"/><circle cx="20" cy="5" r="2" fill="currentColor" stroke="none"/><circle cx="21" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="16" cy="21" r="2" fill="currentColor" stroke="none"/></svg></span>Edit with Agent</button>
+                        <button class="skills-action-btn success" id="skill-activate-btn" onclick="toggleSkillActivation()" title="Activate/Deactivate Skill" style="display:none;"><span class="action-icon"></span>Activate</button>
+                        <span class="skills-action-wrapper" id="skill-download-btn" style="display:none;">
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skill-download-dropdown')" title="Download Skill" aria-haspopup="true"><span class="action-icon"></span>Download<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <div class="sn-dropdown" id="skill-download-dropdown">
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>As Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToJson()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>As JSON File</button>
+                            </div>
+                        </span>
+                        <button class="skills-action-btn danger" id="skill-delete-btn" onclick="deleteCurrentSkill()" title="Delete Skill" style="display:none;"><span class="action-icon"></span>Delete</button>
+                        <button class="skills-action-btn primary" onclick="saveCurrentSkill()" title="Save Skill"><span class="action-icon"></span>Save</button>
+                    </div>
+                </div>
+                <div class="skill-editor-layout">
+                    <div class="skill-editor-main">
+                        <div class="skill-editor-field">
+                            <label for="skill-name-input">Name <span class="field-hint">(lowercase, hyphens only)</span></label>
+                            <input type="text" id="skill-name-input" placeholder="e.g. my-skill-name" aria-describedby="skill-name-hint" />
+                        </div>
+                        <div class="skill-editor-field skill-desc-field">
+                            <label for="skill-description-input">Description</label>
+                            <textarea id="skill-description-input" rows="2" placeholder="What this skill does and when to use it..." aria-label="Skill description"></textarea>
+                        </div>
+                        <div class="skill-editor-field skill-actions-field">
+                            <div class="skill-actions-header">
+                                <label>Actions <span class="field-hint">(one-click buttons that trigger this skill)</span></label>
+                                <button type="button" class="skill-actions-add-btn" onclick="addSkillAction()" title="Add Action" aria-label="Add action">+</button>
+                            </div>
+                            <div class="skill-actions-list" id="skill-actions-list"></div>
+                        </div>
+                        <div class="skill-editor-field skill-body-field">
+                            <div class="skill-body-header">
+                                <label>Content</label>
+                                <button class="skill-body-edit-btn" id="skill-body-edit-btn" onclick="toggleSkillBodyEdit()" title="Edit" aria-label="Edit skill content"></button>
+                            </div>
+                            <div class="skill-body-view" id="skill-body-view"></div>
+                            <textarea id="skill-body-input" placeholder="Enter skill instructions and knowledge..." style="display:none;" aria-label="Skill content"></textarea>
+                        </div>
+                    </div>
+                    <div class="skill-editor-sidebar" id="skill-assets-container" style="display:none;">
+                        <div class="skill-sidebar-header">
+                            <span class="skill-sidebar-title">Artifacts</span>
+                            <button class="skill-sidebar-add-btn" onclick="addSkillAsset()" title="Add Files" aria-label="Add files">+</button>
+                        </div>
+                        <div class="skill-artifacts-list" id="skill-assets-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="dashboard-panel" id="dashboard-panel" style="display:none;">
+            <div class="dashboard-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="dashboard-title">Smart Dashboard</span>
+                <div class="dashboard-actions" id="dashboard-actions">
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" id="dashboard-toggle-headers-btn" onclick="toggleDashboardHeaders()" title="Toggle Headers"><span class="action-icon" id="headers-toggle-icon"></span>Headers</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" id="dashboard-refresh-all-btn" onclick="refreshAllDashboardWidgets()" title="Regenerate All Widgets"><span class="action-icon"></span>Regenerate All</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="importDashboard()" title="Import"><span class="action-icon"></span>Import</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="exportDashboard()" title="Export"><span class="action-icon"></span>Export</button>
+                    <div class="dashboard-more-btn">
+                        <button class="skills-action-btn" onclick="toggleDashboardMoreMenu(event)"><span class="action-icon"></span>More</button>
+                        <div class="dashboard-more-dropdown" id="dashboard-more-dropdown">
+                            <button onclick="openDashboardInNewTab(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-standalone-icon"></span>Open Standalone</button>
+                            <button onclick="toggleDashboardHeaders(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-headers-icon"></span>Headers</button>
+                            <button onclick="refreshAllDashboardWidgets(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-refresh-icon"></span>Regenerate All</button>
+                            <button onclick="importDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-import-icon"></span>Import</button>
+                            <button onclick="exportDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-export-icon"></span>Export</button>
+                        </div>
+                    </div>
+                    <button class="skills-action-btn primary" onclick="openAddWidgetModal()" title="Add Widget"><span class="action-icon"></span>Add Widget</button>
+                </div>
+            </div>
+            <div class="dashboard-grid" id="dashboard-grid" ondragover="handleWidgetDragOver(event)" ondrop="handleWidgetDrop(event)"></div>
+        </div>
+        <div class="home-panel" id="home-panel" style="display:none;">
+            <canvas class="home-trail-canvas" id="home-trail-canvas"></canvas>
+            <div class="home-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="home-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="home-title">New Chat</span>
+                <div class="header-controls">
+                    <div class="header-actions" id="home-header-actions"></div>
+                    <span class="ext-status ext-sn-status" id="home-ext-sn-status" style="display:none" title="ServiceNow connection"></span>
+                    <button class="ext-panel-btn ext-expand-btn" id="home-ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+                    <div class="browser-controls" id="home-browser-controls" style="display:none">
+                        <input type="text" id="home-browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl('home')" aria-label="Enter URL path" />
+                    </div>
+                    <span class="ws-header-status" id="home-ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="credits-display" id="home-credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" id="home-credits-icon" aria-hidden="true"></span>...</span>
+                    <span class="model-name" id="home-model-name" onclick="handleModelNameClick()" role="button" tabindex="0"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><span class="model-login-icon" id="home-model-login-icon" style="display:none"></span></span>
+                    <button type="button" class="open-browser-btn" id="home-open-browser-btn" onclick="openBrowserWithUrl('home')" title="Open Sidebar" style="display:none" aria-label="Open Sidebar"><span class="btn-icon" id="home-browse-icon"></span></button>
+                    <button class="ext-panel-btn ext-reload-btn" id="home-ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+                    <div class="jobs-badge-wrapper" id="home-jobs-badge-wrapper">
+                        <button type="button" class="jobs-badge" id="home-jobs-badge" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
+                        <div class="jobs-dropdown" id="home-jobs-dropdown" style="display:none"></div>
+                    </div>
+                    <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" id="home-settings-btn" aria-label="Open settings"></button>
+                </div>
+            </div>
+            <div class="home-content" id="home-content" style="display:none;">
+                <div class="home-search-section">
+                    <div class="pending-images-container" id="home-pending-images-container" style="display:none;"></div>
+                    <div class="home-search-container">
+                        <textarea id="home-message-input" rows="1" placeholder="Send a message..." onkeydown="handleHomeKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="Message input"></textarea>
+                        <button id="home-attach-btn" onclick="document.getElementById('home-image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span class="btn-icon" id="home-attach-icon"></span></button>
+                        <input type="file" id="home-image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />
+                        <button id="home-send-btn" onclick="sendHomeMessage()" aria-label="Send message"><span class="btn-icon" id="home-send-icon"></span></button>
+                    </div>
+                    <div class="home-recent-prompts" id="home-recent-prompts"></div>
+                </div>
+                <div class="home-stats" id="home-stats"></div>
+                <div class="home-cards" id="home-cards"></div>
+            </div>
+        </div>
+        <div class="settings-page-panel" id="settings-page-panel" style="display:none;">
+            <div class="settings-page-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="settings-page-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="settings-page-title">Settings</span>
+            </div>
+            <div class="settings-page-content" id="settings-page-content"></div>
+        </div>
+        <div class="docs-panel" id="docs-panel" style="display:none;">
+            <div class="docs-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="docs-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="docs-title">Documentation</span>
+                <button class="skills-action-btn" onclick="downloadDocsAsMarkdown()" title="Download as Markdown"><span class="action-icon" id="docs-download-icon"></span>Download</button>
+            </div>
+            <div class="docs-content" id="docs-content"></div>
+        </div>
+        <div class="documents-panel" id="documents-panel" style="display:none;">
+            <div class="documents-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="documents-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="documents-title">Smart Documents</span>
+                <div class="skills-actions">
+                    <button class="skills-action-btn" onclick="importDocuments()" title="Import Documents"><span class="action-icon" id="docs-import-icon"></span>Import</button>
+                    <button class="skills-action-btn" onclick="exportAllDocuments()" title="Export All Documents"><span class="action-icon" id="docs-export-icon"></span>Export</button>
+                    <button class="skills-action-btn primary" onclick="sdocCreateFromPage()" title="Create New Document"><span class="action-icon" id="docs-create-icon"></span>New Document</button>
+                </div>
+            </div>
+            <div class="documents-list" id="documents-list"></div>
+        </div>
+        <div class="history-panel" id="history-panel" style="display:none;">
+            <div class="history-header">
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="history-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <span class="history-title">Chat History</span>
+                <button class="skills-action-btn" onclick="downloadChatHistory()" title="Download all chats"><span class="action-icon" id="history-download-icon"></span>Download All</button>
+            </div>
+            <div class="history-search-bar">
+                <div class="sidebar-search-wrapper history-search-lg">
+                    <span class="sidebar-search-icon" id="history-search-icon" aria-hidden="true"></span>
+                    <input type="text" id="history-search-input" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
+<button class="sidebar-search-clear" id="history-search-clear" onclick="clearHistorySearch()" title="Clear search" aria-label="Clear search">×</button>
+                </div>
+            </div>
+            <div class="history-stats" id="history-stats"></div>
+            <div class="history-list" id="history-list"></div>
+        </div>
+        <div class="screenshot-preview-panel" id="screenshot-preview-panel">
+            <div class="screenshot-preview-toolbar">
+                <span class="screenshot-preview-title" id="screenshot-preview-title">Screenshot</span>
+                <div class="screenshot-preview-actions">
+                    <button class="modal-close-icon" id="screenshot-preview-download-btn" onclick="downloadScreenshotPreview()" title="Download"></button>
+                    <button class="modal-close-icon" id="screenshot-preview-close-btn" onclick="closeScreenshotPreview()" title="Close"></button>
+                </div>
+            </div>
+            <div class="screenshot-preview-image-wrap">
+                <img id="screenshot-preview-img" src="" alt="Screenshot preview" />
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+(function() {
+    var isIframe = (function() { try { return window.self !== window.top; } catch (e) { return true; } })();
+    var prefix = isIframe ? 'iframe_' : '';
+    var v = localStorage.getItem(prefix + 'currentView');
+    if (document.body.classList.contains('standalone-dashboard')) v = 'dashboard';
+    if (v && v !== 'home') {
+        var target = v === 'chat' ? 'main-area' : v === 'skill-editor' ? 'skills-panel' : v + '-panel';
+        var tp = document.getElementById(target);
+        if (tp) tp.style.display = 'flex';
+    } else {
+        var hp = document.getElementById('home-panel');
+        if (hp) hp.style.display = 'flex';
+        var hc = document.getElementById('home-content');
+        if (hc) hc.style.display = '';
+    }
+})();
+</script>
+
+<!-- Drop Overlay -->
+<div class="drop-overlay" id="drop-overlay">
+    <div class="drop-overlay-content">
+        <svg class="drop-overlay-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+        <span>Drop image or PDF here</span>
+    </div>
+</div>
+
+<!-- Notification System -->
+<div class="snackbar" id="snackbar" role="alert" aria-live="polite"></div>
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal()" role="dialog" aria-modal="true" aria-labelledby="modal-header">
+    <div class="modal-dialog" onclick="event.stopPropagation()" role="document">
+        <div class="modal-header" id="modal-header">Confirm</div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-actions" id="modal-actions"></div>
+    </div>
+</div>
+
+<!-- iOS Add to Home Screen Banner -->
+<div class="ios-install-banner" id="ios-install-banner" role="banner" aria-label="Install app">
+    <div class="ios-install-icon">
+        <svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+    </div>
+    <div class="ios-install-text">
+        <div class="ios-install-title">Add AppAgent to Home Screen</div>
+        <div class="ios-install-desc">
+            Tap <svg class="ios-share-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg> then <strong>"Add to Home Screen"</strong>
+        </div>
+    </div>
+    <button class="ios-install-close" id="ios-install-close" aria-label="Dismiss">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+</div>

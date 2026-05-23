@@ -1,0 +1,26 @@
+/* ═══════════════════════════════════════════════════════════
+   PROMPT USER — Inline form (reuses tool-approval chrome)
+   ═══════════════════════════════════════════════════════════ */
+
+/* Field layout */
+.prompt-field { margin-bottom: var(--space-6); }
+.prompt-field:last-child { margin-bottom: 0; }
+.prompt-field-label { display: block; font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); margin-bottom: var(--space-3); }
+
+/* Inputs */
+.prompt-field-input { width: 100%; padding: var(--space-4) var(--space-6); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--text-primary); font-size: var(--text-body); font-family: var(--font-sans); outline: none; transition: border-color var(--transition-fast), box-shadow var(--transition-fast); }
+.prompt-field-input:focus { border-color: var(--primary); box-shadow: var(--shadow-focus); }
+.prompt-field-textarea { min-height: 80px; resize: vertical; line-height: var(--leading-relaxed); }
+select.prompt-field-input { cursor: pointer; }
+select.prompt-field-input[multiple] { min-height: 80px; }
+
+/* Checkbox */
+.prompt-field-checkbox { display: flex; align-items: center; gap: var(--space-4); cursor: pointer; font-size: var(--text-body); color: var(--text-primary); }
+.prompt-field-check { width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary); }
+
+/* Submitted values (read-only) */
+.prompt-submitted-values { font-size: var(--text-body-sm); }
+.prompt-value-row { padding: var(--space-3) 0; border-bottom: 1px solid var(--border-light); }
+.prompt-value-row:last-child { border-bottom: none; }
+.prompt-value-label { font-weight: var(--font-semibold); color: var(--text-secondary); }
+.prompt-value-text { color: var(--text-primary); }

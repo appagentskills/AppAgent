@@ -1,0 +1,9 @@
+/* Browser URL input in header */
+.browser-controls { display: flex; align-items: center; gap: var(--space-4); }
+.browser-url-input { width: 200px; padding: var(--space-5) var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-md); font-size: var(--text-body); }
+.browser-url-input:focus { outline: none; border-color: var(--primary); }
+.open-browser-btn { background: none; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-4); display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--icon-color); transition: all var(--transition-fast); }
+.open-browser-btn .ui-icon { width: 16px; height: 16px; }
+.open-browser-btn:hover { background: var(--secondary-light); border-color: var(--secondary-border-dark); }
+.open-browser-btn:focus { outline: 2px solid var(--primary); outline-offset: 2px; }
+

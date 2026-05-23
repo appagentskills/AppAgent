@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html><head></head><body><script>
+// AppAgent Extension - Widget Sandbox
+// Listed in manifest "sandbox" section => relaxed CSP (allows inline scripts + eval)
+// Receives widget HTML via postMessage, renders via document.write
+// After document.write, the widget's own scripts (including executeTool bridge) run normally
+
+window.addEventListener('message', function(e) {
+    if (e.source !== window.parent) return;
+    if (e.data && e.data.type === 'loadWidget') {
+        document.open();
+        document.write(e.data.html);
+        document.close();
+        // Notify parent that content is rendered and scripts have executed
+        window.parent.postMessage({ type: 'widgetContentLoaded' }, '*');
+    }
+});
+
+// Signal ready to parent
+window.parent.postMessage({ type: 'widgetSandboxReady' }, '*');
+</script></body></html>

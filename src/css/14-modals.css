@@ -1,0 +1,93 @@
+/* Modal Dialog */
+.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: 10001; display: none; align-items: center; justify-content: center; }
+.modal-overlay.show { display: flex; }
+
+/* Widget History Modal */
+.widget-history-modal { background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); max-width: 500px; width: 90%; max-height: 70vh; display: flex; flex-direction: column; }
+.widget-history-header { display: flex; align-items: center; justify-content: space-between; padding: var(--space-6) var(--space-8); border-bottom: 1px solid var(--secondary-border); font-weight: var(--font-semibold); font-size: var(--text-body-lg); min-height: var(--header-height); box-sizing: border-box; }
+.widget-history-header button { width: 28px; height: 28px; border: none; background: var(--secondary-light); border-radius: var(--radius-md); cursor: pointer; font-size: var(--text-2xl); display: flex; align-items: center; justify-content: center; }
+.widget-history-header button:hover { background: var(--danger-light); color: var(--danger); }
+.widget-history-list { flex: 1; overflow-y: auto; padding: var(--space-6); }
+.widget-history-item { padding: var(--space-6); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); margin-bottom: var(--space-4); cursor: pointer; transition: all var(--transition-normal); }
+.widget-history-item:hover { border-color: var(--primary-light); background: var(--primary-lighter); }
+.widget-history-time { font-size: var(--text-body-sm); color: var(--text-muted); margin-bottom: var(--space-2); }
+.widget-history-prompt { font-size: var(--text-body); color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-dialog { background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); max-width: 400px; width: 90%; overflow: hidden; }
+.modal-header { padding: var(--space-6) var(--space-8); font-size: var(--text-body-lg); font-weight: var(--font-semibold); border-bottom: 1px solid var(--secondary-border); min-height: var(--header-height); box-sizing: border-box; display: flex; align-items: center; }
+.modal-body { padding: var(--space-9); font-size: var(--text-body-lg); color: var(--text-secondary); line-height: var(--leading-relaxed); }
+.modal-actions { padding: var(--space-6) var(--space-9); display: flex; gap: var(--space-4); justify-content: flex-end; border-top: 1px solid var(--secondary-border); background: var(--secondary-lighter); }
+.modal-btn { padding: var(--space-4) var(--space-9); border: none; border-radius: var(--radius-md); font-size: var(--text-body); font-weight: var(--font-medium); cursor: pointer; transition: all var(--transition-fast); }
+.modal-btn.primary { background: var(--primary); color: var(--text-inverse); }
+.modal-btn.primary:hover { background: var(--primary-hover); }
+.modal-btn.danger { background: var(--danger); color: var(--text-inverse); }
+.modal-btn.danger:hover { background: var(--danger-hover); }
+.modal-btn.secondary { background: var(--secondary-light); color: var(--text-primary); }
+.modal-btn.secondary:hover { background: var(--secondary-border); }
+
+/* Skill Asset Modal - Larger size */
+.modal-overlay.skill-asset-modal .modal-dialog { max-width: 800px; max-height: 85vh; display: flex; flex-direction: column; }
+.modal-overlay.skill-asset-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-8); }
+.modal-overlay.skill-asset-modal .modal-title-text { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-overlay.skill-asset-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-4); }
+.modal-overlay.skill-asset-modal .modal-body { flex: 1; overflow: hidden; padding: 0; }
+.modal-overlay.skill-asset-modal .modal-actions { display: flex; padding: var(--space-6) var(--space-8); border-top: 1px solid var(--secondary-border); gap: var(--space-4); justify-content: flex-end; }
+.modal-edit-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: var(--secondary-light); border: none; border-radius: var(--radius-md); cursor: pointer; transition: all var(--transition-normal); flex-shrink: 0; }
+.modal-edit-btn:hover { background: var(--primary-lighter); color: var(--primary); }
+.modal-edit-btn.active { background: var(--primary-lighter); color: var(--primary); }
+.modal-edit-btn svg { width: 14px; height: 14px; }
+.modal-close-icon { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: var(--secondary-light); border: none; border-radius: var(--radius-md); cursor: pointer; transition: all var(--transition-normal); flex-shrink: 0; }
+.modal-close-icon:hover { background: var(--danger-light); color: var(--danger); }
+.modal-close-icon svg { width: 14px; height: 14px; }
+
+/* Screenshot Modal - Fixed size like widget fullscreen, image scales within */
+.modal-overlay.screenshot-modal .modal-dialog { width: 95vw; height: 95vh; max-width: 95vw; max-height: 95vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal-overlay.screenshot-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-8); flex-shrink: 0; }
+.modal-overlay.screenshot-modal .screenshot-modal-title { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
+.modal-overlay.screenshot-modal .screenshot-modal-size { font-weight: 400; color: var(--text-secondary); font-size: var(--text-body-sm); margin-left: var(--space-4); }
+.modal-overlay.screenshot-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-3); flex-shrink: 0; }
+.modal-overlay.screenshot-modal .modal-body { flex: 1; padding: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; min-height: 0; }
+.modal-overlay.screenshot-modal .modal-body img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.modal-overlay.screenshot-modal .modal-actions { display: none; }
+.screenshot-modal-counter { font-weight: 400; color: var(--text-muted); font-size: var(--text-body-sm); margin-left: var(--space-5); }
+.screenshot-nav-prev, .screenshot-nav-next { position: absolute; top: 50%; transform: translateY(-50%); width: 40px; height: 40px; border: none; border-radius: var(--radius-full); background: rgba(0,0,0,0.45); color: var(--text-inverse); cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 2; transition: background 0.2s, opacity 0.2s; opacity: 0.7; }
+.screenshot-nav-prev:hover, .screenshot-nav-next:hover { background: rgba(0,0,0,0.7); opacity: 1; }
+.screenshot-nav-prev { left: 12px; }
+.screenshot-nav-next { right: 12px; }
+.screenshot-nav-prev svg, .screenshot-nav-next svg { width: 22px; height: 22px; }
+
+/* Full-screen PDF modal */
+.modal-overlay.pdf-modal .modal-dialog { max-width: 98vw; max-height: 98vh; width: 98vw; height: 98vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal-overlay.pdf-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-8); flex-shrink: 0; }
+.modal-overlay.pdf-modal .modal-title-text { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-overlay.pdf-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-3); }
+.modal-overlay.pdf-modal .modal-body { padding: 0; flex: 1; overflow: hidden; display: flex; }
+.modal-overlay.pdf-modal .modal-body iframe { flex: 1; }
+.modal-overlay.pdf-modal .modal-actions { display: none; }
+
+/* File modal (text files) */
+.modal-overlay.file-modal .modal-dialog { max-width: 90vw; max-height: 90vh; width: 90vw; height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal-overlay.file-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-8); flex-shrink: 0; }
+.modal-overlay.file-modal .modal-title-text { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-overlay.file-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-3); }
+.modal-overlay.file-modal .modal-body { padding: 0; flex: 1; overflow: hidden; display: flex; }
+.modal-overlay.file-modal .modal-body pre { flex: 1; margin: 0; overflow: auto; }
+.modal-overlay.file-modal .modal-actions { display: none; }
+
+/* PDF annotations viewer */
+.pdf-annotations-content { padding: var(--space-9); max-height: calc(95vh - 80px); overflow-y: auto; font-size: var(--text-body); line-height: var(--leading-loose); }
+.pdf-ann-filename { font-size: var(--text-xl); font-weight: 700; margin-bottom: var(--space-2); color: var(--text-primary); }
+.pdf-ann-hash { font-size: var(--text-caption); color: var(--text-muted); margin-bottom: var(--space-8); }
+.pdf-ann-hash code { background: var(--secondary-light); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: var(--text-sm); }
+.pdf-ann-text { margin-bottom: var(--space-6); color: var(--text-primary); white-space: pre-wrap; word-break: break-word; }
+.pdf-ann-image { margin-bottom: var(--space-6); }
+.pdf-ann-image img { max-width: 100%; border-radius: var(--radius-lg); border: 1px solid var(--secondary-border); }
+
+.skill-asset-rendered { padding: var(--space-8); overflow: auto; max-height: calc(85vh - 120px); }
+.skill-asset-rendered pre { margin: 0; background: var(--bg-main); border-radius: var(--radius-lg); padding: var(--space-8); overflow-x: auto; }
+.skill-asset-rendered code { font-family: var(--font-mono); font-size: var(--text-body); line-height: var(--leading-relaxed); }
+.skill-asset-rendered.markdown-body { font-size: var(--text-body-lg); line-height: var(--leading-loose); }
+.skill-asset-rendered ul, .skill-asset-rendered ol { margin: var(--space-4) 0; padding-left: var(--space-10); list-style-position: outside; }
+.skill-asset-rendered li { margin: var(--space-2) 0; padding: 0; line-height: var(--leading-relaxed); }
+.skill-asset-editor { width: 100%; height: calc(85vh - 180px); min-height: 300px; padding: var(--space-8); border: none; font-family: var(--font-mono); font-size: var(--text-body); line-height: var(--leading-relaxed); resize: none; background: var(--bg-main); color: var(--text-primary); }
+.skill-asset-editor:focus { outline: none; }
+.skill-asset-preview { margin: 0; padding: var(--space-8); font-size: var(--text-body-sm); font-family: monospace; line-height: var(--leading-relaxed); background: var(--bg-main); overflow: auto; max-height: calc(80vh - 60px); white-space: pre-wrap; word-break: break-all; }

@@ -1,0 +1,431 @@
+/* Tablet breakpoint (768px and below) */
+@media screen and (max-width: 768px) {
+    /* Sidebar - icons only (collapsed) by default, stays in place */
+    .sidebar { width: 56px !important; min-width: 56px !important; position: relative; z-index: 100; }
+    .sidebar.expanded { width: 260px !important; min-width: 260px !important; }
+    .sidebar.expanded.searching { width: 260px !important; }
+
+    /* Collapsed state adjustments for tablet */
+    .sidebar:not(.expanded) .sidebar-toggle-row { padding: 0; justify-content: center; }
+    .sidebar:not(.expanded) .sidebar-toggle-btn { width: 40px; height: 40px; }
+    .sidebar:not(.expanded) .sidebar-header { padding: var(--space-5) var(--space-4); }
+    .sidebar:not(.expanded) .sidebar-nav-btn { padding: var(--space-6) var(--space-4); }
+
+    /* Hide floating toggle - we use the sidebar's inline toggle on tablet */
+    .floating-sidebar-toggle { display: none !important; }
+
+    /* Main area takes full width */
+    .main { width: 100% !important; }
+
+    /* Messages area */
+    .messages { padding: var(--space-8); }
+    .messages-content { max-width: 100%; }
+
+    /* User messages - wider on tablet */
+    .message.user .message-content { max-width: 75%; }
+    .message.assistant .message-content { margin-right: 10%; }
+    .message.assistant .message-content .code-block-wrapper.expanded { margin-right: -10%; width: 110%; }
+
+    /* Input area adjustments */
+    .input-area { padding: var(--space-6) var(--space-8) var(--space-8); }
+    .input-area.centered { padding: 0 16px; max-width: 100%; }
+    .input-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-8); }
+
+    /* Header adjustments */
+    .main-header { padding: var(--space-5) var(--space-6); }
+    .header-controls { gap: var(--space-4); }
+    .browser-controls { display: none !important; }
+    .credits-display, .storage-display { font-size: var(--text-caption); padding: var(--space-2) var(--space-4); }
+
+    /* Settings panel - full width */
+    .settings-panel { width: 100%; max-width: 360px; right: 0; left: auto; }
+
+    /* Version sidebar - overlay on tablet */
+    .version-sidebar { position: fixed; right: 0; top: 0; bottom: 0; z-index: 1001; width: 300px; }
+
+    /* Dashboard grid - 6 columns on tablet */
+    .dashboard-grid { grid-template-columns: repeat(6, 1fr); gap: var(--space-6); padding: var(--space-6); }
+
+    /* History, Settings pages - full width */
+    .history-list, .settings-page-content, .docs-content { width: 90%; }
+    .skills-list { width: 90%; }
+
+    /* Docs layout - stack on tablet */
+    .docs-layout { flex-direction: column; }
+    .docs-outline { width: 100%; max-height: none; position: relative; border-left: none; border-bottom: 1px solid var(--secondary-border); }
+    .docs-main { padding: var(--space-8); }
+
+    /* Home panel */
+    .home-search-section { max-width: 100%; padding: 0 16px; }
+    .home-stats, .home-cards { max-width: 100%; padding: 0 16px; }
+
+    /* Modal adjustments */
+    .modal-dialog { width: 95vw; max-width: 95vw; }
+    .screenshot-modal { width: 98vw; max-width: 98vw; }
+
+    /* Tool calls and results */
+    .tool-args, .tool-result pre { max-height: 150px; }
+    .compact-tool-args { max-height: 60px; }
+
+    /* Skill editor layout */
+    .skill-editor-layout { flex-direction: column; }
+    .skill-editor-layout .skill-sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--secondary-border); max-height: 200px; }
+}
+
+/* Mobile breakpoint (480px and below) */
+@media screen and (max-width: 480px) {
+    /* Prevent body/html scroll - only content areas should scroll */
+    html, body { height: 100%; overflow: hidden; position: fixed; width: 100%; }
+    .container { height: 100%; overflow: hidden; }
+    .main { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+    .main-wrapper { height: 100%; overflow: hidden; }
+
+    /* Sidebar - use transform for smooth slide animation on mobile */
+    .sidebar { position: fixed !important; left: 0; top: 0; bottom: 0; width: 280px !important; min-width: 280px !important; border: none !important; overflow: hidden; z-index: 1000; transform: translateX(-100%); transition: transform 0.3s ease !important; }
+    .sidebar.expanded { transform: translateX(0); border-right: 1px solid var(--secondary-border) !important; overflow: visible; }
+    .sidebar.no-transition { transition: none !important; }
+
+    /* Overlay is handled by JS (sidebar-overlay div) for click-to-close support */
+
+    /* Show header hamburger button on mobile */
+    .toggle-sidebar-btn { display: flex !important; }
+
+    /* Show sidebar toggle button when expanded on mobile (to close it) */
+    .sidebar.expanded .sidebar-toggle-btn { display: flex !important; }
+    .sidebar:not(.expanded) .sidebar-toggle-btn { display: none !important; }
+
+    /* Expanded state adjustments for mobile */
+    .sidebar.expanded .sidebar-header { padding: var(--space-5) var(--space-5) var(--space-3); }
+    .sidebar.expanded .sidebar-nav-btn { padding: var(--space-5) var(--space-6); font-size: var(--text-body); }
+    .sidebar.expanded .sidebar-toggle-row { gap: var(--space-3); }
+    .sidebar.expanded .sidebar-search-wrapper { padding: var(--space-3) var(--space-5); flex: 1; }
+
+    /* Messages - scrollable area */
+    .messages { padding: var(--space-6); flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .chat-content-wrapper { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+    .message { margin-bottom: var(--space-6); }
+    .message.user .message-content { max-width: 85%; padding: var(--space-5) var(--space-7); border-radius: var(--radius-bubble); }
+    .message.assistant .message-content { margin-right: 5%; padding: var(--space-3) 0; }
+    .message.assistant .message-content .code-block-wrapper.expanded { margin-right: 0; width: 100%; }
+
+    /* Input area - fixed at bottom */
+    .input-area { padding: var(--space-5) var(--space-6) var(--space-7); padding-bottom: calc(14px + env(safe-area-inset-bottom)); flex-shrink: 0; }
+    .input-area.centered { padding: 0 12px; position: relative; }
+    .input-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-7); gap: var(--space-3); }
+    .input-container textarea { font-size: var(--text-xl); padding: var(--space-4) 0; min-height: 20px; }
+    #send-btn { width: 40px; height: 40px; }
+    #send-btn svg { width: 16px; height: 16px; }
+    #attach-btn { width: 32px; height: 32px; }
+    #pause-btn, #retry-btn, #continue-btn { padding: var(--space-3) var(--space-5); font-size: var(--text-body-sm); height: 32px; }
+
+    /* Header - fixed at top */
+    .main-header { padding: var(--space-4) var(--space-5); height: 44px; flex-shrink: 0; }
+    .toggle-sidebar-btn { padding: var(--space-3) var(--space-4); height: 34px; width: 34px; }
+    .header-chat-title { font-size: var(--text-body); }
+    .settings-btn { padding: var(--space-2) var(--space-3); }
+    .model-name { font-size: var(--text-caption); }
+    /* credits-display + storage-display used to be force-hidden on mobile. They
+       now collapse into the header More dropdown via the priority-plus logic
+       in 53e-actions.js, so the user can still reach them. */
+
+    /* Settings panel - full screen on mobile */
+    .settings-panel { width: 100%; max-width: 100%; left: 0; right: 0; bottom: 0; top: auto; max-height: 80vh; border-radius: var(--radius-2xl) var(--radius-2xl) 0 0; }
+    .settings-section { padding: var(--space-5); }
+    .settings-section-title { font-size: var(--text-sm); }
+
+    /* Version sidebar - full width on mobile */
+    .version-sidebar { width: 100%; }
+
+    /* Dashboard - proper scrolling */
+    .dashboard-panel { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+    .dashboard-grid { grid-template-columns: repeat(2, 1fr); grid-auto-rows: 40px; gap: var(--space-5); padding: var(--space-5); flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .dashboard-header { padding: var(--space-5) var(--space-6); height: 44px; flex-shrink: 0; }
+    .dashboard-title { font-size: var(--text-body-lg); }
+    .dashboard-widget-header { padding: var(--space-4) var(--space-5); }
+    .dashboard-widget-title { font-size: var(--text-body-sm); }
+
+    /* History, Settings - proper scrolling */
+    .history-panel, .settings-page-panel, .docs-panel { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+    .history-list, .settings-page-content, .docs-content { width: 100%; padding: var(--space-6); flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .skills-list { width: 100%; padding: var(--space-6); }
+    .history-header, .settings-page-header, .docs-header { padding: var(--space-5) var(--space-6); height: 44px; flex-shrink: 0; }
+    .history-title, .settings-page-title, .docs-title { font-size: var(--text-body-lg); }
+    .history-chat-card { padding: var(--space-6); }
+    .history-chat-title { font-size: var(--text-body-lg); }
+    .history-chat-preview { font-size: var(--text-body-sm); }
+
+    /* Home panel - proper scrolling */
+    .home-panel { padding: var(--space-8) var(--space-6); height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .home-search-section { padding: 0 8px; }
+    .home-search-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-7); }
+    .home-search-container textarea { font-size: var(--text-xl); }
+    #home-send-btn { width: 40px; height: 40px; }
+    .home-stats { gap: var(--space-4); padding: 0 8px; }
+    .home-stat-card { padding: var(--space-5) var(--space-7); min-width: 80px; }
+    .home-stat-value { font-size: var(--text-2xl); }
+    .home-stat-label { font-size: var(--text-sm); }
+    .home-cards { gap: var(--space-4); padding: 0 8px; }
+    .home-card { padding: var(--space-6) var(--space-7); min-width: 100px; }
+    .home-card-title { font-size: var(--text-body-sm); }
+    .home-prompt-chip { padding: var(--space-3) var(--space-6); font-size: var(--text-body-sm); max-width: 200px; }
+
+    /* Modals - full screen on mobile */
+    .modal-overlay { padding: 0; }
+    .modal-dialog { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
+    .modal-header { padding: var(--space-6) var(--space-7); }
+    .modal-body { padding: var(--space-7); }
+    .modal-footer { padding: var(--space-6) var(--space-7); }
+    .screenshot-modal, .pdf-modal { width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh; border-radius: 0; }
+
+    /* Tool calls - more compact */
+    .tool-call summary, .tool-result summary { padding: var(--space-4); }
+    .tool-name { font-size: var(--text-body-sm); }
+    .tool-args { padding: var(--space-3); padding-right: 26px; padding-bottom: var(--space-10); font-size: var(--text-caption); max-height: 120px; }
+    .tool-result pre { font-size: var(--text-caption); max-height: 100px; }
+    .compact-tools-summary { padding: var(--space-4) var(--space-6); font-size: var(--text-body-sm); }
+    .compact-tools-content { padding: var(--space-5); gap: var(--space-5); }
+
+    /* Thinking blocks */
+    .thinking summary { padding: var(--space-4) var(--space-6); font-size: var(--text-body-sm); }
+    .thinking-content { padding: var(--space-6); font-size: var(--text-caption); max-height: 300px; }
+
+    /* Code blocks */
+    .code-block { padding: var(--space-5) var(--space-6); font-size: var(--text-body-sm); }
+    code.inline-code { padding: var(--space-1) var(--space-2); font-size: 0.85em; }
+
+    /* Tables */
+    .md-table { font-size: var(--text-body-sm); }
+    .md-table td, .md-table th { padding: var(--space-4) var(--space-5); }
+
+    /* Markdown content */
+    .message-content { line-height: var(--leading-relaxed); }
+    .message-content h2 { font-size: 1.15em; }
+    .message-content h3 { font-size: 1.05em; }
+    .message-content ul, .message-content ol { padding-left: var(--space-9); }
+
+    /* Attachments */
+    .screenshot-container { max-width: 160px; padding: var(--space-4); }
+    .screenshot-thumbnail { height: 100%; width: auto; }
+    .pending-images-container { padding: var(--space-5); gap: var(--space-3); }
+    .pending-image-item { width: 60px; height: 45px; }
+
+    /* Inline changes */
+    .inline-changes-header { padding: var(--space-4) var(--space-6); font-size: var(--text-caption); }
+    .inline-changes-list { padding: var(--space-4); }
+    .inline-change-item { padding: var(--space-4) var(--space-5); }
+    .inline-change-name { font-size: var(--text-body-sm); }
+    .inline-revert-btn, .inline-delete-btn, .inline-redo-btn { padding: var(--space-2) var(--space-4); font-size: var(--text-sm); }
+
+    /* Approval prompts */
+    .tool-approval-header { padding: var(--space-4) var(--space-6); font-size: var(--text-body-sm); }
+    .tool-approval-body { padding: var(--space-5) var(--space-6); }
+    .tool-approval-name { font-size: var(--text-body); }
+    .tool-approval-args { padding: var(--space-4); font-size: var(--text-sm); max-height: 120px; }
+    .tool-approval-actions { padding: var(--space-4) var(--space-6); flex-wrap: wrap; }
+    .tool-approval-btn { padding: var(--space-3) var(--space-6); font-size: var(--text-body-sm); }
+
+    /* Docs layout on mobile */
+    .docs-outline { padding: var(--space-4) 0; }
+    .docs-outline-title { padding: var(--space-5) var(--space-8) var(--space-3); font-size: var(--text-sm); }
+    .docs-nav-item { padding: var(--space-3) var(--space-8); font-size: var(--text-body-sm); }
+    .docs-nav-subitem { padding: var(--space-2) var(--space-8) var(--space-2) var(--space-10); font-size: var(--text-caption); }
+    .docs-section h1 { font-size: var(--text-2xl); }
+    .docs-section h2 { font-size: var(--text-lg); }
+    .docs-section p, .docs-section li { font-size: var(--text-body); }
+
+    /* Metrics display */
+    .metrics-display { padding: var(--space-3) var(--space-5); font-size: var(--text-sm); gap: var(--space-2); }
+
+    /* Context indicator */
+    .context-indicator { width: 32px; height: 32px; }
+    .context-circle { width: 24px; height: 24px; }
+
+    /* Search results in sidebar */
+    .chat-result-snippets { max-height: 150px; }
+    .chat-result-snippet-item { padding: var(--space-3) var(--space-4); }
+    .snippet-text { font-size: var(--text-caption); }
+}
+
+/* Extra small devices (360px and below) */
+@media screen and (max-width: 360px) {
+    /* Sidebar - smaller expanded width on extra small screens */
+    .sidebar { width: 260px !important; min-width: 260px !important; }
+
+    .messages { padding: var(--space-5); }
+    .message.user .message-content { max-width: 90%; padding: var(--space-4) var(--space-6); }
+
+    .input-container { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-6); }
+    .input-container textarea { font-size: var(--text-body); }
+    #send-btn { width: 36px; height: 36px; }
+
+    .dashboard-grid { grid-template-columns: 1fr; }
+
+    .home-stat-card { min-width: 70px; padding: var(--space-4) var(--space-5); }
+    .home-card { min-width: 90px; padding: var(--space-5) var(--space-6); }
+}
+
+/* Landscape orientation adjustments for mobile */
+@media screen and (max-width: 768px) and (orientation: landscape) {
+    .main-header { height: 40px; padding: var(--space-3) var(--space-5); }
+    .messages { padding: var(--space-5) var(--space-8); }
+
+    .input-area { padding: var(--space-4) var(--space-6) var(--space-5); }
+
+    .modal-dialog { height: 95vh; }
+}
+
+/* Landscape + mobile - completely hide sidebar */
+@media screen and (max-width: 480px) and (orientation: landscape) {
+    .sidebar { width: 240px !important; min-width: 240px !important; }
+}
+
+/* Touch-friendly adjustments */
+@media (hover: none) and (pointer: coarse) {
+    /* Larger touch targets */
+    .chat-item { padding: var(--space-6) var(--space-7); }
+    .sidebar-nav-btn { padding: var(--space-6) var(--space-7); min-height: 44px; }
+    .sidebar-toggle-btn { min-width: 44px; min-height: 44px; }
+    .toggle-sidebar-btn { min-width: 44px; min-height: 44px; }
+    .settings-btn { min-width: 44px; min-height: 44px; }
+
+    /* Collapsed sidebar touch adjustments (for tablet icons-only mode) */
+    .sidebar:not(.expanded) .sidebar-nav-btn { min-height: 44px; padding: var(--space-6) var(--space-4); }
+
+    /* Hide tooltips on touch - they don't work well */
+    .sidebar:not(.expanded) .sidebar-nav-btn::after,
+    .sidebar:not(.expanded) .sidebar-nav-btn::before { display: none !important; }
+
+    /* Always show action buttons on touch devices */
+    .chat-menu-btn { opacity: 1; pointer-events: auto; }
+    .history-chat-actions { opacity: 1; }
+    .dashboard-widget-controls { opacity: 1; }
+    .msg-actions { opacity: 1; }
+
+    /* Disable hover states that don't work well on touch */
+    .chat-item:hover { background: inherit; }
+    .chat-item.active { background: var(--secondary-border); }
+
+    /* Larger buttons for touch */
+    .tool-approval-btn { padding: var(--space-4) var(--space-8); min-height: 40px; }
+    .inline-revert-btn, .inline-delete-btn, .inline-redo-btn { padding: var(--space-3) var(--space-6); min-height: 36px; }
+
+    /* Scroll momentum */
+    .messages, .chat-list, .history-list, .tools-list, .dashboard-grid { -webkit-overflow-scrolling: touch; }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+    .message.user .message-content { border-width: 2px; }
+    .tool-call, .tool-result { border-width: 2px; }
+    .input-container { border-width: 2px; }
+    .sidebar-nav-btn.active { border: 2px solid var(--primary); }
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+    .sidebar { transition: none; }
+    .dashboard-widget { transition: none; }
+    .tool-call, .tool-result { transition: none; }
+    .spinner, .compact-tools-spinner, .streamlined-spinner, .widget-spinner { animation: none; }
+    .streaming-cursor { animation: none; }
+    .chat-attention-dot { animation: none; }
+    .chat-streaming-dot { animation: none; border-top-color: var(--primary); }
+    .thinking-indicator { animation: none; }
+}
+
+/* iOS Add to Home Screen Banner */
+.ios-install-banner {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 10020;
+    background: var(--bg-white);
+    border-top: 1px solid var(--border-light);
+    box-shadow: 0 -4px 24px rgba(0,0,0,0.12);
+    padding: var(--space-8) var(--space-10);
+    display: flex;
+    align-items: center;
+    gap: var(--space-8);
+    transform: translateY(100%);
+    opacity: 0;
+    transition: transform 0.35s cubic-bezier(0.4,0,0.2,1), opacity 0.35s ease;
+    pointer-events: none;
+}
+.ios-install-banner.show {
+    transform: translateY(0);
+    opacity: 1;
+    pointer-events: auto;
+}
+.ios-install-banner::after {
+    content: '';
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 0;
+    height: 0;
+    border-left: 10px solid transparent;
+    border-right: 10px solid transparent;
+    border-top: 10px solid var(--bg-white);
+    filter: drop-shadow(0 2px 2px rgba(0,0,0,0.08));
+}
+.ios-install-icon {
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border-radius: var(--radius-lg);
+    background: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.ios-install-icon svg {
+    width: 24px;
+    height: 24px;
+    stroke: #fff;
+    fill: none;
+}
+.ios-install-text {
+    flex: 1;
+    min-width: 0;
+}
+.ios-install-title {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+.ios-install-desc {
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    line-height: 1.4;
+}
+.ios-install-desc .ios-share-icon {
+    display: inline-block;
+    vertical-align: middle;
+    width: 16px;
+    height: 16px;
+    margin: 0 2px;
+}
+.ios-install-close {
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    border: none;
+    background: var(--bg-hover);
+    border-radius: var(--radius-full);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    transition: background 0.15s ease;
+}
+.ios-install-close:hover {
+    background: var(--bg-active);
+}
+.ios-install-close svg {
+    width: 16px;
+    height: 16px;
+}

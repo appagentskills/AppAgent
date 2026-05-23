@@ -1,0 +1,480 @@
+// TAKE SCREENSHOT TOOL - Capture real PNG screenshots for AI vision
+// =============================================
+
+// Overlay a coordinate grid on a screenshot for identifying click/fill coordinates.
+// Labels show viewport CSS pixel values matching elementFromPoint coordinates.
+async function overlayGrid(base64Data, viewportWidth, viewportHeight) {
+    var img = new Image();
+    await new Promise(function(resolve, reject) {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = base64Data;
+    });
+    // Use actual image dimensions (may be scaled by devicePixelRatio)
+    var imgW = img.naturalWidth;
+    var imgH = img.naturalHeight;
+
+    var canvas = document.createElement('canvas');
+    canvas.width = imgW;
+    canvas.height = imgH;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    img.src = '';
+
+    var scaleX = imgW / viewportWidth;
+    var scaleY = imgH / viewportHeight;
+    var step = viewportWidth > 2000 ? 200 : viewportWidth < 500 ? 50 : 100;
+    var fontSize = Math.max(10, Math.round(12 * scaleX));
+    ctx.font = fontSize + 'px monospace';
+    ctx.textBaseline = 'top';
+
+    // Draw grid lines and labels
+    function drawLabel(text, lx, ly) {
+        var tw = ctx.measureText(text).width;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(lx - 2, ly - 2, tw + 4, fontSize + 4);
+        ctx.fillStyle = '#ff0000';
+        ctx.fillText(text, lx, ly);
+    }
+
+    ctx.strokeStyle = 'rgba(255, 0, 0, 0.4)';
+    ctx.lineWidth = 1;
+
+    for (var vx = step; vx < viewportWidth; vx += step) {
+        var px = Math.round(vx * scaleX);
+        ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, imgH); ctx.stroke();
+        var label = String(vx);
+        drawLabel(label, px - ctx.measureText(label).width / 2, 0);
+    }
+
+    for (var vy = step; vy < viewportHeight; vy += step) {
+        var py = Math.round(vy * scaleY);
+        ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(imgW, py); ctx.stroke();
+        drawLabel(String(vy), 0, py - fontSize / 2);
+    }
+
+    var result = canvas.toDataURL('image/png');
+    canvas.width = 0;
+    canvas.height = 0;
+    return result;
+}
+
+async function executeTakeScreenshot(args) {
+    var target = args.target;
+    var widgetId = args.widget_id;
+    var selector = args.selector;
+    var maxWidth = args.max_width || 1600;
+
+    if (!target) {
+        return { success: false, error: 'target is required. Use "browser", "widget", or "element"' };
+    }
+
+    try {
+        var elementToCapture = null;
+        var captureDescription = '';
+
+        if (target === 'browser') {
+            // Use Chrome Debugger API via background service worker
+            var ssResult = await Platform.sendBrowserAction('take_screenshot', {});
+            if (ssResult.error) {
+                return { success: false, error: ssResult.error };
+            }
+            var ssId = newFileId();
+            var ssBase64 = ssResult.base64;
+            var ssUrl = ssResult.url || currentIframeUrl || '/';
+            if (ssResult.url) currentIframeUrl = ssResult.url;
+
+            // Get actual image dimensions and resize if needed
+            // captureVisibleTab captures at device pixel ratio, so a 1440px tab on 2x display = 2880px image
+            // Anthropic limits images to 2000px per dimension for many-image requests
+            var ssImg = new Image();
+            await new Promise(function(resolve, reject) { ssImg.onload = resolve; ssImg.onerror = reject; ssImg.src = ssBase64; });
+            var ssWidth = ssImg.naturalWidth;
+            var ssHeight = ssImg.naturalHeight;
+            if (ssWidth > maxWidth || ssHeight > maxWidth) {
+                var ssScale = Math.min(maxWidth / ssWidth, maxWidth / ssHeight);
+                var newW = Math.round(ssWidth * ssScale);
+                var newH = Math.round(ssHeight * ssScale);
+                var ssCanvas = document.createElement('canvas');
+                ssCanvas.width = newW;
+                ssCanvas.height = newH;
+                var ssCtx = ssCanvas.getContext('2d');
+                ssCtx.drawImage(ssImg, 0, 0, newW, newH);
+                ssBase64 = ssCanvas.toDataURL('image/png');
+                ssWidth = newW;
+                ssHeight = newH;
+                ssCanvas.width = 0;
+                ssCanvas.height = 0;
+            }
+            ssImg.src = '';
+
+            // If CSS viewport emulation is active (mobile resize), crop to emulated width
+            var _emVp = window._emulatedViewport;
+            if (_emVp && _emVp.width && ssResult.width && _emVp.width < ssResult.width) {
+                var _emScale = ssWidth / ssResult.width;
+                var _emCropW = Math.round(_emVp.width * _emScale);
+                var _emCropX = Math.round((ssWidth - _emCropW) / 2);
+                var _emCanvas = document.createElement('canvas');
+                _emCanvas.width = _emCropW;
+                _emCanvas.height = ssHeight;
+                var _emCtx = _emCanvas.getContext('2d');
+                var _emImg = new Image();
+                await new Promise(function(res, rej) { _emImg.onload = res; _emImg.onerror = rej; _emImg.src = ssBase64; });
+                _emCtx.drawImage(_emImg, _emCropX, 0, _emCropW, ssHeight, 0, 0, _emCropW, ssHeight);
+                ssBase64 = _emCanvas.toDataURL('image/png');
+                ssWidth = _emCropW;
+                _emImg.src = '';
+                _emCanvas.width = 0;
+                _emCanvas.height = 0;
+            }
+
+            if (args.grid) {
+                // Use real viewport dims from background (not scaled image dims)
+                // so grid labels match click/fill viewport coordinates
+                // If emulated, use emulated dims (content was cropped above)
+                var _gridVpW = (_emVp && _emVp.width) ? _emVp.width : (ssResult.width || ssWidth);
+                var _gridVpH = (_emVp && _emVp.height) ? _emVp.height : (ssResult.height || ssHeight);
+                ssBase64 = await overlayGrid(ssBase64, _gridVpW, _gridVpH);
+            }
+            // Compress if over 5MB API limit
+            ssBase64 = await compressBase64Image(ssBase64);
+            return {
+                success: true,
+                screenshot_id: ssId,
+                url: ssUrl,
+                message: 'Screenshot captured: browser tab at ' + ssUrl,
+                dimensions: ssWidth + 'x' + ssHeight,
+                size_bytes: Math.round(ssBase64.length * 0.75),
+                note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + ssId + '" with screenshot_by_id tool to retrieve the image data.',
+                _screenshotMessage: {
+                    role: 'screenshot',
+                    base64: ssBase64,
+                    name: args.name || null,
+                    description: 'browser tab at ' + ssUrl,
+                    url: ssUrl,
+                    timestamp: Date.now(),
+                    width: ssWidth,
+                    height: ssHeight,
+                    screenshot_id: ssId,
+                    file_id: ssId
+                }
+            };
+        } else if (target === 'widget') {
+            if (!widgetId) {
+                return { success: false, error: 'widget_id is required when target is "widget"' };
+            }
+            var _ssWidget = getWidgetById(widgetId);
+            if (!_ssWidget && dashboardWidgets[widgetId]) _ssWidget = dashboardWidgets[widgetId];
+            if (_ssWidget && _ssWidget.deactivated) {
+                return { success: false, error: 'Widget "' + (_ssWidget.title || widgetId) + '" is deactivated. The user has deactivated this widget. Ask the user to activate it first, or proceed differently.' };
+            }
+            var widgetIframe = getWidgetIframe(widgetId);
+            if (!widgetIframe) {
+                return { success: false, error: 'Widget not found: ' + widgetId + '. Make sure the widget is visible in the chat or dashboard.' };
+            }
+            var _widgetCrossOrigin = false;
+            try {
+                var widgetDoc = widgetIframe.contentDocument || widgetIframe.contentWindow.document;
+                elementToCapture = widgetDoc.body || widgetDoc.documentElement;
+                captureDescription = 'widget ' + widgetId;
+            } catch (e) {
+                _widgetCrossOrigin = true;
+            }
+            // Cross-origin widget (extension sandbox): open widget in a
+            // temporary tab via ?widget= deep link, screenshot it, then close
+            if (_widgetCrossOrigin) {
+                var _wssUrl = chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId);
+                var _wssTab = null;
+                try {
+                    _wssTab = await chrome.tabs.create({ url: _wssUrl, active: false });
+                    // Wait for the tab to finish loading
+                    await new Promise(function(resolve) {
+                        function onUpdated(tabId, changeInfo) {
+                            if (tabId === _wssTab.id && changeInfo.status === 'complete') {
+                                chrome.tabs.onUpdated.removeListener(onUpdated);
+                                clearTimeout(_wssFallback);
+                                setTimeout(resolve, 200); // short delay for rendering
+                            }
+                        }
+                        chrome.tabs.onUpdated.addListener(onUpdated);
+                        var _wssFallback = setTimeout(function() {
+                            chrome.tabs.onUpdated.removeListener(onUpdated);
+                            resolve();
+                        }, 5000);
+                    });
+                    // Temporarily point sendBrowserAction at the widget tab
+                    var _wssChat = chats[currentChatId];
+                    var _wssOrigTabId = _wssChat && _wssChat.targetTabId;
+                    if (_wssChat) _wssChat.targetTabId = _wssTab.id;
+                    var _wssResult = await Platform.sendBrowserAction('take_screenshot', {});
+                    if (_wssChat) _wssChat.targetTabId = _wssOrigTabId;
+                    if (_wssResult.error) {
+                        return { success: false, error: 'Widget screenshot failed: ' + _wssResult.error };
+                    }
+                    var _wssId = newFileId();
+                    var _wssBase64 = _wssResult.base64;
+                    var _wssW = _wssResult.width || 800;
+                    var _wssH = _wssResult.height || 600;
+                    if (args.grid) {
+                        _wssBase64 = await overlayGrid(_wssBase64, _wssW, _wssH);
+                    }
+                    // Compress if over 5MB API limit
+                    _wssBase64 = await compressBase64Image(_wssBase64);
+                    captureDescription = 'widget ' + widgetId;
+                    return {
+                        success: true,
+                        screenshot_id: _wssId,
+                        message: 'Screenshot captured: ' + captureDescription,
+                        dimensions: _wssW + 'x' + _wssH,
+                        size_bytes: Math.round(_wssBase64.length * 0.75),
+                        note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + _wssId + '" with screenshot_by_id tool to retrieve the image data.',
+                        _screenshotMessage: {
+                            role: 'screenshot',
+                            base64: _wssBase64,
+                            name: args.name || null,
+                            description: captureDescription,
+                            url: null,
+                            timestamp: Date.now(),
+                            width: _wssW,
+                            height: _wssH,
+                            screenshot_id: _wssId,
+                            file_id: _wssId
+                        }
+                    };
+                } finally {
+                    if (_wssTab) try { chrome.tabs.remove(_wssTab.id); } catch(e) {}
+                }
+            }
+        } else if (target === 'element') {
+            if (!selector) {
+                return { success: false, error: 'selector is required when target is "element"' };
+            }
+
+            // Get element rect from tab, take full screenshot, then crop
+            var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector });
+            if (elProps.error) {
+                return { success: false, error: 'Element not found: ' + selector };
+            }
+            var elRect = elProps.properties && elProps.properties.rect;
+            if (!elRect || elRect.width === 0 || elRect.height === 0) {
+                return { success: false, error: 'Element has no visible dimensions: ' + selector };
+            }
+
+            // Take full page screenshot
+            var fullSs = await Platform.sendBrowserAction('take_screenshot', {});
+            if (fullSs.error) {
+                return { success: false, error: fullSs.error };
+            }
+            var fullWidth = fullSs.width || 1280;
+            var fullHeight = fullSs.height || 900;
+
+            // Crop to element rect
+            var cropImg = new Image();
+            await new Promise(function(resolve, reject) {
+                cropImg.onload = resolve;
+                cropImg.onerror = reject;
+                cropImg.src = fullSs.base64;
+            });
+            var dpr = cropImg.naturalWidth / fullWidth;
+            var cropCanvas = document.createElement('canvas');
+            var cx = Math.round(elRect.left * dpr);
+            var cy = Math.round(elRect.top * dpr);
+            var cw = Math.round(elRect.width * dpr);
+            var ch = Math.round(elRect.height * dpr);
+            // Clamp to image bounds
+            cx = Math.max(0, Math.min(cx, cropImg.naturalWidth - 1));
+            cy = Math.max(0, Math.min(cy, cropImg.naturalHeight - 1));
+            cw = Math.min(cw, cropImg.naturalWidth - cx);
+            ch = Math.min(ch, cropImg.naturalHeight - cy);
+            cropCanvas.width = cw;
+            cropCanvas.height = ch;
+            var cropCtx = cropCanvas.getContext('2d');
+            cropCtx.drawImage(cropImg, cx, cy, cw, ch, 0, 0, cw, ch);
+            cropImg.src = '';
+
+            var cropBase64 = cropCanvas.toDataURL('image/png');
+            var cropW = Math.round(cw / dpr);
+            var cropH = Math.round(ch / dpr);
+            cropCanvas.width = 0; cropCanvas.height = 0;
+
+            var elSsId = newFileId();
+            var elUrl = fullSs.url || currentIframeUrl || '/';
+            if (args.grid) {
+                cropBase64 = await overlayGrid(cropBase64, cropW, cropH);
+            }
+            // Compress if over 5MB API limit
+            cropBase64 = await compressBase64Image(cropBase64);
+            return {
+                success: true,
+                screenshot_id: elSsId,
+                url: elUrl,
+                message: 'Screenshot captured: element ' + selector,
+                dimensions: cropW + 'x' + cropH,
+                size_bytes: Math.round(cropBase64.length * 0.75),
+                note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + elSsId + '" with screenshot_by_id tool to retrieve the image data.',
+                _screenshotMessage: {
+                    role: 'screenshot',
+                    base64: cropBase64,
+                    name: args.name || null,
+                    description: 'element ' + selector + ' at ' + elUrl,
+                    url: elUrl,
+                    timestamp: Date.now(),
+                    width: cropW,
+                    height: cropH,
+                    screenshot_id: elSsId,
+                    file_id: elSsId
+                }
+            };
+        } else {
+            return { success: false, error: 'Invalid target. Use "browser", "widget", or "element"' };
+        }
+
+        if (!elementToCapture) {
+            return { success: false, error: 'Could not find element to capture' };
+        }
+
+        var base64Data;
+        var finalWidth, finalHeight;
+
+        if (screenshotMethod === 'display-media') {
+            // Browser Display Media capture (requires user permission dialog)
+            var canvas = await captureElementToCanvas(elementToCapture);
+            var finalCanvas = canvas;
+            if (canvas.width > maxWidth || canvas.height > maxWidth) {
+                var scale = Math.min(maxWidth / canvas.width, maxWidth / canvas.height);
+                var resizedCanvas = document.createElement('canvas');
+                resizedCanvas.width = Math.round(canvas.width * scale);
+                resizedCanvas.height = Math.round(canvas.height * scale);
+                var ctx = resizedCanvas.getContext('2d');
+                ctx.drawImage(canvas, 0, 0, resizedCanvas.width, resizedCanvas.height);
+                finalCanvas = resizedCanvas;
+                // Release original canvas memory
+                canvas.width = 0;
+                canvas.height = 0;
+            }
+            base64Data = finalCanvas.toDataURL('image/png');
+            finalWidth = finalCanvas.width;
+            finalHeight = finalCanvas.height;
+            // Release final canvas memory
+            finalCanvas.width = 0;
+            finalCanvas.height = 0;
+        } else {
+            // html-to-image capture (default, no permission dialog)
+            var containerEl = elementToCapture;
+            // For body/html, find the containing iframe for dimensions
+            var iframeEl = null;
+            if (containerEl.tagName === 'BODY' || containerEl.tagName === 'HTML') {
+                var win = containerEl.ownerDocument.defaultView;
+                if (win && win.frameElement) iframeEl = win.frameElement;
+            }
+            var w = iframeEl ? iframeEl.clientWidth : containerEl.scrollWidth;
+            var h = iframeEl ? iframeEl.clientHeight : containerEl.scrollHeight;
+            var ratio = window.devicePixelRatio || 1;
+            var htiOpts = {
+                width: w, height: h, pixelRatio: ratio,
+                filter: screenshotFilter
+            };
+            if (_htiFontCache != null) htiOpts.fontEmbedCSS = _htiFontCache;
+            var restoreGCS = patchScrollStyles(containerEl);
+
+            // Fix margin rendering: convert parents of inline spans (containing block children) to flex layout.
+            // See comment in captureScreenshot() for full explanation of WHY and how TO REVERT TO ALL SPANS.
+            var restoreMarginFix = [];
+            try {
+                var doc = containerEl.ownerDocument || containerEl;
+                var widgetSpans = doc.querySelectorAll('span[ng-switch-default][ng-repeat*="rectangle"], span[ng-repeat*="widget"]');
+                var processed = new Set();
+                widgetSpans.forEach(function(span) {
+                    var parent = span.parentElement;
+                    if (!parent || processed.has(parent)) return;
+                    processed.add(parent);
+                    var origDisplay = parent.style.display;
+                    var origFlexDir = parent.style.flexDirection;
+                    parent.style.setProperty('display', 'flex', 'important');
+                    parent.style.setProperty('flex-direction', 'column', 'important');
+                    restoreMarginFix.push({ el: parent, display: origDisplay, flexDir: origFlexDir });
+                });
+            } catch (e) { /* ignore */ }
+
+            try {
+                var svgDataUrl = await _htiToSvg(containerEl, htiOpts);
+                base64Data = await svgToPng(sanitizeSvgDataUrl(svgDataUrl), w, h, ratio);
+            } finally {
+                restoreGCS();
+                restoreMarginFix.forEach(function(item) {
+                    if (item.display) item.el.style.display = item.display;
+                    else item.el.style.removeProperty('display');
+                    if (item.flexDir) item.el.style.flexDirection = item.flexDir;
+                    else item.el.style.removeProperty('flex-direction');
+                });
+            }
+            // Resize if either dimension exceeds maxWidth
+            // (Anthropic limits to 2000px per dimension for many-image requests)
+            finalWidth = Math.round(w * ratio);
+            finalHeight = Math.round(h * ratio);
+            if (finalWidth > maxWidth || finalHeight > maxWidth) {
+                var resizeScale = Math.min(maxWidth / finalWidth, maxWidth / finalHeight);
+                var resizedCanvas = document.createElement('canvas');
+                resizedCanvas.width = Math.round(finalWidth * resizeScale);
+                resizedCanvas.height = Math.round(finalHeight * resizeScale);
+                var rctx = resizedCanvas.getContext('2d');
+                var img = new Image();
+                await new Promise(function(resolve, reject) {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                    img.src = base64Data;
+                });
+                rctx.drawImage(img, 0, 0, resizedCanvas.width, resizedCanvas.height);
+                base64Data = resizedCanvas.toDataURL('image/png');
+                finalWidth = resizedCanvas.width;
+                finalHeight = resizedCanvas.height;
+                // Release memory
+                resizedCanvas.width = 0;
+                resizedCanvas.height = 0;
+                img.src = '';
+            }
+        }
+
+        // Apply grid overlay if requested (viewport coords for click/fill)
+        if (args.grid) {
+            // w/h are viewport dims (CSS pixels); for display-media path they aren't set
+            var vpW = (typeof w !== 'undefined') ? w : finalWidth;
+            var vpH = (typeof h !== 'undefined') ? h : finalHeight;
+            base64Data = await overlayGrid(base64Data, vpW, vpH);
+        }
+
+        // Compress if over 5MB API limit
+        base64Data = await compressBase64Image(base64Data);
+
+        // Generate unique ID for later retrieval via screenshot_by_id (data persisted in chat messages)
+        var screenshotId = newFileId();
+        var screenshotName = args.name || null;
+        var screenshotTimestamp = Date.now();
+
+        return {
+            success: true,
+            screenshot_id: screenshotId,
+            message: 'Screenshot captured: ' + captureDescription,
+            dimensions: finalWidth + 'x' + finalHeight,
+            size_bytes: Math.round(base64Data.length * 0.75),
+            note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + screenshotId + '" with screenshot_by_id tool or executeTool("screenshot_by_id", {id: "' + screenshotId + '"}) in widgets/js_eval to retrieve the image data.',
+            _screenshotMessage: {
+                role: 'screenshot',
+                base64: base64Data,
+                name: screenshotName,
+                description: captureDescription,
+                url: (target === 'browser' ? currentIframeUrl : null) || null,
+                timestamp: screenshotTimestamp,
+                width: finalWidth,
+                height: finalHeight,
+                screenshot_id: screenshotId,
+                file_id: screenshotId
+            }
+        };
+
+    } catch (e) {
+        return { success: false, error: 'Screenshot capture failed: ' + e.message };
+    }
+}
+
+// =============================================

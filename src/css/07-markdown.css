@@ -1,0 +1,72 @@
+/* Markdown styles */
+.code-block-wrapper { position: relative; margin: var(--space-4) 0; }
+.code-block-wrapper.expanded { width: 100%; max-width: none; }
+.code-block-expand-btn { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; padding: 0; background: rgba(255,255,255,0.8); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-lg); line-height: 20px; color: var(--text-secondary); z-index: 1; }
+.code-block-expand-btn:hover { background: var(--bg-white); color: var(--text-primary); }
+.code-copy-btn { position: absolute; bottom: 8px; right: 8px; padding: var(--space-2) var(--space-4); background: rgba(255,255,255,0.9); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-sm); color: var(--text-secondary); z-index: 1; }
+.code-copy-btn:hover { background: var(--bg-white); color: var(--text-primary); border-color: var(--border-dark); }
+.code-block { background: var(--bg-code); color: var(--text-heading); padding: var(--space-6) var(--space-8); padding-right: 30px; border-radius: var(--radius-lg); overflow-x: auto; font-family: var(--font-mono); font-size: var(--text-body); margin: 0; line-height: var(--leading-relaxed); border: 1px solid var(--border); max-height: none; overflow-y: visible; white-space: pre-wrap; word-break: break-word; box-shadow: var(--shadow-sm); }
+.code-block.collapsed { max-height: 200px; overflow-y: auto; white-space: pre; word-break: normal; }
+.code-block code { background: none; padding: 0; color: inherit; }
+.sh-keyword { color: var(--sh-keyword); font-weight: var(--font-medium); }
+.sh-string { color: var(--sh-string); }
+.sh-number { color: var(--sh-number); }
+.sh-comment { color: var(--sh-comment); font-style: italic; }
+code.inline-code { background: var(--bg-hover); color: var(--text-heading); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.9em; border: 1px solid var(--border); white-space: nowrap; }
+.message-content { line-height: var(--leading-loose); }
+.message-content h2 { font-size: 1.25em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }
+.message-content h3 { font-size: 1.1em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }
+.message-content h4 { font-size: 1em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-primary); line-height: var(--leading-tight); }
+.message-content h5 { font-size: 0.95em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
+.message-content h2:first-child, .message-content h3:first-child, .message-content h4:first-child, .message-content h5:first-child { margin-top: 0; }
+.message-content strong { font-weight: var(--font-semibold); color: var(--text-heading); }
+.message-content .md-paragraph { margin: var(--space-4) 0; display: block; }
+.message-content .md-paragraph:first-child { margin-top: 0; }
+.message-content .md-paragraph:last-child { margin-bottom: 0; }
+.message-content .md-paragraph + .md-table { margin-top: var(--space-1); }
+.message-content .md-table + .md-paragraph { margin-top: var(--space-1); }
+.message-content ul, .message-content ol { margin: var(--space-2) 0; padding-left: var(--space-10); list-style-position: outside; }
+.message-content li { margin: 0; padding: 0; line-height: var(--leading-normal); }
+/* Generic list indent for any markdown-rendered container (popovers, action update outputs, etc.).
+   Needed because the universal `* { padding: 0 }` reset in 01-dark-theme.css zeros browser default
+   ul/ol padding — without this, bullets fall outside the container and get clipped. */
+.markdown-body ul, .markdown-body ol { margin: var(--space-2) 0; padding-left: var(--space-10); list-style-position: outside; }
+.markdown-body li { margin: 0; padding: 0; line-height: var(--leading-normal); }
+
+/* JSON formatting styles */
+.json-key { color: var(--text-link); font-weight: var(--font-medium); }
+.json-str { color: var(--text-heading); }
+.json-num { color: var(--sh-keyword); }
+.json-bool { color: var(--sh-bool); }
+.json-null { color: var(--text-muted); font-style: italic; }
+.json-collapse { display: inline-block; width: 14px; height: 14px; line-height: 12px; text-align: center; background: var(--bg-hover); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-sm); font-weight: bold; color: var(--text-secondary); margin-right: var(--space-1); user-select: none; vertical-align: middle; }
+.json-collapse:hover { background: var(--border); color: var(--text-primary); }
+.json-preview { color: var(--text-muted); font-style: italic; font-size: 0.9em; }
+.json-collapsible, .json-collapsed { }
+.md-table { border-collapse: separate; border-spacing: 0; margin: var(--space-1) 0; width: auto; max-width: 100%; display: table; border: 1px solid var(--border-dark); border-radius: var(--radius-md); }
+.message-content .md-table:first-child { margin-top: 0; }
+.md-table td, .md-table th { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: var(--space-5) var(--space-7); text-align: left; }
+.md-table td:last-child, .md-table th:last-child { border-right: none; }
+.md-table tr:last-child td { border-bottom: none; }
+.md-table tr:nth-child(even) { background: var(--bg-light); }
+.md-table tr:first-child td { font-weight: var(--font-semibold); background: var(--bg-code); color: var(--text-primary); }
+
+/* Blockquotes — left border + indent. Works in chat (.message-content) and any
+   .markdown-body container (popovers, action update outputs, smart docs). */
+.message-content .md-blockquote,
+.markdown-body .md-blockquote {
+    margin: var(--space-4) 0;
+    padding: var(--space-1) var(--space-6);
+    border-left: 3px solid var(--border-dark);
+    color: var(--text-secondary);
+    background: var(--bg-light);
+    border-radius: var(--radius-sm);
+}
+.message-content .md-blockquote:first-child,
+.markdown-body .md-blockquote:first-child { margin-top: 0; }
+.message-content .md-blockquote:last-child,
+.markdown-body .md-blockquote:last-child { margin-bottom: 0; }
+.message-content .md-blockquote .md-paragraph:first-child,
+.markdown-body .md-blockquote .md-paragraph:first-child { margin-top: 0; }
+.message-content .md-blockquote .md-paragraph:last-child,
+.markdown-body .md-blockquote .md-paragraph:last-child { margin-bottom: 0; }

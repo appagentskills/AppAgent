@@ -1,0 +1,16 @@
+<script>
+(function() {
+    var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var isStandalone = window.navigator.standalone === true;
+    var dismissed = localStorage.getItem('iosInstallDismissed');
+    if (isIOS && !isStandalone && !dismissed) {
+        var banner = document.getElementById('ios-install-banner');
+        var closeBtn = document.getElementById('ios-install-close');
+        setTimeout(function() { banner.classList.add('show'); }, 1500);
+        closeBtn.addEventListener('click', function() {
+            banner.classList.remove('show');
+            localStorage.setItem('iosInstallDismissed', '1');
+        });
+    }
+})();
+</script>
