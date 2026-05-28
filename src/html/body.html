@@ -138,6 +138,15 @@
             </div>
             <div class="input-area" id="input-area" style="visibility:hidden;">
                 <div class="pending-images-container" id="pending-images-container" style="display:none;"></div>
+                <!-- Workers strip: live sub-agent chips for the active chat.
+                     Hidden by default, populated by renderWorkersStrip()
+                     in src/js/ui/175-sub-agent-ui.js. role="region" was
+                     dropped because (a) when the strip is empty/hidden it's
+                     an empty landmark (anti-pattern, some SR still announce
+                     it) and (b) we don't add aria-live, so updates aren't
+                     announced either way. aria-label is kept for the brief
+                     moments the strip is visible. -->
+                <div class="workers-strip" id="workers-strip" style="display:none;" aria-label="Active sub-agents"></div>
                 <div class="chat-actions-row" id="chat-actions-row"></div>
                 <div class="input-container">
                     <textarea id="message-input" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>

@@ -386,7 +386,7 @@ function getDisabledTools() {
     return disabled;
 }
 
-function getEnabledTools() {
+function getEnabledTools(chatId) {
     var baseTools = TOOLS.filter(function(tool) {
         var name = tool.function.name;
         // For servicenow_api, check if ALL CRUD ops are disabled
@@ -412,6 +412,33 @@ function getEnabledTools() {
     // Add active skill tools
     var skillToolDefs = getActiveSkillTools();
     var allTools = baseTools.concat(skillToolDefs);
+
+    // Sub-agent / parent visibility filter. Honors the per-sub tool_roster
+    // (which is now deterministic across spawns in a session — same parent
+    // tool list minus the nested-delegation trio unless allow_nested:true),
+    // and hides sub-only tools (report_to_parent / sleep_self) from parent
+    // chats — they're useless outside a sub context and just waste tokens
+    // + confuse the model. Optional chatId — when omitted (UI settings
+    // preview, layout token counter), returns the unfiltered global list.
+    if (chatId && typeof chats !== 'undefined' && chats[chatId]) {
+        var _chat = chats[chatId];
+        if (_chat.isSubAgent && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+            var _rec = SubAgents.getById(_chat.subAgentId);
+            if (_rec && Array.isArray(_rec.tool_roster)) {
+                var _rosterSet = Object.create(null);
+                for (var _ri = 0; _ri < _rec.tool_roster.length; _ri++) _rosterSet[_rec.tool_roster[_ri]] = true;
+                allTools = allTools.filter(function(t) {
+                    return _rosterSet[t.function && t.function.name];
+                });
+            }
+        } else {
+            allTools = allTools.filter(function(t) {
+                var n = t.function && t.function.name;
+                return n !== 'report_to_parent' && n !== 'sleep_self';
+            });
+        }
+    }
+
     // Add cache_control on the last tool so Anthropic caches the entire tools block
     if (allTools.length > 0) {
         var last = Object.assign({}, allTools[allTools.length - 1]);

@@ -1609,6 +1609,18 @@ async function loadToolPermissions() {
 
     // Reset to new defaults (clean slate for new permission system)
     initDefaultToolPermissions();
+    // Mirror to SW now that IDB load is complete. initDefaultToolPermissions
+    // ends in saveToolPermissions which pushes ONLY toolPermissions — so
+    // without an explicit instancePermissions push, the SW never learns about
+    // tier='auto' on the user's connected instance and prompts on every
+    // browser:* / sn:write call. Push both sources together as the
+    // authoritative post-IDB-load mirror.
+    if (typeof pushPermissionsToOffscreen === 'function') {
+        pushPermissionsToOffscreen({
+            toolPermissions: toolPermissions,
+            instancePermissions: instancePermissions
+        });
+    }
 }
 
 function initDefaultToolPermissions() {

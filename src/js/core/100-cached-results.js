@@ -859,8 +859,17 @@ function executeCachedContentRead(chatId, args) {
     };
 }
 
-function getSystemPromptWithContext() {
-    // Use custom template if available, otherwise use default template
+function getSystemPromptWithContext(chatId) {
+    // Use custom template if available, otherwise use default template.
+    // chatId is optional — when provided AND the chat is a sub-agent, the
+    // sub-agent preamble is appended (see 110-system-prompt.js). Most
+    // callers (settings preview, token counter) pass no chatId; the agent
+    // loop's streaming path passes the active chatId so subs get their
+    // preamble.
     var template = getSystemPromptTemplate();
-    return expandSystemPromptPlaceholders(template);
+    var expanded = expandSystemPromptPlaceholders(template);
+    if (typeof _maybeAppendSubAgentPreamble === 'function') {
+        expanded = _maybeAppendSubAgentPreamble(expanded, chatId);
+    }
+    return expanded;
 }

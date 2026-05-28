@@ -23,20 +23,85 @@ function executeDisplay(args, messageIndex, options) {
     // Persist on chat for re-render
     var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
+    // Eager-render path: when display is called from inside a sandbox (js_eval
+    // / skill tool / widget bridge), the agent never sees a placeholder string
+    // to emit in its reply text, so the placeholder-in-text render path is
+    // unreachable. Attach the display to the PARENT tool's tool_result slot
+    // so the renderer emits it eagerly alongside that result (same shape as
+    // html_widget). For top-level display calls (no parentToolCallId) the old
+    // behavior — placeholder in agent text triggers render — is preserved.
+    var fromSandbox = !!(options && options.fromSandbox);
+    var parentToolCallId = options && options.parentToolCallId;
+    var eagerMsgIndex = -1;
+    if (fromSandbox && parentToolCallId && chat && chat.messages) {
+        for (var pi = chat.messages.length - 1; pi >= 0; pi--) {
+            var pm = chat.messages[pi];
+            if (pm.role === 'tool' && pm.tool_call_id === parentToolCallId) {
+                eagerMsgIndex = pi;
+                break;
+            }
+        }
+    }
     if (chat) {
         if (!chat.displays) chat.displays = {};
-        chat.displays[displayId] = { template: template, args: args };
+        var entry = { template: template, args: args };
+        if (eagerMsgIndex >= 0) {
+            entry.msgIndex = eagerMsgIndex;
+            entry.eager = true;
+        }
+        chat.displays[displayId] = entry;
         saveChatsToStorage();
     }
 
     var title = args.title || (template.charAt(0).toUpperCase() + template.slice(1));
+    var placeholder = '<!--display:' + displayId + '-->';
+    // Suppress the "include this in your reply" hint when we'll render eagerly
+    // anyway — the agent has no way to do that from inside a sandbox, and the
+    // hint would be misleading.
+    var message = eagerMsgIndex >= 0
+        ? title + ' rendered.'
+        : title + ' ready. Include ' + placeholder + ' in your response to render it inline.';
+
+    var persistEntry = { displayId: displayId, template: template, args: args };
+    if (eagerMsgIndex >= 0) {
+        persistEntry.msgIndex = eagerMsgIndex;
+        persistEntry.eager = true;
+    }
 
     return {
         success: true,
+        // Normalized: `id` matches html_widget / take_screenshot conventions.
+        // `displayId` kept for any caller still relying on it.
+        id: displayId,
         displayId: displayId,
-        message: title + ' ready. Include <!--display:' + displayId + '--> in your response to render it inline.',
-        _display_placeholder: '<!--display:' + displayId + '-->'
+        // Normalized: `placeholder` matches the placeholder-based render
+        // contract; null when eager-rendered (caller doesn't need to emit it).
+        placeholder: eagerMsgIndex >= 0 ? null : placeholder,
+        message: message,
+        _display_placeholder: eagerMsgIndex >= 0 ? null : placeholder,
+        // SW-side wrapper reads this to persist chat.displays on its own chat
+        // object. Without it, the SW's chat snapshot (which is broadcast back
+        // to the panel) wipes the page-side mutation on the next save.
+        _display_persist: persistEntry
     };
+}
+
+// Eager-render scan: returns concatenated HTML for every display attached to
+// `msgIndex` (set when the display was created from inside a sandbox — see
+// `executeDisplay`). Called by the message renderer alongside `getWidgetHtmlForMessage`.
+function getDisplayHtmlForMessage(msgIndex) {
+    var chat = chats[currentChatId];
+    if (!chat || !chat.displays) return '';
+    var html = '';
+    Object.keys(chat.displays).forEach(function(displayId) {
+        var entry = chat.displays[displayId];
+        if (!entry || !entry.eager || entry.msgIndex !== msgIndex) return;
+        // Render via the same path placeholder-in-text uses, so cache + chart
+        // generator code stays single-sourced.
+        var renderedHtml = renderDisplayPlaceholder(displayId);
+        html += '<div class="display-inline" data-display-id="' + escDisplay(displayId) + '">' + renderedHtml + '</div>';
+    });
+    return html;
 }
 
 // Called from formatContent to replace <!--display:ID--> placeholders

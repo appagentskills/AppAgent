@@ -216,6 +216,13 @@ function renderMessages() {
                         for (var ri = msgIdx + 1; ri < chat.messages.length; ri++) {
                             var rm = chat.messages[ri];
                             if (rm.role === 'tool' && rm.tool_call_id === tc.id) {
+                                // Atomic-placeholder seeded by seedPlaceholderToolResults before
+                                // execution — NOT a real result yet. Leave hasResult=false so the
+                                // spinner stays and the literal "[Tool call pending — agent runtime
+                                // restarted…]" text never leaks into the UI during a healthy run.
+                                // The row will get a real result via recordToolResult, which clears
+                                // _placeholder, and the next render will pick it up normally.
+                                if (rm._placeholder) break;
                                 resultContent = typeof rm.content === 'string' ? rm.content : JSON.stringify(rm.content);
                                 hasResult = true;
                                 resultMsgIdx = ri;
@@ -477,7 +484,19 @@ function renderMessages() {
                     }
                     // Show tool count only when agent has finished (hasFinalAnswer), otherwise show status message or tool name
                     // Non-last blocks are always done (conversation moved past them, e.g. after message injection)
-                    var agentDone = !block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming);
+                    //
+                    // BUG FIX: the spinner used to spin forever on any chat whose last block ended on
+                    // a tool call without a trailing assistant-text message. Two cases hit this hard:
+                    //   1. Sub-agent chats end with `report_to_parent` — there is no final answer
+                    //      that follows, so `hasFinalAnswer` is never set and the spinner kept
+                    //      spinning every time you opened the transcript.
+                    //   2. Any chat that was interrupted (browser closed mid-run, network drop)
+                    //      can be persisted with no final-answer message and stale isStreaming flags.
+                    // Gate on `isChatRunning` so the spinner is only ever drawn for a chat that
+                    // genuinely has a live agent loop. If the chat is dormant, there is nothing
+                    // to spin for — done is done.
+                    var chatActuallyRunning = (typeof isChatRunning === 'function') && isChatRunning(currentChatId);
+                    var agentDone = !chatActuallyRunning || !block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming);
                     // Pre-tool-call placeholder: when the model is still streaming with no
                     // status_message and no tool name yet, three concurrent chats would all
                     // show the same generic 'Processing...' — looks like a leak even though
@@ -573,9 +592,16 @@ function renderMessages() {
 
                     // Render widgets OUTSIDE the collapsible in a grouped container
                     var blockWidgetHtml = '';
+                    var blockDisplayHtml = '';
                     block.toolCalls.forEach(function(item) {
                         if (item.hasResult && item.resultMsgIdx >= 0) {
                             blockWidgetHtml += getWidgetHtmlForMessage(item.resultMsgIdx);
+                            // Eager-render displays attached to this tool's result slot
+                            // (created via executeTool('display', ...) from inside js_eval
+                            // / skill / widget sandboxes — see executeDisplay).
+                            if (typeof getDisplayHtmlForMessage === 'function') {
+                                blockDisplayHtml += getDisplayHtmlForMessage(item.resultMsgIdx);
+                            }
                         }
                     });
                     if (blockWidgetHtml) {
@@ -583,6 +609,9 @@ function renderMessages() {
                         var wLabel = 'Widgets' + (wCount > 1 ? ' (' + wCount + ')' : '');
                         var wGroupOpen = closedWidgetGroups[index] ? '' : ' open';
                         html += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + wGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + wLabel + '</summary><div class="widgets-container">' + blockWidgetHtml + '</div></details>';
+                    }
+                    if (blockDisplayHtml) {
+                        html += '<div class="displays-container">' + blockDisplayHtml + '</div>';
                     }
                     
                     // Intermediate content is always shown inside the collapsible timeline
@@ -728,6 +757,13 @@ function renderMessages() {
             if (compactToolCalls) {
                 return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
             }
+            // Atomic-placeholder row (seeded before tool execution to keep the
+            // persisted Anthropic shape valid across SW eviction). Not a real
+            // result — hide it; the row will re-render with real content once
+            // recordToolResult overwrites it and clears _placeholder.
+            if (msg._placeholder) {
+                return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
+            }
             // Hide set_chat_title tool results unless showing API stats
             if (msg.name === 'set_chat_title' && !showApiStats) {
                 return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
@@ -759,6 +795,15 @@ function renderMessages() {
                 var mwGroupOpen = closedWidgetGroups[index] ? '' : ' open';
                 toolHtml += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + mwGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + mwLabel + '</summary><div class="widgets-container">' + msgWidgetHtml + '</div></details>';
             }
+            // Eager-rendered displays for this tool result (created via
+            // executeTool('display', ...) from inside js_eval / skill / widget
+            // sandboxes — see executeDisplay).
+            if (typeof getDisplayHtmlForMessage === 'function') {
+                var msgDisplayHtml = getDisplayHtmlForMessage(index);
+                if (msgDisplayHtml) {
+                    toolHtml += '<div class="displays-container">' + msgDisplayHtml + '</div>';
+                }
+            }
             
             // Add inline changes if this is the last message before next user message or end of chat
             if (isLastBeforeNextUser && prevUserMsgIdx >= 0) {
@@ -774,10 +819,21 @@ function renderMessages() {
             return renderPromptUserMessage(msg, index);
         } else if (msg.role === 'action_button') {
             return renderInlineActionButton(msg, index);
+        } else if (msg.role === 'sub_report') {
+            return renderSubReport(msg, index);
         } else if (msg.role === 'browser_context' || msg.role === 'context') {
             // Context messages are hidden from UI - they're only for API context
             // But we still need the ID for scrolling to work correctly
             return '<div class="message browser-context" id="msg-' + index + '" style="display:none;"></div>';
+        } else if (msg.role === 'parked_tool') {
+            // Parked-tool indicator (pushed by 036-agent-event-handlers-page.js
+            // toolParked handler, after a 750ms grace window). A UI-required tool
+            // is waiting because no panel is currently connected; it auto-resumes
+            // when one is opened. The handler removes this row on toolUnparked,
+            // so this only ever renders in the genuinely panel-less case (not
+            // during a brief SW-restart reconnect flicker).
+            var parkedContent = (typeof msg.content === 'string' && msg.content) ? msg.content : '📌 Tool waiting for a panel — auto-resumes when you open one.';
+            return '<div class="message parked-tool" id="msg-' + index + '">' + escapeHtml(parkedContent) + '</div>';
         }
         return '';
     }).join('');

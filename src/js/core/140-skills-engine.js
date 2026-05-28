@@ -273,13 +273,46 @@ async function executeSkillTool(toolName, args, options) {
         return { success: false, error: 'Skill tool not found: ' + toolName };
     }
 
-    var sandbox = null;
-    var sandboxMessageHandler = null;
     try {
         var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
 
-        sandbox = document.createElement('iframe');
+        // SW context bridges to the offscreen helper, which hosts the
+        // real sandbox iframe. The offscreen runs the same MSG_TOOL_CALL /
+        // MSG_TOOL_RESULT / MSG_DONE protocol against the sandbox and
+        // forwards sandbox tool calls back to the SW via the
+        // chrome.runtime.sendMessage type='sw-exec-tool' handler in
+        // background.js.
+        if (typeof Platform !== 'undefined' && Platform.isWorker) {
+            var swResult = await Platform.callOffscreenHelper('helper-skill-sandbox', {
+                toolCode: toolInfo.code,
+                toolName: toolName,
+                args: args,
+                chatId: chatId,
+                // Plumb the skill-tool toolCallId so display calls from inside
+                // the skill render eagerly attached to this tool's result slot.
+                parentToolCallId: options && options.toolCallId
+            }, 5 * 60 * 1000);
+            var swResultStr = JSON.stringify(swResult, null, 2);
+            var swLines = swResultStr.split('\n');
+            if (swLines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {
+                lastLargeResponse = swResult;
+                var swPreview = swLines.slice(0, LARGE_RESPONSE_LINE_LIMIT).join('\n');
+                return {
+                    success: swResult.success !== undefined ? swResult.success : true,
+                    status: swResult.status,
+                    _response_truncated: true,
+                    _total_lines: swLines.length,
+                    _preview_lines: LARGE_RESPONSE_LINE_LIMIT,
+                    _notice: 'Response too large (' + swLines.length + ' lines). Showing first ' + LARGE_RESPONSE_LINE_LIMIT + ' lines. Full data stored in `lastLargeResponse` variable - use js_eval to process it (e.g., filter, map, count items, extract specific fields).',
+                    preview: swPreview
+                };
+            }
+            return swResult;
+        }
+
+        var sandbox = document.createElement('iframe');
         sandbox.style.display = 'none';
+        var sandboxMessageHandler = null;
 
         var MSG_TOOL_CALL = 'sandboxToolCall';
         var MSG_TOOL_RESULT = 'sandboxToolResult';
@@ -295,7 +328,14 @@ async function executeSkillTool(toolName, args, options) {
                     var code = toolInfo.code + ';\nreturn await ' + toolName + '(' + JSON.stringify(args) + ');';
                     sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: code }, '*');
                 } else if (e.data && e.data.type === MSG_TOOL_CALL) {
-                    var toolPromise = executeTool(e.data.name, e.data.args, null, { chatId: chatId, fromSandbox: true });
+                    // Pass the OUTER skill-tool toolCallId as parentToolCallId
+                    // so display from inside a skill renders eagerly attached
+                    // to the skill's tool_result slot. See executeDisplay.
+                    var toolPromise = executeTool(e.data.name, e.data.args, null, {
+                        chatId: chatId,
+                        fromSandbox: true,
+                        parentToolCallId: options && options.toolCallId
+                    });
                     toolPromise
                         .then(function(result) {
                             if (result && result._screenshotMessage) {
@@ -363,10 +403,14 @@ async function executeSkillTool(toolName, args, options) {
 
         return result;
     } catch (e) {
-        if (sandboxMessageHandler) {
-            window.removeEventListener('message', sandboxMessageHandler);
+        // sandbox / sandboxMessageHandler only exist on the DOM-fallback
+        // path; the SW-bridged path returns earlier.
+        if (typeof sandboxMessageHandler !== 'undefined' && sandboxMessageHandler) {
+            try { window.removeEventListener('message', sandboxMessageHandler); } catch (cleanupErr) {}
         }
-        if (sandbox && sandbox.parentNode) sandbox.parentNode.removeChild(sandbox);
+        if (typeof sandbox !== 'undefined' && sandbox && sandbox.parentNode) {
+            try { sandbox.parentNode.removeChild(sandbox); } catch (cleanupErr) {}
+        }
         return { success: false, error: e.message };
     }
 }
@@ -503,7 +547,7 @@ async function deactivateSkill(skillId) {
 
 async function getCurrentRecordVersion(table, sysId) {
     try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
+        var headers = { 'X-UserToken': Platform.getSessionToken(), 'Accept': 'application/json' };
         var url = '/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId + '^ORDERBYDESCsys_created_on&sysparm_limit=1&sysparm_fields=sys_id';
         var res = await fetch(url, { headers: headers });
         var data = await res.json();

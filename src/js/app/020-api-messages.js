@@ -94,9 +94,37 @@ function buildAPIMessages(chatMessages, chatId) {
         }
         // Handle context messages (document references, etc.)
         if (m.role === 'context') return { role: 'user', content: maybeCacheUserContent(original, m.content) };
+        // sub_report rows are a UI-only callout in the parent transcript:
+        // they record what a sub-agent told the parent via report_to_parent /
+        // agent_message-to-parent. The same payload reaches the parent model
+        // through await_handle's tool result (terminal reports) — echoing it
+        // here would double-feed and break the strict assistant↔tool turn
+        // alternation when injected mid tool-result chain. Drop them.
+        if (m.role === 'sub_report') return null;
         return null;
     }).filter(Boolean);
-    return result;
+
+    // Anthropic invariant: no two consecutive user messages (strict role
+    // alternation). Sub-agent chats can break this when (a) spawn_sub_agent
+    // creates a chat with [user(task)] and the pool is full, then
+    // agent_message pushes another user message before the loop ever runs,
+    // or (b) wakeSubAgent drains the inbox onto a chat whose last message
+    // was already a user row. Parent chats can also break it when a
+    // sub_report row (dropped above) was sandwiched between two user rows.
+    // Merge consecutive same-role string-content user messages into a
+    // single concatenated message so the API request stays well-formed.
+    var merged = [];
+    for (var mi = 0; mi < result.length; mi++) {
+        var cur = result[mi];
+        var prev = merged.length ? merged[merged.length - 1] : null;
+        if (prev && prev.role === 'user' && cur.role === 'user'
+            && typeof prev.content === 'string' && typeof cur.content === 'string') {
+            prev.content = prev.content + '\n\n' + cur.content;
+            continue;
+        }
+        merged.push(cur);
+    }
+    return merged;
 }
 
 // Single source of truth for the pause button's visible label. Read pause state
@@ -138,6 +166,10 @@ function togglePause() {
         // The agent loop catches the AbortError as a user-abort, drops the partial
         // assistant message, then exits cleanly because pausedChats[chatId] is now true
         // (the loop's `while (!isChatPaused(chatId))` condition fails next iteration).
+        // POST-OFFSCREEN-RELOCATION: the stream / interrupt resolvers live in the
+        // offscreen runtime, not on this page — the maps below are empty in the
+        // page bundle. We still call them defensively (no-ops) AND push the
+        // pause state over the bus so offscreen aborts on its side.
         var ac = currentStreamAbortControllers[chatId];
         if (ac && typeof ac.abort === 'function') {
             try { ac.abort(); } catch (e) {}
@@ -145,6 +177,12 @@ function togglePause() {
         var interruptFn = interruptResolversByChatId[chatId];
         if (typeof interruptFn === 'function') {
             try { interruptFn(); } catch (e) {}
+        }
+        if (typeof pushPauseToggleToOffscreen === 'function') {
+            pushPauseToggleToOffscreen(chatId, true);
+        }
+        if (typeof pushInterruptToOffscreen === 'function') {
+            pushInterruptToOffscreen(chatId, false);
         }
         // B-A2: also unblock any approval the loop is parked on. Without this,
         // pausing a chat that's awaiting tool approval is a no-op — the loop stays
@@ -157,9 +195,11 @@ function togglePause() {
         return;
     }
 
-    // Resuming: restart the agent loop only if THIS chat isn't already running.
-    // (Previously gated on the global `isRunning`, which would block resume whenever
-    // any background chat was active.)
+    // Resuming: tell offscreen the pause flag is cleared, then kick off
+    // a fresh run via the shim if this chat isn't already known-running.
+    if (typeof pushPauseToggleToOffscreen === 'function') {
+        pushPauseToggleToOffscreen(chatId, false);
+    }
     if (wasPaused && !nowPaused && !runningChatIds[chatId]) {
         runAgent();
     }
@@ -208,11 +248,37 @@ function hideContinueButton() {
 
 function retryLastCall() {
     if (!lastApiError) return;
+    // Target the chat that actually errored, not whatever the user is
+    // currently looking at. Without this, retrying a 429 after the user
+    // switched chats kicks runAgent on the wrong chat (no-op for the
+    // error context, surprise loop on the other).
+    var targetChatId = lastApiError.chatId || currentChatId;
     hideRetryButton();
+    // Continue and Retry can both be visible after an errored runFinished
+    // (the handler shows Continue when the chat is interrupted). If Retry
+    // doesn't dismiss Continue, the user clicks Retry, sees nothing change
+    // (Continue still sitting there, no spinner), and clicks Continue
+    // assuming Retry was broken. Mirror continueAgent: hide both.
+    hideContinueButton();
     lastApiError = null;
-    setTimeout(function() {
-        runAgent();
-    }, 1000);
+    // Defensive paused-state reset — matches continueAgent. A 429 itself
+    // doesn't set pausedChats, but if a stale pause flag survives from
+    // earlier in the session, runAgent's `while (!isChatPaused)` gate
+    // trips immediately and the retry silently no-ops. This is the
+    // single difference that made Continue "work" where Retry didn't.
+    paused = false;
+    if (targetChatId && typeof pausedChats !== 'undefined') {
+        pausedChats[targetChatId] = false;
+    }
+    if (typeof syncPauseButtonUI === 'function') {
+        syncPauseButtonUI(targetChatId);
+    }
+    // Fire immediately. The previous 1000ms setTimeout gave no visible
+    // feedback and made Retry feel dead — by the time the loop kicked
+    // off, the user had already clicked Continue. The SW-side run-agent
+    // handler is idempotent (early-returns when runningChatIds[chat] is
+    // set), so there's no double-loop risk if the user double-clicks.
+    runAgent(targetChatId);
 }
 
 // Continue an interrupted run (e.g. after a page reload mid-stream).

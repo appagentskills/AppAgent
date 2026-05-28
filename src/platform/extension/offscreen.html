@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+    AppAgent offscreen helper.
+
+    Loaded by background.js via chrome.offscreen.createDocument when the
+    agent needs DOM (js_eval sandbox, skill-tool sandbox) or when the SW
+    wants a keep-alive anchor for long-running agent work.
+
+    The agent loop itself lives in the service worker (sw-bundle.js,
+    imported into background.js via importScripts). This document is a
+    thin DOM helper — see offscreen-helper.js for the message protocol.
+
+    Lifetime:
+      • created by SW the first time a run starts (or when a panel opens)
+      • kept alive by the sw-keepalive port the helper opens
+      • closed by SW after a grace period of full idleness
+-->
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>AppAgent offscreen helper</title>
+</head>
+<body>
+    <script src="offscreen-helper.js"></script>
+</body>
+</html>

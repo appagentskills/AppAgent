@@ -42,6 +42,35 @@ async function saveDocument(doc) {
     }
 }
 
+// Load a single document from IDB into the in-memory cache.
+// Used by the page when the worker emits documentChanged for a doc the
+// page hasn't seen yet (worker created/updated it, page cache is stale).
+async function loadDocumentById(docId) {
+    if (!docId) return null;
+    try {
+        var database = await openDatabase();
+        var tx = database.transaction([documentsStoreName], 'readonly');
+        var store = tx.objectStore(documentsStoreName);
+        var request = store.get(docId);
+        return new Promise(function(resolve) {
+            request.onsuccess = function() {
+                var doc = request.result;
+                if (doc) {
+                    smartDocuments[doc.id] = doc;
+                    if (doc.file_id && typeof registerFile === 'function') {
+                        registerFile(doc.file_id, { type: 'document', docId: doc.id });
+                    }
+                }
+                resolve(doc || null);
+            };
+            request.onerror = function() { resolve(null); };
+        });
+    } catch (e) {
+        console.error('Failed to load document ' + docId + ':', e);
+        return null;
+    }
+}
+
 async function deleteDocumentById(docId) {
     delete smartDocuments[docId];
     try {
@@ -59,18 +88,18 @@ async function executeSmartDocument(args, messageIndex, options) {
     var action = args.action;
     if (!action) return { success: false, error: 'action is required' };
 
-    if (action === 'create') return await sdocToolCreate(args);
-    if (action === 'update') return await sdocToolUpdate(args);
-    if (action === 'edit') return await sdocToolEdit(args);
+    if (action === 'create') return await sdocToolCreate(args, options);
+    if (action === 'update') return await sdocToolUpdate(args, options);
+    if (action === 'edit') return await sdocToolEdit(args, options);
     if (action === 'read') return sdocToolRead(args);
     if (action === 'list') return sdocToolList();
     if (action === 'list_versions') return sdocToolListVersions(args);
     if (action === 'read_version') return sdocToolReadVersion(args);
-    if (action === 'delete') return await sdocToolDelete(args);
+    if (action === 'delete') return await sdocToolDelete(args, options);
     return { success: false, error: 'Unknown action: ' + action };
 }
 
-async function sdocToolCreate(args) {
+async function sdocToolCreate(args, options) {
     var title = args.title || 'Untitled Document';
     var content = args.content || '';
     var docId = 'doc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7);
@@ -84,11 +113,11 @@ async function sdocToolCreate(args) {
         file_id: fileId
     };
 
-    sdocCopyDisplays(doc, content);
+    sdocCopyDisplays(doc, content, options);
     sdocInitPrompts(doc);
     await saveDocument(doc);
     registerFile(fileId, { type: 'document', docId: docId });
-    renderVersionSidebar();
+    AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'created' });
 
     return {
         success: true, doc_id: docId, version: 1, file_id: doc.file_id,
@@ -97,7 +126,7 @@ async function sdocToolCreate(args) {
     };
 }
 
-async function sdocToolUpdate(args) {
+async function sdocToolUpdate(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
@@ -112,7 +141,7 @@ async function sdocToolUpdate(args) {
             version: doc.currentVersion, content: doc.currentContent,
             title: doc.title, author: 'agent', timestamp: Date.now()
         });
-        sdocCopyDisplays(doc, doc.currentContent);
+        sdocCopyDisplays(doc, doc.currentContent, options);
         changed = true;
     }
     if (args.prompts) { doc.prompts = args.prompts; sdocInitPrompts(doc); changed = true; }
@@ -120,8 +149,7 @@ async function sdocToolUpdate(args) {
     if (changed) {
         doc.updatedAt = Date.now();
         await saveDocument(doc);
-        sdocReRenderAll(docId);
-        renderVersionSidebar();
+        AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'updated' });
     }
 
     return {
@@ -183,7 +211,7 @@ function sdocToolReadVersion(args) {
     return { success: true, doc_id: docId, version: v.version, content: v.content, title: v.title, author: v.author, timestamp: v.timestamp };
 }
 
-async function sdocToolEdit(args) {
+async function sdocToolEdit(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
@@ -206,10 +234,9 @@ async function sdocToolEdit(args) {
     doc.currentContent = content;
     doc.versions.push({ version: doc.currentVersion, content: content, title: doc.title, author: 'agent', timestamp: Date.now() });
     doc.updatedAt = Date.now();
-    sdocCopyDisplays(doc, content);
+    sdocCopyDisplays(doc, content, options);
     await saveDocument(doc);
-    sdocReRenderAll(docId);
-    renderVersionSidebar();
+    AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'edited' });
 
     return {
         success: true, doc_id: docId, version: doc.currentVersion,
@@ -219,26 +246,35 @@ async function sdocToolEdit(args) {
     };
 }
 
-async function sdocToolDelete(args) {
+async function sdocToolDelete(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     if (!smartDocuments[docId]) return { success: false, error: 'Document not found: ' + docId };
     await deleteDocumentById(docId);
-    renderVersionSidebar();
+    AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'deleted' });
     return { success: true, message: 'Document deleted' };
+}
+
+// Resolve the chat that owns this smart-document call. SW context has no
+// currentChatId fallback, so the agent loop threads chatId via options.
+function _sdocChatId(options) {
+    return (options && options.chatId)
+        || (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+        || (typeof currentChatId !== 'undefined' && currentChatId)
+        || null;
 }
 
 // ─── Helpers ───
 
-function sdocCopyDisplays(doc, content) {
+function sdocCopyDisplays(doc, content, options) {
     var re = /<!--display:(dsp_\w+)-->/g;
     var match;
+    var chatId = _sdocChatId(options);
     while ((match = re.exec(content)) !== null) {
         var did = match[1];
         if (_displayStore[did]) {
             doc.displays[did] = { template: _displayStore[did].template, args: _displayStore[did].args };
         }
-        var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
         var chat = chats[chatId];
         if (chat && chat.displays && chat.displays[did]) {
             doc.displays[did] = { template: chat.displays[did].template, args: chat.displays[did].args };
@@ -258,7 +294,19 @@ function sdocInitPrompts(doc) {
 
 function renderDocumentPlaceholder(docId) {
     var doc = smartDocuments[docId];
-    if (!doc) return '<div class="sdoc-error">Document not found: ' + escDisplay(docId) + '</div>';
+    if (!doc) {
+        // Doc not in the page's in-memory cache yet. This happens when the
+        // worker just created the doc (its smartDocuments map was updated,
+        // ours wasn't). Kick off an async IDB load; when it completes,
+        // sdocReRenderAll will swap this placeholder for the real render.
+        // The data-doc-id attr is required so sdocReRenderAll can find us.
+        if (typeof loadDocumentById === 'function' && typeof document !== 'undefined') {
+            loadDocumentById(docId).then(function(loaded) {
+                if (loaded && typeof sdocReRenderAll === 'function') sdocReRenderAll(docId);
+            });
+        }
+        return '<div class="sdoc-error" data-doc-id="' + escDisplay(docId) + '">Loading document ' + escDisplay(docId) + '\u2026</div>';
+    }
     return sdocRender(doc);
 }
 
@@ -669,6 +717,12 @@ function sdocOpenPreview(docId) {
 // ─── Re-render all instances of a document ───
 
 function sdocReRenderAll(docId) {
+    // No-op in the SW (headless tool dispatch). The function IS defined in
+    // this file, so the typeof guard at the call sites in sdocToolUpdate /
+    // sdocToolEdit passes — but the body below touches `document`, which
+    // is undefined here. The panel re-renders documents from the next
+    // chat snapshot, so skipping the DOM update is safe.
+    if (typeof document === 'undefined') return;
     var doc = smartDocuments[docId];
     if (!doc) return;
     document.querySelectorAll('[data-doc-id="' + docId + '"]').forEach(function(el) {

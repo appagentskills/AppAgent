@@ -336,9 +336,13 @@ async function executeUpdateActionState(args, options) {
     // (renderActionUpdatesSection) reads update_action_state calls straight from
     // chat.tool_calls. Trigger a sidebar refresh and a title-bar update so the
     // new state shows up everywhere (inline pill next to chat title is always visible).
-    if (typeof renderVersionSidebar === 'function') {
-        try { renderVersionSidebar(); } catch (e) {}
-    }
+    // The sidebar refresh goes through the event bus per architecture-events.md;
+    // the page subscriber calls renderVersionSidebar.
+    AgentEvents.emit('actionStateChanged', {
+        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+        actionId: null,
+        status: args && args.state || null
+    });
     // Pass the in-flight tool_call_id so the pill renderer counts THIS update
     // as completed even though its role:'tool' result row hasn't been pushed
     // yet (the agent loop pushes that row only after this function returns).
@@ -367,20 +371,24 @@ function executeShowActionButton(args, messageIndex, options) {
     var chat = chats[chatId];
     if (!chat) return { success: false, error: 'No active chat' };
     // Push a special message that renders as an inline action button
-    chat.messages.push({
+    var actionBtnMsg = {
         role: 'action_button',
         skillId: skillId,
         actionName: actionName,
         label: args.label || actionName,
         context: args.context || '',
         createdAt: Date.now()
-    });
+    };
+    chat.messages.push(actionBtnMsg);
     saveChatsToStorage();
     if (currentChatId === chatId && currentView === 'chat') {
         renderMessages();
         scrollToBottomIfAllowed();
     }
-    return { success: true };
+    // Mirror to SW so the next agent-event snapshot doesn't wipe the button
+    // message from chat.messages. tool-routing.js splices it before the
+    // tool_result slot for this toolCallId.
+    return { success: true, _message_persist: actionBtnMsg };
 }
 
 // ---------- Lifecycle: start / stop / finish / dismiss ----------
@@ -708,10 +716,23 @@ function renderLiveActionPills() {
     // tagged with `placement-header` so existing header CSS (icon-only mode,
     // responsive collapse, More dropdown) applies unchanged.
     var hh = renderLiveActionPillsHtml('placement-header');
+    // Sub-agent chats: suppress the global live-pill row in the chat header.
+    // The pills are top-level / parent-agent state — e.g. "Security scan
+    // complete", "222 defects found" — and showing them in a sub-agent's
+    // view alongside the "Sub-agent | sleeping | ↳ parent" banner reads as
+    // "the main agent and the sub-agent are mashed together" (the
+    // user-reported "main agent thing showing subagent thing" screenshot).
+    // The jobs-badge dropdown stays available globally, so notifications
+    // are not lost. The home view's pill row is unaffected — home is by
+    // definition not inside a sub-agent.
+    var _curChat = (typeof currentChatId !== 'undefined' && typeof chats !== 'undefined')
+        ? chats[currentChatId] : null;
+    var _suppressForSub = !!(_curChat && _curChat.isSubAgent);
+    var headerHtml = _suppressForSub ? '' : hh;
     var header = document.getElementById('header-actions');
     if (header) {
-        header.innerHTML = hh;
-        header.style.display = hh ? '' : 'none';
+        header.innerHTML = headerHtml;
+        header.style.display = headerHtml ? '' : 'none';
         if (typeof applyHeaderActionsResponsive === 'function') applyHeaderActionsResponsive();
     }
     var homeHeader = document.getElementById('home-header-actions');

@@ -1,7 +1,10 @@
 // IndexedDB for all app data (much larger capacity than localStorage)
 // Use prefix for iframe isolation (separate database for iframe vs standalone)
 var dbName = STORAGE_PREFIX + 'AppAgentDB';
-var dbVersion = 10;
+// Bumped to 12 for the sub_agents store (Phase 2 of the sub-agent
+// architecture spec). Schema migration is additive: existing stores
+// are untouched.
+var dbVersion = 12;
 var workspaceMetaStoreName = 'workspace_meta';
 var workspaceFilesStoreName = 'workspace_files';
 var chatStoreName = 'chats';
@@ -11,6 +14,24 @@ var dashboardWidgetsStoreName = 'dashboardWidgets';
 var apiProvidersStoreName = 'apiProviders';
 var documentsStoreName = 'documents';
 var actionStateStoreName = 'action_state';
+// agent_runs: per-chat run state for the offscreen runtime. Written
+// at every tool boundary by 110-agent-checkpoint.js so a crashed/idle
+// offscreen doc can resume by re-entering the loop from the latest
+// checkpoint. Key is chatId.
+// Schema: { chatId, turn, callNumber, messagesSnapshot, aggregateMetrics,
+//           lastEventAt, status: 'running'|'parked'|'finished'|'errored',
+//           parkedToolCalls: [{toolCallId, name, input, parkedAt}, ...] }
+var agentRunsStoreName = 'agent_runs';
+// sub_agents: persistent per-sub-agent runtime state. Keyed by agent_id.
+// Survives page/SW reload so the worker pool can resume orphaned subs and
+// `agent_status` can report on every spawned sub. Schema:
+//   { agent_id, chat_id, parent_chat_id, parent_agent_id?, name,
+//     state: 'running'|'sleeping'|'stopped'|'errored',
+//     spawn_args, spawn_handle_id, tool_roster,
+//     created_at, last_activity_at, tool_calls_used,
+//     last_report?, inbox: [...], pending_handles: [...],
+//     auto_report, max_tool_calls, summary_cap_bytes }
+var subAgentsStoreName = 'sub_agents';
 var db = null;
 var skills = {};
 var EMBEDDED_SKILLS = /*EMBEDDED_SKILLS_START*/[]/*EMBEDDED_SKILLS_END*/;
@@ -102,6 +123,17 @@ function openDatabase() {
             }
             if (!database.objectStoreNames.contains(actionStateStoreName)) {
                 database.createObjectStore(actionStateStoreName, { keyPath: 'actionId' });
+            }
+            if (!database.objectStoreNames.contains(agentRunsStoreName)) {
+                database.createObjectStore(agentRunsStoreName, { keyPath: 'chatId' });
+            }
+            if (!database.objectStoreNames.contains(subAgentsStoreName)) {
+                var saStore = database.createObjectStore(subAgentsStoreName, { keyPath: 'agent_id' });
+                // Index by parent_chat_id so `agent_status` and the Workers strip
+                // can enumerate every sub owned by a given parent chat without
+                // scanning the whole store.
+                saStore.createIndex('parent_chat_id', 'parent_chat_id', { unique: false });
+                saStore.createIndex('state', 'state', { unique: false });
             }
         };
     });
@@ -452,16 +484,37 @@ async function getAllWorkspaceMetas() {
     } catch (e) { return []; }
 }
 
-// GitHub API call helper — routes through background.js
-function githubApi(method, path, body) {
-    return new Promise(function(resolve) {
-        var msg = { type: 'github-api', method: method, path: path };
-        if (body) { msg.body = body; msg.contentType = 'application/json'; }
-        chrome.runtime.sendMessage(msg, function(response) {
-            if (chrome.runtime.lastError) { resolve({ error: chrome.runtime.lastError.message }); return; }
-            resolve(response || { error: 'No response' });
+// GitHub API call helper. Calls fetch() directly from whichever context invokes
+// it (SW or panel). Previously this round-tripped through background.js via
+// chrome.runtime.sendMessage, but a SW cannot deliver messages to its own
+// onMessage listener, so every call from a tool path (clone/push/etc.) was
+// failing silently with "message port closed". Reading the stored token via
+// chrome.storage.local works the same in both contexts.
+async function githubApi(method, path, body) {
+    try {
+        var ghData = await new Promise(function(resolve) {
+            chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
         });
-    });
+        var token = ghData.githubToken;
+        var instanceUrl = ghData.githubInstanceUrl || 'https://github.com';
+        if (!token) return { error: 'No GitHub token configured' };
+        var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl.replace(/\/$/, '') + '/api/v3';
+        var headers = {
+            'Authorization': 'Bearer ' + token,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+        };
+        if (body) headers['Content-Type'] = 'application/json';
+        var opts = { method: method || 'GET', headers: headers, cache: 'no-store' };
+        if (body) opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+        var res = await fetch(apiBase + path, opts);
+        var text = await res.text();
+        var parsed = null;
+        try { parsed = JSON.parse(text); } catch (e) { /* not JSON */ }
+        return { status: res.status, ok: res.ok, body: parsed || text };
+    } catch (e) {
+        return { error: e && e.message ? e.message : String(e) };
+    }
 }
 
 async function getWorkspaceMeta(repo) {

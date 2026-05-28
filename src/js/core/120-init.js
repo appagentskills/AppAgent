@@ -279,6 +279,12 @@ async function init() {
     await loadDashboardWidgets();
     await loadAllDocuments();
     await loadAllActionStates(); // restore in-flight action states from IDB
+    // Restore sub-agent records from IDB. Subs that were `running` at
+    // crash/reload time get re-queued in the worker pool so their loop
+    // resumes from the persisted chat history. See SubAgents.loadAll.
+    if (typeof SubAgents !== 'undefined' && SubAgents.loadAll) {
+        try { await SubAgents.loadAll(); } catch (e) { /* non-fatal */ }
+    }
     cleanupStaleWorkspaces(); // remove old-format workspace metas with no files
     setSetting('defaultWorkspaceRepo', null); // migration: remove stale default pointer
     refreshWorkspaceContext(); // async, no await — non-blocking

@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.0
+
+### Features
+- **New default model: Opus-4-8** — replaces Opus-4-7 in the default provider list. Sonnet 4.6 added as another OAuth option.
+- **Sub-agents** — the agent can spawn helper agents to work on parts of a task in parallel, each with their own chat. Up to two run at a time; extras queue. You see them as separate chats with a "Sub-agent" pill and a Workers strip on the chat list, and you can jump to the parent or stop a worker at any time.
+- **Async tools** — long-running tools no longer block the agent. It can kick a tool off, do other work, and come back to check the result, cancel it, or wait on any of several at once.
+
+### Fixes
+- **Stays signed in** — when the Claude session expires, the extension silently re-authenticates instead of failing the next request.
+- **Retry after rate-limit works** — the Retry button after a 429 actually retries now (previously it silently did nothing and you had to click Continue).
+- **More reliable form fill** — ServiceNow fields with autocomplete or React-based inputs now fire their handlers correctly.
+
+### Other
+- **New permission: `offscreen`** — required so sub-agents and async tools can keep running when the side panel is closed.
+
+---
+
 ## v1.0.6
 
 ### Other

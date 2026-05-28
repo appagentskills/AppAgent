@@ -120,6 +120,12 @@ async function executeIframeTool(args) {
                             _ftChat.targetTabId = _targetTab.id;
                             saveChatsToStorage();
                         }
+                        // Mirror to SW: when the agent loop runs in the SW, its
+                        // chat snapshot doesn't know about this page-side write,
+                        // so the next agent-event would replace chats[chatId] in
+                        // the panel and wipe targetTabId. tool-routing.js applies
+                        // _target_tab_persist back onto the SW's chat object.
+                        var _ftPersist = _targetTab.id;
                         // If wait requested, wait for the tab to finish loading then inject scripts
                         // Otherwise ask background to inject when page loads (non-blocking)
                         if (_waitMs > 0) {
@@ -172,7 +178,7 @@ async function executeIframeTool(args) {
                             chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
                         }
 
-                        return { success: true, message: 'Opened ' + fullTabNavUrl + ' in background tab' };
+                        return { success: true, message: 'Opened ' + fullTabNavUrl + ' in background tab', _target_tab_persist: _ftPersist };
                     }
 
                     // For sidepanel mode with instance targeting, resolve URL before sending
@@ -205,12 +211,15 @@ async function executeIframeTool(args) {
                     return { success: false, error: extResult.error };
                 }
                 // Persist target tab ID on the chat so it survives restarts
+                var _spPersist = null;
                 if (action === 'navigate' && extResult.tabId) {
                     var _navChat = chats[currentChatId];
                     if (_navChat) {
                         _navChat.targetTabId = extResult.tabId;
                         saveChatsToStorage();
                     }
+                    // See full-tab branch above for why we mirror to the SW.
+                    _spPersist = extResult.tabId;
                 }
                 // Map content script response to tool result format
                 if (action === 'get_visible_text') {
@@ -254,7 +263,9 @@ async function executeIframeTool(args) {
                 if (action === 'set_style') {
                     return { success: true, message: extResult.message || ('Styled ' + (extResult.count || '?') + ' element(s)') };
                 }
-                return { success: true, message: extResult.message || 'Action completed' };
+                var _defaultRet = { success: true, message: extResult.message || 'Action completed' };
+                if (_spPersist) _defaultRet._target_tab_persist = _spPersist;
+                return _defaultRet;
             } catch (e) {
                 return { success: false, error: 'Extension browser action failed: ' + e.message };
             }

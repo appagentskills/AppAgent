@@ -1,26 +1,6 @@
-// Map of chatId -> bool: true if the document was hidden at any point during the
-// chat's current agent run. Drives the "Agent finished" browser notification so
-// it still fires when the user came back to read the streaming reply right
-// before the loop ended. Populated at run-start + on every visibilitychange,
-// cleared when the finish-notification check consumes it.
-var _hiddenDuringRun = {};
-function _markAllRunningHidden() {
-    if (typeof runningChatIds !== 'object' || !runningChatIds) return;
-    for (var _cid in runningChatIds) {
-        if (runningChatIds[_cid]) _hiddenDuringRun[_cid] = true;
-    }
-}
-if (typeof document !== 'undefined' && document.addEventListener) {
-    document.addEventListener('visibilitychange', function() {
-        if (document.hidden) _markAllRunningHidden();
-    });
-}
-// Chrome side panels stay document-visible when the user switches windows, so
-// also treat "window lost focus" as away. document.hasFocus() is checked at
-// run-start too (below).
-if (typeof window !== 'undefined' && window.addEventListener) {
-    window.addEventListener('blur', _markAllRunningHidden);
-}
+// PR1: visibility / window-focus tracking + _hiddenDuringRun map moved to
+// src/js/app/035-agent-events.js (notifyFinish handler). The agent loop is
+// DOM-free; UI side effects live in 035.
 
 // Race executeTool against the user-interrupt flag so a long-running tool can be
 // abandoned the instant the user sends a new message. The orphan promise keeps
@@ -62,49 +42,214 @@ function executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgI
     });
 }
 
-// Inject placeholder results for any tool calls that were interrupted (orphan tool_use without tool_result)
+// Assert the Anthropic invariants before an API call. Returns null if the chat
+// shape is valid; otherwise returns a description of the first violation. Used
+// by the agent loop to fail-loud at the exact site rather than letting the
+// model bounce a 400 back with no context about WHERE the invariant broke.
+//
+// `prompt_user` / `approval` / etc. are stripped by `buildAPIMessages` before
+// the request goes out, so they're transparent here — we skip past them when
+// looking for the tool_result slot. (Without this skip, a prompt_user inserted
+// between an assistant's tool_use and its tool_result placeholder would log
+// a noisy false-positive "orphan tool_use" every API call.)
+var _API_VISIBLE_ROLES = { user:1, assistant:1, tool:1, screenshot:1, pdf:1, file:1, context:1, browser_context:1 };
+function assertAnthropicShape(messages) {
+    if (!messages || !messages.length) return null;
+    var knownIds = {};
+    for (var i = 0; i < messages.length; i++) {
+        var m = messages[i];
+        if (m.role === 'assistant' && m.tool_calls) {
+            for (var j = 0; j < m.tool_calls.length; j++) {
+                var tc = m.tool_calls[j];
+                if (tc && tc.id) knownIds[tc.id] = true;
+            }
+            // Locate the tool_result slot: skip any non-API roles (prompt_user,
+            // approval) that buildAPIMessages will strip before the request.
+            var slotStart = i + 1;
+            while (slotStart < messages.length && !_API_VISIBLE_ROLES[messages[slotStart].role]) slotStart++;
+            var slotEnd = slotStart;
+            var slotIds = {};
+            while (slotEnd < messages.length && messages[slotEnd].role === 'tool') {
+                slotIds[messages[slotEnd].tool_call_id] = true;
+                slotEnd++;
+            }
+            for (var jj = 0; jj < m.tool_calls.length; jj++) {
+                var tcj = m.tool_calls[jj];
+                if (!tcj || !tcj.id) continue;
+                if (!slotIds[tcj.id]) {
+                    var next = messages[slotStart];
+                    return 'orphan tool_use ' + tcj.id + ' at msg#' + i + ' (next API-visible msg is ' + (next ? next.role : 'EOF') + ', slot ids ' + Object.keys(slotIds).join(',') + ')';
+                }
+            }
+        }
+        if (m.role === 'tool' && m.tool_call_id && !knownIds[m.tool_call_id]) {
+            return 'stray tool_result ' + m.tool_call_id + ' at msg#' + i + ' (no prior assistant emitted it)';
+        }
+    }
+    return null;
+}
+
+// Find the tool_result slot for an assistant message's tool_call_id and
+// either update the existing placeholder/result in-place, or push a new one.
+// Used by every tool-result write site in the agent loop so the atomic-
+// placeholder invariant (every tool_use has a matching tool_result in the
+// next slot, persisted before tool execution begins) is preserved across
+// SW eviction.
+function recordToolResult(chat, toolCallId, name, content) {
+    if (!chat || !chat.messages || !toolCallId) return null;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m.role !== 'tool') continue;
+        if (m.tool_call_id !== toolCallId) continue;
+        m.content = content;
+        if (name) m.name = name;
+        delete m._placeholder;
+        return m;
+    }
+    var newMsg = { role: 'tool', tool_call_id: toolCallId, name: name || 'unknown', content: content };
+    chat.messages.push(newMsg);
+    return newMsg;
+}
+
+// Atomic-placeholder seed: BEFORE we start executing this assistant turn's
+// tools, push a `[pending]` `role:'tool'` message for every tool_call. This
+// guarantees the persisted chat is ALWAYS a valid Anthropic shape — every
+// `tool_use` block has its matching `tool_result` block in the next slot —
+// even if the SW is evicted between the assistant save (line 692) and the
+// per-tool save inside the execution loop. Tool execution later updates each
+// placeholder in-place via `recordToolResult`; if execution is interrupted
+// (SW death, pause, user-send), the placeholder content stands and the chat
+// remains valid for the next API call.
+//
+// `_placeholder: true` is kept on the message so the next runAgent's pending-
+// tool replay can detect "I started this tool but never updated the result"
+// and decide whether to retry. The flag is dropped the moment a real result
+// (or a real failure) replaces it.
+function seedPlaceholderToolResults(chat, toolCalls) {
+    if (!chat || !chat.messages || !toolCalls || toolCalls.length === 0) return;
+    var seeded = [];
+    for (var i = 0; i < toolCalls.length; i++) {
+        var tc = toolCalls[i];
+        if (!tc || !tc.id) {
+            console.warn('[seed] skipping tool_call with no id', tc);
+            continue;
+        }
+        var already = false;
+        for (var j = chat.messages.length - 1; j >= 0; j--) {
+            var m = chat.messages[j];
+            if (m.role === 'tool' && m.tool_call_id === tc.id) { already = true; break; }
+            if (m.role === 'assistant') break;
+        }
+        if (already) continue;
+        chat.messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            name: tc.function ? tc.function.name : 'unknown',
+            content: '[Tool call pending — agent runtime restarted before result]',
+            _placeholder: true
+        });
+        seeded.push(tc.id);
+    }
+    if (seeded.length) {
+        console.log('[seed] placeholders for', seeded.join(','), '— chat now has', chat.messages.length, 'messages');
+    }
+}
+
+// Migration helper for chats created before the atomic-placeholder design,
+// AND recovery helper for chats whose tool execution was interrupted (SW
+// eviction mid-loop OR user-send that aborts the current stream while a
+// tool is mid-flight). In both cases the assistant `tool_use` block in the
+// next slot may be matched only by a `_placeholder: true` row — not a real
+// result. The pending-replay scan at line ~462 correctly treats a
+// placeholder as unresolved and re-runs the tool, but for user-interrupt
+// re-running is wrong: an `await_handle` waiting on a long sub would
+// re-block on the same handle the user already meant to abandon.
+//
+// This function runs on every runAgent entry and resolves orphan slots:
+//   • A tool_call with NO matching `role:'tool'` row → splice in a new
+//     interrupted-marker row (legacy path; new chats should never hit this
+//     because `seedPlaceholderToolResults` populates the slot eagerly).
+//   • A tool_call whose only matching row is a `_placeholder: true` row →
+//     overwrite its content in-place with the same interrupted marker and
+//     drop `_placeholder`, so the pending-replay scan sees a real result.
+//   • A misplaced REAL row (correct tool_call_id but landed after the slot)
+//     is moved into the slot unchanged.
 function injectInterruptedToolResults(chat) {
     if (!chat || !chat.messages) return false;
-
     var injected = false;
-    for (var i = 0; i < chat.messages.length; i++) {
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
         var msg = chat.messages[i];
         if (msg.role !== 'assistant' || !msg.tool_calls || msg.tool_calls.length === 0) continue;
-
+        var slotStart = i + 1;
+        var slotEnd = slotStart;
+        while (slotEnd < chat.messages.length && chat.messages[slotEnd].role === 'tool') {
+            slotEnd++;
+        }
+        // Only NON-placeholder rows count as "present". Placeholders are
+        // unresolved slot fillers — they exist solely to keep the chat a
+        // valid Anthropic shape while the tool is in-flight. Treating them
+        // as real results here lets an orphan placeholder survive runAgent
+        // forever; the line-462 replay scan then re-runs the tool on every
+        // turn (the `await_handle` re-block loop described in PR #244).
+        var presentIds = {};
+        var placeholderIdxById = {};
+        for (var rj = slotStart; rj < slotEnd; rj++) {
+            var row = chat.messages[rj];
+            if (row._placeholder) {
+                placeholderIdxById[row.tool_call_id] = rj;
+            } else {
+                presentIds[row.tool_call_id] = true;
+            }
+        }
         for (var j = 0; j < msg.tool_calls.length; j++) {
             var tc = msg.tool_calls[j];
-            var hasResult = false;
-
-            // Look for matching tool result after this message
-            for (var k = i + 1; k < chat.messages.length; k++) {
-                if (chat.messages[k].role === 'tool' && chat.messages[k].tool_call_id === tc.id) {
-                    hasResult = true;
+            if (!tc || !tc.id) continue;
+            if (presentIds[tc.id]) continue;
+            var hasPendingPrompt = false;
+            for (var p = 0; p < chat.messages.length; p++) {
+                if (chat.messages[p].role === 'prompt_user' && chat.messages[p].toolCallId === tc.id && chat.messages[p].status === 'pending') {
+                    hasPendingPrompt = true;
                     break;
                 }
             }
-
-            if (!hasResult) {
-                // Skip tool calls that have a pending prompt_user (user hasn't submitted yet)
-                var hasPendingPrompt = false;
-                for (var p = 0; p < chat.messages.length; p++) {
-                    if (chat.messages[p].role === 'prompt_user' && chat.messages[p].toolCallId === tc.id && chat.messages[p].status === 'pending') {
-                        hasPendingPrompt = true;
-                        break;
-                    }
+            if (hasPendingPrompt) continue;
+            // Placeholder branch: overwrite in-place, drop the flag. No
+            // splice — the slot length doesn't change, so slotEnd stays
+            // correct for subsequent iterations.
+            var placeholderIdx = placeholderIdxById[tc.id];
+            if (typeof placeholderIdx === 'number') {
+                var ph = chat.messages[placeholderIdx];
+                ph.content = '[Tool call interrupted by user - no result available]';
+                if (!ph.name) ph.name = tc.function ? tc.function.name : 'unknown';
+                delete ph._placeholder;
+                presentIds[tc.id] = true;
+                delete placeholderIdxById[tc.id];
+                msg.isStreaming = false;
+                injected = true;
+                continue;
+            }
+            var misplacedIdx = -1;
+            for (var k = slotEnd; k < chat.messages.length; k++) {
+                if (chat.messages[k].role === 'tool' && chat.messages[k].tool_call_id === tc.id) {
+                    misplacedIdx = k;
+                    break;
                 }
-                if (hasPendingPrompt) continue;
-
-                // Inject placeholder result for this orphan tool call
-                chat.messages.push({
+            }
+            if (misplacedIdx !== -1) {
+                var moved = chat.messages.splice(misplacedIdx, 1)[0];
+                chat.messages.splice(slotEnd, 0, moved);
+            } else {
+                chat.messages.splice(slotEnd, 0, {
                     role: 'tool',
                     tool_call_id: tc.id,
                     name: tc.function ? tc.function.name : 'unknown',
                     content: '[Tool call interrupted by user - no result available]'
                 });
-                // Clear streaming state on the interrupted message
-                msg.isStreaming = false;
-                injected = true;
             }
+            slotEnd++;
+            presentIds[tc.id] = true;
+            msg.isStreaming = false;
+            injected = true;
         }
     }
     return injected;
@@ -227,31 +372,29 @@ async function executePendingApprovedTools(chat) {
                 }
             }
             
-            showSpinner('Executing ' + msg.toolName + '...', chat && chat.id);
+            var _chatId = chat && chat.id;
+            AgentEvents.emit('toolCallStarted', { chatId: _chatId, toolCallId: msg.toolCallId, name: toolName, displayName: msg.toolName, input: args });
             try {
                 // executeTool checks for existing approval via requestProgrammaticToolApproval
                 var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
-                hideSpinner(chat && chat.id);
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
-                chat.messages.push({
-                    role: 'tool',
-                    tool_call_id: msg.toolCallId,
-                    name: toolName,
-                    content: processed.content
-                });
+                // recordToolResult overwrites the seeded placeholder in-place. Main's
+                // push-to-end was correct because end-of-array == slot-after-assistant
+                // (no placeholders). With approval messages + atomic placeholders
+                // separating the assistant from the end, pushing here would land the
+                // result after the approval row — invalid Anthropic shape. In-place
+                // update produces the same final shape main did: one tool_result row
+                // in the slot immediately after the assistant.
+                recordToolResult(chat, msg.toolCallId, toolName, processed.content);
                 saveChatsToStorage();
-                renderMessages();
+                // force: true — main called renderMessages() unconditionally here
+                // (no currentChatId gate). The flag tells the handler to match.
+                AgentEvents.emit('toolCallResult', { chatId: _chatId, toolCallId: msg.toolCallId, name: toolName, result: result, force: true });
             } catch (e) {
-                hideSpinner(chat && chat.id);
-                chat.messages.push({
-                    role: 'tool',
-                    tool_call_id: msg.toolCallId,
-                    name: toolName,
-                    content: JSON.stringify({ success: false, error: e.message })
-                });
+                recordToolResult(chat, msg.toolCallId, toolName, JSON.stringify({ success: false, error: e.message }));
                 saveChatsToStorage();
-                renderMessages();
+                AgentEvents.emit('toolCallResult', { chatId: _chatId, toolCallId: msg.toolCallId, name: toolName, error: e, force: true });
             }
         }
     }
@@ -264,36 +407,23 @@ async function runAgent(overrideChatId) {
     // Per-chat concurrency: block only if THIS chat is already running.
     if (runningChatIds[streamingChatId]) return;
     runningChatIds[streamingChatId] = true;
-    // Track whether the document was hidden at any point during this run, so the
-    // "Agent finished" notification still fires if the user came back to read the
-    // streaming reply right before the loop ended. document.hidden at finish-time
-    // alone is too narrow — the approval popup wins this race because it fires
-    // immediately, while finish fires after the user has likely returned.
-    _hiddenDuringRun[streamingChatId] = !!document.hidden || (typeof document.hasFocus === 'function' && !document.hasFocus());
-    // Refresh chat list so the streaming indicator appears immediately on this chat.
-    if (typeof renderChatList === 'function') renderChatList();
+    // PR1: runStarted handler (035-agent-events.js) owns the foreground UI
+    // setup (pause button, is-streaming class, retry/continue cleanup) AND
+    // captures the initial document.hidden / hasFocus state for the
+    // finish-notification heuristic. The loop just emits.
+    //
+    // The emit is INSIDE the try so the finally still runs and clears
+    // runningChatIds even if a UI handler throws — same safety net the
+    // original had when the foreground-UI block lived inside the try.
+    var chat;
+    var isBackgroundRun;
     // try/finally guarantees the per-chat running flag is cleared even if the
     // body throws — without this, an uncaught error would leave the streaming
     // dot spinning forever AND block future sends via the early-return at top.
     try {
-    var chat = chats[streamingChatId];
-    var isBackgroundRun = !!(chat && chat.isBackground);
-
-    // UI-state globals only apply when the currently-viewed chat is the one streaming
-    if (!isBackgroundRun || streamingChatId === currentChatId) {
-        isRunning = true;
-        isFollowingStreamingScroll = true; // Reset scroll tracking
-        lastApiError = null; // Clear any previous error
-        hideRetryButton(); // Hide retry button when starting new run
-        hideContinueButton(); // Hide continue button when actually running
-        showPauseButton();
-        var messagesEl = document.getElementById('messages');
-        if (messagesEl) messagesEl.classList.add('is-streaming');
-        activeStreamingChatId = streamingChatId; // Set focused-stream tracker for navigation handling
-    } else {
-        // Background chat running while PM views a different chat — don't touch foreground UI flags
-        lastApiError = null;
-    }
+    chat = chats[streamingChatId];
+    isBackgroundRun = !!(chat && chat.isBackground);
+    AgentEvents.emit('runStarted', { chatId: streamingChatId, turn: -1 });
 
     // Execute any approved tool calls that don't have results yet
     await executePendingApprovedTools(chat);
@@ -353,13 +483,19 @@ async function runAgent(overrideChatId) {
         var pm = chat.messages[pi];
         if (pm.role === 'user') break; // Stop at last user message
         if (pm.role === 'assistant' && pm.tool_calls && pm.tool_calls.length > 0 && !pm.isSummary) {
-            // Check which tool calls don't have results yet
+            // Check which tool calls don't have results yet. Seeded
+            // placeholders (role:'tool' with _placeholder:true) count as
+            // UNPROCESSED — they exist only to satisfy the Anthropic shape
+            // invariant during execution; on resume we still need to
+            // actually run the tool, otherwise the model sees the
+            // "[Tool call pending …]" placeholder text as the real result.
             var unprocessed = [];
             for (var pti = 0; pti < pm.tool_calls.length; pti++) {
                 var ptc = pm.tool_calls[pti];
                 var hasResult = false;
                 for (var pri = pi + 1; pri < chat.messages.length; pri++) {
-                    if (chat.messages[pri].role === 'tool' && chat.messages[pri].tool_call_id === ptc.id) {
+                    var prm = chat.messages[pri];
+                    if (prm.role === 'tool' && prm.tool_call_id === ptc.id && !prm._placeholder) {
                         hasResult = true;
                         break;
                     }
@@ -391,36 +527,48 @@ async function runAgent(overrideChatId) {
                 args = normalizeToolArgs(args);
             } catch (parseErr) {
                 console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
-                chat.messages.push({
-                    role: 'tool',
-                    tool_call_id: tc.id,
-                    name: toolName,
-                    content: JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message })
-                });
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
             }
 
             var displayName = getToolDisplayName(toolName, args.method || args.action);
-            showSpinner('Executing ' + displayName + '...', streamingChatId);
-            var result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId });
-            hideSpinner(streamingChatId);
+            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            // Match main: tool throws propagate to the outer try/finally → runCrashed.
+            // Before re-throwing we drop the _placeholder marker on this and every
+            // subsequent unrun tool (record a real result), otherwise the next
+            // runAgent's pending-replay sees them as unprocessed placeholders and
+            // re-runs them — looping forever on a deterministic throw. Main got
+            // this for free because there were no placeholders; sendMessage's
+            // injectInterruptedToolResults later filled the orphans with the same
+            // "[interrupted]" content these recordToolResult calls write here.
+            var result;
+            try {
+                result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId });
+            } catch (toolErr) {
+                console.error('[agent-loop] tool execution threw during pending-replay for ' + toolName, toolErr);
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: (toolErr && toolErr.message) ? toolErr.message : String(toolErr) }));
+                for (var prj = pci + 1; prj < pendingToolCalls.length; prj++) {
+                    var prjtc = pendingToolCalls[prj].tc;
+                    recordToolResult(chat, prjtc.id, prjtc.function ? prjtc.function.name : 'unknown', '[Tool call interrupted by user - no result available]');
+                }
+                saveChatsToStorage();
+                throw toolErr;
+            }
 
-            // User-interrupt during pending-tool replay — abandon and exit.
+            // User-interrupt during pending-tool replay — abandon remaining tools.
+            // Their placeholders stay in chat.messages so the Anthropic shape is
+            // valid; we just overwrite the placeholder content with an explanatory
+            // note so the model knows on the next turn.
             if (result && result._interrupted) {
                 for (var rj = pci; rj < pendingToolCalls.length; rj++) {
                     var rjtc = pendingToolCalls[rj].tc;
-                    chat.messages.push({
-                        role: 'tool',
-                        tool_call_id: rjtc.id,
-                        name: rjtc.function ? rjtc.function.name : 'unknown',
-                        content: '[Tool call abandoned — user sent a new message]'
-                    });
+                    recordToolResult(chat, rjtc.id, rjtc.function ? rjtc.function.name : 'unknown', '[Tool call abandoned — user sent a new message]');
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: 'user_message' });
                 break;
             }
 
@@ -430,17 +578,12 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            chat.messages.push({
-                role: 'tool',
-                tool_call_id: tc.id,
-                name: toolName,
-                content: processed.content
-            });
+            recordToolResult(chat, tc.id, toolName, processed.content);
             // Defer screenshot messages so they don't interleave between tool results
             if (screenshotMsg) deferredScreenshots.push(screenshotMsg);
             if (screenshotMsgs) screenshotMsgs.forEach(function(sm) { deferredScreenshots.push(sm); });
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: result });
         }
         // Push all screenshot messages after all tool results
         if (deferredScreenshots.length > 0) {
@@ -450,7 +593,7 @@ async function runAgent(overrideChatId) {
                 if (_fid) registerFile(_fid, { type: 'chat', chatId: streamingChatId, msgIndex: chat.messages.length - 1 });
             });
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('messagesAppended', { chatId: streamingChatId, reason: 'deferred_screenshots' });
         }
 
         // Flush any user message/images injected during tool execution
@@ -460,22 +603,20 @@ async function runAgent(overrideChatId) {
         // injection on chat A just because chat B is paused.
         if (!isChatPaused(streamingChatId) && flushPendingInjection(chat)) {
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('userInjected', { chatId: streamingChatId });
         }
 
         if (isChatPaused(streamingChatId)) {
-            // Paused during pending tool processing - exit cleanly
-            hideSpinner(streamingChatId);
-            isRunning = false;
-            showSnackbar('Agent paused. Click Resume to continue.');
-            isFollowingScroll = true;
+            // Paused during pending tool processing - exit cleanly. The 'paused'
+            // handler owns isRunning / isFollowingScroll writes.
+            AgentEvents.emit('paused', { chatId: streamingChatId });
             fetchCredits();
             return;
         }
     }
 
     while (!isChatPaused(streamingChatId)) {
-        showSpinner('Waiting for response...', streamingChatId);
+        AgentEvents.emit('turnStarted', { chatId: streamingChatId, turn: lastUserMsgIndex, callNumber: callNumber + 1 });
         callNumber++;
 
         // Reset metrics and start timing for this request
@@ -492,8 +633,7 @@ async function runAgent(overrideChatId) {
         };
         var msgIndex = chat.messages.length;
         chat.messages.push(assistantMsg);
-        if (currentChatId === streamingChatId) renderMessages();
-        hideSpinner(streamingChatId);
+        AgentEvents.emit('assistantMessageStarted', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg });
 
         // Declare BEFORE try so the catch block's clearInterval is always safe even
         // if setInterval itself throws (defensive — extremely unlikely but cheap).
@@ -502,39 +642,40 @@ async function runAgent(overrideChatId) {
             streamUpdateInterval = setInterval(function() {
                 // Force UI update while streaming to show activity
                 if (assistantMsg.isStreaming) {
-                    try {
-                        updateStreamingMessage(msgIndex, assistantMsg, streamingChatId);
-                    } catch (e) {
-                        console.error('Stream interval update error:', e);
-                    }
+                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'interval' });
                 }
             }, 1000);
             
+            // Diagnostic: if the chat shape would 400 Anthropic, log a precise
+            // breakdown before the API call. We let the call go through so the
+            // server's exact rejection still surfaces — but the SW console now
+            // tells us WHICH message and WHICH tool_call_id is at fault.
+            var _shapeViolation = assertAnthropicShape(chat.messages);
+            if (_shapeViolation) {
+                console.error('[agent-loop] pre-API invariant violation: ' + _shapeViolation, {
+                    chatId: streamingChatId,
+                    msgs: chat.messages.map(function(m, idx) {
+                        return idx + ':' + m.role +
+                            (m.tool_calls ? '[' + m.tool_calls.map(function(t) { return t && t.id; }).join(',') + ']' : '') +
+                            (m.tool_call_id ? '(' + m.tool_call_id + ')' : '') +
+                            (m._placeholder ? '*' : '');
+                    })
+                });
+            }
+
             await callLLMStreaming(
                 chat.messages,
                 function(thinking) {
                     assistantMsg.thinking = thinking;
-                    try {
-                        updateStreamingMessage(msgIndex, assistantMsg, streamingChatId);
-                    } catch (e) {
-                        console.error('Thinking update error:', e);
-                    }
+                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'thinking', delta: thinking });
                 },
                 function(content) {
                     assistantMsg.content = content;
-                    try {
-                        updateStreamingMessage(msgIndex, assistantMsg, streamingChatId);
-                    } catch (e) {
-                        console.error('Content update error:', e);
-                    }
+                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'text', delta: content });
                 },
                 function(toolCalls) {
                     assistantMsg.tool_calls = toolCalls;
-                    try {
-                        updateStreamingMessage(msgIndex, assistantMsg, streamingChatId);
-                    } catch (e) {
-                        console.error('Tool calls update error:', e);
-                    }
+                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'tool_input', delta: toolCalls });
                 },
                 function(final) {
                     assistantMsg.thinking = final.thinking || '';
@@ -565,18 +706,34 @@ async function runAgent(overrideChatId) {
                 }
                 if (flushPendingInjection(chat)) {
                     saveChatsToStorage();
-                    if (currentChatId === streamingChatId) renderMessages();
+                    AgentEvents.emit('userInjected', { chatId: streamingChatId });
                 }
-                hideSpinner(streamingChatId);
+                AgentEvents.emit('streamAborted', { chatId: streamingChatId });
                 continue; // Restart the loop with the user's queued message in context
             }
 
-            isFollowingScroll = true; // Reset scroll flag on error
-            lastApiError = { message: e.message, chatId: streamingChatId, timestamp: Date.now() };
-            showSnackbar('API Error: ' + e.message, 'error');
+            // Match main verbatim: isFollowingScroll=true is set BEFORE lastApiError
+            // (main line 577, before line 578). Keeping it in the loop body — instead
+            // of folding it into the 'error' handler — preserves the original write
+            // order of state vs. lastApiError around the emit.
+            isFollowingScroll = true;
+            console.error('[agent-loop] caught during stream for chat ' + streamingChatId + ':', e);
+            // Build a safe error envelope: structured clone strips non-Error
+            // properties, so capture message/name/stack into a plain object
+            // that survives the postMessage to panels.
+            var errEnv;
+            if (e instanceof Error) {
+                errEnv = { name: e.name, message: e.message, stack: e.stack };
+            } else if (typeof e === 'string') {
+                errEnv = { message: e };
+            } else if (e && typeof e === 'object') {
+                errEnv = { name: e.name || 'Error', message: e.message || JSON.stringify(e), raw: e };
+            } else {
+                errEnv = { message: String(e) };
+            }
+            lastApiError = { message: errEnv.message, chatId: streamingChatId, timestamp: Date.now() };
             chat.messages.pop();
-            if (currentChatId === streamingChatId) renderMessages();
-            showRetryButton(); // Show retry button for network errors
+            AgentEvents.emit('error', { chatId: streamingChatId, error: errEnv, recoverable: true });
             break;
         }
 
@@ -614,26 +771,37 @@ async function runAgent(overrideChatId) {
         // Track model and accumulate cost on chat
         chat.model = currentProvider;
         chat.totalCost = (chat.totalCost || 0) + (lastRequestMetrics.cost || 0);
-        
+
         delete chat.isTemporary;
+
+        // Atomic-placeholder seeding: BEFORE the first save that persists the
+        // assistant message with its tool_calls, push a `[pending]` tool_result
+        // placeholder for every tool_call. From this save onward, the persisted
+        // chat is ALWAYS a valid Anthropic shape — every tool_use has its
+        // tool_result in the next slot. SW eviction between this point and the
+        // per-tool save inside the execution loop can't strand an orphan because
+        // the placeholder satisfies the invariant; the actual tool result just
+        // overwrites the placeholder content in-place when it completes.
+        seedPlaceholderToolResults(chat, assistantMsg.tool_calls);
+
         saveChatsToStorage();
-        if (currentChatId === streamingChatId) renderMessages();
-        renderChatList();
-        updateContextIndicator(); // Update after each API call, not just at the end
+        AgentEvents.emit('assistantMessage', { chatId: streamingChatId, turn: lastUserMsgIndex, message: assistantMsg, metrics: assistantMsg.metrics });
 
         if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
             // If there's a pending injection, push it and continue the loop
             // so the agent sees the user's message in the next API call
             if (flushPendingInjection(chat)) {
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('userInjected', { chatId: streamingChatId });
                 continue; // Next iteration calls callLLMStreaming with the injected message
             }
             break;
         }
 
-        // Calculate assistant message index
-        var assistantMsgIndex = chat.messages.length - 1;
+        // Assistant message index: with atomic placeholders seeded, chat.messages
+        // length now sits past the placeholders, so find the assistantMsg's
+        // actual position. (Used by tool implementations and widget bookkeeping.)
+        var assistantMsgIndex = chat.messages.indexOf(assistantMsg);
 
         var deferredScreenshots = [];
         for (var i = 0; i < assistantMsg.tool_calls.length; i++) {
@@ -644,16 +812,11 @@ async function runAgent(overrideChatId) {
             if (userInterruptedChats[streamingChatId]) {
                 for (var ri = i; ri < assistantMsg.tool_calls.length; ri++) {
                     var rtc = assistantMsg.tool_calls[ri];
-                    chat.messages.push({
-                        role: 'tool',
-                        tool_call_id: rtc.id,
-                        name: rtc.function ? rtc.function.name : 'unknown',
-                        content: '[Tool call interrupted by user — user sent a new message]'
-                    });
+                    recordToolResult(chat, rtc.id, rtc.function ? rtc.function.name : 'unknown', '[Tool call interrupted by user — user sent a new message]');
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, reason: 'user_message' });
                 break;
             }
             var tc = assistantMsg.tool_calls[i];
@@ -664,26 +827,48 @@ async function runAgent(overrideChatId) {
                 args = normalizeToolArgs(args);
             } catch (parseErr) {
                 console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
-                chat.messages.push({
-                    role: 'tool',
-                    tool_call_id: tc.id,
-                    name: toolName,
-                    content: JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message })
-                });
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
             }
 
             var displayName = getToolDisplayName(toolName, args.method || args.action);
-            showSpinner('Executing ' + displayName + '...', streamingChatId);
-            var result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId });
-            hideSpinner(streamingChatId);
+            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            // Every tool_use already has a placeholder tool_result (seeded by
+            // `seedPlaceholderToolResults` when the assistant turn was finalized).
+            // `recordToolResult` overwrites that placeholder in-place; the chat
+            // remains in a valid Anthropic shape at every save point, so SW
+            // eviction between here and the per-tool save can never strand an
+            // orphan `tool_use`.
+            //
+            // Match main: tool throws propagate to the outer try/finally → runCrashed.
+            // Before re-throwing we drop the _placeholder marker on this and every
+            // subsequent unrun tool (record a real result), otherwise the next
+            // runAgent's pending-replay sees them as unprocessed placeholders and
+            // re-runs them — looping forever on a deterministic throw. Main got
+            // this for free because there were no placeholders; sendMessage's
+            // injectInterruptedToolResults later filled the orphans with the same
+            // "[interrupted]" content these recordToolResult calls write here.
+            var result;
+            try {
+                result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId });
+            } catch (toolErr) {
+                console.error('[agent-loop] tool execution threw for ' + toolName, toolErr);
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: (toolErr && toolErr.message) ? toolErr.message : String(toolErr) }));
+                for (var rti = i + 1; rti < assistantMsg.tool_calls.length; rti++) {
+                    var rttc = assistantMsg.tool_calls[rti];
+                    recordToolResult(chat, rttc.id, rttc.function ? rttc.function.name : 'unknown', '[Tool call interrupted by user - no result available]');
+                }
+                saveChatsToStorage();
+                throw toolErr;
+            }
 
             // Interrupt landed while this tool was running — abandon it (orphan
-            // promise resolves later and its result is discarded), inject placeholder
-            // results for this and all remaining tool calls, and exit so the queued
-            // user message (or pause cleanup) is handled below.
+            // promise resolves later and its result is discarded), update
+            // placeholders for this and all remaining tool calls with an
+            // abandon-reason note, and exit so the queued user message (or pause
+            // cleanup) is handled below.
             //
             // Two distinct triggers share this branch:
             //   1. sendMessage (`:884`) — sets `userInterruptedChats[chatId] = true`
@@ -698,16 +883,11 @@ async function runAgent(overrideChatId) {
                     : '[Tool call abandoned — paused by user]';
                 for (var ri2 = i; ri2 < assistantMsg.tool_calls.length; ri2++) {
                     var rtc2 = assistantMsg.tool_calls[ri2];
-                    chat.messages.push({
-                        role: 'tool',
-                        tool_call_id: rtc2.id,
-                        name: rtc2.function ? rtc2.function.name : 'unknown',
-                        content: _placeholder
-                    });
+                    recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _placeholder);
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
-                if (currentChatId === streamingChatId) renderMessages();
+                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: _wasUserMessage ? 'user_message' : 'paused' });
                 break;
             }
 
@@ -717,13 +897,8 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            var toolResultIdx = chat.messages.length;
-            chat.messages.push({
-                role: 'tool',
-                tool_call_id: tc.id,
-                name: toolName,
-                content: processed.content
-            });
+            var resultMsg = recordToolResult(chat, tc.id, toolName, processed.content);
+            var toolResultIdx = chat.messages.indexOf(resultMsg);
             // Correct widget msgIndex if approval messages shifted it
             if (result.widgetId) {
                 var wList = getWidgetsForChat(streamingChatId);
@@ -735,7 +910,7 @@ async function runAgent(overrideChatId) {
             if (screenshotMsg) deferredScreenshots.push(screenshotMsg);
             if (screenshotMsgs) screenshotMsgs.forEach(function(sm) { deferredScreenshots.push(sm); });
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: result });
 
         }
         // Push all screenshot messages after all tool results
@@ -746,14 +921,14 @@ async function runAgent(overrideChatId) {
                 if (_fid) registerFile(_fid, { type: 'chat', chatId: streamingChatId, msgIndex: chat.messages.length - 1 });
             });
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('messagesAppended', { chatId: streamingChatId, reason: 'deferred_screenshots' });
         }
 
         // Flush any user message/images injected during tool execution
         // Skip if paused — tool results may be incomplete (orphaned tool_use blocks)
         if (!isChatPaused(streamingChatId) && flushPendingInjection(chat)) {
             saveChatsToStorage();
-            if (currentChatId === streamingChatId) renderMessages();
+            AgentEvents.emit('userInjected', { chatId: streamingChatId });
         }
 
         if (isChatPaused(streamingChatId)) break;
@@ -780,24 +955,32 @@ async function runAgent(overrideChatId) {
             isSummary: true
         });
         saveChatsToStorage();
-        if (currentChatId === streamingChatId) renderMessages();
+        AgentEvents.emit('messagesAppended', { chatId: streamingChatId, reason: 'aggregate_summary' });
     }
 
-    hideSpinner(streamingChatId);
-    // Clear per-chat running flag
+    // === Finish: non-UI state cleanup ===
+    // Clear per-chat running flag BEFORE emitting runFinished so the
+    // handler's renderChatList sees the indicator should be hidden.
     delete runningChatIds[streamingChatId];
-    // Refresh chat list so the streaming indicator disappears for this chat.
-    if (typeof renderChatList === 'function') renderChatList();
     // Only clear global foreground UI flags if this chat was the foreground one
     if (activeStreamingChatId === streamingChatId) {
         isRunning = false;
         activeStreamingChatId = null; // Clear streaming tracker
     }
-    // Preserve injection data when paused — it will be flushed after resume completes pending tools
+    // Preserve injection data when paused — it will be flushed after resume completes pending tools.
+    // Sub-agent finish race: agent_message can arrive between the last
+    // flushPendingInjection (line 757 / 893) and this cleanup, setting
+    // pendingInjectionsByChatId AFTER the loop already decided to exit.
+    // SubAgents.onSubAgentRunFinished's backstop (097-sub-agent-registry.js)
+    // re-queues the sub when it sees a pendingInjection — wiping it here
+    // would lose the parent's message. Keep the entry around for sub-agent
+    // chats so the backstop can act on it.
     if (!isChatPaused(streamingChatId)) {
         pendingInjection = null;
         pendingInjectionImages = null;
-        delete pendingInjectionsByChatId[streamingChatId];
+        if (!(chat && chat.isSubAgent)) {
+            delete pendingInjectionsByChatId[streamingChatId];
+        }
     }
     // Clear any leftover interrupt flag so the next run starts clean.
     userInterruptedChats[streamingChatId] = false;
@@ -805,273 +988,80 @@ async function runAgent(overrideChatId) {
     if (chat && chat.isBackground && chat.actionId && typeof finishActionIfDone === 'function') {
         try { await finishActionIfDone(streamingChatId); } catch (e) {}
     }
-    var messagesEl = document.getElementById('messages');
-    if (messagesEl) {
-        messagesEl.classList.remove('is-streaming');
+    // If this was a sub-agent chat, settle the parent's spawn handle (if the
+    // sub finished naturally without calling report_to_parent) and park the
+    // sub. Without this, the parent's `await_handle` would hang forever on a
+    // sub that just returned a final assistant text without explicitly
+    // reporting. See SubAgents.onSubAgentRunFinished.
+    if (chat && chat.isSubAgent && typeof SubAgents !== 'undefined' && SubAgents.onSubAgentRunFinished) {
+        // Pass an explicit reason so the hook can distinguish a run that
+        // ended in an API error from one that simply finished without
+        // calling report_to_parent. Without this signal, auto_report
+        // synthesizes status:'done' over an errored run and the parent
+        // unblocks with a false-positive success.
+        var _finishReason = lastApiError ? 'errored' : 'completed';
+        try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: lastApiError || null }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
     }
-    // Reset silent hook flag before final render so messages are properly displayed
+    // Reset silent hook flag before the UI handler runs the final render so
+    // messages are properly displayed. Capture the pre-reset value for the
+    // notification gate (notifyFinish below).
     var wasSilentHook = _silentHookRunning;
     _silentHookRunning = false;
-    if (currentChatId === streamingChatId) renderMessages();
-    updateContextIndicator(); // Update now that streaming is done
 
-    // Only hide pause button if not paused - keep visible so user can resume
-    if (isChatPaused(streamingChatId)) {
-        // Make sure the button label reflects the actual paused state — covers any
-        // race where togglePause set it but a later UI sync clobbered it back to "Pause".
-        if (typeof syncPauseButtonUI === 'function') syncPauseButtonUI(streamingChatId);
-        showSnackbar('Agent paused. Click Resume to continue.');
-    } else {
-        hidePauseButton();
-        // If the run ended but the chat still looks interrupted (e.g. error mid-tool),
-        // surface the Continue button so the user can resume manually.
-        if (currentChatId === streamingChatId) {
-            refreshContinueButtonForChat(streamingChatId);
-        }
-    }
-    isFollowingScroll = true; // Reset scroll flag when agent run fully completes
-    
+    // === Finish: emit UI cleanup ===
+    // Handler in 035-agent-events.js does: hideSpinner, renderChatList,
+    // remove is-streaming class, renderMessages, updateContextIndicator,
+    // and the paused-vs-finished pause-button branch.
+    // The 'runFinished' handler owns the isFollowingScroll reset now (matching
+    // main's ordering: after the pause-vs-finish UI branch, before hooks).
+    AgentEvents.emit('runFinished', {
+        chatId: streamingChatId,
+        reason: lastApiError ? 'errored' : (isChatPaused(streamingChatId) ? 'paused' : 'completed'),
+        isPaused: isChatPaused(streamingChatId),
+        hasError: !!lastApiError
+    });
+
     // Execute after-response hooks (only if not paused and no error occurred)
     // Per-chat pause check: a paused background chat must not gate hooks for the
     // chat that just finished.
-    if (!isChatPaused(streamingChatId) && !lastApiError) {
+    // Sub-agent chats are invisible to the human and run in service of a parent;
+    // PM-facing hooks (auto-title, etc.) would burn tokens and surface nothing.
+    if (!isChatPaused(streamingChatId) && !lastApiError && !(chat && chat.isSubAgent)) {
         executeAfterResponseHooks(streamingChatId);
     }
-    
+
     // Refresh credits after API calls complete
     fetchCredits();
 
     // Send browser notification when agent finishes in the background.
-    // Fire if the document is hidden NOW *or* was hidden at any point during the
-    // run — covers the common case where the user switched away while the agent
-    // was working and switched back just as it finished.
-    // Per-chat pause check: a paused different chat must not suppress this chat's notification.
-    var _wasHidden = !!_hiddenDuringRun[streamingChatId];
-    delete _hiddenDuringRun[streamingChatId];
-    var _awayNow = document.hidden || (typeof document.hasFocus === 'function' && !document.hasFocus());
-    if (!isChatPaused(streamingChatId) && !wasSilentHook && (_awayNow || _wasHidden)) {
-        var _nc = chats[streamingChatId];
-        var title = _nc && _nc.title ? _nc.title : 'Chat';
-        var hasError = !!lastApiError;
-        Platform.sendNotification({
-            title: hasError ? 'Agent stopped — error' : 'Agent finished',
-            message: title,
-            chatId: streamingChatId
-        });
-    }
+    // notifyFinish handler decides based on document.hidden / hasFocus +
+    // the wasHidden-during-run flag tracked in 035. Kept distinct from
+    // runFinished so it fires AFTER hooks + fetchCredits, matching the
+    // original ordering.
+    AgentEvents.emit('notifyFinish', {
+        chatId: streamingChatId,
+        isPaused: isChatPaused(streamingChatId),
+        wasSilentHook: wasSilentHook,
+        hasError: !!lastApiError
+    });
     } finally {
         // Safety net for uncaught throws inside the agent loop body. The
-        // normal-path cleanup above already deletes this flag (and re-renders
-        // the chat list); this only fires when the body threw before reaching
-        // it. Without the guard, the streaming dot would spin forever and
-        // future sends would be blocked by the early-return at function top.
+        // normal-path cleanup above already deletes this flag (and the
+        // runFinished handler re-renders the chat list); this only fires
+        // when the body threw before reaching it. Without the guard, the
+        // streaming dot would spin forever and future sends would be blocked
+        // by the early-return at function top. The runCrashed event keeps
+        // the loop fully emit-only — handler in 035-agent-events.js owns
+        // the chat list refresh.
         if (runningChatIds[streamingChatId]) {
             delete runningChatIds[streamingChatId];
-            if (typeof renderChatList === 'function') renderChatList();
+            AgentEvents.emit('runCrashed', { chatId: streamingChatId });
         }
     }
 }
 
-async function sendMessage() {
-    var input = document.getElementById('message-input');
-    var message = input.value.trim();
-
-    // Allow sending if we have a message OR pending images
-    if (!message && pendingImageAttachments.length === 0) return;
-
-    // During streaming: queue message and images to inject after current tool results.
-    // Gate on the PER-CHAT running flag, not the global `isRunning`. The global tracks
-    // foreground UI state and can be incidentally true (e.g. after revealing a background
-    // action chat then navigating away) even when the chat the user is currently typing
-    // in has no active stream. Queueing in that case sends the message into the wrong chat.
-    if (runningChatIds[currentChatId]) {
-        // Build user message content with attachment labels (same as normal path)
-        var injImageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;
-        var injPdfCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'pdf'; }).length;
-        var injFileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
-        var injDocCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; }).length;
-        var injAttachLabel = '';
-        if (injImageCount > 0 || injPdfCount > 0 || injFileCount > 0 || injDocCount > 0) {
-            var injParts = [];
-            if (injImageCount > 0) injParts.push(injImageCount + ' image(s)');
-            if (injPdfCount > 0) injParts.push(injPdfCount + ' PDF(s)');
-            if (injFileCount > 0) injParts.push(injFileCount + ' file(s)');
-            if (injDocCount > 0) injParts.push(injDocCount + ' document(s)');
-            injAttachLabel = '[User attached ' + injParts.join(' and ') + ']';
-        }
-        // Concatenate with any existing queued message for THIS chat — never overwrite.
-        // Without this, sending a second message during the abort/restart window silently
-        // dropped the first one (the per-chat entry was a flat replace).
-        var _newText = message || injAttachLabel;
-        var _newImages = pendingImageAttachments.length > 0 ? pendingImageAttachments.slice() : [];
-        var _existing = pendingInjectionsByChatId[currentChatId];
-        var _mergedText, _mergedImages;
-        if (_existing) {
-            _mergedText = _existing.text || '';
-            if (_newText) _mergedText = _mergedText ? (_mergedText + '\n\n' + _newText) : _newText;
-            _mergedImages = (_existing.images || []).concat(_newImages);
-        } else {
-            _mergedText = _newText;
-            _mergedImages = _newImages;
-        }
-        pendingInjection = _mergedText || null;
-        pendingInjectionImages = _mergedImages.length > 0 ? _mergedImages : null;
-        // Key the per-chat map by the chat the user is actually typing in — not by
-        // activeStreamingChatId, which may point to a different (background) chat.
-        pendingInjectionsByChatId[currentChatId] = { text: pendingInjection, images: pendingInjectionImages };
-        clearPendingImages();
-        input.value = '';
-        input.style.height = 'auto';
-
-        // Interrupt the current step so the message is sent instantly:
-        //  • If LLM is mid-stream — abort the fetch (partial response is dropped).
-        //  • If we're mid tool execution — fire the interrupt resolver so the race
-        //    promise resolves _immediately_ (no polling delay). Orphan tool keeps
-        //    running in the background; its result is discarded.
-        userInterruptedChats[currentChatId] = true;
-        var ac = currentStreamAbortControllers[currentChatId];
-        if (ac && typeof ac.abort === 'function') {
-            try { ac.abort(); } catch (e) {}
-        }
-        var interruptFn = interruptResolversByChatId[currentChatId];
-        if (typeof interruptFn === 'function') {
-            try { interruptFn(); } catch (e) {}
-        }
-
-        // Update spinner immediately so the user sees instant acknowledgement.
-        showSpinner('Interrupting…', currentChatId);
-        // Re-render so the queued bubble appears immediately under the chat.
-        renderMessages();
-        showSnackbar('Message sent — interrupting current step.');
-        return;
-    }
-
-    // Clear any stale injection from a previous paused run — this new message supersedes it
-    pendingInjection = null;
-    pendingInjectionImages = null;
-
-    // Check if we're in widget editing mode
-    if (currentEditingWidget) {
-        await sendWidgetMessage(message);
-        return;
-    }
-
-    // Reset scroll flag when user sends a new message
-    isFollowingScroll = true;
-
-    // Clear pending input since we're sending it
-    delete chatPendingTexts[getCurrentPendingContext()];
-    persistPendingTextsToStorage();
-
-    var chat = chats[currentChatId];
-
-    // Add user message (even if empty when attachments present, provide context)
-    var imageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;
-    var pdfCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'pdf'; }).length;
-    var fileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
-    var docAttachments = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; });
-    var attachLabel = '';
-    if (imageCount > 0 || pdfCount > 0 || fileCount > 0 || docAttachments.length > 0) {
-        var parts = [];
-        if (imageCount > 0) parts.push(imageCount + ' image(s)');
-        if (pdfCount > 0) parts.push(pdfCount + ' PDF(s)');
-        if (fileCount > 0) parts.push(fileCount + ' file(s)');
-        if (docAttachments.length > 0) parts.push(docAttachments.length + ' document(s)');
-        attachLabel = '[User attached ' + parts.join(' and ') + ']';
-    }
-    var userMessageContent = message || attachLabel;
-
-    // Inject placeholder results for any interrupted tool calls before adding user message
-    if (injectInterruptedToolResults(chat)) {
-        // Tool calls were interrupted - clean up UI state
-        activeStreamingChatId = null;
-        isRunning = false;
-        paused = false;
-        // User is sending a new message — clear any per-chat pause flag too,
-        // otherwise the next runAgent's `while (!isChatPaused(currentChatId))`
-        // gate fails immediately and the message is silently dropped.
-        if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
-        hideSpinner(currentChatId);
-        hidePauseButton();
-        saveChatsToStorage();
-        renderMessages();
-    }
-
-    chat.messages.push({ role: 'user', content: userMessageContent });
-
-    // Add pending attachments as screenshot/pdf/file/document messages
-    if (pendingImageAttachments.length > 0) {
-        pendingImageAttachments.forEach(function(img) {
-            if (img.fileType === 'document') {
-                // Document reference — inject context message with doc ID for the agent to read
-                var docTitle = img.name || 'Untitled';
-                var docId = img.sdocId;
-                chat.messages.push({
-                    role: 'context',
-                    content: '[User referenced Smart Document "' + docTitle + '" (doc_id: ' + docId + '). Use the document tool with action "read" and this doc_id to access its content.]'
-                });
-                return;
-            }
-            var _fid = img.file_id || newFileId();
-            if (img.fileType === 'pdf') {
-                chat.messages.push({
-                    role: 'pdf',
-                    base64: img.base64,
-                    name: img.name,
-                    description: 'User attached PDF',
-                    timestamp: Date.now(),
-                    file_id: _fid
-                });
-            } else if (img.fileType === 'file') {
-                chat.messages.push({
-                    role: 'file',
-                    content: img.content,
-                    name: img.name,
-                    mimeType: img.mimeType,
-                    size: img.size,
-                    description: 'User attached file',
-                    timestamp: Date.now(),
-                    file_id: _fid
-                });
-            } else {
-                chat.messages.push({
-                    role: 'screenshot',
-                    base64: img.base64,
-                    name: img.name,
-                    description: 'User attached image',
-                    timestamp: Date.now(),
-                    width: img.width,
-                    height: img.height,
-                    file_id: _fid
-                });
-            }
-            registerFile(_fid, { type: 'chat', chatId: chat.id, msgIndex: chat.messages.length - 1 });
-        });
-        // Clear pending attachments after adding to messages
-        clearPendingImages();
-    }
-
-    updateChatTitle(chat);
-
-    delete chat.isTemporary;
-    saveChatsToStorage();
-
-    renderMessages();
-    renderChatList();
-    input.value = '';
-    input.style.height = 'auto';
-    paused = false;
-    // Clear the per-chat pause flag too — without this, runAgent's outer
-    // `while (!isChatPaused(currentChatId))` gate trips immediately and the
-    // user's freshly-sent message is silently dropped on a previously-paused chat.
-    if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
-    // Sync the button label off the (now-cleared) per-chat state instead of
-    // hard-coding it — keeps a single source of truth for the label.
-    if (typeof syncPauseButtonUI === 'function') {
-        syncPauseButtonUI(currentChatId);
-    } else {
-        document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
-    }
-
-    await runAgent();
-}
+// PR1: sendMessage() (the user-input handler) moved to
+// src/js/app/040-send-message.js. It's a UI entry point — reads the input
+// field, shows snackbars, owns the queued-injection plumbing — so it lives
+// with the other send-message helpers, not in the agent-loop file. Behavior
+// is unchanged.

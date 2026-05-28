@@ -109,12 +109,273 @@ function getOrderedFiles(dir, ext) {
 // Insertion within a tier only renames within that tier — never cascades across.
 const JS_TIERS = ['core', 'ui', 'tools', 'app'];
 
+// SW bundle (loaded by background.js via importScripts at the very top).
+// The service worker hosts the agent loop and all state — multiple chats
+// run as concurrent async tasks. No DOM in this context: DOM-needing
+// tools (js_eval sandbox, skills sandbox, image canvas) bridge to the
+// offscreen document via chrome.runtime.sendMessage. The composition:
+//
+//   1. worker tier files with prefix 0xx — declare globals + stubs FIRST
+//   2. shared files (core/, app/, tools/) — agent loop + LLM streaming +
+//      tool dispatch + IDB + skills, reused from the page bundle so we
+//      don't duplicate code
+//   3. worker tier files with prefix 1xx+ — port bridge, tool routing,
+//      checkpoint, entry point — wired AFTER the shared code exists
+//
+// Keep WORKER_SHARED_FILES in sync with skills/extension-dev/build.js.
+const WORKER_JS_TIERS = ['worker'];
+const WORKER_SHARED_FILES = [
+    // core (declarations + utilities)
+    'js/core/030-config.js',
+    'js/core/060-ui-constants.js',
+    'js/core/070-permissions.js',
+    'js/core/080-tools.js',
+    // 090-codemap.js is DOM-free and is called by 100-cached-results.js's
+    // codemap-extract path (large code tool results get summarized via
+    // generateCodemapWithOptions). Without this the SW throws ReferenceError
+    // mid-runAgent the moment any tool returns a large code blob.
+    'js/core/090-codemap.js',
+    // 095-handle-registry defines the global `Handles` object used by
+    // tools/020-tool-execution.js to back the async tool layer (await: false
+    // → returns a handle, then await_handle / poll_handle / await_all /
+    // await_any / cancel_handle collect / inspect). Must load BEFORE
+    // tools/020-tool-execution.js (which references Handles by name at
+    // executeTool's first lines). In WORKER_SHARED_FILES the registry needs
+    // to come ahead of tool-execution; in the page bundle ordering is by
+    // filename prefix (095 < 100 < 110) so it's already in front.
+    'js/core/095-handle-registry.js',
+    // 097-sub-agent-registry defines the global `SubAgents` object that
+    // backs the seven sub-agent runtime tools (spawn_sub_agent,
+    // report_to_parent, agent_status, wake_sub_agent, stop_sub_agent,
+    // sleep_self, agent_message). Must load AFTER the handle registry
+    // (097 takes a deferred handle for the spawn handle) and BEFORE
+    // tools/020-tool-execution.js (which dispatches into SubAgents.*).
+    // The page bundle also picks this up automatically via numeric prefix
+    // sort (095 < 097 < 100 < 110).
+    'js/core/097-sub-agent-registry.js',
+    'js/core/100-cached-results.js',
+    'js/core/110-system-prompt.js',
+    'js/core/130-indexeddb.js',
+    'js/core/140-skills-engine.js',
+    'js/core/150-record-helpers.js',
+    // tools (headless implementations the offscreen runtime can dispatch)
+    'js/tools/040-file-store.js',
+    'js/tools/050-file-tools.js',
+    'js/tools/070-screenshot-by-id.js',
+    'js/tools/110-smart-documents.js',
+    'js/tools/020-tool-execution.js',
+    // app (the agent loop + LLM streaming + API message builder + event bus)
+    'js/app/035-agent-events.js',
+    'js/app/020-api-messages.js',
+    'js/app/010-llm-streaming.js',
+    'js/app/030-agent-loop.js'
+];
+
 function getOrderedJsFiles() {
     return JS_TIERS.flatMap(tier => getOrderedFiles(path.join('js', tier), '.js'));
 }
 
+function getOrderedWorkerJsFiles() {
+    return WORKER_JS_TIERS.flatMap(tier => getOrderedFiles(path.join('js', tier), '.js'));
+}
+
+// Compose the worker bundle: pre-shared worker files, then shared, then
+// post-shared worker files. Pre vs post is decided by the numeric prefix
+// — 0xx files run BEFORE the shared bundle (they declare globals + stubs
+// that the shared code references); 1xx+ files run AFTER (they consume
+// the shared symbols — port bridge, tool routing, entry, etc.).
+function getWorkerBundleFiles() {
+    const workerFiles = getOrderedWorkerJsFiles();
+    const pre = workerFiles.filter(f => /[\\/]0\d\d-/.test(f));
+    const post = workerFiles.filter(f => !pre.includes(f));
+    return [...pre, ...WORKER_SHARED_FILES, ...post];
+}
+
 function concatFiles(files) {
     return files.map(f => readSrcFile(f)).join('\n');
+}
+
+// ─── SW-bundle identifier scanner ─────────────────────────────────────
+// After assembling sw-bundle.js, find every called free identifier that
+// isn't declared in the same bundle. The migration to events made the
+// concatenated SW bundle a closed module (no page tier behind it), so a
+// call to an undeclared identifier is a SW-bundle gap, not a runtime
+// surprise to be papered over with a stub.
+//
+// Heuristics:
+//   • Strip /* ... */ and // comments + string/template literals so we
+//     don't match `function(`-shaped tokens inside docstrings or text.
+//   • Declared:   `function name(`, `async function name(`, `var name`,
+//                  `let name`, `const name`, `class name`, function param
+//                  lists (best-effort), and catch-bindings.
+//   • Called:     a free identifier followed by `(`, NOT preceded by `.`
+//                 (member-call) or `_/$/word` (continuation).
+//   • Allow-list: JS built-ins, Web/Worker APIs, MV3 globals, JS reserved
+//                 keywords that look like calls (`if (`, `while (`, ...).
+//
+// Returns the sorted list of identifiers that are CALLED but NEITHER
+// declared in the bundle NOR on the allow-list. Empty list = the bundle
+// is self-contained.
+const SW_SCANNER_BUILTINS = new Set([
+    // ECMAScript globals
+    'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt',
+    'Math', 'Date', 'JSON', 'RegExp', 'Promise', 'Proxy', 'Reflect',
+    'Map', 'Set', 'WeakMap', 'WeakSet', 'Error', 'TypeError', 'RangeError',
+    'SyntaxError', 'ReferenceError', 'URIError', 'EvalError',
+    'Function', 'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'eval',
+    'encodeURIComponent', 'encodeURI', 'decodeURIComponent', 'decodeURI',
+    'Infinity', 'NaN', 'undefined', 'globalThis',
+    'Iterator', 'AsyncIterator',
+    // Typed arrays
+    'Uint8Array', 'Int8Array', 'Uint16Array', 'Int16Array', 'Uint32Array',
+    'Int32Array', 'Float32Array', 'Float64Array', 'ArrayBuffer', 'DataView',
+    'Uint8ClampedArray', 'BigInt64Array', 'BigUint64Array',
+    // Web / Worker / SW APIs
+    'fetch', 'atob', 'btoa', 'setTimeout', 'clearTimeout', 'setInterval',
+    'clearInterval', 'queueMicrotask', 'requestAnimationFrame',
+    'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback',
+    'console', 'crypto', 'performance', 'navigator', 'location',
+    'Blob', 'File', 'URL', 'URLSearchParams', 'FormData', 'FileReader',
+    'TextEncoder', 'TextDecoder', 'AbortController', 'AbortSignal',
+    'Headers', 'Request', 'Response', 'ReadableStream', 'WritableStream',
+    'TransformStream', 'BroadcastChannel', 'EventTarget', 'Event',
+    'CustomEvent', 'MessageEvent', 'createImageBitmap', 'ImageBitmap',
+    'OffscreenCanvas', 'Path2D', 'DOMException',
+    'IDBKeyRange', 'IDBDatabase', 'indexedDB', 'self', 'caches',
+    // MV3 / extension
+    'chrome', 'importScripts', 'addEventListener', 'removeEventListener',
+    'dispatchEvent', 'postMessage', 'close', 'skipWaiting',
+    'registration',
+    // JS reserved words that look like calls in the regex
+    'if', 'while', 'for', 'switch', 'return', 'throw', 'catch', 'typeof',
+    'instanceof', 'new', 'delete', 'void', 'yield', 'await', 'do', 'else',
+    'in', 'of', 'function', 'break', 'continue', 'case', 'default',
+    'try', 'finally', 'with', 'class', 'extends', 'super', 'this', 'var',
+    'let', 'const', 'async', 'static', 'import', 'export', 'from', 'as',
+    'true', 'false', 'null',
+]);
+
+function _swScannerStripCommentsAndStrings(src) {
+    // Strip line + block comments and quoted string contents so the
+    // identifier scan only sees real code. We deliberately do NOT try
+    // to skip template literals or regex literals — both can contain
+    // characters that confuse a naive single-pass parser (the codebase
+    // has regex char classes like `/[#*_` + backtick + `\n]/g` that
+    // would otherwise be mistaken for the start of a template literal
+    // and eat the rest of the file).
+    //
+    // Bare identifiers inside template `${...}` interpolations are real
+    // call sites anyway, so leaving them visible is correct. Regex
+    // literals only contain method-name-looking tokens behind `.`, so
+    // they don't trigger the free-identifier call regex below.
+    var out = '';
+    var i = 0;
+    var n = src.length;
+    while (i < n) {
+        var c = src[i];
+        var c2 = src[i + 1];
+        // // line comment
+        if (c === '/' && c2 === '/') {
+            while (i < n && src[i] !== '\n') i++;
+            continue;
+        }
+        // /* block comment */
+        if (c === '/' && c2 === '*') {
+            i += 2;
+            while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+            i += 2;
+            continue;
+        }
+        // "..." or '...' string
+        if (c === '"' || c === '\'') {
+            var quote = c;
+            out += ' ';
+            i++;
+            while (i < n) {
+                if (src[i] === '\\') { i += 2; continue; }
+                if (src[i] === quote) { i++; break; }
+                if (src[i] === '\n') break;
+                i++;
+            }
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+function scanSwBundleGaps(bundlePath) {
+    var raw = fs.readFileSync(bundlePath, 'utf-8');
+    var src = _swScannerStripCommentsAndStrings(raw);
+
+    // Declared identifiers
+    var declared = new Set();
+    var declPatterns = [
+        /\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[\(*]/g,
+        /\basync\s+function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g,
+        /\b(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g,
+        /\bclass\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g,
+        // catch (e) — best-effort
+        /\bcatch\s*\(\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\)/g,
+        // Bare assignment with function value — covers patterns like
+        // `executeTool = async function(...)` used by the worker/120-tool-
+        // routing.js override of a shared symbol.
+        /(?:^|[;\n{}])\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?function\b/g,
+    ];
+    for (var di = 0; di < declPatterns.length; di++) {
+        var dm;
+        while ((dm = declPatterns[di].exec(src)) !== null) declared.add(dm[1]);
+    }
+
+    // Guarded references: identifiers that appear inside `typeof X === 'function'`
+    // or `typeof X !== 'undefined'` are explicitly checked at runtime, so a call
+    // gated by such a guard isn't an unsafe reference. We collect those and skip
+    // them in the gap report. Scan the RAW source because the strip step has
+    // already eaten the literal `'function'`/`'undefined'`.
+    var guarded = new Set();
+    var guardRe = /\btypeof\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[!=]==?\s*['"](?:function|undefined|object)['"]/g;
+    var gm;
+    while ((gm = guardRe.exec(raw)) !== null) guarded.add(gm[1]);
+    // Function/arrow parameters — match `function name(a, b)` and
+    // `function(a, b)` and `(a, b) =>`. Coarse: just grab the
+    // parenthesized arg list following `function[ name](` or before `=>`.
+    var paramRe = /\bfunction\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(([^)]*)\)|\bfunction\s*\(([^)]*)\)|\(([^)]*)\)\s*=>/g;
+    var pm;
+    while ((pm = paramRe.exec(src)) !== null) {
+        var params = pm[1] || pm[2] || pm[3] || '';
+        params.split(',').forEach(function(p) {
+            var name = p.trim().split(/[=\s]/)[0].replace(/^\.{3}/, '');
+            if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name)) declared.add(name);
+        });
+    }
+    // Object destructuring & arrow single-param (e.g. `x => ...`) —
+    // single bare identifier before `=>` with no parens
+    var singleArrowRe = /(?:^|[^.\w$])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>/g;
+    var sm;
+    while ((sm = singleArrowRe.exec(src)) !== null) declared.add(sm[1]);
+
+    // Called identifiers
+    var called = new Map(); // name -> sample context
+    var callRe = /(^|[^.\w$])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+    var cm;
+    while ((cm = callRe.exec(src)) !== null) {
+        var name = cm[2];
+        if (called.has(name)) continue;
+        // Snapshot ~30 chars before for diagnostic context
+        var ctxStart = Math.max(0, cm.index - 30);
+        called.set(name, src.substring(ctxStart, cm.index + name.length + 1).replace(/\s+/g, ' ').trim());
+    }
+
+    var gaps = [];
+    called.forEach(function(ctx, name) {
+        if (declared.has(name)) return;
+        if (SW_SCANNER_BUILTINS.has(name)) return;
+        if (guarded.has(name)) return;
+        gaps.push({ name: name, ctx: ctx });
+    });
+    gaps.sort(function(a, b) { return a.name.localeCompare(b.name); });
+    return gaps;
 }
 
 // ─── MV3 CSP HTML Transformation ───
@@ -280,8 +541,49 @@ ${processedBody}
     const versionedHTML = appHTML.split('__VERSION__').join(version);
     console.log(`  Version: ${version}`);
 
-    // 5. Write output files
+    // 5. Build the worker bundle (loaded by offscreen.html). Composition:
+    // worker tier (pre/post around the shared agent code) so the offscreen
+    // runtime declares its own globals + Platform stub before the shared
+    // agent loop / tools / streaming run. See getWorkerBundleFiles().
+    const workerBundleFiles = getWorkerBundleFiles();
+    let workerJS = '';
+    if (workerBundleFiles.length > 0) {
+        workerJS = concatFiles(workerBundleFiles);
+        workerJS = workerJS.split('__VERSION__').join(version);
+        // Embed the same docs/README placeholders the page bundle uses — the
+        // shared system-prompt / docs code reads __DOCS_MARKDOWN_B64__ and
+        // __README_MARKDOWN_B64__ at module load. If left as raw placeholders
+        // they'd just be inert strings, but substituting keeps parity with
+        // the page bundle behavior.
+        const docsMdForWorker = fs.existsSync(path.join(ROOT, 'docs', 'documentation.md'))
+            ? fs.readFileSync(path.join(ROOT, 'docs', 'documentation.md'), 'utf-8').split('__VERSION__').join(version)
+            : '';
+        if (docsMdForWorker) workerJS = workerJS.split('__DOCS_MARKDOWN_B64__').join(Buffer.from(docsMdForWorker, 'utf-8').toString('base64'));
+        const readmeMdForWorker = fs.existsSync(path.join(ROOT, 'README.md'))
+            ? fs.readFileSync(path.join(ROOT, 'README.md'), 'utf-8')
+            : '';
+        if (readmeMdForWorker) workerJS = workerJS.split('__README_MARKDOWN_B64__').join(Buffer.from(readmeMdForWorker, 'utf-8').toString('base64'));
+        // Inject the same embedded skills so the offscreen system prompt
+        // matches what the panel sends. Without this, the worker's prompt
+        // would lack skill instructions.
+        const workerSkills = buildEmbeddedSkills();
+        if (workerSkills.length > 0) {
+            workerJS = injectEmbeddedSkills(workerJS, workerSkills);
+        }
+        const preCount = workerBundleFiles.filter(f => /[\\/]worker[\\/]/.test(f) && /[\\/]0\d\d-/.test(f)).length;
+        const sharedCount = WORKER_SHARED_FILES.length;
+        const postCount = workerBundleFiles.length - preCount - sharedCount;
+        console.log(`  Worker bundle: ${preCount} pre + ${sharedCount} shared + ${postCount} post = ${workerBundleFiles.length} files`);
+    }
+
+    // 6. Write output files
+    // Wipe outDir first so files removed from src/ don't linger as cruft in
+    // dist/extension/ (e.g. if a worker-tier file is renamed/deleted, the old
+    // copy would otherwise still get bundled into the .zip and confuse the
+    // browser at install time). `fs.rmSync(..., { recursive: true })` is a
+    // no-op when the directory doesn't exist (force: true).
     const outDir = path.join(DIST, 'extension');
+    fs.rmSync(outDir, { recursive: true, force: true });
     fs.mkdirSync(outDir, { recursive: true });
 
     fs.writeFileSync(path.join(outDir, 'app.html'), versionedHTML, 'utf-8');
@@ -289,10 +591,22 @@ ${processedBody}
     fs.writeFileSync(path.join(outDir, 'app.css'), cssContent, 'utf-8');
     if (themeInitJS) fs.writeFileSync(path.join(outDir, 'theme-init.js'), themeInitJS, 'utf-8');
     if (viewInitJS) fs.writeFileSync(path.join(outDir, 'view-init.js'), viewInitJS, 'utf-8');
+    if (workerJS) {
+        const swBundlePath = path.join(outDir, 'sw-bundle.js');
+        fs.writeFileSync(swBundlePath, workerJS, 'utf-8');
+        const gaps = scanSwBundleGaps(swBundlePath);
+        if (gaps.length > 0) {
+            console.error('\n  SW-bundle gaps — identifiers called but not declared:');
+            gaps.forEach(g => console.error('    - ' + g.name + '  (near: ' + g.ctx + ')'));
+            console.error('  Fix by declaring them in the bundle (real impl or worker/020-page-stubs.js) or adding them to the SW_SCANNER_BUILTINS allow-list if they are platform globals.\n');
+            throw new Error('SW-bundle has ' + gaps.length + ' undeclared identifier(s); aborting build.');
+        }
+        console.log(`  SW-bundle: no undeclared identifiers`);
+    }
 
-    // 6. Copy extension-specific files
+    // 7. Copy extension-specific files
     const extSrcDir = path.join(SRC, 'platform/extension');
-    for (const file of ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js']) {
+    for (const file of ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js']) {
         const srcPath = path.join(extSrcDir, file);
         if (fs.existsSync(srcPath)) {
             fs.copyFileSync(srcPath, path.join(outDir, file));
@@ -300,7 +614,7 @@ ${processedBody}
         }
     }
 
-    // 7. Copy icons if they exist
+    // 8. Copy icons if they exist
     const iconsDir = path.join(extSrcDir, 'icons');
     if (fs.existsSync(iconsDir)) {
         const outIconsDir = path.join(outDir, 'icons');

@@ -64,6 +64,33 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     '',
     'Note: servicenow_api POST/PUT/PATCH/DELETE calls require a "scope" parameter (e.g. "global" or a scoped app sys_id).',
     '',
+    'ASYNC TOOLS / HANDLES (opt-in via `await: false`):',
+    '',
+    'Any tool call may pass `await: false` to run in the background. Instead of waiting for the result, the call returns IMMEDIATELY with `{ handle: "h_...", status: "pending" }`. Use this when you want to kick off slow work (a long iframe interaction, a deep API scan, a big web_fetch) without blocking other tool calls.',
+    '',
+    'Collect handles with:',
+    '  • `await_handle({ handle, timeout_ms? })` — blocks the scheduler (NOT the model) until the handle settles. Returns `{ snapshot: { status, result?, error?, awaitingApproval? } }`. If timeout_ms elapses, snapshot.status is still "pending" — poll/await again.',
+    '  • `poll_handle({ handle })` — non-blocking peek. Returns `{ snapshot }`. Inspect `snapshot.awaitingApproval` to distinguish "tool blocked on user-approval modal" from "tool actively running".',
+    '  • `await_any({ handles, timeout_ms? })` — wait for the first to settle. Returns `{ handle, snapshot, timeout }`. On timeout: `{ handle: null, snapshot: null, timeout: true, pendingSnapshots }`.',
+    '  • `await_all({ handles, timeout_ms? })` — wait for every handle. Returns `{ snapshots: [...] }` in the same order as input.',
+    '  • `cancel_handle({ handle, reason? })` — mark cancelled. Returns `{ ok, status, error? }`. The underlying work may still finish in the background but its result is discarded. Use this when `awaitingApproval` has stayed true for a long time and the user clearly walked away.',
+    '',
+    'When to use `await: false`: fire off several slow tool calls in parallel (e.g. three iframe_tool actions, or several web_fetches) and then `await_all` to collect. Default (no `await` arg) stays synchronous — do NOT pass `await: false` for tools whose result you need on the very next tool call.',
+    '',
+    'Caveats: handles are per-chat and do not survive a page reload. Cancellation is best-effort (we cannot abort in-flight network requests). Tools with eager-render side effects (`display`, `html_widget`) are forced synchronous even if you pass `await: false` — their result has to land in the calling tool_result slot, which the handle wrap cannot preserve.',
+    '',
+    'SUB-AGENT DELEGATION (`spawn_sub_agent`):',
+    '',
+    'Spawn a background sub-agent when work would pollute your context: file/grep dumps, multi-record audits, deep log scans, iterative debugging, anything where most output is noise. The sub gets its own chat + context window, runs to completion, and reports back a distilled summary via `report_to_parent`. You see ONLY the summary — not the raw tool dumps.',
+    '',
+    'Usage: `spawn_sub_agent({instructions:"...", name:"...", context_seed:{...}})` returns `{agent_id, chat_id, handle}`. Then `await_handle(handle)` to collect when you need the result. Several spawns can run in parallel — pool size is 2 concurrent, excess queues. The pool default is intentionally low because Anthropic enforces an account-level concurrent-request cap above us; even 2 parallel subs can occasionally bump 429 on fresh tiers. If you need a longer fan-out, serialize.',
+    '',
+    'Sub lifecycle: a sub calls `report_to_parent` when it has something to settle the spawn handle with — that ALWAYS settles the handle and parks the sub (state=sleeping). The handle\'s outer status mirrors the report: status:"done"/"need_input" → snapshot.status:"done" (result carries the payload); status:"error" → snapshot.status:"error" (snapshot.error = summary, snapshot.result = full payload). The parent can then `wake_sub_agent({agent_id, instruction})` to give it more work (a fresh user turn drains into its loop, full prior context preserved) — the wake response includes a NEW awaitable `handle` for the next report. `agent_message` to a sleeping sub also auto-wakes and returns a fresh handle the same way. Use `stop_sub_agent` to terminate. For mid-flight progress that should NOT settle the handle, the sub uses `agent_message({to:"parent", content:"..."})` and keeps running. There is no "idle policy" — every sub parks after reporting; terminate it explicitly if you want it gone.',
+    '',
+    'When NOT to delegate: a single small Table API call, anything whose result must flow into the very next tool call (round-trip via sub adds latency), genuinely conversational user-facing work. Cheap, fast tools stay synchronous on the main agent.',
+    '',
+    'Related tools: `agent_status` (peek at every live/finished sub — pass `include_tree:true` to get a parent→children map across nesting levels), `wake_sub_agent` / `agent_message` (talk to a sleeping or running sub — you can only touch subs in your own subtree), `stop_sub_agent` (terminate; cascades to descendants). Subs inherit the parent\'s full tool roster. Nested delegation is OPT-IN: by default subs cannot spawn/stop/wake other subs (fork-bomb prevention). To authorize a sub to manage its own children, pass `allow_nested:true` at spawn time. Max nesting depth is 5.',
+    '',
     'DISPLAY TEMPLATES:',
     '',
     'When a visualization IS warranted (user asked for one, or the data is too large for plain text), prefer the display tool over html_widget when your data fits a template. Only fall back to html_widget for custom interactivity or complex layouts that no template covers.',
@@ -159,6 +186,29 @@ async function clearCustomSystemPrompt() {
 // Get the current system prompt template (custom or default)
 function getSystemPromptTemplate() {
     return customSystemPrompt || DEFAULT_SYSTEM_PROMPT_TEMPLATE;
+}
+
+// Append the sub-agent preamble when the active chat is a sub-agent. The
+// preamble lives in src/js/core/097-sub-agent-registry.js as
+// SubAgents.PREAMBLE — keep it co-located with the runtime that consumes
+// it (system prompt module just reads). We resolve the chat from the
+// argument (preferred — explicit chatId from the streaming caller) or
+// fall back to the global currentChatId for in-UI uses (token counter
+// preview, settings panel).
+function _maybeAppendSubAgentPreamble(expanded, chatId) {
+    try {
+        if (typeof SubAgents === 'undefined' || !SubAgents || !SubAgents.PREAMBLE) return expanded;
+        var resolvedChatId = chatId
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        if (!resolvedChatId) return expanded;
+        if (typeof chats === 'undefined') return expanded;
+        var chat = chats[resolvedChatId];
+        if (!chat || !chat.isSubAgent) return expanded;
+        return expanded + SubAgents.PREAMBLE;
+    } catch (e) {
+        return expanded;
+    }
 }
 
 // Check if using custom system prompt

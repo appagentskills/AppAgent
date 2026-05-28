@@ -32,10 +32,28 @@ function renderHistoryPage() {
     
     // Get filtered chat IDs
     var chatIds = filterHistoryChats(historySearchQuery);
-    var totalChats = Object.keys(chats).length;
+    // Visibility predicate.
+    //
+    // Background ACTION chats are hidden until the user explicitly reveals
+    // one (the original design — keeps short one-shot action runs out of
+    // the history list).
+    //
+    // Sub-agent chats are ALSO `isBackground:true`, but historically that
+    // meant they were hidden too — a user could spawn a dozen subs and only
+    // see the ones they had clicked through to. The new rule: sub-agent
+    // chats are ALWAYS visible in history (they carry their own "Sub-agent"
+    // badge + breadcrumb so the user can still tell them apart from
+    // top-level chats). Background action chats keep the reveal-gate.
+    function _isVisibleHistoryChat(c) {
+        if (!c) return false;
+        if (c.isSubAgent) return true;
+        return !(c.isBackground && !c._revealed);
+    }
+    var visibleChatIds = Object.keys(chats).filter(function(id) { return _isVisibleHistoryChat(chats[id]); });
+    var totalChats = visibleChatIds.length;
     var filteredCount = chatIds.length;
-    var pinnedCount = Object.keys(chats).filter(function(id) { return chats[id].pinned; }).length;
-    var totalCost = Object.keys(chats).reduce(function(sum, id) {
+    var pinnedCount = visibleChatIds.filter(function(id) { return chats[id].pinned; }).length;
+    var totalCost = visibleChatIds.reduce(function(sum, id) {
         var chat = chats[id];
         if (!chat || !chat.messages) return sum;
         return sum + chat.messages.reduce(function(chatSum, msg) {
@@ -166,6 +184,14 @@ function renderHistoryChatCard(chatId) {
     var badgesHtml = '';
     if (chat.pinned) badgesHtml += '<span class="history-chat-badge pinned">' + UI_ICONS.pinFilled + 'Pinned</span>';
     if (stats.hasDashboardWidget) badgesHtml += '<span class="history-chat-badge dashboard">' + UI_ICONS.widget + 'Dashboard</span>';
+    // Sub-agent badge — history cards previously rendered sub-agent transcripts
+    // identically to top-level chats, so a user scanning the history page could
+    // not tell at a glance which chats were delegated workers vs. real
+    // conversations. The sidebar chat list has had this distinction via
+    // `renderSubAgentBreadcrumb` for a while; this brings the history view to
+    // parity. `chat.isSubAgent` is stamped at sub-agent chat creation in
+    // 097-sub-agent-registry.js.
+    if (chat.isSubAgent) badgesHtml += '<span class="history-chat-badge subagent" title="Delegated worker chat">' + UI_ICONS.bot + 'Sub-agent</span>';
     
     // Action buttons - pin button is bold when pinned
     var pinBtnClass = chat.pinned ? 'history-chat-action-btn pinned' : 'history-chat-action-btn';
@@ -214,12 +240,22 @@ function renderHistoryChatCard(chatId) {
     if (stats.model) metaHtml += '<span class="history-meta-model">' + UI_ICONS.model + stats.model + '</span>';
     metaHtml += '</div>';
     
-    return '<div class="history-chat-card' + (isActive ? ' active' : '') + '">' +
+    // Render the parent-chain breadcrumb for sub-agent chats. The same helper
+    // is used by the sidebar chat list — if it's missing (older bundle) we
+    // silently skip the breadcrumb rather than crashing the card render.
+    var subAgentBreadcrumb = (chat.isSubAgent && typeof renderSubAgentBreadcrumb === 'function')
+        ? renderSubAgentBreadcrumb(chat) : '';
+    // `history-chat-card.subagent` lets CSS tint the whole card (left-border
+    // accent) so the row stands out even before the badge is read.
+    var subAgentCardClass = chat.isSubAgent ? ' subagent' : '';
+
+    return '<div class="history-chat-card' + (isActive ? ' active' : '') + subAgentCardClass + '">' +
         '<div class="history-chat-header">' +
         '<div class="history-chat-title-row" onclick="openChatFromHistory(\'' + chatId + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openChatFromHistory(\'' + chatId + '\')" role="button" tabindex="0">' +
         '<span class="history-chat-title">' + escapeHtml(title) + '</span>' +
         '<div class="history-chat-badges">' + badgesHtml + '</div>' +
         '</div>' + actionsHtml + '</div>' +
+        subAgentBreadcrumb +
         previewHtml +
         statsHtml +
         metaHtml +
@@ -291,6 +327,20 @@ function formatHistoryDate(timestamp) {
 
 function openChatFromHistory(chatId) {
     if (!chats[chatId]) return;
+    // Save the outgoing context's pending draft (text + images) and restore the
+    // target chat's draft. This entry point used to mutate `currentChatId`
+    // directly, which silently dropped whatever the user had typed/attached on
+    // the previous chat AND left the target chat's pending state un-restored.
+    // selectChat() does this dance for the sidebar; the history-card path needs
+    // the same treatment or the user loses unsent work every time they bounce
+    // through the history page.
+    if (typeof getCurrentPendingContext === 'function' && typeof savePendingTextForContext === 'function') {
+        try {
+            var _prevCtx = getCurrentPendingContext();
+            savePendingTextForContext(_prevCtx);
+            if (typeof savePendingImagesForContext === 'function') savePendingImagesForContext(_prevCtx);
+        } catch (e) { /* non-fatal */ }
+    }
     currentChatId = chatId;
     appStorage.setItem('currentChatId', chatId);
     appStorage.setItem('lastChatId', chatId);
@@ -300,11 +350,43 @@ function openChatFromHistory(chatId) {
     showChatView();
     clearUpdateSet();
     loadVersionHistory();
+    // Clear the foreground API-error banner so a stale error from a
+    // previously-streaming chat doesn't bleed into the chat we're about to
+    // render. selectChat does this on line 434; this entry-point bypasses
+    // selectChat so it has to do it itself.
+    if (typeof lastApiError !== 'undefined') lastApiError = null;
+    // Re-sync the messages container's `is-streaming` class to the target
+    // chat's actual run state. Without this, the class would carry over from
+    // whichever chat was last viewed — a streaming chat would visually
+    // un-stream when opened from history, and a dormant chat would inherit
+    // streaming layout (extra bottom padding, scroll-pinning) from the
+    // previously-streaming foreground.
+    var _openHistMessagesEl = document.getElementById('messages');
+    if (_openHistMessagesEl) {
+        if (typeof runningChatIds !== 'undefined' && runningChatIds[chatId]) {
+            _openHistMessagesEl.classList.add('is-streaming');
+        } else {
+            _openHistMessagesEl.classList.remove('is-streaming');
+        }
+    }
     renderMessages();
     updateInputPosition();
     updateChatTitleHeader();
     updateAllButtonStates();
     renderChatList();
+    // Refresh Workers strip — see selectChat() in 170-chat-management.js
+    // for the same call. openChatFromHistory bypasses selectChat, so the
+    // strip needs an explicit kick or it shows the previous chat's chips.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
+    // Restore the target chat's pending draft (companion to the save above).
+    if (typeof restorePendingTextForContext === 'function') {
+        try { restorePendingTextForContext(chatId); } catch (e) { /* non-fatal */ }
+    }
+    if (typeof restorePendingImagesForContext === 'function') {
+        try { restorePendingImagesForContext(chatId); } catch (e) { /* non-fatal */ }
+    }
     pushHistoryState('chat', chatId);
     // Sync Pause/Continue button state for the target chat. Without this, the
     // Pause button could leak in from a previously-viewed streaming chat because
@@ -350,11 +432,20 @@ function handleHistorySearch(e) {
 
 function filterHistoryChats(query) {
     var q = (query || '').toLowerCase().trim();
-    if (!q || q.length < 2) return Object.keys(chats);
-    
+    // Always apply the visibility predicate — see renderHistoryPage for the
+    // long-form rationale. Sub-agent chats are always visible in history
+    // (they carry their own breadcrumb/badge), action chats stay reveal-gated.
+    function _vis(c) {
+        if (!c) return false;
+        if (c.isSubAgent) return true;
+        return !(c.isBackground && !c._revealed);
+    }
+    if (!q || q.length < 2) {
+        return Object.keys(chats).filter(function(id) { return _vis(chats[id]); });
+    }
     return Object.keys(chats).filter(function(id) {
         var chat = chats[id];
-        return chatMatchesSearch(chat, q);
+        return _vis(chat) && chatMatchesSearch(chat, q);
     });
 }
 

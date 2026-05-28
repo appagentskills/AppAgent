@@ -4,7 +4,9 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     var abortController = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     if (chatId && abortController) currentStreamAbortControllers[chatId] = abortController;
     try {
-        return await callOpenRouterStreaming(currentProvider, apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController);
+        // Thread chatId through so the system prompt builder can append the
+        // sub-agent preamble when the chat is a sub-agent (see 100-cached-results.js).
+        return await callOpenRouterStreaming(currentProvider, apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId);
     } finally {
         if (chatId && currentStreamAbortControllers[chatId] === abortController) {
             delete currentStreamAbortControllers[chatId];
@@ -12,7 +14,7 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     }
 }
 
-async function callOpenRouterStreaming(currentProvider, messages, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController) {
+async function callOpenRouterStreaming(currentProvider, messages, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId) {
     var provider = getProviderById(currentProvider);
 
     if (!provider) {
@@ -68,8 +70,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     }
 
     // Build system message fresh each time (not stored in chat.messages)
-    // This ensures branched chats work even after browser reload when cache expires
-    var systemPromptText = getSystemPromptWithContext();
+    // This ensures branched chats work even after browser reload when cache expires.
+    // Pass chatId so sub-agent chats get the sub-agent preamble appended.
+    var systemPromptText = getSystemPromptWithContext(chatId);
     var systemMessage;
     if (isAnthropic) {
         // For Anthropic: use array format with cache_control on the system prompt
@@ -84,7 +87,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     var requestBody = {
         model: provider.model,
         messages: [systemMessage].concat(messagesWithCache),
-        tools: getEnabledTools(),
+        // Pass chatId so sub-agent chats see their per-sub tool_roster
+        // (deterministic: parent's full list minus the nested-delegation
+        // trio unless allow_nested:true) and parent chats don't see
+        // sub-only tools (report_to_parent, sleep_self).
+        tools: getEnabledTools(chatId),
         tool_choice: 'auto',
         parallel_tool_calls: true,
         stream: true,
@@ -127,68 +134,44 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
     var reader;
 
-    // Claude OAuth: route through background worker streaming proxy
+    // Claude OAuth: route through the SW's runClaudeOAuthStream proxy.
+    // Two code paths:
+    //   • SW context (Platform.isWorker): we're already in the SW —
+    //     call runClaudeOAuthStream directly. Connecting to a port
+    //     named 'claude-oauth-stream' from inside the SW would fire
+    //     onConnect in every OTHER extension context, never our own.
+    //   • Page context: connect to the SW port (legacy path).
     if (provider.isClaudeOAuth && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.connect) {
         reader = await (function() {
-            return new Promise(function(resolve, reject) {
-                var port = chrome.runtime.connect({ name: 'claude-oauth-stream' });
+            return new Promise(function(resolve) {
                 var chunks = [];
                 var resolveRead = null;
                 var streamDone = false;
-                // Wire abort: disconnect the port and surface a synthetic abort error to the reader.
-                if (abortController && abortController.signal) {
-                    abortController.signal.addEventListener('abort', function() {
-                        try { port.disconnect(); } catch (e) {}
-                        streamDone = true;
+                function onEnvelope(env) {
+                    if (env.type === 'error') {
+                        var encoded = new TextEncoder().encode('data: ' + JSON.stringify({ error: { message: env.error, type: 'api_error' } }) + '\n\n');
                         if (resolveRead) {
-                            var r = resolveRead;
-                            resolveRead = null;
-                            // Synthesize a DOMException-like AbortError so the consumer can detect it.
-                            var err = new Error('User aborted stream');
-                            err.name = 'AbortError';
-                            r({ value: undefined, done: true, _abortErr: err });
-                        }
-                    });
-                }
-
-                port.onMessage.addListener(function(msg) {
-                    if (msg.type === 'error') {
-                        var encoded = new TextEncoder().encode('data: ' + JSON.stringify({ error: { message: msg.error, type: 'api_error' } }) + '\n\n');
-                        if (resolveRead) {
-                            var r = resolveRead;
-                            resolveRead = null;
+                            var r = resolveRead; resolveRead = null;
                             r({ value: encoded, done: false });
                         } else {
                             chunks.push(encoded);
                         }
-                    } else if (msg.type === 'sse') {
-                        var encoded = new TextEncoder().encode(msg.data);
+                    } else if (env.type === 'sse') {
+                        var encoded = new TextEncoder().encode(env.data);
                         if (resolveRead) {
-                            var r = resolveRead;
-                            resolveRead = null;
+                            var r = resolveRead; resolveRead = null;
                             r({ value: encoded, done: false });
                         } else {
                             chunks.push(encoded);
                         }
-                    } else if (msg.type === 'done') {
+                    } else if (env.type === 'done') {
                         streamDone = true;
                         if (resolveRead) {
-                            var r = resolveRead;
-                            resolveRead = null;
+                            var r = resolveRead; resolveRead = null;
                             r({ value: undefined, done: true });
                         }
                     }
-                });
-
-                port.onDisconnect.addListener(function() {
-                    streamDone = true;
-                    if (resolveRead) {
-                        var r = resolveRead;
-                        resolveRead = null;
-                        r({ value: undefined, done: true });
-                    }
-                });
-
+                }
                 var fakeReader = {
                     read: function() {
                         if (chunks.length > 0) return Promise.resolve({ value: chunks.shift(), done: false });
@@ -197,6 +180,36 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                     }
                 };
 
+                if (typeof Platform !== 'undefined' && Platform.isWorker && typeof self.runClaudeOAuthStream === 'function') {
+                    // SW-internal: call the streamer directly.
+                    var signal = (abortController && abortController.signal) || null;
+                    self.runClaudeOAuthStream(requestBody, onEnvelope, signal);
+                    resolve(fakeReader);
+                    return;
+                }
+
+                // Page-side fallback path: port-based.
+                var port = chrome.runtime.connect({ name: 'claude-oauth-stream' });
+                if (abortController && abortController.signal) {
+                    abortController.signal.addEventListener('abort', function() {
+                        try { port.disconnect(); } catch (e) {}
+                        streamDone = true;
+                        if (resolveRead) {
+                            var r = resolveRead; resolveRead = null;
+                            var err = new Error('User aborted stream');
+                            err.name = 'AbortError';
+                            r({ value: undefined, done: true, _abortErr: err });
+                        }
+                    });
+                }
+                port.onMessage.addListener(onEnvelope);
+                port.onDisconnect.addListener(function() {
+                    streamDone = true;
+                    if (resolveRead) {
+                        var r = resolveRead; resolveRead = null;
+                        r({ value: undefined, done: true });
+                    }
+                });
                 port.postMessage({ type: 'start-stream', body: JSON.stringify(requestBody) });
                 resolve(fakeReader);
             });
@@ -208,7 +221,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             headers: {
                 'Authorization': 'Bearer ' + provider.apiKey,
                 'Content-Type': 'application/json',
-                'HTTP-Referer': Platform.instanceUrl || window.location.href
+                // Worker-safe: getReferer() returns a stable string in offscreen
+                // (window.location.href there is offscreen.html, not useful).
+                'HTTP-Referer': (typeof Platform !== 'undefined' && Platform.getReferer)
+                    ? Platform.getReferer()
+                    : (Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : ''))
             },
             body: JSON.stringify(requestBody)
         };

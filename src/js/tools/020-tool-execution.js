@@ -1,3 +1,41 @@
+// =============================================================
+// Image utilities — base64 compress / resize.
+//
+// In the page bundle, these use Image() + <canvas> + canvas.toDataURL.
+// In the SW context (no DOM), they use OffscreenCanvas + createImageBitmap
+// + canvas.convertToBlob and a manual base64 encode (no FileReader in SW).
+// Same external contract: compressBase64Image / resizeImageIfNeeded
+// return promises with the same shape.
+// =============================================================
+
+// Convert a base64 data URL (data:image/...;base64,XXXX) to a Blob.
+function _b64DataUrlToBlob(dataUrl) {
+    var commaIdx = dataUrl.indexOf(',');
+    var meta = commaIdx >= 0 ? dataUrl.substring(0, commaIdx) : '';
+    var b64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
+    var mime = 'application/octet-stream';
+    var m = meta.match(/^data:([^;]+);base64/i);
+    if (m) mime = m[1];
+    var binary = atob(b64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+}
+
+// Convert a Blob to a base64 data URL. Works without FileReader.
+async function _blobToBase64DataUrl(blob) {
+    var buf = await blob.arrayBuffer();
+    var bytes = new Uint8Array(buf);
+    // Chunked binary-string accumulation — large images blow the call stack
+    // if we use String.fromCharCode.apply(null, bytes) directly.
+    var binary = '';
+    var CHUNK = 0x8000;
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+    }
+    return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(binary);
+}
+
 // Compress a base64 image if its decoded size exceeds maxBytes.
 // Re-encodes as JPEG with decreasing quality until under limit.
 // Returns the original base64 if already under limit.
@@ -10,87 +48,81 @@ async function compressBase64Image(base64, maxBytes) {
     else if (b64Part.endsWith('=')) decodedSize -= 1;
     if (decodedSize <= maxBytes) return base64;
 
-    var img = new Image();
-    await new Promise(function(resolve, reject) { img.onload = resolve; img.onerror = reject; img.src = base64; });
-    var canvas = document.createElement('canvas');
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    canvas.getContext('2d').drawImage(img, 0, 0);
-    img.src = '';
+    var blob = _b64DataUrlToBlob(base64);
+    var bitmap = await createImageBitmap(blob);
+    var canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
 
     var result = base64;
     var qualities = [0.85, 0.7, 0.5, 0.3];
     for (var i = 0; i < qualities.length; i++) {
-        result = canvas.toDataURL('image/jpeg', qualities[i]);
-        var rPart = result.substring(result.indexOf(',') + 1);
-        if (Math.floor(rPart.length * 3 / 4) <= maxBytes) break;
+        var outBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: qualities[i] });
+        if (outBlob.size <= maxBytes || i === qualities.length - 1) {
+            result = await _blobToBase64DataUrl(outBlob);
+            break;
+        }
     }
-    canvas.width = 0;
-    canvas.height = 0;
     return result;
 }
 
 // Resize a base64 image so neither dimension exceeds maxDim.
 // Also compresses if the result exceeds 5MB API limit.
 // Returns Promise<{ base64, width, height }>. No-op if already within limits.
-function resizeImageIfNeeded(base64, maxDim) {
+async function resizeImageIfNeeded(base64, maxDim) {
     maxDim = maxDim || 1600;
-    return new Promise(function(resolve) {
-        var img = new Image();
-        img.onload = function() {
-            var w = img.naturalWidth;
-            var h = img.naturalHeight;
-            if (w <= maxDim && h <= maxDim) {
-                img.src = '';
-                compressBase64Image(base64).then(function(compressed) {
-                    resolve({ base64: compressed, width: w, height: h });
-                });
-                return;
-            }
-            var scale = Math.min(maxDim / w, maxDim / h);
-            var newW = Math.round(w * scale);
-            var newH = Math.round(h * scale);
-            var canvas = document.createElement('canvas');
-            canvas.width = newW;
-            canvas.height = newH;
-            var ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, newW, newH);
-            var resized = canvas.toDataURL('image/png');
-            canvas.width = 0;
-            canvas.height = 0;
-            img.src = '';
-            compressBase64Image(resized).then(function(compressed) {
-                resolve({ base64: compressed, width: newW, height: newH });
-            });
-        };
-        img.onerror = function() {
-            resolve({ base64: base64, width: 0, height: 0 });
-        };
-        img.src = base64;
-    });
+    try {
+        var blob = _b64DataUrlToBlob(base64);
+        var bitmap = await createImageBitmap(blob);
+        var w = bitmap.width;
+        var h = bitmap.height;
+        if (w <= maxDim && h <= maxDim) {
+            bitmap.close();
+            var compressed = await compressBase64Image(base64);
+            return { base64: compressed, width: w, height: h };
+        }
+        var scale = Math.min(maxDim / w, maxDim / h);
+        var newW = Math.round(w * scale);
+        var newH = Math.round(h * scale);
+        var canvas = new OffscreenCanvas(newW, newH);
+        var ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0, newW, newH);
+        bitmap.close();
+        var resizedBlob = await canvas.convertToBlob({ type: 'image/png' });
+        var resizedDataUrl = await _blobToBase64DataUrl(resizedBlob);
+        var compressed = await compressBase64Image(resizedDataUrl);
+        return { base64: compressed, width: newW, height: newH };
+    } catch (e) {
+        return { base64: base64, width: 0, height: 0 };
+    }
 }
 
 // Execute set_chat_title tool
-function executeSetChatTitle(args) {
+// SW context: currentChatId is always null (page-only global). Threading the
+// chatId through options lets the agent loop tell us which chat to title;
+// activeStreamingChatId is the page-bundle fallback.
+function executeSetChatTitle(args, options) {
     if (!args.title || typeof args.title !== 'string') {
         return { success: false, error: 'Title is required' };
     }
-    
+
     var title = args.title.trim().substring(0, 60);
     if (title.length === 0) {
         return { success: false, error: 'Title cannot be empty' };
     }
-    
-    var chat = chats[currentChatId];
+
+    var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    var chat = chats[targetChatId];
     if (!chat) {
         return { success: false, error: 'No active chat' };
     }
-    
+
     chat.title = title;
     saveChatsToStorage();
-    renderChatList();
-    updateChatTitleHeader();
-    
+    if (typeof renderChatList === 'function') renderChatList();
+    if (typeof updateChatTitleHeader === 'function') updateChatTitleHeader();
+
     return { success: true, message: 'Chat title updated to: ' + title };
 }
 
@@ -186,7 +218,7 @@ function applySearchReplaceEdits(content, edits) {
 }
 
 // Execute diff edit tool (search-and-replace based)
-async function executeDiffEdit(args, messageIndex) {
+async function executeDiffEdit(args, messageIndex, options) {
     if (!(/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(args.table))) {
         return { success: false, error: 'Invalid table name: must be alphanumeric/underscores only' };
     }
@@ -209,7 +241,7 @@ async function executeDiffEdit(args, messageIndex) {
                 return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _diffInstanceUrl + '). Ensure a tab is open for that instance.' };
             }
         }
-        var _diffApiToken = _diffToken || window.sessionToken || '';
+        var _diffApiToken = _diffToken || Platform.getSessionToken() || '';
 
         // Capture version before the change (skip for cross-instance)
         var versionBefore = null;
@@ -298,10 +330,8 @@ async function executeDiffEdit(args, messageIndex) {
             var versionAfter = await getRecordVersion(args.table, args.sys_id);
             var afterVersion = versionAfter ? versionAfter.sys_id : null;
             var displayName = await getRecordDisplayValue(args.table, args.sys_id);
-            addVersionHistoryEntry({
-                id: 'vh_' + Date.now(),
-                chatId: currentChatId,
-                timestamp: Date.now(),
+            AgentEvents.emit('recordMutated', {
+                chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                 table: args.table,
                 sysId: args.sys_id,
                 field: args.field,
@@ -339,21 +369,395 @@ async function executeDiffEdit(args, messageIndex) {
 
 // Single entry point for all tool execution - always checks permissions
 // options: { batch, toolCallId, chatId } - passed through to requestProgrammaticToolApproval
+//
+// Async tool layer (Sub-Agent spec §4):
+//   • If `args.await === false` AND the tool is not in Handles.ALWAYS_SYNC_TOOLS
+//     AND we are not already wrapping (`options._asyncWrapping`), this call
+//     returns IMMEDIATELY with `{ success: true, handle: 'h_...', status: 'pending', tool: name }`.
+//     The underlying tool runs in the background; the agent retrieves the
+//     real result by calling `await_handle` / `poll_handle` / `await_all` / `await_any`.
+//   • If `args.await` is true or undefined → existing synchronous behavior
+//     (the caller's await on the returned Promise blocks until the real result).
+//   • The `await` meta-key is stripped from `args` ONCE up front so per-tool
+//     branches and the handle entry never see a stray `await` property.
+//   • Approval runs INSIDE the background promise (after the wrap), so a slow
+//     user prompt doesn't block the agent loop — that's the whole point of
+//     `await: false`. The trade-off: the handle stays `pending` while the
+//     user decides, indistinguishable from "tool actively running". A future
+//     `status_message` channel can surface "awaiting approval" to the UI.
+
+// ---------- Pool-deadlock prevention helpers (Phase 5) ----------
+// If the caller is a sub-agent and the target handle is a spawn handle owned
+// by its own chat (i.e. it's awaiting a descendant sub), release the sub's
+// pool slot for the duration of the await. The unpark side of this lives at
+// the `finally` clause of each await arm.
+function _maybeParkForChildAwait(chatIdH, handleId) {
+    try {
+        if (!chatIdH || typeof chats === 'undefined' || !chats[chatIdH] || !chats[chatIdH].isSubAgent) return null;
+        if (typeof SubAgents === 'undefined' || !SubAgents.parkForAwait || !SubAgents.getById) return null;
+        var callerRec = SubAgents.getById(chats[chatIdH].subAgentId);
+        if (!callerRec) return null;
+        var entry = (typeof Handles !== 'undefined' && Handles.get) ? Handles.get(chatIdH, handleId) : null;
+        if (!entry || entry.name !== 'spawn_sub_agent') return null;
+        return SubAgents.parkForAwait(callerRec.agent_id) ? callerRec.agent_id : null;
+    } catch (_) { return null; }
+}
+function _maybeParkForChildAwaitMulti(chatIdH, handleIds) {
+    // For await_any / await_all: park if ANY of the handles is a spawn handle
+    // in the caller chat. One park per call — unparkAfterAwait is idempotent
+    // in the no-park case.
+    if (!Array.isArray(handleIds)) return null;
+    for (var i = 0; i < handleIds.length; i++) {
+        var aid = _maybeParkForChildAwait(chatIdH, handleIds[i]);
+        if (aid) return aid; // first match wins; we only ever park once per arm
+    }
+    return null;
+}
+
 async function executeTool(name, args, messageIndex, options) {
+    // Strip the meta-key once. Both the wrap path and the sync path operate
+    // on the cleaned args from here on.
+    if (args && Object.prototype.hasOwnProperty.call(args, 'await')) {
+        var hadAwaitFalse = args.await === false;
+        var _stripped = {};
+        for (var _sk in args) { if (_sk !== 'await') _stripped[_sk] = args[_sk]; }
+        args = _stripped;
+        // Async-mode wrap: bounce the call into a handle and return the receipt.
+        if (hadAwaitFalse
+            && !(options && options._asyncWrapping)
+            && typeof Handles !== 'undefined'
+            && !(Handles.ALWAYS_SYNC_TOOLS && Handles.ALWAYS_SYNC_TOOLS[name])) {
+            var chatIdForHandle = (options && options.chatId) || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+            var displayName = (typeof getToolDisplayName === 'function') ? getToolDisplayName(name, args.method || args.action) : name;
+            var nextOptions = {};
+            for (var _ok in (options || {})) nextOptions[_ok] = options[_ok];
+            nextOptions._asyncWrapping = true;
+            var asyncArgs = args; // already stripped
+            var started = Handles.start(chatIdForHandle, name, asyncArgs, displayName, function() {
+                return executeTool(name, asyncArgs, messageIndex, nextOptions);
+            });
+            // Plumb handle identity so the inner approval call can flip
+            // awaitingApproval on the entry while the user-prompt modal
+            // is up. See Handles.markAwaitingApproval (registry §) and
+            // the requestProgrammaticToolApproval implementations.
+            nextOptions._handleId = started.handleId;
+            nextOptions._handleChatId = chatIdForHandle;
+            // If the caller is a sub-agent, register this handle so
+            // stop_sub_agent can cancel it on terminate. Without this,
+            // a stopped sub's in-flight async tool calls keep running
+            // and burning resources until they naturally finish.
+            try {
+                if (chatIdForHandle && typeof chats !== 'undefined' && chats[chatIdForHandle]
+                    && chats[chatIdForHandle].isSubAgent
+                    && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+                    var _ownerSub = SubAgents.getById(chats[chatIdForHandle].subAgentId);
+                    if (_ownerSub) {
+                        _ownerSub.pending_handles = _ownerSub.pending_handles || [];
+                        if (_ownerSub.pending_handles.indexOf(started.handleId) === -1) {
+                            _ownerSub.pending_handles.push(started.handleId);
+                        }
+                        // Best-effort cleanup when the handle settles — prevents
+                        // pending_handles from growing without bound over the
+                        // sub's lifetime.
+                        if (Handles.await) {
+                            Handles.await(chatIdForHandle, started.handleId, 0).then(function() {
+                                var _idx = _ownerSub.pending_handles.indexOf(started.handleId);
+                                if (_idx >= 0) _ownerSub.pending_handles.splice(_idx, 1);
+                            });
+                        }
+                    }
+                }
+            } catch (_) { /* tracking is best-effort; don't break async wrap */ }
+            return {
+                success: true,
+                handle: started.handleId,
+                status: 'pending',
+                tool: name,
+                note: 'Async tool call — use await_handle("' + started.handleId + '") to collect the result.'
+            };
+        }
+    }
+
     var approval = await requestProgrammaticToolApproval(name, args, options);
     if (!approval.allowed) {
         return { success: false, error: approval.error, _denied: true };
     }
 
+    // -------- Sub-agent enforcement (roster + budget) --------
+    // Two gates for sub-agent chats:
+    //   1. tool_roster: the deterministic per-sub roster set at spawn. Subs
+    //      inherit the parent's full tool list minus the nested-delegation
+    //      tools (spawn/stop/wake_sub_agent), which are denied unless the
+    //      caller passed `allow_nested:true`. The model-visible list is
+    //      already filtered by getEnabledTools, but the dispatch arm is the
+    //      defense-in-depth boundary — if a denied tool slips through
+    //      (skill tool, cache lag, js_eval bridge), this rejects it.
+    //   2. tool-call budget: increment tool_calls_used; on overflow the registry
+    //      stops the sub and we short-circuit with an explanatory error. Read-only
+    //      finalization tools (agent_status / report_to_parent / sleep_self) and
+    //      the handle helpers are exempt so the sub can always surrender control.
+    if (typeof SubAgents !== 'undefined' && SubAgents.onToolCallInSubAgent) {
+        var _budgetChatId = (options && options.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        // Roster gate. Sub-only tools (report_to_parent / sleep_self / agent_message)
+        // are always allowed regardless of roster — the registry injects them as
+        // SUB_ONLY_TOOLS at spawn, but a defensive check here means "a sub can
+        // always finalize" even if the persisted record is somehow malformed.
+        if (_budgetChatId && typeof chats !== 'undefined' && chats[_budgetChatId]
+            && chats[_budgetChatId].isSubAgent && SubAgents.getById) {
+            var _subRec = SubAgents.getById(chats[_budgetChatId].subAgentId);
+            if (_subRec && Array.isArray(_subRec.tool_roster)) {
+                var _alwaysAllowed = (name === 'report_to_parent'
+                    || name === 'sleep_self'
+                    || name === 'agent_message');
+                if (!_alwaysAllowed && _subRec.tool_roster.indexOf(name) === -1) {
+                    return { success: false, error: 'Tool "' + name + '" is not available to this sub-agent. Nested-delegation tools (spawn_sub_agent, stop_sub_agent, wake_sub_agent) require `allow_nested:true` at spawn.', _roster_denied: true };
+                }
+            }
+        }
+        // Status / lifecycle / handle-management tools don't burn budget — a
+        // sub-agent pushing a `partial` update to the parent via agent_message,
+        // or polling its own handles, shouldn't accelerate its own tool-budget
+        // exhaustion. The cap exists to bound *productive work*, not bookkeeping.
+        var _exemptBudget = (name === 'agent_status'
+            || name === 'report_to_parent'
+            || name === 'sleep_self'
+            || name === 'agent_message'
+            || name === 'poll_handle'
+            || name === 'await_handle'
+            || name === 'await_any'
+            || name === 'await_all'
+            || name === 'cancel_handle');
+        if (!_exemptBudget) {
+            var _ok = SubAgents.onToolCallInSubAgent(_budgetChatId);
+            if (!_ok) {
+                return { success: false, error: 'Sub-agent exceeded max_tool_calls budget. The sub has been stopped.', _budget_exhausted: true };
+            }
+        }
+    }
+
+    // -------- Handle helper tools (always-sync) --------
+    if (name === 'await_handle' || name === 'poll_handle'
+        || name === 'await_any' || name === 'await_all'
+        || name === 'cancel_handle') {
+        if (typeof Handles === 'undefined') {
+            return { success: false, error: 'Handle registry not loaded — async tool layer unavailable.' };
+        }
+        var chatIdH = (options && options.chatId) || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        if (name === 'poll_handle') {
+            if (!args || !args.handle) return { success: false, error: 'poll_handle requires `handle`.' };
+            return { success: true, snapshot: Handles.poll(chatIdH, args.handle) };
+        }
+        if (name === 'await_handle') {
+            if (!args || !args.handle) return { success: false, error: 'await_handle requires `handle`.' };
+            var timeoutMsAH = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            // Pool-deadlock prevention (Phase 5): if the caller is a sub-agent
+            // and the target handle is a spawn handle (i.e. waiting on a
+            // descendant), release the parent sub's pool slot for the duration
+            // of the await. Otherwise four concurrent nested awaits = global
+            // deadlock (pool size = 2, nothing free to start the grandchildren).
+            var _parkedAid = _maybeParkForChildAwait(chatIdH, args.handle);
+            try {
+                var snapAH = await Handles.await(chatIdH, args.handle, timeoutMsAH);
+                return { success: true, snapshot: snapAH };
+            } finally {
+                if (_parkedAid && typeof SubAgents !== 'undefined' && SubAgents.unparkAfterAwait) {
+                    try { SubAgents.unparkAfterAwait(_parkedAid); } catch (_) {}
+                }
+            }
+        }
+        if (name === 'await_any') {
+            if (!args || !Array.isArray(args.handles) || !args.handles.length) {
+                return { success: false, error: 'await_any requires a non-empty `handles` array.' };
+            }
+            var timeoutMsAY = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            var _parkedAidAY = _maybeParkForChildAwaitMulti(chatIdH, args.handles);
+            try {
+                var anyRes = await Handles.awaitAny(chatIdH, args.handles, timeoutMsAY);
+                // anyRes is already { handle, snapshot, timeout, pendingSnapshots? }
+                return Object.assign({ success: true }, anyRes);
+            } finally {
+                if (_parkedAidAY && typeof SubAgents !== 'undefined' && SubAgents.unparkAfterAwait) {
+                    try { SubAgents.unparkAfterAwait(_parkedAidAY); } catch (_) {}
+                }
+            }
+        }
+        if (name === 'await_all') {
+            if (!args || !Array.isArray(args.handles) || !args.handles.length) {
+                return { success: false, error: 'await_all requires a non-empty `handles` array.' };
+            }
+            var timeoutMsAA = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            var _parkedAidAA = _maybeParkForChildAwaitMulti(chatIdH, args.handles);
+            try {
+                var allRes = await Handles.awaitAll(chatIdH, args.handles, timeoutMsAA);
+                // allRes is { snapshots: [...] }
+                return { success: true, snapshots: allRes.snapshots };
+            } finally {
+                if (_parkedAidAA && typeof SubAgents !== 'undefined' && SubAgents.unparkAfterAwait) {
+                    try { SubAgents.unparkAfterAwait(_parkedAidAA); } catch (_) {}
+                }
+            }
+        }
+        if (name === 'cancel_handle') {
+            if (!args || !args.handle) return { success: false, error: 'cancel_handle requires `handle`.' };
+            // If the handle is a spawn_sub_agent handle, plain Handles.cancel
+            // only flips the entry state — the sub-agent itself keeps
+            // running, consuming a pool slot and tool budget, until it
+            // naturally finishes (whose payload is then silently discarded).
+            // Route through SubAgents.stop so the sub is actually terminated
+            // and its own pending handles are cancelled.
+            try {
+                var _entry = Handles.get ? Handles.get(chatIdH, args.handle) : null;
+                if (_entry && _entry.name === 'spawn_sub_agent'
+                    && typeof SubAgents !== 'undefined' && SubAgents.listAll && SubAgents.stop) {
+                    var _subs = SubAgents.listAll();
+                    for (var _si = 0; _si < _subs.length; _si++) {
+                        if (_subs[_si].spawn_handle_id === args.handle) {
+                            // stop() will resolve the spawn handle as cancelled
+                            // (via _resolveSpawnHandle → Handles.cancel) so the
+                            // parent's await_handle returns status:'cancelled'.
+                            // Pass ctx (with chatIdH) so the ACL check in
+                            // SubAgents.stop can resolve the caller. The
+                            // previous call omitted ctx — _callerChatId
+                            // resolved to null, the gate silently skipped,
+                            // and a chat could theoretically cancel any
+                            // spawn handle it learned the id of (currently
+                            // hard to exploit because handles are chat-
+                            // scoped, but the boundary should hold by
+                            // construction, not by accident).
+                            var _stopRes = SubAgents.stop(
+                                { agent_id: _subs[_si].agent_id, reason: args.reason || 'cancelled via cancel_handle' },
+                                { chatId: chatIdH }
+                            );
+                            // Preserve the cancel_handle status contract — a caller
+                            // who used cancel_handle should get back status:'cancelled',
+                            // not status:'stopped' (which is what SubAgents.stop
+                            // returns). Previously Object.assign was {…cancelled,
+                            // _stopRes} which let _stopRes.status='stopped' clobber
+                            // ours. Spread _stopRes FIRST, our base SECOND so our
+                            // cancelled status wins. The handle itself already
+                            // resolves with status:'cancelled' via _resolveSpawnHandle
+                            // — this just makes the immediate tool return shape match.
+                            return Object.assign({}, _stopRes || {}, { success: true, ok: true, status: 'cancelled' });
+                        }
+                    }
+                }
+            } catch (_) { /* fall through to plain cancel */ }
+            var cancelRes = Handles.cancel(chatIdH, args.handle, args.reason);
+            // cancelRes is { ok, status?, reason?, error? }. We always return
+            // success:true at the tool boundary — "handle already settled" or
+            // "unknown handle" is information, not a tool failure. The agent
+            // reads `ok`/`status`/`error` from the flattened body.
+            return Object.assign({ success: true }, cancelRes);
+        }
+    }
+
+    // -------- Sub-agent runtime tools (Phase 2) --------
+    // All seven dispatch to SubAgents.* in src/js/core/097-sub-agent-registry.js.
+    // ctx carries the chatId so the registry can resolve parent/sub identity
+    // (a sub calling report_to_parent / sleep_self uses ctx.chatId to look up
+    // its own record).
+    if (name === 'spawn_sub_agent'
+        || name === 'report_to_parent'
+        || name === 'agent_status'
+        || name === 'wake_sub_agent'
+        || name === 'stop_sub_agent'
+        || name === 'sleep_self'
+        || name === 'agent_message') {
+        if (typeof SubAgents === 'undefined') {
+            return { success: false, error: 'Sub-agent registry not loaded.' };
+        }
+        var subCtxChatId = (options && options.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var subCtx = { chatId: subCtxChatId };
+        if (name === 'spawn_sub_agent')  return SubAgents.spawn(args, subCtx);
+        if (name === 'report_to_parent') return SubAgents.report(args, subCtx);
+        if (name === 'agent_status')     return SubAgents.status(args, subCtx);
+        if (name === 'wake_sub_agent')   return SubAgents.wake(args, subCtx);
+        if (name === 'stop_sub_agent')   return SubAgents.stop(args, subCtx);
+        if (name === 'sleep_self')       return SubAgents.sleep(args, subCtx);
+        if (name === 'agent_message')    return SubAgents.message(args, subCtx);
+    }
+
     // Execute the tool
     if (name === 'js_eval') {
-        var sandbox = null;
-        var sandboxMessageHandler = null;
         try {
             var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
 
-            sandbox = document.createElement('iframe');
+            // SW context bridges js_eval to the offscreen helper which
+            // hosts the real sandbox iframe. Page context falls through
+            // to the existing DOM-based path further below.
+            if (typeof Platform !== 'undefined' && Platform.isWorker) {
+                // Same Unicode sanitization regex as the DOM path below, written
+                // with \uXXXX escapes to keep both branches byte-identical and
+                // immune to silent desync if an editor normalizes one branch.
+                var sanitizedCodeSw = args.code
+                    .replace(/[\u2018\u2019\u02BC\u02B9]/g, "'")
+                    .replace(/[\u201C\u201D]/g, '"')
+                    .replace(/[\u02CB\u0060\u2032\u02B4]/g, '`');
+                var swEvalResult = await Platform.callOffscreenHelper('helper-js-eval', {
+                    code: sanitizedCodeSw,
+                    chatId: chatId,
+                    messageIndex: messageIndex,
+                    // Plumb the js_eval toolCallId down so display calls from
+                    // inside the sandbox can eager-render attached to this
+                    // tool's result slot. See executeDisplay's eager-render path.
+                    parentToolCallId: options && options.toolCallId,
+                    globals: { lastLargeResponse: lastLargeResponse }
+                }, 5 * 60 * 1000);
+                var jsEvalResultSw = { success: true, result: swEvalResult };
+                if (swEvalResult && swEvalResult._images && Array.isArray(swEvalResult._images) && swEvalResult._images.length > 0) {
+                    var imgsSw = swEvalResult._images.filter(function(img) { return img && img.base64; });
+                    delete swEvalResult._images;
+                    var ssMsgsSw = await Promise.all(imgsSw.map(async function(img) {
+                        var ssId = newFileId();
+                        var imgW = img.width || null;
+                        var imgH = img.height || null;
+                        // Look up dimensions from screenshots stored during this js_eval execution
+                        if ((!imgW || !imgH) && chatId) {
+                            var jsChatSw = chats[chatId];
+                            if (jsChatSw && jsChatSw.screenshots) {
+                                if (img.screenshot_id && jsChatSw.screenshots[img.screenshot_id]) {
+                                    var storedSw = jsChatSw.screenshots[img.screenshot_id];
+                                    imgW = imgW || storedSw.width;
+                                    imgH = imgH || storedSw.height;
+                                } else {
+                                    var b64PrefixSw = img.base64 ? img.base64.substring(0, 200) : '';
+                                    for (var ssKeySw in jsChatSw.screenshots) {
+                                        var ssSw = jsChatSw.screenshots[ssKeySw];
+                                        if (ssSw.base64 && ssSw.base64.substring(0, 200) === b64PrefixSw) {
+                                            imgW = imgW || ssSw.width;
+                                            imgH = imgH || ssSw.height;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        var resized = await resizeImageIfNeeded(img.base64);
+                        return {
+                            role: 'screenshot',
+                            base64: resized.base64,
+                            name: img.name || null,
+                            description: img.description || 'Image from js_eval',
+                            timestamp: Date.now(),
+                            width: resized.width,
+                            height: resized.height,
+                            screenshot_id: ssId,
+                            file_id: ssId
+                        };
+                    }));
+                    if (ssMsgsSw.length === 1) jsEvalResultSw._screenshotMessage = ssMsgsSw[0];
+                    else jsEvalResultSw._screenshotMessages = ssMsgsSw;
+                }
+                return jsEvalResultSw;
+            }
+
+            var sandbox = document.createElement('iframe');
             sandbox.style.display = 'none';
+            var sandboxMessageHandler = null;
 
             // Sanitize code: convert Unicode lookalike characters to ASCII equivalents
             var sanitizedCode = args.code
@@ -374,7 +778,18 @@ async function executeTool(name, args, messageIndex, options) {
                     if (e.data && e.data.type === 'sandboxReady') {
                         sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: sanitizedCode, globals: { lastLargeResponse: lastLargeResponse } }, '*');
                     } else if (e.data && e.data.type === MSG_TOOL_CALL) {
-                        var toolPromise = executeTool(e.data.name, e.data.args, messageIndex, { chatId: chatId, fromSandbox: true });
+                        // Pass the OUTER js_eval's toolCallId as parentToolCallId
+                        // so placeholder-based tools (display) can attach their
+                        // render to the parent's tool_result slot — see
+                        // executeDisplay's eager-render path. Without this,
+                        // displays created via `executeTool('display', ...)`
+                        // from inside the sandbox silently never render
+                        // (placeholder string never makes it to the agent's reply).
+                        var toolPromise = executeTool(e.data.name, e.data.args, messageIndex, {
+                            chatId: chatId,
+                            fromSandbox: true,
+                            parentToolCallId: options && options.toolCallId
+                        });
                         var timeoutPromise = new Promise(function(_, rej) { setTimeout(function() { rej(new Error('Tool call timed out after 30s')); }, 30000); });
                         Promise.race([toolPromise, timeoutPromise])
                             .then(function(result) {
@@ -469,10 +884,15 @@ async function executeTool(name, args, messageIndex, options) {
             }
             return jsEvalResult;
         } catch (e) {
-            if (sandboxMessageHandler) {
-                window.removeEventListener('message', sandboxMessageHandler);
+            // sandbox / sandboxMessageHandler are only defined on the DOM
+            // fallback path (page bundle) — they're undefined in the SW
+            // worker context that bridges to offscreen.
+            if (typeof sandboxMessageHandler !== 'undefined' && sandboxMessageHandler) {
+                try { window.removeEventListener('message', sandboxMessageHandler); } catch (cleanupErr) {}
             }
-            if (sandbox && sandbox.parentNode) sandbox.parentNode.removeChild(sandbox);
+            if (typeof sandbox !== 'undefined' && sandbox && sandbox.parentNode) {
+                try { sandbox.parentNode.removeChild(sandbox); } catch (cleanupErr) {}
+            }
             return { success: false, error: e.message };
         }
     } else if (name === 'list_instances') {
@@ -543,7 +963,7 @@ async function executeTool(name, args, messageIndex, options) {
                 '&table_sys_id=' + encodeURIComponent(args.attachment_table_sys_id) +
                 '&file_name=' + encodeURIComponent(args.attachment_file_name);
             if (_attachInstanceUrl) attachUrl = _attachInstanceUrl + attachUrl;
-            var _attachApiToken = _attachToken || window.sessionToken || '';
+            var _attachApiToken = _attachToken || Platform.getSessionToken() || '';
             var attachOpts = {
                 method: 'POST',
                 headers: {
@@ -612,7 +1032,7 @@ async function executeTool(name, args, messageIndex, options) {
                 beforeVersion = versionBefore ? versionBefore.sys_id : null;
             }
 
-            var _apiToken = _targetToken || window.sessionToken || '';
+            var _apiToken = _targetToken || Platform.getSessionToken() || '';
             var opts = {
                 method: args.method,
                 headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-UserToken': _apiToken }
@@ -637,10 +1057,8 @@ async function executeTool(name, args, messageIndex, options) {
                     var versionAfter = await getRecordVersion(args.table, recordSysId);
                     var afterVersion = versionAfter ? versionAfter.sys_id : null;
                     var displayName = await getRecordDisplayValue(args.table, recordSysId);
-                    addVersionHistoryEntry({
-                        id: 'vh_' + Date.now(),
-                        chatId: currentChatId,
-                        timestamp: Date.now(),
+                    AgentEvents.emit('recordMutated', {
+                        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                         table: args.table,
                         sysId: recordSysId,
                         displayName: displayName,
@@ -688,7 +1106,7 @@ async function executeTool(name, args, messageIndex, options) {
         var _rsUrl = '/sys.scripts.do?' + _rsParams.join('&');
         if (_rsTargetUrl) _rsUrl = _rsTargetUrl + _rsUrl;
         try {
-            var _rsApiToken = _rsTargetToken || window.sessionToken || '';
+            var _rsApiToken = _rsTargetToken || Platform.getSessionToken() || '';
             var _rsRes = await fetch(_rsUrl, {
                 method: 'GET',
                 headers: { 'Accept': 'text/html', 'X-UserToken': _rsApiToken }
@@ -730,11 +1148,11 @@ async function executeTool(name, args, messageIndex, options) {
             return { success: false, error: e.message };
         }
     } else if (name === 'servicenow_diff_edit') {
-        return await executeDiffEdit(args, messageIndex);
+        return await executeDiffEdit(args, messageIndex, options);
     } else if (name === 'iframe_tool') {
         return await executeIframeTool(args);
     } else if (name === 'set_chat_title') {
-        return executeSetChatTitle(args);
+        return executeSetChatTitle(args, options);
     } else if (name === 'cached_content_outline') {
         var ccoChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
         return executeCachedContentOutline(ccoChatId, args);
@@ -771,33 +1189,43 @@ async function executeTool(name, args, messageIndex, options) {
     } else if (name === 'web_fetch') {
         try {
             var _wfSaveFile = args.save_file;
-            // Route through background script — Origin header stripped by declarativeNetRequest rule
-            var fetchResult = await new Promise(function(resolve) {
-                var timeout = setTimeout(function() { resolve({ error: 'web_fetch timed out after 30s' }); }, 30000);
-                chrome.runtime.sendMessage({
-                    type: 'web-fetch',
-                    url: args.url,
-                    method: args.method || 'GET',
-                    headers: args.headers || {},
-                    body: args.body || null,
-                    save_file: _wfSaveFile || false
-                }, function(response) {
-                    clearTimeout(timeout);
-                    if (chrome.runtime.lastError) resolve({ error: chrome.runtime.lastError.message });
-                    else resolve(response || { error: 'No response from background script' });
+            // Fetch directly from the SW. The Origin header is stripped by the
+            // declarativeNetRequest rule scoped to initiatorDomains: [extension id],
+            // so calling fetch() from this context behaves the same as the old
+            // background-script round-trip. (chrome.runtime.sendMessage from a SW
+            // is not delivered back to the same SW, which is why the previous
+            // sendMessage-based path always failed with "message port closed".)
+            var _wfOpts = {
+                method: args.method || 'GET',
+                headers: args.headers || {},
+                cache: 'no-store'
+            };
+            if (args.body && ['POST', 'PUT', 'PATCH'].includes(_wfOpts.method)) {
+                _wfOpts.body = args.body;
+            }
+            var _wfRes = await fetch(args.url, _wfOpts);
+            var _wfCT = _wfRes.headers.get('content-type') || '';
+            var _wfBody;
+            if (_wfSaveFile) {
+                var _wfBlob = await _wfRes.blob();
+                _wfBody = await new Promise(function(resolve) {
+                    var reader = new FileReader();
+                    reader.onload = function() { resolve(reader.result); };
+                    reader.readAsDataURL(_wfBlob);
                 });
-            });
-            if (fetchResult.error) return { success: false, error: fetchResult.error };
-            var _wfResult = { success: true, status: fetchResult.status, content_type: fetchResult.content_type };
+            } else {
+                _wfBody = await _wfRes.text();
+            }
+            var _wfResult = { success: true, status: _wfRes.status, content_type: _wfCT };
             if (_wfSaveFile) {
                 var _wfFileId = newFileId();
                 var _wfName = args.url.split('/').pop().split('?')[0] || 'download';
-                registerFile(_wfFileId, { type: 'memory', data: fetchResult.body, name: _wfName, mime: fetchResult.content_type || 'application/octet-stream' });
+                registerFile(_wfFileId, { type: 'memory', data: _wfBody, name: _wfName, mime: _wfCT || 'application/octet-stream' });
                 _wfResult.file_id = _wfFileId;
                 _wfResult.file_name = _wfName;
-                _wfResult.file_size = fetchResult.body ? fetchResult.body.length : 0;
+                _wfResult.file_size = _wfBody ? _wfBody.length : 0;
             } else {
-                _wfResult.body = fetchResult.body;
+                _wfResult.body = _wfBody;
             }
             return _wfResult;
         } catch (e) {
@@ -976,9 +1404,17 @@ async function executeWorkspaceTool(args, options) {
         } else {
             return { success: false, error: 'Unknown workspace action: ' + action };
         }
-        // Update header status after mutating actions
+        // Notify panel after mutating actions. The header refresh used to be
+        // called inline (updateWorkspaceHeaderStatus); now we emit and let the
+        // panel subscriber decide what to refresh.
         if (_wsMutatingActions[action] && result && result.success) {
-            updateWorkspaceHeaderStatus();
+            AgentEvents.emit('workspaceMutated', {
+                chatId: chatId,
+                action: action,
+                repo: wk,
+                branch: (wk && parseWsKey(wk).branch) || null,
+                path: args.path || null
+            });
         }
         return result;
     } catch (e) {
@@ -993,14 +1429,12 @@ async function wsClone(repo, branch) {
 
     var wk = wsKey(repo, branch);
 
-    // Check for existing clone of this repo::branch
-    var existing = await getWorkspaceMeta(wk);
-    if (existing) {
-        await deleteWorkspaceFiles(wk);
-        await deleteWorkspaceMeta(wk);
-    }
-
-    // Get branch ref
+    // Resolve the branch ref BEFORE wiping any existing clone. The previous
+    // order deleted the existing workspace as soon as the user re-cloned the
+    // same repo::branch — so a transient GitHub failure (auth expired, network
+    // down) would surface as both "branch not found" AND a destroyed workspace
+    // that hadn't actually been replaced. Now we only delete after the new
+    // ref is confirmed live.
     var refRes = await githubApi('GET', '/repos/' + repo + '/git/ref/heads/' + encodeURIComponent(branch));
     if (!refRes.ok) {
         // Try 'master' fallback if 'main' was default
@@ -1008,13 +1442,26 @@ async function wsClone(repo, branch) {
             refRes = await githubApi('GET', '/repos/' + repo + '/git/ref/heads/master');
             if (refRes.ok) { branch = 'master'; wk = wsKey(repo, branch); }
         }
-        if (!refRes.ok) return { success: false, error: 'Branch "' + branch + '" not found. Status: ' + refRes.status };
+        if (!refRes.ok) {
+            var _refErr = refRes && refRes.error ? refRes.error : ('HTTP ' + (refRes && refRes.status));
+            return { success: false, error: 'Branch "' + branch + '" not found. ' + _refErr };
+        }
     }
     var headSha = refRes.body.object.sha;
 
     // Get full tree
     var treeRes = await githubApi('GET', '/repos/' + repo + '/git/trees/' + headSha + '?recursive=1');
-    if (!treeRes.ok) return { success: false, error: 'Failed to fetch tree: ' + treeRes.status };
+    if (!treeRes.ok) {
+        var _treeErr = treeRes && treeRes.error ? treeRes.error : ('HTTP ' + (treeRes && treeRes.status));
+        return { success: false, error: 'Failed to fetch tree: ' + _treeErr };
+    }
+
+    // Now that we have a live tree, replace any existing clone.
+    var existing = await getWorkspaceMeta(wk);
+    if (existing) {
+        await deleteWorkspaceFiles(wk);
+        await deleteWorkspaceMeta(wk);
+    }
 
     var tree = treeRes.body.tree.filter(function(e) { return e.type === 'blob'; });
     var fileCount = tree.length;
@@ -1111,7 +1558,7 @@ async function wsClone(repo, branch) {
     });
 
     refreshWorkspaceContext(); // update system prompt context
-    updateWorkspaceHeaderStatus();
+    AgentEvents.emit('workspaceMutated', { action: 'clone', repo: wk, branch: branch });
     var _msg = 'Cloned ' + repo + ' (' + branch + '): ' + storedCount + '/' + fileCount + ' files';
     if (reusedCount > 0) _msg += ' (' + reusedCount + ' reused from local cache)';
     return { success: true, workspace: wk, message: _msg, branch: branch, files: storedCount, reused: reusedCount };
@@ -2036,7 +2483,7 @@ async function wsPush(wk, args) {
     await setWorkspaceMeta(meta);
 
     refreshWorkspaceContext();
-    updateWorkspaceHeaderStatus();
+    AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: meta.branch });
     return { success: true, workspace: wk, pr_url: prUrl, pr_number: prNumber, files_pushed: dirtyFiles.length, branch: meta.branch };
 }
 

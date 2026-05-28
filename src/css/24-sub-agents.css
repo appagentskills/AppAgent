@@ -1,0 +1,508 @@
+/* =============================================
+   Sub-agent UI styles
+   - sub_report callouts in the parent chat
+   - sidebar "↳ parent" breadcrumb on sub chats
+   - Workers strip above the chat input
+   =============================================
+   Token policy: only reference tokens that ACTUALLY exist in
+   src/css/00-tokens.css. The previous version of this file leaned
+   on `--surface-1/2/3`, `--text`, `--muted`, `--text-sm` (which
+   resolves to 10px, not 13), `--text-xs` (9px, not 11), and
+   `--radius-full` (50%, not 999px) — none of which produced what
+   the fallback hex values implied. Result: tiny text, broken pill
+   shapes, light-mode-only colors. This rewrite uses the canonical
+   tokens so dark theme picks up overrides from 01-dark-theme.css
+   automatically and font sizes match design intent.
+*/
+
+/* ---------- sub_report callout ----------
+   The callout is a <details> element — collapsed by default. The <summary>
+   row is the always-visible "header" (chevron + icon + name + status +
+   one-line preview + open-transcript button). Clicking the header expands
+   the full markdown body. CSS resets the native disclosure marker since we
+   render our own chevron, and tightens spacing so the row matches the old
+   visual weight of the pre-collapsed callout. */
+.message.sub-report {
+    background: var(--bg-light);
+    border: 1px solid var(--border, #e1e4ea);
+    border-left: 3px solid var(--accent, #6c63ff);
+    border-radius: var(--radius-md, 6px);
+    padding: var(--space-3, 6px) var(--space-7, 14px);
+    margin: var(--space-5, 10px) 0;
+    font-size: var(--text-body, 13px);
+}
+.message.sub-report.sub-report-done    { border-left-color: var(--success, #2da44e); }
+.message.sub-report.sub-report-error   { border-left-color: var(--danger, #cf222e); }
+.message.sub-report.sub-report-need_input { border-left-color: var(--warning, #bf8700); }
+.message.sub-report.sub-report-partial { border-left-color: var(--text-muted, #8a93a6); }
+.message.sub-report.sub-report-cancelled { border-left-color: var(--text-muted, #8a93a6); }
+
+/* The native ::-webkit-details-marker / ::marker triangle would sit before
+   our custom chevron and double up. Hide it; we paint our own chevron that
+   also rotates via [open] below. */
+.message.sub-report > summary::-webkit-details-marker { display: none; }
+.message.sub-report > summary { list-style: none; }
+.message.sub-report > summary::marker { content: ''; }
+
+.sub-report-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4, 8px);
+    font-weight: var(--font-semibold, 600);
+    cursor: pointer;
+    padding: var(--space-2, 4px) 0;
+    /* Removed margin-bottom — when collapsed the summary should fit on one
+       line; when open the body has its own top margin. */
+}
+.sub-report-chevron {
+    display: inline-block;
+    width: 10px;
+    flex-shrink: 0;
+    color: var(--text-muted, #6b7280);
+    transition: transform 0.15s ease;
+    /* Triangle drawn with CSS borders so we don't depend on a font glyph. */
+    border-style: solid;
+    border-width: 4px 0 4px 6px;
+    border-color: transparent transparent transparent currentColor;
+    margin-right: 2px;
+}
+.message.sub-report[open] > summary .sub-report-chevron { transform: rotate(90deg); }
+.sub-report-preview {
+    color: var(--text-muted, #6b7280);
+    font-weight: var(--font-normal, 400);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.message.sub-report[open] > summary .sub-report-preview { display: none; }
+.sub-report-body {
+    margin-top: var(--space-4, 8px);
+    padding-top: var(--space-3, 6px);
+    border-top: 1px dashed var(--border, #e1e4ea);
+}
+.sub-report-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--bg-hover, #e7e9ee);
+    font-size: var(--text-caption, 11px);
+}
+.sub-report-done    .sub-report-icon { background: rgba(45,164,78,0.15); color: var(--success, #2da44e); }
+.sub-report-error   .sub-report-icon { background: rgba(207,34,46,0.15); color: var(--danger,  #cf222e); }
+.sub-report-need_input .sub-report-icon { background: rgba(191,135,0,0.15); color: var(--warning, #bf8700); }
+.sub-report-partial .sub-report-icon { background: rgba(138,147,166,0.15); color: var(--text-muted, #8a93a6); }
+.sub-report-cancelled .sub-report-icon { background: rgba(138,147,166,0.15); color: var(--text-muted, #8a93a6); }
+
+.sub-report-name { color: var(--text-primary, #1f2328); }
+.sub-report-status {
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-normal, 400);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted, #6b7280);
+    padding: 1px 6px;
+    border-radius: var(--radius-sm, 4px);
+    background: var(--bg-hover, #e7e9ee);
+}
+.sub-report-synth {
+    font-size: var(--text-caption, 11px);
+    color: var(--warning, #bf8700);
+    background: rgba(191,135,0,0.12);
+    padding: 1px 6px;
+    border-radius: var(--radius-sm, 4px);
+}
+/* The "open chat" button on the sub_report header. Styled as a real
+   button (background + border + padding + gap) instead of a text link
+   so it reads as an action target alongside the chat-bubble icon. Two
+   anti-wrap protections keep it on a single line even with a long
+   preview: flex-shrink:0 prevents the flex parent from squeezing it,
+   and white-space:nowrap forbids the icon/label pair from breaking.
+   The preceding .sub-report-preview already truncates with ellipsis
+   (min-width:0 + overflow:hidden) so it yields room to us. */
+.sub-report-open {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-medium, 500);
+    color: var(--accent, #6c63ff);
+    background: var(--bg-white, #fff);
+    border: 1px solid var(--border, #e1e4ea);
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+    padding: 2px 8px;
+    font-family: inherit;
+    line-height: 1.4;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.sub-report-open:hover {
+    background: var(--bg-hover, #e7e9ee);
+    border-color: var(--accent, #6c63ff);
+    text-decoration: none;
+}
+.sub-report-open:focus-visible {
+    outline: 2px solid var(--accent, #6c63ff);
+    outline-offset: 1px;
+}
+.sub-report-open-icon {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+}
+.sub-report-open-label { display: inline; }
+
+.sub-report-summary {
+    /* Body is now rendered through formatContent() — inherit the .markdown-body
+       paragraph / list / blockquote spacing instead of relying on pre-wrap. */
+    color: var(--text-primary, #1f2328);
+    line-height: var(--leading-loose, 1.6);
+}
+.sub-report-artifacts {
+    margin-top: var(--space-3, 6px);
+    font-size: var(--text-caption, 11px);
+    color: var(--text-muted, #6b7280);
+}
+.sub-report-artifact {
+    display: inline-block;
+    margin-right: 4px;
+    padding: 1px 6px;
+    background: var(--bg-hover, #e7e9ee);
+    border-radius: var(--radius-sm, 4px);
+    font-family: var(--font-mono, monospace);
+}
+.sub-report-data {
+    margin-top: var(--space-3, 6px);
+    font-size: var(--text-caption, 11px);
+}
+.sub-report-data > summary {
+    cursor: pointer;
+    color: var(--text-muted, #6b7280);
+}
+.sub-report-data pre {
+    margin-top: var(--space-3, 6px);
+    padding: var(--space-4, 8px);
+    background: var(--bg-white, #fff);
+    border: 1px solid var(--border, #e1e4ea);
+    border-radius: var(--radius-sm, 4px);
+    overflow: auto;
+    max-height: 260px;
+}
+
+/* ---------- History view: sub-agent card treatment ----------
+   Sub-agent transcripts used to render in the history page with the same
+   look as top-level chats, so a user could not tell them apart at a glance.
+   These rules add three layered cues without inventing a new component:
+     1. A subtle left-border accent in the brand color tints the whole card.
+     2. A muted-tinted background so the row reads as "meta" content.
+     3. A pill-style badge in the title row (rendered via .history-chat-badge.subagent).
+   The same `.sub-agent-breadcrumb` block defined just below is reused
+   inside the card to show the ancestor chain.  */
+.history-chat-card.subagent {
+    border-left: 3px solid var(--accent, #6c63ff);
+    background: linear-gradient(180deg, rgba(108, 99, 255, 0.04) 0%, var(--bg-white, #fff) 100%);
+}
+.history-chat-card.subagent:hover {
+    /* Don't let the brand tint fight the existing hover treatment — the
+       hover state already swaps to a stronger border so we just deepen the
+       background a hair. */
+    background: linear-gradient(180deg, rgba(108, 99, 255, 0.07) 0%, var(--bg-white, #fff) 100%);
+}
+.history-chat-card .sub-agent-breadcrumb {
+    /* Inside a history card the breadcrumb sits on its own row between the
+       header and the preview — give it some breathing room and reset the
+       sidebar's compact max-width cap so longer ancestor chains can show in
+       full instead of being aggressively ellipsised. */
+    display: block;
+    margin: 0 0 var(--space-4, 8px) 0;
+    max-width: none;
+}
+.history-chat-badge.subagent {
+    background: rgba(108, 99, 255, 0.12);
+    color: var(--accent, #6c63ff);
+}
+
+/* ---------- Sidebar breadcrumb ---------- */
+.sub-agent-breadcrumb {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    font-size: var(--text-caption, 11px);
+    color: var(--text-muted, #6b7280);
+    background: var(--bg-hover, #e7e9ee);
+    border-radius: var(--radius-sm, 4px);
+    line-height: 1.4;
+    vertical-align: middle;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Phase 5: indent breadcrumb by ancestor depth. The current chat is the
+   tail (not rendered in the breadcrumb), so the indent reflects how many
+   ancestors had to be walked. `--depth` is stamped inline by the renderer
+   because attr() inside calc() is not portable cross-browser. Bump the
+   max-width slightly so multi-segment paths (root › … › parent) have
+   room before the ellipsis kicks in. */
+.sub-agent-breadcrumb[data-depth] {
+    padding-left: calc(var(--depth, 1) * 8px - 8px);
+    max-width: 200px;
+}
+.sub-agent-breadcrumb .breadcrumb-link {
+    color: var(--text-muted, #6b7280);
+    text-decoration: none;
+    cursor: pointer;
+}
+.sub-agent-breadcrumb .breadcrumb-link:hover {
+    color: var(--accent, #6c63ff);
+    text-decoration: underline;
+}
+.sub-agent-breadcrumb .breadcrumb-ellipsis {
+    color: var(--text-muted, #6b7280);
+    opacity: 0.7;
+    margin: 0 2px;
+}
+
+/* ---------- Workers strip ---------- */
+.workers-strip {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4, 8px);
+    padding: var(--space-3, 6px) var(--space-5, 10px);
+    background: var(--bg-light, #f6f7f9);
+    border-top: 1px solid var(--border, #e1e4ea);
+    border-bottom: 1px solid var(--border, #e1e4ea);
+    /* Breathing room before the chat-actions-row pill below. Without
+       this the action buttons sit flush against the strip's bottom
+       border and look glued to it. */
+    margin-bottom: var(--space-3, 6px);
+    overflow-x: auto;
+    flex-shrink: 0;
+}
+.workers-strip-label {
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-semibold, 600);
+    color: var(--text-muted, #6b7280);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+}
+.workers-strip-chips {
+    display: flex;
+    gap: var(--space-3, 6px);
+    flex-wrap: nowrap;
+}
+.worker-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    /* --radius-full is 50% (for circular elements). For pill-shaped chips
+       we want --radius-pill (20px) — large enough to fully round at this
+       height. */
+    border-radius: var(--radius-pill, 999px);
+    border: 1px solid var(--border, #e1e4ea);
+    background: var(--bg-white, #fff);
+    font-size: var(--text-caption, 11px);
+    cursor: pointer;
+    color: var(--text-primary, #1f2328);
+    transition: background 0.12s ease;
+    white-space: nowrap;
+    font-family: inherit;
+    /* Chips are interactive controls, not content. Without user-select:none
+       a user dragging through the page to copy text (e.g. the error JSON
+       above the strip) sweeps the chip's name+state into the clipboard,
+       which then gets pasted at the end of the user's message as
+       "…your testsleeping". Suppress text selection on the whole chip. */
+    user-select: none;
+    -webkit-user-select: none;
+    /* Prevent chips from squishing inside a `flex-wrap: nowrap` parent.
+       Parent `.workers-strip` has overflow-x:auto so chips should scroll
+       horizontally, not collapse. Without flex-shrink:0 the dot squashes
+       and the label ellipses before the scrollbar appears. */
+    flex-shrink: 0;
+}
+.worker-chip:hover { background: var(--bg-hover, #e7e9ee); }
+/* Make the running state unmissable. Stopped/sleeping/errored already have
+   their own dot colors but the chip itself looked identical — a user
+   running a long task glances at the strip and can't tell at a distance
+   whether anything is still in flight. Tint the border + name slightly. */
+.worker-chip.worker-running { border-color: var(--success, #2da44e); }
+.worker-chip.worker-running .worker-state { color: var(--success, #2da44e); }
+.worker-chip.worker-errored  { border-color: var(--danger, #cf222e); }
+.worker-chip.worker-errored  .worker-state { color: var(--danger, #cf222e); }
+/* Phase 5: depth-aware indenting + connector for nested workers. Each
+   chip carries data-depth=1|2|3 (the renderer caps deeper levels at 3).
+   Deeper levels indent further and lighten the border so the visual
+   hierarchy reads top-down without introducing a new palette token. The
+   `::before` line draws a short horizontal connector hinting at the
+   parent → child relationship in the tree. */
+.worker-chip[data-depth="2"] {
+    margin-left: 12px;
+    border-color: var(--bg-hover, #e7e9ee);
+    position: relative;
+}
+.worker-chip[data-depth="3"] {
+    margin-left: 24px;
+    border-color: var(--bg-hover, #e7e9ee);
+    opacity: 0.92;
+    position: relative;
+}
+.worker-chip[data-depth="2"]::before,
+.worker-chip[data-depth="3"]::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    top: 50%;
+    width: 6px;
+    height: 1px;
+    background: var(--border, #e1e4ea);
+}
+.worker-chip[data-depth="3"]::before {
+    left: -10px;
+    width: 8px;
+}
+.worker-state-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.worker-dot-running  { background: var(--success, #2da44e); animation: worker-pulse 1.2s ease-in-out infinite; }
+.worker-dot-sleeping { background: var(--text-muted, #8a93a6); }
+.worker-dot-stopped  { background: var(--text-muted, #6b7280); }
+.worker-dot-errored  { background: var(--danger, #cf222e); }
+@keyframes worker-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.45; }
+}
+.worker-name { font-weight: var(--font-semibold, 600); }
+.worker-state {
+    font-size: var(--text-xs, 10px);
+    color: var(--text-muted, #6b7280);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+/* ---------- Dark theme overrides ----------
+   Most colors already come from themed tokens (--bg-light, --bg-white,
+   --bg-hover, --text-primary, --text-muted, --border) which are
+   redefined in 01-dark-theme.css.
+
+   IMPORTANT — the rest of the app keys dark mode off
+   `:root[data-theme="dark"]` (see 01-dark-theme.css line 5). The previous
+   version of this file used `body.dark-theme` which never matches in this
+   codebase, so these overrides silently never applied. */
+:root[data-theme="dark"] .sub-report-synth {
+    /* Warm-yellow rgba on a dark surface needs a touch more alpha to keep
+       the pill legible against the callout background. */
+    background: rgba(251, 191, 36, 0.18);
+    color: var(--warning, #fbbf24);
+}
+:root[data-theme="dark"] .sub-report-data pre {
+    /* Slightly lighter than --bg-white-in-dark so the pre stands out
+       from the callout background. */
+    background: var(--bg-hover);
+    border-color: var(--border-dark, #3b3f48);
+}
+/* Status-icon halos: the hardcoded rgba(45,164,78,0.15) etc. read fine on
+   light backgrounds but get muddy on the dark callout surface. Bump alpha
+   so the icon halo stays visually distinct. */
+:root[data-theme="dark"] .sub-report-done    .sub-report-icon { background: rgba(52, 211, 153, 0.22); color: var(--success, #34d399); }
+:root[data-theme="dark"] .sub-report-error   .sub-report-icon { background: rgba(248, 113, 113, 0.22); color: var(--danger, #f87171); }
+:root[data-theme="dark"] .sub-report-need_input .sub-report-icon { background: rgba(251, 191, 36, 0.22); color: var(--warning, #fbbf24); }
+:root[data-theme="dark"] .sub-report-partial .sub-report-icon,
+:root[data-theme="dark"] .sub-report-cancelled .sub-report-icon { background: rgba(156, 163, 175, 0.22); color: var(--text-secondary, #9ca3af); }
+/* Workers strip on dark: the running-dot pulse needs to remain visible
+   against the chip's bg-white surface. The chip itself already picks up
+   bg-white-in-dark from the token — just nudge the border so the chip
+   stands out from the strip background, which is bg-light (very close
+   to bg-white in dark). */
+:root[data-theme="dark"] .workers-strip {
+    background: var(--bg-dark, #0d0e12);
+}
+:root[data-theme="dark"] .worker-chip {
+    border-color: var(--border-dark, #3b3f48);
+    background: var(--bg-secondary, #1a1d24);
+}
+:root[data-theme="dark"] .worker-chip:hover {
+    background: var(--bg-hover, #1f2228);
+}
+:root[data-theme="dark"] .worker-chip[data-depth="2"],
+:root[data-theme="dark"] .worker-chip[data-depth="3"] {
+    border-color: var(--border, #2e3138);
+}
+:root[data-theme="dark"] .worker-chip[data-depth="2"]::before,
+:root[data-theme="dark"] .worker-chip[data-depth="3"]::before {
+    background: var(--border-dark, #3b3f48);
+}
+/* Running chip on dark: lift it with a subtle success-tinted border so
+   the running state is unmissable even with the pulse animation paused
+   (some users disable prefers-reduced-motion behaviour at the OS level). */
+:root[data-theme="dark"] .worker-chip.worker-running {
+    border-color: var(--success, #34d399);
+}
+/* Sub-report card on dark: lift slightly above the chat background. */
+:root[data-theme="dark"] .message.sub-report {
+    background: var(--bg-secondary, #1a1d24);
+}
+:root[data-theme="dark"] .sub-report-body {
+    border-top-color: var(--border-dark, #3b3f48);
+}
+
+/* ---------- Chat-title sub-agent pill (header) ---------- */
+/* Mirrors the look of `.chat-title-state-pill` so the two pills sit side-
+   by-side in the header. Clicking the pill jumps to the immediate parent
+   chat (see updateChatTitleHeader in 170-chat-management.js). */
+.chat-title-subagent-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: var(--space-3, 6px);
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-medium, 500);
+    line-height: 1.4;
+    background: var(--accent-light, #eef2ff);
+    color: var(--accent, #6c63ff);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: filter var(--transition-fast), transform var(--transition-fast);
+    vertical-align: middle;
+    white-space: nowrap;
+}
+.chat-title-subagent-pill:hover { filter: brightness(0.95); }
+.chat-title-subagent-pill:active { transform: scale(0.97); }
+.chat-title-subagent-pill .chat-title-subagent-icon { display: inline-flex; }
+.chat-title-subagent-pill .chat-title-subagent-icon .ui-icon { width: 11px; height: 11px; }
+:root[data-theme="dark"] .chat-title-subagent-pill {
+    background: rgba(108, 99, 255, 0.18);
+    color: var(--accent, #a5b4fc);
+}
+
+/* ---------- Parked-tool indicator ---------- */
+/* Shown when a UI-required tool is waiting for a panel to attach. The
+   handler in 036-agent-event-handlers-page.js defers the visible push by
+   750ms so a brief SW-restart reconnect doesn't flash this row. */
+.message.parked-tool {
+    padding: var(--space-3, 6px) var(--space-7, 14px);
+    margin: var(--space-2, 4px) 0;
+    background: var(--accent-light, #eef2ff);
+    border: 1px dashed var(--border, #e1e4ea);
+    border-radius: var(--radius-sm, 4px);
+    font-size: var(--text-caption, 11px);
+    color: var(--text-muted, #6b7280);
+}
+:root[data-theme="dark"] .message.parked-tool {
+    background: rgba(108, 99, 255, 0.10);
+    border-color: var(--border-dark, #3b3f48);
+    color: var(--text-muted, #8a93a6);
+}

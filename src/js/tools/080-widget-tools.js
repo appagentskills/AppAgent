@@ -14,11 +14,37 @@ function executeHtmlWidget(args, messageIndex, options) {
     // Use activeStreamingChatId if available (preserves correct chat during navigation)
     // Otherwise fall back to currentChatId
     var widgetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
-    
-    // Create widget object
-    // The tool result message will be added at the current messages length after this returns
+
+    // Resolve the index where THIS tool's tool_result will land. With the
+    // atomic-placeholder seeding the SW does before dispatching the first
+    // tool of an assistant turn, `chat.messages` already contains a
+    // `role:'tool'` placeholder for our toolCallId — `recordToolResult`
+    // overwrites it in place, so the final tool_result index equals the
+    // placeholder's current index, NOT `chat.messages.length`. Using the
+    // length here would write a `msgIndex` past every placeholder; then
+    // `getWidgetHtmlForMessage(actualToolResultIdx)` would filter to zero
+    // widgets, the `widget-inline` div would never be rendered, and
+    // `getWidgetIframe` would always return null on later iframe_tool calls
+    // (the bug that surfaced as "Widget not found" for click/fill/get_dom
+    // immediately after html_widget created the widget).
     var chat = chats[widgetChatId];
-    var toolResultMsgIndex = chat ? chat.messages.length : -1;
+    var toolResultMsgIndex = -1;
+    var widgetToolCallId = options && options.toolCallId;
+    if (chat && chat.messages && widgetToolCallId) {
+        for (var ti = chat.messages.length - 1; ti >= 0; ti--) {
+            var tim = chat.messages[ti];
+            if (tim.role === 'tool' && tim.tool_call_id === widgetToolCallId) {
+                toolResultMsgIndex = ti;
+                break;
+            }
+        }
+    }
+    // Fallback for callers without a toolCallId or in code paths where the
+    // placeholder hasn't been seeded yet — matches the pre-atomic-placeholder
+    // behavior (push at end-of-array).
+    if (toolResultMsgIndex === -1) {
+        toolResultMsgIndex = chat ? chat.messages.length : -1;
+    }
     
     var widgetId = 'widget_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     var widget = {
@@ -65,11 +91,18 @@ function executeHtmlWidget(args, messageIndex, options) {
     // Update sidebar widget list
     renderWidgetSidebar();
     
-    return { 
-        success: true, 
+    return {
+        success: true,
         message: 'Widget "' + title + '" created successfully',
+        // Normalized: `id` matches display / take_screenshot conventions.
+        // `widgetId` kept for any caller still relying on it.
+        id: widgetId,
         widgetId: widgetId,
-        _debug_hint: 'To debug this widget, use iframe_tool with widget_id="' + widgetId + '". Actions: get_visible_text (extract text), get_dom (get HTML), click (click elements), fill (fill inputs). For visual analysis, use take_screenshot tool.'
+        _debug_hint: 'To debug this widget, use iframe_tool with widget_id="' + widgetId + '". Actions: get_visible_text (extract text), get_dom (get HTML), click (click elements), fill (fill inputs). For visual analysis, use take_screenshot tool.',
+        // SW-side wrapper reads this to persist chat.widgets on its own chat
+        // object. Without it, the SW's chat snapshot wipes the page-side
+        // mutation on the next save and the widget is lost on reload.
+        _widget_persist: widget
     };
 }
 

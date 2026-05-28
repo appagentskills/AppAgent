@@ -610,5 +610,273 @@ var TOOLS = [
                 }
             }
         }
+    },
+    // ─── Async tool layer (Sub-Agent spec §4) ───────────────────────────
+    // Any tool call may pass `await: false` to fire-and-forget — the call
+    // returns immediately with `{ handle: "h_...", status: "pending" }` and
+    // the work runs in the background. Use the tools below to collect.
+    {
+        type: 'function',
+        function: {
+            name: 'await_handle',
+            description: 'Block (on the scheduler, not the model) until an async tool handle resolves. Returns the snapshot {status: done|error|cancelled|pending, result?, error?}. If status is still "pending" after timeout_ms, the handle is left in-flight — you can poll or await again.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    handle: { type: 'string', description: 'Handle id returned by a previous async tool call (e.g. "h_xxx").' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['handle']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'poll_handle',
+            description: 'Non-blocking peek at an async tool handle. Returns the current snapshot {status, result?, error?} without waiting. Status "pending" means the work is still running.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    handle: { type: 'string', description: 'Handle id returned by a previous async tool call.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['handle']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'await_any',
+            description: 'Wait for the FIRST of several async handles to settle. Returns {handle, snapshot, timeout:false} on win, or {handle:null, snapshot:null, timeout:true, pendingSnapshots:[...]} on timeout. Useful when you launched several speculative tool calls and want whichever finishes first.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    handles: { type: 'array', items: { type: 'string' }, description: 'Array of handle ids to race.' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['handles']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'await_all',
+            description: 'Wait for ALL of several async handles to settle. Returns {snapshots: [...]} in the same order as the input. Useful to fan out tool calls and collect when every one is done.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    handles: { type: 'array', items: { type: 'string' }, description: 'Array of handle ids to wait on.' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['handles']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'cancel_handle',
+            description: 'Mark an in-flight async tool handle as cancelled. The underlying tool may still finish in the background (we cannot abort fetches / GlideRecord calls), but the result will be DISCARDED and the handle moves to status "cancelled". No effect if the handle has already settled.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    handle: { type: 'string', description: 'Handle id to cancel.' },
+                    reason: { type: 'string', description: 'Optional human-readable reason recorded on the handle.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['handle']
+            }
+        }
+    },
+    // ─── Sub-agent runtime (Sub-Agent spec §3 / Phase 2) ────────────────
+    // Spawn background sub-agents to offload context-heavy work (file scans,
+    // multi-record audits, log scraping). Each sub gets its own chat + context
+    // window, runs to completion, and reports back a distilled summary via
+    // `report_to_parent`. Pool size = 2 concurrent; excess spawns queue.
+    {
+        type: 'function',
+        function: {
+            name: 'spawn_sub_agent',
+            description: 'Spawn a background sub-agent in a fresh chat to do focused, context-heavy work without polluting your context window. Returns immediately with {agent_id, chat_id, handle}. The sub runs in its own chat with its own context, calls `report_to_parent` when done, and the spawn handle resolves with the distilled summary — collect via `await_handle(handle)`. If the sub reports `status:"error"` or crashes (auto_report fallback), the OUTER handle settles as `status:"error"` too (snapshot.error = headline, snapshot.result = full report). Use for: file/grep dumps, multi-record audits, deep log scans, iterative debugging. Do NOT use for: single small Table API calls or work whose result must flow into the very next tool call.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    instructions: { type: 'string', description: 'The task. Becomes the sub\'s first user message. Be specific about what should be returned (e.g. "return only sys_ids and names, no script bodies").' },
+                    name: { type: 'string', description: 'Short label shown in the sidebar / Workers strip. Defaults to a generated id.' },
+                    allow_nested: { type: 'boolean', description: 'If true, the sub may spawn/stop/wake its own sub-agents (default: false). Use only when you genuinely need the sub to delegate further — multi-stage research, recursive audits, etc. Max nesting depth is 5.' },
+                    context_seed: { type: 'object', description: 'Small JSON blob copied into the sub\'s first message (record ids, queries, etc.).' },
+                    auto_report: { type: 'boolean', description: 'If true (default), a fallback report is synthesized from the last assistant message if the sub finishes without calling report_to_parent.' },
+                    max_tool_calls: { type: 'number', description: 'Hard cap on tool calls the sub may make. Default: 200.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['instructions']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'report_to_parent',
+            description: 'SUB-AGENT ONLY. Push a distilled result up to the parent agent. Settles the parent\'s spawn handle (if still pending) and parks you (state=sleeping) — the parent can `wake_sub_agent` you with a follow-up or `stop_sub_agent` to terminate. `status` is informational (UI badge color, parent decision logic). For mid-flight progress that should NOT settle the handle, use `agent_message({to:"parent", content:"..."})` instead. The summary is what the parent SEES — it never reads your raw transcript. Cap: 4 KB summary, 32 artifacts.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    status: { type: 'string', enum: ['done', 'error', 'need_input'], description: 'Informational status. done=task complete, error=failed, need_input=parked waiting for parent. All three settle the spawn handle and park you.' },
+                    summary: { type: 'string', description: '1-3 sentence distilled result. THIS is what the parent reads. Soft-capped at 4 KB.' },
+                    data: { type: 'object', description: 'Optional small structured payload (counts, ids, etc.).' },
+                    artifacts: { type: 'array', items: { type: 'string' }, description: 'file_ids / doc_ids / widget_ids the parent can reference without inlining the content.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['status', 'summary']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'agent_status',
+            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, tool_calls_used, inbox size, and pool position. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    agent_id: { type: 'string', description: 'Specific sub agent_id. Omit to list.' },
+                    parent_chat_id: { type: 'string', description: 'Filter list by parent chat. Pass "*" to list every sub on the instance.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'wake_sub_agent',
+            description: 'Resume a sleeping sub-agent, optionally with a new instruction. If the sub has queued inbox messages, they are drained into a combined user turn on wake. Returns `{handle}` — an awaitable spawn handle for the resumed run (a fresh handle if the previous one already settled, or the existing one if it\'s still pending). The parent should `await_handle(result.handle)` to collect the next `report_to_parent` payload. No-op if the sub is already running. Errors if the sub is stopped/errored.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    agent_id: { type: 'string', description: 'Sub agent_id to wake.' },
+                    instruction: { type: 'string', description: 'Optional new user message. Drained with any pending inbox into the sub\'s next turn.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['agent_id']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'stop_sub_agent',
+            description: 'Terminate a sub-agent. Pending tool handles owned by the sub are cancelled; the spawn handle resolves with status:"cancelled". Use when you no longer need the sub\'s result (changed your mind, the user redirected, the sub is stuck).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    agent_id: { type: 'string', description: 'Sub agent_id to stop.' },
+                    reason: { type: 'string', description: 'Optional human-readable reason recorded on the sub\'s final report.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['agent_id']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'sleep_self',
+            description: 'SUB-AGENT ONLY. Voluntarily park yourself until the parent wakes you via `wake_sub_agent` or sends a message via `agent_message`. Frees your worker pool slot so another queued sub can start. Prefer `report_to_parent` (it parks you AND tells the parent why) — only use `sleep_self` when you have nothing to report but still need to wait. If the spawn handle is still unsettled when you sleep, it will be auto-settled with status="need_input" so the parent does not hang.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    reason: { type: 'string', description: 'Optional reason recorded for diagnostics.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'agent_message',
+            description: 'Send a message between agents. From a parent: `to:"sub_xxx"` pushes to that sub (auto-wakes if sleeping unless wake:false; the response includes a fresh `handle` the parent can `await_handle` for the resumed run\'s next report). From a sub: `to:"parent"` pushes a mid-flight status update to the parent chat (renders as an inline callout, does NOT settle the spawn handle, the sub keeps running). For terminal sub→parent results that should settle the handle, use `report_to_parent`.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    to: { type: 'string', description: 'Recipient: an agent_id, or the literal string "parent" (sub-only).' },
+                    content: { type: 'string', description: 'Message text.' },
+                    wake: { type: 'boolean', description: 'If recipient is sleeping, wake them. Default: true.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['to', 'content']
+            }
+        }
     }
 ];
+
+// ─── headless flag ──────────────────────────────────────────────────
+// `headless: true` means the tool can run in a Service Worker / offscreen
+// context with no side panel attached. `headless: false` means the tool
+// touches the side panel DOM and must be routed to a registered executor.
+//
+// js_eval is headless because its sandbox iframe is hosted by the offscreen
+// document, not the side panel.
+var HEADLESS_TOOLS = {
+    js_eval: true,
+    servicenow_api: true,
+    servicenow_run_script: true,
+    servicenow_diff_edit: true,
+    set_chat_title: true,
+    cached_content_outline: true,
+    cached_content_search: true,
+    cached_content_read: true,
+    // get_skill / manage_skill / update_action_state / show_action_button
+    // live in tools/080-widget-tools.js + tools/120-actions.js — neither is
+    // in WORKER_SHARED_FILES, and the impls reach into page-only globals
+    // (renderSkillsList, activeActions, persistActionState, scrollToBottomIfAllowed,
+    // currentView, …). Route them to the panel rather than try to mirror that
+    // surface in the SW.
+    get_skill: false,
+    manage_skill: false,
+    screenshot_by_id: true,
+    get_file: true,
+    update_action_state: false,
+    show_action_button: false,
+    web_fetch: true,
+    workspace: true,
+    read_attached_file: true,
+    document: true,
+    list_instances: true,
+    // Async tool layer helpers — pure in-memory registry reads, fully headless
+    await_handle: true,
+    poll_handle: true,
+    await_any: true,
+    await_all: true,
+    cancel_handle: true,
+    // Sub-agent runtime tools — the registry is in-memory + IDB, fully
+    // headless. All seven dispatch through tools/020-tool-execution.js to
+    // SubAgents.* helpers. Side-effects (chat creation, runAgent kick) work
+    // identically in SW and page contexts because runAgent + the chats map
+    // are shared globals in WORKER_SHARED_FILES.
+    spawn_sub_agent: true,
+    report_to_parent: true,
+    agent_status: true,
+    wake_sub_agent: true,
+    stop_sub_agent: true,
+    sleep_self: true,
+    agent_message: true,
+    // UI-required (must route to a page executor)
+    iframe_tool: false,
+    take_screenshot: false,
+    html_widget: false,
+    display: false,
+    prompt_user: false
+};
+for (var _ti = 0; _ti < TOOLS.length; _ti++) {
+    var _tn = TOOLS[_ti].function && TOOLS[_ti].function.name;
+    TOOLS[_ti].headless = !!HEADLESS_TOOLS[_tn];
+}
+function isHeadlessTool(name) { return !!HEADLESS_TOOLS[name]; }

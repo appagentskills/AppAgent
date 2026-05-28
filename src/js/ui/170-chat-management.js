@@ -326,6 +326,12 @@ function completeSummaryAndCreateNewChat() {
     renderMessages();
     renderVersionSidebar();
     updateChatTitleHeader();
+    // Reset Workers strip for the fresh chat — the new chat owns no
+    // sub-agents yet, so the strip should be empty/hidden. Without this,
+    // chips from the previous chat persist until the next selectChat.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
     
     showSnackbar('New chat created with summary', 'success');
     
@@ -361,6 +367,20 @@ function newChat() {
     pendingInjectionImages = null;
     hidePauseButton();
     hideContinueButton();
+    // Clear foreground-UI globals so the previous chat's state doesn't leak
+    // into the fresh new chat. Two real cases were observed:
+    //   - lastApiError: drives the inline error banner. If chat A blew up
+    //     with an API error then the user hit "New Chat", the banner stuck
+    //     to the new chat even though the new chat had never made a request.
+    //   - #messages.is-streaming: drives bottom-padding / scroll pinning for
+    //     the streaming UI. If chat A was mid-stream when New Chat fired,
+    //     the class lingered on the messages container and the empty new
+    //     chat rendered with the streaming layout active.
+    // selectChat clears both via its own branch below; newChat needs the
+    // same treatment since it bypasses selectChat entirely.
+    lastApiError = null;
+    var _newChatMessagesEl = document.getElementById('messages');
+    if (_newChatMessagesEl) _newChatMessagesEl.classList.remove('is-streaming');
 
     currentChatId = generateId();
     chats[currentChatId] = { id: currentChatId, title: 'New Chat', messages: [], createdAt: Date.now(), isTemporary: true };
@@ -373,6 +393,12 @@ function newChat() {
     renderMessages();
     renderVersionSidebar();
     updateChatTitleHeader();
+    // Reset Workers strip for the fresh new chat (no subs yet — strip
+    // should hide). Same reason as in the continue-from-summary path
+    // above: newChat bypasses selectChat.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
     // Same reason as in selectChat — dismiss any popover left over from the
     // previous chat so it doesn't hover over the empty new-chat header.
     if (typeof closeChatProgressPopoverIfStale === 'function') {
@@ -412,9 +438,18 @@ function selectChat(chatId, options) {
     // Reset UI state for the new focused chat.
     // If THAT chat is streaming — show pause/streaming UI.
     // Otherwise, reset (but DO NOT stop any other chat's running loop).
+    // Re-sync the messages container's `is-streaming` class to the target chat's
+    // actual run state. Without this, the class would reflect whichever chat last
+    // started/finished a run, not the chat currently in view.
+    var _messagesEl = document.getElementById('messages');
+    // lastApiError is a foreground-UI global (drives the error banner). Clearing
+    // it on chat switch prevents an error from a previous chat bleeding into the
+    // newly-viewed chat's UI; renderMessages will re-derive any per-chat error.
+    lastApiError = null;
     if (runningChatIds[chatId]) {
         isRunning = true;
         activeStreamingChatId = chatId;
+        if (_messagesEl) _messagesEl.classList.add('is-streaming');
         // Pass chatId explicitly — currentChatId hasn't been updated yet (line below)
         // so showPauseButton's syncPauseButtonUI call would otherwise read the
         // previous chat's pausedChats flag and mislabel the button.
@@ -430,6 +465,7 @@ function selectChat(chatId, options) {
         // Other chats' background loops are unaffected (runningChatIds is unchanged).
         isRunning = false;
         activeStreamingChatId = null;
+        if (_messagesEl) _messagesEl.classList.remove('is-streaming');
         hidePauseButton();
         pendingInjection = null;
         pendingInjectionImages = null;
@@ -445,6 +481,20 @@ function selectChat(chatId, options) {
     renderMessages();
     updateInputPosition();
     updateChatTitleHeader();
+    // Refresh the Workers strip so chips reflect the newly-selected chat's
+    // sub-agents (each parent chat has its own set). Hidden when the chat
+    // owns no subs. Source: src/js/ui/175-sub-agent-ui.js.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
+    // Re-render the header live-action pills: the suppression rule depends on
+    // whether the newly-selected chat is a sub-agent, so switching between a
+    // regular chat and a sub-agent chat must trigger a recompute. Without
+    // this, the pills row would only update on activeActions membership
+    // changes — stale shape persists across navigation.
+    if (typeof renderLiveActionPills === 'function') {
+        try { renderLiveActionPills(); } catch (e) {}
+    }
     // A chat-progress popover belongs to a specific chatId. Without this, the
     // popover would hover above the new chat's header showing stale data from
     // the previous chat — _refreshOpenChatProgressPopover short-circuits on
@@ -492,6 +542,34 @@ function updateChatTitleHeader(includeToolCallId) {
     var chat = chats[currentChatId];
     var title = (chat && chat.title && chat.title !== 'New Chat') ? chat.title : '';
 
+    // Sub-agent badge — makes it instantly visible in the chat header that
+    // the user is looking at a delegated worker chat, not a top-level
+    // conversation. Clicking the badge jumps to the immediate parent chat
+    // (the breadcrumb in the sidebar / history card has the full chain).
+    var subAgentBadgeHtml = '';
+    if (chat && chat.isSubAgent) {
+        var parentChatId = chat.parentChatId || '';
+        var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : 'parent chat';
+        var iconHtml = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
+        // Data-attribute + delegated click handler (in 175-sub-agent-ui.js)
+        // instead of an inline onclick. escapeHtml does NOT escape single
+        // quotes, so a parentChatId containing one would break the inline JS
+        // string and could leak attribute context. The inline onkeydown only
+        // calls this.click() — no user data in inline JS — so Enter/Space on
+        // the focused span dispatches a real click event that the delegated
+        // handler picks up via the data-attribute.
+        var clickAttrs = parentChatId
+            ? ' role="button" tabindex="0" data-open-parent-chat-id="' + escapeHtml(parentChatId) + '" onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027){this.click();event.preventDefault();}"'
+            : '';
+        var tipText = parentChatId
+            ? 'Sub-agent of: ' + parentTitle + ' — click to open parent'
+            : 'Delegated worker chat';
+        subAgentBadgeHtml = ' <span class="chat-title-subagent-pill" title="' + escapeHtml(tipText) + '"' + clickAttrs + '>'
+            + '<span class="chat-title-subagent-icon">' + iconHtml + '</span>'
+            + '<span class="chat-title-subagent-label">Sub-agent</span>'
+            + '</span>';
+    }
+
     // Append a small progress state pill (running/stuck/done/error) when the
     // current chat has any update_action_state calls. Visible always — no need
     // to open the right sidebar to see what state the agent is in.
@@ -518,8 +596,8 @@ function updateChatTitleHeader(includeToolCallId) {
         } catch (e) {}
     }
 
-    if (title || pillHtml) {
-        titleEl.innerHTML = (title ? escapeHtml(title) : '') + pillHtml;
+    if (title || pillHtml || subAgentBadgeHtml) {
+        titleEl.innerHTML = (title ? escapeHtml(title) : '') + subAgentBadgeHtml + pillHtml;
     } else {
         titleEl.textContent = '';
     }

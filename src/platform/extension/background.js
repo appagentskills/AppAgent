@@ -2,6 +2,18 @@
 // Detects ServiceNow tabs via window.g_ck (works for any domain including localhost/vanity URLs)
 // Injects content script only into confirmed SN tabs — no manifest content_scripts needed
 
+// Load the agent runtime into the SW. The bundle declares chats, runningChatIds,
+// runAgent, executeTool, AgentEvents, etc. as module-scope globals on the SW's
+// ServiceWorkerGlobalScope. Code below this line can use those symbols freely.
+// DOM-needing tools (js_eval, skills sandbox, image canvas) bridge to the
+// offscreen document via chrome.runtime.sendMessage — see worker/010-platform-stub.js
+// and the message handlers further down this file.
+try {
+    importScripts('sw-bundle.js');
+} catch (e) {
+    console.error('[SW] failed to import sw-bundle.js — agent runtime unavailable', e);
+}
+
 // Track known ServiceNow tabs (populated by probing for g_ck on page load)
 let snTabs = new Map(); // tabId -> { url, title, origin }
 
@@ -271,6 +283,114 @@ async function getSnTabList() {
     return list;
 }
 
+// --- Multi-instance SN helpers ---
+// Shared between the chrome.runtime.onMessage handlers (used by the panel via
+// platform-bridge) and the SW-side Platform stub in worker/010-platform-stub.js
+// (used by the agent loop). Extracted so we have a single source of truth and
+// the SW doesn't have to sendMessage to itself.
+
+// Probe one tab for { token, userName } from its MAIN world. Returns null on failure.
+async function snProbeTabTokenUser(tabId) {
+    try {
+        var results = await chrome.scripting.executeScript({
+            target: { tabId: tabId },
+            world: 'MAIN',
+            func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
+        });
+        return (results && results[0] && results[0].result) || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Fetch the current user's display name from sys_user when MAIN-world probe didn't give one.
+async function snFetchUserName(instanceUrl, token) {
+    try {
+        var apiRes = await fetch(instanceUrl + '/api/now/table/sys_user?sysparm_query=sys_id=javascript:gs.getUserID()&sysparm_fields=user_name,name&sysparm_limit=1', {
+            method: 'GET',
+            headers: { 'X-UserToken': token, 'Accept': 'application/json' }
+        });
+        if (!apiRes.ok) return '';
+        var apiData = await apiRes.json();
+        var row = apiData && apiData.result && apiData.result[0];
+        return (row && (row.user_name || row.name)) || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// Fetch the current user's direct (non-inherited) roles, used for privilege badges
+// and the list_instances agent tool.
+async function snFetchUserRoles(instanceUrl, token) {
+    var roles = [];
+    try {
+        var rolesRes = await fetch(instanceUrl + '/api/now/table/sys_user_has_role?sysparm_query=user=javascript:gs.getUserID()^inherited=false&sysparm_fields=role.name&sysparm_limit=50', {
+            method: 'GET',
+            headers: { 'X-UserToken': token, 'Accept': 'application/json' }
+        });
+        if (!rolesRes.ok) return roles;
+        var rolesData = await rolesRes.json();
+        var rows = (rolesData && rolesData.result) || [];
+        for (var ri = 0; ri < rows.length; ri++) {
+            var rname = rows[ri] && rows[ri]['role.name'];
+            if (rname) roles.push(rname);
+        }
+    } catch (e) {}
+    return roles;
+}
+
+// Build the detailed instance list: probe every SN tab for tokens, group by origin,
+// fill in user/roles per instance. Used by the panel via list-sn-instances-detailed
+// and by the SW Platform stub's refreshInstances.
+async function snGetInstancesDetailed() {
+    var tabs = await getSnTabList();
+    var byOrigin = {};
+    tabs.forEach(function(tab) {
+        var origin = tab.origin;
+        if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
+        byOrigin[origin].tabs.push({ id: tab.id, title: tab.title, url: tab.url });
+    });
+    var result = [];
+    for (var url in byOrigin) {
+        var inst = byOrigin[url];
+        var tokenData = null;
+        for (var t = 0; t < inst.tabs.length; t++) {
+            tokenData = await snProbeTabTokenUser(inst.tabs[t].id);
+            if (tokenData && tokenData.token) break;
+        }
+        var token = (tokenData && tokenData.token) || '';
+        var userName = (tokenData && tokenData.userName) || '';
+        if (token && !userName) {
+            userName = await snFetchUserName(inst.url, token);
+        }
+        var roles = token ? await snFetchUserRoles(inst.url, token) : [];
+        result.push({ url: inst.url, tabs: inst.tabs, token: token, userName: userName, roles: roles });
+    }
+    return result;
+}
+
+// Probe a fresh g_ck for a specific instance URL by scanning its open tabs.
+// Returns { token, userName, tabId } or { token: '', error } if nothing available.
+async function snGetTokenForInstance(instanceUrl) {
+    var tabs = await getSnTabList();
+    var matchTabs = tabs.filter(function(t) { return t.origin === instanceUrl; });
+    if (!matchTabs.length) {
+        return { token: '', error: 'No open tab for ' + instanceUrl };
+    }
+    for (var i = 0; i < matchTabs.length; i++) {
+        var data = await snProbeTabTokenUser(matchTabs[i].id);
+        if (data && data.token) {
+            return { token: data.token, userName: data.userName, tabId: matchTabs[i].id };
+        }
+    }
+    return { token: '', error: 'Could not get token from tabs for ' + instanceUrl };
+}
+
+// Exposed on `self` so the SW Platform stub (which runs first via importScripts)
+// can lazy-reference them at call time.
+self.snGetInstancesDetailed = snGetInstancesDetailed;
+self.snGetTokenForInstance = snGetTokenForInstance;
+
 // --- Notifications ---
 
 chrome.notifications.onClicked.addListener(function(notificationId) {
@@ -304,6 +424,39 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             message: message.message || ''
         });
         return;
+    }
+
+    // Offscreen helper relays a sandbox-bound tool call back to the SW
+    // for execution (during js_eval or skill-tool runs). We dispatch via
+    // the SW's own executeTool (from sw-bundle.js), then sendResponse
+    // with the result envelope. Return true so the channel stays open
+    // for the async response.
+    if (message.type === 'sw-exec-tool') {
+        if (typeof executeTool !== 'function') {
+            sendResponse({ ok: false, error: 'SW runtime not loaded' });
+            return false;
+        }
+        var p = message.payload || {};
+        var execPromise;
+        try {
+            execPromise = executeTool(p.name, p.args, p.messageIndex, {
+                chatId: p.chatId,
+                fromSandbox: true,
+                toolCallId: p.toolCallId,
+                // The OUTER tool's id, used by display's eager-render path to
+                // attach its msgIndex to the parent's tool_result slot.
+                parentToolCallId: p.parentToolCallId || null
+            });
+        } catch (e) {
+            sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+            return false;
+        }
+        Promise.resolve(execPromise).then(function(result) {
+            sendResponse({ ok: true, result: result });
+        }).catch(function(err) {
+            sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+        });
+        return true;
     }
 
     // Side panel requests browser action -> forward to content script in active tab
@@ -444,108 +597,15 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // List all instances WITH tokens and user info (for multi-instance support)
     if (message.type === 'list-sn-instances-detailed') {
-        (async function() {
-            var tabs = await getSnTabList();
-            var byOrigin = {};
-            tabs.forEach(function(tab) {
-                var origin = tab.origin;
-                if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
-                byOrigin[origin].tabs.push({ id: tab.id, title: tab.title, url: tab.url });
-            });
-            var result = [];
-            for (var url in byOrigin) {
-                var inst = byOrigin[url];
-                var tokenData = null;
-                for (var t = 0; t < inst.tabs.length; t++) {
-                    try {
-                        var results = await chrome.scripting.executeScript({
-                            target: { tabId: inst.tabs[t].id },
-                            world: 'MAIN',
-                            func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
-                        });
-                        tokenData = results && results[0] && results[0].result;
-                        if (tokenData && tokenData.token) break;
-                    } catch(e) {}
-                }
-                var token = (tokenData && tokenData.token) || '';
-                var userName = (tokenData && tokenData.userName) || '';
-
-                // Fallback: if we have a token but no username, look it up via the sys_user table.
-                if (token && !userName) {
-                    try {
-                        var apiRes = await fetch(inst.url + '/api/now/table/sys_user?sysparm_query=sys_id=javascript:gs.getUserID()&sysparm_fields=user_name,name&sysparm_limit=1', {
-                            method: 'GET',
-                            headers: { 'X-UserToken': token, 'Accept': 'application/json' }
-                        });
-                        if (apiRes.ok) {
-                            var apiData = await apiRes.json();
-                            var row = apiData && apiData.result && apiData.result[0];
-                            if (row) {
-                                userName = row.user_name || row.name || '';
-                            }
-                        }
-                    } catch(e) {}
-                }
-
-                // Fetch direct (non-inherited) roles for the current user.
-                // Used by the picker UI to show privilege badges (admin / security_admin / snc_external)
-                // and by the list_instances agent tool for full role context.
-                var roles = [];
-                if (token) {
-                    try {
-                        var rolesRes = await fetch(inst.url + '/api/now/table/sys_user_has_role?sysparm_query=user=javascript:gs.getUserID()^inherited=false&sysparm_fields=role.name&sysparm_limit=50', {
-                            method: 'GET',
-                            headers: { 'X-UserToken': token, 'Accept': 'application/json' }
-                        });
-                        if (rolesRes.ok) {
-                            var rolesData = await rolesRes.json();
-                            var rows = (rolesData && rolesData.result) || [];
-                            for (var ri = 0; ri < rows.length; ri++) {
-                                var rname = rows[ri] && rows[ri]['role.name'];
-                                if (rname) roles.push(rname);
-                            }
-                        }
-                    } catch(e) {}
-                }
-
-                result.push({
-                    url: inst.url,
-                    tabs: inst.tabs,
-                    token: token,
-                    userName: userName,
-                    roles: roles
-                });
-            }
-            sendResponse({ instances: result });
-        })();
+        snGetInstancesDetailed().then(function(instances) {
+            sendResponse({ instances: instances });
+        });
         return true;
     }
 
     // Get a fresh token for a specific instance URL
     if (message.type === 'get-token-for-instance') {
-        (async function() {
-            var tabs = await getSnTabList();
-            var matchTabs = tabs.filter(function(t) { return t.origin === message.instanceUrl; });
-            if (!matchTabs.length) {
-                sendResponse({ token: '', error: 'No open tab for ' + message.instanceUrl });
-                return;
-            }
-            for (var i = 0; i < matchTabs.length; i++) {
-                try {
-                    var results = await chrome.scripting.executeScript({
-                        target: { tabId: matchTabs[i].id },
-                        world: 'MAIN',
-                        func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
-                    });
-                    var data = results && results[0] && results[0].result;
-                    if (data && data.token) {
-                        sendResponse({ token: data.token, userName: data.userName, tabId: matchTabs[i].id });
-                        return;
-                    }
-                } catch(e) {}
-            }
-            sendResponse({ token: '', error: 'Could not get token from tabs for ' + message.instanceUrl });
-        })();
+        snGetTokenForInstance(message.instanceUrl).then(sendResponse);
         return true;
     }
 
@@ -933,6 +993,46 @@ async function handleOpenSnForLogin(sendResponse) {
     }
 }
 
+// SW-internal equivalent of platform-bridge's _openSnForLogin: open/reload the
+// SN tab and poll for a fresh g_ck. Used by the SW SN-fetch shim on persistent
+// 401 so agent-initiated SN calls can recover from a fully-expired session
+// without surfacing the 401 to the tool dispatcher.
+self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
+    var instanceUrl;
+    try {
+        var storage = await chrome.storage.local.get('instanceUrl');
+        if (!storage.instanceUrl) return null;
+        instanceUrl = storage.instanceUrl;
+        var tabs = await getSnTabList();
+        if (tabs.length > 0) {
+            var targetTab = tabs[0];
+            for (var i = 0; i < tabs.length; i++) {
+                if (tabs[i].origin === instanceUrl) { targetTab = tabs[i]; break; }
+            }
+            try { await chrome.tabs.update(targetTab.id, { active: true }); } catch (e) {}
+            try { await chrome.tabs.reload(targetTab.id); } catch (e) {}
+            try { var t = await chrome.tabs.get(targetTab.id); chrome.windows.update(t.windowId, { focused: true }); } catch (e) {}
+            loginTabId = null;
+        } else {
+            var tab = await chrome.tabs.create({ url: instanceUrl, active: true });
+            loginTabId = tab.id;
+        }
+    } catch (e) {
+        return null;
+    }
+    // Poll for a fresh token. 120 attempts × 2s = 4 min, same as page version.
+    for (var attempt = 0; attempt < 120; attempt++) {
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        try {
+            var token = await snGetTokenForInstance(instanceUrl);
+            if (token && token.token && token.token !== oldToken) {
+                return token.token;
+            }
+        } catch (e) {}
+    }
+    return null;
+};
+
 async function handleRefreshToken(sendResponse) {
     try {
         var storage = await chrome.storage.local.get('instanceUrl');
@@ -1144,6 +1244,26 @@ async function refreshClaudeToken(refreshToken) {
     return await res.json();
 }
 
+// Renew the Claude access token. The Claude Desktop OAuth client (the one this
+// extension uses) does NOT issue refresh tokens, so refreshClaudeToken() above
+// always fails for us. Instead we silently re-run startClaudeOAuth(), which only
+// needs the user's claude.ai sessionKey cookie (long-lived). If a refresh_token
+// IS present we still try the proper refresh first — that's the standards path
+// and would work if Anthropic ever turns it on for this client.
+async function renewClaudeToken(oauth) {
+    if (oauth && oauth.refreshToken) {
+        try {
+            var tokenData = await refreshClaudeToken(oauth.refreshToken);
+            return saveOAuthCreds(tokenData, oauth.refreshToken);
+        } catch (e) {
+            // fall through to silent re-auth
+            console.log('[Claude OAuth] refresh failed, falling back to silent re-auth:', e.message);
+        }
+    }
+    // Silent re-auth via the claude.ai session cookie.
+    return await startClaudeOAuth();
+}
+
 function saveOAuthCreds(tokenData, existingRefresh) {
     var creds = {
         accessToken: tokenData.access_token,
@@ -1167,10 +1287,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     }
     if (message.type === 'claude-oauth-refresh') {
         chrome.storage.local.get('claudeOAuth', function(data) {
-            var rt = data.claudeOAuth && data.claudeOAuth.refreshToken;
-            if (!rt) { sendResponse({ error: 'No refresh token' }); return; }
-            refreshClaudeToken(rt).then(function(t) {
-                sendResponse({ success: true, claudeOAuth: saveOAuthCreds(t, rt) });
+            renewClaudeToken(data.claudeOAuth).then(function(creds) {
+                sendResponse({ success: true, claudeOAuth: creds });
             }).catch(function(err) { sendResponse({ error: err.message }); });
         });
         return true;
@@ -1179,13 +1297,14 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         chrome.storage.local.get('claudeOAuth', async function(data) {
             if (!data.claudeOAuth) { sendResponse({ loggedIn: false }); return; }
             var oauth = data.claudeOAuth;
-            // Auto-refresh if expired or expiring within 1 minute
-            if (Date.now() > oauth.expiresAt - 60000 && oauth.refreshToken) {
+            // Auto-renew if expired or expiring within 1 minute. Uses refresh_token
+            // if available, otherwise falls back to silent re-auth via the claude.ai
+            // session cookie (the Desktop OAuth client we use does not issue refresh tokens).
+            if (Date.now() > oauth.expiresAt - 60000) {
                 try {
-                    var tokenData = await refreshClaudeToken(oauth.refreshToken);
-                    oauth = saveOAuthCreds(tokenData, oauth.refreshToken);
+                    oauth = await renewClaudeToken(oauth);
                 } catch(e) {
-                    // Refresh failed — login is truly expired
+                    // Renew failed — login is truly expired (claude.ai session gone too)
                     sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt });
                     return;
                 }
@@ -1213,224 +1332,251 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     }
 });
 
-// --- Claude OAuth Streaming Proxy via Port ---
-// Transforms OpenAI-format request to Anthropic format, streams response back as OpenAI SSE
+// --- Claude OAuth Streaming Proxy ---
+// Transforms OpenAI-format request to Anthropic format, streams response back as OpenAI SSE.
+//
+// Two callers:
+//   • The 'claude-oauth-stream' port (legacy panel path — kept for any UI
+//     that still uses it, e.g. widgets that call the LLM directly).
+//   • The SW-internal LLM streaming code in 010-llm-streaming.js, which
+//     calls `self.runClaudeOAuthStream(requestBody, callbacks, abortSignal)`
+//     directly because the SW can't open a port to itself.
 
+// Core streamer: feeds {type:'sse'|'error'|'done'} envelopes to the
+// provided sink. Generic over transport (port.postMessage vs direct fn).
+async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
+    var streamKeepAlive = null;
+    var aborted = false;
+    function onAbort() {
+        aborted = true;
+        if (streamKeepAlive) { clearInterval(streamKeepAlive); streamKeepAlive = null; }
+    }
+    if (abortSignal) {
+        if (abortSignal.aborted) onAbort();
+        else abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+    try {
+        var data = await chrome.storage.local.get('claudeOAuth');
+        var oauth = data.claudeOAuth;
+        if (!oauth || !oauth.accessToken) {
+            sink({ type: 'error', error: 'Not logged in to Claude. Click the login button.' });
+            sink({ type: 'done' });
+            return;
+        }
+
+        if (Date.now() > oauth.expiresAt - 60000) {
+            try {
+                oauth = await renewClaudeToken(oauth);
+            } catch(e) {
+                sink({ type: 'error', error: 'Token refresh failed: ' + e.message + '. Open https://claude.ai, sign in, then retry.' });
+                sink({ type: 'done' });
+                return;
+            }
+        }
+
+        var anthropicBody = transformToAnthropic(requestBody);
+        var anthropicJson = JSON.stringify(anthropicBody);
+
+        var res;
+        var maxRetries = 3;
+        for (var attempt = 0; attempt <= maxRetries; attempt++) {
+            if (aborted) {
+                // Match the in-loop abort path (post-break fall-through emits both
+                // [DONE] then done); consumers that fold these into a single end
+                // signal expect the SSE marker first.
+                sink({ type: 'sse', data: 'data: [DONE]\n\n' });
+                sink({ type: 'done' });
+                return;
+            }
+            res = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'accept': 'text/event-stream',
+                    'anthropic-version': '2023-06-01',
+                    'anthropic-beta': 'oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05',
+                    'anthropic-dangerous-direct-browser-access': 'true',
+                    'authorization': 'Bearer ' + oauth.accessToken,
+                    'content-type': 'application/json'
+                },
+                body: anthropicJson
+            });
+
+            if (res.status !== 529 || attempt === maxRetries) break;
+            console.error('[AppAgent] 529 overloaded, retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + (4 * Math.pow(2, attempt)) + 's');
+            await new Promise(function(r) { setTimeout(r, 4000 * Math.pow(2, attempt)); });
+        }
+
+        if (!res.ok) {
+            var errText = await res.text();
+            sink({ type: 'error', error: 'API error ' + res.status + ': ' + errText });
+            sink({ type: 'done' });
+            return;
+        }
+
+        var rlHeaders = {};
+        res.headers.forEach(function(v, k) {
+            if (k.startsWith('anthropic-ratelimit-')) rlHeaders[k] = v;
+        });
+        if (Object.keys(rlHeaders).length > 0) chrome.storage.local.set({ claudeRateLimits: rlHeaders });
+
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var sseBuffer = '';
+        var msgId = '';
+        var toolIdx = 0;
+        var currentToolId = null;
+        var anthropicUsage = {};
+        var model = anthropicBody.model;
+
+        streamKeepAlive = setInterval(function() {
+            chrome.runtime.getPlatformInfo(function() {});
+        }, 5000);
+
+        var done = false;
+        while (!done) {
+            if (aborted) { try { reader.cancel(); } catch (e) {} break; }
+            var result = await reader.read();
+            done = result.done;
+            sseBuffer += decoder.decode(result.value, { stream: !done });
+
+            while (sseBuffer.indexOf('\n\n') !== -1) {
+                var splitIdx = sseBuffer.indexOf('\n\n');
+                var eventStr = sseBuffer.substring(0, splitIdx);
+                sseBuffer = sseBuffer.substring(splitIdx + 2);
+
+                var eventType = null, eventData = null;
+                var eventLines = eventStr.split('\n');
+                for (var i = 0; i < eventLines.length; i++) {
+                    if (eventLines[i].startsWith('event: ')) eventType = eventLines[i].substring(7);
+                    else if (eventLines[i].startsWith('data: ')) {
+                        try { eventData = JSON.parse(eventLines[i].substring(6)); } catch(e) {}
+                    }
+                }
+                if (!eventType || !eventData) continue;
+
+                var ts = Math.floor(Date.now() / 1000);
+
+                if (eventType === 'message_start' && eventData.message) {
+                    msgId = eventData.message.id || '';
+                    Object.assign(anthropicUsage, eventData.message.usage || {});
+                    sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                        id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                        choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]
+                    }) + '\n\n' });
+                }
+                else if (eventType === 'content_block_start') {
+                    var block = eventData.content_block || {};
+                    if (block.type === 'tool_use') {
+                        currentToolId = block.id || ('call_' + Math.random().toString(36).substr(2, 8));
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, id: currentToolId, type: 'function', function: { name: block.name || '', arguments: '' } }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                    else if (block.type === 'thinking') {
+                        var blockIdx = eventData.index || 0;
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: '' }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                }
+                else if (eventType === 'content_block_delta') {
+                    var delta = eventData.delta || {};
+                    if (delta.type === 'text_delta') {
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { content: delta.text || '' }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                    else if (delta.type === 'input_json_delta') {
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, function: { arguments: delta.partial_json || '' } }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                    else if (delta.type === 'thinking_delta') {
+                        var blockIdx = eventData.index || 0;
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: delta.thinking || '' }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                    else if (delta.type === 'signature_delta') {
+                        var blockIdx = eventData.index || 0;
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, signature: delta.signature || '' }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
+                }
+                else if (eventType === 'content_block_stop') {
+                    if (currentToolId) { toolIdx++; currentToolId = null; }
+                }
+                else if (eventType === 'message_delta') {
+                    Object.assign(anthropicUsage, eventData.usage || {});
+                    var stopReason = (eventData.delta || {}).stop_reason;
+                    if (stopReason) {
+                        var finishMap = { end_turn: 'stop', max_tokens: 'length', stop_sequence: 'stop', tool_use: 'tool_calls' };
+                        var promptTokens = (anthropicUsage.input_tokens || 0) +
+                            (anthropicUsage.cache_creation_input_tokens || 0) +
+                            (anthropicUsage.cache_read_input_tokens || 0);
+                        var completionTokens = anthropicUsage.output_tokens || 0;
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: {}, finish_reason: finishMap[stopReason] || 'stop' }],
+                            usage: {
+                                prompt_tokens: promptTokens, completion_tokens: completionTokens,
+                                total_tokens: promptTokens + completionTokens,
+                                cache_read_input_tokens: anthropicUsage.cache_read_input_tokens || 0,
+                                cache_creation_input_tokens: anthropicUsage.cache_creation_input_tokens || 0
+                            }
+                        }) + '\n\n' });
+                    }
+                }
+                else if (eventType === 'error') {
+                    sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                        error: { message: (eventData.error || {}).message || 'Unknown error', type: 'api_error' }
+                    }) + '\n\n' });
+                }
+            }
+        }
+
+        clearInterval(streamKeepAlive); streamKeepAlive = null;
+        sink({ type: 'sse', data: 'data: [DONE]\n\n' });
+        sink({ type: 'done' });
+
+    } catch(e) {
+        clearInterval(streamKeepAlive); streamKeepAlive = null;
+        try { sink({ type: 'error', error: e.message }); } catch(e2) {}
+        try { sink({ type: 'done' }); } catch(e2) {}
+    }
+}
+self.runClaudeOAuthStream = runClaudeOAuthStream;
+
+// Thin port wrapper — forwards a 'claude-oauth-stream' port to the
+// shared streamer. Kept for any caller (e.g. widget contexts) that
+// still uses port-based streaming. The SW-internal LLM call path
+// (010-llm-streaming.js) skips this and invokes runClaudeOAuthStream
+// directly.
 chrome.runtime.onConnect.addListener(function(port) {
     if (port.name !== 'claude-oauth-stream') return;
-
-    var portDisconnected = false;
-    var streamKeepAlive = null;
+    var abortController = new AbortController();
     port.onDisconnect.addListener(function() {
-        portDisconnected = true;
-        if (streamKeepAlive) { clearInterval(streamKeepAlive); streamKeepAlive = null; }
+        try { abortController.abort(); } catch (e) {}
     });
-
-    port.onMessage.addListener(async function(msg) {
+    port.onMessage.addListener(function(msg) {
         if (msg.type !== 'start-stream') return;
-
-        try {
-            var data = await chrome.storage.local.get('claudeOAuth');
-            var oauth = data.claudeOAuth;
-            if (!oauth || !oauth.accessToken) {
-                port.postMessage({ type: 'error', error: 'Not logged in to Claude. Click the login button.' });
-                port.postMessage({ type: 'done' });
-                return;
-            }
-
-            // Auto-refresh if expired or expiring within 1 minute
-            if (Date.now() > oauth.expiresAt - 60000) {
-                try {
-                    var tokenData = await refreshClaudeToken(oauth.refreshToken);
-                    var now = Date.now();
-                    oauth = {
-                        accessToken: tokenData.access_token,
-                        refreshToken: tokenData.refresh_token || oauth.refreshToken,
-                        expiresAt: now + (tokenData.expires_in || 3600) * 1000
-                    };
-                    await chrome.storage.local.set({ claudeOAuth: oauth });
-                } catch(e) {
-                    port.postMessage({ type: 'error', error: 'Token refresh failed: ' + e.message });
-                    port.postMessage({ type: 'done' });
-                    return;
-                }
-            }
-
-            var requestBody = JSON.parse(msg.body);
-            var anthropicBody = transformToAnthropic(requestBody);
-            var anthropicJson = JSON.stringify(anthropicBody);
-
-            var res;
-            var maxRetries = 3;
-            for (var attempt = 0; attempt <= maxRetries; attempt++) {
-                res = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'accept': 'text/event-stream',
-                        'anthropic-version': '2023-06-01',
-                        'anthropic-beta': 'oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05',
-                        'anthropic-dangerous-direct-browser-access': 'true',
-                        'authorization': 'Bearer ' + oauth.accessToken,
-                        'content-type': 'application/json'
-                    },
-                    body: anthropicJson
-                });
-
-                if (res.status !== 529 || attempt === maxRetries) break;
-                console.error('[AppAgent] 529 overloaded, retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + (4 * Math.pow(2, attempt)) + 's');
-                // Exponential backoff: 4s, 8s, 16s
-                await new Promise(function(r) { setTimeout(r, 4000 * Math.pow(2, attempt)); });
-            }
-
-            if (!res.ok) {
-                var errText = await res.text();
-                port.postMessage({ type: 'error', error: 'API error ' + res.status + ': ' + errText });
-                port.postMessage({ type: 'done' });
-                return;
-            }
-
-            // Capture rate limit headers (free usage data from every API response)
-            var rlHeaders = {};
-            res.headers.forEach(function(v, k) {
-                if (k.startsWith('anthropic-ratelimit-')) rlHeaders[k] = v;
-            });
-            if (Object.keys(rlHeaders).length > 0) chrome.storage.local.set({ claudeRateLimits: rlHeaders });
-
-            // Read Anthropic SSE stream and convert to OpenAI format
-            var reader = res.body.getReader();
-            var decoder = new TextDecoder();
-            var sseBuffer = '';
-            var msgId = '';
-            var toolIdx = 0;
-            var currentToolId = null;
-            var anthropicUsage = {};
-            var model = anthropicBody.model;
-
-            // Keep service worker alive during streaming — Chrome MV3 can terminate
-            // workers that haven't touched a Chrome API in ~30s, even with active fetch
-            streamKeepAlive = setInterval(function() {
-                chrome.runtime.getPlatformInfo(function() {});
-            }, 5000);
-
-            var done = false;
-            while (!done) {
-                if (portDisconnected) { reader.cancel(); break; }
-                var result = await reader.read();
-                done = result.done;
-                sseBuffer += decoder.decode(result.value, { stream: !done });
-
-                while (sseBuffer.indexOf('\n\n') !== -1) {
-                    var splitIdx = sseBuffer.indexOf('\n\n');
-                    var eventStr = sseBuffer.substring(0, splitIdx);
-                    sseBuffer = sseBuffer.substring(splitIdx + 2);
-
-                    var eventType = null, eventData = null;
-                    var eventLines = eventStr.split('\n');
-                    for (var i = 0; i < eventLines.length; i++) {
-                        if (eventLines[i].startsWith('event: ')) eventType = eventLines[i].substring(7);
-                        else if (eventLines[i].startsWith('data: ')) {
-                            try { eventData = JSON.parse(eventLines[i].substring(6)); } catch(e) {}
-                        }
-                    }
-                    if (!eventType || !eventData) continue;
-
-                    var ts = Math.floor(Date.now() / 1000);
-
-                    if (eventType === 'message_start' && eventData.message) {
-                        msgId = eventData.message.id || '';
-                        Object.assign(anthropicUsage, eventData.message.usage || {});
-                        port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                            choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]
-                        }) + '\n\n' });
-                    }
-                    else if (eventType === 'content_block_start') {
-                        var block = eventData.content_block || {};
-                        if (block.type === 'tool_use') {
-                            currentToolId = block.id || ('call_' + Math.random().toString(36).substr(2, 8));
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, id: currentToolId, type: 'function', function: { name: block.name || '', arguments: '' } }] }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                        else if (block.type === 'thinking') {
-                            var blockIdx = eventData.index || 0;
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: '' }] }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                    }
-                    else if (eventType === 'content_block_delta') {
-                        var delta = eventData.delta || {};
-                        if (delta.type === 'text_delta') {
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { content: delta.text || '' }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                        else if (delta.type === 'input_json_delta') {
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, function: { arguments: delta.partial_json || '' } }] }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                        else if (delta.type === 'thinking_delta') {
-                            var blockIdx = eventData.index || 0;
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: delta.thinking || '' }] }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                        else if (delta.type === 'signature_delta') {
-                            var blockIdx = eventData.index || 0;
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, signature: delta.signature || '' }] }, finish_reason: null }]
-                            }) + '\n\n' });
-                        }
-                    }
-                    else if (eventType === 'content_block_stop') {
-                        if (currentToolId) { toolIdx++; currentToolId = null; }
-                    }
-                    else if (eventType === 'message_delta') {
-                        Object.assign(anthropicUsage, eventData.usage || {});
-                        var stopReason = (eventData.delta || {}).stop_reason;
-                        if (stopReason) {
-                            var finishMap = { end_turn: 'stop', max_tokens: 'length', stop_sequence: 'stop', tool_use: 'tool_calls' };
-                            var promptTokens = (anthropicUsage.input_tokens || 0) +
-                                (anthropicUsage.cache_creation_input_tokens || 0) +
-                                (anthropicUsage.cache_read_input_tokens || 0);
-                            var completionTokens = anthropicUsage.output_tokens || 0;
-                            port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                                choices: [{ index: 0, delta: {}, finish_reason: finishMap[stopReason] || 'stop' }],
-                                usage: {
-                                    prompt_tokens: promptTokens, completion_tokens: completionTokens,
-                                    total_tokens: promptTokens + completionTokens,
-                                    cache_read_input_tokens: anthropicUsage.cache_read_input_tokens || 0,
-                                    cache_creation_input_tokens: anthropicUsage.cache_creation_input_tokens || 0
-                                }
-                            }) + '\n\n' });
-                        }
-                    }
-                    else if (eventType === 'error') {
-                        port.postMessage({ type: 'sse', data: 'data: ' + JSON.stringify({
-                            error: { message: (eventData.error || {}).message || 'Unknown error', type: 'api_error' }
-                        }) + '\n\n' });
-                    }
-                }
-            }
-
-            clearInterval(streamKeepAlive); streamKeepAlive = null;
-            port.postMessage({ type: 'sse', data: 'data: [DONE]\n\n' });
-            port.postMessage({ type: 'done' });
-
-        } catch(e) {
-            clearInterval(streamKeepAlive); streamKeepAlive = null;
-            try { port.postMessage({ type: 'error', error: e.message }); } catch(e2) {}
-            try { port.postMessage({ type: 'done' }); } catch(e2) {}
+        var requestBody;
+        try { requestBody = JSON.parse(msg.body); }
+        catch (e) {
+            try { port.postMessage({ type: 'error', error: 'Bad request body: ' + e.message }); } catch (e2) {}
+            try { port.postMessage({ type: 'done' }); } catch (e2) {}
+            return;
         }
+        runClaudeOAuthStream(requestBody, function(env) {
+            try { port.postMessage(env); } catch (e) {}
+        }, abortController.signal);
     });
 });
 
@@ -1777,6 +1923,163 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 chrome.runtime.onStartup.addListener(function() {
     try { chrome.power.releaseKeepAwake(); } catch (e) {}
 });
+
+// =============================================================
+// Offscreen helper — DOM ops + keep-alive ONLY.
+//
+// The agent loop lives in THIS SW (loaded via importScripts at the
+// top of this file). The offscreen document is just:
+//   1. A keep-alive shell — the persistent 'sw-keepalive' port the
+//      offscreen opens to us holds the SW alive while the doc exists.
+//   2. A DOM helper — handles requests for js_eval sandbox, skills
+//      sandbox iframe, and image canvas operations that need real
+//      DOM (SW has OffscreenCanvas but not <iframe>/Image).
+//
+// SW state to track: whether the doc exists + its keep-alive port +
+// how many agents currently want it open. We create it lazily when
+// the first agent run starts AND/OR when an LLM call wants image
+// processing, and close it after a grace period of full idleness.
+// =============================================================
+
+var _swOffscreenCreating = null;          // Promise while creation is in flight (avoid races)
+var _swOffscreenKeepAlivePort = null;     // Persistent port opened by offscreen → SW
+var _swOffscreenIdleSince = 0;            // ms when last run finished; 0 = busy or unknown
+var _swOffscreenReadyResolvers = [];      // Awaiters that need offscreen up + handlers registered
+var OFFSCREEN_IDLE_GRACE_MS = 60 * 1000;  // close offscreen 60s after the last run ends
+
+async function ensureOffscreenDocument() {
+    if (typeof chrome.offscreen === 'undefined') {
+        console.error('[SW] chrome.offscreen API unavailable — manifest "offscreen" permission missing?');
+        return;
+    }
+    var exists = false;
+    try {
+        if (typeof chrome.offscreen.hasDocument === 'function') {
+            exists = await chrome.offscreen.hasDocument();
+        } else {
+            var contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+            exists = (contexts && contexts.length > 0);
+        }
+    } catch (e) { exists = false; }
+    if (exists) return;
+    if (_swOffscreenCreating) return _swOffscreenCreating;
+    _swOffscreenCreating = chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Host the JS sandbox iframe for js_eval / skill tools and provide a keep-alive anchor for the agent loop in the service worker.'
+    }).then(function() {
+        _swOffscreenCreating = null;
+        _swOffscreenIdleSince = 0;
+    }).catch(function(e) {
+        _swOffscreenCreating = null;
+        if (e && e.message && e.message.indexOf('single offscreen document') >= 0) return;
+        console.error('[SW] offscreen creation failed', e);
+    });
+    return _swOffscreenCreating;
+}
+
+// Wait until the offscreen doc is up AND has connected its keep-alive
+// port (== handlers are registered). Resolves to true if ready.
+function waitForOffscreenReady(timeoutMs) {
+    if (_swOffscreenKeepAlivePort) return Promise.resolve(true);
+    ensureOffscreenDocument();
+    return new Promise(function(resolve) {
+        var done = false;
+        var entry = function() { if (!done) { done = true; resolve(true); } };
+        _swOffscreenReadyResolvers.push(entry);
+        setTimeout(function() {
+            if (!done) {
+                done = true;
+                var idx = _swOffscreenReadyResolvers.indexOf(entry);
+                if (idx >= 0) _swOffscreenReadyResolvers.splice(idx, 1);
+                resolve(false);
+            }
+        }, timeoutMs || 5000);
+    });
+}
+
+// Called by the SW runtime (sw-bundle.js, worker/010-platform-stub.js)
+// any time the agent loop needs DOM (js_eval, skills sandbox, image).
+// Returns the helper's response or throws on timeout.
+async function callOffscreenHelper(type, payload, timeoutMs) {
+    var ready = await waitForOffscreenReady(timeoutMs || 5000);
+    if (!ready) throw new Error('Offscreen helper not available');
+    // Promise-style sendMessage — Chrome MV3 supports it. The offscreen
+    // returns a {ok:true, result} or {ok:false, error} envelope.
+    var resp = await chrome.runtime.sendMessage({
+        type: type,
+        payload: payload
+    });
+    if (!resp) throw new Error('Offscreen helper returned no response');
+    if (!resp.ok) throw new Error(resp.error || 'Offscreen helper error');
+    return resp.result;
+}
+// Expose to the imported SW bundle.
+self.callOffscreenHelper = callOffscreenHelper;
+self.ensureOffscreenDocument = ensureOffscreenDocument;
+
+async function maybeCloseOffscreenIfIdle() {
+    if (!_swOffscreenIdleSince) return;
+    // Don't close while any agent run is active.
+    if (typeof runningChatIds === 'object' && runningChatIds) {
+        for (var c in runningChatIds) {
+            if (runningChatIds[c]) return;
+        }
+    }
+    if (Date.now() - _swOffscreenIdleSince < OFFSCREEN_IDLE_GRACE_MS) return;
+    try {
+        if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) {
+            await chrome.offscreen.closeDocument();
+        }
+    } catch (e) { /* ignore — already gone */ }
+    _swOffscreenIdleSince = 0;
+    _swOffscreenKeepAlivePort = null;
+}
+self.markOffscreenMaybeIdle = function() { _swOffscreenIdleSince = Date.now(); };
+
+// Offscreen→SW keep-alive port. Offscreen opens this in offscreen-helper.js
+// right after its onMessage handlers are registered. While the port is open,
+// the SW stays alive (port traffic resets the idle timer). The offscreen
+// document also stays alive while the SW holds the port reference.
+chrome.runtime.onConnect.addListener(function(port) {
+    if (port.name !== 'sw-keepalive') return;
+    _swOffscreenKeepAlivePort = port;
+    _swOffscreenIdleSince = 0;
+    // Drain ready-waiters now that offscreen is fully online.
+    var waiters = _swOffscreenReadyResolvers.splice(0);
+    waiters.forEach(function(fn) { try { fn(); } catch (e) {} });
+    port.onDisconnect.addListener(function() {
+        if (_swOffscreenKeepAlivePort === port) _swOffscreenKeepAlivePort = null;
+    });
+});
+
+// Heartbeat alarm. Two jobs:
+//   1. Keep the SW alive (chrome.* call resets the SW idle timer).
+//   2. Close the offscreen doc after the idle grace period.
+//   3. Resume runs that the IDB checkpoint store says were in-flight.
+chrome.alarms.create('agent-heartbeat', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(function(alarm) {
+    if (alarm.name !== 'agent-heartbeat') return;
+    chrome.storage.local.get('agent-heartbeat-tick', function() {});
+    maybeCloseOffscreenIfIdle();
+    _swResumeIfNeeded();
+});
+
+async function _swResumeIfNeeded() {
+    try {
+        if (typeof listRunningAgentCheckpoints !== 'function') return;
+        var checkpoints = await listRunningAgentCheckpoints();
+        if (!checkpoints || !checkpoints.length) return;
+        // The sw-bundle's entry already does its own resume scan on
+        // SW boot; this alarm just re-triggers it after a long idle.
+        if (typeof resumeRunningCheckpoints === 'function') {
+            resumeRunningCheckpoints(checkpoints);
+        }
+    } catch (e) { /* non-fatal */ }
+}
+
+chrome.runtime.onStartup.addListener(function() { _swResumeIfNeeded(); });
+chrome.runtime.onInstalled.addListener(function() { _swResumeIfNeeded(); });
 
 // DNR rule: spoof User-Agent for Anthropic API requests
 chrome.declarativeNetRequest.updateDynamicRules({

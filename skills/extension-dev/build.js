@@ -88,6 +88,46 @@ async function extension_build(args) {
     }
     var coreJS = await concatFiles(jsFiles);
 
+    // Worker (service worker) bundle composition. Mirror of build/build.js
+    // WORKER_JS_TIERS + WORKER_SHARED_FILES. The SW hosts the agent loop
+    // and all state — DOM-needing tools bridge to the offscreen document.
+    // Order: 0xx worker files (declare globals + stubs) → shared files
+    // (agent loop, streaming, tools) → 1xx+ worker files (port bridge,
+    // tool routing, entry point).
+    // KEEP IN SYNC with build/build.js WORKER_SHARED_FILES.
+    var WORKER_SHARED_FILES = [
+        'src/js/core/030-config.js',
+        'src/js/core/060-ui-constants.js',
+        'src/js/core/070-permissions.js',
+        'src/js/core/080-tools.js',
+        'src/js/core/090-codemap.js',
+        'src/js/core/095-handle-registry.js',
+        // 097-sub-agent-registry — Phase 2 sub-agent runtime. Defines
+        // global `SubAgents` used by tools/020-tool-execution.js dispatch
+        // arms for spawn_sub_agent / report_to_parent / etc. Must load
+        // AFTER handle-registry (uses Handles.start) and BEFORE tool-execution.
+        'src/js/core/097-sub-agent-registry.js',
+        'src/js/core/100-cached-results.js',
+        'src/js/core/110-system-prompt.js',
+        'src/js/core/130-indexeddb.js',
+        'src/js/core/140-skills-engine.js',
+        'src/js/core/150-record-helpers.js',
+        'src/js/tools/040-file-store.js',
+        'src/js/tools/050-file-tools.js',
+        'src/js/tools/070-screenshot-by-id.js',
+        'src/js/tools/110-smart-documents.js',
+        'src/js/tools/020-tool-execution.js',
+        'src/js/app/035-agent-events.js',
+        'src/js/app/020-api-messages.js',
+        'src/js/app/010-llm-streaming.js',
+        'src/js/app/030-agent-loop.js'
+    ];
+    var workerTierFiles = await getOrderedFiles('src/js/worker', '.js');
+    var workerPre = workerTierFiles.filter(function(f) { return /\/0\d\d-/.test(f); });
+    var workerPost = workerTierFiles.filter(function(f) { return workerPre.indexOf(f) < 0; });
+    var workerBundleFiles = workerPre.concat(WORKER_SHARED_FILES).concat(workerPost);
+    var workerJS = await concatFiles(workerBundleFiles);
+
     var polyfillJS = await readFile('src/platform/extension/csp-polyfill.js') || '';
     var bridgeJS = await readFile('src/platform/extension/platform-bridge.js') || '';
 
@@ -165,15 +205,20 @@ async function extension_build(args) {
         }
     }
 
-    // Inject embedded skills
-    if (embeddedSkills.length > 0) {
+    // Inject embedded skills into BOTH bundles. The worker bundle has the
+    // same EMBEDDED_SKILLS markers because it shares 140-skills-engine.js
+    // with the page bundle. Without this, the SW system prompt would lack
+    // skill instructions.
+    function injectEmbeddedSkills(bundle) {
+        if (embeddedSkills.length === 0) return bundle;
         var skillsJson = JSON.stringify(embeddedSkills);
-        var startIdx = appJS.indexOf(SKILLS_START);
-        var endIdx = appJS.indexOf(SKILLS_END);
-        if (startIdx !== -1 && endIdx !== -1) {
-            appJS = appJS.substring(0, startIdx + SKILLS_START.length) + skillsJson + appJS.substring(endIdx);
-        }
+        var sIdx = bundle.indexOf(SKILLS_START);
+        var eIdx = bundle.indexOf(SKILLS_END);
+        if (sIdx === -1 || eIdx === -1) return bundle;
+        return bundle.substring(0, sIdx + SKILLS_START.length) + skillsJson + bundle.substring(eIdx);
     }
+    appJS = injectEmbeddedSkills(appJS);
+    workerJS = injectEmbeddedSkills(workerJS);
 
     // 3. Concatenate CSS
     var cssFiles = await getOrderedFiles('src/css', '.css');
@@ -249,15 +294,18 @@ async function extension_build(args) {
         if (version) docsMd = docsMd.split('__VERSION__').join(version);
         var docsB64 = btoa(unescape(encodeURIComponent(docsMd)));
         appJS = appJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
+        workerJS = workerJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
     }
     var readmeMd = await readFile('README.md');
     if (readmeMd) {
         var readmeB64 = btoa(unescape(encodeURIComponent(readmeMd)));
         appJS = appJS.split('__README_MARKDOWN_B64__').join(readmeB64);
+        workerJS = workerJS.split('__README_MARKDOWN_B64__').join(readmeB64);
     }
 
     if (version) {
         appJS = appJS.split('__VERSION__').join(version);
+        workerJS = workerJS.split('__VERSION__').join(version);
         appHTML = appHTML.split('__VERSION__').join(version);
     }
 
@@ -265,13 +313,20 @@ async function extension_build(args) {
     var outputFiles = [
         { path: 'dist/extension/app.html', content: appHTML },
         { path: 'dist/extension/app.js', content: appJS },
-        { path: 'dist/extension/app.css', content: cssContent }
+        { path: 'dist/extension/app.css', content: cssContent },
+        // sw-bundle.js is the service worker runtime — background.js does
+        // importScripts('sw-bundle.js') at the top of the file. Without
+        // this output, the SW has zero runtime and every agent call from
+        // the SW context fails silently inside the try/catch in background.js.
+        { path: 'dist/extension/sw-bundle.js', content: workerJS }
     ];
     if (themeInitJS) outputFiles.push({ path: 'dist/extension/theme-init.js', content: themeInitJS });
     if (viewInitJS) outputFiles.push({ path: 'dist/extension/view-init.js', content: viewInitJS });
 
-    // 8. Copy extension platform files
-    var extFiles = ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js'];
+    // 8. Copy extension platform files (offscreen.* host the DOM-needing
+    // helpers the SW bridges to via chrome.runtime.sendMessage — js_eval
+    // sandbox, image canvas, skills sandbox).
+    var extFiles = ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js'];
     for (var ei = 0; ei < extFiles.length; ei++) {
         var extContent = await readFile('src/platform/extension/' + extFiles[ei]);
         if (extContent !== null) {
@@ -311,6 +366,7 @@ async function extension_build(args) {
             write_failures: writeFailures,
             stats: {
                 jsFiles: jsFiles.length,
+                workerBundleFiles: workerBundleFiles.length,
                 cssFiles: cssFiles.length,
                 skills: embeddedSkills.length,
                 iconsCopied: iconsCopied,
@@ -347,6 +403,7 @@ async function extension_build(args) {
         deploy: deployError ? { success: false, error: deployError } : deployResult,
         stats: {
             jsFiles: jsFiles.length,
+            workerBundleFiles: workerBundleFiles.length,
             cssFiles: cssFiles.length,
             skills: embeddedSkills.length,
             eventBindings: (headResult.bindingJS.match(/_bindEv/g) || []).length - 1 + (bodyResult.bindingJS.match(/_bindEv/g) || []).length - 1,

@@ -188,8 +188,12 @@ function getTableDisplayName(tableName) {
     return TABLE_DISPLAY_NAMES[tableName] || tableName.replace(/^sys_|^sp_|^sc_/, '').replace(/_/g, ' ').replace(/\b\w/g, function(l) { return l.toUpperCase(); });
 }
 
-// Dropdown menu helpers
+// Dropdown menu helpers — page-only. This file is also included in the
+// SW bundle (for TOOL_DISPLAY_NAMES / UI_ICONS etc.) where `document`
+// is undefined. Guard every DOM-touching path so SW bundle load doesn't
+// throw ReferenceError.
 function toggleDropdown(dropdownId) {
+    if (typeof document === 'undefined') return;
     var dropdown = document.getElementById(dropdownId);
     if (!dropdown) return;
     var isOpen = dropdown.classList.contains('open');
@@ -200,17 +204,20 @@ function toggleDropdown(dropdownId) {
 }
 
 function closeDropdowns() {
+    if (typeof document === 'undefined') return;
     document.querySelectorAll('.sn-dropdown.open').forEach(function(d) {
         d.classList.remove('open');
     });
 }
 
-// Close dropdowns when clicking outside
-document.addEventListener('click', function(e) {
-    if (!e.target.closest('.sn-artifact-actions') && !e.target.closest('.skills-action-wrapper')) {
-        closeDropdowns();
-    }
-});
+// Close dropdowns when clicking outside (page-only).
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.sn-artifact-actions') && !e.target.closest('.skills-action-wrapper')) {
+            closeDropdowns();
+        }
+    });
+}
 
 // Icons for change entry types
 var CHANGE_ICONS = {

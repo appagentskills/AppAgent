@@ -1,23 +1,8 @@
 // Version History Functions
-var _validTable = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-var _validSysId = /^[0-9a-fA-F]{32}$/;
-
-async function getRecordScope(table, sysId) {
-    if (!sysId || !table) return null;
-    if (!_validTable.test(table) || !_validSysId.test(sysId)) return null;
-    try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-        var res = await fetch('/api/now/table/' + table + '/' + sysId + '?sysparm_fields=sys_scope', { headers: headers });
-        if (!res.ok) return null;
-        var data = await res.json();
-        if (data.result && data.result.sys_scope) {
-            return data.result.sys_scope.value || data.result.sys_scope;
-        }
-    } catch (e) {
-        console.error('Failed to get record scope:', e);
-    }
-    return null;
-}
+// getRecordScope / getRecordVersion / getRecordDisplayValue moved to
+// js/core/150-record-helpers.js so both the page bundle AND the SW
+// share one DOM-free implementation. Imports/usages below resolve to
+// the new helpers at runtime via global hoisting.
 
 // Common helper function for sys_upload.do with scope support
 async function uploadXml(xml, table, sysId) {
@@ -66,7 +51,7 @@ async function uploadXml(xml, table, sysId) {
 }
 
 async function getVersionXml(versionSysId) {
-    if (!versionSysId || !_validSysId.test(versionSysId)) return null;
+    if (!versionSysId || !_recValidSysId.test(versionSysId)) return null;
     try {
         var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
         var res = await fetch('/api/now/table/sys_update_version/' + versionSysId + '?sysparm_fields=payload', { headers: headers });
@@ -80,36 +65,6 @@ async function getVersionXml(versionSysId) {
     return null;
 }
 
-async function getRecordVersion(table, sysId) {
-    if (!sysId || !_validTable.test(table) || !_validSysId.test(sysId)) return null;
-    try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-        var res = await fetch('/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId + '^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,sys_created_on,state&sysparm_limit=1', { headers: headers });
-        var data = await res.json();
-        if (data.result && data.result[0]) {
-            return data.result[0];
-        }
-    } catch (e) {
-        console.error('Failed to get record version:', e);
-    }
-    return null;
-}
-
-async function getRecordDisplayValue(table, sysId) {
-    if (!sysId || !_validTable.test(table) || !_validSysId.test(sysId)) return sysId;
-    try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-        var res = await fetch('/api/now/table/' + table + '/' + sysId + '?sysparm_fields=sys_id,name,number,short_description&sysparm_limit=1', { headers: headers });
-        var data = await res.json();
-        if (data.result) {
-            return data.result.name || data.result.number || data.result.short_description || sysId.substring(0, 8);
-        }
-    } catch (e) {
-        console.error('Failed to get record display value:', e);
-    }
-    return sysId ? sysId.substring(0, 8) : 'New Record';
-}
-
 function addVersionHistoryEntry(entry) {
     versionHistory.push(entry);
     saveVersionHistory();
@@ -117,6 +72,26 @@ function addVersionHistoryEntry(entry) {
     updateVersionSidebarVisibility();
     // Re-render messages to show inline changes
     renderMessages();
+}
+
+// Variant used by the recordMutated event handler. The event carries the
+// chatId that mutated the record, which may not be the chat the user is
+// currently viewing (background chats, multi-agent). Write to the target
+// chat's persisted history directly; only refresh UI when it's the active
+// chat (since versionHistory is the active-chat mirror).
+function addVersionHistoryEntryForChat(chatId, entry) {
+    if (!chatId) return;
+    var chat = chats[chatId];
+    if (!chat) return;
+    if (!Array.isArray(chat.versionHistory)) chat.versionHistory = [];
+    chat.versionHistory.push(entry);
+    if (chatId === currentChatId) {
+        versionHistory = chat.versionHistory;
+        renderVersionSidebar();
+        updateVersionSidebarVisibility();
+        renderMessages();
+    }
+    saveChatsToStorage();
 }
 
 // Get changes for a specific user message (all changes until next user message)

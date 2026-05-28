@@ -199,10 +199,20 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
         msg.status = 'session_allowed';
         if (msg.permissionKey) {
             sessionPermissions[msg.permissionKey] = 'allow';
+            // Session-only permission: not persisted to IDB, so the SW
+            // boot-time `loadToolPermissionsInWorker` won't pick it up. Push
+            // it to the SW now so the next tool call from the SW's agent
+            // loop sees 'allow' instead of falling through to 'ask'.
+            if (typeof pushPermissionsToOffscreen === 'function') {
+                pushPermissionsToOffscreen({ sessionPermissions: sessionPermissions });
+            }
         }
     } else if (action === 'auto') {
         msg.status = 'always_allowed';
         if (msg.permissionKey) {
+            // setToolPermissionByKey → saveToolPermissions / saveInstance-
+            // Permissions → pushPermissionsToOffscreen, so the SW mirror is
+            // updated transitively. No extra push needed here.
             setToolPermissionByKey(msg.permissionKey, 'allow');
         }
     } else if (action === 'deny') {

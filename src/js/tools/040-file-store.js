@@ -273,7 +273,10 @@ async function executeGetFile(args) {
             '}' +
             '<\/script>';
 
-        var _dlWidget = executeHtmlWidget({ title: '\u2B07\uFE0F ' + fname, html: _dlHtml, height: 'auto', width: '320px' });
+        // Route via executeTool so SW context routes the widget render to a
+        // panel executor (executeHtmlWidget lives in tools/080-widget-tools.js,
+        // page-only). The worker tool-routing wrapper handles the dispatch.
+        var _dlWidget = await executeTool('html_widget', { title: '\u2B07\uFE0F ' + fname, html: _dlHtml, height: 'auto', width: '320px' });
 
         var _dlResult = {
             success: true,

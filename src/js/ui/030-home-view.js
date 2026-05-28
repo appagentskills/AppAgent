@@ -645,6 +645,14 @@ function getRecentUserPrompts(count) {
     for (var i = 0; i < chatList.length && prompts.length < count; i++) {
         var chat = chatList[i];
         if (!chat.messages) continue;
+        // Skip sub-agent / background chats — their "first user message" is the
+        // synthetic spawn instruction (e.g. "You are a focused bug scout for the
+        // AppAgent...") which the PM never typed. Leaking these into the Recent
+        // prompts chip strip lets the PM click them as if they were their own past
+        // prompts and resend a sub-agent system instruction to the foreground
+        // model. `chat.isSubAgent` is stamped at sub-agent creation in
+        // 097-sub-agent-registry.js; `isBackground` covers action chats too.
+        if (chat.isSubAgent || chat.isBackground) continue;
         // Only get the first user message from each chat
         for (var j = 0; j < chat.messages.length; j++) {
             var msg = chat.messages[j];

@@ -65,13 +65,13 @@ var DEFAULT_API_PROVIDERS = [
         thinkingBudget: 64000
     },
     {
-        name: 'Opus-4-7 OAuth',
-        model: 'claude-opus-4-7',
+        name: 'Opus-4-8 OAuth',
+        model: 'claude-opus-4-8',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
         maxTokens: 100000,
         context_length: 200000,
-        effort: 'xhigh',
+        effort: 'high',
         isClaudeOAuth: true
     }
 ];
@@ -91,7 +91,7 @@ var DEFAULT_API_PROVIDER = {
     provider: ''
 };
 
-var currentProvider = 'Opus-4-7 OAuth'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
+var currentProvider = 'Opus-4-8 OAuth'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
 var currentChatId = null;
 var chats = {};
 var paused = false; // LEGACY: kept for backwards compat with bits that still read it. Do NOT consult in isChatPaused — it would cross-pollute pause across concurrent chats.

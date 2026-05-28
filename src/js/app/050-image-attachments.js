@@ -614,6 +614,13 @@ function editMessage(msgIndex) {
     renderMessages();
     renderChatList();
     updateChatTitleHeader();
+    // The branched chat has no sub-agents of its own — hide/reset the
+    // strip so chips from the source chat don't carry over. This path
+    // bypasses selectChat (intentionally seamless), so we trigger the
+    // strip refresh here.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
     
     // Put the original message content in the input for editing
     var input = document.getElementById('message-input');

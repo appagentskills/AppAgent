@@ -142,6 +142,8 @@ function renderChatList() {
     // Only show non-empty chats, filtered by search.
     // Background action chats are hidden from the main chat list unless the
     // PM explicitly revealed one via the jobs dropdown (chat._revealed = true).
+    // Sub-agent chats follow the same rule (they ARE background chats), so
+    // they only appear after revealSubAgentChat() flips _revealed.
     var sorted = Object.values(chats)
         .filter(function(c) { return c.messages && c.messages.length > 0 && chatMatchesSearch(c, chatSearchQuery) && !(c.isBackground && !c._revealed); })
         .sort(function(a, b) {
@@ -420,8 +422,15 @@ function renderChatItem(c) {
             '</div>' +
         '</div>';
         
+        // Sub-agent breadcrumb shown in search results too — otherwise a
+        // sub-agent chat that matches a search query looks like a normal
+        // top-level chat. (Without this the breadcrumb only appears in the
+        // non-search branch below.)
+        var searchSubAgentBreadcrumb = (c.isSubAgent && typeof renderSubAgentBreadcrumb === 'function')
+            ? renderSubAgentBreadcrumb(c) : '';
         displayContent = '<div class="chat-search-result">' +
             titleRow +
+            searchSubAgentBreadcrumb +
             '<div class="chat-result-snippets">' + snippetsHtml + '</div>' +
         '</div>';
         
@@ -436,7 +445,12 @@ function renderChatItem(c) {
         var chatPaused = typeof isChatPaused === 'function' ? isChatPaused(c.id) : false;
         var streamingIndicator = (!hasApproval && !chatPaused && typeof isChatRunning === 'function' && isChatRunning(c.id)) ? '<span class="chat-streaming-dot" title="Agent is running"></span>' : '';
         var pendingIndicator = chatHasPendingItems(c.id) ? '<span class="chat-pending-dot" title="Has pending draft"></span>' : '';
-        displayContent = attentionIndicator + streamingIndicator + pendingIndicator + '<span class="chat-title">' + escapeHtml(c.title) + '</span>';
+        // Sub-agent breadcrumb: "↳ parent-title" pill so the user can see
+        // at a glance that this chat is a delegated worker, not a top-level
+        // conversation. Rendered AFTER the title so the dots stay first.
+        var subAgentBreadcrumb = (c.isSubAgent && typeof renderSubAgentBreadcrumb === 'function')
+            ? renderSubAgentBreadcrumb(c) : '';
+        displayContent = attentionIndicator + streamingIndicator + pendingIndicator + '<span class="chat-title">' + escapeHtml(c.title) + '</span>' + subAgentBreadcrumb;
     }
 
     return '<div class="chat-item ' + active + '" onclick="selectChat(\'' + c.id + '\')">'+
@@ -463,9 +477,19 @@ function handleSearchSnippetClick(chatId, matchIndex) {
 }
 
 function escapeHtml(t) {
-    var d = document.createElement('div');
-    d.textContent = t;
-    return d.innerHTML;
+    // Explicit per-char replace — covers BOTH text-content and attribute
+    // contexts. The previous textContent/innerHTML trick correctly escaped
+    // <, >, & but left " and ' untouched, making it unsafe for callers
+    // that interpolate the result into attribute values (title="...",
+    // data-x="...", etc.). 100+ call sites; switching to a stricter
+    // implementation is additive — text-content contexts are unaffected.
+    if (t == null) return '';
+    return String(t)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function formatFileSize(bytes) {

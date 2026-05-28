@@ -66,9 +66,24 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
         }
     }
 
-    // Show approval prompt and wait for user response
+    // Show approval prompt and wait for user response. If this call is
+    // running inside an async-wrapped handle (options._handleId set by
+    // the wrap path in executeTool), flip awaitingApproval on the handle
+    // entry so the agent's poll_handle / await_handle can see that the
+    // tool is blocked on user input rather than on slow work. Cleared
+    // once the user responds, regardless of approve/deny.
     var promptFn = options.batch ? showToolApprovalPromptBatch : showToolApprovalPrompt;
-    var approved = await promptFn(displayName, args, permissionKey, toolCallId, toolName, targetChatId, options);
+    if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {
+        Handles.markAwaitingApproval(options._handleChatId, options._handleId, true);
+    }
+    var approved;
+    try {
+        approved = await promptFn(displayName, args, permissionKey, toolCallId, toolName, targetChatId, options);
+    } finally {
+        if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {
+            Handles.markAwaitingApproval(options._handleChatId, options._handleId, false);
+        }
+    }
 
     if (approved) {
         return Object.assign({ allowed: true }, baseResult);

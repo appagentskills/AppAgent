@@ -111,6 +111,24 @@
         return null;
     };
 
+    // Synchronous access to the active-instance session token.
+    // In the page bundle this mirrors `window.sessionToken`. The Service
+    // Worker has its own implementation that reads from chrome.storage.local.
+    // Always prefer Platform.getSessionToken() over `window.sessionToken` so
+    // shared code (tool implementations) works in either context.
+    Platform.getSessionToken = function() {
+        return (typeof window !== 'undefined' && window.sessionToken) || '';
+    };
+
+    // Worker-portable referer accessor. callLLMStreaming uses this for the
+    // HTTP-Referer header. In the page bundle we use the SN instance URL when
+    // known, falling back to the side-panel URL. The offscreen worker bundle
+    // overrides this to return a stable static referer because window.location
+    // in offscreen points at offscreen.html (not useful for OpenRouter logs).
+    Platform.getReferer = function() {
+        return Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : '');
+    };
+
     // Get a token for a specific instance URL (uses cache, falls back to background probe)
     Platform.getTokenForInstance = function(instanceUrl) {
         // Check active instance first

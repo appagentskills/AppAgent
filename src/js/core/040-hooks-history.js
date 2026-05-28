@@ -81,6 +81,14 @@ function handlePopState(event) {
             updateInputPosition();
             updateChatTitleHeader();
             updateAllButtonStates();
+            // Refresh Workers strip for the newly-selected chat. The rAF-
+            // coalesced listener in 175-sub-agent-ui.js only fires on
+            // registry mutations; a pure chat switch with no sub-agent
+            // activity wouldn't repaint the strip otherwise and we'd
+            // keep the previous chat's chips visible until reload.
+            if (typeof renderWorkersStrip === 'function') {
+                try { renderWorkersStrip(); } catch (e) {}
+            }
             document.title = getHistoryTitle('chat', targetChatId, null);
 
             // Sync streaming UI state for the target chat. Mirror selectChat: if THAT
@@ -242,9 +250,15 @@ async function loadHooksSettings() {
     }
 }
 
-// Save hooks settings to storage
+// Save hooks settings to storage AND mirror to the SW. The agent loop now
+// runs in the SW, so it has its own `hooksEnabled` copy hydrated from IDB
+// at boot; without this push the SW would keep the boot-time value until
+// next restart and the user's toggle wouldn't take effect on background runs.
 async function saveHooksSettings() {
     await setSetting('hooksEnabled', hooksEnabled);
+    if (typeof pushHooksSettingsToOffscreen === 'function') {
+        pushHooksSettingsToOffscreen(hooksEnabled);
+    }
 }
 
 // Toggle a specific hook

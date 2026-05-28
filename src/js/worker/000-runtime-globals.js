@@ -1,0 +1,76 @@
+// =============================================================
+// AppAgent SW runtime — global state.
+//
+// This file is the FIRST entry of sw-bundle.js. It declares the
+// same per-chat globals the page bundle's various files declare so
+// the agent-loop code (loaded later in the same bundle) sees the
+// expected free variables.
+//
+// All state lives in the ServiceWorkerGlobalScope — `var` at the top
+// level becomes a property on `self`. Survives across messages but
+// is wiped if the SW is killed (Chrome MV3 30s idle / extension
+// update). The IDB agent_runs store handles resume after a kill.
+//
+// IMPORTANT: keep names in sync with the page bundle declarations.
+// If a name drifts, the agent loop will throw ReferenceError on the
+// first read. The page bundle declarations are in:
+//   src/js/core/020-bootstrap.js   (chats, currentChatId, etc.)
+//   src/js/app/030-agent-loop.js   (per-chat state maps)
+//   src/js/app/040-send-message.js (pendingInjection*)
+// =============================================================
+
+// Marker: this is the SW runtime context, not the page bundle and
+// not the offscreen helper. Shared agent-loop code branches on this
+// flag where its behavior would otherwise touch the DOM (e.g.
+// isNearBottom, renderMessages) or needs to bridge to offscreen
+// (js_eval sandbox, image canvas).
+var Platform = (typeof Platform === 'object' && Platform) || {};
+Platform.isWorker = true;
+Platform.isOffscreen = false;  // kept for any code that still reads it
+
+// --- Globals declared by core/020-bootstrap.js in the page bundle ---
+// 020-bootstrap.js is page-only (DOM init + localStorage wrapper) so the
+// SW bundle excludes it. But shared files (e.g. core/130-indexeddb.js)
+// reference STORAGE_PREFIX at module load to build the IDB database name.
+// The SW context never has an iframe, so the prefix is always empty.
+var STORAGE_PREFIX = '';
+var isInIframe = false;
+// Minimal appStorage shim. SW has no localStorage; if any shared code
+// happens to call this (page-side cache for credits, etc.) it gets
+// inert no-ops here. Real persistence lives in chrome.storage / IDB.
+var appStorage = {
+    getItem: function() { return null; },
+    setItem: function() {},
+    removeItem: function() {}
+};
+
+// --- Chat state (mirrors page bundle 020-bootstrap.js) ---
+// Loaded from IDB on startup by 080-storage.js. The offscreen runtime
+// is the AUTHORITATIVE writer for chats[*].messages during a run.
+// Panels read from their own copy and update via emitted events.
+var chats = {};
+var currentChatId = null;            // No "current" chat in offscreen; routes by chatId
+var currentProvider = '';            // Set per-run from chat.provider or persisted default
+var lastApiError = null;
+var lastRequestMetrics = null;
+var activeStreamingChatId = null;
+var isRunning = false;
+var isFollowingScroll = false;       // No UI scroll here — kept so loop assignments don't throw
+var isFollowingStreamingScroll = false;
+var pendingInjection = null;         // Used by send-message; offscreen owns these via runQueue
+var pendingInjectionImages = null;
+var _silentHookRunning = false;
+
+// --- Per-chat agent-run state (mirrors page bundle 030-agent-loop.js) ---
+var runningChatIds = {};
+var currentStreamAbortControllers = {};
+var pendingInjectionsByChatId = {};
+var interruptResolversByChatId = {};
+var userInterruptedChats = {};
+var pausedChatIds = {};              // populated by togglePause-equivalent messages
+
+// --- Per-chat parked UI-tool calls (Layer C) ---
+// When a UI-required tool is called and no panel is registered as an
+// executor, the call is parked here AND persisted to IDB. A future
+// connecting panel triggers a replay via replayParkedToolCalls().
+var parkedToolCallsByChatId = {};    // { chatId: [{ toolCallId, name, input, resolve, reject, parkedAt }, ...] }

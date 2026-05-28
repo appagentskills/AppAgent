@@ -19,7 +19,7 @@ async function executePromptUser(args, options) {
 
     // Add prompt message to chat (similar to approval messages)
     // Store toolCallId so we can inject a proper tool_result after page reload
-    chat.messages.push({
+    var promptMsg = {
         role: 'prompt_user',
         promptId: promptId,
         toolCallId: options.toolCallId || null,
@@ -27,7 +27,8 @@ async function executePromptUser(args, options) {
         description: args.description || '',
         fields: fields,
         status: 'pending'
-    });
+    };
+    chat.messages.push(promptMsg);
     saveChatsToStorage();
 
     // If this is a background Action chat, flip the action button to 'needs_input'
@@ -45,6 +46,12 @@ async function executePromptUser(args, options) {
         pendingPromptResolvers[promptId] = resolve;
     });
 
+    // Mirror the prompt message to the SW so its chat snapshot doesn't wipe
+    // it on the next agent-event. submitPromptUser/cancelPromptUser mutated
+    // promptMsg in place (status + values), so the reference captures the
+    // final state. The SW splices it before the matching tool_result slot
+    // in chat.messages — same position the page-side push placed it in.
+    result._message_persist = promptMsg;
     return result;
 }
 
@@ -206,11 +213,15 @@ function cancelPromptUser(promptId) {
     scrollToBottomIfAllowed();
 }
 
-// After page reload: inject a proper tool_result message matching the orphaned tool_use
+// After page reload: write a proper tool_result matching the orphaned tool_use.
+// Uses `recordToolResult` to update the existing placeholder (or any prior
+// "[interrupted]" row injectInterruptedToolResults may have left) in place.
+// The old implementation pushed at chat-end alongside the still-present
+// placeholder, producing two `role:'tool'` rows with the same id and 400-ing
+// the next API call with "multiple tool_result blocks with id …".
 function injectPromptToolResult(chat, promptId, result) {
     if (!chat) return;
 
-    // Find the prompt message to get the toolCallId
     var toolCallId = null;
     for (var i = 0; i < chat.messages.length; i++) {
         if (chat.messages[i].role === 'prompt_user' && chat.messages[i].promptId === promptId) {
@@ -219,23 +230,11 @@ function injectPromptToolResult(chat, promptId, result) {
         }
     }
 
-    if (toolCallId) {
-        // Remove any placeholder "interrupted" tool_result that injectInterruptedToolResults may have added
-        chat.messages = chat.messages.filter(function(m) {
-            return !(m.role === 'tool' && m.tool_call_id === toolCallId && m.content && m.content.indexOf('interrupted') >= 0);
-        });
-
-        // Inject proper tool_result
-        chat.messages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            name: 'prompt_user',
-            content: JSON.stringify(result)
-        });
+    if (toolCallId && typeof recordToolResult === 'function') {
+        recordToolResult(chat, toolCallId, 'prompt_user', JSON.stringify(result));
         saveChatsToStorage();
         renderMessages();
         scrollToBottomIfAllowed();
-        // Continue the agent loop
         runAgent(currentChatId);
     }
 }
