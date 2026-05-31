@@ -623,6 +623,33 @@ async function runAgent(overrideChatId) {
         var currentProviderObj = getProviderById(currentProvider);
         lastRequestMetrics = { startTime: Date.now(), callNumber: callNumber, providerName: currentProviderObj ? currentProviderObj.name : 'Unknown' };
 
+        // Sub-agent nudge: when the running context crosses the threshold, append a
+        // ONE-SHOT reminder to delegate heavy/verbose work to sub-agents (model
+        // quality degrades at long context). Pushed as a trailing `context` message
+        // so buildAPIMessages merges it onto the END of the last user turn — it comes
+        // LAST and sits AFTER the prompt-cache breakpoints, so the cached prefix is
+        // never invalidated (only this short tail is uncached). It is deliberately
+        // NOT placed in the system prompt (that would bust the whole cache every
+        // turn). Skipped for sub-agent chats; fires at most once per chat.
+        if (!chat.isSubAgent && !chat._ctxSubAgentNudgeSent &&
+            typeof SUBAGENT_NUDGE_TOKEN_THRESHOLD === 'number' && SUBAGENT_NUDGE_TOKEN_THRESHOLD > 0) {
+            var _ctxTokens = 0;
+            for (var _ci = chat.messages.length - 1; _ci >= 0; _ci--) {
+                var _cm = chat.messages[_ci];
+                if (_cm && _cm.role === 'assistant' && _cm.metrics && _cm.metrics.input_tokens && !_cm.metrics.isAggregate) {
+                    _ctxTokens = _cm.metrics.input_tokens;
+                    break;
+                }
+            }
+            if (_ctxTokens >= SUBAGENT_NUDGE_TOKEN_THRESHOLD) {
+                chat.messages.push({
+                    role: 'context',
+                    content: '[Context is now ~' + Math.round(_ctxTokens / 1000) + 'k tokens. Model performance degrades as context grows — strongly prefer delegating heavy or verbose work (file/grep dumps, multi-record audits, deep log scans, iterative debugging) to sub-agents via spawn_sub_agent so their raw output stays out of this conversation. Keep this context lean.]'
+                });
+                chat._ctxSubAgentNudgeSent = true;
+            }
+        }
+
         var assistantMsg = {
             role: 'assistant',
             content: '',

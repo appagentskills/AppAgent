@@ -327,6 +327,34 @@ executeTool = async function(name, args, messageIndex, options) {
         return await _executeToolLocal(name, args, messageIndex, options);
     }
 
+    // -------- Sub-agent tool-call budget (UI tools) --------
+    // Headless tools count toward max_tool_calls inside _executeToolLocal's gate
+    // (tools/020-tool-execution.js). Non-headless UI tools never reach
+    // _executeToolLocal in the SW — they route straight to the panel below — so
+    // without this the authoritative budget would silently ignore every
+    // iframe_tool / take_screenshot / html_widget / display / prompt_user /
+    // get_skill / manage_skill call a sub makes, and the cap would never fire.
+    // The SW is the authoritative SubAgents context, so count here. (The page
+    // also runs _executeToolLocal's gate when it executes the routed tool, but
+    // that mutates its read-only mirror, which the next SW snapshot clobbers —
+    // harmless, never the authoritative count.) All UI tools are productive work;
+    // none are in the lifecycle/handle exempt set (those are all headless). Runs
+    // only on the real execution: the await:false async-wrap above returns the
+    // handle before reaching here, and the deferred recursive call (_asyncWrapping)
+    // skips the wrap block and lands here exactly once.
+    if (typeof SubAgents !== 'undefined' && SubAgents.onToolCallInSubAgent) {
+        var _budgetChatId = (options && options.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        if (_budgetChatId && typeof chats !== 'undefined' && chats[_budgetChatId]
+            && chats[_budgetChatId].isSubAgent) {
+            var _budgetOk = SubAgents.onToolCallInSubAgent(_budgetChatId);
+            if (!_budgetOk) {
+                return { success: false, error: 'Sub-agent exceeded max_tool_calls budget. The sub has been stopped.', _budget_exhausted: true };
+            }
+        }
+    }
+
     // UI-required tool. Route to a panel; if none connected, park.
     var chatId = (options && options.chatId) || activeStreamingChatId;
     var toolCallId = (options && options.toolCallId)
@@ -385,7 +413,17 @@ executeTool = async function(name, args, messageIndex, options) {
         }
         if (result._widget_persist) {
             if (!chats[chatId].widgets) chats[chatId].widgets = [];
-            chats[chatId].widgets.push(result._widget_persist);
+            // Upsert by id. html_widget creation sends a brand-new widget (id absent
+            // -> append). edit_html now re-sends the SAME id with updated html/
+            // contentVersion; pushing unconditionally would DUPLICATE the widget and
+            // leave the stale copy first, so getWidgetById / the ?widget= deep-link
+            // temp tab (take_screenshot) would still read the OLD html. Update in
+            // place so the SW's authoritative chat — and its store.clear()+rewrite
+            // save — carries the post-edit html.
+            var _wp = result._widget_persist;
+            var _wpIdx = chats[chatId].widgets.findIndex(function(w) { return w && w.id === _wp.id; });
+            if (_wpIdx !== -1) chats[chatId].widgets[_wpIdx] = _wp;
+            else chats[chatId].widgets.push(_wp);
             delete result._widget_persist;
         }
         // iframe_tool navigate sets chat.targetTabId page-side. Without this

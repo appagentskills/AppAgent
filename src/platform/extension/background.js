@@ -223,7 +223,12 @@ async function updateHeaderRules() {
 
 // --- Helpers ---
 
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+// Open AppAgent in a full page tab when the toolbar icon is clicked.
+// (openPanelOnActionClick must be false so the action.onClicked event fires.)
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+chrome.action.onClicked.addListener(function() {
+    chrome.tabs.create({ url: chrome.runtime.getURL('app.html?mode=tab') });
+});
 
 // Re-open app as a full tab after chrome.runtime.reload().
 // sidePanel.open() requires a user gesture so a tab is the only reliable option.
@@ -1124,6 +1129,14 @@ var CLAUDE_OAUTH = {
     scopes: 'user:inference'
 };
 
+// Guard for silent auto-login (see the claude-oauth-status handler). In-memory
+// flag blocks two overlapping token exchanges within one service-worker
+// lifecycle. The "already failed for this cookie" guard is persisted in
+// chrome.storage.local (claudeAutoLoginFailedFor) so an invalid/expired
+// sessionKey cookie cannot trigger a token-exchange storm across the frequent
+// MV3 service-worker restarts.
+var claudeAutoLoginInFlight = false;
+
 function base64url(bytes) {
     return btoa(String.fromCharCode.apply(null, bytes))
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -1278,6 +1291,8 @@ function saveOAuthCreds(tokenData, existingRefresh) {
 // Handle OAuth messages from side panel and content script
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-login') {
+        // Manual login re-enables auto-login and clears any stale failed-cookie guard.
+        chrome.storage.local.remove(['claudeOAuthSuppressAutoLogin', 'claudeAutoLoginFailedFor']);
         startClaudeOAuth().then(function(creds) {
             sendResponse({ success: true, claudeOAuth: creds });
         }).catch(function(err) {
@@ -1294,8 +1309,40 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
     if (message.type === 'claude-oauth-status') {
-        chrome.storage.local.get('claudeOAuth', async function(data) {
-            if (!data.claudeOAuth) { sendResponse({ loggedIn: false }); return; }
+        chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin'], async function(data) {
+            if (!data.claudeOAuth) {
+                // AUTO-LOGIN: no token stored yet. If the user is signed into
+                // claude.ai (sessionKey cookie present) and has not manually
+                // logged out, silently exchange the cookie for an OAuth token —
+                // no click needed. Guarded so a bad/expired cookie can't spam
+                // token exchange:
+                //   - claudeAutoLoginInFlight (memory) blocks overlapping tries
+                //   - claudeAutoLoginFailedFor (persisted) blocks retrying the
+                //     same cookie value across service-worker restarts
+                if (!claudeAutoLoginInFlight && !data.claudeOAuthSuppressAutoLogin) {
+                    // Claim the in-flight guard SYNCHRONOUSLY (before any await) so two
+                    // near-simultaneous status polls can't both pass the check and each
+                    // launch startClaudeOAuth(). The reset lives in finally.
+                    claudeAutoLoginInFlight = true;
+                    var sk = null;
+                    try {
+                        try { sk = await getClaudeCookie('sessionKey'); } catch (e) {}
+                        if (sk && sk !== data.claudeAutoLoginFailedFor) {
+                            var creds = await startClaudeOAuth();
+                            chrome.storage.local.remove('claudeAutoLoginFailedFor');
+                            sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt });
+                            return;
+                        }
+                    } catch (e) {
+                        // Remember this cookie failed so we don't retry it every poll.
+                        if (sk) chrome.storage.local.set({ claudeAutoLoginFailedFor: sk });
+                    } finally {
+                        claudeAutoLoginInFlight = false;
+                    }
+                }
+                sendResponse({ loggedIn: false });
+                return;
+            }
             var oauth = data.claudeOAuth;
             // Auto-renew if expired or expiring within 1 minute. Uses refresh_token
             // if available, otherwise falls back to silent re-auth via the claude.ai
@@ -1319,6 +1366,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     }
     if (message.type === 'claude-oauth-logout') {
         chrome.storage.local.remove('claudeOAuth');
+        // Suppress auto-login so an explicit logout sticks — otherwise the next
+        // status poll would immediately re-exchange the still-present cookie.
+        chrome.storage.local.set({ claudeOAuthSuppressAutoLogin: true });
         chrome.runtime.sendMessage({ type: 'claude-oauth-updated', claudeOAuth: null }).catch(function() {});
         sendResponse({ success: true });
         return true;
@@ -1379,6 +1429,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
 
         var res;
         var maxRetries = 3;
+        var triedReauth = false;
         for (var attempt = 0; attempt <= maxRetries; attempt++) {
             if (aborted) {
                 // Match the in-loop abort path (post-break fall-through emits both
@@ -1400,6 +1451,24 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                 },
                 body: anthropicJson
             });
+
+            // "Stays signed in": a hard 401 means the access token was rejected
+            // server-side (revoked, or the claude.ai session expired before our
+            // clock-based proactive refresh at expiresAt-60s could fire).
+            // Silently re-authenticate ONCE via renewClaudeToken (refresh_token
+            // if present, else claude.ai cookie re-auth) and retry with the
+            // fresh token instead of surfacing the 401 as a failed request.
+            if (res.status === 401 && !triedReauth) {
+                triedReauth = true;
+                try {
+                    oauth = await renewClaudeToken(oauth);
+                    continue;
+                } catch (e) {
+                    sink({ type: 'error', error: 'Session expired and silent re-auth failed: ' + e.message + '. Open https://claude.ai, sign in, then retry.' });
+                    sink({ type: 'done' });
+                    return;
+                }
+            }
 
             if (res.status !== 529 || attempt === maxRetries) break;
             console.error('[AppAgent] 529 overloaded, retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + (4 * Math.pow(2, attempt)) + 's');

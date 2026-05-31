@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.1
+
+### Features
+- **GitHub REST API skill** — `web_fetch` now auto-attaches the stored GitHub token when called against the configured GitHub instance's REST base (`api.github.com`, or `<instance>/api/v3` for Enterprise), so authenticated calls against private repos work with no manual token handling. New `github-api` skill with endpoint quick-reference and a reusable helper.
+
+### Fixes
+- **Background chats now show in Active Chats** — were missing from the jobs dropdown when started from another chat. The current chat is also included now, rows linger 5 min after a chat finishes, and clicking one opens that chat's progress popover.
+- **Screen no longer sleeps during agent runs** — keep-awake holds the display lock for the whole run. Notice also dismisses on click-outside.
+- **Sub-agent messages render correctly** — newlines came through as literal text and URLs were not clickable.
+- **Widget screenshots no longer return a stale capture** — was happening on every capture, including after edits to the widget.
+- **Chat list no longer grows from completed sub-agents** — finished sub-agents are now cleaned up an hour after they go idle.
+- **Sub-agent tool budgets now apply to browser-side work** — clicks, screenshots, widgets, prompts, and skill calls used to never count toward the cap.
+- **Search Docs action only shows on home** — was also rendering above the chat input.
+
+---
+
 ## v1.1.0
 
 ### Features
@@ -8,9 +24,31 @@
 - **Async tools** — long-running tools no longer block the agent. It can kick a tool off, do other work, and come back to check the result, cancel it, or wait on any of several at once.
 
 ### Fixes
-- **Stays signed in** — when the Claude session expires, the extension silently re-authenticates instead of failing the next request.
+- **Stays signed in** — when the Claude session expires, the extension silently re-authenticates instead of failing the next request. Re-auth now fires both proactively (clock-based, before token expiry) **and** reactively on a server-side `401` (token revoked / session expired early), retrying the request once with a fresh token.
 - **Retry after rate-limit works** — the Retry button after a 429 actually retries now (previously it silently did nothing and you had to click Continue).
+- **Pause works again after the SW move** — pausing a chat aborts the in-flight LLM call / running tool **immediately** again, as documented. When the agent loop moved into the service worker, the in-flight stream's `AbortController` and the tool interrupt resolver moved with it — but the SW's `toggle-pause` handler only set the pause flag and never fired the abort. The panel-side `togglePause` still called `abort()`/the resolver, but on its own now-empty copies of those maps, so Pause silently became a no-op: it only took effect at the next loop-iteration boundary (after the whole streaming turn **and** its tool batch finished). The SW handler now mirrors the `interrupt` path and aborts the stream / resolves the interrupt on pause (without setting `userInterruptedChats`, so abandoned tools still read "paused by user" rather than "user sent a new message").
+- **Reload button reliably restarts the service worker** — clicking Reload now always calls `chrome.runtime.reload()` (a full extension restart that re-imports `sw-bundle.js` from disk), so a freshly deployed service-worker bundle — e.g. an SW-side fix like the pause-abort one above — actually takes effect. Previously the whole reload was gated on the `chrome.storage.local.set({reopenAppTab})` completion callback in `src/js/ui/270-iframe-panel.js` (`reloadExtension()`); if that callback was delayed or never fired (SW asleep/busy, storage blocked, unchecked `lastError`), `chrome.runtime.reload()` was never reached and the **old** SW kept running — with no feedback to tell the user nothing happened, so a new `sw-bundle.js` never took effect. The reload now fires exactly once through a guarded helper with a short timer fallback (a stranded storage callback can no longer strand it), shows a "Reloading extension…" snackbar, and confirms first when an agent run is still in flight (a full reload kills it). The `reopenAppTab` → reopen-as-a-full-tab behavior is unchanged.
 - **More reliable form fill** — ServiceNow fields with autocomplete or React-based inputs now fire their handlers correctly.
+- **Readable `workspace` diffs** — the `diff` action now renders a proper LCS-based unified diff (common prefix/suffix trim + hunked context with `@@` headers). Previously it compared lines by absolute index, so any insert/delete shifted every following line and flagged the whole tail as changed — a localized ~30-line edit produced a ~360-line "whole-file re-alignment" anchored on repeated `}`/`return;`/blank lines. Display-only; file contents were never affected.
+- **Active Chats now actually appear in the jobs badge/dropdown** — a background chat (one you started, then navigated away from while it kept running) is supposed to show under an "Active Chats" group in the jobs badge and its dropdown. It never did: a running chat only qualifies once it is **not** the focused chat (`getActiveChatsList()` excludes `currentChatId`), but `renderJobsBadge()` was only called on run start/finish/crash and action-state changes — never on chat switch. So the badge was computed while the chat was still focused (excluded → count 0 → badge `display:none`, which also hides its dropdown), and never recomputed after you navigated away. `selectChat()` now recomputes the badge **and** re-renders any open dropdown after `currentChatId` updates, and the panel-reconnect `hello` handler (which restores `runningChatIds`) now refreshes the badge too.
+- **Sub-agent reliability hardening** (found in v1.1.0 testing):
+  - `wake_sub_agent` / `stop_sub_agent` ACL now fails **closed** — previously an unresolved caller chat-id bypassed the subtree-ownership check entirely (fail-open), unlike `agent_message` which already failed closed.
+  - Waking a still-running sub *with an instruction* no longer pushes a `user` message mid-turn (which broke Anthropic's assistant→tool_result alternation and 400'd the request) — it routes through `pendingInjectionsByChatId` like `agent_message`.
+  - A sub that finishes without calling `report_to_parent` under `auto_report:false` is now marked `errored` (with `settled_at`) instead of being silently downgraded to `sleeping` — the tombstone sweep can finally GC the record + its background chat row (was a permanent leak). The `auto_report:true` crash path now stamps `settled_at` too.
+  - `_drainPool` no longer leaks a pool slot (and orphans the spawn handle) if `runAgent` is unavailable in the current context.
+  - Resumed (re-woken) sub-agents report their fresh spawn handle in `agent_status.pending_handles` again.
+  - `spawn_sub_agent` now verifies the `chats` map is available **before** allocating the spawn handle + record (the guard previously ran *after* allocation). A missing `chats` map used to leak an orphan `running` record and leave the parent's `await_handle` hanging on a deferred that never resolved.
+  - Budget-exhaustion and crash (`_markErrored`) terminations now **cascade-stop descendants**, like `stop_sub_agent` already did. Previously only an explicit `stop_sub_agent` cascaded, so a nested parent that ran out of tool budget or crashed orphaned its grandchildren — they kept holding pool slots and reporting into a dead chat. The cascade is now a shared `_cascadeStopDescendants` helper used by all three paths.
+  - `wake_sub_agent` (already-running no-op) and `agent_message` (running recipient) now return an awaitable `handle` for the in-flight run, matching the documented "always returns `{handle}`" contract — previously these two branches returned no handle and the caller had to poll `agent_status`.
+- **Async-tool (handle) reliability hardening** (found in v1.1.0 testing):
+  - `cancel_handle` now stamps `settledAt` at cancel time so a cancelled handle whose background work *never* settles (a hung fetch / iframe interaction) can still be garbage-collected — previously it leaked in the registry forever in the long-lived service worker.
+  - `await_any` no longer lets an `unknown` handle (bogus id, or one wiped by a service-worker restart) instantly "win" the race and mask handles that are genuinely still pending. Only a terminal status (`done`/`error`/`cancelled`) wins; if **every** handle is unknown it resolves immediately instead of hanging.
+  - `awaitingApproval` is now forced `false` on any settled snapshot (`done`/`error`/`cancelled`) — it was set while pending but never reset, so a terminal snapshot could still claim the tool was blocked on the approval modal.
+  - The handle GC sweep now also runs from `poll`/`await` (not just `start`/`list`), matching the documented "sweeps on every `Handles.*` call" — a poll/await-only workload previously never swept.
+  - `await_all` now returns a top-level `timedOut` flag (mirrors `await_any`'s `timeout`); the empty-array guard on both helpers returns the uniform `{handle/snapshots, …}` shape instead of a bare `{error}`.
+  - `await_all`'s `timedOut` flag is now actually surfaced to the agent. The registry computed it, but the tool-dispatch arm hand-picked only `{snapshots}` (unlike `await_any`, which spreads its whole result), so the flag was silently dropped at the boundary and never reached the caller — the documented partial-result detection was a no-op. The arm now forwards the full uniform shape via `Object.assign`, and the `await_all` tool description + system-prompt entry document `timedOut`.
+- **Sub-agent boot GC no longer orphans chat rows** — the boot-time tombstone sweep deleted the settled sub-agent record but left its background chat row in `chats` + IndexedDB forever (the runtime idle sweep already deletes both). The boot sweep now reclaims the chat row too.
+- **Sonnet 4.6 OAuth provider** added to the default provider list (the v1.1.0 feature note above shipped without the corresponding provider entry).
 
 ### Other
 - **New permission: `offscreen`** — required so sub-agents and async tools can keep running when the side panel is closed.

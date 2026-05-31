@@ -591,8 +591,14 @@ async function executeTool(name, args, messageIndex, options) {
             var _parkedAidAA = _maybeParkForChildAwaitMulti(chatIdH, args.handles);
             try {
                 var allRes = await Handles.awaitAll(chatIdH, args.handles, timeoutMsAA);
-                // allRes is { snapshots: [...] }
-                return { success: true, snapshots: allRes.snapshots };
+                // allRes is { snapshots: [...], timedOut }. Forward the FULL
+                // uniform shape (mirrors the await_any arm's Object.assign) so
+                // the agent sees `timedOut` — the top-level partial-result flag
+                // the v1.1.0 changelog promised. Hand-picking only `snapshots`
+                // here silently dropped it at the dispatch boundary, defeating
+                // the registry-layer fix and forcing callers to re-scan every
+                // snapshot for status:'pending'.
+                return Object.assign({ success: true }, allRes);
             } finally {
                 if (_parkedAidAA && typeof SubAgents !== 'undefined' && SubAgents.unparkAfterAwait) {
                     try { SubAgents.unparkAfterAwait(_parkedAidAA); } catch (_) {}
@@ -1197,12 +1203,58 @@ async function executeTool(name, args, messageIndex, options) {
             // sendMessage-based path always failed with "message port closed".)
             var _wfOpts = {
                 method: args.method || 'GET',
-                headers: args.headers || {},
+                // Shallow-copy so we never mutate the caller's headers object.
+                headers: Object.assign({}, args.headers || {}),
                 cache: 'no-store'
             };
             if (args.body && ['POST', 'PUT', 'PATCH'].includes(_wfOpts.method)) {
                 _wfOpts.body = args.body;
             }
+            // --- GitHub REST API auth injection -------------------------------
+            // Reuse the GitHub token the workspace tool stores in chrome.storage
+            // (keys 'githubToken' + 'githubInstanceUrl' — the same values read by
+            // githubApi() in core/130-indexeddb.js for clone/push) so REST calls
+            // work against PRIVATE repos. The token is attached ONLY when the
+            // request targets the CONFIGURED instance's REST API base, derived
+            // EXACTLY like githubApi():
+            //   - https://github.com -> https://api.github.com   (any path on host)
+            //   - GHE <instanceUrl>  -> <instanceUrl>/api/v3      (only /api/v3 paths)
+            // Matching the configured host guarantees we send the RIGHT token to
+            // the RIGHT GitHub, and never leak it to another host or to the GHE
+            // web UI (which shares the API host but not the /api/v3 path prefix).
+            // We never override a caller-supplied header. No token => no-op. Runs
+            // in the SW, the same context that performs the fetch below.
+            try {
+                var _wfGh = await new Promise(function(resolve) {
+                    chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
+                });
+                var _wfTok = _wfGh && _wfGh.githubToken;
+                if (_wfTok) {
+                    var _wfInstance = _wfGh.githubInstanceUrl || 'https://github.com';
+                    var _wfApiBase = _wfInstance === 'https://github.com'
+                        ? 'https://api.github.com'
+                        : _wfInstance.replace(/\/$/, '') + '/api/v3';
+                    var _wfReq = new URL(args.url);
+                    var _wfBase = new URL(_wfApiBase);
+                    var _wfReqPath = _wfReq.pathname.toLowerCase();
+                    var _wfBasePath = _wfBase.pathname.replace(/\/$/, '').toLowerCase(); // '' for cloud, '/api/v3' for GHE
+                    var _wfPathOk = _wfBasePath === '' || _wfReqPath === _wfBasePath || _wfReqPath.indexOf(_wfBasePath + '/') === 0;
+                    var _wfHostOk = _wfReq.protocol === _wfBase.protocol
+                        && _wfReq.hostname.toLowerCase() === _wfBase.hostname.toLowerCase()
+                        && _wfReq.port === _wfBase.port;
+                    if (_wfHostOk && _wfPathOk) {
+                        // Case-insensitive presence check so caller-set headers win.
+                        var _wfHasHeader = function(headerName) {
+                            headerName = headerName.toLowerCase();
+                            return Object.keys(_wfOpts.headers).some(function(k) { return k.toLowerCase() === headerName; });
+                        };
+                        if (!_wfHasHeader('authorization')) _wfOpts.headers['Authorization'] = 'Bearer ' + _wfTok;
+                        if (!_wfHasHeader('accept')) _wfOpts.headers['Accept'] = 'application/vnd.github+json';
+                        if (!_wfHasHeader('x-github-api-version')) _wfOpts.headers['X-GitHub-Api-Version'] = '2022-11-28';
+                    }
+                }
+            } catch (_wfGhErr) { /* malformed URL or storage read error: fall through unauthenticated (safe no-op) */ }
+            // ------------------------------------------------------------------
             var _wfRes = await fetch(args.url, _wfOpts);
             var _wfCT = _wfRes.headers.get('content-type') || '';
             var _wfBody;
@@ -2042,6 +2094,130 @@ async function wsStatus(wk, includeIgnored, chatId) {
     return result;
 }
 
+// Line-based unified diff: trims the common prefix/suffix, runs an LCS only on
+// the changed middle, then emits hunks with `ctx` lines of context (@@ headers).
+// Replaces the previous positional (same-index) comparison, which re-aligned the
+// whole file on any insert/delete and produced massive noise anchored on repeated
+// boilerplate lines (}/return;/blank). Display-only — never mutates file content.
+function wsLineDiff(oldText, newText, ctx) {
+    if (ctx == null) ctx = 3;
+    var oldLines = String(oldText == null ? '' : oldText).split('\n');
+    var newLines = String(newText == null ? '' : newText).split('\n');
+    var m = oldLines.length, n = newLines.length;
+
+    // Trim common prefix / suffix so the O(a*b) LCS only runs on the changed middle.
+    var pre = 0;
+    while (pre < m && pre < n && oldLines[pre] === newLines[pre]) pre++;
+    var suf = 0;
+    while (suf < (m - pre) && suf < (n - pre) && oldLines[m - 1 - suf] === newLines[n - 1 - suf]) suf++;
+
+    var oldMid = oldLines.slice(pre, m - suf);
+    var newMid = newLines.slice(pre, n - suf);
+    var a = oldMid.length, b = newMid.length;
+
+    // ops over the WHOLE file: { type:'same'|'add'|'remove', text, oldIdx, newIdx }
+    var ops = [];
+    var i, j, p;
+    for (i = 0; i < pre; i++) ops.push({ type: 'same', text: oldLines[i], oldIdx: i, newIdx: i });
+
+    if (a > 0 || b > 0) {
+        var MAX_LCS_CELLS = 4000000;
+        if (a * b <= MAX_LCS_CELLS) {
+            var dp = [];
+            for (i = 0; i <= a; i++) {
+                dp[i] = [];
+                for (j = 0; j <= b; j++) {
+                    if (i === 0 || j === 0) dp[i][j] = 0;
+                    else if (oldMid[i - 1] === newMid[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+                    else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+                }
+            }
+            var mid = [];
+            i = a; j = b;
+            while (i > 0 || j > 0) {
+                if (i > 0 && j > 0 && oldMid[i - 1] === newMid[j - 1]) {
+                    mid.unshift({ type: 'same', text: oldMid[i - 1], oldIdx: pre + i - 1, newIdx: pre + j - 1 });
+                    i--; j--;
+                } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+                    mid.unshift({ type: 'add', text: newMid[j - 1], oldIdx: -1, newIdx: pre + j - 1 });
+                    j--;
+                } else {
+                    mid.unshift({ type: 'remove', text: oldMid[i - 1], oldIdx: pre + i - 1, newIdx: -1 });
+                    i--;
+                }
+            }
+            ops = ops.concat(mid);
+        } else {
+            // Middle too large for an O(a*b) table — bounded positional fallback.
+            var mx = Math.max(a, b);
+            for (i = 0; i < mx; i++) {
+                if (i >= a) ops.push({ type: 'add', text: newMid[i], oldIdx: -1, newIdx: pre + i });
+                else if (i >= b) ops.push({ type: 'remove', text: oldMid[i], oldIdx: pre + i, newIdx: -1 });
+                else if (oldMid[i] === newMid[i]) ops.push({ type: 'same', text: oldMid[i], oldIdx: pre + i, newIdx: pre + i });
+                else {
+                    ops.push({ type: 'remove', text: oldMid[i], oldIdx: pre + i, newIdx: -1 });
+                    ops.push({ type: 'add', text: newMid[i], oldIdx: -1, newIdx: pre + i });
+                }
+            }
+        }
+    }
+
+    for (p = 0; p < suf; p++) {
+        var oi = m - suf + p, ni = n - suf + p;
+        ops.push({ type: 'same', text: oldLines[oi], oldIdx: oi, newIdx: ni });
+    }
+
+    // Any real changes?
+    var changed = false;
+    for (p = 0; p < ops.length; p++) { if (ops[p].type !== 'same') { changed = true; break; } }
+    if (!changed) return '';
+
+    // Keep only ops within `ctx` lines of a change so long unchanged runs collapse.
+    var keep = [];
+    for (p = 0; p < ops.length; p++) keep[p] = false;
+    for (p = 0; p < ops.length; p++) {
+        if (ops[p].type !== 'same') {
+            var lo = p - ctx; if (lo < 0) lo = 0;
+            var hi = p + ctx; if (hi > ops.length - 1) hi = ops.length - 1;
+            for (var q = lo; q <= hi; q++) keep[q] = true;
+        }
+    }
+
+    // Emit hunks with @@ headers.
+    var out = [];
+    p = 0;
+    while (p < ops.length) {
+        if (!keep[p]) { p++; continue; }
+        var start = p;
+        while (p < ops.length && keep[p]) p++;
+        var end = p; // exclusive
+        var oldStart = -1, newStart = -1, oldCount = 0, newCount = 0;
+        var k, o;
+        for (k = start; k < end; k++) {
+            o = ops[k];
+            if (o.type === 'same') {
+                if (oldStart < 0) oldStart = o.oldIdx;
+                if (newStart < 0) newStart = o.newIdx;
+                oldCount++; newCount++;
+            } else if (o.type === 'remove') {
+                if (oldStart < 0) oldStart = o.oldIdx;
+                oldCount++;
+            } else {
+                if (newStart < 0) newStart = o.newIdx;
+                newCount++;
+            }
+        }
+        if (oldStart < 0) oldStart = 0;
+        if (newStart < 0) newStart = 0;
+        out.push('@@ -' + (oldStart + 1) + ',' + oldCount + ' +' + (newStart + 1) + ',' + newCount + ' @@');
+        for (k = start; k < end; k++) {
+            o = ops[k];
+            out.push((o.type === 'same' ? ' ' : (o.type === 'remove' ? '-' : '+')) + o.text);
+        }
+    }
+    return out.join('\n');
+}
+
 async function wsDiff(repo, filePath, includeIgnored) {
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
@@ -2066,22 +2242,8 @@ async function wsDiff(repo, filePath, includeIgnored) {
             // New file
             diffs.push({ path: f.path, status: 'new', lines: f.content.split('\n').length });
         } else {
-            // Modified file — simple line diff
-            var oldLines = f.original_content.split('\n');
-            var newLines = f.content.split('\n');
-            var diffLines = [];
-            var maxLen = Math.max(oldLines.length, newLines.length);
-            for (var i = 0; i < maxLen; i++) {
-                var ol = i < oldLines.length ? oldLines[i] : undefined;
-                var nl = i < newLines.length ? newLines[i] : undefined;
-                if (ol === nl) {
-                    // context — only include around changes
-                } else {
-                    if (ol !== undefined) diffLines.push('-' + ol);
-                    if (nl !== undefined) diffLines.push('+' + nl);
-                }
-            }
-            diffs.push({ path: f.path, status: 'modified', diff: diffLines.join('\n') });
+            // Modified file — proper LCS-based unified diff (3 lines of context).
+            diffs.push({ path: f.path, status: 'modified', diff: wsLineDiff(f.original_content, f.content, 3) });
         }
     });
 

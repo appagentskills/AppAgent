@@ -1676,6 +1676,82 @@ function getActiveActionsList() {
         .sort(function(a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
 }
 
+// Currently-running chats that are NOT already represented by an active action
+// row (action chats live in the 'Active Actions' section) and are NOT the chat
+// the user is already focused on. Source of truth is the in-memory runningChatIds
+// map (core/030-config.js), kept live in the panel by the worker->page bridge
+// (045-agent-port-bridge-page.js).
+// How long a chat lingers under "Active Chats" after its run stops, so a chat
+// that just finished streaming doesn't vanish from the badge instantly.
+var ACTIVE_CHAT_LINGER_MS = 5 * 60 * 1000; // 5 minutes
+// chatId -> finishedAt (ms). Populated by markChatRecentlyFinished() from the
+// runFinished / runCrashed handlers (app/036-agent-event-handlers-page.js).
+var _recentlyFinishedChats = {};
+
+// Helper for renderers: is this chat actually streaming right now (vs lingering)?
+function isChatActivelyRunning(chatId) {
+    return !!(typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]);
+}
+
+// Called when a chat's run ends. Stamps the finish time so the chat keeps
+// showing under "Active Chats" for ACTIVE_CHAT_LINGER_MS, then schedules a
+// badge/dropdown refresh to drop it when the window expires.
+function markChatRecentlyFinished(chatId) {
+    if (!chatId) return;
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    // Only linger regular user chats. Action chats live under "Active Actions"
+    // (with their own result popover) and sub-agent chats have the Workers
+    // strip — lingering those would clutter the badge.
+    if (c && (c.isBackground || c.isSubAgent)) return;
+    _recentlyFinishedChats[chatId] = Date.now();
+    setTimeout(function() {
+        var t = _recentlyFinishedChats[chatId];
+        if (!t) return;
+        // Re-stamped by a newer finish (chat ran again) — let the newer timer win.
+        if (Date.now() - t < ACTIVE_CHAT_LINGER_MS) return;
+        delete _recentlyFinishedChats[chatId];
+        try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
+        try {
+            var jd = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+            if (jd && typeof renderJobsDropdown === 'function') renderJobsDropdown(jd);
+        } catch (e) {}
+    }, ACTIVE_CHAT_LINGER_MS + 250);
+}
+
+function getActiveChatsList() {
+    var actionChatIds = {};
+    getActiveActionsList().forEach(function(a){ if (a && a.chatId) actionChatIds[a.chatId] = true; });
+    var out = [];
+    var seen = {};
+    var now = Date.now();
+    // NOTE: we intentionally DO NOT exclude currentChatId. The badge is a
+    // truthful "active chats" indicator, so the chat you're currently viewing
+    // shows here while it streams, and a previous chat still streaming after
+    // you hit New Chat / switch away shows too. (The old exclusion hid the
+    // current chat by design, which made the group look permanently empty for
+    // users whose only concurrency is the chat they're in.)
+    function consider(cid) {
+        if (seen[cid]) return;
+        if (actionChatIds[cid]) return;                 // already shown under Active Actions
+        var c = (typeof chats !== 'undefined') ? chats[cid] : null;
+        if (!c) return;
+        seen[cid] = true;
+        out.push(c);
+    }
+    // 1) Currently-running chats.
+    if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+        Object.keys(runningChatIds).forEach(function(cid) {
+            if (runningChatIds[cid]) consider(cid);
+        });
+    }
+    // 2) Recently-finished chats still inside the linger window.
+    Object.keys(_recentlyFinishedChats).forEach(function(cid) {
+        if (now - _recentlyFinishedChats[cid] > ACTIVE_CHAT_LINGER_MS) return;
+        consider(cid);
+    });
+    return out;
+}
+
 function getRunningActionsCount() {
     var n = 0;
     Object.keys(activeActions).forEach(function(id) {
@@ -1746,9 +1822,18 @@ function renderJobsBadge() {
     // entry left in `activeActions` would show "1" in the badge with no
     // clickable pill or dropdown row.
     var list = getActiveActionsList().filter(function(a){ return !_isOrphanActiveAction(a); });
-    var count = list.length;
-    var running = getRunningActionsCount();
+    var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
+    // Lingering (recently-finished) chats count toward the visible total but must
+    // NOT add a spinner or force a 'running' colour — only actively-streaming
+    // chats do.
+    var runningChats = 0;
+    chatList.forEach(function(c){ if (isChatActivelyRunning(c.id)) runningChats++; });
+    var count = list.length + chatList.length;
+    var running = getRunningActionsCount() + runningChats;
     var agg = _getAggregateActionState();
+    // Chats with no actions still need a coloured badge: 'running' if any chat is
+    // actively streaming, else 'done' (a lingering finished chat).
+    if (agg === 'empty' && chatList.length) agg = runningChats ? 'running' : 'done';
     var titleSuffix = '';
     if (agg === 'attention')    titleSuffix = ' — needs attention';
     else if (agg === 'error')   titleSuffix = ' — has errors';
@@ -1768,7 +1853,7 @@ function renderJobsBadge() {
         badge.setAttribute('data-agg', agg);
         // "pulse" is the existing infinite attention pulse; only on attention state.
         badge.classList.toggle('pulse', agg === 'attention');
-        badge.title = count + ' active action' + (count === 1 ? '' : 's') + titleSuffix;
+        badge.title = count + ' active job' + (count === 1 ? '' : 's') + titleSuffix;
         badge.innerHTML =
             '<span class="jobs-badge-icon">' + UI_ICONS.zap + '</span>' +
             '<span class="jobs-badge-count">' + count + '</span>' +
@@ -1837,7 +1922,8 @@ function renderJobsDropdown(dropdown) {
     // would just no-op (onJobsDropdownRowClick reads activeActions[id] but every
     // sub-action requires a real skill+action to render the popover).
     var list = getActiveActionsList().filter(function(a){ return !_isOrphanActiveAction(a); });
-    if (!list.length) {
+    var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
+    if (!list.length && !chatList.length) {
         dropdown.innerHTML = '<div class="jobs-dropdown-empty">No active jobs</div>';
         return;
     }
@@ -1861,9 +1947,32 @@ function renderJobsDropdown(dropdown) {
             ) +
         '</div>';
     }).join('');
-    dropdown.innerHTML =
-        '<div class="jobs-dropdown-header">Active Actions</div>' +
-        '<div class="jobs-dropdown-list">' + rowsHtml + '</div>';
+    var chatRowsHtml = chatList.map(function(c) {
+        var _cRunning = isChatActivelyRunning(c.id);
+        var _cState = _cRunning ? 'running' : 'done';
+        var _cIcon = _cRunning ? (UI_ICONS.spinner || UI_ICONS.chat) : (UI_ICONS.check || UI_ICONS.chat);
+        var _cLabel = _cRunning ? 'Running\u2026' : 'Finished';
+        return '<div class="jobs-dropdown-row state-' + _cState + '" ' +
+            'data-chat-id="' + escapeHtml(c.id) + '" ' +
+            'onclick="onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' +
+            '<span class="jobs-row-icon">' + _cIcon + '</span>' +
+            '<div class="jobs-row-main">' +
+                '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+                '<div class="jobs-row-label">' + _cLabel + '</div>' +
+            '</div>' +
+            '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' + UI_ICONS.chat + '</button>' +
+        '</div>';
+    }).join('');
+    var html = '';
+    if (list.length) {
+        html += '<div class="jobs-dropdown-header">Active Actions</div>' +
+            '<div class="jobs-dropdown-list">' + rowsHtml + '</div>';
+    }
+    if (chatList.length) {
+        html += '<div class="jobs-dropdown-header">Active Chats</div>' +
+            '<div class="jobs-dropdown-list">' + chatRowsHtml + '</div>';
+    }
+    dropdown.innerHTML = html;
 }
 
 function onJobsDropdownRowClick(actionId) {
@@ -1907,6 +2016,51 @@ function viewActionChat(actionId) {
         selectChat(a.chatId);
     }
     closeJobsDropdown();
+}
+
+// Click handler for an 'Active Chats' dropdown row: reveal (for background
+// chats) and switch focus to that chat. Mirrors viewActionChat.
+function onJobsDropdownChatRowClick(chatId) {
+    // Capture the OPEN dropdown panel up-front so we can anchor the progress
+    // popover to it — exactly like onJobsDropdownRowClick does for Actions, so
+    // the popover appears at the dropdown location instead of below the chat
+    // title. We deliberately keep the dropdown open (the Action-row popover
+    // does too) — _positionPopover places the popover below the panel rather
+    // than overlapping its rows.
+    var dropdownEl = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+    // IMPORTANT: defer the navigation + popover to the next frame. selectChat()
+    // re-renders the open dropdown's innerHTML, which DETACHES the clicked row
+    // element. The document-level outside-click handler (see bottom of file)
+    // runs synchronously right after this onclick, in the same click event, and
+    // keeps the dropdown open only if `wrapper.contains(e.target)`. If we
+    // re-rendered synchronously, e.target (the old row) would already be
+    // detached → treated as an outside click → dropdown closed, leaving the
+    // popover orphaned. The Action-row path keeps the dropdown open precisely
+    // because it never re-renders the dropdown. Deferring lets this click finish
+    // with the row still attached (dropdown stays open), then we navigate and
+    // anchor the popover to the still-open dropdown panel.
+    var run = function() {
+        if (typeof selectChat === 'function' && typeof chats !== 'undefined' && chats[chatId]) {
+            if (chats[chatId].isBackground) chats[chatId]._revealed = true;
+            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            selectChat(chatId);
+        }
+        // Surface the chat's progress card — the same popover the chat-title
+        // state pill opens — so clicking an "Active Chats" row feels like
+        // clicking an Action row. If the chat has no update_action_state
+        // progress we just close the dropdown (a plain navigation) instead of
+        // leaving it hanging open with no popover.
+        var hasProgress = (typeof getCurrentChatProgressState === 'function') && !!getCurrentChatProgressState();
+        var anchor = ((typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null) || dropdownEl;
+        if (hasProgress && anchor && typeof openChatProgressPopover === 'function') {
+            try { openChatProgressPopover(anchor); }
+            catch (e) { closeJobsDropdown(); }
+        } else {
+            closeJobsDropdown();
+        }
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+    else setTimeout(run, 0);
 }
 
 // ---------- Re-render on state change ----------

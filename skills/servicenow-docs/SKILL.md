@@ -4,7 +4,7 @@ description: Search and read ServiceNow documentation and community posts
 actions:
   - name: Search Docs
     icon: search
-    show: [chat]
+    show: [home]
 ---
 
 ## Action Lifecycle: Search Docs

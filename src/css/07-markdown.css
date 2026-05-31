@@ -20,9 +20,18 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .message-content h5 { font-size: 0.95em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
 .message-content h2:first-child, .message-content h3:first-child, .message-content h4:first-child, .message-content h5:first-child { margin-top: 0; }
 .message-content strong { font-weight: var(--font-semibold); color: var(--text-heading); }
-.message-content .md-paragraph { margin: var(--space-4) 0; display: block; }
-.message-content .md-paragraph:first-child { margin-top: 0; }
-.message-content .md-paragraph:last-child { margin-bottom: 0; }
+/* Paragraph spans emitted by formatContent() must be block-level so consecutive
+   blank-line-separated paragraphs stack on their own lines. Scope to BOTH the
+   chat container (.message-content) and the generic .markdown-body container
+   (sub-agent report summaries, action-update outputs, popovers, smart docs).
+   Without the .markdown-body branch, those surfaces rendered every paragraph
+   inline and multi-paragraph text collapsed onto a single line. */
+.message-content .md-paragraph,
+.markdown-body .md-paragraph { margin: var(--space-4) 0; display: block; }
+.message-content .md-paragraph:first-child,
+.markdown-body .md-paragraph:first-child { margin-top: 0; }
+.message-content .md-paragraph:last-child,
+.markdown-body .md-paragraph:last-child { margin-bottom: 0; }
 .message-content .md-paragraph + .md-table { margin-top: var(--space-1); }
 .message-content .md-table + .md-paragraph { margin-top: var(--space-1); }
 .message-content ul, .message-content ol { margin: var(--space-2) 0; padding-left: var(--space-10); list-style-position: outside; }

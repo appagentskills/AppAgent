@@ -30,10 +30,26 @@ function executeHtmlWidget(args, messageIndex, options) {
     var chat = chats[widgetChatId];
     var toolResultMsgIndex = -1;
     var widgetToolCallId = options && options.toolCallId;
-    if (chat && chat.messages && widgetToolCallId) {
+    // Eager-render path: when html_widget is invoked via executeTool from INSIDE a
+    // sandbox (js_eval / skill tool / widget bridge), html_widget has no
+    // placeholder of its own — the OUTER js_eval owns the tool_result slot, and
+    // `options.toolCallId` is either absent (page DOM sandbox path) or a synthetic
+    // exec-tool id with no message (SW/offscreen path). Resolve to the PARENT
+    // tool's result slot so the renderer mounts the widget alongside that result —
+    // the exact same contract executeDisplay uses. Without this the widget's
+    // msgIndex falls through to chat.messages.length, getWidgetHtmlForMessage
+    // filters it to zero, and the call returns success+widgetId but the widget
+    // never mounts (a follow-up take_screenshot fails with "Widget not found").
+    // Top-level html_widget calls (no fromSandbox) keep their own-result behavior.
+    var fromSandbox = !!(options && options.fromSandbox);
+    var parentToolCallId = options && options.parentToolCallId;
+    var resolveToolCallId = (fromSandbox && parentToolCallId)
+        ? parentToolCallId
+        : widgetToolCallId;
+    if (chat && chat.messages && resolveToolCallId) {
         for (var ti = chat.messages.length - 1; ti >= 0; ti--) {
             var tim = chat.messages[ti];
-            if (tim.role === 'tool' && tim.tool_call_id === widgetToolCallId) {
+            if (tim.role === 'tool' && tim.tool_call_id === resolveToolCallId) {
                 toolResultMsgIndex = ti;
                 break;
             }
@@ -733,6 +749,19 @@ async function executeManageSkill(args) {
             updatedAt: Date.now()
         });
 
+        // Activate the freshly created skill by default so its knowledge (and any
+        // tools added afterwards) is immediately available to the agent without a
+        // separate activate call.
+        var activated = false;
+        try {
+            if (typeof activateSkill === 'function') {
+                var activation = await activateSkill(id);
+                activated = !!(activation && activation.success);
+            }
+        } catch (e) {
+            console.warn('Auto-activation of created skill failed:', e);
+        }
+
         renderSkillsList();
         if (sanitizedActions.length && typeof renderAllActionPlacements === 'function') {
             renderAllActionPlacements();
@@ -740,7 +769,8 @@ async function executeManageSkill(args) {
         return {
             success: true,
             skill_id: id,
-            message: 'Skill created: ' + name + (sanitizedActions.length ? ' (' + sanitizedActions.length + ' action' + (sanitizedActions.length === 1 ? '' : 's') + ')' : ''),
+            activated: activated,
+            message: 'Skill created' + (activated ? ' and activated' : '') + ': ' + name + (sanitizedActions.length ? ' (' + sanitizedActions.length + ' action' + (sanitizedActions.length === 1 ? '' : 's') + ')' : ''),
             actions: sanitizedActions
         };
     }

@@ -17,9 +17,11 @@
     var HEARTBEAT_MS = 20 * 1000;      // 20s — must be < MV3 service-worker idle timeout (~30s)
     var idleTimer = null;
     var heartbeatTimer = null;
-    var lockActive = false;
-    var sessionDisabled = false;       // "Disable for this session"
-    var foreverDisabled = false;       // persisted setting
+    var lockActive = false;            // OS lock currently asserted (mirror of computeDesired)
+    var idleActivated = false;         // idle threshold fired -> idle-based desire to stay awake
+    var runningChats = {};             // chatId -> true while an agent run is in progress
+    var sessionDisabled = false;       // "Disable for this session" (idle path only)
+    var foreverDisabled = false;       // persisted master setting (disables everything)
     var noticeEl = null;
     var noticeDismissed = false;       // user closed the notice but lock still on
     var noticeFadeTimer = null;        // grace period before hiding notice after activity
@@ -58,28 +60,61 @@
         if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
     }
 
-    function activateLock() {
-        if (lockActive || sessionDisabled || foreverDisabled) return;
-        if (document.hidden) return;
-        // Cancel any pending notice fade — we want it to stay.
-        if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
-        lockActive = true;
-        log('ACTIVATE — idle threshold hit, requesting keep-awake');
-        sendKeepAwake(true);
-        startHeartbeat();
-        if (!noticeDismissed) showNotice();
+    function anyRunActive() {
+        for (var k in runningChats) { if (runningChats[k]) return true; }
+        return false;
     }
 
-    function releaseLock(immediate) {
-        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-        stopHeartbeat();
-        if (lockActive) {
+    // Single source of truth for whether the OS display lock should be held.
+    // PRIMARY trigger: an agent run is in progress (long tasks must keep the
+    // screen on even with zero mouse/keyboard activity). SECONDARY trigger:
+    // the user has been idle for IDLE_MS while just reading. The master
+    // setting (foreverDisabled) turns the whole feature off; the per-session
+    // opt-out only suppresses the idle path, never an active run.
+    function computeDesired() {
+        if (foreverDisabled) return false;
+        if (anyRunActive()) return true;
+        if (sessionDisabled) return false;
+        return idleActivated;
+    }
+
+    // Assert or release the OS lock so it matches computeDesired(). Idempotent —
+    // safe to call on every state change. Heartbeat re-asserts while held.
+    function syncLock() {
+        var want = computeDesired();
+        if (want && !lockActive) {
+            lockActive = true;
+            log('LOCK ON — ' + (anyRunActive() ? 'agent run active' : 'idle threshold'));
+            sendKeepAwake(true);
+            startHeartbeat();
+        } else if (!want && lockActive) {
             lockActive = false;
-            log('RELEASE — releasing keep-awake');
+            log('LOCK OFF — no run + idle cleared/disabled');
             sendKeepAwake(false);
+            stopHeartbeat();
         }
+    }
+
+    // Idle threshold reached. Flag the idle desire and (only for the idle path,
+    // and only when no run is already holding the lock) show the inline notice.
+    function activateLock() {
+        if (foreverDisabled || sessionDisabled) return;
+        if (document.hidden) return;
+        if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
+        var hadRunLock = anyRunActive();
+        idleActivated = true;
+        log('idle threshold hit');
+        syncLock();
+        if (!noticeDismissed && !hadRunLock) showNotice();
+    }
+
+    // Drop the idle-based desire (user is active again). Any active-run lock is
+    // preserved by syncLock(). `immediate` hides the notice now vs. after a grace period.
+    function clearIdle(immediate) {
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        if (idleActivated) { idleActivated = false; log('idle cleared'); }
+        syncLock();
         if (immediate) {
-            // Caller wants the notice gone right now (page hide, explicit disable).
             if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
             hideNotice();
         } else if (noticeEl && !noticeFadeTimer) {
@@ -91,16 +126,44 @@
         }
     }
 
+    // Full teardown on page unload — release the OS lock regardless of run state.
+    function forceRelease() {
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        stopHeartbeat();
+        if (lockActive) { lockActive = false; sendKeepAwake(false); }
+        if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
+        hideNotice();
+    }
+
     function resetIdleTimer(evt) {
         // Activity inside the notice itself — user is reading/clicking buttons. Ignore.
         if (evt && evt.target && noticeEl && noticeEl.contains && noticeEl.contains(evt.target)) return;
-        if (idleTimer) clearTimeout(idleTimer);
-        // Any user activity: release the lock but keep the notice visible briefly.
-        if (lockActive) releaseLock(false);
+        // Any user activity: drop the idle desire (a run lock, if any, persists).
+        clearIdle(false);
         if (sessionDisabled || foreverDisabled || document.hidden) return;
         // Reset notice-dismissed flag so a fresh idle period shows the notice again.
         noticeDismissed = false;
         idleTimer = setTimeout(activateLock, IDLE_MS);
+    }
+
+    // ---------- Agent-run tracking (primary keep-awake trigger) ----------
+    function attachRunListeners() {
+        if (typeof AgentEvents === 'undefined' || !AgentEvents.on) {
+            log('AgentEvents unavailable — run-based keep-awake disabled');
+            return;
+        }
+        AgentEvents.on('runStarted', function (e) {
+            if (e && e.chatId) { runningChats[e.chatId] = true; log('runStarted ' + e.chatId); syncLock(); }
+        });
+        function runEnded(e) {
+            if (e && e.chatId && runningChats[e.chatId]) {
+                delete runningChats[e.chatId];
+                log('runEnded ' + e.chatId);
+                syncLock();
+            }
+        }
+        AgentEvents.on('runFinished', runEnded);
+        AgentEvents.on('runCrashed', runEnded);
     }
 
     // ---------- Inline notice UI ----------
@@ -139,8 +202,9 @@
         void el.offsetWidth;
         el.classList.add('show');
         el.querySelector('.ka-session').addEventListener('click', function () {
+            // Idle-path opt-out only. An active agent run keeps holding the lock.
             sessionDisabled = true;
-            releaseLock(true);
+            clearIdle(true);
         });
         el.querySelector('.ka-forever').addEventListener('click', function () {
             foreverDisabled = true;
@@ -149,7 +213,7 @@
                 var cb = document.getElementById('keep-awake-checkbox');
                 if (cb) cb.checked = false;
             } catch (e) {}
-            releaseLock(true);
+            clearIdle(true);
         });
         el.querySelector('.ka-close').addEventListener('click', function () {
             noticeDismissed = true;
@@ -157,14 +221,29 @@
             // NOTE: lock stays active; user just hid the message.
         });
         noticeEl = el;
+        // Clicking/tapping anywhere outside the panel dismisses it too (same as ×).
+        // pointerdown is capture-phase so it lands before the global activity
+        // 'click' handler, closing the panel immediately rather than after a grace period.
+        document.addEventListener('pointerdown', onOutsidePointerDown, true);
     }
 
     function hideNotice() {
         if (!noticeEl) return;
+        document.removeEventListener('pointerdown', onOutsidePointerDown, true);
         noticeEl.classList.remove('show');
         var el = noticeEl;
         noticeEl = null;
         setTimeout(function () { if (el && el.parentNode) el.parentNode.removeChild(el); }, 250);
+    }
+
+    // Dismiss the notice when the user interacts anywhere outside it. The OS lock
+    // is governed separately by computeDesired()/the activity handler — this only
+    // hides the message, mirroring the × button.
+    function onOutsidePointerDown(evt) {
+        if (!noticeEl) return;
+        if (noticeEl.contains && noticeEl.contains(evt.target)) return;
+        noticeDismissed = true;
+        hideNotice();
     }
 
     // ---------- Lifecycle ----------
@@ -176,11 +255,14 @@
             window.addEventListener(events[i], onActivity, { passive: true, capture: true });
         }
         document.addEventListener('visibilitychange', function () {
-            if (document.hidden) releaseLock(true);
+            // Hiding the panel drops the idle desire but NOT an active-run lock
+            // (chrome.power is machine-global, so the screen should stay awake
+            // while a run streams even if this document is backgrounded).
+            if (document.hidden) clearIdle(true);
             else resetIdleTimer();
         });
-        window.addEventListener('pagehide', function () { releaseLock(true); });
-        window.addEventListener('beforeunload', function () { releaseLock(true); });
+        window.addEventListener('pagehide', function () { forceRelease(); });
+        window.addEventListener('beforeunload', function () { forceRelease(); });
     }
 
     async function init() {
@@ -196,14 +278,24 @@
             if (cb) cb.checked = !foreverDisabled;
         } catch (e) {}
         attachListeners();
+        attachRunListeners();
+        // A run may already be in flight when this panel (re)loads — e.g. a
+        // background chat streaming. runStarted fired before we attached, so
+        // seed from the per-tab running map if it exists.
+        try {
+            if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+                for (var cid in runningChatIds) { if (runningChatIds[cid]) runningChats[cid] = true; }
+            }
+        } catch (e) {}
         resetIdleTimer();
+        syncLock();
     }
 
     // Expose a tiny API the settings UI can call to re-enable.
     window.setKeepAwakeForeverDisabled = function (disabled) {
         foreverDisabled = !!disabled;
         try { if (typeof setSetting === 'function') setSetting('keepAwakeForeverDisabled', foreverDisabled); } catch (e) {}
-        if (foreverDisabled) releaseLock();
+        if (foreverDisabled) { hideNotice(); syncLock(); }
         else resetIdleTimer();
     };
     window.getKeepAwakeForeverDisabled = function () { return foreverDisabled; };
@@ -211,6 +303,9 @@
     window.keepAwakeStatus = function () {
         var s = {
             lockActive: lockActive,
+            idleActivated: idleActivated,
+            runActive: anyRunActive(),
+            runningChats: Object.keys(runningChats),
             sessionDisabled: sessionDisabled,
             foreverDisabled: foreverDisabled,
             idleTimerArmed: !!idleTimer,

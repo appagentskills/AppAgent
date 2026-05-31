@@ -193,6 +193,11 @@ function _handleAgentBusMessage(msg) {
                     runningChatIds[cid] = true;
                 });
                 if (typeof renderChatList === 'function') renderChatList();
+                // Reopening the panel while a background chat runs must also
+                // surface it in the jobs badge/dropdown. renderChatList alone
+                // refreshes the sidebar but not the badge (whose Active Chats
+                // group reads getActiveChatsList()).
+                if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
             }
             // Install initial sub-agent snapshot. The page's own
             // loadAllSubAgents at boot rehydrates from IDB so the strip

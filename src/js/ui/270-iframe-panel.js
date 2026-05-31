@@ -36,17 +36,70 @@ function expandSidePanel() {
 }
 
 function reloadExtension() {
-    // chrome.runtime.reload() is required to pick up new files from disk.
-    // It kills all extension pages (side panel + tabs), so we always reopen
-    // as a full tab — Chrome's sidePanel.open() requires a user gesture
-    // and can't be called programmatically from the background script.
-    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        chrome.storage.local.set({ reopenAppTab: true }, function() {
-            chrome.runtime.reload();
-        });
-    } else {
+    // chrome.runtime.reload() restarts the WHOLE extension — including the
+    // service worker (background.js + the imported sw-bundle.js, where the
+    // agent loop and pause handling live). That is the ONLY reliable way to
+    // pick up freshly deployed files from disk; a plain window.location.reload()
+    // only reloads the panel page (app.js) and leaves the OLD service worker
+    // running, so a new sw-bundle.js never takes effect.
+    //
+    // The reload kills all extension pages (side panel + tabs), so we set
+    // reopenAppTab first and background.js reopens the app as a full tab
+    // afterwards (sidePanel.open() needs a user gesture, so a tab is the only
+    // reliable option from the background script).
+
+    // No extension runtime (dev/web preview): all we can do is reload the page.
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.reload) {
         window.location.reload();
+        return;
     }
+
+    // A full reload tears down in-flight agent runs. Warn before doing so.
+    // runningChatIds is a plain object keyed by chatId (core/030-config.js).
+    var runningCount = 0;
+    if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+        for (var _cid in runningChatIds) { if (runningChatIds[_cid]) runningCount++; }
+    }
+    if (runningCount > 0) {
+        var msg = runningCount === 1
+            ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
+            : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
+        if (!window.confirm(msg)) return;
+    }
+
+    // Immediate feedback — the reload tears the page down a moment later.
+    if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
+
+    // Fire the reload exactly once, and never let anything strand it.
+    var _reloaded = false;
+    function _doReload() {
+        if (_reloaded) return;
+        _reloaded = true;
+        try {
+            chrome.runtime.reload();
+        } catch (e) {
+            // Last resort if reload() itself throws — at least refresh the page.
+            window.location.reload();
+        }
+    }
+
+    // Persist reopenAppTab so background.js reopens the app as a full tab.
+    // CRITICAL: do NOT gate the reload solely on this callback. If the service
+    // worker is asleep/busy or storage is blocked, the callback can be delayed
+    // or never fire — which previously left chrome.runtime.reload() unreached
+    // and the old SW running. We always fall back via a short timer.
+    try {
+        if (chrome.storage && chrome.storage.local) {
+            chrome.storage.local.set({ reopenAppTab: true }, function() {
+                // Touch lastError so Chrome doesn't log an unchecked-error warning.
+                if (chrome.runtime.lastError) { /* ignore */ }
+                _doReload();
+            });
+        }
+    } catch (e) { /* fall through to the timer */ }
+
+    // Guaranteed fallback: reload even if the storage callback never returns.
+    setTimeout(_doReload, 400);
 }
 
 function openSidePanelFromTab() {

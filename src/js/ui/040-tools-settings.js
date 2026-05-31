@@ -174,7 +174,7 @@ function renderSettingsPage() {
                 '<input type="checkbox" ' + (compactToolCalls ? 'checked' : '') + ' onchange="toggleCompactToolCalls()">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Keep Display Awake When Idle</div><div class="settings-page-row-hint">After 5 minutes of inactivity in AppAgent, prevent the screen from sleeping. Released on activity or when the page is closed.</div></div>' +
+                '<div><div class="settings-page-row-label">Keep Display Awake</div><div class="settings-page-row-hint">Prevent the screen from sleeping while the agent is actively running a task, and after 5 minutes of inactivity in AppAgent. Released when the task ends or the page is closed.</div></div>' +
                 '<input type="checkbox" id="settings-keep-awake" ' + ((typeof window.getKeepAwakeForeverDisabled === 'function' && window.getKeepAwakeForeverDisabled()) ? '' : 'checked') + ' onchange="toggleKeepAwake(this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +

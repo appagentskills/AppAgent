@@ -73,6 +73,16 @@ var DEFAULT_API_PROVIDERS = [
         context_length: 200000,
         effort: 'high',
         isClaudeOAuth: true
+    },
+    {
+        name: 'Sonnet 4.6 OAuth',
+        model: 'claude-sonnet-4-6',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        apiKey: 'oauth',
+        maxTokens: 100000,
+        context_length: 200000,
+        effort: 'high',
+        isClaudeOAuth: true
     }
 ];
 
@@ -112,6 +122,10 @@ var sidebarCollapsed = false;
 var historyExpanded = true; // History section expanded by default
 var showApiStats = true;
 var lastRequestMetrics = null; // Track token usage and performance
+// When the running context (last reported prompt size) crosses this many tokens,
+// the agent loop appends a one-shot reminder to delegate heavy work to sub-agents
+// (model quality degrades at long context). Set to 0 to disable the nudge.
+var SUBAGENT_NUDGE_TOKEN_THRESHOLD = 70000;
 var currentIframeUrl = '/'; // Track last browser tab URL for AI context
 var settingsPanelOpen = false; // Track settings panel state
 var llmConnectionStatus = 'unknown'; // 'connected', 'disconnected', 'unknown'

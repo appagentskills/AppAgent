@@ -74,6 +74,8 @@ AgentEvents.on('runStarted', function(e) {
     _agentEventsHiddenDuringRun[chatId] = !!document.hidden ||
         (typeof document.hasFocus === 'function' && !document.hasFocus());
     if (typeof renderChatList === 'function') renderChatList();
+    if (typeof renderJobsBadge === 'function') renderJobsBadge();
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdStart = _getOpenJobsDropdown(); if (_jdStart) renderJobsDropdown(_jdStart); }
     if (chatId === currentChatId) {
         isRunning = true;
         isFollowingStreamingScroll = true;
@@ -223,7 +225,13 @@ AgentEvents.on('runFinished', function(e) {
         isRunning = false;
         activeStreamingChatId = null;
     }
+    // Keep a just-finished chat under "Active Chats" for a grace period instead
+    // of dropping it the instant the run ends (the page bridge already deleted
+    // runningChatIds[chatId] before this handler ran).
+    if (typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(chatId); } catch (e) {} }
     if (typeof renderChatList === 'function') renderChatList();
+    if (typeof renderJobsBadge === 'function') renderJobsBadge();
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdFin = _getOpenJobsDropdown(); if (_jdFin) renderJobsDropdown(_jdFin); }
     var messagesEl = document.getElementById('messages');
     if (messagesEl) messagesEl.classList.remove('is-streaming');
     if (chatId === currentChatId) renderMessages();
@@ -290,7 +298,10 @@ AgentEvents.on('runCrashed', function(e) {
             });
         } catch (err) { console.warn('runCrashed: onSubAgentRunFinished hook threw', err); }
     }
+    if (e && e.chatId && typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(e.chatId); } catch (err) {} }
     if (typeof renderChatList === 'function') renderChatList();
+    if (typeof renderJobsBadge === 'function') renderJobsBadge();
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdCr = _getOpenJobsDropdown(); if (_jdCr) renderJobsDropdown(_jdCr); }
 });
 
 AgentEvents.on('notifyFinish', function(e) {

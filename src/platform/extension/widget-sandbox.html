@@ -11,8 +11,24 @@ window.addEventListener('message', function(e) {
         document.open();
         document.write(e.data.html);
         document.close();
-        // Notify parent that content is rendered and scripts have executed
-        window.parent.postMessage({ type: 'widgetContentLoaded' }, '*');
+        // Notify parent ONLY AFTER the newly written content has been laid out and
+        // painted, so a screenshot taken on this signal reflects the FINAL rendered
+        // widget (not a pre-layout / pre-font-swap frame). The deep-link capture
+        // path (take_screenshot target:widget) depends on this being deterministic:
+        // double rAF guarantees one full frame after layout; fonts.ready avoids
+        // capturing before web fonts swap in. (window survives document.write, so
+        // requestAnimationFrame / document.fonts remain valid here.)
+        var _signalRendered = function() {
+            try { window.parent.postMessage({ type: 'widgetContentLoaded' }, '*'); } catch (err) {}
+        };
+        var _afterLayout = function() {
+            requestAnimationFrame(function() { requestAnimationFrame(_signalRendered); });
+        };
+        if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+            document.fonts.ready.then(_afterLayout, _afterLayout);
+        } else {
+            _afterLayout();
+        }
     }
 });
 

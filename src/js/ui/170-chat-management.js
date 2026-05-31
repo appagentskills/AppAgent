@@ -399,6 +399,21 @@ function newChat() {
     if (typeof renderWorkersStrip === 'function') {
         try { renderWorkersStrip(); } catch (e) {}
     }
+    // Recompute the jobs badge + any open dropdown. getActiveChatsList()
+    // excludes the focused chat, so swapping currentChatId to the fresh new
+    // chat is exactly what makes a still-running previous chat qualify as an
+    // "Active Chat". newChat bypasses selectChat (which got this recompute in
+    // the fix #17 change), so without mirroring it here the just-backgrounded
+    // running chat never shows in the badge/dropdown until some later
+    // runStarted/runFinished event happens to recompute it. Same reason
+    // newChat hand-copies the lastApiError / is-streaming / Workers-strip
+    // resets above.
+    if (typeof renderJobsBadge === 'function') {
+        try { renderJobsBadge(); } catch (e) {}
+    }
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+        try { var _jdNew = _getOpenJobsDropdown(); if (_jdNew) renderJobsDropdown(_jdNew); } catch (e) {}
+    }
     // Same reason as in selectChat — dismiss any popover left over from the
     // previous chat so it doesn't hover over the empty new-chat header.
     if (typeof closeChatProgressPopoverIfStale === 'function') {
@@ -481,6 +496,11 @@ function selectChat(chatId, options) {
     renderMessages();
     updateInputPosition();
     updateChatTitleHeader();
+    // Re-verify the header connection badge on chat switch. The chat page is
+    // where agent runs happen, and llm-streaming stamps 'connected' on HTTP 200;
+    // without this re-check the pill keeps a stale 'connected' the new-chat/home
+    // view doesn't show (home is refreshed by init + the 60s OAuth timer).
+    if (typeof updateModelDisplay === 'function') { try { updateModelDisplay(); } catch (e) {} }
     // Refresh the Workers strip so chips reflect the newly-selected chat's
     // sub-agents (each parent chat has its own set). Hidden when the chat
     // owns no subs. Source: src/js/ui/175-sub-agent-ui.js.
@@ -494,6 +514,17 @@ function selectChat(chatId, options) {
     // changes — stale shape persists across navigation.
     if (typeof renderLiveActionPills === 'function') {
         try { renderLiveActionPills(); } catch (e) {}
+    }
+    // Recompute the jobs badge: getActiveChatsList() excludes the focused chat,
+    // so switching focus away from a still-running chat is exactly what makes
+    // that chat qualify as an "Active Chat". The badge only re-renders on
+    // run start/finish events otherwise, so without this the background chat
+    // never shows up in the badge/dropdown after navigation.
+    if (typeof renderJobsBadge === 'function') {
+        try { renderJobsBadge(); } catch (e) {}
+    }
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+        try { var _jdSel = _getOpenJobsDropdown(); if (_jdSel) renderJobsDropdown(_jdSel); } catch (e) {}
     }
     // A chat-progress popover belongs to a specific chatId. Without this, the
     // popover would hover above the new chat's header showing stale data from

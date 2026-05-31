@@ -1438,6 +1438,29 @@ function formatContent(content) {
     // Markdown links [text](url) — supports http(s) and chrome-extension:// URLs
     html = html.replace(/\[([^\]]+)\]\(((?:https?|chrome-extension):\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
+    // Auto-linkify BARE URLs (http/https) so links are clickable even when the
+    // agent did not use markdown link syntax. We first stash any already-formed
+    // anchors (from the markdown-link pass above) and inline <code> spans so the
+    // autolinker can't nest a link inside an existing <a> or turn a URL that was
+    // deliberately shown as inline code into a link. Restored immediately after.
+    var _protectedSpans = [];
+    html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>|<code\b[^>]*>[\s\S]*?<\/code>/g, function(m) {
+        _protectedSpans.push(m);
+        return '\u0000P' + (_protectedSpans.length - 1) + '\u0000';
+    });
+    html = html.replace(/\bhttps?:\/\/[^\s<\u0000]+/g, function(url) {
+        // Don't swallow trailing sentence punctuation (e.g. "see https://x.com.").
+        var trail = '';
+        var tm = url.match(/[.,;:!?)\]]+$/);
+        if (tm) { trail = tm[0]; url = url.slice(0, url.length - trail.length); }
+        return '<a href="' + url + '" target="_blank" rel="noopener">' + url + '</a>' + trail;
+    });
+    for (var _pi = 0; _pi < _protectedSpans.length; _pi++) {
+        (function(span, idx) {
+            html = html.replace('\u0000P' + idx + '\u0000', function() { return span; });
+        })(_protectedSpans[_pi], _pi);
+    }
+
     // Headers (process in order from most # to fewest)
     html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
     html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');

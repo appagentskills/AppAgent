@@ -656,12 +656,22 @@ async function executeIframeTool(args) {
                 
                 // Update widget HTML
                 widget.html = editResult.content;
+                // Bump a monotonic content version whenever the HTML changes. The
+                // widget runs in a cross-origin (sandboxed, opaque-origin) iframe,
+                // so its live DOM can't be rasterized directly — take_screenshot
+                // re-renders it in a temp tab via the ?widget= deep link. Keying that
+                // deep link on this version (see 060-take-screenshot.js) guarantees a
+                // fresh render after edit_html instead of a stale cached frame.
+                widget.contentVersion = (widget.contentVersion || 0) + 1;
                 
                 // Persist changes
                 var chat = chats[widget.chatId || currentChatId];
                 if (chat && chat.widgets) {
                     var idx = chat.widgets.findIndex(function(w) { return w.id === widgetId; });
-                    if (idx !== -1) chat.widgets[idx].html = widget.html;
+                    if (idx !== -1) {
+                        chat.widgets[idx].html = widget.html;
+                        chat.widgets[idx].contentVersion = widget.contentVersion;
+                    }
                     saveChatsToStorage();
                 }
                 
@@ -677,6 +687,15 @@ async function executeIframeTool(args) {
                     result.warning = 'Some edits failed';
                     result.failedEdits = editResult.failedEdits;
                 }
+                // Propagate the updated html + contentVersion to the service worker's
+                // authoritative chat object. The SW's saveChatsToStorage() does a full
+                // store.clear()+rewrite of the chat store from SW memory after each tool
+                // result; without this the SW still holds the PRE-edit widget and
+                // clobbers the page-side IndexedDB save back to the old html. The
+                // take_screenshot deep-link temp tab then loadChatsFromStorage()'s that
+                // stale html and re-renders the OLD widget — the byte-identical
+                // post-edit screenshot. The SW mirror upserts by id (worker/120-tool-routing.js).
+                result._widget_persist = widget;
                 return result;
 
             // Hidden actions (not in tool schema - used by skill tools via executeTool)

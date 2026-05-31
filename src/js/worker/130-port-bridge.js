@@ -174,11 +174,35 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'toggle-pause':
-            // Set the flag only. Main never emitted 'paused' here — the snackbar
+            // Set the flag FIRST. Main never emitted 'paused' here — the snackbar
             // fires either from the loop's pending-tool early-return emit, or
             // from the runFinished handler's isPaused branch after the stream
             // aborts. Emitting here would double-fire the snackbar.
             pausedChatIds[msg.chatId] = !!msg.paused;
+            // POST-SW-RELOCATION FIX: the in-flight LLM stream's AbortController and
+            // the tool interrupt resolver live HERE in the SW now, not on the panel.
+            // The panel-side togglePause still calls abort()/resolver() but its copies
+            // of those maps are empty no-ops after the loop moved to the SW — so
+            // without the lines below, Pause never aborts the current call. It would
+            // only take effect at the next loop-iteration boundary (after the whole
+            // streaming turn AND its tool batch finish), which reads to the user as
+            // "Pause does nothing". Mirror the `interrupt` handler so Pause aborts the
+            // in-flight stream / running tool immediately, as documented.
+            //
+            // We do this only when PAUSING (not on resume), and we must NOT set
+            // userInterruptedChats: that flag makes the loop label abandoned tools as
+            // "user sent a new message". Leaving it false makes the loop record the
+            // correct "abandoned — paused by user" placeholder (030-agent-loop.js:879).
+            // The stream catch sees an AbortError, drops the partial assistant msg,
+            // and `continue`s — the while-gate then exits because the flag is set.
+            if (msg.paused && msg.chatId) {
+                if (interruptResolversByChatId[msg.chatId]) {
+                    try { interruptResolversByChatId[msg.chatId](); } catch (e) {}
+                }
+                if (currentStreamAbortControllers[msg.chatId]) {
+                    try { currentStreamAbortControllers[msg.chatId].abort(); } catch (e) {}
+                }
+            }
             return;
 
         case 'pull-chat':

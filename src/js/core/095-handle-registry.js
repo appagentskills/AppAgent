@@ -91,7 +91,13 @@ function _snapshot(entry) {
         // hasn't clicked yet" — if awaitingApproval stays true for too
         // long, cancel_handle is the right move. Cleared automatically
         // once the user responds (or denies, which settles the handle).
-        awaitingApproval: !!entry.awaitingApproval
+        //
+        // Force false once the handle has settled: the flag was set by
+        // _markAwaitingApproval while pending but was never reset on any
+        // settle path (done / error / user-denial / cancel), so a terminal
+        // snapshot could still claim the tool was blocked on the approval
+        // modal. It is only meaningful while status === 'pending'.
+        awaitingApproval: (entry.status === 'pending') && !!entry.awaitingApproval
     };
     if (entry.status === 'done') {
         out.result = entry.result;
@@ -194,6 +200,7 @@ function _listEntries(chatId) {
 }
 
 function _poll(chatId, handleId) {
+    _gcSweep();
     var e = _getEntry(chatId, handleId);
     // System prompt promises callers can read `snapshot.status`. For unknown
     // handles we now return a complete snapshot-shaped object so the agent
@@ -206,6 +213,7 @@ function _poll(chatId, handleId) {
 // or when the timeout elapses (snapshot will still show status:'pending' in
 // that case). The caller decides whether timeout is an error.
 function _await(chatId, handleId, timeoutMs) {
+    _gcSweep();
     var e = _getEntry(chatId, handleId);
     if (!e) {
         return Promise.resolve({ handle: handleId, status: 'unknown', error: 'unknown handle: ' + handleId });
@@ -239,7 +247,25 @@ function _await(chatId, handleId, timeoutMs) {
 // The agent only has to check one field (`timeout`) to branch.
 function _awaitAny(chatId, handleIds, timeoutMs) {
     if (!Array.isArray(handleIds) || handleIds.length === 0) {
-        return Promise.resolve({ error: 'await_any requires a non-empty handles array' });
+        // Uniform shape: callers branch on `timeout`, so always include it
+        // (and handle/snapshot) even on the invalid-input path.
+        return Promise.resolve({ handle: null, snapshot: null, timeout: false, error: 'await_any requires a non-empty handles array' });
+    }
+    // Partition known vs unknown handles up front. An `unknown` handle (bogus
+    // id, or one wiped by a service-worker restart) resolves SYNCHRONOUSLY
+    // through _await, and the old win-condition (`status !== 'pending'`)
+    // treated that as a winner — so a single stale handle in the set would
+    // instantly "win" the race and mask handles that were genuinely still
+    // pending. Only race the known handles, and only let a TERMINAL status
+    // win. But if EVERY handle is unknown there is nothing to wait for, so
+    // resolve immediately with the first unknown snapshot rather than hanging
+    // until the timeout (or forever, if none was given).
+    var known = [];
+    for (var ki = 0; ki < handleIds.length; ki++) {
+        if (_getEntry(chatId, handleIds[ki])) known.push(handleIds[ki]);
+    }
+    if (known.length === 0) {
+        return Promise.resolve({ handle: handleIds[0], snapshot: _poll(chatId, handleIds[0]), timeout: false, allUnknown: true });
     }
     return new Promise(function(resolve) {
         var settled = false;
@@ -248,16 +274,17 @@ function _awaitAny(chatId, handleIds, timeoutMs) {
             settled = true;
             resolve({ handle: handleId, snapshot: snap, timeout: false });
         }
-        for (var i = 0; i < handleIds.length; i++) {
+        for (var i = 0; i < known.length; i++) {
             (function(hid) {
                 _await(chatId, hid, timeoutMs).then(function(snap) {
-                    // Only "win" if this handle actually settled. Pending
-                    // snapshots from timeout fire-throughs shouldn't race.
-                    if (snap && snap.status && snap.status !== 'pending') {
+                    // Only "win" on a genuinely terminal status. Pending
+                    // snapshots (timeout fire-throughs) and unknown snapshots
+                    // (raced GC) must not win while a real handle is pending.
+                    if (snap && snap.status && snap.status !== 'pending' && snap.status !== 'unknown') {
                         pick(snap, hid);
                     }
                 });
-            })(handleIds[i]);
+            })(known[i]);
         }
         if (typeof timeoutMs === 'number' && timeoutMs > 0) {
             setTimeout(function() {
@@ -272,11 +299,19 @@ function _awaitAny(chatId, handleIds, timeoutMs) {
 
 function _awaitAll(chatId, handleIds, timeoutMs) {
     if (!Array.isArray(handleIds) || handleIds.length === 0) {
-        return Promise.resolve({ error: 'await_all requires a non-empty handles array' });
+        return Promise.resolve({ snapshots: [], timedOut: false, error: 'await_all requires a non-empty handles array' });
     }
     var promises = handleIds.map(function(h) { return _await(chatId, h, timeoutMs); });
     return Promise.all(promises).then(function(snaps) {
-        return { snapshots: snaps };
+        // timedOut: at least one handle never settled within timeoutMs (its
+        // snapshot is still status:'pending'). Lets a caller detect a partial
+        // result with a single field instead of scanning every snapshot —
+        // mirrors the `timeout` flag await_any already returns.
+        var timedOut = false;
+        for (var i = 0; i < snaps.length; i++) {
+            if (snaps[i] && snaps[i].status === 'pending') { timedOut = true; break; }
+        }
+        return { snapshots: snaps, timedOut: timedOut };
     });
 }
 
@@ -317,9 +352,15 @@ function _cancel(chatId, handleId, reason) {
     e.cancelReason = reason || 'cancelled by caller';
     e.status = 'cancelled';
     e.error = e.cancelReason;
-    // settledAt is set when the underlying promise actually finishes — until
-    // then the work is still running in the background. We surface "cancelled"
-    // immediately to the caller though.
+    // Stamp settledAt NOW so the GC sweep can eventually evict this entry.
+    // Previously settledAt was left null until the underlying promise finished
+    // ("the work is still running in the background"), but a cancelled handle
+    // whose background work NEVER settles — a hung fetch / iframe interaction —
+    // would then live in the registry forever: an unbounded leak in the
+    // long-lived service worker. The status !== 'pending' guard in
+    // _startHandle preserves this cancelled state if the work does later
+    // resolve (it only refreshes settledAt via `|| _nowMs()`, never the status).
+    e.settledAt = _nowMs();
     _drainAwaiters(e);
     return { ok: true, status: 'cancelled', reason: e.cancelReason };
 }

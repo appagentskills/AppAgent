@@ -61,6 +61,12 @@ var _agentSubscribers = new Set();
 // (updateStreamingMessage) needs to write to chats[chatId].messages
 // [msgIndex] and that array must exist with the right length first.
 var EVENTS_WITH_CHAT_INLINE = {
+    // runStarted must carry the chat snapshot so the page mirror gains
+    // chats[chatId] the instant a BACKGROUND chat starts running. Without it,
+    // getActiveChatsList() (which drops any running chat missing from the page
+    // mirror) silently hides freshly-started background chats from the jobs
+    // badge/dropdown "Active Chats" group until some later chat-inlining event.
+    'runStarted': true,
     'assistantMessageStarted': true,
     'streamDelta': true,
     'assistantMessage': true,

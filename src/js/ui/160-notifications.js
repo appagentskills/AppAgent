@@ -275,8 +275,6 @@ function changeProvider(providerId) {
         updateModelDisplay();
         // Re-render the provider dropdown to update selection
         populateProviderDropdown();
-        // Show/hide OAuth button based on provider
-        updateClaudeOAuthButton();
     }
 }
 
@@ -369,32 +367,163 @@ function updateModelConnectionDot() {
     });
 }
 
-function handleModelNameClick() {
+// Resolve the connection route for a provider from its endpoint. The row icon
+// is intentionally a single consistent glyph (the same `model` icon shown in
+// the header pill) rather than a per-vendor guess — guessed vendor icons read
+// as arbitrary and inconsistent.
+function _modelRowMeta(p) {
+    var ep = ((p && p.endpoint) || '').toLowerCase();
+    var conn = '';
+    if (ep.indexOf('openrouter') >= 0) conn = 'OpenRouter';
+    else if (ep.indexOf('localhost') >= 0 || ep.indexOf('127.0.0.1') >= 0) conn = 'Proxy';
+    else if (ep.indexOf('anthropic.com') >= 0) conn = 'Direct';
+    return { conn: conn };
+}
+
+function _modelMenuRowHtml(p) {
+    var meta = _modelRowMeta(p);
+    var sel = p.name === currentProvider;
+    var badges = p.isClaudeOAuth ? '<span class="model-row-badge oauth">OAuth</span>' : '';
+    var subBits = [];
+    if (p.model) subBits.push(escapeHtml(p.model));
+    if (meta.conn) subBits.push(escapeHtml(meta.conn));
+    var sub = subBits.join(' \u00b7 ');
+    var check = sel
+        ? '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>'
+        : '';
+    return '<div class="model-menu-row' + (sel ? ' selected' : '') + '" onclick="selectModelFromMenu(\'' + escapeJsString(p.name) + '\')">' +
+        '<span class="model-row-icon">' + UI_ICONS.model + '</span>' +
+        '<div class="model-row-main">' +
+            '<div class="model-row-title">' + escapeHtml(p.name) + badges + '</div>' +
+            (sub ? '<div class="model-row-sub">' + sub + '</div>' : '') +
+        '</div>' +
+        check +
+    '</div>';
+}
+
+// Reasoning-effort level meter (signal-bar style) — fills `level` of 5 bars so
+// the dropdown conveys intensity at a glance instead of plain text.
+function _effortMeterIcon(level) {
+    var heights = [5, 8, 11, 14, 17];
+    var bars = '';
+    for (var i = 0; i < 5; i++) {
+        var x = 2.5 + i * 4.2;
+        var h = heights[i];
+        var op = i < level ? '1' : '0.22';
+        bars += '<rect x="' + x + '" y="' + (21 - h) + '" width="2.8" height="' + h + '" rx="1" fill="currentColor" opacity="' + op + '"/>';
+    }
+    return '<svg viewBox="0 0 24 24">' + bars + '</svg>';
+}
+
+// The effort the system applies for a provider when nothing is overridden.
+// Pulled from the seed config by name; falls back to 'high' (the server-side
+// default used when no reasoning.effort is sent).
+function _providerDefaultEffort(p) {
+    var def = '';
+    if (p && typeof DEFAULT_API_PROVIDERS !== 'undefined') {
+        var d = DEFAULT_API_PROVIDERS.filter(function(x){ return x.name === p.name; })[0];
+        if (d && d.effort) def = d.effort;
+    }
+    return def || 'high';
+}
+
+var _MODEL_CHECK_SVG = '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>';
+
+function _effortRowHtml(e, curEffort, defEffort) {
+    var sel = curEffort === e.v;
+    var isDef = defEffort === e.v;
+    return '<div class="model-menu-row effort' + (sel ? ' selected' : '') + '" onclick="setProviderEffort(\'' + e.v + '\')">' +
+        '<span class="model-row-icon">' + _effortMeterIcon(e.level) + '</span>' +
+        '<div class="model-row-main"><div class="model-row-title">' + e.label +
+            (isDef ? '<span class="model-row-badge">default</span>' : '') +
+        '</div></div>' +
+        (sel ? _MODEL_CHECK_SVG : '') +
+    '</div>';
+}
+
+// Pill click now opens a dropdown (reasoning effort + model picker + optional
+// OAuth login/logout row). It NO LONGER logs in/out on a single click.
+function toggleModelMenu(event) {
+    if (event) { event.stopPropagation(); event.preventDefault(); }
+    var existing = document.getElementById('model-menu');
+    if (existing) { existing.remove(); document.removeEventListener('click', _closeModelMenuOnOutside); return; }
+
+    var anchor = (event && event.currentTarget) || document.getElementById('model-name') || document.getElementById('home-model-name');
     var provider = getProviderById(currentProvider);
+    var menu = document.createElement('div');
+    menu.id = 'model-menu';
+    menu.className = 'model-menu';
+
+    var html = '<div class="model-menu-section-title">Reasoning effort</div>';
+    var defEffort = _providerDefaultEffort(provider);
+    var curEffort = (provider && provider.effort) || defEffort;
+    [
+        { v: 'low', label: 'Low', level: 1 },
+        { v: 'medium', label: 'Medium', level: 2 },
+        { v: 'high', label: 'High', level: 3 },
+        { v: 'xhigh', label: 'X-High', level: 4 },
+        { v: 'max', label: 'Max', level: 5 }
+    ].forEach(function(e) { html += _effortRowHtml(e, curEffort, defEffort); });
+    html += '<div class="model-menu-section-title">Model</div>';
+    getAllProviders().forEach(function(p) { html += _modelMenuRowHtml(p); });
     if (provider && provider.isClaudeOAuth) {
-        if (llmConnectionStatus === 'connected') {
-            // Connected: logout
-            chrome.runtime.sendMessage({ type: 'claude-oauth-logout' }, function() {
-                updateClaudeOAuthStatus();
-                showSnackbar('Logged out from Claude', 'info');
-            });
-        } else {
-            // Disconnected: login
-            showSnackbar('Logging in to Claude...', 'info');
-            chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
-                if (chrome.runtime.lastError) {
-                    showSnackbar('OAuth error: ' + chrome.runtime.lastError.message, 'error');
-                } else if (response && response.error) {
-                    showSnackbar('OAuth error: ' + response.error, 'error');
-                } else {
-                    showSnackbar('Logged in to Claude via OAuth', 'success');
-                }
-                updateClaudeOAuthStatus();
-            });
-        }
+        html += '<div class="model-menu-section-title">Claude OAuth</div>';
+        var oauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
+        html += '<div class="custom-dropdown-option" onclick="modelMenuOAuthToggle()">' + oauthLabel + '</div>';
+    }
+    menu.innerHTML = html;
+    document.body.appendChild(menu);
+
+    var r = anchor.getBoundingClientRect();
+    menu.style.position = 'fixed';
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    setTimeout(function() { document.addEventListener('click', _closeModelMenuOnOutside); }, 0);
+}
+
+function _closeModelMenuOnOutside(e) {
+    var menu = document.getElementById('model-menu');
+    if (menu && !menu.contains(e.target) && !e.target.closest('.model-name')) {
+        menu.remove();
+        document.removeEventListener('click', _closeModelMenuOnOutside);
+    }
+}
+
+function _closeModelMenu() {
+    var menu = document.getElementById('model-menu');
+    if (menu) menu.remove();
+    document.removeEventListener('click', _closeModelMenuOnOutside);
+}
+
+function setProviderEffort(value) {
+    var provider = getProviderById(currentProvider);
+    if (!provider) return;
+    if (value) { provider.effort = value; } else { delete provider.effort; }
+    if (typeof saveApiProvider === 'function') saveApiProvider(provider);
+    _closeModelMenu();
+    showSnackbar('Reasoning effort: ' + (value || 'default'), 'info');
+}
+
+function selectModelFromMenu(name) {
+    changeProvider(name);
+    _closeModelMenu();
+}
+
+function modelMenuOAuthToggle() {
+    _closeModelMenu();
+    if (llmConnectionStatus === 'connected') {
+        chrome.runtime.sendMessage({ type: 'claude-oauth-logout' }, function() {
+            updateClaudeOAuthStatus();
+            showSnackbar('Logged out from Claude', 'info');
+        });
     } else {
-        // Non-OAuth: open settings
-        toggleSettingsPanel();
+        showSnackbar('Logging in to Claude...', 'info');
+        chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
+            if (chrome.runtime.lastError) { showSnackbar('OAuth error: ' + chrome.runtime.lastError.message, 'error'); }
+            else if (response && response.error) { showSnackbar('OAuth error: ' + response.error, 'error'); }
+            else { showSnackbar('Logged in to Claude via OAuth', 'success'); }
+            updateClaudeOAuthStatus();
+        });
     }
 }
 

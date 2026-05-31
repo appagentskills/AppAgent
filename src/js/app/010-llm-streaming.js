@@ -264,7 +264,15 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
         reader = res.body.getReader();
     }
-    setLLMConnectionStatus('connected');
+    // Badge fix: a 200 response is NOT proof the OAuth session is valid for the
+    // header pill (the SW may hold a token; this may be a non-OAuth provider).
+    // For OAuth providers re-verify real login/expiry instead of blindly going
+    // green, otherwise the chat page shows 'connected' even when logged out.
+    if (provider && provider.isClaudeOAuth && typeof updateClaudeOAuthStatus === 'function') {
+        updateClaudeOAuthStatus();
+    } else {
+        setLLMConnectionStatus('connected');
+    }
     var decoder = new TextDecoder();
     var buffer = '';
     var thinking = '';

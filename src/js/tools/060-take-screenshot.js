@@ -183,25 +183,112 @@ async function executeTakeScreenshot(args) {
             // Cross-origin widget (extension sandbox): open widget in a
             // temporary tab via ?widget= deep link, screenshot it, then close
             if (_widgetCrossOrigin) {
-                var _wssUrl = chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId);
+                // Cache-bust the deep link so the temp tab always performs a fresh
+                // navigation reflecting the CURRENT widget content. Keying on the
+                // widget's contentVersion (bumped by iframe_tool edit_html) plus a
+                // timestamp prevents a stale rasterization being reused after the
+                // widget HTML changes — the bug where post-edit widget screenshots
+                // kept returning the identical pre-edit image.
+                var _wssCv = (_ssWidget && _ssWidget.contentVersion) || 0;
+                // Per-request nonce. Passed to the temp tab as &_ts= and echoed back in
+                // the render-complete record so the capturer accepts ONLY the signal from
+                // THIS request's fresh render — a leftover record from a prior capture of
+                // the same widget/version can never satisfy the wait (no stale frame).
+                var _wssTs = Date.now();
+                var _wssUrl = chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId)
+                    + '&_cv=' + _wssCv + '&_ts=' + _wssTs;
                 var _wssTab = null;
+                // DETERMINISTIC render-complete wait (replaces the old fixed-delay
+                // race). The temp tab's deep-link wrapper (120-init.js) broadcasts
+                // 'widgetRenderComplete' over a same-origin BroadcastChannel once the
+                // cross-origin sandbox has mounted AND laid out the content (the
+                // sandbox fires 'widgetContentLoaded' after document.write + double
+                // rAF + fonts.ready). We resolve ONLY when the broadcast's
+                // contentVersion matches the _cv we requested, so a late signal from
+                // a PRIOR edit can never satisfy this wait -> never a stale capture.
+                // The listener is armed BEFORE the tab is created so an early
+                // broadcast can't be missed.
+                var _wssRenderedViaSignal = false;
+                var _wssSignalPath = null; // which transport actually delivered the signal
+                var _wssChan = null;
+                var _wssRuntimeListener = null;
+                var _wssStorageListener = null;
+                // Cross-context bus key. chrome.storage change events are delivered to
+                // EVERY extension context that can read the area — including this Chrome
+                // side panel — which is exactly the boundary that chrome.runtime.sendMessage
+                // fan-out (PR #274) and BroadcastChannel (separate partitions) both failed
+                // to cross. The temp tab (120-init.js) writes a render-complete record
+                // here once the widget has actually painted; we observe it via
+                // storage.onChanged. The value also persists, so there is no
+                // arm-before-fire race even if the paint beats this listener.
+                var _WSS_BUS_KEY = '__appagent_widget_render__';
+                var _wssRenderPromise = new Promise(function(resolve) {
+                    var _settled = false;
+                    var _wssMaxWait;
+                    // Accept a record ONLY when it is for this widget, reports the
+                    // requested contentVersion, AND carries this request's nonce (_wssTs).
+                    // The nonce guarantees the record came from THIS temp tab's fresh
+                    // render — a leftover record from a prior capture (even at the same
+                    // version) can never satisfy the wait, so we never grab a stale frame.
+                    var _wssMatches = function(d) {
+                        return d && d.type === 'widgetRenderComplete'
+                            && d.widgetId === widgetId
+                            && String(d.contentVersion) === String(_wssCv)
+                            && String(d.sig) === String(_wssTs);
+                    };
+                    var finish = function(viaSignal, path) {
+                        if (_settled) return;
+                        _settled = true;
+                        _wssRenderedViaSignal = viaSignal;
+                        _wssSignalPath = path || null;
+                        clearTimeout(_wssMaxWait);
+                        if (_wssChan) { try { _wssChan.close(); } catch (e) {} _wssChan = null; }
+                        if (_wssRuntimeListener) {
+                            try { chrome.runtime.onMessage.removeListener(_wssRuntimeListener); } catch (e) {}
+                            _wssRuntimeListener = null;
+                        }
+                        if (_wssStorageListener) {
+                            try { chrome.storage.onChanged.removeListener(_wssStorageListener); } catch (e) {}
+                            _wssStorageListener = null;
+                        }
+                        resolve();
+                    };
+                    // PRIMARY signal path: chrome.storage bus. The deep-link temp TAB
+                    // (where 120-init writes the record) and THIS capturing context (the
+                    // side-panel page) are separate top-level extension contexts. A Chrome
+                    // side panel does NOT share a BroadcastChannel with a tab (separate
+                    // partitions) and — empirically (PR #274) — also did not receive the
+                    // tab's chrome.runtime.sendMessage fan-out, so both old handshakes
+                    // timed out on EVERY capture. chrome.storage.onChanged IS dispatched to
+                    // every extension context that can read the area, so it crosses that
+                    // exact boundary. Armed BEFORE the temp tab is created.
+                    try {
+                        _wssStorageListener = function(changes, area) {
+                            if (area !== 'local' || !changes || !changes[_WSS_BUS_KEY]) return;
+                            if (_wssMatches(changes[_WSS_BUS_KEY].newValue)) finish(true, 'storage');
+                        };
+                        chrome.storage.onChanged.addListener(_wssStorageListener);
+                    } catch (e) { /* storage events unavailable -> runtime/BC/safety-net */ }
+                    // Secondary path: chrome.runtime fan-out (works in some Chrome builds).
+                    try {
+                        _wssRuntimeListener = function(msg) { if (_wssMatches(msg)) finish(true, 'runtime'); };
+                        chrome.runtime.onMessage.addListener(_wssRuntimeListener);
+                    } catch (e) { /* runtime messaging unavailable */ }
+                    // Tertiary path: BroadcastChannel (same-partition contexts only).
+                    try {
+                        _wssChan = new BroadcastChannel('appagent-widget-render');
+                        _wssChan.onmessage = function(ev) { if (_wssMatches(ev && ev.data)) finish(true, 'broadcast'); };
+                    } catch (e) { /* BroadcastChannel unavailable -> safety-net governs */ }
+                    // Safety net ONLY (never the primary path): cap the wait so a
+                    // missing signal can't hang the capture. Falls through to
+                    // capture-anyway and is surfaced in the result via render_wait.
+                    _wssMaxWait = setTimeout(function() { finish(false, 'timeout'); }, 5000);
+                });
                 try {
                     _wssTab = await chrome.tabs.create({ url: _wssUrl, active: false });
-                    // Wait for the tab to finish loading
-                    await new Promise(function(resolve) {
-                        function onUpdated(tabId, changeInfo) {
-                            if (tabId === _wssTab.id && changeInfo.status === 'complete') {
-                                chrome.tabs.onUpdated.removeListener(onUpdated);
-                                clearTimeout(_wssFallback);
-                                setTimeout(resolve, 200); // short delay for rendering
-                            }
-                        }
-                        chrome.tabs.onUpdated.addListener(onUpdated);
-                        var _wssFallback = setTimeout(function() {
-                            chrome.tabs.onUpdated.removeListener(onUpdated);
-                            resolve();
-                        }, 5000);
-                    });
+                    // Block until the post-edit widget is actually painted (matching
+                    // contentVersion), or until the safety-net max-wait elapses.
+                    await _wssRenderPromise;
                     // Temporarily point sendBrowserAction at the widget tab
                     var _wssChat = chats[currentChatId];
                     var _wssOrigTabId = _wssChat && _wssChat.targetTabId;
@@ -227,7 +314,13 @@ async function executeTakeScreenshot(args) {
                         message: 'Screenshot captured: ' + captureDescription,
                         dimensions: _wssW + 'x' + _wssH,
                         size_bytes: Math.round(_wssBase64.length * 0.75),
-                        note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + _wssId + '" with screenshot_by_id tool to retrieve the image data.',
+                        // Surfaces whether we captured on the deterministic
+                        // render-complete signal or fell through the safety-net wait.
+                        render_wait: _wssRenderedViaSignal ? 'deterministic-signal' : 'timeout-fallback',
+                        // Which transport delivered the signal: 'storage' (primary),
+                        // 'runtime', 'broadcast', or 'timeout' (safety-net fallback).
+                        render_signal_path: _wssSignalPath,
+                        note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content.' + (_wssRenderedViaSignal ? '' : ' (Note: the widget render-complete signal did not arrive within the max wait; captured on fallback — the image may not reflect the very latest edit.)') + ' Use screenshot_id "' + _wssId + '" with screenshot_by_id tool to retrieve the image data.',
                         _screenshotMessage: {
                             role: 'screenshot',
                             base64: _wssBase64,
@@ -243,6 +336,11 @@ async function executeTakeScreenshot(args) {
                     };
                 } finally {
                     if (_wssTab) try { chrome.tabs.remove(_wssTab.id); } catch(e) {}
+                    // Housekeeping: drop the render-complete bus record so a stale
+                    // key doesn't linger in chrome.storage.local after the capture.
+                    // (Matching is nonce-guarded so residue is harmless, but we keep
+                    // the area clean.)
+                    try { chrome.storage.local.remove(_WSS_BUS_KEY); } catch (e) {}
                 }
             }
         } else if (target === 'element') {

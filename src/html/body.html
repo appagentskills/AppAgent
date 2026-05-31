@@ -83,7 +83,7 @@
             </label>
             <label class="settings-checkbox">
                 <input type="checkbox" id="keep-awake-checkbox" checked="checked" onchange="toggleKeepAwake(this.checked)"/>
-                <span>Keep display awake after 5 minutes of inactivity</span>
+                <span>Keep display awake during active tasks and after 5 minutes of inactivity</span>
             </label>
         </div>
         <div class="settings-section">
@@ -114,7 +114,7 @@
                     <span class="ws-header-status" id="ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
                     <span class="credits-display" id="credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" aria-hidden="true"></span>...</span>
                     <span class="storage-display" id="storage-display" onclick="updateStorageIndicator()" onkeydown="if(event.key==='Enter'||event.key===' ')updateStorageIndicator()" title="Local storage remaining" style="display:none" role="button" tabindex="0" aria-label="Storage remaining, click to refresh"><span class="storage-icon" aria-hidden="true"></span>...</span>
-                    <span class="model-name" id="model-name" style="display:none" onclick="handleModelNameClick()" role="button" tabindex="0"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><span class="model-login-icon" id="model-login-icon" style="display:none"></span></span>
+                    <span class="model-name" id="model-name" style="display:none" onclick="toggleModelMenu(event)" role="button" tabindex="0"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><span class="model-login-icon" id="model-login-icon" style="display:none"></span></span>
                     <button type="button" class="open-browser-btn" id="open-browser-btn" onclick="openBrowserWithUrl()" title="Open Sidebar" style="display:none" aria-label="Open Sidebar"><span class="btn-icon" id="browse-icon"></span></button>
                     <button class="ext-panel-btn ext-reload-btn" id="ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                     <div class="jobs-badge-wrapper" id="jobs-badge-wrapper">
@@ -283,7 +283,7 @@
                     </div>
                     <span class="ws-header-status" id="home-ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
                     <span class="credits-display" id="home-credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" id="home-credits-icon" aria-hidden="true"></span>...</span>
-                    <span class="model-name" id="home-model-name" onclick="handleModelNameClick()" role="button" tabindex="0"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><span class="model-login-icon" id="home-model-login-icon" style="display:none"></span></span>
+                    <span class="model-name" id="home-model-name" onclick="toggleModelMenu(event)" role="button" tabindex="0"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><span class="model-login-icon" id="home-model-login-icon" style="display:none"></span></span>
                     <button type="button" class="open-browser-btn" id="home-open-browser-btn" onclick="openBrowserWithUrl('home')" title="Open Sidebar" style="display:none" aria-label="Open Sidebar"><span class="btn-icon" id="home-browse-icon"></span></button>
                     <button class="ext-panel-btn ext-reload-btn" id="home-ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                     <div class="jobs-badge-wrapper" id="home-jobs-badge-wrapper">

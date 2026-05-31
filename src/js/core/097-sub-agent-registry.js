@@ -70,6 +70,13 @@ var SUBAGENT_IDLE_SWEEP_MS      = 60 * 1000;        // sweep frequency
 // long so the UI can show "last_report" and the user can inspect the
 // chat. After the grace period the record is deleted from IDB.
 var SUBAGENT_TOMBSTONE_TTL_MS   = 60 * 60 * 1000; // 1h
+// Sleeping (parked) subs that reported a result and were never woken again are
+// abandoned: every sub that completes parks as state='sleeping' (so the parent
+// CAN re-wake it), but the tombstone sweep above only reclaims stopped/errored
+// records — so without an idle window the happy-path 'done' sub leaks its record
+// + background chat row forever. Reclaim sleeping subs idle longer than this.
+// Re-waking resets last_activity_at, so an actively-managed sub is never hit.
+var SUBAGENT_SLEEP_TTL_MS       = 60 * 60 * 1000; // 1h idle
 
 // Default-denied nested-delegation tools. Sub-agents cannot spawn /
 // stop / wake other subs unless the caller passes `allow_nested:true`
@@ -158,6 +165,17 @@ async function loadAllSubAgents() {
                     if ((rec.state === 'stopped' || rec.state === 'errored')
                         && rec.settled_at && (now - rec.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS) {
                         _subAgentsDeleteFromDB(rec.agent_id);
+                        // Also reclaim the sub's background chat row. The runtime
+                        // idle sweep (_idleSweepTick) deletes BOTH the record and
+                        // the chat row, but this boot-time GC only deleted the
+                        // record — orphaning the chat row in `chats` + IDB forever
+                        // (it is never revisited: the record is gone from
+                        // _subAgents, so the idle sweep can no longer reach it).
+                        // Mirror the sweep's cleanup here, best-effort and guarded.
+                        try {
+                            if (typeof chats !== 'undefined' && rec.chat_id && chats[rec.chat_id]) delete chats[rec.chat_id];
+                            if (typeof deleteChatFromDB === 'function' && rec.chat_id) deleteChatFromDB(rec.chat_id);
+                        } catch (e) { /* non-fatal */ }
                         return;
                     }
                     // Backfill Phase-5 fields for records persisted before this
@@ -266,6 +284,13 @@ function _drainPool() {
                     .catch(function(err) {
                         _markErrored(capturedAid, 'agent loop crashed: ' + (err && err.message || err));
                     });
+            } else {
+                // F3: runAgent unavailable (early boot / headless / missing
+                // bundle). We already claimed the pool slot above — release it
+                // and settle the sub as errored, otherwise the slot leaks and
+                // the parent's spawn handle hangs forever.
+                delete _subPool.running[aid];
+                _markErrored(aid, 'pool-start failed: runAgent unavailable in this context');
             }
         } catch (e) {
             // Loop failed to start synchronously — release the slot and mark errored.
@@ -298,9 +323,26 @@ function _idleSweepTick() {
     for (var aid in _subAgents) {
         var r = _subAgents[aid];
         if (!r) continue;
-        // GC tombstones first.
-        if ((r.state === 'stopped' || r.state === 'errored')
-            && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS) {
+        // Two reclamation cases:
+        //  • Terminal (stopped/errored) past the tombstone TTL — kept briefly so
+        //    the UI can show last_report, then collected.
+        //  • Sleeping past the sleep-idle TTL — a sub that reported done/need_input
+        //    (or was auto-reported) and was never woken again is abandoned. Without
+        //    this, every completed sub parks as 'sleeping' forever and its record +
+        //    background chat row leak indefinitely (the very slowdown this sweep
+        //    exists to prevent). Gated to the authoritative context AND a settled
+        //    spawn handle: the page mirror has an empty _spawnDeferreds map and must
+        //    NOT judge "handle settled" (it would treat every sleeping sub as
+        //    collectable and race the SW); a still-pending handle means a parent is
+        //    mid-await and must never be collected.
+        var _isTombstone = (r.state === 'stopped' || r.state === 'errored')
+            && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS;
+        var _authoritativeCtx = (typeof Platform === 'undefined') || (Platform.isWorker === true);
+        var _isAbandonedSleep = _authoritativeCtx
+            && r.state === 'sleeping'
+            && r.last_activity_at && (now - r.last_activity_at) > SUBAGENT_SLEEP_TTL_MS
+            && !_spawnDeferreds[r.spawn_handle_id];
+        if (_isTombstone || _isAbandonedSleep) {
             // Skip GC if the user is currently viewing this sub's transcript —
             // otherwise the chat row gets ripped out from under them and the
             // message list goes blank. Defer to the next sweep.
@@ -496,6 +538,15 @@ function spawnSubAgent(args, ctx) {
     if (typeof Handles === 'undefined') {
         return { success: false, error: 'spawn_sub_agent: Handle registry unavailable.' };
     }
+    // Verify the chats map is available BEFORE allocating the spawn handle and
+    // persisting the record below. This guard previously lived ~40 lines down
+    // (after handle + record allocation); if it ever fired, the freshly-created
+    // spawn deferred never resolved (the parent's await_handle hung forever)
+    // and an orphan state:'running' record leaked into _subAgents. Fail fast
+    // here, before anything has been allocated.
+    if (typeof chats === 'undefined') {
+        return { success: false, error: 'spawn_sub_agent: chats map unavailable.' };
+    }
     var displayName = 'spawn_sub_agent: ' + (args.name || (instructions.slice(0, 40) + '…'));
     // We use Handles.start with a runFn that simply waits for a deferred
     // promise the registry exposes — i.e. the handle resolves out-of-band
@@ -540,10 +591,8 @@ function spawnSubAgent(args, ctx) {
     // Create the sub's chat. The agent loop reads `chats[chatId]` so this
     // must exist before runAgent fires. We mark it isBackground so it
     // doesn't pop into the foreground UI, AND isSubAgent so the system
-    // prompt module appends the preamble.
-    if (typeof chats === 'undefined') {
-        return { success: false, error: 'spawn_sub_agent: chats map unavailable.' };
-    }
+    // prompt module appends the preamble. (chats availability was verified at
+    // the top of spawnSubAgent, before any handle/record allocation.)
     chats[chat_id] = {
         id: chat_id,
         title: record.name,
@@ -566,6 +615,16 @@ function spawnSubAgent(args, ctx) {
         try { seedStr = (typeof args.context_seed === 'string') ? args.context_seed : JSON.stringify(args.context_seed, null, 2); }
         catch (e) { seedStr = String(args.context_seed); }
         firstMsg += '\n\n<context_seed>\n' + seedStr + '\n</context_seed>';
+    }
+    // Optional output_schema: declare the exact shape the parent expects back.
+    // The parent typically parses report.data programmatically (e.g. spawned +
+    // awaited inside a single js_eval), so conformance matters.
+    if (args.output_schema != null) {
+        var schemaStr;
+        try { schemaStr = (typeof args.output_schema === 'string') ? args.output_schema : JSON.stringify(args.output_schema, null, 2); }
+        catch (e) { schemaStr = String(args.output_schema); }
+        firstMsg += '\n\n<output_schema>\n' + schemaStr + '\n</output_schema>'
+            + '\nWhen you call report_to_parent, the `data` field MUST be a JSON object that conforms EXACTLY to the schema above — same keys, same types, no extra keys, no prose inside data. Put any human-readable narration in `summary`; put the schema-conformant structured result in `data`. The parent parses `data` programmatically, so a mismatched shape will break it.';
     }
     chats[chat_id].messages.push({ role: 'user', content: firstMsg });
     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -906,11 +965,19 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // ACL gate (Phase 5). Non-internal callers must own the subtree. The
     // gate is unconditional unless the caller is the registry itself.
     if (!isInternalCascade) {
-        var _wakeCallerChatId = (ctx && ctx.chatId) || null;
+        // F1: resolve the caller chat-id via the same fallback chain as
+        // agent_message, and enforce the ACL UNCONDITIONALLY (fail closed).
+        // Previously this only checked when ctx.chatId was truthy and had no
+        // fallback — a call with an unresolved chat-id bypassed the subtree
+        // ownership check entirely (fail open). _callerOwnsTarget(null,…)
+        // returns false, so an unresolvable caller is now correctly denied.
+        var _wakeCallerChatId = (ctx && ctx.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         var _wakeCallerAgentId = (_wakeCallerChatId && typeof chats !== 'undefined'
             && chats[_wakeCallerChatId] && chats[_wakeCallerChatId].isSubAgent)
             ? chats[_wakeCallerChatId].subAgentId : null;
-        if (_wakeCallerChatId && !_callerOwnsTarget(_wakeCallerChatId, _wakeCallerAgentId, rec)) {
+        if (!_callerOwnsTarget(_wakeCallerChatId, _wakeCallerAgentId, rec)) {
             return { success: false, error: 'wake_sub_agent: ACL denied — caller does not own this sub-agent\'s subtree.', _acl_denied: true };
         }
     }
@@ -919,11 +986,15 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // a legitimate user-pause), re-queue the loop, and drain the inbox into
     // an extra user message even though the live loop is already consuming it.
     if (rec.state === 'running' && !args.instruction && !(rec.inbox && rec.inbox.length)) {
-        return { success: true, ok: true, state: 'running', note: 'already running' };
+        // Even on a no-op, hand back an awaitable handle for the in-flight run
+        // so the caller can await the sub's eventual report. The documented
+        // contract is "always returns {handle}". _mintNewSpawnHandle reuses the
+        // still-pending spawn handle (or mints a fresh one if it had settled).
+        return { success: true, ok: true, state: 'running', note: 'already running', handle: _mintNewSpawnHandle(rec) };
     }
 
-    // If the wake carries an instruction, push it onto chat.messages.
-    // Otherwise drain the inbox into a single combined message.
+    // If the wake carries an instruction, deliver it. Otherwise drain the
+    // inbox into a single combined message.
     var pendingMsgs = (rec.inbox || []).slice();
     rec.inbox = [];
     if (args.instruction) {
@@ -931,7 +1002,24 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     }
     if (pendingMsgs.length > 0 && chats[rec.chat_id]) {
         var combined = _formatInboxDrain(pendingMsgs);
-        chats[rec.chat_id].messages.push({ role: 'user', content: combined });
+        // F2: if a loop is already live for this sub (wake-with-instruction on
+        // a still-running sub), a direct chat.messages push lands mid-turn and
+        // breaks Anthropic's assistant→tool_result alternation (request 400s).
+        // Mirror agent_message's live branch: stash into pendingInjectionsByChatId
+        // (coalescing) so the running loop's flushPendingInjection consumes it
+        // at a safe point. Only push directly when no loop is live.
+        var _wakeLive = !!(_subPool.running[rec.agent_id]
+            || (typeof runningChatIds !== 'undefined' && runningChatIds[rec.chat_id]));
+        if (_wakeLive && typeof pendingInjectionsByChatId !== 'undefined') {
+            var _wExisting = pendingInjectionsByChatId[rec.chat_id];
+            var _wPrev = (_wExisting && _wExisting.text) ? _wExisting.text + '\n\n' : '';
+            pendingInjectionsByChatId[rec.chat_id] = {
+                text: _wPrev + combined,
+                images: (_wExisting && _wExisting.images) ? _wExisting.images : []
+            };
+        } else {
+            chats[rec.chat_id].messages.push({ role: 'user', content: combined });
+        }
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
     }
 
@@ -987,6 +1075,11 @@ function _mintNewSpawnHandle(rec) {
     var newHid = started.handleId;
     _spawnDeferreds[newHid] = newDeferred;
     rec.spawn_handle_id = newHid;
+    // F7: re-register the fresh handle as pending so agent_status reflects it.
+    // _resolveSpawnHandle prunes the settled id from pending_handles, so a woken
+    // sub would otherwise report pending_handles:0 despite having a live handle.
+    if (!Array.isArray(rec.pending_handles)) rec.pending_handles = [];
+    if (rec.pending_handles.indexOf(newHid) === -1) rec.pending_handles.push(newHid);
     _subAgentsPersist(rec);
     return newHid;
 }
@@ -1160,6 +1253,11 @@ function agentMessage(args, ctx) {
         _newHandle = (_wakeRes && _wakeRes.handle) || dst.spawn_handle_id || null;
     } else if (dst.state === 'running') {
         _drainPool();
+        // Surface an awaitable handle for the in-flight run, matching the
+        // sleeping-recipient branch and the documented "response includes a
+        // handle the parent can await_handle" contract. Reuses the pending
+        // spawn handle (or mints a fresh one if the previous already settled).
+        _newHandle = _mintNewSpawnHandle(dst);
     }
     _notifyListeners();
     var out = { success: true, ok: true };
@@ -1168,6 +1266,25 @@ function agentMessage(args, ctx) {
 }
 
 // ---------- stop_sub_agent ----------
+
+// Cascade-terminate every descendant of `rec` (deepest first, via
+// _descendants ordering). Shared by stop_sub_agent, the budget-exhaustion
+// path, and _markErrored so that a parent sub going terminal for ANY reason
+// (explicit stop, budget exhausted, crash) never orphans its grandchildren.
+// Orphaned descendants would otherwise keep burning pool slots, report into a
+// now-dead chat, and leave their spawn handles hanging. Runs as an internal
+// cascade (ACL bypassed; ctx is unused by the internal path).
+function _cascadeStopDescendants(rec, reason) {
+    if (!rec) return;
+    var kids = _descendants(rec.agent_id);
+    for (var i = 0; i < kids.length; i++) {
+        var kidRec = _subAgents[kids[i]];
+        if (!kidRec || kidRec.state === 'stopped' || kidRec.state === 'errored') continue;
+        try {
+            _stopSubAgentImpl({ agent_id: kids[i], reason: reason }, null, true);
+        } catch (e) { console.warn('cascade-stop: failed for', kids[i], e); }
+    }
+}
 
 function stopSubAgent(args, ctx) {
     return _stopSubAgentImpl(args, ctx, false);
@@ -1186,11 +1303,16 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     // ACL gate (Phase 5). A sub can only stop its own descendants; a regular
     // chat can only stop subs whose root_chat_id is itself.
     if (!isInternalCascade) {
-        var _callerChatId = (ctx && ctx.chatId) || null;
+        // F1: fail closed (see wake_sub_agent). Resolve caller chat-id via the
+        // standard fallback chain and enforce the ACL unconditionally — an
+        // unresolved caller no longer bypasses the subtree-ownership check.
+        var _callerChatId = (ctx && ctx.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         var _callerAgentId = (_callerChatId && typeof chats !== 'undefined'
             && chats[_callerChatId] && chats[_callerChatId].isSubAgent)
             ? chats[_callerChatId].subAgentId : null;
-        if (_callerChatId && !_callerOwnsTarget(_callerChatId, _callerAgentId, rec)) {
+        if (!_callerOwnsTarget(_callerChatId, _callerAgentId, rec)) {
             return { success: false, error: 'stop_sub_agent: ACL denied — caller does not own this sub-agent\'s subtree.', _acl_denied: true };
         }
     }
@@ -1198,17 +1320,7 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     // _descendants ordering). Without this, grandchildren orphan when their
     // parent sub is stopped: they keep burning pool slots, their reports go
     // to a dead chat, and their handles never settle.
-    var _kids = _descendants(rec.agent_id);
-    for (var _ki = 0; _ki < _kids.length; _ki++) {
-        var _kidRec = _subAgents[_kids[_ki]];
-        if (!_kidRec || _kidRec.state === 'stopped' || _kidRec.state === 'errored') continue;
-        try {
-            _stopSubAgentImpl({
-                agent_id: _kids[_ki],
-                reason: 'parent sub-agent stopped: ' + (args.reason || rec.name)
-            }, ctx, true);
-        } catch (e) { console.warn('stop cascade: failed for', _kids[_ki], e); }
-    }
+    _cascadeStopDescendants(rec, 'parent sub-agent stopped: ' + (args.reason || rec.name));
     var reason = args.reason || 'stopped by parent';
     rec.state = 'stopped';
     rec.settled_at = Date.now();
@@ -1298,6 +1410,10 @@ function _markErrored(agentId, errMsg) {
     var rec = _subAgents[agentId];
     if (!rec) return;
     if (rec.state === 'stopped' || rec.state === 'errored') return;
+    // A crashing parent sub must cascade-stop its descendants, mirroring
+    // stop_sub_agent and the budget path. Without this, grandchildren of a
+    // crashed sub keep running, hold pool slots, and report into a dead chat.
+    _cascadeStopDescendants(rec, 'parent sub-agent errored: ' + rec.name);
     rec.state = 'errored';
     rec.settled_at = Date.now();
     rec.last_report = rec.last_report || {
@@ -1409,6 +1525,10 @@ function onToolCallInSubAgent(chatId) {
     rec.last_activity_at = Date.now();
     if (rec.tool_calls_used > rec.max_tool_calls) {
         var msg = 'Sub-agent ' + rec.name + ' exceeded max_tool_calls (' + rec.max_tool_calls + ').';
+        // Budget termination must cascade-stop descendants too — otherwise a
+        // nested parent that exhausts its budget orphans its grandchildren
+        // (the same hazard stop_sub_agent already guards against).
+        _cascadeStopDescendants(rec, 'parent sub-agent exhausted tool budget: ' + rec.name);
         rec.state = 'stopped';
         rec.settled_at = Date.now();
         rec.last_report = rec.last_report || { status: 'error', summary: msg, from: rec.agent_id, from_name: rec.name, at: rec.settled_at };
@@ -1558,7 +1678,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
             at: Date.now(),
             _synthesized: true
         };
-        if (_runErrored) rec.state = 'errored';
+        if (_runErrored) { rec.state = 'errored'; rec.settled_at = rec.settled_at || Date.now(); }
         _subAgentsPersist(rec);
         _releasePoolSlot(rec.agent_id);
         _resolveSpawnHandle(rec.agent_id, {
@@ -1582,6 +1702,13 @@ function onSubAgentRunFinished(chatId, finishCtx) {
             at: Date.now(),
             _no_report: true
         };
+        // F4: settle as terminal `errored` so the tombstone sweep can GC this
+        // record + its background chat row. Without setting state here, the
+        // trailing _parkSubAgent() downgrades the run to `sleeping`, which the
+        // GC never collects → permanent record + chat-row leak. settled_at is
+        // required for the tombstone TTL check to ever fire.
+        rec.state = 'errored';
+        rec.settled_at = rec.settled_at || Date.now();
         _subAgentsPersist(rec);
         _releasePoolSlot(rec.agent_id);
         _resolveSpawnHandle(rec.agent_id, {

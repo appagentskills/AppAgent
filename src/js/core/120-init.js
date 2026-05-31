@@ -406,6 +406,58 @@ async function init() {
             var wf = document.createElement('iframe');
             wf.style.cssText = 'width:100%;height:100vh;border:none;display:block;';
             document.body.appendChild(wf);
+            // Deterministic render-complete signal for take_screenshot's widget
+            // capture path. This tab is opened (active:false) solely to rasterize
+            // the widget, which renders inside a cross-origin sandbox iframe. Once
+            // that sandbox posts 'widgetContentLoaded' (fired AFTER it mounts the
+            // HTML and double-rAF/fonts settle layout), we stamp a stable DOM marker
+            // and broadcast the widget's contentVersion on a same-origin
+            // BroadcastChannel. The capturing tab resolves only when the broadcast
+            // version matches the &_cv it requested, so it can never capture a stale
+            // frame from a prior edit. IMPORTANT: we broadcast the version of the
+            // content we ACTUALLY rendered (dlWidget.contentVersion from storage),
+            // NOT the requested &_cv. If storage were momentarily behind, the
+            // rendered version won't match the requested one, the capturer keeps
+            // waiting (then falls back via its safety net) rather than being told a
+            // stale frame is the requested version.
+            var _dlRenderedCv = (dlWidget.contentVersion != null) ? dlWidget.contentVersion : 0;
+            // Per-request nonce passed by take_screenshot (060) as &_ts=. Echoed back in
+            // the render-complete record so the capturer accepts ONLY the signal from
+            // this exact request — a leftover record from a prior capture can't satisfy it.
+            var _dlReqTs = urlParams.get('_ts') || '';
+            var _dlSignaled = false;
+            function _dlOnWidgetMsg(ev) {
+                if (ev.source !== wf.contentWindow) return;
+                if (!ev.data || ev.data.type !== 'widgetContentLoaded') return;
+                if (_dlSignaled) return;
+                _dlSignaled = true;
+                window.removeEventListener('message', _dlOnWidgetMsg);
+                // One more rAF so the parent frame reflects the child's final layout.
+                requestAnimationFrame(function() { requestAnimationFrame(function() {
+                    try { document.documentElement.setAttribute('data-widget-ready', String(_dlRenderedCv)); } catch (e) {}
+                    var _dlRenderMsg = { type: 'widgetRenderComplete', widgetId: deepLinkWidgetId, contentVersion: _dlRenderedCv, sig: _dlReqTs, ts: Date.now() };
+                    // PRIMARY: chrome.storage bus. This temp TAB and the capturing
+                    // side-panel page are separate top-level extension contexts. A Chrome
+                    // side panel does NOT receive this tab's BroadcastChannel (separate
+                    // partitions) and — empirically (PR #274) — also did not receive its
+                    // chrome.runtime.sendMessage fan-out, so both old handshakes timed out
+                    // on EVERY capture. chrome.storage change events ARE delivered to every
+                    // extension context that can read the area, the side panel included, so
+                    // writing the record here reliably reaches 060's storage.onChanged
+                    // listener. The value also persists, so there is no arm-before-fire race.
+                    try { chrome.storage.local.set({ '__appagent_widget_render__': _dlRenderMsg }); } catch (e) {}
+                    // Secondary: chrome.runtime fan-out (works in some Chrome builds).
+                    // Fire-and-forget (no response callback -> no spurious lastError).
+                    try { chrome.runtime.sendMessage(_dlRenderMsg); } catch (e) {}
+                    // Tertiary: BroadcastChannel for any same-partition listener.
+                    try {
+                        var ch = new BroadcastChannel('appagent-widget-render');
+                        ch.postMessage(_dlRenderMsg);
+                        ch.close();
+                    } catch (e) {}
+                }); });
+            }
+            window.addEventListener('message', _dlOnWidgetMsg);
             writeWidgetHtml(wf, dlWidget.html);
             return;
         }
@@ -488,7 +540,16 @@ async function renderSkillsList() {
     skillList.forEach(function(skill) {
         var isActive = !!activeSkills[skill.id];
         var activeClass = isActive ? ' skill-item-active' : '';
+        // OOB (out-of-box) skills are seeded from the bundled EMBEDDED_SKILLS and
+        // carry an embeddedHash. Once the user (or agent) edits one, userModified
+        // is set and its content no longer matches the shipped version.
+        var isOob = !!skill.embeddedHash;
+        var isEdited = isOob && !!skill.userModified;
+        var oobBadge = isOob ? '<span class="skill-oob-badge" title="Bundled with the extension (out-of-box)">Built-in</span>' : '';
+        var editedBadge = isEdited ? '<span class="skill-edited-badge" title="Modified — no longer matches the built-in version">Edited</span>' : '';
         var activeBadge = isActive ? '<span class="skill-active-badge">Active</span>' : '';
+        var badgesInner = oobBadge + editedBadge + activeBadge;
+        var badgesHtml = badgesInner ? '<span class="skill-item-badges">' + badgesInner + '</span>' : '';
         var displayName = skill.name || skill.id || 'Untitled';
         var descSnippet = skill.description ? '<div class="skill-item-desc">' + escapeHtml(skill.description) + '</div>' : '';
         
@@ -505,7 +566,7 @@ async function renderSkillsList() {
             attachmentsHtml += '</div>';
         }
         
-        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeHtml(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeHtml(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + activeBadge + '</div>' + descSnippet + attachmentsHtml + '</div>';
+        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeHtml(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeHtml(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + badgesHtml + '</div>' + descSnippet + attachmentsHtml + '</div>';
     });
     container.innerHTML = html;
 }
