@@ -605,6 +605,9 @@ function editMessage(msgIndex) {
     // Switch to new chat without full navigation - keep UI seamless
     currentChatId = newChatId;
     appStorage.setItem('lastChatId', newChatId);
+    // B6: this seamless branch bypasses selectChat — tell the SW the focused chat
+    // changed so the sub-agent GC paths don't reclaim a transcript now in view.
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(newChatId);
     saveChatsToStorage();
 
     // Load version history for the new chat so artifacts are displayed

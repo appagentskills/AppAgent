@@ -55,6 +55,19 @@ async function executeIframeTool(args) {
                 window._emulatedViewport = { width: rw, height: rh };
             } else {
                 window._emulatedViewport = null;
+                // Wait for the real viewport to settle to the requested size before
+                // resolving, so an immediate get_page_info doesn't read stale dims.
+                var _settleDeadline = Date.now() + 1500;
+                while (Date.now() < _settleDeadline) {
+                    var _pi;
+                    try { _pi = await Platform.sendBrowserAction('get_page_info', {}); } catch (e) { _pi = null; }
+                    if (_pi && !_pi.error) {
+                        var _wOk = !rw || Math.abs((_pi.viewportWidth || 0) - rw) <= 2;
+                        var _hOk = !rh || Math.abs((_pi.viewportHeight || 0) - rh) <= 2;
+                        if (_wOk && _hOk) break;
+                    }
+                    await new Promise(function(r){ setTimeout(r, 100); });
+                }
             }
             return { success: true, message: resizeMsg };
         }
@@ -140,12 +153,27 @@ async function executeIframeTool(args) {
                                     chrome.tabs.onRemoved.removeListener(_navOnRemoved);
                                     clearTimeout(_navTimeout);
                                     clearTimeout(_sameUrlCheck);
-                                    if (reason !== 'removed') {
-                                        chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
-                                    }
-                                    // Brief settle delay for SPAs, skipped for fast paths
-                                    var settle = (reason === 'complete') ? 1000 : 0;
-                                    setTimeout(resolve, settle);
+                                    if (reason === 'removed') { resolve(); return; }
+                                    chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
+                                    // Readiness handshake: after re-arming injection, poll the
+                                    // content script with a cheap action until it responds
+                                    // (injected + listening) or a ~3s cap elapses. This closes
+                                    // the "message port closed" race where the very next read
+                                    // action hits a tab whose content script isn't ready yet.
+                                    // Fully defensive: never throws, always resolves.
+                                    var _readyDeadline = Date.now() + 3000;
+                                    (async function _pollReady() {
+                                        while (Date.now() < _readyDeadline) {
+                                            try {
+                                                var _ping = await Platform.sendBrowserAction('get_page_info', {});
+                                                if (_ping && !_ping.error) { resolve(); return; }
+                                            } catch (e) { /* not ready yet */ }
+                                            await new Promise(function(r){ setTimeout(r, 150); });
+                                        }
+                                        // Cap reached: fall through with a brief SPA settle.
+                                        var settle = (reason === 'complete') ? 1000 : 0;
+                                        setTimeout(resolve, settle);
+                                    })();
                                 }
                                 var _navTimeout = setTimeout(function() { _finish('timeout'); }, _waitMs);
                                 function _navOnRemoved(tid) { if (tid === _targetTab.id) _finish('removed'); }
@@ -206,7 +234,40 @@ async function executeIframeTool(args) {
                     return { success: true, message: 'Browser closed. Returning to full page view.' };
                 }
 
-                var extResult = await Platform.sendBrowserAction(action, args);
+                // Read actions can race a content script whose port isn't ready
+                // yet right after navigate ("message port closed"). For those
+                // (non-mutating) actions only, re-arm injection and retry ONCE.
+                var _readRetryActions = ['get_visible_text', 'get_dom', 'get_page_info', 'get_properties', 'get_console_logs', 'get_network_requests', 'scroll'];
+                var _isPortError = function(msg) {
+                    return /message port closed|Receiving end does not exist|Could not establish connection/i.test(msg || '');
+                };
+                var extResult;
+                try {
+                    extResult = await Platform.sendBrowserAction(action, args);
+                } catch (e) {
+                    extResult = { error: 'Extension browser action failed: ' + e.message };
+                }
+                if (_readRetryActions.indexOf(action) !== -1) {
+                    // Content script can take a moment to (re)attach after navigate,
+                    // yielding "message port closed"/"Receiving end does not exist".
+                    // Re-arm injection and retry with a small bounded linear backoff.
+                    var _maxPortRetries = 3;
+                    var _portAttempt = 0;
+                    while (_portAttempt < _maxPortRetries && extResult && extResult.error && _isPortError(extResult.error)) {
+                        _portAttempt++;
+                        try {
+                            var _retryChat = chats[currentChatId];
+                            var _retryTabId = _retryChat && _retryChat.targetTabId;
+                            if (_retryTabId) chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _retryTabId });
+                        } catch (e) { /* defensive */ }
+                        await new Promise(function(r){ setTimeout(r, 300 * _portAttempt); });
+                        try {
+                            extResult = await Platform.sendBrowserAction(action, args);
+                        } catch (e2) {
+                            extResult = { error: 'Extension browser action failed: ' + e2.message };
+                        }
+                    }
+                }
                 if (extResult.error) {
                     return { success: false, error: extResult.error };
                 }
@@ -281,6 +342,9 @@ async function executeIframeTool(args) {
         }
         var widgetIframe = getWidgetIframe(widgetId);
         if (!widgetIframe) {
+            if (_tgtWidget) {
+                return { error: 'Widget "' + (_tgtWidget.title || widgetId) + '" (' + widgetId + ') exists but is not rendered in a live panel in the current chat context, so live-DOM actions (get_visible_text, get_dom, click, fill) cannot attach to it. This typically happens in a background/non-foreground chat where the widget is not mounted in the visible DOM. Re-run the widget interaction in a foreground chat. Note: edit_html still works here because it mutates the stored widget HTML directly.' };
+            }
             return { error: 'Widget not found: ' + widgetId + '. Make sure the widget is visible in the chat or dashboard.' };
         }
         return { iframe: widgetIframe };
@@ -477,8 +541,9 @@ async function executeIframeTool(args) {
                     } else {
                         html = doc.documentElement.outerHTML;
                     }
-                    if (html.length > 50000) {
-                        html = html.substring(0, 50000) + '\n... [truncated, total: ' + html.length + ' chars]';
+                    var maxLen = (typeof args.max_length === 'number' ? args.max_length : 200000);
+                    if (html.length > maxLen) {
+                        html = html.substring(0, maxLen) + '\n... [truncated, total: ' + html.length + ' chars]';
                     }
 
                     return { success: true, html: html, match_count: _domMatchCount, note: 'DOM retrieved (from widget)' };
@@ -672,7 +737,13 @@ async function executeIframeTool(args) {
                         chat.widgets[idx].html = widget.html;
                         chat.widgets[idx].contentVersion = widget.contentVersion;
                     }
-                    saveChatsToStorage();
+                    // Await the IndexedDB commit: a take_screenshot(widget) that runs
+                    // right after this edit deep-links a temp tab that reads the widget
+                    // html back from IndexedDB. If the write hasn't committed the temp
+                    // tab renders the PRE-edit html, broadcasts the old contentVersion,
+                    // never matches the capture guard, and falls back to a stale frame
+                    // after the 5s safety-net.
+                    await saveChatsToStorage();
                 }
                 
                 // Refresh inline widget if visible

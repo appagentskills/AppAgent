@@ -12,6 +12,9 @@ function openHomeView() {
 
     currentView = 'home';
     appStorage.setItem('currentView', 'home');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
     hidePauseButton();
     var homePanel = document.getElementById('home-panel');

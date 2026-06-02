@@ -7,6 +7,9 @@ function toggleHistoryView() {
 function openHistoryView() {
     currentView = 'history';
     appStorage.setItem('currentView', 'history');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
     var historyPanel = document.getElementById('history-panel');
     if (historyPanel) { historyPanel.style.display = 'flex'; renderHistoryPage(); }
@@ -344,6 +347,9 @@ function openChatFromHistory(chatId) {
     currentChatId = chatId;
     appStorage.setItem('currentChatId', chatId);
     appStorage.setItem('lastChatId', chatId);
+    // SAGF-1: tell the SW which chat is focused so its sub-agent GC paths don't
+    // reclaim a transcript the user is now viewing (SW currentChatId is null).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
     currentView = 'chat';
     appStorage.setItem('currentView', 'chat');
     hideAllPanels();
@@ -355,6 +361,14 @@ function openChatFromHistory(chatId) {
     // render. selectChat does this on line 434; this entry-point bypasses
     // selectChat so it has to do it itself.
     if (typeof lastApiError !== 'undefined') lastApiError = null;
+    // R-2: also hide the dead Retry button + stale error snackbar (selectChat's
+    // counterpart does the same), then re-derive Retry from this chat's persisted
+    // _lastApiError so a previously-unfocused errored chat stays recoverable when
+    // opened from history.
+    if (typeof hideRetryButton === 'function') hideRetryButton();
+    if (typeof hideSnackbar === 'function') hideSnackbar();
+    var _histErr = chats[chatId] && chats[chatId]._lastApiError;
+    if (_histErr) { lastApiError = _histErr; if (typeof showRetryButton === 'function') showRetryButton(); }
     // Re-sync the messages container's `is-streaming` class to the target
     // chat's actual run state. Without this, the class would carry over from
     // whichever chat was last viewed — a streaming chat would visually

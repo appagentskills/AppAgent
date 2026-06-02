@@ -441,17 +441,23 @@ function parseWsKey(key) {
 async function resolveWorkspace(workspace) {
     if (workspace) {
         var meta = await getWorkspaceMeta(workspace);
-        if (meta) return workspace;
+        if (meta) {
+            try { meta.last_used_at = Date.now(); setWorkspaceMeta(meta); } catch (e) {}
+            return workspace;
+        }
         return { error: 'Workspace "' + workspace + '" not found. Use workspace clone first.' };
     }
 
-    // No workspace param — check if there's exactly one workspace
+    // No workspace param — pick a workspace deterministically.
     try {
         var all = await getAllWorkspaceMetas();
         if (all.length === 0) return { error: 'No workspaces cloned. Use workspace clone first.' };
-        if (all.length === 1) return all[0].repo;
-        var keys = all.map(function(m) { return m.repo; });
-        return { error: 'Multiple workspaces cloned: ' + keys.join(', ') + '. Specify which workspace to use.' };
+        // One or more workspaces: fall back to the most-recently-used (MRU) one
+        // instead of erroring on ambiguity. last_used_at falls back to cloned_at.
+        all.sort(function(a, b) { return (b.last_used_at || b.cloned_at || 0) - (a.last_used_at || a.cloned_at || 0); });
+        var chosen = all[0];
+        try { chosen.last_used_at = Date.now(); setWorkspaceMeta(chosen); } catch (e) {}
+        return chosen.repo;
     } catch (e) {
         return { error: 'Failed to resolve workspace: ' + e.message };
     }

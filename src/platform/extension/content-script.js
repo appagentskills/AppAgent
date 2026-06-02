@@ -673,6 +673,20 @@
                 props.computedStyle[p] = computed.getPropertyValue(p);
             });
         }
+        var include = args.include || ['rect','styles','value','attributes'];
+        if (include.indexOf('styles') !== -1) {
+            props.styles = {
+                display: computed.display,
+                visibility: computed.visibility,
+                color: computed.color,
+                backgroundColor: computed.backgroundColor,
+                fontSize: computed.fontSize,
+                fontWeight: computed.fontWeight,
+                overflow: computed.overflow,
+                position: computed.position,
+                opacity: computed.opacity
+            };
+        }
         sendResponse({ success: true, properties: props, match_count: matchCount });
     }
 

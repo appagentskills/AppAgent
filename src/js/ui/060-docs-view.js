@@ -43,6 +43,9 @@ function toggleDocsView() {
 function openDocsView() {
     currentView = 'docs';
     appStorage.setItem('currentView', 'docs');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
     var docsPanel = document.getElementById('docs-panel');
     if (docsPanel) { docsPanel.style.display = 'flex'; renderDocsPage(); }
@@ -105,6 +108,9 @@ function scrollToDocSection(id) {
 function openDashboardView() {
     currentView = 'dashboard';
     appStorage.setItem('currentView', 'dashboard');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     currentEditingWidget = null;
     hideAllPanels();
     var dashboardPanel = document.getElementById('dashboard-panel');

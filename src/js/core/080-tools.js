@@ -136,6 +136,7 @@ var TOOLS = [
                     preset: { type: 'string', enum: ['mobile', 'tablet', 'desktop', 'fullhd'], description: 'For resize action: viewport size preset (mobile=375x812, tablet=768x1024, desktop=1440x900, fullhd=1920x1080)' },
                     width: { type: 'number', description: 'For resize action: custom viewport width in pixels' },
                     height: { type: 'number', description: 'For resize action: custom viewport height in pixels' },
+                    max_length: { type: 'number', description: 'Max chars for get_dom output. Default 200000.' },
                     include: { type: 'array', items: { type: 'string', enum: ['rect', 'styles', 'value', 'attributes'] }, description: 'For get_properties action: what to include. Default: all' },
                     styles: { type: 'object', description: 'For set_style action: CSS properties to set, e.g. {"display": "none", "color": "red"}' },
                     className: { type: 'string', description: 'For set_style action: add/remove/toggle a class - "add:className", "remove:className", or "toggle:className"' },
@@ -258,7 +259,7 @@ var TOOLS = [
             parameters: {
                 type: 'object',
                 properties: {
-                    action: { type: 'string', enum: ['create', 'update', 'edit', 'add_file', 'update_file', 'delete_file', 'activate', 'deactivate'], description: 'Action to perform' },
+                    action: { type: 'string', enum: ['create', 'update', 'edit', 'add_file', 'update_file', 'delete_file', 'activate', 'deactivate', 'delete'], description: 'Action to perform. NOTE: "delete" permanently removes the entire skill and cascades to all its files/assets — destructive, confirm recommended.' },
                     skill_id: { type: 'string', description: 'Skill ID (required for all actions except create)' },
                     name: { type: 'string', description: 'Skill name in lowercase with hyphens (for create/update)' },
                     description: { type: 'string', description: 'Brief description of what the skill does (for create/update)' },

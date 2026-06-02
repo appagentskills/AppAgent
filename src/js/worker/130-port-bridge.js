@@ -84,6 +84,77 @@ function _unregisterPanel(port) {
     if (!_swPanelPorts.has(port)) return;
     _swPanelPorts.delete(port);
     _agentSubscribers.delete(port);
+    // SWM-3: if the executing panel disconnects before posting its
+    // exec-tool-result, the SW loop's awaited promise would hang forever.
+    // Re-park any in-flight UI tool calls that were dispatched to THIS port so
+    // a freshly-connected panel replays them (replayParkedToolCalls). Both
+    // _pendingUIToolCalls and parkUIToolCall are globals in the worker bundle
+    // (worker/120-tool-routing.js). The key of _pendingUIToolCalls is the
+    // toolCallId; PART A stored .port/.chatId/.name/.input/.sandboxCtx on each.
+    try {
+        Object.keys(_pendingUIToolCalls).forEach(function(id) {
+            var entry = _pendingUIToolCalls[id];
+            if (!entry || entry.port !== port) return;
+            // Re-park only entries that carry enough metadata to be REPLAYED to a
+            // fresh panel (a real UI tool call: name + input). Approval-prompt
+            // entries record .port for disconnect-visibility but intentionally
+            // omit .name: replayParkedToolCalls re-dispatches via
+            // dispatchUIToolToPort as an `exec-tool`, so a parked approval would
+            // be sent as a bogus exec-tool '__approval_prompt__' the panel can't
+            // run. For those, honour the documented "clean rejection if re-park
+            // is not possible" contract so `await approvalPromise` settles
+            // instead of hanging.
+            if (entry.name) {
+                try {
+                    // B1: pass alreadyDispatched=true — this tool was already sent to
+                    // the now-disconnected panel and may have executed, so replay must
+                    // reconcile rather than blindly re-dispatch (double side effect).
+                    parkUIToolCall(entry.chatId, id, entry.name, entry.input, entry.resolve, entry.reject, entry.sandboxCtx, true);
+                } catch (e) {
+                    // Fallback: never leave the loop hanging.
+                    try { entry.reject(new Error('panel disconnected before returning tool result')); } catch (e2) {}
+                }
+            } else {
+                try { entry.reject(new Error('panel disconnected before returning tool result')); } catch (e2) {}
+            }
+            delete _pendingUIToolCalls[id];
+        });
+    } catch (e) {}
+    // SWM3-F-HANG: re-parked already-dispatched entries only reconcile on a NEW connect; if the
+    // executor panel dies while another panel is still connected (multi-panel) the SW loop's awaited
+    // promise stalls until the 24h TTL. Drive an immediate reconcile against a surviving port.
+    try { if (_swPanelPorts.size > 0) { var _altPort = pickExecutorPort(); if (_altPort) replayParkedToolCalls(_altPort); } } catch (e) {}
+    // B3: also purge any post-SW-restart ADOPTION marker stamped with this dead
+    // port. panel-hello sets _panelAdoptedTools[id].port BEFORE the resumed loop's
+    // executeTool creates the matching _pendingUIToolCalls entry; if the adopting
+    // panel disconnects in that window the pending scan above finds nothing, the
+    // dead-port marker lingers, and executeTool later registers a pending entry on
+    // that dead port that no future disconnect re-scans — hanging the await forever.
+    try {
+        Object.keys(_panelAdoptedTools).forEach(function(id) {
+            if (_panelAdoptedTools[id] && _panelAdoptedTools[id].port === port) {
+                // SWM3-N2: do NOT fully delete the marker. If the resumed loop later
+                // reaches executeTool(id) it would otherwise find no marker and BLIND
+                // RE-DISPATCH a tool this now-dead panel already ran (double side
+                // effect). Downgrade to a port-less tombstone so the adoption arm
+                // reconciles (registers a waiting pending entry + backstop, never
+                // re-dispatches). Drop the buffered result payload. scheduleAdoptedEviction
+                // bounds the tombstone's lifetime so it can't grow unbounded.
+                var _prevAdopt = _panelAdoptedTools[id];
+                delete _adoptedResults[id];
+                _panelAdoptedTools[id] = { dispatched: true, chatId: _prevAdopt && _prevAdopt.chatId };
+                if (typeof scheduleAdoptedEviction === 'function') scheduleAdoptedEviction(id);
+            }
+        });
+    } catch (e) {}
+    // SWM2-F2: drop this panel's focus entry so a disconnected panel stops pinning
+    // the chat it was viewing. The sub-agent GC guard skips a chat focused by ANY
+    // LIVE panel; a dead panel's entry must be cleared or it would pin forever.
+    try {
+        if (typeof SubAgents !== 'undefined' && SubAgents.clearFocusedChatForPort) {
+            SubAgents.clearFocusedChatForPort(_panelId(port));
+        }
+    } catch (e) {}
 }
 
 chrome.runtime.onConnect.addListener(function(port) {
@@ -128,6 +199,15 @@ function _handlePanelMessage(port, msg) {
                 var isRunning = !!runningChatIds[msg.chatId];
                 if (msg.chat && !isRunning) chats[msg.chatId] = msg.chat;
                 if (msg.currentProvider) currentProvider = msg.currentProvider;
+                // SWM1F-1: a run-agent means the user intends this chat to run
+                // now, so clear any stale SW-side pause flag. Post-SW-move the
+                // loop's `while (!isChatPaused)` gate reads the SW's pausedChats
+                // copy; the page only clears its OWN pausedChats copy on send, so
+                // without this a chat that was paused then re-run trips the gate
+                // immediately and the just-sent run is silently dropped
+                // (runFinished{reason:'paused'}). Keep pausedChatIds in sync — we
+                // are intentionally NOT removing it (SWM1F-2 deferred).
+                if (!isRunning) { pausedChats[msg.chatId] = false; pausedChatIds[msg.chatId] = false; }
                 // Same gate order as resumeRunningCheckpoints: chats/providers
                 // loaded, Platform session/instance ready, providers refreshed.
                 // The panel inlines the chat snapshot above so chats[chatId]
@@ -148,7 +228,22 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'send-message':
-            _handlePanelSendMessage(msg);
+            // SWM14-T7: gate the send-message dispatch on the SW boot (and the same
+            // Platform.ready + providers chain run-agent uses @:218). Without the boot
+            // gate, a send arriving during the SW cold-boot window runs
+            // _handlePanelSendMessage while `chats` is still {} — its idle branch then
+            // pushes the user message onto a skeleton chat and saveChatsToStorage()'s
+            // store.clear()+rewrite WIPES every other chat from IDB. Gating until
+            // _swBootReady guarantees `chats` is hydrated first (the page now also
+            // inlines a chat snapshot — app/040-send-message.js — so a brand-new chat
+            // not yet persisted to IDB still seeds correctly without clobbering siblings).
+            (self._swBootReady || Promise.resolve())
+                .then(function() { return Platform.ready; })
+                .then(function() { return loadApiProviders(); })
+                .then(function() {
+                    try { _handlePanelSendMessage(msg); }
+                    catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
+                });
             return;
 
         case 'interrupt':
@@ -161,6 +256,17 @@ function _handlePanelMessage(port, msg) {
                 // would silently flush stale text the user thought they aborted.
                 // send-message takes the running branch with its own assignment, so
                 // this delete won't race with that path.
+                //
+                // SWM14-F4 (DELIBERATE — documented, not a bug): Pause, Stop and
+                // Dismiss all push fromUserMessage=false (pushInterruptToOffscreen(
+                // chatId, false) from togglePause / stopAction / dismissAction), so
+                // they take THIS branch and discard any un-flushed queued injection.
+                // This is intentional: a non-user-message interrupt drops the queued
+                // message to keep interrupt semantics simple. For PAUSE specifically
+                // it means a not-yet-sent queued message is discarded by design (the
+                // user must re-send after Resume). If a future change wants Pause to
+                // PRESERVE the queued injection, gate this delete on the interrupt
+                // kind rather than the fromUserMessage flag.
                 if (!msg.fromUserMessage && pendingInjectionsByChatId[icid]) {
                     delete pendingInjectionsByChatId[icid];
                 }
@@ -179,6 +285,15 @@ function _handlePanelMessage(port, msg) {
             // from the runFinished handler's isPaused branch after the stream
             // aborts. Emitting here would double-fire the snackbar.
             pausedChatIds[msg.chatId] = !!msg.paused;
+            // CRITICAL (Pause regression): the SW agent loop's isChatPaused()
+            // resolves to core/030-config.js's implementation — it is in
+            // WORKER_SHARED_FILES and its function declaration is hoisted over
+            // worker/020-page-stubs.js's pausedChatIds-reading fallback — so the
+            // loop actually reads pausedChats, NOT pausedChatIds. Without the
+            // mirror below, `while (!isChatPaused(chatId))` never trips: Pause
+            // aborts the in-flight step, the loop catches the AbortError and
+            // `continue`s straight into a fresh LLM call. Mirror into pausedChats.
+            pausedChats[msg.chatId] = !!msg.paused;
             // POST-SW-RELOCATION FIX: the in-flight LLM stream's AbortController and
             // the tool interrupt resolver live HERE in the SW now, not on the panel.
             // The panel-side togglePause still calls abort()/resolver() but its copies
@@ -263,6 +378,21 @@ function _handlePanelMessage(port, msg) {
             }
             return;
 
+        case 'focus-chat':
+            // SAGF-1: the page tells us which chat the user is now viewing so
+            // the sub-agent GC paths (_idleSweepTick / loadAllSubAgents) don't
+            // reclaim a tombstone/abandoned-sleep transcript mid-read. In the SW
+            // currentChatId is permanently null, so this is the only focus signal.
+            if (typeof SubAgents !== 'undefined' && SubAgents.setFocusedChat) {
+                // SWM2-F2: pass a stable per-panel key so multiple panels each viewing
+                // a different chat don't clobber each other's focus (last-writer-wins
+                // would GC the other panel's viewed transcript). One panel → one key →
+                // identical to the pre-F2 single-focus behavior. A null msg.chatId
+                // (user left the chat view) clears just THIS port's entry.
+                SubAgents.setFocusedChat(msg.chatId, _panelId(port));
+            }
+            return;
+
         case 'panel-hello':
             // Panel declares which tool executions it's still running AND
             // which it finished but whose result may not have been
@@ -271,10 +401,13 @@ function _handlePanelMessage(port, msg) {
             // executeTool wrapper short-circuits to the buffered result
             // instead of dispatching a duplicate exec-tool.
             if (typeof self._swAdoptPanelInflight === 'function') {
+                // SWM3F-1: pass the connecting port so adopted in-flight tools
+                // record the adopting panel's port — lets _unregisterPanel see
+                // (and clean-reject) them if that panel later disconnects.
                 self._swAdoptPanelInflight({
                     inflightToolCalls: msg.inflightToolCalls || [],
                     completedToolResults: msg.completedToolResults || []
-                });
+                }, port);
             }
             return;
     }
@@ -294,6 +427,15 @@ async function _handlePanelSendMessage(msg) {
     var chatId = msg.chatId;
     if (!chatId) return;
     if (!chats[chatId]) chats[chatId] = msg.chat || { id: chatId, messages: [] };
+
+    // B10: the user sending a message means they intend this chat to run now —
+    // clear any stale SW-side pause flag (mirrors the run-agent handler @:172).
+    // Without this, sending to a chat the SW still considers paused trips the
+    // loop's `while (!isChatPaused)` gate immediately and silently drops the run
+    // (runFinished{reason:'paused'}). Covers both the idle restart below and the
+    // running-branch case where the loop is about to exit on a stale pause.
+    pausedChats[chatId] = false;
+    pausedChatIds[chatId] = false;
 
     if (runningChatIds[chatId]) {
         pendingInjectionsByChatId[chatId] = {

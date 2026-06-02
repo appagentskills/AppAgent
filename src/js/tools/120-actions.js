@@ -471,6 +471,12 @@ async function pauseAction(actionId) {
     var a = activeActions[actionId];
     if (!a) return;
     pausedChats[a.chatId] = true;
+    // B9: the agent loop now runs in the service worker, which reads its OWN
+    // pausedChats copy — setting only the page copy never halts it. Mirror the
+    // pause + interrupt into the SW (as togglePause does) so Pause actually stops
+    // the background loop instead of letting it stream to completion.
+    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, true);
+    if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(a.chatId, false);
     a._isPaused = true;
     a.updatedAt = Date.now();
     await persistActionState(actionId);
@@ -500,6 +506,17 @@ async function resumeAction(actionId) {
     broadcastActionChange('update', actionId, a.chatId);
     notifyActionStateChanged(actionId);
     _syncChatPagePauseUIForChat(a.chatId);
+    // SWM14-F2: clear the SW-side pause copy too, mirroring togglePause
+    // (020-api-messages.js:200-202). resumeAction only cleared the page's
+    // pausedChats; the SW keeps its own copy (set on pause via
+    // pushPauseToggleToOffscreen). Because the page runAgent early-returns while
+    // runningChatIds is set, a still-running SW loop would never get un-paused —
+    // its `while (!isChatPaused)` gate stays tripped. Push the cleared flag BEFORE
+    // the runAgent re-kick so the loop resumes whether or not it re-enters here.
+    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, false);
+    // SWM-T5: bump the interrupt generation too, so a stale interrupt(false) retry
+    // chain armed during a port-down window can't survive resume and abort the run.
+    if (typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(a.chatId);
     // Re-kick the agent loop if it's not already running in THIS tab. Other
     // tabs were unpaused via the broadcast above; if any of them was already
     // running the loop, it just resumes there. Tabs that weren't running rely
@@ -517,6 +534,12 @@ async function stopAction(actionId) {
     if (a._dismissTimer) { clearTimeout(a._dismissTimer); a._dismissTimer = null; }
     // Soft-stop: signal the loop to pause on next check (locally + in any other tab)
     pausedChats[a.chatId] = true;
+    // B9: mirror the stop into the service-worker loop (which reads the SW's own
+    // pausedChats). Without this the PM sees "Stopped" while the SW keeps streaming
+    // and executing tools (ServiceNow writes, sub-agent spawns) to completion — the
+    // "loop halts at its next pause check" comment above was false post-SW-move.
+    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, true);
+    if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(a.chatId, false);
     a.state = 'stopped';
     a.icon = 'stop';
     a.label = 'Stopped';
@@ -553,7 +576,20 @@ async function dismissAction(actionId) {
         if (a.chatId) {
             var dchat = a.chatId;
             pausedChats[dchat] = true;
-            setTimeout(function() { delete pausedChats[dchat]; }, 5000);
+            // B9: also halt the SW-side loop (its own pausedChats copy) + abort any
+            // in-flight stream/tool, else a dismissed action's background loop keeps
+            // running in the service worker after the button is gone.
+            if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(dchat, true);
+            if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(dchat, false);
+            setTimeout(function() {
+                delete pausedChats[dchat];
+                // SWM14-F3: also clear the SW-side pause copy. The push above set
+                // pausedChats[dchat]=true in the SW too; the page-only delete here
+                // never reaches the SW, so without this the SW keeps a stale pause
+                // flag for this chatId forever and a later reuse of the same chatId
+                // would start up paused.
+                if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(dchat, false);
+            }, 5000);
             _syncChatPagePauseUIForChat(dchat);
             // Reveal the chat in the sidebar before dismissing the action.
             // Otherwise the chat becomes orphaned: the action is gone (so it's no
@@ -580,8 +616,14 @@ async function finishActionIfDone(chatId) {
     if (!chat || !chat.isBackground || !chat.actionId) return;
     var a = activeActions[chat.actionId];
     if (!a) return;
-    // Only auto-finalize if the agent didn't explicitly set done/error.
-    if (a.state === 'running') {
+    // Only auto-finalize if the agent didn't explicitly set done/error AND the
+    // action isn't paused. SWM14-F1: pausing a running background Action exits the
+    // SW loop via finish-cleanup → runFinished{paused}; the page runFinished
+    // handler (036-agent-event-handlers-page.js:252) and agent-loop.js:1015 both
+    // call finishActionIfDone unconditionally, which would otherwise flip the
+    // just-paused action to 'Complete' and destroy resumability. Guard INSIDE
+    // finishActionIfDone so every caller (page handler + loop) is covered.
+    if (a.state === 'running' && !a._isPaused && !(typeof isChatPaused === 'function' && isChatPaused(a.chatId))) {
         a.state = 'done';
         a.icon = 'check';
         if (!a.label || a.label === 'Starting…') a.label = 'Complete';
@@ -1735,6 +1777,13 @@ function getActiveChatsList() {
         if (actionChatIds[cid]) return;                 // already shown under Active Actions
         var c = (typeof chats !== 'undefined') ? chats[cid] : null;
         if (!c) return;
+        // Mirror markChatRecentlyFinished()'s linger guard: Action chats live under
+        // "Active Actions" and sub-agent chats live in the Workers strip, so neither
+        // belongs in the "Active Chats" group. Without this, every running sub-agent
+        // chat (mirrored into runningChatIds by the port bridge) double-counts the
+        // badge and surfaces cryptic background/sub transcripts. Regular background
+        // user chats are NOT flagged isBackground, so this does not hide them.
+        if (c.isSubAgent || c.isBackground) return;
         seen[cid] = true;
         out.push(c);
     }
@@ -1833,7 +1882,19 @@ function renderJobsBadge() {
     var agg = _getAggregateActionState();
     // Chats with no actions still need a coloured badge: 'running' if any chat is
     // actively streaming, else 'done' (a lingering finished chat).
-    if (agg === 'empty' && chatList.length) agg = runningChats ? 'running' : 'done';
+    // An actively-streaming chat must also win the colour over a *finished* action
+    // that is still lingering (agg==='done'/'idle'), otherwise the badge paints a
+    // green "done" with a spinner — and fires a premature finish-pulse — while a
+    // chat is still running. attention/error still outrank a running chat.
+    if (runningChats && agg !== 'attention' && agg !== 'error') agg = 'running';
+    else if (agg === 'empty' && chatList.length) agg = runningChats ? 'running' : 'done';
+    // B15: surface an unfocused chat's API error on the badge. A chat that errored
+    // (chats[id]._lastApiError, set by R-1) but isn't actively streaming should
+    // colour the badge 'error' so the failure isn't silent. Ranks below 'attention'
+    // (a pending approval is more urgent) but above running/done.
+    var erroredChats = 0;
+    chatList.forEach(function(c){ if (!isChatActivelyRunning(c.id) && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError) erroredChats++; });
+    if (erroredChats && agg !== 'attention') agg = 'error';
     var titleSuffix = '';
     if (agg === 'attention')    titleSuffix = ' — needs attention';
     else if (agg === 'error')   titleSuffix = ' — has errors';
@@ -1949,9 +2010,12 @@ function renderJobsDropdown(dropdown) {
     }).join('');
     var chatRowsHtml = chatList.map(function(c) {
         var _cRunning = isChatActivelyRunning(c.id);
-        var _cState = _cRunning ? 'running' : 'done';
-        var _cIcon = _cRunning ? (UI_ICONS.spinner || UI_ICONS.chat) : (UI_ICONS.check || UI_ICONS.chat);
-        var _cLabel = _cRunning ? 'Running\u2026' : 'Finished';
+        // B15: an errored, non-running chat shows an explicit error row (icon + msg)
+        // and a Retry button instead of a green "Finished".
+        var _cErr = !_cRunning && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError;
+        var _cState = _cRunning ? 'running' : (_cErr ? 'error' : 'done');
+        var _cIcon = _cRunning ? (UI_ICONS.spinner || UI_ICONS.chat) : (_cErr ? (UI_ICONS.alert || UI_ICONS.close) : (UI_ICONS.check || UI_ICONS.chat));
+        var _cLabel = _cRunning ? 'Running\u2026' : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : 'Finished');
         return '<div class="jobs-dropdown-row state-' + _cState + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' +
@@ -1960,6 +2024,7 @@ function renderJobsDropdown(dropdown) {
                 '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
                 '<div class="jobs-row-label">' + _cLabel + '</div>' +
             '</div>' +
+            (_cErr ? '<button class="jobs-row-btn" title="Retry" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
             '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' + UI_ICONS.chat + '</button>' +
         '</div>';
     }).join('');

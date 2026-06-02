@@ -86,8 +86,16 @@ AgentEvents.on('runStarted', function(e) {
         var messagesEl = document.getElementById('messages');
         if (messagesEl) messagesEl.classList.add('is-streaming');
         activeStreamingChatId = chatId;
+        var _rsFocused = (typeof chats !== 'undefined') ? chats[chatId] : null;
+        if (_rsFocused) _rsFocused._lastApiError = null; // focused chat starting fresh
     } else {
-        lastApiError = null;
+        // R-1 (B11): an UNFOCUSED chat starting a run must NOT mutate the GLOBAL
+        // lastApiError (it belongs to the focused chat — the toolbar Retry reads it).
+        // A sub-agent/background chat starting previously nulled the global and left
+        // the focused chat's Retry button visible-but-dead. Clear only THIS chat's
+        // own persisted error as it starts fresh.
+        var _rsChat = (typeof chats !== 'undefined') ? chats[chatId] : null;
+        if (_rsChat) _rsChat._lastApiError = null;
     }
 });
 
@@ -200,8 +208,34 @@ AgentEvents.on('error', function(e) {
     var chat = (typeof chats !== 'undefined') ? chats[e.chatId] : null;
     var isBackground = !!(chat && (chat.isSubAgent || chat.isBackground));
     if (!isBackground) {
-        showSnackbar('API Error: ' + msg, 'error');
-        showRetryButton();
+        // POST-OFFSCREEN-MOVE FIX: the agent loop runs in offscreen now, so its
+        // `lastApiError = {...}` assignment (030-agent-loop.js) lands in the
+        // OFFSCREEN copy of this global — the page copy stays null. retryLastCall()
+        // guards on `if (!lastApiError) return;`, so without re-hydrating it here
+        // Retry is a silent no-op for every API error (Continue works because
+        // continueAgent never reads lastApiError). Mirror the loop's shape so
+        // retryLastCall can read lastApiError.chatId for the correct target chat.
+        //
+        // R-1: but ONLY the FOCUSED chat may update the GLOBAL lastApiError (the
+        // toolbar Retry button reads it). Previously an unfocused FOREGROUND chat
+        // erroring overwrote the global UNCONDITIONALLY while the focused chat's
+        // Retry was still showing — so clicking Retry ran the WRONG chat. Store an
+        // unfocused chat's error per-chat (chat._lastApiError) instead; selectChat
+        // / openChatFromHistory re-derive the global from it when the user
+        // navigates to that chat (R-2). `chat` is the already null-safe
+        // chats[e.chatId] computed above.
+        if (e.chatId === currentChatId) {
+            lastApiError = { message: msg, chatId: e.chatId, timestamp: Date.now() };
+            // R-2 (B12): persist on the chat too so re-derive (selectChat /
+            // openChatFromHistory) restores Retry if the user switches away from this
+            // focused-but-errored chat and back. Without this a focused-origin error
+            // has no persistent home and the re-derive reads undefined.
+            if (chat) chat._lastApiError = lastApiError;
+            showSnackbar('API Error: ' + msg, 'error');
+            showRetryButton();
+        } else if (chat) {
+            chat._lastApiError = { message: msg, chatId: e.chatId, timestamp: Date.now() };
+        }
     }
     if (e.chatId === currentChatId) renderMessages();
 });
@@ -215,7 +249,10 @@ AgentEvents.on('runFinished', function(e) {
     // actions engine lives in tools/120-actions.js, page-only), so the
     // panel has to do it on receipt of the event instead.
     var fchat = chats[chatId];
-    if (fchat && fchat.isBackground && fchat.actionId && typeof finishActionIfDone === 'function') {
+    // SWM14-T2: gate finalize on the SW's authoritative paused signal carried on the event.
+    // A paused run emits runFinished too; trusting the racy tab-local flags here would finalize
+    // (and dismiss) the action button on a mere pause. Trust e.isPaused / e.reason from the SW.
+    if (fchat && fchat.isBackground && fchat.actionId && !e.isPaused && e.reason !== 'paused' && typeof finishActionIfDone === 'function') {
         try { finishActionIfDone(chatId); } catch (err) { console.error('finishActionIfDone failed', err); }
     }
     // Page-side foreground streaming singletons: main cleared these inline at the

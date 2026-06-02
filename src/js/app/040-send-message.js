@@ -77,17 +77,40 @@ async function sendMessage() {
         // pendingInjectionsByChatId, fire its interrupt resolver, and abort
         // its in-flight stream. The next agent-event broadcast updates the
         // page mirror so the queued bubble appears.
-        if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+        // SWM-T6: the send-message post is best-effort; when _agentBusPort is
+        // falsy (the ~250ms+ window while _openAgentBus reconnects after a SW
+        // eviction) the queued injection was silently dropped and never reached
+        // offscreen. Retry on a short timer (mirrors runAgent's attempt() loop /
+        // pushInterruptToOffscreen) and force-reopen the bus so the injection
+        // reliably lands.
+        (function _sendMessageToOffscreen(_chatId, _text, _images, _retries) {
+            if (typeof _agentBusPort === 'undefined' || !_agentBusPort) {
+                if ((_retries || 0) < 20) { setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, (_retries || 0) + 1); }, 50); }
+                else { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0); }, 250); }
+                return;
+            }
             try {
                 _agentBusPort.postMessage({
                     type: 'send-message',
-                    chatId: currentChatId,
-                    text: _newText,
-                    images: _newImages
+                    chatId: _chatId,
+                    // SWM14-T7: inline the chat snapshot (mirrors run-agent's post @045:405).
+                    // During the SW cold-boot window chats={} in the SW; _handlePanelSendMessage
+                    // seeds chats[chatId]=msg.chat ONLY when the chat is absent (never clobbers a
+                    // live one), so a mid-boot send no longer lands on a skeleton chat whose save
+                    // would store.clear()+rewrite away every sibling chat.
+                    chat: chats[_chatId],
+                    text: _text,
+                    images: _images
                 });
-            } catch (e) {}
-        }
+            } catch (e) {
+                if ((_retries || 0) < 20) { setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, (_retries || 0) + 1); }, 50); }
+                else { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e2) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0); }, 250); }
+            }
+        })(currentChatId, _newText, _newImages, 0);
 
+        // SWM-T4: supersede any pause(true)/interrupt(false) retry chain armed during a port-down window so it can't re-pause or abort this fresh send on reconnect.
+        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+        if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
         // Update spinner immediately so the user sees instant acknowledgement.
         showSpinner('Interrupting…', currentChatId);
         // Re-render so the queued bubble appears immediately under the chat.
@@ -141,6 +164,10 @@ async function sendMessage() {
         // otherwise the next runAgent's `while (!isChatPaused(currentChatId))`
         // gate fails immediately and the message is silently dropped.
         if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
+        // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
+        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+        // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
+        if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
         hideSpinner(currentChatId);
         hidePauseButton();
         saveChatsToStorage();
@@ -215,6 +242,10 @@ async function sendMessage() {
     // `while (!isChatPaused(currentChatId))` gate trips immediately and the
     // user's freshly-sent message is silently dropped on a previously-paused chat.
     if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
+    // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
+    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+    // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
+    if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
     // Sync the button label off the (now-cleared) per-chat state instead of
     // hard-coding it — keeps a single source of truth for the label.
     if (typeof syncPauseButtonUI === 'function') {

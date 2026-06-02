@@ -318,6 +318,9 @@ function completeSummaryAndCreateNewChat() {
     
     currentChatId = newChatId;
     appStorage.setItem('lastChatId', currentChatId);
+    // B6: focused chat changed (continue-from-summary bypasses selectChat) — keep the
+    // SW's focused-chat in sync so GC doesn't reclaim a transcript the user is viewing.
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
     saveChatsToStorage();
     
     versionHistory = [];
@@ -379,6 +382,12 @@ function newChat() {
     // selectChat clears both via its own branch below; newChat needs the
     // same treatment since it bypasses selectChat entirely.
     lastApiError = null;
+    // B14: newChat must also hide the dead Retry button + the (non-auto-dismiss)
+    // error snackbar left over from the previous chat, like selectChat /
+    // openChatFromHistory. Clearing only lastApiError left the button visible-but-dead
+    // and the red error snackbar pinned over the empty new chat.
+    if (typeof hideRetryButton === 'function') hideRetryButton();
+    if (typeof hideSnackbar === 'function') hideSnackbar();
     var _newChatMessagesEl = document.getElementById('messages');
     if (_newChatMessagesEl) _newChatMessagesEl.classList.remove('is-streaming');
 
@@ -400,9 +409,9 @@ function newChat() {
         try { renderWorkersStrip(); } catch (e) {}
     }
     // Recompute the jobs badge + any open dropdown. getActiveChatsList()
-    // excludes the focused chat, so swapping currentChatId to the fresh new
-    // chat is exactly what makes a still-running previous chat qualify as an
-    // "Active Chat". newChat bypasses selectChat (which got this recompute in
+    // now INCLUDES the focused chat (since v1.1.1 a running chat shows
+    // regardless of focus), so this keeps the badge/dropdown fresh while the
+    // previous chat keeps running. newChat bypasses selectChat (which got this recompute in
     // the fix #17 change), so without mirroring it here the just-backgrounded
     // running chat never shows in the badge/dropdown until some later
     // runStarted/runFinished event happens to recompute it. Same reason
@@ -441,6 +450,9 @@ function newChat() {
 
     // Push browser history state
     pushHistoryState('chat', currentChatId);
+    // B6: tell the SW the focused chat changed (newChat bypasses selectChat) so the
+    // sub-agent GC paths don't reclaim the just-defocused chat's transcript.
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
 }
 
 function selectChat(chatId, options) {
@@ -461,6 +473,15 @@ function selectChat(chatId, options) {
     // it on chat switch prevents an error from a previous chat bleeding into the
     // newly-viewed chat's UI; renderMessages will re-derive any per-chat error.
     lastApiError = null;
+    // R-2: clear the dead Retry button + the (non-auto-dismiss) error snackbar
+    // left over from the previous chat, then re-derive Retry from THIS chat's
+    // persisted error (R-1 stores an unfocused foreground chat's error on the
+    // chat as _lastApiError) so a previously-unfocused errored chat stays
+    // recoverable when the user navigates to it.
+    if (typeof hideRetryButton === 'function') hideRetryButton();
+    if (typeof hideSnackbar === 'function') hideSnackbar();
+    var _selErr = chats[chatId] && chats[chatId]._lastApiError;
+    if (_selErr) { lastApiError = _selErr; if (typeof showRetryButton === 'function') showRetryButton(); }
     if (runningChatIds[chatId]) {
         isRunning = true;
         activeStreamingChatId = chatId;
@@ -490,6 +511,9 @@ function selectChat(chatId, options) {
     }
     currentChatId = chatId;
     appStorage.setItem('lastChatId', chatId);
+    // SAGF-1: tell the SW which chat is focused so its sub-agent GC paths don't
+    // reclaim a transcript the user is now viewing (SW currentChatId is null).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
     clearUpdateSet();
     loadVersionHistory();
     renderChatList();
@@ -515,9 +539,9 @@ function selectChat(chatId, options) {
     if (typeof renderLiveActionPills === 'function') {
         try { renderLiveActionPills(); } catch (e) {}
     }
-    // Recompute the jobs badge: getActiveChatsList() excludes the focused chat,
-    // so switching focus away from a still-running chat is exactly what makes
-    // that chat qualify as an "Active Chat". The badge only re-renders on
+    // Recompute the jobs badge: getActiveChatsList() now INCLUDES the focused
+    // chat (since v1.1.1 a running chat shows regardless of focus), so this
+    // recompute keeps the badge count/colour fresh on switch. The badge only re-renders on
     // run start/finish events otherwise, so without this the background chat
     // never shows up in the badge/dropdown after navigation.
     if (typeof renderJobsBadge === 'function') {

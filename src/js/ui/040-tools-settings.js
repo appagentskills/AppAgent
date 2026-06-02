@@ -112,6 +112,9 @@ function toggleSettingsView() {
 function openSettingsPageView() {
     currentView = 'settings-page';
     appStorage.setItem('currentView', 'settings-page');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
     var settingsPanel = document.getElementById('settings-page-panel');
     if (settingsPanel) { settingsPanel.style.display = 'flex'; renderSettingsPage(); }
@@ -1495,6 +1498,12 @@ function hideAllPanels() {
 function showChatView() {
     var mainArea = document.getElementById('main-area');
     if (mainArea) mainArea.style.display = 'flex';
+    // SWM2-T3: returning from a non-chat view (which posted focus-chat(null) and set
+    // _focusSignalReceived=true) leaves no chat pinned as focused — the idle sweep then
+    // GCs the viewed chat's transcript. Re-post focus so the viewed chat is re-pinned.
+    if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId && typeof pushFocusChatToOffscreen === 'function') {
+        pushFocusChatToOffscreen(currentChatId);
+    }
 }
 
 // Update all sidebar button states

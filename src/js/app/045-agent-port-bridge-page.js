@@ -109,6 +109,24 @@ function _openAgentBus() {
     _agentBusPort.onMessage.addListener(_handleAgentBusMessage);
     _agentBusPort.onDisconnect.addListener(function() {
         _agentBusPort = null;
+        // RETRY-F2: an SW eviction disconnects the bus WITHOUT emitting a terminal
+        // runFinished/runCrashed for in-flight chats, so the page-side runningChatIds
+        // (and their _pendingRunAgents promises) are left stuck "running". The runAgent
+        // guard @:378 then treats Retry/Continue/Send as a no-op ("already running") and
+        // silently drops the user's action. Any chat still in runningChatIds here had NO
+        // terminal event by construction (runFinished/runCrashed delete it @:178), so
+        // clear it and settle its pending promise; the SW's 'hello' on reconnect
+        // re-populates runningChatIds for runs it actually resumed (@:206-209), and the
+        // SW-side run-agent handler is idempotent (guards on its own runningChatIds @:222)
+        // so a Retry that re-posts during the gap can't double-run a still-live SW loop.
+        try {
+            Object.keys(runningChatIds).forEach(function(cid) { delete runningChatIds[cid]; });
+            Object.keys(_pendingRunAgents).forEach(function(cid) {
+                var pr = _pendingRunAgents[cid];
+                delete _pendingRunAgents[cid];
+                if (pr && pr.resolve) { try { pr.resolve(); } catch (e) {} }
+            });
+        } catch (e) {}
         // SW restart — re-open. Slight delay to avoid tight loops.
         setTimeout(_openAgentBus, 250);
     });
@@ -116,6 +134,21 @@ function _openAgentBus() {
     // adopts them instead of re-dispatching. Must run synchronously
     // after connect — the SW resume gate waits ~1.5s for this.
     _sendPanelHello();
+    // SWM2-F1(B): re-post the focused chat on every bus (re)connect. After an SW
+    // restart the SW's _focusedChatId / _focusedChatByPort reset (in-memory only), so
+    // without this the sub-agent GC has no focus signal until the user next switches
+    // chats — and a sweep firing in that window could reclaim the very transcript the
+    // user is viewing. (SWM2-F1 part A defers GC when focus is unknown; this
+    // re-establishes it promptly.) Mirrors the permissions + hello re-push below.
+    if (typeof pushFocusChatToOffscreen === 'function') {
+        // SWM2-T1: derive focus from currentView (F3's source of truth) not currentChatId —
+        // view-leave sets currentView but never clears currentChatId, so keying off currentChatId
+        // re-pins a stale last-viewed chat after an SW restart, protecting it from GC. Always post
+        // (incl. null) so focus is treated as reported (pairs with SWM2-T2).
+        var _focusNow = (typeof currentView !== 'undefined' && currentView === 'chat'
+            && typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
+        pushFocusChatToOffscreen(_focusNow);
+    }
     // Re-mirror in-memory session permissions: the SW loses these on
     // restart (in-memory only, not in IDB), so without this push the user
     // would get prompted again after a SW eviction even though they
@@ -198,6 +231,11 @@ function _handleAgentBusMessage(msg) {
                 // refreshes the sidebar but not the badge (whose Active Chats
                 // group reads getActiveChatsList()).
                 if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+                // ...and re-render an already-open jobs dropdown so a newly
+                // discovered background run shows without needing a reopen.
+                if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+                    try { var _jdHello = _getOpenJobsDropdown(); if (_jdHello) renderJobsDropdown(_jdHello); } catch (e) {}
+                }
             }
             // Install initial sub-agent snapshot. The page's own
             // loadAllSubAgents at boot rehydrates from IDB so the strip
@@ -413,15 +451,51 @@ function pushChatUpdateToOffscreen(chatId) {
 
 // Toggle pause from the page side (the existing togglePause UI calls
 // into this and pushes the new state to offscreen).
-function pushPauseToggleToOffscreen(chatId, paused) {
-    if (!_agentBusPort || !chatId) return;
+// SWM14-F5: per-chat latest-wins tokens for pause toggles. A rapid Pause→Resume
+// during a port-down window spawns two independent retry chains (paused=true then
+// paused=false); without these they can post out of order and leave the SW in the
+// WRONG final pause state. Each fresh (non-retry) call bumps the chat's generation
+// and records the latest desired value; a retry carries its generation and no-ops if
+// a newer toggle superseded it, and always posts the CURRENT latest desired value.
+var _pauseToggleGen = Object.create(null);
+var _pauseToggleDesired = Object.create(null);
+
+function pushPauseToggleToOffscreen(chatId, paused, _retries, _gen) {
+    if (!chatId) return;
+    // SWM14-F5: allocate/refresh the generation on a fresh call; drop a superseded
+    // stale chain; always act on the CURRENT latest desired value for this chat.
+    if (_gen === undefined) {
+        _gen = (_pauseToggleGen[chatId] || 0) + 1;
+        _pauseToggleGen[chatId] = _gen;
+        _pauseToggleDesired[chatId] = !!paused;
+    } else if (_gen !== _pauseToggleGen[chatId]) {
+        return; // a newer Pause/Resume for this chat superseded this chain — drop it
+    }
+    var _desired = _pauseToggleDesired[chatId];
+    // Don't silently drop the toggle during the ~250ms+ window while
+    // _openAgentBus re-connects after a SW eviction — a dropped pause means the
+    // SW never aborts and the run keeps going. Retry briefly (mirrors runAgent's
+    // attempt() loop) so the pause reliably reaches the SW.
+    if (!_agentBusPort) {
+        // SWM4F-1: don't give up after the bounded ~1s retry. On a slow SW
+        // reconnect a bare return left the UI showing "paused" while the SW
+        // kept streaming. On exhaustion force-reopen the bus and keep trying
+        // with a reset counter so the toggle eventually lands.
+        if ((_retries || 0) < 20) { setTimeout(function() { pushPauseToggleToOffscreen(chatId, _desired, (_retries || 0) + 1, _gen); }, 50); }
+        else { try { _openAgentBus(); } catch (e) {} setTimeout(function() { pushPauseToggleToOffscreen(chatId, _desired, 0, _gen); }, 250); }
+        return;
+    }
     try {
         _agentBusPort.postMessage({
             type: 'toggle-pause',
             chatId: chatId,
-            paused: !!paused
+            paused: !!_desired
         });
-    } catch (e) {}
+    } catch (e) {
+        // SWM4F-1: same exhaustion fallback as the no-port guard above.
+        if ((_retries || 0) < 20) { setTimeout(function() { pushPauseToggleToOffscreen(chatId, _desired, (_retries || 0) + 1, _gen); }, 50); }
+        else { try { _openAgentBus(); } catch (e2) {} setTimeout(function() { pushPauseToggleToOffscreen(chatId, _desired, 0, _gen); }, 250); }
+    }
 }
 
 // Push the new hooksEnabled to the SW after the user toggles a hook in
@@ -463,16 +537,73 @@ function pushPermissionsToOffscreen(patch) {
     } catch (e) {}
 }
 
+// SAGF-1: tell the SW which chat the user is now viewing so the sub-agent GC
+// paths (_idleSweepTick / loadAllSubAgents) don't reclaim a transcript the user
+// is actively reading. Best-effort — the GC TTLs are minutes-to-hours so a
+// transient miss during a bus reconnect can't realistically race a sweep, and
+// the next selectChat / openChatFromHistory re-posts the focus anyway.
+function pushFocusChatToOffscreen(chatId) {
+    if (!_agentBusPort) return;
+    try {
+        _agentBusPort.postMessage({ type: 'focus-chat', chatId: chatId || null });
+    } catch (e) {}
+}
+
 // Send an interrupt (user pressed send during a tool call).
-function pushInterruptToOffscreen(chatId, fromUserMessage) {
-    if (!_agentBusPort || !chatId) return;
+// SWM14-F5: per-chat latest-wins tokens for the interrupt push — same rationale as
+// the pause toggle above: rapid interrupts during a port-down window must not post
+// out of order. Generation supersedes a stale retry chain; the desired
+// fromUserMessage is always read fresh. (All current callers pass false, so this is
+// belt-and-suspenders, but it keeps the two retry primitives symmetric.)
+var _interruptGen = Object.create(null);
+var _interruptDesired = Object.create(null);
+
+function pushInterruptToOffscreen(chatId, fromUserMessage, _retries, _gen) {
+    if (!chatId) return;
+    if (_gen === undefined) {
+        _gen = (_interruptGen[chatId] || 0) + 1;
+        _interruptGen[chatId] = _gen;
+        _interruptDesired[chatId] = !!fromUserMessage;
+    } else if (_gen !== _interruptGen[chatId]) {
+        return; // a newer interrupt for this chat superseded this chain — drop it
+    }
+    var _fum = _interruptDesired[chatId];
+    // Don't silently drop the interrupt during the ~250ms+ window while
+    // _openAgentBus re-connects after a SW eviction — a dropped interrupt means
+    // the SW never aborts the in-flight tool/stream. Retry briefly (mirrors
+    // runAgent's attempt() loop) so the interrupt reliably reaches the SW.
+    if (!_agentBusPort) {
+        // SWM4F-1: don't give up after the bounded ~1s retry. On a slow SW
+        // reconnect a bare return left the UI showing the run as interrupted
+        // while the SW kept streaming. On exhaustion force-reopen the bus and
+        // keep trying with a reset counter so the interrupt eventually lands.
+        if ((_retries || 0) < 20) { setTimeout(function() { pushInterruptToOffscreen(chatId, _fum, (_retries || 0) + 1, _gen); }, 50); }
+        else { try { _openAgentBus(); } catch (e) {} setTimeout(function() { pushInterruptToOffscreen(chatId, _fum, 0, _gen); }, 250); }
+        return;
+    }
     try {
         _agentBusPort.postMessage({
             type: 'interrupt',
             chatId: chatId,
-            fromUserMessage: !!fromUserMessage
+            fromUserMessage: !!_fum
         });
-    } catch (e) {}
+    } catch (e) {
+        // SWM4F-1: same exhaustion fallback as the no-port guard above.
+        if ((_retries || 0) < 20) { setTimeout(function() { pushInterruptToOffscreen(chatId, _fum, (_retries || 0) + 1, _gen); }, 50); }
+        else { try { _openAgentBus(); } catch (e2) {} setTimeout(function() { pushInterruptToOffscreen(chatId, _fum, 0, _gen); }, 250); }
+    }
+}
+
+// SWM14-T3: symmetric no-post supersede for the interrupt retry primitive. A stale
+// interrupt(false) retry chain armed during a prior port-down window can survive a fresh
+// send and, on reconnect, abort the new stream + delete the just-queued pendingInjection.
+// Bumping the generation (without posting) invalidates any in-flight retry chain carrying
+// an older _gen (it no-ops at the `_gen !== _interruptGen[chatId]` guard), mirroring the
+// pause supersede done at the send sites (SWM14-T1).
+function _supersedeInterruptToggle(chatId) {
+    if (!chatId) return;
+    _interruptGen[chatId] = (_interruptGen[chatId] || 0) + 1;
+    _interruptDesired[chatId] = false;
 }
 
 // Open the port now. We don't wait for Platform.ready because the

@@ -753,13 +753,16 @@ async function executeManageSkill(args) {
         // tools added afterwards) is immediately available to the agent without a
         // separate activate call.
         var activated = false;
-        try {
-            if (typeof activateSkill === 'function') {
-                var activation = await activateSkill(id);
-                activated = !!(activation && activation.success);
+        var activateDisabled = (typeof getDisabledTools === 'function') && getDisabledTools().indexOf('manage_skill:activate') !== -1;
+        if (!activateDisabled) {
+            try {
+                if (typeof activateSkill === 'function') {
+                    var activation = await activateSkill(id);
+                    activated = !!(activation && activation.success);
+                }
+            } catch (e) {
+                console.warn('Auto-activation of created skill failed:', e);
             }
-        } catch (e) {
-            console.warn('Auto-activation of created skill failed:', e);
         }
 
         renderSkillsList();
@@ -770,7 +773,9 @@ async function executeManageSkill(args) {
             success: true,
             skill_id: id,
             activated: activated,
-            message: 'Skill created' + (activated ? ' and activated' : '') + ': ' + name + (sanitizedActions.length ? ' (' + sanitizedActions.length + ' action' + (sanitizedActions.length === 1 ? '' : 's') + ')' : ''),
+            message: (activateDisabled
+                ? 'Skill created (left inactive — Activate Skill capability is disabled): ' + name
+                : 'Skill created' + (activated ? ' and activated' : '') + ': ' + name) + (sanitizedActions.length ? ' (' + sanitizedActions.length + ' action' + (sanitizedActions.length === 1 ? '' : 's') + ')' : ''),
             actions: sanitizedActions
         };
     }
@@ -995,6 +1000,15 @@ async function executeManageSkill(args) {
     if (action === 'deactivate') {
         var result = await deactivateSkill(skillId);
         return result;
+    }
+
+    if (action === 'delete') {
+        if (activeSkills[skillId]) { try { await deactivateSkill(skillId); } catch (e) {} }
+        await deleteSkill(skillId);
+        if (skills[skillId]) delete skills[skillId];
+        if (typeof renderSkillsList === 'function') renderSkillsList();
+        if (typeof renderAllActionPlacements === 'function') renderAllActionPlacements();
+        return { success: true, message: 'Skill deleted: ' + skillId };
     }
     
     return { success: false, error: 'Unknown action: ' + action };

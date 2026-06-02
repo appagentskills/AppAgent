@@ -115,6 +115,38 @@ var SUB_AGENT_PREAMBLE = [
 // truth during a session; persisted to IDB on every mutation.
 var _subAgents = Object.create(null);
 
+// SAGF-1: the chat id the user is currently viewing, threaded page→SW via a
+// `focus-chat` envelope (SubAgents.setFocusedChat). In the SW `currentChatId`
+// is permanently null, so the GC paths consult THIS instead to avoid deleting
+// a tombstone / abandoned-sleep transcript the user is actively reading.
+var _focusedChatId = null;
+// SWM2-F2: focus keyed by panel/port. Multiple panels can each view a different
+// chat; a single scalar is last-writer-wins, so a 2nd panel's focus would clobber
+// the 1st's and the 1st's viewed transcript would be GC'd. Track per-port focus so
+// the GC guards skip a chat focused by ANY live panel. _focusedChatId remains the
+// backward-compatible single/default focus (used when setFocusedChat is called
+// without a portKey) so single-panel behavior is unchanged.
+var _focusedChatByPort = Object.create(null);
+var _focusSignalReceived = false; // SWM2-T2: true once ANY focus-chat (set OR clear) arrives from a live panel — distinguishes boot/restart-unknown (defer GC) from deliberately-cleared focus on a non-chat view (GC may run). Resets on SW restart (module re-eval).
+// SWM2-F1(A): true when ANY focus signal is known (default scalar set, or some port
+// reported a focused chat). When NOTHING is known — at SW boot / right after a
+// restart, before the page re-posts focus-chat — the GC paths DEFER rather than risk
+// reclaiming the transcript the user is actually viewing (the SW's currentChatId is
+// permanently null, so it is no signal). Mirrors loadAllSubAgents' B7 deferral.
+function _isFocusEstablished() {
+    if (_focusedChatId) return true;
+    for (var _pk in _focusedChatByPort) { if (_focusedChatByPort[_pk]) return true; }
+    return _focusSignalReceived; // SWM2-T2: once a panel has reported focus (even a clear), trust it instead of forever deferring GC
+}
+// SWM2-F2: true when chatId is the focused chat of the default scalar OR of any live
+// panel. The GC guards use this so no panel's viewed transcript is reclaimed.
+function _isChatFocusedByAnyPanel(chatId) {
+    if (!chatId) return false;
+    if (_focusedChatId && _focusedChatId === chatId) return true;
+    for (var _pk2 in _focusedChatByPort) { if (_focusedChatByPort[_pk2] === chatId) return true; }
+    return false;
+}
+
 // Worker pool: { running: Set<agent_id>, queue: agent_id[] }. running tracks
 // which subs currently have an active runAgent loop. queue holds subs whose
 // records were created but who haven't been started yet because the pool was
@@ -164,19 +196,47 @@ async function loadAllSubAgents() {
                     // GC tombstoned records past TTL.
                     if ((rec.state === 'stopped' || rec.state === 'errored')
                         && rec.settled_at && (now - rec.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS) {
-                        _subAgentsDeleteFromDB(rec.agent_id);
-                        // Also reclaim the sub's background chat row. The runtime
-                        // idle sweep (_idleSweepTick) deletes BOTH the record and
-                        // the chat row, but this boot-time GC only deleted the
-                        // record — orphaning the chat row in `chats` + IDB forever
-                        // (it is never revisited: the record is gone from
-                        // _subAgents, so the idle sweep can no longer reach it).
-                        // Mirror the sweep's cleanup here, best-effort and guarded.
-                        try {
-                            if (typeof chats !== 'undefined' && rec.chat_id && chats[rec.chat_id]) delete chats[rec.chat_id];
-                            if (typeof deleteChatFromDB === 'function' && rec.chat_id) deleteChatFromDB(rec.chat_id);
-                        } catch (e) { /* non-fatal */ }
-                        return;
+                        // Only the authoritative (SW/headless) context may reclaim
+                        // tombstones from IDB. The page bundle ALSO runs
+                        // loadAllSubAgents() at boot; letting it delete the sub_agents
+                        // record + background chat row races the SW's own persistence —
+                        // the exact bug the runtime _idleSweepTick gating fixed but never
+                        // applied here. The page just skips mirroring the expired
+                        // tombstone (the SW GCs it and rebroadcasts the snapshot).
+                        if (typeof Platform !== 'undefined' && Platform.isWorker !== true) return;
+                        // SAGF-1: never GC a tombstone whose transcript the user is
+                        // actively viewing. In the SW currentChatId is always null, so
+                        // consult the page→SW-threaded _focusedChatId instead; defer
+                        // reclamation to a later sweep once the user navigates away.
+                        // SAGF-1 + B7: never GC a tombstone whose transcript the user
+                        // is actively viewing. In the SW currentChatId is always null,
+                        // so consult the page→SW-threaded _focusedChatId. At SW BOOT it
+                        // may not be threaded yet (the page's focus-chat races this
+                        // synchronous load), so only reclaim when focus is KNOWN and
+                        // points at a DIFFERENT chat. When focus is unknown (null) or
+                        // matches this record, do NOT delete — fall through to load the
+                        // record so a later _idleSweepTick (after focus is established)
+                        // reclaims it. Early-returning here instead would skip the load
+                        // below, hide the tombstone from the sweep, and leak the IDB
+                        // record + chat row forever.
+                        // SWM2-F2: reclaim only when focus is ESTABLISHED and no live
+                        // panel is viewing THIS record's transcript. (Pre-F2 this was a
+                        // single-scalar check; the port-keyed map generalises it so a
+                        // 2nd panel's focus can't be clobbered.) When focus is unknown
+                        // (boot race) it falls through to load the record and defer to
+                        // a later _idleSweepTick — same B7 deferral as before.
+                        if (_isFocusEstablished() && !_isChatFocusedByAnyPanel(rec.chat_id)) {
+                            _subAgentsDeleteFromDB(rec.agent_id);
+                            // Also reclaim the sub's background chat row, mirroring the
+                            // idle sweep's cleanup (best-effort, guarded).
+                            try {
+                                if (typeof chats !== 'undefined' && rec.chat_id && chats[rec.chat_id]) delete chats[rec.chat_id];
+                                if (typeof deleteChatFromDB === 'function' && rec.chat_id) deleteChatFromDB(rec.chat_id);
+                            } catch (e) { /* non-fatal */ }
+                            return;
+                        }
+                        // else: focus unknown (boot race) or user is viewing this
+                        // transcript — defer reclamation to the idle sweep.
                     }
                     // Backfill Phase-5 fields for records persisted before this
                     // upgrade. A legacy record has no `depth` / `root_chat_id`.
@@ -335,18 +395,38 @@ function _idleSweepTick() {
         //    NOT judge "handle settled" (it would treat every sleeping sub as
         //    collectable and race the SW); a still-pending handle means a parent is
         //    mid-await and must never be collected.
-        var _isTombstone = (r.state === 'stopped' || r.state === 'errored')
-            && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS;
         var _authoritativeCtx = (typeof Platform === 'undefined') || (Platform.isWorker === true);
+        // Gate BOTH reclamation paths to the authoritative (SW/headless) context.
+        // The page is a read-only mirror (empty _spawnDeferreds); letting it delete
+        // the sub_agents IDB record + background chat row races the SW's persistence
+        // and breaks the sub_report "open transcript" link. _isAbandonedSleep was
+        // already gated; _isTombstone was not.
+        var _isTombstone = _authoritativeCtx
+            && (r.state === 'stopped' || r.state === 'errored')
+            && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS;
         var _isAbandonedSleep = _authoritativeCtx
             && r.state === 'sleeping'
             && r.last_activity_at && (now - r.last_activity_at) > SUBAGENT_SLEEP_TTL_MS
             && !_spawnDeferreds[r.spawn_handle_id];
         if (_isTombstone || _isAbandonedSleep) {
+            // SWM2-F1(A): if focus is COMPLETELY unknown (SW boot / just after a
+            // restart, before the page re-posts focus-chat) DEFER reclamation to a
+            // later sweep — reclaiming now could rip out the transcript the user is
+            // actively viewing (the SW's currentChatId is permanently null, so it is
+            // no signal). Mirrors loadAllSubAgents' B7 deferral.
+            if (!_isFocusEstablished()) continue;
             // Skip GC if the user is currently viewing this sub's transcript —
             // otherwise the chat row gets ripped out from under them and the
             // message list goes blank. Defer to the next sweep.
-            if (typeof currentChatId !== 'undefined' && currentChatId === r.chat_id) {
+            // B8: the `currentChatId === r.chat_id` clause is effectively dead here —
+            // _isTombstone/_isAbandonedSleep both require _authoritativeCtx (the SW),
+            // where currentChatId is permanently null. The live guard is the page→SW-
+            // threaded focus; the currentChatId clause is kept only as a harmless
+            // defensive fallback should this sweep ever run page-side.
+            // SWM2-F2: skip if ANY live panel is viewing this transcript (focus is now
+            // keyed per panel — a single scalar would let a 2nd panel clobber the 1st).
+            if ((typeof currentChatId !== 'undefined' && currentChatId === r.chat_id)
+                || _isChatFocusedByAnyPanel(r.chat_id)) {
                 continue;
             }
             // Also delete the sub's chat record. Previously only the sub-agent
@@ -361,6 +441,19 @@ function _idleSweepTick() {
                     else if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                 }
             } catch (e) { console.warn('subAgent GC: failed to delete chat row', r.chat_id, e); }
+            // A reclaimed ABANDONED-SLEEP parent may still own live descendants:
+            // 'sleeping' is non-terminal, so no cascade ran when it parked. If we
+            // delete its record + chat row now without cascading, a still-running
+            // descendant orphans — it holds its pool slot until it finishes on its
+            // own and its report/handle targets a deleted parent chat. Tombstones
+            // (stopped/errored) were already cascaded at termination, so gate the
+            // cascade on the abandoned-sleep case only. _cascadeStopDescendants
+            // merely MARKS descendants terminal (no _subAgents key deletion), so
+            // the enclosing for..in over _subAgents stays valid.
+            if (_isAbandonedSleep) {
+                try { _cascadeStopDescendants(r, 'parent sub-agent reclaimed (abandoned sleep): ' + (r.name || aid)); }
+                catch (e) { console.warn('subAgent GC: cascade-stop on reclaim failed', aid, e); }
+            }
             delete _subAgents[aid];
             try { _subAgentsDeleteFromDB(aid); } catch (e) { console.warn('subAgent GC: failed to delete record', aid, e); }
         }
@@ -1678,7 +1771,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
             at: Date.now(),
             _synthesized: true
         };
-        if (_runErrored) { rec.state = 'errored'; rec.settled_at = rec.settled_at || Date.now(); }
+        if (_runErrored) { _cascadeStopDescendants(rec, 'parent sub-agent crashed: ' + rec.name); rec.state = 'errored'; rec.settled_at = rec.settled_at || Date.now(); }
         _subAgentsPersist(rec);
         _releasePoolSlot(rec.agent_id);
         _resolveSpawnHandle(rec.agent_id, {
@@ -1707,6 +1800,11 @@ function onSubAgentRunFinished(chatId, finishCtx) {
         // trailing _parkSubAgent() downgrades the run to `sleeping`, which the
         // GC never collects → permanent record + chat-row leak. settled_at is
         // required for the tombstone TTL check to ever fire.
+        // SA-CASCADE-GAP: this terminal-errored branch must also cascade-stop any
+        // descendants the sub spawned, mirroring _stopSubAgentImpl's cascade —
+        // otherwise a no-report crash orphans the whole sub-tree (leaked pool
+        // slots + chat rows that never GC).
+        _cascadeStopDescendants(rec, 'parent sub-agent errored: ' + rec.name);
         rec.state = 'errored';
         rec.settled_at = rec.settled_at || Date.now();
         _subAgentsPersist(rec);
@@ -1745,6 +1843,28 @@ var SubAgents = {
     // SW registry. Called by the page-side port bridge on `hello` and on
     // every `subagent-snapshot` envelope.
     applySnapshot: applySubAgentSnapshot,
+    // SAGF-1: page→SW focus tracking. The page posts a `focus-chat` envelope
+    // whenever the user selects/opens a chat; the SW port bridge calls this so
+    // the GC paths (_idleSweepTick / loadAllSubAgents) can skip a transcript
+    // the user is actively viewing (SW currentChatId is always null).
+    setFocusedChat: function(id, portKey) {
+        _focusSignalReceived = true; // SWM2-T2: a live panel has now reported its focus (set or clear)
+        // SWM2-F2: portKey-aware. With a portKey, focus is tracked per panel (so a
+        // 2nd panel can't clobber the 1st's focus); a null/empty chatId clears just
+        // that port's entry. Without a portKey, fall back to the single default
+        // scalar — identical to the pre-F2 behavior, so single-panel is unchanged.
+        if (portKey != null && portKey !== '') {
+            if (id) _focusedChatByPort[portKey] = id;
+            else delete _focusedChatByPort[portKey];
+        } else {
+            _focusedChatId = id || null;
+        }
+    },
+    // SWM2-F2: drop a disconnected panel's focus entry (called by the SW port
+    // bridge's _unregisterPanel) so a closed panel doesn't pin a transcript forever.
+    clearFocusedChatForPort: function(portKey) {
+        if (portKey != null && portKey !== '') delete _focusedChatByPort[portKey];
+    },
     // Read-only access for UI components
     getById: function(agentId) { return _subAgents[agentId] || null; },
     listAll: function() {

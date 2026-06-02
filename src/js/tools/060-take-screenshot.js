@@ -170,6 +170,9 @@ async function executeTakeScreenshot(args) {
             }
             var widgetIframe = getWidgetIframe(widgetId);
             if (!widgetIframe) {
+                if (_ssWidget) {
+                    return { success: false, error: 'Widget "' + (_ssWidget.title || widgetId) + '" (' + widgetId + ') exists but is not rendered in a live panel in the current chat context, so it cannot be captured via the live DOM. This typically happens in a background/non-foreground chat where the widget is not mounted in the visible DOM. Re-run the screenshot in a foreground chat where the widget is rendered.' };
+                }
                 return { success: false, error: 'Widget not found: ' + widgetId + '. Make sure the widget is visible in the chat or dashboard.' };
             }
             var _widgetCrossOrigin = false;
@@ -282,13 +285,20 @@ async function executeTakeScreenshot(args) {
                     // Safety net ONLY (never the primary path): cap the wait so a
                     // missing signal can't hang the capture. Falls through to
                     // capture-anyway and is surfaced in the result via render_wait.
-                    _wssMaxWait = setTimeout(function() { finish(false, 'timeout'); }, 5000);
+                    _wssMaxWait = setTimeout(function() { finish(false, 'timeout'); }, 8000);
                 });
                 try {
                     _wssTab = await chrome.tabs.create({ url: _wssUrl, active: false });
                     // Block until the post-edit widget is actually painted (matching
                     // contentVersion), or until the safety-net max-wait elapses.
                     await _wssRenderPromise;
+                    // Fallback-only settle: when the deterministic render-complete
+                    // signal never arrived (safety-net timeout), give a near-miss
+                    // paint a little extra time to land before capturing so we don't
+                    // grab a pre-paint frame. Skipped entirely when the signal arrived.
+                    if (!_wssRenderedViaSignal) {
+                        await new Promise(function(r){ setTimeout(r, 700); });
+                    }
                     // Temporarily point sendBrowserAction at the widget tab
                     var _wssChat = chats[currentChatId];
                     var _wssOrigTabId = _wssChat && _wssChat.targetTabId;

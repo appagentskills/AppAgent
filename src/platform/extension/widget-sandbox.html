@@ -18,14 +18,23 @@ window.addEventListener('message', function(e) {
         // double rAF guarantees one full frame after layout; fonts.ready avoids
         // capturing before web fonts swap in. (window survives document.write, so
         // requestAnimationFrame / document.fonts remain valid here.)
+        // rAF-OR-setTimeout fallback: this widget renders inside the HIDDEN screenshot
+        // temp tab (chrome.tabs.create active:false), where rAF callbacks are throttled/
+        // paused, so a bare requestAnimationFrame chain never fires and widgetContentLoaded
+        // is never posted -> the capturer always hit the 8s timeout. _nextFrame fires on
+        // whichever of rAF or a 50ms timer comes first, so the signal progresses even in a
+        // hidden tab; rAF still wins in a visible/foreground tab (timing unchanged there).
+        var _nextFrame = function(cb){ var done=false; var fire=function(){ if(done) return; done=true; try{ cb(); }catch(e){} }; try{ requestAnimationFrame(fire); }catch(e){} setTimeout(fire, 50); };
         var _signalRendered = function() {
             try { window.parent.postMessage({ type: 'widgetContentLoaded' }, '*'); } catch (err) {}
         };
         var _afterLayout = function() {
-            requestAnimationFrame(function() { requestAnimationFrame(_signalRendered); });
+            _nextFrame(function() { _nextFrame(_signalRendered); });
         };
         if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
-            document.fonts.ready.then(_afterLayout, _afterLayout);
+            // Guard against a never-resolving fonts.ready (also throttled in hidden tabs):
+            // race it against a 200ms cap so the chain can't hang waiting on font swap.
+            Promise.race([document.fonts.ready, new Promise(function(r){ setTimeout(r, 200); })]).then(_afterLayout, _afterLayout);
         } else {
             _afterLayout();
         }

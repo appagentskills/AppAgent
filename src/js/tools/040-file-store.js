@@ -40,6 +40,10 @@ function getFile(fileId) {
         }
         // Also check chat.screenshots map (from widget/js_eval bridge)
         if (c.screenshots && c.screenshots[fileId]) {
+            // Cache the pointer so future getFile()/screenshot_by_id lookups for this
+            // id skip the full O(chats x messages) scan (the 'chat' branch above
+            // already caches; this branch previously did not).
+            fileIndex.set(fileId, { type: 'screenshots_map', chatId: chatIds[ci] });
             var ss = c.screenshots[fileId];
             return {
                 id: fileId, name: ss.name || null,

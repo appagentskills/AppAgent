@@ -44,6 +44,97 @@ var _pendingUIToolCalls = {};
 var _panelAdoptedTools = {};  // toolCallId -> { chatId, name }
 var _adoptedResults = {};      // toolCallId -> { result, error }
 
+// B2: the adopted-reconcile maps above are seeded on panel-hello (SW-restart) and
+// consumed by the executeTool adoption arm. If the resumed loop never re-dispatches
+// that toolCallId (injectInterruptedToolResults back-fills a placeholder instead),
+// the entry would leak until SW teardown. Evict after a TTL so the maps stay bounded.
+// 60s matches the page's completed-tool-results window — the only interval in which
+// adoption is relevant.
+var ADOPTED_RESULT_TTL_MS = 60 * 1000;
+// B1: backstop for a re-parked (already-dispatched) tool whose result never arrives
+// after a panel reconnect — reject rather than hang the loop forever. Generous so a
+// legitimately still-running tool finishing post-reconnect settles first.
+var REDISPATCH_RECONCILE_TTL_MS = 30 * 1000;
+var _adoptedEvictTimers = {};
+function scheduleAdoptedEviction(toolCallId) {
+    // SWM3-N1(a): re-stamping on every panel-hello must EXTEND the TTL, not stack
+    // timers — an OLD timer firing later would clobber a freshly re-stamped live
+    // marker (downgrading a still-running tool to a tombstone). Clear any pending
+    // timer for this id first so a tool that keeps re-declaring inflight never
+    // expires, and so exactly one eviction is ever in flight per id.
+    if (_adoptedEvictTimers[toolCallId]) clearTimeout(_adoptedEvictTimers[toolCallId]);
+    _adoptedEvictTimers[toolCallId] = setTimeout(function() {
+        delete _adoptedEvictTimers[toolCallId];
+        var m = _panelAdoptedTools[toolCallId];
+        // Drop the buffered result payload — its only consumer is the executeTool
+        // adoption arm within this window; past it nobody wants it.
+        delete _adoptedResults[toolCallId];
+        if (!m) return;
+        // Orphaned re-stamp: executeTool ALREADY ran for this id (a pending entry
+        // exists, which owns reconciliation). The marker is stray — delete it (the
+        // original always deleted; keeping it would leak). No tombstone needed.
+        if (_pendingUIToolCalls[toolCallId]) { delete _panelAdoptedTools[toolCallId]; return; }
+        // SWM3-T3: don't downgrade a marker whose adopting panel is STILL connected.
+        // The first-level TTL bounds a marker the resumed loop never consumed, but a
+        // live adopting port means the tool may still be executing (or about to be
+        // adopted) — downgrading to a port-less tombstone here strips the live port, so
+        // a later panel disconnect's _unregisterPanel scan (filters on entry.port)
+        // can't match it and the awaited promise hangs. Re-arm the TTL and bail; the
+        // pending-entry check above already handled the loop-already-ran case.
+        if (m.port && typeof _swPanelPorts !== 'undefined' && _swPanelPorts.has(m.port)) {
+            scheduleAdoptedEviction(toolCallId);
+            return;
+        }
+        // SWM3-N1(b): the loop has NOT reached executeTool(toolCallId) yet. Do NOT
+        // fully delete the marker — a late executeTool would then find nothing and
+        // BLIND RE-DISPATCH a tool the panel already ran (double side effect).
+        // Downgrade to a port-less tombstone so the adoption arm reconciles instead
+        // (registers a waiting pending entry, never re-dispatches).
+        _panelAdoptedTools[toolCallId] = { dispatched: true, chatId: m.chatId };
+        // Bound growth: if the loop never reaches executeTool(toolCallId) to consume
+        // the tombstone, drop it after a second TTL (unless a pending entry adopted
+        // it in the meantime).
+        _adoptedEvictTimers[toolCallId] = setTimeout(function() {
+            delete _adoptedEvictTimers[toolCallId];
+            var t = _panelAdoptedTools[toolCallId];
+            if (t && t.dispatched && !t.port && !_pendingUIToolCalls[toolCallId]) delete _panelAdoptedTools[toolCallId];
+            if (!_pendingUIToolCalls[toolCallId]) delete _adoptedResults[toolCallId]; // SWM3-L1: don't orphan a late-written buffer
+        }, ADOPTED_RESULT_TTL_MS);
+    }, ADOPTED_RESULT_TTL_MS);
+}
+
+// SWM3-N3: arm the 30s redispatch backstop for an already-dispatched/adopted tool
+// whose live panel is gone (a port-less tombstone, or a _unregisterPanel re-park).
+// Stores the timer id ON the pending entry so a later panel-hello that re-declares
+// the id still-inflight can CANCEL it — otherwise the backstop kills a tool the
+// panel is legitimately still executing (slow iframe wait_for / take_screenshot).
+// prompt_user is exempt ENTIRELY: it can wait on the user far longer than 30s and a
+// reconnecting panel keeps re-declaring it inflight.
+function armRedispatchBackstop(toolCallId, name) {
+    if (name === 'prompt_user') return;
+    var pe = _pendingUIToolCalls[toolCallId];
+    if (!pe) return;
+    pe._backstopTimer = setTimeout(function() {
+        var p = _pendingUIToolCalls[toolCallId];
+        if (p && p._backstopTimer) {
+            delete _pendingUIToolCalls[toolCallId];
+            try { p.reject(new Error('panel closed mid-tool; result unrecoverable — not re-executed to avoid duplicate side effects')); } catch (e) {}
+        }
+    }, REDISPATCH_RECONCILE_TTL_MS);
+}
+
+// SWM3-N3: a reconnecting panel re-declared this tool still-inflight, so it's alive
+// and executing — cancel any pending backstop so it doesn't kill a legitimately-slow
+// tool. (The caller also refreshes the pending entry's port for clean-reject on the
+// new panel's disconnect.)
+function clearRedispatchBackstop(toolCallId) {
+    var pe = _pendingUIToolCalls[toolCallId];
+    if (pe && pe._backstopTimer) {
+        clearTimeout(pe._backstopTimer);
+        pe._backstopTimer = null;
+    }
+}
+
 // Resolve when the SW has heard from at least one panel (so the resume
 // path can see _panelAdoptedTools) or after a 1.5s fallback (no panel
 // is open — proceed with redispatch).
@@ -59,14 +150,33 @@ self._swOpenResumeGate = function() {
 setTimeout(self._swOpenResumeGate, 1500);
 
 // Called by 130-port-bridge.js on panel-hello.
-self._swAdoptPanelInflight = function(payload) {
+self._swAdoptPanelInflight = function(payload, port) {
     payload = payload || {};
     var inflight = payload.inflightToolCalls;
     var completed = payload.completedToolResults;
     if (inflight && inflight.length) {
         inflight.forEach(function(it) {
             if (it && it.toolCallId) {
-                _panelAdoptedTools[it.toolCallId] = { chatId: it.chatId, name: it.name };
+                // SWM3-N3: if the loop ALREADY reached executeTool(id) and is awaiting
+                // (a pending entry exists), the marker below won't be re-consumed —
+                // instead the panel re-declaring this tool still-inflight proves it's
+                // alive and executing, so refresh the pending entry's port (for
+                // clean-reject on the NEW panel's disconnect) and CANCEL any pending
+                // redispatch backstop, which would otherwise kill a legitimately-slow
+                // tool (prompt_user on the user, iframe wait_for / take_screenshot).
+                var _pe = _pendingUIToolCalls[it.toolCallId];
+                if (_pe) {
+                    _pe.port = port;
+                    clearRedispatchBackstop(it.toolCallId);
+                }
+                // SWM3F-1: carry the adopting panel's port so the executeTool
+                // adoption arm can stamp it onto the pending entry. Otherwise
+                // _unregisterPanel's disconnect scan (filters on entry.port)
+                // skips the adopted entry and the awaited promise hangs forever.
+                // SWM3-N1(a): re-stamping on every hello (with a fresh eviction)
+                // keeps a still-running tool's marker alive across reconnects.
+                _panelAdoptedTools[it.toolCallId] = { chatId: it.chatId, name: it.name, port: port };
+                scheduleAdoptedEviction(it.toolCallId); // B2: bound the map if never adopted
             }
         });
     }
@@ -108,6 +218,7 @@ self._swAdoptPanelInflight = function(payload) {
                 // adoption short-circuit in the executeTool wrapper.
                 _panelAdoptedTools[c.toolCallId] = { chatId: c.chatId, name: c.name };
                 _adoptedResults[c.toolCallId] = { result: c.result, error: c.error || null };
+                scheduleAdoptedEviction(c.toolCallId); // B2: bound the map if never adopted
             }
         });
     }
@@ -121,7 +232,7 @@ self._swAdoptPanelInflight = function(payload) {
 // can show the placeholder message. The checkpoint module also
 // hooks `toolParked` to persist to IDB.
 // =============================================================
-function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandboxCtx) {
+function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandboxCtx, alreadyDispatched) {
     if (!parkedToolCallsByChatId[chatId]) parkedToolCallsByChatId[chatId] = [];
     var entry = {
         toolCallId: toolCallId,
@@ -132,6 +243,11 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
         // Carry eager-render hints across the park so replay to a fresh panel
         // still lets executeDisplay attach to the parent tool_result slot.
         sandboxCtx: sandboxCtx || null,
+        // B1: true when this park is a _unregisterPanel RE-park of a tool that was
+        // already dispatched to (and may have executed on) the now-disconnected
+        // panel. replayParkedToolCalls must NOT blindly re-dispatch such an entry —
+        // a side-effecting tool would run twice. It reconciles instead.
+        alreadyDispatched: !!alreadyDispatched,
         parkedAt: Date.now()
     };
     parkedToolCallsByChatId[chatId].push(entry);
@@ -172,10 +288,88 @@ function replayParkedToolCalls(port) {
         parkedToolCallsByChatId[chatId] = []; // optimistic clear; we re-park if dispatch fails
         pending.forEach(function(entry) {
             try {
-                dispatchUIToolToPort(port, chatId, entry.toolCallId, entry.name, entry.input, entry.resolve, entry.reject, entry.sandboxCtx);
-                AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed' });
+                if (entry.name === '__approval_prompt__') {
+                    // SWM3F-2: a parked no-panel approval must be replayed through
+                    // the REAL approval-prompt path, NOT dispatched as a generic
+                    // exec-tool. The panel has no '__approval_prompt__' tool, so a
+                    // dispatch returns "Unknown tool", which the approval stub maps
+                    // to a fabricated "DENIED by user" — silently aborting an action
+                    // the user never saw. Re-register a pending entry (port + chatId,
+                    // name omitted so a disconnect clean-rejects) and post the same
+                    // exec-approval-prompt message the port-exists path uses,
+                    // populated from the parked entry.input.
+                    var _ap = entry.input || {};
+                    _pendingUIToolCalls[entry.toolCallId] = {
+                        resolve: entry.resolve,
+                        reject: entry.reject,
+                        startedAt: Date.now(),
+                        port: port,
+                        chatId: chatId
+                    };
+                    port.postMessage({
+                        type: 'exec-approval-prompt',
+                        chatId: chatId,
+                        toolCallId: _ap.toolCallId,
+                        approvalRequestId: entry.toolCallId,
+                        displayName: _ap.displayName,
+                        args: _ap.args,
+                        permissionKey: _ap.permissionKey,
+                        toolName: _ap.toolName
+                    });
+                    AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed-approval' });
+                } else if (entry.alreadyDispatched) {
+                    // B1: this tool was already dispatched to (and may have run on)
+                    // the prior panel before it disconnected. Blindly re-dispatching
+                    // would execute the side effect TWICE. Reconcile instead:
+                    //  • If the reconnecting panel already delivered its buffered
+                    //    result (via _swAdoptPanelInflight, which buffers into
+                    //    _adoptedResults when no live pending entry exists), consume it
+                    //    now and settle the ORIGINAL awaiter (the loop never stopped).
+                    //  • Otherwise register a pending entry (name omitted) so the
+                    //    panel's exec-tool-result / completedToolResults settles it, a
+                    //    further disconnect clean-rejects it, and a backstop rejects if
+                    //    the result is truly lost — trading one retryable error for zero
+                    //    duplicate side effects (the deferred gap's intended direction).
+                    var _buf = _adoptedResults[entry.toolCallId];
+                    if (_buf) {
+                        delete _adoptedResults[entry.toolCallId];
+                        delete _panelAdoptedTools[entry.toolCallId];
+                        try { if (_buf.error) entry.reject(_buf.error); else entry.resolve(_buf.result); } catch (e) {}
+                        AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'adopt-buffered' });
+                    } else if (entry.name === 'prompt_user') {
+                        // SWM3-G-HANG: prompt_user is backstop-exempt, so the generic adopt-await
+                        // arm below registers a pending entry + arms a NO-OP backstop. A prompt_user
+                        // whose executor died then gets reconciled to this surviving port but is never
+                        // re-shown and never bounded — it hangs forever. Re-asking the user is correct
+                        // (no side effect to double), so RE-DISPATCH it to the reconnecting port.
+                        dispatchUIToolToPort(port, chatId, entry.toolCallId, entry.name, entry.input, entry.resolve, entry.reject, entry.sandboxCtx);
+                        AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed-prompt-user' });
+                    } else {
+                        _pendingUIToolCalls[entry.toolCallId] = {
+                            resolve: entry.resolve,
+                            reject: entry.reject,
+                            startedAt: Date.now(),
+                            port: port,
+                            chatId: chatId
+                        };
+                        // SWM3-N3: arm the backstop via the shared helper so the timer
+                        // id is stored on the pending entry (a later panel-hello that
+                        // re-declares this id still-inflight can cancel it) and so an
+                        // interactive prompt_user is exempt from the 30s kill.
+                        armRedispatchBackstop(entry.toolCallId, entry.name);
+                        AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'adopt-await' });
+                    }
+                } else {
+                    dispatchUIToolToPort(port, chatId, entry.toolCallId, entry.name, entry.input, entry.resolve, entry.reject, entry.sandboxCtx);
+                    AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed' });
+                }
             } catch (e) {
-                // Failed to dispatch — re-park.
+                // Failed to dispatch — re-park. B4: also drop any pending entry the
+                // approval branch registered (above) before its postMessage threw,
+                // else a dead-port _pendingUIToolCalls entry leaks (invisible to
+                // _unregisterPanel, whose disconnect for that port likely already
+                // fired) until SW teardown.
+                try { delete _pendingUIToolCalls[entry.toolCallId]; } catch (e2) {}
                 if (!parkedToolCallsByChatId[chatId]) parkedToolCallsByChatId[chatId] = [];
                 parkedToolCallsByChatId[chatId].push(entry);
             }
@@ -192,7 +386,16 @@ function dispatchUIToolToPort(port, chatId, toolCallId, name, input, resolve, re
     _pendingUIToolCalls[toolCallId] = {
         resolve: resolve,
         reject: reject,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        // Re-park metadata: post-SW-move the loop survives panel close, so if THIS
+        // executing panel disconnects before posting exec-tool-result the awaited
+        // promise hangs forever. _unregisterPanel(port) scans _pendingUIToolCalls
+        // for entries with this .port and re-parks them so a fresh panel replays.
+        port: port,
+        chatId: chatId,
+        name: name,
+        input: input,
+        sandboxCtx: sandboxCtx || null
     };
     var msg = {
         type: 'exec-tool',
@@ -227,6 +430,7 @@ function resolvePendingUIToolCall(toolCallId, result, error) {
     // from before SW restart for a tool the SW never re-attempted).
     if (_panelAdoptedTools[toolCallId]) {
         _adoptedResults[toolCallId] = { result: result, error: error };
+        if (typeof scheduleAdoptedEviction === 'function') scheduleAdoptedEviction(toolCallId); // SWM3-L1: bound a buffer created after the tombstone downgrade
     }
 }
 
@@ -369,7 +573,8 @@ executeTool = async function(name, args, messageIndex, options) {
         // Cross-restart reconciliation: the panel is already running this
         // tool from before the SW died. Adopt the in-flight execution
         // instead of dispatching a second one.
-        if (_panelAdoptedTools[toolCallId]) {
+        var adopted = _panelAdoptedTools[toolCallId];
+        if (adopted) {
             delete _panelAdoptedTools[toolCallId];
             var buffered = _adoptedResults[toolCallId];
             if (buffered) {
@@ -378,7 +583,56 @@ executeTool = async function(name, args, messageIndex, options) {
                 else resolve(buffered.result);
                 return;
             }
-            _pendingUIToolCalls[toolCallId] = { resolve: resolve, reject: reject, startedAt: Date.now() };
+            // SWM3F-1 / N1 / N2: register a pending entry that a late real result
+            // settles, a disconnect clean-rejects, and (for a port-less tombstone)
+            // a backstop eventually rejects. NEVER re-dispatch — the tool was already
+            // sent to a (possibly now-gone) panel; a second dispatch would double a
+            // side effect. `adopted` is either a LIVE marker (has .port — the adopting
+            // panel is connected & executing) or a port-less TOMBSTONE ({dispatched:
+            // true} left by B2 eviction / _unregisterPanel's dead-port branch).
+            // DELIBERATELY omit `name` for side-effecting tools so _unregisterPanel's
+            // disconnect scan clean-rejects rather than blind-redispatching a tool that
+            // may have already run. EXCEPTION (SWM3-T2): prompt_user carries name+input
+            // (+sandboxCtx) so a live-marker adoption whose panel later disconnects is
+            // RE-PARKED (entry.name truthy -> parkUIToolCall alreadyDispatched) and
+            // re-SHOWN on a survivor via replay — re-asking the user has no side effect
+            // to double, whereas clean-rejecting silently drops an unanswered prompt.
+            _pendingUIToolCalls[toolCallId] = { resolve: resolve, reject: reject, startedAt: Date.now(), port: adopted.port || null, chatId: adopted.chatId };
+            if (name === 'prompt_user') {
+                _pendingUIToolCalls[toolCallId].name = 'prompt_user';
+                _pendingUIToolCalls[toolCallId].input = args;
+                _pendingUIToolCalls[toolCallId].sandboxCtx = sandboxCtx;
+            }
+            // A live-port adoption relies on _unregisterPanel's disconnect scan to
+            // clean-reject (no backstop — matches the prior SWM3F-1 behavior). A
+            // port-less tombstone has NO live panel for that scan to match, so arm
+            // the backstop here (prompt_user exempt — see armRedispatchBackstop).
+            if (!adopted.port) {
+                // SWM3-G-HANG: armRedispatchBackstop is a NO-OP for prompt_user, so a
+                // port-less tombstone adoption of a prompt_user whose executor died is
+                // never bounded and never re-shown. Re-asking the user is correct (no
+                // side effect to double), so re-dispatch to a surviving port when one is
+                // connected.
+                if (name === 'prompt_user') {
+                    var _survPort = pickExecutorPort();
+                    if (_survPort) {
+                        dispatchUIToolToPort(_survPort, chatId, toolCallId, name, args, resolve, reject, sandboxCtx);
+                        return;
+                    }
+                    // SWM3-T1: NO panel is connected. The pending entry registered just
+                    // above lives in _pendingUIToolCalls, which replayParkedToolCalls does
+                    // NOT iterate, and armRedispatchBackstop below is a no-op for
+                    // prompt_user — so it would hang forever (never re-shown, never bounded).
+                    // Convert it into a real already-dispatched PARKED call so a future
+                    // panel reconnect's replayParkedToolCalls re-dispatches it (replay's
+                    // alreadyDispatched + name==='prompt_user' arm re-shows the prompt).
+                    // Drop the orphaned pending entry first.
+                    delete _pendingUIToolCalls[toolCallId];
+                    parkUIToolCall(chatId, toolCallId, name, args, resolve, reject, sandboxCtx, true);
+                    return;
+                }
+                armRedispatchBackstop(toolCallId, name);
+            }
             return;
         }
         if (!port) {
@@ -535,18 +789,34 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         var port = pickExecutorPort();
         var approvalRequestId = 'approval_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
         var approvalPromise = new Promise(function(resolve, reject) {
-            _pendingUIToolCalls[approvalRequestId] = {
-                resolve: function(v) { resolve(v); },
-                reject: function(e) { reject(e); },
-                startedAt: Date.now()
-            };
             if (!port) {
+                // SWM3F-3: no panel — PARK only. Do NOT register a
+                // _pendingUIToolCalls entry here: a port:null entry is invisible
+                // to every disconnect scan (they filter on entry.port) and would
+                // leak until SW teardown. The parked entry carries resolve/reject;
+                // replayParkedToolCalls re-registers a real pending entry (with a
+                // live port) through the approval-prompt path once a panel connects
+                // (see SWM3F-2).
                 parkUIToolCall(targetChatId, approvalRequestId, '__approval_prompt__', {
                     displayName: displayName, args: args, permissionKey: permissionKey,
                     toolCallId: toolCallId, toolName: toolName
                 }, resolve, reject);
                 return;
             }
+            // Port exists — register the pending entry so exec-approval-prompt-result
+            // resolves it, and so _unregisterPanel(port) can see it when THIS panel
+            // disconnects before the user answers (without it the entry is invisible
+            // to the disconnect scan and `await approvalPromise` hangs forever).
+            // `name` is intentionally left UNSET so _unregisterPanel takes its
+            // clean-reject branch — an approval cannot be faithfully replayed as an
+            // exec-tool.
+            _pendingUIToolCalls[approvalRequestId] = {
+                resolve: function(v) { resolve(v); },
+                reject: function(e) { reject(e); },
+                startedAt: Date.now(),
+                port: port,
+                chatId: targetChatId
+            };
             port.postMessage({
                 type: 'exec-approval-prompt',
                 chatId: targetChatId,

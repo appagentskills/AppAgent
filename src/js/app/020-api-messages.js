@@ -200,6 +200,9 @@ function togglePause() {
     if (typeof pushPauseToggleToOffscreen === 'function') {
         pushPauseToggleToOffscreen(chatId, false);
     }
+    // SWM-T5: bump the interrupt generation too, so a stale interrupt(false) retry
+    // chain armed during a port-down window can't survive resume and abort the run.
+    if (typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(chatId);
     if (wasPaused && !nowPaused && !runningChatIds[chatId]) {
         runAgent();
     }
@@ -260,7 +263,13 @@ function retryLastCall() {
     // (Continue still sitting there, no spinner), and clicks Continue
     // assuming Retry was broken. Mirror continueAgent: hide both.
     hideContinueButton();
+    // RETRY-F2-SNACK: hide the non-auto-dismiss error snackbar (selectChat/newChat do this too).
+    if (typeof hideSnackbar === 'function') hideSnackbar();
     lastApiError = null;
+    // B13: also clear the errored chat's persisted per-chat copy (set by R-2) so the
+    // jobs badge / dropdown row don't stay red after a focused Retry. runStarted also
+    // clears it, but do it now to avoid a transient stale-error flash.
+    if (targetChatId && chats[targetChatId]) chats[targetChatId]._lastApiError = null;
     // Defensive paused-state reset — matches continueAgent. A 429 itself
     // doesn't set pausedChats, but if a stale pause flag survives from
     // earlier in the session, runAgent's `while (!isChatPaused)` gate
@@ -278,7 +287,52 @@ function retryLastCall() {
     // off, the user had already clicked Continue. The SW-side run-agent
     // handler is idempotent (early-returns when runningChatIds[chat] is
     // set), so there's no double-loop risk if the user double-clicks.
+    // RETRY-F2-BADGE: synchronous badge/dropdown repaint, mirroring retryChat (RETRY1-F1).
+    if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e2) {} }
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+        try { var _jdRetryLast = _getOpenJobsDropdown(); if (_jdRetryLast) renderJobsDropdown(_jdRetryLast); } catch (e2) {}
+    }
     runAgent(targetChatId);
+}
+
+// R-3 (partial): chat-targeted retry primitive for an UNFOCUSED chat's
+// persisted API error (chats[id]._lastApiError, set by R-1). retryLastCall
+// above reads the GLOBAL lastApiError — only the focused chat updates that — so
+// it can't retry a background/unfocused chat's error without first navigating
+// there. This reads the per-chat copy and re-runs that specific chat.
+// runAgent(overrideChatId) already accepts a chatId, so no adaptation is needed.
+// B15 wired this up: the jobs-dropdown per-chat Retry button calls retryChat
+// (onclick=retryChat at tools/120-actions.js:2024) and the badge/dropdown surface
+// an unfocused chat's API error. So this is now the chat-targeted retry used by
+// the jobs dropdown's per-chat Retry button — no longer the deferred/unused half
+// of R-3. R-1 + R-2 restore recoverability for the FOCUSED chat (navigating to
+// the errored chat re-shows the toolbar Retry); retryChat handles the
+// unfocused/background-chat case directly from the dropdown.
+function retryChat(chatId) {
+    var e = chats[chatId] && chats[chatId]._lastApiError;
+    if (!e) return;
+    // B13: only touch the GLOBAL (toolbar Retry source) when this chat is focused —
+    // otherwise retrying a background chat's error clobbers the focused chat's.
+    if (chatId === currentChatId) {
+        // RETRY-F1-GAP: F1 repainted only the dropdown/badge; the focused chat kept a live toolbar
+        // Retry + error snackbar AND this used to RE-ARM the global lastApiError toward the chat
+        // being retried. Consume it and hide the toolbar surface, mirroring retryLastCall/selectChat.
+        lastApiError = null;
+        if (typeof hideRetryButton === 'function') hideRetryButton();
+        if (typeof hideContinueButton === 'function') hideContinueButton();
+        // RETRY-F2-SNACK: also hide the non-auto-dismiss error snackbar (selectChat/newChat do this too).
+        if (typeof hideSnackbar === 'function') hideSnackbar();
+    }
+    chats[chatId]._lastApiError = null; // consumed — clear so badge/dropdown row don't stay red
+    // RETRY1-F1: re-render the jobs badge + open dropdown synchronously, mirroring
+    // selectChat (170:547-552) and newChat (170:420-425). Without this, if
+    // runStarted never fires (SW guard sees a stale isRunning, or the SW is
+    // mid-eviction) the dropdown keeps a red error row + a now-dead Retry button.
+    if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e2) {} }
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+        try { var _jdRetry = _getOpenJobsDropdown(); if (_jdRetry) renderJobsDropdown(_jdRetry); } catch (e2) {}
+    }
+    runAgent(chatId);
 }
 
 // Continue an interrupted run (e.g. after a page reload mid-stream).
@@ -288,6 +342,10 @@ function retryLastCall() {
 function continueAgent() {
     hideContinueButton();
     hideRetryButton();
+    // RETRY-F1: hide the non-auto-dismiss error snackbar (mirrors retryLastCall @:267,
+    // retryChat @:324, selectChat/newChat). Without this, Continue resumes the run but
+    // leaves the pinned API-error snackbar sitting on screen.
+    if (typeof hideSnackbar === 'function') hideSnackbar();
     lastApiError = null;
     paused = false;
     // Defensive: skip if no chat is selected. (`pausedChats` is module-level and

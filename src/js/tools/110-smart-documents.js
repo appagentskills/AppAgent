@@ -756,6 +756,12 @@ function toggleDocumentsView() {
 function openDocumentsView() {
     currentView = 'documents';
     appStorage.setItem('currentView', 'documents');
+    // SWM2-T1: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    // Mirrors openDashboardView (ui/060-docs-view.js:113); openDocumentsView was
+    // the lone non-chat view-open missing this clear, so opening Documents left a
+    // stale focus pin protecting the last chat from GC.
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
     var panel = document.getElementById('documents-panel');
     if (panel) { panel.style.display = 'flex'; renderDocumentsPage(); }

@@ -456,7 +456,41 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
             return false;
         }
-        Promise.resolve(execPromise).then(function(result) {
+        Promise.resolve(execPromise).then(async function(result) {
+            // BUG3 (real fix): a take_screenshot — or any tool that returns a
+            // _screenshotMessage — invoked via executeTool() from INSIDE a
+            // js_eval / skill-tool sandbox is bridged through here (offscreen
+            // -> SW). The agent loop only persists _screenshotMessage for
+            // TOP-LEVEL tool calls, so a NESTED capture was never written to
+            // the chat's screenshots map and its base64 never reached the
+            // sandbox caller — the sandbox saw {screenshot_id, no base64} and a
+            // later screenshot_by_id / get_file 404'd on the phantom id. Mirror
+            // the page-side sandbox bridge (tools/020-tool-execution.js):
+            // persist into chats[chatId].screenshots, register the id in the
+            // file index, AWAIT the storage write, then flatten base64 onto the
+            // result before it is posted back to the running sandbox code.
+            try {
+                if (result && result._screenshotMessage) {
+                    var ssMsg = result._screenshotMessage;
+                    if (ssMsg.screenshot_id) {
+                        var ssChat = (typeof chats !== 'undefined' && chats) ? chats[p.chatId] : null;
+                        if (ssChat) {
+                            if (!ssChat.screenshots) ssChat.screenshots = {};
+                            ssChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
+                            if (typeof registerFile === 'function') registerFile(ssMsg.screenshot_id, { type: 'screenshots_map', chatId: p.chatId });
+                            if (typeof saveChatsToStorage === 'function') { try { await saveChatsToStorage(); } catch (e) {} }
+                        }
+                    }
+                    // Flatten base64 + dims onto the result so the sandbox
+                    // caller sees the same shape as a top-level take_screenshot
+                    // ({ base64, width, height, screenshot_id, ... }).
+                    result.base64 = ssMsg.base64;
+                    result.width = ssMsg.width;
+                    result.height = ssMsg.height;
+                    result.screenshot_id = ssMsg.screenshot_id || result.screenshot_id;
+                    delete result._screenshotMessage;
+                }
+            } catch (persistErr) { /* persistence is best-effort; still return the captured result */ }
             sendResponse({ ok: true, result: result });
         }).catch(function(err) {
             sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -960,7 +994,36 @@ async function handleScreenshot(targetTabId, sendResponse) {
             var aid = await getActiveTabId();
             if (aid) { try { var at = await chrome.tabs.get(aid); tabUrl = at.url || ''; tabTitle = at.title || ''; } catch(e) {} }
         }
-        var dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+        // Cold-start: on the very first capture the activeTab permission may not
+        // be in effect yet ('activeTab permission is not in effect'). Proactively
+        // focus the target window, and on that specific error re-activate+focus
+        // the tab and retry once.
+        var _capWindowId = windowId;
+        var _doCapture = async function() {
+            try { if (_capWindowId != null) await chrome.windows.update(_capWindowId, { focused: true }); } catch (e) {}
+            return await chrome.tabs.captureVisibleTab(_capWindowId, { format: 'png' });
+        };
+        var dataUrl;
+        try {
+            dataUrl = await _doCapture();
+        } catch (capErr) {
+            var _capMsg = (capErr && capErr.message) || String(capErr);
+            if (/activeTab|not in effect/i.test(_capMsg)) {
+                try {
+                    var _capTabId = targetTabId || await getActiveTabId();
+                    if (_capTabId) {
+                        await chrome.tabs.update(_capTabId, { active: true });
+                        var _capTab = await chrome.tabs.get(_capTabId);
+                        _capWindowId = _capTab.windowId;
+                        await chrome.windows.update(_capWindowId, { focused: true });
+                    }
+                } catch (focusErr) { /* defensive */ }
+                await new Promise(function(r){ setTimeout(r, 150); });
+                dataUrl = await chrome.tabs.captureVisibleTab(_capWindowId, { format: 'png' });
+            } else {
+                throw capErr;
+            }
+        }
         sendResponse({ success: true, base64: dataUrl, width: tabWidth, height: tabHeight, url: tabUrl, title: tabTitle });
     } catch (e) {
         sendResponse({ error: 'Screenshot failed: ' + e.message });

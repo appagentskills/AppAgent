@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.2
+
+Stabilization release closing out issues from v1.1.0.
+
+### Fixes
+- Pause, Stop, Dismiss, Resume and Send work reliably again, including right after the extension restarts in the background.
+- Retry always targets the right chat and works after a background restart. Error banners and Retry buttons clear when you retry, continue, switch chats, or start a new one.
+- The chat you're viewing is never cleaned up out from under you, even after a reload or going Back.
+- Background and sub-agent chats no longer inflate the active-chats count, and stopping or crashing a sub-agent cleanly stops everything it spawned.
+- Tools that act on the page can't run twice when the panel reopens, and prompts asking for your input are always re-shown instead of hanging.
+- Chats and their edits are reliably saved; sending a message right after a background restart no longer affects other chats.
+
+---
+
 ## v1.1.1
 
 ### Features

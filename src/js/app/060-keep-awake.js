@@ -25,7 +25,7 @@
     var noticeEl = null;
     var noticeDismissed = false;       // user closed the notice but lock still on
     var noticeFadeTimer = null;        // grace period before hiding notice after activity
-    var DEBUG = true;                  // log to console so we can verify it's running
+    var DEBUG = false;                 // ship with logging off (window.keepAwakeStatus() still works for diagnostics)
     function log() {
         if (!DEBUG) return;
         try {

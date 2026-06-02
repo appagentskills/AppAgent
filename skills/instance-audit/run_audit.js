@@ -162,6 +162,12 @@ async function run_audit(args) {
             detail: `${scripts.length} public script includes are client-callable`,
             items: scripts.map(s => s.name)
           });
+        } else {
+          findings.passed.push({
+            check: "client_callable_scripts",
+            title: "No Public Client-Callable Scripts",
+            detail: "No public client-callable script includes found"
+          });
         }
       }
     },
@@ -192,6 +198,12 @@ async function run_audit(args) {
             title: "Open ACLs",
             count: acls.length,
             detail: `${acls.length} ACLs have no restrictions (may be intentional)`
+          });
+        } else {
+          findings.passed.push({
+            check: "open_acls",
+            title: "No Unrestricted ACLs",
+            detail: "No active ACLs lack roles/conditions/scripts"
           });
         }
       }

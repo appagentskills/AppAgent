@@ -74,6 +74,12 @@ function handlePopState(event) {
             // Select the chat
             currentChatId = targetChatId;
             appStorage.setItem('lastChatId', targetChatId);
+            // B5: browser Back/Forward is a real chat switch — tell the SW the focused
+            // chat changed so the sub-agent GC (_idleSweepTick / loadAllSubAgents)
+            // doesn't reclaim a sub transcript the user just navigated to. selectChat
+            // and openChatFromHistory push focus; popstate bypassed both, so a viewed
+            // sub transcript could be GC'd out from under the user within ~60s.
+            if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(targetChatId);
             clearUpdateSet();
             loadVersionHistory();
             renderChatList();
@@ -193,12 +199,27 @@ function handlePopState(event) {
         } else {
             // Default: go to home or current chat
             hideAllPanels();
-            showChatView();
+            // SWM2-T3: set currentView='chat' BEFORE showChatView() so showChatView's
+            // focus-repost guard (ui/040-tools-settings.js:1504, keyed on
+            // currentView==='chat') fires and re-pins the viewed chat for the SW
+            // sub-agent GC. The post-chain :215 null-clear is skipped on this branch
+            // (currentView==='chat'), so showChatView is the ONLY focus signal on a
+            // return-to-chat — it must run after the assignment, not before.
             currentView = 'chat';
+            showChatView();
             appStorage.setItem('currentView', 'chat');
             updateAllButtonStates();
             renderChatList();
             renderMessages();
+        }
+        // SWM2-F3: leaving the chat view for any NON-chat view must clear this
+        // panel's focus entry so the SW sub-agent GC isn't pinned on a chat the user
+        // is no longer viewing (with F2's port-keyed map this clears only THIS port's
+        // focus). Every non-chat branch above leaves currentView !== 'chat'; the chat
+        // + default branches set it back to 'chat', so this single post-chain check
+        // covers dashboard / skill-editor / skills / home / settings / docs / history.
+        if (currentView !== 'chat' && typeof pushFocusChatToOffscreen === 'function') {
+            pushFocusChatToOffscreen(null);
         }
     } finally {
         isHandlingPopState = false;

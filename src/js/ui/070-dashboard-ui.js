@@ -484,7 +484,8 @@ function injectWidgetBridge(html, widgetTitle) {
                 'try{' +
                     'if(_wqAct==="get_dom"){' +
                         'var _h=document.documentElement.outerHTML;' +
-                        'if(_h.length>50000)_h=_h.substring(0,50000)+"... [truncated, total: "+_h.length+" chars]";' +
+                        'var _ml=(typeof _wqArgs.max_length==="number"?_wqArgs.max_length:200000);' +
+                        'if(_h.length>_ml)_h=_h.substring(0,_ml)+"... [truncated, total: "+_h.length+" chars]";' +
                         '_wqR={success:true,html:_h,note:"DOM retrieved (from widget)"};' +
                     '}else if(_wqAct==="get_visible_text"){' +
                         'var _vis=[];' +
@@ -1511,12 +1512,17 @@ async function loadChatsFromStorage() {
 
 var saveChatsPending = false;
 var saveChatsPendingAgain = false;
+var _saveChatsWaiters = [];
 
 async function saveChatsToStorage() {
-    // Prevent concurrent saves which can cause data loss
+    // Prevent concurrent saves which can cause data loss. Callers that AWAIT
+    // this (edit_html must know its widget-html mutation is committed before
+    // take_screenshot deep-links the temp tab) are parked on _saveChatsWaiters
+    // and resolved only after a save capturing the CURRENT state has committed.
+    var _commit = new Promise(function(res) { _saveChatsWaiters.push(res); });
     if (saveChatsPending) {
         saveChatsPendingAgain = true;
-        return;
+        return _commit;
     }
     saveChatsPending = true;
     
@@ -1528,7 +1534,23 @@ async function saveChatsToStorage() {
         // Clear and re-add all chats (simpler than tracking deletes)
         var clearRequest = store.clear();
         
-        await new Promise(function(resolve) {
+        await new Promise(function(_resolve) {
+            // WS1F-1: settle-guard so the commit promise resolves EXACTLY once and
+            // can't wedge if the transaction aborts. A put-error can abort the whole
+            // txn; if that happens before a zero-crossing resolve() fires, `pending`
+            // never reaches 0, the `await` hangs forever, saveChatsPending stays true
+            // and the parked _saveChatsWaiters never drain. Routing every settle
+            // through this guarded resolve() makes each existing zero-crossing
+            // resolve set _settled first, and the transaction.onabort below is the
+            // safety-net. NOTE: the onerror resolves are OPTIMISTIC — a rolled-back
+            // write is repaired by the next full re-serialised save
+            // (saveChatsPendingAgain / the next caller). Do NOT switch these to
+            // reject/resolve(false): callers only await that a commit was attempted.
+            var _settled = false;
+            function resolve() { if (_settled) return; _settled = true; _resolve(); }
+            transaction.onabort = function() {
+                if (!_settled) { updateStorageIndicator(); resolve(); }
+            };
             clearRequest.onsuccess = function() {
                 var chatIds = Object.keys(chats);
                 var pending = 0;
@@ -1545,7 +1567,19 @@ async function saveChatsToStorage() {
                                 resolve();
                             }
                         };
-                        addRequest.onerror = function() { pending--; };
+                        addRequest.onerror = function() {
+                            // WS-1 follow-up: if the LAST-completing put errors,
+                            // failing to resolve here leaves the `await new Promise`
+                            // hung forever — saveChatsPending stays true and the
+                            // parked _saveChatsWaiters (e.g. an awaited edit_html)
+                            // never drain, wedging all future saves. Mirror
+                            // onsuccess so a final errored put still settles.
+                            pending--;
+                            if (pending === 0) {
+                                updateStorageIndicator();
+                                resolve();
+                            }
+                        };
                     }
                 }
                 
@@ -1563,10 +1597,18 @@ async function saveChatsToStorage() {
         console.error('Failed to save chats to IndexedDB:', e);
     } finally {
         saveChatsPending = false;
-        // If another save was requested while we were saving, do it now
+        // If another save was requested while we were saving, do it now. That
+        // follow-up save captures the newest state and will drain the accumulated
+        // _saveChatsWaiters when IT completes — so do NOT drain here.
         if (saveChatsPendingAgain) {
             saveChatsPendingAgain = false;
             saveChatsToStorage();
+        } else {
+            // No follow-up: this save committed the current state. Resolve every
+            // awaiting caller (edit_html etc.) now so its await unblocks.
+            var _w = _saveChatsWaiters;
+            _saveChatsWaiters = [];
+            _w.forEach(function(r) { try { r(); } catch (e) {} });
         }
     }
 }

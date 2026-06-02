@@ -333,6 +333,15 @@ async function init() {
         isNewChat = true;
     }
 
+    // SAGF-1 / SWM2-T2: thread the initial focus to the SW so its sub-agent GC
+    // paths don't reclaim the viewed transcript (in the SW currentChatId is null).
+    // When boot will show a NON-chat view (willShowNonChatView), post null instead of
+    // currentChatId — otherwise we pin a chat the user isn't actually viewing (the same
+    // stale pin SWM2-F3 clears on a view-leave), wrongly protecting it from GC. The
+    // chat-render branch above already covers the chat case; this is re-posted on
+    // every later chat switch.
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(willShowNonChatView ? null : currentChatId);
+
     // Show/hide version sidebar based on chat state
     if (isNewChat || !chats[currentChatId] || !chats[currentChatId].messages || chats[currentChatId].messages.length === 0) {
         var versionSidebar = document.getElementById('version-sidebar');
@@ -414,13 +423,19 @@ async function init() {
             // and broadcast the widget's contentVersion on a same-origin
             // BroadcastChannel. The capturing tab resolves only when the broadcast
             // version matches the &_cv it requested, so it can never capture a stale
-            // frame from a prior edit. IMPORTANT: we broadcast the version of the
-            // content we ACTUALLY rendered (dlWidget.contentVersion from storage),
-            // NOT the requested &_cv. If storage were momentarily behind, the
-            // rendered version won't match the requested one, the capturer keeps
-            // waiting (then falls back via its safety net) rather than being told a
-            // stale frame is the requested version.
-            var _dlRenderedCv = (dlWidget.contentVersion != null) ? dlWidget.contentVersion : 0;
+            // frame from a prior edit. IMPORTANT: we ECHO the requested &_cv back
+            // verbatim rather than re-reading dlWidget.contentVersion from storage.
+            // The capturer's match requires String(d.contentVersion)===String(_wssCv)
+            // where _wssCv is the side panel's IN-MEMORY contentVersion at capture
+            // time. This temp tab reloads widget state fresh from storage, whose
+            // contentVersion can be undefined (freshly created widget) or stale
+            // (an in-memory edit_html bump not yet persisted) -> the stored value
+            // would never match _wssCv and the signal ALWAYS timed out. The
+            // per-request nonce (&_ts -> sig) already guarantees this record came
+            // from THIS fresh render, so echoing &_cv restores the match without
+            // weakening freshness (a stale frame still can't satisfy the nonce).
+            var _dlReqCv = urlParams.get('_cv');
+            var _dlRenderedCv = (_dlReqCv != null) ? _dlReqCv : ((dlWidget.contentVersion != null) ? dlWidget.contentVersion : 0);
             // Per-request nonce passed by take_screenshot (060) as &_ts=. Echoed back in
             // the render-complete record so the capturer accepts ONLY the signal from
             // this exact request — a leftover record from a prior capture can't satisfy it.
@@ -432,8 +447,16 @@ async function init() {
                 if (_dlSignaled) return;
                 _dlSignaled = true;
                 window.removeEventListener('message', _dlOnWidgetMsg);
-                // One more rAF so the parent frame reflects the child's final layout.
-                requestAnimationFrame(function() { requestAnimationFrame(function() {
+                // rAF-OR-setTimeout fallback: this writer runs in the HIDDEN screenshot
+                // temp tab (chrome.tabs.create active:false) where rAF is throttled/paused,
+                // so a bare requestAnimationFrame chain never fires and the chrome.storage
+                // render record never gets written -> the capturer always hit the 8s
+                // safety-net timeout. _nextFrame fires on whichever of rAF or a 50ms timer
+                // comes first, so the write happens even in a hidden tab; rAF still wins in
+                // a visible tab (foreground timing unchanged).
+                var _nextFrame = function(cb){ var done=false; var fire=function(){ if(done) return; done=true; try{ cb(); }catch(e){} }; try{ requestAnimationFrame(fire); }catch(e){} setTimeout(fire, 50); };
+                // One more frame so the parent frame reflects the child's final layout.
+                _nextFrame(function() { _nextFrame(function() {
                     try { document.documentElement.setAttribute('data-widget-ready', String(_dlRenderedCv)); } catch (e) {}
                     var _dlRenderMsg = { type: 'widgetRenderComplete', widgetId: deepLinkWidgetId, contentVersion: _dlRenderedCv, sig: _dlReqTs, ts: Date.now() };
                     // PRIMARY: chrome.storage bus. This temp TAB and the capturing
@@ -482,6 +505,9 @@ function toggleSkillsView() {
 function openSkillsView() {
     currentView = 'skills';
     appStorage.setItem('currentView', 'skills');
+    // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
+    // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
+    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     appStorage.removeItem('currentEditingSkill');
     currentEditingSkill = null;
     hideAllPanels();

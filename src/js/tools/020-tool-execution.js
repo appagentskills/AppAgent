@@ -798,7 +798,7 @@ async function executeTool(name, args, messageIndex, options) {
                         });
                         var timeoutPromise = new Promise(function(_, rej) { setTimeout(function() { rej(new Error('Tool call timed out after 30s')); }, 30000); });
                         Promise.race([toolPromise, timeoutPromise])
-                            .then(function(result) {
+                            .then(async function(result) {
                                 if (result && result._screenshotMessage) {
                                     var ssMsg = result._screenshotMessage;
                                     if (ssMsg.screenshot_id) {
@@ -806,7 +806,11 @@ async function executeTool(name, args, messageIndex, options) {
                                         if (jsChat) {
                                             if (!jsChat.screenshots) jsChat.screenshots = {};
                                             jsChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
-                                            saveChatsToStorage();
+                                            // Register in the file index so screenshot_by_id/getFile resolve it
+                                            // immediately, and AWAIT the persistence write BEFORE the id is
+                                            // posted back to the running js_eval code (avoids a phantom id).
+                                            if (typeof registerFile === 'function') registerFile(ssMsg.screenshot_id, { type: 'screenshots_map', chatId: chatId });
+                                            try { await saveChatsToStorage(); } catch (e) {}
                                         }
                                     }
                                     result.base64 = ssMsg.base64;
