@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.3
+
+Version bump to sync the extension manifest with the tagged release (manifest was still at 1.1.1 when v1.1.2 was tagged).
+
+---
+
 ## v1.1.2
 
 Stabilization release closing out issues from v1.1.0.
