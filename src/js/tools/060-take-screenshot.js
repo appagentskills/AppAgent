@@ -200,6 +200,50 @@ async function executeTakeScreenshot(args) {
                 var _wssTs = Date.now();
                 var _wssUrl = chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId)
                     + '&_cv=' + _wssCv + '&_ts=' + _wssTs;
+                // --- LIVE DOM SNAPSHOT (preserve interactive widget state) ---
+                // The widget runs in a cross-origin sandbox iframe, so we can't read its
+                // contentDocument from here. Instead ask the LIVE iframe (via the bridge's
+                // __appagentSerializeForCapture handler) to serialize its CURRENT DOM. If it
+                // answers within ~1.5s, we stash it in chrome.storage.local so the temp tab
+                // can render that static snapshot (scripts neutralized) -> counters/loaded
+                // data are preserved. On timeout/null we fall back to the fresh-render path
+                // below, unchanged.
+                var _WSS_SNAP_KEY = '__appagent_widget_snapshot__';
+                var _wssSnapshot = null;
+                try {
+                    _wssSnapshot = await new Promise(function(resolve) {
+                        var _snDone = false;
+                        var _snTimer = setTimeout(function(){
+                            if (_snDone) return; _snDone = true;
+                            try { window.removeEventListener('message', _onSnap); } catch (e) {}
+                            resolve(null);
+                        }, 1500);
+                        function _onSnap(ev) {
+                            var d = ev && ev.data;
+                            if (!d || d.type !== '__appagentSerializedDom' || String(d.reqId) !== String(_wssTs)) return;
+                            if (_snDone) return; _snDone = true;
+                            clearTimeout(_snTimer);
+                            try { window.removeEventListener('message', _onSnap); } catch (e) {}
+                            resolve(d.html ? { html: d.html, width: d.width, height: d.height } : null);
+                        }
+                        window.addEventListener('message', _onSnap);
+                        try {
+                            widgetIframe.contentWindow.postMessage({ type: '__appagentSerializeForCapture', reqId: _wssTs }, '*');
+                        } catch (e) { /* fall through to timeout -> fresh render */ }
+                    });
+                } catch (e) { _wssSnapshot = null; }
+                if (_wssSnapshot && _wssSnapshot.html) {
+                    try {
+                        await chrome.storage.local.set({ '__appagent_widget_snapshot__': {
+                            widgetId: widgetId,
+                            html: _wssSnapshot.html,
+                            width: _wssSnapshot.width,
+                            height: _wssSnapshot.height,
+                            sig: _wssTs
+                        } });
+                        _wssUrl += '&snap=1';
+                    } catch (e) { _wssSnapshot = null; /* couldn't stash -> fresh render */ }
+                }
                 var _wssTab = null;
                 // DETERMINISTIC render-complete wait (replaces the old fixed-delay
                 // race). The temp tab's deep-link wrapper (120-init.js) broadcasts
@@ -312,6 +356,28 @@ async function executeTakeScreenshot(args) {
                     var _wssBase64 = _wssResult.base64;
                     var _wssW = _wssResult.width || 800;
                     var _wssH = _wssResult.height || 600;
+                    // When a live-DOM snapshot was rendered, the temp tab still rasterizes a
+                    // full-viewport frame, so crop the raster down to the widget's real
+                    // content size and report widget-sized dimensions (not the viewport).
+                    if (_wssSnapshot && _wssSnapshot.html && _wssSnapshot.width && _wssSnapshot.height) {
+                        try {
+                            var _snImg = new Image();
+                            await new Promise(function(res, rej){ _snImg.onload = res; _snImg.onerror = rej; _snImg.src = _wssBase64; });
+                            var _snDpr = _snImg.naturalWidth / _wssW;
+                            var _snCw = Math.min(Math.round(_wssSnapshot.width * _snDpr), _snImg.naturalWidth);
+                            var _snCh = Math.min(Math.round(_wssSnapshot.height * _snDpr), _snImg.naturalHeight);
+                            if (_snCw > 0 && _snCh > 0) {
+                                var _snCanvas = document.createElement('canvas');
+                                _snCanvas.width = _snCw; _snCanvas.height = _snCh;
+                                _snCanvas.getContext('2d').drawImage(_snImg, 0, 0, _snCw, _snCh, 0, 0, _snCw, _snCh);
+                                _wssBase64 = _snCanvas.toDataURL('image/png');
+                                _wssW = Math.round(_snCw / _snDpr);
+                                _wssH = Math.round(_snCh / _snDpr);
+                                _snCanvas.width = 0; _snCanvas.height = 0;
+                            }
+                            _snImg.src = '';
+                        } catch (e) { /* keep full-viewport capture on crop failure */ }
+                    }
                     if (args.grid) {
                         _wssBase64 = await overlayGrid(_wssBase64, _wssW, _wssH);
                     }
@@ -351,6 +417,8 @@ async function executeTakeScreenshot(args) {
                     // (Matching is nonce-guarded so residue is harmless, but we keep
                     // the area clean.)
                     try { chrome.storage.local.remove(_WSS_BUS_KEY); } catch (e) {}
+                    // Drop the live-DOM snapshot record so it can't be reused by a later capture.
+                    try { chrome.storage.local.remove(_WSS_SNAP_KEY); } catch (e) {}
                 }
             }
         } else if (target === 'element') {

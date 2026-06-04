@@ -194,6 +194,27 @@ function _handleAgentBusMessage(msg) {
             if ((msg.eventType === 'runFinished' || msg.eventType === 'runCrashed') &&
                 msg.detail && msg.detail.chatId) {
                 delete runningChatIds[msg.detail.chatId];
+                // SWM14-F5 cleanup: prune the per-chat pause/interrupt latest-wins token
+                // maps on terminal run end so they don't grow unbounded across many chats.
+                // Skip a pause-induced finish (reason 'paused') — a pushPauseToggleToOffscreen
+                // retry chain for that very pause may still be in flight and keys off these
+                // maps; they're pruned on the eventual non-paused finish (or chat delete).
+                // SWM-TOKENLEAK: a 'paused' finish deliberately skips this prune (a
+                // pushPauseToggleToOffscreen retry chain may still key off these maps).
+                // RESIDUAL LEAK: a chat paused-and-never-resumed then DELETED never gets
+                // a non-paused terminal event, so its 4 token-map entries leak forever.
+                // The clean fix is to call _pruneChatPauseTokens(chatId) from the page
+                // delete path deleteChat() in src/js/ui/170-chat-management.js (not owned
+                // by this change). The helper is exported below for that wiring; this
+                // non-paused terminal prune remains the fallback for resumed-then-finished
+                // chats.
+                if (msg.detail.reason !== 'paused') {
+                    var _doneCid = msg.detail.chatId;
+                    delete _pauseToggleGen[_doneCid];
+                    delete _pauseToggleDesired[_doneCid];
+                    delete _interruptGen[_doneCid];
+                    delete _interruptDesired[_doneCid];
+                }
             }
             // Re-emit on the local bus so app/036 handlers fire as if
             // the loop ran in this page.
@@ -222,6 +243,27 @@ function _handleAgentBusMessage(msg) {
                 });
             }
             if (msg.runningChatIds) {
+                // SWM-RETRYF2: reconcile-DOWN. The bus onDisconnect (RETRY-F2 @:110)
+                // clears ALL runningChatIds + resolves ALL pending runAgent promises on
+                // ANY disconnect — including a transient flap while the SW keeps streaming
+                // — so `await runAgent()` callers can resolve early and the page can be
+                // left with a runningChatId the SW is NOT actually running. The proper
+                // debounce / reconcile redesign is a deferred design change (see
+                // changelog); this is the SAFE half: treat the hello snapshot as
+                // authoritative and DROP any page-side runningChatId ABSENT from it, so
+                // the UI self-heals after a flap. (The UP direction — adding ids the SW
+                // resumed — is the loop below.)
+                var _helloRunning = Object.create(null);
+                msg.runningChatIds.forEach(function(cid) { _helloRunning[cid] = true; });
+                Object.keys(runningChatIds).forEach(function(cid) {
+                    if (!_helloRunning[cid]) {
+                        delete runningChatIds[cid];
+                        // settle any orphaned pending runAgent promise so a caller's await
+                        // doesn't hang on a chat the SW reports it is not running.
+                        var _orphan = _pendingRunAgents[cid];
+                        if (_orphan) { delete _pendingRunAgents[cid]; try { if (_orphan.resolve) _orphan.resolve(); } catch (e) {} }
+                    }
+                });
                 msg.runningChatIds.forEach(function(cid) {
                     runningChatIds[cid] = true;
                 });
@@ -604,6 +646,20 @@ function _supersedeInterruptToggle(chatId) {
     if (!chatId) return;
     _interruptGen[chatId] = (_interruptGen[chatId] || 0) + 1;
     _interruptDesired[chatId] = false;
+}
+
+// SWM-TOKENLEAK: prune all four per-chat pause/interrupt latest-wins token maps
+// for a chat. Intended to be called from the page-side chat-delete path
+// (deleteChat in src/js/ui/170-chat-management.js) so a chat paused-and-never-
+// resumed then deleted doesn't leak its 4 entries forever — the runFinished
+// cleanup above only prunes on a NON-paused terminal event, which a deleted
+// still-paused chat never receives. Safe to call any time (idempotent).
+function _pruneChatPauseTokens(chatId) {
+    if (!chatId) return;
+    delete _pauseToggleGen[chatId];
+    delete _pauseToggleDesired[chatId];
+    delete _interruptGen[chatId];
+    delete _interruptDesired[chatId];
 }
 
 // Open the port now. We don't wait for Platform.ready because the

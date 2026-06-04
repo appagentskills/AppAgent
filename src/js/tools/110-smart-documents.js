@@ -272,9 +272,6 @@ function sdocCopyDisplays(doc, content, options) {
     var chatId = _sdocChatId(options);
     while ((match = re.exec(content)) !== null) {
         var did = match[1];
-        if (_displayStore[did]) {
-            doc.displays[did] = { template: _displayStore[did].template, args: _displayStore[did].args };
-        }
         var chat = chats[chatId];
         if (chat && chat.displays && chat.displays[did]) {
             doc.displays[did] = { template: chat.displays[did].template, args: chat.displays[did].args };

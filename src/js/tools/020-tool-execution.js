@@ -120,8 +120,20 @@ function executeSetChatTitle(args, options) {
 
     chat.title = title;
     saveChatsToStorage();
-    if (typeof renderChatList === 'function') renderChatList();
-    if (typeof updateChatTitleHeader === 'function') updateChatTitleHeader();
+    // set_chat_title is a HEADLESS tool — it normally runs in the SW where the
+    // page-only UI fns (renderChatList/updateChatTitleHeader) don't exist and
+    // the page's `chats` mirror is stale. Emit a sync event (mirrors
+    // documentChanged / recordMutated / workspaceMutated) so the page hydrates
+    // its mirror and refreshes the header + chat list IMMEDIATELY. The SW
+    // broadcast bridge forwards the event to every connected panel; in a
+    // page-only context the local bus fires the same handler. Falls back to
+    // direct calls only if the event bus isn't available.
+    if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+        AgentEvents.emit('chatTitleChanged', { chatId: targetChatId, title: title });
+    } else {
+        if (typeof renderChatList === 'function') renderChatList();
+        if (typeof updateChatTitleHeader === 'function') updateChatTitleHeader();
+    }
 
     return { success: true, message: 'Chat title updated to: ' + title };
 }
@@ -991,6 +1003,77 @@ async function executeTool(name, args, messageIndex, options) {
         } catch (e) {
             return { success: false, error: e.message };
         }
+    } else if (name === 'servicenow_api' && args.table === 'attachment' && (args.method === 'GET' || args.method === 'DELETE')) {
+        // Attachment read/delete via /api/now/attachment. The generic Table API
+        // branch below would hit /api/now/table/attachment, which ServiceNow
+        // rejects with HTTP 400 'Invalid table attachment'. Mirror the same
+        // instance/token resolution used by the upload (POST) branch above.
+        //   GET  -> /api/now/attachment (or /api/now/attachment/{sys_id})
+        //   DELETE -> /api/now/attachment/{sys_id} (sys_id required)
+        try {
+            if (args.method === 'DELETE' && !args.sys_id) {
+                return { success: false, error: 'sys_id is required to DELETE an attachment.' };
+            }
+            // Resolve target instance for attachments
+            var _atInstanceUrl = null;
+            var _atToken = null;
+            if (args.instance) {
+                _atInstanceUrl = Platform.resolveInstanceUrl(args.instance);
+                if (!_atInstanceUrl) {
+                    return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
+                }
+                _atToken = await Platform.getTokenForInstance(_atInstanceUrl);
+                if (!_atToken) {
+                    return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Ensure a tab is open for that instance.' };
+                }
+            }
+
+            var atUrl = '/api/now/attachment';
+            if (args.sys_id) atUrl += '/' + args.sys_id;
+            if (args.method === 'GET') {
+                var atParams = [];
+                if (args.query) atParams.push('sysparm_query=' + encodeURIComponent(args.query));
+                if (args.fields) atParams.push('sysparm_fields=' + encodeURIComponent(args.fields));
+                if (args.limit) atParams.push('sysparm_limit=' + args.limit);
+                // BUG2-NIT: track an explicit sysparm_limit in url_params so the
+                // default-cap below doesn't double-add a limit param.
+                var _atHasUrlLimit = false;
+                if (args.url_params && typeof args.url_params === 'object') {
+                    Object.keys(args.url_params).forEach(function(key) {
+                        if (key === 'sysparm_limit') _atHasUrlLimit = true;
+                        atParams.push(encodeURIComponent(key) + '=' + encodeURIComponent(args.url_params[key]));
+                    });
+                }
+                // BUG2-NIT: a bare GET on table:'attachment' with no sys_id and no
+                // limit lists EVERY attachment in the instance. When neither a sys_id
+                // nor any limit (args.limit or an explicit sysparm_limit in url_params)
+                // is supplied, apply a default sysparm_limit=1000 to avoid an unbounded
+                // dump. An explicit limit/query still wins.
+                if (!args.sys_id && !args.limit && !_atHasUrlLimit) {
+                    atParams.push('sysparm_limit=1000');
+                }
+                if (atParams.length) atUrl += '?' + atParams.join('&');
+            }
+            if (_atInstanceUrl) atUrl = _atInstanceUrl + atUrl;
+
+            var _atApiToken = _atToken || Platform.getSessionToken() || '';
+            var atRes = await fetch(atUrl, {
+                method: args.method,
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-UserToken': _atApiToken }
+            });
+            var atData;
+            if (atRes.status === 204) {
+                atData = {};
+            } else {
+                var _atRespText = await atRes.text();
+                try { atData = JSON.parse(_atRespText); } catch (e) { atData = { error: { message: 'Non-JSON response (HTTP ' + atRes.status + ')' } }; }
+            }
+            var _atResult = { success: atRes.ok, status: atRes.status, data: atData };
+            if (_atInstanceUrl) _atResult.instance = args.instance;
+            return _atResult;
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
     } else if (name === 'servicenow_api') {
         // Resolve target instance (if specified)
         var _targetInstanceUrl = null;
@@ -1144,14 +1227,27 @@ async function executeTool(name, args, messageIndex, options) {
                     raw: _rsText.length > 2000 ? _rsText.substring(0, 2000) + '...' : _rsText
                 };
             }
+            // B3 fix: sys.scripts.do returns HTTP 200 (and often still prints
+            // "Script completed in scope") even when the executed script THREW at
+            // runtime — the Rhino/evaluator exception is rendered into the <PRE>
+            // output. The old `success: _rsCompleted` therefore reported success:true
+            // for a thrown script, so the caller couldn't tell a clean run from a
+            // failed one. Detect an UNAMBIGUOUS evaluator/Java-exception signal in the
+            // captured output and surface it. NOTE: "*** Script:" is the normal
+            // gs.print log prefix, NOT an error — do not match on it.
+            var _rsErrMatch = _rsOutput && _rsOutput.match(/(?:Evaluator error|Javascript compiler exception|org\.mozilla\.javascript\.[A-Za-z]*(?:Error|Exception)|java\.lang\.[A-Za-z.]*Exception)[^\n]*/i);
+            var _rsScriptError = _rsErrMatch ? _rsErrMatch[0].trim() : null;
             var _rsResult = {
-                success: _rsCompleted,
+                // Flip success only on an unambiguous runtime-error signal; the
+                // happy path (no error markers) keeps the original `_rsCompleted`.
+                success: _rsCompleted && !_rsScriptError,
                 status: _rsRes.status,
                 output: _rsOutput,
                 scope: _rsActualScope,
                 executionHistorySysId: _rsHistorySysId,
                 executionHistoryUrl: _rsHistorySysId ? '/sys_script_execution_history.do?sys_id=' + _rsHistorySysId : null
             };
+            if (_rsScriptError) { _rsResult.hasError = true; _rsResult.script_error = _rsScriptError; }
             if (_rsTargetUrl) _rsResult.instance = args.instance;
             return _rsResult;
         } catch (e) {

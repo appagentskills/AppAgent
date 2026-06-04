@@ -39,12 +39,13 @@ dist/extension/- Built extension output (DO NOT edit directly, use src/)
 ## JS File Map (src/js/)
 
 Files are organized into **tiers** (folders); within each tier the numeric prefix sets load order.
-Tier concatenation order (in `build/build.js` `JS_TIERS`): `core` → `ui` → `tools` → `app`.
+Tier concatenation order (in `build/build.js` `JS_TIERS`): `core` → `ui` → `tools` → `app` for the page bundle, plus a separate `worker` tier bundled into the service worker. Since the service-worker move, the authoritative agent loop and all run state live in the `worker` tier (the SW); tools that need the DOM bridge from the SW to an offscreen document.
 
 - `src/js/core/` — platform detection, bootstrap, config, storage, permissions, tool registry, system prompt, skills engine, IndexedDB
 - `src/js/ui/` — views, panels, sidebar, settings, modals, dropdowns, message rendering, layout, iframe panel UI
 - `src/js/tools/` — agent tool implementations (iframe_tool, file_tools, screenshot_tools, widget_tools, prompt_user, actions, smart_documents, display_templates)
-- `src/js/app/` — top-level orchestration (llm_streaming, api_messages, agent_loop, send_message, image_attachments, keep_awake)
+- `src/js/app/` — page-side bridge / event-handler layer between the page and the service worker (llm_streaming, api_messages, send_message, image_attachments, keep_awake), plus the page-side agent bus / port bridge (045-agent-port-bridge-page.js) and agent-event handlers (035-agent-events.js, 036-agent-event-handlers-page.js). NOTE: the authoritative agent loop no longer runs here — it runs in the `worker` tier (service worker); `030-agent-loop.js` here is the page-side wrapper.
+- `src/js/worker/` — service worker: agent-loop host, run sequencing, tool routing / port bridge, SW storage, checkpoints, broadcasts (000-runtime-globals, 010-platform-stub, 020-page-stubs, 025-permissions-helpers, 100-agent-event-broadcast, 105-subagent-broadcast, 110-agent-checkpoint, 115-storage, 120-tool-routing, 130-port-bridge, 190-entry)
 
 Insertion: drop a new file into the right tier folder with an unused numeric prefix (gaps of 10). No global renumber.
 
@@ -62,7 +63,12 @@ Insertion: drop a new file into the right tier folder with an unused numeric pre
 - `src/js/tools/020-tool-execution.js` — Tool execution logic (executeTool)
 - `src/js/tools/010-iframe-tool.js` — Browser interaction tool
 - `src/js/core/120-init.js` — Initialization and startup
-- `src/js/app/030-agent-loop.js` — Agent message loop
+- `src/js/worker/190-entry.js` — Service worker entry; hosts the authoritative agent message loop + run state
+- `src/js/worker/120-tool-routing.js` — SW tool routing (parks/replays UI tool calls, bridges DOM-needing tools to the offscreen document)
+- `src/js/worker/130-port-bridge.js` — SW port bridge (run-agent handler, page↔SW messaging)
+- `src/js/app/045-agent-port-bridge-page.js` — Page-side agent port bridge (runningChatIds, _pendingRunAgents)
+- `src/js/app/035-agent-events.js` / `036-agent-event-handlers-page.js` — Page-side agent event bus / handlers
+- `src/js/app/030-agent-loop.js` — Page-side agent loop wrapper (authoritative loop is in the worker tier)
 - `src/js/ui/250-message-render.js` — Chat message rendering
 - `src/platform/extension/background.js` — Extension service worker
 - `src/platform/extension/content-script.js` — Tab content script

@@ -146,6 +146,27 @@ function _isChatFocusedByAnyPanel(chatId) {
     for (var _pk2 in _focusedChatByPort) { if (_focusedChatByPort[_pk2] === chatId) return true; }
     return false;
 }
+// F2: number of connected panels (i.e. live transcript viewers). The SW port
+// bridge (src/js/worker/130-port-bridge.js) tracks every connected panel port in
+// the shared-scope global _swPanelPorts (a Set); other worker-bundle files such as
+// src/js/worker/120-tool-routing.js already reference it the same bare, typeof-
+// guarded way, confirming it is reachable from here at runtime in the SW bundle.
+// Returns -1 when NOT reachable (e.g. the page bundle, where the GC paths are
+// gated off anyway) so callers fall back to the pre-F2 focus-only behavior.
+// Why this matters: #309's clearFocusedChatForPort latch reset makes
+// _isFocusEstablished() return false once the last panel disconnects, which froze
+// ALL tombstone / abandoned-sleep GC during headless background runs (panel
+// closed). GC is in fact SAFE when zero panels are connected — no transcript is
+// being viewed — so the gates below only DEFER when a panel IS connected but its
+// focus is still unknown (a transient reconnect gap).
+function _connectedPanelCount() {
+    try {
+        if (typeof _swPanelPorts !== 'undefined' && _swPanelPorts && typeof _swPanelPorts.size === 'number') {
+            return _swPanelPorts.size;
+        }
+    } catch (e) { /* not reachable from this bundle */ }
+    return -1;
+}
 
 // Worker pool: { running: Set<agent_id>, queue: agent_id[] }. running tracks
 // which subs currently have an active runAgent loop. queue holds subs whose
@@ -225,7 +246,14 @@ async function loadAllSubAgents() {
                         // 2nd panel's focus can't be clobbered.) When focus is unknown
                         // (boot race) it falls through to load the record and defer to
                         // a later _idleSweepTick — same B7 deferral as before.
-                        if (_isFocusEstablished() && !_isChatFocusedByAnyPanel(rec.chat_id)) {
+                        // F2: GC is also SAFE when ZERO panels are connected (no
+                        // transcript is being viewed), even if focus is "unknown" —
+                        // #309's latch reset on the last disconnect made focus look
+                        // unknown forever during headless runs and froze this boot GC.
+                        // Allow GC when (no panel connected) OR (focus established);
+                        // _connectedPanelCount() returns -1 when unreachable, so the
+                        // === 0 branch is false there and behavior matches pre-F2.
+                        if ((_connectedPanelCount() === 0 || _isFocusEstablished()) && !_isChatFocusedByAnyPanel(rec.chat_id)) {
                             _subAgentsDeleteFromDB(rec.agent_id);
                             // Also reclaim the sub's background chat row, mirroring the
                             // idle sweep's cleanup (best-effort, guarded).
@@ -414,7 +442,13 @@ function _idleSweepTick() {
             // later sweep — reclaiming now could rip out the transcript the user is
             // actively viewing (the SW's currentChatId is permanently null, so it is
             // no signal). Mirrors loadAllSubAgents' B7 deferral.
-            if (!_isFocusEstablished()) continue;
+            // F2: only DEFER when a panel IS connected but its focus is still
+            // unknown (transient reconnect gap). When ZERO panels are connected
+            // (_connectedPanelCount() === 0) no transcript is being viewed, so GC
+            // is safe — don't defer. _connectedPanelCount() returns -1 when the
+            // signal is unreachable, so the !== 0 branch is true there and the
+            // pre-F2 focus-only deferral is preserved.
+            if (_connectedPanelCount() !== 0 && !_isFocusEstablished()) continue;
             // Skip GC if the user is currently viewing this sub's transcript —
             // otherwise the chat row gets ripped out from under them and the
             // message list goes blank. Defer to the next sweep.
@@ -1416,6 +1450,13 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     _cascadeStopDescendants(rec, 'parent sub-agent stopped: ' + (args.reason || rec.name));
     var reason = args.reason || 'stopped by parent';
     rec.state = 'stopped';
+    // SA-STOP-CANCEL (BUGFIX): mark this as an intentional, user-initiated stop
+    // BEFORE the abort/handle settlement below. The aborted run loop will still
+    // reach onSubAgentRunFinished; without this flag its auto_report branch can
+    // synthesize a 'done' report and overwrite the 'cancelled' settlement made
+    // here (notably when a prior wake re-armed the spawn deferred, defeating the
+    // !_spawnDeferreds guard). onSubAgentRunFinished early-returns on this flag.
+    rec._stoppedByUser = true;
     rec.settled_at = Date.now();
     rec.last_activity_at = rec.settled_at;
     if (!rec.last_report) {
@@ -1690,6 +1731,28 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     // wake it (new instructions) or stop it. Without this guard the
     // parent's spawn handle resolves with a misleading auto-`done` even
     // though the sub never produced a terminal report.
+    // SA-STOP-CANCEL (BUGFIX): a user-initiated stop_sub_agent already set
+    // rec.state='stopped' / rec._stoppedByUser and settled the spawn handle as
+    // 'cancelled'. The !_spawnDeferreds guard above covers the common case, but
+    // if a prior wake re-armed the spawn deferred (re-await), it no longer
+    // fires — so without this branch the auto_report path below would
+    // synthesize a 'done' report and overwrite the 'cancelled' settlement.
+    // Never auto-report over a sub that was stopped by the user or is terminal.
+    if (rec.state === 'stopped' || rec.state === 'errored' || rec._stoppedByUser) {
+        _subAgentsPersist(rec);
+        _releasePoolSlot(rec.agent_id);
+        // BUG1-NIT: narrow re-arm race — if a prior stop already resolved the
+        // previous spawn deferred, then a wake re-armed a NEW deferred which is
+        // STILL present here, returning now would leave it unsettled and a parent
+        // await would hang. Settle it as 'cancelled' (mirrors the user-stop
+        // settlement) before standing down.
+        if (_spawnDeferreds[rec.spawn_handle_id]) {
+            _resolveSpawnHandle(rec.agent_id, { status: 'cancelled', summary: rec.last_report && rec.last_report.summary, from: rec.agent_id });
+        }
+        _notifyListeners();
+        return;
+    }
+
     if (rec.state === 'sleeping') {
         _subAgentsPersist(rec);
         _releasePoolSlot(rec.agent_id);
@@ -1864,6 +1927,18 @@ var SubAgents = {
     // bridge's _unregisterPanel) so a closed panel doesn't pin a transcript forever.
     clearFocusedChatForPort: function(portKey) {
         if (portKey != null && portKey !== '') delete _focusedChatByPort[portKey];
+        // SWM2-T2 fix: the bare _focusSignalReceived latch stays true forever, so once
+        // the LAST focus entry is cleared (only panel disconnected) _isFocusEstablished()
+        // would still report "focus known" via the latch — letting GC reclaim the
+        // transcript the user is viewing during the reconnect gap. Re-arm the
+        // "defer GC when focus unknown" guard by resetting the latch when BOTH the
+        // default scalar AND the per-port map are empty; the reconnecting panel
+        // re-posts focus-chat and re-sets the latch.
+        if (!_focusedChatId) {
+            var _anyPortFocus = false;
+            for (var _pk3 in _focusedChatByPort) { if (_focusedChatByPort[_pk3]) { _anyPortFocus = true; break; } }
+            if (!_anyPortFocus) _focusSignalReceived = false;
+        }
     },
     // Read-only access for UI components
     getById: function(agentId) { return _subAgents[agentId] || null; },

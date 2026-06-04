@@ -1034,6 +1034,13 @@ async function runAgent(overrideChatId) {
     // notification gate (notifyFinish below).
     var wasSilentHook = _silentHookRunning;
     _silentHookRunning = false;
+    // If a silent hook just finished streaming, tell the page to clear its
+    // mirrored flag so the upcoming runFinished render shows the real final
+    // state. Emitted BEFORE runFinished so the port preserves ordering and the
+    // page flag is false by the time renderMessages runs.
+    if (wasSilentHook && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+        AgentEvents.emit('silentHookState', { active: false, chatId: streamingChatId });
+    }
 
     // === Finish: emit UI cleanup ===
     // Handler in 035-agent-events.js does: hideSpinner, renderChatList,

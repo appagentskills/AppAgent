@@ -138,10 +138,19 @@ function _unregisterPanel(port) {
                 // RE-DISPATCH a tool this now-dead panel already ran (double side
                 // effect). Downgrade to a port-less tombstone so the adoption arm
                 // reconciles (registers a waiting pending entry + backstop, never
-                // re-dispatches). Drop the buffered result payload. scheduleAdoptedEviction
-                // bounds the tombstone's lifetime so it can't grow unbounded.
+                // re-dispatches). scheduleAdoptedEviction bounds the tombstone's
+                // lifetime so it can't grow unbounded.
+                // F1: do NOT destroy a genuine buffered exec-tool-result. The earlier
+                // version unconditionally `delete _adoptedResults[id]`; when the adopting
+                // panel disconnected holding a real buffered result this wiped it, so the
+                // resumed loop found no buffer, the 30s redispatch backstop REJECTED a
+                // tool that already succeeded, and the model retried -> duplicate side
+                // effect. Preserve a present buffer (mirroring the SWM3-T3 live-port path
+                // in 120-tool-routing.js which deliberately keeps it) and rely on the
+                // bounded ADOPTED_RESULT_TTL eviction below to reclaim it if it is never
+                // consumed. Only drop when there's nothing valuable to keep.
                 var _prevAdopt = _panelAdoptedTools[id];
-                delete _adoptedResults[id];
+                if (!_adoptedResults[id]) delete _adoptedResults[id];
                 _panelAdoptedTools[id] = { dispatched: true, chatId: _prevAdopt && _prevAdopt.chatId };
                 if (typeof scheduleAdoptedEviction === 'function') scheduleAdoptedEviction(id);
             }
@@ -246,6 +255,13 @@ function _handlePanelMessage(port, msg) {
                 });
             return;
 
+        // SWM-SW-NOGEN-NOTE: the 'interrupt' and 'toggle-pause' handlers below apply
+        // msg.paused / msg.fromUserMessage with NO generation / run-id guard. This is
+        // correct ONLY because of single-port FIFO message ordering plus page-side
+        // latest-wins reconciliation: messages from a given panel arrive in send order,
+        // and the page resolves any stale paused/interrupt state on the next snapshot.
+        // If multi-port or out-of-order delivery is ever introduced, these handlers will
+        // need an explicit generation guard. Documentation only -- no logic change.
         case 'interrupt':
             var icid = msg.chatId;
             if (icid) {
@@ -438,10 +454,26 @@ async function _handlePanelSendMessage(msg) {
     pausedChatIds[chatId] = false;
 
     if (runningChatIds[chatId]) {
-        pendingInjectionsByChatId[chatId] = {
-            text: msg.text || null,
-            images: msg.images || null
-        };
+        // SWM-INJ-DROP: concatenate rather than flat-replace. Two rapid sends inside one
+        // abort/restart window previously dropped the first message at the model level,
+        // because the second assignment clobbered the first un-flushed injection. Merge
+        // text (separator between non-empty parts) and concat image arrays, mirroring the
+        // page-side merge in app/040-send-message.js:39-51.
+        var _existingInj = pendingInjectionsByChatId[chatId];
+        if (_existingInj) {
+            var _mergedText;
+            if (_existingInj.text && msg.text) _mergedText = _existingInj.text + '\n\n' + msg.text;
+            else _mergedText = _existingInj.text || msg.text || null;
+            var _mergedImages;
+            if (_existingInj.images && msg.images) _mergedImages = _existingInj.images.concat(msg.images);
+            else _mergedImages = _existingInj.images || msg.images || null;
+            pendingInjectionsByChatId[chatId] = { text: _mergedText, images: _mergedImages };
+        } else {
+            pendingInjectionsByChatId[chatId] = {
+                text: msg.text || null,
+                images: msg.images || null
+            };
+        }
         userInterruptedChats[chatId] = true;
         if (interruptResolversByChatId[chatId]) {
             try { interruptResolversByChatId[chatId](); } catch (e) {}

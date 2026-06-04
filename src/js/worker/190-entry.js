@@ -38,6 +38,12 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
             return null;
         });
     }
+    // Skill DEFINITIONS (the `skills` global) must be hydrated in the SW too —
+    // getSkillsSummaryForPrompt does Object.values(skills) to build the ACTIVE
+    // SKILLS block. The page boot (120-init.js) loads these; without this the
+    // SW-built system prompt has an empty skills list even though activeSkills
+    // is populated, so active skills never reach the model.
+    var loadSkillDefs = (typeof loadSkillsFromStorage === 'function') ? loadSkillsFromStorage() : Promise.resolve();
     var loadActive = (typeof loadActiveSkills === 'function') ? loadActiveSkills() : Promise.resolve();
     var loadCustom = (typeof loadCustomSystemPrompt === 'function') ? loadCustomSystemPrompt() : Promise.resolve();
     var loadHooks = (typeof loadHooksSettings === 'function') ? loadHooksSettings() : Promise.resolve();
@@ -50,6 +56,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     Promise.all([
         safe(loadChatsFromStorage(), 'chats'),
         safe(loadApiProviders(), 'apiProviders'),
+        safe(loadSkillDefs, 'skills'),
         safe(loadActive, 'activeSkills'),
         safe(loadCustom, 'customSystemPrompt'),
         safe(loadHooks, 'hooksEnabled'),

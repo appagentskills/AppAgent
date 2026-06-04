@@ -252,7 +252,17 @@ AgentEvents.on('runFinished', function(e) {
     // SWM14-T2: gate finalize on the SW's authoritative paused signal carried on the event.
     // A paused run emits runFinished too; trusting the racy tab-local flags here would finalize
     // (and dismiss) the action button on a mere pause. Trust e.isPaused / e.reason from the SW.
-    if (fchat && fchat.isBackground && fchat.actionId && !e.isPaused && e.reason !== 'paused' && typeof finishActionIfDone === 'function') {
+    // SWM-PAUSE-FINALIZE: !e.isPaused && e.reason!=='paused' alone can finalize the
+    // action to 'Complete' even when a pause issued during the port-down window
+    // hasn't LANDED at the SW yet (pause lost + button wrongly shows Complete).
+    // Also require that no desired-but-unlanded pause is in-flight for this chat:
+    // _pauseToggleDesired[chatId] (set in 045's pushPauseToggleToOffscreen and
+    // pruned on a non-paused terminal event) === true means a pause was requested
+    // but not yet confirmed by the SW — suppress finalize until it lands or clears.
+    // Read the map bare with a typeof guard (it's a shared page-bundle global,
+    // same access pattern tools/120-actions.js uses for _pauseToggleGen).
+    var _pausePending = (typeof _pauseToggleDesired !== 'undefined' && _pauseToggleDesired && _pauseToggleDesired[chatId] === true);
+    if (fchat && fchat.isBackground && fchat.actionId && !e.isPaused && e.reason !== 'paused' && !_pausePending && typeof finishActionIfDone === 'function') {
         try { finishActionIfDone(chatId); } catch (err) { console.error('finishActionIfDone failed', err); }
     }
     // Page-side foreground streaming singletons: main cleared these inline at the
@@ -492,6 +502,34 @@ AgentEvents.on('actionStateChanged', function(e) {
     if (typeof renderVersionSidebar === 'function') {
         try { renderVersionSidebar(); } catch (err) {}
     }
+});
+
+// chatTitleChanged: set_chat_title (a headless tool) updated chat.title in the
+// SW. The page's chats mirror is stale and the header/list were never
+// refreshed. Hydrate the local title then re-run the UI side effects the tool
+// used to perform inline. Without this, a freshly-set title doesn't appear
+// until some later unrelated render (the "title not visible right away" bug).
+AgentEvents.on('chatTitleChanged', function(e) {
+    if (!e || !e.chatId) return;
+    if (chats[e.chatId]) chats[e.chatId].title = e.title;
+    if (typeof renderChatList === 'function') {
+        try { renderChatList(); } catch (err) {}
+    }
+    if (e.chatId === currentChatId && typeof updateChatTitleHeader === 'function') {
+        try { updateChatTitleHeader(); } catch (err) {}
+    }
+});
+
+// silentHookState: a silent (hidden) after-response hook — e.g. auto-title —
+// runs its OWN agent loop in the SW and sets `_silentHookRunning` THERE. The
+// page bundle has a separate copy of that flag which would otherwise stay
+// false, so the streamDelta broadcasts for the hook render briefly and then
+// get hidden on the final renderMessages → a visible flash of lines that
+// appear then disappear. Mirror the SW flag onto the page so the existing
+// render gates (renderMessages / updateStreamingMessage) suppress the hook's
+// output while it streams.
+AgentEvents.on('silentHookState', function(e) {
+    _silentHookRunning = !!(e && e.active);
 });
 
 // recordMutated: servicenow_api or servicenow_diff_edit modified a record.

@@ -686,6 +686,10 @@ async function deleteChat(chatId, e) {
     ]);
     if (result !== 'delete') return;
     delete chats[chatId];
+    // SWM-TOKENLEAK: prune the per-chat pause/interrupt latest-wins token maps so a
+    // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
+    // (the runFinished cleanup in app/045 only prunes on a NON-paused terminal event).
+    try { if (typeof _pruneChatPauseTokens === 'function') _pruneChatPauseTokens(chatId); } catch (ePt) {}
     saveChatsToStorage();
     if (currentChatId === chatId) {
         var ids = Object.keys(chats);

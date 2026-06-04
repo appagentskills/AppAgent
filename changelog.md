@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.4
+
+Stability release.
+
+### Fixes
+- Active skills were not loading on the system prompt.
+- Actions no longer run twice when the panel reconnects mid-task.
+- Chat titles update promptly, and the chat view no longer flickers while the agent works.
+- Fixed crashes when viewing certain embedded content and stale widget screenshots.
+
+---
+
 ## v1.1.3
 
 Version bump to sync the extension manifest with the tagged release (manifest was still at 1.1.1 when v1.1.2 was tagged).

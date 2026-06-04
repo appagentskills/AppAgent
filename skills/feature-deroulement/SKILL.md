@@ -298,6 +298,8 @@ But don't wait for these phrases when the branch-count gate triggers — the gat
 
 ## Worked examples
 
+> **Note (predates the service-worker move):** The examples and anti-patterns below cite the old page-side coordination model — `BroadcastChannel('appagent-actions')` at `53e-actions.js`, `executeUpdateActionState`, `notifyActionStateChanged`, `refreshActionButtons`, and halting via `pausedChats[deletedChatId] = true`. The *methodology* (depth calibration, reverse mode, branch-count gate) is still valid, but the cited file:line anchors are stale. Current run/pause/resume sequencing lives in the service worker, not the page: `app/045-agent-port-bridge-page.js` (`runningChatIds`, `_pendingRunAgents`), `worker/120-tool-routing.js` (`parkUIToolCall` / `replayParkedToolCalls` / `_swPanelPorts`), and `worker/130-port-bridge.js` (run-agent handler). Grep there, not in `53e-actions.js`.
+
 ### Picking depth in practice (Action audit)
 - `executeUpdateActionState` — **L3 line-by-line.** State validator, alias normalization, label clamping, timer arming. Off-by-one country.
 - `onActionButtonClick` — **L4 branch-by-branch.** Switch on 7 states, each with different routing.

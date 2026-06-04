@@ -66,14 +66,17 @@ function scheduleAdoptedEviction(toolCallId) {
     _adoptedEvictTimers[toolCallId] = setTimeout(function() {
         delete _adoptedEvictTimers[toolCallId];
         var m = _panelAdoptedTools[toolCallId];
-        // Drop the buffered result payload — its only consumer is the executeTool
-        // adoption arm within this window; past it nobody wants it.
-        delete _adoptedResults[toolCallId];
-        if (!m) return;
+        // SWM3-T3 fix: the buffered-result drop is deferred to AFTER the live-port
+        // re-arm guard below. Dropping it here (top of TTL) stripped the buffer on
+        // every re-arm of a STILL-LIVE marker, so a tool that finished post-reconnect
+        // lost its buffered result. Its only consumer is the executeTool adoption arm;
+        // for the !m / pending-entry / dead-port tombstone paths we still drop it here
+        // (identical behavior) — only the live-port re-arm path now retains it.
+        if (!m) { delete _adoptedResults[toolCallId]; return; }
         // Orphaned re-stamp: executeTool ALREADY ran for this id (a pending entry
         // exists, which owns reconciliation). The marker is stray — delete it (the
         // original always deleted; keeping it would leak). No tombstone needed.
-        if (_pendingUIToolCalls[toolCallId]) { delete _panelAdoptedTools[toolCallId]; return; }
+        if (_pendingUIToolCalls[toolCallId]) { delete _adoptedResults[toolCallId]; delete _panelAdoptedTools[toolCallId]; return; }
         // SWM3-T3: don't downgrade a marker whose adopting panel is STILL connected.
         // The first-level TTL bounds a marker the resumed loop never consumed, but a
         // live adopting port means the tool may still be executing (or about to be
@@ -82,9 +85,24 @@ function scheduleAdoptedEviction(toolCallId) {
         // can't match it and the awaited promise hangs. Re-arm the TTL and bail; the
         // pending-entry check above already handled the loop-already-ran case.
         if (m.port && typeof _swPanelPorts !== 'undefined' && _swPanelPorts.has(m.port)) {
-            scheduleAdoptedEviction(toolCallId);
-            return;
+            // F3: bound the live-port re-arm with an ABSOLUTE deadline. Without it, a
+            // never-consumed live marker + buffer re-arms forever while the adopting
+            // panel stays connected, leaking for the entire connection lifetime. Stamp
+            // the first time eviction was scheduled for this marker; while we're within
+            // a generous cap (10x the TTL) keep re-arming (a genuinely slow tool still
+            // settles), but once the cap is exceeded STOP re-arming and fall through to
+            // the dead-port terminal cleanup path below so the buffer + marker are
+            // reclaimed instead of leaking.
+            if (!m.firstScheduledAt) m.firstScheduledAt = Date.now();
+            if ((Date.now() - m.firstScheduledAt) <= (10 * ADOPTED_RESULT_TTL_MS)) {
+                scheduleAdoptedEviction(toolCallId);
+                return;
+            }
+            // Past the absolute deadline — fall through to the dead-port terminal path.
         }
+        // Dead-port terminal path: drop the buffered result (identical to the original
+        // top-of-TTL delete; deferred here only so the live-port re-arm above keeps it).
+        delete _adoptedResults[toolCallId];
         // SWM3-N1(b): the loop has NOT reached executeTool(toolCallId) yet. Do NOT
         // fully delete the marker — a late executeTool would then find nothing and
         // BLIND RE-DISPATCH a tool the panel already ran (double side effect).
@@ -250,10 +268,19 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
         alreadyDispatched: !!alreadyDispatched,
         parkedAt: Date.now()
     };
+    // F4: if an entry for this toolCallId is already parked (re-park), clear its stale
+    // 24h TTL timer first so we don't stack a second never-cleared closure.
+    try {
+        parkedToolCallsByChatId[chatId].forEach(function(_e) {
+            if (_e.toolCallId === toolCallId && _e._ttlTimer) { clearTimeout(_e._ttlTimer); _e._ttlTimer = null; }
+        });
+    } catch (e) {}
     parkedToolCallsByChatId[chatId].push(entry);
     AgentEvents.emit('toolParked', { chatId: chatId, toolCallId: toolCallId, name: name, input: input });
-    // Schedule TTL cancellation.
-    setTimeout(function() {
+    // Schedule TTL cancellation. F4: store the timer id ON the entry so consume/replay/
+    // cancel can clearTimeout it — otherwise the 24h closure outlives the parked entry
+    // and a re-park stacks a second timer.
+    entry._ttlTimer = setTimeout(function() {
         cancelParkedToolCall(chatId, toolCallId, 'TTL expired (24h with no panel)');
     }, PARKED_TOOL_TTL_MS);
 }
@@ -265,6 +292,9 @@ function cancelParkedToolCall(chatId, toolCallId, reason) {
         if (arr[i].toolCallId === toolCallId) {
             var entry = arr[i];
             arr.splice(i, 1);
+            // F4: clear the stored TTL timer so the 24h closure can't fire again on an
+            // id that's now cancelled.
+            try { if (entry._ttlTimer) { clearTimeout(entry._ttlTimer); entry._ttlTimer = null; } } catch (eT) {}
             try {
                 entry.resolve({ success: false, error: 'Tool call cancelled: ' + (reason || 'unknown') });
             } catch (e) {}
@@ -363,6 +393,10 @@ function replayParkedToolCalls(port) {
                     dispatchUIToolToPort(port, chatId, entry.toolCallId, entry.name, entry.input, entry.resolve, entry.reject, entry.sandboxCtx);
                     AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed' });
                 }
+                // F4: this entry is leaving the parked set on a successful dispatch/
+                // reconcile — clear its 24h TTL timer so a stale closure doesn't later
+                // fire cancelParkedToolCall on an id that's now live (or already settled).
+                try { if (entry._ttlTimer) { clearTimeout(entry._ttlTimer); entry._ttlTimer = null; } } catch (e3) {}
             } catch (e) {
                 // Failed to dispatch — re-park. B4: also drop any pending entry the
                 // approval branch registered (above) before its postMessage threw,

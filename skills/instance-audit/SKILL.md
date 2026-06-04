@@ -127,7 +127,7 @@ const html = `
 </div>`;
 
 const widget = await executeTool('html_widget', { html, width: 700, height: 600 });
-return widget.widget_id;
+return widget.widgetId;
 ```
 
 ## Widget Display Guidelines

@@ -29,7 +29,7 @@ Fast, one-click inspection of an instance's structure. Each action queries Servi
 ## Action Lifecycle: Show Tables
 
 1. `update_action_state({ state: 'running', icon: 'database', label: 'Loading tables…' })`
-2. Call `servicenow_api` GET on `sys_db_object` with `limit: 200`, fields `name,label,super_class,sys_scope`
+2. Call `servicenow_api` GET on `sys_db_object` with `limit: 200`, fields `name,label,sys_scope`
 3. `update_action_state({ state: 'running', icon: 'list', label: 'Building table' })`
 4. Use `display` tool with `template: 'table'` columns `[Name, Label, Scope]`
 5. `update_action_state({ state: 'done', icon: 'check', label: 'N tables' })`

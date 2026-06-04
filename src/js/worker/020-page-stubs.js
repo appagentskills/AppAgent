@@ -244,6 +244,13 @@ function executeAfterResponseHooks(chatId) {
     if (!chat || !chat.messages || chat.messages.length < 2) return;
     if (chat.title && chat.title !== 'New Chat') return;
     _silentHookRunning = !hooksEnabled.showHookMessages;
+    // Tell the page to mirror the silent-hook flag so its render gates
+    // suppress this hook's streaming output (prevents the flash of lines
+    // that appear then disappear). Cleared via silentHookState(false) at the
+    // agent-loop reset. No-op when the hook isn't silent.
+    if (_silentHookRunning && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+        AgentEvents.emit('silentHookState', { active: true, chatId: chatId });
+    }
     chat.messages.push({
         role: 'user',
         content: 'Now set a concise chat title (max 50 chars) for this conversation using the set_chat_title tool. Do NOT say anything else.',

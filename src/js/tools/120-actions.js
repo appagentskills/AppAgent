@@ -581,7 +581,16 @@ async function dismissAction(actionId) {
             // running in the service worker after the button is gone.
             if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(dchat, true);
             if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(dchat, false);
+            // SWM-F5: capture the pause-toggle generation we just issued (pushPauseToggleToOffscreen
+            // bumps _pauseToggleGen[chatId] synchronously on a fresh call). The 5s deferred clear
+            // below must NO-OP if a NEWER pause/resume toggle for this chatId is issued in the
+            // meantime — otherwise, when the chatId is reused and legitimately RE-PAUSED during
+            // that window, our stale deferred resume would clobber it (resume a chat the user just
+            // paused). Reuses the same latest-wins generation mechanism as the toggle retry chains.
+            var _dismissPauseGen = (typeof _pauseToggleGen !== 'undefined' && _pauseToggleGen) ? _pauseToggleGen[dchat] : undefined;
             setTimeout(function() {
+                // Superseded by a newer pause/resume toggle for this chatId — leave its state alone.
+                if (typeof _pauseToggleGen !== 'undefined' && _pauseToggleGen && _pauseToggleGen[dchat] !== _dismissPauseGen) return;
                 delete pausedChats[dchat];
                 // SWM14-F3: also clear the SW-side pause copy. The push above set
                 // pausedChats[dchat]=true in the SW too; the page-only delete here

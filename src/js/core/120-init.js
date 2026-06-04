@@ -480,8 +480,33 @@ async function init() {
                     } catch (e) {}
                 }); });
             }
+            // Live-DOM snapshot path (set by take_screenshot 060 via &snap=1): render a
+            // STATIC snapshot of the widget's CURRENT live DOM instead of re-running
+            // dlWidget.html from scratch. The widget's scripts are neutralized so the
+            // captured frame preserves interactive state (counters, loaded data) without
+            // re-executing and resetting it. Falls back to a fresh render if no snapshot.
+            var _dlHtml = dlWidget.html;
+            if (urlParams.get('snap') === '1') {
+                try {
+                    var _dlSnap = await new Promise(function(res){
+                        try { chrome.storage.local.get('__appagent_widget_snapshot__', function(o){ res(o && o['__appagent_widget_snapshot__']); }); }
+                        catch (e) { res(null); }
+                    });
+                    if (_dlSnap && _dlSnap.widgetId === deepLinkWidgetId && _dlSnap.html) {
+                        // Neutralize ALL <script> tags (set a non-executable type) so the
+                        // snapshot is purely visual and no script re-runs to reset state.
+                        _dlHtml = String(_dlSnap.html).replace(/<script\b/gi, '<script type="application/x-neutered" data-neutered="1" ');
+                        // Size the iframe + body to the snapshot's content height so the
+                        // temp tab lays out at widget size (060 also crops the raster).
+                        if (_dlSnap.height) {
+                            wf.style.height = _dlSnap.height + 'px';
+                            try { document.body.style.height = _dlSnap.height + 'px'; } catch (e) {}
+                        }
+                    }
+                } catch (e) { /* fall back to fresh render of dlWidget.html */ }
+            }
             window.addEventListener('message', _dlOnWidgetMsg);
-            writeWidgetHtml(wf, dlWidget.html);
+            writeWidgetHtml(wf, _dlHtml);
             return;
         }
     }

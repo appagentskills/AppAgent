@@ -44,7 +44,7 @@ const response = await executeTool('servicenow_api', {
     limit: 10,
     fields: 'sys_id,number,short_description'
 });
-// response.result contains the API response
+// response.data.result contains the API response
 ```
 
 ### Common API Parameters
@@ -84,12 +84,12 @@ const res = await executeTool('servicenow_api', {
   method: 'GET', scope: 'global', table: 'incident',
   query: 'active=true', fields: 'number,short_description', limit: 10
 });
-const rows = (res.result || []).map(r =>
+const rows = (res.data.result || []).map(r =>
   '<tr><td>' + r.number + '</td><td>' + r.short_description + '</td></tr>'
 ).join('');
 const widget = await executeTool('html_widget', {
   html: '<table><tr><th>Number</th><th>Description</th></tr>' + rows + '</table>',
   width: 600, height: 400
 });
-return widget.widget_id; // use this to screenshot or edit later
+return widget.widgetId; // use this to screenshot or edit later
 ```

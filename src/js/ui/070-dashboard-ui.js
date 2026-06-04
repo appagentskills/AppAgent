@@ -539,6 +539,20 @@ function injectWidgetBridge(html, widgetTitle) {
                 '}catch(_wqErr){_wqR={success:false,error:_wqErr.message};}' +
                 'window.parent.postMessage({type:"widgetQueryResult",id:_wqId,result:_wqR},"*");' +
             '}' +
+            // Serialize-for-capture handler. take_screenshot (060) asks the LIVE
+            // sandbox to snapshot its CURRENT DOM so the capture preserves interactive
+            // state (counters, loaded data) instead of re-running scripts from scratch.
+            // Tiny + defensive; does not touch the executeTool bridge or height reporter.
+            'if(e.data&&e.data.type==="__appagentSerializeForCapture"){' +
+                'try{' +
+                    'var _scH="<!doctype html>"+document.documentElement.outerHTML;' +
+                    'var _scW=document.documentElement.scrollWidth;' +
+                    'var _scHt=(document.body?document.body.scrollHeight:document.documentElement.scrollHeight);' +
+                    'window.parent.postMessage({type:"__appagentSerializedDom",reqId:e.data.reqId,html:_scH,width:_scW,height:_scHt},"*");' +
+                '}catch(_scErr){' +
+                    'try{window.parent.postMessage({type:"__appagentSerializedDom",reqId:e.data.reqId,html:null,error:_scErr.message},"*");}catch(_scE2){}' +
+                '}' +
+            '}' +
         '});' +
     '<\/script>';
     var result = html.replace(/<\/head>/i, bridgeScript + '</head>');
