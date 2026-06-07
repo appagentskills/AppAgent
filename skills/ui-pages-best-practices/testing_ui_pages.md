@@ -125,6 +125,6 @@ Check `get_console_logs` for JavaScript errors that don't surface in the UI. The
 ### API calls failing
 
 Use `get_network_requests` to inspect failed requests. Common causes:
-- Missing `X-UserToken: window.g_ck` header
+- Missing `X-UserToken: window.sessionToken` header (set `window.sessionToken = "$[gs.getSessionToken()]"` in the page; see the main SKILL.md)
 - Wrong table name or query syntax
 - ACL restrictions for the current user

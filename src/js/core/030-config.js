@@ -109,6 +109,7 @@ var pausedChats = {}; // Per-chat pause flags (for background Action chats the u
 function isChatPaused(chatId) { return chatId ? pausedChats[chatId] === true : false; }
 var isRunning = false;
 var runningChatIds = {}; // Set of chatIds with an active agent loop — supports concurrent background chats
+var _runCleanupGuard = {}; // Per-chat: true during the finish/cleanup→hook-rerun window. runningChatIds is briefly cleared there (line ~991) before the auto-title hook's recursive runAgent re-sets it; an await in between (finishActionIfDone) lets a stale panel run-agent observe "not running" and start a SECOND loop, producing interleaved/orphan tool_use blocks. The SW run-agent handler treats a guarded chat as running.
 var pendingInjection = null; // User message to inject into the next tool result batch
 var pendingInjectionImages = null; // Images/files to inject alongside pendingInjection
 var pendingInjectionsByChatId = {}; // Per-chat pending injections: { chatId: { text, images } }

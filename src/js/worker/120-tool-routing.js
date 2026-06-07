@@ -788,6 +788,15 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         if (permission === 'disabled') {
             return Object.assign({ allowed: false, error: displayName + ' is disabled by user settings' }, baseResult);
         }
+        // web_fetch to the CONFIGURED GitHub REST base is agent-governed via
+        // the `confirm` param (mirrors the page gate in ui/150-tool-approval.js).
+        // Downgrade the DEFAULT 'ask' only; explicit user overrides aren't 'ask'.
+        if (toolName === 'web_fetch' && permission === 'ask' && args && args.url
+            && typeof isConfiguredGitHubApiUrl === 'function'
+            && (await isConfiguredGitHubApiUrl(args.url))) {
+            permission = 'auto';
+            baseResult.permission = 'auto';
+        }
         if (permission === 'allow') {
             return Object.assign({ allowed: true }, baseResult);
         }

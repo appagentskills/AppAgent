@@ -466,6 +466,12 @@ async function renderGitHubReposList() {
                 if (!el) return;
                 wsSyncWithRemote(rd.wk).then(function(syncResult) {
                     if (!el || !el.parentNode) return;
+                    if (syncResult && syncResult.deleted) {
+                        // Workspace auto-removed (merged head branch) — drop its row.
+                        var _rowEl = el.closest('.settings-page-row');
+                        if (_rowEl) _rowEl.remove();
+                        return;
+                    }
                     if (!syncResult) {
                         el.style.color = 'var(--text-muted)'; el.textContent = 'offline';
                         return;
@@ -677,6 +683,12 @@ async function syncAndUpdateWorkspaceHeader() {
         // Sync all repos in parallel
         await Promise.all(summaries.map(function(s) {
             return wsSyncWithRemote(s.wk).then(async function(syncResult) {
+                if (syncResult && syncResult.deleted) {
+                    // Workspace auto-removed (merged head branch) — drop from caches.
+                    delete _wsHeaderCaches[s.wk];
+                    _renderWsHeaderBadge();
+                    return;
+                }
                 var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
                 // Re-read after sync (files may have been cleaned)
                 var meta = await getWorkspaceMeta(s.wk);
@@ -713,6 +725,17 @@ async function _syncDropdownInBackground() {
     var keys = Object.keys(_wsHeaderCaches);
     await Promise.all(keys.map(function(wk) {
         return wsSyncWithRemote(wk).then(async function(syncResult) {
+            if (syncResult && syncResult.deleted) {
+                // Workspace auto-removed (merged head branch). Drop it from the
+                // dropdown + caches and refresh the badge.
+                delete _wsHeaderCaches[wk];
+                if (_wsDropdown) {
+                    var _goneSection = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
+                    if (_goneSection) _goneSection.remove();
+                }
+                _renderWsHeaderBadge();
+                return;
+            }
             var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
             var meta = await getWorkspaceMeta(wk);
             var isIgnored = await wsGetIgnoreFilter(wk);

@@ -29,6 +29,19 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
         return Object.assign({ allowed: false, error: displayName + ' is disabled by user settings' }, baseResult);
     }
 
+    // web_fetch to the CONFIGURED GitHub REST base is agent-governed via the
+    // `confirm` param (like servicenow_api): reads run silently, writes prompt
+    // only when the agent sets confirm:true. We downgrade the DEFAULT 'ask'
+    // only — an explicit user 'disabled'/'allow'/'auto' override is left
+    // untouched (none of those equal 'ask'). isConfiguredGitHubApiUrl lives in
+    // tools/020-tool-execution.js (same page bundle; hoisted function decl).
+    if (toolName === 'web_fetch' && permission === 'ask' && args && args.url
+        && typeof isConfiguredGitHubApiUrl === 'function'
+        && (await isConfiguredGitHubApiUrl(args.url))) {
+        permission = 'auto';
+        baseResult.permission = 'auto';
+    }
+
     // 'allow' — always execute silently
     if (permission === 'allow') {
         return Object.assign({ allowed: true }, baseResult);

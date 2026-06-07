@@ -428,7 +428,7 @@ async function executeTakeScreenshot(args) {
 
             // Get element rect from tab, take full screenshot, then crop
             var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector });
-            if (elProps.error) {
+            if (elProps.error || !elProps.properties) {
                 return { success: false, error: 'Element not found: ' + selector };
             }
             var elRect = elProps.properties && elProps.properties.rect;

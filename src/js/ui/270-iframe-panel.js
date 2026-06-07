@@ -67,9 +67,6 @@ function reloadExtension() {
         if (!window.confirm(msg)) return;
     }
 
-    // Immediate feedback — the reload tears the page down a moment later.
-    if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
-
     // Fire the reload exactly once, and never let anything strand it.
     var _reloaded = false;
     function _doReload() {
@@ -83,23 +80,65 @@ function reloadExtension() {
         }
     }
 
-    // Persist reopenAppTab so background.js reopens the app as a full tab.
-    // CRITICAL: do NOT gate the reload solely on this callback. If the service
-    // worker is asleep/busy or storage is blocked, the callback can be delayed
-    // or never fire — which previously left chrome.runtime.reload() unreached
-    // and the old SW running. We always fall back via a short timer.
-    try {
-        if (chrome.storage && chrome.storage.local) {
-            chrome.storage.local.set({ reopenAppTab: true }, function() {
-                // Touch lastError so Chrome doesn't log an unchecked-error warning.
-                if (chrome.runtime.lastError) { /* ignore */ }
-                _doReload();
-            });
-        }
-    } catch (e) { /* fall through to the timer */ }
+    // Persist reopenAppTab so background.js reopens the app as a full tab, then
+    // fire the reload. CRITICAL: do NOT gate the reload solely on the storage
+    // callback. If the service worker is asleep/busy or storage is blocked, the
+    // callback can be delayed or never fire — which previously left
+    // chrome.runtime.reload() unreached and the old SW running. We always fall
+    // back via a short timer.
+    function _startReloadSequence() {
+        // Immediate feedback — the reload tears the page down a moment later.
+        if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
+        try {
+            if (chrome.storage && chrome.storage.local) {
+                chrome.storage.local.set({ reopenAppTab: true }, function() {
+                    // Touch lastError so Chrome doesn't log an unchecked-error warning.
+                    if (chrome.runtime.lastError) { /* ignore */ }
+                    _doReload();
+                });
+            }
+        } catch (e) { /* fall through to the timer */ }
+        // Guaranteed fallback: reload even if the storage callback never returns.
+        setTimeout(_doReload, 400);
+    }
 
-    // Guaranteed fallback: reload even if the storage callback never returns.
-    setTimeout(_doReload, 400);
+    // Rebuild-then-reload: when running as an installed extension with a deploy
+    // folder connected (and the in-browser build tool available), rebuild +
+    // redeploy the extension from the workspace FIRST, so chrome.runtime.reload()
+    // picks up the freshly built files from disk. Without a connected folder (or
+    // build tool) there is nothing on disk to update, so we just reload.
+    _rebuildBeforeReload().then(function(proceed) {
+        if (proceed) _startReloadSequence();
+    });
+}
+
+// Rebuild + redeploy the extension from the workspace before a reload, but only
+// when a deploy folder is connected and the `extension_build` skill tool is
+// loaded (the extension-dev skill is active). Reuses the exact same build the
+// agent runs — no duplicated build logic. Returns a promise resolving to `true`
+// when the caller should proceed with the reload, or `false` to abort (the user
+// declined to reload after a failed build).
+async function _rebuildBeforeReload() {
+    try {
+        // Need the in-browser build tool — provided by the extension-dev skill.
+        if (typeof isSkillTool !== 'function' || !isSkillTool('extension_build')) return true;
+        // Need a connected deploy folder, else there's nothing on disk to update.
+        if (typeof getDeployDirHandle !== 'function') return true;
+        var handle = await getDeployDirHandle();
+        if (!handle) return true;
+
+        if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
+        var res = await executeTool('extension_build', {});
+        var ok = !!(res && res.success && res.stats && res.stats.jsFiles > 0 && res.stats.filesDeployed > 0);
+        if (ok) return true;
+
+        // Build/deploy failed — let the user decide whether to reload the
+        // previously built files instead of silently shipping a broken build.
+        var err = (res && (res.error || (res.deploy && res.deploy.error))) || 'no files were built/deployed (is the repo cloned?)';
+        return window.confirm('Extension rebuild failed:\n' + err + '\n\nReload with the previously built files anyway?');
+    } catch (e) {
+        return window.confirm('Extension rebuild error:\n' + (e && e.message ? e.message : String(e)) + '\n\nReload with the previously built files anyway?');
+    }
 }
 
 function openSidePanelFromTab() {

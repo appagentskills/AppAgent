@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.5
+
+### Features
+- New `ui-driver` skill for driving tricky Service Portal / ESC form widgets (select2, native inputs, date/datetime, duration, list collector) on both catalog and custom widgets.
+- GitHub REST calls no longer prompt on every request — reads run silently, writes still confirm.
+- Reload now rebuilds and redeploys the extension first when a deploy folder is connected.
+- Merged workspaces are cleaned up automatically on the next remote sync.
+
+### Fixes
+- More reliable synthetic clicks (real `MouseEvent`s); `get_properties` no longer throws on a no-match selector.
+- `dispatch_event` rejects unknown events consistently across both backends.
+
+---
+
 ## v1.1.4
 
 Stability release.

@@ -11,9 +11,18 @@ Free, keyless web search via **Google** (default) and **DuckDuckGo** (fallback).
 
 One tool, two engines. Google is the default — richer snippets, embedded freshness stamps ("2 hours ago"), better ranking for current events. DDG is the fallback when Google is rate-limited or when you need to burn through many low-priority queries fast.
 
+### Quick start
+
+```js
+// queries MUST be an array of strings — even for a single search.
+web_search({ queries: ["servicenow flow designer best practices"] })
+```
+
+> ⚠️ **`queries` must be a list/array, not a plain string.** Passing a bare string (`queries: "..."`) fails silently / returns nothing. Always wrap it: `queries: ["..."]`.
+
 ### Input
 
-- `queries`: string[] — run sequentially.
+- `queries`: string[] — run sequentially. **Required, must be an array** (wrap single queries too).
 - `engine`: `"google"` (default) or `"ddg"`.
 - `max_results_per_query`: optional, default 10.
 - `sleep_ms`: optional. Defaults to **5000 for Google**, **2000 for DDG**. Lower at your own risk.

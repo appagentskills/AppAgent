@@ -305,8 +305,10 @@ async function executeIframeTool(args) {
                     return { success: true, requests: extResult.requests || [] };
                 }
                 if (action === 'get_properties') {
-                    var _propRes = { success: true, properties: extResult.properties || {} };
-                    if (extResult.match_count !== undefined) _propRes.match_count = extResult.match_count;
+                    // Preserve an explicit null (no-match) instead of masking it as {}, and
+                    // always surface match_count so callers can branch on 0 matches cleanly.
+                    var _propRes = { success: true, properties: (extResult.properties !== undefined ? extResult.properties : {}) };
+                    _propRes.match_count = (extResult.match_count !== undefined ? extResult.match_count : (extResult.properties ? 1 : 0));
                     return _propRes;
                 }
                 if (action === 'get_page_info') {
@@ -814,14 +816,15 @@ async function executeIframeTool(args) {
                     } catch(selErr) {
                         return { success: false, error: 'Invalid selector: ' + args.selector + ' (' + selErr.message + ')' };
                     }
-                    if (!elements.length) return { success: false, error: 'No elements found: ' + args.selector };
+                    if (!elements.length) return { success: true, count: 0, match_count: 0, elements: [], properties: null };
                     var include = args.include || ['rect', 'styles', 'value', 'attributes'];
                     var results = [];
                     var limit = Math.min(elements.length, 20);
                     for (var i = 0; i < limit; i++) {
                         var el = elements[i];
                         var elWin = el.ownerDocument.defaultView || target.iframe.contentWindow;
-                        var info = { tagName: el.tagName.toLowerCase(), visible: el.offsetParent !== null || el.offsetWidth > 0 || el.offsetHeight > 0 };
+                        var _clsStr = (typeof el.className === 'string') ? el.className : ((el.getAttribute && el.getAttribute('class')) || '');
+                        var info = { tagName: el.tagName.toLowerCase(), visible: el.offsetParent !== null || el.offsetWidth > 0 || el.offsetHeight > 0, className: _clsStr, classList: _clsStr ? _clsStr.trim().split(/\s+/).filter(Boolean) : [] };
                         if (include.indexOf('rect') !== -1) {
                             var rect = el.getBoundingClientRect();
                             info.rect = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
@@ -843,7 +846,9 @@ async function executeIframeTool(args) {
                         }
                         results.push(info);
                     }
-                    return { success: true, count: elements.length, elements: results };
+                    // `properties` mirrors the extension path (first match) so callers get one
+                    // consistent shape regardless of which backend served the request.
+                    return { success: true, count: elements.length, match_count: elements.length, elements: results, properties: results[0] || null };
                 } catch(e) {
                     return { success: false, error: 'get_properties failed: ' + e.message };
                 }
@@ -884,7 +889,7 @@ async function executeIframeTool(args) {
                 try {
                     if (!args.selector) return { success: false, error: 'selector is required for dispatch_event action' };
                     if (!args.event) return { success: false, error: 'event is required for dispatch_event action' };
-                    var allowedEvents = ['click', 'change', 'input', 'focus', 'blur', 'submit', 'mouseenter', 'mouseleave', 'mouseover', 'mouseout', 'keydown', 'keyup'];
+                    var allowedEvents = ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'contextmenu', 'change', 'input', 'focus', 'blur', 'submit', 'mouseenter', 'mouseleave', 'mouseover', 'mouseout', 'keydown', 'keyup'];
                     if (allowedEvents.indexOf(args.event) === -1) return { success: false, error: 'Event "' + args.event + '" not allowed. Allowed: ' + allowedEvents.join(', ') };
                     var target = getTargetIframe();
                     if (target.error) return { success: false, error: target.error };
@@ -902,8 +907,19 @@ async function executeIframeTool(args) {
                         var codeMap = { Escape: 'Escape', Enter: 'Enter', Tab: 'Tab', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight', Backspace: 'Backspace', Delete: 'Delete', Space: 'Space', ' ': 'Space' };
                         var keyCode = codeMap[keyName] || (keyName.length === 1 ? 'Key' + keyName.toUpperCase() : keyName);
                         eventObj = new elWin.KeyboardEvent(args.event, { key: keyName, code: keyCode, keyCode: kc, which: kc, bubbles: true, cancelable: true });
-                    } else if (args.event === 'mouseenter' || args.event === 'mouseleave' || args.event === 'mouseover' || args.event === 'mouseout') {
-                        eventObj = new elWin.MouseEvent(args.event, { bubbles: args.event === 'mouseover' || args.event === 'mouseout', cancelable: true });
+                    } else if (['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseenter', 'mouseleave', 'mouseover', 'mouseout', 'contextmenu'].indexOf(args.event) !== -1) {
+                        // Real MouseEvent (not a generic Event) so frameworks see a genuine pointer interaction.
+                        var _mr = el.getBoundingClientRect();
+                        var _nb = (args.event === 'mouseenter' || args.event === 'mouseleave');
+                        eventObj = new elWin.MouseEvent(args.event, {
+                            bubbles: !_nb,
+                            cancelable: true,
+                            view: elWin,
+                            button: 0,
+                            buttons: (args.event === 'mousedown' ? 1 : 0),
+                            clientX: Math.round(_mr.left + _mr.width / 2),
+                            clientY: Math.round(_mr.top + _mr.height / 2)
+                        });
                     } else {
                         eventObj = new elWin.Event(args.event, { bubbles: true, cancelable: true });
                     }

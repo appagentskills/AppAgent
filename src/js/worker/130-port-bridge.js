@@ -205,7 +205,14 @@ function _handlePanelMessage(port, msg) {
             // and the SW used to clobber its in-memory chat with that copy.
             // The next save then persisted the stale shape to IDB.
             if (msg.chatId) {
-                var isRunning = !!runningChatIds[msg.chatId];
+                // Treat the brief finish→hook-rerun cleanup window as "running"
+                // too. During it runningChatIds is transiently cleared, but the
+                // SW is still the authoritative writer (about to push the hook's
+                // assistant + tool_result). A panel run-agent that lands here
+                // carries a stale snapshot — honoring _runCleanupGuard stops it
+                // from clobbering chats[id] AND from starting a parallel loop.
+                var isRunning = !!runningChatIds[msg.chatId]
+                    || !!(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[msg.chatId]);
                 if (msg.chat && !isRunning) chats[msg.chatId] = msg.chat;
                 if (msg.currentProvider) currentProvider = msg.currentProvider;
                 // SWM1F-1: a run-agent means the user intends this chat to run

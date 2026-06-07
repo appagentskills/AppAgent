@@ -1312,46 +1312,22 @@ async function executeTool(name, args, messageIndex, options) {
             }
             // --- GitHub REST API auth injection -------------------------------
             // Reuse the GitHub token the workspace tool stores in chrome.storage
-            // (keys 'githubToken' + 'githubInstanceUrl' — the same values read by
-            // githubApi() in core/130-indexeddb.js for clone/push) so REST calls
-            // work against PRIVATE repos. The token is attached ONLY when the
-            // request targets the CONFIGURED instance's REST API base, derived
-            // EXACTLY like githubApi():
-            //   - https://github.com -> https://api.github.com   (any path on host)
-            //   - GHE <instanceUrl>  -> <instanceUrl>/api/v3      (only /api/v3 paths)
-            // Matching the configured host guarantees we send the RIGHT token to
-            // the RIGHT GitHub, and never leak it to another host or to the GHE
-            // web UI (which shares the API host but not the /api/v3 path prefix).
-            // We never override a caller-supplied header. No token => no-op. Runs
-            // in the SW, the same context that performs the fetch below.
+            // so REST calls work against PRIVATE repos. The token is attached
+            // ONLY when the request targets the CONFIGURED instance's REST API
+            // base (see getGitHubApiAuthForUrl below — the SAME match also makes
+            // these calls confirm-governed in the approval gate). We never
+            // override a caller-supplied header. No token / non-match => no-op.
             try {
-                var _wfGh = await new Promise(function(resolve) {
-                    chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
-                });
-                var _wfTok = _wfGh && _wfGh.githubToken;
-                if (_wfTok) {
-                    var _wfInstance = _wfGh.githubInstanceUrl || 'https://github.com';
-                    var _wfApiBase = _wfInstance === 'https://github.com'
-                        ? 'https://api.github.com'
-                        : _wfInstance.replace(/\/$/, '') + '/api/v3';
-                    var _wfReq = new URL(args.url);
-                    var _wfBase = new URL(_wfApiBase);
-                    var _wfReqPath = _wfReq.pathname.toLowerCase();
-                    var _wfBasePath = _wfBase.pathname.replace(/\/$/, '').toLowerCase(); // '' for cloud, '/api/v3' for GHE
-                    var _wfPathOk = _wfBasePath === '' || _wfReqPath === _wfBasePath || _wfReqPath.indexOf(_wfBasePath + '/') === 0;
-                    var _wfHostOk = _wfReq.protocol === _wfBase.protocol
-                        && _wfReq.hostname.toLowerCase() === _wfBase.hostname.toLowerCase()
-                        && _wfReq.port === _wfBase.port;
-                    if (_wfHostOk && _wfPathOk) {
-                        // Case-insensitive presence check so caller-set headers win.
-                        var _wfHasHeader = function(headerName) {
-                            headerName = headerName.toLowerCase();
-                            return Object.keys(_wfOpts.headers).some(function(k) { return k.toLowerCase() === headerName; });
-                        };
-                        if (!_wfHasHeader('authorization')) _wfOpts.headers['Authorization'] = 'Bearer ' + _wfTok;
-                        if (!_wfHasHeader('accept')) _wfOpts.headers['Accept'] = 'application/vnd.github+json';
-                        if (!_wfHasHeader('x-github-api-version')) _wfOpts.headers['X-GitHub-Api-Version'] = '2022-11-28';
-                    }
+                var _wfAuth = await getGitHubApiAuthForUrl(args.url);
+                if (_wfAuth) {
+                    // Case-insensitive presence check so caller-set headers win.
+                    var _wfHasHeader = function(headerName) {
+                        headerName = headerName.toLowerCase();
+                        return Object.keys(_wfOpts.headers).some(function(k) { return k.toLowerCase() === headerName; });
+                    };
+                    if (!_wfHasHeader('authorization')) _wfOpts.headers['Authorization'] = 'Bearer ' + _wfAuth.token;
+                    if (!_wfHasHeader('accept')) _wfOpts.headers['Accept'] = 'application/vnd.github+json';
+                    if (!_wfHasHeader('x-github-api-version')) _wfOpts.headers['X-GitHub-Api-Version'] = '2022-11-28';
                 }
             } catch (_wfGhErr) { /* malformed URL or storage read error: fall through unauthenticated (safe no-op) */ }
             // ------------------------------------------------------------------
@@ -1389,6 +1365,55 @@ async function executeTool(name, args, messageIndex, options) {
         return await executeSkillTool(name, args, options);
     }
     return { success: false, error: 'Unknown tool' };
+}
+
+// =============================================
+// GitHub REST API URL matching (shared)
+// =============================================
+// Single source of truth for "does this URL target the CONFIGURED GitHub REST
+// API base?". Used by web_fetch token-injection (to attach the stored token)
+// AND by the permission gate (to make these calls confirm-governed instead of
+// always prompting). The base is derived EXACTLY like githubApi() in
+// core/130-indexeddb.js:
+//   - https://github.com -> https://api.github.com   (any path on host)
+//   - GHE <instanceUrl>  -> <instanceUrl>/api/v3      (only /api/v3 paths)
+// Matching the configured host+path guarantees we treat the RIGHT GitHub, and
+// never leak the token to another host or to the GHE web UI (which shares the
+// API host but not the /api/v3 path prefix).
+//
+// Returns { token, apiBase } when `url` matches AND a token is stored;
+// otherwise null. Lives here because this file is bundled into BOTH the page
+// and the worker (service-worker) bundles, so both approval gates can call it.
+async function getGitHubApiAuthForUrl(url) {
+    try {
+        if (!url) return null;
+        var gh = await new Promise(function(resolve) {
+            chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
+        });
+        var tok = gh && gh.githubToken;
+        if (!tok) return null;
+        var instance = gh.githubInstanceUrl || 'https://github.com';
+        var apiBase = instance === 'https://github.com'
+            ? 'https://api.github.com'
+            : instance.replace(/\/$/, '') + '/api/v3';
+        var req = new URL(url);
+        var base = new URL(apiBase);
+        var reqPath = req.pathname.toLowerCase();
+        var basePath = base.pathname.replace(/\/$/, '').toLowerCase(); // '' for cloud, '/api/v3' for GHE
+        var pathOk = basePath === '' || reqPath === basePath || reqPath.indexOf(basePath + '/') === 0;
+        var hostOk = req.protocol === base.protocol
+            && req.hostname.toLowerCase() === base.hostname.toLowerCase()
+            && req.port === base.port;
+        if (hostOk && pathOk) return { token: tok, apiBase: apiBase };
+        return null;
+    } catch (e) {
+        return null; // malformed URL or storage read error: treat as non-match
+    }
+}
+
+// Boolean convenience for the permission gate.
+async function isConfiguredGitHubApiUrl(url) {
+    return !!(await getGitHubApiAuthForUrl(url));
 }
 
 // =============================================
@@ -2146,11 +2171,30 @@ async function wsStatus(wk, includeIgnored, chatId) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
-    // Sync with remote first — cleans up merged PRs and detects behind/conflict files
+    // Sync with remote first — cleans up merged PRs, auto-deletes a merged
+    // head-branch workspace whose base is cloned locally, and detects behind/
+    // conflict files.
     var syncResult = null;
     try { syncResult = await wsSyncWithRemote(wk); } catch(e) {}
+
+    // wsSyncWithRemote auto-deleted this workspace (branch merged into a locally
+    // cloned base) — report that instead of normal status.
+    if (syncResult && syncResult.deleted) {
+        return {
+            success: true,
+            workspace: wk,
+            auto_deleted: true,
+            branch: syncResult.branch,
+            base_branch: syncResult.base_branch,
+            pr_number: syncResult.pr_number,
+            pr_url: syncResult.pr_url,
+            message: 'Workspace auto-deleted — branch "' + syncResult.branch + '" was merged (PR #' + syncResult.pr_number + ') into "' + syncResult.base_branch + '", which is cloned locally. The merged work remains available in the "' + syncResult.base_branch + '" workspace.'
+        };
+    }
+
     // Re-read meta + files after sync (may have been updated)
     meta = await getWorkspaceMeta(wk);
+    if (!meta) return { success: false, error: 'Workspace "' + wk + '" no longer exists.' };
 
     var files = await getAllWorkspaceFiles(wk);
     var isIgnored = includeIgnored ? function() { return false; } : await wsGetIgnoreFilter(wk);
@@ -2324,7 +2368,11 @@ async function wsDiff(repo, filePath, includeIgnored) {
 
     // Sync with remote first — updates original_content for dirty files whose base changed
     var _syncErr = null;
-    try { await wsSyncWithRemote(repo); } catch(e) { _syncErr = e; }
+    var _diffSync = null;
+    try { _diffSync = await wsSyncWithRemote(repo); } catch(e) { _syncErr = e; }
+    if (_diffSync && _diffSync.deleted) {
+        return { success: true, deleted: true, message: 'Workspace auto-deleted — branch "' + _diffSync.branch + '" was merged into the locally-cloned base "' + _diffSync.base_branch + '".' };
+    }
 
     var files = await getAllWorkspaceFiles(repo);
     var isIgnored = includeIgnored ? function() { return false; } : await wsGetIgnoreFilter(repo);
@@ -2376,10 +2424,100 @@ async function computeGitBlobSha(content) {
 
 // Sync local workspace with remote — compare dirty files against remote tree.
 // Returns { synced: number, behind: boolean, remoteHead: string, dirty_remaining: number }
+// Auto-delete this workspace when its OWN branch is the head of a MERGED pull
+// request whose base (target) branch is ALSO cloned locally. In that case the
+// merged work is fully recoverable from the base-branch workspace, so the
+// head-branch clone is redundant and we drop it automatically.
+//
+// Guards (all must hold):
+//   - the workspace has NO unpushed dirty (non-ignored) edits  → never lose work
+//   - the branch has NO still-open PR                          → work isn't ongoing
+//   - a merged PR exists with head == this branch
+//   - that PR's base/target branch is cloned locally           → content recoverable
+// Returns { deleted:true, ... } when it removes the workspace, else null.
+async function wsMaybeAutoDeleteMerged(wk, meta) {
+    try {
+        if (!meta || !meta.branch) return null;
+
+        // Cheap local guard first: never auto-delete a workspace that still has
+        // unpushed local edits, and skip the remote PR lookup entirely in that case.
+        var files = await getAllWorkspaceFiles(wk);
+        var isIgnored = await wsGetIgnoreFilter(wk);
+        var dirty = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
+        if (dirty.length > 0) return null;
+
+        var githubRepo = meta.github_repo || parseWsKey(wk).repo;
+        var branch = meta.branch;
+        var ownerName = githubRepo.split('/')[0];
+
+        // Cheap local guard: the base must be cloned locally, so unless at least
+        // one OTHER workspace of the same repo exists there's nothing to fall back
+        // to — skip the remote PR lookup entirely. Keeps the common single-clone
+        // case at zero extra GitHub calls.
+        var _allMetas = await getAllWorkspaceMetas();
+        var _sameRepoOthers = (_allMetas || []).filter(function(m) {
+            return m && m.repo !== wk && (m.github_repo || parseWsKey(m.repo).repo) === githubRepo;
+        });
+        if (_sameRepoOthers.length === 0) return null;
+
+        // Find PRs whose HEAD is this workspace's branch.
+        var listRes = await githubApi('GET', '/repos/' + githubRepo + '/pulls?state=all&head=' + encodeURIComponent(ownerName + ':' + branch));
+        if (!listRes || !listRes.ok || !Array.isArray(listRes.body) || !listRes.body.length) return null;
+
+        var mergedPr = null, hasOpen = false;
+        for (var i = 0; i < listRes.body.length; i++) {
+            var pr = listRes.body[i];
+            if (!pr) continue;
+            if (pr.state === 'open') { hasOpen = true; break; } // ongoing work — keep it
+            if (pr.merged_at) {
+                if (!mergedPr || new Date(pr.merged_at) > new Date(mergedPr.merged_at)) mergedPr = pr;
+            }
+        }
+        if (hasOpen || !mergedPr) return null;
+
+        var baseBranch = mergedPr.base && mergedPr.base.ref;
+        if (!baseBranch || baseBranch === branch) return null;
+
+        // The PR's target (base) branch must itself be cloned locally.
+        var baseLocal = _sameRepoOthers.some(function(m) {
+            return (m.branch || parseWsKey(m.repo).branch) === baseBranch;
+        });
+        if (!baseLocal) return null;
+
+        // Never auto-delete the repo's default branch (your trunk) — guards the
+        // unusual reverse PR (e.g. main → release merged with `release` cloned),
+        // which would otherwise match the rule and drop your main workspace.
+        var repoRes = await githubApi('GET', '/repos/' + githubRepo);
+        if (repoRes && repoRes.ok && repoRes.body && repoRes.body.default_branch === branch) return null;
+
+        // Safe to remove the redundant head-branch workspace.
+        await deleteWorkspaceFiles(wk);
+        await deleteWorkspaceMeta(wk);
+        try { refreshWorkspaceContext(); } catch (e) {}
+        try { AgentEvents.emit('workspaceMutated', { action: 'auto_delete_merged', repo: wk, branch: branch, base: baseBranch, pr: mergedPr.number }); } catch (e) {}
+        return { deleted: true, workspace: wk, branch: branch, base_branch: baseBranch, pr_number: mergedPr.number, pr_url: mergedPr.html_url };
+    } catch (e) { return null; }
+}
+
 async function wsSyncWithRemote(wk) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return null;
     var githubRepo = meta.github_repo || parseWsKey(wk).repo;
+
+    // Auto-delete this workspace when its branch is the head of a MERGED PR whose
+    // base (target) branch is also cloned locally — the merged work is recoverable
+    // there, so the head-branch clone is redundant. Runs before the HEAD-compare
+    // early return because a merged head branch's own tip does not move when the
+    // PR lands on the base. No-op for dirty trees / open PRs / non-local base /
+    // default branch (see wsMaybeAutoDeleteMerged).
+    var _autoDel = await wsMaybeAutoDeleteMerged(wk, meta);
+    if (_autoDel && _autoDel.deleted) {
+        return {
+            synced: 0, behind: false, deleted: true, remoteHead: null, dirty_remaining: 0,
+            workspace: wk, branch: _autoDel.branch, base_branch: _autoDel.base_branch,
+            pr_number: _autoDel.pr_number, pr_url: _autoDel.pr_url
+        };
+    }
 
     // 1. Get remote HEAD
     var refRes = await githubApi('GET', '/repos/' + githubRepo + '/git/ref/heads/' + encodeURIComponent(meta.branch));
@@ -2533,6 +2671,9 @@ async function wsPull(wk) {
 
     // Re-sync to get fresh behind files list
     var syncResult = await wsSyncWithRemote(wk);
+    if (syncResult && syncResult.deleted) {
+        return { success: true, deleted: true, pulled: 0, message: 'Workspace auto-deleted — branch "' + syncResult.branch + '" was merged into the locally-cloned base "' + syncResult.base_branch + '".' };
+    }
     if (!syncResult || !syncResult.behindFiles || syncResult.behindFiles.length === 0) {
         return { success: true, message: 'Already up to date', pulled: 0 };
     }
@@ -2658,6 +2799,29 @@ async function wsPush(wk, args) {
     // Re-read meta after sync (head_sha may have advanced)
     meta = await getWorkspaceMeta(wk);
 
+    // Base is always the source/cloned branch unless explicitly overridden.
+    var baseBranch = args.base_branch || meta.source_branch || meta.branch;
+    // Pushing to a branch_name equal to the base is ONLY valid as an APPEND to an
+    // already-open PR whose head IS that branch — i.e. the common "I cloned a PR's
+    // branch and want to add another commit to that same PR" case. In that case we
+    // never open a new PR (head===base would 422 on GitHub); we just fast-forward
+    // the branch so its open PR picks up the new commit. Confirm such a PR exists
+    // BEFORE mutating anything — otherwise the fast-forward below would push a
+    // commit straight onto the base branch (e.g. main) with no PR. When no open PR
+    // exists this really is an invalid self-PR, so error out (the original guard).
+    var branchIsBase = (args.branch_name === baseBranch);
+    if (branchIsBase) {
+        var _ownerForCheck = githubRepo.split('/')[0];
+        var _openPrCheck = await githubApi('GET', '/repos/' + githubRepo + '/pulls?state=open&head=' + encodeURIComponent(_ownerForCheck + ':' + args.branch_name));
+        var _hasOpenPrForBranch = !!(_openPrCheck && _openPrCheck.ok && Array.isArray(_openPrCheck.body) && _openPrCheck.body.length > 0);
+        if (!_hasOpenPrForBranch) {
+            return { success: false, error: 'branch_name "' + args.branch_name + '" is the same as the base branch "' + baseBranch + '" and has no open PR to append to. To open a NEW PR, choose a different branch_name (a PR cannot be opened from a branch onto itself).' };
+        }
+        // An open PR exists for this branch → valid append. Fall through: the
+        // branch-exists / PR-reuse logic below fast-forwards it and reuses the PR.
+        // (Verified end-to-end: clone a PR's branch, edit, push the same branch_name.)
+    }
+
     var files = await getAllWorkspaceFiles(wk);
     var isIgnored = await wsGetIgnoreFilter(wk);
     var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
@@ -2688,33 +2852,87 @@ async function wsPush(wk, args) {
     var treeRes = await githubApi('POST', '/repos/' + githubRepo + '/git/trees', { base_tree: meta.tree_sha, tree: treeEntries });
     if (!treeRes.ok) return { success: false, error: 'Failed to create tree: ' + JSON.stringify(treeRes.body) };
 
-    // 3. Create commit (single commit on top of current HEAD)
+    // 3. Determine the parent commit. If the target branch already exists
+    //    (a previous push to the same PR), append the new commit on top of its
+    //    tip so the open PR picks it up. Otherwise branch from the base HEAD.
+    var ownerName = githubRepo.split('/')[0];
+    var existingRef = await githubApi('GET', '/repos/' + githubRepo + '/git/ref/heads/' + encodeURIComponent(args.branch_name));
+    var branchExists = !!(existingRef && existingRef.ok && existingRef.body && existingRef.body.object && existingRef.body.object.sha);
+    var parentSha = branchExists ? existingRef.body.object.sha : meta.head_sha;
+
+    // Create commit on top of the chosen parent
     var commitRes = await githubApi('POST', '/repos/' + githubRepo + '/git/commits', {
         message: args.commit_message,
         tree: treeRes.body.sha,
-        parents: [meta.head_sha]
+        parents: [parentSha]
     });
     if (!commitRes.ok) return { success: false, error: 'Failed to create commit: ' + JSON.stringify(commitRes.body) };
 
-    // 4. Create branch ref
-    var refRes = await githubApi('POST', '/repos/' + githubRepo + '/git/refs', {
-        ref: 'refs/heads/' + args.branch_name,
-        sha: commitRes.body.sha
-    });
-    if (!refRes.ok) return { success: false, error: 'Failed to create branch "' + args.branch_name + '": ' + JSON.stringify(refRes.body) };
+    // 4. Create the branch ref (new branch) or fast-forward it (existing PR branch).
+    //    force:false so a concurrent push to the same branch is NOT clobbered —
+    //    GitHub rejects a non-fast-forward update and we ask the user to sync.
+    if (branchExists) {
+        var updRes = await githubApi('PATCH', '/repos/' + githubRepo + '/git/refs/heads/' + encodeURIComponent(args.branch_name), {
+            sha: commitRes.body.sha,
+            force: false
+        });
+        if (!updRes.ok) {
+            var _ffMsg = (updRes && updRes.body && /fast.?forward/i.test(JSON.stringify(updRes.body)))
+                ? 'Branch "' + args.branch_name + '" moved on the remote since this workspace last synced (a concurrent push?). Pull/sync the branch and push again.'
+                : 'Failed to update branch "' + args.branch_name + '": ' + JSON.stringify(updRes.body);
+            return { success: false, error: _ffMsg };
+        }
+    } else {
+        var refRes = await githubApi('POST', '/repos/' + githubRepo + '/git/refs', {
+            ref: 'refs/heads/' + args.branch_name,
+            sha: commitRes.body.sha
+        });
+        if (!refRes.ok) return { success: false, error: 'Failed to create branch "' + args.branch_name + '": ' + JSON.stringify(refRes.body) };
+    }
 
-    // 5. Open PR (base is always the source/cloned branch)
-    var baseBranch = args.base_branch || meta.source_branch || meta.branch;
-    var prRes = await githubApi('POST', '/repos/' + githubRepo + '/pulls', {
-        title: args.pr_title,
-        body: args.pr_body || '',
-        head: args.branch_name,
-        base: baseBranch
-    });
-    if (!prRes.ok) return { success: false, error: 'Failed to create PR: ' + JSON.stringify(prRes.body) };
-
-    var prUrl = prRes.body.html_url;
-    var prNumber = prRes.body.number;
+    // 5. Resolve the PR for this branch. Prefer an open PR; if the only PR(s) are
+    //    closed-but-never-merged, reopen and reuse one; if merged (or none), open
+    //    a new PR. (Blindly POSTing when a closed PR exists for the head 422s.)
+    var prUrl, prNumber, prReused = false;
+    var existingPr = null;
+    if (branchExists) {
+        var listRes = await githubApi('GET', '/repos/' + githubRepo + '/pulls?state=all&head=' + encodeURIComponent(ownerName + ':' + args.branch_name));
+        if (listRes && listRes.ok && Array.isArray(listRes.body) && listRes.body.length > 0) {
+            var _openPr = null, _reopenable = null;
+            for (var _i = 0; _i < listRes.body.length; _i++) {
+                var _candidate = listRes.body[_i];
+                if (_candidate.state === 'open') { _openPr = _candidate; break; }
+                // closed but never merged → can be reopened and reused
+                if (!_candidate.merged_at && !_reopenable) _reopenable = _candidate;
+            }
+            if (_openPr) {
+                existingPr = _openPr;
+            } else if (_reopenable) {
+                var reopenRes = await githubApi('PATCH', '/repos/' + githubRepo + '/pulls/' + _reopenable.number, { state: 'open' });
+                if (reopenRes && reopenRes.ok) existingPr = reopenRes.body;
+            }
+        }
+    }
+    if (existingPr) {
+        prReused = true;
+        prNumber = existingPr.number;
+        prUrl = existingPr.html_url;
+        // Refresh the PR title (always provided) and the body ONLY when a non-empty
+        // body was passed — otherwise we'd wipe the existing PR description on append.
+        var _prPatch = { title: args.pr_title };
+        if (typeof args.pr_body === 'string' && args.pr_body !== '') _prPatch.body = args.pr_body;
+        await githubApi('PATCH', '/repos/' + githubRepo + '/pulls/' + prNumber, _prPatch);
+    } else {
+        var prRes = await githubApi('POST', '/repos/' + githubRepo + '/pulls', {
+            title: args.pr_title,
+            body: args.pr_body || '',
+            head: args.branch_name,
+            base: baseBranch
+        });
+        if (!prRes.ok) return { success: false, error: 'Failed to create PR: ' + JSON.stringify(prRes.body) };
+        prUrl = prRes.body.html_url;
+        prNumber = prRes.body.number;
+    }
 
     // 6. Track PR on dirty files and in workspace meta — files stay dirty locally,
     //    but cross-chat ownership is released since the work has been published to a PR.
@@ -2739,14 +2957,31 @@ async function wsPush(wk, args) {
         await setWorkspaceFile(dirtyFiles[k]);
     }
 
-    // Add PR to workspace meta prs list
+    // Add (or refresh) the PR in the workspace meta prs list. When we appended to an
+    // existing PR branch we update the tracked entry instead of pushing a duplicate.
     if (!meta.prs) meta.prs = [];
-    meta.prs.push(prInfo);
+    var _trackedIdx = -1;
+    for (var _p = 0; _p < meta.prs.length; _p++) {
+        if (meta.prs[_p] && (meta.prs[_p].number === prNumber || meta.prs[_p].branch === args.branch_name)) { _trackedIdx = _p; break; }
+    }
+    if (_trackedIdx >= 0) meta.prs[_trackedIdx] = prInfo; else meta.prs.push(prInfo);
     await setWorkspaceMeta(meta);
 
     refreshWorkspaceContext();
-    AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: meta.branch });
-    return { success: true, workspace: wk, pr_url: prUrl, pr_number: prNumber, files_pushed: dirtyFiles.length, branch: meta.branch };
+    AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: args.branch_name });
+    return {
+        success: true,
+        workspace: wk,
+        pr_url: prUrl,
+        pr_number: prNumber,
+        files_pushed: dirtyFiles.length,
+        branch: args.branch_name,
+        base_branch: (prReused && existingPr && existingPr.base && existingPr.base.ref) ? existingPr.base.ref : baseBranch,
+        pr_reused: prReused,
+        message: prReused
+            ? ('Added a commit (' + dirtyFiles.length + ' file(s)) to existing PR #' + prNumber)
+            : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)')
+    };
 }
 
 // Path the built extension lives at inside the workspace. Always the same

@@ -527,12 +527,20 @@
             sendResponse({ error: 'event is required for dispatch_event action' });
             return;
         }
+        // Allowlist parity with the in-page twin (010-iframe-tool.js) and the tool schema enum:
+        // reject unknown event types up front instead of silently dispatching a generic Event.
+        var ALLOWED_EVENTS = ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'contextmenu', 'change', 'input', 'focus', 'blur', 'submit', 'mouseenter', 'mouseleave', 'mouseover', 'mouseout', 'keydown', 'keyup'];
+        if (ALLOWED_EVENTS.indexOf(args.event) === -1) {
+            sendResponse({ error: 'Event "' + args.event + '" not allowed. Allowed: ' + ALLOWED_EVENTS.join(', ') });
+            return;
+        }
         var el = findElement(doc, args.selector);
         if (!el) {
             sendResponse({ error: 'Element not found: ' + args.selector });
             return;
         }
         var evt;
+        var MOUSE_EVENT_TYPES = ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseenter', 'mouseleave', 'mouseover', 'mouseout', 'contextmenu'];
         if (args.event === 'keydown' || args.event === 'keyup') {
             // Map common key names to keyCodes for AngularJS compatibility
             var keyCodeMap = { Enter: 13, Escape: 27, Tab: 9, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Backspace: 8, Delete: 46, Space: 32, ' ': 32 };
@@ -540,8 +548,21 @@
             var codeMap = { Escape: 'Escape', Enter: 'Enter', Tab: 'Tab', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight', Backspace: 'Backspace', Delete: 'Delete', Space: 'Space', ' ': 'Space' };
             var code = codeMap[args.key] || (args.key && args.key.length === 1 ? 'Key' + args.key.toUpperCase() : args.key || '');
             evt = new KeyboardEvent(args.event, { key: args.key || '', keyCode: kc, which: kc, code: code, bubbles: true, cancelable: true });
-        } else if (args.event === 'mouseenter' || args.event === 'mouseleave' || args.event === 'mouseover' || args.event === 'mouseout') {
-            evt = new MouseEvent(args.event, { bubbles: args.event === 'mouseover' || args.event === 'mouseout', cancelable: true });
+        } else if (MOUSE_EVENT_TYPES.indexOf(args.event) !== -1) {
+            // Build a REAL MouseEvent (not a generic Event) so widgets that read
+            // button/buttons/coordinates or check `instanceof MouseEvent` react like a real
+            // pointer interaction. mouseenter/mouseleave are non-bubbling by spec.
+            var _mrect = el.getBoundingClientRect();
+            var _noBubble = (args.event === 'mouseenter' || args.event === 'mouseleave');
+            evt = new MouseEvent(args.event, {
+                bubbles: !_noBubble,
+                cancelable: true,
+                view: el.ownerDocument.defaultView || window,
+                button: 0,
+                buttons: (args.event === 'mousedown' ? 1 : 0),
+                clientX: Math.round(_mrect.left + _mrect.width / 2),
+                clientY: Math.round(_mrect.top + _mrect.height / 2)
+            });
         } else {
             evt = new Event(args.event, { bubbles: true, cancelable: true });
         }
@@ -651,15 +672,27 @@
             el = findElement(doc, args.selector);
         }
         if (!el) {
-            sendResponse({ error: 'Element not found: ' + args.selector + (matchIdx >= 0 ? ' (match_index=' + matchIdx + ', total matches: ' + matchCount + ')' : ''), match_count: matchCount });
+            // An explicit match_index that is out of range is a real misuse -> keep it an error.
+            if (matchIdx >= 0 && matchCount > 0) {
+                sendResponse({ error: 'match_index ' + matchIdx + ' out of range (total matches: ' + matchCount + ')', match_count: matchCount });
+            } else {
+                // A valid selector that simply matches nothing is NOT an error: return a
+                // consistent empty result so callers can branch on match_count === 0
+                // without a defensive wrapper around success:false.
+                sendResponse({ success: true, properties: null, match_count: 0 });
+            }
             return;
         }
         var rect = getTopLevelRect(el);
         var computed = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+        // className is an SVGAnimatedString on SVG nodes; normalize to a plain string, and
+        // expose a ready-to-use classList array so callers don't have to scrape get_dom + regex.
+        var _classStr = (typeof el.className === 'string') ? el.className : ((el.getAttribute && el.getAttribute('class')) || '');
         var props = {
             tagName: el.tagName,
             id: el.id,
-            className: el.className,
+            className: _classStr,
+            classList: _classStr ? _classStr.trim().split(/\s+/).filter(Boolean) : [],
             textContent: (el.textContent || '').substring(0, 500),
             value: el.value,
             checked: el.checked,

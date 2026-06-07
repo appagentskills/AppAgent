@@ -55,7 +55,8 @@ async function run_audit(args) {
         limit: options.limit || 50,
         url_params: options.display_value ? { sysparm_display_value: "true" } : undefined
       });
-      return res.result || [];
+      // executeTool returns { success, status, data: { result } }; older shape was { result }
+      return (res && res.data && res.data.result) || (res && res.result) || [];
     } catch (e) {
       console.error("Query failed:", e);
       return [];

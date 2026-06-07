@@ -417,6 +417,13 @@ async function runAgent(overrideChatId) {
     // original had when the foreground-UI block lived inside the try.
     var chat;
     var isBackgroundRun;
+    // Set true once the normal finish/cleanup path has run (right after the
+    // per-chat running flag is cleared below). The finally uses it to tell a
+    // genuine pre-cleanup crash (flag still false, runningChatIds still ours)
+    // apart from the auto-title hook having re-set runningChatIds for its
+    // nested run — in the latter case the finally must NOT clear that flag or
+    // emit runCrashed, or it would clobber the rerun and reopen the race.
+    var _ranNormalCleanup = false;
     // try/finally guarantees the per-chat running flag is cleared even if the
     // body throws — without this, an uncaught error would leave the streaming
     // dot spinning forever AND block future sends via the early-return at top.
@@ -988,7 +995,22 @@ async function runAgent(overrideChatId) {
     // === Finish: non-UI state cleanup ===
     // Clear per-chat running flag BEFORE emitting runFinished so the
     // handler's renderChatList sees the indicator should be hidden.
+    // Atomically (same sync tick) raise the cleanup guard: from here until the
+    // auto-title hook's recursive runAgent re-sets runningChatIds (or we decide
+    // no hook fires), an await below (finishActionIfDone) can yield and let a
+    // stale panel `run-agent` slip in. Without the guard it would read
+    // runningChatIds as false, replace chats[id] with its stale snapshot AND
+    // start a second loop — the root cause of interleaved/orphan tool_use blocks.
+    _runCleanupGuard[streamingChatId] = true;
     delete runningChatIds[streamingChatId];
+    // From here on, any throw is POST-cleanup: runningChatIds is already
+    // cleared and runFinished is (about to be) emitted, so the finally's
+    // crash path must not fire. Critically this also fences off the auto-title
+    // hook below — when it re-sets runningChatIds for its nested run, the
+    // finally sees _ranNormalCleanup === true and leaves that flag intact, so
+    // the chat stays observably "running" for the whole rerun (closing the
+    // window a stale panel run-agent used to slip a second loop into).
+    _ranNormalCleanup = true;
     // Only clear global foreground UI flags if this chat was the foreground one
     if (activeStreamingChatId === streamingChatId) {
         isRunning = false;
@@ -1063,6 +1085,13 @@ async function runAgent(overrideChatId) {
     if (!isChatPaused(streamingChatId) && !lastApiError && !(chat && chat.isSubAgent)) {
         executeAfterResponseHooks(streamingChatId);
     }
+    // Hook decision made: executeAfterResponseHooks' recursive runAgent (if it
+    // fired) has already synchronously re-set runningChatIds[streamingChatId].
+    // Because _ranNormalCleanup is now true, the finally below will NOT clear
+    // that re-set flag, so it survives and the chat stays observably running
+    // for the rerun — dropping the guard here therefore leaves no idle gap. If
+    // no hook fired the chat is genuinely idle and a future run-agent proceeds.
+    delete _runCleanupGuard[streamingChatId];
 
     // Refresh credits after API calls complete
     fetchCredits();
@@ -1079,18 +1108,28 @@ async function runAgent(overrideChatId) {
         hasError: !!lastApiError
     });
     } finally {
-        // Safety net for uncaught throws inside the agent loop body. The
-        // normal-path cleanup above already deletes this flag (and the
-        // runFinished handler re-renders the chat list); this only fires
-        // when the body threw before reaching it. Without the guard, the
-        // streaming dot would spin forever and future sends would be blocked
-        // by the early-return at function top. The runCrashed event keeps
-        // the loop fully emit-only — handler in 035-agent-events.js owns
-        // the chat list refresh.
-        if (runningChatIds[streamingChatId]) {
+        // Safety net for uncaught throws inside the agent loop body. This only
+        // fires when the body threw BEFORE the normal finish cleanup ran (so
+        // _ranNormalCleanup is still false and runningChatIds is still this
+        // run's). Without it the streaming dot would spin forever and future
+        // sends would be blocked by the early-return at function top. The
+        // runCrashed event keeps the loop fully emit-only — handler in
+        // 035-agent-events.js owns the chat list refresh.
+        //
+        // The _ranNormalCleanup gate is essential: once normal cleanup ran we
+        // must NOT touch runningChatIds here. The auto-title hook re-sets it
+        // for its nested run, and the old unconditional `if (runningChatIds)`
+        // deleted that fresh flag + emitted a spurious runCrashed — leaving the
+        // rerun with runningChatIds AND _runCleanupGuard both false, i.e. the
+        // exact orphan-tool_use race this guard was meant to close.
+        if (!_ranNormalCleanup && runningChatIds[streamingChatId]) {
             delete runningChatIds[streamingChatId];
             AgentEvents.emit('runCrashed', { chatId: streamingChatId });
         }
+        // Never leak the cleanup guard: a throw between raising it and the
+        // post-hook clear would otherwise permanently mark the chat "busy" to
+        // the run-agent handler, wedging all future runs for that chat.
+        delete _runCleanupGuard[streamingChatId];
     }
 }
 

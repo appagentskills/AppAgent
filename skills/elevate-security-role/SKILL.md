@@ -37,13 +37,17 @@ await executeTool("iframe_tool", {
   url: "/elevated_role_dialog.do"
 });
 
-// Wait for the dialog to load
-await new Promise(r => setTimeout(r, 3000));
+// Wait until the dialog's checkbox is actually visible (don't use a fixed delay)
+await executeTool("iframe_tool", {
+  action: "wait_for",
+  selector_visible: "input#security_admin",
+  timeout: 10000
+});
 
-// Check the security_admin checkbox
+// Check the security_admin checkbox (target the named role row, not "the first checkbox")
 await executeTool("iframe_tool", {
   action: "click",
-  selector: "input[type='checkbox']"
+  selector: "input#security_admin"
 });
 
 // Click OK to elevate
@@ -144,8 +148,12 @@ await executeTool("iframe_tool", {
   url: "/elevated_role_dialog.do"
 });
 
-// 2. Wait for the dialog to load
-await new Promise(r => setTimeout(r, 3000));
+// 2. Wait until the dialog's checkbox is visible (don't use a fixed delay)
+await executeTool("iframe_tool", {
+  action: "wait_for",
+  selector_visible: "input#security_admin",
+  timeout: 10000
+});
 
 // 3. Check the security_admin checkbox
 await executeTool("iframe_tool", {

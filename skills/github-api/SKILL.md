@@ -1,6 +1,6 @@
 ---
 name: github-api
-description: Call the GitHub REST API from this extension. web_fetch now auto-attaches the stored GitHub token (the same credential the workspace tool uses for clone/push) on any request targeting the CONFIGURED GitHub instance's REST base (api.github.com for github.com, or <instance>/api/v3 for GitHub Enterprise), so authenticated REST calls work against PRIVATE repos with no manual token handling. Quick-reference for repos, branches, files/contents, commits, pull requests, PR files/commits, PR comments (conversation + inline review), and reviews/approvers, plus a reusable js_eval helper, pagination, rate-limit and error notes.
+description: Call the GitHub REST API from this extension. web_fetch now auto-attaches the stored GitHub token (the same credential the workspace tool uses for clone/push) on any request targeting the CONFIGURED GitHub instance's REST base (api.github.com for github.com, or <instance>/api/v3 for GitHub Enterprise), so authenticated REST calls work against PRIVATE repos with no manual token handling. Quick-reference for repos, branches, files/contents, commits, pull requests, PR files/commits, PR comments (conversation + inline review), reviews/approvers, and merging PRs (mergeability checks, merge methods, update-branch, branch deletion, direct branch merges), plus a reusable js_eval helper, pagination, rate-limit and error notes.
 ---
 
 # github-api
@@ -29,6 +29,22 @@ Notes:
 - The token only goes to the configured instance's REST base — never to other hosts, the
   GitHub web UI, or `raw.*` blobs.
 - On **GitHub Enterprise**, use `<instanceUrl>/api/v3/...` (not `api.github.com`).
+
+## Permissions: agent-governed (no prompt on reads)
+
+`web_fetch` normally prompts the user on **every** call. The one exception is a
+request to the **configured GitHub REST API base** (the same match that triggers
+auto-auth above): those are treated like `servicenow_api` — **governed by the
+`confirm` flag**, not a forced prompt.
+
+- **Reads** (`GET`, and any call without `confirm:true`) run **silently** — no
+  approval prompt. Loop over commits / PRs / files without interrupting the user.
+- **Writes** — merging a PR, posting a comment/review, creating a branch, GraphQL
+  mutations — set **`confirm: true`** so the user reviews before it runs.
+
+This only applies to the connected GitHub host; every other `web_fetch` URL still
+prompts. If the user has explicitly set `web_fetch` to *disabled* or *allow* in
+settings, that override wins (only the default *ask* is downgraded).
 
 ## Reusable helper (use inside one js_eval)
 
@@ -109,6 +125,9 @@ Fields: `sha`, `commit.message`, `commit.author/committer.{name,date}`, `author.
 | One PR | `GET /repos/{o}/{r}/pulls/{n}` → `title`, `state`, `merged`, `user.login`, `head.ref`, `base.ref`, `additions`, `deletions` |
 | PR changed files | `GET /repos/{o}/{r}/pulls/{n}/files` → `filename`, `status`, `additions`, `deletions`, `patch` |
 | PR commits | `GET /repos/{o}/{r}/pulls/{n}/commits` |
+| Check if merged | `GET /repos/{o}/{r}/pulls/{n}/merge` → **204**=merged · **404**=not merged |
+| Merge a PR | `PUT /repos/{o}/{r}/pulls/{n}/merge` — see *Merge a pull request* below |
+| Update PR branch (pull base in) | `PUT /repos/{o}/{r}/pulls/{n}/update-branch` → 202 |
 
 ### PR comments
 | Kind | Endpoint |
@@ -116,6 +135,7 @@ Fields: `sha`, `commit.message`, `commit.author/committer.{name,date}`, `author.
 | Conversation (issue) comments | `GET /repos/{o}/{r}/issues/{n}/comments` → `user.login`, `body`, `created_at` |
 | Inline (review) comments | `GET /repos/{o}/{r}/pulls/{n}/comments` → adds `path`, `line`/`original_line`, `diff_hunk` |
 | Post a conversation comment | `POST /repos/{o}/{r}/issues/{n}/comments` body `{"body":"..."}` |
+| Post a review + inline comments | `POST /repos/{o}/{r}/pulls/{n}/reviews` — see *Post a review* below |
 
 ### Reviews & approvers
 | Goal | Endpoint |
@@ -125,6 +145,128 @@ Fields: `sha`, `commit.message`, `commit.author/committer.{name,date}`, `author.
 
 To get **current approvers**: pull `/reviews`, keep the latest review per `user.login`, and
 filter `state === 'APPROVED'`.
+
+### Post a review (summary + inline comments)
+
+One call posts a review **summary plus many inline comments** atomically:
+`POST /repos/{o}/{r}/pulls/{n}/reviews` with a JSON body:
+
+```json
+{
+  "commit_id": "<head sha>",   // optional; defaults to the PR's latest commit
+  "event": "COMMENT",           // COMMENT | APPROVE | REQUEST_CHANGES | (omit = PENDING draft)
+  "body": "Overall summary…",
+  "comments": [
+    { "path": "src/foo.js", "line": 42, "side": "RIGHT", "body": "single-line note" },
+    { "path": "src/foo.js", "start_line": 10, "line": 14, "side": "RIGHT", "body": "multi-line note" }
+  ]
+}
+```
+
+- **`line` is the line number in the file, not a diff offset.** Use the post-change number for `side:"RIGHT"` (added/context), the pre-change number for `side:"LEFT"` (deleted lines). Compute it from the hunk header `@@ -a,b +c,d @@`: the new side starts at line `c`, then increment once per non-removed line.
+- A comment **must land on a line that is part of the diff** (an added/removed/context line shown in the file's `patch`), otherwise GitHub returns **422 "line must be part of the diff"**. Fetch `GET /pulls/{n}/files` first and read each `patch` to pick valid anchors.
+- `start_line` + `line` = a multi-line comment; omit `start_line` for a single line. `side` defaults to `RIGHT`.
+- You **cannot `APPROVE` your own PR** (422) — use `event:"COMMENT"` to leave notes without a verdict.
+
+Standalone single inline comment (no review wrapper):
+`POST /repos/{o}/{r}/pulls/{n}/comments` body `{commit_id, path, line, side, body}`.
+Reply to an existing inline comment: same endpoint with `{body, in_reply_to: <comment_id>}`.
+
+### Merge a pull request
+
+`PUT /repos/{o}/{r}/pulls/{n}/merge` merges the PR. JSON body (all optional):
+
+```json
+{
+  "merge_method": "merge",          // merge (default) | squash | rebase
+  "commit_title": "...",            // overrides the auto commit title (merge/squash)
+  "commit_message": "...",          // overrides the auto commit body (merge/squash)
+  "sha": "<expected head sha>"      // guard: 409 if the head moved since you read it
+}
+```
+
+Success = **200** with `{ "merged": true, "sha": "<merge commit sha>", "message": "Pull Request successfully merged" }`.
+
+**Always check mergeability first.** `GET /repos/{o}/{r}/pulls/{n}` returns:
+- `mergeable` — `true` / `false` / **`null`** (GitHub is still computing it in the background — re-GET after ~1s until it settles; do **not** merge while `null`).
+- `mergeable_state` — `clean` (good to go) · `dirty` (merge conflicts) · `blocked` (branch protection: required reviews/checks not satisfied) · `behind` (head is behind base — update the branch first) · `unstable` (non-required checks failing, still mergeable) · `draft` (PR is a draft) · `has_hooks`.
+- `merged` — already merged? (skip if `true`).
+
+Recommended flow inside one js_eval (uses the `gh` helper above; replace `{o}/{r}/{n}`):
+```javascript
+var pr = (await gh('/repos/{o}/{r}/pulls/{n}')).data;
+if (pr.merged) return { already: true };
+// poll until GitHub finishes computing mergeable
+for (var i = 0; i < 5 && pr.mergeable === null; i++) {
+  await new Promise(function (r) { setTimeout(r, 1200); });
+  pr = (await gh('/repos/{o}/{r}/pulls/{n}')).data;
+}
+if (!pr.mergeable) return { blocked: pr.mergeable_state };   // dirty / blocked / behind ...
+var m = await gh('/repos/{o}/{r}/pulls/{n}/merge', {
+  method: 'PUT',
+  body: JSON.stringify({ merge_method: 'squash', sha: pr.head.sha })
+});
+return { status: m.status, merged: m.data.merged, sha: m.data.sha, msg: m.data.message };
+```
+
+**Response codes:**
+- **200** — merged.
+- **405** `"Pull Request is not mergeable"` — conflicts, a draft, or branch protection (`blocked`) is stopping it. The merge API has **no admin-override** for protected branches; satisfy the requirement (approve / pass checks) or merge from the GitHub UI as an admin.
+- **409** `"Head branch was modified..."` — the `sha` you passed no longer matches the PR head (someone pushed). Re-read the PR and retry with the fresh head sha.
+- **404** — no write access or wrong path.
+- **422** — bad `merge_method` (e.g. `squash`/`rebase` disabled in the repo's merge settings) or other validation; read `.errors`.
+
+> **Confirm before merging.** A merge is a hard-to-undo write that runs as the connected user — treat it like a production change and confirm intent first.
+
+**If `mergeable_state` is `behind`:** sync the head with base first via
+`PUT /repos/{o}/{r}/pulls/{n}/update-branch` (→ **202**, `{message, url}`), let checks re-run, then merge.
+
+**Clean up after merge:** delete the merged head branch with
+`DELETE /repos/{o}/{r}/git/refs/heads/{head.ref}` (→ **204**). Never delete a branch that other open PRs still target.
+
+**Enable auto-merge** (merge automatically once required checks/reviews pass) — **GraphQL only**, there is no REST endpoint:
+```graphql
+mutation {
+  enablePullRequestAutoMerge(input:{ pullRequestId:"PR_…", mergeMethod:SQUASH }) {
+    pullRequest { autoMergeRequest { enabledAt } }
+  }
+}
+```
+Get the GraphQL `pullRequestId` (`PR_…`) from `repository(owner:"{o}",name:"{r}"){ pullRequest(number:{n}){ id } }`. Turn it off with `disablePullRequestAutoMerge`.
+
+### Merge one branch into another (no PR)
+
+To merge branches directly without opening a PR, `POST /repos/{o}/{r}/merges` with
+`{ "base": "main", "head": "feature", "commit_message": "..." }`:
+- **201** — created a merge commit (returns the commit object).
+- **204** — nothing to merge (base already contains head).
+- **409** — merge conflict (resolve through a PR/branch instead).
+- **404** — missing base/head or no access.
+
+### Resolve / unresolve a review thread (GraphQL only)
+
+**REST cannot resolve review threads** — there is no endpoint for it. Use the GraphQL API at
+`POST https://api.github.com/graphql` (same host, so the token auto-attaches; send `{"query": "…"}`).
+
+1. Get the thread IDs (and which inline comment opened each):
+```graphql
+query {
+  repository(owner:"{o}", name:"{r}") {
+    pullRequest(number:{n}) {
+      reviewThreads(first:50) {
+        nodes { id isResolved comments(first:1){ nodes { databaseId path line } } }
+      }
+    }
+  }
+}
+```
+Match a thread to a known inline comment via `comments.nodes[0].databaseId` (that's the REST comment `id`).
+2. Resolve (or `unresolveReviewThread` to reopen):
+```graphql
+mutation { resolveReviewThread(input:{threadId:"PRRT_…"}) { thread { id isResolved } } }
+```
+- `threadId` is the GraphQL node id (`PRRT_…`), **not** the REST comment id.
+- GraphQL errors come back as `{ "errors": […] }` with HTTP 200 — always check `body.errors`, not just the status.
 
 ### Search
 | Goal | Endpoint |
