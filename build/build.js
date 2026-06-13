@@ -130,6 +130,7 @@ const WORKER_SHARED_FILES = [
     'js/core/060-ui-constants.js',
     'js/core/070-permissions.js',
     'js/core/080-tools.js',
+    'js/core/085-eval-runner.js',
     // 090-codemap.js is DOM-free and is called by 100-cached-results.js's
     // codemap-extract path (large code tool results get summarized via
     // generateCodemapWithOptions). Without this the SW throws ReferenceError
@@ -305,8 +306,7 @@ function _swScannerStripCommentsAndStrings(src) {
     return out;
 }
 
-function scanSwBundleGaps(bundlePath) {
-    var raw = fs.readFileSync(bundlePath, 'utf-8');
+function scanSwBundleGaps(raw) {
     var src = _swScannerStripCommentsAndStrings(raw);
 
     // Declared identifiers
@@ -576,7 +576,23 @@ ${processedBody}
         console.log(`  Worker bundle: ${preCount} pre + ${sharedCount} shared + ${postCount} post = ${workerBundleFiles.length} files`);
     }
 
-    // 6. Write output files
+    // 6. Validate the SW bundle BEFORE touching dist/ — a failed validation
+    // must never destroy a previously working build output. (Previously the
+    // gap scan ran AFTER the wipe + partial writes, so an aborted build left
+    // dist/extension/ without manifest.json/background.js — an unloadable
+    // extension that looks like total data loss to the user.)
+    if (workerJS) {
+        const gaps = scanSwBundleGaps(workerJS);
+        if (gaps.length > 0) {
+            console.error('\n  SW-bundle gaps — identifiers called but not declared:');
+            gaps.forEach(g => console.error('    - ' + g.name + '  (near: ' + g.ctx + ')'));
+            console.error('  Fix by declaring them in the bundle (real impl or worker/020-page-stubs.js) or adding them to the SW_SCANNER_BUILTINS allow-list if they are platform globals.\n');
+            throw new Error('SW-bundle has ' + gaps.length + ' undeclared identifier(s); aborting build (dist/ untouched).');
+        }
+        console.log(`  SW-bundle: no undeclared identifiers`);
+    }
+
+    // 7. Write output files
     // Wipe outDir first so files removed from src/ don't linger as cruft in
     // dist/extension/ (e.g. if a worker-tier file is renamed/deleted, the old
     // copy would otherwise still get bundled into the .zip and confuse the
@@ -592,19 +608,10 @@ ${processedBody}
     if (themeInitJS) fs.writeFileSync(path.join(outDir, 'theme-init.js'), themeInitJS, 'utf-8');
     if (viewInitJS) fs.writeFileSync(path.join(outDir, 'view-init.js'), viewInitJS, 'utf-8');
     if (workerJS) {
-        const swBundlePath = path.join(outDir, 'sw-bundle.js');
-        fs.writeFileSync(swBundlePath, workerJS, 'utf-8');
-        const gaps = scanSwBundleGaps(swBundlePath);
-        if (gaps.length > 0) {
-            console.error('\n  SW-bundle gaps — identifiers called but not declared:');
-            gaps.forEach(g => console.error('    - ' + g.name + '  (near: ' + g.ctx + ')'));
-            console.error('  Fix by declaring them in the bundle (real impl or worker/020-page-stubs.js) or adding them to the SW_SCANNER_BUILTINS allow-list if they are platform globals.\n');
-            throw new Error('SW-bundle has ' + gaps.length + ' undeclared identifier(s); aborting build.');
-        }
-        console.log(`  SW-bundle: no undeclared identifiers`);
+        fs.writeFileSync(path.join(outDir, 'sw-bundle.js'), workerJS, 'utf-8');
     }
 
-    // 7. Copy extension-specific files
+    // 8. Copy extension-specific files
     const extSrcDir = path.join(SRC, 'platform/extension');
     for (const file of ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js']) {
         const srcPath = path.join(extSrcDir, file);
@@ -614,7 +621,7 @@ ${processedBody}
         }
     }
 
-    // 8. Copy icons if they exist
+    // 9. Copy icons if they exist
     const iconsDir = path.join(extSrcDir, 'icons');
     if (fs.existsSync(iconsDir)) {
         const outIconsDir = path.join(outDir, 'icons');

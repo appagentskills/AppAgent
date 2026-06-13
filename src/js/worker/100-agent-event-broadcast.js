@@ -77,7 +77,10 @@ var EVENTS_WITH_CHAT_INLINE = {
     'streamAborted': true,
     'error': true,
     'toolParked': true,
-    'toolUnparked': true
+    'toolUnparked': true,
+    // tldrChanged's page handler (036-agent-event-handlers-page.js) writes the
+    // TL;DR onto chats[chatId].messages — a stale mirror would drop the card.
+    'tldrChanged': true
 };
 
 function broadcastAgentEvent(type, detail) {

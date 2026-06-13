@@ -28,11 +28,24 @@ var _workerSavePendingAgain = false;
 // message on SW eviction / a stale edit_html→screenshot read. Restored here.
 var _workerSaveWaiters = [];
 
+// WIPE-GUARD: mirrors the page-side flag in ui/070-dashboard-ui.js. Saves are
+// forbidden until this worker context has successfully hydrated `chats` from
+// IDB — otherwise a save from an empty/unhydrated `chats` global would erase
+// every stored chat (the SW boot's safe() wrapper swallows load failures, so
+// without this gate a broken boot silently wipes the store on first save).
+var _chatsHydrated = false;
+
 async function saveChatsToStorage() {
     // Park this caller on a waiter resolved only after a save capturing the
     // CURRENT state commits — never resolved by an in-flight save that started
     // before this caller's mutation. Mirrors page-side dashboard-ui.js (minus the
     // DOM storage indicator, which the worker must not touch).
+    // WIPE-GUARD: never persist before a successful hydration. Callers get a
+    // resolved promise and proceed; persistence is skipped, loudly.
+    if (!_chatsHydrated) {
+        console.error('[worker-storage] saveChatsToStorage blocked: chats not hydrated — refusing to persist to avoid wiping stored chats');
+        return;
+    }
     var _commit = new Promise(function(res) { _workerSaveWaiters.push(res); });
     if (_workerSavePending) {
         _workerSavePendingAgain = true;
@@ -43,7 +56,9 @@ async function saveChatsToStorage() {
         var database = await openDatabase();
         var transaction = database.transaction([chatStoreName], 'readwrite');
         var store = transaction.objectStore(chatStoreName);
-        var clearRequest = store.clear();
+        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
+        // vanished from memory, upsert the rest.
+        var keysRequest = store.getAllKeys();
         await new Promise(function(_resolve) {
             // WS-1 (B16/B17): settle-guard so the commit promise resolves EXACTLY
             // once and can't wedge. A put-error can ABORT the whole txn; without the
@@ -56,29 +71,38 @@ async function saveChatsToStorage() {
             var _settled = false;
             function resolve() { if (_settled) return; _settled = true; _resolve(); }
             transaction.onabort = function() { resolve(); };
-            clearRequest.onsuccess = function() {
-                var chatIds = Object.keys(chats);
+            keysRequest.onsuccess = function() {
+                var existingKeys = keysRequest.result || [];
+                var desired = {};
+                Object.keys(chats).forEach(function(id) {
+                    var c = chats[id];
+                    if (c && c.messages && c.messages.length > 0) desired[id] = c;
+                });
                 var pending = 0;
-                for (var i = 0; i < chatIds.length; i++) {
-                    var chat = chats[chatIds[i]];
-                    if (chat.messages && chat.messages.length > 0) {
-                        pending++;
-                        var addRequest = store.put(chat);
-                        addRequest.onsuccess = function() {
-                            pending--;
-                            if (pending === 0) resolve();
-                        };
-                        addRequest.onerror = function() {
-                            // B16: mirror onsuccess — a final errored put must still
-                            // settle, else the await hangs and wedges every future save.
-                            pending--;
-                            if (pending === 0) resolve();
-                        };
-                    }
+                // B16 semantics preserved: every request (delete or put, success or
+                // error) settles through here so a final errored request still
+                // resolves — else the await hangs and wedges every future save.
+                function settleOne() {
+                    pending--;
+                    if (pending === 0) resolve();
                 }
+                existingKeys.forEach(function(key) {
+                    if (!Object.prototype.hasOwnProperty.call(desired, key)) {
+                        pending++;
+                        var delRequest = store.delete(key);
+                        delRequest.onsuccess = settleOne;
+                        delRequest.onerror = settleOne;
+                    }
+                });
+                Object.keys(desired).forEach(function(id) {
+                    pending++;
+                    var putRequest = store.put(desired[id]);
+                    putRequest.onsuccess = settleOne;
+                    putRequest.onerror = settleOne;
+                });
                 if (pending === 0) resolve();
             };
-            clearRequest.onerror = function() { resolve(); };
+            keysRequest.onerror = function() { resolve(); };
         });
     } catch (e) {
         console.error('[worker-storage] save failed', e);
@@ -119,6 +143,7 @@ async function loadChatsFromStorage() {
                     // (attachments, screenshots) broken with no diagnostic.
                     try { rebuildFileIndexAll(); } catch (e) { console.error('[worker-storage] rebuildFileIndexAll failed', e); }
                 }
+                _chatsHydrated = true;
                 resolve();
             };
             request.onerror = function() {

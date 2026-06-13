@@ -456,7 +456,9 @@ function handleWidgetResizeEnd(event) {
 
 // Inject executeTool bridge into widget HTML before </head> tag
 function injectWidgetBridge(html, widgetTitle) {
-    var safeTitle = (widgetTitle || 'Widget').replace(/'/g, "\\'").replace(/"/g, '\\"');
+    // escapeJsString escapes \ first, then quotes/</>/& as JS hex sequences —
+    // a title containing \ or </script> can no longer corrupt the script block.
+    var safeTitle = escapeJsString(widgetTitle || 'Widget');
     var bridgeScript = '<script>' +
         'window._widgetTitle="' + safeTitle + '";' +
         // executeTool bridge - allows widgets to call agent tools via postMessage
@@ -535,6 +537,21 @@ function injectWidgetBridge(html, widgetTitle) {
                             '_el.dispatchEvent(new Event("change",{bubbles:true}));' +
                             'var _fi=_el.tagName.toLowerCase();if(_el.id)_fi+="#"+_el.id;' +
                             '_wqR={success:true,message:"Filled "+_fi+" in widget"};}' +
+                    '}else if(_wqAct==="type"){' +
+                        'var _el=_wqArgs.selector?document.querySelector(_wqArgs.selector):' +
+                            '(_wqArgs.x!==undefined?document.elementFromPoint(_wqArgs.x,_wqArgs.y):null);' +
+                        'if(!_el){_wqR={success:false,error:"Element not found: "+(_wqArgs.selector||_wqArgs.x+","+_wqArgs.y)};}' +
+                        'else{_el.focus();var _tv=String(_wqArgs.value==null?"":_wqArgs.value);' +
+                            'var _cur=_wqArgs.append?(_el.value||""):"";' +
+                            'for(var _k=0;_k<_tv.length;_k++){var _ch=_tv.charAt(_k);' +
+                                'try{_el.dispatchEvent(new KeyboardEvent("keydown",{bubbles:true,key:_ch}));}catch(_e1){}' +
+                                '_cur+=_ch;_el.value=_cur;' +
+                                '_el.dispatchEvent(new Event("input",{bubbles:true}));' +
+                                'try{_el.dispatchEvent(new KeyboardEvent("keyup",{bubbles:true,key:_ch}));}catch(_e2){}' +
+                            '}' +
+                            '_el.dispatchEvent(new Event("change",{bubbles:true}));' +
+                            'var _ty=_el.tagName.toLowerCase();if(_el.id)_ty+="#"+_el.id;' +
+                            '_wqR={success:true,message:"Typed into "+_ty+" in widget"};}' +
                     '}else{_wqR={success:false,error:"Unknown widget query action: "+_wqAct};}' +
                 '}catch(_wqErr){_wqR={success:false,error:_wqErr.message};}' +
                 'window.parent.postMessage({type:"widgetQueryResult",id:_wqId,result:_wqR},"*");' +
@@ -710,6 +727,7 @@ async function addWidgetToDashboard(widgetId, event) {
 
     // Find the prompt from the source chat
     // IMPORTANT: Always use chatWidget.chatId if it exists - this preserves the original chat reference
+    var prompt = null;
     var chatId = chatWidget.chatId || currentChatId;
     var msgIndex = chatWidget.msgIndex;
     if (chatId && chats[chatId] && msgIndex !== undefined) {
@@ -1495,6 +1513,12 @@ function getSkillsSummaryForPrompt() {
     return summary;
 }
 
+// WIPE-GUARD: saves are forbidden until a load has SUCCEEDED. If hydration
+// fails or is skipped (broken bundle, IDB error), in-memory `chats` is empty
+// and a save would erase every stored chat. Set ONLY in the load onsuccess
+// handler below.
+var _chatsHydrated = false;
+
 async function loadChatsFromStorage() {
     try {
         var database = await openDatabase();
@@ -1511,7 +1535,13 @@ async function loadChatsFromStorage() {
                         chats[chat.id] = chat;
                     }
                 });
-                rebuildFileIndexAll();
+                // WIPE-GUARD follow-up: a throw here previously prevented
+                // resolve() — wedging init() at the awaited load — and now
+                // would also leave _chatsHydrated false (saves blocked all
+                // session) even though `chats` hydrated fine. The file index
+                // is a derived cache; its failure must not block hydration.
+                try { rebuildFileIndexAll(); } catch (e) { console.error('rebuildFileIndexAll failed during hydration:', e); }
+                _chatsHydrated = true;
                 resolve();
             };
             request.onerror = function() {
@@ -1533,6 +1563,14 @@ async function saveChatsToStorage() {
     // this (edit_html must know its widget-html mutation is committed before
     // take_screenshot deep-links the temp tab) are parked on _saveChatsWaiters
     // and resolved only after a save capturing the CURRENT state has committed.
+    // WIPE-GUARD: never persist before a successful hydration — `chats` may
+    // be empty and a save would erase the store (the wipe class behind the
+    // 2026-06 data loss). Callers get a resolved promise and proceed;
+    // persistence is skipped for this session, loudly.
+    if (!_chatsHydrated) {
+        console.error('saveChatsToStorage blocked: chats not hydrated — refusing to persist to avoid wiping stored chats');
+        return;
+    }
     var _commit = new Promise(function(res) { _saveChatsWaiters.push(res); });
     if (saveChatsPending) {
         saveChatsPendingAgain = true;
@@ -1545,8 +1583,10 @@ async function saveChatsToStorage() {
         var transaction = database.transaction([chatStoreName], 'readwrite');
         var store = transaction.objectStore(chatStoreName);
         
-        // Clear and re-add all chats (simpler than tracking deletes)
-        var clearRequest = store.clear();
+        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
+        // vanished from memory, upsert the rest. Even a buggy save can no
+        // longer mass-erase the store in one transaction.
+        var keysRequest = store.getAllKeys();
         
         await new Promise(function(_resolve) {
             // WS1F-1: settle-guard so the commit promise resolves EXACTLY once and
@@ -1565,45 +1605,49 @@ async function saveChatsToStorage() {
             transaction.onabort = function() {
                 if (!_settled) { updateStorageIndicator(); resolve(); }
             };
-            clearRequest.onsuccess = function() {
-                var chatIds = Object.keys(chats);
+            keysRequest.onsuccess = function() {
+                var existingKeys = keysRequest.result || [];
+                // Persistable snapshot — same filter as before (drop 0-message chats)
+                var desired = {};
+                Object.keys(chats).forEach(function(id) {
+                    var c = chats[id];
+                    if (c && c.messages && c.messages.length > 0) desired[id] = c;
+                });
                 var pending = 0;
-                
-                for (var i = 0; i < chatIds.length; i++) {
-                    var chat = chats[chatIds[i]];
-                    if (chat.messages && chat.messages.length > 0) {
-                        pending++;
-                        var addRequest = store.put(chat);
-                        addRequest.onsuccess = function() {
-                            pending--;
-                            if (pending === 0) {
-                                updateStorageIndicator();
-                                resolve();
-                            }
-                        };
-                        addRequest.onerror = function() {
-                            // WS-1 follow-up: if the LAST-completing put errors,
-                            // failing to resolve here leaves the `await new Promise`
-                            // hung forever — saveChatsPending stays true and the
-                            // parked _saveChatsWaiters (e.g. an awaited edit_html)
-                            // never drain, wedging all future saves. Mirror
-                            // onsuccess so a final errored put still settles.
-                            pending--;
-                            if (pending === 0) {
-                                updateStorageIndicator();
-                                resolve();
-                            }
-                        };
+                // WS-1 semantics preserved: EVERY request (delete or put, success
+                // or error) settles through here so a final errored request still
+                // resolves — otherwise the await hangs, saveChatsPending stays
+                // true and the parked _saveChatsWaiters never drain. The onerror
+                // settles are OPTIMISTIC: a rolled-back write is repaired by the
+                // next full save.
+                function settleOne() {
+                    pending--;
+                    if (pending === 0) {
+                        updateStorageIndicator();
+                        resolve();
                     }
                 }
-                
+                existingKeys.forEach(function(key) {
+                    if (!Object.prototype.hasOwnProperty.call(desired, key)) {
+                        pending++;
+                        var delRequest = store.delete(key);
+                        delRequest.onsuccess = settleOne;
+                        delRequest.onerror = settleOne;
+                    }
+                });
+                Object.keys(desired).forEach(function(id) {
+                    pending++;
+                    var putRequest = store.put(desired[id]);
+                    putRequest.onsuccess = settleOne;
+                    putRequest.onerror = settleOne;
+                });
                 if (pending === 0) {
                     updateStorageIndicator();
                     resolve();
                 }
             };
-            clearRequest.onerror = function() {
-                console.error('Failed to clear chat store:', clearRequest.error);
+            keysRequest.onerror = function() {
+                console.error('Failed to read chat store keys:', keysRequest.error);
                 resolve();
             };
         });
@@ -1631,6 +1675,17 @@ async function loadProviderFromStorage() {
     var stored = appStorage.getItem('appagent_provider');
     if (stored && getProviderById(stored)) {
         currentProvider = stored;
+    } else if (stored && typeof PROVIDER_RENAMES !== 'undefined' && PROVIDER_RENAMES[stored]
+        && getProviderById(PROVIDER_RENAMES[stored])) {
+        // The stored selection carries a legacy default-provider name that the
+        // IDB rename migration (core/130-indexeddb.js) already migrated — but
+        // that migration only rewrites this localStorage key when it runs in
+        // the PAGE (the SW's appStorage shim is inert). If the SW migrated
+        // first, the legacy IDB entry is gone by the time the page loads and
+        // the rewrite never fires. Recover via the PROVIDER_RENAMES map
+        // (core/030-config.js) and persist the new name so this is one-shot.
+        currentProvider = PROVIDER_RENAMES[stored];
+        try { appStorage.setItem('appagent_provider', currentProvider); } catch (e) {}
     }
 }
 
@@ -1652,10 +1707,8 @@ async function updateCacheTokenLimitFromK(valueInK) {
     k = Math.max(1, Math.min(100, k)); // Clamp between 1K and 100K
     cacheTokenLimit = k * 1000;
     await saveCacheTokenLimit();
-    // Sync both inputs if they exist
-    var panelInput = document.getElementById('cache-token-limit');
+    // Sync the settings-page input if it exists
     var pageInput = document.getElementById('settings-page-cache-limit');
-    if (panelInput) panelInput.value = k;
     if (pageInput) pageInput.value = k;
 }
 
@@ -1677,6 +1730,11 @@ async function loadToolPermissions() {
             instancePermissions: instancePermissions
         });
     }
+    // The header tier pill (updateSnStatus) typically renders BEFORE this
+    // async IDB load completes, so it shows the default 'Manual' even when
+    // the stored tier is 'auto' — and nothing re-renders it until the next
+    // connection-state change. Re-render now that the real tiers are loaded.
+    if (typeof updateSnStatus === 'function') updateSnStatus();
 }
 
 function initDefaultToolPermissions() {

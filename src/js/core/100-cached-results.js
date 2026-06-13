@@ -200,8 +200,14 @@ function processToolResultForCache(chatId, toolCallId, toolName, result) {
     // Generate unique content ID
     var contentId = 'cache_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 
-    // Store full content in chat's cache
+    // Store full content in chat's cache. Guard against a missing chat row
+    // (chat deleted / GC'd while a tool was still in flight) — mirror
+    // processUserMessageForCache's guard instead of throwing TypeError and
+    // killing the agent loop's tool-result processing.
     var chat = chats[chatId];
+    if (!chat) {
+        return { content: resultStr, cached: false };
+    }
     if (!chat.cachedToolResults) {
         chat.cachedToolResults = {};
     }

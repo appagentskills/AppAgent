@@ -40,10 +40,13 @@
                 if (domSelector) {
                     var matchIdx = (msg.args && typeof msg.args.match_index === 'number') ? msg.args.match_index : -1;
                     var allDomMatches;
-                    try { allDomMatches = doc.querySelectorAll(domSelector); } catch(selectorErr) {
+                    try { doc.querySelectorAll(domSelector); } catch(selectorErr) {
                         sendResponse({ success: false, error: 'Invalid CSS selector: ' + domSelector + ' (' + selectorErr.message + ')' });
                         break;
                     }
+                    // Pierce shadow DOM + iframes so match_count / match_index reflect components
+                    // inside Seismic / Now Experience shadow roots, not just the light DOM.
+                    allDomMatches = queryAllDeep(doc, domSelector);
                     var domMatchCount = allDomMatches.length;
                     var domEl;
                     if (matchIdx >= 0) {
@@ -244,6 +247,74 @@
         return null;
     }
 
+    // Shadow- and iframe-piercing variant of querySelectorAll: collects EVERY match across the
+    // light DOM, same-origin nested iframes, and OPEN shadow roots. Seismic / Now Experience
+    // workspace forms render all controls inside nested open shadow roots, so plain
+    // querySelectorAll (light DOM only) reports match_count 0 for real components. Mirrors
+    // findElement's traversal but returns ALL matches, so get_dom / get_properties / set_style get
+    // a truthful match_count and can address deep matches by match_index. Invalid selectors are
+    // swallowed here; callers validate the selector once up front to still surface a syntax error.
+    function queryAllDeep(root, selector) {
+        var results = [];
+        try {
+            var direct = root.querySelectorAll(selector);
+            for (var i = 0; i < direct.length; i++) results.push(direct[i]);
+        } catch(e) { return results; }
+        try {
+            var iframes = root.querySelectorAll('iframe');
+            for (var f = 0; f < iframes.length; f++) {
+                try {
+                    var idoc = iframes[f].contentDocument;
+                    if (idoc) { var inner = queryAllDeep(idoc, selector); for (var k = 0; k < inner.length; k++) results.push(inner[k]); }
+                } catch(e) { /* cross-origin */ }
+            }
+        } catch(e) {}
+        try {
+            var hosts = root.querySelectorAll('*');
+            for (var h = 0; h < hosts.length; h++) {
+                if (hosts[h].shadowRoot) { var sh = queryAllDeep(hosts[h].shadowRoot, selector); for (var s = 0; s < sh.length; s++) results.push(sh[s]); }
+            }
+        } catch(e) {}
+        return results;
+    }
+
+    // Shadow- and iframe-piercing plain-text extraction for get_visible_text (simple mode) and
+    // wait_for(text). element/body.innerText stop at shadow boundaries, so on a Seismic / Now
+    // Experience page (content nested in open shadow roots) they return ''. Honors display:none,
+    // descends open shadow roots + same-origin iframes, and includes form-control value/placeholder.
+    // Slotted light-DOM text is captured once (the <slot> only projects it; the text node lives in
+    // light DOM, so walking shadow roots + light children does not double-count it).
+    function deepText(node, parts, depth) {
+        if (!node || depth > 300) return;
+        var type = node.nodeType;
+        if (type === 3) {
+            var t = node.nodeValue;
+            if (t && /\S/.test(t)) parts.push(t.replace(/\s+/g, ' ').trim());
+            return;
+        }
+        if (type !== 1 && type !== 9 && type !== 11) return;
+        if (type === 1) {
+            var tag = node.tagName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
+            try {
+                var cs = (node.ownerDocument.defaultView || window).getComputedStyle(node);
+                if (cs && cs.display === 'none') return;
+            } catch(e) {}
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+                var v = node.value;
+                if (!v && tag !== 'SELECT') { try { v = node.getAttribute('placeholder'); } catch(e) {} }
+                if (v && String(v).trim()) parts.push(String(v).trim());
+            }
+            if (node.shadowRoot) deepText(node.shadowRoot, parts, depth + 1);
+            if (tag === 'IFRAME') {
+                try { var fdoc = node.contentDocument; if (fdoc) deepText(fdoc.body || fdoc.documentElement, parts, depth + 1); } catch(e) {}
+                return;
+            }
+        }
+        var kids = node.childNodes;
+        if (kids) for (var c = 0; c < kids.length; c++) deepText(kids[c], parts, depth + 1);
+    }
+
     // For coordinate-based clicks, find the most specific interactive element at the point
     // Returns { el, snapped, dist } — snapped=true if we used proximity fallback
     function findInteractiveTarget(el, x, y) {
@@ -430,7 +501,9 @@
                     var grect = g.getBoundingClientRect();
                     if (grect.width === 0 && grect.height === 0) return done(true, 'selector_gone: ' + args.selector_gone);
                 } else if (args.text) {
-                    if ((doc.body && doc.body.innerText || '').indexOf(args.text) !== -1) return done(true, 'text: ' + args.text);
+                    var _wtParts = [];
+                    deepText(doc.body || doc.documentElement || doc, _wtParts, 0);
+                    if (_wtParts.join(' ').indexOf(args.text) !== -1) return done(true, 'text: ' + args.text);
                 } else if (args.url_matches) {
                     if (location.href.indexOf(args.url_matches) !== -1) return done(true, 'url_matches: ' + args.url_matches);
                 } else {
@@ -660,10 +733,13 @@
         var matchIdx = (args && typeof args.match_index === 'number') ? args.match_index : -1;
         var allMatches;
         try {
-            allMatches = doc.querySelectorAll(args.selector);
+            doc.querySelectorAll(args.selector);
         } catch(e) {
             sendResponse({ error: 'Invalid selector: ' + args.selector + ' (' + e.message + ')' }); return;
         }
+        // Pierce shadow DOM + iframes so match_count / match_index see components inside
+        // Seismic / Now Experience shadow roots (plain querySelectorAll stops at the light DOM).
+        allMatches = queryAllDeep(doc, args.selector);
         var matchCount = allMatches.length;
         var el;
         if (matchIdx >= 0) {
@@ -727,10 +803,12 @@
         if (!args.selector) { sendResponse({ error: 'selector is required for set_style action' }); return; }
         var els;
         try {
-            els = doc.querySelectorAll(args.selector);
+            doc.querySelectorAll(args.selector);
         } catch(e) {
             sendResponse({ error: 'Invalid selector: ' + args.selector + ' (' + e.message + ')' }); return;
         }
+        // Pierce shadow DOM + iframes so styling reaches Seismic / Now Experience components.
+        els = queryAllDeep(doc, args.selector);
         if (!els.length) { sendResponse({ error: 'No elements found: ' + args.selector }); return; }
         for (var i = 0; i < els.length; i++) {
             if (args.styles && typeof args.styles === 'object') {
@@ -825,8 +903,12 @@
     function handleGetVisibleText(doc, args, sendResponse) {
         try {
             if (!args.deep) {
-                // Simple mode: just return innerText
-                sendResponse({ success: true, text: doc.body ? doc.body.innerText : '' });
+                // Simple mode: shadow- and iframe-piercing plain text. doc.body.innerText stops at
+                // shadow boundaries, so on Seismic / Now Experience pages (all content in nested
+                // shadow roots) it returns ''. deepText descends open shadow roots + iframes.
+                var _stParts = [];
+                deepText(doc.body || doc.documentElement || doc, _stParts, 0);
+                sendResponse({ success: true, text: _stParts.join(' ').replace(/\s+/g, ' ').trim() });
                 return;
             }
 
@@ -840,9 +922,14 @@
                         var tag = node.tagName.toLowerCase();
                         if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'svg') return;
                         var style = (root.defaultView || doc.defaultView || window).getComputedStyle(node);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
+                        // display:none subtrees are genuinely unrendered -> prune entirely. But
+                        // visibility:hidden / opacity:0 / zero-box wrappers (custom elements with
+                        // display:contents, ubiquitous in Seismic / Now Experience) can still hold
+                        // VISIBLE descendants -> don't prune the subtree, just skip RECORDING this
+                        // node's own text via the _recordable guard below.
+                        if (style.display === 'none') return;
                         var rect = getTopLevelRect(node);
-                        if (rect.width === 0 && rect.height === 0) return;
+                        var _recordable = !(style.visibility === 'hidden' || style.opacity === '0' || (rect.width === 0 && rect.height === 0));
 
                         // Detect element type
                         var isInteractive = ['INPUT','TEXTAREA','SELECT','BUTTON','A'].indexOf(node.tagName) !== -1;
@@ -858,7 +945,7 @@
                             }
                         }
 
-                        if (directText.length > 0 || isInteractive || isHeading) {
+                        if (_recordable && (directText.length > 0 || isInteractive || isHeading)) {
                             var textValue = '';
                             if (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA') {
                                 textValue = node.value || node.placeholder || '';

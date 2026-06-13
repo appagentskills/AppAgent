@@ -7,7 +7,6 @@
 
     if (!fileId) return show('No file ID provided.', true);
 
-    var DB_VERSION = 9;
     var dbNames = ['AppAgentDB', 'iframe_AppAgentDB'];
 
     tryDatabases(dbNames, 0);
@@ -50,7 +49,10 @@
 
     function openDB(name) {
         return new Promise(function(resolve, reject) {
-            var req = indexedDB.open(name, DB_VERSION);
+            // No explicit version: a read-only consumer must attach to whatever
+            // version exists. Pinning a stale version throws VersionError once the
+            // app DB migrates past it, which broke every download.
+            var req = indexedDB.open(name);
             req.onerror = function() { reject(new Error('DB open failed: ' + (req.error || 'unknown'))); };
             req.onsuccess = function() { resolve(req.result); };
             req.onupgradeneeded = function(e) {

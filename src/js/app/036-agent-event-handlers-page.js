@@ -124,13 +124,61 @@ AgentEvents.on('streamDelta', function(e) {
     }
 });
 
+// FLUSH-TAIL: streamed assistant text is painted into #streaming-text at a
+// PACED reveal rate — getDisplayContent (core/040-hooks-history.js) exposes
+// only ~40-120 chars per updateStreamingText call, and those calls only
+// happen while streamDelta events keep arriving. When the model finishes the
+// text and the turn moves into tool execution, the deltas stop, the reveal
+// freezes mid-message, and renderMessages deliberately skips the last
+// block's content while isRunning (ui/250-message-render.js — "content for
+// the current block goes to #streaming-text"). SYMPTOM: only part of the
+// final answer was visible for the whole duration of a long-blocking tool
+// call (e.g. await_handle); the full text only appeared at run end /
+// interrupt, when isRunning flipped false and the full render finally
+// included msg.content. Repaint the streaming container ONCE with the final
+// content as soon as the message finalizes (and again, defensively, when a
+// tool call starts): the message has isStreaming=false by then, so
+// getDisplayContent returns the FULL text and drops its pacing buffer.
+// Mid-stream throttling is untouched — this only guarantees the final flush.
+function _flushFinalizedStreamingText(chatId) {
+    if (chatId !== currentChatId) return;
+    if (typeof updateStreamingText !== 'function') return;
+    // Only repaint an EXISTING streaming container — renderMessages owns the
+    // container lifecycle; never create one from here.
+    if (!document.getElementById('streaming-text')) return;
+    var chat = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!chat || !chat.messages) return;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m && m.role === 'assistant') {
+            if (m.isStreaming !== true && m.content) {
+                updateStreamingText(m, i, chatId);
+                // SF-3: the full-text repaint can grow the streaming el (and the
+                // outer scrollHeight) AFTER renderMessages' scroll restore ran
+                // (the 'assistantMessage' handler renders first, then flushes) —
+                // route through the SF-2 choke point so a following user is
+                // re-pinned instead of stranded off-bottom until the next event.
+                if (typeof scrollToBottomIfAllowed === 'function') scrollToBottomIfAllowed();
+            }
+            return; // only the latest assistant message can have a stale reveal
+        }
+    }
+}
+
 AgentEvents.on('assistantMessage', function(e) {
     if (e.chatId === currentChatId) renderMessages();
+    // FLUSH-TAIL: after the render (the full-rebuild path may recreate an
+    // EMPTY #streaming-text whose REG-F4 repopulation skips finalized tails).
+    _flushFinalizedStreamingText(e.chatId);
     renderChatList();
     updateContextIndicator();
 });
 
 AgentEvents.on('toolCallStarted', function(e) {
+    // FLUSH-TAIL: belt-and-braces for resume paths that start tools without a
+    // fresh assistantMessage event in this panel's lifetime (SW restart /
+    // pending-tool resume in 030-agent-loop.js).
+    _flushFinalizedStreamingText(e.chatId);
     showSpinner('Executing ' + e.displayName + '...', e.chatId);
 });
 
@@ -158,7 +206,12 @@ AgentEvents.on('userInjected', function(e) {
 });
 
 AgentEvents.on('messagesAppended', function(e) {
-    if (e.chatId === currentChatId) renderMessages();
+    // Honor e.force like the toolCallResult handler above — _repaintParent
+    // (097-sub-agent-registry.js) emits force:true so the page repaints even
+    // when the event originated for another chat id; renderMessages always
+    // renders the CURRENT chat, so a forced call is safe regardless of which
+    // chat the event names.
+    if (e.force || e.chatId === currentChatId) renderMessages();
 });
 
 AgentEvents.on('paused', function(e) {
@@ -187,7 +240,12 @@ AgentEvents.on('paused', function(e) {
         if (!_isSubAgentChat) {
             showSnackbar('Agent paused. Click Resume to continue.');
         }
-        isFollowingScroll = true;
+        // SF-3: derive the flag from the user's actual position instead of
+        // forcing true. Since SF-2, isFollowingScroll directly drives the
+        // per-chunk outer pin during streaming — a stale forced-true here
+        // (user scrolled up to read, then paused) yanked them to the bottom
+        // on the first chunk after resume.
+        isFollowingScroll = isNearBottom();
     }
 });
 
@@ -264,6 +322,47 @@ AgentEvents.on('runFinished', function(e) {
     var _pausePending = (typeof _pauseToggleDesired !== 'undefined' && _pauseToggleDesired && _pauseToggleDesired[chatId] === true);
     if (fchat && fchat.isBackground && fchat.actionId && !e.isPaused && e.reason !== 'paused' && !_pausePending && typeof finishActionIfDone === 'function') {
         try { finishActionIfDone(chatId); } catch (err) { console.error('finishActionIfDone failed', err); }
+    } else if (fchat && fchat.isBackground && fchat.actionId && !e.isPaused && e.reason !== 'paused' && _pausePending) {
+        // PR383-F4: dead-end closer for the pause-vs-natural-finish race. A Pause
+        // issued just as the run finishes naturally sets _pauseToggleDesired=true,
+        // the gate above suppresses finalize, and 045's post-emit prune (RES-3)
+        // then deletes the token — no later runFinished ever comes, so nothing
+        // finalizes and the Action button spins forever. Arm a deferred re-check:
+        // if the chat is still not running once the dust settles, the pause
+        // definitively lost the race and the natural finish must be finalized.
+        var _f4ActionId = fchat.actionId;
+        // PR384-FIX-5: bound re-arm counter. The old code returned PERMANENTLY when
+        // a newer pause was desired at fire time — if that pause then cleared
+        // without ever landing, nothing finalized and the button span forever.
+        // Re-arm the same deferred re-check (max 3 retries) so the finalize
+        // survives a pause that lands-then-clears within the window.
+        var _f4Attempts = 0;
+        function _f4Finalize() {
+            try {
+                // Run resumed/restarted — its own terminal event finalizes.
+                if (typeof runningChatIds !== 'undefined' && runningChatIds[chatId]) return;
+                // A newer pause is in flight for this chat. PR384-FIX-5: instead of
+                // returning permanently, RE-ARM (bounded) so a pause that lands
+                // then clears still finalizes once the dust settles.
+                if (typeof _pauseToggleDesired !== 'undefined' && _pauseToggleDesired && _pauseToggleDesired[chatId] === true) {
+                    if (_f4Attempts++ < 3) setTimeout(_f4Finalize, 2500);
+                    return;
+                }
+                var _f4Act = (typeof activeActions !== 'undefined') ? activeActions[_f4ActionId] : null;
+                // No double-finalize: only a still-'running', not explicitly paused
+                // action qualifies (same guard finishActionIfDone applies; the
+                // agent's own update_action_state verdict and pauseAction's
+                // _isPaused both win).
+                if (!_f4Act || _f4Act.state !== 'running' || _f4Act._isPaused) return;
+                // The pause lost: the run already ended non-paused and nothing is
+                // running. A togglePause from the chat view set only the page's
+                // pausedChats flag — clear that stale flag, or finishActionIfDone's
+                // isChatPaused guard refuses and the button spins forever anyway.
+                if (typeof pausedChats !== 'undefined' && pausedChats[chatId] === true) pausedChats[chatId] = false;
+                if (typeof finishActionIfDone === 'function') finishActionIfDone(chatId);
+            } catch (err) { console.error('PR383-F4 deferred action finalize failed', err); }
+        }
+        setTimeout(_f4Finalize, 2500);
     }
     // Page-side foreground streaming singletons: main cleared these inline at the
     // loop's exit (030-agent-loop.js:738-740 on main). The loop now runs in SW,
@@ -319,7 +418,8 @@ AgentEvents.on('runFinished', function(e) {
         if (chatId === _fgElse) {
             hidePauseButton();
             refreshContinueButtonForChat(chatId);
-            isFollowingScroll = true;
+            // SF-3: same as the 'paused' handler — derive, don't force (see above).
+            isFollowingScroll = isNearBottom();
         }
     }
 });
@@ -328,6 +428,45 @@ AgentEvents.on('runCrashed', function(e) {
     if (e && e.chatId && activeStreamingChatId === e.chatId) {
         isRunning = false;
         activeStreamingChatId = null;
+    }
+    // A crashed run never emits runFinished, so the runFinished handler's UI
+    // cleanup never fires for it. Without this block the foreground chat keeps
+    // a spinning "Executing…" row, the is-streaming class, and a live Pause
+    // button forever after an uncaught loop throw.
+    if (e && e.chatId) {
+        hideSpinner(e.chatId);
+        if (e.chatId === currentChatId) {
+            var _crMsgsEl = document.getElementById('messages');
+            if (_crMsgsEl) _crMsgsEl.classList.remove('is-streaming');
+            hidePauseButton();
+            if (typeof refreshContinueButtonForChat === 'function') { try { refreshContinueButtonForChat(e.chatId); } catch (err) {} }
+            renderMessages();
+        }
+    }
+    // Background Action crash finalize: finishActionIfDone only runs on
+    // runFinished (page handler above + the SW loop's finish cleanup), so a
+    // crashed Action chat's button stayed state 'running' forever — spinning,
+    // no verdict, not dismissable as failed. Finalize it as 'error' here.
+    // Page-side on purpose: tools/120-actions.js (activeActions /
+    // persistActionState / notifyActionStateChanged) is NOT in
+    // WORKER_SHARED_FILES, so the SW cannot finalize — the page owns action
+    // state, exactly like the runFinished path. Same guard as
+    // finishActionIfDone: only auto-finalize a still-'running' action that
+    // isn't paused (the agent's own update_action_state verdict wins).
+    if (e && e.chatId && typeof chats !== 'undefined' && chats[e.chatId]
+        && chats[e.chatId].isBackground && chats[e.chatId].actionId
+        && typeof activeActions !== 'undefined' && activeActions[chats[e.chatId].actionId]) {
+        var _crAct = activeActions[chats[e.chatId].actionId];
+        var _crPaused = _crAct._isPaused || (typeof isChatPaused === 'function' && isChatPaused(e.chatId));
+        if (_crAct.state === 'running' && !_crPaused) {
+            _crAct.state = 'error';
+            _crAct.icon = 'alert';
+            if (!_crAct.label || _crAct.label === 'Starting…') _crAct.label = 'Crashed';
+            if (!_crAct.output) _crAct.output = 'The run crashed with an uncaught error before reporting a result. Open the chat for details.';
+            _crAct.updatedAt = Date.now();
+            if (typeof persistActionState === 'function') { try { persistActionState(chats[e.chatId].actionId); } catch (err) {} }
+            if (typeof notifyActionStateChanged === 'function') { try { notifyActionStateChanged(chats[e.chatId].actionId); } catch (err) {} }
+        }
     }
     // Sub-agent crash recovery: if the loop threw uncaught, the normal finish
     // path never called SubAgents.onSubAgentRunFinished and the parent's spawn
@@ -346,6 +485,11 @@ AgentEvents.on('runCrashed', function(e) {
         } catch (err) { console.warn('runCrashed: onSubAgentRunFinished hook threw', err); }
     }
     if (e && e.chatId && typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(e.chatId); } catch (err) {} }
+    // A crash is a finish the user must see: notifyFinish (which stamps the
+    // finished-chat bell on natural finishes) is skipped when the loop throws,
+    // so stamp the bell here. noteChatFinishedUnseen itself skips the focused
+    // chat and sub-agent/background chats.
+    if (e && e.chatId && typeof noteChatFinishedUnseen === 'function') { try { noteChatFinishedUnseen(e.chatId, true); } catch (err) {} }
     if (typeof renderChatList === 'function') renderChatList();
     if (typeof renderJobsBadge === 'function') renderJobsBadge();
     if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdCr = _getOpenJobsDropdown(); if (_jdCr) renderJobsDropdown(_jdCr); }
@@ -371,6 +515,15 @@ AgentEvents.on('notifyFinish', function(e) {
             message: title,
             chatId: chatId
         });
+    }
+    // In-app counterpart: when the user is ON the extension page but viewing
+    // a DIFFERENT chat, no browser notification fires — light up the small
+    // finished-chat badge in the top-right header bar instead. Also stamped
+    // when away (harmless): the badge greets the user when they come back.
+    // noteChatFinishedUnseen() itself skips currentChatId / sub-agent /
+    // background chats. (ui/165-finished-chat-badge.js)
+    if (!e.isPaused && !e.wasSilentHook && typeof noteChatFinishedUnseen === 'function') {
+        try { noteChatFinishedUnseen(chatId, !!e.hasError); } catch (err) {}
     }
 });
 
@@ -491,6 +644,13 @@ AgentEvents.on('documentChanged', function(e) {
 // copy/delete/push/clone). The header badge reads from local IDB state, so
 // the panel just refreshes it.
 AgentEvents.on('workspaceMutated', function(e) {
+    // Merge-lifecycle auto-delete: the engine already synced+pulled the base
+    // workspace — clear any stale "behind" cached for it (the summaries path
+    // deliberately carries the previous syncStatus forward, so without this
+    // the base keeps a stale behind badge until the next full remote sync).
+    if (e && e.action === 'auto_delete_merged' && typeof _resetBaseCacheAfterAutoDelete === 'function') {
+        try { _resetBaseCacheAfterAutoDelete({ base_workspace: e.base_workspace, base_synced: e.synced }); } catch (err) {}
+    }
     if (typeof updateWorkspaceHeaderStatus === 'function') updateWorkspaceHeaderStatus();
 });
 
@@ -511,12 +671,74 @@ AgentEvents.on('actionStateChanged', function(e) {
 // until some later unrelated render (the "title not visible right away" bug).
 AgentEvents.on('chatTitleChanged', function(e) {
     if (!e || !e.chatId) return;
-    if (chats[e.chatId]) chats[e.chatId].title = e.title;
+    if (chats[e.chatId]) {
+        chats[e.chatId].title = e.title;
+        // Mirror the SW-side flag clear (executeSetChatTitle). Without this the
+        // page's stale titleProvisional=true gets re-inlined to the SW on the
+        // next send and the auto-title hook needlessly re-fires.
+        delete chats[e.chatId].titleProvisional;
+    }
     if (typeof renderChatList === 'function') {
         try { renderChatList(); } catch (err) {}
     }
     if (e.chatId === currentChatId && typeof updateChatTitleHeader === 'function') {
         try { updateChatTitleHeader(); } catch (err) {}
+    }
+});
+
+// tldrChanged: set_tldr (a headless tool) attached a TL;DR to the final-answer
+// assistant message in the SW. The page's chats mirror is stale — hydrate the
+// local mirror (same target search as executeSetTldr) then re-render so the
+// card appears immediately in the currently viewed chat.
+AgentEvents.on('tldrChanged', function(e) {
+    if (!e || !e.chatId || !e.tldr) return;
+    var chat = chats[e.chatId];
+    if (chat && chat.messages) {
+        // Same target search as executeSetTldr: last non-hook user msg, then
+        // the last assistant msg with content after it that isn't a hook run.
+        var lastUserIdx = -1;
+        for (var i = chat.messages.length - 1; i >= 0; i--) {
+            var m = chat.messages[i];
+            if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
+        }
+        var target = null;
+        if (lastUserIdx !== -1) {
+            // Anchor the search span to the REAL turn (stop before the first
+            // hook user message) and never pick a message carrying a hook
+            // tool call — mirrors executeSetTldr exactly.
+            var endIdx = chat.messages.length - 1;
+            for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
+                if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
+            }
+            var hasSetTldrCall = function(am) {
+                return !!(am.tool_calls && am.tool_calls.some(function(tc) {
+                    return tc.function && tc.function.name === 'set_tldr';
+                }));
+            };
+            for (var j = endIdx; j > lastUserIdx; j--) {
+                var am = chat.messages[j];
+                if (am.role === 'assistant' && am.content && !am.isStreaming) {
+                    if (hasSetTldrCall(am)) continue;
+                    target = am; break;
+                }
+            }
+            if (!target) {
+                for (var k = endIdx; k > lastUserIdx; k--) {
+                    if (chat.messages[k].role === 'assistant' && chat.messages[k].content && !hasSetTldrCall(chat.messages[k])) { target = chat.messages[k]; break; }
+                }
+            }
+        }
+        if (target) {
+            // Mirror executeSetTldr's TLDR-3 clearing: drop any earlier TL;DR
+            // in the same turn span so the page never renders two cards.
+            for (var c = lastUserIdx + 1; c <= endIdx; c++) {
+                if (chat.messages[c] !== target && chat.messages[c].tldr) delete chat.messages[c].tldr;
+            }
+            target.tldr = e.tldr;
+        }
+    }
+    if (e.chatId === currentChatId && typeof renderMessages === 'function') {
+        try { renderMessages(); } catch (err) {}
     }
 });
 
@@ -537,10 +759,16 @@ AgentEvents.on('silentHookState', function(e) {
 // owns the versionHistory array + sidebar + inline-changes rendering.
 // Route to the chat that owns the mutation (may not be the active chat
 // when a background chat ran the tool).
+// The executing tier already appended the entry to chats[chatId].versionHistory
+// via trackRecordMutation (tools/020-tool-execution.js, shared with the SW).
+// When the SW ran the tool, that entry reaches the page via the next
+// chat-inlined broadcast — but THIS event may arrive first, so append-if-
+// missing (deduped by entryId in addVersionHistoryEntryForChat) covers both
+// orderings without double entries.
 AgentEvents.on('recordMutated', function(e) {
     if (typeof addVersionHistoryEntryForChat !== 'function') return;
     addVersionHistoryEntryForChat(e.chatId, {
-        id: 'vh_' + Date.now(),
+        id: e.entryId || ('vh_' + Date.now()),
         chatId: e.chatId,
         timestamp: Date.now(),
         table: e.table,

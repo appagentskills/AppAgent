@@ -14,7 +14,38 @@
 select.prompt-field-input { cursor: pointer; }
 select.prompt-field-input[multiple] { min-height: 80px; }
 
-/* Checkbox */
+/* Required marker + inline validation */
+.prompt-field-required { color: var(--danger); margin-left: 2px; }
+.prompt-field-error { display: none; color: var(--danger); font-size: var(--text-caption); margin-top: var(--space-2); }
+.prompt-field.invalid .prompt-field-error { display: block; }
+.prompt-field.invalid .prompt-field-input { border-color: var(--danger); }
+.prompt-field.invalid .prompt-chip { border-color: var(--danger); }
+.prompt-validation-notice { margin-top: var(--space-5); padding: var(--space-3) var(--space-5); background: var(--danger-lighter, var(--danger-light)); color: var(--danger); font-size: var(--text-caption); font-weight: var(--font-semibold); border-radius: var(--radius-md); }
+
+/* Chip / pill groups (single-click select & multi-select) */
+.prompt-chip-group { display: flex; flex-wrap: wrap; gap: var(--space-3); }
+.prompt-chip { padding: var(--space-3) var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--bg-white); color: var(--text-secondary); font-size: var(--text-body-sm); font-family: var(--font-sans); line-height: 1.4; cursor: pointer; user-select: none; transition: all var(--transition-fast); max-width: 100%; text-align: left; }
+.prompt-chip:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+.prompt-chip.selected { background: var(--primary); border-color: var(--primary); color: var(--text-inverse); font-weight: var(--font-semibold); }
+.prompt-chip-multi.selected::before { content: "\2713"; margin-right: var(--space-3); font-size: var(--text-caption); }
+
+/* Toggle switch (boolean) */
+.prompt-switch-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); cursor: pointer; padding: var(--space-2) 0; }
+.prompt-switch-label { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); }
+.prompt-switch { position: relative; display: inline-flex; flex-shrink: 0; }
+.prompt-switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; z-index: 1; }
+.prompt-switch-track { position: relative; display: block; width: 38px; height: 22px; background: var(--border-dark); border-radius: var(--radius-pill); transition: background var(--transition-fast); }
+.prompt-switch-thumb { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,0.25); transition: left var(--transition-fast); }
+.prompt-switch input:checked + .prompt-switch-track { background: var(--primary); }
+.prompt-switch input:checked + .prompt-switch-track .prompt-switch-thumb { left: 18px; }
+
+/* Checkbox list (multi-select with widget:"checkboxes") */
+.prompt-checklist { display: flex; flex-direction: column; gap: var(--space-2); }
+.prompt-checklist .prompt-field-checkbox { padding: var(--space-3) var(--space-4); border-radius: var(--radius-md); align-items: flex-start; font-size: var(--text-body-sm); line-height: 1.45; }
+.prompt-checklist .prompt-field-checkbox:hover { background: var(--bg-hover); }
+.prompt-checklist .prompt-field-check { margin-top: 2px; flex-shrink: 0; }
+.prompt-field.invalid .prompt-checklist { border: 1px solid var(--danger); border-radius: var(--radius-md); }
+
 .prompt-field-checkbox { display: flex; align-items: center; gap: var(--space-4); cursor: pointer; font-size: var(--text-body); color: var(--text-primary); }
 .prompt-field-check { width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary); }
 

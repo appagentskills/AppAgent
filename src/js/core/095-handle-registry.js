@@ -114,6 +114,44 @@ function _snapshot(entry) {
     return out;
 }
 
+// Arm an entry with its background work. `runFn` MUST return a promise.
+// Fire-and-forget — we never await it here. Capture both branches so a
+// thrown synchronous error inside runFn still settles the handle.
+//
+// Out-of-band settlement: some callers (notably the sub-agent registry)
+// flip the entry to a terminal status BEFORE the deferred returned by
+// runFn ever resolves — e.g. `Handles.cancel` for stop_sub_agent, and
+// `Handles.errorWith` for sub-agent reports with status:'error'. In
+// those cases the entry is already settled (status ≠ 'pending'), and
+// the subsequent runFn settlement must NOT overwrite. We guard both
+// branches on `entry.status === 'pending'` so any pre-settled entry
+// is preserved verbatim (we still bump settledAt for cancellation as a
+// record of when the underlying work actually finished).
+//
+// Shared by _startHandle (fresh handles) and _restoreHandle (handles
+// rehydrated from a persisted sub-agent record after an MV3 SW restart).
+function _armRunFn(entry, runFn) {
+    entry.promise = Promise.resolve().then(runFn).then(function(result) {
+        if (entry.status !== 'pending') {
+            entry.settledAt = entry.settledAt || _nowMs();
+        } else {
+            entry.status = 'done';
+            entry.result = result;
+            entry.settledAt = _nowMs();
+        }
+        _drainAwaiters(entry);
+    }, function(err) {
+        if (entry.status !== 'pending') {
+            entry.settledAt = entry.settledAt || _nowMs();
+        } else {
+            entry.status = 'error';
+            entry.error = (err && err.message) ? err.message : String(err);
+            entry.settledAt = _nowMs();
+        }
+        _drainAwaiters(entry);
+    });
+}
+
 // Register a new handle and kick off the work. `runFn` MUST return a promise.
 // We never await it here — the caller gets the handle id back immediately.
 function _startHandle(chatId, name, args, displayName, runFn) {
@@ -138,40 +176,54 @@ function _startHandle(chatId, name, args, displayName, runFn) {
         awaiters: []
     };
     _handles[chatId][handleId] = entry;
-
-    // Fire-and-forget. Capture both branches so a thrown synchronous error
-    // inside runFn still settles the handle.
-    //
-    // Out-of-band settlement: some callers (notably the sub-agent registry)
-    // flip the entry to a terminal status BEFORE the deferred returned by
-    // runFn ever resolves — e.g. `Handles.cancel` for stop_sub_agent, and
-    // `Handles.errorWith` for sub-agent reports with status:'error'. In
-    // those cases the entry is already settled (status ≠ 'pending'), and
-    // the subsequent runFn settlement must NOT overwrite. We guard both
-    // branches on `entry.status === 'pending'` so any pre-settled entry
-    // is preserved verbatim (we still bump settledAt for cancellation as a
-    // record of when the underlying work actually finished).
-    entry.promise = Promise.resolve().then(runFn).then(function(result) {
-        if (entry.status !== 'pending') {
-            entry.settledAt = entry.settledAt || _nowMs();
-        } else {
-            entry.status = 'done';
-            entry.result = result;
-            entry.settledAt = _nowMs();
-        }
-        _drainAwaiters(entry);
-    }, function(err) {
-        if (entry.status !== 'pending') {
-            entry.settledAt = entry.settledAt || _nowMs();
-        } else {
-            entry.status = 'error';
-            entry.error = (err && err.message) ? err.message : String(err);
-            entry.settledAt = _nowMs();
-        }
-        _drainAwaiters(entry);
-    });
-
+    _armRunFn(entry, runFn);
     return { handleId: handleId, entry: entry };
+}
+
+// Re-register a handle under a SPECIFIC, previously-issued id. Handles are
+// in-memory by design (see header), so an MV3 service-worker restart wipes
+// `_handles` — but sub-agent records persist `spawn_handle_id` + `last_report`
+// in IDB. SYMPTOM this fixes: after a SW restart the parent's `await_handle`
+// / `poll_handle` against a persisted spawn handle returned `unknown handle`,
+// so a sub's report was unreachable even though the record still carried it.
+// The sub-agent registry calls this at boot (loadAllSubAgents) to rebuild:
+//   • settled subs   → a PRE-SETTLED entry (opts.status done/error/cancelled,
+//     with result/error built from last_report) the parent can still collect;
+//   • running subs   → a PENDING entry re-armed with a fresh deferred
+//     (opts.runFn), settled later by the registry's normal push paths.
+// No-op (existed:true) when the id is already registered — loadAll can run
+// concurrently with live spawns and must never clobber a live entry.
+function _restoreHandle(chatId, handleId, opts) {
+    opts = opts || {};
+    _gcSweep();
+    chatId = _resolvedChatId(chatId);
+    if (!handleId) return { handleId: null, entry: null, existed: false };
+    if (!_handles[chatId]) _handles[chatId] = Object.create(null);
+    var existing = _handles[chatId][handleId];
+    if (existing) return { handleId: handleId, entry: existing, existed: true };
+    var status = opts.status || 'pending';
+    var entry = {
+        handleId: handleId,
+        chatId: chatId,
+        name: opts.name || 'spawn_sub_agent',
+        displayName: opts.displayName || opts.name || 'restored handle',
+        args: opts.args || null,
+        status: status,
+        createdAt: opts.createdAt || _nowMs(),
+        settledAt: (status === 'pending') ? null : (opts.settledAt || _nowMs()),
+        result: (opts.result != null) ? opts.result : null,
+        error: (opts.error != null) ? opts.error : null,
+        cancelled: status === 'cancelled',
+        cancelReason: (status === 'cancelled') ? (opts.error || 'cancelled') : null,
+        promise: null,
+        awaiters: [],
+        restored: true
+    };
+    _handles[chatId][handleId] = entry;
+    if (status === 'pending' && typeof opts.runFn === 'function') {
+        _armRunFn(entry, opts.runFn);
+    }
+    return { handleId: handleId, entry: entry, existed: false };
 }
 
 function _drainAwaiters(entry) {
@@ -392,6 +444,7 @@ function _markAwaitingApproval(chatId, handleId, awaiting) {
 
 var Handles = {
     start: _startHandle,
+    restore: _restoreHandle,
     get: _getEntry,
     list: _listEntries,
     snapshot: _snapshot,
@@ -424,6 +477,7 @@ var Handles = {
         // Cheap reads — no point in async-wrapping.
         list_instances: true,
         set_chat_title: true,
+        set_tldr: true,
         // Cache navigators are pure in-memory reads.
         cached_content_outline: true,
         cached_content_read: true,

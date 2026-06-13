@@ -65,6 +65,35 @@ async function getVersionXml(versionSysId) {
     return null;
 }
 
+// Latest XML for a record, for download/preview. Prefers the newest
+// chat-tracked sys_update_version payload, then any live version on the
+// instance, then falls back to the <table>.do?XML export — data tables
+// (incident, sys_user, …) are not update-set tracked and have NO versions,
+// so without the export fallback download/preview dead-ends with
+// "No version to download".
+async function getLatestRecordXml(table, sysId) {
+    try {
+        var latestAfterVersion = (typeof getLatestAfterVersion === 'function')
+            ? getLatestAfterVersion(table, sysId) : null;
+        var xml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : null;
+        if (!xml) {
+            var liveVersion = await getRecordVersion(table, sysId);
+            if (liveVersion) xml = await getVersionXml(liveVersion.sys_id);
+        }
+        if (!xml) {
+            if (!_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
+            var res = await fetch('/' + table + '.do?XML&sys_id=' + sysId, {
+                headers: { 'X-UserToken': window.sessionToken }
+            });
+            if (res.ok) xml = await res.text();
+        }
+        return xml || null;
+    } catch (e) {
+        console.error('Failed to get record XML:', e);
+        return null;
+    }
+}
+
 function addVersionHistoryEntry(entry) {
     versionHistory.push(entry);
     saveVersionHistory();
@@ -84,7 +113,12 @@ function addVersionHistoryEntryForChat(chatId, entry) {
     var chat = chats[chatId];
     if (!chat) return;
     if (!Array.isArray(chat.versionHistory)) chat.versionHistory = [];
-    chat.versionHistory.push(entry);
+    // Dedupe by id: the executing tier (trackRecordMutation in
+    // tools/020-tool-execution.js) already appended this entry to the
+    // authoritative chat, and it may have reached the page mirror via a
+    // chat-inlined broadcast before this event handler ran.
+    var already = entry && entry.id && chat.versionHistory.some(function(v) { return v && v.id === entry.id; });
+    if (!already) chat.versionHistory.push(entry);
     if (chatId === currentChatId) {
         versionHistory = chat.versionHistory;
         renderVersionSidebar();
@@ -382,9 +416,9 @@ function renderInlineChanges(userMsgIdx) {
         var tableDisplayName = getTableDisplayName(file.table);
         var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">NEW</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">MODIFIED</span>' : '');
 
-        var jsTable = escapeHtml(file.table);
-        var jsSysId = escapeHtml(file.sysId);
-        var jsDisplayName = escapeHtml(file.displayName).replace(/'/g, "\\'");
+        var jsTable = escapeJsString(file.table);
+        var jsSysId = escapeJsString(file.sysId);
+        var jsDisplayName = escapeJsString(file.displayName);
 
         html += '<div class="sn-artifact-card">';
         html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
@@ -418,9 +452,9 @@ function renderInlineChanges(userMsgIdx) {
         var tableIcon = getTableIcon(file.table);
         var tableDisplayName = getTableDisplayName(file.table);
 
-        var jsTable = escapeHtml(file.table);
-        var jsSysId = escapeHtml(file.sysId);
-        var jsDisplayName = escapeHtml(file.displayName).replace(/'/g, "\\'");
+        var jsTable = escapeJsString(file.table);
+        var jsSysId = escapeJsString(file.sysId);
+        var jsDisplayName = escapeJsString(file.displayName);
 
         html += '<div class="sn-artifact-card reverted">';
         html += '<div class="sn-artifact-icon sn-icon-reverted">' + tableIcon + '</div>';
@@ -1020,6 +1054,46 @@ function prettyPrintXml(xmlString) {
 }
 
 // Format XML content for display (pretty print)
+// Lightweight per-line XML syntax highlighter for the diff-viewer preview.
+// Returns HTML (all raw content escaped). Standard scheme: brackets muted,
+// tag names blue, attribute names purple, attribute values green, text
+// default, comments/declarations muted italic. Per-line by design (the
+// preview renders line by line); a tag/comment spanning lines degrades
+// gracefully to plain text — cosmetic only.
+function highlightXmlLine(rawLine) {
+    var out = '';
+    var re = /<[^>]*>?/g;
+    var last = 0, m;
+    while ((m = re.exec(rawLine)) !== null) {
+        if (m.index > last) out += '<span class="xml-text">' + escapeHtml(rawLine.slice(last, m.index)) + '</span>';
+        out += _highlightXmlTag(m[0]);
+        last = m.index + m[0].length;
+    }
+    if (last < rawLine.length) out += '<span class="xml-text">' + escapeHtml(rawLine.slice(last)) + '</span>';
+    return out;
+}
+
+function _highlightXmlTag(tag) {
+    if (/^<!--/.test(tag)) return '<span class="xml-comment">' + escapeHtml(tag) + '</span>';
+    // <?xml ... ?>, <!DOCTYPE ...>, CDATA openers, etc.
+    if (/^<[!?]/.test(tag)) return '<span class="xml-decl">' + escapeHtml(tag) + '</span>';
+    var m = tag.match(/^(<\/?)([\w:.-]+)([\s\S]*?)(\/?>?)$/);
+    if (!m) return '<span class="xml-text">' + escapeHtml(tag) + '</span>';
+    var html = '<span class="xml-bracket">' + escapeHtml(m[1]) + '</span>' +
+               '<span class="xml-tag">' + escapeHtml(m[2]) + '</span>';
+    html += m[3].replace(/([\w:.-]+)(\s*=\s*)("[^"]*"|'[^']*')|(\s+)|([^\s]+)/g, function(a, name, eq, val, ws, lone) {
+        if (ws) return ws;
+        if (name) {
+            return '<span class="xml-attr">' + escapeHtml(name) + '</span>' +
+                   '<span class="xml-bracket">' + escapeHtml(eq) + '</span>' +
+                   '<span class="xml-attr-value">' + escapeHtml(val) + '</span>';
+        }
+        return '<span class="xml-text">' + escapeHtml(lone) + '</span>';
+    });
+    html += '<span class="xml-bracket">' + escapeHtml(m[4]) + '</span>';
+    return html;
+}
+
 function formatXmlForDiff(xml) {
     if (!xml) return '';
     xml = normalizeLineEndings(xml);

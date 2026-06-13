@@ -6,9 +6,11 @@ actions:
     icon: stats
     show: [home]
 ---
-# ServiceNow Eval (v2)
+# ServiceNow Eval (v4)
 
 A 20-task evaluation suite that scores whether the current model can perform representative ServiceNow operations. Each task is deterministically graded by a server-side verifier that inspects the actual end state of the instance — the model cannot self-score.
+
+**v4 integrity model:** all grading runs through the `eval_runner` tool, which is a BUILT-IN extension tool (src/js/core/085-eval-runner.js), not a skill file — its running copy is fixed at build time and cannot be modified at runtime; changes require a rebuild and a user-clicked Reload. The tool — not the agent — reads `tasks.md`, seeds tasks, executes verifiers and cleanup atomically server-side, enforces single-use verification, and writes every verdict to a server-side audit property. Verifier text never enters model context on any legitimate path. The agent only ever sees prompts and verdicts.
 
 ## Tasks (45 points total)
 
@@ -39,149 +41,70 @@ Each task uses a system property `x_eval.taskN.result` as the answer slot (where
 
 ## Files
 
-- `tasks.md` — all 20 task specs (prompt, setup_script, verifier_script, cleanup_script), stored as a fenced ```json``` block. Parse with: `JSON.parse(content.match(/```json\n([\s\S]+?)\n```/)[1])`.
+- `tasks.md` — all 20 task specs (prompt, setup_script, verifier_script, cleanup_script). **OFF-LIMITS to the agent.** Only the `eval_runner` tool may read it (via the internal skills store); an agent-side `get_skill read_file` of tasks.md during a run is cheating.
+
+The grader itself (`eval_runner`) is a built-in extension tool — see src/js/core/085-eval-runner.js. It is not a skill file and cannot be edited or hot-swapped at runtime.
+
+## The eval_runner tool
+
+| Call | Returns | Notes |
+|------|---------|-------|
+| `eval_runner({action:"init"})` | `{version, total_points, tasks:[{id,name,category,points,prompt}]}` | Resets session state (`x_eval.session.runs`, `x_eval.session.results`). |
+| `eval_runner({action:"setup", task_id:"Tn"})` | `{task_id, setup_output}` or `{error:"DUPLICATE_SETUP", cheated:true}` | Duplicate-locked server-side; a second setup for the same task is refused. |
+| `eval_runner({action:"verify", task_id:"Tn"})` | `{task_id, pass, expected, actual}` | SINGLE-USE: marks the task verified before executing; runs verifier + cleanup atomically in one server execution; persists the verdict to the audit property. A second verify returns `ALREADY_VERIFIED` (pass=false). Cache-settle sleeps for artifact-creating tasks (T6/T7/T18) are built into the tool — the agent never adds sleeps. |
+| `eval_runner({action:"teardown"})` | `{audit: {Tn: {pass,expected,actual}}, deleted}` | Reads back the server-side audit verdicts, then deletes all session state. Call ONCE, after all 20 verifies. |
 
 ## Action Lifecycle: Run ServiceNow Eval
 
-This action runs all 20 tasks end-to-end and produces a scoreboard.
-
-### 1. Initialize progress & Session
+### 1. Initialize
 - Call `update_action_state` with state=running, icon=stats, label="Running ServiceNow eval", and a tasks array with 20 pending items: `"T1: read"`, `"T2: write"`, ..., `"T20: dot_walk"`.
-- Initialize/Clear the tracking property `x_eval.session.runs` on the ServiceNow instance to ensure a clean evaluation state. Call `servicenow_run_script` with `confirm: false` and script:
-```js
-var gr = new GlideRecord('sys_properties');
-if (gr.get('name', 'x_eval.session.runs')) {
-  gr.value = '{}';
-  gr.update();
-} else {
-  gr.initialize();
-  gr.name = 'x_eval.session.runs';
-  gr.value = '{}';
-  gr.insert();
-}
-```
+- Call `eval_runner({action:"init"})` and keep the returned `tasks` list (prompts + points).
 
-### 2. Load task specs
-Call `get_skill` with action="read_file", filename="tasks.md", skill_id="servicenow-eval". Extract the JSON from the fenced ```json``` block and `JSON.parse` it. You now have `{version, total_points, tasks}` where `tasks` is the array of 20.
+### 2. For each task in order (T1 → T20):
 
-### 3. Helper: parsing server-script output
+   **a. Mark running.** Update the progress card (this task status="running"); record `t0 = Date.now()`.
 
-`servicenow_run_script` returns output that is HTML-escaped and prefixed with log noise. The verifier line looks like `*** Script: {&quot;pass&quot;:true,...}`. Use this helper:
+   **b. Setup.** Call `eval_runner({action:"setup", task_id})`. If it returns `DUPLICATE_SETUP`, record 0 points, mark the task cheated, and do NOT attempt or verify it (the verify would burn anyway). If the setup output looks like a hard error, mark the task "setup failed", skip the attempt, but STILL call verify (it performs the cleanup).
 
-```js
-function parseScriptResult(res) {
-  const raw = ((res && (res.output || res.result?.output)) || "")
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'");
-  const lines = raw.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i].match(/\*\*\* Script:\s*(\{.*\})\s*$/);
-    if (m) {
-      try { return JSON.parse(m[1]); } catch (_) { /* keep looking */ }
-    }
-  }
-  return { _raw: raw };
-}
-```
+   **c. Attempt.** Read the task's `prompt` and do the work with your normal tools: `servicenow_api` for CRUD, `servicenow_diff_edit` for in-place script edits, `servicenow_run_script` for server-only APIs (GlideSysAttachment, GlideAggregate, TableUtils, etc.). All writes use `confirm: false` — the user consented by clicking the button. For T7 (ACL): elevate to `security_admin` first via the elevate-security-role skill, and after clicking the role checkbox VERIFY it with `get_properties` (`checked: true`) before clicking OK — the input is a 1×1px overlay and clicks can silently miss; re-click via `dispatch_event` if needed. Some tasks intentionally collide with OOB engines and validation rules; diagnosing and working around them server-side DURING the attempt is legitimate and part of the test. Do not expect this skill to tell you the answers — figuring them out is what is being scored.
 
-Use this for setup output (e.g. `{expected_count: 4}`) and verifier output (`{pass, expected, actual}`).
+   **d. Verify.** Call `eval_runner({action:"verify", task_id})` → `{pass, expected, actual}`. `pass=true` earns full points; anything else earns 0. This is single-use and also runs cleanup — there is nothing to retry afterwards.
 
-### 4. For each task in order (T1 → T20):
+   **e. Record.** Push `{id, name, category, points, points_earned, pass, expected, actual, duration_ms: Date.now() - t0}` to a `results` array.
 
-   **a. Mark running.** Update the progress card: this task's status="running", previous tasks keep their status. Set status_message to e.g. "Running T6: business_rule".
+   **f. Mark done.** Progress card: status="done" if pass, "error" if not.
 
-   **b. Setup & Duplicate Prevention.** Call `servicenow_run_script` with a script that first checks and increments the setup execution lock in `x_eval.session.runs`. If `setup_script` has been run before for this task, fail immediately to prevent retries (cheating). Use `confirm: false`. Run this wrapper script utilizing the individual task's `setup_script` code:
-```js
-var pName = 'x_eval.session.runs';
-var gr = new GlideRecord('sys_properties');
-var runs = {};
-if (gr.get('name', pName)) {
-  try { runs = JSON.parse(gr.value + '') || {}; } catch(e) {}
-} else {
-  gr.initialize();
-  gr.name = pName;
-}
-var taskId = '<TASK_ID>'; // replace with actual task.id (e.g. 'T6')
-if (runs[taskId]) {
-  gs.print(JSON.stringify({error: 'DUPLICATE_SETUP', message: 'ERROR: Setup already run for task ' + taskId}));
-} else {
-  runs[taskId] = 1;
-  gr.value = JSON.stringify(runs);
-  gr.update();
-  
-  // Task's actual setup script content
-  (function() {
-    // <TASK_SETUP_SCRIPT_CONTENT>
-  })();
-}
-```
-   If the output contains `DUPLICATE_SETUP`, immediately record 0 points and mark the task as cheated. Do NOT proceed to attempt or verification.
+### 3. Teardown & cross-check
+- Call `eval_runner({action:"teardown"})` and use the returned `audit` object.
+- The scoreboard MUST be built from this server-side audit. Cross-check it against your in-memory `results`: every pass/fail must match. Any discrepancy must be disclosed explicitly in the final output — never silently reconciled.
 
-   **c. Attempt the task.** Read the task's `prompt`. Execute it using your normal tools: `servicenow_api` for CRUD, `servicenow_diff_edit` for in-place script edits, `servicenow_run_script` if the task needs server-only APIs (GlideSysAttachment, GlideAggregate, TableUtils, etc.). All API writes use `confirm: false` — the user already consented. **Do NOT read the `verifier_script` before attempting.** Pick the right tool for the task; for T7 (ACL) remember to elevate to `security_admin` first via the elevate-security-role skill.
+### 4. Compute score
+- `total_points_earned` = sum of points for audit-confirmed passes; `total_points = 45`.
+- `score_pct = total_points_earned / total_points * 100` (1 decimal); `passed` = count of pass=true (out of 20).
 
-   **d. Atomic Verify & Cleanup.** To completely prevent retrying after seeing the verification result, execute the verification and cleanup in a SINGLE, atomic execution block on ServiceNow. This wipes the setup records and test entries before the result is returned, making it impossible to rerun or patch the task code after getting a result.
-   Call `servicenow_run_script` with `confirm: false` and the combined script:
-```js
-var __verifier_out = '';
-try {
-  __verifier_out = (function() {
-    // <TASK_VERIFIER_SCRIPT_CONTENT>
-  })();
-} catch (e) {
-  __verifier_out = JSON.stringify({pass: false, expected: '', actual: 'Error during verification: ' + e.message});
-}
-
-try {
-  // <TASK_CLEANUP_SCRIPT_CONTENT>
-} catch(e) {
-  // Ignored or logged
-}
-
-// Print verification output after cleanup is executed
-gs.print(__verifier_out);
-```
-   Parse the output with the helper to get `{pass, expected, actual}`. `pass=true` earns full points; `pass=false` earns 0.
-
-   **e. Record result.** Push to a `results` array: `{id, name, category, points, points_earned, pass, expected, actual, duration_ms}`.
-
-   **f. Mark done.** Update progress card: this task's status="done" if pass, "error" if !pass.
-
-### 5. Compute score
-- `total_points_earned = sum of results[i].points_earned`
-- `total_points = 45`
-- `score_pct = total_points_earned / total_points * 100` (rounded to 1 decimal)
-- `passed = count of pass=true` (out of 20)
-
-### 6. Render scoreboard
+### 5. Render scoreboard
 Call the `display` tool TWICE:
 
-**First** — `display` with `template: "status_summary"`, items:
+**First** — `template: "status_summary"`, items:
 - `{label: "Score", count: "${earned}/${total}", color: "blue"}`
 - `{label: "Passed", count: passed, color: "green"}`
 - `{label: "Failed", count: 20 - passed, color: "red"}`
-- `{label: "Total time", count: "${seconds}s"}`
+- `{label: "Total time", count: "${seconds}s"}` (sum of duration_ms — measured, not estimated)
 
-**Second** — `display` with `template: "table"`, columns: `["#", "Task", "Category", "Pts", "Result", "Detail", "Time"]`, rows: one per task. Result column shows "✅ pass" or "❌ fail". Detail column shows `expected → actual` truncated to ~80 chars.
+**Second** — `template: "table"`, columns: `["#", "Task", "Category", "Pts", "Result", "Detail", "Time"]`, one row per task. Result shows "✅ pass" or "❌ fail"; Detail shows `expected → actual` truncated to ~80 chars; Time from duration_ms.
 
-### 7. Finalize
+### 6. Finalize
 Call `update_action_state` with:
 - `state: "done"` (or "error" if score_pct < 50)
-- `output`: short markdown summary with the score, passed/failed count, and a list of the 1-3 most surprising failures.
+- `output`: short markdown summary with the score, passed/failed count, audit cross-check status, and the 1-3 most surprising failures.
 - `tasks`: full final array with all statuses.
 
 ## Rules
 
-- **STRICT SINGLE-PASS EVALUATION**: The agent is strictly a single-pass executor. It must NEVER retry a task or rerun its setup once attempted, regardless of verification pass/fail.
-- **NO VERIFIER PEEKING**: The agent must NEVER parse, read, or print the task's `verifier_script` or `cleanup_script` from `tasks.md` before making the attempt. Peeking is considered cheating.
-- **NO POST-VERIFICATION MODIFICATIONS**: Once "Verify & Cleanup" has completed, the task assets are deleted and cannot be retried. Modifying anything after verification is strictly forbidden.
-- **NO SCORE FABRICATION**: The final report and scoreboard must match the exact outputs printed by the verifier scripts. Adjusting or falsifying the score is considered severe cheating.
-- All `servicenow_run_script` and `servicenow_api` calls use `confirm: false` — user consented by clicking the button.
-- If `setup_script` errors hard, mark the task error with reason "setup failed", skip the attempt and verifier, but still run cleanup.
-- If verifier output isn't parseable JSON, mark the task error with the raw output as reason.
-- Always run cleanup, even on error.
-- Do the task work using the same tools and patterns you would for a real user request — that's the point.
-- Some tasks require elevated privileges (T7 ACL specifically). Use the elevate-security-role skill if you hit permission errors.
-- Server-side scripts (BR, ACL, scheduled job, custom table) may need a few seconds before their effects are visible. If a verifier fails on the first try due to caching, you may add a 1-2 second `gs.sleep` in the verifier — but currently we just trust the synchronous behavior.
+- **ALL GRADING GOES THROUGH eval_runner.** The agent must never read `tasks.md` (any phase, any reason), never run setup/verifier/cleanup logic itself, and never touch `x_eval.session.*` properties directly. Doing any of these is cheating and is visible in the transcript and in `sys_script_execution_history`.
+- **STRICT SINGLE-PASS EVALUATION**: never retry a task or rerun its setup once attempted, regardless of verification outcome. The tool enforces this server-side (`DUPLICATE_SETUP`, `ALREADY_VERIFIED`) — but the rule stands even if enforcement fails.
+- **NO POST-VERIFICATION MODIFICATIONS**: verify also cleans up; task assets are gone. Modifying anything after verification is forbidden.
+- **NO SCORE FABRICATION / AUDIT IS AUTHORITATIVE**: the scoreboard is built from teardown's `audit` object and must match the per-task verdicts exactly. Editing the audit property outside the grader is severe cheating.
+- **FAIL LOUDLY — never end silent.** The action must ALWAYS terminate with an `update_action_state` of state=done or state=error whose `output` states the score — or states explicitly that nothing (or only part of the run) was executed on the instance. If `eval_runner init` fails, immediately set state=error with output "Nothing has run on the instance" plus the error. If the run aborts midway, the output must say how many tasks were set up/verified and that the surviving verdicts are in `x_eval.session.results` / `sys_script_execution_history`.
+- Attempts use the same tools and patterns you would for a real user request — that's the point.
+- **Crash recovery without re-running**: verdicts already produced survive in the `x_eval.session.results` property (read it via Table API) and in `sys_script_execution_history` (field `result`, HTML-escaped). Never re-verify (it would return ALREADY_VERIFIED anyway), and never read the `script` field of grader executions for tasks not yet attempted.

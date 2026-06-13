@@ -59,9 +59,10 @@ Test the page from the perspective of these personas. Not every persona applies 
 
 During testing, for each relevant persona:
 1. **Identify which personas apply** based on the page's purpose and the roles it checks (from Phase 0 source review).
-2. **Test the happy path as each persona** — at minimum the Admin and the most restrictive relevant persona.
-3. **Verify role-based UI differences** — elements that should be hidden, disabled, or absent for lower-privilege personas.
-4. **Verify backend enforcement** — even if the UI hides a button, use `servicenow_api` to call the underlying API directly and confirm the backend also blocks the action for unauthorized roles.
+2. **Switch personas with impersonation** — use `iframe_tool` with action `impersonate` and `user` set to the persona's username/name/sys_id; pass `user: "stop"` to end impersonation. Always stop impersonation when finished with a persona.
+3. **Test the happy path as each persona** — at minimum the Admin and the most restrictive relevant persona.
+4. **Verify role-based UI differences** — elements that should be hidden, disabled, or absent for lower-privilege personas.
+5. **Verify backend enforcement** — even if the UI hides a button, use `servicenow_api` to call the underlying API directly and confirm the backend also blocks the action for unauthorized roles.
 
 > **Shortcut:** If the page does not have any role-based logic (no ACL checks, no role conditionals in the code), you may skip multi-persona testing and test as the current user only. Note this in your test report.
 
@@ -331,6 +332,7 @@ For every bug found during testing, document it with the following format:
 | `iframe_tool` (resize) | Resize viewport (presets: mobile, tablet, desktop, fullhd) |
 | `iframe_tool` (get_properties) | Read computed styles, dimensions, values, attributes of elements |
 | `iframe_tool` (set_style) | Apply CSS styles or toggle classes on elements |
+| `iframe_tool` (impersonate) | Impersonate a user for persona testing (`user: "stop"` to end) |
 | `take_screenshot` | Capture the browser panel or a specific element as PNG |
 | `servicenow_api` | Query, create, update ServiceNow records |
 

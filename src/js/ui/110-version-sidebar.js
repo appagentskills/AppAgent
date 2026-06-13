@@ -1,14 +1,15 @@
 // Download single file from sidebar
 async function downloadSingleFile(table, sysId, displayName) {
-    var latestAfterVersion = getLatestAfterVersion(table, sysId);
-    if (!latestAfterVersion) {
-        showSnackbar('No version to download', 'warning');
-        return;
-    }
-
     showSpinner('Downloading...');
     try {
-        var xml = await getVersionXml(latestAfterVersion);
+        // getLatestRecordXml (ui/090-version-history.js) falls back to the
+        // <table>.do?XML export for data tables with no sys_update_version rows.
+        var xml = await getLatestRecordXml(table, sysId);
+        if (!xml) {
+            hideSpinner();
+            showSnackbar('No version to download', 'warning');
+            return;
+        }
         if (xml) {
             var prettyXml = prettyPrintXml(xml) || xml;
             var blob = new Blob([prettyXml], { type: 'application/xml' });

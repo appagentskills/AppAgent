@@ -1,5 +1,5 @@
 /* Modal Dialog */
-.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: 10001; display: none; align-items: center; justify-content: center; }
+.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-modal); display: none; align-items: center; justify-content: center; }
 .modal-overlay.show { display: flex; }
 
 /* Widget History Modal */

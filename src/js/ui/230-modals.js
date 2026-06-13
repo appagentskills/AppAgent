@@ -77,3 +77,22 @@ function showPromptModal(title, message, defaultValue) {
         }, 100);
     });
 }
+
+// Enter-to-submit for the generic prompt/confirm modals (showModal / showPromptModal).
+// Escape-to-cancel is already handled by the global Escape handler in core/120-init.js,
+// which calls closeModal() and resolves the pending modal promise with null —
+// so Escape is intentionally NOT duplicated here.
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' || e.isComposing) return;
+    if (!modalResolve) return; // only generic prompt/confirm modals set modalResolve
+    var overlay = document.getElementById('modal-overlay');
+    if (!overlay || !overlay.classList.contains('show')) return;
+    // Multi-line inputs keep Enter for newlines
+    if (e.target && e.target.tagName === 'TEXTAREA') return;
+    // Let focused buttons/links activate natively (e.g. Tab to Cancel, then Enter)
+    if (e.target && (e.target.tagName === 'BUTTON' || e.target.tagName === 'A')) return;
+    var primary = document.querySelector('#modal-actions .modal-btn.primary');
+    if (!primary) return;
+    e.preventDefault();
+    primary.click();
+});

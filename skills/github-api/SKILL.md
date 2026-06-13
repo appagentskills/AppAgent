@@ -3,9 +3,9 @@ name: github-api
 description: Call the GitHub REST API from this extension. web_fetch now auto-attaches the stored GitHub token (the same credential the workspace tool uses for clone/push) on any request targeting the CONFIGURED GitHub instance's REST base (api.github.com for github.com, or <instance>/api/v3 for GitHub Enterprise), so authenticated REST calls work against PRIVATE repos with no manual token handling. Quick-reference for repos, branches, files/contents, commits, pull requests, PR files/commits, PR comments (conversation + inline review), reviews/approvers, and merging PRs (mergeability checks, merge methods, update-branch, branch deletion, direct branch merges), plus a reusable js_eval helper, pagination, rate-limit and error notes.
 ---
 
-# github-api
+# GitHub REST API
 
-Read GitHub data via the **official REST API** at `https://api.github.com`.
+Read and write GitHub data via the **official REST API** at `https://api.github.com`.
 
 ## Auth is automatic
 

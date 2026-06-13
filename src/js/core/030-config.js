@@ -11,22 +11,26 @@ var DEFAULT_API_PROVIDERS = [
         provider: 'moonshotai'
     },
     {
-        name: 'opus-4.6',
+        // Opus 4.7+ is adaptive-thinking-only: effort replaces thinkingBudget
+        // (budget_tokens returns 400). xhigh is the documented recommended
+        // starting point for coding/agentic work on Opus 4.8.
+        name: 'opus-4.8',
         apiKey: '',
-        model: 'anthropic/claude-opus-4-6',
+        model: 'anthropic/claude-opus-4.8',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         context_length: 200000,
         maxTokens: 64000,
-        thinkingBudget: 40000
+        effort: 'xhigh'
     },
     {
-        name: 'sonnet-4.5',
+        // Sonnet 4.6 supports adaptive thinking via effort (xhigh is Opus/Fable-only)
+        name: 'sonnet-4.6',
         apiKey: '',
-        model: 'anthropic/claude-sonnet-4.5',
+        model: 'anthropic/claude-sonnet-4.6',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         context_length: 200000,
         maxTokens: 64000,
-        thinkingBudget: 40000
+        effort: 'high'
     },
     {
         name: 'haiku-4.5',
@@ -35,7 +39,10 @@ var DEFAULT_API_PROVIDERS = [
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         context_length: 200000,
         maxTokens: 64000,
-        thinkingBudget: 40000
+        // 32k is the documented budget ceiling (Anthropic recommends batch
+        // processing for budgets above 32k; the official migration example
+        // also uses 32000)
+        thinkingBudget: 32000
     },
     {
         name: 'gpt-5.2',
@@ -57,12 +64,12 @@ var DEFAULT_API_PROVIDERS = [
     },
     {
         name: 'Proxy',
-        model: 'anthropic/claude-opus-4-6',
+        model: 'anthropic/claude-opus-4-8',
         endpoint: 'http://localhost:8000/api/v1/chat/completions',
         apiKey: '----',
         maxTokens: 100000,
         context_length: 200000,
-        thinkingBudget: 64000
+        effort: 'xhigh'
     },
     {
         name: 'Opus-4-8 OAuth',
@@ -71,7 +78,9 @@ var DEFAULT_API_PROVIDERS = [
         apiKey: 'oauth',
         maxTokens: 100000,
         context_length: 200000,
-        effort: 'high',
+        // xhigh is supported on Opus 4.8 (and Fable/Mythos 5) and is the
+        // documented recommended starting point for coding/agentic work
+        effort: 'xhigh',
         isClaudeOAuth: true
     },
     {
@@ -97,25 +106,61 @@ var DEFAULT_API_PROVIDER = {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     context_length: 200000,
     maxTokens: 64000,
-    thinkingBudget: 40000,
+    // Doc-recommended budget ceiling (batch processing advised above 32k).
+    // Ignored automatically for adaptive-only Claude models (Opus 4.7+,
+    // Fable/Mythos 5) — see callOpenRouterStreaming.
+    thinkingBudget: 32000,
     provider: ''
 };
 
+// Adaptive-only Claude models (Opus 4.7+, Opus 5+, Fable 5, Mythos 5) reject
+// budget-style thinking (`budget_tokens` → 400 error); the effort parameter is
+// the only thinking-depth control. Matches both '.' and '-' version separators,
+// dated ids (claude-opus-4-8-20260115), and future versions (opus-5, opus-4.10).
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES), so it is
+// visible to callOpenRouterStreaming everywhere. transformToAnthropic in
+// src/platform/extension/background.js keeps a related (4.8+ only) regex for
+// mid-conversation system support — keep the two in sync when models change.
+var ADAPTIVE_ONLY_CLAUDE_RE = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[7-9]|\d{2,})))/;
+function isAdaptiveOnlyClaude(model) {
+    return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
+}
+
 var currentProvider = 'Opus-4-8 OAuth'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
+
+// Old default-provider names → their renamed successors (the Opus 4.8
+// alignment). Used by loadProviderFromStorage (ui/070-dashboard-ui.js) as a
+// fallback when the persisted `appagent_provider` selection still carries a
+// legacy name: the SW (whose appStorage shim is inert, getItem → null) can run
+// the loadApiProviders() rename migration in core/130-indexeddb.js FIRST, so
+// by the time the page loads, the IDB entry is already renamed and that
+// migration's localStorage rewrite never fires. KEEP IN SYNC with the
+// migration list in core/130-indexeddb.js. Loaded in BOTH bundles
+// (page core tier + WORKER_SHARED_FILES).
+var PROVIDER_RENAMES = {
+    'opus-4.6': 'opus-4.8',
+    'sonnet-4.5': 'sonnet-4.6'
+};
 var currentChatId = null;
 var chats = {};
 var paused = false; // LEGACY: kept for backwards compat with bits that still read it. Do NOT consult in isChatPaused — it would cross-pollute pause across concurrent chats.
 var pausedChats = {}; // Per-chat pause flags (for background Action chats the user paused via button)
 function isChatPaused(chatId) { return chatId ? pausedChats[chatId] === true : false; }
 var isRunning = false;
-var runningChatIds = {}; // Set of chatIds with an active agent loop — supports concurrent background chats
+// PR390-FU-3: the five per-chat run-state maps below are ALSO declared in
+// src/js/worker/000-runtime-globals.js, which executes BEFORE this file in the
+// SW bundle (worker 0xx → shared files). A bare `= {}` here re-initializes
+// them at SW load — harmless today (load is synchronous, no state exists yet)
+// but a wipe-landmine if any earlier-loaded worker file ever stashes state in
+// them. Guarded init: reuse the existing object when one is already defined.
+var runningChatIds = (typeof runningChatIds !== 'undefined' && runningChatIds) || {}; // Set of chatIds with an active agent loop — supports concurrent background chats
 var _runCleanupGuard = {}; // Per-chat: true during the finish/cleanup→hook-rerun window. runningChatIds is briefly cleared there (line ~991) before the auto-title hook's recursive runAgent re-sets it; an await in between (finishActionIfDone) lets a stale panel run-agent observe "not running" and start a SECOND loop, producing interleaved/orphan tool_use blocks. The SW run-agent handler treats a guarded chat as running.
 var pendingInjection = null; // User message to inject into the next tool result batch
 var pendingInjectionImages = null; // Images/files to inject alongside pendingInjection
-var pendingInjectionsByChatId = {}; // Per-chat pending injections: { chatId: { text, images } }
-var currentStreamAbortControllers = {}; // Per-chat AbortController for the in-flight LLM stream
-var userInterruptedChats = {}; // Per-chat: true when user pressed send mid-stream and wants to abort current step
-var interruptResolversByChatId = {}; // Per-chat: function to resolve the in-flight tool's interrupt-race promise instantly
+var pendingInjectionsByChatId = (typeof pendingInjectionsByChatId !== 'undefined' && pendingInjectionsByChatId) || {}; // Per-chat pending injections: { chatId: { text, images } } (PR390-FU-3 guarded — see runningChatIds)
+var currentStreamAbortControllers = (typeof currentStreamAbortControllers !== 'undefined' && currentStreamAbortControllers) || {}; // Per-chat AbortController for the in-flight LLM stream (PR390-FU-3 guarded)
+var userInterruptedChats = (typeof userInterruptedChats !== 'undefined' && userInterruptedChats) || {}; // Per-chat: true when user pressed send mid-stream and wants to abort current step (PR390-FU-3 guarded)
+var interruptResolversByChatId = (typeof interruptResolversByChatId !== 'undefined' && interruptResolversByChatId) || {}; // Per-chat: function to resolve the in-flight tool's interrupt-race promise instantly (PR390-FU-3 guarded)
 var currentStreamingMsgIndex = -1;
 var activeStreamingChatId = null; // Track which chat has active streaming (the one the UI is focused on)
 function isChatRunning(chatId) { return !!runningChatIds[chatId]; }
@@ -124,9 +169,14 @@ var historyExpanded = true; // History section expanded by default
 var showApiStats = true;
 var lastRequestMetrics = null; // Track token usage and performance
 // When the running context (last reported prompt size) crosses this many tokens,
-// the agent loop appends a one-shot reminder to delegate heavy work to sub-agents
+// the agent loop appends a reminder to delegate heavy work to sub-agents
 // (model quality degrades at long context). Set to 0 to disable the nudge.
 var SUBAGENT_NUDGE_TOKEN_THRESHOLD = 70000;
+// After a nudge fires, it re-arms once the context has grown this many tokens
+// PAST the size at which the last nudge fired (appended as a fresh trailing
+// context message — never mutates history, so the prompt cache stays intact).
+// Set to 0 to restore the old one-shot behavior.
+var SUBAGENT_NUDGE_REARM_TOKENS = 50000;
 var currentIframeUrl = '/'; // Track last browser tab URL for AI context
 var settingsPanelOpen = false; // Track settings panel state
 var llmConnectionStatus = 'unknown'; // 'connected', 'disconnected', 'unknown'

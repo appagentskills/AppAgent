@@ -95,6 +95,20 @@ function assertAnthropicShape(messages) {
 // placeholder invariant (every tool_use has a matching tool_result in the
 // next slot, persisted before tool execution begins) is preserved across
 // SW eviction.
+// Sub-agent soft tool-budget: if the SubAgents registry staged a budget
+// notice for this chat (>=90% used, or past the cap), append it to the
+// tool-result content so the model sees the warning inline on its very
+// next read. No-op for normal chats. Content is always a string here
+// (processToolResultForCache stringifies).
+function appendBudgetNotice(chatId, content) {
+    try {
+        if (typeof SubAgents === 'undefined' || !SubAgents.consumeBudgetNotice) return content;
+        var notice = SubAgents.consumeBudgetNotice(chatId);
+        if (!notice) return content;
+        return content + '\n\n' + notice;
+    } catch (_) { return content; }
+}
+
 function recordToolResult(chat, toolCallId, name, content) {
     if (!chat || !chat.messages || !toolCallId) return null;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
@@ -277,7 +291,15 @@ function flushPendingInjection(chat) {
     }
     if (!text && (!images || images.length === 0)) return false;
     if (text) {
-        chat.messages.push({ role: 'user', content: text });
+        // REG376-2: stamp injection-built user rows. This push can JOIN several
+        // queued texts (and context pointers) into one row via '\n\n', so the
+        // port-bridge flap dedup (_seenInSwTail, worker/130-port-bridge.js)
+        // applies paragraph-boundary containment — but ONLY to rows carrying
+        // this stamp. Organic user rows keep exact-equality dedup, or a
+        // genuinely-new re-send equal to a paragraph of an earlier
+        // multi-paragraph message would be silently dropped. The flag survives
+        // IDB persistence (structured clone) and port postMessage.
+        chat.messages.push({ role: 'user', content: text, injected: true });
     }
     if (images && images.length > 0) {
         images.forEach(function(img) {
@@ -379,6 +401,7 @@ async function executePendingApprovedTools(chat) {
                 var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
+                processed.content = appendBudgetNotice(chat.id, processed.content);
                 // recordToolResult overwrites the seeded placeholder in-place. Main's
                 // push-to-end was correct because end-of-array == slot-after-assistant
                 // (no placeholders). With approval messages + atomic placeholders
@@ -424,12 +447,24 @@ async function runAgent(overrideChatId) {
     // nested run — in the latter case the finally must NOT clear that flag or
     // emit runCrashed, or it would clobber the rerun and reopen the race.
     var _ranNormalCleanup = false;
+    // PR390-FU-1: the uncaught throw that lands us in the finally's crash arm,
+    // captured by the catch below. The runCrashed emit forwards it so the SW
+    // handler (105-subagent-broadcast.js) and onSubAgentRunFinished can report
+    // the REAL message and run transient-crash classification (auto-retry) —
+    // with a bare {chatId} emit, that consumer's `e.error` branch was dead and
+    // fallback-path crashes were never classified transient.
+    var _loopCrashError = null;
     // try/finally guarantees the per-chat running flag is cleared even if the
     // body throws — without this, an uncaught error would leave the streaming
     // dot spinning forever AND block future sends via the early-return at top.
     try {
     chat = chats[streamingChatId];
     isBackgroundRun = !!(chat && chat.isBackground);
+    // Clear any stale API error left from a PREVIOUS run of THIS chat so the
+    // finish path below can't misreport a fresh successful run as errored.
+    // Another chat's error is left alone — the finish decisions are keyed on
+    // chatId via _runApiError (see the finish section).
+    if (lastApiError && lastApiError.chatId === streamingChatId) lastApiError = null;
     AgentEvents.emit('runStarted', { chatId: streamingChatId, turn: -1 });
 
     // Execute any approved tool calls that don't have results yet
@@ -579,12 +614,14 @@ async function runAgent(overrideChatId) {
                 break;
             }
 
+            if (!result) result = { success: false, error: 'Tool returned no result' };
             delete result._denied;
             var screenshotMsg = result._screenshotMessage;
             var screenshotMsgs = result._screenshotMessages;
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
+            processed.content = appendBudgetNotice(streamingChatId, processed.content);
             recordToolResult(chat, tc.id, toolName, processed.content);
             // Defer screenshot messages so they don't interleave between tool results
             if (screenshotMsg) deferredScreenshots.push(screenshotMsg);
@@ -615,30 +652,62 @@ async function runAgent(overrideChatId) {
 
         if (isChatPaused(streamingChatId)) {
             // Paused during pending tool processing - exit cleanly. The 'paused'
-            // handler owns isRunning / isFollowingScroll writes.
+            // handler owns isRunning / isFollowingScroll writes. Do NOT bare-
+            // return here: that skipped runFinished entirely, so the finally
+            // emitted a spurious runCrashed, the checkpoint stayed 'running'
+            // (the resume scan then re-armed a user-paused chat after SW
+            // restart — pause flags are in-memory only), and the page's
+            // `await runAgent()` promise (resolved only by runFinished) hung.
+            // Emit 'paused' and fall through: the while-gate below fails on
+            // the same flag, so the normal finish path runs and emits
+            // runFinished{isPaused:true}, mirroring the mid-loop pause break.
             AgentEvents.emit('paused', { chatId: streamingChatId });
-            fetchCredits();
-            return;
         }
     }
 
     while (!isChatPaused(streamingChatId)) {
+        // QUEUE-SYNC-FIX (defense-in-depth): a user send can land in the gap
+        // between loop steps — no stream controller registered (deleted in
+        // callLLMStreaming's finally) and no tool resolver armed — so the
+        // resolver/abort fired by _handlePanelSendMessage are no-ops and only
+        // the userInterruptedChats flag survives. Consume it and flush the
+        // queued message NOW instead of streaming a whole extra turn first.
+        if (userInterruptedChats[streamingChatId]) {
+            userInterruptedChats[streamingChatId] = false;
+            if (flushPendingInjection(chat)) {
+                saveChatsToStorage();
+                AgentEvents.emit('userInjected', { chatId: streamingChatId });
+            }
+        }
         AgentEvents.emit('turnStarted', { chatId: streamingChatId, turn: lastUserMsgIndex, callNumber: callNumber + 1 });
         callNumber++;
 
-        // Reset metrics and start timing for this request
+        // Reset metrics and start timing for this request.
         var currentProviderObj = getProviderById(currentProvider);
-        lastRequestMetrics = { startTime: Date.now(), callNumber: callNumber, providerName: currentProviderObj ? currentProviderObj.name : 'Unknown' };
+        // PER-CALL metrics object: the SW runs multiple chats concurrently and the
+        // old shared `lastRequestMetrics` global got clobbered across interleaved
+        // streams (chat A's usage landing on chat B's assistant message — which
+        // also corrupted the sub-agent nudge's token reading). Each turn now owns
+        // its object and threads it into callLLMStreaming; the global is kept
+        // pointing at the most recent request purely for debugging.
+        var reqMetrics = { startTime: Date.now(), callNumber: callNumber, providerName: currentProviderObj ? currentProviderObj.name : 'Unknown' };
+        lastRequestMetrics = reqMetrics;
 
         // Sub-agent nudge: when the running context crosses the threshold, append a
-        // ONE-SHOT reminder to delegate heavy/verbose work to sub-agents (model
-        // quality degrades at long context). Pushed as a trailing `context` message
+        // reminder to delegate heavy/verbose work to sub-agents (model quality
+        // degrades at long context). Pushed as a trailing `context` message
         // so buildAPIMessages merges it onto the END of the last user turn — it comes
         // LAST and sits AFTER the prompt-cache breakpoints, so the cached prefix is
         // never invalidated (only this short tail is uncached). It is deliberately
         // NOT placed in the system prompt (that would bust the whole cache every
-        // turn). Skipped for sub-agent chats; fires at most once per chat.
-        if (!chat.isSubAgent && !chat._ctxSubAgentNudgeSent &&
+        // turn). Skipped for sub-agent chats. RE-ARMING: after firing at N tokens it
+        // fires again once the context grows past N + SUBAGENT_NUDGE_REARM_TOKENS
+        // (each firing is a fresh appended message — history is never mutated, so
+        // the prompt cache is unaffected). chat._ctxSubAgentNudgedAt records the
+        // token count at the last firing; the legacy one-shot boolean
+        // _ctxSubAgentNudgeSent (persisted on older chats) is treated as "nudged
+        // at the threshold".
+        if (!chat.isSubAgent &&
             typeof SUBAGENT_NUDGE_TOKEN_THRESHOLD === 'number' && SUBAGENT_NUDGE_TOKEN_THRESHOLD > 0) {
             var _ctxTokens = 0;
             for (var _ci = chat.messages.length - 1; _ci >= 0; _ci--) {
@@ -648,12 +717,17 @@ async function runAgent(overrideChatId) {
                     break;
                 }
             }
-            if (_ctxTokens >= SUBAGENT_NUDGE_TOKEN_THRESHOLD) {
+            var _nudgedAt = (typeof chat._ctxSubAgentNudgedAt === 'number') ? chat._ctxSubAgentNudgedAt
+                : (chat._ctxSubAgentNudgeSent ? SUBAGENT_NUDGE_TOKEN_THRESHOLD : 0);
+            var _rearmStep = (typeof SUBAGENT_NUDGE_REARM_TOKENS === 'number' && SUBAGENT_NUDGE_REARM_TOKENS > 0)
+                ? SUBAGENT_NUDGE_REARM_TOKENS : Infinity;
+            var _nudgeDue = (_nudgedAt > 0) ? (_nudgedAt + _rearmStep) : SUBAGENT_NUDGE_TOKEN_THRESHOLD;
+            if (_ctxTokens >= _nudgeDue) {
                 chat.messages.push({
                     role: 'context',
                     content: '[Context is now ~' + Math.round(_ctxTokens / 1000) + 'k tokens. Model performance degrades as context grows — strongly prefer delegating heavy or verbose work (file/grep dumps, multi-record audits, deep log scans, iterative debugging) to sub-agents via spawn_sub_agent so their raw output stays out of this conversation. Keep this context lean.]'
                 });
-                chat._ctxSubAgentNudgeSent = true;
+                chat._ctxSubAgentNudgedAt = _ctxTokens;
             }
         }
 
@@ -673,9 +747,39 @@ async function runAgent(overrideChatId) {
         // if setInterval itself throws (defensive — extremely unlikely but cheap).
         var streamUpdateInterval = null;
         try {
+            // R9: track what the last interval tick saw so we can skip the emit
+            // entirely when nothing changed — the per-kind deltas (thinking/text/
+            // tool_input) already fire on every real change, so an unchanged tick
+            // is pure render noise.
+            var _ivLastContentLen = -1;
+            var _ivLastThinkingLen = -1;
+            var _ivLastTcCount = -1;
+            var _ivLastArgsLen = -1;
             streamUpdateInterval = setInterval(function() {
                 // Force UI update while streaming to show activity
                 if (assistantMsg.isStreaming) {
+                    var _ivContentLen = assistantMsg.content ? assistantMsg.content.length : 0;
+                    var _ivThinkingLen = assistantMsg.thinking ? assistantMsg.thinking.length : 0;
+                    var _ivTcCount = assistantMsg.tool_calls ? assistantMsg.tool_calls.length : 0;
+                    var _ivArgsLen = 0;
+                    if (assistantMsg.tool_calls) {
+                        for (var _ivi = 0; _ivi < assistantMsg.tool_calls.length; _ivi++) {
+                            var _ivTc = assistantMsg.tool_calls[_ivi];
+                            if (_ivTc && _ivTc.function && _ivTc.function.arguments) {
+                                _ivArgsLen += _ivTc.function.arguments.length;
+                            }
+                        }
+                    }
+                    if (_ivContentLen === _ivLastContentLen &&
+                        _ivThinkingLen === _ivLastThinkingLen &&
+                        _ivTcCount === _ivLastTcCount &&
+                        _ivArgsLen === _ivLastArgsLen) {
+                        return; // R9: nothing changed since last tick — skip the emit
+                    }
+                    _ivLastContentLen = _ivContentLen;
+                    _ivLastThinkingLen = _ivThinkingLen;
+                    _ivLastTcCount = _ivTcCount;
+                    _ivLastArgsLen = _ivArgsLen;
                     AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'interval' });
                 }
             }, 1000);
@@ -713,7 +817,6 @@ async function runAgent(overrideChatId) {
                 },
                 function(final) {
                     assistantMsg.thinking = final.thinking || '';
-                    assistantMsg.thinkingSignature = final.thinkingSignature || null; // Preserve for Anthropic multi-turn
                     assistantMsg.content = final.content || '';
                     assistantMsg.tool_calls = final.tool_calls;
                     assistantMsg.reasoning_details = final.reasoning_details; // Preserve for OpenRouter API continuity
@@ -722,7 +825,8 @@ async function runAgent(overrideChatId) {
                 function(status, count) {
                     // Stream status callback - model is processing
                 },
-                chat.id
+                chat.id,
+                reqMetrics
             );
             
             clearInterval(streamUpdateInterval);
@@ -768,6 +872,21 @@ async function runAgent(overrideChatId) {
             lastApiError = { message: errEnv.message, chatId: streamingChatId, timestamp: Date.now() };
             chat.messages.pop();
             AgentEvents.emit('error', { chatId: streamingChatId, error: errEnv, recoverable: true });
+            // If this chat is a background Action, the PM only sees the action
+            // button — a silent crash leaves it spinning forever with no result.
+            // Best-effort: flag the card as errored so the user is told that the
+            // run died (and, if no tool calls happened, that nothing ran at all).
+            if (chat && chat.actionId) {
+                try {
+                    executeTool('update_action_state', {
+                        state: 'error',
+                        icon: 'alert',
+                        label: ('Crashed: ' + (errEnv.message || 'unknown error')).slice(0, 60),
+                        status_message: 'Agent loop crashed — marking action as errored',
+                        output: '⚠️ **The agent crashed before completing this action.**\n\nError: `' + String(errEnv.message || 'unknown').slice(0, 300) + '`\n\nNo final result was produced. Open the action chat to see how far it got — if there are no tool calls in the transcript, nothing was executed on the instance.'
+                    }, null, { chatId: streamingChatId }).catch(function() { /* no panel attached — nothing to paint */ });
+                } catch (e3) { /* best-effort only */ }
+            }
             break;
         }
 
@@ -776,25 +895,26 @@ async function runAgent(overrideChatId) {
             assistantMsg.thinkingCollapsed = true;
         }
 
-        // Capture performance metrics
-        if (lastRequestMetrics) {
-            lastRequestMetrics.endTime = Date.now();
-            lastRequestMetrics.duration = lastRequestMetrics.endTime - lastRequestMetrics.startTime;
+        // Capture performance metrics (per-call object — see reqMetrics above;
+        // never read the shared global here, concurrent chats clobber it)
+        if (reqMetrics) {
+            reqMetrics.endTime = Date.now();
+            reqMetrics.duration = reqMetrics.endTime - reqMetrics.startTime;
             
             // Accumulate to aggregate metrics
             aggregateMetrics.callCount++;
-            aggregateMetrics.duration += lastRequestMetrics.duration || 0;
-            aggregateMetrics.input_tokens += lastRequestMetrics.input_tokens || 0;
-            aggregateMetrics.output_tokens += lastRequestMetrics.output_tokens || 0;
-            aggregateMetrics.cache_read_tokens += lastRequestMetrics.cache_read_tokens || 0;
-            aggregateMetrics.cache_creation_tokens += lastRequestMetrics.cache_creation_tokens || 0;
-            aggregateMetrics.cache_write_tokens += lastRequestMetrics.cache_write_tokens || 0;
-            aggregateMetrics.reasoning_tokens += lastRequestMetrics.reasoning_tokens || 0;
-            aggregateMetrics.cost += lastRequestMetrics.cost || 0;
+            aggregateMetrics.duration += reqMetrics.duration || 0;
+            aggregateMetrics.input_tokens += reqMetrics.input_tokens || 0;
+            aggregateMetrics.output_tokens += reqMetrics.output_tokens || 0;
+            aggregateMetrics.cache_read_tokens += reqMetrics.cache_read_tokens || 0;
+            aggregateMetrics.cache_creation_tokens += reqMetrics.cache_creation_tokens || 0;
+            aggregateMetrics.cache_write_tokens += reqMetrics.cache_write_tokens || 0;
+            aggregateMetrics.reasoning_tokens += reqMetrics.reasoning_tokens || 0;
+            aggregateMetrics.cost += reqMetrics.cost || 0;
             
             // Copy metrics but exclude requestBody to prevent memory bloat
             // (requestBody contains full conversation history with base64 images)
-            var metricsToStore = Object.assign({}, lastRequestMetrics);
+            var metricsToStore = Object.assign({}, reqMetrics);
             delete metricsToStore.requestBody;
             assistantMsg.metrics = metricsToStore;
         }
@@ -804,7 +924,7 @@ async function runAgent(overrideChatId) {
 
         // Track model and accumulate cost on chat
         chat.model = currentProvider;
-        chat.totalCost = (chat.totalCost || 0) + (lastRequestMetrics.cost || 0);
+        chat.totalCost = (chat.totalCost || 0) + (reqMetrics.cost || 0);
 
         delete chat.isTemporary;
 
@@ -925,12 +1045,14 @@ async function runAgent(overrideChatId) {
                 break;
             }
 
+            if (!result) result = { success: false, error: 'Tool returned no result' };
             delete result._denied;
             var screenshotMsg = result._screenshotMessage;
             var screenshotMsgs = result._screenshotMessages;
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
+            processed.content = appendBudgetNotice(streamingChatId, processed.content);
             var resultMsg = recordToolResult(chat, tc.id, toolName, processed.content);
             var toolResultIdx = chat.messages.indexOf(resultMsg);
             // Correct widget msgIndex if approval messages shifted it
@@ -1011,6 +1133,11 @@ async function runAgent(overrideChatId) {
     // the chat stays observably "running" for the whole rerun (closing the
     // window a stale panel run-agent used to slip a second loop into).
     _ranNormalCleanup = true;
+    // This run's error ONLY: the global lastApiError can hold another chat's
+    // error (the SW runs chats concurrently) or a stale one from an earlier
+    // run — keying the finish decisions below on it misreported successful
+    // runs as errored, suppressed hooks, and fed parents false sub errors.
+    var _runApiError = (lastApiError && lastApiError.chatId === streamingChatId) ? lastApiError : null;
     // Only clear global foreground UI flags if this chat was the foreground one
     if (activeStreamingChatId === streamingChatId) {
         isRunning = false;
@@ -1027,7 +1154,26 @@ async function runAgent(overrideChatId) {
     if (!isChatPaused(streamingChatId)) {
         pendingInjection = null;
         pendingInjectionImages = null;
-        if (!(chat && chat.isSubAgent)) {
+        // PR383-R4 (loss window 1): also preserve the entry for a PARENT chat
+        // that has spawned sub-agents. _notifySubLifecycle (core/097) stashes
+        // model-visible lifecycle notices into pendingInjectionsByChatId while
+        // this loop is live; one stashed after the loop's last
+        // flushPendingInjection would be destroyed by the delete below (sub
+        // chats already had the onSubAgentRunFinished re-queue backstop —
+        // parent chats had none). A preserved entry is consumed by the next
+        // run's flushPendingInjection. Deliberately includes TERMINAL subs:
+        // a force-stop/crash notice fires right as the sub turns terminal,
+        // which is exactly this loss window (tombstones GC after ~1h, so the
+        // preservation is bounded to sub-spawning chats).
+        var _hasOwnSubs = false;
+        try {
+            if (typeof SubAgents !== 'undefined' && SubAgents.listAll) {
+                _hasOwnSubs = SubAgents.listAll().some(function(r) {
+                    return r && r.parent_chat_id === streamingChatId;
+                });
+            }
+        } catch (e) { /* best-effort — fall back to legacy delete */ }
+        if (!(chat && chat.isSubAgent) && !_hasOwnSubs) {
             delete pendingInjectionsByChatId[streamingChatId];
         }
     }
@@ -1048,8 +1194,8 @@ async function runAgent(overrideChatId) {
         // calling report_to_parent. Without this signal, auto_report
         // synthesizes status:'done' over an errored run and the parent
         // unblocks with a false-positive success.
-        var _finishReason = lastApiError ? 'errored' : 'completed';
-        try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: lastApiError || null }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
+        var _finishReason = _runApiError ? 'errored' : 'completed';
+        try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: _runApiError || null }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
     }
     // Reset silent hook flag before the UI handler runs the final render so
     // messages are properly displayed. Capture the pre-reset value for the
@@ -1072,9 +1218,9 @@ async function runAgent(overrideChatId) {
     // main's ordering: after the pause-vs-finish UI branch, before hooks).
     AgentEvents.emit('runFinished', {
         chatId: streamingChatId,
-        reason: lastApiError ? 'errored' : (isChatPaused(streamingChatId) ? 'paused' : 'completed'),
+        reason: _runApiError ? 'errored' : (isChatPaused(streamingChatId) ? 'paused' : 'completed'),
         isPaused: isChatPaused(streamingChatId),
-        hasError: !!lastApiError
+        hasError: !!_runApiError
     });
 
     // Execute after-response hooks (only if not paused and no error occurred)
@@ -1082,7 +1228,7 @@ async function runAgent(overrideChatId) {
     // chat that just finished.
     // Sub-agent chats are invisible to the human and run in service of a parent;
     // PM-facing hooks (auto-title, etc.) would burn tokens and surface nothing.
-    if (!isChatPaused(streamingChatId) && !lastApiError && !(chat && chat.isSubAgent)) {
+    if (!isChatPaused(streamingChatId) && !_runApiError && !(chat && chat.isSubAgent)) {
         executeAfterResponseHooks(streamingChatId);
     }
     // Hook decision made: executeAfterResponseHooks' recursive runAgent (if it
@@ -1092,6 +1238,34 @@ async function runAgent(overrideChatId) {
     // for the rerun — dropping the guard here therefore leaves no idle gap. If
     // no hook fired the chat is genuinely idle and a future run-agent proceeds.
     delete _runCleanupGuard[streamingChatId];
+
+    // REG391-2: end-of-run wake-on-report race. A sub can call report_to_parent
+    // in the window between this loop's last flushPendingInjection (line 1085)
+    // and the cleanup above. _wakeParentOnReport sees the parent loop still
+    // `live` (runningChatIds set until line 1127), so it only QUEUES the notice
+    // into pendingInjectionsByChatId and starts no run. The preserve-for-parent
+    // logic above (PR383-R4) keeps that entry instead of deleting it — but for
+    // a TOP-LEVEL parent nothing ever consumes it: sub-agent chats get the
+    // onSubAgentRunFinished re-queue backstop, top-level chats had none, so the
+    // report stalled until the user's next message (the exact symptom PR #389
+    // set out to fix). Drain it here: if this non-sub chat finished cleanly,
+    // is not paused, no hook already restarted it, and a pending injection is
+    // still parked, start a follow-up run so the parent actually sees the
+    // report. Mirrors _wakeParentOnReport's idle top-level arm.
+    try {
+        if (chat && !chat.isSubAgent && !_runApiError
+            && !isChatPaused(streamingChatId)
+            && !runningChatIds[streamingChatId]
+            && typeof pendingInjectionsByChatId !== 'undefined') {
+            var _pendFollow = pendingInjectionsByChatId[streamingChatId];
+            if (_pendFollow && (_pendFollow.text || (_pendFollow.images && _pendFollow.images.length))
+                && typeof runAgent === 'function') {
+                Promise.resolve()
+                    .then(function() { return runAgent(streamingChatId); })
+                    .catch(function(err) { console.warn('[agent-loop] follow-up run for parked report failed', streamingChatId, err); });
+            }
+        }
+    } catch (e) { console.warn('[agent-loop] end-of-run report drain check threw', e); }
 
     // Refresh credits after API calls complete
     fetchCredits();
@@ -1105,8 +1279,14 @@ async function runAgent(overrideChatId) {
         chatId: streamingChatId,
         isPaused: isChatPaused(streamingChatId),
         wasSilentHook: wasSilentHook,
-        hasError: !!lastApiError
+        hasError: !!_runApiError
     });
+    } catch (_loopErr) {
+        // PR390-FU-1: stash for the finally's runCrashed emit, then rethrow
+        // UNCHANGED — callers (e.g. _drainPool's .catch → _markErrored) still
+        // see the original error; this catch adds no behavior of its own.
+        _loopCrashError = _loopErr;
+        throw _loopErr;
     } finally {
         // Safety net for uncaught throws inside the agent loop body. This only
         // fires when the body threw BEFORE the normal finish cleanup ran (so
@@ -1124,7 +1304,16 @@ async function runAgent(overrideChatId) {
         // exact orphan-tool_use race this guard was meant to close.
         if (!_ranNormalCleanup && runningChatIds[streamingChatId]) {
             delete runningChatIds[streamingChatId];
-            AgentEvents.emit('runCrashed', { chatId: streamingChatId });
+            // PR390-FU-1: carry the real error (when we have one) so the SW
+            // sub-agent crash handler reports an accurate message and can
+            // classify transient errors for the single auto-retry. Consumers
+            // fall back to a generic message when error is null.
+            AgentEvents.emit('runCrashed', {
+                chatId: streamingChatId,
+                error: _loopCrashError
+                    ? { message: (_loopCrashError && _loopCrashError.message) ? _loopCrashError.message : String(_loopCrashError) }
+                    : null
+            });
         }
         // Never leak the cleanup guard: a throw between raising it and the
         // post-hook clear would otherwise permanently mark the chat "busy" to

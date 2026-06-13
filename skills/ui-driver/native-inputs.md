@@ -81,7 +81,10 @@ Numeric Scale is a horizontal radio group `1..N` (anchor by `aria-label`/`value`
   - empty asterisk:  `class="fa fa-asterisk mandatory sp-field-label-padding ng-scope"`
   - filled asterisk: the same **plus** a real trailing ` mandatory-filled`, and `aria-label` flips `Required ` → `Required Filled `
   - safest check — the aria-label flip: `/aria-label="Required Filled/.test(html)`; or capture the real `class` attribute and test *that* string (not the raw markup) for the word `mandatory-filled`.
+  - ⚠️ the aria-label value has a **TRAILING SPACE** (`"Required Filled "`) — verified live. The unanchored regex above is safe; a regex that closes the quote (`/Required Filled"/`) **misses**.
 
 ---
 
 *Verified on live Employee Center forms:* `setText` (text + multiline textarea) and `setCheckbox` (the raw `#sp_formfield_<var>` input, which carries the `ng-click`) proven; `setRadio` verified on a real Multiple Choice (`input[aria-label]` scoped to the `<fieldset>`). **Note:** the `label[for="mon"]`-style tile is the *day-of-week macro* in `custom-macro.md`, **not** a Multiple Choice — the two were previously conflated here.
+
+*Re-verified end-to-end (2026-06, second instance):* `setText` (input + textarea, stuck on first attempt), `setCheckbox` (false→true), `setRadio("Medium")` via the fieldset + `input[aria-label]` anchor, and the mandatory asterisk gaining a real `mandatory-filled` in `classList` with the `aria-label="Required Filled "` flip (trailing space confirmed).

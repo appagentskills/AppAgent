@@ -64,7 +64,7 @@
 .pdf-sidebar-thumb { display: flex; align-items: center; justify-content: center; background: var(--secondary-lighter); border: 1px solid var(--secondary-border); color: var(--danger); }
 
 /* Full-page drop overlay */
-.drop-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(59, 130, 246, 0.08); border: 3px dashed var(--primary); z-index: 99999; display: none; align-items: center; justify-content: center; pointer-events: none; }
+.drop-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(59, 130, 246, 0.08); border: 3px dashed var(--primary); z-index: var(--z-max); display: none; align-items: center; justify-content: center; pointer-events: none; }
 .drop-overlay.visible { display: flex; }
 .drop-overlay-content { display: flex; flex-direction: column; align-items: center; gap: var(--space-6); color: var(--primary); font-size: var(--text-2xl); font-weight: var(--font-semibold); }
 .drop-overlay-icon { width: 48px; height: 48px; opacity: 0.7; }

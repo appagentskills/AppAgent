@@ -73,9 +73,9 @@ function copyInspectorContent(type) {
 
 // Helper: render a small "view source" icon button for use in Settings rows / group titles.
 function _toolSourceBtn(toolName, skillId) {
-    var skillArg = skillId ? ', \'' + String(skillId).replace(/'/g, "\\'") + '\'' : '';
+    var skillArg = skillId ? ', \'' + escapeJsString(skillId) + '\'' : '';
     return '<button class="tool-source-btn" onclick="event.stopPropagation(); showToolInspector(\'' +
-        String(toolName).replace(/'/g, "\\'") + '\'' + skillArg + ')" title="View source: ' +
+        escapeJsString(toolName) + '\'' + skillArg + ')" title="View source: ' +
         escapeHtml(toolName) + '">' + UI_ICONS.code + '</button>';
 }
 
@@ -87,6 +87,7 @@ function getToolFunctionSource(toolName) {
         'servicenow_diff_edit': executeDiffEdit,
         'iframe_tool': executeIframeTool,
         'set_chat_title': executeSetChatTitle,
+        'set_tldr': executeSetTldr,
         'get_skill': executeGetSkill,
         'manage_skill': executeManageSkill,
         'html_widget': executeHtmlWidget
@@ -194,6 +195,10 @@ function renderSettingsPage() {
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Auto-generate Chat Title</div><div class="settings-page-row-hint">Automatically generate a title after agent completes</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoTitle ? 'checked' : '') + ' onchange="toggleHook(\'autoTitle\')">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Answer TL;DR Card</div><div class="settings-page-row-hint">Ask the agent for a short TL;DR after each answer, shown as a card at the end of the answer</div></div>' +
+                '<input type="checkbox" ' + (hooksEnabled.autoTldr ? 'checked' : '') + ' onchange="toggleHook(\'autoTldr\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Show Hook Messages</div><div class="settings-page-row-hint">Display hook messages and responses in chat</div></div>' +
@@ -391,7 +396,6 @@ async function renderGitHubReposList() {
             var totalSize = 0;
             files.forEach(function(f) { totalSize += (f.content || '').length; });
             var sizeStr = totalSize > 1048576 ? (totalSize / 1048576).toFixed(1) + ' MB' : totalSize > 1024 ? (totalSize / 1024).toFixed(0) + ' KB' : totalSize + ' B';
-            var escapedWk = escapeHtml(wk);
 
             // Determine status label and PR info
             var pushedPrs = {};
@@ -407,7 +411,7 @@ async function renderGitHubReposList() {
             // Count files that are dirty but NOT pushed to any PR (truly local-only changes)
             var unpushedDirty = dirtyFiles.filter(function(f) { return !f.pushed_pr; });
 
-            repoData.push({ meta: meta, wk: wk, githubRepo: githubRepo, totalFiles: totalFiles, dirtyFiles: dirtyFiles, dirtyCount: dirtyCount, sizeStr: sizeStr, escapedWk: escapedWk, prLinks: prLinks, unpushedDirty: unpushedDirty });
+            repoData.push({ meta: meta, wk: wk, githubRepo: githubRepo, totalFiles: totalFiles, dirtyFiles: dirtyFiles, dirtyCount: dirtyCount, sizeStr: sizeStr, prLinks: prLinks, unpushedDirty: unpushedDirty });
         }
 
         for (var ri = 0; ri < repoData.length; ri++) {
@@ -452,8 +456,9 @@ async function renderGitHubReposList() {
                     detailHtml +
                 '</div>' +
                 '<div style="display:flex;gap:var(--space-3);align-items:center;flex-shrink:0;">' +
-                    '<button class="skills-action-btn" onclick="recloneGitHubRepo(\'' + escapeHtml(rd.githubRepo) + '\', \'' + escapeHtml(rd.meta.branch) + '\')" title="Re-clone (fetch latest)" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
-                    '<button class="skills-action-btn danger" onclick="deleteGitHubRepo(\'' + rd.escapedWk + '\')" title="Delete local clone" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
+                    '<button class="skills-action-btn" onclick="_toggleWorkspacePinFromUi(\'' + escapeJsString(rd.wk) + '\')" title="' + (rd.meta.pinned ? 'Pinned — Reload and default resolution use this workspace. Click to unpin.' : 'Pin this workspace (Reload + default resolution will use it)') + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);' + (rd.meta.pinned ? '' : 'opacity:0.4;filter:grayscale(1);') + '">\uD83D\uDCCC</button>' +
+                    '<button class="skills-action-btn" onclick="recloneGitHubRepo(\'' + escapeJsString(rd.githubRepo) + '\', \'' + escapeJsString(rd.meta.branch) + '\')" title="Re-clone (fetch latest)" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
+                    '<button class="skills-action-btn danger" onclick="deleteGitHubRepo(\'' + escapeJsString(rd.wk) + '\')" title="Delete local clone" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
                 '</div>' +
             '</div>';
         }
@@ -470,6 +475,9 @@ async function renderGitHubReposList() {
                         // Workspace auto-removed (merged head branch) — drop its row.
                         var _rowEl = el.closest('.settings-page-row');
                         if (_rowEl) _rowEl.remove();
+                        // The auto-delete pulled the BASE workspace internally — its
+                        // racing sibling sync may have painted a stale "behind".
+                        _refreshBaseRowAfterAutoDelete(syncResult, repoData);
                         return;
                     }
                     if (!syncResult) {
@@ -534,6 +542,27 @@ async function renderGitHubReposList() {
     }
 }
 
+// After a merge-lifecycle auto-delete, the engine has already synced+pulled
+// the BASE workspace — repaint its (possibly stale) row in the settings list
+// so the user doesn't see a lingering "N behind" badge.
+function _refreshBaseRowAfterAutoDelete(syncResult, repoData) {
+    if (!syncResult || !syncResult.base_synced || !syncResult.base_workspace) return;
+    for (var bi = 0; bi < repoData.length; bi++) {
+        if (repoData[bi].wk !== syncResult.base_workspace) continue;
+        var bEl = document.getElementById('repo-sync-' + bi);
+        if (bEl) { bEl.style.color = 'var(--success)'; bEl.textContent = 'up to date'; }
+        var bDetail = document.getElementById('repo-detail-' + bi);
+        if (bDetail) {
+            var staleBadges = bDetail.querySelectorAll('.ws-file-badge.behind');
+            for (var sj = staleBadges.length - 1; sj >= 0; sj--) {
+                var staleRow = staleBadges[sj].closest('.ws-file-row');
+                if (staleRow) staleRow.remove();
+            }
+        }
+        break;
+    }
+}
+
 async function cloneGitHubRepo() {
     var repoInput = document.getElementById('github-add-repo-input');
     var branchInput = document.getElementById('github-add-branch-input');
@@ -583,6 +612,7 @@ async function recloneGitHubRepo(repo, branch) {
 async function deleteGitHubRepo(repo) {
     await deleteWorkspaceFiles(repo);
     await deleteWorkspaceMeta(repo);
+    try { gcWorkspaceBlobs(); } catch (e) {}
     refreshWorkspaceContext();
     updateWorkspaceHeaderStatus();
     renderGitHubReposList();
@@ -616,6 +646,17 @@ async function getAllWorkspaceSummaries() {
         });
     }
     return summaries;
+}
+
+// The merge auto-delete synced+pulled the base workspace inside the FORK's
+// sync — reset the base's cached sync state so a stale "behind" (painted by
+// a racing sibling sync) doesn't linger on the header badge/dropdown.
+function _resetBaseCacheAfterAutoDelete(syncResult) {
+    var bw = syncResult && syncResult.base_workspace;
+    if (!bw || !syncResult.base_synced || !_wsHeaderCaches[bw]) return;
+    _wsHeaderCaches[bw].syncStatus = 'up-to-date';
+    _wsHeaderCaches[bw].behindFiles = [];
+    _wsHeaderCaches[bw].conflictFiles = [];
 }
 
 // Render header badge text from caches
@@ -686,6 +727,7 @@ async function syncAndUpdateWorkspaceHeader() {
                 if (syncResult && syncResult.deleted) {
                     // Workspace auto-removed (merged head branch) — drop from caches.
                     delete _wsHeaderCaches[s.wk];
+                    _resetBaseCacheAfterAutoDelete(syncResult);
                     _renderWsHeaderBadge();
                     return;
                 }
@@ -732,6 +774,11 @@ async function _syncDropdownInBackground() {
                 if (_wsDropdown) {
                     var _goneSection = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
                     if (_goneSection) _goneSection.remove();
+                }
+                _resetBaseCacheAfterAutoDelete(syncResult);
+                if (_wsDropdown && syncResult.base_workspace && _wsHeaderCaches[syncResult.base_workspace]) {
+                    var _bSection = _wsDropdown.querySelector('[data-ws="' + CSS.escape(syncResult.base_workspace) + '"]');
+                    if (_bSection) _renderDropdownSection(_bSection, _wsHeaderCaches[syncResult.base_workspace]);
                 }
                 _renderWsHeaderBadge();
                 return;
@@ -785,11 +832,42 @@ function _getSyncLabel(syncStatus) {
         '<span class="ws-sync">syncing…</span>';
 }
 
+// Pin button HTML — filled (full opacity) for the pinned workspace, dimmed
+// for the rest. Clicks are handled by the dropdown's delegated listener
+// (showWorkspaceDropdown) via the data-pin-ws attribute.
+function _wsPinBtnHtml(wk, pinned) {
+    return '<button class="ws-pin-btn" data-pin-ws="' + escapeHtml(wk) + '" title="' +
+        (pinned ? 'Pinned — Reload and default workspace resolution use this workspace. Click to unpin.' : 'Pin this workspace — Reload and default workspace resolution will use it.') +
+        '" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);font-size:12px;line-height:1;vertical-align:middle;' +
+        (pinned ? '' : 'opacity:0.3;filter:grayscale(1);') + '">\uD83D\uDCCC</button>';
+}
+
+// Toggle a workspace pin from the UI — shared logic lives in setWorkspacePin
+// (020-tool-execution.js), same code path as the `pin` workspace action.
+async function _toggleWorkspacePinFromUi(wk) {
+    try {
+        var meta = await getWorkspaceMeta(wk);
+        if (!meta) return;
+        await setWorkspacePin(wk, !!meta.pinned); // toggle
+        // Refresh cached metas + re-render every open dropdown section (a pin
+        // elsewhere may have been cleared by the single-pin invariant).
+        var all = await getAllWorkspaceMetas();
+        all.forEach(function(m) { if (_wsHeaderCaches[m.repo]) _wsHeaderCaches[m.repo].meta = m; });
+        if (_wsDropdown) {
+            Object.keys(_wsHeaderCaches).forEach(function(k) {
+                var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(k) + '"]');
+                if (section) _renderDropdownSection(section, _wsHeaderCaches[k]);
+            });
+        }
+        renderGitHubReposList();
+    } catch (e) {}
+}
+
 function _renderDropdownSection(section, cache) {
     var parsed = parseWsKey(cache.wk);
     var header = section.querySelector('.ws-dropdown-header');
     if (header) {
-        header.innerHTML = '<span>' + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span></span>' + _getSyncLabel(cache.syncStatus);
+        header.innerHTML = '<span>' + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + _wsPinBtnHtml(cache.wk, !!(cache.meta && cache.meta.pinned)) + '</span>' + _getSyncLabel(cache.syncStatus);
     }
     var body = section.querySelector('.ws-dropdown-body');
     if (!body) return;
@@ -895,6 +973,15 @@ async function showWorkspaceDropdown() {
         dd.appendChild(section);
     });
 
+    // Delegated pin-toggle handler — header innerHTML is re-rendered on every
+    // sync, so a per-button listener would be lost; delegation survives it.
+    dd.addEventListener('click', function(e) {
+        var pinBtn = e.target.closest('[data-pin-ws]');
+        if (!pinBtn) return;
+        e.stopPropagation();
+        _toggleWorkspacePinFromUi(pinBtn.getAttribute('data-pin-ws'));
+    });
+
     var rect = anchor.getBoundingClientRect();
     dd.style.top = (rect.bottom + 4) + 'px';
     dd.style.right = (window.innerWidth - rect.right) + 'px';
@@ -947,9 +1034,9 @@ function renderApiProvidersList() {
             statusBadge +
             '<div class="api-provider-tags">' + activeTag + domainTag + providerTag + '</div>' +
             '<div class="api-provider-actions">' +
-                '<button class="api-provider-btn' + (isActive ? ' selected' : '') + '" onclick="selectApiProvider(\'' + escapeHtml(provider.name).replace(/'/g, "\\'") + '\')" title="' + (isActive ? 'Active' : 'Use this model') + '">' + UI_ICONS.check + '</button>' +
-                '<button class="api-provider-btn" onclick="editApiProvider(\'' + escapeHtml(provider.name).replace(/'/g, "\\'") + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
-                '<button class="api-provider-btn danger" onclick="confirmDeleteApiProvider(\'' + escapeHtml(provider.name).replace(/'/g, "\\'") + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
+                '<button class="api-provider-btn' + (isActive ? ' selected' : '') + '" onclick="selectApiProvider(\'' + escapeJsString(provider.name) + '\')" title="' + (isActive ? 'Active' : 'Use this model') + '">' + UI_ICONS.check + '</button>' +
+                '<button class="api-provider-btn" onclick="editApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
+                '<button class="api-provider-btn danger" onclick="confirmDeleteApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
             '</div>' +
         '</div>';
     });
@@ -1042,7 +1129,7 @@ function showAddApiProviderModal(editingProvider) {
             '</div>' +
             '<div class="modal-actions">' +
                 '<button class="modal-btn secondary" onclick="closeApiProviderModal()">Cancel</button>' +
-                '<button class="modal-btn primary" onclick="saveApiProviderFromModal(\'' + escapeHtml(originalName).replace(/'/g, "\\'") + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
+                '<button class="modal-btn primary" onclick="saveApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
             '</div>' +
         '</div>';
     
@@ -1153,7 +1240,7 @@ async function deleteApiProviderAndRefresh(providerName) {
     // Check if this provider is currently selected
     if (currentProvider === providerName) {
         // Switch to first available provider
-        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'opus-4.6';
+        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'opus-4.8';
         saveProviderToStorage();
     }
     
@@ -1526,6 +1613,12 @@ function showChatView() {
     // GCs the viewed chat's transcript. Re-post focus so the viewed chat is re-pinned.
     if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId && typeof pushFocusChatToOffscreen === 'function') {
         pushFocusChatToOffscreen(currentChatId);
+    }
+    // Returning to the chat view counts as 'seeing' the focused chat — consume
+    // its finished-chat badge entry (ui/165-finished-chat-badge.js). Covers the
+    // home/history → back-to-chat path, which bypasses selectChat().
+    if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId && typeof clearUnseenFinishedChat === 'function') {
+        try { clearUnseenFinishedChat(currentChatId); } catch (e) {}
     }
 }
 

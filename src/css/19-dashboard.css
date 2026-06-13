@@ -22,7 +22,7 @@
 /* Dashboard Widget */
 .dashboard-widget { background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-xl); display: flex; flex-direction: column; overflow: hidden; position: relative; cursor: grab; transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, opacity 0.15s ease; }
 .dashboard-widget:hover { border-color: var(--primary-light); box-shadow: var(--shadow-lg); }
-.dashboard-widget.dragging { opacity: 0.6; cursor: grabbing; z-index: 1000; transform: scale(1.02); box-shadow: var(--shadow-xl); }
+.dashboard-widget.dragging { opacity: 0.6; cursor: grabbing; z-index: var(--z-overlay-base); transform: scale(1.02); box-shadow: var(--shadow-xl); }
 .dashboard-widget.widget-error { border-color: var(--danger-light); }
 .dashboard-widget.widget-loading .dashboard-widget-content { pointer-events: none; }
 .dashboard-widget-header { display: none; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-6); background: var(--primary-lighter); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; cursor: grab; }
@@ -78,6 +78,6 @@
 .screenshot-preview-image-wrap img { display: block; max-width: none; }
 
 /* Skip link accessibility */
-.skip-link:focus { position: fixed !important; left: 50% !important; top: 10px !important; transform: translateX(-50%); width: auto !important; height: auto !important; overflow: visible !important; padding: var(--space-5) var(--space-9); background: var(--primary); color: var(--text-inverse); text-decoration: none; border-radius: var(--radius-sm); font-weight: var(--font-semibold); z-index: 10000; box-shadow: var(--shadow-md); }
+.skip-link:focus { position: fixed !important; left: 50% !important; top: 10px !important; transform: translateX(-50%); width: auto !important; height: auto !important; overflow: visible !important; padding: var(--space-5) var(--space-9); background: var(--primary); color: var(--text-inverse); text-decoration: none; border-radius: var(--radius-sm); font-weight: var(--font-semibold); z-index: var(--z-overlay); box-shadow: var(--shadow-md); }
 
 /* ==================== RESPONSIVE DESIGN ==================== */

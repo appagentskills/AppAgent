@@ -33,7 +33,7 @@ When an Action button is clicked, call `update_action_state` frequently to show 
 1. `update_action_state({ state: 'running', icon: 'search', label: 'Scanning…', tasks: [{label: 'Run audit', status: 'running'}, {label: 'Render report', status: 'pending'}] })`
 2. Call `run_audit({ category: 'all' })`
 3. `update_action_state({ state: 'running', icon: 'list', label: 'Building report', tasks: [{label: 'Run audit', status: 'done'}, {label: 'Render report', status: 'running'}] })`
-4. Build an `html_widget` summarizing findings (status_summary + table)
+4. Build an `html_widget` summarizing findings (stats grid + per-severity sections, see example below)
 5. `update_action_state({ state: 'done', icon: 'check', label: 'N findings', tasks: [{label: 'Run audit', status: 'done'}, {label: 'Render report', status: 'done'}] })`
 
 ### Action Lifecycle: Full Audit
@@ -126,7 +126,7 @@ const html = `
   ${renderFindings(audit.passed, 'passed')}
 </div>`;
 
-const widget = await executeTool('html_widget', { html, width: 700, height: 600 });
+const widget = await executeTool('html_widget', { title: 'Instance Audit', html, width: '700px', height: '600px' });
 return widget.widgetId;
 ```
 

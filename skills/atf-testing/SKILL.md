@@ -320,10 +320,10 @@ Default is `false`. ATF execution silently no-ops without it.
 gs.setProperty('sn_atf.runner.enabled', 'true');
 ```
 
-This is a property toggled per instance and respected globally.
+It is a single instance-wide property — set it once per instance.
 
 ### 7. Dictionary `mandatory=true` is UI-only
-`GlideRecord.insert()` ignores it. To test mandatory enforcement, use a **Form Submission** step (`sys_atf_step_config` for "Submission") instead of an RSS step doing GlideRecord inserts. RSS-based tests for mandatory fields will give false negatives.
+`GlideRecord.insert()` ignores it. To test mandatory enforcement, use a **Form Submission** step (`sys_atf_step_config` for "Submission") instead of an RSS step doing GlideRecord inserts. RSS-based tests for mandatory fields will give false negatives. Note: Form Submission steps require a connected browser test runner, so they fall outside this skill's pure-API scope (see "What this skill deliberately does NOT cover").
 
 ### 8. Cross-step output references
 The syntax `${steps.<step_sys_id>.<output>}` does **not** work as a literal string in `sys_variable_value.value` for `record_id` references. The proper format involves an output binding stored differently and is hard to get right via API.

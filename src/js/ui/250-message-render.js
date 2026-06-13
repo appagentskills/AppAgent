@@ -3,6 +3,20 @@ function isAttachmentRole(role) {
     return role === 'screenshot' || role === 'pdf' || role === 'file';
 }
 
+// Hook tools (set_chat_title / set_tldr) get special rendering treatment:
+// their calls/results are hidden unless API stats are shown, and a hook-only
+// tool message still counts as a final answer.
+function isHookToolName(n) {
+    return n === 'set_chat_title' || n === 'set_tldr';
+}
+
+// TL;DR card rendered at the end of an answer (set by the autoTldr hook via
+// the set_tldr tool — see executeSetTldr in tools/020-tool-execution.js).
+function renderTldrCard(msg) {
+    if (!msg || !msg.tldr) return '';
+    return '<div class="tldr-card"><div class="tldr-card-label">TL;DR</div><div class="tldr-card-text">' + formatContent(msg.tldr) + '</div></div>';
+}
+
 // Render just the inner content of a single attachment (no group wrapper)
 function renderAttachmentContent(msg, index) {
     if (msg.role === 'screenshot') {
@@ -19,7 +33,7 @@ function renderAttachmentContent(msg, index) {
         h += '<div class="screenshot-container">';
         h += '<div class="screenshot-header" title="' + escapeHtml(screenshotName) + '"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + escapeHtml(screenshotName) + '</div>';
         if (base64) {
-            h += '<img class="screenshot-thumbnail" src="' + base64 + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeHtml(screenshotName).replace(/'/g, "\\'") + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeHtml(msg.url || '').replace(/'/g, "\\'") + '\')" />';
+            h += '<img class="screenshot-thumbnail" src="' + base64 + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
         } else {
             h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">Screenshot unavailable</div>';
         }
@@ -72,6 +86,157 @@ function findAdjacentForAttachmentGroup(messages, index, direction) {
     return null;
 }
 
+// R1: incremental render fast-path state. sigs[i] is the normalized HTML that
+// the last completed render produced for chat.messages[i]. Normalized = the
+// per-render rc-N copy nonces minted by storeRawCopy() are stripped, otherwise
+// identical content would never compare equal across renders (gcRawCopyStore
+// sweeps the discarded nonces afterwards — it keeps whatever the DOM still
+// references, so untouched nodes keep working copy buttons).
+var _lastRenderState = { chatId: null, count: 0, sigs: [] };
+
+function _renderSig(part) {
+    return part.replace(/ data-copy-id="rc-[0-9]+"/g, '');
+}
+
+// Shared by the full render and the R1 fast path: right-edge fade shadow for
+// horizontally scrollable attachment/widget rows.
+function _attachRowScrollShadow(row) {
+    function updateShadow() {
+        var hasOverflow = row.scrollWidth > row.clientWidth + 1;
+        var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
+        row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
+    }
+    updateShadow();
+    row.addEventListener('scroll', updateShadow);
+}
+
+// R1: conservative incremental fast path for renderMessages(). Applies ONLY
+// when we previously rendered this same chat and at most the LAST previously
+// rendered message changed and/or new messages were appended. Patches just
+// those nodes (outerHTML swap + append) instead of rebuilding the whole
+// container, then runs the post-render side effects scoped to the touched
+// subtree. Returns true when the patch was applied; false = caller must do
+// the full rebuild. Every structural assumption is verified against the live
+// DOM before mutating — any surprise falls back to the full render.
+function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop, wasAtBottom) {
+    var prev = _lastRenderState;
+    var newCount = mappedParts.length;
+    var oldCount = prev.count;
+
+    // Same chat, nothing removed, and a previous render to diff against.
+    if (prev.chatId !== currentChatId) return false;
+    if (oldCount < 1 || newCount < oldCount) return false;
+
+    // #streaming-text presence must match the current run state; a transition
+    // in either direction needs the full render (it creates/removes the node).
+    var streamingElNow = document.getElementById('streaming-text');
+    if (!!streamingElNow !== !!isRunning) return false;
+
+    // Locate the root holding the mapped message nodes. The full render puts
+    // them in #messages-inner while streaming, directly in container otherwise.
+    var root;
+    if (streamingElNow) {
+        root = container.querySelector('#messages-inner');
+        if (!root) return false; // first streaming render hasn't built the wrapper yet
+    } else {
+        if (container.querySelector('#messages-inner')) return false; // stale streaming wrapper
+        root = container;
+    }
+
+    // Any non-tail signature change forces the full render.
+    for (var i = 0; i < oldCount - 1; i++) {
+        if (newSigs[i] !== prev.sigs[i]) return false;
+    }
+    var tailIdx = oldCount - 1;
+    var tailChanged = newSigs[tailIdx] !== prev.sigs[tailIdx];
+
+    // Widget markup in the touched range → full render so the existing
+    // moveBefore iframe-preservation logic owns it.
+    var touchedHtml = tailChanged ? (prev.sigs[tailIdx] + mappedParts[tailIdx]) : '';
+    for (var ai = oldCount; ai < newCount; ai++) touchedHtml += mappedParts[ai];
+    if (touchedHtml.indexOf('widgets-container') !== -1 || touchedHtml.indexOf('widget-inline') !== -1) return false;
+
+    // The old tail node must be an id-addressable DIRECT child of root. This
+    // anchors both the patch and the append, and doubles as a DOM integrity
+    // check (e.g. the widget editor swapped out #messages content earlier).
+    var tailEl = document.getElementById('msg-' + tailIdx);
+    if (!tailEl || tailEl.parentNode !== root) return false;
+
+    var preScrollHeight = container.scrollHeight; // SF-1: growth delta for streaming follow
+
+    var newTailEl = tailEl;
+    if (tailChanged) {
+        // The replacement must be exactly ONE element carrying the same id.
+        var probe = document.createElement('div');
+        probe.innerHTML = mappedParts[tailIdx];
+        if (probe.children.length !== 1 || probe.childNodes.length !== 1) return false;
+        if (probe.firstElementChild.id !== ('msg-' + tailIdx)) return false;
+        tailEl.outerHTML = mappedParts[tailIdx];
+        newTailEl = document.getElementById('msg-' + tailIdx);
+        if (!newTailEl) return false; // defensive — should be unreachable
+    }
+
+    // Append new messages right AFTER the tail node (not beforeend) so a
+    // trailing queued-user bubble can't end up in front of them.
+    var appendedNodes = [];
+    if (newCount > oldCount) {
+        var appendHtml = '';
+        for (var ni = oldCount; ni < newCount; ni++) appendHtml += mappedParts[ni];
+        if (appendHtml) {
+            var stopAt = newTailEl.nextElementSibling; // first pre-existing node after tail (or null)
+            newTailEl.insertAdjacentHTML('afterend', appendHtml);
+            var walk = newTailEl.nextElementSibling;
+            while (walk && walk !== stopAt) {
+                appendedNodes.push(walk);
+                walk = walk.nextElementSibling;
+            }
+        }
+    }
+
+    // Post-render side effects, scoped to the touched nodes.
+    var touched = tailChanged ? [newTailEl].concat(appendedNodes) : appendedNodes;
+    for (var ti = 0; ti < touched.length; ti++) {
+        var tn = touched[ti];
+        if (!tn.querySelectorAll) continue;
+        var stickies = tn.querySelectorAll('details.tool-call.expanded, details.tool-result.expanded');
+        for (var si = 0; si < stickies.length; si++) setupStickyObserver(stickies[si]);
+        var rows = tn.querySelectorAll('.attachments-row, .widgets-container');
+        for (var ri = 0; ri < rows.length; ri++) _attachRowScrollShadow(rows[ri]);
+    }
+
+    // Global side effects that are cheap and idempotent (mirrors the tail of
+    // the full render path).
+    renderQueuedUserBubble(container);
+    updateVersionSidebarVisibility();
+    renderVersionSidebar();
+    initializeWidgetsInView();
+    renderWidgetSidebar();
+    initDisplayChecklists();
+
+    // Scroll restore — same policy as the full render.
+    if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2
+    if (streamingElNow) {
+        // SF-1: advance by the growth delta (see the full render's streaming
+        // restore) so appended tool rows don't push the streaming container
+        // below the fold for an at-bottom user.
+        var _sfGrowthInc = container.scrollHeight - preScrollHeight;
+        container.scrollTop = (wasAtBottom && _sfGrowthInc > 0) ? savedScrollTop + _sfGrowthInc : savedScrollTop;
+        // SF-2: route through the choke point — re-pins the outer container
+        // for a following user (recovering any drift the in-place streaming
+        // paths produced before this render) and still owns the streaming
+        // container's height + inner scroll. Non-following users keep the
+        // absolute restore above (the pin is gated on isFollowingScroll).
+        scrollToBottomIfAllowed(container);
+    } else if (wasAtBottom || isFollowingScroll) {
+        container.scrollTop = container.scrollHeight;
+    } else {
+        container.scrollTop = savedScrollTop;
+    }
+
+    if (typeof gcRawCopyStore === 'function') gcRawCopyStore();
+    return true;
+}
+
 function renderMessages() {
     // Skip DOM rebuilds during silent hook runs (prevents flash)
     if (_silentHookRunning) return;
@@ -105,6 +270,7 @@ function renderMessages() {
 
     if (!chat || chat.messages.length === 0) {
         container.innerHTML = '';
+        _lastRenderState = { chatId: currentChatId, count: 0, sigs: [] }; // R1: container wiped
         // Show empty state in input area
         var inputArea = document.getElementById('input-area');
         if (inputArea && !inputArea.querySelector('.empty-state')) {
@@ -131,7 +297,6 @@ function renderMessages() {
     
     // In compact mode, collect everything grouped by response block (between user messages)
     var responseBlocks = [];
-    var matchedApprovalIndices = {}; // Track which approvals are matched to tool calls
     var lastUserMsgIdx = -1;
     if (compactToolCalls) {
         // Find the last user message index to determine the "last" response block
@@ -161,7 +326,6 @@ function renderMessages() {
                     lastToolName: null,
                     lastStatusMessage: null, // Human-friendly status message from last tool call
                     firstAssistantIdx: -1,
-                    pendingApprovals: [],
                     hasFinalAnswer: false // True when agent has sent final answer (not streaming)
                 };
             } else if (msg.role === 'assistant' && currentBlock) {
@@ -197,8 +361,8 @@ function renderMessages() {
                 if (msg.tool_calls) {
                     var hasSetChatTitleCompleted = false;
                     msg.tool_calls.forEach(function(tc, tcIdx) {
-                        // Check if set_chat_title tool call has completed (has a result)
-                        if (tc.function.name === 'set_chat_title') {
+                        // Check if a hook tool call (set_chat_title / set_tldr) has completed (has a result)
+                        if (isHookToolName(tc.function.name)) {
                             for (var ri = msgIdx + 1; ri < chat.messages.length; ri++) {
                                 var rm = chat.messages[ri];
                                 if (rm.role === 'tool' && rm.tool_call_id === tc.id) {
@@ -237,7 +401,6 @@ function renderMessages() {
                             var am = chat.messages[ai];
                             if (am.role === 'approval' && am.toolCallId === tc.id) {
                                 approval = { msg: am, approvalIdx: ai, tcIdx: tcIdx, msgIdx: msgIdx };
-                                matchedApprovalIndices[ai] = true;
                                 break;
                             }
                             if (am.role === 'user') break;
@@ -248,9 +411,6 @@ function renderMessages() {
                         currentBlock.toolCalls.push(toolItem);
                         // Add tool call to timeline
                         currentBlock.timeline.push({ type: 'tool', item: toolItem });
-                        if (approval && approval.msg.status === 'pending') {
-                            currentBlock.pendingApprovals.push({ tc: tc, approval: approval, tcIdx: tcIdx, msgIdx: msgIdx, args: tc.function.arguments });
-                        }
                         currentBlock.lastToolName = TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name;
                         // Extract status_message for display in collapsible header (works with partial JSON during streaming)
                         var blockStatusMsg = extractStatusMessage(tc.function.arguments);
@@ -258,8 +418,10 @@ function renderMessages() {
                             currentBlock.lastStatusMessage = blockStatusMsg;
                         }
                     });
-                    // If the only tool call was set_chat_title and it completed, mark as final answer
-                    if (hasSetChatTitleCompleted && msg.tool_calls.length === 1 && msg.tool_calls[0].function.name === 'set_chat_title') {
+                    // If ALL tool calls were hook tools (set_chat_title / set_tldr) and
+                    // completion was tracked, mark as final answer
+                    var allHookTools = msg.tool_calls.every(function(tc) { return isHookToolName(tc.function.name); });
+                    if (hasSetChatTitleCompleted && msg.tool_calls.length > 0 && allHookTools) {
                         currentBlock.hasFinalAnswer = true;
                     }
                 }
@@ -291,20 +453,6 @@ function renderMessages() {
         if (currentBlock) {
             responseBlocks.push(currentBlock);
         }
-
-        // Add unmatched pending approvals to the last block (e.g., from programmatic tool calls)
-        var lastBlock = responseBlocks[responseBlocks.length - 1];
-        if (lastBlock) {
-            chat.messages.forEach(function(msg, msgIdx) {
-                if (msg.role === 'approval' && msg.status === 'pending' && !matchedApprovalIndices[msgIdx]) {
-                    lastBlock.pendingApprovals.push({
-                        tc: { function: { name: msg.actualToolName || msg.toolName } },
-                        approval: { msg: msg, approvalIdx: msgIdx },
-                        args: JSON.stringify(msg.args) // formatJsonPretty expects a JSON string
-                    });
-                }
-            });
-        }
     }
 
     // Map response blocks by their userMsgIdx for quick lookup
@@ -316,6 +464,7 @@ function renderMessages() {
     
     // Save scroll position before DOM rebuild - widgets will temporarily lose height
     var savedScrollTop = container.scrollTop;
+    var savedScrollHeight = container.scrollHeight; // SF-1: growth delta for streaming follow
     var wasAtBottom = isNearBottom(container);
 
     // Save collapsed state of attachment groups so re-render doesn't re-expand them
@@ -331,7 +480,7 @@ function renderMessages() {
     // Track attachments already rendered as part of a group
     var processedAttachments = {};
 
-    var mappedHtml = chat.messages.map(function(msg, index) {
+    var mappedParts = chat.messages.map(function(msg, index) {
         var html = '';
 
         // Check for attachment grouping (screenshot, pdf, file should wrap together)
@@ -358,7 +507,14 @@ function renderMessages() {
                 j++;
             }
             var attachCount = groupIndices.length;
-            var groupLabel = 'Screenshots' + (attachCount > 1 ? ' (' + attachCount + ')' : '');
+            // Label reflects what the group actually contains: roles are
+            // 'screenshot' | 'pdf' | 'file' (see isAttachmentRole).
+            var screenshotCount = groupIndices.filter(function(gIdx) {
+                return chat.messages[gIdx].role === 'screenshot';
+            }).length;
+            var groupNoun = screenshotCount === attachCount ? 'Screenshots'
+                : (screenshotCount === 0 ? 'Files' : 'Attachments');
+            var groupLabel = groupNoun + (attachCount > 1 ? ' (' + attachCount + ')' : '');
             var groupOpen = closedAttachmentGroups[index] ? '' : ' open';
             html += '<details class="attachments-details" data-group-idx="' + index + '"' + groupOpen + '><summary class="attachments-summary"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + groupLabel + '</summary><div class="attachments-row">';
             // Render all attachments in the group and close the wrapper
@@ -404,7 +560,13 @@ function renderMessages() {
                 var bodyClass = 'user-text user-text-cached' + (expanded ? ' expanded' : '');
                 userBodyHtml = badge + '<div class="' + bodyClass + '">' + escapeHtml(msg.content) + '</div>' + toggleBtn;
             } else {
-                userBodyHtml = '<span class="user-text">' + escapeHtml(msg.content) + '</span>';
+                // Render user messages as markdown (same pipeline as assistant
+                // content). formatContent() escapes HTML before applying
+                // markdown, so this is safe for arbitrary user input. Block
+                // elements (headers, lists, code blocks) need a div, not a span.
+                // Sub-agent task messages ("## Task") benefit directly.
+                var rawUser = (typeof msg.content === 'string') ? msg.content : String(msg.content == null ? '' : msg.content);
+                userBodyHtml = '<div class="user-text user-text-md">' + formatContent(rawUser) + '</div>';
             }
             return '<div class="message user" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="Edit and branch">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="Copy message">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
         } else if (msg.role === 'assistant') {
@@ -561,7 +723,7 @@ function renderMessages() {
                             if (compactStatusMessage) {
                                 html += '<span class="tool-status-message">' + escapeHtml(compactStatusMessage) + '</span>';
                             }
-                            html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                            html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
                             if (item.hasResult) {
                                 html += '<span class="tool-result-badge">' + UI_ICONS.check + '</span>';
                             }
@@ -623,6 +785,7 @@ function renderMessages() {
                 // Old completed blocks always render their content normally
                 if (msg.content && !msg.isStreaming && isLastAssistant && !(isRunning && block && block.isLastBlock)) {
                     html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+                    if (msg.tldr) html += renderTldrCard(msg);
                 }
                 
                 // Add metrics for non-tool messages
@@ -661,12 +824,13 @@ function renderMessages() {
             }
             if (msg.content && !msg.isStreaming && !isRunning) {
                 html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+                if (msg.tldr) html += renderTldrCard(msg);
             }
             if (msg.tool_calls) {
                 // Standard mode: render each tool call separately
                 msg.tool_calls.forEach(function(tc, tcIdx) {
-                    // Hide set_chat_title tool calls unless showing API stats
-                    if (tc.function.name === 'set_chat_title' && !showApiStats) {
+                    // Hide hook tool calls (set_chat_title / set_tldr) unless showing API stats
+                    if (isHookToolName(tc.function.name) && !showApiStats) {
                         return; // Skip rendering this tool call
                     }
                     var tcKey = 'tc-' + index + '-' + tcIdx;
@@ -721,7 +885,7 @@ function renderMessages() {
                     var expandedClass = tcFullHeight ? ' expanded' : '';
                     
                     html += '<details class="tool-call' + statusClass + expandedClass + '" id="' + tcKey + '" onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)"' + (tcOpen ? ' open' : '') + '>';
-                    html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                    html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
                     if (tcStatusMessage) {
                         html += '<span class="tool-status-message">' + escapeHtml(tcStatusMessage) + '</span>';
                     }
@@ -764,8 +928,8 @@ function renderMessages() {
             if (msg._placeholder) {
                 return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
             }
-            // Hide set_chat_title tool results unless showing API stats
-            if (msg.name === 'set_chat_title' && !showApiStats) {
+            // Hide hook tool results (set_chat_title / set_tldr) unless showing API stats
+            if (isHookToolName(msg.name) && !showApiStats) {
                 return '<div class="message tool" id="msg-' + index + '" style="display:none;"></div>';
             }
             var content = typeof msg.content === 'string' ? formatJsonPretty(msg.content) : formatJsonValue(msg.content, 0);
@@ -780,7 +944,7 @@ function renderMessages() {
             var rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
             var resultCopyId = storeRawCopy(rawContent);
             var toolHtml = '<div class="message tool" id="msg-' + index + '"><details class="tool-result' + (toolResultFullHeight ? ' expanded' : '') + '" onclick="toggleToolResultExpanded(' + index + ', this)"' + (toolResultOpen ? ' open' : '') + '>' +
-                '<summary><span class="tool-label">' + getToolIcon(msg.name) + ' ' + (TOOL_DISPLAY_NAMES[msg.name] || msg.name) + ' result</span></summary>' +
+                '<summary><span class="tool-label">' + getToolIcon(msg.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[msg.name] || msg.name) + ' result</span></summary>' +
                 '<div class="tool-result-wrapper" data-copy-id="' + resultCopyId + '">' +
                 '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (toolResultFullHeight ? 'Collapse' : 'Expand') + '">' + (toolResultFullHeight ? '⤡' : '⤢') + '</button>' +
                 '<pre' + (toolResultFullHeight ? ' class="expanded"' : '') + '>' + contentHtml + '</pre>' +
@@ -813,7 +977,9 @@ function renderMessages() {
             toolHtml += '</div>';
             return toolHtml;
         } else if (msg.role === 'approval') {
-            // Approval messages are rendered inline with tool calls via pendingApprovals
+            // Approval messages have no inline rendering here — pending approvals
+            // surface via the snackbar (160-notifications); standard mode shows a
+            // status pill on the matching tool-call summary.
             return '<div class="message approval" id="msg-' + index + '" style="display:none;"></div>';
         } else if (msg.role === 'prompt_user') {
             return renderPromptUserMessage(msg, index);
@@ -836,7 +1002,17 @@ function renderMessages() {
             return '<div class="message parked-tool" id="msg-' + index + '">' + escapeHtml(parkedContent) + '</div>';
         }
         return '';
-    }).join('');
+    });
+    var mappedHtml = mappedParts.join('');
+
+    // R1: compute per-message signatures and try the incremental fast path
+    // before falling through to the full innerHTML rebuild below.
+    var newSigs = new Array(mappedParts.length);
+    for (var sgi = 0; sgi < mappedParts.length; sgi++) newSigs[sgi] = _renderSig(mappedParts[sgi]);
+    if (_tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop, wasAtBottom)) {
+        _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
+        return;
+    }
 
     // During streaming, keep #streaming-text in the DOM to preserve its scroll position.
     // All other content goes inside a #messages-inner wrapper - a single innerHTML swap.
@@ -881,6 +1057,27 @@ function renderMessages() {
         container.innerHTML = mappedHtml;
         if (isRunning) {
             container.appendChild(createStreamingTextEl());
+            // REG-F4: the fresh streaming container is EMPTY and is only ever
+            // filled by updateStreamingText via a streamDelta. With the R9
+            // interval skip there is no guaranteed 1s repaint anymore — if the
+            // user switches back to this chat during a token stall, the
+            // streaming area would stay blank until the next chunk. Repopulate
+            // immediately from the mirror when the tail is mid-stream.
+            var _f4TailIdx = chat.messages.length - 1;
+            var _f4Tail = chat.messages[_f4TailIdx];
+            if (_f4Tail && _f4Tail.role === 'assistant' && _f4Tail.isStreaming === true && _f4Tail.content) {
+                updateStreamingText(_f4Tail, _f4TailIdx, currentChatId);
+            } else if (typeof _flushFinalizedStreamingText === 'function') {
+                // FLUSH-TAIL companion (see 036-agent-event-handlers-page.js):
+                // mid-run the tail can be a FINALIZED assistant message sitting
+                // behind `[pending]` placeholder tool rows (long-blocking tool
+                // call in flight). The strict tail check above misses it, so
+                // switching back to the chat showed a blank/partial answer
+                // until the run ended. Repopulate from the last assistant
+                // message — isStreaming=false makes getDisplayContent return
+                // the full text.
+                _flushFinalizedStreamingText(currentChatId);
+            }
         }
     }
 
@@ -905,7 +1102,7 @@ function renderMessages() {
     }
 
     // Scope post-render queries to the rebuilt content area only
-    contentRoot = container.querySelector('#messages-inner') || container;
+    var contentRoot = container.querySelector('#messages-inner') || container;
 
     // Set up sticky observers for any expanded tool panels
     contentRoot.querySelectorAll('details.tool-call.expanded, details.tool-result.expanded').forEach(function(details) {
@@ -914,6 +1111,10 @@ function renderMessages() {
 
     // Click-to-fullscreen for widget thumbnails inside .widgets-container
     contentRoot.querySelectorAll('.widgets-container .widget-inline').forEach(function(wi) {
+        // R4: widget nodes survive re-renders via moveBefore — without this guard
+        // every render stacked ANOTHER click listener on the same node.
+        if (wi.dataset.fsBound) return;
+        wi.dataset.fsBound = '1';
         wi.addEventListener('click', function(e) {
             if (e.target.closest('.widget-controls')) return;
             var wid = wi.getAttribute('data-widget-id');
@@ -923,13 +1124,7 @@ function renderMessages() {
 
     // Set up scroll shadow for attachments rows and widget rows (right fade when more content is hidden)
     contentRoot.querySelectorAll('.attachments-row, .widgets-container').forEach(function(row) {
-        function updateShadow() {
-            var hasOverflow = row.scrollWidth > row.clientWidth + 1;
-            var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
-            row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
-        }
-        updateShadow();
-        row.addEventListener('scroll', updateShadow);
+        _attachRowScrollShadow(row);
     });
     
     // Render a "queued" user bubble at the very end if the user typed a message during
@@ -950,19 +1145,98 @@ function renderMessages() {
 
     // Restore scroll position after widgets are rendered
     var streamingEl = document.getElementById('streaming-text');
+    if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2: these scrollTop writes must not count as user scrolls
     if (streamingEl) {
-        // During streaming: #streaming-text was never removed from DOM, scroll is intact
-        // Just restore outer container position and update height constraint
-        container.scrollTop = savedScrollTop;
-        updateStreamingContainerHeight();
+        // During streaming: #streaming-text was never removed from DOM, scroll is intact.
+        // SF-1: tool rows appended ABOVE the streaming container grow the outer
+        // scrollHeight while the absolute restore pinned scrollTop, pushing the
+        // container (and the live text tail) below the fold for an at-bottom user —
+        // updateStreamingContainerHeight's shrink-to-fit bottoms out at the CSS
+        // min-height (33vh). Advance the restore by the growth delta so the
+        // container keeps its viewport position; users who scrolled up keep their
+        // absolute position. NOTE (SF-2): scrollToBottomIfAllowed no longer
+        // early-returns on .streaming-answer — the call below re-pins the outer
+        // container to the bottom for FOLLOWING users, overwriting this delta
+        // restore. The delta math still matters for the non-following window
+        // (isFollowingScroll false but wasAtBottom true — e.g. content shrank
+        // under a disengaged user): those users get position-preservation here
+        // and are NOT pinned.
+        var _sfGrowth = container.scrollHeight - savedScrollHeight;
+        container.scrollTop = (wasAtBottom && _sfGrowth > 0) ? savedScrollTop + _sfGrowth : savedScrollTop;
+        // SF-2: same choke-point routing as the incremental path — see
+        // _tryIncrementalRender. Recovers drift for following users; the
+        // pin inside scrollToBottomIfAllowed is gated on isFollowingScroll
+        // so scrolled-up users keep the absolute restore above.
+        scrollToBottomIfAllowed(container);
     } else if (wasAtBottom || isFollowingScroll) {
         container.scrollTop = container.scrollHeight;
     } else {
         container.scrollTop = savedScrollTop;
     }
+
+    // R1: record what this full render produced so the next render can diff.
+    _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
+
+    // The rebuild above minted fresh rc-N rawCopyStore entries for every
+    // tool panel / code fence and orphaned the previous render's keys —
+    // sweep the orphans now (see gcRawCopyStore in 200-ui-interactions.js
+    // for why a sweep, not a reset).
+    if (typeof gcRawCopyStore === 'function') gcRawCopyStore();
 }
 
+// R3: coalesce per-SSE-chunk streaming updates into at most one DOM update per
+// animation frame. The streamDelta handler (036-agent-event-handlers-page.js)
+// calls updateStreamingMessage synchronously for EVERY chunk, and the
+// content path re-runs full markdown formatting + innerHTML each time — at
+// high token rates that starves the main thread. We keep only the LATEST
+// args; the rAF callback re-reads current state and drops the update if the
+// user navigated away or the message already finalized (the finalize path is
+// a full renderMessages() via the 'assistantMessage' event, which stays
+// synchronous and never goes through this wrapper — grep-verified: the only
+// caller of updateStreamingMessage is the streamDelta handler).
+var _usmScheduled = false;
+var _usmLatest = null;
+
 function updateStreamingMessage(index, msg, streamingChatId) {
+    // DRLM-B1: background-chat deltas must not claim the single latest-args
+    // slot — 036's streamDelta handler calls this for ALL chats, and a fast
+    // background run could overwrite an unpainted foreground delta (the frame
+    // guard would then drop it, leaving the foreground stream stale until the
+    // next delta). Mirrors the pre-R3 synchronous no-op for background chats.
+    if (streamingChatId && currentChatId !== streamingChatId) return;
+    _usmLatest = { index: index, msg: msg, streamingChatId: streamingChatId };
+    if (_usmScheduled) return;
+    _usmScheduled = true;
+    var raf = (typeof requestAnimationFrame === 'function')
+        ? requestAnimationFrame
+        : function(cb) { return setTimeout(cb, 16); };
+    raf(function() {
+        _usmScheduled = false;
+        var a = _usmLatest;
+        _usmLatest = null;
+        if (!a) return;
+        // Re-check state at frame time: chat still current?
+        if (a.streamingChatId && currentChatId !== a.streamingChatId) return;
+        // REG-F1: a.msg can be a structured clone from the port bridge
+        // (045-agent-port-bridge-page.js re-emits postMessage envelopes), and a
+        // clone's isStreaming NEVER flips false — so gating on it missed
+        // finalize/abort that landed between scheduling and this frame, letting
+        // a stale streaming patch dirty the finalized DOM (or a flushed user
+        // bubble recycled into the same index). Re-read the LIVE message from
+        // the page mirror; fall back to the captured clone only when the
+        // mirror lookup fails (same-context emitters, partial mirrors).
+        var _f1Chat = (typeof chats !== 'undefined') ? chats[a.streamingChatId || currentChatId] : null;
+        var _f1Live = (_f1Chat && _f1Chat.messages) ? _f1Chat.messages[a.index] : null;
+        var _f1Msg = _f1Live || a.msg;
+        // Still streaming? If the message finalized between scheduling and the
+        // frame, the assistantMessage event already did a full render — a late
+        // streaming patch would dirty the finalized DOM.
+        if (!_f1Msg || _f1Msg.isStreaming !== true) return;
+        _updateStreamingMessageNow(a.index, _f1Msg, a.streamingChatId);
+    });
+}
+
+function _updateStreamingMessageNow(index, msg, streamingChatId) {
     // If we navigated away from the streaming chat, skip DOM updates but let streaming continue
     if (streamingChatId && currentChatId !== streamingChatId) {
         return; // Streaming continues in background, data is saved to correct chat
@@ -984,6 +1258,13 @@ function updateStreamingMessage(index, msg, streamingChatId) {
         }
         return;
     }
+
+    // REG-F2: defense-in-depth — only assistant message nodes may receive
+    // streaming markup. After an abort flushes a queued user message into the
+    // recycled index, a stale delta would otherwise clobber the user's bubble
+    // with thinking/tool-call HTML (and the R1 signature fast path would never
+    // repair it, since the message DATA at that index is unchanged).
+    if (msgEl.classList && !msgEl.classList.contains('assistant')) return;
 
     // Optimization: try to do incremental update for tool call arguments during streaming
     // This avoids rebuilding the entire HTML when only the tool args are changing
@@ -1193,7 +1474,7 @@ function updateStreamingMessage(index, msg, streamingChatId) {
                     var tcStatusMsg = extractStatusMessage(lastTc.function.arguments);
                     var statusMsgHtml = tcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(tcStatusMsg) + '</span>' : '';
                     var newTcHtml = '<details class="tool-call" id="' + tcKey + '" open onclick="toggleToolCallExpanded(' + index + ', ' + lastTcIdx + ', this)">';
-                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(lastTc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) + '</span>' + statusMsgHtml + '</summary>';
+                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(lastTc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) + '</span>' + statusMsgHtml + '</summary>';
                     newTcHtml += '<div class="tool-args-wrapper">';
                     newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
                     var argsText = lastTc.function.arguments || '';
@@ -1291,7 +1572,7 @@ function updateStreamingMessage(index, msg, streamingChatId) {
                 // Add spinner to summary if this tool call is streaming
                 var toolSpinner = (msg.isStreaming && isLastToolCall) ? '<span class="tool-streaming-indicator"></span>' : '';
                 var statusMsgHtml = streamingTcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(streamingTcStatusMsg) + '</span>' : '';
-                html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + (TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
+                html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
                 var argsCopyId = storeRawCopy(tc.function.arguments);
                 html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
                 html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (tcFullHeight ? 'Collapse' : 'Expand') + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
@@ -1313,6 +1594,7 @@ function updateStreamingMessage(index, msg, streamingChatId) {
     
     // Restore scroll position if user had scrolled away (prevents browser auto-scroll on details expansion)
     if (savedScrollTop !== null && container) {
+        if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2
         container.scrollTop = savedScrollTop;
     }
     
@@ -1598,19 +1880,23 @@ function formatContent(content) {
     // Remove br tags right after block elements
     html = html.replace(/(<\/table>|<\/ul>|<\/ol>|<\/h[234]>|<\/div>|<\/pre>|<\/blockquote>)(\s|<br>)+/g, '$1');
     
-    // Restore code blocks AFTER cleanup to preserve their whitespace
+    // Restore code blocks AFTER cleanup to preserve their whitespace.
+    // Function replacement (not a string) so $-patterns ($$, $&, $`, $') in
+    // the restored HTML are NOT interpreted by String.replace — same rationale
+    // as the protected-span restore above. Safe with `var i` because replace
+    // runs synchronously within the same iteration.
     for (var i = 0; i < codeBlocks.length; i++) {
-        html = html.replace('%%CODEBLOCK' + i + '%%', codeBlocks[i]);
+        html = html.replace('%%CODEBLOCK' + i + '%%', function() { return codeBlocks[i]; });
     }
 
     // Restore display template blocks
     for (var i = 0; i < displayBlocks.length; i++) {
-        html = html.replace('%%DISPLAY' + i + '%%', displayBlocks[i]);
+        html = html.replace('%%DISPLAY' + i + '%%', function() { return displayBlocks[i]; });
     }
 
     // Restore document blocks
     for (var i = 0; i < documentBlocks.length; i++) {
-        html = html.replace('%%DOCUMENT' + i + '%%', documentBlocks[i]);
+        html = html.replace('%%DOCUMENT' + i + '%%', function() { return documentBlocks[i]; });
     }
     
     // Apply search highlighting if active
@@ -1634,6 +1920,35 @@ function renderQueuedUserBubble(container) {
     if (!currentChatId) return;
     var entry = pendingInjectionsByChatId[currentChatId];
     if (!entry) return;
+    // QUEUE-SYNC-FIX: self-healing retirement of a stale mirror entry. This map
+    // entry is page-side optimistic UI; the authoritative copy lives in the SW
+    // and is consumed by flushPendingInjection, which broadcasts 'userInjected'
+    // so we delete our mirror. If that ONE broadcast is lost or races (SW
+    // restart, port blip), nothing else retires the entry and the "Queued"
+    // badge re-paints forever. Detect the flush directly instead: if the LAST
+    // user message in the mirrored transcript equals the queued text, the
+    // injection has landed — retire the bubble. Likewise if the run has ended
+    // un-paused (the SW drops un-flushed injections at loop exit), the entry
+    // can never flush — it's stale.
+    var _qChat = chats[currentChatId];
+    if (_qChat && _qChat.messages && entry.text) {
+        for (var _qi = _qChat.messages.length - 1; _qi >= 0; _qi--) {
+            var _qm = _qChat.messages[_qi];
+            if (_qm && _qm.role === 'user' && typeof _qm.content === 'string') {
+                if (_qm.content === entry.text) {
+                    delete pendingInjectionsByChatId[currentChatId];
+                    return;
+                }
+                break; // only the LAST user message can be the flushed injection
+            }
+        }
+    }
+    if (!runningChatIds[currentChatId] && !(typeof pausedChats !== 'undefined' && pausedChats[currentChatId])) {
+        // Not running and not paused: a paused chat keeps its SW-side injection
+        // (flushed on resume), so its bubble stays. Anything else is a leftover.
+        delete pendingInjectionsByChatId[currentChatId];
+        return;
+    }
     var text = entry.text || '';
     var images = entry.images || [];
     if (!text && (!images || images.length === 0)) return;

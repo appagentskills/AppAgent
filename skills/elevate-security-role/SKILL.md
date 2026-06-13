@@ -15,7 +15,7 @@ ServiceNow uses **elevated privileges** as a security feature. Certain sensitive
 - `security_admin` - Required for ACL modifications
 - Other high-security roles may also require elevation
 
-## Method 1: UI Navigation (Recommended)
+## How to Elevate: UI Navigation (the only method)
 
 ### Direct URL
 Navigate to the elevation dialog:
@@ -60,10 +60,10 @@ return "Security role elevation completed";
 ```
 
 ## Important Notes
-- This is a **session-based** operation - elevation persists until logout or session timeout
-- **Cannot be done purely via REST API** - requires UI page processor
+- This is a **session-based** operation — elevation persists until logout or session timeout
+- **Cannot be done purely via REST API** — requires the UI page processor
 
-## Method 2: Check Current Elevation Status
+## Checking Elevation Status
 
 ### Via API - Check User's Role Assignment
 ```javascript
@@ -75,6 +75,8 @@ servicenow_api({
   fields: "user,role,state,sys_id"
 })
 ```
+
+Note: this confirms the role is **assigned**, not that the current session is **elevated** — elevation state is session-bound and not exposed via the Table API. Confirm elevation via the visual indicator below, or by attempting the privileged operation.
 
 ### Visual Indicator
 When elevated, the user avatar in the ServiceNow header shows a **red ring/border**.

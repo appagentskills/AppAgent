@@ -24,6 +24,7 @@
 .tool-approval-btn.auto:hover { background: var(--primary-lighter); }
 .tool-approval-btn.deny { border-color: var(--danger); }
 .tool-approval-btn.deny:hover { background: var(--danger-lighter); }
+.tool-approval-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .tool-approval-status { font-size: var(--text-body-sm); font-weight: var(--font-medium); padding: var(--space-2) var(--space-6); border-radius: var(--radius-sm); }
 .tool-approval-status.allowed { color: var(--success-hover); background: var(--success-light); }
 .tool-approval-status.denied { color: var(--danger-hover); background: var(--danger-light); }

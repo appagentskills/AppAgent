@@ -149,4 +149,8 @@ function saveInstancePermissions() {
     if (typeof pushPermissionsToOffscreen === 'function') {
         pushPermissionsToOffscreen({ instancePermissions: instancePermissions });
     }
+    // Keep the header tier pill in sync with EVERY mutation path (settings
+    // panel, instance-picker toggle, data import) — some callers don't call
+    // updateSnStatus themselves, leaving a stale 'Manual'/'Auto' label.
+    if (typeof updateSnStatus === 'function') updateSnStatus();
 }

@@ -3,6 +3,8 @@ name: ui-pages-best-practices
 description: A comprehensive guide for working with ServiceNow UI Pages, including best practices, patterns, and common pitfalls to avoid. Use when creating or editing UI Pages.
 ---
 
+# UI Pages Best Practices
+
 ## Overview
 UI Pages in ServiceNow are custom web pages that can be created using HTML, CSS, and JavaScript. They provide a flexible way to create custom user interfaces.
 
@@ -83,8 +85,8 @@ UI Pages in ServiceNow are custom web pages that can be created using HTML, CSS,
    // May break - parser sees < and > as tag markers
    if (a < b && c > d)
 
-   // Safer - rearrange comparisons to avoid <
-   if (b > a && d < c)
+   // Safer - rearrange comparisons so only > is used
+   if (b > a && c > d)
    ```
 
 

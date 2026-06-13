@@ -117,7 +117,7 @@ Configure AppAgent preferences. [Open Settings →](app:openSettingsPageView)
 
 - **Agent Model** — Choose which LLM to use
 - **API Providers** — Add or edit providers (Anthropic, OpenRouter, custom). Supports API-key and OAuth (Claude Code sign-in) providers
-- **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. Only Opus 4.7 accepts `xhigh` on Anthropic directly; OpenRouter maps unsupported values to the nearest supported level
+- **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. `xhigh` is accepted on Opus 4.7/4.8 and Fable/Mythos 5 on Anthropic directly (other models top out at `high`/`max`); OpenRouter maps unsupported values to the nearest supported level
 - **App Scope** — Set the scope for new records
 - **Display** — Toggle API stats, compact mode, and keep-display-awake
 - **Hooks** — Enable auto-title generation, "Agent finished" notifications, and other automation

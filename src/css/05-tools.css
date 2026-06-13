@@ -1,6 +1,6 @@
 /* Compact Tools Area (collapsible panel with thinking + tools at top) */
 .compact-tools-area { background: var(--secondary-lighter); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); margin-bottom: 0; }
-.compact-tools-summary { padding: var(--space-5) var(--space-7); cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--space-5); font-size: var(--text-body); color: var(--text-secondary); user-select: none; background: var(--secondary-lighter); }
+.compact-tools-summary { padding: var(--space-5) var(--space-7); cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--space-5); font-size: var(--text-body); color: var(--text-secondary); user-select: none; background: var(--secondary-lighter); border-radius: var(--radius-lg); }
 .compact-tools-area[open] > .compact-tools-summary { position: sticky; top: 0; z-index: 10; border-radius: var(--radius-lg) var(--radius-lg) 0 0; margin: -1px -1px 0 -1px; border: 1px solid var(--secondary-border); border-bottom: none; box-shadow: 0 -10px 0 10px var(--bg-white); }
 .compact-tools-summary::-webkit-details-marker { display: none; }
 .compact-tools-icon { display: flex; align-items: center; justify-content: center; }
@@ -12,7 +12,7 @@
 .compact-tools-chevron { display: flex; align-items: center; transition: transform var(--transition-normal); }
 .compact-tools-chevron .ui-icon { width: 16px; height: 16px; color: var(--text-muted); }
 .compact-tools-area[open] .compact-tools-chevron { transform: rotate(180deg); }
-.compact-tools-content { padding: var(--space-6); border-top: 1px solid var(--secondary-border); display: flex; flex-direction: column; gap: var(--space-6); background: var(--bg-white); }
+.compact-tools-content { padding: var(--space-6); border-top: 1px solid var(--secondary-border); display: flex; flex-direction: column; gap: var(--space-6); background: var(--bg-white); border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 .compact-status-line { font-size: var(--text-body); color: var(--text-secondary); padding: var(--space-3) var(--space-5); background: var(--secondary-lighter); border-radius: var(--radius-md); }
 .compact-tools-content .tool-call, .compact-tools-content .tool-result { margin-top: 0; }
 .compact-tools-metrics { display: flex; gap: var(--space-8); padding: var(--space-5) var(--space-6); background: var(--secondary-lighter); border-radius: var(--radius-md); margin-top: var(--space-2); }
@@ -85,7 +85,7 @@
 .spinner-text { font-size: var(--text-body-lg); color: var(--text-secondary); }
 
 /* Overlay Spinner */
-.overlay-spinner { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); display: flex; align-items: center; justify-content: center; z-index: 10000; }
+.overlay-spinner { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); display: flex; align-items: center; justify-content: center; z-index: var(--z-overlay); }
 .overlay-spinner-content { display: flex; flex-direction: column; align-items: center; gap: var(--space-6); background: var(--bg-white); padding: var(--space-10) var(--space-11); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); }
 .overlay-spinner-content .spinner { width: 32px; height: 32px; border-width: 3px; }
 .overlay-spinner-content span { font-size: var(--text-body-lg); color: var(--text-secondary); }
@@ -214,6 +214,21 @@
 .tool-result pre { background: var(--bg-white); padding: var(--space-4); padding-right: 30px; padding-bottom: 28px; border-radius: 0 0 var(--radius-md) var(--radius-md); overflow-x: auto; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; color: var(--text-primary); margin: 0; }
 .tool-result pre.expanded { max-height: none; overflow: visible; order: 2; }
 
+/* Sub-report card panels (175-sub-agent-ui.js) reuse the tool-args-wrapper /
+   tool-result-wrapper markup but sit inside .sub-report-body instead of a
+   .tool-call / .tool-result <details>, so the expanded flex-order + sticky
+   button rules above never applied to them. Mirror them here. Keyed off the
+   persisted pre.expanded state (re-rendered from _subPanelPref on every
+   repaint) so the treatment survives live-card repaints; buttons are
+   position:sticky directly (no IntersectionObserver/.stuck on these). */
+.sub-report-body .tool-args-wrapper:has(> .tool-args.expanded),
+.sub-report-body .tool-result-wrapper:has(> pre.expanded) { display: flex; flex-direction: column; }
+.sub-report-body .tool-args-wrapper:has(> .tool-args.expanded) .tool-expand-btn,
+.sub-report-body .tool-result-wrapper:has(> pre.expanded) .tool-result-expand-btn { order: 1; margin-left: auto; margin-right: var(--space-2); margin-top: var(--space-2); margin-bottom: -26px; position: sticky; top: 16px; z-index: 11; }
+.sub-report-body .tool-args-wrapper:has(> .tool-args.expanded) .tool-copy-btn,
+.sub-report-body .tool-result-wrapper:has(> pre.expanded) .tool-copy-btn { order: 3; margin-left: auto; margin-right: var(--space-3); width: fit-content; position: sticky; bottom: -8px; z-index: 11; }
+.sub-report-body .tool-result-wrapper > pre.expanded { order: 2; }
+
 /* Screenshot/attachment group collapsible */
 .attachments-details { margin-top: var(--space-4); margin-bottom: var(--space-8); }
 .attachments-summary { display: flex; align-items: center; gap: var(--space-4); font-weight: var(--font-semibold); color: var(--primary); font-size: var(--text-body); cursor: pointer; list-style: none; user-select: none; padding: var(--space-3) 0; }
@@ -248,7 +263,7 @@
 .attachments-row.has-right-shadow { mask-image: linear-gradient(to right, black calc(100% - 40px), transparent); -webkit-mask-image: linear-gradient(to right, black calc(100% - 40px), transparent); }
 .attachments-row > .message.screenshot { margin: 0 !important; width: auto !important; flex: 0 0 auto; height: 100%; }
 .attachments-row .screenshot-container { max-width: none; height: 100%; padding: var(--space-4); display: flex; flex-direction: column; box-sizing: border-box; }
-.attachments-row .screenshot-thumbnail { flex: 1; min-height: 0; width: auto; border-radius: var(--radius-lg); object-fit: contain; }
+.attachments-row .screenshot-thumbnail { flex: 1; min-height: 0; width: auto; border-radius: var(--radius-lg); object-fit: contain; /* Ultra-wide captures (e.g. 1200x70): height:100% of the 20vh row would scale width to several thousand px. Cap it — object-fit:contain letterboxes instead of distorting. */ max-width: min(480px, 60vw); }
 .message.screenshot { margin-left: var(--space-9); margin-top: var(--space-4); margin-bottom: var(--space-8); }
 .screenshot-container { background: var(--primary-lighter); border: 1px solid var(--primary-light); border-radius: var(--radius-xl); padding: var(--space-5); max-width: 200px; text-align: center; }
 .screenshot-header { display: flex; align-items: center; justify-content: center; gap: var(--space-4); font-weight: var(--font-semibold); color: var(--primary); font-size: var(--text-body); margin-bottom: var(--space-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

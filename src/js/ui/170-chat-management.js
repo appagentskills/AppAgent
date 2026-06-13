@@ -176,6 +176,38 @@ async function fetchCredits() {
     }
 }
 
+// Live-refresh Claude OAuth usage by hitting claude.ai's cookie-authenticated usage
+// endpoint (via the SW), instead of only reading rate-limit headers scraped off the
+// last inference response. The SW writes claudeRateLimits, and storage.onChanged in
+// platform-bridge.js re-renders through fetchCredits(). Throttled to once/60s unless
+// forced (an explicit click forces). Render-only fetchCredits() never calls this, so
+// there is no refresh<->render loop.
+var _lastClaudeUsageRefresh = 0;
+var _claudeUsageRefreshInFlight = false;
+function refreshClaudeOAuthUsage(force) {
+    var provider = getProviderByName(currentProvider);
+    if (!provider || !provider.isClaudeOAuth) return;
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return;
+    var now = Date.now();
+    if (!force && now - _lastClaudeUsageRefresh < 60000) return;
+    // Even forced (click) refreshes are debounced: minimum 5s spacing, and never
+    // more than one credentialed claude.ai request in flight at a time.
+    if (force && now - _lastClaudeUsageRefresh < 5000) return;
+    if (_claudeUsageRefreshInFlight) return;
+    _claudeUsageRefreshInFlight = true;
+    _lastClaudeUsageRefresh = now;
+    try {
+        chrome.runtime.sendMessage({ type: 'claude-oauth-usage-refresh' }, function(response) {
+            _claudeUsageRefreshInFlight = false;
+            if (chrome.runtime.lastError) return;
+            if (response && response.error) { console.log('Claude usage refresh error:', response.error); return; }
+            // On a value change, storage.onChanged already re-rendered; call fetchCredits
+            // anyway for the no-change case (onChanged does not fire on identical values).
+            try { fetchCredits(); } catch(e) {}
+        });
+    } catch(e) { _claudeUsageRefreshInFlight = false; }
+}
+
 async function updateStorageIndicator() {
     var storageEl = document.getElementById('storage-display');
     if (!storageEl) return;
@@ -233,8 +265,17 @@ async function summarizeAndStartNewChat() {
         return;
     }
     
-    // Check if agent is already running
-    if (isRunning) {
+    // Check if agent is already running. Gate on the PER-CHAT running flag,
+    // not the bare global `isRunning` — the global tracks foreground UI state
+    // and can be incidentally true (e.g. after revealing a background action
+    // chat then navigating away) even when THIS chat has no active stream.
+    // Mirrors the sendMessage fix in app/040-send-message.js:13-16.
+    // REG-F3: ALSO honor the global pair when it points at THIS chat —
+    // runningChatIds is wholesale-cleared by the bus onDisconnect, so during a
+    // port flap a live foreground run would otherwise slip past the per-chat
+    // check and summarize would inject its prompt mid-run.
+    if (runningChatIds[currentChatId] ||
+        (isRunning && typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId === currentChatId)) {
         showSnackbar('Please wait for the current request to complete', 'warning');
         return;
     }
@@ -461,6 +502,16 @@ function selectChat(chatId, options) {
     var prevContext = getCurrentPendingContext();
     savePendingImagesForContext(prevContext);
     savePendingTextForContext(prevContext);
+
+    // Mark the chat as seen — the Active Chats dropdown surfaces chats whose
+    // last response the user hasn't viewed yet (lastResponseAt > lastViewedAt).
+    if (chats[chatId]) {
+        chats[chatId].lastViewedAt = Date.now();
+        if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+        // Viewing the chat consumes its "finished while you were elsewhere"
+        // header badge entry (ui/165-finished-chat-badge.js).
+        if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
+    }
 
     // Reset UI state for the new focused chat.
     // If THAT chat is streaming — show pause/streaming UI.

@@ -36,6 +36,8 @@
 .message.sub-report.sub-report-need_input { border-left-color: var(--warning, #bf8700); }
 .message.sub-report.sub-report-partial { border-left-color: var(--text-muted, #8a93a6); }
 .message.sub-report.sub-report-cancelled { border-left-color: var(--text-muted, #8a93a6); }
+.message.sub-report.sub-report-running { border-left-color: var(--accent, #6c63ff); }
+.message.sub-report.sub-report-waiting { border-left-color: var(--warning, #bf8700); }
 
 /* The native ::-webkit-details-marker / ::marker triangle would sit before
    our custom chevron and double up. Hide it; we paint our own chevron that
@@ -56,16 +58,14 @@
 }
 .sub-report-chevron {
     display: inline-block;
-    width: 10px;
     flex-shrink: 0;
-    color: var(--text-muted, #6b7280);
-    transition: transform 0.15s ease;
-    /* Triangle drawn with CSS borders so we don't depend on a font glyph. */
-    border-style: solid;
-    border-width: 4px 0 4px 6px;
-    border-color: transparent transparent transparent currentColor;
-    margin-right: 2px;
+    /* Identical to the tool-call summary chevron (05-tools.css):
+       same glyph, size, color and rotation behavior. */
+    font-size: var(--text-sm);
+    color: var(--primary);
+    transition: transform var(--transition-normal);
 }
+.sub-report-chevron::before { content: '▶'; }
 .message.sub-report[open] > summary .sub-report-chevron { transform: rotate(90deg); }
 .sub-report-preview {
     color: var(--text-muted, #6b7280);
@@ -97,6 +97,128 @@
 .sub-report-need_input .sub-report-icon { background: rgba(191,135,0,0.15); color: var(--warning, #bf8700); }
 .sub-report-partial .sub-report-icon { background: rgba(138,147,166,0.15); color: var(--text-muted, #8a93a6); }
 .sub-report-cancelled .sub-report-icon { background: rgba(138,147,166,0.15); color: var(--text-muted, #8a93a6); }
+.sub-report-waiting .sub-report-icon { background: rgba(191,135,0,0.15); color: var(--warning, #bf8700); }
+
+/* Animated spinner shown in the icon slot while a sub-agent is running. */
+.sub-report-spinner {
+    display: inline-flex;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 2px solid rgba(108, 99, 255, 0.25);
+    border-top-color: var(--accent, #6c63ff);
+    animation: sub-report-spin 0.7s linear infinite;
+}
+@keyframes sub-report-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .sub-report-spinner { animation-duration: 2.4s; } }
+
+/* Sub progress card — the sub's update_action_state mirrored onto the
+   parent's sub_report card (state pill + label + tasks checklist).
+   Stamped as msg.actionState / phase.actionState by recordSubActionState
+   (097-sub-agent-registry.js), rendered by _subActionStateHtml
+   (175-sub-agent-ui.js). */
+.sub-report-action-state {
+    margin: var(--space-4, 8px) 0;
+    padding: var(--space-4, 8px) var(--space-5, 12px);
+    border: 1px solid var(--border, #d0d7de);
+    border-radius: 8px;
+    background: var(--bg-secondary, rgba(108, 99, 255, 0.04));
+}
+.sub-report-action-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4, 8px);
+    margin-bottom: var(--space-3, 6px);
+}
+.sub-report-action-head:last-child { margin-bottom: 0; }
+.sub-report-action-pill {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    background: rgba(108, 99, 255, 0.15);
+    color: var(--accent, #6c63ff);
+}
+.sub-action-done .sub-report-action-pill { background: rgba(45, 164, 78, 0.15); color: var(--success, #2da44e); }
+.sub-action-error .sub-report-action-pill { background: rgba(207, 34, 46, 0.12); color: var(--danger, #cf222e); }
+.sub-action-stuck .sub-report-action-pill { background: rgba(191, 135, 0, 0.15); color: var(--warning, #bf8700); }
+.sub-report-action-label {
+    font-size: var(--text-body, 13px);
+    font-weight: 600;
+    color: var(--text-primary, #1f2328);
+    min-width: 0;
+}
+.sub-report-task {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-4, 8px);
+    padding: 2px 0;
+    font-size: var(--text-body, 13px);
+    color: var(--text-primary, #1f2328);
+}
+.sub-report-task-icon {
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+    color: var(--text-secondary, #57606a);
+}
+.sub-task-done .sub-report-task-icon { color: var(--success, #2da44e); }
+.sub-task-error .sub-report-task-icon { color: var(--danger, #cf222e); }
+.sub-task-error .sub-report-task-label { color: var(--danger, #cf222e); }
+.sub-task-done .sub-report-task-label { text-decoration: line-through; opacity: 0.65; }
+.sub-task-pending .sub-report-task-label { color: var(--text-secondary, #57606a); }
+/* Smaller spinner variant for a running task row (base spinner is 18px). */
+.sub-report-task-spinner {
+    width: 11px;
+    height: 11px;
+    vertical-align: middle;
+}
+
+/* Progress stream — one entry per agent_message(to:'parent') update. */
+.sub-report-progress {
+    margin-bottom: var(--space-4, 8px);
+    border-left: 2px solid var(--border, #e1e4ea);
+    padding-left: var(--space-5, 10px);
+}
+.sub-report-progress-item {
+    position: relative;
+    display: flex;
+    gap: var(--space-4, 8px);
+    padding: 2px 0;
+}
+.sub-report-progress-dot {
+    position: absolute;
+    left: calc(-1 * var(--space-5, 10px) - 6px);
+    top: 9px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent, #6c63ff);
+}
+.sub-report-progress-text { flex: 1 1 auto; min-width: 0; font-size: var(--text-body, 13px); }
+.sub-report-progress-text > :first-child { margin-top: 0; }
+.sub-report-progress-text > :last-child { margin-bottom: 0; }
+
+/* Archived wake phases — one completed input → progress → output block per
+   wake_sub_agent cycle (msg.phases, archived by the wake path in
+   097-sub-agent-registry.js). A dashed rule separates each archived phase
+   from the next/current one; the small status pill (reuses the
+   .sub-report-status look) sits above the phase's output panel showing
+   that phase's terminal status. */
+.sub-report-phase {
+    margin-bottom: var(--space-4, 8px);
+    padding-bottom: var(--space-4, 8px);
+    border-bottom: 1px dashed var(--border, #e1e4ea);
+}
+.sub-report-phase-status {
+    display: inline-block;
+    margin-bottom: 4px;
+}
 
 .sub-report-name { color: var(--text-primary, #1f2328); }
 .sub-report-status {
@@ -158,43 +280,6 @@
     flex-shrink: 0;
 }
 .sub-report-open-label { display: inline; }
-
-.sub-report-summary {
-    /* Body is now rendered through formatContent() — inherit the .markdown-body
-       paragraph / list / blockquote spacing instead of relying on pre-wrap. */
-    color: var(--text-primary, #1f2328);
-    line-height: var(--leading-loose, 1.6);
-}
-.sub-report-artifacts {
-    margin-top: var(--space-3, 6px);
-    font-size: var(--text-caption, 11px);
-    color: var(--text-muted, #6b7280);
-}
-.sub-report-artifact {
-    display: inline-block;
-    margin-right: 4px;
-    padding: 1px 6px;
-    background: var(--bg-hover, #e7e9ee);
-    border-radius: var(--radius-sm, 4px);
-    font-family: var(--font-mono, monospace);
-}
-.sub-report-data {
-    margin-top: var(--space-3, 6px);
-    font-size: var(--text-caption, 11px);
-}
-.sub-report-data > summary {
-    cursor: pointer;
-    color: var(--text-muted, #6b7280);
-}
-.sub-report-data pre {
-    margin-top: var(--space-3, 6px);
-    padding: var(--space-4, 8px);
-    background: var(--bg-white, #fff);
-    border: 1px solid var(--border, #e1e4ea);
-    border-radius: var(--radius-sm, 4px);
-    overflow: auto;
-    max-height: 260px;
-}
 
 /* ---------- History view: sub-agent card treatment ----------
    Sub-agent transcripts used to render in the history page with the same
@@ -406,12 +491,6 @@
     background: rgba(251, 191, 36, 0.18);
     color: var(--warning, #fbbf24);
 }
-:root[data-theme="dark"] .sub-report-data pre {
-    /* Slightly lighter than --bg-white-in-dark so the pre stands out
-       from the callout background. */
-    background: var(--bg-hover);
-    border-color: var(--border-dark, #3b3f48);
-}
 /* Status-icon halos: the hardcoded rgba(45,164,78,0.15) etc. read fine on
    light backgrounds but get muddy on the dark callout surface. Bump alpha
    so the icon halo stays visually distinct. */
@@ -506,3 +585,50 @@
     border-color: var(--border-dark, #3b3f48);
     color: var(--text-muted, #8a93a6);
 }
+
+/* ---------- Markdown in sub-report input/output panels ----------
+   _subInputPanel/_subOutputPanel (175-sub-agent-ui.js) render spawn/wake
+   instructions and report_to_parent summaries as markdown via
+   _renderSubCollapsibleMarkdown. The container stays a <pre> (toggleToolExpand
+   and the :has(> pre.expanded) rules in 05-tools.css depend on pre/.tool-args),
+   so pre.sub-md resets the pre-isms — monospace + white-space:pre — and lets
+   07-markdown.css's .markdown-body rules (md-paragraph blocks, ul/ol indent,
+   blockquotes) do the layout. Code blocks emitted by formatContent keep their
+   own .code-block / .inline-code rules (07-markdown.css), which already
+   restore monospace + pre-wrap, so no override is needed for them. */
+.sub-report-body pre.sub-md {
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+    font-family: inherit;
+    line-height: var(--leading-normal, 1.5);
+}
+/* The expanded markdown body is block-level so it sits on its own line below
+   the −/+ toggle (block children would interleave awkwardly with the inline
+   toggle otherwise). The delegated [data-sub-collapse] listener restores
+   display:'' (not 'inline') on .sub-md re-show so this rule re-applies. */
+.sub-report-body pre.sub-md .json-collapsible.sub-md {
+    display: block;
+    margin-top: var(--space-2, 4px);
+}
+/* Short single-line markdown (no collapse affordance) stays inline-ish. */
+.sub-report-body pre.sub-md .sub-md-inline .md-paragraph { display: inline; margin: 0; }
+/* Collapsed preview: one plain-text line with ellipsis. */
+.sub-report-body pre.sub-md .json-collapsed {
+    display: inline-block;
+    max-width: calc(100% - 28px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+}
+/* Headers: 07-markdown.css scopes h2-h5 to .message-content only — mirror
+   compact sizes for the panel context. */
+.sub-report-body .sub-md h2 { font-size: 1.15em; font-weight: var(--font-semibold, 600); margin: var(--space-5, 10px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
+.sub-report-body .sub-md h3 { font-size: 1.05em; font-weight: var(--font-semibold, 600); margin: var(--space-5, 10px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
+.sub-report-body .sub-md h4,
+.sub-report-body .sub-md h5 { font-size: 1em; font-weight: var(--font-semibold, 600); margin: var(--space-4, 8px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
+.sub-report-body .sub-md h2:first-child,
+.sub-report-body .sub-md h3:first-child,
+.sub-report-body .sub-md h4:first-child,
+.sub-report-body .sub-md h5:first-child { margin-top: 0; }

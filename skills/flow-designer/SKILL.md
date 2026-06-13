@@ -3,7 +3,7 @@ name: flow-designer
 description: A recipe for creating flows in ServiceNow Flow Designer via UI automation. Covers approval flows, trigger configuration, and common patterns.
 ---
 
-# Flow Designer Skill
+# Flow Designer — UI Automation Recipes
 
 Create ServiceNow flows by driving the Flow Designer UI with `iframe_tool`. No usable REST API exists for flow creation.
 

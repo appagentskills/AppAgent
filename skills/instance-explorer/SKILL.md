@@ -37,7 +37,7 @@ Fast, one-click inspection of an instance's structure. Each action queries Servi
 ## Action Lifecycle: Show Business Rules
 
 1. `update_action_state({ state: 'running', icon: 'code', label: 'Loading business rules…' })`
-2. Call `servicenow_api` GET on `sys_script` with `active=true`, fields `name,collection,when,action_insert,action_update,action_delete,active`
+2. Call `servicenow_api` GET on `sys_script` with query `active=true`, fields `name,collection,when,action_insert,action_update,action_delete,active`
 3. Render via `display` table
 4. `update_action_state({ state: 'done', icon: 'check', label: 'N active business rules' })`
 

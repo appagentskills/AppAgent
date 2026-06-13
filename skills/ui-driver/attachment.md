@@ -43,4 +43,4 @@ await executeTool("servicenow_api", {
 - **`input.files` is read-only + native picker** ⇒ no programmatic UI upload; use the Attachment API.
 
 ---
-*Characterized on a live Employee Center Attachment variable:* the variable control is a hidden `ng-file-select` input + an "Upload" button (`openAttachmentSelector`) scoped under `#<varname>`; the native picker is not automatable, so attach via the Attachment API. A second, page-level SP attachment widget is the visible "Add attachments" dropzone — do not confuse the two.
+*Characterized on a live Employee Center Attachment variable:* the variable control is a hidden `ng-file-select` input + an "Upload" button (`openAttachmentSelector`) scoped under `#<varname>`; the native picker is not automatable, so attach via the Attachment API. A second, page-level SP attachment widget is the visible "Add attachments" dropzone — do not confuse the two. *Re-verified (2026-06, second instance):* page-wide `input[type=file]` = 2 vs scoped = 1; button = "Upload" with `ng-click="openAttachmentSelector($event)"`, `aria-label="Upload Attachment for <Label> "`.

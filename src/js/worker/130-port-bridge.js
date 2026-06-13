@@ -30,6 +30,55 @@
 // panel = one subscription = one executor candidate.
 var _swPanelPorts = new Set();
 
+// REG-AUDIT-2: resume-scan settle signal. The page's hello-grace reconcile
+// (app/045-agent-port-bridge-page.js) settles orphaned pending runAgents after
+// a fixed grace window, but resumeRunningCheckpoints' gate chain
+// (_swBootReady → _swResumeGate → Platform.ready → loadApiProviders) is
+// unbounded — on a slow cold boot the page timer could win and finalize a
+// still-resuming run. Once the SW knows the resume scan is decided (no
+// checkpoints, or all checkpoints re-armed, or the gate chain failed), it
+// flips this flag and notifies every connected panel so the page can stop
+// extending its grace window.
+var _swResumeScanSettled = false;
+function _settleResumeScan() {
+    if (_swResumeScanSettled) return;
+    _swResumeScanSettled = true;
+    _swPanelPorts.forEach(function(p) { try { p.postMessage({ type: 'resume-scan-done' }); } catch (e) {} });
+}
+self._settleResumeScan = _settleResumeScan;
+
+// ZR1-R1 (follow-up): registry-side orphan sweep for boot-claimed,
+// never-resumed subs. The boot decision in 097 claims a pool slot for every
+// checkpoint-resumable sub BEFORE the resume scan runs; any settle path that
+// fires without runAgent having started those loops (gate-chain failure,
+// listRunningAgentCheckpoints rejecting or returning a PARTIAL list in
+// 190-entry.js) must orphan them, or the records stay fake-'running' with a
+// claimed slot + pending rehydrated handle for the whole SW session (no
+// sweeper covers 'running'; two leaks block the 2-slot pool). Registry-side
+// (not checkpoint-side) so it also works when the checkpoint list itself is
+// what failed. Selection: state 'running' + pool slot CLAIMED + loop not in
+// runningChatIds — exactly the boot-claimed-unresumed shape. Subs started
+// this session are excluded by the runningChatIds guard (a drain's
+// claim→runAgent pair is atomic w.r.t. other tasks' microtasks, so the
+// claimed-but-not-yet-running window cannot interleave with this sweep);
+// queued subs and throttle-backoff retries hold no slot and are skipped.
+// Failure path — guard every step.
+function _orphanUnresumedSubs(reason) {
+    try {
+        if (typeof SubAgents === 'undefined' || !SubAgents.listAll || !SubAgents.markOrphaned) return;
+        if (typeof _subPool === 'undefined' || !_subPool.running) return;
+        SubAgents.listAll().forEach(function(rec) {
+            try {
+                if (!rec || rec.state !== 'running') return;
+                if (!_subPool.running[rec.agent_id]) return;
+                if (typeof runningChatIds !== 'undefined' && runningChatIds[rec.chat_id]) return;
+                SubAgents.markOrphaned(rec.agent_id, reason);
+            } catch (e2) { /* per-record best-effort */ }
+        });
+    } catch (e3) { /* never block the caller's settle */ }
+}
+self._orphanUnresumedSubs = _orphanUnresumedSubs;
+
 // Lazy id stamping for routing UI-tool replies back to the right
 // panel.
 var _swPanelIds = new WeakMap();
@@ -65,6 +114,10 @@ function _registerPanel(port) {
             type: 'hello',
             chatsSnapshot: _serializeChatsSnapshot(),
             runningChatIds: Object.keys(runningChatIds).filter(function(c) { return runningChatIds[c]; }),
+            // REG-AUDIT-2: tell the panel whether the boot resume scan has
+            // already settled, so the hello-grace reconcile doesn't wait for a
+            // 'resume-scan-done' that was posted before this panel connected.
+            resumeScanSettled: _swResumeScanSettled,
             // Initial sub-agent snapshot. The page's own loadAllSubAgents
             // (which skips the orphan-rewrite per PR #244) populated the
             // page mirror from IDB at panel boot — the SW is authoritative
@@ -72,7 +125,17 @@ function _registerPanel(port) {
             // the page-side hello handler. After this, live updates flow
             // via the `subagent-snapshot` envelope from
             // src/js/worker/105-subagent-broadcast.js.
-            subAgentRecords: (typeof SubAgents !== 'undefined' && SubAgents.listAll) ? SubAgents.listAll() : []
+            // GATED on SubAgents.isLoaded(): right after an MV3 SW restart
+            // this hello can fire BEFORE the boot's async SubAgents.loadAll
+            // (190-entry.js) has drained IDB — the registry is empty, and
+            // shipping [] here made the page's full-replace
+            // applySubAgentSnapshot WIPE its correctly IDB-loaded mirror.
+            // Send null instead (the page handler skips falsy); once loadAll
+            // completes it fires _notifyListeners and the broadcast bridge
+            // (105) pushes the real snapshot to every connected panel.
+            subAgentRecords: (typeof SubAgents !== 'undefined' && SubAgents.listAll
+                && (typeof SubAgents.isLoaded !== 'function' || SubAgents.isLoaded()))
+                ? SubAgents.listAll() : null
         });
         replayParkedToolCalls(port);
     } catch (e) {
@@ -150,7 +213,6 @@ function _unregisterPanel(port) {
                 // bounded ADOPTED_RESULT_TTL eviction below to reclaim it if it is never
                 // consumed. Only drop when there's nothing valuable to keep.
                 var _prevAdopt = _panelAdoptedTools[id];
-                if (!_adoptedResults[id]) delete _adoptedResults[id];
                 _panelAdoptedTools[id] = { dispatched: true, chatId: _prevAdopt && _prevAdopt.chatId };
                 if (typeof scheduleAdoptedEviction === 'function') scheduleAdoptedEviction(id);
             }
@@ -213,7 +275,92 @@ function _handlePanelMessage(port, msg) {
                 // from clobbering chats[id] AND from starting a parallel loop.
                 var isRunning = !!runningChatIds[msg.chatId]
                     || !!(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[msg.chatId]);
-                if (msg.chat && !isRunning) chats[msg.chatId] = msg.chat;
+                // PR383-R4 (loss window 2): _notifySubLifecycle's idle branch
+                // pushes injected user rows (lifecycle notices) straight into
+                // the SW's chats copy. A panel's run-agent for an idle chat
+                // adopts the incoming snapshot wholesale below — a stale panel
+                // snapshot taken BEFORE the notice broadcast would silently
+                // clobber those rows. Carry over injected:true user rows that
+                // exist in the SW copy but not in the incoming snapshot
+                // (append at the end when their original index is gone — the
+                // run starts on a user turn either way). Content-equality
+                // dedup keeps rows the panel already has from duplicating.
+                if (msg.chat && !isRunning) {
+                    try {
+                        var _swPrev = chats[msg.chatId];
+                        if (_swPrev && Array.isArray(_swPrev.messages) && Array.isArray(msg.chat.messages)) {
+                            var _incomingMsgs = msg.chat.messages;
+                            // PR384-FIX-7: COUNT-BASED dedup. The old matcher treated
+                            // ONE content match as full presence, so a second
+                            // byte-identical lifecycle notice (e.g. the same sub
+                            // crashing twice with the same headline) was silently
+                            // dropped. Consume each incoming copy at most once so
+                            // surplus SW copies are carried over instead of collapsed.
+                            var _consumed = {};
+                            for (var _ci = 0; _ci < _swPrev.messages.length; _ci++) {
+                                var _cm = _swPrev.messages[_ci];
+                                if (!_cm || _cm.role !== 'user' || !_cm.injected || typeof _cm.content !== 'string') continue;
+                                var _present = false;
+                                for (var _cj = 0; _cj < _incomingMsgs.length; _cj++) {
+                                    if (_consumed[_cj]) continue; // already matched by an earlier SW row
+                                    var _im = _incomingMsgs[_cj];
+                                    if (_im && _im.role === 'user' && _im.injected && _im.content === _cm.content) { _consumed[_cj] = true; _present = true; break; }
+                                }
+                                if (!_present) _incomingMsgs.push(_cm);
+                            }
+                        }
+                    } catch (e) { console.warn('[port-bridge] injected-row carry-over failed', msg.chatId, e); }
+                    chats[msg.chatId] = msg.chat;
+                }
+                // SWM-S1 (flap message loss): a run-agent for a chat the SW is STILL
+                // running means the page took its IDLE send path during a port-flap
+                // window (the bus onDisconnect cleared the page's runningChatIds), so
+                // the user's freshly-typed message lives ONLY in this discarded
+                // snapshot — the guard below skips the run and the next agent-event
+                // broadcast overwrites the page mirror, silently dropping it. Recover:
+                // extract trailing user-role messages (and their attachment rows)
+                // present in msg.chat but absent from the SW's own copy, and route
+                // them through the existing mid-run injection path exactly as if the
+                // page had posted send-message to a running chat.
+                if (msg.chat && isRunning) {
+                    try {
+                        // REG376-1: also dedup against the un-flushed pending
+                        // injection queue (third arg) — a second flap arriving
+                        // BEFORE the loop's flushPendingInjection consumed a
+                        // previous flap's recovery re-extracted the same block
+                        // (it is absent from the SW chat rows) and the merge
+                        // below / in _handlePanelSendMessage concatenated a
+                        // duplicate of the user's text.
+                        var _unseen = _extractUnseenTrailingUserInput(msg.chat, chats[msg.chatId], pendingInjectionsByChatId[msg.chatId]);
+                        if (_unseen) {
+                            console.warn('[port-bridge] run-agent arrived for running chat', msg.chatId,
+                                '— recovering', _unseen.count, 'unseen trailing user message(s) via mid-run injection');
+                            if (runningChatIds[msg.chatId]) {
+                                // Running branch of _handlePanelSendMessage: merge into
+                                // pendingInjectionsByChatId + interrupt/abort — the loop's
+                                // flushPendingInjection pushes it next iteration.
+                                _handlePanelSendMessage({ chatId: msg.chatId, text: _unseen.text, images: _unseen.images });
+                            } else {
+                                // _runCleanupGuard window (finish→hook-rerun): the loop is
+                                // between iterations — queue the injection WITHOUT firing an
+                                // interrupt (same merge semantics as _handlePanelSendMessage's
+                                // running branch); the re-run's flushPendingInjection flushes it.
+                                var _exInj = pendingInjectionsByChatId[msg.chatId];
+                                if (_exInj) {
+                                    var _mTxt;
+                                    if (_exInj.text && _unseen.text) _mTxt = _exInj.text + '\n\n' + _unseen.text;
+                                    else _mTxt = _exInj.text || _unseen.text || null;
+                                    var _mImgs;
+                                    if (_exInj.images && _unseen.images) _mImgs = _exInj.images.concat(_unseen.images);
+                                    else _mImgs = _exInj.images || _unseen.images || null;
+                                    pendingInjectionsByChatId[msg.chatId] = { text: _mTxt, images: _mImgs };
+                                } else {
+                                    pendingInjectionsByChatId[msg.chatId] = { text: _unseen.text, images: _unseen.images };
+                                }
+                            }
+                        }
+                    } catch (e) { console.error('[port-bridge] flap-recovery injection failed', msg.chatId, e); }
+                }
                 if (msg.currentProvider) currentProvider = msg.currentProvider;
                 // SWM1F-1: a run-agent means the user intends this chat to run
                 // now, so clear any stale SW-side pause flag. Post-SW-move the
@@ -239,6 +386,32 @@ function _handlePanelMessage(port, msg) {
                             try { runAgent(msg.chatId); }
                             catch (e) { console.error('[port-bridge] runAgent threw', e); }
                         }
+                    })
+                    .catch(function(e) {
+                        // A gate failure (IDB/provider load) must surface — without
+                        // this the user's run is silently dropped with no diagnostic.
+                        console.error('[port-bridge] run-agent gate chain failed', msg.chatId, e);
+                        // Emit the terminal event too: the panel showed a spinner and
+                        // parked an _pendingRunAgents promise the moment it posted
+                        // run-agent. A console line alone leaves that spinner live and
+                        // every `await runAgent()` caller hanging until the 15s
+                        // no-hello fallback (or forever on a healthy port) — the exact
+                        // hang class the runCrashed settle in 045 closes. runCrashed
+                        // is safe for a run that never started: the 036 handler's
+                        // cleanup is no-op-tolerant and 045's settle just resolves.
+                        // RES-2: this gate chain ALSO runs for run-agent posts on
+                        // chats that are already live (port-flap re-post, SWM-S1
+                        // above) — the .then deliberately skips runAgent for them.
+                        // A transient gate rejection must not crash that healthy
+                        // run: only emit runCrashed when the chat is NOT live
+                        // (same liveness check as `isRunning` above).
+                        try {
+                            if (msg.chatId && typeof AgentEvents !== 'undefined' && AgentEvents.emit
+                                && !runningChatIds[msg.chatId]
+                                && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[msg.chatId])) {
+                                AgentEvents.emit('runCrashed', { chatId: msg.chatId });
+                            }
+                        } catch (e2) {}
                     });
             }
             return;
@@ -253,12 +426,47 @@ function _handlePanelMessage(port, msg) {
             // _swBootReady guarantees `chats` is hydrated first (the page now also
             // inlines a chat snapshot — app/040-send-message.js — so a brand-new chat
             // not yet persisted to IDB still seeds correctly without clobbering siblings).
+            // QUEUE-SYNC-FIX: a send to a RUNNING chat must be handled SYNCHRONOUSLY.
+            // The running branch only touches in-memory maps (pendingInjectionsByChatId /
+            // userInterruptedChats / interrupt resolver / stream abort) — it needs neither
+            // chats hydration nor providers. Deferring it behind the async boot chain broke
+            // the single-port FIFO ordering the interrupt path depends on (SWM-SW-NOGEN-NOTE):
+            // the abort must land while the stream/tool it targets is still the current step,
+            // otherwise the resolver/abort fire as no-ops in the between-steps gap and the
+            // queued message only flushes at the end of the run. The SWM14-T7 wipe risk only
+            // applies to the IDLE branch (which writes chats + IDB); during the cold-boot
+            // window runningChatIds is empty, so this fast path can never take that branch.
+            if (msg.chatId && runningChatIds[msg.chatId]) {
+                try { _handlePanelSendMessage(msg); }
+                catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
+                return;
+            }
             (self._swBootReady || Promise.resolve())
                 .then(function() { return Platform.ready; })
                 .then(function() { return loadApiProviders(); })
                 .then(function() {
                     try { _handlePanelSendMessage(msg); }
                     catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
+                })
+                .catch(function(e) {
+                    // A gate failure (IDB/provider load) must surface — without
+                    // this the user's message is silently dropped with no diagnostic.
+                    console.error('[port-bridge] send-message gate chain failed', msg.chatId, e);
+                    // Same rationale as the run-agent catch above: unstick the
+                    // panel's spinner/streaming UI and settle any pending runAgent
+                    // promise for this chat instead of leaving them hanging.
+                    try {
+                        // PR384-FIX-3: guard the emit with the SAME liveness check
+                        // as the run-agent gate catch above. FIX-1's handler now
+                        // routes runCrashed into a terminal sub settle, so an
+                        // unguarded emit here (this gate chain also runs for sends
+                        // on chats that are already live) could error a HEALTHY sub.
+                        if (msg.chatId && typeof AgentEvents !== 'undefined' && AgentEvents.emit
+                            && !runningChatIds[msg.chatId]
+                            && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[msg.chatId])) {
+                            AgentEvents.emit('runCrashed', { chatId: msg.chatId });
+                        }
+                    } catch (e2) {}
                 });
             return;
 
@@ -357,7 +565,8 @@ function _handlePanelMessage(port, msg) {
             // chats[chatId] while a run is in flight for it, otherwise we
             // clobber the SW's in-flight tool_result placeholders / partial
             // assistant message and the next save persists an orphan shape.
-            if (msg.chatId && msg.chat && !runningChatIds[msg.chatId]) {
+            if (msg.chatId && msg.chat && !runningChatIds[msg.chatId]
+                && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[msg.chatId])) {
                 chats[msg.chatId] = msg.chat;
             }
             return;
@@ -436,6 +645,150 @@ function _handlePanelMessage(port, msg) {
     }
 }
 
+// SWM-S1: extract the trailing user-input block of an incoming chat snapshot
+// that the SW's own copy does NOT have. Used by the run-agent handler's
+// flap-recovery path above. Walks the snapshot tail collecting user-input
+// rows (user text + screenshot/pdf/file attachment rows — the shapes the
+// page's idle send path pushes), then drops any row already present in the
+// SW copy's tail under a CONSERVATIVE identity check (exact role + content /
+// base64 + name match) — preferring a skipped recovery over a double-inject.
+// REG376-1: pendInj (optional) is the chat's un-flushed pendingInjectionsByChatId
+// entry — candidates already queued there are 'seen' too, or a second flap
+// inside the queue→flush window re-recovered and duplicated them.
+// Returns { text, images, count } or null when nothing unseen remains.
+function _extractUnseenTrailingUserInput(inChat, swChat, pendInj) {
+    var inMsgs = (inChat && inChat.messages) || [];
+    var swMsgs = (swChat && swChat.messages) || [];
+    // REG-F4: include 'context' — the page's idle send path pushes a
+    // role:'context' row AFTER the user row for Smart Document references
+    // (app/040-send-message.js); without it the backward walk broke at the
+    // context row and recovered NOTHING for a doc-referencing send.
+    var TRAIL_ROLES = { user: 1, screenshot: 1, pdf: 1, file: 1, context: 1 };
+    var block = [];
+    for (var i = inMsgs.length - 1; i >= 0; i--) {
+        var m = inMsgs[i];
+        if (!m || !TRAIL_ROLES[m.role]) break;
+        block.unshift(m);
+    }
+    if (!block.length) return null;
+    // REG-F2 (revised): scan everything the SW added BEYOND the shared
+    // prefix, not the entire SW copy. The page mirror is exactly
+    // <shared prefix> + <trailing block>, so the prefix occupies SW indexes
+    // 0..(inMsgs.length - block.length - 1) and anything the SW appended
+    // while the port was down — including the tool-heavy 20+-row tails the
+    // original bounded (+20) scan missed — sits at index >= that boundary.
+    // Scanning from the boundary keeps REG-F2's guarantee (an already-
+    // processed message arbitrarily deep in the SW tail is still found, no
+    // double-inject + interrupt of a healthy stream) WITHOUT the full-scan
+    // regression: with tailStart 0, a genuinely-new re-send whose text
+    // equals ANY older row in the shared history ("yes", "ok", "continue")
+    // dedup-matched the OLD occurrence and the recovery was silently
+    // dropped.
+    var tailStart = Math.max(0, inMsgs.length - block.length);
+    function _seenInSwTail(cand) {
+        // REG376-1: a cand already sitting in the un-flushed pending injection
+        // (a previous flap's recovery the loop hasn't consumed yet) is seen —
+        // it lives in NO chat row yet, so the SW-tail scan below cannot find
+        // it. Text cands match whole or as a '\n\n'-boundary segment (pendInj
+        // text is itself a '\n\n' join — same anchoring as the REG-AUDIT-1 row
+        // check); attachment cands match on content/base64 + name.
+        if (pendInj) {
+            if ((cand.role === 'user' || cand.role === 'context') &&
+                typeof cand.content === 'string' && cand.content &&
+                typeof pendInj.text === 'string' && pendInj.text &&
+                (pendInj.text === cand.content ||
+                 ('\n\n' + pendInj.text + '\n\n').indexOf('\n\n' + cand.content + '\n\n') !== -1)) return true;
+            if (cand.role !== 'user' && cand.role !== 'context' && pendInj.images && pendInj.images.length) {
+                for (var k = 0; k < pendInj.images.length; k++) {
+                    var pImg = pendInj.images[k];
+                    if (cand.role === 'file') {
+                        if (pImg.fileType === 'file' && pImg.content === cand.content && pImg.name === cand.name) return true;
+                    } else if (pImg.base64 && pImg.base64 === cand.base64 && pImg.name === cand.name) return true;
+                }
+            }
+        }
+        for (var j = swMsgs.length - 1; j >= tailStart; j--) {
+            var s = swMsgs[j];
+            if (!s) continue;
+            // REG-F4: a recovered context row is re-injected JOINED into a
+            // single user row by flushPendingInjection (its content is appended
+            // to the injected text), so dedup must also treat a user row
+            // CONTAINING the context pointer as 'seen'. The bracketed pointer
+            // carries a unique doc_id, so containment cannot false-positive
+            // the way generic user text would.
+            if (cand.role === 'context' && s.role === 'user' &&
+                typeof s.content === 'string' && typeof cand.content === 'string' &&
+                cand.content && s.content.indexOf(cand.content) !== -1) return true;
+            if (s.role !== cand.role) continue;
+            if (cand.role === 'user' || cand.role === 'context') {
+                if (s.content === cand.content) return true;
+                // REG-AUDIT-1: a recovered multi-row block (user text + context
+                // rows) is re-injected by flushPendingInjection as ONE user row
+                // whose content is texts.join('\n\n'). Exact equality alone
+                // misses the original user cand inside that joined SW row
+                // ("M2\n\nC" never === "M2") → a second port flap duplicated
+                // the user's text. Treat the cand as seen when an SW user row
+                // contains it as a '\n\n'-boundary-delimited segment; the
+                // boundary anchoring (and multi-paragraph cands matching as a
+                // whole) avoids generic substring false positives, and the
+                // tailStart-bounded loop preserves #375's bounded-scan
+                // guarantee.
+                // REG376-2: containment applies ONLY to rows stamped
+                // injected:true by flushPendingInjection (the only writer of
+                // joined rows). Matching ANY user row dropped a genuinely-new
+                // re-send whose text equaled a '\n\n'-paragraph of an earlier
+                // organic multi-paragraph message. (Joined rows persisted
+                // before the stamp existed lose containment dedup, but that
+                // exposure is transient — only flap windows on already-running
+                // chats are scanned.)
+                if (s.role === 'user' && s.injected === true &&
+                    typeof s.content === 'string' && typeof cand.content === 'string' && cand.content &&
+                    s.content !== cand.content &&
+                    ('\n\n' + s.content + '\n\n').indexOf('\n\n' + cand.content + '\n\n') !== -1) return true;
+            } else if (cand.role === 'file') {
+                if (s.content === cand.content && s.name === cand.name) return true;
+            } else {
+                if (s.base64 === cand.base64 && s.name === cand.name) return true;
+            }
+        }
+        return false;
+    }
+    var texts = [];
+    var images = [];
+    // REG-F4: unseen context rows ride along inline in block order — their
+    // content is already a self-describing bracketed pointer ("[User
+    // referenced Smart Document ...]") so joining them into the injected text
+    // preserves the doc_id for the model. They never count as recoverable user
+    // input on their own: the page always pushes the user row first, so a
+    // context-only unseen block means there is nothing genuinely new to
+    // recover.
+    var hasUserInput = false;
+    block.forEach(function(m) {
+        if (_seenInSwTail(m)) return;
+        if (m.role === 'user') {
+            if (typeof m.content === 'string' && m.content) { texts.push(m.content); hasUserInput = true; }
+        } else if (m.role === 'context') {
+            if (typeof m.content === 'string' && m.content) texts.push(m.content);
+        } else if (m.role === 'pdf') {
+            images.push({ fileType: 'pdf', base64: m.base64, name: m.name, file_id: m.file_id });
+            hasUserInput = true;
+        } else if (m.role === 'file') {
+            images.push({ fileType: 'file', content: m.content, name: m.name, mimeType: m.mimeType, size: m.size, file_id: m.file_id });
+            hasUserInput = true;
+        } else {
+            images.push({ fileType: 'image', base64: m.base64, name: m.name, width: m.width, height: m.height, file_id: m.file_id });
+            hasUserInput = true;
+        }
+    });
+    // REG-F4: context-only (or empty) recovery ⇒ nothing to recover.
+    if (!hasUserInput) return null;
+    return {
+        text: texts.length ? texts.join('\n\n') : null,
+        images: images.length ? images : null,
+        count: texts.length + images.length
+    };
+}
+
 // Handle a send-message from a panel.
 //
 // Two modes:
@@ -459,6 +812,17 @@ async function _handlePanelSendMessage(msg) {
     // running-branch case where the loop is about to exit on a stale pause.
     pausedChats[chatId] = false;
     pausedChatIds[chatId] = false;
+
+    // RES-6: a user send into a SUB-AGENT chat is an unsolicited lifecycle
+    // event — stamp user_interactions.last_user_message_at on the record and
+    // push a lifecycle notice to the parent (the sub may go off-script under
+    // user direction). Covers both branches below (live injection AND idle
+    // restart). Best-effort: a hook failure must never block the send.
+    if (chats[chatId] && chats[chatId].isSubAgent
+        && typeof SubAgents !== 'undefined' && SubAgents.onUserMessageToSubChat) {
+        try { SubAgents.onUserMessageToSubChat(chatId); }
+        catch (e) { console.warn('[port-bridge] onUserMessageToSubChat threw', e); }
+    }
 
     if (runningChatIds[chatId]) {
         // SWM-INJ-DROP: concatenate rather than flat-replace. Two rapid sends inside one
@@ -518,7 +882,9 @@ async function _handlePanelSendMessage(msg) {
 // skipped by the runningChatIds guard inside runAgent.
 // =============================================================
 function resumeRunningCheckpoints(checkpoints) {
-    if (!checkpoints || !checkpoints.length) return;
+    // REG-AUDIT-2: nothing to resume — the scan is decided; settle so the
+    // page's hello-grace reconcile doesn't keep extending its grace window.
+    if (!checkpoints || !checkpoints.length) { _settleResumeScan(); return; }
     // Three gates, in order:
     //   1. _swBootReady — `chats` and providers are loaded. background.js's
     //      onStartup/heartbeat path calls this function independently of
@@ -544,11 +910,123 @@ function resumeRunningCheckpoints(checkpoints) {
                 // the model on resume will either accept the placeholder or issue
                 // a fresh tool_use (which the panel would also execute). Either
                 // way the replayed call's result is discarded. Cleaner to skip.
+                // ZR-1: SUB-AGENT chats resume only when the registry still
+                // says 'running' — loadAllSubAgents (awaited by 190-entry's
+                // boot Promise.all BEFORE this scan runs) keeps checkpoint-
+                // resumable subs 'running' and claims their pool slot, and
+                // orphan-errors the rest. Resuming a terminal/missing record
+                // would restart the loop as a ZOMBIE: tokens burned outside
+                // the pool cap, report_to_parent rejected against an already-
+                // settled record + handle. Reap the stale checkpoint so the
+                // alarm-driven path (background.js → this function) can't
+                // revive it later either.
+                var _chatRow = (typeof chats !== 'undefined') ? chats[cp.chatId] : null;
+                var _looksSub = ((cp.chatId || '').indexOf('chat_sub_') === 0)
+                    || !!(_chatRow && _chatRow.isSubAgent);
+                if (_looksSub) {
+                    var _subRec = (typeof SubAgents !== 'undefined' && SubAgents.getByChatId)
+                        ? SubAgents.getByChatId(cp.chatId) : null;
+                    if (!_subRec) {
+                        // ZR1 follow-up: a missing record means EITHER the
+                        // record was GC'd (stale checkpoint — reap) OR the
+                        // registry never hydrated this boot (loadAll failed;
+                        // 097 swallows the drain error and isLoaded() stays
+                        // false). Reaping on a failed hydration irreversibly
+                        // loses a resumable sub — skip (no resume, no reap)
+                        // and let the alarm-driven path retry after a
+                        // successful hydration.
+                        if (typeof SubAgents !== 'undefined' && SubAgents.isLoaded && SubAgents.isLoaded()) {
+                            try { deleteAgentCheckpoint(cp.chatId); } catch (e) {}
+                        }
+                        return;
+                    }
+                    if (_subRec.state !== 'running') {
+                        // Record already terminal/sleeping — stale checkpoint,
+                        // never restart. (The record EXISTS and is
+                        // authoritative, so the reap is correct regardless of
+                        // hydration state.)
+                        try { deleteAgentCheckpoint(cp.chatId); } catch (e) {}
+                        return;
+                    }
+                    if (!_chatRow) {
+                        // Running record but the chat transcript vanished from
+                        // the chats store (runAgent would crash; the boot
+                        // decision in 097 deliberately skipped this check — it
+                        // races loadChatsFromStorage there, but here the boot
+                        // Promise.all has settled so absence is real). Settle
+                        // everything (record + rehydrated pending handle +
+                        // pool slot + parent notice) via markOrphaned.
+                        try {
+                            if (SubAgents.markOrphaned) SubAgents.markOrphaned(_subRec.agent_id);
+                        } catch (e) {}
+                        try { deleteAgentCheckpoint(cp.chatId); } catch (e) {}
+                        return;
+                    }
+                }
                 if (!runningChatIds[cp.chatId]) {
-                    try { runAgent(cp.chatId); }
-                    catch (e) { console.error('[port-bridge] resume runAgent threw', cp.chatId, e); }
+                    if (_looksSub && _subRec) {
+                        // ZR1-R1: the boot decision in 097 already claimed this
+                        // sub's pool slot; a runAgent failure here (sync throw OR
+                        // async rejection before the loop's runFinished/runCrashed
+                        // events exist) would otherwise leave the record fake-
+                        // 'running' with a claimed slot + pending handle forever
+                        // (no sweeper covers 'running'). Same wrapper pattern as
+                        // _drainPool: settle record/slot/handle via markOrphaned,
+                        // then reap the checkpoint ONLY if the record went
+                        // terminal (see the conditional reap in the catch — a
+                        // transient crash keeps the sub alive via the retry latch).
+                        Promise.resolve()
+                            .then(function() { return runAgent(cp.chatId); })
+                            .catch(function(err) {
+                                console.error('[port-bridge] resume runAgent failed for sub chat', cp.chatId, err);
+                                try {
+                                    if (typeof SubAgents !== 'undefined' && SubAgents.markOrphaned) {
+                                        SubAgents.markOrphaned(_subRec.agent_id, 'resume failed: ' + (err && err.message || err));
+                                    }
+                                } catch (e2) {}
+                                // ZR1-R1 (follow-up): markOrphaned routes a
+                                // TRANSIENT-class failure with an unused retry
+                                // latch into _queueTransientRetry — the sub is
+                                // still ALIVE (state stays 'running', re-queued
+                                // or in the ~8s throttle back-off) and its next
+                                // runStarted re-writes the checkpoint. Reaping
+                                // unconditionally here left the live retry with
+                                // no durable checkpoint until then — an SW death
+                                // in that window orphaned a sub that should have
+                                // resumed. Only reap when the record actually
+                                // went terminal (or is gone): a still-'running'
+                                // record means the retry owns the checkpoint.
+                                try {
+                                    var _postRec = (typeof SubAgents !== 'undefined' && SubAgents.getByChatId)
+                                        ? SubAgents.getByChatId(cp.chatId) : null;
+                                    if (!_postRec || _postRec.state !== 'running') {
+                                        try { deleteAgentCheckpoint(cp.chatId); } catch (e2) {}
+                                    }
+                                } catch (e2) {}
+                            });
+                    } else {
+                        try { runAgent(cp.chatId); }
+                        catch (e) { console.error('[port-bridge] resume runAgent threw', cp.chatId, e); }
+                    }
                 }
             });
+            // REG-AUDIT-2: every checkpoint has been re-armed (runAgent fires
+            // runStarted synchronously enough for the page's grace re-check) —
+            // the resume scan is settled.
+            _settleResumeScan();
+        })
+        .catch(function(e) {
+            // REG-AUDIT-2: a gate failure must still settle, or the page would
+            // burn its extended grace window for nothing.
+            console.error('[port-bridge] resume gate chain failed', e);
+            // ZR1-R1: nothing was resumed, but the boot decision in 097 already
+            // claimed pool slots for checkpoint-resumable subs. Without runAgent
+            // those records stay fake-'running' (claimed slot, pending handle)
+            // for the whole SW session and block the 2-slot pool. Orphan them so
+            // record + slot + handle + parent card all settle — shared registry-
+            // side sweep (also used by 190-entry's outer boot .catch).
+            _orphanUnresumedSubs('resume aborted: boot gate chain failed: ' + (e && e.message || e));
+            _settleResumeScan();
         });
 }
 self.resumeRunningCheckpoints = resumeRunningCheckpoints;

@@ -86,6 +86,7 @@ if (typeof updateContextIndicator !== 'function') var updateContextIndicator = f
 if (typeof updateStreamingMessage !== 'function') var updateStreamingMessage = function() {};
 if (typeof setLLMConnectionStatus !== 'function') var setLLMConnectionStatus = function() {};
 if (typeof fetchCredits !== 'function') var fetchCredits = function() {};
+if (typeof refreshClaudeOAuthUsage !== 'function') var refreshClaudeOAuthUsage = function() {};
 
 // =============================================================
 // Intentional SW-bundle gaps — declared as no-ops to satisfy the
@@ -204,6 +205,7 @@ if (typeof isChatPaused !== 'function') {
 // so the SW respects the user's auto-title / showHookMessages toggles.
 var hooksEnabled = (typeof hooksEnabled === 'object' && hooksEnabled) || {
     autoTitle: true,
+    autoTldr: true,
     showHookMessages: false
 };
 var _silentHookRunning = (typeof _silentHookRunning !== 'undefined') ? _silentHookRunning : false;
@@ -215,7 +217,11 @@ var _silentHookRunning = (typeof _silentHookRunning !== 'undefined') ? _silentHo
 async function loadHooksSettings() {
     if (typeof getSetting !== 'function') return;
     var saved = await getSetting('hooksEnabled', null);
-    if (saved !== null) hooksEnabled = saved;
+    if (saved !== null) {
+        hooksEnabled = saved;
+        // Migration: autoTldr was added after users may have saved settings.
+        if (hooksEnabled.autoTldr === undefined) hooksEnabled.autoTldr = true;
+    }
 }
 
 // Hydrate tool / instance permissions from IDB. Matches the page-side
@@ -238,11 +244,93 @@ async function loadToolPermissionsInWorker() {
     } catch (e) {}
 }
 
+// Find the final-answer assistant message of the last REAL (non-hook) turn —
+// same search as executeSetTldr in tools/020-tool-execution.js. Local copy:
+// core/040-hooks-history.js (which declares the page-side findTldrTarget) is
+// excluded from the worker bundle.
+function findTldrTarget(chat) {
+    if (!chat || !chat.messages) return null;
+    var lastUserIdx = -1;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx === -1) return null;
+    // Anchor the search span to the REAL turn: stop before the first hook
+    // user message after the last real user message — prose replies to hook
+    // runs must never become TLDR targets.
+    var endIdx = chat.messages.length - 1;
+    for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
+        if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
+    }
+    for (var j = endIdx; j > lastUserIdx; j--) {
+        var am = chat.messages[j];
+        if (am.role === 'assistant' && am.content && !am.isStreaming) {
+            // Never target a message carrying a set_tldr tool call, regardless
+            // of its content. (A spontaneous set_chat_title call alongside the
+            // answer text is fine — still a valid target.)
+            var hasSetTldr = am.tool_calls && am.tool_calls.some(function(tc) {
+                return tc.function && tc.function.name === 'set_tldr';
+            });
+            if (hasSetTldr) continue;
+            return am;
+        }
+    }
+    return null;
+}
+
 function executeAfterResponseHooks(chatId) {
-    if (!hooksEnabled.autoTitle) return;
     var chat = chats[chatId];
     if (!chat || !chat.messages || chat.messages.length < 2) return;
-    if (chat.title && chat.title !== 'New Chat') return;
+
+    // Auto-title hook. Provisional titles (first-message snippet set by the
+    // page's updateChatTitle) still need upgrading to a model-generated title.
+    var needsTitle = false;
+    if (hooksEnabled.autoTitle && (!chat.title || chat.title === 'New Chat' || chat.titleProvisional)) {
+        // Retry cap (mirrors core/040-hooks-history.js): success clears
+        // titleProvisional via executeSetChatTitle, so reaching here again means
+        // the previous attempt failed. After 2 failures, keep the provisional
+        // snippet as the final title.
+        chat._titleHookTries = (chat._titleHookTries || 0) + 1;
+        if (chat._titleHookTries > 2) {
+            delete chat.titleProvisional;
+            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        } else {
+            needsTitle = true;
+        }
+    }
+
+    // TLDR hook: ask for a TL;DR card on the final answer of the last real
+    // turn. Single attempt per answer (_tldrAsked, set BEFORE firing)
+    // prevents hook loops when the model fails to call set_tldr.
+    // Skipped on background chats (actions / sub-agents): the TL;DR card is
+    // never rendered there, so the extra hook LLM run would be pure waste.
+    var needsTldr = false;
+    if (hooksEnabled.autoTldr && !chat.isBackground) {
+        var tldrTarget = findTldrTarget(chat);
+        if (tldrTarget && !tldrTarget.tldr && !tldrTarget._tldrAsked) {
+            // Retry cap mirroring _titleHookTries: a successful set_tldr
+            // resets the counter (executeSetTldr); repeated failures stop
+            // burning an extra LLM run on every subsequent response.
+            chat._tldrHookTries = (chat._tldrHookTries || 0) + 1;
+            if (chat._tldrHookTries <= 2) {
+                tldrTarget._tldrAsked = true;
+                needsTldr = true;
+            }
+        }
+    }
+
+    if (!needsTitle && !needsTldr) return;
+
+    var instruction;
+    if (needsTitle && needsTldr) {
+        instruction = 'Now do two things using tools, and say nothing else: 1) set a concise chat title (max 50 chars) using the set_chat_title tool; 2) provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars).';
+    } else if (needsTldr) {
+        instruction = 'Now provide a TL;DR of your answer using the set_tldr tool — 1-2 short sentences (max 280 chars) summarizing the outcome. Do NOT say anything else.';
+    } else {
+        instruction = 'Now set a concise chat title (max 50 chars) for this conversation using the set_chat_title tool. Do NOT say anything else.';
+    }
+
     _silentHookRunning = !hooksEnabled.showHookMessages;
     // Tell the page to mirror the silent-hook flag so its render gates
     // suppress this hook's streaming output (prevents the flash of lines
@@ -253,7 +341,7 @@ function executeAfterResponseHooks(chatId) {
     }
     chat.messages.push({
         role: 'user',
-        content: 'Now set a concise chat title (max 50 chars) for this conversation using the set_chat_title tool. Do NOT say anything else.',
+        content: instruction,
         isHookMessage: true
     });
     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();

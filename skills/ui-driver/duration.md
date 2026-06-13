@@ -48,4 +48,4 @@ async function setDuration(varName, parts){            // parts = {days,hours,mi
 - **`fill` alone commits** — each sub-input's `ng-change="updateDuration()"` fires on the `change` event that `fill` dispatches; the trailing `blur` is belt-and-suspenders.
 
 ---
-*Verified on a live Employee Center Duration field:* days/hours/minutes/seconds set via `fill` each read back exactly; the fieldset `#sp_formfield_<varname>` wraps `#dur-{days,hours,minutes,seconds}-<varname>` with no aggregate input.
+*Verified on a live Employee Center Duration field:* days/hours/minutes/seconds set via `fill` each read back exactly; the fieldset `#sp_formfield_<varname>` wraps `#dur-{days,hours,minutes,seconds}-<varname>` with no aggregate input. *Re-verified end-to-end (2026-06, second instance):* `setDuration({3,4,30,0})` read back exactly; `input#sp_formfield_<var>` matched 0 (fieldset confirmed).

@@ -34,7 +34,7 @@ Runs a smoke test on the page currently open in the browser panel.
 Shows what's been changed in the instance in the last 24 hours.
 
 1. `update_action_state({ state: 'running', icon: 'clock', label: 'Loading changes…' })`
-2. `servicenow_api` GET on `sys_update_xml` with `sysparm_query: sys_updated_on>javascript:gs.hoursAgoStart(24)` and fields `name,target_name,type,sys_updated_on,sys_updated_by`
+2. `servicenow_api` GET on `sys_update_xml` with `query: sys_updated_on>javascript:gs.hoursAgoStart(24)` and fields `name,target_name,type,sys_updated_on,sys_updated_by`
 3. Render via `display` `table` sorted by `sys_updated_on` desc
 4. `update_action_state({ state: 'done', icon: 'check', label: 'N changes in 24h' })`
 

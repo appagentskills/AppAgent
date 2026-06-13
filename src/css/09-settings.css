@@ -3,7 +3,7 @@
 .settings-btn .ui-icon { width: 16px; height: 16px; }
 .settings-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .settings-btn:focus { outline: 2px solid var(--text-link); outline-offset: 2px; }
-.settings-panel { display: none; position: fixed; width: 320px; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: 1000; }
+.settings-panel { display: none; position: fixed; width: 320px; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: var(--z-overlay-base); }
 .settings-panel.visible { display: block; }
 .settings-panel-header { display: flex; align-items: center; justify-content: space-between; padding: var(--space-6) var(--space-6) var(--space-5) var(--space-6); border-bottom: 1px solid var(--border); }
 .settings-panel-title { font-size: var(--text-body-lg); font-weight: var(--font-semibold); color: var(--text-primary); }
@@ -75,7 +75,7 @@
 
 /* "View source" inline icon button next to a tool name or group title */
 .tool-source-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); display: inline-flex; align-items: center; vertical-align: middle; }
-.tool-source-btn:hover { background: var(--bg-hover); color: var(--text); }
+.tool-source-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .tool-source-btn svg { width: 12px; height: 12px; }
 
 /* Settings checkbox */

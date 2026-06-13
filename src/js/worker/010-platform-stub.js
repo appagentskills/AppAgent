@@ -62,7 +62,12 @@ Platform.sendNotification = function(opts) {
     try {
         var title = (opts && opts.title) || 'AppAgent';
         var message = (opts && opts.message) || '';
-        chrome.notifications.create({
+        // 'appagent-' id prefix is REQUIRED: background.js's notifications.onClicked
+        // handler only focuses/opens the panel for ids starting with 'appagent-'.
+        // An auto-generated id would make the notification click a silent no-op.
+        // Random suffix: two notifications in the same millisecond would share an
+        // id and Chrome silently REPLACES the first (concurrent chats can finish together).
+        chrome.notifications.create('appagent-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), {
             type: 'basic',
             iconUrl: 'icons/AppAgentIconStarOnly_128.png',
             title: title,
@@ -181,11 +186,27 @@ Platform.getTokenForInstance = async function(instanceUrl) {
 };
 
 // Tab targeting (used by iframe_tool when args.instance is given).
-Platform.getTabForInstance = function(instanceUrl) {
+// When a target URL is given, only return a tab already sitting on that page
+// (same origin + path) so we never hand back a tab the user is actively using;
+// with no match, return null and let the caller's guarded adoption logic decide.
+Platform.getTabForInstance = function(instanceUrl, targetUrl) {
     for (var i = 0; i < Platform.instances.length; i++) {
-        if (Platform.instances[i].url === instanceUrl && Platform.instances[i].tabs.length > 0) {
-            return Platform.instances[i].tabs[0].id;
+        if (Platform.instances[i].url !== instanceUrl || Platform.instances[i].tabs.length === 0) continue;
+        var tabs = Platform.instances[i].tabs;
+        if (targetUrl) {
+            try {
+                var _tgt = new URL(targetUrl);
+                var _tgtPath = _tgt.pathname.replace(/\/+$/, '');
+                for (var j = 0; j < tabs.length; j++) {
+                    try {
+                        var _tu = new URL(tabs[j].url);
+                        if (_tu.origin === _tgt.origin && _tu.pathname.replace(/\/+$/, '') === _tgtPath) return tabs[j].id;
+                    } catch (e) {}
+                }
+                return null;
+            } catch (e) {}
         }
+        return tabs[0].id;
     }
     return null;
 };

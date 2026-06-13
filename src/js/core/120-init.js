@@ -86,13 +86,14 @@ async function init() {
     var homeCreditsDisplay = document.getElementById('home-credits-display');
     var cachedCreditsVal = appStorage.getItem('cachedCredits');
     if (creditsDisplay) {
-        creditsDisplay.onclick = fetchCredits;
-        if (cachedCreditsVal) creditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>$' + cachedCreditsVal;
+        creditsDisplay.onclick = function() { refreshClaudeOAuthUsage(true); fetchCredits(); };
+        // cachedCredits already embeds its unit ('$12.34' or '57% for 2h') — no '$' prefix
+        if (cachedCreditsVal) creditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedCreditsVal;
     }
     if (homeCreditsDisplay) {
-        homeCreditsDisplay.onclick = fetchCredits;
+        homeCreditsDisplay.onclick = function() { refreshClaudeOAuthUsage(true); fetchCredits(); };
         if (cachedCreditsVal) {
-            homeCreditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>$' + cachedCreditsVal;
+            homeCreditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedCreditsVal;
             homeCreditsDisplay.style.display = '';
         }
     }
@@ -174,8 +175,9 @@ async function init() {
     // Initialize image attachment event listeners (paste, drag & drop)
     initImageAttachmentListeners();
 
-    // Initialize cache token limit input
-    var cacheTokenInput = document.getElementById('cache-token-limit');
+    // Initialize cache token limit input (settings page; value in K tokens,
+    // matching renderSettingsPage in ui/040-tools-settings.js)
+    var cacheTokenInput = document.getElementById('settings-page-cache-limit');
     if (cacheTokenInput) cacheTokenInput.value = Math.round(cacheTokenLimit / 1000);
     
     // Setup and update storage indicator
@@ -216,6 +218,7 @@ async function init() {
     var urlInput = document.getElementById('browser-url-input');
     if (urlInput) urlInput.style.display = 'none';
     
+    var messageInput = document.getElementById('message-input');
     if (messageInput) messageInput.focus();
     
     // Initialize skills button icon
@@ -266,6 +269,18 @@ async function init() {
     // ===========================================
     // PHASE 2: IndexedDB async loading
     // ===========================================
+    // WIPE-GUARD: ask the browser to mark this origin's storage as persistent
+    // so IndexedDB (chats, skills, files) is exempt from best-effort eviction
+    // under disk pressure. Paired with the manifest's `unlimitedStorage`
+    // permission (lifts the per-origin quota). Best-effort — failures are
+    // non-fatal and logged only.
+    try {
+        if (navigator.storage && navigator.storage.persist) {
+            navigator.storage.persist().then(function(granted) {
+                if (!granted) console.warn('[init] storage.persist() not granted — origin data remains best-effort evictable');
+            }).catch(function() {});
+        }
+    } catch (e) {}
     await loadChatsFromStorage();
     await loadApiProviders();
     await loadProviderFromStorage();
@@ -362,7 +377,7 @@ async function init() {
     }
 
     // Restore pending input text for current chat (per-chat from IndexedDB)
-    var messageInput = document.getElementById('message-input');
+    // (messageInput was already looked up earlier in init — reuse it)
     if (messageInput && chatPendingTexts[currentChatId]) {
         messageInput.value = chatPendingTexts[currentChatId];
         autoResizeTextarea(messageInput);
@@ -519,6 +534,15 @@ async function init() {
 
     // Fetch credits last (external API call shouldn't block UI initialization)
     fetchCredits();
+    // For Claude OAuth, also kick a live usage refresh (no message needed) and keep it
+    // fresh whenever the panel regains focus (throttled inside the fn).
+    refreshClaudeOAuthUsage();
+    if (typeof document !== 'undefined' && !window._claudeUsageVisibilityWired) {
+        window._claudeUsageVisibilityWired = true;
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'visible') refreshClaudeOAuthUsage();
+        });
+    }
 }
 
 function toggleSkillsView() {
@@ -617,7 +641,7 @@ async function renderSkillsList() {
             attachmentsHtml += '</div>';
         }
         
-        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeHtml(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeHtml(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + badgesHtml + '</div>' + descSnippet + attachmentsHtml + '</div>';
+        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeJsString(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeJsString(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + badgesHtml + '</div>' + descSnippet + attachmentsHtml + '</div>';
     });
     container.innerHTML = html;
 }
@@ -808,8 +832,9 @@ async function renderSkillAssets() {
         var iconClass = asset.type === 'xml' ? 'xml' : (asset.type === 'js' ? 'js' : 'md');
         var typeLabel = asset.type === 'js' ? 'JS Tool' : asset.type.toUpperCase();
         var dropdownId = 'artifact-dropdown-' + idx;
-        // Escape for JS string context (not HTML entities)
-        var jsFilename = asset.filename.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        // Escape for JS-string-in-onclick context (handles \ ' " < > & — a
+        // user-renamable filename containing " must not break out of the attribute)
+        var jsFilename = escapeJsString(asset.filename);
         
         html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillAsset(\'' + jsFilename + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')viewSkillAsset(\'' + jsFilename + '\')" role="button" tabindex="0" aria-label="View asset: ' + escapeHtml(asset.filename) + '">';
         html += '<div class="sn-artifact-icon sn-icon-' + iconClass + '">' + icon + '</div>';

@@ -126,6 +126,11 @@ async function importAllData() {
                 var newId = 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
                 importedChat.id = newId;
                 importedChat.title = importedChat.title + ' (imported)';
+                // The import-time name is authoritative — drop a serialized
+                // provisional flag so the auto-title hook doesn't re-title the
+                // chat (losing the '(imported)' marker) on its next run.
+                delete importedChat.titleProvisional;
+                delete importedChat._titleHookTries;
                 importedChat.createdAt = Date.now();
                 chats[newId] = importedChat;
                 await saveChatsToStorage();

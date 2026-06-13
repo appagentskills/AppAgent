@@ -67,6 +67,9 @@ function confirmRenameChat(chatId) {
     var chat = chats[chatId];
     if (chat) {
         chat.title = newTitle;
+        // A user-chosen name is authoritative — clear the provisional flag so
+        // the auto-title hook doesn't overwrite the manual rename later.
+        delete chat.titleProvisional;
         saveChatsToStorage();
         renderChatList();
         if (chatId === currentChatId) updateChatTitleHeader();
@@ -125,6 +128,11 @@ function importSingleChat() {
             var newId = 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             importedChat.id = newId;
             importedChat.title = importedChat.title + ' (imported)';
+            // The import-time name is authoritative — drop a serialized
+            // provisional flag so the auto-title hook doesn't re-title the
+            // chat (losing the '(imported)' marker) on its next run.
+            delete importedChat.titleProvisional;
+            delete importedChat._titleHookTries;
             importedChat.createdAt = Date.now();
             
             // Add to chats without affecting existing ones

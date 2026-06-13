@@ -344,7 +344,8 @@ function replayParkedToolCalls(port) {
                         displayName: _ap.displayName,
                         args: _ap.args,
                         permissionKey: _ap.permissionKey,
-                        toolName: _ap.toolName
+                        toolName: _ap.toolName,
+                        widgetName: _ap.widgetName || null
                     });
                     AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed-approval' });
                 } else if (entry.alreadyDispatched) {
@@ -443,6 +444,7 @@ function dispatchUIToolToPort(port, chatId, toolCallId, name, input, resolve, re
     if (sandboxCtx) {
         if (sandboxCtx.fromSandbox) msg.fromSandbox = true;
         if (sandboxCtx.parentToolCallId) msg.parentToolCallId = sandboxCtx.parentToolCallId;
+        if (typeof sandboxCtx.messageIndex === 'number') msg.messageIndex = sandboxCtx.messageIndex;
     }
     port.postMessage(msg);
 }
@@ -586,9 +588,14 @@ executeTool = async function(name, args, messageIndex, options) {
             || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         if (_budgetChatId && typeof chats !== 'undefined' && chats[_budgetChatId]
             && chats[_budgetChatId].isSubAgent) {
+            // Soft cap: onToolCallInSubAgent counts usage and stages a budget
+            // warning (>=90% / past cap) that the agent loop appends to the
+            // next tool result via appendBudgetNotice. SAFETY BACKSTOP: past
+            // 2x max_tool_calls the registry force-stops the runaway sub and
+            // returns false — short-circuit so the stopped sub does no work.
             var _budgetOk = SubAgents.onToolCallInSubAgent(_budgetChatId);
             if (!_budgetOk) {
-                return { success: false, error: 'Sub-agent exceeded max_tool_calls budget. The sub has been stopped.', _budget_exhausted: true };
+                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped.', _budget_exhausted: true };
             }
         }
     }
@@ -602,6 +609,15 @@ executeTool = async function(name, args, messageIndex, options) {
     var sandboxCtx = (options && (options.fromSandbox || options.parentToolCallId))
         ? { fromSandbox: !!options.fromSandbox, parentToolCallId: options.parentToolCallId || null }
         : null;
+    // Carry the assistant-message index to the page executor. Without it the
+    // page runs the tool with messageIndex undefined and any recordMutated it
+    // emits is stamped -1 — which renderInlineChanges filters out, so the
+    // record never shows in the chat's Artifacts block. Piggybacks on
+    // sandboxCtx so it survives parkUIToolCall → replay re-dispatch too.
+    if (typeof messageIndex === 'number' && messageIndex >= 0) {
+        sandboxCtx = sandboxCtx || {};
+        sandboxCtx.messageIndex = messageIndex;
+    }
 
     var result = await new Promise(function(resolve, reject) {
         // Cross-restart reconciliation: the panel is already running this
@@ -720,6 +736,21 @@ executeTool = async function(name, args, messageIndex, options) {
         if (result._target_tab_persist != null) {
             chats[chatId].targetTabId = result._target_tab_persist;
             delete result._target_tab_persist;
+        }
+        // A SUB-AGENT's update_action_state progress card. The page-side tool
+        // attached the normalized snapshot to its result (its chats/SubAgents
+        // globals are read-only mirrors); persist it here in the SW — the
+        // authoritative writer — onto the registry record (agent_status
+        // exposes it to the parent) and the parent chat's sub_report card
+        // (renderSubReport draws the live tasks checklist). Strip the marker
+        // so it never reaches the model / the persisted tool result row.
+        if (result._sub_action_state) {
+            try {
+                if (typeof SubAgents !== 'undefined' && SubAgents.recordActionState) {
+                    SubAgents.recordActionState(chatId, result._sub_action_state);
+                }
+            } catch (_) { /* never fail the tool result over a progress mirror */ }
+            delete result._sub_action_state;
         }
         // Page-side tools (prompt_user, show_action_button) that push a
         // custom-role message into chat.messages need it mirrored to the SW
@@ -842,7 +873,8 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 // (see SWM3F-2).
                 parkUIToolCall(targetChatId, approvalRequestId, '__approval_prompt__', {
                     displayName: displayName, args: args, permissionKey: permissionKey,
-                    toolCallId: toolCallId, toolName: toolName
+                    toolCallId: toolCallId, toolName: toolName,
+                    widgetName: options.widgetName || null
                 }, resolve, reject);
                 return;
             }
@@ -868,7 +900,11 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 displayName: displayName,
                 args: args,
                 permissionKey: permissionKey,
-                toolName: toolName
+                toolName: toolName,
+                // Forward the originating widget's name so the panel-side prompt
+                // labels the notification correctly (mirrors the page-side path
+                // where options flow into showToolApprovalPrompt directly).
+                widgetName: options.widgetName || null
             });
         });
 
@@ -879,13 +915,31 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {
             Handles.markAwaitingApproval(options._handleChatId, options._handleId, true);
         }
+        // RES-6: a SUB-AGENT parked on a permission prompt is invisible to its
+        // parent — surface the park (once per episode) and the user's verdict
+        // through the registry so the parent gets a lifecycle notice.
+        var _subApprovalChat = !!(targetChatId && chats[targetChatId] && chats[targetChatId].isSubAgent
+            && typeof SubAgents !== 'undefined' && SubAgents.onSubApprovalEvent);
+        if (_subApprovalChat) {
+            try { SubAgents.onSubApprovalEvent(targetChatId, 'requested', { displayName: displayName }); } catch (eN) {}
+        }
         try {
             var approved = await approvalPromise;
+            // RES-6: user verdict — stamps user_interactions.last_user_approval_at
+            // and notifies the parent on denial.
+            if (_subApprovalChat) {
+                try { SubAgents.onSubApprovalEvent(targetChatId, (approved && approved.allowed) ? 'approved' : 'denied', { displayName: displayName }); } catch (eN2) {}
+            }
             if (approved && approved.allowed) {
                 return Object.assign({ allowed: true }, baseResult);
             }
             return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
         } catch (e) {
+            // RES-6: prompt aborted (panel disconnect etc.) — not a user verdict;
+            // just release the pending-approval episode counter.
+            if (_subApprovalChat) {
+                try { SubAgents.onSubApprovalEvent(targetChatId, 'aborted', { displayName: displayName }); } catch (eN3) {}
+            }
             return Object.assign({ allowed: false, error: 'Approval prompt error: ' + (e && e.message ? e.message : String(e)) }, baseResult);
         } finally {
             if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {

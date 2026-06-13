@@ -55,7 +55,8 @@ async function addToListCollector(C, query){    // mechanically identical to add
 
 - **Not a slushbucket** — don't look for arrows / dual panes on `/esc`; they don't exist here.
 - **Type per-character** (`type`, delay ~50ms); one-shot `fill` may not fire the debounced server search.
-- **Cold first search is slow (verified live).** The *first* glide_list query on a fresh form can sit in `#select2-drop li.select2-searching` ("Searching…") for **>8s** before results arrive (a later "warm" search returns in ~1s). Poll **up to ~15s** and keep waiting while `.select2-searching` is present; only fail fast on `.select2-no-results`. The original 8s/40-iteration window timed out on a cold search and threw an opaque "list results never appeared".
+- **Cold first search CAN be slow — but it's variable, not guaranteed.** One verified run saw the first glide_list query sit in `#select2-drop li.select2-searching` ("Searching…") for **>8s**; a re-verification run on another instance saw the cold search resolve in **~0.3s** (the ~3.5s of per-char typing itself absorbed the server latency). Treat the **~15s poll as an upper bound, not an expectation**: keep waiting while `.select2-searching` is present; only fail fast on `.select2-no-results`. (The original 8s/40-iteration window timed out on a cold search and threw an opaque "list results never appeared".)
+- **A no-results search is ALSO slow to say so** — `.select2-no-results` took ~4–5s to render after typing (verified). Poll for it inside the same loop; don't assert "no results" immediately after typing. After a no-results search, dispatch `keydown` `Escape` on the select2 input to close the drop before driving chips or other fields.
 - **Commit the highlighted top row** — make the query specific (or arrow-down first), or you add the wrong item.
 - **Starts-with typeahead — query the BEGINNING of the display name (verified live).** "Abel" → "Abel Tuter"; the surname "Tuter" → explicit **No matches**. The list matches the *start* of the display value, so leading tokens work and middle/last words don't (unless the instance is configured for contains-search). ⚠️ Earlier guidance here suggested a surname like "Tuter" — that was **wrong**; use a leading token like "Abel".
 - **Value is a hidden CSV text input**, not a `<select multiple>` — `select_option` does not apply.
@@ -64,3 +65,5 @@ async function addToListCollector(C, query){    // mechanically identical to add
 
 ---
 *Verified on a live Employee Center List Collector field:* two items added & removed; the hidden value updated to the selected sys_ids and cleared on remove. Commit via `mouseup` on the result label confirmed working (also `keydown Enter`). *Re-verified (starts-with):* `addToListCollector(C,"Abel")` committed the user's sys_id, while the surname "Tuter" returned **No matches** — query the leading token.
+
+*Re-verified end-to-end (2026-06, second instance):* "Abel" added (hidden CSV = the user's sys_id), "Tuter" → `.select2-no-results` after ~4.7s, chip remove cleared the CSV to `""`. Cold search resolved in ~0.3s on this run — confirming cold-search slowness is variable (poll window = upper bound).

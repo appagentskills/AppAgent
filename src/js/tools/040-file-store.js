@@ -134,6 +134,14 @@ async function getFileAsync(fileId) {
         try {
             var file = await getWorkspaceFile(ptr.workspace, ptr.path);
             if (!file) return null;
+            // Lazy clone: hydrate stub content before resolving the file
+            if (file.stub && file.content == null && typeof wsHydrate === 'function') {
+                try {
+                    await wsHydrate(ptr.workspace, [ptr.path]);
+                    file = await getWorkspaceFile(ptr.workspace, ptr.path);
+                } catch (e) { /* fall through to null-content guard */ }
+            }
+            if (!file || file.content == null) return null;
             var name = ptr.path.split('/').pop();
             var mime = guessMimeFromExt(name);
             var data = file.content;

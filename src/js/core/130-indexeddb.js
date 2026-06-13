@@ -1,12 +1,17 @@
 // IndexedDB for all app data (much larger capacity than localStorage)
 // Use prefix for iframe isolation (separate database for iframe vs standalone)
 var dbName = STORAGE_PREFIX + 'AppAgentDB';
-// Bumped to 12 for the sub_agents store (Phase 2 of the sub-agent
-// architecture spec). Schema migration is additive: existing stores
-// are untouched.
-var dbVersion = 12;
+// Bumped to 13 for the content-addressed `workspace_blobs` store: file
+// content is stored ONCE per git SHA and workspace_files rows become
+// lightweight refs (path, sha, flags) + dirty overlay content only.
+// v13 also runs an eager row migration inside the versionchange
+// transaction (see onupgradeneeded).
+var dbVersion = 13;
 var workspaceMetaStoreName = 'workspace_meta';
 var workspaceFilesStoreName = 'workspace_files';
+// Content-addressed blob store: { sha, content }. Shared across all
+// workspaces — git blobs are immutable, same sha == same bytes.
+var workspaceBlobsStoreName = 'workspace_blobs';
 var chatStoreName = 'chats';
 var settingsStoreName = 'settings';
 var skillsStoreName = 'skills';
@@ -118,6 +123,35 @@ function openDatabase() {
                 wsStore.createIndex('repo', 'repo', { unique: false });
                 wsStore.createIndex('repo_path', ['repo', 'path'], { unique: true });
             }
+            if (!database.objectStoreNames.contains(workspaceBlobsStoreName)) {
+                database.createObjectStore(workspaceBlobsStoreName, { keyPath: 'sha' });
+            }
+            // v13 migration: move pristine content out of workspace_files rows
+            // into the content-addressed blob store. Runs eagerly inside the
+            // versionchange transaction so rows and blobs commit atomically.
+            if (e.oldVersion < 13 && database.objectStoreNames.contains(workspaceFilesStoreName)) {
+                try {
+                    var migrationTx = e.target.transaction || request.transaction;
+                    var filesStore = migrationTx.objectStore(workspaceFilesStoreName);
+                    var blobStore = migrationTx.objectStore(workspaceBlobsStoreName);
+                    filesStore.openCursor().onsuccess = function(ev) {
+                        var cursor = ev.target.result;
+                        if (!cursor) return;
+                        try {
+                            var row = cursor.value;
+                            if (row && row.sha && row.original_content != null) {
+                                blobStore.put({ sha: row.sha, content: row.original_content });
+                                delete row.original_content;
+                                // Clean rows read their content from the blob;
+                                // dirty rows keep their overlay content inline.
+                                if (!row.dirty) delete row.content;
+                                cursor.update(row);
+                            }
+                        } catch (rowErr) { console.error('workspace_blobs v13 row migration failed:', rowErr); }
+                        cursor.continue();
+                    };
+                } catch (migErr) { console.error('workspace_blobs v13 migration failed:', migErr); }
+            }
             if (!database.objectStoreNames.contains(documentsStoreName)) {
                 database.createObjectStore(documentsStoreName, { keyPath: 'id' });
             }
@@ -181,6 +215,12 @@ function getAllProviders() {
     return apiProviders;
 }
 
+// WIPE-GUARD: mirrors the chats-store flag. saveAllApiProviders is forbidden
+// until a load has SUCCEEDED — the load failure paths reset `apiProviders` to
+// DEFAULTS, so an unhydrated save would overwrite the user's configured
+// providers (API keys!) with defaults. Set ONLY in the load onsuccess below.
+var _apiProvidersHydrated = false;
+
 // API Providers Management
 async function loadApiProviders() {
     try {
@@ -191,6 +231,9 @@ async function loadApiProviders() {
         return new Promise(function(resolve) {
             request.onsuccess = function() {
                 var loaded = request.result || [];
+                // Hydration succeeded — unblock saves BEFORE the default-seeding /
+                // merge / migration branches below, which legitimately save.
+                _apiProvidersHydrated = true;
                 if (loaded.length === 0) {
                     // First load - initialize with defaults
                     apiProviders = DEFAULT_API_PROVIDERS.slice();
@@ -198,6 +241,72 @@ async function loadApiProviders() {
                     saveAllApiProviders();
                 } else {
                     apiProviders = loaded;
+                    // One-shot migration for renamed/retuned defaults (the Opus 4.8
+                    // alignment renamed opus-4.6 → opus-4.8 and sonnet-4.5 →
+                    // sonnet-4.6 and bumped the Opus-4-8 OAuth effort high → xhigh
+                    // without migrating stored providers — upgraders got keyless
+                    // duplicates and stale effort). Only UNCUSTOMIZED legacy
+                    // entries (every field equal to the old default, apiKey
+                    // excepted) are touched; runs BEFORE the default-merge below so
+                    // a rename prevents the duplicate from being added.
+                    // KEEP the from/to names IN SYNC with PROVIDER_RENAMES
+                    // (core/030-config.js) — the page-side fallback in
+                    // loadProviderFromStorage relies on it when the SW runs this
+                    // migration first and the appStorage rewrite below cannot fire.
+                    var migratedDefaults = false;
+                    [
+                        { to: 'opus-4.8', from: { name: 'opus-4.6', apiKey: '', model: 'anthropic/claude-opus-4-6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
+                        { to: 'sonnet-4.6', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } }
+                    ].forEach(function(mig) {
+                        var idx = -1;
+                        for (var i = 0; i < apiProviders.length; i++) {
+                            if (apiProviders[i].name === mig.from.name) { idx = i; break; }
+                        }
+                        if (idx === -1) return;
+                        var legacy = apiProviders[idx];
+                        // Uncustomized = exact same shape/values as the old default
+                        // (apiKey excepted — it is carried over).
+                        var untouched = Object.keys(mig.from).every(function(k) {
+                            return k === 'apiKey' || legacy[k] === mig.from[k];
+                        }) && Object.keys(legacy).every(function(k) {
+                            return Object.prototype.hasOwnProperty.call(mig.from, k);
+                        });
+                        if (!untouched) return;
+                        var newDef = DEFAULT_API_PROVIDERS.find(function(d) { return d.name === mig.to; });
+                        if (!newDef) return;
+                        var existingNew = apiProviders.find(function(p) { return p.name === mig.to; });
+                        if (existingNew) {
+                            // New default already present (added by an earlier merge
+                            // run): drop the stale legacy entry, donating its apiKey
+                            // if the new entry is still keyless.
+                            if (legacy.apiKey && !existingNew.apiKey) existingNew.apiKey = legacy.apiKey;
+                            apiProviders.splice(idx, 1);
+                        } else {
+                            apiProviders[idx] = Object.assign({}, newDef, { apiKey: legacy.apiKey || '' });
+                        }
+                        if (currentProvider === mig.from.name) currentProvider = mig.to;
+                        // Also migrate the PERSISTED selection — at this point the
+                        // in-memory currentProvider may still be the config default
+                        // (loadProviderFromStorage runs later and would silently
+                        // drop a selection whose provider was just renamed).
+                        // appStorage lives in the page bundle only (020-bootstrap is
+                        // not in WORKER_SHARED_FILES) — guard for the SW context.
+                        if (typeof appStorage !== 'undefined'
+                            && appStorage.getItem('appagent_provider') === mig.from.name) {
+                            try { appStorage.setItem('appagent_provider', mig.to); } catch (e) {}
+                        }
+                        migratedDefaults = true;
+                    });
+                    // Opus-4-8 OAuth: bump effort high → xhigh only when the entry
+                    // still matches the old default shape (i.e. not user-tuned).
+                    apiProviders.forEach(function(p) {
+                        if (p.isClaudeOAuth && p.name === 'Opus-4-8 OAuth' && p.effort === 'high'
+                            && p.model === 'claude-opus-4-8' && p.maxTokens === 100000) {
+                            p.effort = 'xhigh';
+                            migratedDefaults = true;
+                        }
+                    });
+                    if (migratedDefaults) saveAllApiProviders();
                     // Merge any new default providers not yet in IndexedDB
                     var added = false;
                     DEFAULT_API_PROVIDERS.forEach(function(def) {
@@ -223,25 +332,64 @@ async function loadApiProviders() {
             };
             request.onerror = function() {
                 console.error('Failed to load API providers:', request.error);
-                apiProviders = DEFAULT_API_PROVIDERS.slice();
+                // Only fall back to defaults if we NEVER hydrated — a failed
+                // RE-load must not replace the user's in-memory providers with
+                // defaults while saves are unblocked (silent desync + key loss).
+                if (!_apiProvidersHydrated) {
+                    apiProviders = DEFAULT_API_PROVIDERS.slice();
+                    if (typeof showSnackbar === 'function') {
+                        try { showSnackbar('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.', 'error'); } catch (e) {}
+                    }
+                }
                 resolve();
             };
         });
     } catch (e) {
         console.error('IndexedDB error loading API providers:', e);
-        apiProviders = DEFAULT_API_PROVIDERS.slice();
+        // Same rule as request.onerror: never clobber hydrated in-memory state.
+        if (!_apiProvidersHydrated) {
+            apiProviders = DEFAULT_API_PROVIDERS.slice();
+            if (typeof showSnackbar === 'function') {
+                try { showSnackbar('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.', 'error'); } catch (e2) {}
+            }
+        }
         return Promise.resolve();
     }
 }
 
 async function saveAllApiProviders() {
+    // WIPE-GUARD: never persist before a successful hydration (see flag above).
+    if (!_apiProvidersHydrated) {
+        console.error('saveAllApiProviders blocked: providers not hydrated — refusing to overwrite stored providers');
+        return;
+    }
     try {
         var database = await openDatabase();
         var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
         var store = transaction.objectStore(apiProvidersStoreName);
-        // Clear and re-add all
-        store.clear();
-        apiProviders.forEach(function(p) { store.put(p); });
+        // WIPE-GUARD: diff save — no store.clear(). Delete only names that
+        // vanished from memory, upsert the rest.
+        var keysRequest = store.getAllKeys();
+        keysRequest.onerror = function() {
+            console.error('saveAllApiProviders: getAllKeys failed — save skipped', keysRequest.error);
+        };
+        transaction.onabort = function() {
+            console.error('saveAllApiProviders: transaction aborted — save lost', transaction.error);
+        };
+        keysRequest.onsuccess = function() {
+            var existingKeys = keysRequest.result || [];
+            var desiredNames = {};
+            apiProviders.forEach(function(p) { if (p && p.name) desiredNames[p.name] = true; });
+            existingKeys.forEach(function(key) {
+                if (!Object.prototype.hasOwnProperty.call(desiredNames, key)) {
+                    try { store.delete(key); } catch (e) { console.error('saveAllApiProviders: delete failed', key, e); }
+                }
+            });
+            apiProviders.forEach(function(p) {
+                if (!p || !p.name) { console.warn('saveAllApiProviders: skipping provider without a name', p); return; }
+                try { store.put(p); } catch (e) { console.error('saveAllApiProviders: put failed', p.name, e); }
+            });
+        };
     } catch (e) {
         console.error('Failed to save all API providers:', e);
     }
@@ -456,6 +604,18 @@ async function resolveWorkspace(workspace) {
         // instead of erroring on ambiguity. last_used_at falls back to cloned_at.
         all.sort(function(a, b) { return (b.last_used_at || b.cloned_at || 0) - (a.last_used_at || a.cloned_at || 0); });
         var chosen = all[0];
+        // Pin override: when the MRU workspace's repo has a PINNED sibling
+        // workspace (at most one per owner/repo — invariant enforced by
+        // setWorkspacePin), the pin wins over MRU. Explicit workspace params
+        // never reach this path, so they always win.
+        var chosenRepo = chosen.github_repo || parseWsKey(chosen.repo).repo;
+        for (var pi = 0; pi < all.length; pi++) {
+            var pm = all[pi];
+            if (pm && pm.pinned && (pm.github_repo || parseWsKey(pm.repo).repo) === chosenRepo) {
+                chosen = pm;
+                break;
+            }
+        }
         try { chosen.last_used_at = Date.now(); setWorkspaceMeta(chosen); } catch (e) {}
         return chosen.repo;
     } catch (e) {
@@ -523,6 +683,40 @@ async function githubApi(method, path, body) {
     }
 }
 
+// GitHub GraphQL API call helper. Same stored token as githubApi, but POSTs to
+// the GraphQL endpoint: https://api.github.com/graphql for github.com, or
+// <instanceUrl>/api/graphql for GitHub Enterprise (NOT /api/v3/graphql).
+// Returns { ok, status, body } parsed the same way as githubApi.
+async function githubGraphql(query) {
+    try {
+        var ghData = await new Promise(function(resolve) {
+            chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
+        });
+        var token = ghData.githubToken;
+        var instanceUrl = ghData.githubInstanceUrl || 'https://github.com';
+        if (!token) return { error: 'No GitHub token configured' };
+        var gqlUrl = instanceUrl === 'https://github.com'
+            ? 'https://api.github.com/graphql'
+            : instanceUrl.replace(/\/$/, '') + '/api/graphql';
+        var res = await fetch(gqlUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + token,
+                'Accept': 'application/vnd.github+json',
+                'Content-Type': 'application/json'
+            },
+            cache: 'no-store',
+            body: JSON.stringify({ query: query })
+        });
+        var text = await res.text();
+        var parsed = null;
+        try { parsed = JSON.parse(text); } catch (e) { /* not JSON */ }
+        return { status: res.status, ok: res.ok, body: parsed || text };
+    } catch (e) {
+        return { error: e && e.message ? e.message : String(e) };
+    }
+}
+
 async function getWorkspaceMeta(repo) {
     try {
         var database = await openDatabase();
@@ -544,6 +738,123 @@ async function setWorkspaceMeta(meta) {
     } catch (e) { console.error('Failed to save workspace meta:', e); }
 }
 
+// ---- Content-addressed blob helpers (workspace_blobs store) ----
+
+// Idempotent put: git blobs are immutable (same sha == same bytes), so a
+// blind put never corrupts an existing entry. Awaits tx completion so
+// callers can rely on the blob being durable before stripping rows.
+// Returns true on success, false on failure (e.g. quota) so callers can
+// decide not to strip inline content when the blob is not durable.
+async function putWorkspaceBlob(sha, content) {
+    try {
+        var database = await openDatabase();
+        var tx = database.transaction([workspaceBlobsStoreName], 'readwrite');
+        tx.objectStore(workspaceBlobsStoreName).put({ sha: sha, content: content });
+        await new Promise(function(resolve, reject) {
+            tx.oncomplete = resolve;
+            tx.onerror = function() { reject(tx.error); };
+        });
+        return true;
+    } catch (e) { console.error('Failed to save workspace blob:', e); return false; }
+}
+
+// Batch lookup: returns a map { sha: content } containing only the shas
+// that exist in the blob store. Dedupes input; one readonly tx with
+// parallel gets.
+async function getWorkspaceBlobsBySha(shas) {
+    var out = {};
+    try {
+        var unique = [];
+        var seen = {};
+        for (var i = 0; i < (shas || []).length; i++) {
+            var s = shas[i];
+            if (s && !seen[s]) { seen[s] = true; unique.push(s); }
+        }
+        if (!unique.length) return out;
+        var database = await openDatabase();
+        var tx = database.transaction([workspaceBlobsStoreName], 'readonly');
+        var store = tx.objectStore(workspaceBlobsStoreName);
+        var promises = unique.map(function(sha) {
+            return new Promise(function(resolve) {
+                var req = store.get(sha);
+                req.onsuccess = function() {
+                    if (req.result && req.result.content != null) out[sha] = req.result.content;
+                    resolve();
+                };
+                req.onerror = function() { resolve(); };
+            });
+        });
+        await Promise.all(promises);
+    } catch (e) { /* best-effort: return what we have */ }
+    return out;
+}
+
+// Garbage-collect orphaned blobs: keep every sha referenced by ANY
+// workspace_files row across all repos (including stubs and dirty rows —
+// stub blobs may exist from other clones and stay reusable). Returns the
+// number of deleted blobs; never throws.
+async function gcWorkspaceBlobs() {
+    try {
+        var rows = await getAllWorkspaceFilesAllRepos();
+        var keep = {};
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i] && rows[i].sha) keep[rows[i].sha] = true;
+        }
+        var database = await openDatabase();
+        var tx = database.transaction([workspaceBlobsStoreName], 'readwrite');
+        var store = tx.objectStore(workspaceBlobsStoreName);
+        var deleted = 0;
+        await new Promise(function(resolve, reject) {
+            var cursorReq = store.openCursor();
+            cursorReq.onsuccess = function(ev) {
+                var cursor = ev.target.result;
+                if (!cursor) { resolve(); return; }
+                if (!keep[cursor.key]) {
+                    cursor.delete();
+                    deleted++;
+                }
+                cursor.continue();
+            };
+            cursorReq.onerror = function() { reject(cursorReq.error); };
+        });
+        return deleted;
+    } catch (e) { return 0; }
+}
+
+// Internal: re-attach blob content to workspace_files rows fetched from
+// IndexedDB so upper layers keep seeing inline original_content/content.
+// Rows that are dirty keep their inline overlay content; clean rows get
+// content mirrored from the blob. Deleted tombstones ARE resolved too —
+// wsDiscard restores them from original_content (and they are always
+// dirty, so the self-heal below can never demote them). If a blob is
+// missing for a clean row (e.g. partially-failed GC), self-heal by
+// reverting the row to a stub so the next read re-hydrates from GitHub
+// by sha.
+async function _resolveWorkspaceRows(rows) {
+    var need = [];
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (r && r.original_content == null && r.sha && !r.stub) need.push(r.sha);
+    }
+    if (!need.length) return rows;
+    var blobs = await getWorkspaceBlobsBySha(need);
+    for (var j = 0; j < rows.length; j++) {
+        var row = rows[j];
+        if (!row || row.original_content != null || !row.sha || row.stub) continue;
+        var blob = blobs[row.sha];
+        if (blob !== undefined) {
+            row.original_content = blob;
+            if (!row.dirty && row.content == null) row.content = blob;
+        } else if (!row.dirty) {
+            // Blob missing — self-heal: demote to stub; wsHydrate will
+            // re-fetch the content from GitHub by sha on next access.
+            row.stub = true;
+            row.content = null;
+        }
+    }
+    return rows;
+}
+
 async function getWorkspaceFile(repo, path) {
     try {
         var database = await openDatabase();
@@ -551,18 +862,35 @@ async function getWorkspaceFile(repo, path) {
         var store = tx.objectStore(workspaceFilesStoreName);
         var index = store.index('repo_path');
         var request = index.get([repo, path]);
-        return new Promise(function(resolve) {
+        var row = await new Promise(function(resolve) {
             request.onsuccess = function() { resolve(request.result || null); };
             request.onerror = function() { resolve(null); };
         });
+        if (!row) return null;
+        await _resolveWorkspaceRows([row]);
+        return row;
     } catch (e) { return null; }
 }
 
 async function setWorkspaceFile(file) {
     try {
+        // Content-addressed storage: persist pristine content ONCE per sha in
+        // the blob store, then strip it from the row. Persist a CLONE so the
+        // caller's in-memory object keeps its inline content.
+        var toStore = file;
+        if (file && file.sha && file.original_content != null) {
+            var blobOk = await putWorkspaceBlob(file.sha, file.original_content);
+            if (blobOk) {
+                toStore = Object.assign({}, file);
+                delete toStore.original_content;
+                if (!file.dirty && file.content === file.original_content) delete toStore.content;
+            }
+            // blob put failed (e.g. quota) — keep inline content rather than
+            // stripping a row whose blob is not durable.
+        }
         var database = await openDatabase();
         var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
-        tx.objectStore(workspaceFilesStoreName).put(file);
+        tx.objectStore(workspaceFilesStoreName).put(toStore);
         await new Promise(function(resolve, reject) {
             tx.oncomplete = resolve;
             tx.onerror = function() { reject(tx.error); };
@@ -577,14 +905,17 @@ async function getAllWorkspaceFiles(repo) {
         var store = tx.objectStore(workspaceFilesStoreName);
         var index = store.index('repo');
         var request = index.getAll(repo);
-        return new Promise(function(resolve) {
+        var rows = await new Promise(function(resolve) {
             request.onsuccess = function() { resolve(request.result || []); };
             request.onerror = function() { resolve([]); };
         });
+        return await _resolveWorkspaceRows(rows);
     } catch (e) { return []; }
 }
 
-// Returns every workspace file across all clones. Used by clone for blob dedup.
+// Returns RAW rows for every workspace file across all clones — post-v13
+// these usually lack inline content (it lives in workspace_blobs). Used by
+// clone's legacy-row scan and gcWorkspaceBlobs.
 async function getAllWorkspaceFilesAllRepos() {
     try {
         var database = await openDatabase();

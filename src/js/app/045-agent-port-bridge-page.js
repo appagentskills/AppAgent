@@ -42,6 +42,150 @@ var _agentBusPort = null;
 // runFinished. Value: { resolve, reject, chatId }.
 var _pendingRunAgents = {};
 
+// SWM-S2: safety timer armed by the bus onDisconnect. Pending runAgent
+// promises are no longer settled at disconnect time (a transient SW flap
+// would resolve callers' awaits mid-run); they settle on the next 'hello'
+// against the SW's authoritative runningChatIds. If NO hello arrives within
+// this window (SW never came back), resolve everything so callers can't
+// hang forever.
+var _busHelloSafetyTimer = null;
+var BUS_HELLO_SAFETY_MS = 15000;
+
+function _settleAllPendingRunAgents() {
+    Object.keys(_pendingRunAgents).forEach(function(cid) {
+        var pr = _pendingRunAgents[cid];
+        delete _pendingRunAgents[cid];
+        if (pr && pr.resolve) { try { pr.resolve(); } catch (e) {} }
+    });
+}
+
+// REG-F1: deferred hello orphan reconcile. The SW's hello is posted
+// synchronously at port connect — BEFORE resumeRunningCheckpoints re-arms
+// checkpointed runs (gated on _swResumeGate ≈1.5s after the first panel-hello)
+// and before a run-agent posted during the reconnect gap is processed. A chat
+// can therefore be absent from hello's runningChatIds and still be running
+// seconds later. Instead of settling its promise / finalizing its action /
+// wiping its streaming UI at hello time, the hello handler captures the
+// candidates and acts after a grace window, re-checking live state first.
+// Genuinely-dead runs settle exactly as before, just HELLO_SETTLE_GRACE_MS
+// later (still well inside the 15s no-hello worst case).
+// REG-AUDIT-2/REG376-3: if the SW hasn't yet signalled that its checkpoint
+// resume scan settled (resumeScanSettled on hello / 'resume-scan-done'
+// message), the timer re-arms itself for HELLO_SETTLE_RESUME_EXTRA_MS more —
+// up to HELLO_SETTLE_RESUME_MAX_REARMS times (3s + 3×9s = 30s total) — before
+// reconciling, covering slow cold boots where the unbounded resume gate chain
+// outlives the first grace window.
+var _helloGraceTimer = null;
+var _helloGraceState = null; // { orphans: { cid: pendingEntry }, cleanups: { cid: true }, rearms?: number }
+var HELLO_SETTLE_GRACE_MS = 3000;
+// REG-AUDIT-2: extra grace when the SW hasn't reported its resume scan as
+// settled by the time the first window expires. The SW's
+// resumeRunningCheckpoints gate chain (_swBootReady → _swResumeGate →
+// Platform.ready → loadApiProviders) is unbounded on a slow cold boot, so the
+// fixed 3s timer could win and finalize a still-resuming run.
+// REG376-3: re-arm up to HELLO_SETTLE_RESUME_MAX_REARMS times (30s total),
+// not once — a single 9s extension still lost to gate chains slower than 12s.
+// (Note: BUS_HELLO_SAFETY_MS caps the NO-hello window only; it says nothing
+// about how long the gate chain may run AFTER a hello arrived, so it is no
+// upper bound here. The hard re-arm cap is what keeps a wedged SW — one that
+// never settles its scan — from deferring the reconcile forever.)
+var HELLO_SETTLE_RESUME_EXTRA_MS = 9000;
+var HELLO_SETTLE_RESUME_MAX_REARMS = 3;
+// True once the SW has signalled the resume scan is decided — via the hello
+// payload's resumeScanSettled flag or a 'resume-scan-done' message.
+var _swResumeScanSettledSeen = false;
+
+function _cancelHelloGraceReconcile() {
+    if (_helloGraceTimer) { try { clearTimeout(_helloGraceTimer); } catch (e) {} }
+    _helloGraceTimer = null;
+    _helloGraceState = null;
+}
+
+function _armHelloGraceReconcile(orphans, cleanups) {
+    // One timer only — a fresh hello supersedes any pending reconcile (its
+    // candidate sets are stale relative to the newer authoritative snapshot).
+    _cancelHelloGraceReconcile();
+    if (!Object.keys(orphans).length && !Object.keys(cleanups).length) return;
+    _helloGraceState = { orphans: orphans, cleanups: cleanups };
+    // REG-AUDIT-2/REG376-3: named so the callback can re-arm itself (up to
+    // HELLO_SETTLE_RESUME_MAX_REARMS times) when the SW's resume scan hasn't
+    // settled yet (slow cold boot). The one-timer invariant holds: re-arm
+    // reuses the same _helloGraceTimer/_helloGraceState slots, and a fresh
+    // hello still cancels via _cancelHelloGraceReconcile.
+    function _helloGraceFire() {
+        var st = _helloGraceState;
+        _helloGraceTimer = null;
+        _helloGraceState = null;
+        if (!st) return;
+        // REG-AUDIT-2/REG376-3: the SW hasn't finished (or failed) its
+        // checkpoint resume scan — a chat absent from runningChatIds may
+        // still come back. Extend the window (capped) instead of finalizing
+        // early.
+        if (!_swResumeScanSettledSeen && st && (st.rearms || 0) < HELLO_SETTLE_RESUME_MAX_REARMS) {
+            st.rearms = (st.rearms || 0) + 1;
+            _helloGraceState = st;
+            _helloGraceTimer = setTimeout(_helloGraceFire, HELLO_SETTLE_RESUME_EXTRA_MS);
+            return;
+        }
+        Object.keys(st.orphans).forEach(function(cid) {
+            // Re-check 1: the run came back — the SW resumed it from checkpoint
+            // (runStarted re-added the id) or processed a gap-posted run-agent.
+            // Its promise stays pending and resolves on the real runFinished.
+            if (runningChatIds[cid]) return;
+            // Re-check 2: the entry already settled (runFinished arrived during
+            // the grace window) or was replaced by a fresh runAgent — only
+            // settle the exact entry captured at hello time.
+            var cur = _pendingRunAgents[cid];
+            if (!cur || cur !== st.orphans[cid]) return;
+            delete _pendingRunAgents[cid];
+            if (cur.resolve) { try { cur.resolve(); } catch (e) {} }
+            // DRLM-B3: if this orphaned run belonged to a background ACTION
+            // chat, no runFinished will ever fire its finishActionIfDone (only
+            // call sites are the loop exit and the runFinished handler) — the
+            // action button would stay 'running' forever. Finalize it now.
+            if (typeof finishActionIfDone === 'function') {
+                try { finishActionIfDone(cid); } catch (e) {}
+            }
+        });
+        Object.keys(st.cleanups).forEach(function(cid) {
+            // Skip if the run re-established itself during the grace window;
+            // _cleanupStaleForegroundRun itself re-reads the live foreground
+            // state (activeStreamingChatId / currentChatId) at call time.
+            if (runningChatIds[cid]) return;
+            _cleanupStaleForegroundRun(cid);
+        });
+    }
+    _helloGraceTimer = setTimeout(_helloGraceFire, HELLO_SETTLE_GRACE_MS);
+}
+
+// SWM-S3: replicate the foreground cleanup the runFinished handler performs
+// (app/036-agent-event-handlers-page.js, runFinished) for a chat whose run
+// evaporated WITHOUT a terminal event — the SW restarted and its hello no
+// longer lists the chat as running, so no runFinished/runCrashed will ever
+// arrive to clear the streaming UI (stuck pause button, is-streaming class,
+// stale isRunning/activeStreamingChatId).
+function _cleanupStaleForegroundRun(chatId) {
+    if (!chatId) return;
+    try {
+        if (typeof hideSpinner === 'function') { try { hideSpinner(chatId); } catch (e) {} }
+        if (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId === chatId) {
+            isRunning = false;
+            activeStreamingChatId = null;
+        } else if (typeof currentChatId !== 'undefined' && chatId === currentChatId &&
+                   typeof isRunning !== 'undefined' && isRunning) {
+            isRunning = false;
+        }
+        if (typeof currentChatId !== 'undefined' && chatId === currentChatId) {
+            var _staleMsgsEl = document.getElementById('messages');
+            if (_staleMsgsEl) _staleMsgsEl.classList.remove('is-streaming');
+            if (typeof hidePauseButton === 'function') { try { hidePauseButton(); } catch (e) {} }
+            if (typeof refreshContinueButtonForChat === 'function') { try { refreshContinueButtonForChat(chatId); } catch (e) {} }
+            if (typeof renderMessages === 'function') { try { renderMessages(); } catch (e) {} }
+        }
+        if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+    } catch (e) {}
+}
+
 // Tool calls the panel is currently executing on behalf of the SW. Used
 // to tell a fresh SW (after restart) which tools to ADOPT rather than
 // re-dispatch — otherwise the panel would run the same tool twice
@@ -99,6 +243,16 @@ function _sendPanelHello() {
 }
 
 function _openAgentBus() {
+    // Idempotency guard: several independent retry chains can call this
+    // concurrently after a long SW outage (onDisconnect's 250ms reconnect, the
+    // connect-throw 500ms retry below, and the exhaustion fallbacks in
+    // pushPauseToggleToOffscreen / pushInterruptToOffscreen / 040's
+    // _sendMessageToOffscreen). Without the guard each winning chain opened a
+    // PARALLEL port whose _handleAgentBusMessage listener was never removed —
+    // every agent-event then got processed N times (duplicate renders,
+    // notifications, hello merges). A truthy _agentBusPort is always live:
+    // onDisconnect nulls it synchronously when the port dies.
+    if (_agentBusPort) return;
     try {
         _agentBusPort = chrome.runtime.connect({ name: 'agent-bus' });
     } catch (e) {
@@ -115,18 +269,74 @@ function _openAgentBus() {
         // guard @:378 then treats Retry/Continue/Send as a no-op ("already running") and
         // silently drops the user's action. Any chat still in runningChatIds here had NO
         // terminal event by construction (runFinished/runCrashed delete it @:178), so
-        // clear it and settle its pending promise; the SW's 'hello' on reconnect
+        // clear it; the SW's 'hello' on reconnect
         // re-populates runningChatIds for runs it actually resumed (@:206-209), and the
         // SW-side run-agent handler is idempotent (guards on its own runningChatIds @:222)
         // so a Retry that re-posts during the gap can't double-run a still-live SW loop.
         try {
             Object.keys(runningChatIds).forEach(function(cid) { delete runningChatIds[cid]; });
-            Object.keys(_pendingRunAgents).forEach(function(cid) {
-                var pr = _pendingRunAgents[cid];
-                delete _pendingRunAgents[cid];
-                if (pr && pr.resolve) { try { pr.resolve(); } catch (e) {} }
-            });
         } catch (e) {}
+        // SWM-S2: do NOT settle _pendingRunAgents here. On a transient flap the SW
+        // keeps streaming, and resolving now returns `await runAgent()` callers
+        // mid-run (widget spinners die, summarize finalizes early). The promises
+        // settle in the 'hello' handler against the SW's authoritative
+        // runningChatIds; this timer is only the no-hello fallback so callers
+        // never hang if the SW never comes back.
+        // REG-F1: a disconnect invalidates any pending hello grace reconcile —
+        // its candidates were computed against a hello that no longer reflects
+        // the SW; the next hello re-derives them (or the 15s fallback settles).
+        _cancelHelloGraceReconcile();
+        if (_busHelloSafetyTimer) { try { clearTimeout(_busHelloSafetyTimer); } catch (e) {} }
+        _busHelloSafetyTimer = setTimeout(function() {
+            _busHelloSafetyTimer = null;
+            // DRLM-B2: the SW never came back — no hello, no runFinished. Clear
+            // the stale foreground streaming UI (same cleanup the hello
+            // reconcile performs) before settling, or the pause button /
+            // is-streaming class stay stuck forever in this path.
+            try {
+                if (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId) {
+                    _cleanupStaleForegroundRun(activeStreamingChatId);
+                } else if (typeof isRunning !== 'undefined' && isRunning &&
+                           typeof currentChatId !== 'undefined' && currentChatId) {
+                    _cleanupStaleForegroundRun(currentChatId);
+                }
+            } catch (e) {}
+            // RES-4: mirror DRLM-B3 (hello-grace path above) for the no-hello
+            // fallback too — a settled pending runAgent belonging to a
+            // background ACTION chat gets no runFinished ever (SW is dead), so
+            // without this the action button spins forever.
+            // _settleAllPendingRunAgents doesn't expose the chat ids, so
+            // capture them BEFORE it clears the map.
+            var _settledCids = [];
+            try { _settledCids = Object.keys(_pendingRunAgents); } catch (e) {}
+            _settleAllPendingRunAgents();
+            _settledCids.forEach(function(cid) {
+                try {
+                    var _c = (typeof chats !== 'undefined') ? chats[cid] : null;
+                    // PR383-F5: the SW never came back — this run DIED. The old
+                    // finishActionIfDone(cid) call stamped the action button
+                    // 'done'/'Complete' (wrong verdict for a dead run). Mirror the
+                    // 036 runCrashed action-finalize instead: error verdict, same
+                    // guards (the agent's own update_action_state result wins via
+                    // the state==='running' check, pause wins via _isPaused/
+                    // isChatPaused).
+                    if (_c && _c.isBackground && _c.actionId
+                        && typeof activeActions !== 'undefined' && activeActions[_c.actionId]) {
+                        var _dAct = activeActions[_c.actionId];
+                        var _dPaused = _dAct._isPaused || (typeof isChatPaused === 'function' && isChatPaused(cid));
+                        if (_dAct.state === 'running' && !_dPaused) {
+                            _dAct.state = 'error';
+                            _dAct.icon = 'alert';
+                            if (!_dAct.label || _dAct.label === 'Starting…') _dAct.label = 'Lost connection';
+                            if (!_dAct.output) _dAct.output = 'The background service worker disconnected and never responded again, so this run was lost before reporting a result. Open the chat for details and re-run the action if needed.';
+                            _dAct.updatedAt = Date.now();
+                            if (typeof persistActionState === 'function') { try { persistActionState(_c.actionId); } catch (e2) {} }
+                            if (typeof notifyActionStateChanged === 'function') { try { notifyActionStateChanged(_c.actionId); } catch (e2) {} }
+                        }
+                    }
+                } catch (e) {}
+            });
+        }, BUS_HELLO_SAFETY_MS);
         // SW restart — re-open. Slight delay to avoid tight loops.
         setTimeout(_openAgentBus, 250);
     });
@@ -172,6 +382,73 @@ function _openAgentBus() {
     }
 }
 
+// RES-5: preserve page-only PENDING interactive rows across SW chat-snapshot
+// replaces. Page-side tools push `prompt_user` (and the approval prompt pushes
+// `approval`) rows into the PAGE mirror only — they are mirrored into the SW's
+// authoritative copy AFTER they resolve (result._message_persist for
+// prompt_user; the decision write-back for approvals). Any snapshot that
+// arrives while one is still pending — e.g. a sub-agent progress repaint
+// (recordSubActionState → _repaintParent → messagesAppended force:true, which
+// inlines the SW's parent-chat copy) — lacks the row, so the wholesale
+// `chats[chatId] = snapshot` assignment dropped it and the handler's
+// renderMessages() wiped the live form out from under the user. Splice each
+// missing pending row back at its original page index: approvals are
+// index-keyed (pendingToolApprovals[chatId + ':' + approvalIndex]), so
+// position matters, and ascending iteration keeps later indexes correct.
+// Re-inserting the PAGE's own message object also preserves any draft values
+// promptCaptureDraft stashed on msg.fields (see tools/100-prompt-user.js).
+// Resolved rows (status no longer 'pending') are deliberately NOT preserved —
+// the SW snapshot owns them from resolution onward, so a submitted/cancelled
+// form stays dismissed on every later re-render.
+function _mergePagePendingRows(prevChat, inChat, chatId) {
+    if (!prevChat || !inChat || !Array.isArray(prevChat.messages) || !Array.isArray(inChat.messages)) return;
+    for (var ri = 0; ri < prevChat.messages.length; ri++) {
+        var rm = prevChat.messages[ri];
+        if (!rm || rm.status !== 'pending') continue;
+        if (rm.role !== 'prompt_user' && rm.role !== 'approval') continue;
+        var dup = false;
+        for (var rj = 0; rj < inChat.messages.length; rj++) {
+            var rn = inChat.messages[rj];
+            if (!rn || rn.role !== rm.role) continue;
+            if (rm.role === 'prompt_user' ? (rn.promptId === rm.promptId)
+                                          : (rn.toolCallId === rm.toolCallId && rn.toolCallId)) { dup = true; break; }
+        }
+        if (dup) continue;
+        var _pos = Math.min(ri, inChat.messages.length);
+        inChat.messages.splice(_pos, 0, rm);
+        // PR383-F3: approvals are resolved strictly by index — handleApproval
+        // (ui/160-notifications.js) reads chat.messages[approvalIndex] and
+        // silently no-ops on a mismatch. When the incoming snapshot is SHORTER
+        // than the row's original page index, the row lands at a clamped
+        // position != ri, so the pendingToolApprovals entry (keyed
+        // chatId+':'+index) points at the wrong slot — Allow/Deny would no-op
+        // forever and the parked SW tool call hangs. Re-key the entry to the
+        // actual insertion index. Prefer locating the entry by toolCallId
+        // (robust to drift from earlier merges); fall back to the
+        // original-index key.
+        if (rm.role === 'approval' && _pos !== ri && chatId &&
+            typeof pendingToolApprovals !== 'undefined' && pendingToolApprovals) {
+            var _entKey = null;
+            if (rm.toolCallId) {
+                for (var _ak in pendingToolApprovals) {
+                    var _pe = pendingToolApprovals[_ak];
+                    if (_pe && _pe.chatId === chatId && _pe.toolCallId === rm.toolCallId) { _entKey = _ak; break; }
+                }
+            }
+            if (!_entKey && pendingToolApprovals[chatId + ':' + ri]) _entKey = chatId + ':' + ri;
+            if (_entKey) {
+                var _newKey = chatId + ':' + _pos;
+                if (_newKey !== _entKey && !pendingToolApprovals[_newKey]) {
+                    var _ent = pendingToolApprovals[_entKey];
+                    delete pendingToolApprovals[_entKey];
+                    _ent.approvalIndex = _pos;
+                    pendingToolApprovals[_newKey] = _ent;
+                }
+            }
+        }
+    }
+}
+
 function _handleAgentBusMessage(msg) {
     if (!msg || !msg.type) return;
     switch (msg.type) {
@@ -181,7 +458,43 @@ function _handleAgentBusMessage(msg) {
             // BEFORE re-emitting so the handlers (which read chats[chatId])
             // see the updated state.
             if (msg.detail && msg.detail.chat && msg.detail.chatId) {
-                chats[msg.detail.chatId] = msg.detail.chat;
+                var _inChat = msg.detail.chat;
+                var _prevChat = chats[msg.detail.chatId];
+                // Merge versionHistory instead of letting the wholesale chat
+                // replace drop entries. The page owns some entries/flags the SW
+                // snapshot can't know about: entries appended for page-bridged
+                // tools, revert entries, and `invalidated` flags set by undo/redo.
+                // Rule: prefer the PAGE copy when ids match (richer flags), and
+                // append page-only entries the snapshot lacks.
+                if (_prevChat && Array.isArray(_prevChat.versionHistory) && _prevChat.versionHistory.length) {
+                    var _prevById = {};
+                    _prevChat.versionHistory.forEach(function(v) { if (v && v.id) _prevById[v.id] = v; });
+                    var _inVH = Array.isArray(_inChat.versionHistory) ? _inChat.versionHistory : [];
+                    var _inSeen = {};
+                    var _mergedVH = _inVH.map(function(v) {
+                        if (v && v.id) {
+                            _inSeen[v.id] = true;
+                            if (_prevById[v.id]) return _prevById[v.id];
+                        }
+                        return v;
+                    });
+                    _prevChat.versionHistory.forEach(function(v) {
+                        if (v && (!v.id || !_inSeen[v.id])) _mergedVH.push(v);
+                    });
+                    _mergedVH.sort(function(a, b) { return (a && a.timestamp || 0) - (b && b.timestamp || 0); });
+                    _inChat.versionHistory = _mergedVH;
+                }
+                // RES-5: keep pending prompt_user / approval rows the SW
+                // snapshot can't know about (see _mergePagePendingRows).
+                _mergePagePendingRows(_prevChat, _inChat, msg.detail.chatId); // PR383-F3: chatId for approval re-key
+                chats[msg.detail.chatId] = _inChat;
+                // Re-point the active-chat versionHistory mirror: it referenced
+                // the replaced chat object's array, so sidebar/inline renders
+                // would otherwise read (and write flags into) a dangling copy.
+                if (msg.detail.chatId === currentChatId && typeof versionHistory !== 'undefined') {
+                    if (!Array.isArray(_inChat.versionHistory)) _inChat.versionHistory = [];
+                    versionHistory = _inChat.versionHistory;
+                }
             }
             // Track running state locally so the chat list pill / pause button
             // sync with offscreen without each handler having to deal with it.
@@ -208,13 +521,11 @@ function _handleAgentBusMessage(msg) {
                 // by this change). The helper is exported below for that wiring; this
                 // non-paused terminal prune remains the fallback for resumed-then-finished
                 // chats.
-                if (msg.detail.reason !== 'paused') {
-                    var _doneCid = msg.detail.chatId;
-                    delete _pauseToggleGen[_doneCid];
-                    delete _pauseToggleDesired[_doneCid];
-                    delete _interruptGen[_doneCid];
-                    delete _interruptDesired[_doneCid];
-                }
+                // RES-3: the prune itself moved BELOW the AgentEvents.emit
+                // re-dispatch — 036's runFinished handler reads
+                // _pauseToggleDesired[chatId] synchronously during that emit
+                // to build _pausePending (SWM-PAUSE-FINALIZE gate); pruning
+                // here first made that gate permanently false (dead gate).
             }
             // Re-emit on the local bus so app/036 handlers fire as if
             // the loop ran in this page.
@@ -223,8 +534,24 @@ function _handleAgentBusMessage(msg) {
             } catch (e) {
                 console.error('[agent-bus] re-emit failed', msg.eventType, e);
             }
-            // Resolve any pending runAgent promises waiting on runFinished.
-            if (msg.eventType === 'runFinished' && msg.detail && msg.detail.chatId) {
+            // RES-3: prune the pause/interrupt token maps AFTER the re-emit so
+            // 036's handlers saw the live values (same condition and keys as
+            // the original pre-emit prune — see SWM14-F5 / SWM-TOKENLEAK above).
+            if ((msg.eventType === 'runFinished' || msg.eventType === 'runCrashed') &&
+                msg.detail && msg.detail.chatId && msg.detail.reason !== 'paused') {
+                var _doneCid = msg.detail.chatId;
+                delete _pauseToggleGen[_doneCid];
+                delete _pauseToggleDesired[_doneCid];
+                delete _interruptGen[_doneCid];
+                delete _interruptDesired[_doneCid];
+            }
+            // Resolve any pending runAgent promises waiting on a terminal
+            // event. runCrashed is terminal too — the SW loop's finally emits
+            // it INSTEAD of runFinished on an uncaught throw, so without
+            // settling here every `await runAgent()` caller would hang until
+            // the next port flap's hello reconcile (or forever on a healthy
+            // port).
+            if ((msg.eventType === 'runFinished' || msg.eventType === 'runCrashed') && msg.detail && msg.detail.chatId) {
                 var pr = _pendingRunAgents[msg.detail.chatId];
                 if (pr) {
                     delete _pendingRunAgents[msg.detail.chatId];
@@ -234,20 +561,48 @@ function _handleAgentBusMessage(msg) {
             return;
 
         case 'hello':
+            // SWM-S2: hello ends the disconnect grace window — cancel the
+            // no-hello safety timer; pending runAgent promises are settled
+            // below against the authoritative runningChatIds instead.
+            if (_busHelloSafetyTimer) {
+                try { clearTimeout(_busHelloSafetyTimer); } catch (e) {}
+                _busHelloSafetyTimer = null;
+            }
+            // REG-AUDIT-2: record whether the SW's resume scan already settled
+            // BEFORE arming the grace reconcile below, so the timer knows
+            // whether it may need its one-shot extension.
+            _swResumeScanSettledSeen = !!msg.resumeScanSettled;
             // Offscreen sent us the running-chats snapshot + the list of
             // running chat ids. Merge into local state so the panel UI
             // reflects ongoing background runs immediately on connect.
             if (msg.chatsSnapshot) {
+                var _helloRerenderCurrent = false;
                 Object.keys(msg.chatsSnapshot).forEach(function(cid) {
+                    // PR383-F6: same pending prompt_user/approval row preservation
+                    // as the agent-event inline-snapshot and chat-snapshot paths
+                    // (RES-5 / _mergePagePendingRows) — the wholesale replace here
+                    // wiped page-only pending rows on every reconnect hello.
+                    _mergePagePendingRows(chats[cid], msg.chatsSnapshot[cid], cid);
                     chats[cid] = msg.chatsSnapshot[cid];
+                    if (typeof currentChatId !== 'undefined' && cid === currentChatId) _helloRerenderCurrent = true;
                 });
+                // PR383-F6: mirror the chat-snapshot path's re-render so a
+                // preserved pending form/approval on the focused chat is painted
+                // from the merged copy instead of a stale DOM.
+                if (_helloRerenderCurrent && typeof renderMessages === 'function') {
+                    try { renderMessages(); } catch (e) {}
+                }
             }
+            // REG-F1: cids whose page-side running flag is dropped by the
+            // reconcile-DOWN loop below — their foreground-UI cleanup is
+            // deferred to the grace reconcile rather than run synchronously.
+            var _helloStaleCleanupCids = [];
             if (msg.runningChatIds) {
                 // SWM-RETRYF2: reconcile-DOWN. The bus onDisconnect (RETRY-F2 @:110)
-                // clears ALL runningChatIds + resolves ALL pending runAgent promises on
-                // ANY disconnect — including a transient flap while the SW keeps streaming
-                // — so `await runAgent()` callers can resolve early and the page can be
-                // left with a runningChatId the SW is NOT actually running. The proper
+                // clears ALL runningChatIds on ANY disconnect — including a transient
+                // flap while the SW keeps streaming — so the page can be left with a
+                // runningChatId the SW is NOT actually running (pending runAgent
+                // promises now survive the flap and settle below — SWM-S2). The proper
                 // debounce / reconcile redesign is a deferred design change (see
                 // changelog); this is the SAFE half: treat the hello snapshot as
                 // authoritative and DROP any page-side runningChatId ABSENT from it, so
@@ -258,10 +613,12 @@ function _handleAgentBusMessage(msg) {
                 Object.keys(runningChatIds).forEach(function(cid) {
                     if (!_helloRunning[cid]) {
                         delete runningChatIds[cid];
-                        // settle any orphaned pending runAgent promise so a caller's await
-                        // doesn't hang on a chat the SW reports it is not running.
-                        var _orphan = _pendingRunAgents[cid];
-                        if (_orphan) { delete _pendingRunAgents[cid]; try { if (_orphan.resolve) _orphan.resolve(); } catch (e) {} }
+                        // SWM-S3/REG-F1: no runFinished may ever come for this chat —
+                        // but the SW may equally be about to resume it from checkpoint
+                        // or process a run-agent we just re-posted. Don't wipe the
+                        // foreground streaming UI synchronously; queue it for the
+                        // deferred grace reconcile, which re-checks live state.
+                        _helloStaleCleanupCids.push(cid);
                     }
                 });
                 msg.runningChatIds.forEach(function(cid) {
@@ -279,6 +636,32 @@ function _handleAgentBusMessage(msg) {
                     try { var _jdHello = _getOpenJobsDropdown(); if (_jdHello) renderJobsDropdown(_jdHello); } catch (e) {}
                 }
             }
+            // SWM-S2/REG-F1: settle pending runAgent promises ONLY for chats the
+            // SW does NOT report as running — but NOT synchronously. This hello
+            // was posted BEFORE resumeRunningCheckpoints re-arms checkpointed
+            // runs and before any run-agent posted during the reconnect gap was
+            // processed, so a chat can be missing from _helloLive yet come back
+            // seconds later. Settling here finalized actions and wiped streaming
+            // UI for those runs. Capture the orphan candidates (entry identity
+            // included) and defer the reconcile via _armHelloGraceReconcile,
+            // which re-checks live state before acting.
+            // SWM-S3 (companion): stale foreground streaming-UI cleanup for
+            // chats the SW isn't running rides the same grace timer.
+            var _helloLive = Object.create(null);
+            (msg.runningChatIds || []).forEach(function(cid) { _helloLive[cid] = true; });
+            var _helloOrphans = {};
+            Object.keys(_pendingRunAgents).forEach(function(cid) {
+                if (!_helloLive[cid]) _helloOrphans[cid] = _pendingRunAgents[cid];
+            });
+            var _helloCleanups = {};
+            _helloStaleCleanupCids.forEach(function(cid) { _helloCleanups[cid] = true; });
+            if (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId && !_helloLive[activeStreamingChatId]) {
+                _helloCleanups[activeStreamingChatId] = true;
+            } else if (typeof isRunning !== 'undefined' && isRunning &&
+                       typeof currentChatId !== 'undefined' && currentChatId && !_helloLive[currentChatId]) {
+                _helloCleanups[currentChatId] = true;
+            }
+            _armHelloGraceReconcile(_helloOrphans, _helloCleanups);
             // Install initial sub-agent snapshot. The page's own
             // loadAllSubAgents at boot rehydrates from IDB so the strip
             // can paint before the SW connects, but the SW is the
@@ -288,6 +671,14 @@ function _handleAgentBusMessage(msg) {
             if (msg.subAgentRecords && typeof SubAgents !== 'undefined' && SubAgents.applySnapshot) {
                 SubAgents.applySnapshot(msg.subAgentRecords);
             }
+            return;
+
+        case 'resume-scan-done':
+            // REG-AUDIT-2: the SW's checkpoint resume scan is decided. Just
+            // record it — do NOT run the reconcile early; the grace timer
+            // (or its one-shot extension) fires on schedule and re-checks
+            // live state then.
+            _swResumeScanSettledSeen = true;
             return;
 
         case 'subagent-snapshot':
@@ -301,6 +692,9 @@ function _handleAgentBusMessage(msg) {
 
         case 'chat-snapshot':
             if (msg.chatId && msg.chat) {
+                // RES-5: same pending-row preservation as the agent-event
+                // inline-snapshot path above.
+                _mergePagePendingRows(chats[msg.chatId], msg.chat, msg.chatId); // PR383-F3: chatId for approval re-key
                 chats[msg.chatId] = msg.chat;
                 if (msg.chatId === currentChatId && typeof renderMessages === 'function') {
                     renderMessages();
@@ -355,7 +749,10 @@ async function _handleExecToolFromOffscreen(msg) {
     var capturedResult = null;
     var capturedError = null;
     try {
-        capturedResult = await executeTool(msg.name, msg.input, undefined, {
+        // messageIndex forwarded by the SW wrapper (via sandboxCtx → exec-tool
+        // envelope) so page-executed tools stamp recordMutated entries with the
+        // real assistant-message index instead of -1.
+        capturedResult = await executeTool(msg.name, msg.input, (typeof msg.messageIndex === 'number' ? msg.messageIndex : undefined), {
             toolCallId: msg.toolCallId,
             chatId: msg.chatId,
             // Forwarded by the SW wrapper when this UI tool was dispatched from
@@ -401,7 +798,10 @@ async function _handleApprovalPromptFromOffscreen(msg) {
                 msg.toolCallId,
                 msg.toolName,
                 msg.chatId,
-                {}
+                // Forward widgetName (set by the SW envelope when the call
+                // originated from a widget) so the notification is labeled
+                // with the widget's title instead of the chat title.
+                { widgetName: msg.widgetName || undefined }
             );
         }
         if (_agentBusPort) {
@@ -447,9 +847,18 @@ async function runAgent(overrideChatId) {
     // the foreground state via the page handlers.
     runningChatIds[chatId] = true;
 
-    var resolveFn;
-    var p = new Promise(function(resolve) { resolveFn = resolve; });
-    _pendingRunAgents[chatId] = { resolve: resolveFn, promise: p };
+    // SWM-S2: reuse an existing pending entry instead of overwriting it. With
+    // pending promises now surviving a port flap (settled on hello, not on
+    // disconnect), a Retry/Send during the gap lands here with runningChatIds
+    // cleared but the old promise still pending — a fresh entry would orphan
+    // the earlier caller's await forever (its resolve fn is dropped).
+    var _pendingEntry = _pendingRunAgents[chatId];
+    if (!_pendingEntry) {
+        var resolveFn;
+        var p = new Promise(function(resolve) { resolveFn = resolve; });
+        _pendingEntry = { resolve: resolveFn, promise: p };
+        _pendingRunAgents[chatId] = _pendingEntry;
+    }
 
     // Make sure the port is open. The async retry in _openAgentBus
     // means it may not be there yet at boot; queue and try shortly.
@@ -475,7 +884,7 @@ async function runAgent(overrideChatId) {
         }
     };
     attempt();
-    return p;
+    return _pendingEntry.promise;
 }
 
 // Push a chat update to offscreen (used by panel-side mutations

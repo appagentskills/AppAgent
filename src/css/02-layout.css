@@ -20,9 +20,9 @@
 
 /* Tooltip for collapsed sidebar icons */
 .sidebar:not(.expanded) .sidebar-nav-btn { position: relative; }
-.sidebar:not(.expanded) .sidebar-nav-btn::after { content: attr(data-tooltip); position: absolute; left: 100%; top: 50%; transform: translateY(-50%); background: var(--text-primary); color: var(--bg-white); padding: var(--space-3) var(--space-5); border-radius: var(--radius-md); font-size: var(--text-body-sm); font-weight: var(--font-medium); white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity var(--transition-fast), transform var(--transition-fast); z-index: 1000; margin-left: var(--space-4); box-shadow: var(--shadow-md); }
+.sidebar:not(.expanded) .sidebar-nav-btn::after { content: attr(data-tooltip); position: absolute; left: 100%; top: 50%; transform: translateY(-50%); background: var(--text-primary); color: var(--bg-white); padding: var(--space-3) var(--space-5); border-radius: var(--radius-md); font-size: var(--text-body-sm); font-weight: var(--font-medium); white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity var(--transition-fast), transform var(--transition-fast); z-index: var(--z-overlay-base); margin-left: var(--space-4); box-shadow: var(--shadow-md); }
 .sidebar:not(.expanded) .sidebar-nav-btn:hover::after { opacity: 1; }
-.sidebar:not(.expanded) .sidebar-nav-btn::before { content: ''; position: absolute; left: 100%; top: 50%; transform: translateY(-50%); border: 6px solid transparent; border-right-color: var(--text-primary); opacity: 0; pointer-events: none; transition: opacity 0.15s ease; z-index: 1000; margin-left: calc(-1 * var(--space-2)); }
+.sidebar:not(.expanded) .sidebar-nav-btn::before { content: ''; position: absolute; left: 100%; top: 50%; transform: translateY(-50%); border: 6px solid transparent; border-right-color: var(--text-primary); opacity: 0; pointer-events: none; transition: opacity 0.15s ease; z-index: var(--z-overlay-base); margin-left: calc(-1 * var(--space-2)); }
 .sidebar:not(.expanded) .sidebar-nav-btn:hover::before { opacity: 1; }
 
 /* Hover effect for collapsed icons */
@@ -113,7 +113,7 @@ mark.search-highlight-current { background: var(--warning); padding: var(--space
 .chat-menu-btn { background: var(--secondary-border); border: none; color: var(--text-muted); cursor: pointer; font-size: var(--text-xl); padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm); transition: all var(--transition-fast); font-weight: bold; letter-spacing: 1px; opacity: 0; pointer-events: none; }
 .chat-item:hover .chat-menu-btn, .chat-item.active .chat-menu-btn, .chat-menu-wrapper:has(.chat-dropdown.open) .chat-menu-btn { opacity: 1; pointer-events: auto; background: var(--secondary-border); }
 .chat-menu-btn:hover { background: var(--secondary-border-dark); color: var(--text-primary); }
-.chat-dropdown { display: none; position: absolute; top: 100%; right: 0; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 160px; z-index: 1000; overflow: hidden; }
+.chat-dropdown { display: none; position: absolute; top: 100%; right: 0; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 160px; z-index: var(--z-overlay-base); overflow: hidden; }
 .chat-dropdown.open { display: block; }
 .chat-dropdown-item { display: flex; align-items: center; gap: var(--space-4); width: 100%; padding: var(--space-5) var(--space-7); border: none; background: none; cursor: pointer; font-size: var(--text-body); color: var(--text-primary); text-align: left; transition: background var(--transition-fast); }
 .chat-dropdown-item:hover { background: var(--secondary-light); }

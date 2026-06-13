@@ -28,6 +28,9 @@ function executeHtmlWidget(args, messageIndex, options) {
     // (the bug that surfaced as "Widget not found" for click/fill/get_dom
     // immediately after html_widget created the widget).
     var chat = chats[widgetChatId];
+    if (!chat) {
+        return { success: false, error: 'No active chat' };
+    }
     var toolResultMsgIndex = -1;
     var widgetToolCallId = options && options.toolCallId;
     // Eager-render path: when html_widget is invoked via executeTool from INSIDE a
@@ -188,6 +191,10 @@ function toggleWidgetRunning(widgetId, event) {
         if (container) {
             var iframe = container.querySelector('iframe');
             if (iframe) {
+                // Release the onWidgetResize 'message' listener registered by
+                // renderWidgetInContainer — every other teardown path calls
+                // this; skipping it here leaked a listener per deactivation.
+                if (iframe.__widgetCleanup) { try { iframe.__widgetCleanup(); } catch (e) {} }
                 iframe.srcdoc = '';
                 iframe.remove();
             }
@@ -212,7 +219,7 @@ function renderWidgetInContainer(widget, container, options) {
     // Create iframe for complete CSS and script isolation
     var iframe = document.createElement('iframe');
     iframe.className = 'widget-iframe';
-    iframe.style.cssText = 'width:100%; border:none; display:block; overflow:hidden;';
+    iframe.style.cssText = 'width:100%; border:none; display:block;';
     iframe.setAttribute('scrolling', 'no');
 
     var isThumbnail = container.closest('.widgets-container') !== null;
@@ -227,7 +234,11 @@ function renderWidgetInContainer(widget, container, options) {
         'window.addEventListener("load",_rh);' +
         'if(document.body){try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});' +
         '}catch(e){}}document.addEventListener("DOMContentLoaded",function(){' +
-        'if(document.body){document.body.style.margin="0";document.body.style.overflow="hidden";' +
+        // overflow "auto" (NOT "hidden"): hidden made widget content unscrollable in any
+        // fixed-height context (fullscreen/panel view, or inline when the auto-resize
+        // height reporter lags/fails). With auto, no scrollbar shows when the iframe is
+        // auto-resized to fit, but taller content can still scroll inside the iframe.
+        'if(document.body){document.body.style.margin="0";document.body.style.overflow="auto";' +
         'try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});}catch(e){}_rh();}});' +
         'setInterval(_rh,2000);' +
     '})();<\/script>';
@@ -246,9 +257,16 @@ function renderWidgetInContainer(widget, container, options) {
         return iframe;
     }
 
+    // Non-thumbnail views (inline, modal, fullscreen/panel): allow the iframe
+    // viewport to scroll. scrolling="no" force-hides the viewport scrollbar at the
+    // HTML-attribute level, which (combined with the injected body overflow style)
+    // made content taller than the iframe impossible to scroll in the panel view —
+    // it only worked when the widget was opened in a new tab (raw HTML, no wrapper).
+    iframe.removeAttribute('scrolling');
+
     // Set initial height from last known value to prevent layout shift on re-render
     if (!isFullscreen && widget.lastHeight > 0) {
-        iframe.style.height = widget.lastHeight + 'px';
+        iframe.style.height = (widget.lastHeight + 2) + 'px';
     }
 
     // Listen for height updates from the in-widget height reporter (cross-origin)
@@ -256,7 +274,16 @@ function renderWidgetInContainer(widget, container, options) {
         if (e.source !== iframe.contentWindow) return;
         if (isFullscreen) return;
         if (e.data && e.data.type === 'widgetResize' && e.data.height > 0) {
-            iframe.style.height = e.data.height + 'px';
+            // Skip reports within the +2px slack of the last applied height:
+            // viewport-tracking content (100vh / height:100% bodies) reports
+            // back the applied iframe height on every 2s reporter tick, so an
+            // unconditional re-apply would grow the iframe +2px per report
+            // forever (unbounded feedback loop).
+            if (widget.lastHeight > 0 && Math.abs(e.data.height - widget.lastHeight) <= 2) return;
+            // +2px slack: body.scrollHeight is an integer that can round BELOW
+            // the real layout height (fractional zoom), and with body
+            // overflow:auto a >=1px mismatch shows a scrollbar.
+            iframe.style.height = (e.data.height + 2) + 'px';
             widget.lastHeight = e.data.height;
         }
     }
@@ -271,8 +298,6 @@ function renderWidgetInContainer(widget, container, options) {
     if (isFullscreen) {
         iframe.style.height = '100%';
         iframe.style.flex = '1';
-        iframe.removeAttribute('scrolling');
-        iframe.style.overflow = 'auto';
     }
     
     return iframe;
@@ -374,7 +399,11 @@ function openWidgetFullscreen(widgetId, event) {
 
 function closeWidgetFullscreen() {
     var overlay = document.getElementById('widget-fullscreen-overlay');
-    if (overlay) overlay.remove();
+    if (overlay) {
+        var iframe = overlay.querySelector('iframe');
+        if (iframe && iframe.__widgetCleanup) { try { iframe.__widgetCleanup(); } catch (e) {} }
+        overlay.remove();
+    }
     expandedWidgetId = null;
 }
 
@@ -574,7 +603,11 @@ function openWidgetModal(widgetId) {
 
 function closeWidgetModal() {
     var overlay = document.getElementById('widget-modal-overlay');
-    if (overlay) overlay.remove();
+    if (overlay) {
+        var iframe = overlay.querySelector('iframe');
+        if (iframe && iframe.__widgetCleanup) { try { iframe.__widgetCleanup(); } catch (e) {} }
+        overlay.remove();
+    }
 }
 
 function renderWidgetSidebar() {
@@ -722,11 +755,39 @@ async function executeGetSkill(args) {
     };
 }
 
+// True when a Reload would rebuild + redeploy the extension from the workspace — the
+// EXACT same gate _rebuildBeforeReload() (270-iframe-panel.js) checks, so this matches
+// precisely the condition under which a manage_skill write to the ephemeral runtime copy
+// gets silently overwritten on the next Reload. BOTH must hold: the extension-dev build
+// tool is loaded (extension_build) AND a deploy folder is connected. Gating on the build
+// tool first also avoids a spurious File System permission prompt for users who merely
+// have a deploy folder persisted but aren't currently doing extension development. Fails
+// open (returns false) on any error so a permission hiccup never hard-blocks a live edit.
+async function _reloadRebuildsFromWorkspace() {
+    // No in-browser build tool (extension-dev skill inactive) → a Reload never rebuilds.
+    if (typeof isSkillTool !== 'function' || !isSkillTool('extension_build')) return false;
+    // No connected deploy folder → nothing on disk for a rebuild to overwrite.
+    if (typeof getDeployDirHandle !== 'function') return false;
+    try { return !!(await getDeployDirHandle()); } catch (e) { return false; }
+}
+
 async function executeManageSkill(args) {
     var action = args.action;
     var skillId = args.skill_id;
     
     if (action === 'create') {
+        // Extension-dev guard: with the deploy folder connected a created skill lives
+        // only in the ephemeral runtime and is discarded on the next Reload — create it
+        // in the cloned repo so the build embeds it.
+        if (await _reloadRebuildsFromWorkspace()) {
+            var _newId = (args.name || 'untitled-skill').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'new-skill';
+            return {
+                success: false,
+                blocked_reason: 'extension_dev_mode',
+                source_path: 'skills/' + _newId + '/',
+                error: 'Blocked: the extension deploy folder is connected (extension-dev mode), so manage_skill would only create an ephemeral runtime skill that the next Reload discards. Create it in the cloned repo instead: add skills/' + _newId + '/SKILL.md (with frontmatter name + description, plus any tool *.js / *.md files) via the workspace tool (workspace write), then ask the user to click Reload. See the extension-dev skill.'
+            };
+        }
         var name = args.name || 'untitled-skill';
         var description = args.description || '';
         var body = args.body || '';
@@ -783,6 +844,23 @@ async function executeManageSkill(args) {
     if (!skillId) return { success: false, error: 'skill_id is required for action: ' + action };
     var skill = skills[skillId];
     if (!skill && action !== 'create') return { success: false, error: 'Skill not found: ' + skillId };
+
+    // Extension-dev guard (out-of-box skills): OOB skills carry an embeddedHash and their
+    // canonical source lives at skills/<id>/ in the cloned extension repo. When the deploy
+    // folder is connected, a manage_skill write only mutates the ephemeral runtime copy,
+    // which the next Reload rebuilds over from the workspace — so block the source-mutating
+    // actions and point the agent at the workspace tool. User-created live-instance skills
+    // (no embeddedHash) are unaffected; activate/deactivate stay allowed (they don't touch source).
+    var SKILL_SOURCE_MUTATING_ACTIONS = ['update', 'edit', 'add_file', 'update_file', 'delete_file', 'delete'];
+    if (skill && skill.embeddedHash && SKILL_SOURCE_MUTATING_ACTIONS.indexOf(action) !== -1 && await _reloadRebuildsFromWorkspace()) {
+        return {
+            success: false,
+            blocked_reason: 'oob_skill_extension_dev',
+            skill_id: skillId,
+            source_path: 'skills/' + skillId + '/',
+            error: 'Blocked: "' + (skill.name || skillId) + '" is a built-in (out-of-box) skill and the extension deploy folder is connected (extension-dev mode). manage_skill writes only the ephemeral runtime copy, which the next Reload rebuilds over from the workspace. Edit the source instead: skills/' + skillId + '/SKILL.md (and any *.md / tool *.js files) with the workspace tool (workspace edit / write), then ask the user to click Reload. See the extension-dev skill.'
+        };
+    }
     
     if (action === 'update') {
         if (args.name) skill.name = args.name;

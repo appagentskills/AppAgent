@@ -28,6 +28,7 @@ var TOOL_DISPLAY_NAMES = {
     'iframe_tool:impersonate': 'Impersonate User',
     'iframe_tool:get_page_info': 'Get Page Info',
     'set_chat_title': 'Set Chat Title',
+    'set_tldr': 'Set TLDR',
     'cached_content_outline': 'Cached Outline',
     'cached_content_search': 'Cached Search',
     'cached_content_read': 'Cached Read',
@@ -39,6 +40,7 @@ var TOOL_DISPLAY_NAMES = {
     'manage_skill:add_file': 'Add Skill File',
     'manage_skill:update_file': 'Update Skill File',
     'manage_skill:delete_file': 'Delete Skill File',
+    'manage_skill:delete': 'Delete Skill',
     'manage_skill:activate': 'Activate Skill',
     'manage_skill:deactivate': 'Deactivate Skill',
     'display': 'Display',
@@ -59,6 +61,8 @@ var TOOL_DISPLAY_NAMES = {
     'workspace:delete': 'Delete File',
     'workspace:grep': 'Search Files',
     'workspace:status': 'File Status',
+    'workspace:list': 'List Workspaces',
+    'workspace:discard': 'Discard Changes',
     'workspace:diff': 'View Diff',
     'workspace:copy': 'Copy File',
     'workspace:push': 'Push & Create PR',
@@ -82,6 +86,9 @@ var TOOL_DISPLAY_NAMES = {
     'browser:read': 'Read Page',
     'browser:click': 'Click Element',
     'browser:fill': 'Fill Input',
+    'browser:type': 'Type Text',
+    'iframe_tool:type': 'Type Text',
+    'iframe_tool:wait_for': 'Wait For',
     'browser:impersonate': 'Impersonate User',
     'browser:dispatch_event': 'Dispatch Event',
     'browser:select_option': 'Select Option'
@@ -311,6 +318,7 @@ var UI_ICONS = {
     check: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
     infinity: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18.178 8c5.096 0 5.096 8 0 8-5.095 0-7.133-8-12.739-8-4.585 0-4.585 8 0 8 5.606 0 7.644-8 12.74-8z"/></svg>',
     agentEdit: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 1l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7z"/><circle cx="20" cy="5" r="2" fill="currentColor" stroke="none"/><circle cx="21" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="16" cy="21" r="2" fill="currentColor" stroke="none"/></svg>',
+    bell_filled: '<svg class="ui-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
     bell: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
     attach: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>',
     image: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>',
@@ -332,6 +340,7 @@ function getToolIcon(toolName) {
     if (toolName === 'servicenow_diff_edit') return UI_ICONS.diff;
     if (toolName === 'iframe_tool') return UI_ICONS.browser;
     if (toolName === 'set_chat_title') return UI_ICONS.title;
+    if (toolName === 'set_tldr') return UI_ICONS.list;
     if (toolName === 'cached_content_outline') return UI_ICONS.file;
     if (toolName === 'cached_content_search') return UI_ICONS.search;
     if (toolName === 'cached_content_read') return UI_ICONS.file;

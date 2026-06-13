@@ -47,10 +47,24 @@ function getEnabledTools(chatId) {
             return !browserKeys.every(function(k) { return getInstanceToolPermission(k) === 'disabled'; });
         }
         if (name === 'set_chat_title' && !hooksEnabled.autoTitle) return false;
+        if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });
     var skillToolDefs = (typeof getActiveSkillTools === 'function') ? getActiveSkillTools() : [];
+    // Dedupe by name, core-first: a skill tool that shadows a built-in tool's
+    // name (e.g. a stale skill asset left in IDB after the tool was promoted
+    // to core) would otherwise produce a duplicate entry and a hard provider
+    // error ("Tool names must be unique"). Core wins — matching the dispatch
+    // order in tools/020-tool-execution.js where isSkillTool is the last arm.
+    var seenToolNames = {};
+    baseTools.forEach(function(t) { seenToolNames[t.function.name] = true; });
+    skillToolDefs = skillToolDefs.filter(function(t) {
+        var n = t && t.function && t.function.name;
+        if (!n || seenToolNames[n]) return false;
+        seenToolNames[n] = true;
+        return true;
+    });
     var allTools = baseTools.concat(skillToolDefs);
 
     // Sub-agent / parent visibility filter — keep in sync with page-side

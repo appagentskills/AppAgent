@@ -393,7 +393,7 @@ function renderVersionSidebar() {
             var screenshot = item.msg;
             var screenshotName = screenshot.name || screenshot.description || ('Screenshot ' + (i + 1));
             html += '<div class="screenshot-sidebar-item" onclick="scrollToMessage(' + item.idx + ')">' +
-                '<img class="screenshot-sidebar-thumb" src="' + screenshot.base64 + '" alt="' + escapeHtml(screenshotName) + '" onclick="event.stopPropagation();openScreenshotModal(this.src, \'' + escapeHtml(screenshotName).replace(/'/g, "\\'") + '\')" />' +
+                '<img class="screenshot-sidebar-thumb" src="' + screenshot.base64 + '" alt="' + escapeHtml(screenshotName) + '" onclick="event.stopPropagation();openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\')" />' +
                 '<div class="screenshot-sidebar-info">' +
                 '<span class="screenshot-sidebar-title">' + escapeHtml(screenshotName) + '</span>' +
                 '<span class="screenshot-sidebar-size">' + screenshot.width + '×' + screenshot.height + '</span>' +
@@ -454,9 +454,9 @@ function renderVersionSidebar() {
             var changesBadge = changeCount > 1 ? '<span class="sn-changes-badge">' + changeCount + ' changes</span>' : '';
 
             // Escape values for JS
-            var jsTable = escapeHtml(file.table);
-            var jsSysId = escapeHtml(file.sysId);
-            var jsDisplayName = escapeHtml(file.displayName).replace(/'/g, "\\'");
+            var jsTable = escapeJsString(file.table);
+            var jsSysId = escapeJsString(file.sysId);
+            var jsDisplayName = escapeJsString(file.displayName);
 
             html += '<div class="sn-artifact-card sidebar-card">';
             html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
@@ -512,7 +512,7 @@ function renderVersionSidebar() {
         html += '<div class="version-section-title">' + UI_ICONS.file + ' Documents (' + chatDocs.length + ')</div>';
         html += '<div class="documents-sidebar-list">';
         chatDocs.forEach(function(doc) {
-            html += '<div class="sdoc-sidebar-item" onclick="sdocOpenPreview(\'' + escapeHtml(doc.id) + '\')" title="' + escapeHtml(doc.title) + '">';
+            html += '<div class="sdoc-sidebar-item" onclick="sdocOpenPreview(\'' + escapeJsString(doc.id) + '\')" title="' + escapeHtml(doc.title) + '">';
             html += '<span class="sdoc-sidebar-icon">' + UI_ICONS.file + '</span>';
             html += '<span class="sdoc-sidebar-name">' + escapeHtml(doc.title) + '</span>';
             html += '<span class="sdoc-sidebar-ver">v' + doc.currentVersion + '</span>';

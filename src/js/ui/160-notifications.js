@@ -66,6 +66,9 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
         // Use targetChatId if provided (for background streaming), otherwise currentChatId
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
+        // Unknown/deleted chatId: degrade to a denial instead of throwing an
+        // uncaught TypeError inside the Promise (which would hang the caller).
+        if (!chat) { resolve(false); return; }
         var approvalIndex = chat.messages.length;
 
         // Add approval message to chat
@@ -86,16 +89,21 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
         }
 
         // Store resolve function BEFORE rendering (so it's available for handleApproval)
+        // PR383-F3: carry toolCallId so the entry/row can be re-matched after a
+        // snapshot merge shifts the row's index (see _mergePagePendingRows).
         var approvalKey = chatId + ':' + approvalIndex;
-        pendingToolApprovals[approvalKey] = { resolve: resolve, approvalIndex: approvalIndex, chatId: chatId };
+        pendingToolApprovals[approvalKey] = { resolve: resolve, approvalIndex: approvalIndex, chatId: chatId, toolCallId: toolCallId };
 
         // For programmatic tool calls (from widgets/js_eval), always use notification
         // This avoids calling renderMessages() which would destroy widget iframes
         // Notifications work everywhere: chat view, dashboard, any view
         var isProgrammaticCall = toolCallId && toolCallId.startsWith('prog_');
         if (isProgrammaticCall) {
-            // Use widget name if provided (from widget tool calls), otherwise fallback to 'Widget'
-            var notificationTitle = options.widgetName || 'Widget';
+            // Use widget name if provided (from widget tool calls); programmatic
+            // calls also come from js_eval chains and other chats routed via the
+            // worker, so fall back to the originating chat's title before the
+            // generic label — "Widget" was misleading for non-widget callers.
+            var notificationTitle = options.widgetName || chat.title || 'Background task';
             var statusMessage = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args);
         } else if (currentChatId === chatId && currentView === 'chat') {
@@ -123,6 +131,8 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
     return new Promise(function(resolve) {
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
+        // Same guard as showToolApprovalPrompt: degrade to denial, don't throw.
+        if (!chat) { resolve(false); return; }
         var approvalIndex = chat.messages.length;
 
         // Add approval message to chat
@@ -137,13 +147,14 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
         });
 
         // Store resolve function
+        // PR383-F3: carry toolCallId (same rationale as showToolApprovalPrompt).
         var approvalKey = chatId + ':' + approvalIndex;
-        pendingToolApprovals[approvalKey] = { resolve: resolve, approvalIndex: approvalIndex, chatId: chatId };
+        pendingToolApprovals[approvalKey] = { resolve: resolve, approvalIndex: approvalIndex, chatId: chatId, toolCallId: toolCallId };
 
         // Queue notification (will be shown after all approvals are added)
         // Always show notification popup (not just when on different chat/view)
         var isProgrammaticCall = toolCallId && toolCallId.startsWith('prog_');
-        var notificationTitle = isProgrammaticCall ? (options.widgetName || 'Widget') : (chat.title || 'A chat');
+        var notificationTitle = isProgrammaticCall ? (options.widgetName || chat.title || 'Background task') : (chat.title || 'A chat');
         var statusMessage = (args && args.status_message) ? args.status_message : null;
         showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args);
     });
@@ -165,6 +176,37 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
         if (pendingToolApprovals[directKey]) {
             approvalKey = directKey;
             chatId = targetChatId;
+        } else {
+            // PR384-FIX-4: the direct key ALSO misses when the clicked approval
+            // was already RESOLVED (stale popover / lingering notification). The
+            // sole-entry fallback below would then resolve a DIFFERENT pending
+            // approval — approving a tool the user never reviewed. Guard it: if
+            // the caller's index points at an approval row that is no longer
+            // pending, this click is STALE → no-op. Only fall through to the
+            // sole-entry fallback when the index points at nothing / a shifted
+            // row (the merge-drift case the fallback actually targets).
+            var _staleChat = chats[targetChatId];
+            var _staleRow = (_staleChat && Array.isArray(_staleChat.messages))
+                ? _staleChat.messages[approvalIndex] : null;
+            if (_staleRow && _staleRow.role === 'approval' && _staleRow.status !== 'pending') {
+                return;
+            }
+            // PR383-F3: a snapshot merge may have re-keyed this chat's pending
+            // entry to the row's new index (_mergePagePendingRows), so a
+            // notification/onclick carrying the OLD index misses the direct key.
+            // If the chat has exactly ONE pending entry it is unambiguously the
+            // one being answered; with several we refuse to guess (old no-op).
+            var _soleKey = null, _multi = false;
+            for (var _pk in pendingToolApprovals) {
+                if (pendingToolApprovals[_pk] && pendingToolApprovals[_pk].chatId === targetChatId) {
+                    if (_soleKey) { _multi = true; break; }
+                    _soleKey = _pk;
+                }
+            }
+            if (_soleKey && !_multi) {
+                approvalKey = _soleKey;
+                chatId = targetChatId;
+            }
         }
     } else {
         // No targetChatId — fall back to scanning, but prefer matches on currentChatId first
@@ -185,10 +227,32 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
 
     var chat = chats[chatId];
-    if (!chat || !chat.messages[approvalIndex]) return;
+    if (!chat || !Array.isArray(chat.messages)) return;
 
+    // PR383-F3: the pending entry holds the authoritative row index (kept
+    // current by _mergePagePendingRows' re-key); a caller-supplied index from a
+    // stale notification or pre-merge onclick may lag. Trust the entry's index.
+    if (approvalKey && pendingToolApprovals[approvalKey] &&
+        typeof pendingToolApprovals[approvalKey].approvalIndex === 'number') {
+        approvalIndex = pendingToolApprovals[approvalKey].approvalIndex;
+    }
     var msg = chat.messages[approvalIndex];
-    if (msg.role !== 'approval' || msg.status !== 'pending') return;
+    // PR383-F3 (defense in depth): if the index lookup still misses (row drifted
+    // in a snapshot merge without a re-key), locate the pending approval row by
+    // the entry's toolCallId — approval rows carry it from creation.
+    if ((!msg || msg.role !== 'approval' || msg.status !== 'pending') &&
+        approvalKey && pendingToolApprovals[approvalKey] && pendingToolApprovals[approvalKey].toolCallId) {
+        var _wantTc = pendingToolApprovals[approvalKey].toolCallId;
+        for (var _fi = 0; _fi < chat.messages.length; _fi++) {
+            var _fm = chat.messages[_fi];
+            if (_fm && _fm.role === 'approval' && _fm.status === 'pending' && _fm.toolCallId === _wantTc) {
+                approvalIndex = _fi;
+                msg = _fm;
+                break;
+            }
+        }
+    }
+    if (!msg || msg.role !== 'approval' || msg.status !== 'pending') return;
 
     var approved = action !== 'deny';
 

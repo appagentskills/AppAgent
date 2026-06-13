@@ -4,13 +4,14 @@ var INSTANCE_READ_KEYS = [
     'sn:read',           // servicenow_api GET
     'browser:read'       // iframe_tool: navigate, get_visible_text, get_dom, get_console_logs,
                          //   get_network_requests, scroll, resize, get_properties, set_style,
-                         //   get_page_info, open_widget, close, edit_html
+                         //   get_page_info, open_widget, close, edit_html, wait_for
 ];
 
 // iframe_tool actions that map to browser:read
 var BROWSER_READ_ACTIONS = [
     'navigate', 'get_visible_text', 'get_dom', 'get_console_logs', 'get_network_requests',
-    'scroll', 'resize', 'get_properties', 'set_style', 'get_page_info', 'open_widget', 'close', 'edit_html'
+    'scroll', 'resize', 'get_properties', 'set_style', 'get_page_info', 'open_widget', 'close', 'edit_html',
+    'wait_for'
 ];
 
 // Write: default 'ask' in Manual tier, 'auto' in Auto tier
@@ -21,6 +22,7 @@ var INSTANCE_WRITE_KEYS = [
     'sn:run_script',     // servicenow_run_script — server-side script execution via sys.scripts.do
     'browser:click',
     'browser:fill',
+    'browser:type',      // iframe_tool per-character typing — writes into instance forms like fill
     'browser:impersonate',
     'browser:dispatch_event',
     'browser:select_option'
@@ -42,11 +44,11 @@ var GLOBAL_READ_KEYS = [
     'get_file',
     'read_attached_file',
     'workspace:ls',
+    'workspace:list',
     'workspace:read',
     'workspace:grep',
     'workspace:status',
     'workspace:diff',
-    'workspace:copy',
     'document:read',
     'document:list',
     'document:list_versions',
@@ -60,6 +62,7 @@ var GLOBAL_WRITE_KEYS = [
     'html_widget',
     'web_fetch',
     'set_chat_title',
+    'set_tldr',
     'manage_skill:create',
     'manage_skill:update',
     'manage_skill:edit',
@@ -68,10 +71,13 @@ var GLOBAL_WRITE_KEYS = [
     'manage_skill:delete_file',
     'manage_skill:activate',
     'manage_skill:deactivate',
+    'manage_skill:delete',
     'workspace:clone',
     'workspace:write',
     'workspace:edit',
     'workspace:delete',
+    'workspace:copy',
+    'workspace:discard',
     'workspace:push',
     'workspace:deploy',
     'document:create',

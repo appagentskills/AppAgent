@@ -7,6 +7,9 @@ description: "Develop the AppAgent Chrome extension using the workspace tool. Cl
 
 Develop the AppAgent Chrome extension using the `workspace` tool. You edit source files in the workspace; the **Reload** button in the extension applies them (it rebuilds + redeploys from the workspace and restarts). You do **not** deploy yourself.
 
+> ## ⛔ #1 RULE — skills are SOURCE FILES here, not live-instance objects
+> **If a task is "improve / test / edit / fix the `<name>` skill" (e.g. ui-driver, instance-audit), that IS extension development — edit `skills/<name>/SKILL.md` and its `*.md` / tool `*.js` files with the `workspace` tool, then ask the user to Reload.** Do **NOT** reach for the `manage_skill` tool: it mutates only the *ephemeral live/runtime copy*, which the next build **overwrites** — so that work is silently lost and diverges from the repo (this exact mistake has recurred across multiple agents — see PR history). All *writes* go through the `workspace` tool. For *reading*, `get_skill` is fine for a quick look — but the **canonical source is the repo**, so prefer `workspace read` as the source of truth (the runtime copy `get_skill` returns can lag what's in `skills/<name>/`). Rule of thumb: **write with `workspace`, never `manage_skill`.**
+
 ## Prerequisites
 
 - GitHub connected in Settings (PAT with `repo` scope)
@@ -20,6 +23,13 @@ Develop the AppAgent Chrome extension using the `workspace` tool. You edit sourc
 3. **Edit**: Use `workspace edit` for surgical changes (preferred) or `workspace write` for new files
 4. **Reload to apply**: Do **not** run `extension_build` to deploy. After editing, ask the user to click the **Reload** button in the extension header. With a deploy folder connected and this skill active, the reload rebuilds + redeploys from the workspace and restarts in one click — that is what makes your changes take effect. (Reload calls `extension_build` internally; you don't.)
 5. **Push**: When happy, `workspace push` creates a branch + commit + PR on GitHub
+
+## Workspace Pinning, Branch Forks & Edit Moves
+
+- **Pinning**: `workspace pin` (args: `workspace`, or `{unpin: true}`) marks ONE workspace per owner/repo as pinned. Reload / `extension_build` build the **pinned** `/AppAgent` workspace; without a pin they fall back to the trunk (`::main` / `::master`), then the first match. Default workspace resolution also prefers the pin over most-recently-used. The pin is also toggleable from the workspace header dropdown (📌) and the Settings repos list.
+- **`branch` action (local fork)**: `workspace branch` with `branch: "feat/x"` forks the current workspace into `owner/repo::feat/x` locally — a cheap row copy; the **remote branch is only created on the first push** from the fork (cut from the fork's base branch; `branch_name` defaults to the fork's own branch). Dirty edits travel to the fork by default (`move_dirty: true` reverts the source clean); pass `move_dirty: false` to keep them in both. The fork is pinned automatically, so Reload builds it.
+- **`move` action**: `workspace move` with `to: "owner/repo::other"` (optional `files: [...]`) moves dirty edits onto another workspace — written against the target's own base, source restored clean. A target file that is itself dirty with different content blocks the whole move (use `force` to overwrite); differing base shas are allowed but reported in `base_diverged`.
+- **Merge lifecycle**: when a workspace's branch is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the fork workspace: dirty files are moved to the base first (a blocked move keeps the workspace and returns a warning), the base workspace is synced/pulled so it contains the merged code, and the pin follows the merge onto the base (only if the deleted workspace held the pin, or no pin existed — a pin pointing elsewhere is never stolen).
 
 ## Project Structure
 
@@ -38,9 +48,9 @@ dist/extension/- Built extension output (DO NOT edit directly, use src/)
 ## JS File Map (src/js/)
 
 Files are organized into **tiers** (folders); within each tier the numeric prefix sets load order.
-Tier concatenation order (in `build/build.js` `JS_TIERS`): `core` → `ui` → `tools` → `app` for the page bundle, plus a separate `worker` tier bundled into the service worker. Since the service-worker move, the authoritative agent loop and all run state live in the `worker` tier (the SW); tools that need the DOM bridge from the SW to an offscreen document.
+Tier concatenation order (in `build/build.js` `JS_TIERS`): `core` → `ui` → `tools` → `app` for the page bundle, plus a separate `worker` tier bundled into the service worker. Since the service-worker move, the authoritative agent loop and all run state live in the `worker` tier (the SW); tools that need the DOM are bridged from the SW to an offscreen document.
 
-- `src/js/core/` — platform detection, bootstrap, config, storage, permissions, tool registry, system prompt, skills engine, IndexedDB
+- `src/js/core/` — platform detection, bootstrap, config, hooks/history, streaming, permissions, tool registry, codemap, handle & sub-agent registries, cached results, system prompt, init, IndexedDB, skills engine, record helpers
 - `src/js/ui/` — views, panels, sidebar, settings, modals, dropdowns, message rendering, layout, iframe panel UI
 - `src/js/tools/` — agent tool implementations (iframe_tool, file_tools, screenshot_tools, widget_tools, prompt_user, actions, smart_documents, display_templates)
 - `src/js/app/` — page-side bridge / event-handler layer between the page and the service worker (llm_streaming, api_messages, send_message, image_attachments, keep_awake), plus the page-side agent bus / port bridge (045-agent-port-bridge-page.js) and agent-event handlers (035-agent-events.js, 036-agent-event-handlers-page.js). NOTE: the authoritative agent loop no longer runs here — it runs in the `worker` tier (service worker); `030-agent-loop.js` here is the page-side wrapper.
@@ -50,10 +60,10 @@ Insertion: drop a new file into the right tier folder with an unused numeric pre
 
 ## CSS File Map (src/css/)
 
-- `01-03` — Variables, base/reset, layout
-- `04-08` — Header, sidebar, chat, messages, code blocks
-- `09-15` — Settings, modals, tools, browser panel, widgets
-- `16-22` — Dashboard, skills, docs, history, sidepanel, responsive
+- `00-03` — Tokens (variables), dark theme, layout, chat
+- `04-08` — Header, tools, input, markdown, browser panel
+- `09-15` — Settings, approval, version, artifacts, notifications, modals, widgets
+- `16-24` — Diff, skills, panels, dashboard, responsive, display templates (`21*`: display-templates, prompt-user, smart-documents), sidepanel, actions, sub-agents
 
 ## Key Files
 

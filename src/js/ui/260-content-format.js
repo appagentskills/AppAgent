@@ -80,13 +80,20 @@ function formatMetrics(metrics) {
 }
 
 function updateChatTitle(chat) {
-    // Skip if auto-title hook is enabled - let the hook generate the title
-    if (hooksEnabled.autoTitle) return;
-    
-    var userMsgs = chat.messages.filter(function(m) { return m.role === 'user'; });
+    // Immediately give a brand-new chat a provisional title derived from the
+    // first user message (no LLM involved) so the sidebar never shows
+    // "New Chat". When the auto-title hook is enabled it later replaces this
+    // with a model-generated title — `titleProvisional` tells the hook the
+    // title still needs upgrading (see executeAfterResponseHooks).
+    if (chat.title && chat.title !== 'New Chat' && !chat.titleProvisional) return;
+
+    var userMsgs = chat.messages.filter(function(m) { return m.role === 'user' && !m.isHookMessage; });
     if (userMsgs.length === 1) {
-        var first = userMsgs[0].content;
-        chat.title = first.substring(0, 60) + (first.length > 60 ? '...' : '');
+        var first = (typeof userMsgs[0].content === 'string') ? userMsgs[0].content : '';
+        first = first.replace(/\s+/g, ' ').trim();
+        if (!first) return;
+        chat.title = first.substring(0, 80) + (first.length > 80 ? '...' : '');
+        chat.titleProvisional = true;
         saveChatsToStorage();
         renderChatList();
         updateChatTitleHeader();

@@ -90,7 +90,7 @@ async function openDiffViewer(table, sysId, displayName) {
         '<div class="diff-header-center" id="diff-header-stats"></div>' +
         '<div class="diff-header-right">' +
         '<a class="diff-action-btn" href="' + instanceUrl + '" target="_blank" title="Open on instance">' + UI_ICONS.externalLink + '<span>Open</span></a>' +
-        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + displayName.replace(/'/g, "\\'") + '\')" title="Screenshot">' + UI_ICONS.camera + '<span>Screenshot</span></button>' : '') +
+        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + escapeJsString(displayName) + '\')" title="Screenshot">' + UI_ICONS.camera + '<span>Screenshot</span></button>' : '') +
         '<button class="diff-action-btn" onclick="downloadFromDiffViewer()" title="Download XML">' + UI_ICONS.download + '<span>Download</span></button>' +
         revertBtnHtml +
         '<button class="diff-close-btn" onclick="closeDiffViewer()" title="Close">' + UI_ICONS.close + '</button>' +
@@ -183,21 +183,9 @@ async function updateDiffView() {
     // If preview only mode, just show the current version
     if (isPreviewOnly) {
         try {
-            var xml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : null;
-            if (!xml) {
-                // Try fetching latest version directly from SN
-                var liveVersion = await getRecordVersion(currentDiffFile.table, currentDiffFile.sysId);
-                if (liveVersion) xml = await getVersionXml(liveVersion.sys_id);
-            }
-            if (!xml) {
-                // No version data — fetch XML export directly from SN
-                try {
-                    if (!_validTable.test(currentDiffFile.table) || !_validSysId.test(currentDiffFile.sysId)) throw new Error('Invalid table/sys_id');
-                    var headers = { 'X-UserToken': window.sessionToken };
-                    var recRes = await fetch('/' + currentDiffFile.table + '.do?XML&sys_id=' + currentDiffFile.sysId, { headers: headers });
-                    xml = await recRes.text();
-                } catch(e) {}
-            }
+            // Shared helper (ui/090-version-history.js): chat version → live
+            // version → <table>.do?XML export fallback for data tables.
+            var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
             if (!xml) {
                 content.innerHTML = '<div class="diff-error">Could not load record data.</div>';
                 return;
@@ -210,7 +198,7 @@ async function updateDiffView() {
             lines.forEach(function(line, idx) {
                 html += '<div class="diff-line">';
                 html += '<span class="diff-line-num">' + (idx + 1) + '</span>';
-                html += '<span class="diff-text">' + escapeHtml(line) + '</span>';
+                html += '<span class="diff-text">' + highlightXmlLine(line) + '</span>';
                 html += '</div>';
             });
             html += '</div></div>';
@@ -372,15 +360,17 @@ function closeDiffViewer() {
 async function downloadFromDiffViewer() {
     if (!currentDiffFile) return;
 
-    var latestAfterVersion = getLatestAfterVersion(currentDiffFile.table, currentDiffFile.sysId);
-    if (!latestAfterVersion) {
-        showSnackbar('No version to download', 'warning');
-        return;
-    }
-
     showSpinner('Downloading...');
     try {
-        var xml = await getVersionXml(latestAfterVersion);
+        // getLatestRecordXml falls back to the <table>.do?XML export for data
+        // tables (no sys_update_version rows) — the old getLatestAfterVersion
+        // early-return made Download dead-end with "No version to download".
+        var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
+        if (!xml) {
+            hideSpinner();
+            showSnackbar('No version to download', 'warning');
+            return;
+        }
         if (xml) {
             var prettyXml = prettyPrintXml(xml) || xml;
             var blob = new Blob([prettyXml], { type: 'application/xml' });

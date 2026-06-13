@@ -1,13 +1,16 @@
 // READ ATTACHED FILE TOOL - Read user-attached text files (CSV, etc.)
 // =============================================
 
-function executeReadAttachedFile(args) {
+function executeReadAttachedFile(args, options) {
     var filename = args.filename;
     if (!filename) {
         return { success: false, error: 'filename is required' };
     }
 
-    var chat = chats[currentChatId];
+    // Resolve the owning chat: options.chatId (threaded by the dispatcher) is
+    // authoritative — currentChatId is permanently null in the SW context.
+    var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    var chat = chats[chatId];
     if (!chat || !chat.messages) {
         return { success: false, error: 'No active chat found' };
     }

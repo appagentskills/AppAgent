@@ -48,7 +48,7 @@ Pick per-step, not per-scenario. Four levels:
 | **L3 — Line-by-line** | "Line 351 existing-check, line 357 dismiss old, line 362 new chatId, line 377 assign activeActions[actionId] = {…}" | State mutators, validators, guards, anything where ordering or off-by-one matters |
 | **L4 — Branch-by-branch** | Every `if`/`switch` arm enumerated, including the `else` that does nothing | Tool dispatch, click routers, switch-on-state patterns |
 
-A healthy mix on a medium feature: ~70% L2, ~20% L3 on the high-risk functions, ~10% L1 on glue and ~5% L4 on routers. Tracing everything at L3 buries the signal. Tracing everything at L1 misses off-by-ones.
+A healthy mix on a medium feature: ~65% L2, ~20% L3 on the high-risk functions, ~10% L1 on glue and ~5% L4 on routers. Tracing everything at L3 buries the signal. Tracing everything at L1 misses off-by-ones.
 
 **Where to spend L3/L4 budget:** state mutators, guard expressions, validation, switch-on-state. **Where L1 is fine:** renderers, leaf utilities, well-tested helpers, IDB writes.
 

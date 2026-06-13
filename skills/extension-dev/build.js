@@ -21,10 +21,24 @@ async function extension_build(args) {
         try {
             var list = await executeTool("workspace", { action: "list" });
             if (list && list.workspaces && list.workspaces.length) {
-                // Prefer a workspace ending with /AppAgent, else the first one
+                // Auto-detect order:
+                //   1. the PINNED /AppAgent workspace (workspace pin / branch fork)
+                //   2. the trunk among /AppAgent matches (::main, ::master)
+                //   3. the first /AppAgent match
+                //   4. the first workspace
+                var appAgentMatches = [];
                 for (var i = 0; i < list.workspaces.length; i++) {
-                    if (/\/AppAgent(::|$)/.test(list.workspaces[i].workspace)) { defaultWorkspace = list.workspaces[i].workspace; break; }
+                    if (/\/AppAgent(::|$)/.test(list.workspaces[i].workspace)) appAgentMatches.push(list.workspaces[i]);
                 }
+                for (var pi = 0; pi < appAgentMatches.length; pi++) {
+                    if (appAgentMatches[pi].pinned) { defaultWorkspace = appAgentMatches[pi].workspace; break; }
+                }
+                if (!defaultWorkspace) {
+                    for (var ti = 0; ti < appAgentMatches.length; ti++) {
+                        if (/::(main|master)$/.test(appAgentMatches[ti].workspace)) { defaultWorkspace = appAgentMatches[ti].workspace; break; }
+                    }
+                }
+                if (!defaultWorkspace && appAgentMatches.length) defaultWorkspace = appAgentMatches[0].workspace;
                 if (!defaultWorkspace) defaultWorkspace = list.workspaces[0].workspace;
             }
         } catch (e) { /* non-fatal */ }
@@ -36,6 +50,28 @@ async function extension_build(args) {
         if (defaultWorkspace) params.workspace = defaultWorkspace;
         return executeTool("workspace", params);
     };
+
+    // Lazy clones store file stubs (content fetched on demand). Bulk-hydrate
+    // everything once up front so the hundreds of reads below don't each
+    // trigger a one-file fetch. NOTE: hydrate reports failure via
+    // success:false (it does NOT throw). A failed hydration would let the
+    // parallel reads below fan out into ~200 concurrent per-file GitHub
+    // fetches and/or silently drop files from the bundle — so abort the
+    // build instead. Exception: an older runtime without the hydrate action
+    // returns "Unknown workspace action" — that stays non-fatal (per-read
+    // hydration still applies there).
+    var hydrateResult = null;
+    try { hydrateResult = await ws("hydrate", {}); }
+    catch (e) { hydrateResult = { success: false, error: (e && e.message) ? e.message : String(e) }; }
+    if (hydrateResult && hydrateResult.success === false && !/unknown workspace action/i.test(hydrateResult.error || '')) {
+        var hydrateFailedPaths = hydrateResult.failed || [];
+        return {
+            success: false,
+            error: 'Build aborted — workspace hydrate failed: ' + (hydrateResult.error || hydrateResult.last_error || (hydrateFailedPaths.length + ' file(s) failed to hydrate')),
+            built_from: defaultWorkspace || null,
+            hydrate_failed: hydrateFailedPaths.slice(0, 20)
+        };
+    }
 
     // Helper: list and sort files by name in a directory
     async function getOrderedFiles(dir, ext) {
@@ -62,14 +98,12 @@ async function extension_build(args) {
         return lines.join('\n');
     }
 
-    // Helper: read and concat files in order
+    // Helper: read and concat files in order. Reads are fired in PARALLEL
+    // (each one is a sandbox->host message round-trip, so a sequential loop
+    // over ~200 files costs seconds); Promise.all preserves input order.
     async function concatFiles(filePaths) {
-        var contents = [];
-        for (var i = 0; i < filePaths.length; i++) {
-            var content = await readFile(filePaths[i]);
-            if (content !== null) contents.push(content);
-        }
-        return contents.join('\n');
+        var contents = await Promise.all(filePaths.map(readFile));
+        return contents.filter(function(c) { return c !== null; }).join('\n');
     }
 
     // 1. Concatenate JS: CSP polyfill (first) + core JS + platform bridge (last)
@@ -81,11 +115,9 @@ async function extension_build(args) {
     // Within each tier folder, files are sorted by their numeric prefix.
     // Keep in sync with build/build.js (JS_TIERS).
     var JS_TIERS = ['core', 'ui', 'tools', 'app'];
+    var tierLists = await Promise.all(JS_TIERS.map(function(t) { return getOrderedFiles('src/js/' + t, '.js'); }));
     var jsFiles = [];
-    for (var i = 0; i < JS_TIERS.length; i++) {
-        var tierFiles = await getOrderedFiles('src/js/' + JS_TIERS[i], '.js');
-        jsFiles = jsFiles.concat(tierFiles);
-    }
+    for (var i = 0; i < tierLists.length; i++) jsFiles = jsFiles.concat(tierLists[i]);
     var coreJS = await concatFiles(jsFiles);
 
     // Worker (service worker) bundle composition. Mirror of build/build.js
@@ -100,6 +132,7 @@ async function extension_build(args) {
         'src/js/core/060-ui-constants.js',
         'src/js/core/070-permissions.js',
         'src/js/core/080-tools.js',
+        'src/js/core/085-eval-runner.js',
         'src/js/core/090-codemap.js',
         'src/js/core/095-handle-registry.js',
         // 097-sub-agent-registry — Phase 2 sub-agent runtime. Defines
@@ -144,10 +177,18 @@ async function extension_build(args) {
     var embeddedSkills = [];
     if (skillsLs.success) {
         var skillDirs = skillsLs.entries.filter(function(e) { return e.indexOf('/') > 0; }).map(function(e) { return e.split('/')[0]; });
-        for (var si = 0; si < skillDirs.length; si++) {
-            var skillName = skillDirs[si];
+        // Build each skill's embed in parallel (every readFile/ls is a message
+        // round-trip). Results are collected in order to keep the hash stable.
+        var skillResults = await Promise.all(skillDirs.map(function(skillName) { return buildSkillEmbed(skillName); }));
+        for (var si = 0; si < skillResults.length; si++) {
+            if (skillResults[si]) embeddedSkills.push(skillResults[si]);
+        }
+    }
+
+    async function buildSkillEmbed(skillName) {
+        {
             var skillMd = await readFile('skills/' + skillName + '/SKILL.md');
-            if (!skillMd) continue;
+            if (!skillMd) return null;
 
             var name = skillName, description = '', body = skillMd;
             var fmMatch = skillMd.match(/^---\s*\n([\s\S]*?)\n---/);
@@ -171,12 +212,12 @@ async function extension_build(args) {
                     var n = e.split(' ')[0];
                     return n !== 'SKILL.md' && (n.endsWith('.js') || n.endsWith('.xml') || n.endsWith('.md'));
                 });
-                for (var ai = 0; ai < assetEntries.length; ai++) {
-                    var assetName = assetEntries[ai].split(' ')[0];
-                    var assetContent = await readFile('skills/' + skillName + '/' + assetName);
-                    if (assetContent) {
-                        var ext = assetName.split('.').pop().toLowerCase();
-                        assets.push({ filename: assetName, type: ext, content: btoa(unescape(encodeURIComponent(assetContent))) });
+                var assetNames = assetEntries.map(function(e) { return e.split(' ')[0]; });
+                var assetContents = await Promise.all(assetNames.map(function(n) { return readFile('skills/' + skillName + '/' + n); }));
+                for (var ai = 0; ai < assetNames.length; ai++) {
+                    if (assetContents[ai]) {
+                        var ext = assetNames[ai].split('.').pop().toLowerCase();
+                        assets.push({ filename: assetNames[ai], type: ext, content: btoa(unescape(encodeURIComponent(assetContents[ai]))) });
                     }
                 }
             }
@@ -193,7 +234,7 @@ async function extension_build(args) {
             }
             var hash = h.map(function(v) { return (v >>> 0).toString(16).padStart(8, '0'); }).join('');
 
-            embeddedSkills.push({
+            return {
                 id: name,
                 name: name,
                 description: description,
@@ -201,7 +242,7 @@ async function extension_build(args) {
                 frontmatter: btoa(unescape(encodeURIComponent(fmRaw))),
                 hash: hash,
                 assets: assets
-            });
+            };
         }
     }
 
@@ -327,10 +368,10 @@ async function extension_build(args) {
     // helpers the SW bridges to via chrome.runtime.sendMessage — js_eval
     // sandbox, image canvas, skills sandbox).
     var extFiles = ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js'];
+    var extContents = await Promise.all(extFiles.map(function(f) { return readFile('src/platform/extension/' + f); }));
     for (var ei = 0; ei < extFiles.length; ei++) {
-        var extContent = await readFile('src/platform/extension/' + extFiles[ei]);
-        if (extContent !== null) {
-            outputFiles.push({ path: 'dist/extension/' + extFiles[ei], content: extContent });
+        if (extContents[ei] !== null) {
+            outputFiles.push({ path: 'dist/extension/' + extFiles[ei], content: extContents[ei] });
         }
     }
 
@@ -340,21 +381,30 @@ async function extension_build(args) {
     var iconsDeploy = await executeTool("workspace", {
         action: "deploy",
         path: "src/platform/extension/icons",
+        dest: "icons",
         workspace: defaultWorkspace
     });
-    var iconsCopied = iconsDeploy.success ? iconsDeploy.files_written : 0;
+    // files_skipped = already identical on disk (counts as deployed)
+    var iconsCopied = iconsDeploy.success ? (iconsDeploy.files_written || 0) + (iconsDeploy.files_skipped || 0) : 0;
+    // Zero icons means the icons source dir is missing/renamed or its deploy
+    // failed — the extension would load without icons. Surface it prominently.
+    var iconsWarning = iconsCopied === 0
+        ? ('Icons deploy produced 0 files' + (iconsDeploy && iconsDeploy.error ? ' (' + iconsDeploy.error + ')' : '') + ' — extension icons may be missing or stale.')
+        : null;
 
     // Write all output files. dist/* is gitignored, so the workspace cross-chat
     // conflict guard skips them automatically — we still check per-file success in
     // case some other failure mode (IDB write error, validation, etc.) trips.
     var fileNames = [];
     var writeFailures = [];
+    var writeResults = await Promise.all(outputFiles.map(function(f) {
+        return ws("write", { path: f.path, content: f.content });
+    }));
     for (var wi = 0; wi < outputFiles.length; wi++) {
-        var writeResult = await ws("write", { path: outputFiles[wi].path, content: outputFiles[wi].content });
-        if (writeResult && writeResult.success) {
+        if (writeResults[wi] && writeResults[wi].success) {
             fileNames.push(outputFiles[wi].path);
         } else {
-            writeFailures.push({ path: outputFiles[wi].path, error: (writeResult && writeResult.error) || 'unknown error' });
+            writeFailures.push({ path: outputFiles[wi].path, error: (writeResults[wi] && writeResults[wi].error) || 'unknown error' });
         }
     }
 
@@ -362,6 +412,7 @@ async function extension_build(args) {
         return {
             success: false,
             error: 'Build aborted — ' + writeFailures.length + ' of ' + outputFiles.length + ' file write(s) failed. Skipping deploy.',
+            built_from: defaultWorkspace || null,
             files: fileNames,
             write_failures: writeFailures,
             stats: {
@@ -393,12 +444,14 @@ async function extension_build(args) {
         deployError = e && e.message ? e.message : String(e);
     }
 
-    var filesDeployed = deployResult && deployResult.success ? (deployResult.files_written || 0) : 0;
+    var filesDeployed = deployResult && deployResult.success ? (deployResult.files_written || 0) + (deployResult.files_skipped || 0) : 0;
     var deployedSummary = deployError ? 'deploy failed: ' + deployError : 'deployed ' + filesDeployed + ' files to connected folder';
 
     return {
         success: !deployError,
         message: 'Built ' + fileNames.length + ' files to dist/extension/; ' + deployedSummary,
+        warning: iconsWarning || undefined,
+        built_from: defaultWorkspace || null,
         files: fileNames,
         deploy: deployError ? { success: false, error: deployError } : deployResult,
         stats: {

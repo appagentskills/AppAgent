@@ -130,7 +130,12 @@ async function _rebuildBeforeReload() {
         if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
         var res = await executeTool('extension_build', {});
         var ok = !!(res && res.success && res.stats && res.stats.jsFiles > 0 && res.stats.filesDeployed > 0);
-        if (ok) return true;
+        if (ok) {
+            // Surface WHICH workspace was built — with pinning + forks the
+            // build may come from a non-trunk workspace.
+            if (typeof showSnackbar === 'function' && res.built_from) showSnackbar('Rebuilt extension from ' + res.built_from);
+            return true;
+        }
 
         // Build/deploy failed — let the user decide whether to reload the
         // previously built files instead of silently shipping a broken build.

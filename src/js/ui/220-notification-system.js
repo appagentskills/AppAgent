@@ -506,7 +506,7 @@ function showModal(title, message, buttons) {
         header.textContent = title;
         body.innerHTML = message;
         actions.innerHTML = buttons.map(function(btn) {
-            return '<button class="modal-btn ' + (btn.class || 'secondary') + '" onclick="resolveModal(\'' + btn.value + '\')">' + btn.label + '</button>';
+            return '<button class="modal-btn ' + (btn.class || 'secondary') + '" onclick="resolveModal(\'' + escapeJsString(btn.value) + '\')">' + escapeHtml(btn.label) + '</button>';
         }).join('');
         overlay.classList.add('show');
     });

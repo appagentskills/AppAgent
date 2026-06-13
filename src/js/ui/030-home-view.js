@@ -1,7 +1,17 @@
 // Home View Management
-function toggleHomeView() {
-    if (currentView === 'home') return;
-    openHomeView();
+// Sidebar "New Chat" entry point. Home IS the de-facto new-chat composer
+// (sendHomeMessage() -> newChat() -> send), so "New Chat" means: open Home
+// and put the cursor in the composer. Unlike the old toggleHomeView(), this
+// also does something useful when Home is already open (re-focuses the
+// composer instead of returning early). Any pending home draft is preserved
+// on purpose — the sidebar home-pending-dot tracks it.
+function startNewChat() {
+    if (currentView !== 'home') {
+        openHomeView(); // restores draft + focuses composer via its own setTimeout
+        return;
+    }
+    var input = document.getElementById('home-message-input');
+    if (input) input.focus();
 }
 
 function openHomeView() {
@@ -492,6 +502,10 @@ var EXAMPLE_SUGGESTIONS = [
     { text: "Set up a daily report of unresolved tickets", icon: "timer" }
 ];
 
+// Memoized chip order: shuffled once per session (page load) so the example
+// chips stay stable across renderHome() re-renders.
+var memoizedExampleChips = null;
+
 function renderHome() {
     var statsContainer = document.getElementById('home-stats');
     var cardsContainer = document.getElementById('home-cards');
@@ -513,9 +527,10 @@ function renderHome() {
     // these chips entirely (one-click > free-text).
     var hasHomeActions = (typeof collectActionsForPlacement === 'function')
         && collectActionsForPlacement('home').length > 0;
-    var shuffledExamples = hasHomeActions
-        ? []
-        : EXAMPLE_SUGGESTIONS.slice().sort(function() { return 0.5 - Math.random(); }).slice(0, 4);
+    if (!memoizedExampleChips) {
+        memoizedExampleChips = EXAMPLE_SUGGESTIONS.slice().sort(function() { return 0.5 - Math.random(); }).slice(0, 4);
+    }
+    var shuffledExamples = hasHomeActions ? [] : memoizedExampleChips;
 
     // Render home content with centered chat input (Google-style)
     contentEl.innerHTML =
@@ -530,7 +545,7 @@ function renderHome() {
             (recentPrompts.length > 0 ? '<div class="home-recent-prompts" id="home-recent-prompts">' +
                 '<span class="home-section-label">Recent</span>' +
                 recentPrompts.map(function(p) {
-                    return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeHtml(p.text).replace(/'/g, "\\'").replace(/\n/g, ' ') + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeHtml(p.text).replace(/'/g, "\\'").replace(/\n/g, ' ') + '\')" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
+                    return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeJsString(p.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeJsString(p.text) + '\')" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
                 }).join('') +
             '</div>' : '') +
             // Free-text example chips fallback (only when no `home` actions exist).
@@ -538,7 +553,7 @@ function renderHome() {
                 ? '<div class="home-example-chips">' +
                     shuffledExamples.map(function(ex) {
                         var iconHtml = UI_ICONS[ex.icon] ? '<span class="home-example-chip-icon">' + UI_ICONS[ex.icon] + '</span>' : '';
-                        return '<div class="home-example-chip" onclick="fillHomeInput(\'' + escapeHtml(ex.text).replace(/'/g, "\\'") + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeHtml(ex.text).replace(/'/g, "\\'") + '\')" title="' + escapeHtml(ex.text) + '" role="button" tabindex="0">' + iconHtml + '<span>' + escapeHtml(ex.text) + '</span></div>';
+                        return '<div class="home-example-chip" onclick="fillHomeInput(\'' + escapeJsString(ex.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeJsString(ex.text) + '\')" title="' + escapeHtml(ex.text) + '" role="button" tabindex="0">' + iconHtml + '<span>' + escapeHtml(ex.text) + '</span></div>';
                     }).join('') +
                   '</div>'
                 : '') +
@@ -564,7 +579,7 @@ function renderHome() {
     var widgetCount = Object.keys(dashboardWidgets).length;
     var skillCount = Object.keys(skills).length;
     var toolCount = TOOLS.length;
-    var cachedCredits = appStorage.getItem('cachedCredits') || '...';
+    var cachedCredits = appStorage.getItem('cachedCredits');
     var systemPromptTokens = getSystemPromptTokenCount();
     var systemPromptTokensFormatted = systemPromptTokens >= 1000 ? (systemPromptTokens / 1000).toFixed(1) + 'k' : systemPromptTokens.toString();
     
@@ -575,8 +590,8 @@ function renderHome() {
         '<div class="home-stat-card"><div class="home-stat-value">' + skillCount + '</div><div class="home-stat-label">Skills</div></div>' +
         '<div class="home-stat-card"><div class="home-stat-value">' + toolCount + '</div><div class="home-stat-label">Tools</div></div>' +
         '<div class="home-stat-card"><div class="home-stat-value">' + systemPromptTokensFormatted + '</div><div class="home-stat-label">System Prompt</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value" id="home-credits-value">$' + cachedCredits + '</div><div class="home-stat-label">Credits</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value" id="home-storage-value">...</div><div class="home-stat-label">Storage</div></div>';
+        '<div class="home-stat-card"><div class="home-stat-value" id="home-credits-value">' + (cachedCredits ? escapeHtml(cachedCredits) : '—') + '</div><div class="home-stat-label">Credits</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value" id="home-storage-value">—</div><div class="home-stat-label">Storage</div></div>';
     
     // Fetch and update credits
     updateHomeCredits();
@@ -613,7 +628,8 @@ function updateHomeCredits() {
     if (!el) return;
     var cachedCredits = appStorage.getItem('cachedCredits');
     if (cachedCredits) {
-        el.textContent = '$' + cachedCredits;
+        // cachedCredits already embeds its unit ('$12.34' or '57% for 2h')
+        el.textContent = cachedCredits;
     }
 }
 

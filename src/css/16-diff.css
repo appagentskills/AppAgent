@@ -1,5 +1,5 @@
 /* Diff Viewer Overlay and Modal */
-.diff-viewer-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: 10000; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.15s ease; }
+.diff-viewer-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-overlay); display: flex; align-items: center; justify-content: center; animation: fadeIn 0.15s ease; }
 .diff-viewer-modal { width: 95vw; height: 92vh; max-width: 1400px; background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); display: flex; flex-direction: column; overflow: hidden; animation: slideUp 0.2s ease; }
 @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 
@@ -79,6 +79,14 @@
 .diff-word-remove { background: var(--diff-remove-word); color: var(--diff-remove-word-text); border-radius: var(--radius-xs); padding: 0 1px; }
 .diff-preview .diff-line-num { width: 60px; min-width: 60px; border-right: 1px solid var(--secondary-border); }
 .diff-preview .diff-text { padding-left: var(--space-8); }
+
+/* XML syntax highlighting (diff-viewer preview — highlightXmlLine) */
+.diff-text .xml-bracket { color: var(--text-muted); }
+.diff-text .xml-tag { color: var(--primary); }
+.diff-text .xml-attr { color: var(--accent); }
+.diff-text .xml-attr-value { color: var(--success); }
+.diff-text .xml-text { color: var(--text-primary); }
+.diff-text .xml-comment, .diff-text .xml-decl { color: var(--text-muted); font-style: italic; }
 
 /* Inline Revert All Button */
 .inline-revert-all-btn { margin-left: auto; padding: var(--space-2) var(--space-5); background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.5); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--success-hover); cursor: pointer; transition: all var(--transition-normal); display: inline-flex; align-items: center; }

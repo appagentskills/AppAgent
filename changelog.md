@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.6
+
+### Features
+- You can now branch a workspace to work on changes separately, or move unfinished edits from one workspace to another — and merging brings those edits back automatically.
+- Workspaces now take up much less space — identical files are saved once instead of being copied again and again.
+- If the model declines a request you'll see a clear message instead of a blank reply, and responses stay fast.
+- Helper agents are no longer cut off in the middle of a task — they get a heads-up as they near their limit but are allowed to finish and report back, and the limit itself is higher than before.
+
+### Fixes
+- Several fixes to merging and syncing workspaces — merging is no longer blocked by ignored files, re-downloading a workspace remembers where it branched from, and the "behind" indicator updates correctly.
+- Widgets no longer slowly grow taller on their own.
+- The agent's final reply now repeats any important conclusion or question, instead of leaving it buried in the hidden step-by-step details.
+- Helper agents now pick up where they left off if the extension restarts in the background, instead of stopping.
+- Pushing your changes to GitHub now works in several cases that used to fail.
+
+---
+
 ## v1.1.5
 
 ### Features

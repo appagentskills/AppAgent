@@ -21,7 +21,7 @@ function navigateScreenshot(delta) {
     var titleText = escapeHtml(s.name || s.description || 'Screenshot');
     var sizeText = (s.width && s.height) ? ' <span class="screenshot-modal-size">' + s.width + ' × ' + s.height + 'px</span>' : '';
     var url = s.url || '';
-    var urlBtn = url ? '<button class="modal-close-icon" onclick="window.open(\'' + escapeHtml(url).replace(/'/g, "\\'") + '\', \'_blank\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
+    var urlBtn = url ? '<button class="modal-close-icon" onclick="window.open(\'' + escapeJsString(url) + '\', \'_blank\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
     var counterText = '<span class="screenshot-modal-counter">' + (newIndex + 1) + ' / ' + screenshotNav.list.length + '</span>';
     header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="Download">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
     body.querySelector('img').src = s.base64;
@@ -63,7 +63,7 @@ function openScreenshotModal(src, title, width, height, url) {
     var titleText = escapeHtml(title || 'Screenshot');
     var sizeText = (width && height) ? ' <span class="screenshot-modal-size">' + width + ' × ' + height + 'px</span>' : '';
     var counterText = hasNav ? '<span class="screenshot-modal-counter">' + (screenshotNav.index + 1) + ' / ' + screenshotNav.list.length + '</span>' : '';
-    var urlBtn = url ? '<button class="modal-close-icon" onclick="window.open(\'' + escapeHtml(url).replace(/'/g, "\\'") + '\', \'_blank\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
+    var urlBtn = url ? '<button class="modal-close-icon" onclick="window.open(\'' + escapeJsString(url) + '\', \'_blank\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
 
     header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="Download">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
 

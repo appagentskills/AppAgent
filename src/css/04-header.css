@@ -56,7 +56,7 @@
 /* Model pill dropdown menu — same visual language as the jobs/Action dropdown:
    white surface, grey banded section headers, full-width divided rows, plain
    --primary icons, green selected state (matches the header connection pill). */
-.model-menu { z-index: 1000; min-width: 286px; max-width: 360px; max-height: 72vh; overflow-y: auto; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); padding: 0; }
+.model-menu { z-index: var(--z-overlay-base); min-width: 286px; max-width: 360px; max-height: 72vh; overflow-y: auto; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); padding: 0; }
 .model-menu-section-title { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; padding: var(--space-3) var(--space-4); background: var(--bg-light); border-bottom: 1px solid var(--secondary-border); position: sticky; top: 0; z-index: 1; }
 .model-menu .model-menu-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; border-bottom: 1px solid var(--secondary-border); transition: background var(--transition-fast); }
 .model-menu .model-menu-row:hover { background: var(--bg-hover); }
@@ -94,14 +94,18 @@
 .ext-sn-status.disconnected .ext-status-dot { background: var(--danger); }
 .ext-status-tier { font-size: 10px; opacity: 0.7; margin-left: var(--space-1); }
 .ext-browser-status .ext-status-dot { background: var(--primary); }
-.ext-instance-dropdown { position: fixed; z-index: 10010; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 220px; padding: var(--space-1) 0; }
+.ext-instance-dropdown { position: fixed; z-index: var(--z-dropdown); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 220px; padding: var(--space-1) 0; }
 .ext-instance-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); transition: background 0.1s; }
 .ext-instance-row:hover { background: var(--bg-hover); }
 .ext-instance-row.active { background: var(--success-lighter); }
 .ext-instance-dot { width: 8px; height: 8px; min-width: 8px; min-height: 8px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; transition: background 0.2s; }
 .ext-instance-dot.ok { background: var(--success); }
 .ext-instance-dot.fail { background: var(--danger); }
-.ext-instance-row.active .ext-instance-dot:not(.ok):not(.fail) { background: var(--success); }
+.ext-instance-row.active:not(.retained) .ext-instance-dot:not(.ok):not(.fail) { background: var(--success); }
+/* Retained (closed / signed-out) instances: kept visible but dimmed, shown at the end of the list. */
+.ext-instance-row.retained { opacity: 0.55; }
+.ext-instance-row.retained:hover { opacity: 0.85; }
+.ext-instance-signedout { color: var(--text-muted); font-style: italic; }
 .ext-instance-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ext-instance-user { color: var(--text-muted); font-size: var(--text-caption); margin-left: var(--space-1); font-weight: var(--font-normal); }
 .ext-instance-role-badge { display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: var(--radius-sm); font-size: 10px; font-weight: var(--font-medium); margin-left: var(--space-2); white-space: nowrap; vertical-align: middle; }
@@ -133,10 +137,8 @@
 .ext-instance-open { display: inline-flex; align-items: center; color: var(--text-muted); padding: 2px; border-radius: var(--radius-sm); transition: color 0.15s, background 0.15s; }
 .ext-instance-open:hover { color: var(--text-primary); background: var(--bg-hover); }
 .ext-instance-open .ui-icon { width: 12px; height: 12px; }
-.ext-instance-count { color: var(--text-muted); font-size: 11px; min-width: 16px; text-align: center; }
 .ext-instance-test { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-white); font-size: 11px; cursor: pointer; min-width: 40px; transition: all 0.15s; }
 .ext-instance-test:hover { background: var(--bg-hover); }
-.ext-instance-test.ok { color: var(--success-hover); border-color: var(--success-light); background: var(--success-lighter); }
 .ext-instance-test.fail { color: var(--danger-hover); border-color: var(--danger-light); background: var(--danger-lighter); }
 .ext-instance-empty { padding: var(--space-4); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); }
 
@@ -147,7 +149,7 @@
 .ws-header-status.modified { color: var(--warning-hover); background: var(--warning-lighter); border-color: var(--warning-light); }
 .ws-header-status .ws-icon { display: inline-flex; align-items: center; }
 .ws-header-status .ws-icon .ui-icon { width: 12px; height: 12px; }
-.ws-dropdown { position: fixed; z-index: 10000; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 320px; max-width: 420px; max-height: 400px; overflow-y: auto; }
+.ws-dropdown { position: fixed; z-index: var(--z-overlay); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 320px; max-width: 420px; max-height: 400px; overflow-y: auto; }
 .ws-dropdown-header { padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; }
 .ws-dropdown-header .ws-branch { font-weight: var(--font-normal); color: var(--text-muted); background: var(--bg-tertiary); padding: 1px var(--space-3); border-radius: var(--radius-sm); font-size: var(--text-caption); }
 .ws-dropdown-header .ws-sync { font-weight: var(--font-normal); color: var(--text-muted); font-size: var(--text-caption); }
@@ -181,6 +183,10 @@
 .toggle-sidebar-btn:focus:not(:focus-visible) { outline: none; }
 
 .messages { flex: 1; overflow-y: auto; padding: var(--space-10); display: flex; flex-direction: column; scrollbar-gutter: stable; }
+/* While a run is streaming, reserve extra bottom space so the streaming tail
+   isn't flush against the input area (class maintained by chat-management /
+   agent-event handlers). */
+.messages.is-streaming { padding-bottom: var(--space-13); }
 .streaming-answer { max-height: 50vh; min-height: 33vh; overflow-y: auto; scrollbar-width: none; position: relative; }
 .streaming-answer::-webkit-scrollbar { display: none; }
 .streaming-answer.has-top-shadow { box-shadow: var(--shadow-inset); }
@@ -195,6 +201,13 @@
 .assistant-actions { display: flex; gap: var(--space-2); margin-top: var(--space-6); padding-bottom: var(--space-8); border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
 .message.user .message-content { background: var(--secondary-light); padding: var(--space-6) var(--space-8); border-radius: var(--radius-bubble); color: var(--text-primary); position: relative; display: inline-block; max-width: 50%; width: fit-content; border: 1px solid var(--secondary-border); }
 .message.user .user-text { white-space: pre-wrap; word-wrap: break-word; }
+/* Markdown-rendered user message: formatContent() already converts newlines
+   to <br>/paragraphs and emits block elements, so pre-wrap would double the
+   spacing — use normal flow. Headers/lists/code blocks inherit the same
+   markdown styles assistant messages use. */
+.message.user .user-text-md { display: block; white-space: normal; word-wrap: break-word; }
+.message.user .user-text-md > :first-child { margin-top: 0; }
+.message.user .user-text-md > :last-child { margin-bottom: 0; }
 .message.user .user-cached-badge { display: inline-flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); padding: var(--space-1) var(--space-3); background: var(--bg-tertiary, rgba(0,0,0,0.06)); color: var(--text-secondary); border-radius: var(--radius-md, 6px); font-size: 11px; font-weight: 500; opacity: 0.85; }
 .message.user .user-cached-badge .ui-icon { width: 12px; height: 12px; }
 .message.user .user-text-cached { display: block; max-height: 180px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; padding: var(--space-3) var(--space-4); background: var(--bg-tertiary, rgba(0,0,0,0.04)); border: 1px solid var(--border, rgba(0,0,0,0.08)); border-radius: var(--radius-md, 6px); font-family: var(--font-mono, ui-monospace, monospace); font-size: var(--text-body-sm, 12px); line-height: 1.5; transition: max-height var(--transition-normal, 0.2s ease); }
@@ -207,7 +220,7 @@
 .message.user:hover .msg-actions { opacity: 1; }
 
 /* Queued user bubble — message typed during streaming, not yet sent to the model. */
-.message.user.queued .message-content { opacity: 0.7; border: 1px dashed var(--border-color, rgba(0,0,0,0.18)); background: var(--bg-tertiary, rgba(0,0,0,0.04)); }
+.message.user.queued .message-content { opacity: 0.7; border: 1px dashed var(--border-dark); background: var(--bg-tertiary, rgba(0,0,0,0.04)); }
 .message.user.queued .queued-badge { display: inline-flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); padding: var(--space-1) var(--space-3); border-radius: var(--radius-pill, 12px); background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text-secondary, #666); font-size: 11px; font-weight: 500; letter-spacing: 0.02em; }
 .message.user.queued .queued-attachments { margin-top: var(--space-2); font-size: 11px; color: var(--text-secondary, #666); }
 .message.user.queued .user-text { white-space: pre-wrap; word-wrap: break-word; }

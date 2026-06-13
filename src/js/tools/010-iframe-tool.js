@@ -6,6 +6,10 @@ function describeEl(el) {
     return s;
 }
 
+// Tab ids currently being adopted/navigated by a navigate call in this context.
+// Guards against two concurrent navigates (e.g. two chats) adopting the same tab.
+var _adoptionInFlight = new Set();
+
 // Send a DOM query to a cross-origin widget iframe via postMessage and wait for response
 function queryWidgetViaPostMessage(iframe, action, args) {
     return new Promise(function(resolve) {
@@ -99,13 +103,77 @@ async function executeIframeTool(args) {
                         var _reuseTab = false;
                         // If targeting a different instance, try to find an existing tab on it first
                         if (_navInstanceUrl && Platform.getTabForInstance) {
-                            var _instanceTabId = Platform.getTabForInstance(_navInstanceUrl);
+                            var _instanceTabId = Platform.getTabForInstance(_navInstanceUrl, fullTabNavUrl);
                             if (_instanceTabId && _instanceTabId !== _existingTabId) {
                                 _existingTabId = _instanceTabId;
                             }
                         }
+                        // Validate the recorded / cross-instance tab still exists.
                         if (_existingTabId) {
-                            try { await chrome.tabs.get(_existingTabId); _reuseTab = true; } catch(e) {}
+                            try { await chrome.tabs.get(_existingTabId); _reuseTab = true; } catch(e) { _existingTabId = null; }
+                        }
+                        // No live tab to reuse yet? Adopt an already-open tab that is already
+                        // sitting on the *same* page instead of spawning a duplicate. We only
+                        // adopt when an open tab has the same origin + path AND already contains
+                        // every query param of the target URL, so we never hijack a tab showing a
+                        // different record / catalog item. This lets iframe_tool drive a tab the
+                        // user already had open (previously, navigating to a page the user already
+                        // had open always created a second background tab).
+                        var _adoptedTab = null;
+                        if (!_reuseTab) {
+                            try {
+                                var _tgtU = new URL(fullTabNavUrl);
+                                var _tgtPath = _tgtU.pathname.replace(/\/+$/, '');
+                                // Tab ids already owned by OTHER chats — never steal those.
+                                var _otherChatTabIds = {};
+                                try {
+                                    Object.keys(chats || {}).forEach(function(_cid) {
+                                        if (_cid !== currentChatId && chats[_cid] && chats[_cid].targetTabId) {
+                                            _otherChatTabIds[chats[_cid].targetTabId] = true;
+                                        }
+                                    });
+                                } catch (e) {}
+                                // Focused window id — used to skip the tab the user is looking at.
+                                var _focusedWinId = null;
+                                try {
+                                    if (chrome.windows && chrome.windows.getLastFocused) {
+                                        var _focusedWin = await chrome.windows.getLastFocused();
+                                        if (_focusedWin) _focusedWinId = _focusedWin.id;
+                                    }
+                                } catch (e) {}
+                                var _openTabs = await chrome.tabs.query({});
+                                for (var _oti = 0; _oti < _openTabs.length; _oti++) {
+                                    var _cand = _openTabs[_oti];
+                                    if (!_cand || !_cand.url) continue;
+                                    // Never adopt pinned/incognito/discarded tabs, tabs another
+                                    // chat owns, or tabs another navigate is currently adopting.
+                                    if (_cand.pinned || _cand.incognito || _cand.discarded) continue;
+                                    if (_adoptionInFlight.has(_cand.id) || _otherChatTabIds[_cand.id]) continue;
+                                    // Skip the tab the user is actively looking at (active tab of
+                                    // the focused window). If we can't tell which window is
+                                    // focused, err on the side of skipping every active tab.
+                                    if (_cand.active && (_focusedWinId === null || _cand.windowId === _focusedWinId)) continue;
+                                    var _candU;
+                                    try { _candU = new URL(_cand.url); } catch (e) { continue; }
+                                    if (_candU.origin !== _tgtU.origin) continue;
+                                    if (_candU.pathname.replace(/\/+$/, '') !== _tgtPath) continue;
+                                    // Require EXACT query equality (both directions) so we never
+                                    // hijack a tab showing a more specific page (e.g. target
+                                    // /incident.do must not adopt /incident.do?sys_id=X).
+                                    var _paramsMatch = true;
+                                    _tgtU.searchParams.forEach(function(v, k) {
+                                        if (_candU.searchParams.get(k) !== v) _paramsMatch = false;
+                                    });
+                                    _candU.searchParams.forEach(function(v, k) {
+                                        if (_tgtU.searchParams.get(k) !== v) _paramsMatch = false;
+                                    });
+                                    if (!_paramsMatch) continue;
+                                    _existingTabId = _cand.id;
+                                    _adoptedTab = _cand;
+                                    _reuseTab = true;
+                                    break;
+                                }
+                            } catch (e) { /* fall through and create a new tab */ }
                         }
                         // Pre-register load listener BEFORE initiating navigation to avoid
                         // missing the 'complete' event for fast loads / cached pages.
@@ -123,15 +191,44 @@ async function executeIframeTool(args) {
                         }
 
                         var _targetTab;
-                        if (_reuseTab) {
-                            _targetTab = await chrome.tabs.update(_existingTabId, { url: fullTabNavUrl });
-                        } else {
-                            _targetTab = await chrome.tabs.create({ url: fullTabNavUrl, active: false });
-                            if (_earlyListener) _navTabIdEarly = _targetTab.id;
+                        if (_reuseTab && _existingTabId != null) _adoptionInFlight.add(_existingTabId);
+                        try {
+                            // If the adopted tab is already sitting on the exact target URL
+                            // (ignoring hash / trailing slash), don't force a reload — a
+                            // tabs.update would destroy the user's in-page state.
+                            var _normNavUrl = function(u) {
+                                try { var _x = new URL(u); return _x.origin + _x.pathname.replace(/\/+$/, '') + _x.search; }
+                                catch (e) { return String(u || '').split('#')[0].replace(/\/+$/, ''); }
+                            };
+                            if (_reuseTab && _adoptedTab && _adoptedTab.url && _normNavUrl(_adoptedTab.url) === _normNavUrl(fullTabNavUrl)) {
+                                _targetTab = _adoptedTab;
+                            } else if (_reuseTab) {
+                                _targetTab = await chrome.tabs.update(_existingTabId, { url: fullTabNavUrl });
+                            } else {
+                                _targetTab = await chrome.tabs.create({ url: fullTabNavUrl, active: false });
+                                if (_earlyListener) _navTabIdEarly = _targetTab.id;
+                            }
+                            if (_ftChat) {
+                                _ftChat.targetTabId = _targetTab.id;
+                                saveChatsToStorage();
+                            }
+                        } finally {
+                            if (_existingTabId != null) _adoptionInFlight.delete(_existingTabId);
                         }
-                        if (_ftChat) {
-                            _ftChat.targetTabId = _targetTab.id;
-                            saveChatsToStorage();
+                        // Adopted tabs were opened by the user (not the agent), so the
+                        // content script may not be injected yet — inject eagerly so the
+                        // very next action doesn't fail. Idempotent; mirrors the pattern
+                        // background.js uses in getSnTabList.
+                        if (_adoptedTab) {
+                            try {
+                                if (chrome.scripting && chrome.scripting.executeScript) {
+                                    await chrome.scripting.executeScript({ target: { tabId: _targetTab.id }, files: ['content-script.js'] });
+                                } else {
+                                    chrome.runtime.sendMessage({ type: 'ensure-content-script', tabId: _targetTab.id });
+                                }
+                            } catch (e) {
+                                try { chrome.runtime.sendMessage({ type: 'ensure-content-script', tabId: _targetTab.id }); } catch (e2) {}
+                            }
                         }
                         // Mirror to SW: when the agent loop runs in the SW, its
                         // chat snapshot doesn't know about this page-side write,
@@ -223,7 +320,7 @@ async function executeIframeTool(args) {
                 // Side panel mode close: expand back to full page after response completes
                 if (action === 'close' && document.body.classList.contains('sidepanel-mode')) {
                     var _expandCheck = setInterval(function() {
-                        if (!isLoading) {
+                        if (typeof isChatRunning !== 'function' || !isChatRunning(currentChatId)) {
                             clearInterval(_expandCheck);
                             saveChatsToStorage().then(function() {
                                 expandSidePanel();

@@ -3,6 +3,8 @@ name: memory
 description: Self-improving memory for recording mistakes and solutions. Read knowledge-base.md before tasks to learn from past mistakes, and append new learnings when discovering fixes.
 ---
 
+# Memory
+
 ## Overview
 
 This skill is your **self-improving memory**. When you make mistakes and discover solutions, record them in `knowledge-base.md`. This creates a growing knowledge base that prevents repeating errors.
@@ -12,6 +14,8 @@ This skill is your **self-improving memory**. When you make mistakes and discove
 ### Before Starting a Task
 
 Read `knowledge-base.md` in this directory to review accumulated learnings from previous sessions. This helps avoid repeating past mistakes.
+
+At runtime, read it with `get_skill({ skill_id: 'memory', action: 'read_file', filename: 'knowledge-base.md' })` and append entries with `manage_skill({ skill_id: 'memory', action: 'update_file', filename: 'knowledge-base.md', file_content: <existing + new entry> })`. **Exception:** if the AppAgent repo is cloned and extension-dev is active, edit `skills/memory/knowledge-base.md` with the `workspace` tool instead — `manage_skill` writes are ephemeral there and get overwritten by the next build.
 
 ### When to Add a Learning
 

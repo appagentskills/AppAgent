@@ -76,6 +76,33 @@ function deleteAgentCheckpoint(chatId) {
     });
 }
 
+// Boot-time reaper. Deletes every checkpoint record that is not a LIVE
+// run ('running'/'parked' are never touched) and is either explicitly
+// 'finished' (legacy records written before delete-on-finish landed) or
+// stale: lastEventAt missing or older than 24h. Cursor-based so we never
+// materialize the (potentially huge) records and never store.clear().
+function sweepFinishedAgentCheckpoints() {
+    var cutoff = Date.now() - (24 * 60 * 60 * 1000);
+    return _agentRunsStore('readwrite').then(function(store) {
+        return new Promise(function(resolve) {
+            var deleted = 0;
+            var req = store.openCursor();
+            req.onsuccess = function(e) {
+                var cur = e.target.result;
+                if (!cur) { resolve(deleted); return; }
+                var rec = cur.value || {};
+                var isLive = (rec.status === 'running' || rec.status === 'parked');
+                var isStale = (typeof rec.lastEventAt !== 'number') || (rec.lastEventAt < cutoff);
+                if (!isLive && (rec.status === 'finished' || isStale)) {
+                    try { cur.delete(); deleted++; } catch (e2) {}
+                }
+                cur.continue();
+            };
+            req.onerror = function() { resolve(deleted); };
+        });
+    });
+}
+
 function listRunningAgentCheckpoints() {
     return _agentRunsStore('readonly').then(function(store) {
         return new Promise(function(resolve) {
@@ -108,10 +135,11 @@ function listRunningAgentCheckpoints() {
 // `assistantMessage` (after a complete API call's metrics are stored)
 // so a resume can pick up token/duration totals.
 //
-// `runFinished` is the natural commit-and-clear point: status flips
-// to 'finished' (or 'errored') and the resume scanner skips it. We
-// keep the record around for diagnostics; a future cleanup pass can
-// delete records older than N days.
+// `runFinished` is the natural commit-and-clear point: a clean finish
+// DELETES the checkpoint outright (each record holds a full
+// messagesSnapshot — keeping them bloats IDB unboundedly). 'errored'
+// and 'paused' records are kept for diagnostics / resume-by-user and
+// reaped by sweepFinishedAgentCheckpoints after 24h on SW boot.
 function _buildCheckpointSnapshotFor(chatId) {
     var chat = chats[chatId];
     if (!chat) return null;
@@ -154,8 +182,16 @@ AgentEvents.on('assistantMessage', function(e) {
 });
 
 AgentEvents.on('runFinished', function(e) {
+    if (!e.hasError && !e.isPaused) {
+        // Clean finish — the checkpoint has served its purpose. The resume
+        // scanner only ever looks at 'running'/'parked' records, so a
+        // 'finished' record is dead weight (with a full messagesSnapshot
+        // inside). Delete instead of writing status:'finished'.
+        deleteAgentCheckpoint(e.chatId);
+        return;
+    }
     var snap = _buildCheckpointSnapshotFor(e.chatId) || { chatId: e.chatId };
-    snap.status = e.hasError ? 'errored' : (e.isPaused ? 'paused' : 'finished');
+    snap.status = e.hasError ? 'errored' : 'paused';
     writeAgentCheckpoint(e.chatId, snap);
 });
 

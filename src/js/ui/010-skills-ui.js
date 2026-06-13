@@ -734,6 +734,7 @@ async function importSkillFromFolder(dirHandle, folderName) {
         name: parsed.name || folderName,
         description: parsed.description || '',
         body: parsed.body,
+        actions: dedupeActionsByActionId(parsed.name || folderName, parsed.actions || []),
         userModified: true,
         createdAt: skills[id] ? skills[id].createdAt : Date.now(),
         updatedAt: Date.now()
@@ -954,6 +955,13 @@ async function importSkills() {
     var saveScrollTimeout = null;
     document.addEventListener('scroll', function(e) {
         if (e.target && e.target.id === 'messages' && currentChatId) {
+            // R2: ignore scroll events caused by our own programmatic scrolls
+            // (scrollToBottomIfAllowed / renderMessages restore). They are not
+            // user activity — recording them disengaged auto-follow mid-run.
+            // A real gesture (wheel/touchmove/keydown) clears the flag instantly,
+            // so deliberate user scrolls still pass through (see 050-streaming.js).
+            if (Date.now() < (window._programmaticScrollUntil || 0)) return;
+
             // Record user scroll time for debounce
             lastUserScrollTime = Date.now();
 

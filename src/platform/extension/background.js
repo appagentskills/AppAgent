@@ -56,11 +56,20 @@ async function onTabReady(tabId) {
         try { tab = await chrome.tabs.get(tabId); } catch(e) { return; }
         snTabs.set(tabId, { url: tab.url, title: tab.title, origin: info.origin });
 
-        // Update stored session
-        var data = { sessionToken: info.token };
-        if (info.origin) data.instanceUrl = info.origin;
-        if (info.userName) data.userName = info.userName;
-        chrome.storage.local.set(data);
+        // Update stored session — but never steal the ACTIVE instance: after an
+        // explicit tab-less switch, an unrelated SN tab loading/reloading must
+        // not overwrite instanceUrl/sessionToken with its own origin. Only adopt
+        // the tab's session when nothing is stored yet or the tab belongs to the
+        // currently active instance. (The per-origin instanceTokens cache below
+        // is always updated regardless.)
+        chrome.storage.local.get('instanceUrl', function(cur) {
+            var stored = cur && cur.instanceUrl;
+            if (stored && info.origin && stored !== info.origin) return;
+            var data = { sessionToken: info.token };
+            if (info.origin) data.instanceUrl = info.origin;
+            if (info.userName) data.userName = info.userName;
+            chrome.storage.local.set(data);
+        });
 
         // Maintain a per-origin token cache so the heartbeat works even when
         // tabs are discarded by Chrome's Memory Saver (no JS context to probe).
@@ -309,39 +318,53 @@ async function snProbeTabTokenUser(tabId) {
 }
 
 // Fetch the current user's display name from sys_user when MAIN-world probe didn't give one.
+// Returns { name, responded, status }: responded is true when the instance returned ANY
+// HTTP response (including 401/403), false on a network/CORS error; status is the HTTP
+// status code (0 on network error) — so the caller can tell an explicit auth rejection
+// (401) from an empty-but-OK answer (ACL-filtered 200) or an unreachable instance.
 async function snFetchUserName(instanceUrl, token) {
     try {
+        // credentials:'include' — see snFetchUserRoles: keeps the cross-origin GET
+        // authenticated for tab-less instances via the still-valid session cookie
+        // when the cached X-UserToken is stale.
         var apiRes = await fetch(instanceUrl + '/api/now/table/sys_user?sysparm_query=sys_id=javascript:gs.getUserID()&sysparm_fields=user_name,name&sysparm_limit=1', {
             method: 'GET',
+            credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
         });
-        if (!apiRes.ok) return '';
+        if (!apiRes.ok) return { name: '', responded: true, status: apiRes.status };
         var apiData = await apiRes.json();
         var row = apiData && apiData.result && apiData.result[0];
-        return (row && (row.user_name || row.name)) || '';
+        return { name: (row && (row.user_name || row.name)) || '', responded: true, status: apiRes.status };
     } catch (e) {
-        return '';
+        return { name: '', responded: false, status: 0 };
     }
 }
 
 // Fetch the current user's direct (non-inherited) roles, used for privilege badges
-// and the list_instances agent tool.
+// and the list_instances agent tool. Returns { roles, responded, status } (see snFetchUserName).
 async function snFetchUserRoles(instanceUrl, token) {
     var roles = [];
     try {
+        // credentials:'include' sends the instance session cookie so the fetch
+        // still authenticates for tab-less instances whose cached g_ck (X-UserToken)
+        // has gone stale — the cookie stays valid as long as the heartbeat's
+        // touch-session keeps returning non-401. Mirrors heartbeatAllInstances.
         var rolesRes = await fetch(instanceUrl + '/api/now/table/sys_user_has_role?sysparm_query=user=javascript:gs.getUserID()^inherited=false&sysparm_fields=role.name&sysparm_limit=50', {
             method: 'GET',
+            credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
         });
-        if (!rolesRes.ok) return roles;
+        if (!rolesRes.ok) return { roles: roles, responded: true, status: rolesRes.status };
         var rolesData = await rolesRes.json();
         var rows = (rolesData && rolesData.result) || [];
         for (var ri = 0; ri < rows.length; ri++) {
             var rname = rows[ri] && rows[ri]['role.name'];
             if (rname) roles.push(rname);
         }
+        return { roles: roles, responded: true, status: rolesRes.status };
     } catch (e) {}
-    return roles;
+    return { roles: roles, responded: false, status: 0 };
 }
 
 // Build the detailed instance list: probe every SN tab for tokens, group by origin,
@@ -355,20 +378,67 @@ async function snGetInstancesDetailed() {
         if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
         byOrigin[origin].tabs.push({ id: tab.id, title: tab.title, url: tab.url });
     });
+
+    // Keep instances visible in the selector after their last tab closes. The
+    // touch-session heartbeat (heartbeatAllInstances) keeps pinging every cached
+    // origin and only DELETES the instanceTokens entry on a hard 401 (logged out
+    // for good). So any origin still present in this cache is one ServiceNow that
+    // still considers us connected — fold it in even with zero open tabs, since
+    // the user may have closed the tab without paying attention.
+    var instanceTokenCache = await new Promise(function(r) {
+        chrome.storage.local.get('instanceTokens', function(d) { r((d && d.instanceTokens) || {}); });
+    });
+    Object.keys(instanceTokenCache).forEach(function(origin) {
+        if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
+    });
+
     var result = [];
     for (var url in byOrigin) {
         var inst = byOrigin[url];
         var tokenData = null;
+        var sawOpenTab = false;   // a tab whose MAIN-world context we could actually read
         for (var t = 0; t < inst.tabs.length; t++) {
             tokenData = await snProbeTabTokenUser(inst.tabs[t].id);
+            if (tokenData) sawOpenTab = true;          // page responded (even if g_ck was empty = logged out)
             if (tokenData && tokenData.token) break;
         }
         var token = (tokenData && tokenData.token) || '';
         var userName = (tokenData && tokenData.userName) || '';
-        if (token && !userName) {
-            userName = await snFetchUserName(inst.url, token);
+        // Fall back to the cached heartbeat token ONLY when there is no live tab we could
+        // read (all tabs closed, or discarded by Chrome Memory Saver — no JS context), so a
+        // tab-less instance still resolves as connected (tabCount:0) for list_instances.
+        // If an open tab DID respond with an empty g_ck the user is LOGGED OUT — never
+        // resurrect a stale token, or the selector would wrongly show it connected.
+        if (!token && !sawOpenTab && instanceTokenCache[inst.url] && instanceTokenCache[inst.url].token) {
+            token = instanceTokenCache[inst.url].token;
+            if (!userName) userName = instanceTokenCache[inst.url].userName || '';
         }
-        var roles = token ? await snFetchUserRoles(inst.url, token) : [];
+        // Resolve identity + roles. Track whether the instance EXPLICITLY rejected the
+        // session (HTTP 401) — that is the only response that proves the token is dead.
+        var authRejected = false;
+        if (token && !userName) {
+            var _nm = await snFetchUserName(inst.url, token);
+            userName = _nm.name;
+            if (_nm.status === 401) authRejected = true;
+        }
+        var roles = [];
+        if (token) {
+            var _rr = await snFetchUserRoles(inst.url, token);
+            roles = _rr.roles;
+            if (_rr.status === 401) authRejected = true;
+        }
+        // A token by itself is NOT proof of an authenticated session: a logged-out tab
+        // still exposes an anonymous g_ck, and a cached heartbeat token can outlive its
+        // session. But an EMPTY answer is not proof of a dead one either: low-privilege
+        // (ESS) users get HTTP 200 with zero rows from BOTH probes (ACL-filtered reads
+        // of sys_user / sys_user_has_role), so demoting on "responded but empty" wrongly
+        // flips valid ESS sessions to signed-out. Clear the token only when the instance
+        // EXPLICITLY rejected it (HTTP 401). 403 (authenticated but access denied) and
+        // network failures are indeterminate — keep the token and let the next refresh
+        // or the heartbeat (which deletes the cache entry on a hard 401) re-check.
+        if (token && !userName && roles.length === 0 && authRejected) {
+            token = '';
+        }
         result.push({ url: inst.url, tabs: inst.tabs, token: token, userName: userName, roles: roles });
     }
     return result;
@@ -379,16 +449,27 @@ async function snGetInstancesDetailed() {
 async function snGetTokenForInstance(instanceUrl) {
     var tabs = await getSnTabList();
     var matchTabs = tabs.filter(function(t) { return t.origin === instanceUrl; });
-    if (!matchTabs.length) {
-        return { token: '', error: 'No open tab for ' + instanceUrl };
-    }
     for (var i = 0; i < matchTabs.length; i++) {
         var data = await snProbeTabTokenUser(matchTabs[i].id);
         if (data && data.token) {
             return { token: data.token, userName: data.userName, tabId: matchTabs[i].id };
         }
     }
-    return { token: '', error: 'Could not get token from tabs for ' + instanceUrl };
+    // No open tab yielded a token — fall back to the cached heartbeat token
+    // (per-origin instanceTokens map), mirroring the switch-sn-instance
+    // _cachedTokenSwitch path, so tab-less but still-connected instances
+    // (kept warm by the heartbeat) can still resolve a usable token.
+    var cached = await new Promise(function(resolve) {
+        chrome.storage.local.get('instanceTokens', function(d) {
+            resolve((d && d.instanceTokens && d.instanceTokens[instanceUrl]) || null);
+        });
+    });
+    if (cached && cached.token) {
+        return { token: cached.token, userName: cached.userName || '' };
+    }
+    return { token: '', error: matchTabs.length
+        ? 'Could not get token from tabs for ' + instanceUrl
+        : 'No open tab for ' + instanceUrl };
 }
 
 // Exposed on `self` so the SW Platform stub (which runs first via importScripts)
@@ -422,7 +503,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Show browser notification (from app when agent finishes in background)
     if (message.type === 'show-notification') {
-        chrome.notifications.create('appagent-' + Date.now(), {
+        // Random suffix: two notifications in the same millisecond would share an
+        // id and Chrome silently REPLACES the first (concurrent chats can finish together).
+        chrome.notifications.create('appagent-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), {
             type: 'basic',
             iconUrl: 'icons/AppAgentIconStarOnly_128.png',
             title: message.title || 'AppAgent',
@@ -536,6 +619,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                     if (requestedW && actualW > requestedW + 5) {
                         try {
                             await chrome.tabs.sendMessage(tabId, {
+                                type: 'browser-action',
                                 action: 'viewport_emulate',
                                 args: { width: requestedW, enable: true }
                             });
@@ -545,6 +629,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                         // Remove any previous emulation if viewport fits
                         try {
                             await chrome.tabs.sendMessage(tabId, {
+                                type: 'browser-action',
                                 action: 'viewport_emulate',
                                 args: { enable: false }
                             });
@@ -650,21 +735,46 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Switch active ServiceNow instance
     if (message.type === 'switch-sn-instance') {
+        // Persist the active instance plus the best token available: a live tab's g_ck when
+        // a tab is open and readable, else the cached heartbeat token — so a tab-less but
+        // still-connected instance can be selected without forcing open a new tab.
+        var _finishSwitch = function(token, userName) {
+            // Read the currently-active instance so we can tell a real cross-instance
+            // switch from re-selecting the same one.
+            chrome.storage.local.get('instanceUrl', function(cur) {
+                var updates = { instanceUrl: message.instanceUrl };
+                if (token) updates.sessionToken = token;
+                if (userName) updates.userName = userName;
+                // Switching to a DIFFERENT instance but no token resolved (e.g. logged out
+                // mid-switch): drop the previous instance's cached session so tools never
+                // send instance A's g_ck to instance B. A same-instance transient read
+                // failure keeps the existing token (defensive — avoids killing a live
+                // session over one bad probe).
+                if (!token && cur && cur.instanceUrl && cur.instanceUrl !== message.instanceUrl) {
+                    updates.sessionToken = '';
+                    updates.userName = '';
+                }
+                chrome.storage.local.set(updates);
+                sendResponse({ success: true, token: token || '' });
+            });
+        };
+        var _cachedTokenSwitch = function() {
+            chrome.storage.local.get('instanceTokens', function(d) {
+                var c = (d && d.instanceTokens && d.instanceTokens[message.instanceUrl]) || null;
+                _finishSwitch((c && c.token) || '', (c && c.userName) || '');
+            });
+        };
+        if (!message.tabId) { _cachedTokenSwitch(); return true; }
         chrome.scripting.executeScript({
             target: { tabId: message.tabId },
             world: 'MAIN',
             func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
         }).then(function(results) {
             var data = results && results[0] && results[0].result || {};
-            var updates = { instanceUrl: message.instanceUrl };
-            if (data.token) updates.sessionToken = data.token;
-            if (data.userName) updates.userName = data.userName;
-            chrome.storage.local.set(updates);
-            sendResponse({ success: true, token: data.token || '' });
-        }).catch(function() {
-            chrome.storage.local.set({ instanceUrl: message.instanceUrl });
-            sendResponse({ success: true, token: '' });
-        });
+            // A readable tab returning an empty g_ck = logged out; don't resurrect a cached
+            // token (mirrors snGetInstancesDetailed). A discarded/closed tab throws → catch.
+            _finishSwitch(data.token || '', data.userName || '');
+        }).catch(function() { _cachedTokenSwitch(); });
         return true;
     }
 
@@ -756,6 +866,24 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             if (tab.status === 'complete') _injListener(injTabId, { status: 'complete' });
         });
         return;
+    }
+
+    // Eagerly (re)inject the content script into a tab. Used when iframe_tool
+    // adopts an already-open user tab whose content script may be missing/stale
+    // and chrome.scripting isn't available in the caller's context.
+    if (message.type === 'ensure-content-script') {
+        (async function() {
+            try {
+                await chrome.scripting.executeScript({
+                    target: { tabId: message.tabId },
+                    files: ['content-script.js']
+                });
+                sendResponse({ ok: true });
+            } catch (e) {
+                sendResponse({ ok: false, error: e.message });
+            }
+        })();
+        return true;
     }
 
     // GitHub API proxy (avoids CORS issues for GitHub API calls)
@@ -1239,6 +1367,79 @@ async function resolveActiveOrg(sessionKey) {
     return list[0].uuid || list[0].id;
 }
 
+// Live-refresh Claude usage from claude.ai's web API (cookie-authenticated).
+// Unlike the anthropic-ratelimit-* headers we scrape off /v1/messages responses
+// (which only update AFTER an inference call), this can be polled on demand with no
+// message sent. Auth is the claude.ai sessionKey cookie — Chrome attaches it
+// automatically for the credentialed fetch (we hold <all_urls> host + cookies perms).
+// The user:inference OAuth bearer is NOT honored on claude.ai org endpoints, so we
+// deliberately send no Authorization header.
+async function refreshClaudeOrgUsage() {
+    var sessionKey = await getClaudeCookie('sessionKey');
+    if (!sessionKey) throw new Error('Not signed into claude.ai');
+    var orgId = await resolveActiveOrg(sessionKey);
+    var res = await fetch('https://claude.ai/api/organizations/' + orgId + '/usage', {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'Accept': 'application/json' }
+    });
+    if (!res.ok) throw new Error('Usage HTTP ' + res.status);
+    var json = await res.json();
+    var normalized = normalizeClaudeUsage(json);
+    if (!normalized || !Object.keys(normalized).length) {
+        // Endpoint shape changed; degrade gracefully — the indicator keeps the
+        // last header-based value rather than rendering nothing useful.
+        console.warn('[Claude usage] response shape not recognized');
+        return json;
+    }
+    // Merge over header-captured values so we never drop fields the headers carry.
+    var existing = (await chrome.storage.local.get('claudeRateLimits')).claudeRateLimits || {};
+    var merged = Object.assign({}, existing, normalized);
+    await chrome.storage.local.set({ claudeRateLimits: merged });
+    return merged;
+}
+
+// Map an unknown claude.ai usage payload into the anthropic-ratelimit-unified-*
+// header shape the credits indicator already parses (fetchCredits in
+// 170-chat-management.js). Handles the {five_hour:{utilization,resets_at}} style plus
+// a few field aliases, and passes through any flat anthropic-ratelimit-* keys verbatim.
+function normalizeClaudeUsage(json) {
+    if (!json || typeof json !== 'object') return null;
+    var out = {};
+    function toEpochSeconds(v) {
+        if (v == null) return null;
+        if (typeof v === 'number') return v > 9999999999 ? Math.floor(v / 1000) : Math.floor(v);
+        var t = Date.parse(v);
+        return isNaN(t) ? null : Math.floor(t / 1000);
+    }
+    function applyBucket(bucket, label) {
+        if (!bucket || typeof bucket !== 'object') return;
+        var u = bucket.utilization;
+        if (u == null) u = bucket.used_fraction;
+        if (u == null) u = bucket.utilization_percent;
+        var un = parseFloat(u);
+        if (!isNaN(un)) {
+            // claude.ai reports utilization as a percent (0-100); the header shape
+            // the indicator parses (fetchCredits) expects a 0-1 fraction — it
+            // multiplies values <= 1 by 100. Canonicalize to a fraction here so
+            // sub-1% utilization doesn't render ~100x too large.
+            un = un > 1 ? un / 100 : un;
+            out['anthropic-ratelimit-unified-' + label + '-utilization'] = String(un);
+        }
+        var r = bucket.resets_at;
+        if (r == null) r = bucket.reset_at;
+        if (r == null) r = bucket.resets;
+        var rs = toEpochSeconds(r);
+        if (rs != null) out['anthropic-ratelimit-unified-' + label + '-reset'] = String(rs);
+    }
+    applyBucket(json.five_hour || json.fiveHour || json.unified_5h || json['5h'], '5h');
+    applyBucket(json.seven_day || json.sevenDay || json.unified_7d || json['7d'], '7d');
+    Object.keys(json).forEach(function(k) {
+        if (k.indexOf('anthropic-ratelimit-') === 0) out[k] = String(json[k]);
+    });
+    return out;
+}
+
 async function startClaudeOAuth() {
     var sessionKey = await getClaudeCookie('sessionKey');
     if (!sessionKey) {
@@ -1443,6 +1644,14 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         });
         return true;
     }
+    if (message.type === 'claude-oauth-usage-refresh') {
+        refreshClaudeOrgUsage().then(function(data) {
+            sendResponse({ data: data });
+        }).catch(function(e) {
+            sendResponse({ error: e.message });
+        });
+        return true;
+    }
 });
 
 // --- Claude OAuth Streaming Proxy ---
@@ -1549,7 +1758,16 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
         res.headers.forEach(function(v, k) {
             if (k.startsWith('anthropic-ratelimit-')) rlHeaders[k] = v;
         });
-        if (Object.keys(rlHeaders).length > 0) chrome.storage.local.set({ claudeRateLimits: rlHeaders });
+        if (Object.keys(rlHeaders).length > 0) {
+            // Merge over existing values (mirrors refreshClaudeOrgUsage) so a header
+            // capture doesn't wipe API-derived keys the headers don't carry (e.g. 7d).
+            try {
+                var _rlExisting = (await chrome.storage.local.get('claudeRateLimits')).claudeRateLimits || {};
+                chrome.storage.local.set({ claudeRateLimits: Object.assign({}, _rlExisting, rlHeaders) });
+            } catch (e) {
+                chrome.storage.local.set({ claudeRateLimits: rlHeaders });
+            }
+        }
 
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
@@ -1649,7 +1867,22 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                     Object.assign(anthropicUsage, eventData.usage || {});
                     var stopReason = (eventData.delta || {}).stop_reason;
                     if (stopReason) {
-                        var finishMap = { end_turn: 'stop', max_tokens: 'length', stop_sequence: 'stop', tool_use: 'tool_calls' };
+                        var finishMap = { end_turn: 'stop', max_tokens: 'length', stop_sequence: 'stop', tool_use: 'tool_calls', refusal: 'content_filter' };
+                        // Fable 5 (and Opus 4.7+ stop_details) refusals arrive as a
+                        // SUCCESSFUL HTTP 200 stream with stop_reason 'refusal' — not an
+                        // error. Without explicit handling the turn renders as a normal
+                        // empty 'stop' and the user never learns the request was declined.
+                        // Surface it as visible assistant text including the classifier
+                        // category from stop_details when present.
+                        if (stopReason === 'refusal') {
+                            var sd = (eventData.delta || {}).stop_details || null;
+                            var sdCat = (sd && (sd.category || sd.reason || sd.type)) || '';
+                            var refusalNote = '\n\n[Request declined by the model (' + model + ')' + (sdCat ? ' (category: ' + sdCat + ')' : '') + '. Refused requests can often be served by a different model — switch the provider and retry.]';
+                            sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                                choices: [{ index: 0, delta: { content: refusalNote }, finish_reason: null }]
+                            }) + '\n\n' });
+                        }
                         var promptTokens = (anthropicUsage.input_tokens || 0) +
                             (anthropicUsage.cache_creation_input_tokens || 0) +
                             (anthropicUsage.cache_read_input_tokens || 0);
@@ -1763,17 +1996,51 @@ function transformToAnthropic(body) {
     var systemBlocks = [];
     var transformedMessages = [];
 
+    // Opus 4.8 / Fable 5 / Mythos 5 accept role:"system" messages MID-conversation
+    // (placement rule: immediately after a user turn). For those models, keeping a
+    // late system message IN PLACE preserves the prompt prefix — hoisting it to the
+    // top-level `system` field (the legacy behavior) rewrites the cached prefix and
+    // invalidates every prompt-cache entry for the conversation. Older models
+    // (Sonnet 4.6, Opus ≤4.7, Haiku) do not accept mid-conversation system
+    // messages, so they keep the hoisting behavior.
+    //
+    // NOTE: no caller currently produces mid-conversation system messages — the
+    // only system-message producer in the app is the single top-of-conversation
+    // message built in src/js/app/010-llm-streaming.js (always hoisted because
+    // seenNonSystem is false there). This branch is forward wiring for future
+    // producers (e.g. sub-agent wake notices); until one exists it is dead code.
+    //
+    // Keep this pattern in sync with ADAPTIVE_ONLY_CLAUDE_RE in
+    // src/js/core/030-config.js — this one is intentionally NARROWER (4.8+,
+    // not 4.7) because Opus 4.7 is adaptive-only but does NOT accept
+    // mid-conversation system messages.
+    var supportsMidSystem = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[89]|\d{2,})))/.test(String(body.model || '').toLowerCase());
+    var seenNonSystem = false;
+
     (body.messages || []).forEach(function(msg) {
         if (msg.role === 'system') {
             var content = msg.content;
-            if (typeof content === 'string') systemBlocks.push({ type: 'text', text: content });
+            var blocks = [];
+            if (typeof content === 'string') blocks.push({ type: 'text', text: content });
             else if (Array.isArray(content)) {
                 content.forEach(function(item) {
-                    if (typeof item === 'string') systemBlocks.push({ type: 'text', text: item });
-                    else if (typeof item === 'object') systemBlocks.push(item); // preserves cache_control
+                    if (typeof item === 'string') blocks.push({ type: 'text', text: item });
+                    else if (typeof item === 'object') blocks.push(item); // preserves cache_control
                 });
             }
+            // Keep mid-conversation system messages inline only when the model
+            // supports them AND the preceding transformed message is a user turn
+            // (tool results transform to user turns), matching the API placement
+            // rule. Anything else falls back to legacy hoisting — still a valid
+            // request, just without the cache benefit.
+            var prevMsg = transformedMessages[transformedMessages.length - 1];
+            if (supportsMidSystem && seenNonSystem && prevMsg && prevMsg.role === 'user') {
+                transformedMessages.push({ role: 'system', content: blocks });
+            } else {
+                systemBlocks = systemBlocks.concat(blocks);
+            }
         } else {
+            seenNonSystem = true;
             transformedMessages.push(transformMessageToAnthropic(msg));
         }
     });

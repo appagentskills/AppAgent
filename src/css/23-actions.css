@@ -234,7 +234,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 10000;
+    z-index: var(--z-overlay);
     padding: var(--space-6);
 }
 
@@ -511,7 +511,7 @@
 
 .action-result-popover {
     position: fixed;
-    z-index: 10002;
+    z-index: var(--z-widget-modal);
     min-width: 280px;
     max-width: 400px;
     background: var(--bg-primary);
@@ -1016,7 +1016,7 @@
    ancestor and never lands behind the sidebar. The CSS here just defines the
    look. */
 .action-more-panel {
-    z-index: 10005;
+    z-index: var(--z-action-panel);
     min-width: 220px;
     max-width: 320px;
     background: var(--bg-primary);
@@ -1092,6 +1092,38 @@
 .sidebar:not(.expanded) .sidebar-actions-row .action-btn.placement-sidebar {
     justify-content: center;
     padding: var(--space-3);
+}
+
+/* =============================================
+   FINISHED-CHAT BELL (inside the jobs badge)
+   Orange bell segment appended to the ⚡ pill when chats
+   finished while the user was viewing another chat/view.
+   Rendered by renderJobsBadge(); state lives in
+   ui/165-finished-chat-badge.js.
+   ============================================= */
+
+.jobs-badge .jobs-badge-bell {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: var(--space-1);
+    color: var(--warning, #f59e0b);
+}
+.jobs-badge .jobs-badge-bell svg { width: 13px; height: 13px; }
+.jobs-badge .jobs-badge-bell-count { font-variant-numeric: tabular-nums; }
+
+/* At least one of the finished chats ended with an error. */
+.jobs-badge .jobs-badge-bell.err { color: var(--danger, #dc2626); }
+
+/* One-shot orange pop on the pill when a new finished chat lands. */
+.jobs-badge.bell-pop {
+    animation: finished-chat-pop 1.2s ease-out 1;
+}
+@keyframes finished-chat-pop {
+    0%   { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.55); transform: scale(1); }
+    35%  { box-shadow: 0 0 0 8px rgba(245, 158, 11, 0); transform: scale(1.08); }
+    60%  { transform: scale(0.98); }
+    100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); transform: scale(1); }
 }
 
 /* =============================================
@@ -1171,7 +1203,7 @@
     position: absolute;
     top: calc(100% + 6px);
     right: 0;
-    z-index: 9000;
+    z-index: var(--z-jobs-dropdown);
     min-width: 340px;
     max-width: 440px;
     max-height: 420px;
@@ -1264,7 +1296,7 @@
 
 .action-tooltip {
     position: fixed;
-    z-index: 10001;
+    z-index: var(--z-tooltip);
     background: var(--bg-primary);
     border: 1px solid var(--secondary-border);
     border-radius: var(--radius-md);
@@ -1316,7 +1348,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 10000;
+    z-index: var(--z-overlay);
     padding: var(--space-6);
 }
 

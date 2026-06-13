@@ -580,6 +580,7 @@ function sdocDownloadMd(docId) {
     a.href = URL.createObjectURL(blob);
     a.download = (doc.title || 'document').replace(/[^a-zA-Z0-9_-]/g, '_') + '.md';
     a.click();
+    URL.revokeObjectURL(a.href);
 }
 
 function sdocOpenNewTab(docId) {
@@ -601,7 +602,9 @@ function sdocOpenNewTab(docId) {
         '<style>' + allCss + 'body{max-width:900px;margin:40px auto;padding:20px;line-height:1.6;}@media print{body{margin:0;padding:20px;}}</style></head><body class="message-content">' +
         '<h1>' + escDisplay(doc.title) + '</h1>' + rendered + '</body></html>';
     var blob = new Blob([page], { type: 'text/html' });
-    window.open(URL.createObjectURL(blob), '_blank');
+    var url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+    setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
 }
 
 function sdocStartChat(docId) {

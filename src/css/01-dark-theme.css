@@ -59,6 +59,7 @@
     --text-muted: #6b7280;
     --text-heading: #f3f4f6;
     --text-inverse: #111827;
+    --on-primary: #0d1117;
     --text-link: #60a5fa;
 
     /* Backgrounds */
@@ -71,6 +72,7 @@
     --bg-tooltip: #e5e7eb;
     --bg-primary: #161a24;
     --bg-secondary: #1a1d24;
+    --bg-tertiary: #232730;
     --bg-main: #111317;
 
     /* Code */

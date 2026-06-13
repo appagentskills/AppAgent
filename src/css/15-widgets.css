@@ -54,7 +54,7 @@
 .widget-sidebar-btn svg { width: 12px; height: 12px; }
 
 /* Widget Modal Overlay */
-.widget-modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: 10002; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
+.widget-modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-widget-modal); display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
 .widget-modal { background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); max-width: 90vw; max-height: 90vh; overflow: hidden; display: flex; flex-direction: column; animation: slideUp 0.25s ease-out; }
 .widget-modal-header { display: flex; align-items: center; gap: var(--space-5); padding: var(--space-6) var(--space-8); background: var(--primary-lighter); border-bottom: 1px solid var(--secondary-border); }
 .widget-modal-header .widget-icon { width: 22px; height: 22px; color: var(--primary); display: flex; align-items: center; justify-content: center; }
@@ -67,7 +67,7 @@
 .widget-close-btn svg { width: 16px; height: 16px; }
 
 /* Widget Fullscreen Overlay */
-.widget-fullscreen-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: 10003; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
+.widget-fullscreen-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-fullscreen); display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
 .widget-fullscreen-modal { width: 95vw; height: 95vh; background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); overflow: hidden; display: flex; flex-direction: column; animation: scaleIn 0.25s ease-out; }
 .widget-fullscreen-header { display: flex; align-items: center; gap: var(--space-6); padding: var(--space-7) var(--space-9); background: var(--primary-lighter); border-bottom: 1px solid var(--secondary-border); position: relative; z-index: 1; flex-shrink: 0; }
 .widget-fullscreen-header .widget-icon { width: 24px; height: 24px; color: var(--primary); display: flex; align-items: center; justify-content: center; }
@@ -77,6 +77,7 @@
 .widget-modal-btn { width: 32px; height: 32px; border: none; background: var(--bg-white); border-radius: var(--radius-md); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
 .widget-modal-btn:hover { background: var(--primary-lighter); color: var(--primary); }
 .widget-modal-btn.danger:hover { background: var(--danger-light); color: var(--danger); }
+.widget-ctrl-btn:focus-visible, .widget-sidebar-btn:focus-visible, .widget-close-btn:focus-visible, .widget-modal-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .widget-fullscreen-content { flex: 1; overflow: auto; }
 
 /* Widget Animations */

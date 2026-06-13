@@ -90,6 +90,7 @@
                         isActive: inst.url === Platform.instanceUrl
                     };
                 });
+                _cacheInstances(response.instances); // keep the picker's instant-open cache warm
                 resolve(Platform.instances);
             });
         });
@@ -175,12 +176,30 @@
         });
     };
 
-    // Find a tab ID for a specific instance (for iframe_tool targeting)
-    Platform.getTabForInstance = function(instanceUrl) {
+    // Find a tab ID for a specific instance (for iframe_tool targeting).
+    // When a target URL is given, only return a tab already sitting on that page
+    // (same origin + path) — returning an arbitrary tab would let the caller
+    // navigate away a tab the user is actively using, bypassing the adoption
+    // safeguards in iframe_tool. With no match, return null so the caller's own
+    // (guarded) adoption / tab-creation logic decides.
+    Platform.getTabForInstance = function(instanceUrl, targetUrl) {
         for (var i = 0; i < Platform.instances.length; i++) {
-            if (Platform.instances[i].url === instanceUrl && Platform.instances[i].tabs.length > 0) {
-                return Platform.instances[i].tabs[0].id;
+            if (Platform.instances[i].url !== instanceUrl || Platform.instances[i].tabs.length === 0) continue;
+            var tabs = Platform.instances[i].tabs;
+            if (targetUrl) {
+                try {
+                    var _tgt = new URL(targetUrl);
+                    var _tgtPath = _tgt.pathname.replace(/\/+$/, '');
+                    for (var j = 0; j < tabs.length; j++) {
+                        try {
+                            var _tu = new URL(tabs[j].url);
+                            if (_tu.origin === _tgt.origin && _tu.pathname.replace(/\/+$/, '') === _tgtPath) return tabs[j].id;
+                        } catch (e) {}
+                    }
+                    return null;
+                } catch (e) {}
             }
+            return tabs[0].id;
         }
         return null;
     };
@@ -225,6 +244,15 @@
             el.style.display = '';
         });
     }
+    // Expose on window: the core bundle (loadToolPermissions in ui/070-dashboard-ui.js,
+    // saveInstancePermissions in ui/080-scope.js, the tier toggle in ui/140-dropdowns.js)
+    // re-renders the header tier pill via a guarded `typeof updateSnStatus === 'function'`
+    // call. Those callers live OUTSIDE this IIFE, so without this assignment the guard
+    // reads 'undefined' and silently no-ops — the pill keeps showing the stale 'Manual'
+    // rendered by validateToken() before the async IDB load of instancePermissions
+    // completed, even though the saved tier is 'auto' (and the picker dropdown,
+    // which renders later inside this IIFE, correctly shows 'Auto').
+    window.updateSnStatus = updateSnStatus;
 
     // Sole authority on connection state — validates and recovers tokens
     function validateToken() {
@@ -233,26 +261,23 @@
             updateSnStatus();
             return;
         }
-        // No token — try to recover one from an open SN tab
+        // No token — try to recover one: an open SN tab's g_ck first, else the
+        // cached heartbeat token (the background's get-token-for-instance probes
+        // tabs and then falls back to the per-origin instanceTokens cache). A
+        // tab-less but heartbeat-connected active instance must NOT render as
+        // Disconnected in the header while the picker shows it green; only mark
+        // disconnected when neither a tab nor a cached token exists.
         if (!window.sessionToken) {
-            chrome.runtime.sendMessage({ type: 'list-sn-instances' }, function(response) {
-                if (chrome.runtime.lastError || !response || !response.instances) return;
-                var match = response.instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
-                if (!match || !match.tabs.length) {
+            chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl }, function(resp) {
+                if (chrome.runtime.lastError) return;
+                if (resp && resp.token) {
+                    window.sessionToken = resp.token;
+                    chrome.storage.local.set({ sessionToken: resp.token });
+                    validateToken(); // Now validate the recovered token
+                } else {
                     _snStatusState = 'disconnected';
                     updateSnStatus();
-                    return;
                 }
-                chrome.runtime.sendMessage({ type: 'get-instance-token', tabId: match.tabs[0].id }, function(resp) {
-                    if (resp && resp.token) {
-                        window.sessionToken = resp.token;
-                        chrome.storage.local.set({ sessionToken: resp.token });
-                        validateToken(); // Now validate the recovered token
-                    } else {
-                        _snStatusState = 'disconnected';
-                        updateSnStatus();
-                    }
-                });
             });
             return;
         }
@@ -267,13 +292,13 @@
                 updateSnStatus();
                 return;
             }
-            // Token valid — verify a matching SN tab is still open
-            chrome.runtime.sendMessage({ type: 'list-sn-instances' }, function(tabResp) {
-                var instances = (tabResp && tabResp.instances) || [];
-                var match = instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
-                _snStatusState = (match && match.tabs.length) ? 'connected' : 'disconnected';
-                updateSnStatus();
-            });
+            // The touch-session POST above did NOT return 401, so the session is
+            // still alive server-side. Keep the instance marked connected even when
+            // every tab has been closed — the user may have closed the tab without
+            // paying attention, and the heartbeat keeps the session warm. A truly
+            // dead session returns 401 above and is marked disconnected.
+            _snStatusState = 'connected';
+            updateSnStatus();
         }).catch(function() {
             // Network error — leave status as-is
         });
@@ -444,29 +469,202 @@
 
     // --- Instance picker dropdown ---
     var _instanceDropdown = null;
-    var _instancePickerPollTimer = null;
-    // Last-rendered instance list signature — used by the live-refresh poll to
-    // skip re-rendering when nothing meaningful changed (avoids collapsing any
-    // open per-row roles panel on every tick).
+    // Cache of the last detailed instance list we received. Lets us render the
+    // dropdown INSTANTLY from known values on open, then quietly reconcile — so
+    // opening never blocks on the (network-heavy) detailed probe. Persisted to
+    // storage so even the first open after a reload shows the last-known list.
+    var _instancesCache = null;
+    var _INSTANCES_CACHE_KEY = 'snInstancesCache';
+
+    // How long a closed / signed-out instance stays visible in the picker after we
+    // last saw it live. Past this window it is evicted from the cache entirely.
+    var _INSTANCE_RETENTION_MS = 24 * 60 * 60 * 1000; // 1 day
+
+    // Store a slim copy (only what the dropdown renders — no tokens) in memory and
+    // in chrome.storage so it survives panel reloads. Instances that drop out of the
+    // live probe (tab closed / signed out) are RETAINED as disconnected until they
+    // age out, so they keep showing — at the end of the list — instead of vanishing.
+    // Normalize an instance URL for identity comparisons — strips trailing slashes
+    // so e.g. "https://x.service-now.com" (live tab origin) and
+    // "https://x.service-now.com/" (older persisted entry) merge into ONE picker row
+    // instead of rendering duplicates with the same host.
+    function _normUrl(u) { return String(u || '').replace(/\/+$/, ''); }
+
+    function _cacheInstances(list) {
+        if (!list) return;
+        var now = Date.now();
+        var merged = {};
+        // 1) Carry existing cache entries forward as DISCONNECTED (no live tab) and
+        //    keep their old lastSeen so they continue to age out. Legacy entries with
+        //    NO lastSeen are stamped `now` so they age out from here instead of being
+        //    evicted instantly (keeps eviction consistent with _seedRenderList, which
+        //    retains lastSeen-less entries). Still-live ones are
+        //    fully replaced with fresh data in step 2.
+        (_instancesCache || []).forEach(function(c) {
+            if (!c || !c.url) return;
+            var u = _normUrl(c.url);
+            merged[u] = { url: u, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || now };
+        });
+        // 2) Upsert everything currently live with a fresh lastSeen + latest details.
+        (list || []).forEach(function(i) {
+            if (!i || !i.url) return;
+            var u = _normUrl(i.url);
+            merged[u] = { url: u, tabs: i.tabs || [], userName: i.userName || '', roles: i.roles || [], connected: !!i.token, lastSeen: now };
+        });
+        // 3) Drop anything not seen within the retention window.
+        var cutoff = now - _INSTANCE_RETENTION_MS;
+        _instancesCache = Object.keys(merged).map(function(k) { return merged[k]; })
+            .filter(function(c) { return (c.lastSeen || 0) >= cutoff; });
+        try { var _o = {}; _o[_INSTANCES_CACHE_KEY] = _instancesCache; chrome.storage.local.set(_o); } catch (e) {}
+    }
+
+    // Build the picker's render list from a fresh live probe: the live instances
+    // (which still carry tokens for roles/test) plus any cached-but-no-longer-live
+    // instances rendered as disconnected "signed out" rows. Connected first.
+    function _withRetainedInstances(liveList) {
+        liveList = liveList || [];
+        var liveUrls = {};
+        liveList.forEach(function(i) { if (i && i.url) liveUrls[_normUrl(i.url)] = true; });
+        var retained = (_instancesCache || []).filter(function(c) {
+            return c && c.url && !liveUrls[_normUrl(c.url)];
+        }).map(function(c) {
+            return { url: c.url, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, retained: true };
+        });
+        return _orderInstances(liveList.concat(retained));
+    }
+
+    // Render list for a cache-seeded open (before the live probe returns): mark any
+    // entry we have no live session for AND no open tab as a signed-out row, so the
+    // instant-open view matches what the reconciling refresh will show.
+    function _seedRenderList(seed) {
+        var cutoff = Date.now() - _INSTANCE_RETENTION_MS;
+        seed = (seed || []).filter(function(i) {
+            return i && (!i.lastSeen || i.lastSeen >= cutoff);
+        });
+        return _orderInstances(seed.map(function(i) {
+            if (!i) return i;
+            var connected = !!(i.token || i.connected);
+            var hasTab = !!(i.tabs && i.tabs.length);
+            if (!connected && !hasTab) {
+                return { url: i.url, tabs: [], userName: i.userName || '', roles: i.roles || [], connected: false, retained: true };
+            }
+            return i;
+        }));
+    }
+
+    // Deterministic display order: connected instances first, signed-out last,
+    // alphabetical by URL within each group. Deterministic (not probe order) so the
+    // cache-seeded open and the reconciling refresh yield the same signature and
+    // never flicker a re-render when nothing actually changed.
+    function _orderInstances(list) {
+        return (list || []).filter(Boolean).slice().sort(function(a, b) {
+            var ac = (a.token || a.connected) ? 0 : 1;
+            var bc = (b.token || b.connected) ? 0 : 1;
+            if (ac !== bc) return ac - bc;
+            return String(a.url || '').localeCompare(String(b.url || ''));
+        });
+    }
+
+    // Hydrate the cache from storage at startup so the very first open (before any
+    // live probe returns) can still show the last-known instances instead of a
+    // "checking…" placeholder. Guarded so it never clobbers fresher in-memory data.
+    try {
+        chrome.storage.local.get(_INSTANCES_CACHE_KEY, function(d) {
+            var stored = (d && d[_INSTANCES_CACHE_KEY]) || [];
+            if (!stored.length) return;
+            if (!_instancesCache || !_instancesCache.length) {
+                _instancesCache = stored;
+                return;
+            }
+            // A live refresh beat hydration: fold in stored entries the fresh
+            // list doesn't know about so retained instances aren't evicted.
+            // The live probe has ALREADY run and did not see these entries, so
+            // they have no live session right now — fold them in as disconnected
+            // rather than trusting a connected flag persisted by a prior session.
+            var known = {};
+            _instancesCache.forEach(function(c) { if (c && c.url) known[_normUrl(c.url)] = true; });
+            stored.forEach(function(c) {
+                if (!c || !c.url || known[_normUrl(c.url)]) return;
+                _instancesCache.push({ url: _normUrl(c.url), tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || 0 });
+            });
+        });
+    } catch (e) {}
+    // Last-rendered instance list signature — used to skip re-rendering when
+    // nothing meaningful changed (avoids collapsing an open per-row roles panel
+    // or flickering when a refresh returns identical data).
     var _instancePickerLastSig = '';
 
     function showInstancePicker() {
         if (_instanceDropdown) { hideInstancePicker(); return; }
-        // Use detailed variant so we have the resolved username for each instance.
-        chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
-            if (chrome.runtime.lastError || !response) return;
-            renderInstanceDropdown(response.instances || []);
-            // Start a live-refresh poll so the dropdown stays in sync with the
-            // background's view of open SN tabs (logout in another tab, new tab
-            // opened, role change, etc.) without forcing the user to close +
-            // re-open the picker.
-            _startInstancePickerPoll();
-        });
+        // Open INSTANTLY from the last-known instance list so the dropdown never
+        // waits on the network-heavy detailed probe. Prefer our persisted picker
+        // cache, then the live Platform.instances registry; only show a brief
+        // "checking…" placeholder when nothing is known yet (e.g. fresh install).
+        var seed = (_instancesCache && _instancesCache.length) ? _instancesCache
+                 : (Platform.instances && Platform.instances.length) ? Platform.instances
+                 : null;
+        var seeded = seed ? _seedRenderList(seed) : [];
+        if (seeded.length) {
+            renderInstanceDropdown(seeded);
+        } else {
+            // Nothing known (fresh install) or every cached entry aged past the
+            // retention window — show the loading placeholder, not "no tabs".
+            renderInstanceDropdown([], true);          // loading placeholder
+            _instancePickerLastSig = '\u0000loading';  // force first response to re-render
+        }
+        // If neither status anchor was mounted, renderInstanceDropdown bailed (and
+        // already called hideInstancePicker). With no dropdown there is nothing to
+        // reconcile or keep in sync — don't fire a pointless probe or leak a
+        // window-focus listener that would otherwise accumulate on every failed open.
+        if (!_instanceDropdown) return;
+        // Kick off ONE fresh detailed fetch to reconcile the cached view.
+        _refreshInstancePicker();
+        // Stay in sync WITHOUT polling: re-fetch only when the user returns focus
+        // to the panel (e.g. after logging out / switching user in a SN tab).
+        // Event-driven — so an open dropdown never fires REST calls non-stop.
+        // remove-before-add keeps it idempotent (never stacks duplicate listeners).
+        window.removeEventListener('focus', _refreshInstancePicker);
+        window.addEventListener('focus', _refreshInstancePicker);
+    }
+
+    // One-shot detailed refresh: update the cache and re-render only when the
+    // visible signature actually changed (no flicker, no needless work). An
+    // in-flight guard collapses overlapping triggers (the open-time call racing a
+    // window-focus event) into a single detailed probe.
+    // Timestamp (0 = idle) rather than a boolean: if the callback never fires
+    // (SW restart / context churn), an in-flight older than 10s is treated as
+    // stale so a new probe is allowed instead of wedging refreshes forever.
+    var _refreshInFlightAt = 0;
+    var _REFRESH_STALE_MS = 10000;
+    function _refreshInstancePicker() {
+        if (_refreshInFlightAt && (Date.now() - _refreshInFlightAt) < _REFRESH_STALE_MS) return;
+        _refreshInFlightAt = Date.now();
+        try {
+            chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
+                _refreshInFlightAt = 0;
+                if (chrome.runtime.lastError || !response) return;
+                var instances = response.instances || [];
+                _cacheInstances(instances);                     // warm + persist (retains closed)
+                if (!_instanceDropdown) return;                 // closed while in flight — cache already warmed
+                var renderList = _withRetainedInstances(instances);
+                if (_instancesSignature(renderList) === _instancePickerLastSig) return;
+                renderInstanceDropdown(renderList);
+            });
+        } catch (e) { _refreshInFlightAt = 0; }                 // context invalidated — don't wedge future refreshes
     }
 
     function hideInstancePicker() {
-        if (_instancePickerPollTimer) { clearInterval(_instancePickerPollTimer); _instancePickerPollTimer = null; }
+        window.removeEventListener('focus', _refreshInstancePicker);
+        _refreshInFlightAt = 0;
         _instancePickerLastSig = '';
+        _teardownDropdownDom();
+    }
+
+    // Tear down ONLY the dropdown DOM + its element-scoped listeners. Used both
+    // by hideInstancePicker (full close) and by renderInstanceDropdown (swap the
+    // DOM on re-render) — kept separate so a re-render doesn't drop the
+    // window-focus refresh listener that lives for the whole open session.
+    function _teardownDropdownDom() {
         if (_instanceDropdown) {
             _instanceDropdown.remove();
             _instanceDropdown = null;
@@ -475,8 +673,8 @@
         }
     }
 
-    // Cheap signature of the instance list — stable across ticks unless something
-    // the user can actually see has changed (URL set, tab count, username, role tier).
+    // Cheap signature of the instance list — stable unless something the user can
+    // actually see has changed (URL set, tab count, username, role tier).
     function _instancesSignature(instances) {
         try {
             return instances.map(function(i) {
@@ -487,27 +685,11 @@
                     (i.tabs || []).length,
                     i.userName || '',
                     (i.roles || []).slice().sort().join(','),
+                    (i.token || i.connected) ? 'c' : 'd',
                     perm.tier || 'manual'
                 ].join('|');
             }).join('\n');
         } catch (e) { return String(Date.now()); }
-    }
-
-    function _startInstancePickerPoll() {
-        if (_instancePickerPollTimer) clearInterval(_instancePickerPollTimer);
-        _instancePickerPollTimer = setInterval(function() {
-            if (!_instanceDropdown) {
-                clearInterval(_instancePickerPollTimer); _instancePickerPollTimer = null; return;
-            }
-            chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
-                if (!_instanceDropdown) return;
-                if (chrome.runtime.lastError || !response) return;
-                var instances = response.instances || [];
-                var sig = _instancesSignature(instances);
-                if (sig === _instancePickerLastSig) return; // nothing the user would notice
-                renderInstanceDropdown(instances);
-            });
-        }, 2000);
     }
 
     function _onWindowResizeDropdown() {
@@ -527,27 +709,17 @@
         }
     }
 
-    function renderInstanceDropdown(instances) {
-        // Tear down only the DOM — keep the poll timer alive so periodic
-        // re-renders triggered from inside the poll callback don't kill
-        // their own ticker.
-        var keepPoll = _instancePickerPollTimer;
-        _instancePickerPollTimer = null; // shield from hideInstancePicker
-        hideInstancePicker();
-        _instancePickerPollTimer = keepPoll;
+    function renderInstanceDropdown(instances, isLoading) {
+        // Swap out the old DOM but keep the window-focus refresh listener alive
+        // (it spans the whole open session, not a single render).
+        _teardownDropdownDom();
         _instancePickerLastSig = _instancesSignature(instances);
         var anchor = document.getElementById('ext-sn-status');
         if (anchor && anchor.offsetParent === null) anchor = document.getElementById('home-ext-sn-status');
         if (!anchor) {
-            // Both anchors are unmounted/hidden — we can't position the dropdown.
-            // Tear down the poll timer too: the keepPoll shield above preserved it
-            // through hideInstancePicker, but with no anchor we have no UI to refresh.
-            // Without this clear, the 2s interval would keep round-tripping to the
-            // background for the lifetime of the panel.
-            if (_instancePickerPollTimer) {
-                clearInterval(_instancePickerPollTimer);
-                _instancePickerPollTimer = null;
-            }
+            // Both anchors are unmounted/hidden — we can't position the dropdown,
+            // so fully close (also drops the focus listener).
+            hideInstancePicker();
             return;
         }
 
@@ -555,19 +727,31 @@
         dd.className = 'ext-instance-dropdown';
 
         if (instances.length === 0) {
-            dd.innerHTML = '<div class="ext-instance-empty">No ServiceNow tabs open.<br>Open a ServiceNow page to connect.</div>';
+            dd.innerHTML = isLoading
+                ? '<div class="ext-instance-empty">Checking ServiceNow connections…</div>'
+                : '<div class="ext-instance-empty">No ServiceNow tabs open.<br>Open a ServiceNow page to connect.</div>';
         } else {
             instances.forEach(function(inst) {
                 var isActive = inst.url === Platform.instanceUrl;
+                // Connected = we hold a valid token: either a live tab's g_ck OR a cached
+                // heartbeat token that still passes touch-session. Tab-less instances stay
+                // connected (the heartbeat keeps the session warm for multi-instance work).
+                // The background probe now reports an EMPTY token for an open-but-logged-out
+                // tab, so a logged-out session correctly reads as signed-out here without a
+                // tab-presence check (which would wrongly demote valid tab-less instances).
+                var isConnected = !!(inst.token || inst.connected);
+                // Non-connected rows (logged out while open, or closed/evicted) render as a
+                // dimmed "signed out" row that OPENS on click instead of selecting.
+                var signedOut = !isConnected;
                 var host = inst.url.replace(/^https?:\/\//, '').replace(/\/$/, '');
                 var shortName = host.split('.')[0];
                 var instPerms = instancePermissions[host] || { tier: 'manual', tools: {} };
                 var currentTier = instPerms.tier || 'manual';
                 var row = document.createElement('div');
-                row.className = 'ext-instance-row' + (isActive ? ' active' : '');
+                row.className = 'ext-instance-row' + (isActive ? ' active' : '') + (signedOut ? ' retained' : '');
                 var openIcon = typeof UI_ICONS !== 'undefined' ? UI_ICONS.externalLink : '&#x2197;';
                 var userName = inst.userName || '';
-                var roles = inst.roles || [];
+                var roles = signedOut ? [] : (inst.roles || []);  // signed-out rows show no privilege badge
                 // Privilege badge replaces username when present. Priority: security_admin > admin > snc_external.
                 var badgeHtml = '';
                 var shieldIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.shield) ? UI_ICONS.shield : '&#x1F6E1;';
@@ -579,10 +763,12 @@
                 } else if (roles.indexOf('snc_external') !== -1) {
                     badgeHtml = '<span class="ext-instance-role-badge muted" title="Click to view all roles">' + lockIcon + 'snc_external</span>';
                 }
-                var userSuffix = (!badgeHtml && userName)
-                    ? ' <span class="ext-instance-user" title="Click to view all roles">· ' + escapeHtml(userName) + '</span>'
-                    : '';
-                row.innerHTML = '<span class="ext-instance-dot"></span>' +
+                var userSuffix = signedOut
+                    ? ' <span class="ext-instance-signedout" title="No live session — click to open and sign in">· signed out</span>'
+                    : (!badgeHtml && userName)
+                        ? ' <span class="ext-instance-user" title="Click to view all roles">· ' + escapeHtml(userName) + '</span>'
+                        : '';
+                row.innerHTML = '<span class="ext-instance-dot' + (isConnected ? ' ok' : '') + '"></span>' +
                     '<span class="ext-instance-name" title="' + escapeHtml(host) + '">' + escapeHtml(shortName) + userSuffix + '</span>' +
                     badgeHtml +
                     '<a class="ext-instance-open" href="' + escapeHtml(inst.url) + '" target="_blank" title="Open ' + escapeHtml(host) + '">' + openIcon + '</a>' +
@@ -621,6 +807,14 @@
                         updateSnStatus();
                         return;
                     }
+                    if (!isConnected) {
+                        // Logged out / closed (no live session): open the instance so
+                        // the user can sign in, rather than selecting a dead session.
+                        // A connected instance just gets selected as current below.
+                        var openLink = row.querySelector('.ext-instance-open');
+                        if (openLink) { openLink.click(); } else { window.open(inst.url, '_blank'); }
+                        return;
+                    }
                     switchToInstance(inst);
                 });
 
@@ -632,10 +826,10 @@
                 dd.appendChild(item);
 
                 // Active + already connected: show tier immediately, no test needed
-                if (isActive && _snStatusState === 'connected') {
+                if (isActive && !signedOut && _snStatusState === 'connected') {
                     var dot = row.querySelector('.ext-instance-dot');
                     if (dot) dot.className = 'ext-instance-dot ok';
-                } else if (isActive) {
+                } else if (isActive && !signedOut) {
                     testInstanceConnection(inst, row);
                 }
             });
@@ -658,16 +852,39 @@
     }
 
     function switchToInstance(inst) {
+        if (!inst || !inst.url) return;
+        // Bind to a live tab when one is open; otherwise switch tab-less using the cached
+        // heartbeat token (the background fills it in). Only fall back to opening the
+        // instance when neither a tab nor a usable cached token is available.
+        var tabId = (inst.tabs && inst.tabs[0] && inst.tabs[0].id) || null;
         chrome.runtime.sendMessage({
             type: 'switch-sn-instance',
             instanceUrl: inst.url,
-            tabId: inst.tabs[0].id
+            tabId: tabId
         }, function(response) {
             if (chrome.runtime.lastError) return;
-            if (response && response.token) window.sessionToken = response.token;
-            Platform.instanceUrl = inst.url;
-            updateSnStatus();
-            hideInstancePicker();
+            if (response && response.token) {
+                window.sessionToken = response.token;
+                Platform.instanceUrl = inst.url;
+                updateSnStatus();
+                hideInstancePicker();
+            } else if (!tabId) {
+                // No live tab and no usable cached token — the background has already
+                // committed the switch (signed-out), so treat it as a completed
+                // switch-to-signed-out: reflect it in the UI, close the picker, and
+                // open the instance so the user can sign in.
+                Platform.instanceUrl = inst.url;
+                _snStatusState = 'disconnected';
+                updateSnStatus();
+                hideInstancePicker();
+                window.open(inst.url, '_blank');
+            } else {
+                // Had a tab but no token came back (logged out mid-switch): keep it active
+                // and let the status/test reflect the signed-out state.
+                Platform.instanceUrl = inst.url;
+                updateSnStatus();
+                hideInstancePicker();
+            }
         });
     }
 
@@ -689,39 +906,59 @@
         // Render loading state
         panel.innerHTML = '<div class="ext-roles-loading">Loading roles…</div>';
 
-        var token = inst.token;
-        if (!token) {
-            panel.innerHTML = '<div class="ext-roles-empty">No active session for this instance.</div>';
-            return;
-        }
-        var url = inst.url + '/api/now/table/sys_user_has_role'
-            + '?sysparm_query=user=javascript:gs.getUserID()'
-            + '&sysparm_fields=role.name,inherited'
-            + '&sysparm_limit=500';
-        _origFetch.call(window, url, {
-            method: 'GET',
-            headers: { 'X-UserToken': token, 'Accept': 'application/json' },
-            credentials: 'include'
-        }).then(function(res) {
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return res.json();
-        }).then(function(data) {
-            var rows = (data && data.result) || [];
-            var all = [];
-            for (var i = 0; i < rows.length; i++) {
-                var name = rows[i] && rows[i]['role.name'];
-                if (!name) continue;
-                all.push({ name: name, inherited: String(rows[i].inherited) === 'true' });
-            }
-            // Sort: direct roles first (alphabetical), then inherited (alphabetical)
-            all.sort(function(a, b) {
-                if (a.inherited !== b.inherited) return a.inherited ? 1 : -1;
-                return a.name.localeCompare(b.name);
+        var _loadRoles = function(token) {
+            var url = inst.url + '/api/now/table/sys_user_has_role'
+                + '?sysparm_query=user=javascript:gs.getUserID()'
+                + '&sysparm_fields=role.name,inherited'
+                + '&sysparm_limit=500';
+            _origFetch.call(window, url, {
+                method: 'GET',
+                headers: { 'X-UserToken': token, 'Accept': 'application/json' },
+                credentials: 'include'
+            }).then(function(res) {
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return res.json();
+            }).then(function(data) {
+                var rows = (data && data.result) || [];
+                var all = [];
+                for (var i = 0; i < rows.length; i++) {
+                    var name = rows[i] && rows[i]['role.name'];
+                    if (!name) continue;
+                    all.push({ name: name, inherited: String(rows[i].inherited) === 'true' });
+                }
+                // Sort: direct roles first (alphabetical), then inherited (alphabetical)
+                all.sort(function(a, b) {
+                    if (a.inherited !== b.inherited) return a.inherited ? 1 : -1;
+                    return a.name.localeCompare(b.name);
+                });
+                inst._allRoles = all;
+                if (!panel.hidden) renderRolesPanel(panel, all, inst.userName);
+            }).catch(function(err) {
+                // Friendly message; keep technical detail (e.g. "HTTP 401") in the
+                // tooltip only so non-technical users aren't shown raw status codes.
+                var detail = String((err && err.message) || err || '');
+                var msg = /401/.test(detail) ? 'Session expired — open the instance and sign in again.'
+                        : 'Could not load roles. Open the instance and try again.';
+                panel.innerHTML = '<div class="ext-roles-empty" title="' + escapeHtml(detail) + '">' + msg + '</div>';
             });
-            inst._allRoles = all;
-            if (!panel.hidden) renderRolesPanel(panel, all, inst.userName);
-        }).catch(function(err) {
-            panel.innerHTML = '<div class="ext-roles-empty">Could not load roles: ' + escapeHtml(String(err && err.message || err)) + '</div>';
+        };
+
+        if (inst.token) { _loadRoles(inst.token); return; }
+        // Connected row opened from the instant cache-seeded view, before the live probe
+        // has re-attached a token (the persisted picker cache intentionally stores none).
+        // Resolve the heartbeat token for this instance on demand instead of showing a
+        // misleading "no active session"; credentials:'include' lets the GET authenticate
+        // via the session cookie even if that cached token is slightly stale.
+        chrome.storage.local.get('instanceTokens', function(d) {
+            if (panel.hidden) return;
+            var cached = (d && d.instanceTokens && d.instanceTokens[inst.url]) || null;
+            if (cached && cached.token) {
+                inst.token = cached.token;
+                if (cached.userName && !inst.userName) inst.userName = cached.userName;
+                _loadRoles(cached.token);
+            } else {
+                panel.innerHTML = '<div class="ext-roles-empty">Open the instance and sign in to view roles.</div>';
+            }
         });
     }
 
@@ -752,6 +989,15 @@
         panel.innerHTML = header + '<ul class="ext-roles-list">' + listItems + '</ul>';
     }
 
+    // Map a failed connection test to a non-technical label. The raw HTTP code
+    // stays in the tooltip (title) only — non-technical users should never see
+    // bare numbers like "401".
+    function _friendlyConnError(status) {
+        if (status === 401) return { label: 'Signed out', title: 'Session expired (HTTP 401). Open the instance and sign in again, then retry.' };
+        if (status === 403) return { label: 'No access',  title: 'Access denied (HTTP 403). Your account lacks permission on this instance.' };
+        return { label: 'Unavailable', title: 'Connection failed (HTTP ' + status + '). Click to retry.' };
+    }
+
     function testInstanceConnection(inst, row) {
         var btn = row.querySelector('.ext-instance-test');
         var dot = row.querySelector('.ext-instance-dot');
@@ -770,11 +1016,14 @@
             btn.style.display = 'none';
             dot.className = 'ext-instance-dot ok';
         };
-        var _showFailed = function(label) {
-            // Failed: hide tier, show Test button
+        var _showFailed = function(label, title) {
+            // Failed: hide tier, show the status pill (doubles as a retry button).
             if (tier) tier.style.display = 'none';
             btn.style.display = '';
             btn.textContent = label || 'Test';
+            // Keep technical detail (e.g. HTTP 401) in the tooltip only — never
+            // surface raw status codes to non-technical users.
+            btn.title = title || 'Click to retry';
             btn.className = 'ext-instance-test fail';
             dot.className = 'ext-instance-dot fail';
             btn.disabled = false;
@@ -782,7 +1031,7 @@
 
         var doTest = function(token) {
             if (!token) {
-                _showFailed('No token');
+                _showFailed('Signed out', 'Not signed in to this instance. Open it and sign in, then retry.');
                 return;
             }
             _origFetch.call(window, inst.url + '/api/now/uisession/touch-session', {
@@ -793,7 +1042,8 @@
                 if (res.ok) {
                     _showConnected();
                 } else {
-                    _showFailed('' + res.status);
+                    var f = _friendlyConnError(res.status);
+                    _showFailed(f.label, f.title);
                 }
                 // Sync header status for active instance
                 if (isActive) {
@@ -806,19 +1056,33 @@
                     updateSnStatus();
                 }
             }).catch(function() {
-                _showFailed('Error');
+                _showFailed('Offline', 'Could not reach the instance. Check your connection and retry.');
             });
         };
 
         if (isActive && window.sessionToken) {
             doTest(window.sessionToken);
-        } else {
+        } else if (inst.tabs && inst.tabs.length && inst.tabs[0]) {
             chrome.runtime.sendMessage({
                 type: 'get-instance-token',
                 tabId: inst.tabs[0].id
             }, function(response) {
-                doTest(response && response.token || '');
+                // Read lastError so a dead background never logs "Unchecked
+                // runtime.lastError". When the tab could not be read (discarded by
+                // Memory Saver — background returns an empty token) fall back to the
+                // probe-attached heartbeat token instead of wrongly rendering
+                // "Signed out": an open-but-logged-out tab always yields
+                // inst.token === '' from the detailed probe, so this fallback can
+                // never resurrect a dead session.
+                var err = chrome.runtime.lastError;
+                doTest((!err && response && response.token) || inst.token || '');
             });
+        } else if (inst.token) {
+            // Tab-less but the live probe attached a heartbeat token (#345):
+            // test with it instead of wrongly rendering "Signed out".
+            doTest(inst.token);
+        } else {
+            doTest('');   // no live tab and no token (closed / signed out) → render as signed-out
         }
     }
 

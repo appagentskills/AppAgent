@@ -61,6 +61,7 @@
     --text-muted: #9ca3af;
     --text-heading: #111827;
     --text-inverse: #fff;
+    --on-primary: #fff;
     --text-link: #2563eb;
 
     /* Backgrounds */
@@ -73,6 +74,7 @@
     --bg-tooltip: #1f2937;
     --bg-primary: #f4f7fc;
     --bg-secondary: #f3f4f6;
+    --bg-tertiary: #e5e7eb;
     --bg-main: #fff;
 
     /* Code */
@@ -120,6 +122,7 @@
     --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace;
 
+    --font-normal: 400;
     --font-medium: 500;
     --font-semibold: 600;
 
@@ -153,6 +156,29 @@
     --sidebar-width: 60px;
     --sidebar-expanded: 260px;
     --header-height: 48px;
+
+    /* ─── Z-Index Scale (overlay band, >= 1000) ───
+       Tokens preserve the historical stacking order. Local stacking
+       contexts (< 1000) intentionally stay as raw numbers.
+       Ladder (bottom → top): overlay-base < drawer < jobs-dropdown
+         < overlay < modal < widget-modal < fullscreen < action-panel
+         < snackbar < dropdown < tooltip < banner < max
+       Note: --z-dropdown was historically tied with --z-snackbar (10010);
+       the dropdown now sits one step above to resolve the tie, and
+       --z-tooltip moved 10011 → 10012 to stay above the dropdown. */
+    --z-overlay-base: 1000;   /* in-page dropdown menus, sidebar tooltips, dragged widgets, mobile/sidepanel sidebar */
+    --z-drawer: 1001;         /* slide-in version sidebar */
+    --z-jobs-dropdown: 9000;  /* jobs dropdown (below full-screen overlays) */
+    --z-overlay: 10000;       /* full-screen overlays & backdrops: spinner, diff viewer, ws dropdown, doc preview, icon picker, bg-popup, skip link */
+    --z-modal: 10001;         /* generic modal overlay */
+    --z-widget-modal: 10002;  /* widget modal, action result popover */
+    --z-fullscreen: 10003;    /* widget fullscreen overlay */
+    --z-action-panel: 10005;  /* action "more" panel */
+    --z-snackbar: 10010;      /* snackbar toasts */
+    --z-dropdown: 10011;      /* instance picker dropdown (one above snackbar) */
+    --z-tooltip: 10012;       /* action tooltip (was 10011) */
+    --z-banner: 10020;        /* iOS install banner */
+    --z-max: 99999;           /* drag-and-drop file overlay — always on top */
 
     /* ─── Syntax Highlighting ─── */
     --sh-keyword: #d73a49;

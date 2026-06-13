@@ -1,4 +1,4 @@
-async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall, onDone, onStreamStatus, chatId) {
+async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall, onDone, onStreamStatus, chatId, metrics) {
     var apiMsgs = buildAPIMessages(chatMessages, chatId);
     // Register an AbortController so a user-typed message can interrupt the in-flight stream.
     var abortController = (typeof AbortController !== 'undefined') ? new AbortController() : null;
@@ -6,7 +6,7 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     try {
         // Thread chatId through so the system prompt builder can append the
         // sub-agent preamble when the chat is a sub-agent (see 100-cached-results.js).
-        return await callOpenRouterStreaming(currentProvider, apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId);
+        return await callOpenRouterStreaming(currentProvider, apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId, metrics);
     } finally {
         if (chatId && currentStreamAbortControllers[chatId] === abortController) {
             delete currentStreamAbortControllers[chatId];
@@ -14,12 +14,20 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     }
 }
 
-async function callOpenRouterStreaming(currentProvider, messages, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId) {
+async function callOpenRouterStreaming(currentProvider, messages, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId, metrics) {
     var provider = getProviderById(currentProvider);
 
     if (!provider) {
         throw new Error('Provider "' + currentProvider + '" not found. Please select a valid model in settings.');
     }
+
+    // Per-call metrics object owned by the calling chat's loop turn. The SW runs
+    // multiple chats concurrently — writing usage into the shared
+    // `lastRequestMetrics` global let interleaved streams clobber each other
+    // (wrong input_tokens/cost on assistant messages, corrupting the sub-agent
+    // nudge). All writes below go to this object; the global fallback covers
+    // any legacy caller that didn't pass one.
+    var reqMetrics = metrics || lastRequestMetrics || (lastRequestMetrics = {});
 
     // For Anthropic: normalize ALL messages to array format, then add cache_control at branching points
     // Cache points: system prompt + last 2 user messages + last message
@@ -95,23 +103,43 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         tool_choice: 'auto',
         parallel_tool_calls: true,
         stream: true,
-        temperature: 1,
         //top_p: 0.95,
         //top_k: 40,
         max_tokens: provider.maxTokens,
         usage: { include: true }  // Required to get cache info in response
     };
+    // Claude 4.7+ returns 400 on any non-default sampling param (temperature/
+    // top_p/top_k), so omit temperature entirely for Anthropic models — the
+    // default is 1 anyway. Keep the explicit default for other providers.
+    if (!isAnthropic) {
+        requestBody.temperature = 1;
+    }
     // For Anthropic models, disable transforms to pass through cache_control
     if (isAnthropic) {
         requestBody.transforms = [];
     }
+    // Adaptive-only Claude models (Opus 4.7+, Fable 5, Mythos 5) reject
+    // budget-style thinking (`budget_tokens` → 400 error); the effort parameter
+    // is the only thinking-depth control. Ignore any legacy thinkingBudget on
+    // the provider for those models so a provider created from the generic
+    // template doesn't 400. Detection lives in core/030-config.js
+    // (isAdaptiveOnlyClaude) so the page and SW bundles share one pattern.
+    var isAdaptiveOnly = isAdaptiveOnlyClaude(modelLower);
     // Enable reasoning - OpenRouter handles the format normalization
-    if (provider.thinkingBudget) {
+    if (provider.thinkingBudget && !isAdaptiveOnly) {
         requestBody.reasoning = { max_tokens: provider.thinkingBudget };
     }
     if (provider.effort) {
         if (!requestBody.reasoning) requestBody.reasoning = {};
         requestBody.reasoning.effort = provider.effort;
+    }
+    if (isAdaptiveOnly && provider.thinkingBudget && !requestBody.reasoning) {
+        // A legacy thinkingBudget was suppressed above and no effort is
+        // configured: send the documented default effort explicitly so
+        // OpenRouter doesn't fall back to budget-style thinking. When the
+        // provider has NEITHER thinkingBudget nor effort, leave reasoning
+        // absent — "(default)" effort must keep meaning the model default.
+        requestBody.reasoning = { effort: 'high' };
     }
 	if (provider.provider) {
 		requestBody.provider = {
@@ -130,7 +158,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     }
 
     // Store request body in metrics for debugging
-    lastRequestMetrics.requestBody = requestBody;
+    reqMetrics.requestBody = requestBody;
 
     var reader;
 
@@ -278,6 +306,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     var thinking = '';
     var content = '';
     var toolCalls = [];
+    var refusalFinish = null; // finish_reason 'refusal'/'content_filter' seen in stream
     var toolCallBuffers = {};
     var reasoningDetails = []; // Preserve for API continuity
     var reasoningDetailsMap = {}; // Merge streaming fragments by index
@@ -330,52 +359,62 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 // Detect error responses in stream (backend errors sent mid-stream)
                 if (data.error) {
                     var errMsg = data.error.message || (typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
-                    throw new Error(errMsg);
+                    var apiErr = new Error(errMsg);
+                    // Flag so the parse-error swallow below can't eat a genuine
+                    // in-stream API error whose text happens to contain 'JSON'
+                    // or 'Unexpected token'.
+                    apiErr.isApiError = true;
+                    throw apiErr;
                 }
 
                 // Capture usage data from OpenRouter
                 if (data.usage) {
-                    lastRequestMetrics = lastRequestMetrics || {};
-                    if (data.usage.prompt_tokens) lastRequestMetrics.input_tokens = data.usage.prompt_tokens;
-                    if (data.usage.completion_tokens) lastRequestMetrics.output_tokens = data.usage.completion_tokens;
-                    if (data.usage.total_tokens) lastRequestMetrics.total_tokens = data.usage.total_tokens;
+                    if (data.usage.prompt_tokens) reqMetrics.input_tokens = data.usage.prompt_tokens;
+                    if (data.usage.completion_tokens) reqMetrics.output_tokens = data.usage.completion_tokens;
+                    if (data.usage.total_tokens) reqMetrics.total_tokens = data.usage.total_tokens;
                     // Capture cache info from OpenRouter (Anthropic models via OpenRouter)
-                    if (data.usage.cache_creation_input_tokens) lastRequestMetrics.cache_creation_tokens = data.usage.cache_creation_input_tokens;
-                    if (data.usage.cache_read_input_tokens) lastRequestMetrics.cache_read_tokens = data.usage.cache_read_input_tokens;
+                    if (data.usage.cache_creation_input_tokens) reqMetrics.cache_creation_tokens = data.usage.cache_creation_input_tokens;
+                    if (data.usage.cache_read_input_tokens) reqMetrics.cache_read_tokens = data.usage.cache_read_input_tokens;
                     // Also check prompt_tokens_details for cache info
                     if (data.usage.prompt_tokens_details) {
-                        if (data.usage.prompt_tokens_details.cached_tokens) lastRequestMetrics.cache_read_tokens = data.usage.prompt_tokens_details.cached_tokens;
-                        if (data.usage.prompt_tokens_details.cache_write_tokens) lastRequestMetrics.cache_write_tokens = data.usage.prompt_tokens_details.cache_write_tokens;
+                        if (data.usage.prompt_tokens_details.cached_tokens) reqMetrics.cache_read_tokens = data.usage.prompt_tokens_details.cached_tokens;
+                        if (data.usage.prompt_tokens_details.cache_write_tokens) reqMetrics.cache_write_tokens = data.usage.prompt_tokens_details.cache_write_tokens;
                     }
                     // Capture cost
-                    if (data.usage.cost !== undefined) lastRequestMetrics.cost = data.usage.cost;
+                    if (data.usage.cost !== undefined) reqMetrics.cost = data.usage.cost;
                     // Capture reasoning tokens from completion_tokens_details
                     if (data.usage.completion_tokens_details) {
-                        if (data.usage.completion_tokens_details.reasoning_tokens) lastRequestMetrics.reasoning_tokens = data.usage.completion_tokens_details.reasoning_tokens;
+                        if (data.usage.completion_tokens_details.reasoning_tokens) reqMetrics.reasoning_tokens = data.usage.completion_tokens_details.reasoning_tokens;
                     }
                 }
                 // Check for cache_discount at top level of response (OpenRouter cache savings)
                 if (data.cache_discount !== undefined) {
-                    lastRequestMetrics = lastRequestMetrics || {};
-                    lastRequestMetrics.cache_discount = data.cache_discount;
+                    reqMetrics.cache_discount = data.cache_discount;
                 }
                 // Capture the actual model/provider used (OpenRouter returns the routed model)
                 if (data.model) {
-                    lastRequestMetrics = lastRequestMetrics || {};
-                    lastRequestMetrics.actualModel = data.model;
+                    reqMetrics.actualModel = data.model;
                     // Update header display with full model name
                     updateModelDisplayWithProvider(data.model);
                 }
                 // Capture the actual provider from the response (e.g., "Parasail")
                 if (data.provider) {
-                    lastRequestMetrics = lastRequestMetrics || {};
-                    lastRequestMetrics.providerName = data.provider;
+                    reqMetrics.providerName = data.provider;
                 }
 
                 chunkCount++;
 
                 var choice = data.choices && data.choices[0];
                 if (!choice) continue;
+
+                // Fable 5 / Opus 4.7+ refusals arrive as a SUCCESSFUL stream with
+                // finish_reason 'refusal' (OpenRouter passes Anthropic's stop_reason
+                // through; some routes normalize it to 'content_filter'). Track it so
+                // the turn doesn't end as a silent empty message — mirrors the
+                // OAuth-path handling in src/platform/extension/background.js.
+                if (choice.finish_reason === 'refusal' || choice.finish_reason === 'content_filter') {
+                    refusalFinish = choice.finish_reason;
+                }
 
                 var delta = choice.delta;
                 var thinkingChunk = null;
@@ -519,6 +558,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             } catch (e) {
                 // Re-throw real errors (e.g. API errors detected in stream)
                 // Only silently continue for JSON parse errors
+                if (e && e.isApiError) throw e;
                 if (e.message && !e.message.includes('JSON') && !e.message.includes('Unexpected token')) throw e;
             }
         }
@@ -536,6 +576,14 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // Capture usage from OpenRouter if available in final data
     // OpenRouter typically includes usage in X-headers or final message
     
+    // Surface refusals as visible assistant text (see refusalFinish capture in
+    // the chunk loop). 'content_filter' only counts when the model produced no
+    // content at all — some providers use it for partial output filtering.
+    if (refusalFinish && (refusalFinish === 'refusal' || !content)) {
+        content += (content ? '\n\n' : '') + '[Request declined by the model (' + provider.model + '). Refused requests can often be served by a different model — switch the provider and retry.]';
+        onContent(content);
+    }
+
     // IMPORTANT: Only pass back reasoning_details that came from the API
     // Do NOT construct it ourselves - that can cause issues with subsequent calls
     onDone({

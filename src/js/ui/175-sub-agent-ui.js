@@ -22,35 +22,391 @@
 // depth: report.status is server-validated, but if any future code path
 // pushes a sub_report row with an unsanitized status the class attribute
 // stays safe.
-var SUB_REPORT_STATUSES = { done: 1, error: 1, partial: 1, need_input: 1, cancelled: 1 };
+var SUB_REPORT_STATUSES = { done: 1, error: 1, partial: 1, need_input: 1, cancelled: 1, running: 1, waiting: 1 };
+
+// User open/collapse choices for sub-report cards, keyed by a stable
+// per-card key. renderMessages rebuilds the chat
+// innerHTML on every repaint (each progress append / live-state change),
+// which would otherwise snap a user-collapsed live card back open and shut
+// a user-opened data panel. Session-scoped on purpose — defaults win again
+// after a reload.
+var _subReportOpenPref = Object.create(null);
+
+// −/+ string-collapse and ⤢ full-height choices for the input/output
+// panels INSIDE a sub-report card, keyed 'str:'/'exp:' + cardKey +
+// ':in'/':out'. Live cards repaint on every progress append; with the
+// per-render Math.random() ids formatJsonValue mints, every repaint
+// forgot the user's toggle and snapped the panel back to its default.
+// Stable keys + this map make the choice survive repaints. Session-
+// scoped on purpose, like _subReportOpenPref above.
+var _subPanelPref = Object.create(null);
+
+// storeRawCopy() (200-ui-interactions.js) appends a NEW _rawCopyStore
+// entry on every call. A live sub card re-renders on every progress
+// event and used to push two fresh entries per repaint, growing the
+// store without bound for the lifetime of the page. Write under a
+// STABLE per-card key and overwrite instead — one entry per panel per
+// card, however often it repaints.
+function _storeSubRawCopy(key, content) {
+    if (typeof window !== 'undefined') {
+        window._rawCopyStore = window._rawCopyStore || {};
+        window._rawCopyStore[key] = content;
+    }
+    return key;
+}
+
+// Same −/+ long-string collapse affordance as formatJsonValue's string
+// case (190-json-format.js), but with a STABLE DOM id + pref key instead
+// of a random per-render id, so the toggle state survives the card's
+// progress repaints. Toggling is handled by the delegated click listener
+// below (data-sub-collapse) — no inline onclick, same XSS rationale as
+// the chip / open-chat buttons.
+function _renderSubCollapsibleText(text, prefKey, domId) {
+    var escaped = escapeHtml(text);
+    var lines = text.split('\n');
+    var lineCount = lines.length;
+    if (lineCount <= 1 && text.length <= 80) {
+        return '<span class="json-str">' + escaped + '</span>';
+    }
+    var firstLine = lines[0];
+    if (firstLine.length > 80) firstLine = firstLine.substring(0, 77) + '...';
+    var preview = escapeHtml(firstLine);
+    if (lineCount > 1) {
+        preview += '<span class="json-preview"> +' + (lineCount - 1) + ' line' + (lineCount > 2 ? 's' : '') + '</span>';
+    }
+    var collapsed = !!_subPanelPref['str:' + prefKey];
+    return '<span class="json-collapse" data-sub-collapse="' + escapeHtml(prefKey) + '" data-sub-collapse-id="' + escapeHtml(domId) + '">' + (collapsed ? '+' : '−') + '</span>' +
+        '<span id="' + escapeHtml(domId) + '" class="json-collapsible json-str"' + (collapsed ? ' style="display:none"' : '') + '>' + escaped + '</span>' +
+        '<span id="' + escapeHtml(domId) + '-collapsed" class="json-collapsed json-str"' + (collapsed ? '' : ' style="display:none"') + '>' + preview + '</span>';
+}
+
+// Markdown variant of _renderSubCollapsibleText — same structure (collapse
+// toggle + expanded element + collapsed preview, SAME ids/classes/data
+// attributes so the delegated [data-sub-collapse] listener and _subPanelPref
+// keep working), but the EXPANDED element renders the text as markdown via
+// formatContent (250-message-render.js) inside a markdown-body container —
+// the same pattern _subProgressHtml below already uses. The collapsed
+// preview stays PLAIN TEXT (first non-empty line, markdown noise stripped —
+// same regex chain as the card-header previewSrc). Falls back to the
+// escaped-text variant when formatContent is unavailable.
+function _renderSubCollapsibleMarkdown(text, prefKey, domId) {
+    if (typeof formatContent !== 'function') {
+        return _renderSubCollapsibleText(text, prefKey, domId);
+    }
+    var rendered;
+    try {
+        rendered = formatContent(text);
+    } catch (_) {
+        // Same fallback shape as _subProgressHtml, with newlines preserved
+        // (the surrounding pre.sub-md resets white-space to normal).
+        rendered = '<span class="md-paragraph">' + escapeHtml(text).replace(/\n/g, '<br>') + '</span>';
+    }
+    var lines = text.split('\n');
+    var lineCount = lines.length;
+    if (lineCount <= 1 && text.length <= 80) {
+        return '<span class="json-str sub-md-inline markdown-body">' + rendered + '</span>';
+    }
+    // Plain-text one-line preview: first non-empty line with leading
+    // header/bullet markers, **bold** and `code` stripped (same chain as
+    // previewSrc in renderSubReport).
+    var firstLine = (lines.find(function(l) { return l.trim().length > 0; }) || '')
+        .replace(/^#+\s*/, '')
+        .replace(/^[-*]\s+/, '')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .trim();
+    if (firstLine.length > 80) firstLine = firstLine.substring(0, 77) + '...';
+    var preview = escapeHtml(firstLine);
+    if (lineCount > 1) {
+        preview += '<span class="json-preview"> +' + (lineCount - 1) + ' line' + (lineCount > 2 ? 's' : '') + '</span>';
+    }
+    var collapsed = !!_subPanelPref['str:' + prefKey];
+    // NOTE: the expanded element renders display:block (CSS) so the markdown
+    // body sits on its own line under the −/+ toggle. toggleJsonCollapse
+    // re-shows with display:'inline' — the delegated listener below restores
+    // '' for .sub-md elements so the stylesheet rule applies again.
+    return '<span class="json-collapse" data-sub-collapse="' + escapeHtml(prefKey) + '" data-sub-collapse-id="' + escapeHtml(domId) + '">' + (collapsed ? '+' : '−') + '</span>' +
+        '<span id="' + escapeHtml(domId) + '" class="json-collapsible json-str sub-md markdown-body"' + (collapsed ? ' style="display:none"' : '') + '>' + rendered + '</span>' +
+        '<span id="' + escapeHtml(domId) + '-collapsed" class="json-collapsed json-str"' + (collapsed ? '' : ' style="display:none"') + '>' + preview + '</span>';
+}
+
+// onclick shim for the ⤢ expand buttons on sub-report input/output
+// panels. Delegates to toggleToolExpand (190-json-format.js) for the
+// actual class flips, then records the resulting state so the next
+// repaint renders the panel already expanded/collapsed. toggleToolExpand
+// calls event.stopPropagation(), so the document-level delegated
+// listener can never observe these clicks — hence the explicit shim.
+function toggleSubReportExpand(btn, event) {
+    if (typeof toggleToolExpand === 'function') toggleToolExpand(btn, event);
+    try {
+        var wrapper = btn.closest('.tool-args-wrapper') || btn.closest('.tool-result-wrapper');
+        var key = wrapper && wrapper.getAttribute('data-sub-expand-key');
+        var pre = wrapper ? (wrapper.querySelector('.tool-args') || wrapper.querySelector('pre')) : null;
+        if (key && pre) _subPanelPref['exp:' + key] = pre.classList.contains('expanded');
+    } catch (_) { /* ignore */ }
+}
+
+// ---------- sub progress card (update_action_state mirrored from the sub) ----------
+// recordSubActionState (097-sub-agent-registry.js) stamps msg.actionState /
+// phase.actionState with the sub's latest update_action_state snapshot
+// ({state, icon, label, tasks, output, at}). Render it as a state pill +
+// label head + tasks checklist. Class names are whitelist-interpolated —
+// same defense-in-depth rationale as SUB_REPORT_STATUSES above.
+var SUB_ACTION_STATES = { running: 1, stuck: 1, done: 1, error: 1 };
+var SUB_ACTION_TASK_STATUSES = { pending: 1, running: 1, done: 1, error: 1 };
+function _subActionStateHtml(st) {
+    if (!st) return '';
+    var tasks = Array.isArray(st.tasks) ? st.tasks : [];
+    if (!st.label && !tasks.length) return '';
+    var stClass = SUB_ACTION_STATES[st.state] ? st.state : 'running';
+    var head = '';
+    if (st.label) {
+        head = '<div class="sub-report-action-head">' +
+            '<span class="sub-report-action-pill">' + escapeHtml(stClass) + '</span>' +
+            '<span class="sub-report-action-label">' + escapeHtml(String(st.label)) + '</span>' +
+        '</div>';
+    }
+    var rows = tasks.map(function(t) {
+        var ts = (t && SUB_ACTION_TASK_STATUSES[t.status]) ? t.status : 'pending';
+        var glyph = (ts === 'done') ? '\u2713'
+                  : (ts === 'error') ? '\u2715'
+                  : (ts === 'running') ? '<span class="sub-report-spinner sub-report-task-spinner" aria-hidden="true"></span>'
+                  : '\u25cb';
+        return '<div class="sub-report-task sub-task-' + ts + '">' +
+            '<span class="sub-report-task-icon" aria-hidden="true">' + glyph + '</span>' +
+            '<span class="sub-report-task-label">' + escapeHtml(String((t && t.label) || '')) + '</span>' +
+        '</div>';
+    }).join('');
+    return '<div class="sub-report-action-state sub-action-' + stClass + '">' + head + rows + '</div>';
+}
+
+// Resolve the status to SHOW for a sub_report card. Terminal stored statuses
+// are authoritative; a non-terminal (running/partial) card reflects the LIVE
+// registry state so the spinner/label tracks the worker in real time even
+// between the discrete rows we persist (spawn -> progress -> final report).
+function _subReportLiveStatus(msg) {
+    var stored = (msg.report && msg.report.status) || 'partial';
+    if (stored === 'done' || stored === 'error' || stored === 'need_input' || stored === 'cancelled') return stored;
+    var live = null;
+    if (msg.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+        var r = SubAgents.getById(msg.subAgentId);
+        if (r) live = r.state;
+    }
+    if (live === 'running')  return 'running';
+    if (live === 'sleeping') return 'waiting';
+    if (live === 'stopped')  return 'cancelled';
+    if (live === 'errored')  return 'error';
+    // No live record (GC'd / not yet rehydrated) and not terminal: keep showing
+    // running rather than inventing a terminal status.
+    return 'running';
+}
 
 function renderSubReport(msg, index) {
     var report = msg.report || {};
-    var rawStatus = report.status || 'partial';
-    var status = SUB_REPORT_STATUSES[rawStatus] ? rawStatus : 'partial';
+    var status = _subReportLiveStatus(msg);
+    if (!SUB_REPORT_STATUSES[status]) status = 'partial';
     var statusClass = 'sub-report-' + status;
-    var icon = (status === 'done') ? '✓'
+    var isRunning = (status === 'running');
+    var isWaiting = (status === 'waiting');
+    var isLive = isRunning || isWaiting;
+    var statusLabelMap = { running: 'working', waiting: 'waiting', partial: 'working',
+        done: 'done', error: 'error', need_input: 'needs input', cancelled: 'cancelled' };
+    var statusLabel = statusLabelMap[status] || status;
+    var iconChar = (status === 'done') ? '✓'
              : (status === 'error') ? '✕'
              : (status === 'need_input') ? '?'
+             : (status === 'cancelled') ? '⊘'
+             : (status === 'waiting') ? '\u275a\u275a'
              : '…';
+    // Running shows an animated spinner in the icon slot; everything else a glyph.
+    var iconHtml = isRunning
+        ? '<span class="sub-report-spinner" aria-hidden="true"></span>'
+        : '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>';
     var summary = report.summary || '';
     var name = msg.subAgentName || report.from_name || msg.subAgentId || 'sub-agent';
-    var artifactsHtml = '';
-    if (Array.isArray(report.artifacts) && report.artifacts.length) {
-        var chips = report.artifacts.map(function(a) {
-            return '<span class="sub-report-artifact" title="' + escapeHtml(a) + '">' + escapeHtml(a) + '</span>';
+    // Stable per-card key — drives the open/collapse pref maps and the
+    // stable ids/keys for the input/output panels below. Computed up here
+    // so inputsHtml/outputHtml can derive stable child keys from it.
+    // Fallbacks (rare: legacy rows persisted without subAgentId) prefer
+    // fields that survive history mutations — subChatId, then the row's own
+    // timestamp — over the array index, which shifts whenever earlier
+    // messages are inserted/removed and would silently re-key the prefs.
+    var cardKey = 'card:' + (msg.subAgentId || msg.subChatId || ('t' + (msg.createdAt || msg.timestamp || index)));
+
+    // ----- Panel builders -----
+    // Same wrapper/classes/buttons as the tool-call args / inline tool result
+    // panels in 250-message-render.js (tool-args-wrapper + tool-expand-btn +
+    // pre.tool-args + tool-copy-btn / tool-result-section + tool-result-
+    // wrapper). Content = ONLY the instructions / summary text (no JSON
+    // envelope, no label) — the full spawn args are already visible on the
+    // spawn_sub_agent tool call panel itself. Each panel derives a STABLE
+    // pref key (cardKey + suffix) so the −/+ and ⤢ toggles survive repaints;
+    // the CURRENT phase keeps the legacy ':in'/':out' suffixes so prefs
+    // recorded before a wake (or persisted by older builds) still apply,
+    // while archived phases get indexed suffixes (':in:0', ':out:0', …).
+    function _subInputPanel(text, prefSuffix, domSuffix) {
+        var taskText = String(text);
+        var argsCopyId = _storeSubRawCopy('sub:' + cardKey + prefSuffix, taskText);
+        // _renderSubCollapsibleMarkdown gives long/multi-line strings the
+        // same −/+ collapse toggle (with one-line plain-text preview) that
+        // tool arg panels have, but renders the expanded body as markdown
+        // (spawn/wake instructions are written in markdown by agents).
+        // Stable id/key so the toggle survives repaints. The raw markdown
+        // stays in _rawCopyStore (argsCopyId above) so Copy is unaffected.
+        var mdOk = (typeof formatContent === 'function');
+        var taskHtml = mdOk
+            ? _renderSubCollapsibleMarkdown(taskText, cardKey + prefSuffix, 'sub-str-' + index + domSuffix)
+            : _renderSubCollapsibleText(taskText, cardKey + prefSuffix, 'sub-str-' + index + domSuffix);
+        var inExpanded = !!_subPanelPref['exp:' + cardKey + prefSuffix];
+        // KEEP the <pre> + tool-args class: toggleToolExpand queries
+        // '.tool-args' and the :has(> pre.expanded) rules in 05-tools.css
+        // key off them. sub-md (only when markdown rendered) resets the
+        // pre's white-space/font so markdown reads naturally (24-sub-agents.css).
+        return '<div class="tool-args-wrapper" data-copy-id="' + escapeHtml(argsCopyId) + '" data-sub-expand-key="' + escapeHtml(cardKey + prefSuffix) + '">' +
+            '<button class="tool-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + (inExpanded ? 'Collapse' : 'Expand') + '">' + (inExpanded ? '⤡' : '⤢') + '</button>' +
+            '<pre class="tool-args' + (mdOk ? ' sub-md markdown-body' : '') + (inExpanded ? ' expanded' : '') + '">' + taskHtml + '</pre>' +
+            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+    }
+    function _subOutputPanel(text, prefSuffix, domSuffix, labelHtml) {
+        var summaryText = String(text);
+        var resultCopyId = _storeSubRawCopy('sub:' + cardKey + prefSuffix, summaryText);
+        // Same −/+ collapse treatment as tool result panels, but the
+        // expanded body renders as markdown (report_to_parent summaries are
+        // written in markdown). Stable id/key so the toggle survives
+        // repaints; raw markdown stays in _rawCopyStore for Copy.
+        var mdOk = (typeof formatContent === 'function');
+        var summaryHtml = mdOk
+            ? _renderSubCollapsibleMarkdown(summaryText, cardKey + prefSuffix, 'sub-str-' + index + domSuffix)
+            : _renderSubCollapsibleText(summaryText, cardKey + prefSuffix, 'sub-str-' + index + domSuffix);
+        var outExpanded = !!_subPanelPref['exp:' + cardKey + prefSuffix];
+        // KEEP the bare <pre>: toggleToolExpand falls back to
+        // wrapper.querySelector('pre') and 05-tools.css keys off
+        // :has(> pre.expanded). sub-md/markdown-body only when markdown
+        // actually rendered (white-space reset would mangle plain text).
+        return '<div class="tool-result-section">' + (labelHtml || '') +
+            '<div class="tool-result-wrapper" data-copy-id="' + escapeHtml(resultCopyId) + '" data-sub-expand-key="' + escapeHtml(cardKey + prefSuffix) + '">' +
+            '<button class="tool-result-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + (outExpanded ? 'Collapse' : 'Expand') + '">' + (outExpanded ? '⤡' : '⤢') + '</button>' +
+            '<pre class="' + (mdOk ? 'sub-md markdown-body' : '') + (outExpanded ? ' expanded' : '') + '">' + summaryHtml + '</pre>' +
+            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></div>';
+    }
+    function _subProgressHtml(progArr, dropped) {
+        if (!progArr.length && !dropped) return '';
+        var items = progArr.map(function(p) {
+            var t = (p && p.text) ? String(p.text) : '';
+            var rendered = (typeof formatContent === 'function' && t)
+                ? formatContent(t)
+                : ('<span class="md-paragraph">' + escapeHtml(t) + '</span>');
+            return '<div class="sub-report-progress-item">' +
+                '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
+                '<div class="sub-report-progress-text markdown-body">' + rendered + '</div>' +
+            '</div>';
         }).join('');
-        artifactsHtml = '<div class="sub-report-artifacts">artifacts: ' + chips + '</div>';
+        // agentMessage (097-sub-agent-registry.js) caps the stream at 50
+        // entries and counts trimmed ones in progressDropped — surface the
+        // trim as one stub line instead of silently losing history.
+        if (dropped) {
+            items = '<div class="sub-report-progress-item">' +
+                '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
+                '<div class="sub-report-progress-text">[' + (dropped | 0) + ' earlier update' + (dropped > 1 ? 's' : '') + ' truncated]</div>' +
+            '</div>' + items;
+        }
+        return '<div class="sub-report-progress">' + items + '</div>';
     }
-    var dataHtml = '';
-    if (report.data && typeof report.data === 'object') {
-        try {
-            var json = JSON.stringify(report.data, null, 2);
-            // Soft cap on inline data display — anything bigger should be in artifacts.
-            if (json.length > 800) json = json.slice(0, 800) + '\n…[truncated; see artifacts]';
-            dataHtml = '<details class="sub-report-data"><summary>data</summary><pre>' + escapeHtml(json) + '</pre></details>';
-        } catch (e) { /* ignore */ }
+
+    // ----- Archived phases (each wake_sub_agent closes one) -----
+    // The wake path (097-sub-agent-registry.js) archives the completed
+    // {input, report, progress} triple onto msg.phases. Render every phase
+    // as its own input panel → progress items → output panel block, with the
+    // phase's terminal status as a small inline pill above the output.
+    // Legacy cards persisted by older builds have no msg.phases — their old
+    // archival lines simply remain in msg.progress and render as before.
+    var phases = Array.isArray(msg.phases) ? msg.phases : [];
+    var phasesHtml = '';
+    if (msg.phasesDropped) {
+        // The wake path caps msg.phases at 10 and counts trimmed ones in
+        // phasesDropped — surface the trim as one stub line (same visual
+        // treatment as the progressDropped stub).
+        phasesHtml += '<div class="sub-report-progress"><div class="sub-report-progress-item">' +
+            '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
+            '<div class="sub-report-progress-text">[' + (msg.phasesDropped | 0) + ' earlier phase' + (msg.phasesDropped > 1 ? 's' : '') + ' truncated]</div>' +
+        '</div></div>';
     }
+    for (var pi = 0; pi < phases.length; pi++) {
+        var ph = phases[pi] || {};
+        // REG374-2: key panel prefs (_subPanelPref / _rawCopyStore) by the
+        // stable per-phase id stamped at archive time (097-sub-agent-registry
+        // wake path), not the array index — the 10-phase cap shift()s the
+        // array and index-keyed prefs migrated to the wrong phase. Phases
+        // persisted before this fix have no id → fall back to the index.
+        var phKey = (ph.id != null) ? ph.id : pi;
+        var phReport = ph.report || {};
+        var phStatus = String(phReport.status || 'done');
+        if (!SUB_REPORT_STATUSES[phStatus]) phStatus = 'partial';
+        var phLabel = '<span class="sub-report-status sub-report-phase-status">' + escapeHtml(statusLabelMap[phStatus] || phStatus) + '</span>';
+        phasesHtml += '<div class="sub-report-phase">' +
+            (ph.input ? _subInputPanel(ph.input, ':in:' + phKey, '-in-' + phKey) : '') +
+            _subProgressHtml(Array.isArray(ph.progress) ? ph.progress : [], ph.progressDropped | 0) +
+            // The phase's archived update_action_state card (wake path stamps
+            // phase.actionState before resetting the live one).
+            _subActionStateHtml(ph.actionState) +
+            // A summary-less phase (e.g. report_to_parent with empty summary)
+            // still shows its terminal-status pill — gating the pill on the
+            // summary dropped it entirely and the phase read as unlabeled.
+            (phReport.summary ? _subOutputPanel(phReport.summary, ':out:' + phKey, '-out-' + phKey, phLabel)
+                              : '<div class="tool-result-section">' + phLabel + '</div>') +
+        '</div>';
+    }
+    // REG376-1: the stable per-phase ids above mint NEW _rawCopyStore /
+    // _subPanelPref entries on every wake; entries for phases the 10-phase
+    // cap shift()ed out of msg.phases were never overwritten or pruned
+    // (storeRawCopy's GC only touches 'rc-' keys), so both stores grew
+    // without bound on long-running woken subs. Prune THIS card's
+    // phase-suffixed keys (':in:<id>' / ':out:<id>') whose phase id is no
+    // longer in msg.phases. The current phase's suffix-less ':in'/':out'
+    // keys never match the trailing-id pattern, and other cards' keys never
+    // match this card's prefix (a longer cardKey leaves residue before
+    // ':in:'/':out:', failing the anchored pattern) — both stay intact.
+    if (phases.length && typeof window !== 'undefined' && window._rawCopyStore) {
+        var _liveIds = Object.create(null);
+        for (var li = 0; li < phases.length; li++) {
+            var lp = phases[li] || {};
+            _liveIds[(lp.id != null) ? lp.id : li] = true;
+        }
+        var _phaseSuffixRe = /^:(?:in|out):(.+)$/;
+        var _pruneStalePhaseKeys = function(store, prefix) {
+            var ks = Object.keys(store);
+            for (var ki = 0; ki < ks.length; ki++) {
+                if (ks[ki].indexOf(prefix) !== 0) continue;
+                var m = _phaseSuffixRe.exec(ks[ki].slice(prefix.length));
+                if (m && !_liveIds[m[1]]) delete store[ks[ki]];
+            }
+        };
+        _pruneStalePhaseKeys(window._rawCopyStore, 'sub:' + cardKey);
+        _pruneStalePhaseKeys(_subPanelPref, 'exp:' + cardKey);
+        _pruneStalePhaseKeys(_subPanelPref, 'str:' + cardKey);
+    }
+
+    // ----- Current phase input -----
+    // After a wake, msg.currentInput carries the latest wake instruction;
+    // before any wake it is unset and the spawn instructions are the input.
+    var sa = msg.spawnArgs;
+    var currentInput = msg.currentInput || (sa && sa.instructions) || '';
+    var inputsHtml = currentInput ? _subInputPanel(currentInput, ':in', '-in') : '';
+
+    // ----- Progress stream (agent_message -> parent, accumulated in place) -----
+    // After a wake this stream is reset per phase — only the CURRENT phase's
+    // updates live here (archived phases carry their own in msg.phases).
+    var prog = Array.isArray(msg.progress) ? msg.progress : [];
+    var progressHtml = _subProgressHtml(prog, msg.progressDropped | 0);
+
+    // ----- Live progress card (sub's update_action_state, mirrored in place) -----
+    var actionStateHtml = _subActionStateHtml(msg.actionState);
+
+    // ----- Output — styled like a tool call's result block -----
+    // Content = ONLY the report summary text — data/artifacts live on the
+    // spawn handle result and in the sub's own chat. (_subOutputPanel reuses
+    // the exact tool-result-section markup this section used to inline.)
+    var outputHtml = summary ? _subOutputPanel(summary, ':out', '-out', '') : '';
     // Resolve the sub's chat for the "open transcript" link. Prefer the
     // live registry record (most accurate, follows chat_id changes), but
     // fall back to msg.subChatId persisted on the message itself — the
@@ -91,19 +447,23 @@ function renderSubReport(msg, index) {
     // see at a glance what came back; clicking the row expands the full
     // markdown body. Native <details> handles the toggle — no extra JS.
     //
-    // The summary text is now rendered through formatContent() so subs can
-    // report rich markdown (headings, lists, code blocks, tables). The
-    // global delegated click listener calls preventDefault() on any
-    // [data-sub-chat-id] / [data-sub-agent-reveal] hit, which cancels the
-    // <details> toggle as well — so clicking "open transcript" reveals
-    // the sub's chat without toggling the panel.
-    var summaryRendered = (typeof formatContent === 'function' && summary)
-        ? formatContent(summary)
-        : ('<span class="md-paragraph">' + escapeHtml(summary) + '</span>');
-    // One-line preview for the collapsed header. Strip markdown noise so the
-    // preview reads as plain text: leading `#` headings, list bullets, bold
-    // markers, inline code backticks. Cap at 140 chars + ellipsis.
-    var previewSrc = (summary.split('\n').find(function(l) { return l.trim().length > 0; }) || '')
+    // The report payload renders as a tool-style JSON result block (see
+    // outputHtml above). The global delegated click listener calls
+    // preventDefault() on any [data-sub-chat-id] / [data-sub-agent-reveal]
+    // hit, which cancels the <details> toggle as well — so clicking
+    // "open chat" reveals the sub's chat without toggling the panel.
+    // One-line preview for the collapsed header. While the sub is live, show
+    // the latest progress line (its current activity); once terminal, show the
+    // final summary. Strip markdown noise so the preview reads as plain text.
+    var previewBase = '';
+    if (isLive && prog.length) previewBase = (prog[prog.length - 1] && prog[prog.length - 1].text) || '';
+    else previewBase = summary;
+    // Live card with no agent_message stream yet: fall back to the sub's
+    // update_action_state label so the collapsed header still tracks activity.
+    if (isLive && !previewBase && msg.actionState && msg.actionState.label) {
+        previewBase = msg.actionState.label;
+    }
+    var previewSrc = (String(previewBase).split('\n').find(function(l) { return l.trim().length > 0; }) || '')
         .replace(/^#+\s*/, '')
         .replace(/^[-*]\s+/, '')
         .replace(/\*\*([^*]+)\*\*/g, '$1')
@@ -111,26 +471,36 @@ function renderSubReport(msg, index) {
         .trim();
     var preview = previewSrc.length > 140 ? (previewSrc.slice(0, 140) + '…') : previewSrc;
     var previewHtml = preview ? '<span class="sub-report-preview">' + escapeHtml(preview) + '</span>' : '';
-    // Auto-open reports that need the parent's attention: error reports so
-    // failures aren't hidden behind a chevron, and need_input reports since
-    // the parent literally cannot continue without reading them. `done`,
-    // `partial`, `cancelled` stay collapsed (the preview line + status
-    // badge is enough at-a-glance, and these tend to be the verbose ones).
-    var defaultOpen = (status === 'error' || status === 'need_input') ? ' open' : '';
-    return '<details' + defaultOpen + ' class="message sub-report ' + statusClass + '" id="msg-' + index + '">' +
+    // Open by default while the sub is live (so the user watches inputs +
+    // progress stream) and for terminal reports that need the parent's
+    // attention (error / need_input). `done`, `cancelled` collapse to the
+    // header (preview line + status badge is enough at a glance).
+    // The user's explicit open/collapse choice (recorded by the delegated
+    // click listener below) beats the computed default — otherwise every
+    // repaint (progress append, live-state change) would snap a collapsed
+    // live card back open. (cardKey is computed near the top of this
+    // function — the input/output panels derive their stable keys from it.)
+    var cardPref = _subReportOpenPref[cardKey];
+    var openNow = (cardPref != null) ? cardPref : (isLive || status === 'error' || status === 'need_input');
+    var defaultOpen = openNow ? ' open' : '';
+    var bodyHtml = phasesHtml + inputsHtml + progressHtml + actionStateHtml + outputHtml;
+    // data-rendered-open stamps the state this render PRODUCED. Chrome fires
+    // a (trusted) 'toggle' event even when a <details open> is merely inserted
+    // via innerHTML, so the pref recorder below compares against this stamp to
+    // tell genuine user toggles apart from render echoes — recording the echo
+    // would pin the computed default as a "user" pref on every repaint.
+    return '<details' + defaultOpen + ' class="message sub-report ' + statusClass + '" id="msg-' + index + '" data-sub-report-toggle="' + escapeHtml(cardKey) + '" data-rendered-open="' + (openNow ? '1' : '0') + '">' +
         '<summary class="sub-report-header">' +
             '<span class="sub-report-chevron" aria-hidden="true"></span>' +
-            '<span class="sub-report-icon" aria-hidden="true">' + icon + '</span>' +
+            iconHtml +
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
-            '<span class="sub-report-status">' + escapeHtml(status) + '</span>' +
+            '<span class="sub-report-status">' + escapeHtml(statusLabel) + '</span>' +
             synth +
             previewHtml +
             openLink +
         '</summary>' +
         '<div class="sub-report-body">' +
-            '<div class="sub-report-summary markdown-body">' + summaryRendered + '</div>' +
-            artifactsHtml +
-            dataHtml +
+            bodyHtml +
         '</div>' +
     '</details>';
 }
@@ -348,9 +718,33 @@ function renderWorkersStrip() {
         if (typeof currentChatId === 'undefined' || !currentChatId) return '';
         if (typeof chats === 'undefined' || !chats[currentChatId]) return '';
         var msgs = chats[currentChatId].messages || [];
-        var n = 0;
-        for (var i = 0; i < msgs.length; i++) if (msgs[i].role === 'sub_report') n++;
-        return currentChatId + ':' + n;
+        // Key over every sub_report card's identity + stored status + progress
+        // length + (for non-terminal cards) the LIVE registry state. This makes
+        // renderMessages re-run when: a card is added, progress streams in, the
+        // stored status changes, or a running card's live state transitions
+        // (running -> sleeping/stopped/done). tool_calls_used is deliberately
+        // EXCLUDED so heartbeat ticks don't trigger a full message repaint —
+        // the spinner animates via CSS, no re-render needed.
+        var parts = [currentChatId];
+        for (var i = 0; i < msgs.length; i++) {
+            var m = msgs[i];
+            if (!m || m.role !== 'sub_report') continue;
+            var st = (m.report && m.report.status) || 'partial';
+            var prog = Array.isArray(m.progress) ? m.progress.length : 0;
+            // Include archived-phase count (+ trim counter) so a wake —
+            // which moves progress into msg.phases and resets the stream —
+            // changes the key and triggers a repaint even when the lengths
+            // above happen to collide with the pre-wake values.
+            var phn = Array.isArray(m.phases) ? m.phases.length : 0;
+            var live = '';
+            if ((st === 'running' || st === 'partial')
+                && m.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+                var r = SubAgents.getById(m.subAgentId);
+                if (r) live = r.state;
+            }
+            parts.push((m.subAgentId || '') + ':' + st + ':' + prog + ':' + phn + ':' + ((m.phasesDropped | 0)) + ':' + live);
+        }
+        return parts.join('|');
     }
     function _doRender() {
         _renderScheduled = false;
@@ -400,6 +794,36 @@ function renderWorkersStrip() {
     // if any agent_id ever contained one.
     if (typeof document !== 'undefined') {
         document.addEventListener('click', function(evt) {
+            // −/+ string-collapse toggles inside sub-report panels carry
+            // data-sub-collapse (stable pref key) + data-sub-collapse-id
+            // (stable DOM id). Toggle via the shared toggleJsonCollapse,
+            // then record the new state so the next repaint re-renders the
+            // panel exactly as the user left it.
+            var colEl = (evt.target && evt.target.getAttribute) ? evt.target : null;
+            var colKey = colEl ? colEl.getAttribute('data-sub-collapse') : null;
+            if (colKey) {
+                var colId = colEl.getAttribute('data-sub-collapse-id');
+                if (colId && typeof toggleJsonCollapse === 'function') {
+                    toggleJsonCollapse(colId, evt);
+                    var expandedEl = document.getElementById(colId);
+                    // toggleJsonCollapse re-shows with display:'inline',
+                    // which pins the markdown variant (.sub-md, block
+                    // content) inline next to the toggle and defeats the
+                    // collapsed preview's inline-block ellipsis. Restore ''
+                    // on whichever element it just re-showed so the
+                    // stylesheet display rules (24-sub-agents.css) apply.
+                    if (expandedEl && expandedEl.classList && expandedEl.classList.contains('sub-md')) {
+                        if (expandedEl.style.display !== 'none') {
+                            expandedEl.style.display = '';
+                        } else {
+                            var collapsedEl = document.getElementById(colId + '-collapsed');
+                            if (collapsedEl && collapsedEl.style.display !== 'none') collapsedEl.style.display = '';
+                        }
+                    }
+                    _subPanelPref['str:' + colKey] = !!(expandedEl && expandedEl.style.display === 'none');
+                }
+                return;
+            }
             var t = evt.target;
             while (t && t !== document) {
                 if (t.getAttribute) {
@@ -430,6 +854,30 @@ function renderWorkersStrip() {
                 t = t.parentNode;
             }
         });
+        // Record the user's open/collapse choice for sub-report cards so the
+        // next repaint honors it. Listen for the native 'toggle' event in the
+        // CAPTURE phase (toggle does not bubble) — it fires for EVERY way a
+        // <details> can flip: mouse click on the summary AND keyboard
+        // (Enter/Space on the focused summary), which the old click+setTimeout
+        // recorder missed, so keyboard collapses were forgotten and the next
+        // progress repaint snapped the card back open. This listener is the
+        // SINGLE recorder (the click-path heuristic was removed — it had no
+        // other side effects) so prefs can't be double-recorded.
+        // Chrome also fires 'toggle' when a <details open> is inserted via
+        // innerHTML (every repaint!), so compare against the data-rendered-open
+        // stamp renderSubReport writes and ignore render echoes; only a state
+        // that DIFFERS from what was rendered is a real user choice.
+        document.addEventListener('toggle', function(evt) {
+            var det = evt.target;
+            if (!det || !det.getAttribute) return;
+            var prefKey = det.getAttribute('data-sub-report-toggle');
+            if (!prefKey) return;
+            var isOpen = !!det.open;
+            var rendered = det.getAttribute('data-rendered-open');
+            if (rendered !== null && ((rendered === '1') === isOpen)) return; // render echo
+            det.setAttribute('data-rendered-open', isOpen ? '1' : '0');
+            _subReportOpenPref[prefKey] = isOpen;
+        }, true);
     }
     if (typeof SubAgents !== 'undefined' && SubAgents.addListener) {
         SubAgents.addListener(onChange);

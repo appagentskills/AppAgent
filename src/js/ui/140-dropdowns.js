@@ -11,8 +11,8 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
         var html = '<div class="radio-group">';
         options.forEach(function(opt) {
             var isSelected = opt.value === selectedValue;
-            html += '<div class="radio-option' + (isSelected ? ' selected' : '') + '" ' +
-                'onclick="event.stopPropagation(); selectRadioOption(\'' + containerId + '\', \'' + opt.value + '\', ' + onChangeCallback + ')">' +
+            html += '<div class="radio-option' + (isSelected ? ' selected' : '') + '" data-value="' + escapeHtml(opt.value) + '" ' +
+                'onclick="event.stopPropagation(); selectRadioOption(\'' + containerId + '\', \'' + escapeJsString(opt.value) + '\', ' + onChangeCallback + ')">' +
                 escapeHtml(opt.label) + '</div>';
         });
         html += '</div>';
@@ -47,7 +47,7 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
         var isSelected = opt.value === selectedValue;
         html += '<div class="custom-dropdown-option' + (isSelected ? ' selected' : '') + '" ' +
             'data-value="' + escapeHtml(opt.value) + '" data-label="' + escapeHtml(opt.label) + '" ' +
-            'onclick="selectCustomDropdownOption(\'' + containerId + '\', \'' + dropdownId + '\', \'' + opt.value + '\', ' + onChangeCallback + ', event)">' +
+            'onclick="selectCustomDropdownOption(\'' + containerId + '\', \'' + dropdownId + '\', \'' + escapeJsString(opt.value) + '\', ' + onChangeCallback + ', event)">' +
             escapeHtml(opt.label) + '</div>';
     });
     html += '</div></div></div>';
@@ -103,8 +103,14 @@ function selectCustomDropdownOption(containerId, dropdownId, value, callback, ev
     var dropdown = document.getElementById(dropdownId);
     if (dropdown) {
         dropdown.classList.remove('open');
-        // Update the label
-        var option = dropdown.querySelector('.custom-dropdown-option[data-value="' + value + '"]');
+        // Update the label. Iterate + compare instead of building an attribute
+        // selector: the click-time value is the RAW string (post-#366), and a
+        // value containing " or \ makes querySelector('[data-value="..."]')
+        // throw a DOMException (invalid selector).
+        var option = null;
+        dropdown.querySelectorAll('.custom-dropdown-option').forEach(function(o) {
+            if (!option && o.getAttribute('data-value') === value) option = o;
+        });
         var label = option ? option.getAttribute('data-label') : value;
         var labelEl = dropdown.querySelector('.dropdown-label');
         if (labelEl) labelEl.textContent = label;
@@ -307,9 +313,9 @@ function _renderPermRadio(containerId, selectedValue, permKey, isInstance, isAut
         var isSelected = opt.value === selectedValue;
         var handler = isInstance ? 'setInstancePermFromRadio' : 'setGlobalPermFromRadio';
         html += '<div class="radio-option' + (isSelected ? ' selected' : '') + '" ' +
-            'data-value="' + opt.value + '" ' +
-            'onclick="event.stopPropagation(); ' + handler + '(\'' + permKey + '\', \'' + opt.value + '\', this)">' +
-            opt.label + '</div>';
+            'data-value="' + escapeHtml(opt.value) + '" ' +
+            'onclick="event.stopPropagation(); ' + handler + '(\'' + escapeJsString(permKey) + '\', \'' + escapeJsString(opt.value) + '\', this)">' +
+            escapeHtml(opt.label) + '</div>';
     });
     html += '</div>';
     container.innerHTML = html;
@@ -405,12 +411,26 @@ function getEnabledTools(chatId) {
         }
         // Hide set_chat_title when autoTitle hook is disabled
         if (name === 'set_chat_title' && !hooksEnabled.autoTitle) return false;
+        // Hide set_tldr when autoTldr hook is disabled
+        if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });
     
     // Add active skill tools
     var skillToolDefs = getActiveSkillTools();
+    // Dedupe by name, core-first — keep in sync with worker-side
+    // getEnabledTools in src/js/worker/025-permissions-helpers.js. A skill
+    // tool shadowing a built-in name (e.g. stale IDB asset after a tool was
+    // promoted to core) would otherwise cause "Tool names must be unique".
+    var seenToolNames = {};
+    baseTools.forEach(function(t) { seenToolNames[t.function.name] = true; });
+    skillToolDefs = skillToolDefs.filter(function(t) {
+        var n = t && t.function && t.function.name;
+        if (!n || seenToolNames[n]) return false;
+        seenToolNames[n] = true;
+        return true;
+    });
     var allTools = baseTools.concat(skillToolDefs);
 
     // Sub-agent / parent visibility filter. Honors the per-sub tool_roster

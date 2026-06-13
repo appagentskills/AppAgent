@@ -18,7 +18,7 @@ One tool, two engines. Google is the default — richer snippets, embedded fresh
 web_search({ queries: ["servicenow flow designer best practices"] })
 ```
 
-> ⚠️ **`queries` must be a list/array, not a plain string.** Passing a bare string (`queries: "..."`) fails silently / returns nothing. Always wrap it: `queries: ["..."]`.
+> ⚠️ **`queries` must be a list/array, not a plain string.** Passing a bare string (`queries: "..."`) is treated as zero queries and returns `{ error: "no queries provided" }`. Always wrap it: `queries: ["..."]`.
 
 ### Input
 

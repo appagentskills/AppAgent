@@ -115,7 +115,14 @@ function toggleJsonCollapse(id, event) {
 function toggleToolExpand(btn, event) {
     event.stopPropagation();
     var wrapper = btn.closest('.tool-args-wrapper') || btn.closest('.tool-result-wrapper');
-    var details = btn.closest('.tool-call') || btn.closest('.tool-result');
+    // Sub-report cards (175-sub-agent-ui.js) reuse the tool-call wrapper
+    // markup but live inside .sub-report-body instead of a .tool-call /
+    // .tool-result <details> — accept it as the class-flip target so
+    // expanded panels get the same wrapper treatment (CSS in 05-tools.css
+    // mirrors the .tool-call rules for .sub-report-body). setupStickyObserver
+    // no-ops on it (no <summary> child), which is fine — the sub-report CSS
+    // makes the buttons position:sticky directly instead of via .stuck.
+    var details = btn.closest('.tool-call') || btn.closest('.tool-result') || btn.closest('.sub-report-body');
     var pre = wrapper.querySelector('.tool-args') || wrapper.querySelector('pre');
     if (!pre) return;
     

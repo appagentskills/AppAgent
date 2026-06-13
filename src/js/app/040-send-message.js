@@ -52,6 +52,12 @@ async function sendMessage() {
         clearPendingImages();
         input.value = '';
         input.style.height = 'auto';
+        // Clear the persisted draft too — mirrors the idle path below. Without
+        // this, the draft saved by the input listener survives in chatPendingTexts
+        // and the next restorePendingTextForContext (chat switch / reopen / boot)
+        // re-paints the already-sent message into the input box.
+        delete chatPendingTexts[getCurrentPendingContext()];
+        persistPendingTextsToStorage();
 
         // Interrupt the current step so the message is sent instantly:
         //  • If LLM is mid-stream — abort the fetch (partial response is dropped).

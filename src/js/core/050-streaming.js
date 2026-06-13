@@ -16,6 +16,78 @@ Object.defineProperty(window, 'isFollowingStreamingScroll', {
         isFollowingStreamingScrollByChatId[k] = !!v;
     }
 });
+// R2: programmatic scrolls (smooth scrollTo / scrollTop writes from the render
+// and streaming helpers) fire the same document-level scroll events as real user
+// scrolls, so the capture-phase listener in 010-skills-ui.js would record them as
+// user activity and randomly disengage auto-follow mid-run. Every programmatic
+// scroll site calls markProgrammaticScroll() first; the listener early-returns
+// while the window is open. A real user gesture (wheel / touchmove / keydown)
+// clears the window immediately so deliberate scrolls still disengage.
+window._programmaticScrollUntil = 0;
+function markProgrammaticScroll(ms) {
+    window._programmaticScrollUntil = Date.now() + (ms || 600);
+}
+(function() {
+    function clearProgrammaticScrollFlag() {
+        window._programmaticScrollUntil = 0;
+    }
+    document.addEventListener('wheel', clearProgrammaticScrollFlag, { capture: true, passive: true });
+    document.addEventListener('touchmove', clearProgrammaticScrollFlag, { capture: true, passive: true });
+    document.addEventListener('keydown', clearProgrammaticScrollFlag, true);
+    // REG-F3 (revised): scrollbar drags and middle-click autoscroll produce
+    // NO wheel/touchmove/keydown — only scroll events — so those gestures
+    // were swallowed by the continuously re-armed window and could never
+    // disengage auto-follow. But the first cut (clear on ANY pointer-down)
+    // reintroduced the original R2 bug for plain clicks: the smooth glide
+    // (scrollToBottomIfAllowed emits trailing scroll events for ~600ms) was
+    // mid-flight when the user clicked a copy/expand button anywhere on the
+    // page, the cleared window let the glide's own events register as user
+    // scrolls at a not-near-bottom position, and auto-follow disengaged.
+    // Clear ONLY for gestures that can actually begin a manual scroll:
+    //   • middle button (autoscroll) — anywhere;
+    //   • a press on a scrollable container ITSELF — a scrollbar/track hit
+    //     targets the element, while content clicks target a descendant, so
+    //     button/text clicks no longer kill the window.
+    function _scrollGestureDown(e) {
+        if (e.button === 1) { clearProgrammaticScrollFlag(); return; }
+        var t = e.target;
+        // REG-AUDIT-3: 'messages' only — the flag is only consulted by the
+        // #messages scroll listener (ui/010-skills-ui.js); #streaming-text's
+        // own handler applies hysteresis directly and never reads it.
+        if (t && t.nodeType === 1 &&
+            t.id === 'messages' &&
+            t.scrollHeight > t.clientHeight) {
+            clearProgrammaticScrollFlag();
+        }
+    }
+    document.addEventListener('mousedown', _scrollGestureDown, { capture: true, passive: true });
+    document.addEventListener('pointerdown', _scrollGestureDown, { capture: true, passive: true });
+    // SF-3: selection-drag autoscroll (primary-button press on message CONTENT,
+    // then drag past the container edge) emits ONLY scroll events — no wheel/
+    // touchmove/keydown, and _scrollGestureDown above deliberately ignores
+    // content-targeted presses (REG-AUDIT-3). With the SF-2 streaming pin
+    // re-arming the programmatic window every chunk, those drag scrolls were
+    // swallowed by the #messages listener (010-skills-ui.js), isFollowingScroll
+    // never disengaged, and every chunk yanked the selection back to the
+    // bottom. Clear the window while a primary-button DRAG is in flight; the
+    // 4px slop keeps plain clicks (the original R2 false positive — click
+    // during the smooth glide) from clearing it. A drag that never scrolls
+    // may let a concurrent glide's trailing events register as user activity,
+    // which is acceptable: the user IS gesturing, and the listener only
+    // disengages follow when they are genuinely away from the bottom.
+    var _sfDragStart = null;
+    document.addEventListener('mousedown', function(e) {
+        if (e.button === 0) _sfDragStart = { x: e.clientX, y: e.clientY };
+    }, { capture: true, passive: true });
+    document.addEventListener('mousemove', function(e) {
+        if (!_sfDragStart || !(e.buttons & 1)) return;
+        if (Math.abs(e.clientX - _sfDragStart.x) > 4 || Math.abs(e.clientY - _sfDragStart.y) > 4) {
+            clearProgrammaticScrollFlag();
+        }
+    }, { capture: true, passive: true });
+    document.addEventListener('mouseup', function() { _sfDragStart = null; }, { capture: true, passive: true });
+})();
+
 // Create and configure the #streaming-text container element
 function createStreamingTextEl() {
     var el = document.createElement('div');
@@ -112,7 +184,31 @@ function scrollToBottomIfAllowed(container) {
     // During streaming, scroll the inner container independently of outer scroll state
     var streamingEl = container.querySelector('.streaming-answer');
     if (streamingEl) {
+        // SF-2: in-place streaming growth (tool-args textContent, appended
+        // tool-call/thinking details, spinner) raises the OUTER scrollHeight
+        // without ever passing through renderMessages, so SF-1's render-time
+        // growth delta never saw it and the streaming container slid below the
+        // fold for an at-bottom user. This function is the single choke point
+        // every incremental path already calls — keep the outer container
+        // pinned to the bottom here while the user is following. Direct
+        // scrollTop write (no smooth glide) so rapid per-chunk calls can't
+        // race a 600ms animation; markProgrammaticScroll so the #messages
+        // listener (010-skills-ui.js) doesn't count it as user activity;
+        // gated on isFollowingScroll + the user-scroll debounce so a user who
+        // deliberately scrolled up is never fought (the listener re-arms the
+        // flag when they return near the bottom).
+        //
+        // SF-3 ordering: height BEFORE pin. updateStreamingContainerHeight can
+        // raise the streaming el's maxHeight (its input, rect.top, depends on
+        // the current scrollTop) and thereby grow the outer scrollHeight —
+        // pinning first left the pin short by that growth until the next
+        // chunk. Computing the height at the pre-pin position only makes the
+        // cap momentarily conservative, which the next call corrects.
         updateStreamingContainerHeight();
+        if (isFollowingScroll && Date.now() - lastUserScrollTime >= SCROLL_DEBOUNCE_MS) {
+            markProgrammaticScroll();
+            container.scrollTop = container.scrollHeight;
+        }
         if (isFollowingStreamingScroll) {
             streamingEl.scrollTop = streamingEl.scrollHeight;
         }
@@ -122,5 +218,6 @@ function scrollToBottomIfAllowed(container) {
     // For non-streaming: only scroll if user is following and hasn't scrolled recently
     if (!isFollowingScroll) return;
     if (Date.now() - lastUserScrollTime < SCROLL_DEBOUNCE_MS) return;
+    markProgrammaticScroll(); // R2: smooth scroll emits many scroll events over ~600ms
     container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
 }

@@ -271,6 +271,19 @@ async function executeUpdateActionState(args, options) {
     // Coerce off-list icons to spinner so the agent can't sneak in icons outside the tool def enum.
     if (ALLOWED_ACTION_ICONS.indexOf(icon) < 0) icon = 'spinner';
     var label = (args.label || '').substring(0, 60);
+    // Normalize the task list ONCE — shared by the Action-button branch and the
+    // sub-agent mirroring below. Cap the length so a runaway agent can't
+    // overflow the popover / tooltip / parent card. Validate each status
+    // against the documented enum and fall back to 'pending' for anything
+    // off-list — otherwise the CSS selector (.task-row.status-…) silently
+    // fails to match and the row renders unstyled.
+    var VALID_TASK_STATUSES = ['pending', 'running', 'done', 'error'];
+    var normTasks = Array.isArray(args.tasks)
+        ? args.tasks.slice(0, 20).map(function(t) {
+            var status = t && VALID_TASK_STATUSES.indexOf(t.status) >= 0 ? t.status : 'pending';
+            return { label: String((t && t.label) || '').substring(0, 80), status: status };
+        })
+        : null;
 
     // Background chat hooked up to an Action button: drive the live button state.
     // Foreground chats just contribute to the sidebar timeline via their tool_calls.
@@ -284,17 +297,7 @@ async function executeUpdateActionState(args, options) {
         a.state = state;
         a.icon = icon;
         a.label = label;
-        if (Array.isArray(args.tasks)) {
-            // Cap task list length so a runaway agent can't overflow the popover
-            // / tooltip. Validate each status against the documented enum and fall
-            // back to 'pending' for anything off-list — otherwise the CSS selector
-            // (.task-row.status-…) silently fails to match and the row renders unstyled.
-            var VALID_TASK_STATUSES = ['pending', 'running', 'done', 'error'];
-            a.tasks = args.tasks.slice(0, 20).map(function(t) {
-                var status = t && VALID_TASK_STATUSES.indexOf(t.status) >= 0 ? t.status : 'pending';
-                return { label: String((t && t.label) || '').substring(0, 80), status: status };
-            });
-        }
+        if (normTasks) a.tasks = normTasks;
         // Accept null as an explicit "clear the output" signal. Without this, an agent
         // sending output:null to clear the result panel would silently leave the previous
         // output sitting there (typeof null === 'object').
@@ -354,7 +357,30 @@ async function executeUpdateActionState(args, options) {
     // when the agent posts a new update_action_state call. Without this, the
     // popover would freeze on the snapshot it had at click-time.
     try { _refreshOpenChatProgressPopover(_inFlightToolCallId); } catch (e) {}
-    return { success: true };
+    // Sub-agent chat: mirror this progress card onto the parent chat's live
+    // sub_report card + the registry record. This tool executes on the PAGE
+    // (non-headless), where the chats / SubAgents globals are read-only
+    // mirrors of the SW's authoritative state — so attach the normalized
+    // snapshot to the RESULT and let the SW tool-routing layer
+    // (worker/120-tool-routing.js) persist it via SubAgents.recordActionState.
+    // That repaints the parent transcript (tasks checklist on the sub_report
+    // card) and exposes the card to the parent agent via agent_status.
+    // `tasks: null` means "not provided, keep previous"; output uses an
+    // explicit clearOutput marker for the output:null "clear" signal so the
+    // merge in recordSubActionState can tell clear apart from absent.
+    var _uasResult = { success: true };
+    if (chat.isSubAgent) {
+        _uasResult._sub_action_state = {
+            state: state,
+            icon: icon,
+            label: label,
+            tasks: normTasks,
+            output: (typeof args.output === 'string') ? args.output.substring(0, 4000) : null,
+            clearOutput: args.output === null,
+            at: Date.now()
+        };
+    }
+    return _uasResult;
 }
 
 // show_action_button tool — embed an action button inline in the current chat
@@ -977,7 +1003,14 @@ function renderActionUpdatesSection(chat) {
 // row AFTER the tool returns, so without this hint the pill would skip the
 // just-issued state on the very call that triggered the refresh.
 function getCurrentChatProgressState(includeToolCallId) {
-    var chat = chats[currentChatId];
+    return getChatProgressStateFor(currentChatId, includeToolCallId);
+}
+
+// Per-chat variant: latest executed update_action_state of ANY chat (used by
+// the Active Chats dropdown rows + their progress popovers, which must not
+// depend on which chat is currently focused).
+function getChatProgressStateFor(chatId, includeToolCallId) {
+    var chat = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!chat) return null;
     var updates = collectAllActionUpdates(chat, includeToolCallId);
     if (!updates.length) return null;
@@ -1101,8 +1134,11 @@ function onChatTitleStatePillClick(pillEl, e) {
 // an in-flight tool call (whose result row hasn't been pushed yet) still shows
 // up in the popover — keeps the popover in sync when refreshed from inside
 // executeUpdateActionState.
-function openChatProgressPopover(anchor, includeToolCallId) {
-    var current = (typeof getCurrentChatProgressState === 'function') ? getCurrentChatProgressState(includeToolCallId) : null;
+// `chatId` (optional): show the progress of a specific chat instead of the
+// current one — used by the Active Chats dropdown rows.
+function openChatProgressPopover(anchor, includeToolCallId, chatId) {
+    var _popChatId = chatId || currentChatId;
+    var current = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(_popChatId, includeToolCallId) : null;
     if (!current) return;
     var anchorRect = _captureAnchorRect(anchor);
     closeResultPopover();
@@ -1158,7 +1194,7 @@ function openChatProgressPopover(anchor, includeToolCallId) {
         outputHtml +
         tasksHtml;
     el.dataset.popoverType = 'chat-progress';
-    el.dataset.chatId = currentChatId || '';
+    el.dataset.chatId = _popChatId || '';
     document.body.appendChild(el);
     _resultPopover = el;
     _positionPopover(el, anchorRect);
@@ -1735,6 +1771,9 @@ function getActiveActionsList() {
 // How long a chat lingers under "Active Chats" after its run stops, so a chat
 // that just finished streaming doesn't vanish from the badge instantly.
 var ACTIVE_CHAT_LINGER_MS = 5 * 60 * 1000; // 5 minutes
+// Chats younger than this always show under "Active Chats" (recent work the
+// user may want to get back to), even when idle and already seen.
+var RECENT_CHAT_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 // chatId -> finishedAt (ms). Populated by markChatRecentlyFinished() from the
 // runFinished / runCrashed handlers (app/036-agent-event-handlers-page.js).
 var _recentlyFinishedChats = {};
@@ -1754,6 +1793,14 @@ function markChatRecentlyFinished(chatId) {
     // (with their own result popover) and sub-agent chats have the Workers
     // strip — lingering those would clutter the badge.
     if (c && (c.isBackground || c.isSubAgent)) return;
+    // Stamp the response time — drives the 'unseen last response' rule in
+    // getActiveChatsList(). If the user is currently looking at this chat the
+    // response counts as seen immediately.
+    if (c) {
+        c.lastResponseAt = Date.now();
+        if (typeof currentChatId !== 'undefined' && chatId === currentChatId) c.lastViewedAt = Date.now();
+        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+    }
     _recentlyFinishedChats[chatId] = Date.now();
     setTimeout(function() {
         var t = _recentlyFinishedChats[chatId];
@@ -1807,6 +1854,24 @@ function getActiveChatsList() {
         if (now - _recentlyFinishedChats[cid] > ACTIVE_CHAT_LINGER_MS) return;
         consider(cid);
     });
+    // 3) Chats the user hasn't caught up on (a response arrived after they last
+    //    viewed the chat — the chat in focus is always 'seen'), and
+    // 4) chats younger than RECENT_CHAT_WINDOW_MS with at least one message
+    //    (empty/temporary New Chats have nothing to show).
+    if (typeof chats !== 'undefined' && chats) {
+        Object.keys(chats).forEach(function(cid) {
+            var c = chats[cid];
+            if (!c || !Array.isArray(c.messages) || !c.messages.length) return;
+            var unseen = !!(c.lastResponseAt && c.lastResponseAt > (c.lastViewedAt || 0) &&
+                (typeof currentChatId === 'undefined' || cid !== currentChatId));
+            var young = !!(c.createdAt && (now - c.createdAt) < RECENT_CHAT_WINDOW_MS);
+            if (unseen || young) consider(cid);
+        });
+    }
+    // Stable order: always by chat creation time (oldest first). Without this
+    // the rows follow runningChatIds/_recentlyFinishedChats key insertion order,
+    // which reshuffles as runs start/stop.
+    out.sort(function(a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
     return out;
 }
 
@@ -1904,6 +1969,10 @@ function renderJobsBadge() {
     var erroredChats = 0;
     chatList.forEach(function(c){ if (!isChatActivelyRunning(c.id) && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError) erroredChats++; });
     if (erroredChats && agg !== 'attention') agg = 'error';
+    // Finished-while-elsewhere bell segment (ui/165-finished-chat-badge.js):
+    // chats that finished while the user was viewing another chat/view and
+    // hasn't opened since. Rendered inside this same pill, after the count.
+    var unseen = (typeof getUnseenFinishedChatsInfo === 'function') ? getUnseenFinishedChatsInfo() : { count: 0, hasError: false };
     var titleSuffix = '';
     if (agg === 'attention')    titleSuffix = ' — needs attention';
     else if (agg === 'error')   titleSuffix = ' — has errors';
@@ -1913,7 +1982,7 @@ function renderJobsBadge() {
     var justFinished = (_prevAggregateState === 'running' && (agg === 'done' || agg === 'idle'));
     _prevAggregateState = agg;
     badges.forEach(function(badge) {
-        if (!count) {
+        if (!count && !unseen.count) {
             badge.style.display = 'none';
             badge.removeAttribute('data-agg');
             badge.classList.remove('pulse', 'finish-pulse');
@@ -1923,11 +1992,16 @@ function renderJobsBadge() {
         badge.setAttribute('data-agg', agg);
         // "pulse" is the existing infinite attention pulse; only on attention state.
         badge.classList.toggle('pulse', agg === 'attention');
-        badge.title = count + ' active job' + (count === 1 ? '' : 's') + titleSuffix;
+        // Bell-only state (no active jobs, unseen finished chats remain): drop
+        // the '⚡ 0' segment so the pill shows just the bell.
+        badge.title = (count ? count + ' active job' + (count === 1 ? '' : 's') + titleSuffix : '') +
+            (unseen.count ? (count ? ' — ' : '') + unseen.count + ' finished chat' + (unseen.count === 1 ? '' : 's') + ' to review' : '');
         badge.innerHTML =
-            '<span class="jobs-badge-icon">' + UI_ICONS.zap + '</span>' +
-            '<span class="jobs-badge-count">' + count + '</span>' +
-            (running ? '<span class="jobs-badge-spinner">' + UI_ICONS.spinner + '</span>' : '');
+            (count ? '<span class="jobs-badge-icon">' + UI_ICONS.zap + '</span>' +
+                '<span class="jobs-badge-count">' + count + '</span>' : '') +
+            (running ? '<span class="jobs-badge-spinner">' + UI_ICONS.spinner + '</span>' : '') +
+            (unseen.count ? '<span class="jobs-badge-bell' + (unseen.hasError ? ' err' : '') + '">' + (UI_ICONS.bell_filled || UI_ICONS.bell) +
+                (unseen.count > 1 ? '<span class="jobs-badge-bell-count">' + unseen.count + '</span>' : '') + '</span>' : '');
         if (justFinished) {
             // Restart the one-shot animation by toggling the class.
             badge.classList.remove('finish-pulse');
@@ -2024,7 +2098,26 @@ function renderJobsDropdown(dropdown) {
         var _cErr = !_cRunning && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError;
         var _cState = _cRunning ? 'running' : (_cErr ? 'error' : 'done');
         var _cIcon = _cRunning ? (UI_ICONS.spinner || UI_ICONS.chat) : (_cErr ? (UI_ICONS.alert || UI_ICONS.close) : (UI_ICONS.check || UI_ICONS.chat));
-        var _cLabel = _cRunning ? 'Running\u2026' : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : 'Finished');
+        // Show the chat's current progress task under its title (latest
+        // update_action_state: the running task label, falling back to the
+        // progress label / status_message). Generic 'Running…' only when the
+        // chat has reported no progress at all.
+        var _cProg = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(c.id) : null;
+        var _cTask = null;
+        if (_cProg && Array.isArray(_cProg.tasks)) {
+            for (var _ti = 0; _ti < _cProg.tasks.length; _ti++) {
+                var _t = _cProg.tasks[_ti];
+                if (_t && _t.status === 'running') { _cTask = _t.label; break; }
+            }
+        }
+        var _cProgText = _cTask || (_cProg && (_cProg.label || _cProg.status_message)) || null;
+        // Unseen: the chat got a response after the user last viewed it (the
+        // focused chat is always seen) — flag it so the user knows to catch up.
+        var _cUnseen = !_cRunning && !_cErr && c.lastResponseAt &&
+            c.lastResponseAt > (c.lastViewedAt || 0) &&
+            (typeof currentChatId === 'undefined' || c.id !== currentChatId);
+        var _cLabel = _cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished'));
+        if (_cUnseen) _cIcon = UI_ICONS.bell || _cIcon;
         return '<div class="jobs-dropdown-row state-' + _cState + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' +
@@ -2034,7 +2127,7 @@ function renderJobsDropdown(dropdown) {
                 '<div class="jobs-row-label">' + _cLabel + '</div>' +
             '</div>' +
             (_cErr ? '<button class="jobs-row-btn" title="Retry" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
-            '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();onJobsDropdownChatRowClick(\'' + escapeJsString(c.id) + '\')">' + UI_ICONS.chat + '</button>' +
+            '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + escapeJsString(c.id) + '\')">' + UI_ICONS.chat + '</button>' +
         '</div>';
     }).join('');
     var html = '';
@@ -2092,49 +2185,72 @@ function viewActionChat(actionId) {
     closeJobsDropdown();
 }
 
-// Click handler for an 'Active Chats' dropdown row: reveal (for background
-// chats) and switch focus to that chat. Mirrors viewActionChat.
+// Click handler for an 'Active Chats' dropdown row: show that chat's progress
+// in a popover anchored to the open dropdown WITHOUT navigating away from the
+// current page. If the chat has no update_action_state progress yet, show a
+// 'No progress' popover instead. Only the chat-bubble button
+// (openChatFromJobsDropdown) opens the chat.
 function onJobsDropdownChatRowClick(chatId) {
-    // Capture the OPEN dropdown panel up-front so we can anchor the progress
-    // popover to it — exactly like onJobsDropdownRowClick does for Actions, so
-    // the popover appears at the dropdown location instead of below the chat
-    // title. We deliberately keep the dropdown open (the Action-row popover
-    // does too) — _positionPopover places the popover below the panel rather
-    // than overlapping its rows.
     var dropdownEl = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
-    // IMPORTANT: defer the navigation + popover to the next frame. selectChat()
-    // re-renders the open dropdown's innerHTML, which DETACHES the clicked row
-    // element. The document-level outside-click handler (see bottom of file)
-    // runs synchronously right after this onclick, in the same click event, and
-    // keeps the dropdown open only if `wrapper.contains(e.target)`. If we
-    // re-rendered synchronously, e.target (the old row) would already be
-    // detached → treated as an outside click → dropdown closed, leaving the
-    // popover orphaned. The Action-row path keeps the dropdown open precisely
-    // because it never re-renders the dropdown. Deferring lets this click finish
-    // with the row still attached (dropdown stays open), then we navigate and
-    // anchor the popover to the still-open dropdown panel.
-    var run = function() {
-        if (typeof selectChat === 'function' && typeof chats !== 'undefined' && chats[chatId]) {
-            if (chats[chatId].isBackground) chats[chatId]._revealed = true;
-            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
-            selectChat(chatId);
-        }
-        // Surface the chat's progress card — the same popover the chat-title
-        // state pill opens — so clicking an "Active Chats" row feels like
-        // clicking an Action row. If the chat has no update_action_state
-        // progress we just close the dropdown (a plain navigation) instead of
-        // leaving it hanging open with no popover.
-        var hasProgress = (typeof getCurrentChatProgressState === 'function') && !!getCurrentChatProgressState();
-        var anchor = ((typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null) || dropdownEl;
-        if (hasProgress && anchor && typeof openChatProgressPopover === 'function') {
-            try { openChatProgressPopover(anchor); }
-            catch (e) { closeJobsDropdown(); }
-        } else {
-            closeJobsDropdown();
-        }
-    };
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
-    else setTimeout(run, 0);
+    var rowEl = dropdownEl
+        ? dropdownEl.querySelector('.jobs-dropdown-row[data-chat-id="' + chatId + '"]')
+        : document.querySelector('.jobs-dropdown-row[data-chat-id="' + chatId + '"]');
+    var anchor = dropdownEl || rowEl;
+    if (!anchor) return;
+    // Toggle: a second click on the same row dismisses its open popover.
+    // (_resultPopoverOutside ignores clicks inside the open dropdown, so the
+    // popover is still open when this onclick runs.)
+    if (_resultPopover && _resultPopover.dataset.popoverType === 'chat-progress' &&
+        _resultPopover.dataset.chatId === chatId) {
+        closeResultPopover();
+        return;
+    }
+    var progress = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null;
+    if (progress) {
+        try { openChatProgressPopover(anchor, null, chatId); }
+        catch (e) { closeResultPopover(); }
+    } else {
+        openNoProgressPopover(anchor, chatId);
+    }
+}
+
+// 'No progress' popover for an Active Chats row whose chat never called
+// update_action_state. Same styling + dataset tags as the chat-progress
+// popover so the row-click toggle and outside-click dismissal behave the same.
+function openNoProgressPopover(anchor, chatId) {
+    var anchorRect = _captureAnchorRect(anchor);
+    closeResultPopover();
+    if (typeof _hideTooltip === 'function') _hideTooltip();
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    var el = document.createElement('div');
+    el.className = 'action-result-popover state-running';
+    el.innerHTML =
+        '<div class="action-result-header">' +
+            '<span class="action-result-icon">' + (UI_ICONS.list || UI_ICONS.chat || '') + '</span>' +
+            '<div class="action-result-title">' +
+                '<div class="action-result-name">' + escapeHtml((c && c.title) || 'New Chat') + '</div>' +
+                '<div class="action-result-label">No progress reported yet</div>' +
+            '</div>' +
+            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+        '</div>';
+    el.dataset.popoverType = 'chat-progress';
+    el.dataset.chatId = chatId || '';
+    document.body.appendChild(el);
+    _resultPopover = el;
+    _positionPopover(el, anchorRect);
+    setTimeout(function() { document.addEventListener('click', _resultPopoverOutside, true); }, 0);
+}
+
+// Open (navigate to) a chat from its Active Chats dropdown row — triggered by
+// the chat-bubble button only. Mirrors viewActionChat.
+function openChatFromJobsDropdown(chatId) {
+    if (typeof selectChat === 'function' && typeof chats !== 'undefined' && chats[chatId]) {
+        if (chats[chatId].isBackground) chats[chatId]._revealed = true;
+        // Persist the reveal flag immediately — don't rely on selectChat to save it.
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        selectChat(chatId);
+    }
+    closeJobsDropdown();
 }
 
 // ---------- Re-render on state change ----------

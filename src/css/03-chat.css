@@ -4,3 +4,10 @@
 .floating-sidebar-toggle:hover { background: var(--bg-hover); }
 .main-wrapper { display: flex; flex: 1; overflow: hidden; }
 
+/* TL;DR card — rendered at the end of an answer by the autoTldr hook */
+.tldr-card { position: relative; margin: var(--space-6) 20% var(--space-2) 0; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.tldr-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.tldr-card-text { font-size: var(--text-body-sm); color: var(--text-primary); line-height: var(--leading-normal); }
+.tldr-card-text .md-paragraph { margin: 0; }
+@media (max-width: 768px) { .tldr-card { margin-right: 0; } }
+

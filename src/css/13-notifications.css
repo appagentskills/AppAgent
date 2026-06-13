@@ -1,5 +1,5 @@
 /* Snackbar Notification */
-.snackbar { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--bg-tooltip); color: var(--text-inverse); padding: var(--space-6) var(--space-10); border-radius: var(--radius-lg); font-size: var(--text-body-lg); z-index: 10010; opacity: 0; pointer-events: none; transition: transform 0.3s ease, opacity 0.3s ease; box-shadow: var(--shadow-lg); max-width: 400px; text-align: center; display: flex; align-items: center; gap: var(--space-6); }
+.snackbar { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--bg-tooltip); color: var(--text-inverse); padding: var(--space-6) var(--space-10); border-radius: var(--radius-lg); font-size: var(--text-body-lg); z-index: var(--z-snackbar); opacity: 0; pointer-events: none; transition: transform 0.3s ease, opacity 0.3s ease; box-shadow: var(--shadow-lg); max-width: 400px; text-align: center; display: flex; align-items: center; gap: var(--space-6); }
 .snackbar.show { transform: translateX(-50%) translateY(0); opacity: 1; pointer-events: auto; }
 .snackbar.error { background: var(--danger); max-width: 600px; }
 .snackbar.success { background: var(--success); }

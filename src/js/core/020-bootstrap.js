@@ -16,7 +16,7 @@ var appStorage = {
     if (cachedCredits) {
         document.addEventListener('DOMContentLoaded', function() {
             var el = document.getElementById('credits-display');
-            if (el) el.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>$' + cachedCredits;
+            if (el) el.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedCredits;
         });
     }
 })();

@@ -69,6 +69,35 @@ function storeRawCopy(content) {
     return id;
 }
 
+// GC for the rc-N entries minted by storeRawCopy(). Every full renderMessages
+// rebuild mints FRESH rc-N keys for every tool-args panel / tool result /
+// code fence, and nothing ever deleted the previous render's entries — with
+// live sub-agent cards repainting on every progress tick, the store grew
+// without bound for the lifetime of the page. We cannot simply reset the
+// store at the start of a render: formatContent() (which mints rc-N keys for
+// code fences) is also used by surfaces whose DOM survives renderMessages —
+// action-button outputs (120-actions.js), the skill asset viewer
+// (010-skills-ui.js), the dashboard chat preview (070-dashboard-ui.js), the
+// document body view (120-init.js) — and resetting would break their copy
+// buttons. Instead, sweep: drop every rc-N entry whose data-copy-id consumer
+// is no longer anywhere in the document. Sub-report cards use stable
+// 'sub:'-prefixed keys (175-sub-agent-ui.js) and are not touched. Worst case
+// (a temporarily detached node re-attached later) copyCodeBlock() falls back
+// to the wrapper's textContent, so copy still works.
+function gcRawCopyStore() {
+    var store = window._rawCopyStore;
+    if (!store) return;
+    var live = Object.create(null);
+    var nodes = document.querySelectorAll('[data-copy-id]');
+    for (var i = 0; i < nodes.length; i++) {
+        live[nodes[i].getAttribute('data-copy-id')] = true;
+    }
+    var keys = Object.keys(store);
+    for (var k = 0; k < keys.length; k++) {
+        if (keys[k].indexOf('rc-') === 0 && !live[keys[k]]) delete store[keys[k]];
+    }
+}
+
 // Copy code block content - get raw text without formatting
 function copyCodeBlock(btn, event) {
     event.stopPropagation();

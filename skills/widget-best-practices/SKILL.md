@@ -3,6 +3,8 @@ name: widget-best-practices
 description: Best practices for creating rich widgets inline in chat using html_widget tool. Use when displaying dashboards, data visualizations, tables, forms, or any visual presentations.
 ---
 
+# Widget Best Practices
+
 ## Overview
 
 The `html_widget` tool creates rich visual presentations inline in chat instead of plain text. Widgets appear in the conversation and can be added to the dashboard.
@@ -51,7 +53,7 @@ const response = await executeTool('servicenow_api', {
 
 | Parameter | Purpose | Example |
 |-----------|---------|---------|
-| `scope` | Application scope sys_id (required) | `scope: 'global'` |
+| `scope` | `'global'` or a scoped-app sys_id; required for POST/PUT/PATCH | `scope: 'global'` |
 | `limit` | Limit results | `limit: 100` |
 | `query` | Filter records | `query: 'active=true'` |
 | `fields` | Limit fields returned | `fields: 'sys_id,number'` |
@@ -88,8 +90,9 @@ const rows = (res.data.result || []).map(r =>
   '<tr><td>' + r.number + '</td><td>' + r.short_description + '</td></tr>'
 ).join('');
 const widget = await executeTool('html_widget', {
+  title: 'Active Incidents',  // required
   html: '<table><tr><th>Number</th><th>Description</th></tr>' + rows + '</table>',
-  width: 600, height: 400
+  width: '600px', height: '400px'  // strings, not numbers
 });
 return widget.widgetId; // use this to screenshot or edit later
 ```

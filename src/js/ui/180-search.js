@@ -93,7 +93,7 @@ function renderChatList() {
         if (matchingSkills.length > 0) {
             html += '<div class="search-section-header">' + UI_ICONS.skill + ' Skills</div>';
             matchingSkills.forEach(function(s) {
-                html += '<div class="search-result-item" onclick="toggleSkillsView();setTimeout(function(){openSkillEditor(\'' + escapeHtml(s.id) + '\')},100)">' +
+                html += '<div class="search-result-item" onclick="toggleSkillsView();setTimeout(function(){openSkillEditor(\'' + escapeJsString(s.id) + '\')},100)">' +
                     '<span class="search-result-icon">' + UI_ICONS.skill + '</span>' +
                     '<span class="search-result-text">' + escapeHtml(s.name || s.id) + '</span>' +
                 '</div>';
@@ -111,7 +111,7 @@ function renderChatList() {
             html += '<div class="search-section-header">' + UI_ICONS.tool + ' Tools</div>';
             matchingTools.forEach(function(t) {
                 var displayName = TOOL_DISPLAY_NAMES[t.function.name] || t.function.name;
-                html += '<div class="search-result-item" onclick="showToolInspector(\'' + escapeHtml(t.function.name).replace(/'/g, "\\'") + '\')">' +
+                html += '<div class="search-result-item" onclick="showToolInspector(\'' + escapeJsString(t.function.name) + '\')">' +
                     '<span class="search-result-icon">' + getToolIcon(t.function.name) + '</span>' +
                     '<span class="search-result-text">' + escapeHtml(displayName) + '</span>' +
                 '</div>';

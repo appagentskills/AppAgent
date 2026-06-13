@@ -53,7 +53,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'servicenow_run_script',
-            description: 'Execute a server-side JavaScript snippet on the ServiceNow instance. Runs synchronously, captures gs.print/gs.info output, and returns the response. Each execution is logged in sys_script_execution_history. DO NOT use this as a replacement for multiple Table API calls — if the work is just "fetch N records, update each", chain servicenow_api calls inside js_eval instead. ONLY use servicenow_run_script for things the Table API genuinely cannot do: server-only globals (gs.*), GlideRecord-only APIs, transactions, system operations, or logic that must run server-side.',
+            description: 'Execute a server-side JavaScript snippet on the ServiceNow instance. Runs synchronously, captures gs.print/gs.info output, and returns the response. Each execution is logged in sys_script_execution_history. DO NOT use this as a replacement for multiple Table API calls — if the work is just "fetch N records, update each", chain servicenow_api calls inside js_eval instead. ONLY use servicenow_run_script for things the Table API genuinely cannot do: server-only globals (gs.*), GlideRecord-only APIs, transactions, system operations, or logic that must run server-side. REQUIRES THE ADMIN ROLE on the target instance: it executes server-side via /sys.scripts.do, which is restricted to admins — if the signed-in user lacks the admin role the call will fail (use list_instances to see the user roles on the instance).',
             parameters: {
                 type: 'object',
                 properties: {
@@ -114,7 +114,6 @@ var TOOLS = [
                         description: 'Action to perform: navigate (load URL - not for widgets), get_visible_text (extract visible text content from page - use take_screenshot tool for actual images), get_dom (get HTML), click (click element), fill (fill input - one-shot, fires full keydown→input→keyup→change chain so frameworks/client-scripts see real user input), type (per-character typing with key events - slower but reliably triggers debounced/autocomplete handlers; supports delay, append), wait_for (block until a condition is met: selector_visible, selector_gone, text, or url_matches), get_console_logs, get_network_requests, close (close panel - not for widgets), open_widget (open widget in panel for debugging - requires widget_id), edit_html (edit widget HTML using find/replace - requires widget_id and edits), dispatch_event (trigger a DOM event on element - requires selector and event; mouse events fire a real MouseEvent, and a mousedown+mouseup pair reliably opens/commits select2 & jQuery widgets), select_option (select dropdown option - requires selector and value or text), scroll (scroll page to position/element/coordinates), resize (resize viewport - use preset or width/height), get_properties (get computed styles, dimensions, values, className/classList of elements; a no-match returns success with match_count:0, not an error), set_style (apply CSS styles or toggle classes on elements), impersonate (impersonate a ServiceNow user - requires user param with username/name/sys_id, use "stop" to end), get_page_info (get current page URL, title, and viewport dimensions)'
                     },
                     url: { type: 'string', description: 'URL path to navigate to (for navigate action, not applicable for widgets). Same-origin only.' },
-                    early_error_capture: { type: 'boolean', description: 'For navigate action: if true, injects error capture script to catch errors that occur before page load. WARNING: This may break some pages (e.g. ServiceNow Unified Navigation). Default: false.' },
                     wait: { type: 'boolean', description: 'For navigate action: if true, waits for the page (and any nested gsft_main iframe) to fully load before returning, up to 15 seconds. Useful when you need to take a screenshot or interact with the page immediately after navigation. Default: false.' },
                     selector: { type: 'string', description: 'CSS selector for element (for click/fill/dispatch_event/select_option/scroll/get_properties/set_style actions). For click/fill: optional if x and y coordinates are provided instead.' },
                     value: { type: 'string', description: 'Value to fill (for fill/type action) or option value to select (for select_option action)' },
@@ -175,6 +174,21 @@ var TOOLS = [
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['title']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'set_tldr',
+            description: 'Set a short TL;DR summary card for your final answer. Called automatically by the TLDR hook after you finish a task.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    tldr: { type: 'string', description: '1-2 short sentences (max 280 chars) summarizing the outcome of your answer.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['tldr']
             }
         }
     },
@@ -255,7 +269,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'manage_skill',
-            description: 'Create, update, or manage AI skills and their files. Use this to create new skills with custom tools (JS files) or content files (XML/MD). Use action="edit" with an `edits` array to apply search-and-replace changes to the skill body (or a skill file when `filename` is supplied) without resending the whole content — same shape as servicenow_diff_edit, workspace edit, and document edit.',
+            description: 'Create, update, or manage AI skills and their files (create skills with custom tool JS files or content MD/XML; action="edit" does search-and-replace on the skill body or a named file — same shape as servicenow_diff_edit / workspace edit / document edit). ⚠️ IMPORTANT — this mutates ONLY the live/runtime copy of a skill. If you are doing extension development from the cloned AppAgent repo (extension-dev skill active with a deploy folder connected — i.e. Reload rebuilds from the workspace — including tasks like "improve/test/edit the <name> skill"), the skill SOURCE lives at skills/<name>/ in that repo: edit those files with the workspace tool (write/edit) and have the user click Reload. manage_skill edits in that mode are EPHEMERAL and get overwritten by the next extension build/reload — so do NOT use manage_skill for skill changes when the repo is cloned. Use manage_skill only when you are NOT working from the cloned extension repo.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -480,6 +494,7 @@ var TOOLS = [
                                 label: { type: 'string', description: 'Display label' },
                                 value: { description: 'Default/prefilled value' },
                                 options: { type: 'array', items: {}, description: 'For select/multi-select: array of option strings or {value, label} objects' },
+                                widget: { type: 'string', enum: ['checkboxes'], description: 'For multi-select: render as a vertical checkbox list instead of toggle chips (better for long option labels)' },
                                 required: { type: 'boolean', description: 'Whether the field is required' },
                                 placeholder: { type: 'string', description: 'Placeholder text' }
                             },
@@ -516,18 +531,21 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'workspace',
-            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated).\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. read and status surface ownership metadata. Pass {"force": true} to override a hard block.',
+            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. Pass `files` (array of workspace paths) to push ONLY those dirty files — other dirty files stay modified locally and are left out of the commit/PR (use this to keep unrelated changes, e.g. from another chat, out of your PR). If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated).\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n- pin: Pin a workspace (pass `workspace`; `{unpin: true}` to clear). At most ONE pinned workspace per owner/repo — pinning clears any sibling pin. The pinned workspace wins default-workspace resolution (over MRU) and extension_build auto-detect, so Reload builds it. `list` exposes `pinned`/`forked_from`; `status` adds a `pin_notice` when a sibling holds the pin.\n- branch: LOCAL fork — creates workspace owner/repo::<branch> by cheaply copying the source workspace (args: `branch` = new branch name; optional `workspace` = source; `move_dirty` default true moves dirty edits to the fork and reverts the source clean, false copies them to both). The remote branch does NOT exist until the first push from the fork, which cuts it from the fork base. The fork is pinned automatically.\n- move: Move dirty edits between workspaces (args: `to` = target workspace key; optional `files` = paths, default all dirty; `workspace` = source). Writes the source content onto the target row (dirty recomputed vs the target own original) then discards the source. Blocks the WHOLE move when a target file is itself dirty with different content (unless `force`); reports `base_diverged` paths when the two bases differ.\n- hydrate: Pre-fetch lazy-clone file contents from GitHub (optionally limited to a `path` prefix). read/grep/edit hydrate on demand automatically — use this only to bulk-prefetch before many reads.\n\nMerge lifecycle: when the branch of a workspace is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the workspace — dirty files are moved to the base first (a blocked move keeps the workspace with a warning), the base is synced, and the pin follows the merge onto the base when the deleted workspace held it.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. read and status surface ownership metadata. Pass {"force": true} to override a hard block.',
             parameters: {
                 type: 'object',
                 properties: {
                     action: {
                         type: 'string',
-                        enum: ['clone', 'list', 'ls', 'read', 'write', 'edit', 'delete', 'grep', 'status', 'diff', 'push', 'discard'],
+                        enum: ['clone', 'list', 'ls', 'read', 'write', 'edit', 'copy', 'delete', 'grep', 'status', 'diff', 'push', 'discard', 'pin', 'branch', 'move', 'hydrate'],
                         description: 'Action to perform'
                     },
                     repo: { type: 'string', description: 'Repository in "owner/repo" format (for clone action)' },
                     workspace: { type: 'string', description: 'Workspace identifier (owner/repo::branch). Optional — defaults to the current workspace if omitted.' },
-                    branch: { type: 'string', description: 'Branch name (for clone: branch to clone; for push: ignored — use branch_name to control the push target)' },
+                    branch: { type: 'string', description: 'Branch name (for clone: branch to clone; for branch action: the NEW branch name to fork to; for push: ignored — use branch_name to control the push target)' },
+                    to: { type: 'string', description: 'For move action: target workspace key (owner/repo::branch) the dirty edits are moved onto.' },
+                    unpin: { type: 'boolean', description: 'For pin action: true clears the pin on the given workspace instead of setting it. Default: false.' },
+                    move_dirty: { type: 'boolean', description: 'For branch action: true (default) moves dirty edits to the fork (source is reverted clean); false copies them so both workspaces keep the edits.' },
                     path: { type: 'string', description: 'File or directory path (for ls, read, write, edit, diff)' },
                     content: { type: 'string', description: 'File content (for write action). Not needed if file_id is provided.' },
                     file_id: { type: 'string', description: 'Write a file from the file store (for write action). Use instead of content to copy a screenshot, attachment, or fetched file into the workspace.' },
@@ -547,13 +565,18 @@ var TOOLS = [
                         }
                     },
                     pattern: { type: 'string', description: 'Regex pattern (for grep action)' },
+                    files: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'For push action: only commit these workspace paths (must all be dirty); omit to push all dirty files. For move action: only move these dirty paths; omit to move all dirty files.'
+                    },
                     branch_name: { type: 'string', description: 'Branch name for push. A new branch+PR are created if it does not exist; reuse the SAME branch_name from a prior push to append another commit to that existing PR.' },
                     commit_message: { type: 'string', description: 'Commit message (for push action)' },
                     pr_title: { type: 'string', description: 'Pull request title (for push action)' },
                     pr_body: { type: 'string', description: 'Pull request body (for push action). Supports full GitHub markdown. Use actual newlines in the string value for multi-line content — do NOT use backslash-n escape sequences.' },
                     base_branch: { type: 'string', description: 'Base branch for PR (for push action, defaults to cloned branch). Omit this unless you need to override — the default is almost always correct.' },
                     include_git_ignored: { type: 'boolean', description: 'If true, includes gitignored files (e.g. dist/) in ls, grep, status, diff results. Default: false.' },
-                    force: { type: 'boolean', description: 'For mutating actions (write, edit, delete, copy, discard): override the cross-chat conflict block and clobber another chat\'s uncommitted changes. Use only when you have intentionally decided to take over the file. Default: false.' },
+                    force: { type: 'boolean', description: 'For mutating actions (write, edit, delete, copy, discard): override the cross-chat conflict block and clobber another chat\'s uncommitted changes. Use only when you have intentionally decided to take over the file. For grep: bypass the slow-hydration guard (a grep whose lazy-clone content fetch is estimated > 60s is refused with a scope_breakdown — prefer narrowing `path`). Default: false.' },
                     confirm: { type: 'boolean', description: 'Set to true for write operations (write, edit, delete, push) that you think the user should review before execution. Omit or set false for read-only operations.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
@@ -708,13 +731,14 @@ var TOOLS = [
             parameters: {
                 type: 'object',
                 properties: {
-                    instructions: { type: 'string', description: 'The task. Becomes the sub\'s first user message. Be specific about what should be returned (e.g. "return only sys_ids and names, no script bodies").' },
+                    instructions: { type: 'string', description: 'The task. Becomes the sub\'s first user message. Be specific about what should be returned (e.g. "return only sys_ids and names, no script bodies"). Write in markdown — it is rendered as markdown in the parent chat\'s sub-agent panel.' },
                     name: { type: 'string', description: 'Short label shown in the sidebar / Workers strip. Defaults to a generated id.' },
                     allow_nested: { type: 'boolean', description: 'If true, the sub may spawn/stop/wake its own sub-agents (default: false). Use only when you genuinely need the sub to delegate further — multi-stage research, recursive audits, etc. Max nesting depth is 5.' },
                     context_seed: { type: 'object', description: 'Small JSON blob copied into the sub\'s first message (record ids, queries, etc.).' },
                     output_schema: { type: 'object', description: 'Optional JSON-Schema-ish object describing the EXACT shape the sub must return in report_to_parent\'s `data` field. Injected into the sub\'s first message with a directive to conform (same keys/types, no extras). Use when you spawn + parse the result programmatically (e.g. inside one js_eval) and want a predictable structure to destructure. The root should be an object (report_to_parent\'s `data` is itself an object) — wrap arrays in a named property, e.g. {items:[...]}, rather than using a root-level array.' },
                     auto_report: { type: 'boolean', description: 'If true (default), a fallback report is synthesized from the last assistant message if the sub finishes without calling report_to_parent.' },
-                    max_tool_calls: { type: 'number', description: 'Hard cap on tool calls the sub may make. Default: 200.' },
+                    wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash, budget force-stop): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Pass false for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
+                    max_tool_calls: { type: 'number', description: 'Soft tool-call budget for the sub. Default: 300. From 90% usage onward (and on every call past the budget) an escalating warning is appended to its tool results telling it to wrap up and report_to_parent. Safety backstop: a sub that ignores every warning is force-stopped at 2x the budget.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['instructions']
@@ -725,12 +749,12 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'report_to_parent',
-            description: 'SUB-AGENT ONLY. Push a distilled result up to the parent agent. Settles the parent\'s spawn handle (if still pending) and parks you (state=sleeping) — the parent can `wake_sub_agent` you with a follow-up or `stop_sub_agent` to terminate. `status` is informational (UI badge color, parent decision logic). For mid-flight progress that should NOT settle the handle, use `agent_message({to:"parent", content:"..."})` instead. The summary is what the parent SEES — it never reads your raw transcript. Cap: 4 KB summary, 32 artifacts.',
+            description: 'SUB-AGENT ONLY. Push a distilled result up to the parent agent. Settles the parent\'s spawn handle (if still pending) and parks you (state=sleeping) — the parent can `wake_sub_agent` you with a follow-up or `stop_sub_agent` to terminate. `status` is informational (UI badge color, parent decision logic). Unless the parent spawned you with wake_parent:false, reporting also WAKES the parent: an idle parent chat starts a run with a notice of your report, and a running parent gets the notice injected at a safe point (skipped when the parent is already blocked in await_handle — the settle delivers there). For mid-flight progress that should NOT settle the handle, use `agent_message({to:"parent", content:"..."})` instead. The summary is what the parent SEES — it never reads your raw transcript — and MUST be written in markdown (it is rendered as markdown in the parent chat\'s sub-agent output panel). Cap: 4 KB summary, 32 artifacts.',
             parameters: {
                 type: 'object',
                 properties: {
                     status: { type: 'string', enum: ['done', 'error', 'need_input'], description: 'Informational status. done=task complete, error=failed, need_input=parked waiting for parent. All three settle the spawn handle and park you.' },
-                    summary: { type: 'string', description: '1-3 sentence distilled result. THIS is what the parent reads. Soft-capped at 4 KB.' },
+                    summary: { type: 'string', description: '1-3 sentence distilled result, written in MARKDOWN (it is rendered as markdown in the parent\'s sub-agent output panel). THIS is what the parent reads. Soft-capped at 4 KB.' },
                     data: { type: 'object', description: 'Optional small structured payload (counts, ids, etc.).' },
                     artifacts: { type: 'array', items: { type: 'string' }, description: 'file_ids / doc_ids / widget_ids the parent can reference without inlining the content.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
@@ -743,7 +767,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'agent_status',
-            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, tool_calls_used, inbox size, and pool position. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
+            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, tool_calls_used, inbox size, pool position, and action_state — the sub\'s live update_action_state progress card ({state, label, tasks[], output}), i.e. how to check a running sub\'s progress and its current todo list without reading its chat. Each sub also carries lifecycle diagnostics: last_error {message, at, transient, retried}, crash_cause, retries_used (transient network/timeout crashes are auto-retried once before the sub is declared errored), resurrectable (true when an errored/stopped sub can be revived via wake_sub_agent with its full prior context intact), and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -758,7 +782,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'wake_sub_agent',
-            description: 'Resume a sleeping sub-agent, optionally with a new instruction. If the sub has queued inbox messages, they are drained into a combined user turn on wake. Returns `{handle}` — an awaitable spawn handle for the resumed run (a fresh handle if the previous one already settled, or the existing one if it\'s still pending). The parent should `await_handle(result.handle)` to collect the next `report_to_parent` payload. No-op if the sub is already running. Errors if the sub is stopped/errored.',
+            description: 'Resume a sleeping sub-agent — or RESURRECT an errored/stopped one — optionally with a new instruction. Resurrection revives the sub with its FULL prior chat context (a crashed sub continues where it left off instead of redoing the work), as long as its record/transcript still exists (terminal subs are garbage-collected ~1h after settling). If the sub has queued inbox messages, they are drained into a combined user turn on wake. Returns `{handle}` — an awaitable spawn handle for the resumed run (a fresh handle if the previous one already settled, or the existing one if it\'s still pending), plus `resurrected_from` when a terminal sub was revived. The parent should `await_handle(result.handle)` to collect the next `report_to_parent` payload. No-op if the sub is already running.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -816,6 +840,22 @@ var TOOLS = [
                 required: ['to', 'content']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'eval_runner',
+            description: 'Built-in sandboxed grader for the ServiceNow Eval (servicenow-eval skill). Handles ALL access to task setup/verifier/cleanup scripts so they never enter model context. Actions: \'init\' (reset session, returns the 20 task prompts), \'setup\' (seed one task, duplicate-locked), \'verify\' (single-use atomic verify+cleanup+audit for one task, returns {pass,expected,actual}), \'teardown\' (returns the server-side audit verdicts, then deletes all session state). The agent must NEVER read tasks.md directly — only this tool may.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    action: { type: 'string', enum: ['init', 'setup', 'verify', 'teardown'], description: 'Lifecycle phase to run.' },
+                    task_id: { type: 'string', description: 'Task ID (e.g. \'T6\'). Required for setup and verify.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['action']
+            }
+        }
     }
 ];
 
@@ -832,6 +872,7 @@ var HEADLESS_TOOLS = {
     servicenow_run_script: true,
     servicenow_diff_edit: true,
     set_chat_title: true,
+    set_tldr: true,
     cached_content_outline: true,
     cached_content_search: true,
     cached_content_read: true,
@@ -863,6 +904,9 @@ var HEADLESS_TOOLS = {
     // SubAgents.* helpers. Side-effects (chat creation, runAgent kick) work
     // identically in SW and page contexts because runAgent + the chats map
     // are shared globals in WORKER_SHARED_FILES.
+    // eval_runner only needs executeTool (servicenow_run_script) + getSkillAsset,
+    // both available in WORKER_SHARED_FILES — fully headless.
+    eval_runner: true,
     spawn_sub_agent: true,
     report_to_parent: true,
     agent_status: true,

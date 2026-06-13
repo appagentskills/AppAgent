@@ -65,7 +65,7 @@ If you ever need it: open via `#<varname> button.datepickericon`, popup is `.dat
 ## Gotchas (all verified)
 
 - **Blur is mandatory** — `fill` alone never commits (`updateOn:'blur'`). Always `dispatch_event blur` after.
-- **Strict 24-hour format** — locale/AM-PM rejected; model silently keeps the last valid value while the box shows your bad text.
+- **Strict 24-hour format** — locale/AM-PM rejected; model silently keeps the last valid value while the box shows your bad text. Verified: after a rejected string the hidden mirror **still holds the last committed value** (not empty) — a handy “model unchanged” assertion for negative tests; the `.sp-date-format-info` hint is readable via plain `get_properties` `textContent` (exact text seen: *“Date in format YYYY-MM-DD HH:mm:ss”*).
 - **`input.datepickerinput` is NOT field-specific** — multiple date fields on one form share it. Always scope within `#<varname>`.
 - **Detect `has-error` safely** — `get_properties` on a no-match now returns `success:true` with `match_count:0` (it used to return `success:false` with **no** `match_count`, so the old `err.match_count === 0` read `undefined === 0` → **false** and falsely failed a valid commit). Treat "has error" as `err.match_count > 0`; the `gp` shim in `select2.md` still normalizes `match_count` for older builds.
 - **Page-load instability** — a page may briefly redirect or re-render on first load, and a parallel click can trigger a stray navigation. Re-navigate, `wait_for selector_visible: "#sp_formfield_<varname>"`, and interact **sequentially** (not parallel) with click actions.
@@ -85,3 +85,5 @@ el.dispatchEvent(new Event("blur",   {bubbles:true}));   // REQUIRED
 
 ---
 *Verified on a live Employee Center Date/Time field:* a strict-format string set via fill+blur stuck (`ng-valid`, `mandatory-filled`, hidden input synced); a negative test with a locale string surfaced `has-error` + the format hint. Calendar popup day-click also commits live.
+
+*Re-verified end-to-end (2026-06, second instance):* the pre-blur negative-commit (hidden mirror held the “now” default after `fill`, committed only after `blur`), `setDateField` on both Date and Date/Time, and the bad-format → `has-error` + hint + model-keeps-last-valid behavior.
