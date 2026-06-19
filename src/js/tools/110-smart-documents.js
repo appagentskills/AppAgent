@@ -91,10 +91,10 @@ async function executeSmartDocument(args, messageIndex, options) {
     if (action === 'create') return await sdocToolCreate(args, options);
     if (action === 'update') return await sdocToolUpdate(args, options);
     if (action === 'edit') return await sdocToolEdit(args, options);
-    if (action === 'read') return sdocToolRead(args);
-    if (action === 'list') return sdocToolList();
-    if (action === 'list_versions') return sdocToolListVersions(args);
-    if (action === 'read_version') return sdocToolReadVersion(args);
+    if (action === 'read') return sdocToolRead(args, options);
+    if (action === 'list') return sdocToolList(options);
+    if (action === 'list_versions') return sdocToolListVersions(args, options);
+    if (action === 'read_version') return sdocToolReadVersion(args, options);
     if (action === 'delete') return await sdocToolDelete(args, options);
     return { success: false, error: 'Unknown action: ' + action };
 }
@@ -105,12 +105,19 @@ async function sdocToolCreate(args, options) {
     var docId = 'doc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7);
     var now = Date.now();
 
+    var scope = (args.scope === 'chat') ? 'chat' : 'shared';
+    var ownerChatId = _sdocChatId(options);
+    // A 'chat'-scoped doc with no resolvable owner would be orphaned — invisible
+    // to everyone (list/read/edit/delete all gate on accessibility), so it could
+    // never even be deleted. Fall back to 'shared' in that impossible-owner case.
+    if (scope === 'chat' && !ownerChatId) scope = 'shared';
     var fileId = newFileId();
     var doc = {
         id: docId, title: title, currentContent: content, currentVersion: 1,
         versions: [{ version: 1, content: content, title: title, author: 'agent', timestamp: now }],
         displays: {}, prompts: args.prompts || [], createdAt: now, updatedAt: now,
-        file_id: fileId
+        file_id: fileId,
+        scope: scope, ownerChatId: ownerChatId
     };
 
     sdocCopyDisplays(doc, content, options);
@@ -120,8 +127,8 @@ async function sdocToolCreate(args, options) {
     AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'created' });
 
     return {
-        success: true, doc_id: docId, version: 1, file_id: doc.file_id,
-        message: 'Document created. Include <!--document:' + docId + '--> in your response to render it inline.',
+        success: true, doc_id: docId, version: 1, file_id: doc.file_id, scope: scope,
+        message: 'Document created (scope: ' + scope + '). Include <!--document:' + docId + '--> in your response to render it inline.',
         _document_placeholder: '<!--document:' + docId + '-->'
     };
 }
@@ -130,7 +137,7 @@ async function sdocToolUpdate(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
-    if (!doc) return { success: false, error: 'Document not found: ' + docId };
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
 
     var changed = false;
     if (args.content !== undefined || args.title) {
@@ -159,11 +166,11 @@ async function sdocToolUpdate(args, options) {
     };
 }
 
-function sdocToolRead(args) {
+function sdocToolRead(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
-    if (!doc) return { success: false, error: 'Document not found: ' + docId };
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
 
     var promptResponses = {};
     (doc.prompts || []).forEach(function(p) {
@@ -173,24 +180,26 @@ function sdocToolRead(args) {
     return {
         success: true, doc_id: doc.id, title: doc.title, content: doc.currentContent,
         version: doc.currentVersion, versions_count: doc.versions.length,
-        file_id: doc.file_id || null,
+        file_id: doc.file_id || null, scope: doc.scope || 'shared',
         prompt_responses: promptResponses, updated_at: doc.updatedAt
     };
 }
 
-function sdocToolList() {
-    var list = Object.values(smartDocuments).map(function(doc) {
-        return { doc_id: doc.id, title: doc.title, current_version: doc.currentVersion, updated_at: doc.updatedAt, created_at: doc.createdAt };
+function sdocToolList(options) {
+    var list = Object.values(smartDocuments).filter(function(doc) {
+        return _sdocAccessible(doc, options);
+    }).map(function(doc) {
+        return { doc_id: doc.id, title: doc.title, scope: doc.scope || 'shared', current_version: doc.currentVersion, updated_at: doc.updatedAt, created_at: doc.createdAt };
     });
     list.sort(function(a, b) { return b.updated_at - a.updated_at; });
     return { success: true, documents: list };
 }
 
-function sdocToolListVersions(args) {
+function sdocToolListVersions(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
-    if (!doc) return { success: false, error: 'Document not found: ' + docId };
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
     return {
         success: true, doc_id: docId,
         versions: doc.versions.map(function(v) {
@@ -199,13 +208,13 @@ function sdocToolListVersions(args) {
     };
 }
 
-function sdocToolReadVersion(args) {
+function sdocToolReadVersion(args, options) {
     var docId = args.doc_id;
     var version = args.version;
     if (!docId) return { success: false, error: 'doc_id is required' };
     if (!version) return { success: false, error: 'version is required' };
     var doc = smartDocuments[docId];
-    if (!doc) return { success: false, error: 'Document not found: ' + docId };
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
     var v = doc.versions.find(function(ver) { return ver.version === version; });
     if (!v) return { success: false, error: 'Version ' + version + ' not found' };
     return { success: true, doc_id: docId, version: v.version, content: v.content, title: v.title, author: v.author, timestamp: v.timestamp };
@@ -215,7 +224,7 @@ async function sdocToolEdit(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
     var doc = smartDocuments[docId];
-    if (!doc) return { success: false, error: 'Document not found: ' + docId };
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
     var edits = args.edits;
     if (!edits || !Array.isArray(edits) || edits.length === 0) return { success: false, error: 'edits array is required' };
 
@@ -249,7 +258,8 @@ async function sdocToolEdit(args, options) {
 async function sdocToolDelete(args, options) {
     var docId = args.doc_id;
     if (!docId) return { success: false, error: 'doc_id is required' };
-    if (!smartDocuments[docId]) return { success: false, error: 'Document not found: ' + docId };
+    var doc = smartDocuments[docId];
+    if (!doc || !_sdocAccessible(doc, options)) return { success: false, error: 'Document not found: ' + docId };
     await deleteDocumentById(docId);
     AgentEvents.emit('documentChanged', { chatId: _sdocChatId(options), docId: docId, kind: 'deleted' });
     return { success: true, message: 'Document deleted' };
@@ -262,6 +272,51 @@ function _sdocChatId(options) {
         || (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
         || (typeof currentChatId !== 'undefined' && currentChatId)
         || null;
+}
+
+// Visibility gate. A 'shared' (or legacy/undefined-scope) doc is global and
+// readable from any chat. A 'chat'-scoped doc is private to the chat that
+// created it (its ownerChatId) AND to that chat's sub-agent lineage — a chat
+// and its sub-agents (any depth, up or down the parent_chat_id chain) can all
+// list/read it, so a parent and the sub-agent it spawns can share a scratchpad.
+// Sibling sub-agents and unrelated chats still cannot see each other's docs.
+function _sdocAccessible(doc, options) {
+    if (!doc) return false;
+    if (doc.scope !== 'chat') return true;
+    var here = _sdocChatId(options);
+    if (!here || !doc.ownerChatId) return false;
+    if (here === doc.ownerChatId) return true;
+    // Also visible across the parent↔sub-agent boundary: accessible when `here`
+    // and the doc's ownerChatId sit on the same sub-agent lineage (one is an
+    // ancestor/descendant of the other).
+    return _sdocSameLineage(here, doc.ownerChatId);
+}
+
+// Walk the sub-agent chat lineage upward from `chatId`, returning the chain
+// [chatId, parent_chat_id, ...] up to the root human chat. Bounded to 10 hops
+// (cycle/runaway guard). Uses the SW-global SubAgents registry (core/097); a
+// top-level human chat has no registry record so the walk stops there.
+function _sdocChatChain(chatId) {
+    var chain = [];
+    var cur = chatId;
+    for (var i = 0; i < 10 && cur; i++) {
+        chain.push(cur);
+        if (typeof SubAgents === 'undefined' || !SubAgents || !SubAgents.getByChatId) break;
+        var rec = SubAgents.getByChatId(cur);
+        if (!rec || !rec.parent_chat_id || rec.parent_chat_id === cur) break;
+        cur = rec.parent_chat_id;
+    }
+    return chain;
+}
+
+// True when chats `a` and `b` lie on the same sub-agent lineage — i.e. one is
+// an ancestor (or descendant) of the other via parent_chat_id links. Siblings
+// (sharing only a common ancestor) return false.
+function _sdocSameLineage(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (_sdocChatChain(a).indexOf(b) !== -1) return true;
+    return _sdocChatChain(b).indexOf(a) !== -1;
 }
 
 // ─── Helpers ───
@@ -778,7 +833,8 @@ function renderDocumentsPage() {
     var toggleBtn = document.getElementById('documents-toggle-sidebar-btn');
     if (toggleBtn) toggleBtn.innerHTML = UI_ICONS.panelLeftClose;
 
-    var docs = Object.values(smartDocuments);
+    // chat-scoped docs are private to their chat — never list them in the global Documents page.
+    var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
     docs.sort(function(a, b) { return b.updatedAt - a.updatedAt; });
 
     if (docs.length === 0) {
@@ -881,7 +937,8 @@ async function sdocCreateFromPage() {
 // ─── Import / Export ───
 
 function exportAllDocuments() {
-    var docs = Object.values(smartDocuments);
+    // Exclude chat-scoped (private) docs from "export all" — they belong to their chat only.
+    var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
     if (docs.length === 0) { showSnackbar('No documents to export', 'error'); return; }
 
     var exportData = docs.map(function(doc) {

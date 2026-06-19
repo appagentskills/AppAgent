@@ -30,7 +30,30 @@ function queryWidgetViaPostMessage(iframe, action, args) {
     });
 }
 
+// Public entry point. Thin wrapper around the implementation that handles the
+// explicit tab_id pin: it validates the tab ONCE and, after the action runs,
+// mirrors the pin to the service-worker chat snapshot via _target_tab_persist
+// for EVERY browser action. navigate sets its own _target_tab_persist; without
+// this, the page-side chats[].targetTabId write for NON-navigate actions is
+// wiped by the next agent-event, so the "pins subsequent browser actions in
+// this chat to that tab" contract was broken for everything except navigate.
 async function executeIframeTool(args) {
+    var _pinTab = null;
+    if (args && args.tab_id != null && !args.widget_id &&
+        typeof chrome !== 'undefined' && chrome.tabs &&
+        typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode')) {
+        try { await chrome.tabs.get(args.tab_id); }
+        catch (e) { return { success: false, error: 'tab_id ' + args.tab_id + ' is not an open tab. Use list_instances to see open tab ids.' }; }
+        _pinTab = args.tab_id;
+    }
+    var _ftResult = await _executeIframeToolImpl(args);
+    if (_pinTab != null && _ftResult && typeof _ftResult === 'object' && _ftResult._target_tab_persist == null) {
+        _ftResult._target_tab_persist = _pinTab;
+    }
+    return _ftResult;
+}
+
+async function _executeIframeToolImpl(args) {
     var action = args.action;
     var widgetId = args.widget_id;
 
@@ -42,6 +65,20 @@ async function executeIframeTool(args) {
     // Route browser actions through the real Chrome tab (not an embedded iframe)
     // Widget actions still use local iframes in the extension page
     if (!widgetId) {
+        // Explicit tab_id: pin every browser action in this chat to that exact Chrome
+        // tab (e.g. an id from list_instances' activeTabs), so the caller can drive /
+        // reuse a specific tab. Full-tab mode only (real tabs). A non-existent id is a
+        // hard error rather than silently falling back to a new tab.
+        if (args.tab_id != null && typeof chrome !== 'undefined' && chrome.tabs &&
+            typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode')) {
+            // tab_id already validated by the executeIframeTool wrapper, which also
+            // mirrors this pin to the SW chat snapshot (_target_tab_persist), so a
+            // subsequent browser action that omits tab_id stays pinned to this tab.
+            if (chats[currentChatId]) {
+                chats[currentChatId].targetTabId = args.tab_id;
+                if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            }
+        }
         var extBrowserActions = ['navigate', 'get_visible_text', 'get_dom', 'click', 'fill', 'type', 'wait_for',
             'scroll', 'close', 'get_console_logs', 'get_network_requests',
             'dispatch_event', 'select_option', 'get_properties', 'set_style', 'get_page_info'];
@@ -108,6 +145,10 @@ async function executeIframeTool(args) {
                                 _existingTabId = _instanceTabId;
                             }
                         }
+                        // An explicit tab_id wins over instance-based tab discovery and the
+                        // adoption guard: navigate exactly the tab the caller named (already
+                        // validated + pinned to the chat above).
+                        if (args.tab_id != null) _existingTabId = args.tab_id;
                         // Validate the recorded / cross-instance tab still exists.
                         if (_existingTabId) {
                             try { await chrome.tabs.get(_existingTabId); _reuseTab = true; } catch(e) { _existingTabId = null; }
@@ -303,7 +344,10 @@ async function executeIframeTool(args) {
                             chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
                         }
 
-                        return { success: true, message: 'Opened ' + fullTabNavUrl + ' in background tab', _target_tab_persist: _ftPersist };
+                        var _navMsg = _reuseTab
+                            ? 'Navigated the existing tab (id ' + _targetTab.id + ') to ' + fullTabNavUrl + ' \u2014 same tab reused in place, not brought to the foreground'
+                            : 'Opened ' + fullTabNavUrl + ' in a new background tab (id ' + _targetTab.id + ')';
+                        return { success: true, message: _navMsg, _target_tab_persist: _ftPersist };
                     }
 
                     // For sidepanel mode with instance targeting, resolve URL before sending

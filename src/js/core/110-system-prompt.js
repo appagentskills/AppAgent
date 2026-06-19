@@ -69,6 +69,7 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     'When running as an Action, consult the active skill body for a section titled "Action Lifecycle: <name>" and follow its steps.',
     '',
     'SMART DOCUMENTS: use the document tool for persistent, versioned markdown that renders inline and persists across chats. Users can edit documents inline — read the document to see their changes.',
+    'SCRATCHPAD: private smart docs are your scratchpad — use a private-scoped smart document (`scope: "chat"`), which can also be shared between a sub-agent and its parent agent without crowding the smart document list.',
     '',
     'COLLECTING USER INPUT & CONFIRMING PLANS (prompt_user):',
     '',

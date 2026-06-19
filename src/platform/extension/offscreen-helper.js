@@ -91,16 +91,32 @@
                     // parentToolCallId is the OUTER tool's id (js_eval / skill)
                     // so display can eager-render attached to its result slot.
                     //
-                    // We deliberately do NOT pass d.id as toolCallId here. d.id is
-                    // a numeric counter (++window._callId) the sandbox uses to
-                    // correlate sandboxToolCall ↔ sandboxToolResult messages on
-                    // the local postMessage channel — it has no meaning at the
-                    // agent layer, and feeding it as toolCallId crashed the
-                    // approval flow (`(1).startsWith('prog_')` throws). Letting
-                    // the SW generate a fresh `prog_…` id mirrors the page-side
-                    // sandbox bridge in tools/020-tool-execution.js (which also
-                    // omits toolCallId) and correctly marks the inner call as
-                    // programmatic.
+                    // STABLE toolCallId (double-approval fix): we DERIVE a stable
+                    // `prog_…` id from the outer tool's id + the sandbox call
+                    // counter (d.id) instead of letting the SW mint a fresh
+                    // `prog_<timestamp>_<random>` per dispatch. Why it matters:
+                    // every approval dedup is keyed on toolCallId (the worker
+                    // stub's recorded-approval scan in worker/120-tool-routing.js
+                    // and the page stub in ui/150-tool-approval.js). A fresh id
+                    // per dispatch never matches the persisted `approval` message,
+                    // so when the agent loop re-enters dispatch (SW recycle while
+                    // the user is on the prompt, restart replay, reload) the outer
+                    // js_eval/skill re-runs and an inner 'ask' tool (e.g.
+                    // web_fetch) re-prompts — the user sees the panel twice. A
+                    // STABLE id is recognized as already-approved on re-run, so it
+                    // prompts exactly once.
+                    // Constraints baked into the format below:
+                    //  • Must be a STRING — the original reason d.id was dropped
+                    //    was that the bare numeric counter threw on
+                    //    `(1).startsWith('prog_')`.
+                    //  • Must START WITH 'prog_' — executePendingApprovedTools
+                    //    (app/030-agent-loop.js) skips `prog_` ids so the page
+                    //    never re-executes a sandbox call as a top-level tool
+                    //    (skipping that prefix would trade a double-prompt for a
+                    //    double-EXECUTION).
+                    //  • Must be DETERMINISTIC across re-dispatch — d.id is
+                    //    ++window._callId, which re-increments in the same order
+                    //    when the sandbox code re-runs from the top.
                     chrome.runtime.sendMessage({
                         type: 'sw-exec-tool',
                         payload: {
@@ -108,6 +124,7 @@
                             args: d.args,
                             chatId: chatId,
                             messageIndex: messageIndex,
+                            toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + d.id,
                             parentToolCallId: parentToolCallId || null
                         }
                     }).then(function(resp) {

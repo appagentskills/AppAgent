@@ -134,21 +134,49 @@ function openDatabase() {
                     var migrationTx = e.target.transaction || request.transaction;
                     var filesStore = migrationTx.objectStore(workspaceFilesStoreName);
                     var blobStore = migrationTx.objectStore(workspaceBlobsStoreName);
+                    // Diagnostics: if the versionchange tx aborts for ANY reason the open
+                    // request rejects and the DB stays unusable — surface the cause instead
+                    // of a silent brick.
+                    migrationTx.onabort = function() { console.error('workspace_blobs v13 migration tx aborted:', migrationTx.error); };
+                    // Serialized cursor walk: advance ONLY from each per-row blob put's
+                    // callbacks. This (a) lets a single put failure be contained with
+                    // preventDefault so it can't abort the whole upgrade and brick the DB,
+                    // and (b) defers stripping a row's inline content until its blob is
+                    // durably written, so a failed put leaves the row fully intact.
                     filesStore.openCursor().onsuccess = function(ev) {
                         var cursor = ev.target.result;
-                        if (!cursor) return;
+                        if (!cursor) return; // exhausted — tx auto-commits
+                        var row = cursor.value;
+                        if (!(row && row.sha && row.original_content != null)) { cursor.continue(); return; }
+                        var putReq;
                         try {
-                            var row = cursor.value;
-                            if (row && row.sha && row.original_content != null) {
-                                blobStore.put({ sha: row.sha, content: row.original_content });
+                            putReq = blobStore.put({ sha: row.sha, content: row.original_content });
+                        } catch (putErr) {
+                            // Synchronous throw — leave row inline, keep going.
+                            console.error('workspace_blobs v13 put threw (row left inline):', putErr);
+                            cursor.continue();
+                            return;
+                        }
+                        putReq.onsuccess = function() {
+                            try {
                                 delete row.original_content;
                                 // Clean rows read their content from the blob;
                                 // dirty rows keep their overlay content inline.
                                 if (!row.dirty) delete row.content;
                                 cursor.update(row);
-                            }
-                        } catch (rowErr) { console.error('workspace_blobs v13 row migration failed:', rowErr); }
-                        cursor.continue();
+                            } catch (uErr) { console.error('workspace_blobs v13 row update failed:', uErr); }
+                            cursor.continue();
+                        };
+                        putReq.onerror = function(putEv) {
+                            // A single blob write failing (e.g. quota/IO) must NOT abort the
+                            // versionchange transaction — preventDefault stops the error from
+                            // bubbling to the tx (which would roll back the upgrade and leave
+                            // openDatabase permanently rejecting). Leave the row fully inline
+                            // (original_content intact); it migrates on a later normal write.
+                            if (putEv && typeof putEv.preventDefault === 'function') putEv.preventDefault();
+                            console.error('workspace_blobs v13 blob put failed (row left inline):', putReq.error);
+                            cursor.continue();
+                        };
                     };
                 } catch (migErr) { console.error('workspace_blobs v13 migration failed:', migErr); }
             }
@@ -753,6 +781,10 @@ async function putWorkspaceBlob(sha, content) {
         await new Promise(function(resolve, reject) {
             tx.oncomplete = resolve;
             tx.onerror = function() { reject(tx.error); };
+            // A tx can abort with NO bubbled request error (e.g. forced close
+            // during another connection's versionchange) — without this the
+            // awaited Promise would hang forever and stall the write loop.
+            tx.onabort = function() { reject(tx.error || new DOMException('Transaction aborted', 'AbortError')); };
         });
         return true;
     } catch (e) { console.error('Failed to save workspace blob:', e); return false; }
@@ -795,29 +827,48 @@ async function getWorkspaceBlobsBySha(shas) {
 // number of deleted blobs; never throws.
 async function gcWorkspaceBlobs() {
     try {
-        var rows = await getAllWorkspaceFilesAllRepos();
-        var keep = {};
-        for (var i = 0; i < rows.length; i++) {
-            if (rows[i] && rows[i].sha) keep[rows[i].sha] = true;
-        }
         var database = await openDatabase();
-        var tx = database.transaction([workspaceBlobsStoreName], 'readwrite');
-        var store = tx.objectStore(workspaceBlobsStoreName);
+        // Atomic mark-and-sweep in ONE readwrite tx spanning BOTH stores: the
+        // keep-set is built by reading workspace_files INSIDE the same tx that
+        // sweeps workspace_blobs. This closes the TOCTOU where a concurrent
+        // setWorkspaceFile (which writes the blob BEFORE its row) could have its
+        // just-written, not-yet-referenced blob swept by a mark snapshot taken a
+        // moment earlier.
+        var tx = database.transaction([workspaceFilesStoreName, workspaceBlobsStoreName], 'readwrite');
+        var filesStore = tx.objectStore(workspaceFilesStoreName);
+        var blobStore = tx.objectStore(workspaceBlobsStoreName);
         var deleted = 0;
-        await new Promise(function(resolve, reject) {
-            var cursorReq = store.openCursor();
-            cursorReq.onsuccess = function(ev) {
-                var cursor = ev.target.result;
-                if (!cursor) { resolve(); return; }
-                if (!keep[cursor.key]) {
-                    cursor.delete();
-                    deleted++;
+        return await new Promise(function(resolve, reject) {
+            // MARK: keep every sha referenced by ANY workspace_files row
+            // (stubs and dirty rows included — their blobs stay reusable).
+            var keep = {};
+            var filesReq = filesStore.getAll();
+            filesReq.onsuccess = function() {
+                var rows = filesReq.result || [];
+                for (var i = 0; i < rows.length; i++) {
+                    if (rows[i] && rows[i].sha) keep[rows[i].sha] = true;
                 }
-                cursor.continue();
+                // SWEEP: delete blobs not in the keep-set within the SAME tx.
+                var cursorReq = blobStore.openCursor();
+                cursorReq.onsuccess = function(ev) {
+                    var cursor = ev.target.result;
+                    if (!cursor) return; // exhausted — tx commits, oncomplete resolves
+                    if (!keep[cursor.key]) {
+                        cursor.delete();
+                        deleted++;
+                    }
+                    cursor.continue();
+                };
+                cursorReq.onerror = function() { reject(cursorReq.error); };
             };
-            cursorReq.onerror = function() { reject(cursorReq.error); };
+            filesReq.onerror = function() { reject(filesReq.error); };
+            // Resolve only after the tx COMMITS (deletes durable) — this also
+            // fixes the prior resolve-on-cursor-exhaustion that returned the
+            // count before the deletes were committed.
+            tx.oncomplete = function() { resolve(deleted); };
+            tx.onerror = function() { reject(tx.error); };
+            tx.onabort = function() { reject(tx.error || new DOMException('Transaction aborted', 'AbortError')); };
         });
-        return deleted;
     } catch (e) { return 0; }
 }
 
@@ -894,6 +945,10 @@ async function setWorkspaceFile(file) {
         await new Promise(function(resolve, reject) {
             tx.oncomplete = resolve;
             tx.onerror = function() { reject(tx.error); };
+            // A tx can abort with NO bubbled request error (e.g. forced close
+            // during another connection's versionchange) — without this the
+            // awaited Promise would hang forever and stall the write loop.
+            tx.onabort = function() { reject(tx.error || new DOMException('Transaction aborted', 'AbortError')); };
         });
     } catch (e) { console.error('Failed to save workspace file:', e); }
 }
@@ -915,7 +970,7 @@ async function getAllWorkspaceFiles(repo) {
 
 // Returns RAW rows for every workspace file across all clones — post-v13
 // these usually lack inline content (it lives in workspace_blobs). Used by
-// clone's legacy-row scan and gcWorkspaceBlobs.
+// clone's legacy-row scan.
 async function getAllWorkspaceFilesAllRepos() {
     try {
         var database = await openDatabase();

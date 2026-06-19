@@ -49,6 +49,15 @@
     function _broadcastNow() {
         _scheduled = false;
         if (_agentSubscribers.size === 0) return;
+        // PR: don't ship an UNHYDRATED snapshot. Right after an MV3 SW restart
+        // a refreshed panel can subscribe before loadAllSubAgents drains IDB,
+        // so listAll() returns [] transiently. The page's applySubAgentSnapshot
+        // is a FULL-REPLACE, so a records:[] broadcast would WIPE the mirror the
+        // page just rehydrated from its own IDB and blank the workers strip
+        // (intermittent). Same gate as the hello envelope in 130-port-bridge.js;
+        // once loadAll completes it fires _notifyListeners and we broadcast the
+        // real set.
+        if (typeof SubAgents.isLoaded === 'function' && !SubAgents.isLoaded()) return;
         var records;
         try {
             records = SubAgents.listAll();

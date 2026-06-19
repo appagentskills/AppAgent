@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.7
+
+### Features
+- Helper agents now live in the sidebar with live progress, tool count, and a link to open their chat.
+- Documents can be kept private to a chat or shared, and no longer leak into chats they don't belong to.
+
+### Fixes
+- More reliable instance picker: no false "disconnected", click-to-select, no session loss on switch, correct role badge.
+- You won't be asked to approve the same fetch twice.
+
+---
+
 ## v1.1.6
 
 ### Features

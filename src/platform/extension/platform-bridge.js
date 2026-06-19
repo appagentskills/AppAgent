@@ -69,6 +69,77 @@
     // Tracks tokens/users for ALL connected instances, not just the active one
     Platform.instances = []; // [{ url, shortName, token, userName, tabs }]
 
+    // Reconcile a raw probe list with the active session token. The active instance
+    // is the one this panel actually holds a live token for (window.sessionToken); a
+    // tab probe that transiently can't read g_ck (tab discarded by Chrome Memory
+    // Saver, scripting blocked, no readable main-world context) returns an empty token
+    // for it, which would wrongly render it "signed out" in the picker even though we
+    // are connected — and contradicts the header pill, which keys off the session
+    // token. Patch the active entry to reflect the token we actually hold (inserting it
+    // if the probe missed the origin entirely). Mirrors the SW Platform stub's
+    // refreshInstances guard and getTokenForInstance, which already trust the active
+    // session token unconditionally.
+    function _reconcileActiveToken(list) {
+        list = list || [];
+        if (!Platform.instanceUrl || !window.sessionToken) return list;
+        var norm = _normUrl(Platform.instanceUrl);
+        // Carry the active instance's already-resolved identity (roles/userName) forward
+        // from the live registry: the tab probe returns them empty for the active
+        // instance (g_ck unreadable), but _ensureActiveRoles patches Platform.instances
+        // once fetched, so reuse that so the badge survives subsequent refreshes.
+        var prevActive = (Platform.instances || []).filter(function(p) { return p && _normUrl(p.url) === norm; })[0];
+        var seen = false;
+        list.forEach(function(i) {
+            if (i && _normUrl(i.url) === norm) {
+                seen = true;
+                if (!i.token) i.token = window.sessionToken;
+                if ((!i.roles || !i.roles.length) && prevActive && prevActive.roles && prevActive.roles.length) i.roles = prevActive.roles;
+                if (!i.userName && prevActive && prevActive.userName) i.userName = prevActive.userName;
+            }
+        });
+        if (!seen) {
+            list.push({ url: Platform.instanceUrl, tabs: [], userName: (prevActive && prevActive.userName) || '', roles: (prevActive && prevActive.roles) || [], token: window.sessionToken });
+        }
+        return list;
+    }
+
+    // The tab probe can't read g_ck for the active instance, so its roles come back
+    // empty and the privilege badge (admin / security_admin) is missing even though we
+    // hold a usable session token. Fetch the role list directly via window.sessionToken
+    // (same query as the per-row roles panel), patch the registry + the passed list, and
+    // re-render so the badge appears. Guarded to fire at most once per instance so the
+    // re-render can't loop.
+    var _activeRolesFetchedFor = '';
+    function _ensureActiveRoles(inst, instances) {
+        if (!inst || inst.url !== Platform.instanceUrl || !window.sessionToken) return;
+        if (inst.roles && inst.roles.length) return;
+        if (_activeRolesFetchedFor === inst.url) return;
+        _activeRolesFetchedFor = inst.url;
+        var url = inst.url + '/api/now/table/sys_user_has_role'
+            + '?sysparm_query=user=javascript:gs.getUserID()'
+            + '&sysparm_fields=role.name'
+            + '&sysparm_limit=500';
+        _origFetch.call(window, url, {
+            method: 'GET',
+            headers: { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' },
+            credentials: 'include'
+        }).then(function(res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+        }).then(function(data) {
+            var rows = (data && data.result) || [];
+            var roles = [];
+            for (var i = 0; i < rows.length; i++) {
+                var name = rows[i] && rows[i]['role.name'];
+                if (name && roles.indexOf(name) === -1) roles.push(name);
+            }
+            if (!roles.length) return;
+            (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url) p.roles = roles; });
+            inst.roles = roles;
+            if (_instanceDropdown) renderInstanceDropdown(instances);
+        }).catch(function() { _activeRolesFetchedFor = ''; });
+    }
+
     // Refresh the full instance list from background (probes all open SN tabs)
     Platform.refreshInstances = function() {
         return new Promise(function(resolve) {
@@ -77,7 +148,8 @@
                     resolve(Platform.instances);
                     return;
                 }
-                Platform.instances = response.instances.map(function(inst) {
+                var _reconciled = _reconcileActiveToken(response.instances);
+                Platform.instances = _reconciled.map(function(inst) {
                     var host = inst.url.replace(/^https?:\/\//, '').replace(/\/$/, '');
                     return {
                         url: inst.url,
@@ -90,7 +162,7 @@
                         isActive: inst.url === Platform.instanceUrl
                     };
                 });
-                _cacheInstances(response.instances); // keep the picker's instant-open cache warm
+                _cacheInstances(_reconciled); // keep the picker's instant-open cache warm
                 resolve(Platform.instances);
             });
         });
@@ -643,7 +715,7 @@
             chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
                 _refreshInFlightAt = 0;
                 if (chrome.runtime.lastError || !response) return;
-                var instances = response.instances || [];
+                var instances = _reconcileActiveToken(response.instances || []);
                 _cacheInstances(instances);                     // warm + persist (retains closed)
                 if (!_instanceDropdown) return;                 // closed while in flight — cache already warmed
                 var renderList = _withRetainedInstances(instances);
@@ -807,6 +879,14 @@
                         updateSnStatus();
                         return;
                     }
+                    if (isActive && isConnected) {
+                        // Already the current, connected instance — a click just
+                        // confirms the selection. Re-running switchToInstance can
+                        // transiently demote it (no live tab token to hand back), so
+                        // just close the picker instead of round-tripping a switch.
+                        hideInstancePicker();
+                        return;
+                    }
                     if (!isConnected) {
                         // Logged out / closed (no live session): open the instance so
                         // the user can sign in, rather than selecting a dead session.
@@ -831,6 +911,11 @@
                     if (dot) dot.className = 'ext-instance-dot ok';
                 } else if (isActive && !signedOut) {
                     testInstanceConnection(inst, row);
+                }
+                // Active row often has empty roles (probe can't read g_ck) — fetch them
+                // via the session token so the privilege badge shows for it too.
+                if (isActive && !signedOut) {
+                    _ensureActiveRoles(inst, instances);
                 }
             });
         }
@@ -864,6 +949,25 @@
         }, function(response) {
             if (chrome.runtime.lastError) return;
             if (response && response.token) {
+                // Persist the OUTGOING instance's token into the per-origin heartbeat
+                // cache so it stays connected in the picker after we switch away. The
+                // background probe folds instanceTokens entries back in for tab-less or
+                // unreadable-tab instances, and the heartbeat keeps validating them
+                // (dropping them on a hard 401), so this never resurrects a dead session.
+                var _prevUrl = Platform.instanceUrl;
+                var _prevToken = window.sessionToken;
+                if (_prevUrl && _prevToken && _prevUrl !== inst.url) {
+                    try {
+                        chrome.storage.local.get('instanceTokens', function(d) {
+                            var map = (d && d.instanceTokens) || {};
+                            map[_prevUrl] = {
+                                token: _prevToken,
+                                userName: (window.NOW && window.NOW.user_name) || (map[_prevUrl] && map[_prevUrl].userName) || ''
+                            };
+                            chrome.storage.local.set({ instanceTokens: map });
+                        });
+                    } catch (e) {}
+                }
                 window.sessionToken = response.token;
                 Platform.instanceUrl = inst.url;
                 updateSnStatus();

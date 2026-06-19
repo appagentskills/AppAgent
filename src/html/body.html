@@ -131,6 +131,10 @@
                 <!-- Version History Sidebar (inline with messages) -->
                 <div class="version-sidebar" id="version-sidebar">
                     <button class="version-sidebar-close" id="version-sidebar-close" onclick="closeVersionSidebar()" title="Close panel" aria-label="Close version history panel"></button>
+                    <!-- Live sub-agent "Workers" cards (robot icon, tool-call
+                         counter, real-time context circle). Populated by
+                         renderWorkersStrip() in src/js/ui/175-sub-agent-ui.js. -->
+                    <div class="sidebar-workers" id="sidebar-workers" style="display:none;" aria-label="Active sub-agents"></div>
                     <div class="version-history-list" id="version-history-list" role="list" aria-label="Version history">
                         <div class="version-empty">No changes tracked yet</div>
                     </div>
@@ -138,15 +142,8 @@
             </div>
             <div class="input-area" id="input-area" style="visibility:hidden;">
                 <div class="pending-images-container" id="pending-images-container" style="display:none;"></div>
-                <!-- Workers strip: live sub-agent chips for the active chat.
-                     Hidden by default, populated by renderWorkersStrip()
-                     in src/js/ui/175-sub-agent-ui.js. role="region" was
-                     dropped because (a) when the strip is empty/hidden it's
-                     an empty landmark (anti-pattern, some SR still announce
-                     it) and (b) we don't add aria-live, so updates aren't
-                     announced either way. aria-label is kept for the brief
-                     moments the strip is visible. -->
-                <div class="workers-strip" id="workers-strip" style="display:none;" aria-label="Active sub-agents"></div>
+                <!-- Workers UI moved to the version sidebar (#sidebar-workers),
+                     rendered by renderWorkersStrip() in 175-sub-agent-ui.js. -->
                 <div class="chat-actions-row" id="chat-actions-row"></div>
                 <div class="input-container">
                     <textarea id="message-input" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>

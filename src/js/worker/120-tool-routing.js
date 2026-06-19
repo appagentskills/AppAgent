@@ -132,13 +132,21 @@ function armRedispatchBackstop(toolCallId, name) {
     if (name === 'prompt_user') return;
     var pe = _pendingUIToolCalls[toolCallId];
     if (!pe) return;
-    pe._backstopTimer = setTimeout(function() {
+    // Clear any prior backstop on this entry before overwriting so a stale timer
+    // can't survive and later fire against a re-armed entry.
+    if (pe._backstopTimer) clearTimeout(pe._backstopTimer);
+    var _bt = setTimeout(function() {
         var p = _pendingUIToolCalls[toolCallId];
-        if (p && p._backstopTimer) {
+        // Identity guard: only fire if THIS timer is still the entry's active
+        // backstop. A settle (resolvePendingUIToolCall) or a re-arm that replaced/
+        // cleared the timer leaves _bt orphaned — it must NOT reject the (possibly
+        // freshly re-registered) entry it no longer owns.
+        if (p && p._backstopTimer === _bt) {
             delete _pendingUIToolCalls[toolCallId];
             try { p.reject(new Error('panel closed mid-tool; result unrecoverable — not re-executed to avoid duplicate side effects')); } catch (e) {}
         }
     }, REDISPATCH_RECONCILE_TTL_MS);
+    pe._backstopTimer = _bt;
 }
 
 // SWM3-N3: a reconnecting panel re-declared this tool still-inflight, so it's alive
@@ -234,7 +242,11 @@ self._swAdoptPanelInflight = function(payload, port) {
                 // No live awaiter — this is the SW-restart case. Buffer so
                 // the agent loop's re-dispatch finds the result via the
                 // adoption short-circuit in the executeTool wrapper.
-                _panelAdoptedTools[c.toolCallId] = { chatId: c.chatId, name: c.name };
+                // Stamp the adopting port so scheduleAdoptedEviction's live-panel
+                // re-arm protects this buffered result while the panel stays connected
+                // (matches the inflight arm above). Without it the marker is port-less
+                // and the 60s eviction drops a still-valid completed result. (bug #2)
+                _panelAdoptedTools[c.toolCallId] = { chatId: c.chatId, name: c.name, port: port };
                 _adoptedResults[c.toolCallId] = { result: c.result, error: c.error || null };
                 scheduleAdoptedEviction(c.toolCallId); // B2: bound the map if never adopted
             }
@@ -452,6 +464,9 @@ function dispatchUIToolToPort(port, chatId, toolCallId, name, input, resolve, re
 function resolvePendingUIToolCall(toolCallId, result, error) {
     var pending = _pendingUIToolCalls[toolCallId];
     if (pending) {
+        // Settling — clear any redispatch backstop so its timer can't later fire
+        // against a re-registered entry for the same (stable) toolCallId.
+        if (pending._backstopTimer) { clearTimeout(pending._backstopTimer); pending._backstopTimer = null; }
         delete _pendingUIToolCalls[toolCallId];
         if (error) {
             try { pending.reject(error); } catch (e) {}

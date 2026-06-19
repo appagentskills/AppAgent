@@ -199,7 +199,26 @@ var chatWidgets = {}; // Track widgets per chat: { chatId: [{ id, title, html, h
 var isFollowingScroll = true; // Track if user is following scroll (turned off when user scrolls away from bottom)
 var streamingDisplayLen = {}; // Buffered display length keyed by chatId+':'+msgIndex (B1: per-chat to avoid cross-chat index collisions during concurrent streaming)
 var STREAM_CHARS_PER_TICK = 40; // Base chars revealed per 50ms tick (~800 chars/sec readable pace)
-var lastLargeResponse = null; // Store the last large API response for Agent manipulation via js_eval
+var lastLargeResponse = null; // DEPRECATED: retained only for back-compat (always null now); superseded by lastLargeResponseByChatId
+var lastLargeResponseByChatId = {}; // CONC-FIX: last large skill-tool response keyed by chatId, so two chats running concurrently don't overwrite each other's js_eval data (mirrors the streamingDisplayLen per-chat pattern above). Read into the js_eval sandbox global `lastLargeResponse` per owning chat.
+var LAST_LARGE_RESPONSE_MAX_CHATS = 50; // LEAK-FIX: cap distinct-chat slots. The replaced single global was self-bounding (one slot, overwrite-in-place); the per-chat map otherwise grows one full untruncated response per chat for the whole bundle lifetime. Oldest-inserted slot is evicted past the cap.
+// Bounded setter for lastLargeResponseByChatId. Overwrites in place for an
+// existing chat; when adding a NEW chat key past the cap, evicts the
+// oldest-inserted entry (string keys preserve insertion order, so
+// Object.keys()[0] is the oldest). Defined in the shared bundle so BOTH the
+// page realm and the service-worker realm (where headless sub-agents
+// accumulate slots) self-prune. Falsy chatId is a no-op, matching the
+// `if (chatId)` guards at the call sites.
+function setLastLargeResponse(chatId, value) {
+    if (!chatId) return;
+    if (!Object.prototype.hasOwnProperty.call(lastLargeResponseByChatId, chatId)) {
+        var llrKeys = Object.keys(lastLargeResponseByChatId);
+        if (llrKeys.length >= LAST_LARGE_RESPONSE_MAX_CHATS) {
+            delete lastLargeResponseByChatId[llrKeys[0]];
+        }
+    }
+    lastLargeResponseByChatId[chatId] = value;
+}
 var lastUserScrollTime = 0; // Track when user last scrolled (for debounce)
 var SCROLL_DEBOUNCE_MS = 1000; // 1 second debounce before auto-scroll can take over
 var compactToolCalls = true; // Display option: collapse all tool calls in one area

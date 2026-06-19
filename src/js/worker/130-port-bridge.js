@@ -158,6 +158,11 @@ function _unregisterPanel(port) {
         Object.keys(_pendingUIToolCalls).forEach(function(id) {
             var entry = _pendingUIToolCalls[id];
             if (!entry || entry.port !== port) return;
+            // Defensive: clear any redispatch backstop on the entry being torn down so
+            // its timer can't later fire against a re-registered entry for the same id.
+            // (Backstop entries are normally port-less and not matched here, but this
+            // keeps the invariant safe if that ever changes.) (bug #3)
+            if (entry._backstopTimer) { clearTimeout(entry._backstopTimer); entry._backstopTimer = null; }
             // Re-park only entries that carry enough metadata to be REPLAYED to a
             // fresh panel (a real UI tool call: name + input). Approval-prompt
             // entries record .port for disconnect-visibility but intentionally

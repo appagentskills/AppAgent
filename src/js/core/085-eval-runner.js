@@ -121,6 +121,13 @@ async function executeEvalRunner(args, options) {
             var task2 = evalRunnerGetTask(spec3, args.task_id);
             if (!task2) return { success: false, error: 'unknown task_id: ' + args.task_id };
             var pre = EVAL_RUNNER_PRE_SLEEP_MS[task2.id] || 0;
+            // Verifier scripts EMIT their verdict via gs.print(JSON.stringify(...)),
+            // they do NOT `return` it (same contract as setup_script). Rewrite
+            // gs.print(...) -> __emit(...) so the wrapper captures the verdict into
+            // __verifier_out. A verifier that `return`s a value is still honored via
+            // the IIFE return as a fallback.
+            var __vscript = (task2.verifier_script || "__emit(JSON.stringify({pass:false,expected:'',actual:'no verifier'}));");
+            __vscript = __vscript.replace(/gs\s*\.\s*print\s*\(/g, '__emit(');
             var verifyScript =
                 "var pName = '" + EVAL_RUNNER_RUNS_PROP + "';\n" +
                 "var gr = new GlideRecord('sys_properties');\n" +
@@ -137,9 +144,11 @@ async function executeEvalRunner(args, options) {
                 "  if (found) { gr.value = JSON.stringify(runs); gr.update(); }\n" +
                 "  else { gr.initialize(); gr.name = pName; gr.value = JSON.stringify(runs); gr.insert(); }\n" +
                 (pre ? "  gs.sleep(" + pre + ");\n" : "") +
-                "  var __verifier_out = '';\n" +
+                "  var __verifier_out = JSON.stringify({pass:false, expected:'', actual:'verifier produced no output'});\n" +
+                "  function __emit(__x){ __verifier_out = String(__x); }\n" +
                 "  try {\n" +
-                "    __verifier_out = (function() {\n" + (task2.verifier_script || "return JSON.stringify({pass:false,expected:'',actual:'no verifier'});") + "\n    })();\n" +
+                "    var __ret = (function() {\n" + __vscript + "\n    })();\n" +
+                "    if (__ret !== undefined && __ret !== null && String(__ret).length) { __verifier_out = String(__ret); }\n" +
                 "  } catch (e) {\n" +
                 "    __verifier_out = JSON.stringify({pass: false, expected: '', actual: 'Error during verification: ' + e.message});\n" +
                 "  }\n" +

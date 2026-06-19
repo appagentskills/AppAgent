@@ -584,12 +584,138 @@ function renderSubAgentBreadcrumb(chat) {
     return '<div class="sub-agent-breadcrumb" data-depth="' + depth + '" style="--depth:' + depth + '" title="Sub-agent of: ' + escapeHtml(tip) + '">\u21b3 ' + parts.join(' \u203a ') + '</div>';
 }
 
-// ---------- Workers strip (above chat input in parent chats) ----------
-// Renders chips for every live sub owned by the active chat. Click a chip
-// to open the sub's transcript. State drives the pill color.
+// ---------- Workers panel (in the version sidebar, like artifacts) ----------
+// Renders a card for every live sub owned by the active chat. Each card shows
+// a robot icon, the sub's name + state, a live tool-call counter, and a
+// real-time context-length circle (mirrors the main chat's context circle —
+// see updateContextIndicator in 240-layout.js). Click a card to open the
+// sub's transcript. Moved here from the old above-input "Workers strip".
+
+// Context limit for the active model (same lookup as updateContextIndicator).
+function _subContextLimit() {
+    try {
+        var provider = (typeof currentProvider !== 'undefined' && typeof getProviderById === 'function' && getProviderById(currentProvider)) ? getProviderById(currentProvider) : null;
+        return (provider && provider.context_length) || (provider && provider.maxTokens ? provider.maxTokens * 2 : 128000) || 128000;
+    } catch (_) { return 128000; }
+}
+
+// Derive a sub-agent's current context size from its chat. Sub-agent chats
+// live in the same global `chats` map as the parent, so we read the last
+// non-aggregate assistant message's input_tokens — exactly the value the main
+// context circle uses. Returns { tokens, pct }.
+function _subContextInfo(chatId) {
+    var tokens = 0;
+    var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (c && c.messages) {
+        for (var i = c.messages.length - 1; i >= 0; i--) {
+            var m = c.messages[i];
+            if (m && m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) {
+                tokens = m.metrics.input_tokens;
+                break;
+            }
+        }
+    }
+    var limit = _subContextLimit();
+    var pct = (limit > 0) ? Math.min(100, Math.round((tokens / limit) * 100)) : 0;
+    return { tokens: tokens, pct: pct };
+}
+
+function _fmtTokens(t) {
+    t = t || 0;
+    return t >= 1000 ? (Math.round(t / 1000) + 'k') : String(t);
+}
+
+// Lightweight per-tick refresh of the live metrics (context circle + tool-call
+// counter) on already-rendered worker cards, WITHOUT rebuilding their innerHTML
+// — so the running-dot pulse and the circle's stroke transition don't restart
+// on every heartbeat. Full rebuilds (renderWorkersStrip) only happen when the
+// worker set or a state actually changes (gated by _chipKey in _doRender).
+function updateSidebarWorkerMetrics() {
+    var panel = document.getElementById('sidebar-workers');
+    if (!panel || panel.style.display === 'none') return;
+    var cards = panel.querySelectorAll('.worker-card[data-worker-chat]');
+    for (var i = 0; i < cards.length; i++) {
+        var card = cards[i];
+        var ctx = _subContextInfo(card.getAttribute('data-worker-chat'));
+        var fill = card.querySelector('[data-worker-ctx-fill]');
+        if (fill) fill.setAttribute('stroke-dasharray', ctx.pct + ', 100');
+        var pctEl = card.querySelector('[data-worker-ctx-pct]');
+        if (pctEl) pctEl.textContent = ctx.tokens ? (ctx.pct + '%') : '\u2014';
+        var ctxWrap = card.querySelector('[data-worker-ctx]');
+        if (ctxWrap) {
+            ctxWrap.classList.toggle('worker-ctx-danger', ctx.pct >= 90);
+            ctxWrap.classList.toggle('worker-ctx-warning', ctx.pct >= 70 && ctx.pct < 90);
+        }
+        // Tool-call counter — authoritative live value from the registry record.
+        var toolsEl = card.querySelector('[data-worker-tools]');
+        if (toolsEl) {
+            var aid = card.getAttribute('data-worker-toggle');
+            var rec = (aid && typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(aid) : null;
+            if (rec) {
+                var used = rec.tool_calls_used || 0;
+                var cap = rec.max_tool_calls || '?';
+                toolsEl.innerHTML = escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools';
+            }
+        }
+        // Live-refresh an expanded card's progress panel when the sub's
+        // action_state advances — keyed on `at` so we rebuild only on a real
+        // progress change, not on every heartbeat tick.
+        var wkAid = card.getAttribute('data-worker-toggle');
+        if (wkAid && _workerExpanded[wkAid]) {
+            var wkProg = card.nextElementSibling;
+            if (wkProg && wkProg.classList && wkProg.classList.contains('worker-card-progress')) {
+                var wkRec = (typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(wkAid) : null;
+                var wkAt = String(wkRec && wkRec.action_state ? (wkRec.action_state.at || 0) : 0);
+                if (wkProg.getAttribute('data-prog-at') !== wkAt) {
+                    wkProg.innerHTML = _workerProgressInner(wkRec);
+                    wkProg.setAttribute('data-prog-at', wkAt);
+                }
+            }
+        }
+    }
+}
+
+// Expanded-state memory for worker cards, keyed by agent_id, so the inline
+// progress panel a user opens survives strip rebuilds (renderWorkersStrip
+// replaces innerHTML on every state change).
+var _workerExpanded = Object.create(null);
+
+// Build the inner HTML of a worker card's expandable progress panel from the
+// sub's live update_action_state snapshot (rec.action_state). Reuses the same
+// .sub-report-action-state / .sub-report-task markup the parent's sub_report
+// card uses, so the checklist is already themed. Always appends an "open
+// transcript" link (data-sub-agent-reveal -> revealSubAgentChat).
+function _workerProgressInner(rec) {
+    var inner = rec ? _subActionStateHtml(rec.action_state) : '';
+    if (!inner) inner = '<div class="worker-progress-empty">No progress reported yet.</div>';
+    var aid = rec ? (rec.agent_id || '') : '';
+    inner += '<a class="worker-progress-open" data-sub-agent-reveal="' + escapeHtml(aid) + '" role="button" tabindex="0" title="Open chat">' +
+        '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
+        '<span>open chat</span></a>';
+    return inner;
+}
+
+// Toggle a worker card's inline progress panel. Re-renders the panel from the
+// live registry record on open so it shows current progress even if it changed
+// while the card was collapsed.
+function toggleWorkerProgress(agentId, cardEl) {
+    if (!cardEl) return;
+    var panel = cardEl.nextElementSibling;
+    if (!panel || !panel.classList || !panel.classList.contains('worker-card-progress')) return;
+    var open = !_workerExpanded[agentId];
+    _workerExpanded[agentId] = open;
+    if (open) {
+        var rec = (typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(agentId) : null;
+        panel.innerHTML = _workerProgressInner(rec);
+        panel.setAttribute('data-prog-at', String(rec && rec.action_state ? (rec.action_state.at || 0) : 0));
+    }
+    panel.hidden = !open;
+    cardEl.classList.toggle('worker-card-expanded', open);
+    cardEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
 
 function renderWorkersStrip() {
-    var stripEl = document.getElementById('workers-strip');
+    var stripEl = document.getElementById('sidebar-workers');
     if (!stripEl) return;
     if (typeof SubAgents === 'undefined' || !SubAgents.listAll) { stripEl.innerHTML = ''; stripEl.style.display = 'none'; return; }
     if (typeof currentChatId === 'undefined' || !currentChatId) { stripEl.innerHTML = ''; stripEl.style.display = 'none'; return; }
@@ -645,20 +771,50 @@ function renderWorkersStrip() {
         // instead of marching off-screen on pathological chains.
         var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
         var renderDepth = Math.min(depth, 3);
+        var used = (r.tool_calls_used || 0);
+        var cap = r.max_tool_calls || '?';
+        var ctx = _subContextInfo(r.chat_id);
+        var ctxClass = ctx.pct >= 90 ? ' worker-ctx-danger' : (ctx.pct >= 70 ? ' worker-ctx-warning' : '');
+        var tokTip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
+        var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
         // Inline onclick removed (escapeHtml does not escape single quotes,
         // so an attacker-controlled or even unusual id could break out of
         // the JS string). Delegated click listener handles `data-sub-agent-reveal`.
-        return '<button class="worker-chip worker-' + stateClass + '" ' +
-            'data-sub-agent-reveal="' + escapeHtml(r.agent_id) + '" ' +
-            'data-depth="' + renderDepth + '" ' +
-            'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(r.tool_calls_used || 0)) + '/' + escapeHtml(String(r.max_tool_calls || '?')) + ' tool calls \u2014 depth ' + escapeHtml(String(depth)) + '">' +
-            '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
-            '<span class="worker-name">' + escapeHtml(label) + '</span>' +
-            '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
-        '</button>';
+        var wkExpanded = !!_workerExpanded[r.agent_id];
+        var progAt = r.action_state ? (r.action_state.at || 0) : 0;
+        return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
+            '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
+            'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
+            'data-worker-chat="' + escapeHtml(r.chat_id || '') + '" ' +
+            'aria-expanded="' + (wkExpanded ? 'true' : 'false') + '" ' +
+            'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(used)) + '/' + escapeHtml(String(cap)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
+            '<span class="worker-card-icon" aria-hidden="true">' + botIcon + '</span>' +
+            '<span class="worker-card-main">' +
+                '<span class="worker-card-row">' +
+                    '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
+                    '<span class="worker-name">' + escapeHtml(label) + '</span>' +
+                '</span>' +
+                '<span class="worker-card-row worker-card-sub">' +
+                    '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
+                    '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools</span>' +
+                '</span>' +
+            '</span>' +
+            '<span class="worker-ctx' + ctxClass + '" data-worker-ctx>' +
+                '<svg class="worker-ctx-circle" viewBox="0 0 36 36">' +
+                    '<path class="worker-ctx-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
+                    '<path class="worker-ctx-fill" data-worker-ctx-fill stroke-dasharray="' + ctx.pct + ', 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
+                '</svg>' +
+                '<span class="worker-ctx-pct" data-worker-ctx-pct>' + (ctx.tokens ? ctx.pct + '%' : '\u2014') + '</span>' +
+            '</span>' +
+            '<span class="worker-card-caret" aria-hidden="true">\u203a</span>' +
+        '</button>' +
+        '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(r.agent_id) + '" data-prog-at="' + progAt + '"' + (wkExpanded ? '' : ' hidden') + '>' +
+            (wkExpanded ? _workerProgressInner(r) : '') +
+        '</div>' +
+        '</div>';
     }).join('');
-    stripEl.innerHTML = '<div class="workers-strip-label">Workers (' + mine.length + ')</div>' +
-        '<div class="workers-strip-chips">' + chips + '</div>';
+    stripEl.innerHTML = '<div class="sidebar-workers-header">Workers (' + mine.length + ')</div>' +
+        '<div class="sidebar-workers-list">' + chips + '</div>';
     stripEl.style.display = '';
 }
 
@@ -763,6 +919,11 @@ function renderWorkersStrip() {
                 _lastChipKey = key;
                 renderWorkersStrip();
                 if (typeof renderChatList === 'function') renderChatList();
+            } else {
+                // Worker set + states unchanged (a heartbeat tick: tool counter
+                // ticked or context grew) — refresh only the live metrics so the
+                // cards' pulse/circle animations don't restart on every tick.
+                updateSidebarWorkerMetrics();
             }
         } catch (_) {}
         // Re-render messages only when a sub_report was actually appended
@@ -827,6 +988,16 @@ function renderWorkersStrip() {
             var t = evt.target;
             while (t && t !== document) {
                 if (t.getAttribute) {
+                    // Worker card click -> toggle its inline progress panel
+                    // (update_action_state tasks). Checked before the reveal
+                    // branch; the "open chat" link inside the panel carries
+                    // data-sub-agent-reveal and falls through to it.
+                    var wkToggle = t.getAttribute('data-worker-toggle');
+                    if (wkToggle) {
+                        toggleWorkerProgress(wkToggle, t);
+                        evt.preventDefault();
+                        return;
+                    }
                     // data-sub-agent-reveal carries an agent_id (resolved
                     // via registry); data-sub-chat-id carries a direct
                     // chat id (used for sub_report links so they keep

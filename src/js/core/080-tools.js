@@ -41,11 +41,11 @@ var TOOLS = [
                     attachment_table_name: { type: 'string', description: 'Target table for attachment, e.g. "incident"' },
                     attachment_table_sys_id: { type: 'string', description: 'sys_id of the record to attach the file to' },
                     attachment_content_type: { type: 'string', description: 'MIME type of the attachment, e.g. "image/png". Auto-detected from file name if not provided.' },
-                    instance: { type: 'string', description: 'Target a specific ServiceNow instance by short name (e.g. "dev12345") or URL. Defaults to the active instance. Use list_instances to see available instances.' },
+                    instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name (e.g. "dev12345") or URL. Use list_instances to see available instances.' },
                     confirm: { type: 'boolean', description: 'Set to true for write operations (POST/PUT/PATCH/DELETE) that you think the user should review before execution. When true, the user will be prompted to approve. Omit or set false for routine operations.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
-                required: ['method', 'table', 'scope']
+                required: ['method', 'table', 'scope', 'instance']
             }
         }
     },
@@ -61,11 +61,11 @@ var TOOLS = [
                     scope: { type: 'string', description: 'Application scope to execute in (e.g. "global" or a scope name like "x_snc_myapp"). Default: global.' },
                     record_for_rollback: { type: 'boolean', description: 'If true (default), records changes for rollback via sys_script_execution_history.' },
                     sandbox: { type: 'boolean', description: 'If true, runs in sandboxed mode (limits some operations). Default: false.' },
-                    instance: { type: 'string', description: 'Target a specific ServiceNow instance by short name. Defaults to the active instance.' },
+                    instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name. Use list_instances to see available instances.' },
                     confirm: { type: 'boolean', description: 'Set to true when you think the user should review before execution. Often appropriate for this tool.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
-                required: ['script']
+                required: ['script', 'instance']
             }
         }
     },
@@ -92,11 +92,11 @@ var TOOLS = [
                             required: ['find', 'replace']
                         }
                     },
-                    instance: { type: 'string', description: 'Target a specific ServiceNow instance by short name (e.g. "dev12345") or URL. Defaults to the active instance.' },
+                    instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name (e.g. "dev12345") or URL. Use list_instances to see available instances.' },
                     confirm: { type: 'boolean', description: 'Set to true when you think the user should review this code edit before execution. Omit or set false for routine changes.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
-                required: ['table', 'sys_id', 'field', 'edits']
+                required: ['table', 'sys_id', 'field', 'edits', 'instance']
             }
         }
     },
@@ -141,7 +141,8 @@ var TOOLS = [
                     className: { type: 'string', description: 'For set_style action: add/remove/toggle a class - "add:className", "remove:className", or "toggle:className"' },
                     widget_id: { type: 'string', description: 'Target a specific html_widget by its ID. Required for open_widget, edit_html. Optional for get_visible_text, get_dom, click, fill to target widget instead of browser.' },
                     user: { type: 'string', description: 'For impersonate action: username, display name, or sys_id of user to impersonate. Use "stop" to end impersonation.' },
-                    instance: { type: 'string', description: 'Target a specific ServiceNow instance by short name for navigate action. Finds/creates a tab on that instance.' },
+                    instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name. For navigate, the tab is found/created/reused on this instance. Use list_instances to see available instances.' },
+                    tab_id: { type: 'number', description: 'Optionally target a specific open Chrome tab by id (from list_instances activeTabs[].id). For navigate: navigates THAT exact tab, bypassing the safeguard that avoids reusing a tab already in use. For other actions: pins subsequent browser actions in this chat to that tab. A non-existent id is an error.' },
                     edits: {
                         type: 'array',
                         description: 'For edit_html action: array of edit operations to apply to widget HTML.',
@@ -157,7 +158,7 @@ var TOOLS = [
                     confirm: { type: 'boolean', description: 'Set to true for actions that modify the instance (click, fill, impersonate, dispatch_event, select_option) when you think the user should review before execution. Omit or set false for read-only actions.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
-                required: ['action']
+                required: ['action', 'instance']
             }
         }
     },
@@ -603,7 +604,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'document',
-            description: 'Create, read, update, and manage Smart Documents. Documents are persistent, versioned markdown files that render inline in chat. They support embedded display templates (table, chart, etc.) and non-blocking user prompts. Multiple references to the same document always show the latest version. Documents persist across chats and are accessible from any conversation.\n\nActions:\n- create: Create a new document. Args: title, content (markdown), prompts? (non-blocking questions).\n- update: Update document content/title (creates new version). Args: doc_id, content?, title?, prompts?.\n- edit: Search-and-replace edits on document content (creates new version). Args: doc_id, edits (array of {find, replace}). Each find must be unique in the document.\n- read: Read current version + prompt responses. Args: doc_id.\n- list: List all documents.\n- list_versions: List version history. Args: doc_id.\n- read_version: Read a specific version. Args: doc_id, version.\n- delete: Delete a document. Args: doc_id.\n\nTo embed display templates: call the display tool first, get the placeholder, include it in the document content.\nTo add prompts: pass a prompts array with fields (same schema as prompt_user fields).\nThe user can edit documents inline — read the document to see their changes.',
+            description: 'Create, read, update, and manage Smart Documents. Documents are persistent, versioned markdown files that render inline in chat. They support embedded display templates (table, chart, etc.) and non-blocking user prompts. Multiple references to the same document always show the latest version.\n\nVisibility: \'scope\' is \'shared\' by default (global) or \'chat\' (private to the creating chat); fixed at creation.\n\nActions:\n- create: Create a new document. Args: title, content (markdown), scope? (\'shared\' default | \'chat\'), prompts? (non-blocking questions).\n- update: Update document content/title (creates new version). Args: doc_id, content?, title?, prompts?.\n- edit: Search-and-replace edits on document content (creates new version). Args: doc_id, edits (array of {find, replace}). Each find must be unique in the document.\n- read: Read current version + prompt responses. Args: doc_id.\n- list: List documents visible to you.\n- list_versions: List version history. Args: doc_id.\n- read_version: Read a specific version. Args: doc_id, version.\n- delete: Delete a document. Args: doc_id.\n\nTo embed display templates: call the display tool first, get the placeholder, include it in the document content.\nTo add prompts: pass a prompts array with fields (same schema as prompt_user fields).\nThe user can edit documents inline — read the document to see their changes.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -611,6 +612,7 @@ var TOOLS = [
                     doc_id: { type: 'string', description: 'Document ID (for update, read, list_versions, read_version, delete)' },
                     title: { type: 'string', description: 'Document title (for create, update)' },
                     content: { type: 'string', description: 'Markdown content (for create, update)' },
+                    scope: { type: 'string', enum: ['shared', 'chat'], description: 'Create visibility: \'shared\' (default, global) or \'chat\' (private to the creating chat). Fixed at creation.' },
                     version: { type: 'number', description: 'Version number (for read_version)' },
                     edits: { type: 'array', description: 'For edit action: search-and-replace operations. Each find must be unique in the document.', items: { type: 'object', properties: { find: { type: 'string', description: 'Unique text to find' }, replace: { type: 'string', description: 'Replacement text' } }, required: ['find', 'replace'] } },
                     prompts: { type: 'array', description: 'Non-blocking prompts below document. Array of {title?, description?, fields: [{name, type, label, options?, placeholder?, value?}]}', items: { type: 'object' } },

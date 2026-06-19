@@ -2205,17 +2205,35 @@ async function heartbeatAllInstances() {
         var origin = origins[i];
         var tab = byOrigin[origin];
         var cached = cache[origin];
-        var token = (cached && cached.token) || '';
-        var source = token ? 'cache' : '';
+        var token = '';
+        var source = '';
 
-        // No cached token? Try to read from a live tab.
-        if (!token && tab) {
-            token = await readTokenFromTab(tab);
-            if (token) {
+        // Prefer the LIVE tab's current g_ck over the cached token. After a
+        // logoff -> logon, ServiceNow mints a brand-new session + g_ck on the
+        // tab, but our per-origin cache still holds the OLD token. Pinging
+        // touch-session with that stale token — especially with
+        // X-WantAuthSessionNotifications below — makes ServiceNow broadcast a
+        // "you have been logged off" notification to the open tab even though
+        // the user just signed back in. Reading the tab first keeps the
+        // heartbeat on the session's current token and refreshes the cache.
+        if (tab) {
+            var live = await readTokenFromTab(tab);
+            if (live) {
+                token = live;
                 source = 'tab';
-                cache[origin] = { token: token, userName: (cached && cached.userName) || '', updated: Date.now() };
-                cacheDirty = true;
+                if (!cached || cached.token !== live) {
+                    cache[origin] = { token: live, userName: (cached && cached.userName) || '', updated: Date.now() };
+                    cacheDirty = true;
+                }
             }
+        }
+
+        // Fall back to the cached heartbeat token only when no live tab yielded
+        // one (all tabs closed, or discarded by Chrome's Memory Saver — no JS
+        // context to probe). This keeps tab-less instances pinging/connected.
+        if (!token && cached && cached.token) {
+            token = cached.token;
+            source = 'cache';
         }
 
         if (!token) { results.push({ origin: origin, status: 'no-token' }); continue; }

@@ -116,6 +116,7 @@ Platform.instances = [];
 
 Platform.refreshInstances = async function() {
     if (typeof self.snGetInstancesDetailed !== 'function') return Platform.instances;
+    var prev = Platform.instances || [];
     var raw = await self.snGetInstancesDetailed();
     Platform.instances = raw.map(function(inst) {
         var host = inst.url.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -130,6 +131,40 @@ Platform.refreshInstances = async function() {
             isActive: inst.url === Platform.instanceUrl
         };
     });
+    // Guard: the active instance is the one this service worker is actively making
+    // authenticated API calls against via _workerSessionToken. A tab probe that
+    // transiently fails to read g_ck (tab discarded by Chrome Memory Saver, scripting
+    // blocked, or no readable main-world context) returns an empty token, which would
+    // wrongly flip our live session to "disconnected" in list_instances even though we
+    // are demonstrably using it. Never let the probe override a session we hold a token
+    // for: restore the worker token (carrying the prior identity forward) for the
+    // active instance. This matches getTokenForInstance(), which already trusts
+    // _workerSessionToken for the active instance unconditionally.
+    if (Platform.instanceUrl && _workerSessionToken) {
+        var _prevActive = prev.filter(function(p) { return p && p.url === Platform.instanceUrl; })[0];
+        var _activeEntry = Platform.instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
+        if (_activeEntry) {
+            if (!_activeEntry.token) {
+                _activeEntry.token = _workerSessionToken;
+                if (!_activeEntry.userName && _prevActive) _activeEntry.userName = _prevActive.userName || '';
+                if ((!_activeEntry.roles || !_activeEntry.roles.length) && _prevActive) _activeEntry.roles = _prevActive.roles || [];
+            }
+        } else {
+            // Active origin wasn't even in the probe (no readable tab + no cached token
+            // entry). We still hold a usable session for it — surface it as connected.
+            var _ah = Platform.instanceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+            Platform.instances.push({
+                url: Platform.instanceUrl,
+                shortName: _ah.split('.')[0],
+                host: _ah,
+                token: _workerSessionToken,
+                userName: _prevActive ? (_prevActive.userName || '') : '',
+                roles: _prevActive ? (_prevActive.roles || []) : [],
+                tabs: [],
+                isActive: true
+            });
+        }
+    }
     return Platform.instances;
 };
 

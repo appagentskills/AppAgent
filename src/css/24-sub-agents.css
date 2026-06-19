@@ -476,6 +476,173 @@
     letter-spacing: 0.04em;
 }
 
+/* ---------- Workers panel (in the version sidebar, like artifacts) ----------
+   Moved here from the old above-input "Workers strip". Each sub-agent gets a
+   card with a robot icon, name + state, a live tool-call counter, and a
+   real-time context-length ring (mirrors the main chat's .context-circle). */
+.sidebar-workers {
+    flex-shrink: 0;
+    /* Top padding clears the absolutely-positioned .version-sidebar-close
+       button (top:8px, 28px tall) — same trick .version-history-list uses. */
+    padding: var(--space-12, 40px) var(--space-4, 8px) var(--space-3, 6px);
+    border-bottom: 1px solid var(--border, #e1e4ea);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3, 6px);
+}
+.sidebar-workers-header {
+    /* Keep the header text clear of the close button on the right. */
+    padding-right: 32px;
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-semibold, 600);
+    color: var(--text-muted, #6b7280);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.sidebar-workers-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3, 6px);
+    /* Cap the workers list so a long roster scrolls internally instead of
+       growing tall and squeezing the parent's progress / version history
+       below it in the version sidebar. */
+    max-height: 34vh;
+    min-height: 88px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 2px;
+}
+.worker-card {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4, 8px);
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: var(--radius-md, 8px);
+    border: 1px solid var(--border, #e1e4ea);
+    background: var(--bg-white, #fff);
+    color: var(--text-primary, #1f2328);
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    transition: background 0.12s ease, border-color 0.12s ease;
+}
+.worker-card:hover { background: var(--bg-hover, #e7e9ee); }
+.worker-card.worker-running { border-color: var(--success, #2da44e); }
+.worker-card.worker-running .worker-state { color: var(--success, #2da44e); }
+.worker-card.worker-errored { border-color: var(--danger, #cf222e); }
+.worker-card.worker-errored .worker-state { color: var(--danger, #cf222e); }
+.worker-card-wrap[data-depth="2"] { margin-left: 10px; }
+.worker-card-wrap[data-depth="3"] { margin-left: 20px; }
+.worker-card-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-muted, #6b7280);
+}
+.worker-card.worker-running .worker-card-icon { color: var(--success, #2da44e); }
+.worker-card-icon .ui-icon { width: 18px; height: 18px; }
+.worker-card-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+.worker-card-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.worker-card .worker-name {
+    font-size: var(--text-caption, 12px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.worker-card-sub { gap: 8px; }
+.worker-tools {
+    font-size: var(--text-xs, 10px);
+    color: var(--text-muted, #6b7280);
+    white-space: nowrap;
+}
+.worker-tools-sep { opacity: 0.55; margin: 0 1px; }
+/* Per-sub context-length ring — mirrors .context-circle in 06-input.css. */
+.worker-ctx {
+    position: relative;
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.worker-ctx-circle { width: 30px; height: 30px; transform: rotate(-90deg); }
+.worker-ctx-bg { fill: none; stroke: var(--secondary-border, #e1e4ea); stroke-width: 3.5; }
+.worker-ctx-fill {
+    fill: none;
+    stroke: var(--primary, #2f81f7);
+    stroke-width: 3.5;
+    stroke-linecap: round;
+    transition: stroke-dasharray 0.3s ease;
+}
+.worker-ctx.worker-ctx-warning .worker-ctx-fill { stroke: var(--warning, #d29922); }
+.worker-ctx.worker-ctx-danger  .worker-ctx-fill { stroke: var(--danger, #cf222e); }
+.worker-ctx-pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    font-weight: var(--font-semibold, 600);
+    color: var(--text-muted, #6b7280);
+}
+
+/* ---------- Worker card expand-to-progress ----------
+   The card is a disclosure button; clicking it toggles an inline panel that
+   shows the sub's update_action_state progress (label + tasks checklist),
+   reusing the themed .sub-report-action-state markup. */
+.worker-card-wrap { display: block; }
+.worker-card-caret {
+    flex-shrink: 0;
+    margin-left: 2px;
+    color: var(--text-muted, #6b7280);
+    font-size: 13px;
+    line-height: 1;
+    transition: transform 0.15s ease;
+}
+.worker-card.worker-card-expanded .worker-card-caret { transform: rotate(90deg); }
+.worker-card.worker-card-expanded {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+.worker-card-progress {
+    margin-top: -1px;
+    padding: 8px 10px;
+    border: 1px solid var(--border, #e1e4ea);
+    border-top: none;
+    border-radius: 0 0 var(--radius-md, 8px) var(--radius-md, 8px);
+    background: var(--bg-light, #f6f8fa);
+}
+.worker-card-progress[hidden] { display: none; }
+.worker-card-progress .sub-report-action-state { margin: 0; }
+.worker-progress-empty {
+    font-size: var(--text-xs, 11px);
+    color: var(--text-muted, #6b7280);
+    font-style: italic;
+}
+.worker-progress-open {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 6px;
+    font-size: var(--text-xs, 11px);
+    font-weight: var(--font-semibold, 600);
+    color: var(--primary, #2f81f7);
+    cursor: pointer;
+}
+.worker-progress-open .worker-progress-open-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.worker-progress-open:hover { text-decoration: underline; }
+
 /* ---------- Dark theme overrides ----------
    Most colors already come from themed tokens (--bg-light, --bg-white,
    --bg-hover, --text-primary, --text-muted, --border) which are
@@ -513,6 +680,20 @@
 }
 :root[data-theme="dark"] .worker-chip:hover {
     background: var(--bg-hover, #1f2228);
+}
+:root[data-theme="dark"] .sidebar-workers { border-color: var(--border, #2e3138); }
+:root[data-theme="dark"] .worker-card {
+    border-color: var(--border-dark, #3b3f48);
+    background: var(--bg-secondary, #1a1d24);
+}
+:root[data-theme="dark"] .worker-card:hover { background: var(--bg-hover, #1f2228); }
+:root[data-theme="dark"] .worker-card.worker-running { border-color: var(--success, #2da44e); }
+:root[data-theme="dark"] .worker-card.worker-errored { border-color: var(--danger, #cf222e); }
+:root[data-theme="dark"] .worker-card-wrap[data-depth="2"] .worker-card,
+:root[data-theme="dark"] .worker-card-wrap[data-depth="3"] .worker-card { border-color: var(--border, #2e3138); }
+:root[data-theme="dark"] .worker-card-progress {
+    border-color: var(--border-dark, #3b3f48);
+    background: var(--bg-secondary, #1a1d24);
 }
 :root[data-theme="dark"] .worker-chip[data-depth="2"],
 :root[data-theme="dark"] .worker-chip[data-depth="3"] {

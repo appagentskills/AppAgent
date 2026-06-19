@@ -966,7 +966,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                             // inside the sandbox can eager-render attached to this
                             // tool's result slot. See executeDisplay's eager-render path.
                             parentToolCallId: options && options.toolCallId,
-                            globals: { lastLargeResponse: lastLargeResponse }
+                            globals: { lastLargeResponse: (chatId && lastLargeResponseByChatId[chatId]) || null } // CONC-FIX: this chat's own slot, not the shared global
                         }, 5 * 60 * 1000),
                         new Promise(function(_, rej) {
                             var _swLast = Date.now();
@@ -1062,7 +1062,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
 
                     // Sandbox ready -> send code to execute
                     if (e.data && e.data.type === 'sandboxReady') {
-                        sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: sanitizedCode, globals: { lastLargeResponse: lastLargeResponse } }, '*');
+                        sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: sanitizedCode, globals: { lastLargeResponse: (chatId && lastLargeResponseByChatId[chatId]) || null } }, '*'); // CONC-FIX: this chat's own slot, not the shared global
                     } else if (e.data && e.data.type === MSG_TOOL_CALL) {
                         // Pass the OUTER js_eval's toolCallId as parentToolCallId
                         // so placeholder-based tools (display) can attach their
@@ -1071,9 +1071,19 @@ async function _executeToolInner(name, args, messageIndex, options) {
                         // displays created via `executeTool('display', ...)`
                         // from inside the sandbox silently never render
                         // (placeholder string never makes it to the agent's reply).
+                        // STABLE toolCallId (double-approval fix) — mirror of the
+                        // offscreen bridge in platform/extension/offscreen-helper.js.
+                        // Derive a deterministic `prog_<parent>_<callCounter>` id so an
+                        // inner 'ask' tool (e.g. web_fetch) that the agent loop
+                        // re-dispatches (reload / replay) matches its persisted
+                        // approval instead of re-prompting. Must START WITH 'prog_'
+                        // so executePendingApprovedTools keeps skipping it (no
+                        // double-execution) and must be a STRING (bare numeric d.id
+                        // throws on .startsWith).
                         var toolPromise = executeTool(e.data.name, e.data.args, messageIndex, {
                             chatId: chatId,
                             fromSandbox: true,
+                            toolCallId: 'prog_' + ((options && options.toolCallId) || 'np') + '_' + e.data.id,
                             parentToolCallId: options && options.toolCallId
                         });
                         var timeoutPromise = new Promise(function(_, rej) { setTimeout(function() { rej(new Error('Tool call timed out after 30s')); }, 30000); });
@@ -1229,7 +1239,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 return {
                     shortName: inst.shortName,
                     url: inst.url,
-                    active: inst.isActive || inst.url === Platform.instanceUrl,
+                    activeTabs: (inst.tabs || []).map(function(t) { return { id: t.id, title: t.title, url: t.url }; }),
                     connected: !!inst.token,
                     userName: inst.userName || '',
                     roles: inst.roles || [],
@@ -3109,14 +3119,27 @@ async function wsStatus(wk, includeIgnored, chatId) {
             entry.last_modified_by_chat_title = f.last_modified_by_chat_title || null;
             entry.last_modified_at = f.last_modified_at || null;
             entry.last_modified_ago = _wsFormatAgo(f.last_modified_at);
+            // Human-readable per-file work-in-progress message so another agent
+            // reading `status` immediately understands WHO is editing this file
+            // (the owning chat/agent id) and that it is uncommitted WIP — instead
+            // of having to infer it from the foreign_chat/other_chat_running flags.
+            var _wAgo = entry.last_modified_ago ? (' (' + entry.last_modified_ago + ')') : '';
+            var _wWho = entry.last_modified_by_chat_title ? (' titled "' + entry.last_modified_by_chat_title + '"') : '';
             if (chatId && f.last_modified_by_chat_id !== chatId) {
                 entry.foreign_chat = true;
                 if ((typeof isChatRunning === 'function') && isChatRunning(f.last_modified_by_chat_id)) {
                     entry.other_chat_running = true;
                     foreignRunningCount++;
+                    entry.message = '\u26a0 WORK IN PROGRESS by another agent \u2014 chat/agent ' + f.last_modified_by_chat_id + _wWho + ' is STILL RUNNING and has uncommitted edits to this file' + _wAgo + '. Leave it alone: any mutation is blocked unless you pass {"force": true}, and forcing would clobber their unsaved work.';
+                } else {
+                    entry.message = 'Work in progress by another (now dormant) agent \u2014 chat/agent ' + f.last_modified_by_chat_id + _wWho + ' last edited this file' + _wAgo + '. Editing it will silently take over ownership from that agent.';
                 }
                 foreignCount++;
+            } else {
+                entry.message = 'Work in progress by THIS agent (chat/agent ' + f.last_modified_by_chat_id + ')' + _wAgo + ' \u2014 uncommitted local changes, not yet pushed.';
             }
+        } else {
+            entry.message = 'Work in progress \u2014 uncommitted local changes (the editing agent was not recorded for this file).';
         }
         return entry;
     });
@@ -3545,6 +3568,15 @@ async function wsSyncWithRemote(wk) {
     // 2. Get remote tree (SHA-only metadata, not file contents)
     var treeRes = await githubApi('GET', '/repos/' + githubRepo + '/git/trees/' + remoteHead + '?recursive=1');
     if (!treeRes.ok) return { synced: 0, behind: true, remoteHead: remoteHead, dirty_remaining: -1 };
+    // FAIL CLOSED on a truncated recursive tree (GitHub caps at ~100k entries /
+    // 7MB): the partial treeRes.body.tree would silently OMIT upstream-changed
+    // paths, so the step-4 conflict/behind detection below would miss them and
+    // wsPush could full-file-replace an upstream change with no prompt (data
+    // loss). Mirror wsClone (refuses) / wsPush (skips its re-check when
+    // truncated): return the SAME behind:true / no-conflictFiles shape the
+    // !treeRes.ok guard uses so wsPush's existing
+    // `behind && !Array.isArray(conflictFiles)` guard aborts the push.
+    if (treeRes.body && treeRes.body.truncated) return { synced: 0, behind: true, remoteHead: remoteHead, dirty_remaining: -1, treeTruncated: true };
 
     // Build remote tree lookup: path → sha (+ sizes for stub repointing)
     var remoteTree = {};

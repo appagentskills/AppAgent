@@ -295,7 +295,7 @@ async function executeSkillTool(toolName, args, options) {
             var swResultStr = JSON.stringify(swResult, null, 2);
             var swLines = swResultStr.split('\n');
             if (swLines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {
-                lastLargeResponse = swResult;
+                setLastLargeResponse(chatId, swResult); // CONC-FIX: per-chat, not shared global; LEAK-FIX: bounded (evicts oldest past cap)
                 var swPreview = swLines.slice(0, LARGE_RESPONSE_LINE_LIMIT).join('\n');
                 return {
                     success: swResult.success !== undefined ? swResult.success : true,
@@ -382,8 +382,10 @@ async function executeSkillTool(toolName, args, options) {
         var lines = resultStr.split('\n');
 
         if (lines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {
-            // Store full response in global variable for Agent manipulation
-            lastLargeResponse = result;
+            // Store full response in a per-chat slot for Agent manipulation (CONC-FIX:
+            // not a shared global — avoids cross-chat bleed when two chats run at once;
+            // LEAK-FIX: bounded setter evicts the oldest slot past the cap).
+            setLastLargeResponse(chatId, result);
 
             // Create truncated preview (first 50 lines)
             var preview = lines.slice(0, LARGE_RESPONSE_LINE_LIMIT).join('\n');

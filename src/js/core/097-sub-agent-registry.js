@@ -113,6 +113,7 @@ var SUB_AGENT_PREAMBLE = [
     '  • If you need parent input mid-task, call `report_to_parent({status:"need_input", ...})`. That settles the parent\'s handle and parks you — the parent will wake you with new instructions.',
     '  • If you are idle and waiting, call `sleep_self` to free the worker pool slot.',
     '  • Use `artifacts: [doc_id, file_id, ...]` in your report for larger payloads — never inline a long list/dump into `summary`.',
+    '  • SCRATCHPAD: stage a long result in a smart doc (`document` tool) and return its doc_id in `artifacts` instead of inlining it — `shared` scope lets the parent read it, `chat` keeps it private to you.',
     '  • Maintain a progress card with `update_action_state` (state + `tasks` todo list) — it is mirrored LIVE onto your card in the parent chat and exposed to the parent via `agent_status`, so the parent can watch your progress without reading your transcript.',
     '  • Do NOT spawn nested sub-agents unless explicitly authorized — `spawn_sub_agent`, `stop_sub_agent`, and `wake_sub_agent` are denied by default. The parent must pass `allow_nested:true` at spawn time to grant nested delegation.',
     '  • You may only `stop`/`wake`/`message` sub-agents that are your own descendants (the ACL is enforced server-side; calls against siblings or ancestors fail).',
@@ -1595,6 +1596,20 @@ function reportToParent(args, ctx) {
     if (rec.state === 'stopped' || rec.state === 'errored') {
         return { success: false, error: 'report_to_parent: sub is already terminal (' + rec.state + '); cannot report again.', already_settled: true };
     }
+    // FIX #6 (idempotency): the FIRST settling call in this turn parks the sub
+    // (_parkSubAgent -> state='sleeping') and consumes the spawn deferred
+    // (_resolveSpawnHandle deletes _spawnDeferreds[spawn_handle_id]). A SECOND
+    // settling call in the same tool batch (two reports, or sleep_self+report)
+    // would otherwise pass the terminal guard above ('sleeping' is not
+    // stopped/errored) and re-run side effects: _wakeParentOnReport fires a
+    // duplicate parent notice and rec.last_report is overwritten so it diverges
+    // from the already-settled handle. Refuse once the handle is settled. A
+    // legitimate re-report after wake_sub_agent is fine: _wakeSubAgentImpl sets
+    // state back to 'running' and _mintNewSpawnHandle re-arms the deferred, so
+    // neither condition holds on that path.
+    if (rec.state === 'sleeping' || !_spawnDeferreds[rec.spawn_handle_id]) {
+        return { success: false, already_settled: true, error: 'report_to_parent: this turn already settled the spawn handle (state=' + rec.state + '); the sub is parked. It can report again only after being woken.' };
+    }
     var summary = String(args.summary || '');
     if (summary.length > rec.summary_cap_bytes) {
         // Soft-truncate with marker so the parent still sees a usable report.
@@ -1703,6 +1718,15 @@ function sleepSelf(args, ctx) {
     if (!rec) return { success: false, error: 'sleep_self: record missing.' };
     if (rec.state === 'stopped' || rec.state === 'errored') {
         return { success: false, error: 'sleep_self: sub is already terminal (' + rec.state + ').' };
+    }
+    // FIX #6 (idempotency): mirror reportToParent. If a prior settling call in
+    // this same tool batch already parked the sub (state='sleeping') or consumed
+    // the spawn deferred, a second sleep_self must be a no-op -- otherwise it
+    // re-fires the synthetic need_input settle / _wakeParentOnReport below. A
+    // woken sub is 'running' again with a freshly minted deferred, so a legit
+    // later sleep passes.
+    if (rec.state === 'sleeping' || !_spawnDeferreds[rec.spawn_handle_id]) {
+        return { success: false, already_settled: true, error: 'sleep_self: this turn already settled the spawn handle (state=' + rec.state + '); the sub is already parked.' };
     }
     rec.state = 'sleeping';
     rec.last_activity_at = Date.now();
@@ -1847,7 +1871,11 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // If the wake carries an instruction, deliver it. Otherwise drain the
     // inbox into a single combined message.
     var pendingMsgs = (rec.inbox || []).slice();
-    rec.inbox = [];
+    // FIX #7: do NOT clear rec.inbox here. Clearing is deferred into the
+    // delivery block below so the drained messages are discarded only once
+    // delivery into chats[rec.chat_id] is guaranteed. Previously this cleared
+    // unconditionally while delivery was gated on the chat row being present,
+    // so a missing/GC'd chat transcript silently dropped the inbox forever.
     if (args.instruction) {
         pendingMsgs.push({ kind: 'instruction', from: 'parent', content: String(args.instruction), at: Date.now() });
     }
@@ -1864,6 +1892,12 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         });
     }
     if (pendingMsgs.length > 0 && chats[rec.chat_id]) {
+        // FIX #7: delivery is guaranteed here (chat row present), so it is now
+        // safe to clear the inbox we snapshotted into pendingMsgs above. This
+        // function runs synchronously, so no new inbox entries can have arrived
+        // between the snapshot and this point. When the chat is missing this
+        // block is skipped and rec.inbox is left intact for a later wake.
+        rec.inbox = [];
         var combined = _formatInboxDrain(pendingMsgs);
         // F2: if a loop is already live for this sub (wake-with-instruction on
         // a still-running sub), a direct chat.messages push lands mid-turn and
