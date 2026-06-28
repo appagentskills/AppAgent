@@ -7,11 +7,6 @@ function setBrowserControlsVisibility(visible) {
         // Show URL input only when browser panel is open (visible=false means iframe is open)
         controls.style.display = visible ? 'none' : '';
     });
-    // Always show the standalone browse buttons in full-tab mode
-    ['open-browser-btn', 'home-open-browser-btn'].forEach(function(id) {
-        var btn = document.getElementById(id);
-        if (btn) btn.style.display = '';
-    });
 }
 
 function openIframePanel() {
@@ -35,7 +30,7 @@ function expandSidePanel() {
     setTimeout(function() { window.close(); }, 300);
 }
 
-function reloadExtension() {
+async function reloadExtension() {
     // chrome.runtime.reload() restarts the WHOLE extension — including the
     // service worker (background.js + the imported sw-bundle.js, where the
     // agent loop and pause handling live). That is the ONLY reliable way to
@@ -64,7 +59,7 @@ function reloadExtension() {
         var msg = runningCount === 1
             ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
             : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
-        if (!window.confirm(msg)) return;
+        if (!(await showConfirmModal('Reload extension?', escapeHtml(msg)))) return;
     }
 
     // Fire the reload exactly once, and never let anything strand it.
@@ -140,10 +135,28 @@ async function _rebuildBeforeReload() {
         // Build/deploy failed — let the user decide whether to reload the
         // previously built files instead of silently shipping a broken build.
         var err = (res && (res.error || (res.deploy && res.deploy.error))) || 'no files were built/deployed (is the repo cloned?)';
-        return window.confirm('Extension rebuild failed:\n' + err + '\n\nReload with the previously built files anyway?');
+        return await showConfirmModal('Extension rebuild failed', 'Extension rebuild failed:<br>' + escapeHtml(err) + '<br><br>Reload with the previously built files anyway?');
     } catch (e) {
-        return window.confirm('Extension rebuild error:\n' + (e && e.message ? e.message : String(e)) + '\n\nReload with the previously built files anyway?');
+        return await showConfirmModal('Extension rebuild error', 'Extension rebuild error:<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>Reload with the previously built files anyway?');
     }
+}
+
+// Show the Reload button only when a Reload would actually rebuild + redeploy the
+// extension from the workspace — i.e. the extension-dev skill is active AND a deploy
+// folder is connected (the same gate _rebuildBeforeReload uses). For everyone else
+// the button would just restart the extension, so we keep it hidden. Re-run this
+// after connecting/disconnecting the deploy folder.
+async function updateReloadBtnVisibility() {
+    var show = false;
+    try {
+        if (typeof _reloadRebuildsFromWorkspace === 'function') {
+            show = await _reloadRebuildsFromWorkspace();
+        }
+    } catch (e) { show = false; }
+    ['ext-reload-btn', 'home-ext-reload-btn'].forEach(function(id) {
+        var btn = document.getElementById(id);
+        if (btn) btn.style.display = show ? '' : 'none';
+    });
 }
 
 function openSidePanelFromTab() {

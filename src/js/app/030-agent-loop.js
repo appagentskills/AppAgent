@@ -1269,6 +1269,11 @@ async function runAgent(overrideChatId) {
 
     // Refresh credits after API calls complete
     fetchCredits();
+    // Also pull fresh usage from claude.ai (throttled ~60s inside
+    // refreshClaudeOAuthUsage) so extra-usage-only subscriptions update the pill
+    // on each answer, not just on init/visibility. No-op for non-Claude providers
+    // and while on cooldown.
+    if (typeof refreshClaudeOAuthUsage === 'function') refreshClaudeOAuthUsage();
 
     // Send browser notification when agent finishes in the background.
     // notifyFinish handler decides based on document.hidden / hasFocus +

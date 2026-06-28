@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.8
+
+### Features
+- New Jobs dropdown shows your running and recent agents in tabs, with live progress, an always-visible badge, a pinned section, and per-chat dismiss.
+- Workspace dropdown now sorts by most recently used, lets you clone or pin a workspace, and collapses long sections by default.
+- Usage pill now shows your extra usage as a percentage with a used/limit tooltip.
+
+### Fixes
+- Stale approval requests are now swept out automatically.
+- Model pill tooltip was broken in the workspace dropdown.
+
+---
+
 ## v1.1.7
 
 ### Features

@@ -1204,16 +1204,25 @@
     top: calc(100% + 6px);
     right: 0;
     z-index: var(--z-jobs-dropdown);
-    min-width: 340px;
-    max-width: 440px;
-    max-height: 420px;
+    /* Fixed footprint: at least 40% of the viewport, clamped so it can't
+       overflow. Stays constant across tab switches (no content-driven resize). */
+    width: max(40vw, 380px);
+    height: max(40vh, 360px);
+    max-width: 90vw;
+    max-height: 85vh;
     background: var(--bg-primary);
     border: 1px solid var(--secondary-border);
     border-radius: var(--radius-lg);
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
     overflow: hidden;
+}
+/* Inner flex column gives the scroll panel a bounded height even though the
+   dropdown itself is toggled to inline display:block when opened. */
+.jobs-dd-inner {
     display: flex;
     flex-direction: column;
+    height: 100%;
+    min-height: 0;
 }
 .jobs-dropdown-header {
     padding: var(--space-3) var(--space-4);
@@ -1221,6 +1230,7 @@
     font-weight: var(--font-semibold);
     color: var(--text-primary);
     font-size: var(--text-body-sm);
+    flex-shrink: 0;
 }
 .jobs-dropdown-empty {
     padding: var(--space-6);
@@ -1237,6 +1247,7 @@
     gap: var(--space-3);
     padding: var(--space-3) var(--space-4);
     cursor: pointer;
+    background: var(--bg-white);
     border-bottom: 1px solid var(--secondary-border);
     transition: background 0.12s;
 }
@@ -1245,8 +1256,15 @@
 .jobs-dropdown-row.state-running { background: var(--primary-lighter); }
 .jobs-dropdown-row.state-needs_input,
 .jobs-dropdown-row.state-needs_permission { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
+.jobs-dropdown-row.state-attention { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
 .jobs-dropdown-row.state-done { background: var(--success-lighter, rgba(16, 185, 129, 0.06)); }
 .jobs-dropdown-row.state-error { background: var(--danger-lighter, rgba(239, 68, 68, 0.06)); }
+/* The chat you're currently viewing gets a subtle green highlight + left accent
+   so it stands out from the rest of the (now-neutral) chat rows. */
+.jobs-dropdown-row.is-current {
+    background: var(--success-lighter, rgba(16, 185, 129, 0.08));
+    box-shadow: inset 3px 0 0 var(--success, #10b981);
+}
 
 .jobs-row-icon {
     width: 28px; height: 28px;
@@ -1289,6 +1307,189 @@
     color: var(--danger, #ef4444);
 }
 .jobs-row-btn svg { width: 14px; height: 14px; }
+
+/* =============================================
+   TABBED JOBS DROPDOWN (Active / Recent / Done)
+   ============================================= */
+.jobs-panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4) var(--space-2);
+    flex-shrink: 0;
+}
+.jobs-panel-title {
+    font-weight: var(--font-semibold);
+    color: var(--text-primary);
+    font-size: var(--text-body-sm);
+}
+.jobs-panel-viewall {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: var(--text-caption);
+    color: var(--primary);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.jobs-panel-viewall:hover { text-decoration: underline; }
+.jobs-panel-viewall svg { width: 12px; height: 12px; }
+
+.jobs-tabs {
+    display: flex; gap: var(--space-1);
+    padding: 0 var(--space-3) var(--space-2);
+    flex-shrink: 0;
+}
+.jobs-tab {
+    flex: 1;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 6px 10px;
+    border: 1px solid var(--secondary-border);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--text-body-sm);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.jobs-tab:hover { color: var(--text-primary); background: var(--secondary-light); }
+.jobs-tab.active { color: var(--success, #059669); background: rgba(5, 150, 105, 0.16); border-color: var(--success, #059669); }
+/* Count rendered as a rounded pill in every state. */
+.jobs-tab-count {
+    font-variant-numeric: tabular-nums;
+    font-size: var(--text-caption);
+    font-weight: var(--font-semibold);
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--secondary-light);
+    color: var(--text-secondary);
+}
+.jobs-tab:hover .jobs-tab-count { color: var(--text-primary); }
+.jobs-tab.active .jobs-tab-count { background: var(--success, #059669); color: #fff; }
+
+.jobs-tab-panel {
+    overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+.jobs-tab-empty {
+    padding: var(--space-5);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: var(--text-body-sm);
+}
+
+.jobs-row-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0; margin: 0 5px;
+    background: var(--text-muted);
+}
+.jobs-row-dot.state-running {
+    background: var(--success, #10b981);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+}
+.jobs-row-dot.state-error { background: var(--danger, #ef4444); }
+.jobs-row-dot.state-done { background: var(--text-muted); }
+.jobs-row-dot.state-attention {
+    background: var(--warning, #f59e0b);
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+/* Bell shown when a finished chat has an unviewed response. */
+.jobs-row-bell {
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--warning, #f59e0b);
+    flex-shrink: 0;
+    margin: 0 3px;
+}
+.jobs-row-bell svg { width: 15px; height: 15px; }
+/* When a dot/bell is rendered inside the 28px icon slot (Active-tab rows), drop
+   the dot's own side margins so it stays centered. */
+.jobs-row-icon .jobs-row-dot { margin: 0; }
+.jobs-row-icon .jobs-row-bell { margin: 0; }
+
+.jobs-row-time {
+    font-size: var(--text-caption);
+    color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+}
+.jobs-chat-row .jobs-row-btn,
+.jobs-today-row .jobs-row-btn { opacity: 0; transition: opacity 0.12s; }
+.jobs-chat-row:hover .jobs-row-btn,
+.jobs-today-row:hover .jobs-row-btn { opacity: 1; }
+
+.jobs-subhead {
+    padding: var(--space-3) var(--space-4) var(--space-1);
+    font-size: var(--text-caption);
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    border-top: 1px solid var(--secondary-border);
+    margin-top: var(--space-1);
+}
+.jobs-today-row .jobs-row-check {
+    width: 20px; height: 20px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--success, #10b981);
+    flex-shrink: 0;
+}
+.jobs-today-row .jobs-row-check svg { width: 16px; height: 16px; }
+
+/* ---- Pinned section + per-row pin / dismiss controls ---- */
+/* Accent the 'Pinned' subhead so it reads as its own group above Completed Today. */
+.jobs-subhead.jobs-subhead-pinned {
+    color: var(--primary);
+    border-top-color: var(--primary-lighter, rgba(37, 99, 235, 0.18));
+}
+/* Pin indicator at the left of a pinned row (when it isn't running/unseen). */
+.jobs-pinned-row .jobs-row-pin-dot {
+    width: 20px; height: 20px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--primary);
+    flex-shrink: 0;
+}
+.jobs-pinned-row .jobs-row-pin-dot svg { width: 14px; height: 14px; }
+/* Pin toggle button: tinted + always visible (not hover-gated) when the chat is
+   pinned, so the pinned state is obvious at a glance. The other row buttons stay
+   hover-revealed via the .jobs-chat-row / .jobs-today-row opacity rules above. */
+.jobs-row-btn.jobs-pin-btn.pinned { color: var(--primary); opacity: 1; }
+.jobs-chat-row:hover .jobs-row-btn.jobs-pin-btn,
+.jobs-today-row:hover .jobs-row-btn.jobs-pin-btn { opacity: 1; }
+
+/* Inline accordion: progress panel expanded under a clicked chat row. The open
+   row + its accordion keep a WHITE background and are tied together by a thin
+   blue left-accent bar; the open row drops its bottom divider so it merges into
+   the accordion, and its title turns blue to show which chat is expanded. */
+.jobs-dropdown-row.acc-open {
+    background: var(--bg-white);
+    box-shadow: inset 3px 0 0 var(--primary);
+    border-bottom-color: transparent;
+}
+.jobs-row-accordion {
+    padding: var(--space-2) var(--space-4) var(--space-3);
+    background: var(--bg-white);
+    border-bottom: 1px solid var(--secondary-border);
+    box-shadow: inset 3px 0 0 var(--primary);
+}
+.jobs-dropdown-row.acc-open .jobs-row-title { color: var(--primary); }
+.jobs-row-accordion .jobs-acc-label {
+    font-weight: var(--font-semibold);
+    color: var(--text-primary);
+    font-size: var(--text-body-sm);
+    margin-bottom: 2px;
+}
+.jobs-row-accordion .jobs-acc-status {
+    color: var(--text-secondary);
+    font-size: var(--text-caption);
+    margin-bottom: var(--space-2);
+}
+.jobs-row-accordion .jobs-acc-empty {
+    color: var(--text-muted);
+    font-size: var(--text-body-sm);
+}
+.jobs-row-accordion .action-result-tasks { margin-top: var(--space-1); }
+.jobs-row-accordion .action-result-output { margin-bottom: var(--space-2); }
+
 
 /* =============================================
    ACTION TOOLTIP (hover on action button)

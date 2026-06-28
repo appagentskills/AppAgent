@@ -18,11 +18,10 @@ async function init() {
         document.body.classList.add('standalone-dashboard');
     }
 
-    // Show reload buttons (always present in extension)
-    var _reloadBtn = document.getElementById('ext-reload-btn');
-    if (_reloadBtn) _reloadBtn.style.display = '';
-    var _homeReloadBtn = document.getElementById('home-ext-reload-btn');
-    if (_homeReloadBtn) _homeReloadBtn.style.display = '';
+    // Show the reload button only when a Reload would rebuild + redeploy from the
+    // workspace (extension-dev skill active + deploy folder connected). The buttons
+    // default to display:none in markup, so non-dev users never see them.
+    if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
 
     // Side panel vs. full-tab layout
     if (urlParams.get('mode') !== 'tab') {
@@ -282,6 +281,11 @@ async function init() {
         }
     } catch (e) {}
     await loadChatsFromStorage();
+    // After the SW 'hello' has had a chance to repopulate runningChatIds for
+    // genuinely-live runs, clear any stale status:'pending' tool-approval rows
+    // left by an abandoned/reloaded run (else a permission bell shows forever
+    // on a chat with nothing there). One-shot; guarded inside the function.
+    try { setTimeout(function() { try { if (typeof reconcileStaleApprovals === 'function') reconcileStaleApprovals(); } catch (e) {} }, 4000); } catch (e) {}
     await loadApiProviders();
     await loadProviderFromStorage();
     await loadToolPermissions();
@@ -291,6 +295,10 @@ async function init() {
     await loadSkillsFromStorage();
     await loadActiveSkills();
     await importEmbeddedSkills();
+    // Re-evaluate the reload-button gate now that skill tools are loaded. The gate
+    // call at the top of init() runs before skills load, so isSkillTool('extension_build')
+    // is false there and the button stays hidden. (Regression from the gating PR.)
+    if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
     await loadDashboardWidgets();
     await loadAllDocuments();
     await loadAllActionStates(); // restore in-flight action states from IDB
@@ -528,6 +536,12 @@ async function init() {
 
     // Mark initial load complete - subsequent pushHistoryState calls will use pushState instead of replaceState
     isInitialLoad = false;
+
+    // The jobs badge is always-on (launcher for the Active/Recent/Done chats
+    // popup). Paint it now so it shows even when we boot straight to a non-chat
+    // view (Home/Dashboard), where selectChat — which normally renders it —
+    // never runs.
+    if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
 
     // Initialize Claude OAuth button
     initClaudeOAuth();

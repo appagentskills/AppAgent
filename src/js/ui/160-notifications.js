@@ -60,6 +60,23 @@ function showPendingApprovalNotifications(chatId) {
     }
 }
 
+// Double-approval guard: locate an existing approval row for this exact tool
+// call (matched on the STABLE prog_<parent>_<callId> toolCallId) in the target
+// chat. Used to stop a SECOND prompt when the outer js_eval / skill is
+// re-dispatched (MV3 service-worker respawn, agent-loop replay) and the inner
+// call is re-issued with the same id. Scans newest-first so the most recent
+// row wins. Returns { index, msg } or null.
+function findExistingApprovalRow(chat, toolCallId) {
+    if (!chat || !Array.isArray(chat.messages) || !toolCallId) return null;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m && m.role === 'approval' && m.toolCallId === toolCallId) {
+            return { index: i, msg: m };
+        }
+    }
+    return null;
+}
+
 function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, targetChatId, options) {
     options = options || {};
     return new Promise(function(resolve) {
@@ -69,6 +86,36 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
         // Unknown/deleted chatId: degrade to a denial instead of throwing an
         // uncaught TypeError inside the Promise (which would hang the caller).
         if (!chat) { resolve(false); return; }
+
+        // DOUBLE-APPROVAL FIX: if a prior dispatch of this exact call already
+        // created an approval row, do NOT append a second prompt. A terminal
+        // verdict resolves this caller immediately (covers the race where the
+        // user already answered on the page but the re-dispatching service
+        // worker still saw 'pending'); a still-pending row is REUSED — we rebind
+        // THIS call's resolver to it and re-surface the (already-deduped)
+        // notification so the user sees exactly one prompt and the live caller
+        // gets the verdict.
+        var existingRow = findExistingApprovalRow(chat, toolCallId);
+        if (existingRow) {
+            var existingStatus = existingRow.msg.status;
+            if (existingStatus === 'allowed' || existingStatus === 'session_allowed' || existingStatus === 'always_allowed') {
+                resolve(true); return;
+            }
+            if (existingStatus === 'denied') {
+                resolve(false); return;
+            }
+            // Non-terminal (pending): reuse the existing row, rebinding the
+            // resolver to this (live) caller so the verdict reaches it.
+            var reuseKey = chatId + ':' + existingRow.index;
+            pendingToolApprovals[reuseKey] = { resolve: resolve, approvalIndex: existingRow.index, chatId: chatId, toolCallId: toolCallId };
+            var reuseTitle = (toolCallId && toolCallId.startsWith('prog_'))
+                ? (options.widgetName || chat.title || 'Background task')
+                : (chat.title || 'A chat');
+            var reuseStatusMessage = (args && args.status_message) ? args.status_message : null;
+            showApprovalNotification(reuseTitle, displayName, chatId, reuseStatusMessage, existingRow.index, args);
+            renderChatList();
+            return;
+        }
         var approvalIndex = chat.messages.length;
 
         // Add approval message to chat
@@ -133,6 +180,26 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
         var chat = chats[chatId];
         // Same guard as showToolApprovalPrompt: degrade to denial, don't throw.
         if (!chat) { resolve(false); return; }
+
+        // DOUBLE-APPROVAL FIX (batch mirror): reuse/short-circuit an existing
+        // approval row for this toolCallId instead of appending a duplicate.
+        var existingRowB = findExistingApprovalRow(chat, toolCallId);
+        if (existingRowB) {
+            var existingStatusB = existingRowB.msg.status;
+            if (existingStatusB === 'allowed' || existingStatusB === 'session_allowed' || existingStatusB === 'always_allowed') {
+                resolve(true); return;
+            }
+            if (existingStatusB === 'denied') {
+                resolve(false); return;
+            }
+            var reuseKeyB = chatId + ':' + existingRowB.index;
+            pendingToolApprovals[reuseKeyB] = { resolve: resolve, approvalIndex: existingRowB.index, chatId: chatId, toolCallId: toolCallId };
+            var isProgB = toolCallId && toolCallId.startsWith('prog_');
+            var reuseTitleB = isProgB ? (options.widgetName || chat.title || 'Background task') : (chat.title || 'A chat');
+            var reuseStatusMessageB = (args && args.status_message) ? args.status_message : null;
+            showApprovalNotification(reuseTitleB, displayName, chatId, reuseStatusMessageB, existingRowB.index, args);
+            return;
+        }
         var approvalIndex = chat.messages.length;
 
         // Add approval message to chat
@@ -412,7 +479,10 @@ function updateModelConnectionDot() {
         // Set pill class for connected/disconnected coloring
         el.className = 'model-name ' + llmConnectionStatus;
         if (llmConnectionStatus === 'connected') {
-            el.title = name + (isOAuth ? ' — Connected. Click to logout.' : ' — Connected');
+            // Clicking the pill opens the model menu (reasoning effort + model picker +
+            // optional OAuth login/logout row) — it does NOT log out on a single click,
+            // so don't advertise "Click to logout" here.
+            el.title = name + ' — Connected';
         } else if (isOAuth && isDisconnected) {
             el.title = name + ' — Click to login';
         } else {

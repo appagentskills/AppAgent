@@ -71,26 +71,41 @@ async function fetchCredits() {
             var util5h = parseFloat(rl['anthropic-ratelimit-unified-5h-utilization']);
             var reset5h = rl['anthropic-ratelimit-unified-5h-reset'];
             var utilRaw = !isNaN(util5h) ? util5h : parseFloat(rl['anthropic-ratelimit-unified-7d-utilization']);
-            if (isNaN(utilRaw)) throw new Error('No utilization');
-            // Header value is 0-1 decimal (0.28 = 28%), convert to percentage
-            var util = utilRaw <= 1 ? utilRaw * 100 : utilRaw;
-            var resetStr = '';
-            var resetKey = reset5h || rl['anthropic-ratelimit-unified-7d-reset'];
-            if (resetKey) {
-                var resetTs = parseFloat(resetKey);
-                // Unix timestamp in seconds — convert to ms
-                var diffMs = (resetTs > 9999999999 ? resetTs : resetTs * 1000) - Date.now();
-                if (diffMs > 0) {
-                    var diffMin = Math.floor(diffMs / 60000);
-                    var h = Math.floor(diffMin / 60);
-                    var m = diffMin % 60;
-                    resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
+            var displayText = '', creditTitle = '', cssClass = 'credits-display';
+            if (!isNaN(utilRaw)) {
+                // Header value is 0-1 decimal (0.28 = 28%), convert to percentage
+                var util = utilRaw <= 1 ? utilRaw * 100 : utilRaw;
+                var resetStr = '';
+                var resetKey = reset5h || rl['anthropic-ratelimit-unified-7d-reset'];
+                if (resetKey) {
+                    var resetTs = parseFloat(resetKey);
+                    // Unix timestamp in seconds — convert to ms
+                    var diffMs = (resetTs > 9999999999 ? resetTs : resetTs * 1000) - Date.now();
+                    if (diffMs > 0) {
+                        var diffMin = Math.floor(diffMs / 60000);
+                        var h = Math.floor(diffMin / 60);
+                        var m = diffMin % 60;
+                        resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
+                    }
                 }
+                displayText = Math.round(util) + '%' + (resetStr ? ' for ' + resetStr : '');
+                // Surface extra usage in the tooltip too, even when 5h/7d is the
+                // pill's primary value, so it's visible without waiting for the
+                // plan buckets to go null.
+                var euTip = parseClaudeExtraUsage(rl);
+                var euTipStr = euTip ? ' \u00b7 extra usage: ' + euTip.pct.toFixed(1) + '% (' + euTip.usedStr + ' / ' + euTip.limitStr + ')' : '';
+                creditTitle = util.toFixed(1) + '% used' + (resetStr ? ' \u00b7 resets in ' + resetStr : '') + euTipStr + ' | Click to refresh';
+                if (util > 80) cssClass += ' error';
+            } else {
+                // Subscription on extra-usage only: five_hour/seven_day come back
+                // null, so render the extra-usage bucket instead — percentage in
+                // the pill, used credits / monthly limit in the tooltip.
+                var eu = parseClaudeExtraUsage(rl);
+                if (!eu) throw new Error('No utilization');
+                displayText = Math.round(eu.pct) + '%';
+                creditTitle = 'Extra usage: ' + eu.pct.toFixed(1) + '% used \u00b7 ' + eu.usedStr + ' / ' + eu.limitStr + ' | Click to refresh';
+                if (eu.pct > 80) cssClass += ' error';
             }
-            var displayText = Math.round(util) + '%' + (resetStr ? ' for ' + resetStr : '');
-            var creditTitle = util.toFixed(1) + '% used' + (resetStr ? ' \u00b7 resets in ' + resetStr : '') + ' | Click to refresh';
-            var cssClass = 'credits-display';
-            if (util > 80) cssClass += ' error';
             if (displayText) {
                 appStorage.setItem('cachedCredits', displayText);
                 var creditHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + displayText;
@@ -174,6 +189,34 @@ async function fetchCredits() {
             homeCreditsEl.className = 'credits-display error';
         }
     }
+}
+
+// Build a renderable extra-usage summary from the stored claude usage keys
+// (written by normalizeClaudeUsage in background.js). claude.ai reports
+// monthly_limit/used_credits in MINOR units (divide by 10^decimal_places) and
+// utilization as a 0-100 percent that may be null (then derive from used/limit).
+// Returns { pct, usedStr, limitStr } or null when extra usage isn't active/usable.
+function parseClaudeExtraUsage(rl) {
+    if (!rl || rl['appagent-extra-usage-enabled'] === 'false') return null;
+    var used = parseFloat(rl['appagent-extra-usage-used']);
+    var limit = parseFloat(rl['appagent-extra-usage-limit']);
+    var utilPct = parseFloat(rl['appagent-extra-usage-utilization']);
+    var decimals = parseInt(rl['appagent-extra-usage-decimals'], 10);
+    if (isNaN(decimals)) decimals = 2;
+    var divisor = Math.pow(10, decimals);
+    var pct;
+    if (!isNaN(utilPct)) pct = utilPct;                 // claude.ai already 0-100
+    else if (!isNaN(used) && limit > 0) pct = (used / limit) * 100;
+    if (pct == null || isNaN(pct)) return null;
+    var sym = claudeCurrencySymbol(rl['appagent-extra-usage-currency']);
+    function money(v) { return isNaN(v) ? '?' : sym + (v / divisor).toFixed(decimals); }
+    return { pct: pct, usedStr: money(used), limitStr: money(limit) };
+}
+
+function claudeCurrencySymbol(code) {
+    if (!code) return '$';
+    var map = { USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5', CAD: 'CA$', AUD: 'A$' };
+    return map[code] || (code + ' ');
 }
 
 // Live-refresh Claude OAuth usage by hitting claude.ai's cookie-authenticated usage

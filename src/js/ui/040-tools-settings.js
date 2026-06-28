@@ -349,7 +349,12 @@ async function disconnectGitHub() {
 
 async function connectDeployDir() {
     var handle = await pickDeployDir();
-    if (handle) updateDeployDirButton();
+    if (handle) {
+        updateDeployDirButton();
+        // The Reload button is only meaningful in extension-dev mode — reveal it now
+        // that a deploy folder is connected.
+        if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
+    }
 }
 
 async function updateDeployDirButton() {
@@ -623,6 +628,11 @@ async function deleteGitHubRepo(repo) {
 // ============================================
 var _wsDropdown = null;
 var _wsHeaderCaches = {}; // map of wk -> { wk, meta, dirtyCount, dirtyFiles, syncStatus, behindFiles, conflictFiles }
+// True only in extension-dev mode (the extension_build skill tool is loaded AND a deploy
+// folder is connected) — the same gate the Reload button uses. Resolved (async) when the
+// dropdown opens and then read synchronously by _renderDropdownSection to decide whether
+// to show the per-repo pin button.
+var _wsExtDevMode = false;
 
 // Helper: get summary for all workspaces (local only, no remote sync)
 async function getAllWorkspaceSummaries() {
@@ -756,6 +766,10 @@ async function syncAndUpdateWorkspaceHeader() {
 
 async function toggleWorkspaceDropdown() {
     if (_wsDropdown) { hideWorkspaceDropdown(); return; }
+    // Resolve extension-dev mode once (async) so the synchronous section render can gate
+    // the pin button on it — same condition the Reload button is shown under.
+    try { _wsExtDevMode = (typeof _reloadRebuildsFromWorkspace === 'function') ? await _reloadRebuildsFromWorkspace() : false; }
+    catch (e) { _wsExtDevMode = false; }
     // Show dropdown immediately with cached/local data, then sync in background
     await updateWorkspaceHeaderStatus();
     showWorkspaceDropdown();
@@ -842,6 +856,41 @@ function _wsPinBtnHtml(wk, pinned) {
         (pinned ? '' : 'opacity:0.3;filter:grayscale(1);') + '">\uD83D\uDCCC</button>';
 }
 
+// Re-clone (fetch latest) button for a repo+branch. Clicks are handled by the dropdown's
+// delegated listener (showWorkspaceDropdown) via the data-clone-* attributes.
+function _wsCloneBtnHtml(repo, branch) {
+    var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.refresh) ? UI_ICONS.refresh : '\u21BB';
+    return '<button class="ws-clone-btn" data-clone-repo="' + escapeHtml(repo) + '" data-clone-branch="' + escapeHtml(branch) +
+        '" title="Re-clone this repo (fetch the latest from remote)" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);line-height:1;vertical-align:middle;color:var(--text-secondary);">' + icon + '</button>';
+}
+
+// Re-clone a repo from the workspace dropdown. Re-cloning replaces the local clone, so
+// guard against silently discarding uncommitted changes, then report via snackbar (the
+// settings #github-clone-status element used by recloneGitHubRepo isn't present here).
+async function _recloneWorkspaceFromDropdown(repo, branch) {
+    var wk = repo + '::' + branch;
+    var c = _wsHeaderCaches[wk];
+    if (c && c.dirtyCount > 0) {
+        var ok = await showConfirmModal('Re-clone ' + repo + '?',
+            'Re-cloning ' + escapeHtml(repo) + ' (' + escapeHtml(branch) + ') fetches the latest from remote and <strong>discards ' +
+            c.dirtyCount + ' local change' + (c.dirtyCount > 1 ? 's' : '') + '</strong>. Continue?');
+        if (!ok) return;
+    }
+    if (typeof showSnackbar === 'function') showSnackbar('Re-cloning ' + repo + '\u2026');
+    try {
+        var result = await wsClone(repo, branch);
+        if (result && result.success) {
+            if (typeof showSnackbar === 'function') showSnackbar('Re-cloned ' + repo + ' (' + branch + ')');
+            if (typeof renderGitHubReposList === 'function') renderGitHubReposList();
+            if (typeof updateWorkspaceHeaderStatus === 'function') await updateWorkspaceHeaderStatus();
+        } else if (typeof showSnackbar === 'function') {
+            showSnackbar('Re-clone failed: ' + ((result && result.error) || 'unknown error'), 'error');
+        }
+    } catch (e) {
+        if (typeof showSnackbar === 'function') showSnackbar('Re-clone failed: ' + (e && e.message ? e.message : String(e)), 'error');
+    }
+}
+
 // Toggle a workspace pin from the UI — shared logic lives in setWorkspacePin
 // (020-tool-execution.js), same code path as the `pin` workspace action.
 async function _toggleWorkspacePinFromUi(wk) {
@@ -863,11 +912,29 @@ async function _toggleWorkspacePinFromUi(wk) {
     } catch (e) {}
 }
 
+// Total number of change rows shown for a workspace section (local dirty +
+// conflicts + behind). Drives both the header count chip and the
+// "> 5 changes" collapse-by-default rule for the top 3 workspaces.
+function _wsSectionChangeCount(cache) {
+    if (!cache) return 0;
+    var d = cache.dirtyFiles ? cache.dirtyFiles.length : 0;
+    var c = cache.conflictFiles ? cache.conflictFiles.length : 0;
+    var b = cache.behindFiles ? cache.behindFiles.length : 0;
+    return d + c + b;
+}
+
 function _renderDropdownSection(section, cache) {
     var parsed = parseWsKey(cache.wk);
     var header = section.querySelector('.ws-dropdown-header');
     if (header) {
-        header.innerHTML = '<span>' + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + _wsPinBtnHtml(cache.wk, !!(cache.meta && cache.meta.pinned)) + '</span>' + _getSyncLabel(cache.syncStatus);
+        // Clone button is always available; pin button only in extension-dev mode
+        // (deploy folder connected), matching the Reload button's visibility gate.
+        var cloneBtn = _wsCloneBtnHtml(parsed.repo, parsed.branch);
+        var pinBtn = _wsExtDevMode ? _wsPinBtnHtml(cache.wk, !!(cache.meta && cache.meta.pinned)) : '';
+        var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
+        var changeCount = _wsSectionChangeCount(cache);
+        var countChip = changeCount > 0 ? '<span class="ws-change-count" title="' + changeCount + ' change' + (changeCount > 1 ? 's' : '') + '">' + changeCount + '</span>' : '';
+        header.innerHTML = '<span class="ws-dd-title">' + chevron + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + '</span>' + _getSyncLabel(cache.syncStatus);
     }
     var body = section.querySelector('.ws-dropdown-body');
     if (!body) return;
@@ -947,16 +1014,32 @@ async function showWorkspaceDropdown() {
     var keys = Object.keys(_wsHeaderCaches);
     if (keys.length === 0) return;
 
+    // Most-recently-used workspaces first (last_used_at, falling back to
+    // cloned_at), so the workspace you touched last sits on top.
+    keys.sort(function(a, b) {
+        var ma = _wsHeaderCaches[a] && _wsHeaderCaches[a].meta;
+        var mb = _wsHeaderCaches[b] && _wsHeaderCaches[b].meta;
+        var ta = (ma && (ma.last_used_at || ma.cloned_at)) || 0;
+        var tb = (mb && (mb.last_used_at || mb.cloned_at)) || 0;
+        return tb - ta;
+    });
+
     var dd = document.createElement('div');
     dd.className = 'ws-dropdown';
 
-    keys.forEach(function(wk) {
+    keys.forEach(function(wk, idx) {
         var cache = _wsHeaderCaches[wk];
         var parsed = parseWsKey(wk);
 
         var section = document.createElement('div');
         section.className = 'ws-dropdown-section';
         section.setAttribute('data-ws', wk);
+
+        // Default expand state: only the top 3 workspaces start expanded, and
+        // even a top-3 workspace starts collapsed when it has more than 5
+        // changes. Everything past the top 3 starts collapsed. User toggles and
+        // background re-renders preserve this class afterwards.
+        if (idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
 
         // Section header
         var header = document.createElement('div');
@@ -976,10 +1059,27 @@ async function showWorkspaceDropdown() {
     // Delegated pin-toggle handler — header innerHTML is re-rendered on every
     // sync, so a per-button listener would be lost; delegation survives it.
     dd.addEventListener('click', function(e) {
+        var cloneBtn = e.target.closest('[data-clone-repo]');
+        if (cloneBtn) {
+            e.stopPropagation();
+            var repo = cloneBtn.getAttribute('data-clone-repo');
+            var branch = cloneBtn.getAttribute('data-clone-branch');
+            hideWorkspaceDropdown();
+            _recloneWorkspaceFromDropdown(repo, branch);
+            return;
+        }
         var pinBtn = e.target.closest('[data-pin-ws]');
-        if (!pinBtn) return;
-        e.stopPropagation();
-        _toggleWorkspacePinFromUi(pinBtn.getAttribute('data-pin-ws'));
+        if (pinBtn) {
+            e.stopPropagation();
+            _toggleWorkspacePinFromUi(pinBtn.getAttribute('data-pin-ws'));
+            return;
+        }
+        // Clicking anywhere else on a section header toggles its file list.
+        var hdr = e.target.closest('.ws-dropdown-header');
+        if (hdr) {
+            var sec = hdr.closest('.ws-dropdown-section');
+            if (sec) sec.classList.toggle('collapsed');
+        }
     });
 
     var rect = anchor.getBoundingClientRect();

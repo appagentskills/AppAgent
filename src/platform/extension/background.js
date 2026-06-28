@@ -1434,6 +1434,25 @@ function normalizeClaudeUsage(json) {
     }
     applyBucket(json.five_hour || json.fiveHour || json.unified_5h || json['5h'], '5h');
     applyBucket(json.seven_day || json.sevenDay || json.unified_7d || json['7d'], '7d');
+    // Extra usage (pay-as-you-go beyond plan limits). When a subscription is on
+    // extra usage only, five_hour/seven_day come back null, so this is the only
+    // bucket with data. The anthropic-ratelimit header shape can't express
+    // currency/amounts, so stash it under appagent-extra-usage-* for the pill
+    // (parseClaudeExtraUsage in 170-chat-management.js) to render. monthly_limit
+    // and used_credits are in MINOR units (divide by 10^decimal_places).
+    var eu = json.extra_usage || json.extraUsage;
+    if (eu && typeof eu === 'object') {
+        out['appagent-extra-usage-enabled'] = String(eu.is_enabled !== false);
+        if (eu.monthly_limit != null && !isNaN(parseFloat(eu.monthly_limit)))
+            out['appagent-extra-usage-limit'] = String(parseFloat(eu.monthly_limit));
+        if (eu.used_credits != null && !isNaN(parseFloat(eu.used_credits)))
+            out['appagent-extra-usage-used'] = String(parseFloat(eu.used_credits));
+        if (eu.utilization != null && !isNaN(parseFloat(eu.utilization)))
+            out['appagent-extra-usage-utilization'] = String(parseFloat(eu.utilization));
+        if (eu.currency) out['appagent-extra-usage-currency'] = String(eu.currency);
+        var _dp = parseInt(eu.decimal_places, 10);
+        out['appagent-extra-usage-decimals'] = String(isNaN(_dp) ? 2 : _dp);
+    }
     Object.keys(json).forEach(function(k) {
         if (k.indexOf('anthropic-ratelimit-') === 0) out[k] = String(json[k]);
     });
