@@ -1783,6 +1783,67 @@ function isChatActivelyRunning(chatId) {
     return !!(typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]);
 }
 
+// True when a chat finished within the last ACTIVE_CHAT_LINGER_MS and so should
+// keep showing under "Active Chats" (the running list) instead of immediately
+// dropping into Completed Today the instant its run ends.
+function _isChatLingering(chatId) {
+    var t = _recentlyFinishedChats[chatId];
+    // Fall back to the PERSISTED finish stamp (lastResponseAt) when the in-memory
+    // map has no entry. That map is per-page-session, so after a panel reload — or
+    // for a finish the page never received a runFinished event for (SW reconnect
+    // flap) — it is empty, which is exactly why a just-finished chat sometimes
+    // failed to keep showing under Active Chats. lastResponseAt is saved to storage
+    // at finish time, so it survives reloads and makes the 5-minute linger reliable.
+    if (!t) {
+        var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+        if (c && !c.isBackground && !c.isSubAgent && c.lastResponseAt) t = c.lastResponseAt;
+    }
+    return !!(t && (Date.now() - t) <= ACTIVE_CHAT_LINGER_MS);
+}
+
+// True when this chat has a FINISHED response the user hasn't opened yet (an
+// "unread" chat). Such a chat must keep showing under "Active Chats" no matter
+// how old it is — past the 5-minute linger window, even days later — until the
+// user actually views it (which sets lastViewedAt and clears the unseen flag).
+// Mirrors the 'unseen' branch of _jobsChatState. Scoped to regular user chats:
+// background Action chats live in their own strip and sub-agents in Workers, so
+// they never qualify here (keeps them out of Active and unaffected in
+// Completed Today).
+function _isChatUnseen(chatId) {
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || c.isBackground || c.isSubAgent) return false;
+    // Running / approval-blocked chats are handled by isChatBusy; this predicate
+    // is only about an idle chat with an unread response.
+    if (typeof isChatBusy === 'function' && isChatBusy(chatId)) return false;
+    return !!(c.lastResponseAt && c.lastResponseAt > (c.lastViewedAt || 0) &&
+        (typeof currentChatId === 'undefined' || chatId !== currentChatId));
+}
+
+// True when this chat (as root or direct parent) still owns a sub-agent that is
+// running, even though the chat's OWN agent loop has stopped. Such a chat is not
+// finished — its workers are still producing results — so it must stay under
+// Active Chats and out of Recent/Done/Completed Today.
+function chatHasRunningSubAgents(chatId) {
+    if (!chatId || typeof _subAgents === 'undefined' || !_subAgents) return false;
+    for (var _said in _subAgents) {
+        var _sr = _subAgents[_said];
+        if (!_sr || _sr.state !== 'running') continue;
+        if (_sr.root_chat_id === chatId || _sr.parent_chat_id === chatId) return true;
+    }
+    return false;
+}
+
+// Broader "busy" predicate for the jobs dropdown's Active-vs-Done classification:
+// a chat counts as active when its own loop is streaming, OR a sub-agent it owns
+// is still running, OR it is blocked on a pending tool-approval (it needs the
+// user). Used so none of those three cases is mislabelled "completed".
+function isChatBusy(chatId) {
+    if (isChatActivelyRunning(chatId)) return true;
+    if (chatHasRunningSubAgents(chatId)) return true;
+    if (typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) return true;
+    return false;
+}
+
 // Called when a chat's run ends. Stamps the finish time so the chat keeps
 // showing under "Active Chats" for ACTIVE_CHAT_LINGER_MS, then schedules a
 // badge/dropdown refresh to drop it when the window expires.
@@ -1854,11 +1915,16 @@ function getActiveChatsList() {
             if (runningChatIds[cid]) consider(cid);
         });
     }
-    // 2) Recently-finished chats still inside the linger window.
-    Object.keys(_recentlyFinishedChats).forEach(function(cid) {
-        if (now - _recentlyFinishedChats[cid] > ACTIVE_CHAT_LINGER_MS) return;
-        consider(cid);
-    });
+    // 2) Recently-finished chats still inside the linger window. Scan ALL chats
+    //    via _isChatLingering (not just the in-memory _recentlyFinishedChats map)
+    //    so a finish whose in-memory stamp was lost to a panel reload — but whose
+    //    persisted lastResponseAt is still within the window — keeps lingering
+    //    under Active Chats instead of intermittently disappearing.
+    if (typeof chats !== 'undefined' && chats) {
+        Object.keys(chats).forEach(function(cid) {
+            if (_isChatLingering(cid)) consider(cid);
+        });
+    }
     // 3) Chats the user hasn't caught up on (a response arrived after they last
     //    viewed the chat — the chat in focus is always 'seen'), and
     // 4) chats younger than RECENT_CHAT_WINDOW_MS with at least one message
@@ -1873,10 +1939,26 @@ function getActiveChatsList() {
             if (unseen || young) consider(cid);
         });
     }
-    // Stable order: always by chat creation time (oldest first). Without this
-    // the rows follow runningChatIds/_recentlyFinishedChats key insertion order,
-    // which reshuffles as runs start/stop.
-    out.sort(function(a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    // 5) Chats whose own agent loop has stopped but that still own a running
+    //    sub-agent — keep them under Active Chats until their workers finish.
+    if (typeof _subAgents !== 'undefined' && _subAgents) {
+        Object.keys(_subAgents).forEach(function(_said) {
+            var _sr = _subAgents[_said];
+            if (!_sr || _sr.state !== 'running') return;
+            if (_sr.root_chat_id) consider(_sr.root_chat_id);
+            if (_sr.parent_chat_id) consider(_sr.parent_chat_id);
+        });
+    }
+    // 6) Chats blocked on a pending tool-approval — they need the user, so they
+    //    belong under Active Chats (orange), not Recent/Done/Completed Today.
+    if (typeof chats !== 'undefined' && chats && typeof chatHasPendingApproval === 'function') {
+        Object.keys(chats).forEach(function(cid) {
+            if (chatHasPendingApproval(cid)) consider(cid);
+        });
+    }
+    // Order by chat creation time, MOST RECENT FIRST, so the newest active chat
+    // sits at the top of the Active list.
+    out.sort(function(a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
     return out;
 }
 
@@ -1945,6 +2027,8 @@ var _prevAggregateState = 'empty';
 function renderJobsBadge() {
     var badges = document.querySelectorAll('.jobs-badge');
     if (!badges.length) return;
+    // Keep the full-screen Expand modal (if open) live alongside the badge.
+    if (typeof _refreshJobsExpandModal === 'function') _refreshJobsExpandModal();
     // Filter orphans so the badge count matches what the user actually sees in
     // the live-pill row and the dropdown. Without this, an uninstalled-skill
     // entry left in `activeActions` would show "1" in the badge with no
@@ -1955,7 +2039,7 @@ function renderJobsBadge() {
     // NOT add a spinner or force a 'running' colour — only actively-streaming
     // chats do.
     var runningChats = 0;
-    chatList.forEach(function(c){ if (isChatActivelyRunning(c.id)) runningChats++; });
+    chatList.forEach(function(c){ if (isChatActivelyRunning(c.id) || chatHasRunningSubAgents(c.id)) runningChats++; });
     var count = list.length + chatList.length;
     var running = getRunningActionsCount() + runningChats;
     var agg = _getAggregateActionState();
@@ -1974,6 +2058,11 @@ function renderJobsBadge() {
     var erroredChats = 0;
     chatList.forEach(function(c){ if (!isChatActivelyRunning(c.id) && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError) erroredChats++; });
     if (erroredChats && agg !== 'attention') agg = 'error';
+    // A chat blocked on a pending tool-approval needs the user — surface it as
+    // 'attention' (orange) on the badge, outranking running/done/error.
+    var approvalChats = 0;
+    chatList.forEach(function(c){ if (typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(c.id)) approvalChats++; });
+    if (approvalChats) agg = 'attention';
     // Finished-while-elsewhere bell segment (ui/165-finished-chat-badge.js):
     // chats that finished while the user was viewing another chat/view and
     // hasn't opened since. Rendered inside this same pill, after the count.
@@ -1991,28 +2080,44 @@ function renderJobsBadge() {
         // Active / Recent / Done chats popup, so it must stay reachable even
         // when nothing is running and there is nothing to review.
         badge.style.display = 'inline-flex';
-        if (!count && !unseen.count) {
-            // Idle: no active jobs, nothing unseen. Show a neutral history icon
-            // in the grey 'idle' pill so Recent/Done are still openable.
+        // Only genuinely running jobs (running actions + actively-running chats)
+        // count as "Active". Pinned / completed-today / lingering-finished chats
+        // stay visible in the dropdown but must NOT inflate the pill. Idle =
+        // nothing running, nothing to review, nothing needing attention.
+        if (!running && !unseen.count && agg !== 'attention' && agg !== 'error') {
+            // Idle: no active jobs, nothing unseen. The pill is the launcher for
+            // the Active/Recent/History chats popup, so it keeps the "Active chats"
+            // label even when nothing is running, instead of collapsing to a lone
+            // icon. data-agg='idle' is styled with the SAME primary pill look as
+            // the running/active state (see 23-actions.css) so it never greys out.
             badge.setAttribute('data-agg', 'idle');
             badge.classList.remove('pulse', 'finish-pulse');
-            badge.title = 'Chats';
-            badge.innerHTML = '<span class="jobs-badge-icon">' + (UI_ICONS.history || UI_ICONS.zap) + '</span>';
+            badge.title = 'Active chats';
+            badge.innerHTML = '<span class="jobs-badge-icon">' + (UI_ICONS.chat || UI_ICONS.history || UI_ICONS.zap) + '</span>' +
+                '<span class="jobs-badge-label">Active chats</span>';
             return;
         }
         badge.setAttribute('data-agg', agg);
         // "pulse" is the existing infinite attention pulse; only on attention state.
         badge.classList.toggle('pulse', agg === 'attention');
-        // Bell-only state (no active jobs, unseen finished chats remain): drop
-        // the '⚡ 0' segment so the pill shows just the bell.
-        badge.title = (count ? count + ' active job' + (count === 1 ? '' : 's') + titleSuffix : '') +
-            (unseen.count ? (count ? ' — ' : '') + unseen.count + ' finished chat' + (unseen.count === 1 ? '' : 's') + ' to review' : '');
+        // The pill counts only genuinely-running jobs ("Active N"). A finished
+        // chat needing review shows the bell; an attention/error state with
+        // nothing running shows an alert icon so the coloured pill isn't empty.
+        badge.title = (running ? running + ' active job' + (running === 1 ? '' : 's') + titleSuffix : '') +
+            (unseen.count ? (running ? ' — ' : '') + unseen.count + ' finished chat' + (unseen.count === 1 ? '' : 's') + ' to review' : '');
         badge.innerHTML =
-            (count ? '<span class="jobs-badge-icon">' + UI_ICONS.zap + '</span>' +
-                '<span class="jobs-badge-count">' + count + '</span>' : '') +
-            (running ? '<span class="jobs-badge-spinner">' + UI_ICONS.spinner + '</span>' : '') +
+            (running ? '<span class="jobs-badge-icon">' + UI_ICONS.chat + '</span>' +
+                '<span class="jobs-badge-label">Active</span>' +
+                '<span class="jobs-badge-count">' + running + '</span>' +
+                '<span class="jobs-badge-spinner">' + UI_ICONS.spinner + '</span>' : '') +
+            (!running && (agg === 'attention' || agg === 'error') ?
+                '<span class="jobs-badge-icon">' + (UI_ICONS.alert || UI_ICONS.bell || UI_ICONS.chat) + '</span>' : '') +
             (unseen.count ? '<span class="jobs-badge-bell' + (unseen.hasError ? ' err' : '') + '">' + (UI_ICONS.bell_filled || UI_ICONS.bell) +
-                (unseen.count > 1 ? '<span class="jobs-badge-bell-count">' + unseen.count + '</span>' : '') + '</span>' : '');
+                (unseen.count > 1 ? '<span class="jobs-badge-bell-count">' + unseen.count + '</span>' : '') + '</span>' : '') +
+            // Nothing is actively running, so the pill is still the "Active chats"
+            // launcher: keep the text label. The bell (or alert) rendered above
+            // stands in for the icon — the bell replaces the icon, the text stays.
+            (!running ? '<span class="jobs-badge-label">Active chats</span>' : '');
         if (justFinished) {
             // Restart the one-shot animation by toggling the class.
             badge.classList.remove('finish-pulse');
@@ -2090,7 +2195,9 @@ function renderJobsDropdown(dropdown) {
         return;
     }
     var rowsHtml = list.map(function(a) {
-        var iconSvg = UI_ICONS[a.icon] || UI_ICONS.spinner;
+        // Use the action's own configured icon (same one its button/pill shows),
+        // not the transient update_action_state icon — the row identifies the action.
+        var iconSvg = UI_ICONS[a.originalIcon] || UI_ICONS[a.icon] || UI_ICONS.play;
         var showViewChat = (a.state !== 'running');
         return '<div class="jobs-dropdown-row state-' + a.state + '" ' +
             'data-action-id="' + escapeHtml(a.actionId) + '" ' +
@@ -2109,11 +2216,15 @@ function renderJobsDropdown(dropdown) {
             ) +
         '</div>';
     }).join('');
-    // Active tab shows only chats running right now; recently-finished/unseen
-    // chats live under the Recent/Done tabs built by _renderJobsChatTabs().
-    var runningChats = chatList.filter(function(_rc) { return isChatActivelyRunning(_rc.id); });
+    // Active list = chats running right now, OR still inside the post-finish
+    // linger window, OR with an UNREAD finished response. A just-finished chat
+    // lingers here (bold if unseen) for ACTIVE_CHAT_LINGER_MS; once that window
+    // passes it KEEPS showing — regardless of age, even days old — as long as the
+    // user still hasn't opened it (_isChatUnseen). It only leaves Active when the
+    // user views it (clearing unseen) or removes it.
+    var runningChats = chatList.filter(function(_rc) { return isChatBusy(_rc.id) || _isChatLingering(_rc.id) || _isChatUnseen(_rc.id); });
     var chatRowsHtml = runningChats.map(function(c) {
-        var _cRunning = isChatActivelyRunning(c.id);
+        var _cRunning = isChatActivelyRunning(c.id) || chatHasRunningSubAgents(c.id);
         // B15: an errored, non-running chat shows an explicit error row (icon + msg)
         // and a Retry button instead of a green "Finished".
         var _cErr = !_cRunning && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError;
@@ -2138,10 +2249,12 @@ function renderJobsDropdown(dropdown) {
         var _cUnseen = !_cRunning && !_cErr && c.lastResponseAt &&
             c.lastResponseAt > (c.lastViewedAt || 0) &&
             (typeof currentChatId === 'undefined' || c.id !== currentChatId);
-        var _cLabel = _cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished'));
+        var _cLabel = _cApproval ? 'Awaiting approval' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished')));
         if (_cUnseen) _cIcon = '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>';
         var _cCur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-        return '<div class="jobs-dropdown-row state-' + _cState + _cCur + '" ' +
+        // Unseen finished response → bold the title like an unread email (the
+        // .jobs-unread CSS rule), until the user opens the chat.
+        return '<div class="jobs-dropdown-row state-' + _cState + _cCur + (_cUnseen ? ' jobs-unread' : '') + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
             '<span class="jobs-row-icon">' + _cIcon + '</span>' +
@@ -2154,19 +2267,49 @@ function renderJobsDropdown(dropdown) {
         '</div>';
     }).join('');
     var html = '';
-    if (list.length) {
-        html += '<div class="jobs-dropdown-header">Active Actions</div>' +
-            '<div class="jobs-dropdown-list">' + rowsHtml + '</div>';
-    }
+    // Active actions are treated like chats: they live in the same Active tab/list
+    // (carrying their own action icon) rather than a separate "Active Actions"
+    // section. Render them above the running chats and count them toward Active.
     // Tabbed chat panel: Active (running now) / Recent (24h) / Done (finished).
-    html += _renderJobsChatTabs(chatRowsHtml, runningChats.length);
+    html += _renderJobsChatTabs(rowsHtml + chatRowsHtml, runningChats.length + list.length);
     // The badge is always-on, so it can be opened with nothing to show (no
     // actions, no chats yet) — render a friendly empty state, not a blank box.
     if (!html) html = '<div class="jobs-dropdown-empty">No active or recent chats</div>';
+    // Preserve any open inline progress accordions across this full re-render, so a
+    // running action/chat the user expanded doesn't snap shut on every state tick
+    // (and the restored body reflects the latest progress).
+    var _openAccIds = [];
+    try {
+        dropdown.querySelectorAll('.jobs-row-accordion[data-acc-for]').forEach(function(el) {
+            _openAccIds.push(el.getAttribute('data-acc-for'));
+        });
+    } catch (e) {}
     // Wrap in an inner flex column: the dropdown itself is toggled to inline
     // display:block when opened, which overrides the CSS flex container, so the
     // scroll panel needs its own flex parent with a bounded (100%) height.
     dropdown.innerHTML = '<div class="jobs-dd-inner">' + html + '</div>';
+    _reopenJobsAccordions(dropdown, _openAccIds);
+}
+// Re-insert inline progress accordions for the given row ids after a full
+// renderJobsDropdown (which wipes them via innerHTML). A chat row is keyed by
+// data-chat-id, an action row by data-action-id — rebuild the matching body so
+// the restored accordion also reflects the latest state.
+function _reopenJobsAccordions(dropdown, ids) {
+    if (!dropdown || !ids || !ids.length) return;
+    ids.forEach(function(id) {
+        var esc = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+        var isAction = false;
+        var row = dropdown.querySelector('.jobs-dropdown-row[data-chat-id="' + esc + '"]');
+        if (!row) { row = dropdown.querySelector('.jobs-dropdown-row[data-action-id="' + esc + '"]'); isAction = !!row; }
+        if (!row) return;
+        if (row.nextElementSibling && row.nextElementSibling.classList.contains('jobs-row-accordion')) return;
+        var acc = document.createElement('div');
+        acc.className = 'jobs-row-accordion';
+        acc.setAttribute('data-acc-for', id);
+        acc.innerHTML = isAction ? _jobsActionAccordionContentHtml(id) : _jobsAccordionContentHtml(id);
+        row.parentNode.insertBefore(acc, row.nextSibling);
+        row.classList.add('acc-open');
+    });
 }
 
 // ---- Tabbed jobs dropdown helpers (Active / Recent / Done) ----------------
@@ -2194,7 +2337,7 @@ function _jobsChatTs(c) { return (c && (c.updatedAt || c.lastResponseAt || c.cre
 function _jobsChatState(chatId) {
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) return 'attention';
-    var running = (typeof isChatActivelyRunning === 'function') && isChatActivelyRunning(chatId);
+    var running = (typeof isChatActivelyRunning === 'function') && (isChatActivelyRunning(chatId) || chatHasRunningSubAgents(chatId));
     var paused = (typeof isChatPaused === 'function') ? isChatPaused(chatId) : false;
     if (running && !paused) return 'running';
     if (c && c._lastApiError) return 'error';
@@ -2202,17 +2345,19 @@ function _jobsChatState(chatId) {
         (typeof currentChatId === 'undefined' || chatId !== currentChatId)) return 'unseen';
     return 'done';
 }
-// Recent = non-empty chats touched in the last 24h, newest first.
+// Recent = non-empty chats touched in the last week (7 days), newest first,
+// capped at 10.
 function getRecentChatsList() {
-    var now = Date.now(), win = 24 * 60 * 60 * 1000;
+    var now = Date.now(), win = 7 * 24 * 60 * 60 * 1000;
     return _jobsAllUserChats()
         .filter(function(c) { return (now - _jobsChatTs(c)) < win; })
-        .sort(function(a, b) { return _jobsChatTs(b) - _jobsChatTs(a); });
+        .sort(function(a, b) { return _jobsChatTs(b) - _jobsChatTs(a); })
+        .slice(0, 10);
 }
 // Done = every finished (not currently running) non-empty chat, newest first.
 function getDoneChatsList() {
     return _jobsAllUserChats()
-        .filter(function(c) { return !isChatActivelyRunning(c.id); })
+        .filter(function(c) { return !isChatBusy(c.id); })
         .sort(function(a, b) { return _jobsChatTs(b) - _jobsChatTs(a); });
 }
 // Completed today = finished (not-running) chats whose last activity (updatedAt,
@@ -2223,7 +2368,7 @@ function getCompletedTodayChats() {
     var start = new Date(); start.setHours(0, 0, 0, 0);
     var t0 = start.getTime();
     return _jobsAllUserChats()
-        .filter(function(c) { return !isChatActivelyRunning(c.id) && !c.pinned && _jobsChatTs(c) >= t0; })
+        .filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id) && !c.pinned && _jobsChatTs(c) >= t0; })
         .sort(function(a, b) { return _jobsChatTs(b) - _jobsChatTs(a); });
 }
 // Pinned = chats the user pinned (chat.pinned), newest first. They surface in
@@ -2237,7 +2382,7 @@ function getPinnedChatsList() {
 // dismiss-notification (only when the row carries an unseen/error flag),
 // open-chat, and — for non-pinned rows — remove-from-list. Buttons stop
 // propagation so the row's own click (accordion) doesn't also fire.
-function _jobsRowButtons(c, hasNotif) {
+function _jobsRowButtons(c, hasNotif, noDismiss) {
     var idJs = escapeJsString(c.id);
     var pinned = !!c.pinned;
     var h = '';
@@ -2245,114 +2390,293 @@ function _jobsRowButtons(c, hasNotif) {
     if (hasNotif) {
         h += '<button class="jobs-row-btn" title="Dismiss notification" onclick="event.stopPropagation();dismissChatNotifications(\'' + idJs + '\')">' + (UI_ICONS.check || UI_ICONS.close) + '</button>';
     }
-    h += '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
-    if (!pinned) {
+    h += '<button class="jobs-row-btn jobs-open-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
+    if (!pinned && !noDismiss) {
         h += '<button class="jobs-row-btn danger" title="Remove from list" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
     }
     return h;
 }
+// Trailing buttons for a 'Completed Today' row: pin toggle (hover-only) +
+// open-chat (always visible). No dismiss/remove icon — Today rows aren't
+// individually dismissable; they roll off on their own once no longer "today".
+function _jobsTodayRowButtons(c) {
+    var idJs = escapeJsString(c.id);
+    var pinned = !!c.pinned;
+    var h = '';
+    h += '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + (pinned ? 'Unpin chat' : 'Pin chat') + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
+    h += '<button class="jobs-row-btn jobs-open-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
+    return h;
+}
+// Time string for a Pinned / History / Recent row (relative time or short date).
+function _jobsHistTimeStr(c) {
+    var when = _jobsChatTs(c);
+    return (when && typeof formatHistoryDate === 'function') ? formatHistoryDate(when) : '';
+}
+// Time string for a Completed-Today row ('Today, h:mm AM').
+function _jobsTodayTimeStr(c) {
+    var when = _jobsChatTs(c);
+    if (!when) return '';
+    try { return 'Today, ' + new Date(when).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+    catch (e) { return ''; }
+}
+// Width (px) of the widest time string in a SECTION, so every row in that
+// section shares one time-column width (no global static width) and the icons
+// to the left of the time line up within the section. 0 when no times.
+var _jobsTimeMeasureCtx = null;
+function _jobsTimeColWidth(timeStrings) {
+    var any = false, i;
+    for (i = 0; i < timeStrings.length; i++) { if (timeStrings[i]) { any = true; break; } }
+    if (!any) return 0;
+    if (!_jobsTimeMeasureCtx) {
+        try { _jobsTimeMeasureCtx = document.createElement('canvas').getContext('2d'); }
+        catch (e) { _jobsTimeMeasureCtx = null; }
+    }
+    var ctx = _jobsTimeMeasureCtx, fam = 'sans-serif';
+    try { fam = getComputedStyle(document.body).fontFamily || fam; } catch (e2) {}
+    if (ctx) ctx.font = '11px ' + fam;
+    var max = 0;
+    for (i = 0; i < timeStrings.length; i++) {
+        var s = timeStrings[i];
+        if (!s) continue;
+        var w = ctx ? ctx.measureText(s).width : s.length * 6.2;
+        if (w > max) max = w;
+    }
+    // +2px guard: measureText ignores tabular-nums, which renders a hair wider.
+    return max ? (Math.ceil(max) + 2) : 0;
+}
+// A '.jobs-row-time' span, optionally pinned to a section width (px).
+function _jobsTimeSpan(timeStr, timeW) {
+    if (!timeStr) return '';
+    var style = (timeW && timeW > 0) ? ' style="width:' + timeW + 'px"' : '';
+    return '<span class="jobs-row-time"' + style + '>' + escapeHtml(timeStr) + '</span>';
+}
 // A pinned chat row (Pinned section): pin indicator + title + time; row click
 // expands the inline progress accordion (the bubble button opens the chat).
-function _jobsPinnedRowHtml(c) {
+function _jobsPinnedRowHtml(c, timeW) {
     var st = _jobsChatState(c.id);
-    var when = _jobsChatTs(c);
-    var timeStr = (when && typeof formatHistoryDate === 'function') ? formatHistoryDate(when) : '';
+    var timeStr = _jobsHistTimeStr(c);
     var indicator = (st === 'unseen')
         ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
         : '<span class="jobs-row-pin-dot">' + UI_ICONS.pinFilled + '</span>';
     var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + cur + '" ' +
+    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div></div>' +
-        (timeStr ? '<span class="jobs-row-time">' + escapeHtml(timeStr) + '</span>' : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error') +
+        _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
 // A single Recent/Done chat row: status indicator + title + relative time + open
 // btn. Indicator is a BELL for an unseen finished response, else a status dot
 // (green running, orange awaiting a tool-call approval, red error, grey done).
-function _jobsChatRowHtml(c, mode) {
+function _jobsChatRowHtml(c, mode, timeW) {
     var st = _jobsChatState(c.id);
-    var when = _jobsChatTs(c);
-    var timeStr = (when && typeof formatHistoryDate === 'function') ? formatHistoryDate(when) : '';
+    var timeStr = _jobsHistTimeStr(c);
     var indicator = (st === 'unseen')
         ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
         : '<span class="jobs-row-dot state-' + st + '"></span>';
     var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
     // No per-state row tint on Recent/Done rows — the status dot already conveys
     // state; only the current chat gets a highlight (.is-current).
-    return '<div class="jobs-dropdown-row jobs-chat-row' + cur + '" ' +
+    return '<div class="jobs-dropdown-row jobs-chat-row' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main">' +
             '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
         '</div>' +
-        (timeStr ? '<span class="jobs-row-time">' + escapeHtml(timeStr) + '</span>' : '') +
-        _jobsRowButtons(c, st === 'unseen' || st === 'error') +
+        _jobsRowButtons(c, st === 'unseen' || st === 'error', true) +
+        _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
 // A 'Completed Today' row: check icon + title + 'Today, h:mm AM'.
-function _jobsTodayRowHtml(c) {
-    var when = _jobsChatTs(c);
-    var timeStr = '';
-    if (when) {
-        try { timeStr = 'Today, ' + new Date(when).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
-        catch (e) { timeStr = ''; }
-    }
+function _jobsTodayRowHtml(c, timeW) {
+    var timeStr = _jobsTodayTimeStr(c);
     var st = _jobsChatState(c.id);
-    return '<div class="jobs-dropdown-row jobs-today-row" ' +
+    // Unread = a finished response the user hasn't opened yet. Show a bell + bold
+    // title (like an unread email) until they view the chat; otherwise a green check.
+    var _unread = (st === 'unseen');
+    var _todayIndicator = _unread
+        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
+        : '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
+    // Highlight the row for the chat the user is currently viewing (.is-current),
+    // matching the Active / Pinned / Recent / History rows.
+    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
+    return '<div class="jobs-dropdown-row jobs-today-row' + cur + (_unread ? ' jobs-unread' : '') + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
-        '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>' +
+        _todayIndicator +
         '<div class="jobs-row-main">' +
             '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
         '</div>' +
-        (timeStr ? '<span class="jobs-row-time">' + escapeHtml(timeStr) + '</span>' : '') +
-        _jobsRowButtons(c, st === 'unseen' || st === 'error') +
+        _jobsTodayRowButtons(c) +
+        _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
 // Build the header + Active/Recent/Done tabs + panels + footer. Returns '' when
 // there are no chats to show at all (keeps the dropdown clean for action-only runs).
 function _renderJobsChatTabs(activeRowsHtml, activeCount) {
-    var recentChats = getRecentChatsList();
     var doneChats = getDoneChatsList();
     var todayChats = getCompletedTodayChats();
     var pinnedChats = getPinnedChatsList();
-    if (!activeCount && !recentChats.length && !doneChats.length && !pinnedChats.length) return '';
-    var extIcon = '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
-    var recentRows = recentChats.map(function(c) { return _jobsChatRowHtml(c, 'list'); }).join('');
-    var doneRows = doneChats.map(function(c) { return _jobsChatRowHtml(c, 'list'); }).join('');
+    if (!activeCount && !doneChats.length && !pinnedChats.length) return '';
     var activePanel = (activeRowsHtml && activeRowsHtml.length) ? activeRowsHtml
         : '<div class="jobs-tab-empty">No chats running right now</div>';
     var pinnedHtml = '';
-    // Don't duplicate a pinned chat that is ALSO actively running — it already
-    // shows in the running list above (with a filled pin button).
-    var pinnedToShow = pinnedChats.filter(function(c) { return !isChatActivelyRunning(c.id); });
+    // Don't duplicate a pinned chat that is ALSO in the Active list above — it
+    // already shows there (with a filled pin button). The Active list now keeps
+    // busy, lingering AND unread chats, so mirror that exact predicate here.
+    var pinnedToShow = pinnedChats.filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id); });
     if (pinnedToShow.length) {
+        var _pinW = _jobsTimeColWidth(pinnedToShow.map(_jobsHistTimeStr));
         pinnedHtml = '<div class="jobs-subhead jobs-subhead-pinned">Pinned</div>' +
-            pinnedToShow.map(function(c) { return _jobsPinnedRowHtml(c); }).join('');
+            pinnedToShow.map(function(c) { return _jobsPinnedRowHtml(c, _pinW); }).join('');
     }
     var todayHtml = '';
     if (todayChats.length) {
+        var _todayW = _jobsTimeColWidth(todayChats.map(_jobsTodayTimeStr));
         todayHtml = '<div class="jobs-subhead">Completed Today</div>' +
-            todayChats.map(function(c) { return _jobsTodayRowHtml(c); }).join('');
+            todayChats.map(function(c) { return _jobsTodayRowHtml(c, _todayW); }).join('');
     }
     var h = '';
     h += '<div class="jobs-panel-head">' +
             '<span class="jobs-panel-title">Active Chats</span>' +
-            '<span class="jobs-panel-viewall" onclick="openHistoryFromJobsDropdown()">View all ' + extIcon + '</span>' +
+            '<span class="jobs-panel-expand" onclick="expandJobsDropdown()" title="Expand to full screen">Expand <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></span>' +
         '</div>';
     h += '<div class="jobs-tabs" role="tablist">' +
             '<button class="jobs-tab active" data-tab="active" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
-            '<button class="jobs-tab" data-tab="recent" onclick="switchJobsTab(\'recent\')">Recent<span class="jobs-tab-count">' + recentChats.length + '</span></button>' +
-            '<button class="jobs-tab" data-tab="done" onclick="switchJobsTab(\'done\')">Done<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
+            '<button class="jobs-tab" data-tab="done" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
         '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active">' + activePanel + pinnedHtml + todayHtml + '</div>';
-    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="recent" style="display:none">' +
-            (recentRows || '<div class="jobs-tab-empty">No recent chats</div>') + '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done" style="display:none">' +
-            (doneRows || '<div class="jobs-tab-empty">No finished chats</div>') + '</div>';
+            _renderJobsHistoryPanel(doneChats) + '</div>';
     return h;
+}
+// ---- History panel: quick-search + Today/This Week/This Month grouping ------
+// History (formerly 'Done') panel: a quick-search box above the finished chats,
+// which are grouped under Today / This Week / This Month / Older subheads. The
+// search mirrors the full History view (matches title + message/tool content via
+// chatMatchesSearch) but filters only these History rows.
+var _jobsHistoryQuery = '';
+function _renderJobsHistoryPanel(doneChats) {
+    _ensureJobsHistorySearchBound();
+    var searchVal = escapeHtml(_jobsHistoryQuery || '');
+    var bar = '<div class="jobs-history-search">' +
+        '<span class="jobs-history-search-icon">' + (UI_ICONS.search || '') + '</span>' +
+        '<input type="text" id="jobs-history-search-input" class="jobs-history-search-input" ' +
+            'placeholder="Search history\u2026" value="' + searchVal + '" ' +
+            'autocomplete="off" aria-label="Search history chats" />' +
+        (searchVal ? '<button type="button" class="jobs-history-search-clear" title="Clear search" aria-label="Clear search">\u00d7</button>' : '') +
+    '</div>';
+    return bar + '<div class="jobs-history-results">' + _renderJobsHistoryResults(doneChats) + '</div>';
+}
+// Bind (once) the History quick-search via event delegation on document. The
+// search input + clear button are re-created on every dropdown render, so a
+// delegated listener is more reliable than per-element inline handlers.
+var _jobsHistorySearchBound = false;
+function _ensureJobsHistorySearchBound() {
+    if (_jobsHistorySearchBound) return;
+    _jobsHistorySearchBound = true;
+    document.addEventListener('input', function(e) {
+        var t = e.target;
+        if (t && t.id === 'jobs-history-search-input') onJobsHistorySearch(t.value);
+    });
+    document.addEventListener('click', function(e) {
+        var t = e.target;
+        if (t && t.closest && t.closest('.jobs-history-search-clear')) {
+            e.stopPropagation();
+            e.preventDefault();
+            clearJobsHistorySearch();
+        }
+    });
+}
+// Build the grouped (Today / This Week / This Month / Older) History rows,
+// honoring the current quick-search query. doneChats is optional — recomputed
+// from getDoneChatsList() when omitted (e.g. on a search-only re-render).
+function _renderJobsHistoryResults(doneChats) {
+    var chatsArr = doneChats || (typeof getDoneChatsList === 'function' ? getDoneChatsList() : []);
+    var q = (_jobsHistoryQuery || '').trim();
+    if (q.length >= 2 && typeof chatMatchesSearch === 'function') {
+        chatsArr = chatsArr.filter(function(c) { return chatMatchesSearch(c, q); });
+    }
+    if (!chatsArr.length) {
+        return '<div class="jobs-tab-empty">' + (q ? 'No matching chats' : 'No finished chats') + '</div>';
+    }
+    return _renderJobsGroupedRows(chatsArr, 'history');
+}
+// Group chat rows under date subheads. mode 'history' => Today / This Week /
+// This Month / Older; mode 'recent' => Today / This Week (everything not-today
+// folds into This Week, since the Recent list is already capped to ~1 week).
+// Rolling windows relative to midnight today, so "This Week" is never empty by
+// construction the way a Monday-anchored calendar week would be.
+function _renderJobsGroupedRows(chatsArr, mode) {
+    if (!chatsArr || !chatsArr.length) return '';
+    var t0 = new Date(); t0.setHours(0, 0, 0, 0); t0 = t0.getTime();
+    var weekAgo = t0 - 7 * 86400000;
+    var monthAgo = t0 - 30 * 86400000;
+    var groups, order;
+    if (mode === 'recent') {
+        groups = { today: [], week: [] };
+        chatsArr.forEach(function(c) {
+            if (_jobsChatTs(c) >= t0) groups.today.push(c); else groups.week.push(c);
+        });
+        order = [['today', 'Today'], ['week', 'This Week']];
+    } else {
+        groups = { today: [], week: [], month: [], older: [] };
+        chatsArr.forEach(function(c) {
+            var ts = _jobsChatTs(c);
+            if (ts >= t0) groups.today.push(c);
+            else if (ts >= weekAgo) groups.week.push(c);
+            else if (ts >= monthAgo) groups.month.push(c);
+            else groups.older.push(c);
+        });
+        order = [['today', 'Today'], ['week', 'This Week'], ['month', 'This Month'], ['older', 'Older']];
+    }
+    var h = '';
+    order.forEach(function(g) {
+        var arr = groups[g[0]];
+        if (!arr.length) return;
+        var _gw = _jobsTimeColWidth(arr.map(_jobsHistTimeStr));
+        h += '<div class="jobs-subhead">' + g[1] + '</div>' +
+            arr.map(function(c) { return _jobsChatRowHtml(c, 'list', _gw); }).join('');
+    });
+    return h;
+}
+// Quick-search input handler: re-render ONLY the results list so the input keeps
+// focus while the user types.
+function onJobsHistorySearch(val) {
+    _jobsHistoryQuery = val || '';
+    var dd = (typeof _getOpenJobsDropdown === 'function' && _getOpenJobsDropdown()) ||
+             (typeof _getVisibleJobsDropdown === 'function' && _getVisibleJobsDropdown());
+    if (!dd) return;
+    var results = dd.querySelector('.jobs-history-results');
+    if (results) results.innerHTML = _renderJobsHistoryResults();
+    var bar = dd.querySelector('.jobs-history-search');
+    if (!bar) return;
+    var clearBtn = bar.querySelector('.jobs-history-search-clear');
+    if (_jobsHistoryQuery && !clearBtn) {
+        clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.className = 'jobs-history-search-clear';
+        clearBtn.title = 'Clear search';
+        clearBtn.setAttribute('aria-label', 'Clear search');
+        clearBtn.textContent = '\u00d7';
+        bar.appendChild(clearBtn);
+    } else if (!_jobsHistoryQuery && clearBtn) {
+        clearBtn.parentNode.removeChild(clearBtn);
+    }
+}
+function clearJobsHistorySearch() {
+    _jobsHistoryQuery = '';
+    var dd = (typeof _getOpenJobsDropdown === 'function' && _getOpenJobsDropdown()) ||
+             (typeof _getVisibleJobsDropdown === 'function' && _getVisibleJobsDropdown());
+    if (!dd) return;
+    var input = dd.querySelector('#jobs-history-search-input');
+    if (input) { input.value = ''; input.focus(); }
+    var results = dd.querySelector('.jobs-history-results');
+    if (results) results.innerHTML = _renderJobsHistoryResults();
+    var bar = dd.querySelector('.jobs-history-search');
+    var clearBtn = bar && bar.querySelector('.jobs-history-search-clear');
+    if (clearBtn) clearBtn.parentNode.removeChild(clearBtn);
 }
 // Switch the visible tab panel within the open jobs dropdown.
 function switchJobsTab(tabName) {
@@ -2372,6 +2696,141 @@ function switchJobsTab(tabName) {
 function openHistoryFromJobsDropdown() {
     if (typeof closeJobsDropdown === 'function') closeJobsDropdown();
     if (typeof openHistoryView === 'function') openHistoryView();
+}
+
+// ---- Expand: centered modal of active chats as live progress cards --------
+// The jobs dropdown's 'Expand' control opens a centered modal that mirrors the
+// dropdown's Active view as three fixed columns — Active, Completed Today and
+// Pinned — each stacking its chats as cards showing title + live progress. Kept real-time
+// by a 1s polling refresh (diffed, so it only repaints on change) plus the
+// renderJobsBadge -> _refreshJobsExpandModal event hook.
+var _jobsExpandTimer = null;
+function expandJobsDropdown() {
+    // Drop the small dropdown — the modal replaces it.
+    if (typeof closeJobsDropdown === 'function') { try { closeJobsDropdown(); } catch (e) {} }
+    if (document.getElementById('jobs-expand-overlay')) { renderJobsExpandModal(); return; }
+    var overlay = document.createElement('div');
+    overlay.id = 'jobs-expand-overlay';
+    overlay.className = 'jobs-expand-overlay';
+    // Click on the backdrop (not the modal) closes it.
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) closeJobsExpandModal(); });
+    document.body.appendChild(overlay);
+    document.addEventListener('keydown', _jobsExpandEscHandler, true);
+    renderJobsExpandModal();
+    // Real-time progress: poll while the modal is open. renderJobsExpandModal
+    // diffs its HTML and only repaints on change, so this stays cheap + flicker-free.
+    if (_jobsExpandTimer) clearInterval(_jobsExpandTimer);
+    _jobsExpandTimer = setInterval(function() {
+        if (!document.getElementById('jobs-expand-overlay')) { clearInterval(_jobsExpandTimer); _jobsExpandTimer = null; return; }
+        try { renderJobsExpandModal(); } catch (e) {}
+    }, 1000);
+}
+function _jobsExpandEscHandler(e) {
+    if (e && e.key === 'Escape') { e.stopPropagation(); closeJobsExpandModal(); }
+}
+function closeJobsExpandModal() {
+    var overlay = document.getElementById('jobs-expand-overlay');
+    if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    document.removeEventListener('keydown', _jobsExpandEscHandler, true);
+    if (_jobsExpandTimer) { clearInterval(_jobsExpandTimer); _jobsExpandTimer = null; }
+}
+// Re-render the open expand modal in place (preserving scroll) so progress
+// content stays live while chats run. No-op when the modal isn't open.
+function _refreshJobsExpandModal() {
+    if (document.getElementById('jobs-expand-overlay')) {
+        try { renderJobsExpandModal(); } catch (e) {}
+    }
+}
+function renderJobsExpandModal() {
+    var overlay = document.getElementById('jobs-expand-overlay');
+    if (!overlay) return;
+    var prevBody = overlay.querySelector('.jobs-expand-body');
+    var prevScroll = prevBody ? prevBody.scrollTop : 0;
+    // Each column scrolls on its own now, so snapshot per-column scroll (by
+    // index — column order is stable) to restore it after the live repaint.
+    var prevColScroll = [];
+    overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { prevColScroll[i] = el.scrollTop; });
+    var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
+    // Source the same three buckets as the dropdown's Active view. Dedupe so a
+    // pinned-but-lingering chat only shows once (under Active). The modal then
+    // renders them as columns in the order Active → Completed Today → Pinned.
+    var activeChats = chatList.filter(function(c) { return isChatBusy(c.id) || _isChatLingering(c.id) || _isChatUnseen(c.id); });
+    var activeIds = {};
+    activeChats.forEach(function(c) { activeIds[c.id] = true; });
+    var pinnedChats = (typeof getPinnedChatsList === 'function' ? getPinnedChatsList() : [])
+        .filter(function(c) { return !isChatBusy(c.id) && !activeIds[c.id]; });
+    var todayChats = (typeof getCompletedTodayChats === 'function') ? getCompletedTodayChats() : [];
+    var total = activeChats.length + pinnedChats.length + todayChats.length;
+    var closeIcon = UI_ICONS.close || '\u00d7';
+    // Three fixed columns side by side — Active, then Completed Today, then
+    // Pinned (kanban-style). Each column keeps its own header and stacks its
+    // cards vertically. Empty columns still render (with a placeholder) so the
+    // layout stays stable as chats move between buckets.
+    function column(label, arr) {
+        var cards = arr.length
+            ? arr.map(function(c) { return _jobsExpandCardHtml(c); }).join('')
+            : '<div class="jobs-expand-col-empty">None</div>';
+        return '<div class="jobs-expand-column">' +
+            '<div class="jobs-expand-subhead">' + escapeHtml(label) +
+                ' <span class="jobs-expand-col-count">' + arr.length + '</span></div>' +
+            '<div class="jobs-expand-col-cards">' + cards + '</div>' +
+        '</div>';
+    }
+    var body;
+    if (!total) {
+        body = '<div class="jobs-expand-empty">No active chats right now</div>';
+    } else {
+        body = '<div class="jobs-expand-columns">' +
+            column('Active', activeChats) +
+            column('Completed Today', todayChats) +
+            column('Pinned', pinnedChats) +
+        '</div>';
+    }
+    var html =
+        '<div class="jobs-expand-modal" role="dialog" aria-label="Active chats">' +
+            '<div class="jobs-expand-head">' +
+                '<span class="jobs-expand-title">Active Chats</span>' +
+                '<span class="jobs-expand-count">' + total + '</span>' +
+                '<button class="jobs-expand-close" aria-label="Close" onclick="closeJobsExpandModal()">' + closeIcon + '</button>' +
+            '</div>' +
+            '<div class="jobs-expand-body">' + body + '</div>' +
+        '</div>';
+    // Diff: skip the repaint (and its flicker) when nothing changed.
+    if (overlay._jobsLastHtml === html) {
+        if (prevBody) prevBody.scrollTop = prevScroll;
+        return;
+    }
+    overlay._jobsLastHtml = html;
+    overlay.innerHTML = html;
+    var newBody = overlay.querySelector('.jobs-expand-body');
+    if (newBody) newBody.scrollTop = prevScroll;
+    overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) {
+        if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i];
+    });
+}
+// One active chat as a card: status indicator + title + open button, with the
+// chat's progress content (label / status / tasks / output) as the card body.
+function _jobsExpandCardHtml(c) {
+    var st = (typeof _jobsChatState === 'function') ? _jobsChatState(c.id) : 'done';
+    var indicator = (st === 'unseen')
+        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
+        : '<span class="jobs-row-dot state-' + st + '"></span>';
+    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
+    var idJs = escapeJsString(c.id);
+    return '<div class="jobs-expand-card' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
+        '<div class="jobs-expand-card-head">' +
+            indicator +
+            '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
+        '</div>' +
+        '<div class="jobs-expand-card-body">' + _jobsAccordionContentHtml(c.id) + '</div>' +
+    '</div>';
+}
+// Open a chat from an expand-modal card: close the modal, then navigate (which
+// also marks the chat seen, clearing its unread/bold state).
+function openChatFromExpand(chatId) {
+    closeJobsExpandModal();
+    if (typeof openChatFromJobsDropdown === 'function') openChatFromJobsDropdown(chatId);
 }
 // Accordion: toggle an inline progress panel right under the clicked chat row
 // (inside the dropdown) instead of a floating popover. One open at a time;
@@ -2403,10 +2862,56 @@ function toggleJobsRowAccordion(chatId) {
     row.parentNode.insertBefore(acc, row.nextSibling);
     row.classList.add('acc-open');
 }
+// Action-row variant of toggleJobsRowAccordion: toggles an inline progress
+// accordion directly below the action row (keyed on data-action-id) so an action
+// behaves like a chat row instead of opening a popover.
+function toggleJobsActionAccordion(actionId) {
+    var dd = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+    if (!dd) return;
+    var sel = (window.CSS && CSS.escape) ? CSS.escape(actionId) : actionId;
+    var rows = dd.querySelectorAll('.jobs-dropdown-row[data-action-id="' + sel + '"]');
+    var row = null;
+    for (var i = 0; i < rows.length; i++) {
+        if (rows[i].offsetParent !== null) { row = rows[i]; break; }
+    }
+    if (!row) row = rows[0];
+    if (!row) return;
+    // Toggle off if this row's accordion is already open.
+    var nx = row.nextElementSibling;
+    if (nx && nx.classList.contains('jobs-row-accordion') && nx.getAttribute('data-acc-for') === actionId) {
+        nx.parentNode.removeChild(nx);
+        row.classList.remove('acc-open');
+        return;
+    }
+    var acc = document.createElement('div');
+    acc.className = 'jobs-row-accordion';
+    acc.setAttribute('data-acc-for', actionId);
+    acc.innerHTML = _jobsActionAccordionContentHtml(actionId);
+    row.parentNode.insertBefore(acc, row.nextSibling);
+    row.classList.add('acc-open');
+}
 // Build the inline progress content for a chat's accordion (label, status,
 // done/error output, task checklist) — mirrors the progress popover body.
 function _jobsAccordionContentHtml(chatId) {
     var current = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null;
+    return _jobsAccordionBodyHtml(current);
+}
+// Inline progress for an action row's accordion — mirrors a chat row. Prefers the
+// live update_action_state progress from the action's background chat, falling
+// back to the action's own mirrored fields (a just-started action whose chat has
+// not executed an update yet).
+function _jobsActionAccordionContentHtml(actionId) {
+    var a = (typeof activeActions !== 'undefined') ? activeActions[actionId] : null;
+    if (!a) return '<div class="jobs-acc-empty">No progress reported yet</div>';
+    var current = (a.chatId && typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(a.chatId) : null;
+    if (!current) {
+        current = { state: a.state, label: a.label, status_message: a.status_message, tasks: a.tasks, output: a.output };
+    }
+    return _jobsAccordionBodyHtml(current);
+}
+// Shared inline-progress body for chat-row and action-row accordions. `current`
+// is a {state,label,status_message,tasks,output} snapshot or null.
+function _jobsAccordionBodyHtml(current) {
     if (!current) return '<div class="jobs-acc-empty">No progress reported yet</div>';
     var s = current.state || 'running';
     var headHtml = current.label ? '<div class="jobs-acc-label">' + escapeHtml(current.label) + '</div>' : '';
@@ -2441,24 +2946,21 @@ function _jobsAccordionContentHtml(chatId) {
 function onJobsDropdownRowClick(actionId) {
     var a = activeActions[actionId];
     if (!a) return;
-    // Anchor the popover to the dropdown PANEL itself (not the row) so the popover
-    // appears below the dropdown rather than overlapping its rows. The dropdown
-    // stays open so the user can pick another action without re-opening it.
-    // IMPORTANT: scope the row lookup to the OPEN dropdown. Both dropdowns
-    // (chat header + home header) render the same rows; a global querySelector
-    // would return the row from the hidden dropdown, whose bounding rect is zero
-    // — causing _positionPopover to fall back to a viewport-centered location.
-    var dropdownEl = _getOpenJobsDropdown();
-    var rowEl = dropdownEl
-        ? dropdownEl.querySelector('.jobs-dropdown-row[data-action-id="' + actionId + '"]')
-        : document.querySelector('.jobs-dropdown-row[data-action-id="' + actionId + '"]');
-    if (!dropdownEl && rowEl) dropdownEl = rowEl.closest('.jobs-dropdown');
-    var anchor = dropdownEl || rowEl;
+    // Prompt / approval states keep their dedicated interactive popovers — an
+    // inline accordion can't host the response UI.
     if (a.state === 'needs_input') { openPendingPromptForAction(actionId); return; }
-    if (a.state === 'needs_permission' && anchor) { openPendingApprovalForActionInline(anchor, actionId); return; }
-    if (a.state === 'running' && anchor) { openRunningPopover(anchor, actionId); return; }
-    if (a.state === 'stuck' && anchor) { openResultPopover(anchor, actionId); return; }
-    if ((a.state === 'done' || a.state === 'error' || a.state === 'stopped') && anchor) { openResultPopover(anchor, actionId); return; }
+    if (a.state === 'needs_permission') {
+        var ddEl = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+        var rowEl = ddEl
+            ? ddEl.querySelector('.jobs-dropdown-row[data-action-id="' + actionId + '"]')
+            : document.querySelector('.jobs-dropdown-row[data-action-id="' + actionId + '"]');
+        var anchor = ddEl || rowEl;
+        if (anchor) openPendingApprovalForActionInline(anchor, actionId);
+        return;
+    }
+    // Progress states (running / stuck / done / error / stopped): toggle an inline
+    // accordion below the row showing the action's progress — just like a chat row.
+    toggleJobsActionAccordion(actionId);
 }
 
 // Keep the old function name for backward compat with any lingering callers

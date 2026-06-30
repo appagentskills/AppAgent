@@ -167,6 +167,13 @@ function _armHelloGraceReconcile(orphans, cleanups) {
 function _cleanupStaleForegroundRun(chatId) {
     if (!chatId) return;
     try {
+        // The run evaporated WITHOUT a terminal runFinished event (SW restart /
+        // reconnect flap). The grace reconcile already re-checked that the chat is
+        // no longer running, so stamp it finished now — otherwise it never enters
+        // the 5-minute linger and drops out of Active Chats the instant the SW
+        // flaps. (No-op for background/sub chats, which markChatRecentlyFinished
+        // intentionally skips.)
+        if (typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(chatId); } catch (e) {} }
         if (typeof hideSpinner === 'function') { try { hideSpinner(chatId); } catch (e) {} }
         if (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId === chatId) {
             isRunning = false;

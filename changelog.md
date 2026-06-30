@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.9
+
+### Features
+- Jobs dropdown is cleaner: timestamps are right-aligned, the Recent tab is gone, and row icons are clearer at a glance.
+- An unread finished chat now stays in Active Chats until you actually open it, no matter how old it is, instead of dropping out after a few minutes.
+
+### Fixes
+- The legacy frame-busting guard no longer redirects the extension panel to your instance.
+
+---
+
 ## v1.1.8
 
 ### Features

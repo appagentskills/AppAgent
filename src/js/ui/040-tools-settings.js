@@ -446,7 +446,7 @@ async function renderGitHubReposList() {
             }
             detailHtml += '</div>';
 
-            html += '<div class="settings-page-row" style="padding:var(--space-4) 0;border-bottom:1px solid var(--border);align-items:flex-start;">' +
+            html += '<div class="settings-page-row" data-wk="' + escapeHtml(rd.wk) + '" style="padding:var(--space-4) 0;border-bottom:1px solid var(--border);align-items:flex-start;">' +
                 '<div style="flex:1;min-width:0;">' +
                     '<div style="display:flex;align-items:center;gap:var(--space-4);">' +
                         '<div class="settings-page-row-label" style="margin:0;">' + escapeHtml(rd.githubRepo) + '</div>' +
@@ -615,12 +615,31 @@ async function recloneGitHubRepo(repo, branch) {
 }
 
 async function deleteGitHubRepo(repo) {
-    await deleteWorkspaceFiles(repo);
-    await deleteWorkspaceMeta(repo);
-    try { gcWorkspaceBlobs(); } catch (e) {}
+    // Instant UI: drop just this one row. A full renderGitHubReposList() re-render
+    // re-reads every workspace's files from IndexedDB AND re-runs a remote GitHub
+    // sync ("checking...") for every OTHER repo — that round-trip is what made
+    // removal feel slow. Remove the row now; clean up storage in the background.
+    var container = document.getElementById('github-repos-list');
+    if (container) {
+        var rows = container.querySelectorAll('.settings-page-row[data-wk]');
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].getAttribute('data-wk') === repo) { rows[i].remove(); break; }
+        }
+        // Last one gone — show the empty state.
+        if (!container.querySelector('.settings-page-row[data-wk]')) {
+            container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">No repositories cloned yet.</div>';
+        }
+    }
+    try {
+        await deleteWorkspaceFiles(repo);
+        await deleteWorkspaceMeta(repo);
+        try { gcWorkspaceBlobs(); } catch (e) {}
+    } catch (e) {
+        // Storage cleanup failed — re-render so the list matches reality.
+        renderGitHubReposList();
+    }
     refreshWorkspaceContext();
     updateWorkspaceHeaderStatus();
-    renderGitHubReposList();
 }
 
 // ============================================

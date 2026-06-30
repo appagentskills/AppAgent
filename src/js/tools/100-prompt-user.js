@@ -11,6 +11,24 @@ async function executePromptUser(args, options) {
     var title = args.title || 'Input needed';
     if (!fields.length) return { success: false, error: 'fields array is required' };
 
+    // MANDATORY FREE-TEXT ESCAPE HATCH: every user panel question must let the PM
+    // answer in their own words, regardless of the constrained fields the agent
+    // defined. If no open text/textarea field is present, append one so that
+    // predefined select / multi-select / boolean / number / date choices are
+    // never the ONLY way to respond.
+    var _hasFreeText = fields.some(function(f) {
+        return f && (f.type === 'text' || f.type === 'textarea');
+    });
+    if (!_hasFreeText) {
+        fields = fields.concat([{
+            name: 'free_text_response',
+            type: 'textarea',
+            label: 'Your answer (free text)',
+            placeholder: 'Type your own answer here if none of the options above fit…',
+            required: false
+        }]);
+    }
+
     var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
     if (!chat) return { success: false, error: 'No active chat' };

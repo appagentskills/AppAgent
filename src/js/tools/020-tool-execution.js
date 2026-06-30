@@ -3871,7 +3871,10 @@ async function wsPush(wk, args) {
     if (!args.branch_name && meta.forked_from) args.branch_name = meta.branch;
     if (!args.branch_name) return { success: false, error: 'branch_name is required' };
     if (!args.commit_message) return { success: false, error: 'commit_message is required' };
-    if (!args.pr_title) return { success: false, error: 'pr_title is required' };
+    // pr_title is validated LATER (after we resolve whether an OPEN PR already
+    // exists for this branch). It is REQUIRED only when this push will OPEN A NEW
+    // PR; when appending to an existing open PR we keep that PR's current title,
+    // so pr_title is optional there. See the deferred gate after openPrForBranch.
     var githubRepo = meta.github_repo || parseWsKey(wk).repo;
     var gh = await loadGitHubSettings();
     if (!gh.token) return { success: false, error: 'GitHub not connected' };
@@ -4017,6 +4020,15 @@ async function wsPush(wk, args) {
             }
             staleBranchRecreated = true;
         }
+    }
+
+    // pr_title gate (deferred from the top of wsPush): if an OPEN PR already
+    // exists for this branch we will APPEND to it and keep its current title, so
+    // pr_title is optional. In every other case this push opens a new PR (or
+    // reopens a closed one), which needs a title — require it now, BEFORE any
+    // remote mutation, so a missing title never leaves an orphan branch/commit.
+    if (!openPrForBranch && !args.pr_title) {
+        return { success: false, error: 'pr_title is required (no open PR exists for branch "' + args.branch_name + '" to append to)' };
     }
 
     // Base for NEW branches (including recreated stale ones): the CURRENT remote
@@ -4247,11 +4259,15 @@ async function wsPush(wk, args) {
         prReused = true;
         prNumber = existingPr.number;
         prUrl = existingPr.html_url;
-        // Refresh the PR title (always provided) and the body ONLY when a non-empty
-        // body was passed — otherwise we'd wipe the existing PR description on append.
-        var _prPatch = { title: args.pr_title };
+        // Refresh the PR title ONLY when a pr_title was passed (it is optional when
+        // appending to an existing open PR) and the body ONLY when a non-empty body
+        // was passed — otherwise we'd wipe the existing PR title/description on append.
+        var _prPatch = {};
+        if (typeof args.pr_title === 'string' && args.pr_title !== '') _prPatch.title = args.pr_title;
         if (typeof args.pr_body === 'string' && args.pr_body !== '') _prPatch.body = args.pr_body;
-        await githubApi('PATCH', '/repos/' + githubRepo + '/pulls/' + prNumber, _prPatch);
+        if (Object.keys(_prPatch).length > 0) {
+            await githubApi('PATCH', '/repos/' + githubRepo + '/pulls/' + prNumber, _prPatch);
+        }
     } else {
         var prRes = await githubApi('POST', '/repos/' + githubRepo + '/pulls', {
             title: args.pr_title,

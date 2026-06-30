@@ -1,8 +1,10 @@
 async function init() {
-    // If inside an iframe, try to redirect to standalone page
-    // This works for platform iframes (gsft_main) but fails for sandboxed
-    // iframes (integrated browser) which then continue normally
-    if (window.self !== window.top) {
+    // Legacy frame-bust: only relevant to the old ServiceNow UI Page deployment
+    // (app loaded inside gsft_main). In the Chrome extension app.html is always
+    // the top frame, so this would wrongly point window.top at
+    // <top-origin>/app.html (e.g. the ServiceNow instance). Skip it entirely for
+    // chrome-extension: pages; keep it only for a genuine same-origin platform iframe.
+    if (window.self !== window.top && location.protocol !== 'chrome-extension:') {
         try {
             window.top.location.href = window.location.pathname;
             return;
