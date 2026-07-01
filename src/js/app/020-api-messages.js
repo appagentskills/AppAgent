@@ -405,15 +405,29 @@ function rejectPendingApprovalsForChat(chatId) {
 // interrupted run can leave the chat ending on an aux role. Walk backward past
 // aux roles to find the last "real" message, then apply the standard logic.
 var _AUX_ROLES_FOR_INTERRUPTION = ['screenshot', 'pdf', 'file', 'context', 'browser_context'];
+// Answer-card hook tools (see ANSWER_CARD_TOOLS in 030-agent-loop.js): when a
+// turn consists ONLY of these and all succeed, the loop intentionally ends the
+// run right after recording their results (`_answerCardOnlyTurn` break) — no
+// final LLM round-trip. That leaves the transcript ending on role:'tool'
+// messages for a chat that finished NORMALLY. Skip completed (non-placeholder)
+// answer-card results in the walk-back so they don't read as an interrupted
+// run; placeholders (`_placeholder: true`, hook never actually ran) still
+// count as interruption.
+var _ANSWER_CARD_TOOLS_FOR_INTERRUPTION = { set_chat_title: true, set_tldr: true, set_links: true };
 function isChatInterrupted(chat) {
     if (!chat || !chat.id || !Array.isArray(chat.messages) || chat.messages.length === 0) return false;
     if (typeof runningChatIds !== 'undefined' && runningChatIds[chat.id]) return false;
     var msgs = chat.messages;
-    // Walk back past auxiliary attachment roles. If the chat is entirely aux
-    // (impossible in practice — always preceded by a user msg — but defensive),
-    // treat as not interrupted.
+    // Walk back past auxiliary attachment roles and completed answer-card hook
+    // results. If the chat is entirely aux (impossible in practice — always
+    // preceded by a user msg — but defensive), treat as not interrupted.
     var lastIdx = msgs.length - 1;
-    while (lastIdx >= 0 && _AUX_ROLES_FOR_INTERRUPTION.indexOf(msgs[lastIdx].role) >= 0) lastIdx--;
+    while (lastIdx >= 0) {
+        var _wm = msgs[lastIdx];
+        if (_AUX_ROLES_FOR_INTERRUPTION.indexOf(_wm.role) >= 0) { lastIdx--; continue; }
+        if (_wm.role === 'tool' && _wm.name && _ANSWER_CARD_TOOLS_FOR_INTERRUPTION[_wm.name] && !_wm._placeholder) { lastIdx--; continue; }
+        break;
+    }
     if (lastIdx < 0) return false;
     var last = msgs[lastIdx];
     if (last.role === 'user') return true;

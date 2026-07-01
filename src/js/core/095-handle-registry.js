@@ -478,6 +478,7 @@ var Handles = {
         list_instances: true,
         set_chat_title: true,
         set_tldr: true,
+        set_links: true,
         // Cache navigators are pure in-memory reads.
         cached_content_outline: true,
         cached_content_read: true,

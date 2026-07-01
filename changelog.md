@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.1.10
+
+### Features
+- New Links card: the agent can attach relevant links right below the TL;DR, and pushed PR links now show up in the chat sidebar.
+- Jobs dropdown got smarter: chat rows show sub-agents and a context-usage ring, unread chats stand out email-style, and the sub-agent drawer is docked inside the expanded card.
+- Workspace dropdown opens instantly, and the workspace pill has a "This chat" section listing the workspaces this chat has touched.
+- Workspace ls, grep, and diff now warn when another chat owns the workspace, and grep keeps output short by default.
+- Clicking the usage pill now refreshes your usage and opens a dropdown breaking down your limits in detail, updating live as fresh numbers land.
+- Sub-agent chats have a clearer header with a link back to the parent chat, and internal tools show friendly names instead of raw identifiers.
+
+### Fixes
+- Switching chats mid-run no longer leaves a blank pane, leaks another chat's streaming text, or hides text the agent streamed between tool calls.
+- Sent messages appear as normal messages immediately — no more "Queued" badge.
+- The Continue button no longer shows up after a run that ends with just an answer card, and answer cards land in the right chat.
+- Chat text rendering is hardened against HTML injection.
+- Pushing a new PR without a description now falls back to your commit message.
+
+---
+
 ## v1.1.9
 
 ### Features

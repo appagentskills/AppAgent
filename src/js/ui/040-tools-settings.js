@@ -88,6 +88,7 @@ function getToolFunctionSource(toolName) {
         'iframe_tool': executeIframeTool,
         'set_chat_title': executeSetChatTitle,
         'set_tldr': executeSetTldr,
+        'set_links': executeSetLinks,
         'get_skill': executeGetSkill,
         'manage_skill': executeManageSkill,
         'html_widget': executeHtmlWidget
@@ -199,6 +200,10 @@ function renderSettingsPage() {
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Answer TL;DR Card</div><div class="settings-page-row-hint">Ask the agent for a short TL;DR after each answer, shown as a card at the end of the answer</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoTldr ? 'checked' : '') + ' onchange="toggleHook(\'autoTldr\')">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Answer Links Card</div><div class="settings-page-row-hint">Ask the agent for relevant links (PRs, diffs, records, docs) after each answer, shown as a card below the TL;DR</div></div>' +
+                '<input type="checkbox" ' + (hooksEnabled.autoLinks ? 'checked' : '') + ' onchange="toggleHook(\'autoLinks\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Show Hook Messages</div><div class="settings-page-row-hint">Display hook messages and responses in chat</div></div>' +
@@ -785,14 +790,35 @@ async function syncAndUpdateWorkspaceHeader() {
 
 async function toggleWorkspaceDropdown() {
     if (_wsDropdown) { hideWorkspaceDropdown(); return; }
-    // Resolve extension-dev mode once (async) so the synchronous section render can gate
-    // the pin button on it — same condition the Reload button is shown under.
-    try { _wsExtDevMode = (typeof _reloadRebuildsFromWorkspace === 'function') ? await _reloadRebuildsFromWorkspace() : false; }
-    catch (e) { _wsExtDevMode = false; }
-    // Show dropdown immediately with cached/local data, then sync in background
-    await updateWorkspaceHeaderStatus();
+    // Open INSTANTLY from the cached header state (_wsHeaderCaches is kept warm
+    // by startup + every sync). The user mostly wants dirty files / PR links,
+    // which the cache already has — everything else refreshes lazily below.
+    var hadCache = Object.keys(_wsHeaderCaches).length > 0;
+    if (!hadCache) {
+        // First-ever open with a cold cache: one local scan so we know what exists.
+        await updateWorkspaceHeaderStatus();
+    }
     showWorkspaceDropdown();
-    // Background sync — update dropdown sections progressively
+
+    // Lazy phase 1 — resolve extension-dev mode (gates the per-repo pin button,
+    // same condition the Reload button is shown under) without blocking the
+    // open. The value is sticky across opens, so pins render instantly from the
+    // second open on; on a change we re-render the open sections in place.
+    var extDevPromise;
+    try { extDevPromise = (typeof _reloadRebuildsFromWorkspace === 'function') ? Promise.resolve(_reloadRebuildsFromWorkspace()) : Promise.resolve(false); }
+    catch (e) { extDevPromise = Promise.resolve(false); }
+    extDevPromise.then(function(v) {
+        if (!!v !== _wsExtDevMode) { _wsExtDevMode = !!v; _reconcileDropdownSections(); }
+    }).catch(function() {});
+
+    // Lazy phase 2 — refresh local dirty files / PR links from IndexedDB and
+    // reconcile the open dropdown in place (preserves collapse toggles).
+    if (hadCache) {
+        await updateWorkspaceHeaderStatus();
+        _reconcileDropdownSections();
+    }
+
+    // Lazy phase 3 — remote sync per repo, progressive section re-render.
     _syncDropdownInBackground();
 }
 
@@ -832,6 +858,7 @@ async function _syncDropdownInBackground() {
             if (_wsDropdown) {
                 var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
                 if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
+                _reconcileThisChatSection();
             }
         }).catch(function() {
             if (_wsHeaderCaches[wk]) _wsHeaderCaches[wk].syncStatus = 'offline';
@@ -942,6 +969,78 @@ function _wsSectionChangeCount(cache) {
     return d + c + b;
 }
 
+// Shared row builder for a dirty file (status badge + optional PR link).
+function _dirtyFileRow(f) {
+    var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
+        (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
+        '<span class="ws-file-badge modified">modified</span>';
+    var prLink = '';
+    if (f.pushed_pr && f.pushed_pr.url) {
+        prLink = '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank" onclick="event.stopPropagation()">PR #' + f.pushed_pr.number + '</a>';
+    }
+    var row = document.createElement('div');
+    row.className = 'ws-file-row';
+    row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' + badge + prLink;
+    return row;
+}
+
+// Small uppercase group label used inside dropdown bodies.
+function _wsGroupLabel(text) {
+    var el = document.createElement('div');
+    el.className = 'ws-file-group-label';
+    el.textContent = text;
+    return el;
+}
+
+// Aggregate dirty files whose uncommitted changes were stamped by the CURRENT
+// chat (cross-chat ownership, see 020-tool-execution.js), grouped by
+// workspace. Returns [{wk, files:[...]}] in _wsHeaderCaches order.
+function _thisChatChanges() {
+    var cid = (typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
+    if (!cid) return [];
+    var out = [];
+    Object.keys(_wsHeaderCaches).forEach(function(wk) {
+        var c = _wsHeaderCaches[wk];
+        var files = ((c && c.dirtyFiles) || []).filter(function(f) { return f.last_modified_by_chat_id === cid; });
+        if (files.length > 0) out.push({ wk: wk, files: files });
+    });
+    return out;
+}
+
+// Create/refresh/remove the "This chat" section pinned to the TOP of the
+// dropdown: lists each workspace this chat has touched with its dirty files.
+// Rendered only when the current chat owns at least one uncommitted change.
+function _reconcileThisChatSection() {
+    if (!_wsDropdown) return;
+    var groups = _thisChatChanges();
+    var sec = _wsDropdown.querySelector('.ws-this-chat-section');
+    if (groups.length === 0) { if (sec) sec.remove(); return; }
+    if (!sec) {
+        sec = document.createElement('div');
+        sec.className = 'ws-dropdown-section ws-this-chat-section';
+        var hdr = document.createElement('div');
+        hdr.className = 'ws-dropdown-header';
+        sec.appendChild(hdr);
+        var bdy = document.createElement('div');
+        bdy.className = 'ws-dropdown-body';
+        sec.appendChild(bdy);
+        _wsDropdown.insertBefore(sec, _wsDropdown.firstChild);
+    }
+    var total = 0;
+    groups.forEach(function(g) { total += g.files.length; });
+    var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
+    var countChip = '<span class="ws-change-count" title="' + total + ' uncommitted change' + (total > 1 ? 's' : '') + ' by this chat">' + total + '</span>';
+    var header = sec.querySelector('.ws-dropdown-header');
+    header.innerHTML = '<span class="ws-dd-title">' + chevron + 'This chat' + countChip + '</span><span class="ws-sync">uncommitted</span>';
+    var body = sec.querySelector('.ws-dropdown-body');
+    body.innerHTML = '';
+    groups.forEach(function(g) {
+        var parsed = parseWsKey(g.wk);
+        body.appendChild(_wsGroupLabel(parsed.repo + ' \u00b7 ' + parsed.branch));
+        g.files.forEach(function(f) { body.appendChild(_dirtyFileRow(f)); });
+    });
+}
+
 function _renderDropdownSection(section, cache) {
     var parsed = parseWsKey(cache.wk);
     var header = section.querySelector('.ws-dropdown-header');
@@ -961,19 +1060,7 @@ function _renderDropdownSection(section, cache) {
 
     // Dirty files
     if (cache.dirtyFiles && cache.dirtyFiles.length > 0) {
-        cache.dirtyFiles.forEach(function(f) {
-            var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
-                (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
-                '<span class="ws-file-badge modified">modified</span>';
-            var prLink = '';
-            if (f.pushed_pr && f.pushed_pr.url) {
-                prLink = '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank" onclick="event.stopPropagation()">PR #' + f.pushed_pr.number + '</a>';
-            }
-            var row = document.createElement('div');
-            row.className = 'ws-file-row';
-            row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' + badge + prLink;
-            body.appendChild(row);
-        });
+        cache.dirtyFiles.forEach(function(f) { body.appendChild(_dirtyFileRow(f)); });
     }
 
     // Conflict files
@@ -1024,6 +1111,47 @@ function _renderDropdownSection(section, cache) {
     }
 }
 
+// Build one workspace section (header + collapsible body) from the current
+// cache. Default expand state: only the top 3 workspaces (idx) start expanded,
+// and even a top-3 workspace starts collapsed when it has more than 5 changes.
+// User toggles and background re-renders preserve the class afterwards.
+function _createDropdownSection(wk, idx) {
+    var cache = _wsHeaderCaches[wk];
+    var section = document.createElement('div');
+    section.className = 'ws-dropdown-section';
+    section.setAttribute('data-ws', wk);
+    if (idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
+    var header = document.createElement('div');
+    header.className = 'ws-dropdown-header';
+    section.appendChild(header);
+    var body = document.createElement('div');
+    body.className = 'ws-dropdown-body';
+    section.appendChild(body);
+    _renderDropdownSection(section, cache); // fills header + body
+    return section;
+}
+
+// Reconcile the open dropdown with _wsHeaderCaches after a lazy refresh:
+// re-render existing sections in place (preserving the user's collapse
+// toggles), drop sections whose workspace vanished, and append sections for
+// newly discovered workspaces.
+function _reconcileDropdownSections() {
+    if (!_wsDropdown) return;
+    _wsDropdown.querySelectorAll('.ws-dropdown-section[data-ws]').forEach(function(sec) {
+        if (!_wsHeaderCaches[sec.getAttribute('data-ws')]) sec.remove();
+    });
+    Object.keys(_wsHeaderCaches).forEach(function(wk) {
+        var sec = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
+        if (sec) {
+            _renderDropdownSection(sec, _wsHeaderCaches[wk]);
+        } else {
+            var idx = _wsDropdown.querySelectorAll('.ws-dropdown-section[data-ws]').length;
+            _wsDropdown.appendChild(_createDropdownSection(wk, idx));
+        }
+    });
+    _reconcileThisChatSection();
+}
+
 async function showWorkspaceDropdown() {
     hideWorkspaceDropdown();
     var anchor = document.getElementById('ws-header-status');
@@ -1047,32 +1175,7 @@ async function showWorkspaceDropdown() {
     dd.className = 'ws-dropdown';
 
     keys.forEach(function(wk, idx) {
-        var cache = _wsHeaderCaches[wk];
-        var parsed = parseWsKey(wk);
-
-        var section = document.createElement('div');
-        section.className = 'ws-dropdown-section';
-        section.setAttribute('data-ws', wk);
-
-        // Default expand state: only the top 3 workspaces start expanded, and
-        // even a top-3 workspace starts collapsed when it has more than 5
-        // changes. Everything past the top 3 starts collapsed. User toggles and
-        // background re-renders preserve this class afterwards.
-        if (idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
-
-        // Section header
-        var header = document.createElement('div');
-        header.className = 'ws-dropdown-header';
-        header.innerHTML = '<span>' + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span></span>' + _getSyncLabel(cache.syncStatus);
-        section.appendChild(header);
-
-        // Section body (collapsible file list)
-        var body = document.createElement('div');
-        body.className = 'ws-dropdown-body';
-        section.appendChild(body);
-        _renderDropdownSection(section, cache);
-
-        dd.appendChild(section);
+        dd.appendChild(_createDropdownSection(wk, idx));
     });
 
     // Delegated pin-toggle handler — header innerHTML is re-rendered on every
@@ -1106,6 +1209,7 @@ async function showWorkspaceDropdown() {
     dd.style.right = (window.innerWidth - rect.right) + 'px';
     document.body.appendChild(dd);
     _wsDropdown = dd;
+    _reconcileThisChatSection();
 
     setTimeout(function() {
         document.addEventListener('click', _onClickOutsideWsDropdown, true);

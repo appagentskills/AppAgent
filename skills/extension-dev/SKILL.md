@@ -22,7 +22,7 @@ Develop the AppAgent Chrome extension using the `workspace` tool. You edit sourc
 2. **Explore**: Use `workspace ls`, `workspace read`, `workspace grep` to understand the codebase
 3. **Edit**: Use `workspace edit` for surgical changes (preferred) or `workspace write` for new files
 4. **Reload to apply**: Do **not** run `extension_build` to deploy. After editing, ask the user to click the **Reload** button in the extension header. With a deploy folder connected and this skill active, the reload rebuilds + redeploys from the workspace and restarts in one click — that is what makes your changes take effect. (Reload calls `extension_build` internally; you don't.)
-5. **Push**: When happy, `workspace push` creates a branch + commit + PR on GitHub
+5. **Push**: When happy, `workspace push` creates a branch + commit + PR on GitHub. **By default, pass `files: [...]` listing ONLY the files YOU worked on in this chat** — other dirty files in the workspace may be work-in-progress from other agents/chats, and pushing them would leak unrelated, possibly half-finished changes into your PR. Run `workspace status` first: it shows which chat owns each dirty file. Only omit `files` when you have verified every dirty file belongs to your task.
 
 ## Workspace Pinning, Branch Forks & Edit Moves
 

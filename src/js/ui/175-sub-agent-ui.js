@@ -650,7 +650,7 @@ function updateSidebarWorkerMetrics() {
         var toolsEl = card.querySelector('[data-worker-tools]');
         if (toolsEl) {
             var aid = card.getAttribute('data-worker-toggle');
-            var rec = (aid && typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(aid) : null;
+            var rec = _resolveSubRec(aid);
             if (rec) {
                 var used = rec.tool_calls_used || 0;
                 var cap = rec.max_tool_calls || '?';
@@ -664,7 +664,7 @@ function updateSidebarWorkerMetrics() {
         if (wkAid && _workerExpanded[wkAid]) {
             var wkProg = card.nextElementSibling;
             if (wkProg && wkProg.classList && wkProg.classList.contains('worker-card-progress')) {
-                var wkRec = (typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(wkAid) : null;
+                var wkRec = _resolveSubRec(wkAid);
                 var wkAt = String(wkRec && wkRec.action_state ? (wkRec.action_state.at || 0) : 0);
                 if (wkProg.getAttribute('data-prog-at') !== wkAt) {
                     wkProg.innerHTML = _workerProgressInner(wkRec);
@@ -688,10 +688,22 @@ var _workerExpanded = Object.create(null);
 function _workerProgressInner(rec) {
     var inner = rec ? _subActionStateHtml(rec.action_state) : '';
     if (!inner) inner = '<div class="worker-progress-empty">No progress reported yet.</div>';
-    var aid = rec ? (rec.agent_id || '') : '';
-    inner += '<a class="worker-progress-open" data-sub-agent-reveal="' + escapeHtml(aid) + '" role="button" tabindex="0" title="Open chat">' +
-        '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
-        '<span>open chat</span></a>';
+    // Open-chat affordance. Live records reveal by agent_id (follows chat_id
+    // changes); reconstructed/purged records use the persisted chat_id and only
+    // when that chat still exists (GC deletes the sub's chat row too).
+    var openAttr = '';
+    if (rec && rec._reconstructed) {
+        if (rec.chat_id && typeof chats !== 'undefined' && chats[rec.chat_id]) {
+            openAttr = 'data-sub-chat-id="' + escapeHtml(rec.chat_id) + '"';
+        }
+    } else if (rec && rec.agent_id) {
+        openAttr = 'data-sub-agent-reveal="' + escapeHtml(rec.agent_id) + '"';
+    }
+    if (openAttr) {
+        inner += '<a class="worker-progress-open" ' + openAttr + ' role="button" tabindex="0" title="Open chat">' +
+            '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
+            '<span>open chat</span></a>';
+    }
     return inner;
 }
 
@@ -705,13 +717,176 @@ function toggleWorkerProgress(agentId, cardEl) {
     var open = !_workerExpanded[agentId];
     _workerExpanded[agentId] = open;
     if (open) {
-        var rec = (typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(agentId) : null;
+        var rec = _resolveSubRec(agentId);
         panel.innerHTML = _workerProgressInner(rec);
         panel.setAttribute('data-prog-at', String(rec && rec.action_state ? (rec.action_state.at || 0) : 0));
     }
     panel.hidden = !open;
     cardEl.classList.toggle('worker-card-expanded', open);
     cardEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+// Whitelist worker state for class-name interpolation (defense-in-depth,
+// same rationale as SUB_REPORT_STATUSES).
+var WORKER_CARD_STATES = { running: 1, sleeping: 1, stopped: 1, errored: 1 };
+
+// Context-length ring for a chat (sub-agent OR a normal top-level chat). Mirrors
+// the main chat's .context-circle. Shared by worker cards (sidebar Workers
+// panel) AND the jobs-dropdown chat rows so every surface shows the same live
+// ring. `withTitle` opt-in adds a hover tooltip (worker cards keep their own
+// button-level tooltip, so they pass it falsy for identical output).
+function _contextCircleHtml(chatId, extraClass, withTitle) {
+    var ctx = _subContextInfo(chatId);
+    var ctxClass = ctx.pct >= 90 ? ' worker-ctx-danger' : (ctx.pct >= 70 ? ' worker-ctx-warning' : '');
+    var titleAttr = '';
+    if (withTitle) {
+        var tip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
+        titleAttr = ' title="' + escapeHtml(tip) + '"';
+    }
+    return '<span class="worker-ctx' + ctxClass + (extraClass ? ' ' + extraClass : '') + '" data-worker-ctx' + titleAttr + '>' +
+        '<svg class="worker-ctx-circle" viewBox="0 0 36 36">' +
+            '<path class="worker-ctx-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
+            '<path class="worker-ctx-fill" data-worker-ctx-fill stroke-dasharray="' + ctx.pct + ', 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
+        '</svg>' +
+        '<span class="worker-ctx-pct" data-worker-ctx-pct>' + (ctx.tokens ? ctx.pct + '%' : '\u2014') + '</span>' +
+    '</span>';
+}
+
+// Sorted list of sub-agents in a regular chat's subtree (root match, or direct
+// parent match for legacy records with no root_chat_id). Same filter/sort
+// renderWorkersStrip uses for a non-sub chat — reused by the jobs dropdown to
+// list a chat's sub-agents inline under its progress.
+function subAgentsForChatTree(chatId) {
+    if (!chatId) return [];
+    var all = (typeof SubAgents !== 'undefined' && SubAgents.listAll) ? SubAgents.listAll() : [];
+    var mine = all.filter(function(r) {
+        var root = r.root_chat_id || r.parent_chat_id;
+        return root === chatId || r.parent_chat_id === chatId;
+    });
+    // Include GC'd subs reconstructed from persisted sub_report messages so the
+    // jobs-dropdown accordion matches the sidebar Workers panel for old chats.
+    _mergeReconstructedSubs(mine, chatId);
+    var rank = { running: 0, sleeping: 1, stopped: 2, errored: 3 };
+    mine.sort(function(a, b) {
+        var ra = rank[a.state] != null ? rank[a.state] : 4;
+        var rb = rank[b.state] != null ? rank[b.state] : 4;
+        if (ra !== rb) return ra - rb;
+        return (b.last_activity_at || 0) - (a.last_activity_at || 0);
+    });
+    return mine;
+}
+
+// Build a single sub-agent "worker card" (robot icon, name + state, live
+// tool-call counter, context-length ring) plus its expandable inline progress
+// panel. Shared by the sidebar Workers panel (renderWorkersStrip) and the jobs
+// dropdown chat-row accordion so both surfaces render the identical component.
+function _workerCardHtml(r) {
+    var label = r.name || r.agent_id;
+    var stateClass = WORKER_CARD_STATES[r.state] ? r.state : 'unknown';
+    var stateLabel = r.state;
+    // Phase 5: legacy records may lack `depth` — default to 1 (direct child of
+    // root). Cap the rendered depth at 3 to match the CSS rule ladder.
+    var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
+    var renderDepth = Math.min(depth, 3);
+    var used = (r.tool_calls_used || 0);
+    var cap = r.max_tool_calls || '?';
+    var ctx = _subContextInfo(r.chat_id);
+    var tokTip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
+    var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
+    // Inline onclick removed (escapeHtml does not escape single quotes). The
+    // document-level delegated listener handles data-worker-toggle / -reveal.
+    var wkExpanded = !!_workerExpanded[r.agent_id];
+    var progAt = r.action_state ? (r.action_state.at || 0) : 0;
+    return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
+        '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
+        'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
+        'data-worker-chat="' + escapeHtml(r.chat_id || '') + '" ' +
+        'aria-expanded="' + (wkExpanded ? 'true' : 'false') + '" ' +
+        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(used)) + '/' + escapeHtml(String(cap)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
+        '<span class="worker-card-icon" aria-hidden="true">' + botIcon + '</span>' +
+        '<span class="worker-card-main">' +
+            '<span class="worker-card-row">' +
+                '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
+                '<span class="worker-name">' + escapeHtml(label) + '</span>' +
+            '</span>' +
+            '<span class="worker-card-row worker-card-sub">' +
+                '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
+                '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools</span>' +
+            '</span>' +
+        '</span>' +
+        _contextCircleHtml(r.chat_id) +
+        '<span class="worker-card-caret" aria-hidden="true">\u203a</span>' +
+    '</button>' +
+    '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(r.agent_id) + '" data-prog-at="' + progAt + '"' + (wkExpanded ? '' : ' hidden') + '>' +
+        (wkExpanded ? _workerProgressInner(r) : '') +
+    '</div>' +
+    '</div>';
+}
+
+// Synthetic worker-card records reconstructed from a finished chat's persisted
+// sub_report messages (see _reconstructSubsFromMessages). Keyed by agent_id so
+// toggleWorkerProgress / updateSidebarWorkerMetrics can resolve a card whose
+// live registry record has already been GC'd. Rebuilt on every renderWorkersStrip.
+var _reconstructedSubs = Object.create(null);
+
+// Resolve a sub-agent record for card interactions: prefer the live registry
+// record, fall back to a reconstructed-from-message record (registry-purged).
+function _resolveSubRec(agentId) {
+    var rec = (agentId && typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(agentId) : null;
+    return rec || _reconstructedSubs[agentId] || null;
+}
+
+// Map a sub_report message's report.status to a worker-card lifecycle state.
+function _reportStatusToWorkerState(status) {
+    if (status === 'error') return 'errored';
+    if (status === 'running' || status === 'need_input') return 'sleeping';
+    return 'stopped'; // done / cancelled / partial / unknown -> terminal
+}
+
+// Reconstruct synthetic worker-card records from a chat's persisted sub_report
+// messages. The sidebar Workers panel is normally driven by the live SubAgents
+// registry, but that registry GCs settled/sleeping sub records ~1h after they
+// finish (SUBAGENT_TOMBSTONE_TTL_MS). The inline sub_report cards survive in
+// chat.messages, so we mine them to keep listing a finished chat's sub-agents.
+// One record per sub — iterate newest-first so the latest report wins.
+function _reconstructSubsFromMessages(chatId) {
+    var out = [];
+    var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || !Array.isArray(c.messages)) return out;
+    var seen = Object.create(null);
+    for (var i = c.messages.length - 1; i >= 0; i--) {
+        var m = c.messages[i];
+        if (!m || m.role !== 'sub_report' || !m.subAgentId || seen[m.subAgentId]) continue;
+        seen[m.subAgentId] = true;
+        var report = m.report || {};
+        out.push({
+            agent_id: m.subAgentId,
+            name: m.subAgentName || m.subAgentId,
+            chat_id: m.subChatId || '',
+            state: _reportStatusToWorkerState(report.status),
+            action_state: m.actionState || null,
+            tool_calls_used: (typeof m.toolCallsUsed === 'number') ? m.toolCallsUsed : 0,
+            max_tool_calls: m.maxToolCalls || '?',
+            depth: (typeof m.subDepth === 'number' && m.subDepth > 0) ? m.subDepth : 1,
+            last_activity_at: report.at || m.createdAt || 0,
+            _reconstructed: true
+        });
+    }
+    return out;
+}
+
+// Merge reconstructed (message-persisted) sub records into a live list for a
+// chat: for each sub in the chat's sub_report history NOT already present as a
+// live record, append a synthetic record and register it in _reconstructedSubs
+// so click/metrics can resolve a card whose registry record was GC'd. Live
+// records always win. Mutates and returns `list`.
+function _mergeReconstructedSubs(list, chatId) {
+    var liveIds = Object.create(null);
+    list.forEach(function(r) { if (r && r.agent_id) liveIds[r.agent_id] = true; });
+    _reconstructSubsFromMessages(chatId).forEach(function(r) {
+        if (!liveIds[r.agent_id]) { _reconstructedSubs[r.agent_id] = r; list.push(r); }
+    });
+    return list;
 }
 
 function renderWorkersStrip() {
@@ -749,6 +924,12 @@ function renderWorkersStrip() {
             return root === currentChatId || r.parent_chat_id === currentChatId;
         });
     }
+    // Backfill from persisted sub_report messages: once the registry GCs a
+    // finished chat's settled sub records (~1h), listAll() no longer returns
+    // them, so a stopped chat would show an EMPTY Workers panel even though its
+    // inline sub_report cards persist. Reconstruct synthetic cards for any sub
+    // not already live (a sub-agent's own chat keeps the live-subtree view).
+    if (!isCurrentSub) _mergeReconstructedSubs(mine, currentChatId);
     if (!mine.length) { stripEl.innerHTML = ''; stripEl.style.display = 'none'; return; }
     // Sort: running, sleeping, then terminal (most-recent first).
     var rank = { running: 0, sleeping: 1, stopped: 2, errored: 3 };
@@ -758,61 +939,7 @@ function renderWorkersStrip() {
         if (ra !== rb) return ra - rb;
         return (b.last_activity_at || 0) - (a.last_activity_at || 0);
     });
-    // Whitelist worker state for the class-name interpolation — same
-    // defense-in-depth rationale as SUB_REPORT_STATUSES above.
-    var WORKER_STATES = { running: 1, sleeping: 1, stopped: 1, errored: 1 };
-    var chips = mine.map(function(r) {
-        var label = r.name || r.agent_id;
-        var stateClass = WORKER_STATES[r.state] ? r.state : 'unknown';
-        var stateLabel = r.state;
-        // Phase 5: legacy records may lack `depth` — default to 1
-        // (direct child of root). Cap the rendered depth at 3 to match
-        // the CSS rule ladder; deeper trees still get the level-3 indent
-        // instead of marching off-screen on pathological chains.
-        var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
-        var renderDepth = Math.min(depth, 3);
-        var used = (r.tool_calls_used || 0);
-        var cap = r.max_tool_calls || '?';
-        var ctx = _subContextInfo(r.chat_id);
-        var ctxClass = ctx.pct >= 90 ? ' worker-ctx-danger' : (ctx.pct >= 70 ? ' worker-ctx-warning' : '');
-        var tokTip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
-        var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
-        // Inline onclick removed (escapeHtml does not escape single quotes,
-        // so an attacker-controlled or even unusual id could break out of
-        // the JS string). Delegated click listener handles `data-sub-agent-reveal`.
-        var wkExpanded = !!_workerExpanded[r.agent_id];
-        var progAt = r.action_state ? (r.action_state.at || 0) : 0;
-        return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
-            '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
-            'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
-            'data-worker-chat="' + escapeHtml(r.chat_id || '') + '" ' +
-            'aria-expanded="' + (wkExpanded ? 'true' : 'false') + '" ' +
-            'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(used)) + '/' + escapeHtml(String(cap)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
-            '<span class="worker-card-icon" aria-hidden="true">' + botIcon + '</span>' +
-            '<span class="worker-card-main">' +
-                '<span class="worker-card-row">' +
-                    '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
-                    '<span class="worker-name">' + escapeHtml(label) + '</span>' +
-                '</span>' +
-                '<span class="worker-card-row worker-card-sub">' +
-                    '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
-                    '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools</span>' +
-                '</span>' +
-            '</span>' +
-            '<span class="worker-ctx' + ctxClass + '" data-worker-ctx>' +
-                '<svg class="worker-ctx-circle" viewBox="0 0 36 36">' +
-                    '<path class="worker-ctx-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
-                    '<path class="worker-ctx-fill" data-worker-ctx-fill stroke-dasharray="' + ctx.pct + ', 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>' +
-                '</svg>' +
-                '<span class="worker-ctx-pct" data-worker-ctx-pct>' + (ctx.tokens ? ctx.pct + '%' : '\u2014') + '</span>' +
-            '</span>' +
-            '<span class="worker-card-caret" aria-hidden="true">\u203a</span>' +
-        '</button>' +
-        '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(r.agent_id) + '" data-prog-at="' + progAt + '"' + (wkExpanded ? '' : ' hidden') + '>' +
-            (wkExpanded ? _workerProgressInner(r) : '') +
-        '</div>' +
-        '</div>';
-    }).join('');
+    var chips = mine.map(_workerCardHtml).join('');
     stripEl.innerHTML = '<div class="sidebar-workers-header">Workers (' + mine.length + ')</div>' +
         '<div class="sidebar-workers-list">' + chips + '</div>';
     stripEl.style.display = '';

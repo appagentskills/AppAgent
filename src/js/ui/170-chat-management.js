@@ -111,6 +111,10 @@ async function fetchCredits() {
                 var creditHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + displayText;
                 if (creditsEl) { creditsEl.innerHTML = creditHtml; creditsEl.className = cssClass; creditsEl.title = creditTitle; creditsEl.style.display = ''; }
                 if (homeCreditsEl) { homeCreditsEl.innerHTML = creditHtml; homeCreditsEl.className = cssClass; homeCreditsEl.title = creditTitle; homeCreditsEl.style.display = ''; }
+                // Rich click dropdown (per-limit bars). The native title stays
+                // for hover ('Click to refresh'); clicking refreshes + opens it.
+                attachUsageTooltip(creditsEl, rl);
+                attachUsageTooltip(homeCreditsEl, rl);
             }
         } catch(e) {
             console.log('Claude OAuth usage error:', e.message);
@@ -159,6 +163,13 @@ async function fetchCredits() {
             displayText = Math.round(fiveHour) + '%' + (resetStr ? ' for ' + resetStr : '');
             creditTitle = fiveHour.toFixed(1) + '% used' + (resetStr ? ' \u00b7 resets in ' + resetStr : '') + ' | Click to refresh';
             if (fiveHour > 80) cssClass += ' error';
+            // Same rich tooltip for the direct claude-usage-format endpoint —
+            // its limits array is raw (ISO resets_at, scope.model.display_name),
+            // which claudeUsageModelFromRl also understands.
+            if (Array.isArray(data.limits) && data.limits.length) {
+                var rlLike = { 'appagent-usage-limits': JSON.stringify(data.limits) };
+                setTimeout(function() { attachUsageTooltip(creditsEl, rlLike); attachUsageTooltip(homeCreditsEl, rlLike); }, 0);
+            }
         }
 
         if (!displayText) return;
@@ -189,6 +200,161 @@ async function fetchCredits() {
             homeCreditsEl.className = 'credits-display error';
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rich usage tooltip on the credits pill — one progress bar per rate limit
+// (current session, weekly all-models, weekly per-model scoped, extra usage),
+// modeled after claude.ai's own usage panel.
+// ---------------------------------------------------------------------------
+var _usageTooltipEl = null;
+var _usageTooltipOwner = null;
+
+// Parse stored usage keys into { session, weekly: [], extra }. Accepts both the
+// normalized limits shape written by normalizeClaudeUsage in background.js
+// ({percent, resets_at: epochSecs, label}) and the raw claude.ai shape
+// ({percent, resets_at: ISO, scope:{model:{display_name}}}). Falls back to the
+// flat 5h/7d header keys when no limits array is stored.
+function claudeUsageModelFromRl(rl) {
+    var model = { session: null, weekly: [], extra: parseClaudeExtraUsage(rl) };
+    function toMs(v) {
+        if (v == null) return null;
+        if (typeof v === 'number' || /^\d+(\.\d+)?$/.test(String(v).trim())) {
+            var n = parseFloat(v);
+            return n > 9999999999 ? n : n * 1000;
+        }
+        var t = Date.parse(v);
+        return isNaN(t) ? null : t;
+    }
+    var limits = null;
+    try { limits = JSON.parse(rl['appagent-usage-limits'] || 'null'); } catch(e) {}
+    if (Array.isArray(limits) && limits.length) {
+        limits.forEach(function(l) {
+            if (!l || typeof l !== 'object') return;
+            var pct = parseFloat(l.percent);
+            if (isNaN(pct)) return;
+            var resetsAt = toMs(l.resets_at);
+            if (l.group === 'session' || l.kind === 'session') {
+                model.session = { percent: pct, resetsAt: resetsAt };
+            } else {
+                var label = l.label || (l.scope && l.scope.model && l.scope.model.display_name);
+                if (!label) label = (l.kind === 'weekly_all' || !l.kind) ? 'All models' : String(l.kind).replace(/_/g, ' ');
+                model.weekly.push({ label: label, percent: pct, resetsAt: resetsAt });
+            }
+        });
+        if (model.session || model.weekly.length) return model;
+    }
+    // Fallback: flat header keys only (older cached data / header-scraped)
+    var u5 = parseFloat(rl['anthropic-ratelimit-unified-5h-utilization']);
+    if (!isNaN(u5)) model.session = { percent: u5 <= 1 ? u5 * 100 : u5, resetsAt: toMs(rl['anthropic-ratelimit-unified-5h-reset']) };
+    var u7 = parseFloat(rl['anthropic-ratelimit-unified-7d-utilization']);
+    if (!isNaN(u7)) model.weekly.push({ label: 'All models', percent: u7 <= 1 ? u7 * 100 : u7, resetsAt: toMs(rl['anthropic-ratelimit-unified-7d-reset']) });
+    return model;
+}
+
+function fmtUsageResetIn(ms) { // "4 hr 34 min"
+    var diff = ms - Date.now();
+    if (diff <= 0) return '';
+    var min = Math.ceil(diff / 60000);
+    var d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
+    if (d > 0) return d + ' d ' + h + ' hr';
+    if (h > 0) return h + ' hr' + (m > 0 ? ' ' + m + ' min' : '');
+    return m + ' min';
+}
+
+function fmtUsageResetAt(ms) { // "Sun 5:59 AM"
+    var d = new Date(ms);
+    try { return d.toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }); }
+    catch(e) { return d.toLocaleString(); }
+}
+
+function buildUsageTooltipHtml(model) {
+    function bar(pct) {
+        var v = Math.max(0, Math.min(100, pct));
+        var cls = v >= 90 ? ' crit' : (v >= 70 ? ' warn' : '');
+        return '<div class="usage-tt-bar"><div class="usage-tt-fill' + cls + '" style="width:' + Math.max(v, 2) + '%"></div></div>';
+    }
+    function row(label, sub, pct) {
+        return '<div class="usage-tt-row">' +
+            '<div class="usage-tt-row-head"><span class="usage-tt-label">' + escapeHtml(label) + '</span><span class="usage-tt-pct">' + Math.round(pct) + '% used</span></div>' +
+            bar(pct) +
+            (sub ? '<div class="usage-tt-sub">' + escapeHtml(sub) + '</div>' : '') +
+            '</div>';
+    }
+    var html = '';
+    if (model.session) {
+        var inStr = model.session.resetsAt ? fmtUsageResetIn(model.session.resetsAt) : '';
+        html += row('Current session', inStr ? 'Resets in ' + inStr : '', model.session.percent);
+    }
+    if (model.weekly.length) {
+        html += '<div class="usage-tt-section">Weekly limits</div>';
+        model.weekly.forEach(function(w) {
+            html += row(w.label, w.resetsAt ? 'Resets ' + fmtUsageResetAt(w.resetsAt) : '', w.percent);
+        });
+    }
+    if (model.extra) {
+        html += '<div class="usage-tt-section">Extra usage</div>';
+        html += row(model.extra.usedStr + ' / ' + model.extra.limitStr, '', model.extra.pct);
+    }
+    return html;
+}
+
+// Attach (or refresh the data behind) the rich dropdown on a credits pill.
+// Hover shows the native title ('Click to refresh'); clicking the pill
+// refreshes usage (pill onclick in 120-init.js) AND opens this dropdown.
+// When the refreshed data lands while the dropdown is open, it re-renders
+// in place. Returns true when rich data is available.
+function attachUsageTooltip(el, rl) {
+    if (!el || !rl) return false;
+    el._usageRl = rl;
+    var model = claudeUsageModelFromRl(rl);
+    if (!model.session && !model.weekly.length && !model.extra) return false;
+    if (!el._usageTooltipWired) {
+        el._usageTooltipWired = true;
+        el.addEventListener('click', function() { showUsageTooltip(el); });
+    }
+    // Live-update an open dropdown when fresh data arrives after the click
+    if (_usageTooltipEl && _usageTooltipOwner === el && _usageTooltipEl.style.display === 'block') {
+        _usageTooltipEl.innerHTML = buildUsageTooltipHtml(model);
+    }
+    return true;
+}
+
+function showUsageTooltip(el) {
+    var rl = el._usageRl;
+    if (!rl) return;
+    var model = claudeUsageModelFromRl(rl);
+    if (!model.session && !model.weekly.length && !model.extra) return;
+    if (!_usageTooltipEl) {
+        _usageTooltipEl = document.createElement('div');
+        _usageTooltipEl.className = 'usage-tooltip';
+        document.body.appendChild(_usageTooltipEl);
+        // Dropdown behavior: close on any click outside the pill/dropdown
+        document.addEventListener('click', function(e) {
+            if (!_usageTooltipEl || _usageTooltipEl.style.display !== 'block') return;
+            if (_usageTooltipEl.contains(e.target)) return;
+            if (_usageTooltipOwner && _usageTooltipOwner.contains(e.target)) return;
+            hideUsageTooltipNow();
+        });
+    }
+    _usageTooltipOwner = el;
+    _usageTooltipEl.innerHTML = buildUsageTooltipHtml(model);
+    // Measure hidden, then position under the pill (right-aligned, clamped)
+    _usageTooltipEl.style.visibility = 'hidden';
+    _usageTooltipEl.style.display = 'block';
+    var r = el.getBoundingClientRect();
+    var tw = _usageTooltipEl.offsetWidth, th = _usageTooltipEl.offsetHeight;
+    var left = Math.max(8, Math.min(r.right - tw, window.innerWidth - tw - 8));
+    var top = r.bottom + 8;
+    if (top + th > window.innerHeight - 8) top = Math.max(8, r.top - th - 8);
+    _usageTooltipEl.style.left = left + 'px';
+    _usageTooltipEl.style.top = top + 'px';
+    _usageTooltipEl.style.visibility = '';
+}
+
+function hideUsageTooltipNow() {
+    if (_usageTooltipEl) _usageTooltipEl.style.display = 'none';
+    _usageTooltipOwner = null;
 }
 
 // Build a renderable extra-usage summary from the stored claude usage keys
@@ -693,29 +859,45 @@ function updateChatTitleHeader(includeToolCallId) {
 
     // Sub-agent badge — makes it instantly visible in the chat header that
     // the user is looking at a delegated worker chat, not a top-level
-    // conversation. Clicking the badge jumps to the immediate parent chat
-    // (the breadcrumb in the sidebar / history card has the full chain).
+    // conversation. The pill is SPLIT into two segments: a non-interactive
+    // identity badge ("Sub-agent") and a clickable navigation segment that
+    // shows the DESTINATION's real title ("↰ <parent title>") — showing where
+    // the click lands is clearer than a generic "parent chat" label sitting
+    // next to the sub-agent chat's own title. (The breadcrumb in the
+    // sidebar / history card still has the full parent chain.)
     var subAgentBadgeHtml = '';
     if (chat && chat.isSubAgent) {
         var parentChatId = chat.parentChatId || '';
-        var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : 'parent chat';
+        var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : '';
         var iconHtml = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
-        // Data-attribute + delegated click handler (in 175-sub-agent-ui.js)
-        // instead of an inline onclick. escapeHtml does NOT escape single
-        // quotes, so a parentChatId containing one would break the inline JS
-        // string and could leak attribute context. The inline onkeydown only
-        // calls this.click() — no user data in inline JS — so Enter/Space on
-        // the focused span dispatches a real click event that the delegated
-        // handler picks up via the data-attribute.
-        var clickAttrs = parentChatId
-            ? ' role="button" tabindex="0" data-open-parent-chat-id="' + escapeHtml(parentChatId) + '" onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027){this.click();event.preventDefault();}"'
-            : '';
-        var tipText = parentChatId
-            ? 'Sub-agent of: ' + parentTitle + ' — click to open parent'
-            : 'Delegated worker chat';
-        subAgentBadgeHtml = ' <span class="chat-title-subagent-pill" title="' + escapeHtml(tipText) + '"' + clickAttrs + '>'
+        // Identity segment — plain badge, not a button.
+        var badgeSeg = '<span class="chat-title-subagent-badge" title="Delegated worker chat">'
             + '<span class="chat-title-subagent-icon">' + iconHtml + '</span>'
             + '<span class="chat-title-subagent-label">Sub-agent</span>'
+            + '</span>';
+        // Navigation segment — "↰ <parent title>", truncated; full title in
+        // the tooltip. Data-attribute + delegated click handler (in
+        // 175-sub-agent-ui.js) instead of an inline onclick. escapeHtml does
+        // NOT escape single quotes, so a parentChatId containing one would
+        // break the inline JS string and could leak attribute context. The
+        // inline onkeydown only calls this.click() — no user data in inline
+        // JS — so Enter/Space on the focused span dispatches a real click
+        // event that the delegated handler picks up via the data-attribute.
+        var navSeg = '';
+        if (parentChatId) {
+            var navLabel = (parentTitle && parentTitle !== 'New Chat') ? parentTitle : 'Back';
+            var navShort = navLabel.length > 26 ? navLabel.slice(0, 25) + '\u2026' : navLabel;
+            var navTip = parentTitle ? 'Back to: ' + parentTitle : 'Back to the chat that spawned this sub-agent';
+            navSeg = '<span class="chat-title-parent-nav" role="button" tabindex="0"'
+                + ' data-open-parent-chat-id="' + escapeHtml(parentChatId) + '"'
+                + ' title="' + escapeHtml(navTip) + '"'
+                + ' onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027){this.click();event.preventDefault();}">'
+                + '<span class="chat-title-parent-nav-arrow">\u21B0</span>'
+                + '<span class="chat-title-parent-nav-label">' + escapeHtml(navShort) + '</span>'
+                + '</span>';
+        }
+        subAgentBadgeHtml = ' <span class="chat-title-subagent-pill' + (navSeg ? ' split' : '') + '">'
+            + badgeSeg + navSeg
             + '</span>';
     }
 

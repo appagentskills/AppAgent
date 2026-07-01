@@ -11,3 +11,18 @@
 .tldr-card-text .md-paragraph { margin: 0; }
 @media (max-width: 768px) { .tldr-card { margin-right: 0; } }
 
+/* Links card — relevant links (PRs, diffs, records, docs) rendered just below
+   the TL;DR by the autoLinks hook via the set_links tool */
+.links-card { position: relative; margin: var(--space-8) 20% var(--space-2) 0; padding: var(--space-7) var(--space-6) var(--space-5); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.links-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.links-card-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.links-card-item { margin: 0; padding: 0; }
+.links-card-link { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); color: var(--accent); text-decoration: none; font-size: var(--text-body-sm); line-height: var(--leading-normal); transition: background 0.15s ease; }
+.links-card-link:hover { background: var(--bg-hover); text-decoration: none; }
+.links-card-link:hover .links-card-title { text-decoration: underline; }
+.links-card-icon { display: inline-flex; flex-shrink: 0; color: var(--text-muted); }
+.links-card-icon .ui-icon { width: 14px; height: 14px; }
+.links-card-link:hover .links-card-icon { color: var(--accent); }
+.links-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 768px) { .links-card { margin-right: 0; } }
+

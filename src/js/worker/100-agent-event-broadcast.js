@@ -80,7 +80,10 @@ var EVENTS_WITH_CHAT_INLINE = {
     'toolUnparked': true,
     // tldrChanged's page handler (036-agent-event-handlers-page.js) writes the
     // TL;DR onto chats[chatId].messages — a stale mirror would drop the card.
-    'tldrChanged': true
+    'tldrChanged': true,
+    // linksChanged's page handler writes the links array onto
+    // chats[chatId].messages — a stale mirror would drop the links card.
+    'linksChanged': true
 };
 
 function broadcastAgentEvent(type, detail) {

@@ -2,6 +2,7 @@
 var hooksEnabled = {
     autoTitle: true, // Hook to auto-generate chat title after agent completes
     autoTldr: true, // Hook to ask the agent for a TL;DR card after each answer
+    autoLinks: true, // Hook to ask the agent for relevant links after each answer
     showHookMessages: false // Show hook messages in chat UI
 };
 var _silentHookRunning = false; // Suppress UI updates during silent hook runs
@@ -275,6 +276,8 @@ async function loadHooksSettings() {
         hooksEnabled = saved;
         // Migration: autoTldr was added after users may have saved settings.
         if (hooksEnabled.autoTldr === undefined) hooksEnabled.autoTldr = true;
+        // Migration: autoLinks was added after users may have saved settings.
+        if (hooksEnabled.autoLinks === undefined) hooksEnabled.autoLinks = true;
     }
 }
 
@@ -296,40 +299,11 @@ async function toggleHook(hookName) {
     renderSettingsPage();
 }
 
-// Find the final-answer assistant message of the last REAL (non-hook) turn —
-// same search as executeSetTldr in tools/020-tool-execution.js: last non-hook
-// user message, then the last assistant message with non-empty content after
-// it that isn't a hook-run message.
-function findTldrTarget(chat) {
-    if (!chat || !chat.messages) return null;
-    var lastUserIdx = -1;
-    for (var i = chat.messages.length - 1; i >= 0; i--) {
-        var m = chat.messages[i];
-        if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
-    }
-    if (lastUserIdx === -1) return null;
-    // Anchor the search span to the REAL turn: stop before the first hook
-    // user message after the last real user message — prose replies to hook
-    // runs must never become TLDR targets.
-    var endIdx = chat.messages.length - 1;
-    for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
-        if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
-    }
-    for (var j = endIdx; j > lastUserIdx; j--) {
-        var am = chat.messages[j];
-        if (am.role === 'assistant' && am.content && !am.isStreaming) {
-            // Never target a message carrying a set_tldr tool call, regardless
-            // of its content. (A spontaneous set_chat_title call alongside the
-            // answer text is fine — still a valid target.)
-            var hasSetTldr = am.tool_calls && am.tool_calls.some(function(tc) {
-                return tc.function && tc.function.name === 'set_tldr';
-            });
-            if (hasSetTldr) continue;
-            return am;
-        }
-    }
-    return null;
-}
+// The final-answer target search for the TL;DR / Links hook gating lives in
+// findHookAnswerTarget (tools/020-tool-execution.js) — shared with the SW
+// bundle, the executeSetTldr / executeSetLinks implementations, and the
+// page-side mirror handlers, so gating and attachment always agree on the
+// same target message.
 
 // Execute hooks after agent completes. autoTitle + autoTldr share ONE
 // combined hook run (single extra LLM call) when both are needed.
@@ -363,8 +337,17 @@ function executeAfterResponseHooks(chatId) {
     // never rendered there, so the extra hook LLM run would be pure waste.
     var needsTldr = false;
     if (hooksEnabled.autoTldr && !chat.isBackground && chat.messages && chat.messages.length) {
-        var tldrTarget = findTldrTarget(chat);
-        if (tldrTarget && !tldrTarget.tldr && !tldrTarget._tldrAsked) {
+        var tldrTarget = findHookAnswerTarget(chat);
+        if (tldrTarget && !tldrTarget.tldr && relocateAnswerCard(chat, 'tldr')) {
+            // A spontaneous mid-run set_tldr attached the card to an earlier
+            // message of this turn — relocateAnswerCard moved it onto the
+            // final answer. The hook is satisfied; no extra LLM run. Emit so
+            // mirrors/renders pick up the relocated card.
+            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+                AgentEvents.emit('tldrChanged', { chatId: chatId, tldr: tldrTarget.tldr });
+            }
+        } else if (tldrTarget && !tldrTarget.tldr && !tldrTarget._tldrAsked) {
             // Retry cap mirroring _titleHookTries: a successful set_tldr
             // resets the counter (executeSetTldr); repeated failures stop
             // burning an extra LLM run on every subsequent response.
@@ -376,15 +359,47 @@ function executeAfterResponseHooks(chatId) {
         }
     }
 
-    if (!needsTitle && !needsTldr) return;
+    // Links hook: ask for a list of relevant links (PRs, diffs, records, docs)
+    // on the final answer of the last real turn. Single attempt per answer
+    // (_linksAsked, set BEFORE firing) prevents hook loops when the model fails
+    // to call set_links. Skipped on background chats: the links card is never
+    // rendered there, so the extra hook LLM run would be pure waste.
+    var needsLinks = false;
+    if (hooksEnabled.autoLinks && !chat.isBackground && chat.messages && chat.messages.length) {
+        var linksTarget = findHookAnswerTarget(chat);
+        if (linksTarget && !linksTarget.links && relocateAnswerCard(chat, 'links')) {
+            // Spontaneous mid-run set_links — same relocation as the TLDR
+            // branch above; hook satisfied without an extra LLM run.
+            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+                AgentEvents.emit('linksChanged', { chatId: chatId, links: linksTarget.links });
+            }
+        } else if (linksTarget && !linksTarget.links && !linksTarget._linksAsked) {
+            // Retry cap mirroring _tldrHookTries: a successful set_links resets
+            // the counter (executeSetLinks); repeated failures stop burning an
+            // extra LLM run on every subsequent response.
+            chat._linksHookTries = (chat._linksHookTries || 0) + 1;
+            if (chat._linksHookTries <= 2) {
+                linksTarget._linksAsked = true;
+                needsLinks = true;
+            }
+        }
+    }
 
+    if (!needsTitle && !needsTldr && !needsLinks) return;
+
+    // Build ONE combined instruction so title + TL;DR + links share a single
+    // extra LLM run when more than one is needed.
+    var tasks = [];
+    if (needsTitle) tasks.push('set a concise chat title (max 50 chars) using the set_chat_title tool');
+    if (needsTldr) tasks.push('provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars)');
+    if (needsLinks) tasks.push('provide any relevant links using the set_links tool — an array of {title, url} for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty array if there is nothing worth linking');
     var instruction;
-    if (needsTitle && needsTldr) {
-        instruction = 'Now do two things using tools, and say nothing else: 1) set a concise chat title (max 50 chars) using the set_chat_title tool; 2) provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars).';
-    } else if (needsTldr) {
-        instruction = 'Now provide a TL;DR of your answer using the set_tldr tool — 1-2 short sentences (max 280 chars) summarizing the outcome. Do NOT say anything else.';
+    if (tasks.length === 1) {
+        instruction = 'Now ' + tasks[0] + '. Do NOT say anything else.';
     } else {
-        instruction = 'Now set a concise chat title (max 50 chars) for this conversation using the set_chat_title tool. Do NOT say anything else.';
+        var numbered = tasks.map(function(t, i) { return (i + 1) + ') ' + t; }).join('; ');
+        instruction = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: ' + numbered + '.';
     }
     executeHookRun(chatId, instruction);
 }

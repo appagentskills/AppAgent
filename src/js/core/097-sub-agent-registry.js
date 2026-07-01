@@ -1018,6 +1018,8 @@ function spawnSubAgent(args, ctx) {
             subAgentId: agent_id,
             subAgentName: record.name,
             subChatId: chat_id,
+            maxToolCalls: record.max_tool_calls || 0,
+            subDepth: record.depth || 1,
             spawnArgs: {
                 instructions: _cardInstr,
                 context_seed: (args.context_seed != null) ? args.context_seed : null,
@@ -1650,6 +1652,12 @@ function reportToParent(args, ctx) {
             _rcard.report = report;
             _rcard.subChatId = rec.chat_id;
             _rcard.subAgentName = rec.name;
+            // Stamp the final metrics onto the persisted card so the sidebar
+            // Workers panel can reconstruct an accurate card (tool counts,
+            // depth) after the registry GCs this sub's live record (~1h).
+            _rcard.toolCallsUsed = rec.tool_calls_used || 0;
+            _rcard.maxToolCalls = rec.max_tool_calls || 0;
+            _rcard.subDepth = rec.depth || 1;
         } else {
             chats[rec.parent_chat_id].messages.push({
                 role: 'sub_report',
@@ -1657,6 +1665,9 @@ function reportToParent(args, ctx) {
                 subAgentName: rec.name,
                 subChatId: rec.chat_id,
                 report: report,
+                toolCallsUsed: rec.tool_calls_used || 0,
+                maxToolCalls: rec.max_tool_calls || 0,
+                subDepth: rec.depth || 1,
                 createdAt: report.at
             });
         }

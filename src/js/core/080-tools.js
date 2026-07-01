@@ -166,7 +166,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'set_chat_title',
-            description: 'Set the title of the current chat. Use this to give the chat a descriptive, concise title that summarizes what was accomplished. Call this as your FINAL action after completing all tasks.',
+            description: 'Set the title of the current chat (a descriptive, concise title summarizing what was accomplished). Do NOT call this on your own while working on a task — an after-response hook automatically asks for it (grouped with set_tldr / set_links) once your final answer is complete. Only call it earlier if the user explicitly asks to rename the chat.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -182,7 +182,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'set_tldr',
-            description: 'Set a short TL;DR summary card for your final answer. Called automatically by the TLDR hook after you finish a task.',
+            description: 'Set a short TL;DR summary card for your final answer. Do NOT call this on your own — the TLDR hook automatically asks for it after your final answer; wait for that explicit hook instruction.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -190,6 +190,32 @@ var TOOLS = [
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['tldr']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'set_links',
+            description: 'Provide a list of relevant links (each with a title) the user may want to look into as part of this conversation — e.g. a PR link, a diff link, a link to a ServiceNow record, or a documentation page. Do NOT call this on your own while working on a task — the Links hook automatically asks for it after your final answer; wait for that explicit hook instruction. Only include genuinely useful links; pass an empty array if there is nothing worth linking.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    links: {
+                        type: 'array',
+                        description: 'Array of links to surface to the user, most relevant first. Each item is an object with a title and a url.',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                title: { type: 'string', description: 'Short, descriptive title for the link (what the user will click).' },
+                                url: { type: 'string', description: 'The URL — an absolute http(s) link, or a ServiceNow record/instance URL.' }
+                            },
+                            required: ['title', 'url']
+                        }
+                    },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['links']
             }
         }
     },
@@ -532,7 +558,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'workspace',
-            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. Pass `files` (array of workspace paths) to push ONLY those dirty files — other dirty files stay modified locally and are left out of the commit/PR (use this to keep unrelated changes, e.g. from another chat, out of your PR). If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated).\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n- pin: Pin a workspace (pass `workspace`; `{unpin: true}` to clear). At most ONE pinned workspace per owner/repo — pinning clears any sibling pin. The pinned workspace wins default-workspace resolution (over MRU) and extension_build auto-detect, so Reload builds it. `list` exposes `pinned`/`forked_from`; `status` adds a `pin_notice` when a sibling holds the pin.\n- branch: LOCAL fork — creates workspace owner/repo::<branch> by cheaply copying the source workspace (args: `branch` = new branch name; optional `workspace` = source; `move_dirty` default true moves dirty edits to the fork and reverts the source clean, false copies them to both). The remote branch does NOT exist until the first push from the fork, which cuts it from the fork base. The fork is pinned automatically.\n- move: Move dirty edits between workspaces (args: `to` = target workspace key; optional `files` = paths, default all dirty; `workspace` = source). Writes the source content onto the target row (dirty recomputed vs the target own original) then discards the source. Blocks the WHOLE move when a target file is itself dirty with different content (unless `force`); reports `base_diverged` paths when the two bases differ.\n- hydrate: Pre-fetch lazy-clone file contents from GitHub (optionally limited to a `path` prefix). read/grep/edit hydrate on demand automatically — use this only to bulk-prefetch before many reads.\n\nMerge lifecycle: when the branch of a workspace is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the workspace — dirty files are moved to the base first (a blocked move keeps the workspace with a warning), the base is synced, and the pin follows the merge onto the base when the deleted workspace held it.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. read and status surface ownership metadata. Pass {"force": true} to override a hard block.',
+            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files. Returns up to 5 matches by default — pass `limit` (max 100) for more.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. Pass `files` (array of workspace paths) to push ONLY those dirty files — other dirty files stay modified locally and are left out of the commit/PR (use this to keep unrelated changes, e.g. from another chat, out of your PR). If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated).\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n- pin: Pin a workspace (pass `workspace`; `{unpin: true}` to clear). At most ONE pinned workspace per owner/repo — pinning clears any sibling pin. The pinned workspace wins default-workspace resolution (over MRU) and extension_build auto-detect, so Reload builds it. `list` exposes `pinned`/`forked_from`; `status` adds a `pin_notice` when a sibling holds the pin.\n- branch: LOCAL fork — creates workspace owner/repo::<branch> by cheaply copying the source workspace (args: `branch` = new branch name; optional `workspace` = source; `move_dirty` default true moves dirty edits to the fork and reverts the source clean, false copies them to both). The remote branch does NOT exist until the first push from the fork, which cuts it from the fork base. The fork is pinned automatically.\n- move: Move dirty edits between workspaces (args: `to` = target workspace key; optional `files` = paths, default all dirty; `workspace` = source). Writes the source content onto the target row (dirty recomputed vs the target own original) then discards the source. Blocks the WHOLE move when a target file is itself dirty with different content (unless `force`); reports `base_diverged` paths when the two bases differ.\n- hydrate: Pre-fetch lazy-clone file contents from GitHub (optionally limited to a `path` prefix). read/grep/edit hydrate on demand automatically — use this only to bulk-prefetch before many reads.\n\nMerge lifecycle: when the branch of a workspace is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the workspace — dirty files are moved to the base first (a blocked move keeps the workspace with a warning), the base is synced, and the pin follows the merge onto the base when the deleted workspace held it.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. Read-only actions surface ownership too: read and status include ownership metadata, and ls, grep, and diff attach cross_chat_warnings / per-entry flags when a listed, matched, or diffed file has uncommitted changes owned by another chat. Pass {"force": true} to override a hard block.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -552,7 +578,7 @@ var TOOLS = [
                     file_id: { type: 'string', description: 'Write a file from the file store (for write action). Use instead of content to copy a screenshot, attachment, or fetched file into the workspace.' },
                     dest: { type: 'string', description: 'Destination path (for copy action)' },
                     offset: { type: 'number', description: 'Start line for read (1-indexed). Default: 1' },
-                    limit: { type: 'number', description: 'Max lines to return for read. Default: all' },
+                    limit: { type: 'number', description: 'For read: max lines to return (default: all). For grep: max matches to return (default: 5, max: 100) — raise it when you need more results.' },
                     edits: {
                         type: 'array',
                         description: 'For edit action: search-and-replace operations. Each find must be unique in the file.',
@@ -875,6 +901,7 @@ var HEADLESS_TOOLS = {
     servicenow_diff_edit: true,
     set_chat_title: true,
     set_tldr: true,
+    set_links: true,
     cached_content_outline: true,
     cached_content_search: true,
     cached_content_read: true,

@@ -63,6 +63,7 @@ var GLOBAL_WRITE_KEYS = [
     'web_fetch',
     'set_chat_title',
     'set_tldr',
+    'set_links',
     'manage_skill:create',
     'manage_skill:update',
     'manage_skill:edit',

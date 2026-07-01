@@ -1783,6 +1783,18 @@ function isChatActivelyRunning(chatId) {
     return !!(typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]);
 }
 
+// chatId -> true while that chat's AFTER-RESPONSE HOOKS (auto-title / tldr /
+// links) are running as a silent hook run. Maintained by the silentHookState
+// handler (app/036-agent-event-handlers-page.js). From the user's point of
+// view the chat is DONE the moment its visible answer landed — the hook run
+// re-sets runningChatIds for a couple of seconds, which used to keep the jobs
+// rows in "Running…" (no bell) while the pill bell was already lit. Display
+// predicates below subtract this so the row bell shows immediately.
+var _silentHookChats = {};
+function _isChatInSilentHook(chatId) {
+    return !!(chatId && _silentHookChats[chatId]);
+}
+
 // True when a chat finished within the last ACTIVE_CHAT_LINGER_MS and so should
 // keep showing under "Active Chats" (the running list) instead of immediately
 // dropping into Completed Today the instant its run ends.
@@ -2224,7 +2236,10 @@ function renderJobsDropdown(dropdown) {
     // user views it (clearing unseen) or removes it.
     var runningChats = chatList.filter(function(_rc) { return isChatBusy(_rc.id) || _isChatLingering(_rc.id) || _isChatUnseen(_rc.id); });
     var chatRowsHtml = runningChats.map(function(c) {
-        var _cRunning = isChatActivelyRunning(c.id) || chatHasRunningSubAgents(c.id);
+        // Silent after-response hooks (auto-title/tldr) keep runningChatIds set
+        // for a few seconds after the visible answer — don't show "Running…"
+        // (and suppress the unseen bell) for that window; the chat is done.
+        var _cRunning = (isChatActivelyRunning(c.id) && !_isChatInSilentHook(c.id)) || chatHasRunningSubAgents(c.id);
         // B15: an errored, non-running chat shows an explicit error row (icon + msg)
         // and a Retry button instead of a green "Finished".
         var _cErr = !_cRunning && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError;
@@ -2262,6 +2277,8 @@ function renderJobsDropdown(dropdown) {
                 '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
                 '<div class="jobs-row-label">' + _cLabel + '</div>' +
             '</div>' +
+            _jobsPinBtnHtml(c) +
+            (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
             (_cErr ? '<button class="jobs-row-btn" title="Retry" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
             _jobsRowButtons(c, _cUnseen || _cErr) +
         '</div>';
@@ -2337,7 +2354,10 @@ function _jobsChatTs(c) { return (c && (c.updatedAt || c.lastResponseAt || c.cre
 function _jobsChatState(chatId) {
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) return 'attention';
-    var running = (typeof isChatActivelyRunning === 'function') && (isChatActivelyRunning(chatId) || chatHasRunningSubAgents(chatId));
+    // A run that only executes silent after-response hooks counts as finished
+    // for display — the user's answer is already there (see _silentHookChats).
+    var running = (typeof isChatActivelyRunning === 'function') &&
+        ((isChatActivelyRunning(chatId) && !_isChatInSilentHook(chatId)) || chatHasRunningSubAgents(chatId));
     var paused = (typeof isChatPaused === 'function') ? isChatPaused(chatId) : false;
     if (running && !paused) return 'running';
     if (c && c._lastApiError) return 'error';
@@ -2382,11 +2402,17 @@ function getPinnedChatsList() {
 // dismiss-notification (only when the row carries an unseen/error flag),
 // open-chat, and — for non-pinned rows — remove-from-list. Buttons stop
 // propagation so the row's own click (accordion) doesn't also fire.
+// Pin toggle button for a chat row — rendered separately, BEFORE the context
+// circle, so rows read: pin → context spinner → trailing buttons.
+function _jobsPinBtnHtml(c) {
+    var idJs = escapeJsString(c.id);
+    var pinned = !!c.pinned;
+    return '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + (pinned ? 'Unpin chat' : 'Pin chat') + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
+}
 function _jobsRowButtons(c, hasNotif, noDismiss) {
     var idJs = escapeJsString(c.id);
     var pinned = !!c.pinned;
     var h = '';
-    h += '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + (pinned ? 'Unpin chat' : 'Pin chat') + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
     if (hasNotif) {
         h += '<button class="jobs-row-btn" title="Dismiss notification" onclick="event.stopPropagation();dismissChatNotifications(\'' + idJs + '\')">' + (UI_ICONS.check || UI_ICONS.close) + '</button>';
     }
@@ -2401,9 +2427,7 @@ function _jobsRowButtons(c, hasNotif, noDismiss) {
 // individually dismissable; they roll off on their own once no longer "today".
 function _jobsTodayRowButtons(c) {
     var idJs = escapeJsString(c.id);
-    var pinned = !!c.pinned;
     var h = '';
-    h += '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + (pinned ? 'Unpin chat' : 'Pin chat') + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
     h += '<button class="jobs-row-btn jobs-open-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
     return h;
 }
@@ -2463,6 +2487,8 @@ function _jobsPinnedRowHtml(c, timeW) {
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div></div>' +
+        _jobsPinBtnHtml(c) +
+        (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error') +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
@@ -2485,6 +2511,8 @@ function _jobsChatRowHtml(c, mode, timeW) {
         '<div class="jobs-row-main">' +
             '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
         '</div>' +
+        _jobsPinBtnHtml(c) +
+        (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error', true) +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
@@ -2508,6 +2536,8 @@ function _jobsTodayRowHtml(c, timeW) {
         '<div class="jobs-row-main">' +
             '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
         '</div>' +
+        _jobsPinBtnHtml(c) +
+        (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsTodayRowButtons(c) +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
@@ -2750,6 +2780,15 @@ function renderJobsExpandModal() {
     // index — column order is stable) to restore it after the live repaint.
     var prevColScroll = [];
     overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { prevColScroll[i] = el.scrollTop; });
+    // Card bodies scroll too (progress content, max-height capped). Snapshot
+    // their scrollTop keyed by chat id so a live repaint doesn't yank the user
+    // back to the top of the card they were reading.
+    var prevCardScroll = {};
+    overlay.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
+        var cid = cardEl.getAttribute('data-chat-id');
+        var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
+        if (cid && bodyEl && bodyEl.scrollTop) prevCardScroll[cid] = bodyEl.scrollTop;
+    });
     var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
     // Source the same three buckets as the dropdown's Active view. Dedupe so a
     // pinned-but-lingering chat only shows once (under Active). The modal then
@@ -2807,6 +2846,13 @@ function renderJobsExpandModal() {
     overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) {
         if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i];
     });
+    overlay.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
+        var cid = cardEl.getAttribute('data-chat-id');
+        if (cid && prevCardScroll[cid] != null) {
+            var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
+            if (bodyEl) bodyEl.scrollTop = prevCardScroll[cid];
+        }
+    });
 }
 // One active chat as a card: status indicator + title + open button, with the
 // chat's progress content (label / status / tasks / output) as the card body.
@@ -2817,13 +2863,21 @@ function _jobsExpandCardHtml(c) {
         : '<span class="jobs-row-dot state-' + st + '"></span>';
     var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
     var idJs = escapeJsString(c.id);
-    return '<div class="jobs-expand-card' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
+    // Progress only in the scrollable body — sub-agent rows live in a drawer
+    // docked INSIDE the card but BELOW the body scroll, so they stay visible
+    // while the progress scrolls, and expand on their own via the delegated
+    // data-worker-toggle listener.
+    var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(c.id) : null;
+    var workers = (typeof _jobsAccWorkersHtml === 'function') ? _jobsAccWorkersHtml(c.id) : '';
+    return '<div class="jobs-expand-card' + cur + (st === 'unseen' ? ' jobs-unread' : '') + (workers ? ' has-workers' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
         '<div class="jobs-expand-card-head">' +
             indicator +
             '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
             '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
         '</div>' +
-        '<div class="jobs-expand-card-body">' + _jobsAccordionContentHtml(c.id) + '</div>' +
+        '<div class="jobs-expand-card-body">' + _jobsAccordionBodyHtml(prog) + '</div>' +
+        (workers ? '<div class="jobs-expand-card-workers" data-workers-for="' + escapeHtml(c.id) + '">' + workers + '</div>' : '') +
     '</div>';
 }
 // Open a chat from an expand-modal card: close the modal, then navigate (which
@@ -2894,7 +2948,25 @@ function toggleJobsActionAccordion(actionId) {
 // done/error output, task checklist) — mirrors the progress popover body.
 function _jobsAccordionContentHtml(chatId) {
     var current = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null;
-    return _jobsAccordionBodyHtml(current);
+    var html = _jobsAccordionBodyHtml(current);
+    // After the chat's own progress, list its sub-agents using the SAME worker
+    // card component the parent-chat sidebar Workers panel uses (robot icon,
+    // live tool-call counter, context ring). Each card is click-to-expand to
+    // reveal that sub's progress — the document-level delegated listener in
+    // 175-sub-agent-ui.js (data-worker-toggle) drives it here too.
+    var workers = _jobsAccWorkersHtml(chatId);
+    if (workers) html += '<div class="jobs-acc-workers">' + workers + '</div>';
+    return html;
+}
+// Sub-agents header + worker-card list for a chat, or '' when it has none.
+// Shared by the dropdown accordion (inline, inside .jobs-acc-workers) and the
+// expand modal (as a docked drawer under the card).
+function _jobsAccWorkersHtml(chatId) {
+    if (typeof subAgentsForChatTree !== 'function' || typeof _workerCardHtml !== 'function') return '';
+    var subs = subAgentsForChatTree(chatId);
+    if (!subs.length) return '';
+    return '<div class="jobs-acc-workers-header">Sub-agents (' + subs.length + ')</div>' +
+        '<div class="jobs-acc-workers-list">' + subs.map(_workerCardHtml).join('') + '</div>';
 }
 // Inline progress for an action row's accordion — mirrors a chat row. Prefers the
 // live update_action_state progress from the action's background chat, falling

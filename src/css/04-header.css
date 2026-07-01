@@ -81,6 +81,18 @@
 .credits-display:hover { background: var(--success-light); color: var(--success-hover); }
 .credits-display.loading { color: var(--text-secondary); background: var(--bg-code); border-color: var(--border); }
 .credits-display.error { color: var(--danger-hover); background: var(--danger-lighter); border-color: var(--danger-light); }
+/* Rich usage tooltip on the credits pill (session / weekly / per-model bars) */
+.usage-tooltip { position: fixed; z-index: var(--z-overlay-base); width: 264px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); padding: var(--space-4) var(--space-5); display: none; }
+.usage-tt-row { padding: var(--space-2) 0; }
+.usage-tt-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); margin-bottom: 4px; }
+.usage-tt-label { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-tt-pct { font-size: var(--text-caption); color: var(--text-secondary); white-space: nowrap; }
+.usage-tt-bar { height: 6px; border-radius: 3px; background: var(--bg-code); border: 1px solid var(--border); overflow: hidden; }
+.usage-tt-fill { height: 100%; border-radius: 3px; background: var(--primary); }
+.usage-tt-fill.warn { background: var(--warning, #b45309); }
+.usage-tt-fill.crit { background: var(--danger); }
+.usage-tt-sub { font-size: var(--text-caption); color: var(--text-muted); margin-top: 3px; }
+.usage-tt-section { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--secondary-border); }
 .storage-display { font-size: var(--text-body-sm); color: var(--primary); background: var(--primary-lighter); padding: var(--space-2) var(--space-5); border-radius: var(--radius-xl); cursor: pointer; border: 1px solid var(--primary-light); transition: all var(--transition-normal); }
 .storage-display:hover { background: var(--primary-light); color: var(--primary-hover); }
 .storage-display.warning { color: var(--warning-hover); background: var(--warning-lighter); border-color: var(--warning-light); }
@@ -175,6 +187,10 @@
 .ws-file-badge.conflict { color: var(--danger-hover); background: var(--danger-lighter); }
 .ws-file-badge.behind { color: var(--primary); background: var(--primary-lighter); }
 .ws-file-pr { font-size: 10px; color: var(--accent); text-decoration: none; white-space: nowrap; }
+.ws-file-group-label { padding: var(--space-2) var(--space-5); font-size: 10px; font-weight: var(--font-semibold); text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); background: var(--bg-tertiary); border-bottom: 1px solid var(--border-light); }
+.ws-this-chat-section { border-bottom: 2px solid var(--border); }
+.ws-this-chat-section .ws-file-group-label { text-transform: none; letter-spacing: 0; font-family: var(--font-mono); }
+.ws-this-chat-section .ws-dd-title { color: var(--primary); }
 .ws-file-pr:hover { text-decoration: underline; }
 .ws-dropdown-empty { padding: var(--space-6); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); }
 .ws-dropdown-section { border-bottom: 1px solid var(--border); }
@@ -228,11 +244,11 @@
 .msg-actions { display: flex; flex-direction: row; gap: var(--space-1); opacity: 0; transition: opacity var(--transition-normal); align-items: center; }
 .message.user:hover .msg-actions { opacity: 1; }
 
-/* Queued user bubble — message typed during streaming, not yet sent to the model. */
-.message.user.queued .message-content { opacity: 0.7; border: 1px dashed var(--border-dark); background: var(--bg-tertiary, rgba(0,0,0,0.04)); }
-.message.user.queued .queued-badge { display: inline-flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); padding: var(--space-1) var(--space-3); border-radius: var(--radius-pill, 12px); background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text-secondary, #666); font-size: 11px; font-weight: 500; letter-spacing: 0.02em; }
+/* Optimistic user bubble — message sent during streaming, rendered instantly and
+   styled IDENTICALLY to a real user bubble (no badge, no dashed border) while the
+   service worker flushes it into the real history. Only the attachment count line
+   keeps a dedicated style. */
 .message.user.queued .queued-attachments { margin-top: var(--space-2); font-size: 11px; color: var(--text-secondary, #666); }
-.message.user.queued .user-text { white-space: pre-wrap; word-wrap: break-word; }
 .copy-msg-btn, .edit-msg-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: var(--text-body-sm); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; }
 .copy-msg-btn:hover, .edit-msg-btn:hover { background: var(--border); color: var(--text-primary); }
 .copy-msg-btn .ui-icon, .edit-msg-btn .ui-icon { width: 14px; height: 14px; }

@@ -150,18 +150,32 @@ function _flushFinalizedStreamingText(chatId) {
     if (!chat || !chat.messages) return;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         var m = chat.messages[i];
-        if (m && m.role === 'assistant') {
-            if (m.isStreaming !== true && m.content) {
-                updateStreamingText(m, i, chatId);
-                // SF-3: the full-text repaint can grow the streaming el (and the
-                // outer scrollHeight) AFTER renderMessages' scroll restore ran
-                // (the 'assistantMessage' handler renders first, then flushes) —
-                // route through the SF-2 choke point so a following user is
-                // re-pinned instead of stranded off-bottom until the next event.
-                if (typeof scrollToBottomIfAllowed === 'function') scrollToBottomIfAllowed();
-            }
-            return; // only the latest assistant message can have a stale reveal
+        if (!m) continue;
+        // SC-2: stop at the turn boundary — updateStreamingText only paints
+        // entries AFTER the last user message, so anything before it is
+        // already rendered as a normal (non-streaming) message.
+        if (m.role === 'user') return;
+        if (m.role !== 'assistant') continue;
+        // Mid-stream tail: the streamDelta path (and REG-F4 on full renders)
+        // owns the paced reveal — every delta repaints the whole turn's
+        // entries, so nothing to flush here.
+        if (m.isStreaming === true) return;
+        if (m.content) {
+            updateStreamingText(m, i, chatId);
+            // SF-3: the full-text repaint can grow the streaming el (and the
+            // outer scrollHeight) AFTER renderMessages' scroll restore ran
+            // (the 'assistantMessage' handler renders first, then flushes) —
+            // route through the SF-2 choke point so a following user is
+            // re-pinned instead of stranded off-bottom until the next event.
+            if (typeof scrollToBottomIfAllowed === 'function') scrollToBottomIfAllowed();
+            return;
         }
+        // SC-2: finalized TOOL-ONLY assistant row (tool_calls, no text) — the
+        // common shape while a tool executes. The turn's streamed text lives
+        // on an EARLIER assistant message; the old `return` here left the
+        // freshly-created (empty) #streaming-text blank after a chat switch,
+        // hiding the between-tool-call text for the rest of the run. Keep
+        // walking back within the turn.
     }
 }
 
@@ -195,7 +209,7 @@ AgentEvents.on('toolCallCancelled', function(e) {
 AgentEvents.on('userInjected', function(e) {
     // Offscreen just flushed pendingInjectionsByChatId[e.chatId] into chat.messages
     // and broadcast the snapshot. Drop our PAGE-side mirror entry too so
-    // renderQueuedUserBubble stops re-painting the "Queued" badge on the real msg.
+    // renderQueuedUserBubble stops re-painting the optimistic bubble over the real msg.
     // The bubble is still doing its optimistic-UI job for the brief window between
     // the user pressing Enter and offscreen broadcasting userInjected — we just
     // need to retire it once the real message lands.
@@ -203,6 +217,27 @@ AgentEvents.on('userInjected', function(e) {
         delete pendingInjectionsByChatId[e.chatId];
     }
     if (e.chatId === currentChatId) renderMessages();
+    // INT-B1: the render above PRESERVES #streaming-text (same chat, still
+    // running), so entries painted for the pre-interrupt turn are still inside
+    // it — now sitting BELOW the freshly-injected user message. Prune them
+    // immediately instead of waiting for the next turn's first streamDelta to
+    // reach updateStreamingText's own prune. Same turn boundary as the paint
+    // loop (data-msg-idx must be > last user row index).
+    if (e.chatId === currentChatId) {
+        var _uiEl = document.getElementById('streaming-text');
+        var _uiChat = (typeof chats !== 'undefined') ? chats[e.chatId] : null;
+        if (_uiEl && _uiChat && _uiChat.messages) {
+            var _uiLastUser = -1;
+            for (var _ui = _uiChat.messages.length - 1; _ui >= 0; _ui--) {
+                if (_uiChat.messages[_ui].role === 'user') { _uiLastUser = _ui; break; }
+            }
+            var _uiStale = _uiEl.querySelectorAll('.streaming-entry');
+            for (var _uk = 0; _uk < _uiStale.length; _uk++) {
+                var _uidx = parseInt(_uiStale[_uk].getAttribute('data-msg-idx'), 10);
+                if (!(_uidx > _uiLastUser)) _uiStale[_uk].remove();
+            }
+        }
+    }
 });
 
 AgentEvents.on('messagesAppended', function(e) {
@@ -251,6 +286,19 @@ AgentEvents.on('paused', function(e) {
 
 AgentEvents.on('streamAborted', function(e) {
     hideSpinner(e.chatId);
+    // INT-B5: drop the paced-reveal buffer entries for this chat. After a
+    // user abort the partial assistant message may be popped from the
+    // transcript (worker loop), so getDisplayContent is never re-called for
+    // its index and the streamingDisplayLen key leaks — and if a LATER
+    // assistant message lands on the same index, its reveal inherits the
+    // stale offset and skips the pacing animation for the prefix. No live
+    // stream exists for this chat at abort time, so mid-stream throttling
+    // (FLUSH-TAIL contract) is unaffected.
+    if (e && e.chatId && typeof streamingDisplayLen !== 'undefined') {
+        for (var _sk in streamingDisplayLen) {
+            if (_sk.indexOf(e.chatId + ':') === 0) delete streamingDisplayLen[_sk];
+        }
+    }
 });
 
 AgentEvents.on('error', function(e) {
@@ -375,6 +423,12 @@ AgentEvents.on('runFinished', function(e) {
     // of dropping it the instant the run ends (the page bridge already deleted
     // runningChatIds[chatId] before this handler ran).
     if (typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(chatId); } catch (e) {} }
+    // Self-heal the per-chat silent-hook flag at every run boundary: the hook
+    // run's own silentHookState{active:false} normally clears it, but if that
+    // event was lost (SW reconnect flap) a stale entry would make a future
+    // real run render as finished. Any runFinished for this chat means no
+    // silent hook is streaming for it anymore.
+    if (typeof _silentHookChats !== 'undefined' && _silentHookChats[chatId]) delete _silentHookChats[chatId];
     if (typeof renderChatList === 'function') renderChatList();
     if (typeof renderJobsBadge === 'function') renderJobsBadge();
     if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdFin = _getOpenJobsDropdown(); if (_jdFin) renderJobsDropdown(_jdFin); }
@@ -485,6 +539,9 @@ AgentEvents.on('runCrashed', function(e) {
         } catch (err) { console.warn('runCrashed: onSubAgentRunFinished hook threw', err); }
     }
     if (e && e.chatId && typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(e.chatId); } catch (err) {} }
+    // A crashed hook run never emits silentHookState{active:false} — clear the
+    // per-chat flag here too (same self-heal as the runFinished handler).
+    if (e && e.chatId && typeof _silentHookChats !== 'undefined' && _silentHookChats[e.chatId]) delete _silentHookChats[e.chatId];
     // A crash is a finish the user must see: notifyFinish (which stamps the
     // finished-chat bell on natural finishes) is skipped when the loop throws,
     // so stamp the bell here. noteChatFinishedUnseen itself skips the focused
@@ -686,57 +743,25 @@ AgentEvents.on('chatTitleChanged', function(e) {
     }
 });
 
-// tldrChanged: set_tldr (a headless tool) attached a TL;DR to the final-answer
-// assistant message in the SW. The page's chats mirror is stale — hydrate the
-// local mirror (same target search as executeSetTldr) then re-render so the
-// card appears immediately in the currently viewed chat.
+// tldrChanged / linksChanged: set_tldr / set_links (headless tools) attached a
+// value to the final-answer assistant message in the SW. The page's chats
+// mirror is stale — hydrate it via attachAnswerCard (the SAME shared helper
+// the tools use in tools/020-tool-execution.js, so target search + same-turn
+// dedupe stay identical) then re-render so the card appears immediately in
+// the currently viewed chat.
 AgentEvents.on('tldrChanged', function(e) {
     if (!e || !e.chatId || !e.tldr) return;
     var chat = chats[e.chatId];
-    if (chat && chat.messages) {
-        // Same target search as executeSetTldr: last non-hook user msg, then
-        // the last assistant msg with content after it that isn't a hook run.
-        var lastUserIdx = -1;
-        for (var i = chat.messages.length - 1; i >= 0; i--) {
-            var m = chat.messages[i];
-            if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
-        }
-        var target = null;
-        if (lastUserIdx !== -1) {
-            // Anchor the search span to the REAL turn (stop before the first
-            // hook user message) and never pick a message carrying a hook
-            // tool call — mirrors executeSetTldr exactly.
-            var endIdx = chat.messages.length - 1;
-            for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
-                if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
-            }
-            var hasSetTldrCall = function(am) {
-                return !!(am.tool_calls && am.tool_calls.some(function(tc) {
-                    return tc.function && tc.function.name === 'set_tldr';
-                }));
-            };
-            for (var j = endIdx; j > lastUserIdx; j--) {
-                var am = chat.messages[j];
-                if (am.role === 'assistant' && am.content && !am.isStreaming) {
-                    if (hasSetTldrCall(am)) continue;
-                    target = am; break;
-                }
-            }
-            if (!target) {
-                for (var k = endIdx; k > lastUserIdx; k--) {
-                    if (chat.messages[k].role === 'assistant' && chat.messages[k].content && !hasSetTldrCall(chat.messages[k])) { target = chat.messages[k]; break; }
-                }
-            }
-        }
-        if (target) {
-            // Mirror executeSetTldr's TLDR-3 clearing: drop any earlier TL;DR
-            // in the same turn span so the page never renders two cards.
-            for (var c = lastUserIdx + 1; c <= endIdx; c++) {
-                if (chat.messages[c] !== target && chat.messages[c].tldr) delete chat.messages[c].tldr;
-            }
-            target.tldr = e.tldr;
-        }
+    if (chat && chat.messages) attachAnswerCard(chat, 'tldr', e.tldr);
+    if (e.chatId === currentChatId && typeof renderMessages === 'function') {
+        try { renderMessages(); } catch (err) {}
     }
+});
+
+AgentEvents.on('linksChanged', function(e) {
+    if (!e || !e.chatId || !Array.isArray(e.links)) return;
+    var chat = chats[e.chatId];
+    if (chat && chat.messages) attachAnswerCard(chat, 'links', e.links);
     if (e.chatId === currentChatId && typeof renderMessages === 'function') {
         try { renderMessages(); } catch (err) {}
     }
@@ -752,6 +777,20 @@ AgentEvents.on('tldrChanged', function(e) {
 // output while it streams.
 AgentEvents.on('silentHookState', function(e) {
     _silentHookRunning = !!(e && e.active);
+    // Per-chat mirror (tools/120-actions.js): while a chat's silent hooks run,
+    // its jobs rows must NOT show "Running…" — the user-visible answer already
+    // landed, so the unseen bell should light up on the row immediately instead
+    // of waiting a couple of seconds for the hook run to finish. Re-render the
+    // jobs surfaces on both edges so the row flips right away.
+    if (e && e.chatId && typeof _silentHookChats !== 'undefined') {
+        if (e.active) _silentHookChats[e.chatId] = true;
+        else delete _silentHookChats[e.chatId];
+        try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (err) {}
+        try {
+            var _jdSh = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+            if (_jdSh && typeof renderJobsDropdown === 'function') renderJobsDropdown(_jdSh);
+        } catch (err) {}
+    }
 });
 
 // recordMutated: servicenow_api or servicenow_diff_edit modified a record.

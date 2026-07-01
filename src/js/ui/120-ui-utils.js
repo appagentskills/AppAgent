@@ -291,6 +291,53 @@ function reopenBrowser() {
     }
 }
 
+// Collect PRs pushed from this chat (workspace push tool calls + their results).
+// Returns [{url, number, title, branch}] deduped by URL. A later push to the
+// same PR (append) replaces the tracked entry, but only overwrites the title
+// when the later push actually passed a pr_title (it is optional on append).
+function getPushedPRsForChat(chat) {
+    if (!chat || !chat.messages) return [];
+    var pushArgs = {}; // tool_call_id -> { title, branch }
+    var prs = [];
+    var byUrl = {};
+    chat.messages.forEach(function(msg) {
+        if (msg.role === 'assistant' && msg.tool_calls) {
+            msg.tool_calls.forEach(function(tc) {
+                if (tc.function && tc.function.name === 'workspace') {
+                    try {
+                        var a = JSON.parse(tc.function.arguments);
+                        if (a.action === 'push') pushArgs[tc.id] = { title: a.pr_title || '', branch: a.branch_name || '' };
+                    } catch (e) { /* malformed args — skip */ }
+                }
+            });
+        }
+        if (msg.role === 'tool' && msg.tool_call_id && pushArgs[msg.tool_call_id] && msg.content) {
+            var r = null;
+            try { r = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch (e) { /* not JSON — skip */ }
+            if (r && r.success && r.pr_url) {
+                var args = pushArgs[msg.tool_call_id];
+                var entry = {
+                    url: r.pr_url,
+                    number: r.pr_number,
+                    title: args.title,
+                    branch: r.branch || args.branch || ''
+                };
+                if (byUrl[entry.url] !== undefined) {
+                    var prev = prs[byUrl[entry.url]];
+                    if (!entry.title) entry.title = prev.title; // append without pr_title keeps prior title
+                    prs[byUrl[entry.url]] = entry;
+                } else {
+                    byUrl[entry.url] = prs.length;
+                    prs.push(entry);
+                }
+            }
+        }
+    });
+    // Fallback title when no pr_title was ever passed
+    prs.forEach(function(pr) { if (!pr.title) pr.title = pr.branch || ('PR #' + pr.number); });
+    return prs;
+}
+
 function renderVersionSidebar() {
     var container = document.getElementById('version-history-list');
     if (!container) return;
@@ -337,6 +384,28 @@ function renderVersionSidebar() {
             html += '<div class="version-action-hint">' + changedFiles.length + ' file' + (changedFiles.length > 1 ? 's' : '') + ' changed</div>';
         }
         
+        html += '</div>';
+        html += '</div>';
+    }
+    
+    // Pull Requests Section — PRs pushed from this chat via workspace push.
+    // Derived from the chat's tool calls/results, so it works retroactively
+    // for existing chats with no extra persistence.
+    var pushedPRs = getPushedPRsForChat(chats[currentChatId]);
+    if (pushedPRs.length > 0) {
+        html += '<div class="version-prs-section">';
+        html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' Pull Requests (' + pushedPRs.length + ')</div>';
+        html += '<div class="pr-sidebar-list">';
+        pushedPRs.forEach(function(pr) {
+            html += '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '">';
+            html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
+            html += '<span class="pr-sidebar-info">';
+            html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
+            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.branch ? ' \u00b7 ' + escapeHtml(pr.branch) : '') + '</span>';
+            html += '</span>';
+            html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
+            html += '</a>';
+        });
         html += '</div>';
         html += '</div>';
     }

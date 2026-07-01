@@ -48,6 +48,7 @@ function getEnabledTools(chatId) {
         }
         if (name === 'set_chat_title' && !hooksEnabled.autoTitle) return false;
         if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
+        if (name === 'set_links' && !hooksEnabled.autoLinks) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });

@@ -1268,14 +1268,14 @@
 .jobs-dropdown-row.state-needs_input,
 .jobs-dropdown-row.state-needs_permission { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
 .jobs-dropdown-row.state-attention { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
-.jobs-dropdown-row.state-done { background: var(--success-lighter, rgba(16, 185, 129, 0.06)); }
 .jobs-dropdown-row.state-error { background: var(--danger-lighter, rgba(239, 68, 68, 0.06)); }
-/* The chat you're currently viewing gets a subtle green highlight + left accent
-   so it stands out from the rest of the (now-neutral) chat rows. */
+/* The chat you're currently viewing gets a green left accent band only (no
+   background tint) so it stands out from the rest of the neutral chat rows —
+   matches .jobs-expand-card.is-current. */
 .jobs-dropdown-row.is-current {
-    background: var(--success-lighter, rgba(16, 185, 129, 0.08));
     box-shadow: inset 3px 0 0 var(--success, #10b981);
 }
+.jobs-dropdown-row.is-current .jobs-row-title { font-weight: var(--font-bold, 700); }
 
 .jobs-row-icon {
     width: 28px; height: 28px;
@@ -1289,7 +1289,9 @@
 .jobs-row-main { flex: 1; min-width: 0; }
 .jobs-row-title {
     font-size: var(--text-body-sm);
-    font-weight: var(--font-semibold);
+    /* Read (seen) chats use normal weight so the unread-email-style bold
+       (.jobs-unread below) actually stands out. */
+    font-weight: var(--font-normal, 400);
     color: var(--text-primary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -1544,7 +1546,8 @@
 /* Inline accordion: progress panel expanded under a clicked chat row. The open
    row + its accordion keep a WHITE background and are tied together by a thin
    blue left-accent bar; the open row drops its bottom divider so it merges into
-   the accordion, and its title turns blue to show which chat is expanded. */
+   the accordion, and its title goes semibold to show which chat is expanded
+   (normal text color — the accent bar already carries the blue). */
 .jobs-dropdown-row.acc-open {
     background: var(--bg-white);
     box-shadow: inset 3px 0 0 var(--primary);
@@ -1556,7 +1559,7 @@
     border-bottom: 1px solid var(--secondary-border);
     box-shadow: inset 3px 0 0 var(--primary);
 }
-.jobs-dropdown-row.acc-open .jobs-row-title { color: var(--primary); }
+.jobs-dropdown-row.acc-open .jobs-row-title { font-weight: var(--font-semibold, 600); }
 .jobs-row-accordion .jobs-acc-label {
     font-weight: var(--font-semibold);
     color: var(--text-primary);
@@ -1574,6 +1577,32 @@
 }
 .jobs-row-accordion .action-result-tasks { margin-top: var(--space-1); }
 .jobs-row-accordion .action-result-output { margin-bottom: var(--space-2); }
+/* Sub-agent worker cards listed inside a chat-row accordion, just below the
+   chat's own progress. Reuses the .worker-card component (24-sub-agents.css);
+   this block only titles + spaces the list. */
+.jobs-row-accordion .jobs-acc-workers {
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
+    border-top: 1px dashed var(--secondary-border);
+}
+.jobs-row-accordion .jobs-acc-workers-header {
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-semibold, 600);
+    color: var(--text-muted, #6b7280);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: var(--space-2);
+}
+.jobs-row-accordion .jobs-acc-workers-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2, 4px);
+}
+/* Compact context ring for the (non-expanded) jobs chat rows — smaller than
+   the sidebar worker ring so it fits the dense row beside the action buttons. */
+.jobs-dropdown-row .jobs-row-ctx { width: 22px; height: 22px; }
+.jobs-dropdown-row .jobs-row-ctx .worker-ctx-circle { width: 22px; height: 22px; }
+.jobs-dropdown-row .jobs-row-ctx .worker-ctx-pct { font-size: 7px; }
 
 /* =============================================
    EXPAND: centered modal of active-chat cards
@@ -1692,20 +1721,26 @@
     flex-shrink: 0;
 }
 .jobs-expand-card.is-current { box-shadow: inset 3px 0 0 var(--success, #10b981); }
+.jobs-expand-card.is-current .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
 .jobs-expand-card-head {
     display: flex; align-items: center; gap: var(--space-2);
     margin-bottom: var(--space-2);
 }
 .jobs-expand-card-head .jobs-row-dot,
 .jobs-expand-card-head .jobs-row-bell { flex-shrink: 0; }
+/* Context ring on expand-modal cards — same compact size as the dropdown rows. */
+.jobs-expand-card-head .jobs-row-ctx { width: 22px; height: 22px; flex-shrink: 0; }
+.jobs-expand-card-head .jobs-row-ctx .worker-ctx-circle { width: 22px; height: 22px; }
+.jobs-expand-card-head .jobs-row-ctx .worker-ctx-pct { font-size: 7px; }
 .jobs-expand-card-title {
     flex: 1; min-width: 0;
     font-size: var(--text-body-sm);
-    font-weight: var(--font-semibold);
+    /* Normal weight when read — only unread (unopened finished) cards go bold. */
+    font-weight: var(--font-normal, 400);
     color: var(--text-primary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* Unread (unopened finished) chat: a touch bolder, still on the same card. */
+/* Unread (unopened finished) chat: bold like an unread email. */
 .jobs-expand-card.jobs-unread .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
 .jobs-expand-card-body { min-width: 0; max-height: 260px; overflow-y: auto; }
 .jobs-expand-card-body .jobs-acc-label {
@@ -1721,6 +1756,33 @@
 }
 .jobs-expand-card-body .action-result-tasks { margin-top: var(--space-1); }
 .jobs-expand-card-body .action-result-output { margin-bottom: 0; }
+/* Sub-agent drawer: INSIDE the card but BELOW (outside) the card-body scroll,
+   so the worker rows stay pinned while the progress body scrolls on its own
+   and expand via data-worker-toggle. Negative margins stretch it across the
+   card's padding so it reads as a docked footer band. Reuses .worker-card
+   from 24-sub-agents.css. */
+.jobs-expand-card-workers {
+    border-top: 1px dashed var(--secondary-border);
+    border-radius: 0 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px);
+    background: var(--bg-secondary, var(--bg-white));
+    padding: var(--space-2) var(--space-4) var(--space-3);
+    margin: var(--space-2) calc(-1 * var(--space-4)) calc(-1 * var(--space-3));
+    min-width: 0;
+    flex-shrink: 0;
+}
+.jobs-expand-card-workers .jobs-acc-workers-header {
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-semibold, 600);
+    color: var(--text-muted, #6b7280);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: var(--space-2);
+}
+.jobs-expand-card-workers .jobs-acc-workers-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2, 4px);
+}
 /* Only when truly cramped do the three columns stack vertically (cards get too
    narrow to read otherwise); the body then scrolls as a whole instead of each
    column scrolling on its own. Above this they stay side by side as columns. */

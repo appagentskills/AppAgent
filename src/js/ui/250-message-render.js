@@ -3,11 +3,11 @@ function isAttachmentRole(role) {
     return role === 'screenshot' || role === 'pdf' || role === 'file';
 }
 
-// Hook tools (set_chat_title / set_tldr) get special rendering treatment:
-// their calls/results are hidden unless API stats are shown, and a hook-only
-// tool message still counts as a final answer.
+// Hook tools (set_chat_title / set_tldr / set_links) get special rendering
+// treatment: their calls/results are hidden unless API stats are shown, and a
+// hook-only tool message still counts as a final answer.
 function isHookToolName(n) {
-    return n === 'set_chat_title' || n === 'set_tldr';
+    return n === 'set_chat_title' || n === 'set_tldr' || n === 'set_links';
 }
 
 // TL;DR card rendered at the end of an answer (set by the autoTldr hook via
@@ -15,6 +15,27 @@ function isHookToolName(n) {
 function renderTldrCard(msg) {
     if (!msg || !msg.tldr) return '';
     return '<div class="tldr-card"><div class="tldr-card-label">TL;DR</div><div class="tldr-card-text">' + formatContent(msg.tldr) + '</div></div>';
+}
+
+// Links card rendered just below the TL;DR at the end of an answer (set by the
+// autoLinks hook via the set_links tool — see executeSetLinks in
+// tools/020-tool-execution.js). Each entry is a {title, url} the user may want
+// to look into (PR, diff, ServiceNow record, doc page); opens in a new tab.
+function renderLinksCard(msg) {
+    if (!msg || !Array.isArray(msg.links) || !msg.links.length) return '';
+    var items = msg.links.map(function(l) {
+        // Defense in depth: executeSetLinks only stores http(s) urls, but old
+        // or hand-edited chat data flows through here too — never emit a
+        // clickable href for any other scheme (javascript:, data:, ...).
+        if (!l || !l.url || !/^https?:\/\//i.test(l.url)) return '';
+        var title = escapeHtml((l.title || l.url).toString());
+        var href = escapeHtml(l.url.toString());
+        return '<li class="links-card-item"><a class="links-card-link" href="' + href + '" target="_blank" rel="noopener noreferrer">' +
+            '<span class="links-card-icon">' + UI_ICONS.externalLink + '</span>' +
+            '<span class="links-card-title">' + title + '</span></a></li>';
+    }).join('');
+    if (!items) return '';
+    return '<div class="links-card"><div class="links-card-label">LINKS</div><ul class="links-card-list">' + items + '</ul></div>';
 }
 
 // Render just the inner content of a single attachment (no group wrapper)
@@ -33,7 +54,7 @@ function renderAttachmentContent(msg, index) {
         h += '<div class="screenshot-container">';
         h += '<div class="screenshot-header" title="' + escapeHtml(screenshotName) + '"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + escapeHtml(screenshotName) + '</div>';
         if (base64) {
-            h += '<img class="screenshot-thumbnail" src="' + base64 + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
+            h += '<img class="screenshot-thumbnail" src="' + escapeHtml(base64) + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
         } else {
             h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">Screenshot unavailable</div>';
         }
@@ -238,8 +259,17 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
 }
 
 function renderMessages() {
-    // Skip DOM rebuilds during silent hook runs (prevents flash)
-    if (_silentHookRunning) return;
+    // Skip DOM rebuilds during silent hook runs (prevents flash) — but ONLY
+    // when the container already shows the current chat. _silentHookRunning
+    // is a GLOBAL flag (set while ANY chat runs its hidden after-response
+    // hooks: title/tldr/links), so an unconditional bail here broke chat
+    // SWITCHING during that window: selectChat() → renderMessages() returned
+    // without painting, leaving the PREVIOUS chat's messages on screen while
+    // the header/title already showed the new chat. A switch is detected by
+    // _lastRenderState.chatId !== currentChatId and must always rebuild —
+    // safe against hook flash, because the full render path filters hook
+    // messages and their responses (isHookMessage checks below).
+    if (_silentHookRunning && _lastRenderState.chatId === currentChatId) return;
 
     // B-B1: widget chat mode (the dashboard widget editor running inline) reuses
     // the #messages container via renderWidgetInChat. If a background agent loop
@@ -553,7 +583,7 @@ function renderMessages() {
                 var sizeKB = Math.round((msg.content || '').length / 1024);
                 var lines = (msg.content || '').split('\n').length;
                 var expanded = !!userMsgExpandedState[(currentChatId || '_') + ':' + index];
-                var badge = '<div class="user-cached-badge" title="This long message is cached. The agent reads it via cached_content_read/search/outline (content_id: ' + msg.cachedContentId + ').">' + UI_ICONS.cache + ' Cached · ' + sizeKB + 'KB · ' + lines + ' lines</div>';
+                var badge = '<div class="user-cached-badge" title="This long message is cached. The agent reads it via cached_content_read/search/outline (content_id: ' + escapeHtml(msg.cachedContentId) + ').">' + UI_ICONS.cache + ' Cached · ' + sizeKB + 'KB · ' + lines + ' lines</div>';
                 var toggleLabel = expanded ? 'Collapse' : 'Expand';
                 var toggleClass = 'user-cached-toggle' + (expanded ? ' expanded' : '');
                 var toggleBtn = '<button class="' + toggleClass + '" onclick="toggleUserMsgExpanded(' + index + ')" title="' + toggleLabel + ' full message">' + UI_ICONS.chevronDown + ' ' + toggleLabel + '</button>';
@@ -786,6 +816,7 @@ function renderMessages() {
                 if (msg.content && !msg.isStreaming && isLastAssistant && !(isRunning && block && block.isLastBlock)) {
                     html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
                     if (msg.tldr) html += renderTldrCard(msg);
+                    if (msg.links) html += renderLinksCard(msg);
                 }
                 
                 // Add metrics for non-tool messages
@@ -825,6 +856,7 @@ function renderMessages() {
             if (msg.content && !msg.isStreaming && !isRunning) {
                 html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
                 if (msg.tldr) html += renderTldrCard(msg);
+                if (msg.links) html += renderLinksCard(msg);
             }
             if (msg.tool_calls) {
                 // Standard mode: render each tool call separately
@@ -1018,6 +1050,24 @@ function renderMessages() {
     // All other content goes inside a #messages-inner wrapper - a single innerHTML swap.
     var existingStreamingEl = isRunning ? document.getElementById('streaming-text') : null;
 
+    // SC-1: the preserved element must belong to THIS chat. When the user
+    // switches between two RUNNING chats, selectChat sets isRunning=true and
+    // activeStreamingChatId=<target chat> BEFORE calling renderMessages, so
+    // the lookup above finds the PREVIOUS chat's #streaming-text and the
+    // preserve branch below would rebuild #messages-inner AROUND it — keeping
+    // the old chat's streamed text (and any embedded smart-document card,
+    // which sdocReRenderAll keeps refreshing via a document-wide selector)
+    // under the new chat's tools panel indefinitely. Its .streaming-entry
+    // rows are keyed by data-msg-idx only, so the new chat's deltas merely
+    // overwrite colliding indices and never clear the rest. Treat a foreign
+    // (or unstamped) element as stale: drop it and take the fresh-element
+    // branch, whose REG-F4 repopulation rebuilds the tail from THIS chat's
+    // own messages.
+    if (existingStreamingEl && existingStreamingEl.dataset.chatId !== currentChatId) {
+        existingStreamingEl.remove();
+        existingStreamingEl = null;
+    }
+
     // Preserve live widget iframes across innerHTML rebuild using moveBefore().
     // moveBefore() (Chrome 124+, Firefox 131+) is the ONLY DOM API that moves
     // nodes without resetting iframe content. appendChild/replaceChild/insertBefore
@@ -1065,7 +1115,14 @@ function renderMessages() {
             // immediately from the mirror when the tail is mid-stream.
             var _f4TailIdx = chat.messages.length - 1;
             var _f4Tail = chat.messages[_f4TailIdx];
-            if (_f4Tail && _f4Tail.role === 'assistant' && _f4Tail.isStreaming === true && _f4Tail.content) {
+            // SC-2: no `&& _f4Tail.content` — a tail that is mid-stream but has
+            // no text yet (thinking / tool_input phase) still needs the call:
+            // updateStreamingText repaints EVERY finalized .streaming-entry of
+            // the current turn (earlier between-tool-call text), not just the
+            // streaming tail. Requiring content here left the whole turn's
+            // streamed text hidden when the user switched back during that
+            // window. updateStreamingText itself skips content-less messages.
+            if (_f4Tail && _f4Tail.role === 'assistant' && _f4Tail.isStreaming === true) {
                 updateStreamingText(_f4Tail, _f4TailIdx, currentChatId);
             } else if (typeof _flushFinalizedStreamingText === 'function') {
                 // FLUSH-TAIL companion (see 036-agent-event-handlers-page.js):
@@ -1954,12 +2011,15 @@ function renderQueuedUserBubble(container) {
     if (!text && (!images || images.length === 0)) return;
 
     var bubble = document.createElement('div');
+    // Styled as a NORMAL user bubble (no "Queued" badge) — the send is
+    // effectively instant (interrupt + flush), so the optimistic bubble must
+    // be visually indistinguishable from the real message that replaces it.
+    // The 'queued' class is kept purely as the selector for the idempotent
+    // removal above; it no longer carries any special styling.
     bubble.className = 'message user queued';
-    bubble.title = 'Queued — will be sent as soon as the current step finishes.';
     var inner = '<div class="message-content">';
-    inner += '<div class="queued-badge">' + (UI_ICONS && UI_ICONS.clock ? UI_ICONS.clock : '⏳') + ' Queued</div>';
     if (text) {
-        inner += '<span class="user-text">' + escapeHtml(text) + '</span>';
+        inner += '<div class="user-text user-text-md">' + (typeof formatContent === 'function' ? formatContent(text) : escapeHtml(text)) + '</div>';
     }
     if (images && images.length > 0) {
         inner += '<div class="queued-attachments">' + images.length + ' attachment' + (images.length === 1 ? '' : 's') + '</div>';
@@ -1967,7 +2027,20 @@ function renderQueuedUserBubble(container) {
     inner += '</div>';
     bubble.innerHTML = inner;
 
-    // Append at the very end of the messages container.
-    var inner2 = container.querySelector('#messages-inner') || container;
-    inner2.appendChild(bubble);
+    // Append at the very end of the messages container. INT-B2: during
+    // streaming the container is [#messages-inner][#streaming-text] and the
+    // old target (#messages-inner) put the optimistic bubble ABOVE the live
+    // streaming text — so for the whole Enter→userInjected window the
+    // pre-interrupt stream appeared visually AFTER the user's new message.
+    // Place the bubble AFTER a same-chat #streaming-text instead (true end).
+    // Removal stays idempotent — the selector at the top of this function
+    // finds it regardless of parent. A foreign-chat streaming el is already
+    // dropped by SC-1 before we get here; the dataset check is just defense.
+    var _qStreamEl = document.getElementById('streaming-text');
+    if (_qStreamEl && _qStreamEl.parentNode === container && _qStreamEl.dataset.chatId === currentChatId) {
+        container.insertBefore(bubble, _qStreamEl.nextSibling);
+    } else {
+        var inner2 = container.querySelector('#messages-inner') || container;
+        inner2.appendChild(bubble);
+    }
 }

@@ -413,6 +413,8 @@ function getEnabledTools(chatId) {
         if (name === 'set_chat_title' && !hooksEnabled.autoTitle) return false;
         // Hide set_tldr when autoTldr hook is disabled
         if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
+        // Hide set_links when autoLinks hook is disabled
+        if (name === 'set_links' && !hooksEnabled.autoLinks) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });

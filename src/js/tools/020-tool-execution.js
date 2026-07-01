@@ -141,6 +141,118 @@ function executeSetChatTitle(args, options) {
     return { success: true, message: 'Chat title updated to: ' + title };
 }
 
+// ---- Answer-card hooks (set_tldr / set_links) -----------------------------
+// Both tools attach a value to the final-answer assistant message of the last
+// REAL (non-hook) turn. The shared helpers below keep the target search
+// identical across the tools themselves, the hook gating in
+// core/040-hooks-history.js + worker/020-page-stubs.js, and the page-side
+// mirror handlers in app/036-agent-event-handlers-page.js. This file is in
+// WORKER_SHARED_FILES, so the helpers exist in both the page and SW bundles.
+
+// Find the final-answer span of the last REAL (non-hook) turn. Returns
+// { target, lastUserIdx, endIdx } (target may be null when the turn has no
+// usable answer message) or null when the chat has no real user turn.
+function findHookAnswerSpan(chat) {
+    if (!chat || !chat.messages) return null;
+    var lastUserIdx = -1;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx === -1) return null;
+    // Anchor the search span to the REAL turn: stop before the first hook
+    // user message after the last real user message — prose replies to hook
+    // runs must never become targets.
+    var endIdx = chat.messages.length - 1;
+    for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
+        if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
+    }
+    // Prefer messages NOT carrying a set_tldr / set_links tool call — those
+    // are usually "say nothing else" hook responses whose prose is filler.
+    // (A spontaneous set_chat_title call alongside the answer text is fine —
+    // still a valid target.) But see the final fallback below: when the ONLY
+    // content-bearing message in the turn is the one carrying the call (the
+    // "one response" pattern — final answer text + answer-card calls in the
+    // SAME assistant message), that message IS the answer and must be usable.
+    function carriesAnswerCardCall(am) {
+        return !!(am.tool_calls && am.tool_calls.some(function(tc) {
+            return tc.function && (tc.function.name === 'set_tldr' || tc.function.name === 'set_links');
+        }));
+    }
+    var target = null;
+    for (var j = endIdx; j > lastUserIdx; j--) {
+        var am = chat.messages[j];
+        if (am.role === 'assistant' && am.content && !am.isStreaming) {
+            if (carriesAnswerCardCall(am)) continue;
+            target = am; break;
+        }
+    }
+    if (!target) {
+        // Fall back to the last assistant message with any content (same
+        // real-turn span, still skipping hook-carrying messages).
+        for (var k = endIdx; k > lastUserIdx; k--) {
+            if (chat.messages[k].role === 'assistant' && chat.messages[k].content && !carriesAnswerCardCall(chat.messages[k])) { target = chat.messages[k]; break; }
+        }
+    }
+    if (!target) {
+        // Final fallback: a content-bearing message that ITSELF carries the
+        // answer-card call — the "one response" pattern where the model puts
+        // its final answer text and set_tldr / set_links in the same assistant
+        // message, with no other prose in the turn. Without this pass such
+        // calls fail with "No answer message found to attach ..." even though
+        // the answer is right there on the calling message.
+        for (var f = endIdx; f > lastUserIdx; f--) {
+            if (chat.messages[f].role === 'assistant' && chat.messages[f].content) { target = chat.messages[f]; break; }
+        }
+    }
+    return { target: target, lastUserIdx: lastUserIdx, endIdx: endIdx };
+}
+
+// Just the target message — the afterResponse hook gating uses this.
+function findHookAnswerTarget(chat) {
+    var span = findHookAnswerSpan(chat);
+    return (span && span.target) || null;
+}
+
+// Attach `value` to the final answer as msg[prop], clearing earlier copies in
+// the same turn span so a spontaneous mid-run call followed by the
+// afterResponse hook never leaves two cards on one answer (TLDR-3).
+function attachAnswerCard(chat, prop, value) {
+    var span = findHookAnswerSpan(chat);
+    if (!span) return { success: false, error: 'No user turn found' };
+    if (!span.target) return { success: false, error: 'No answer message found to attach ' + prop };
+    for (var c = span.lastUserIdx + 1; c <= span.endIdx; c++) {
+        if (chat.messages[c] !== span.target && chat.messages[c][prop]) delete chat.messages[c][prop];
+    }
+    span.target[prop] = value;
+    return { success: true, target: span.target };
+}
+
+// Relocate an answer card (tldr/links) that a SPONTANEOUS mid-run call
+// attached to an earlier assistant message of the current real-turn span onto
+// the final answer target. Returns the card value when a card was found (and
+// the target now carries it), null when no card exists anywhere in the span.
+// Used by the afterResponse hook gating (core/040-hooks-history.js +
+// worker/020-page-stubs.js): without this, a mid-run set_tldr/set_links call
+// attaches to the then-last assistant message, the model keeps going, and the
+// gating — which only checks the NEW final message — never sees the card and
+// burns an extra hook LLM run re-asking for it (the "spontaneous call + hook
+// duplicate" bug).
+function relocateAnswerCard(chat, prop) {
+    var span = findHookAnswerSpan(chat);
+    if (!span || !span.target) return null;
+    if (span.target[prop]) return span.target[prop];
+    for (var i = span.endIdx; i > span.lastUserIdx; i--) {
+        var m = chat.messages[i];
+        if (m !== span.target && m[prop]) {
+            span.target[prop] = m[prop];
+            delete m[prop];
+            return span.target[prop];
+        }
+    }
+    return null;
+}
+
 // Execute set_tldr tool (TLDR hook). Headless — runs in the SW. Attaches the
 // TLDR to the final-answer assistant message of the last REAL (non-hook) turn.
 function executeSetTldr(args, options) {
@@ -150,52 +262,8 @@ function executeSetTldr(args, options) {
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
     if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
-    // Find last non-hook user message, then the last assistant message with
-    // content after it (the final answer of the real turn).
-    var lastUserIdx = -1;
-    for (var i = chat.messages.length - 1; i >= 0; i--) {
-        var m = chat.messages[i];
-        if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
-    }
-    if (lastUserIdx === -1) return { success: false, error: 'No user turn found' };
-    // Anchor the search span to the REAL turn: stop before the first hook
-    // user message after the last real user message — prose replies to hook
-    // runs must never become TLDR targets.
-    var endIdx = chat.messages.length - 1;
-    for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
-        if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
-    }
-    function hasSetTldrCall(am) {
-        return !!(am.tool_calls && am.tool_calls.some(function(tc) {
-            return tc.function && tc.function.name === 'set_tldr';
-        }));
-    }
-    var target = null;
-    for (var j = endIdx; j > lastUserIdx; j--) {
-        var am = chat.messages[j];
-        if (am.role === 'assistant' && am.content && !am.isStreaming) {
-            // Never attach to a message carrying a set_tldr tool call,
-            // regardless of its content. (A spontaneous set_chat_title call
-            // alongside the answer text is fine — still a valid target.)
-            if (hasSetTldrCall(am)) continue;
-            target = am; break;
-        }
-    }
-    if (!target) {
-        // Fall back to last assistant message with any content (same
-        // real-turn span, still skipping set_tldr-carrying messages)
-        for (var k = endIdx; k > lastUserIdx; k--) {
-            if (chat.messages[k].role === 'assistant' && chat.messages[k].content && !hasSetTldrCall(chat.messages[k])) { target = chat.messages[k]; break; }
-        }
-    }
-    if (!target) return { success: false, error: 'No answer message found to attach TLDR' };
-    // Clear any earlier TL;DR inside the same turn span so a spontaneous
-    // mid-run set_tldr followed by the afterResponse hook never leaves two
-    // TL;DR cards on one answer (TLDR-3).
-    for (var c = lastUserIdx + 1; c <= endIdx; c++) {
-        if (chat.messages[c] !== target && chat.messages[c].tldr) delete chat.messages[c].tldr;
-    }
-    target.tldr = text;
+    var attached = attachAnswerCard(chat, 'tldr', text);
+    if (!attached.success) return attached;
     // Success — reset the per-turn TLDR hook retry cap (mirrors how a
     // successful set_chat_title clears titleProvisional).
     chat._tldrHookTries = 0;
@@ -207,6 +275,47 @@ function executeSetTldr(args, options) {
         renderMessages();
     }
     return { success: true, message: 'TLDR set' };
+}
+
+// Normalize + sanitize a set_links payload: keep {title, url} items with an
+// http(s) url (blocks javascript:/data:/vbscript: etc. — the card renders
+// clickable <a href> elements from model output), dedupe by url, cap at 12.
+function sanitizeHookLinks(rawLinks) {
+    var links = [];
+    var seen = {};
+    for (var i = 0; i < rawLinks.length && links.length < 12; i++) {
+        var item = rawLinks[i];
+        if (!item || typeof item !== 'object') continue;
+        var url = (item.url || item.href || '').toString().trim();
+        if (!/^https?:\/\//i.test(url) || seen[url]) continue;
+        seen[url] = true;
+        var title = (item.title || item.text || item.label || url).toString().trim().substring(0, 200);
+        links.push({ title: title, url: url });
+    }
+    return links;
+}
+
+// Execute set_links tool (Links hook). Headless — runs in the SW. Attaches a
+// list of relevant links to the final-answer assistant message of the last
+// REAL (non-hook) turn via the same shared helpers as executeSetTldr.
+function executeSetLinks(args, options) {
+    if (!args.links || !Array.isArray(args.links)) return { success: false, error: 'links (array) is required' };
+    var links = sanitizeHookLinks(args.links);
+    var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    var chat = chats[targetChatId];
+    if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
+    var attached = attachAnswerCard(chat, 'links', links);
+    if (!attached.success) return attached;
+    // Success — reset the per-turn Links hook retry cap (mirrors executeSetTldr).
+    chat._linksHookTries = 0;
+    saveChatsToStorage();
+    // Sync page mirror + re-render (mirrors tldrChanged pattern)
+    if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+        AgentEvents.emit('linksChanged', { chatId: targetChatId, links: links });
+    } else if (typeof renderMessages === 'function') {
+        renderMessages();
+    }
+    return { success: true, message: 'Links set (' + links.length + ')' };
 }
 
 // Apply search-and-replace edits to content (no line numbers needed)
@@ -1572,6 +1681,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return executeSetChatTitle(args, options);
     } else if (name === 'set_tldr') {
         return executeSetTldr(args, options);
+    } else if (name === 'set_links') {
+        return executeSetLinks(args, options);
     } else if (name === 'cached_content_outline') {
         var ccoChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
         return executeCachedContentOutline(ccoChatId, args);
@@ -1787,6 +1898,32 @@ function _wsCheckCrossChatConflict(file, chatId) {
     };
 }
 
+// Foreign-ownership metadata for read-only listings (ls / grep / diff): when a
+// dirty file's uncommitted changes were stamped by ANOTHER chat, return a
+// compact descriptor so the reading agent is told someone else is working on
+// that file (mirrors the per-file messaging of wsStatus). Returns null for
+// clean files, unstamped files, and files owned by THIS chat.
+function _wsForeignOwnership(f, chatId) {
+    if (!f || !f.dirty || !f.last_modified_by_chat_id) return null;
+    if (chatId && f.last_modified_by_chat_id === chatId) return null;
+    var running = (typeof isChatRunning === 'function') && isChatRunning(f.last_modified_by_chat_id);
+    var ago = _wsFormatAgo(f.last_modified_at);
+    var who = f.last_modified_by_chat_title ? ' "' + f.last_modified_by_chat_title + '"' : '';
+    var msg = running
+        ? '\u26a0 WORK IN PROGRESS by another agent \u2014 chat' + who + ' (' + f.last_modified_by_chat_id + ') is STILL RUNNING and has uncommitted edits to this file' + (ago ? ' (' + ago + ')' : '') + '. Leave it alone: mutations are blocked unless you pass {"force": true}.'
+        : 'Uncommitted changes by another (now dormant) chat' + who + ' (' + f.last_modified_by_chat_id + ')' + (ago ? ' \u2014 last edited ' + ago : '') + '. Mutating this file will silently take over ownership.';
+    return {
+        path: f.path,
+        foreign_chat: true,
+        other_chat_running: running,
+        last_modified_by_chat_id: f.last_modified_by_chat_id,
+        last_modified_by_chat_title: f.last_modified_by_chat_title || null,
+        last_modified_at: f.last_modified_at || null,
+        last_modified_ago: ago,
+        message: msg
+    };
+}
+
 // Decide whether a mutator should block on a cross-chat conflict.
 // - force=true: always allow.
 // - gitignored path (e.g. dist/, .env): always allow — generated artefacts shouldn't gate cross-chat work.
@@ -1858,7 +1995,7 @@ async function executeWorkspaceTool(args, options) {
         var result;
         var _incIgnored = !!args.include_git_ignored;
         if (action === 'ls') {
-            result = await wsLs(wk, args.path || '', _incIgnored);
+            result = await wsLs(wk, args.path || '', _incIgnored, chatId);
         } else if (action === 'read') {
             result = await wsRead(wk, args.path, args.offset, args.limit, chatId);
         } else if (action === 'write') {
@@ -1884,11 +2021,11 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'delete') {
             result = await wsDelete(wk, args.path, chatId, chatTitle, force);
         } else if (action === 'grep') {
-            result = await wsGrep(wk, args.pattern, args.path, _incIgnored, args.force === true);
+            result = await wsGrep(wk, args.pattern, args.path, _incIgnored, args.force === true, chatId, args.limit);
         } else if (action === 'status') {
             result = await wsStatus(wk, _incIgnored, chatId);
         } else if (action === 'diff') {
-            result = await wsDiff(wk, args.path, _incIgnored);
+            result = await wsDiff(wk, args.path, _incIgnored, chatId);
         } else if (action === 'push') {
             result = await wsPush(wk, args);
         } else if (action === 'deploy') {
@@ -2234,7 +2371,7 @@ async function wsHydrate(wk, matcher) {
     return _hRes;
 }
 
-async function wsLs(wk, dirPath, includeIgnored) {
+async function wsLs(wk, dirPath, includeIgnored, chatId) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
@@ -2253,7 +2390,7 @@ async function wsLs(wk, dirPath, includeIgnored) {
         var rest = p.substring(prefix.length);
         var slashIdx = rest.indexOf('/');
         if (slashIdx === -1) {
-            entries[rest] = { type: 'file', size: f.content != null ? f.content.length : (f.size || 0), dirty: f.dirty };
+            entries[rest] = { type: 'file', size: f.content != null ? f.content.length : (f.size || 0), dirty: f.dirty, _file: f };
         } else {
             var dirName = rest.substring(0, slashIdx);
             if (!entries[dirName]) entries[dirName] = { type: 'dir', count: 0 };
@@ -2261,12 +2398,23 @@ async function wsLs(wk, dirPath, includeIgnored) {
         }
     });
 
+    var _lsWarnings = [];
     var listing = Object.keys(entries).sort().map(function(name) {
         var e = entries[name];
-        return e.type === 'dir' ? name + '/ (' + e.count + ' files)' : name + (e.dirty ? ' *' : '');
+        if (e.type === 'dir') return name + '/ (' + e.count + ' files)';
+        // Cross-chat ownership: mark files whose uncommitted changes belong to
+        // another chat so a browsing agent is told before it touches them.
+        var _lsOwn = e.dirty ? _wsForeignOwnership(e._file, chatId) : null;
+        if (_lsOwn) {
+            _lsWarnings.push(_lsOwn);
+            return name + ' * \u26a0 ' + (_lsOwn.other_chat_running ? 'WIP by another RUNNING agent' : 'WIP by another (dormant) chat');
+        }
+        return name + (e.dirty ? ' *' : '');
     });
 
-    return { success: true, path: prefix || '/', entries: listing, total: listing.length };
+    var _lsRes = { success: true, path: prefix || '/', entries: listing, total: listing.length };
+    if (_lsWarnings.length > 0) _lsRes.cross_chat_warnings = _lsWarnings;
+    return _lsRes;
 }
 
 async function wsRead(repo, filePath, offset, limit, chatId) {
@@ -2911,7 +3059,7 @@ function _wsEstimateHydration(stubs) {
     return { batches: batches, bytes: bytes, binary_files: binCount, seconds: seconds };
 }
 
-async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force) {
+async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, limit) {
     if (!pattern) return { success: false, error: 'pattern is required for grep' };
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
@@ -2967,7 +3115,10 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force) {
     } catch (e) { /* failed stubs are skipped in the scan loop below */ }
 
     var matches = [];
-    var MAX_MATCHES = 100;
+    // Default to 5 matches to keep results lean; the agent can pass a higher
+    // `limit` (capped at 100) when it wants more.
+    var MAX_MATCHES = 5;
+    if (typeof limit === 'number' && isFinite(limit) && limit > 0) MAX_MATCHES = Math.min(Math.floor(limit), 100);
     var _gUnscanned = 0;
     for (var i = 0; i < files.length && matches.length < MAX_MATCHES; i++) {
         var f = files[i];
@@ -2989,6 +3140,20 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force) {
         }
     }
     var _gRes = { success: true, pattern: pattern, matches: matches, total: matches.length, truncated: matches.length >= MAX_MATCHES };
+    if (_gRes.truncated) _gRes.hint = 'Results capped at ' + MAX_MATCHES + ' matches. Pass a higher `limit` (max 100) or narrow the pattern/path to see more.';
+    // Cross-chat ownership: tell the agent when matched files have uncommitted
+    // changes owned by another chat (same warning read/status/diff surface).
+    var _gByPath = {};
+    files.forEach(function(f) { _gByPath[f.path] = f; });
+    var _gWarned = {};
+    var _gWarnings = [];
+    matches.forEach(function(m) {
+        if (_gWarned[m.file]) return;
+        _gWarned[m.file] = 1;
+        var _gOwn = _wsForeignOwnership(_gByPath[m.file], chatId);
+        if (_gOwn) _gWarnings.push(_gOwn);
+    });
+    if (_gWarnings.length > 0) _gRes.cross_chat_warnings = _gWarnings;
     if (_gUnscanned > 0) {
         _gRes.unscanned_files = _gUnscanned;
         _gRes.warning = 'Incomplete search: ' + _gUnscanned + ' in-scope file(s) could not be hydrated from GitHub and were not scanned. Retry, or read them individually.';
@@ -3308,7 +3473,7 @@ function wsLineDiff(oldText, newText, ctx) {
     return out.join('\n');
 }
 
-async function wsDiff(repo, filePath, includeIgnored) {
+async function wsDiff(repo, filePath, includeIgnored, chatId) {
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
@@ -3328,20 +3493,35 @@ async function wsDiff(repo, filePath, includeIgnored) {
         if (!f.dirty) return;
         if (filePath && f.path !== filePath) return;
         if (isIgnored(f.path)) return;
+        var entry;
         if (f.deleted) {
-            diffs.push({ path: f.path, status: 'deleted' });
-            return;
-        }
-        if (f.original_content === null) {
+            entry = { path: f.path, status: 'deleted' };
+        } else if (f.original_content === null) {
             // New file
-            diffs.push({ path: f.path, status: 'new', lines: (f.content || '').split('\n').length });
+            entry = { path: f.path, status: 'new', lines: (f.content || '').split('\n').length };
         } else {
             // Modified file — proper LCS-based unified diff (3 lines of context).
-            diffs.push({ path: f.path, status: 'modified', diff: wsLineDiff(f.original_content, f.content, 3) });
+            entry = { path: f.path, status: 'modified', diff: wsLineDiff(f.original_content, f.content, 3) };
         }
+        // Cross-chat ownership: tell the agent when a diffed file's uncommitted
+        // changes belong to another chat (it may be reviewing someone else's WIP).
+        var _dOwn = _wsForeignOwnership(f, chatId);
+        if (_dOwn) {
+            entry.foreign_chat = true;
+            entry.other_chat_running = _dOwn.other_chat_running;
+            entry.cross_chat_warning = _dOwn.message;
+        }
+        diffs.push(entry);
     });
 
     var result = { success: true, diffs: diffs, total: diffs.length };
+    var _dForeign = diffs.filter(function(d) { return d.foreign_chat; });
+    if (_dForeign.length > 0) {
+        var _dRunning = _dForeign.filter(function(d) { return d.other_chat_running; }).length;
+        result.foreign_warning = _dRunning > 0
+            ? '\u26a0 ' + _dRunning + ' of ' + _dForeign.length + ' diffed file(s) have uncommitted changes from another chat that is STILL RUNNING \u2014 do not mutate them (blocked unless {"force": true}).'
+            : _dForeign.length + ' diffed file(s) have uncommitted changes from other (now dormant) chats \u2014 mutating them silently takes over ownership.';
+    }
     if (_syncErr) result.sync_warning = 'Remote sync failed — diffs may be against stale base';
     return result;
 }
@@ -4269,9 +4449,15 @@ async function wsPush(wk, args) {
             await githubApi('PATCH', '/repos/' + githubRepo + '/pulls/' + prNumber, _prPatch);
         }
     } else {
+        // A brand-new PR must never ship with an empty description. pr_body is
+        // optional when appending to an open PR, so a push that EXPECTED to
+        // append (but lands here because the branch was stale — its PR was
+        // merged/closed — and a fresh PR is opened instead) would otherwise
+        // create a PR with no body. Fall back to the commit message.
+        var _newPrBody = (typeof args.pr_body === 'string' && args.pr_body !== '') ? args.pr_body : args.commit_message;
         var prRes = await githubApi('POST', '/repos/' + githubRepo + '/pulls', {
             title: args.pr_title,
-            body: args.pr_body || '',
+            body: _newPrBody,
             head: args.branch_name,
             base: baseBranch
         });

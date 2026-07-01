@@ -93,6 +93,19 @@ function createStreamingTextEl() {
     var el = document.createElement('div');
     el.id = 'streaming-text';
     el.className = 'streaming-answer';
+    // SC-1: stamp the owning chat. renderMessages' preserve branch keeps
+    // #streaming-text alive across full rebuilds (protects its scroll
+    // position) — but on a chat switch between two RUNNING chats the element
+    // found in the DOM belongs to the PREVIOUSLY viewed chat. The stamp lets
+    // the render distinguish "same chat, keep it" from "another chat's
+    // leftovers, wipe it": .streaming-entry rows inside are keyed by
+    // data-msg-idx only (no chat identity), so a foreign chat's finalized
+    // entries would otherwise survive under the new chat's tools panel
+    // indefinitely. Both callers (renderMessages' fresh-element branch and
+    // updateStreamingText's lazy create, which is guarded on
+    // streamingChatId === currentChatId) create the element FOR the
+    // currently-viewed chat, so currentChatId is the owner at creation time.
+    el.dataset.chatId = currentChatId || '';
     // Reset only the foreground chat's flag (B5). Other chats keep their intent.
     isFollowingStreamingScroll = true;
     el.addEventListener('scroll', function() {
@@ -130,6 +143,33 @@ function updateStreamingText(msg, index, streamingChatId) {
     var lastUserIdx = -1;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         if (chat.messages[i].role === 'user') { lastUserIdx = i; break; }
+    }
+    // INT-B1: prune stale entries from a PREVIOUS turn. When the user
+    // interrupts mid-stream by sending a message, renderMessages preserves
+    // #streaming-text across the userInjected re-render (same chat), but the
+    // paint loop below only touches entries with data-msg-idx > lastUserIdx —
+    // entries from the pre-interrupt turn were never overwritten NOR removed,
+    // so the old (possibly popped-from-transcript) text sat frozen BELOW the
+    // new user bubble for the rest of the run. The prune boundary is the SAME
+    // turn boundary the paint loop uses (SC-2/FLUSH-TAIL contract: only
+    // entries AFTER the last user message are painted), so nothing that can
+    // still be painted is ever removed.
+    var _staleEntries = el.querySelectorAll('.streaming-entry');
+    for (var _k = 0; _k < _staleEntries.length; _k++) {
+        var _si = parseInt(_staleEntries[_k].getAttribute('data-msg-idx'), 10);
+        if (!(_si > lastUserIdx)) _staleEntries[_k].remove();
+    }
+    // INT-B3: hidden after-response hook turn (set_chat_title / set_tldr with
+    // showHookMessages off) — never paint the hook's streamed chatter into
+    // #streaming-text. Matters after SILENT-HOOK-QUEUE-FIX (040-send-message.js)
+    // clears the page's _silentHookRunning on an interrupting send: that flag
+    // was the only gate keeping hook output invisible here. The spinner /
+    // queued-bubble behavior that fix wanted is untouched — only the hook
+    // TEXT stays hidden, consistent with renderMessages' own hook filtering.
+    if (lastUserIdx >= 0 && chat.messages[lastUserIdx].isHookMessage &&
+        !(typeof hooksEnabled !== 'undefined' && hooksEnabled && hooksEnabled.showHookMessages)) {
+        updateStreamingContainerHeight();
+        return;
     }
     // For each assistant message, find or create its div - only update the streaming one
     var prevMsgDiv = null;

@@ -1440,6 +1440,27 @@ function normalizeClaudeUsage(json) {
     // currency/amounts, so stash it under appagent-extra-usage-* for the pill
     // (parseClaudeExtraUsage in 170-chat-management.js) to render. monthly_limit
     // and used_credits are in MINOR units (divide by 10^decimal_places).
+    // Capture the per-limit breakdown (session / weekly all-models / weekly
+    // per-model scoped) so the pill can render a rich tooltip with one bar per
+    // limit. Normalized to a compact array under appagent-usage-limits.
+    if (Array.isArray(json.limits) && json.limits.length) {
+        var lims = [];
+        json.limits.forEach(function(l) {
+            if (!l || typeof l !== 'object') return;
+            var pct = parseFloat(l.percent);
+            if (isNaN(pct)) return;
+            lims.push({
+                kind: l.kind || null,
+                group: l.group || null,
+                percent: pct,
+                severity: l.severity || null,
+                resets_at: toEpochSeconds(l.resets_at),
+                is_active: l.is_active === true,
+                label: (l.scope && l.scope.model && l.scope.model.display_name) ? String(l.scope.model.display_name) : null
+            });
+        });
+        if (lims.length) out['appagent-usage-limits'] = JSON.stringify(lims);
+    }
     var eu = json.extra_usage || json.extraUsage;
     if (eu && typeof eu === 'object') {
         out['appagent-extra-usage-enabled'] = String(eu.is_enabled !== false);

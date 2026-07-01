@@ -31,7 +31,12 @@ function formatJsonPretty(str) {
         }
         return formatJsonValue(parsed, 0);
     } catch (e) {
-        return str; // Return original if not valid JSON
+        // HARDENING: every caller interpolates our return value into an
+        // innerHTML context (<pre> panels in message render + notification
+        // params). Partial/streaming JSON and plain-text tool results land
+        // here — escape so raw <tags> in args/results can't inject markup
+        // into the tool panel (they rendered as live HTML before this).
+        return escapeHtml(str);
     }
 }
 

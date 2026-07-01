@@ -17,8 +17,8 @@ function formatMetrics(metrics) {
     // Show model name first, then provider
     if (!isAggregate) {
         var modelInfo = [];
-        if (metrics.actualModel) modelInfo.push('<strong>' + metrics.actualModel + '</strong>');
-        if (metrics.providerName) modelInfo.push(metrics.providerName);
+        if (metrics.actualModel) modelInfo.push('<strong>' + escapeHtml(metrics.actualModel) + '</strong>');
+        if (metrics.providerName) modelInfo.push(escapeHtml(metrics.providerName));
         if (modelInfo.length > 0) {
             parts.push('<span class="stats-icon">' + UI_ICONS.model + '</span> ' + modelInfo.join(' · '));
         }

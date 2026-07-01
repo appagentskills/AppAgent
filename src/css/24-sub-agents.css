@@ -719,14 +719,15 @@
 
 /* ---------- Chat-title sub-agent pill (header) ---------- */
 /* Mirrors the look of `.chat-title-state-pill` so the two pills sit side-
-   by-side in the header. Clicking the pill jumps to the immediate parent
-   chat (see updateChatTitleHeader in 170-chat-management.js). */
+   by-side in the header. The pill is split into two segments (see
+   updateChatTitleHeader in 170-chat-management.js):
+     .chat-title-subagent-badge — non-interactive identity ("Sub-agent")
+     .chat-title-parent-nav     — clickable "↰ <parent title>" that jumps
+                                  to the immediate parent chat. */
 .chat-title-subagent-pill {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
     margin-left: var(--space-3, 6px);
-    padding: 2px 8px;
     border-radius: 999px;
     font-size: var(--text-caption, 11px);
     font-weight: var(--font-medium, 500);
@@ -734,19 +735,39 @@
     background: var(--accent-light, #eef2ff);
     color: var(--accent, #6c63ff);
     border: 1px solid transparent;
-    cursor: pointer;
-    transition: filter var(--transition-fast), transform var(--transition-fast);
     vertical-align: middle;
     white-space: nowrap;
+    overflow: hidden;
 }
-.chat-title-subagent-pill:hover { filter: brightness(0.95); }
-.chat-title-subagent-pill:active { transform: scale(0.97); }
+.chat-title-subagent-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+}
 .chat-title-subagent-pill .chat-title-subagent-icon { display: inline-flex; }
 .chat-title-subagent-pill .chat-title-subagent-icon .ui-icon { width: 11px; height: 11px; }
+.chat-title-parent-nav {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 9px 2px 7px;
+    max-width: 220px;
+    border-left: 1px solid rgba(108, 99, 255, 0.25);
+    cursor: pointer;
+    transition: background var(--transition-fast);
+}
+.chat-title-parent-nav:hover { background: rgba(108, 99, 255, 0.12); }
+.chat-title-parent-nav:active { filter: brightness(0.92); }
+.chat-title-parent-nav:focus-visible { outline: 2px solid var(--accent, #6c63ff); outline-offset: -2px; }
+.chat-title-parent-nav-arrow { font-size: 12px; line-height: 1; }
+.chat-title-parent-nav-label { overflow: hidden; text-overflow: ellipsis; }
 :root[data-theme="dark"] .chat-title-subagent-pill {
     background: rgba(108, 99, 255, 0.18);
     color: var(--accent, #a5b4fc);
 }
+:root[data-theme="dark"] .chat-title-parent-nav { border-left-color: rgba(165, 180, 252, 0.3); }
+:root[data-theme="dark"] .chat-title-parent-nav:hover { background: rgba(165, 180, 252, 0.14); }
 
 /* ---------- Parked-tool indicator ---------- */
 /* Shown when a UI-required tool is waiting for a panel to attach. The

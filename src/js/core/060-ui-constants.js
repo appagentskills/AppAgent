@@ -8,6 +8,7 @@ var TOOL_DISPLAY_NAMES = {
     'servicenow_api:PATCH': 'Patch Records',
     'servicenow_api:DELETE': 'Delete Records',
     'servicenow_diff_edit': 'Edit Code/Scripts',
+    'servicenow_run_script': 'Run Server Script',
     'iframe_tool': 'Browser Control',
     'iframe_tool:navigate': 'Navigate',
     'iframe_tool:get_visible_text': 'Get Visible Text',
@@ -29,6 +30,7 @@ var TOOL_DISPLAY_NAMES = {
     'iframe_tool:get_page_info': 'Get Page Info',
     'set_chat_title': 'Set Chat Title',
     'set_tldr': 'Set TLDR',
+    'set_links': 'Set Links',
     'cached_content_outline': 'Cached Outline',
     'cached_content_search': 'Cached Search',
     'cached_content_read': 'Cached Read',
@@ -67,6 +69,10 @@ var TOOL_DISPLAY_NAMES = {
     'workspace:copy': 'Copy File',
     'workspace:push': 'Push & Create PR',
     'workspace:deploy': 'Deploy to Disk',
+    'workspace:pin': 'Pin Workspace',
+    'workspace:branch': 'Fork Branch',
+    'workspace:move': 'Move Changes',
+    'workspace:hydrate': 'Hydrate Files',
     'document': 'Smart Document',
     'document:create': 'Create Document',
     'document:update': 'Update Document',
@@ -77,6 +83,24 @@ var TOOL_DISPLAY_NAMES = {
     'document:read_version': 'Read Version',
     'document:delete': 'Delete Document',
     'list_instances': 'List Instances',
+    'web_fetch': 'Fetch URL',
+    'web_search': 'Web Search',
+    'extension_build': 'Build Extension',
+    'run_audit': 'Run Instance Audit',
+    'search_docs': 'Search Docs',
+    'eval_runner': 'Eval Runner',
+    'await_handle': 'Await Task',
+    'poll_handle': 'Poll Task',
+    'await_any': 'Await Any Task',
+    'await_all': 'Await All Tasks',
+    'cancel_handle': 'Cancel Task',
+    'spawn_sub_agent': 'Spawn Sub-Agent',
+    'report_to_parent': 'Report to Parent',
+    'agent_status': 'Sub-Agent Status',
+    'wake_sub_agent': 'Wake Sub-Agent',
+    'stop_sub_agent': 'Stop Sub-Agent',
+    'sleep_self': 'Sleep',
+    'agent_message': 'Agent Message',
     // Instance permission display names (CRUD presentation)
     'sn:read': 'Read Records',
     'sn:create': 'Create Records',
@@ -341,6 +365,7 @@ function getToolIcon(toolName) {
     if (toolName === 'iframe_tool') return UI_ICONS.browser;
     if (toolName === 'set_chat_title') return UI_ICONS.title;
     if (toolName === 'set_tldr') return UI_ICONS.list;
+    if (toolName === 'set_links') return UI_ICONS.externalLink;
     if (toolName === 'cached_content_outline') return UI_ICONS.file;
     if (toolName === 'cached_content_search') return UI_ICONS.search;
     if (toolName === 'cached_content_read') return UI_ICONS.file;

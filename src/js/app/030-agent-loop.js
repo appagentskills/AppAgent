@@ -958,6 +958,17 @@ async function runAgent(overrideChatId) {
         var assistantMsgIndex = chat.messages.indexOf(assistantMsg);
 
         var deferredScreenshots = [];
+        // Answer-card hook tools (set_chat_title / set_tldr / set_links) are
+        // fire-and-forget: their results carry no information the model needs.
+        // When EVERY tool call in this turn is one of them and all succeed,
+        // the run ends after executing them instead of sending the results
+        // back to the LLM for one more (pure-waste) round-trip — see the
+        // `_answerCardOnlyTurn` break below. Any failure clears the flag so
+        // the model still sees the error and can retry.
+        var ANSWER_CARD_TOOLS = { set_chat_title: true, set_tldr: true, set_links: true };
+        var _answerCardOnlyTurn = assistantMsg.tool_calls.every(function(_ac) {
+            return _ac.function && ANSWER_CARD_TOOLS[_ac.function.name];
+        });
         for (var i = 0; i < assistantMsg.tool_calls.length; i++) {
             if (isChatPaused(streamingChatId)) break;
             // User pressed send mid-tool-batch — inject placeholder results for ALL
@@ -981,6 +992,7 @@ async function runAgent(overrideChatId) {
                 args = normalizeToolArgs(args);
             } catch (parseErr) {
                 console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
+                _answerCardOnlyTurn = false; // let the model see the parse error
                 recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
@@ -1046,6 +1058,7 @@ async function runAgent(overrideChatId) {
             }
 
             if (!result) result = { success: false, error: 'Tool returned no result' };
+            if (result.success === false) _answerCardOnlyTurn = false; // failed hook call → model gets a retry pass
             delete result._denied;
             var screenshotMsg = result._screenshotMessage;
             var screenshotMsgs = result._screenshotMessages;
@@ -1082,12 +1095,19 @@ async function runAgent(overrideChatId) {
 
         // Flush any user message/images injected during tool execution
         // Skip if paused — tool results may be incomplete (orphaned tool_use blocks)
+        var _injectedDuringTools = false;
         if (!isChatPaused(streamingChatId) && flushPendingInjection(chat)) {
+            _injectedDuringTools = true;
             saveChatsToStorage();
             AgentEvents.emit('userInjected', { chatId: streamingChatId });
         }
 
         if (isChatPaused(streamingChatId)) break;
+        // Answer-card-only turn: every tool call was set_chat_title / set_tldr /
+        // set_links, all succeeded, and no user message arrived mid-turn — end
+        // the run here; the results are recorded in the transcript but no extra
+        // LLM round-trip is made just to acknowledge them.
+        if (_answerCardOnlyTurn && !_injectedDuringTools) break;
     }
 
     // Show aggregate summary if there were multiple API calls
