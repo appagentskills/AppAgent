@@ -121,6 +121,7 @@ if (typeof executePromptUser !== 'function') var executePromptUser = async funct
 if (typeof executeTakeScreenshot !== 'function') var executeTakeScreenshot = async function() { return { success: false, error: 'take_screenshot unavailable in SW context' }; };
 if (typeof executeUpdateActionState !== 'function') var executeUpdateActionState = async function() { return { success: false, error: 'update_action_state unavailable in SW context' }; };
 if (typeof executeShowActionButton !== 'function') var executeShowActionButton = function() { return { success: false, error: 'show_action_button unavailable in SW context' }; };
+if (typeof executeGitHubSetup !== 'function') var executeGitHubSetup = async function() { return { success: false, error: 'github_setup unavailable in SW context' }; };
 if (typeof executeGetSkill !== 'function') var executeGetSkill = async function() { return { success: false, error: 'get_skill unavailable in SW context' }; };
 if (typeof executeManageSkill !== 'function') var executeManageSkill = async function() { return { success: false, error: 'manage_skill unavailable in SW context' }; };
 
