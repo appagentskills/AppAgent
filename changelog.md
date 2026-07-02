@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.12
+
+### Fixes
+- Fixed the extension build breaking on the new GitHub setup popup (the service-worker bundle was missing a stub for the page-only tool).
+
+---
+
 ## v1.1.11
 
 ### Features
