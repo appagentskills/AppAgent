@@ -96,6 +96,23 @@ async function exportAllData() {
         await writable.write(JSON.stringify(apiProvidersData, null, 2).split('\n').map(function(line, idx) {
             return idx === 0 ? line : '  ' + line;
         }).join('\n'));
+
+        // Get and write LLM endpoints
+        var llmEndpointsData = [];
+        if (database.objectStoreNames.contains(llmEndpointsStoreName)) {
+            var llmEndpointsTransaction = database.transaction([llmEndpointsStoreName], 'readonly');
+            var llmEndpointsStore = llmEndpointsTransaction.objectStore(llmEndpointsStoreName);
+            llmEndpointsData = await new Promise(function(resolve) {
+                var request = llmEndpointsStore.getAll();
+                request.onsuccess = function() { resolve(request.result || []); };
+                request.onerror = function() { resolve([]); };
+            });
+        }
+
+        await writable.write(',\n  "llmEndpoints": ');
+        await writable.write(JSON.stringify(llmEndpointsData, null, 2).split('\n').map(function(line, idx) {
+            return idx === 0 ? line : '  ' + line;
+        }).join('\n'));
         await writable.write('\n}');
 
         await writable.close();
@@ -182,6 +199,16 @@ async function importAllData() {
                 }
             }
             
+            // Import LLM endpoints (if present) — providers reference these by
+            // endpointId, so they round-trip together with apiProviders.
+            if (importData.llmEndpoints && importData.llmEndpoints.length > 0 && database.objectStoreNames.contains(llmEndpointsStoreName)) {
+                var llmEndpointsTransaction = database.transaction([llmEndpointsStoreName], 'readwrite');
+                var llmEndpointsStore = llmEndpointsTransaction.objectStore(llmEndpointsStoreName);
+                for (var n = 0; n < importData.llmEndpoints.length; n++) {
+                    llmEndpointsStore.put(importData.llmEndpoints[n]);
+                }
+            }
+            
             showSnackbar('Data imported successfully! Reloading...', 'success');
             window.location.reload();
         } catch (e) {
@@ -193,10 +220,10 @@ async function importAllData() {
 }
 
 async function deleteAllData() {
-    if (!await showConfirmModal('Delete All Data', 'Are you sure you want to delete ALL data? This cannot be undone!')) {
+    if (!await showConfirmModal('Delete All Data', 'Are you sure you want to delete ALL data? This cannot be undone!', 'danger')) {
         return;
     }
-    if (!await showConfirmModal('Confirm Delete', 'This will delete all chats, settings, and preferences. Are you REALLY sure?')) {
+    if (!await showConfirmModal('Confirm Delete', 'This will delete all chats, settings, and preferences. Are you REALLY sure?', 'danger')) {
         return;
     }
 

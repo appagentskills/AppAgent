@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.1.11
+
+### Features
+- Workspace files now live in the chat sidebar: open one to view it, diff it, or browse past versions, with a chip showing which chat owns each change.
+- You can now merge a PR straight from the sidebar — squash-merged with the PR title, and your workspace syncs afterwards.
+- LLM endpoints are now named objects with their own Settings section, and the default providers were refreshed to the July 2026 model lineup.
+- Rate limits are handled far more gracefully: requests retry automatically, chat shows a live retry countdown instead of a stuck "Thinking…", and messages tell apart a busy endpoint from running out of credits.
+- A new GitHub setup popup walks you through connecting your account and cloning your repo.
+- Your workspace keeps itself in sync automatically as you navigate, switch chats, or return to the extension tab.
+
+### Fixes
+- Two regression sweeps over recent releases fixed 18 small issues.
+- Sub-agents that hit a rate limit but recovered can now report their results back to the parent chat.
+- Garbled characters in embedded skill content are fixed.
+- Workspace changes made in one panel now show up in the others, and the file modal no longer flashes when switching views or files.
+
+---
+
 ## v1.1.10
 
 ### Features

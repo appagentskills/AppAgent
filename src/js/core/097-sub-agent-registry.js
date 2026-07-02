@@ -1411,12 +1411,21 @@ function _isTransientSubError(msg) {
 // PR383-R5: throttle-class subset of the transient errors above. These mean
 // the provider is actively shedding load — an IMMEDIATE synchronous replay is
 // near-guaranteed to fail again and burns the single per-crash auto-retry.
-// The auto-retry path in onSubAgentRunFinished delays this class ~8s before
-// re-queueing; connection/fetch/timeout-class errors keep the immediate retry.
+// The auto-retry path delays this class before re-queueing (escalating
+// schedule below, up to SUBAGENT_THROTTLE_MAX_RETRIES attempts);
+// connection/fetch/timeout-class errors keep the single immediate retry.
 function _isThrottleSubError(msg) {
     if (!msg) return false;
     return /rate.?limit|too many requests|overloaded|temporarily unavailable|\b(429|529)\b/i.test(String(msg));
 }
+
+// Throttle-class crashes get a DEEPER retry budget than the single generic
+// transient retry — the provider is shedding load (429/529), so patience
+// wins where a lone replay burns out. Delays escalate per attempt; the
+// budget resets alongside _retry_used on the next successful turn (tool
+// call dispatched, clean finish, or report_to_parent).
+var SUBAGENT_THROTTLE_MAX_RETRIES = 3;
+var SUBAGENT_THROTTLE_RETRY_DELAYS_MS = [8000, 20000, 45000];
 
 // RES-6: push a short structured lifecycle notice to the PARENT so it is
 // never blind to unsolicited sub events (crash, stuck, approval park, user
@@ -1596,7 +1605,39 @@ function reportToParent(args, ctx) {
         return { success: false, error: 'report_to_parent: `status` must be one of done|error|need_input. For mid-flight updates that should not settle the handle, use agent_message(to:"parent").' };
     }
     if (rec.state === 'stopped' || rec.state === 'errored') {
-        return { success: false, error: 'report_to_parent: sub is already terminal (' + rec.state + '); cannot report again.', already_settled: true };
+        // REVIVE-ON-REPORT: a report can only originate from a LIVE loop on the
+        // sub's chat — if the record says 'errored', the terminal state is
+        // STALE. This happens when a crashed run (e.g. a 429 whose single
+        // auto-retry was already burned) is resumed OUTSIDE the registry:
+        // toolbar Retry / Continue and per-chat jobs-dropdown Retry call
+        // runAgent(chatId) directly, and a user message typed into the sub's
+        // chat does the same — none of them perform wake_sub_agent's
+        // resurrection bookkeeping, so rec.state stays 'errored' while the
+        // loop recovers and finishes the task. Refusing here strands the
+        // recovered run's report ("sub is already terminal; cannot report
+        // again") and the parent never learns the work actually succeeded.
+        // Self-revive instead: mirror _wakeSubAgentImpl's resurrect
+        // bookkeeping, re-arm the spawn deferred, and accept the report.
+        // 'stopped' stays refused — that is an explicit stop_sub_agent /
+        // user cancellation, not a stale crash record.
+        if (rec.state === 'errored') {
+            rec.settled_at = null;
+            delete rec._retry_used;
+            delete rec._throttle_retries;
+            // Archive the recovered crash's diagnostics (PR383-R3 pattern) so
+            // agent_status history stays readable without corrupting the NEXT
+            // terminal event's fresh fields.
+            if (rec.last_error)  { rec.prev_error = rec.last_error; rec.last_error = null; }
+            if (rec.crash_cause) { rec.prev_crash_cause = rec.crash_cause; rec.crash_cause = null; }
+            rec.state = 'running';
+            // Re-arm the spawn deferred (the errored settlement consumed it)
+            // so THIS report settles a live handle and _wakeParentOnReport
+            // delivers the recovery to the parent.
+            _mintNewSpawnHandle(rec);
+            _subAgentsPersist(rec);
+        } else {
+            return { success: false, error: 'report_to_parent: sub is already terminal (' + rec.state + '); cannot report again.', already_settled: true };
+        }
     }
     // FIX #6 (idempotency): the FIRST settling call in this turn parks the sub
     // (_parkSubAgent -> state='sleeping') and consumes the spawn deferred
@@ -1635,7 +1676,7 @@ function reportToParent(args, ctx) {
     rec.report_collected = false;
     // RES-6: a successful report completes the turn — reset the per-crash
     // auto-retry latch so a future transient crash gets its own retry.
-    if (rec._retry_used) { delete rec._retry_used; rec.last_error = null; } // PR383-R3: drop the recovered error too
+    if (rec._retry_used || rec._throttle_retries) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; } // PR383-R3: drop the recovered error too
     _subAgentsPersist(rec);
 
     // Push a styled callout row into the parent chat so the human reading
@@ -1846,6 +1887,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         rec.settled_at = null;
         delete rec._stoppedByUser;
         delete rec._retry_used;
+        delete rec._throttle_retries;
         // PR383-R1: a sub force-stopped for budget exhaustion carries
         // tool_calls_used past the hard ceiling (SUBAGENT_BUDGET_HARD_MULT ×
         // max_tool_calls). Without a rebase, its FIRST tool call after
@@ -2150,6 +2192,9 @@ function agentMessage(args, ctx) {
                     subChatId: rec.chat_id,
                     progress: [_entry],
                     report: { status: 'running', summary: '', from: rec.agent_id, from_name: rec.name, at: Date.now() },
+                    toolCallsUsed: rec.tool_calls_used || 0,
+                    maxToolCalls: rec.max_tool_calls || 0,
+                    subDepth: rec.depth || 1,
                     createdAt: Date.now()
                 });
             }
@@ -2454,8 +2499,11 @@ function unparkAfterAwait(agentId) {
 // timeout) gets ONE automatic retry before the sub is declared errored. The
 // partial assistant turn was already popped by the loop's catch, so
 // re-queueing simply replays the failed turn with the same context. The
-// _retry_used latch caps it at one retry per crash; it resets on the next
-// successful turn (onToolCallInSubAgent / clean finish / report_to_parent).
+// _retry_used latch caps generic transient errors at ONE retry per crash;
+// throttle-class errors (429/529) get up to SUBAGENT_THROTTLE_MAX_RETRIES
+// attempts with escalating delays before the latch engages. Both budgets
+// reset on the next successful turn (onToolCallInSubAgent / clean finish /
+// report_to_parent).
 // The retry is logged visibly in the sub's transcript via an injected user
 // row, which also guarantees the resumed run starts on a user turn.
 // Extracted from onSubAgentRunFinished so _markErrored (the COMMON crash
@@ -2463,14 +2511,26 @@ function unparkAfterAwait(agentId) {
 // settled terminal unconditionally, making agent_status's promised
 // auto-retry unreachable for pool-driven crashes.
 function _queueTransientRetry(rec, errMsg) {
-    rec._retry_used = true;
+    var throttled = _isThrottleSubError(errMsg);
+    var attemptNo = 1, attemptMax = 1;
+    if (throttled) {
+        rec._throttle_retries = (rec._throttle_retries || 0) + 1;
+        attemptNo = rec._throttle_retries;
+        attemptMax = SUBAGENT_THROTTLE_MAX_RETRIES;
+        // Latch _retry_used only once the throttle budget is SPENT, so the
+        // !rec._retry_used gates in _markErrored / onSubAgentRunFinished
+        // admit attempts 2..N back into this function.
+        if (rec._throttle_retries >= SUBAGENT_THROTTLE_MAX_RETRIES) rec._retry_used = true;
+    } else {
+        rec._retry_used = true;
+    }
     rec.retries_used = (rec.retries_used || 0) + 1;
     rec.last_error = { message: errMsg || 'transient run error', at: Date.now(), transient: true, retried: true };
     try {
         if (chats[rec.chat_id] && Array.isArray(chats[rec.chat_id].messages)) {
             chats[rec.chat_id].messages.push({
                 role: 'user', injected: true,
-                content: '[sub-agent lifecycle] The previous turn crashed with a transient error ("' + (errMsg || 'network error') + '"). Automatic retry 1/1 — resume the task from where you left off; do not redo completed work.'
+                content: '[sub-agent lifecycle] The previous turn crashed with a transient error ("' + (errMsg || 'network error') + '"). Automatic retry ' + attemptNo + '/' + attemptMax + ' — resume the task from where you left off; do not redo completed work.'
             });
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         }
@@ -2480,9 +2540,10 @@ function _queueTransientRetry(rec, errMsg) {
     rec.last_activity_at = Date.now();
     _subAgentsPersist(rec);
     _releasePoolSlot(rec.agent_id);
-    // PR383-R5: throttle-class errors (429/529/rate-limit/overloaded) get a
-    // ~8s back-off before the re-queue — replaying immediately against a
-    // provider that is shedding load burns the single retry for nothing.
+    // PR383-R5: throttle-class errors (429/529/rate-limit/overloaded) get an
+    // escalating back-off (8s → 20s → 45s per attempt) before the re-queue —
+    // replaying immediately against a provider that is shedding load burns
+    // the retry for nothing.
     // KNOWN LIMITATION (accepted, low severity): an MV3 SW can be killed
     // before the timer fires, leaving state 'running' with nothing queued.
     // Recovery: (a) _retry_delayed_until is stamped on the record and
@@ -2490,8 +2551,9 @@ function _queueTransientRetry(rec, errMsg) {
     // cold-boot orphan-rewrite in loadAllSubAgents (worker ctx marks
     // 'running' records errored + resurrectable) reclaims exactly that
     // state on the next SW start.
-    if (_isThrottleSubError(errMsg)) {
-        rec._retry_delayed_until = Date.now() + 8000;
+    if (throttled) {
+        var throttleDelayMs = SUBAGENT_THROTTLE_RETRY_DELAYS_MS[Math.min(attemptNo - 1, SUBAGENT_THROTTLE_RETRY_DELAYS_MS.length - 1)];
+        rec._retry_delayed_until = Date.now() + throttleDelayMs;
         _subAgentsPersist(rec);
         (function(capturedAid) {
             setTimeout(function() {
@@ -2507,7 +2569,7 @@ function _queueTransientRetry(rec, errMsg) {
                 }
                 _subAgentsPersist(r2);
                 _notifyListeners();
-            }, 8000);
+            }, throttleDelayMs);
         })(rec.agent_id);
     } else {
         if (_subPool.queue.indexOf(rec.agent_id) === -1) _subPool.queue.push(rec.agent_id);
@@ -2605,6 +2667,7 @@ function agentStatus(args, ctx) {
             // PR383-R5: set while a throttle-class auto-retry is deliberately
             // delayed (~8s) before re-queueing; null once the timer fires.
             retry_delayed_until: rec._retry_delayed_until || null,
+            throttle_retries_used: rec._throttle_retries || 0,
             retries_used: rec.retries_used || 0,
             // True when wake_sub_agent can REVIVE this sub with its full prior
             // chat context (terminal state + transcript still present).
@@ -2700,7 +2763,7 @@ function onToolCallInSubAgent(chatId) {
     // PR383-R3: also drop the recovered crash's last_error — leaving it set
     // let a later no_report / auto-report-disabled finish reuse the OLD
     // (already recovered) error in error_info and the parent notice.
-    if (rec._retry_used) { delete rec._retry_used; rec.last_error = null; }
+    if (rec._retry_used || rec._throttle_retries) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; }
     var used = rec.tool_calls_used;
     var cap = rec.max_tool_calls;
     var ceiling = cap * SUBAGENT_BUDGET_HARD_MULT;
@@ -2807,7 +2870,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     var _runErrTransient = _runErrored ? _isTransientSubError(_runErrorMsg) : false;
     // A clean (non-errored) finish completes the turn — reset the per-crash
     // retry latch (belt-and-braces with the onToolCallInSubAgent reset).
-    if (!_runErrored && rec._retry_used) { delete rec._retry_used; rec.last_error = null; } // PR383-R3: drop the recovered error too
+    if (!_runErrored && (rec._retry_used || rec._throttle_retries)) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; } // PR383-R3: drop the recovered error too
     // CRITICAL: do NOT release the pool slot up-front. The wake-during-
     // finish race can install a NEW runAgent loop for the same agent_id
     // in the window between runningChatIds being cleared by the agent
@@ -2997,7 +3060,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
         // retry, if it was transient) — a crash is never parent-initiated.
         if (_runErrored) {
             _notifySubLifecycle(rec, 'errored — ' + (_runErrorMsg || 'run crashed')
-                + (_runErrTransient ? ' (transient' + (rec._retry_used ? '; one auto-retry already failed' : '') + ')' : '')
+                + (_runErrTransient ? ' (transient' + (rec._retry_used ? '; auto-retry budget exhausted' : '') + ')' : '')
                 + ' — resurrectable via wake_sub_agent');
         }
         // P2: auto-reports wake too — a fire-and-forget parent would otherwise

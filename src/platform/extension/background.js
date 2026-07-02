@@ -1480,6 +1480,73 @@ function normalizeClaudeUsage(json) {
     return out;
 }
 
+// Decide whether an ACCOUNT limit (credits / 5h window / weekly window /
+// extra-usage cap) is actually exhausted, from a flat claudeRateLimits-style
+// map — either headers scraped off a /v1/messages response or the output of
+// refreshClaudeOrgUsage(). Used to reclassify ambiguous 429s whose body
+// doesn't say WHY we were shed: a credit-exhausted 429 looks identical to a
+// transient rate-limit unless we cross-check usage. Returns
+// { label, resetsAt (epoch seconds|null) } or null when nothing is exhausted.
+function detectUsageExhaustion(map) {
+    if (!map || typeof map !== 'object') return null;
+    function num(k) { var v = parseFloat(map[k]); return isNaN(v) ? null : v; }
+    // Reset values are epoch seconds from normalizeClaudeUsage but RFC3339
+    // timestamps in raw anthropic-ratelimit-*-reset headers — accept both.
+    function epochSec(k) {
+        var raw = map[k];
+        if (raw == null) return null;
+        if (/^\d+(\.\d+)?$/.test(String(raw).trim())) {
+            var n = parseFloat(raw);
+            return n > 9999999999 ? Math.floor(n / 1000) : Math.floor(n);
+        }
+        var t = Date.parse(raw);
+        return isNaN(t) ? null : Math.floor(t / 1000);
+    }
+    // Per-limit breakdown from claude.ai (percent is 0-100 per limit).
+    try {
+        var lims = JSON.parse(map['appagent-usage-limits'] || 'null') || [];
+        for (var i = 0; i < lims.length; i++) {
+            var l = lims[i];
+            if (!l || typeof l.percent !== 'number') continue;
+            if (l.percent >= 100) {
+                return {
+                    label: 'Usage limit reached' + (l.label ? ' — ' + l.label : (l.kind ? ' — ' + String(l.kind).replace(/_/g, ' ') : '')),
+                    resetsAt: l.resets_at || null
+                };
+            }
+        }
+    } catch (e) {}
+    // Unified window utilization — a 0-1 fraction in both the header shape
+    // and normalizeClaudeUsage output (which canonicalizes percents).
+    var u5 = num('anthropic-ratelimit-unified-5h-utilization');
+    if (u5 != null && u5 >= 1) return { label: 'Usage limit reached — 5-hour window', resetsAt: epochSec('anthropic-ratelimit-unified-5h-reset') };
+    var u7 = num('anthropic-ratelimit-unified-7d-utilization');
+    if (u7 != null && u7 >= 1) return { label: 'Usage limit reached — weekly window', resetsAt: epochSec('anthropic-ratelimit-unified-7d-reset') };
+    // Extra usage (pay-as-you-go credits): cap reached = out of credits.
+    if (map['appagent-extra-usage-enabled'] === 'true') {
+        var lim = num('appagent-extra-usage-limit');
+        var used = num('appagent-extra-usage-used');
+        if (lim != null && used != null && lim > 0 && used >= lim) {
+            // No rolling window here — credits stay exhausted until the user
+            // raises the cap or the billing month rolls over. hardStop tells
+            // the retry loop to surface immediately instead of retrying.
+            return { label: 'Out of credits — extra-usage cap reached', resetsAt: null, hardStop: true };
+        }
+    }
+    return null;
+}
+
+// "2h 5m" / "12m" until an epoch-seconds reset, or '' when unknown/past.
+function formatResetDelta(epochSec) {
+    if (!epochSec) return '';
+    var ms = epochSec * 1000 - Date.now();
+    if (ms <= 0) return '';
+    var m = Math.round(ms / 60000);
+    if (m < 1) return 'under a minute';
+    if (m < 60) return m + 'm';
+    return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+}
+
 async function startClaudeOAuth() {
     var sessionKey = await getClaudeCookie('sessionKey');
     if (!sessionKey) {
@@ -1704,11 +1771,46 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 //     calls `self.runClaudeOAuthStream(requestBody, callbacks, abortSignal)`
 //     directly because the SW can't open a port to itself.
 
-// Core streamer: feeds {type:'sse'|'error'|'done'} envelopes to the
+// --- Claude stream semaphore (PR#501 follow-up) ---
+// Tracks how many Anthropic streams are currently consuming a response
+// body. A 429 whose representativeClaim is "concurrents" means the
+// account-level concurrent-stream cap is hit — the right recovery is to
+// PARK until a sibling stream actually ends (event-driven), not to sleep
+// on a blind timer. A timeout fallback prevents deadlock when ALL local
+// streams are parked (the cap may be consumed by another device/session).
+var _claudeStreams = { active: 0, waiters: [] };
+function _claudeStreamEnded() {
+    _claudeStreams.active = Math.max(0, _claudeStreams.active - 1);
+    var ws = _claudeStreams.waiters.splice(0);
+    for (var i = 0; i < ws.length; i++) { try { ws[i](); } catch (e) {} }
+}
+// Resolves when ANY in-flight stream ends, or after timeoutMs — whichever
+// comes first. Never rejects.
+function _waitForFreeStreamSlot(timeoutMs) {
+    return new Promise(function(resolve) {
+        var done = false;
+        function fire() {
+            if (done) return;
+            done = true;
+            // Remove ourselves so timed-out waiters don't accumulate in the
+            // array when no stream ever completes (inert but unbounded).
+            var i = _claudeStreams.waiters.indexOf(fire);
+            if (i >= 0) _claudeStreams.waiters.splice(i, 1);
+            resolve();
+        }
+        _claudeStreams.waiters.push(fire);
+        setTimeout(fire, timeoutMs);
+    });
+}
+
+// Core streamer: feeds {type:'sse'|'error'|'done'|'status'} envelopes to the
 // provided sink. Generic over transport (port.postMessage vs direct fn).
+// 'status' envelopes are transport-level progress (rate-limit backoff / slot
+// park) — consumers that don't know the type safely ignore it.
 async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
     var streamKeepAlive = null;
     var aborted = false;
+    var _slotHeld = false;
     function onAbort() {
         aborted = true;
         if (streamKeepAlive) { clearInterval(streamKeepAlive); streamKeepAlive = null; }
@@ -1741,7 +1843,11 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
 
         var res;
         var maxRetries = 3;
+        var maxParks = 4;
+        var parks = 0;
+        var errBodyText = null;
         var triedReauth = false;
+        var usageProbed = false;
         for (var attempt = 0; attempt <= maxRetries; attempt++) {
             if (aborted) {
                 // Match the in-loop abort path (post-break fall-through emits both
@@ -1782,17 +1888,105 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                 }
             }
 
-            if (res.status !== 529 || attempt === maxRetries) break;
-            console.error('[AppAgent] 529 overloaded, retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + (4 * Math.pow(2, attempt)) + 's');
-            await new Promise(function(r) { setTimeout(r, 4000 * Math.pow(2, attempt)); });
+            // 429 (rate-limit) and 529 (overloaded) are transient shed-load
+            // responses — recover instead of surfacing them. Reset errBodyText
+            // BEFORE the break so a 429 attempt followed by a DIFFERENT failing
+            // status (400/500/second 401) doesn't surface the stale 429 body
+            // under the new status code — the !res.ok handler below re-reads
+            // the fresh body when errBodyText is null.
+            errBodyText = null;
+            if (res.status !== 529 && res.status !== 429) break;
+            // Read the error body ONCE (a Response body is single-use) — it
+            // tells us WHICH limit was hit, and the final surfaced error
+            // reuses it after the loop.
+            try { errBodyText = await res.text(); } catch (e) { errBodyText = ''; }
+            // "concurrents": the account-level concurrent-stream cap. This
+            // clears the moment a sibling stream ends, so park on the
+            // semaphore (event-driven, jittered 8-15s timeout fallback for
+            // the all-parked / other-device case). Parks have their own
+            // budget and do NOT burn timed-backoff attempts.
+            var isConcurrents = res.status === 429 && /concurrents/.test(errBodyText || '');
+            if (isConcurrents && parks < maxParks && !aborted) {
+                parks++;
+                var parkMs = Math.round(8000 + Math.random() * 7000);
+                // Only claim "another agent" when a sibling stream from THIS
+                // service worker is actually holding a slot. With 0 local
+                // streams the concurrency cap was consumed elsewhere (another
+                // device/profile) or the endpoint is shedding load under
+                // saturation — saying "another agent" there is misleading.
+                var parkSuffix = parks > 1 ? ' (' + parks + '/' + maxParks + ')…' : '…';
+                var parkMsg = _claudeStreams.active > 0
+                    ? (parks > 1 ? 'Still waiting for another agent to finish' : 'Waiting for another agent to finish') + parkSuffix
+                    : 'AI endpoint saturated — no free stream slot, waiting' + parkSuffix;
+                sink({ type: 'status', status: 'rate_limited', reason: 'concurrents', waitMs: parkMs, message: parkMsg });
+                console.warn('[AppAgent] 429 concurrents, parking for a free stream slot (' + parks + '/' + maxParks + ', ≤' + Math.round(parkMs / 1000) + 's, ' + _claudeStreams.active + ' active)');
+                await _waitForFreeStreamSlot(parkMs);
+                attempt--; // compensate the for-loop increment — parks are budgeted separately
+                continue;
+            }
+            if (attempt === maxRetries) break;
+            // Timed backoff: honor Retry-After (seconds, capped 30s — an MV3
+            // SW can be killed during long sleeps) else exponential 4s → 8s →
+            // 16s, with ±30% jitter so parent + sub-agent streams that got
+            // shed at the same instant don't retry in lockstep and
+            // re-collide on the same cap.
+            var retryDelayMs = 4000 * Math.pow(2, attempt);
+            var retryAfterSec = parseInt(res.headers.get('retry-after'), 10);
+            if (!isNaN(retryAfterSec) && retryAfterSec > 0) retryDelayMs = Math.min(retryAfterSec * 1000, 30000);
+            retryDelayMs = Math.round(retryDelayMs * (0.7 + Math.random() * 0.6));
+            // Classify WHY we were shed so the snackbar tells the truth:
+            // 529 = endpoint saturated; 429 mentioning credits/usage-limit =
+            // account exhaustion (retry-after still honored — OAuth usage
+            // windows roll over); anything else = plain rate-limit.
+            var backoffLabel;
+            if (res.status === 529) backoffLabel = 'AI endpoint saturated';
+            else if (/credit|billing|balance/i.test(errBodyText || '')) backoffLabel = 'Out of credits';
+            else if (/usage[ _-]?limit|quota/i.test(errBodyText || '')) backoffLabel = 'Usage limit reached';
+            else backoffLabel = 'Rate-limited';
+            // A 429 whose body doesn't mention credits is often still an
+            // exhausted ACCOUNT limit, not a transient rate-limit. Cross-check:
+            // first the unified ratelimit headers on THIS 429 (free), then the
+            // claude.ai usage API (cookie-auth'd, probed at most once per
+            // request). When a limit is truly exhausted and resets far in the
+            // future, retrying in seconds is pointless — surface a clear error
+            // immediately instead of burning the retry budget on "Rate-limited".
+            if (res.status === 429) {
+                var hdrMap = {};
+                try { res.headers.forEach(function(v, k) { if (k.indexOf('anthropic-ratelimit-') === 0) hdrMap[k] = v; }); } catch (e) {}
+                var exhaustion = detectUsageExhaustion(hdrMap);
+                if (!exhaustion && !usageProbed) {
+                    usageProbed = true;
+                    try { exhaustion = detectUsageExhaustion(await refreshClaudeOrgUsage()); } catch (e) {}
+                }
+                if (exhaustion) {
+                    backoffLabel = exhaustion.label;
+                    var resetIn = formatResetDelta(exhaustion.resetsAt);
+                    if (exhaustion.hardStop || (exhaustion.resetsAt && exhaustion.resetsAt * 1000 - Date.now() > 60000)) {
+                        errBodyText = exhaustion.label + (resetIn ? ' — resets in ' + resetIn : '') + '. Retrying won\'t help until the limit resets.' + (errBodyText ? ' (' + errBodyText + ')' : '');
+                        console.error('[AppAgent] 429 ' + exhaustion.label + (resetIn ? ', resets in ' + resetIn : '') + ' — not retrying');
+                        break;
+                    }
+                    if (resetIn) backoffLabel += ' (resets in ' + resetIn + ')';
+                }
+            }
+            sink({ type: 'status', status: 'rate_limited', reason: res.status, waitMs: retryDelayMs, message: backoffLabel + ' — retrying in ' + Math.round(retryDelayMs / 1000) + 's (attempt ' + (attempt + 1) + '/' + maxRetries + ')…' });
+            console.error('[AppAgent] ' + res.status + ' ' + backoffLabel + ', retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + Math.round(retryDelayMs / 1000) + 's');
+            await new Promise(function(r) { setTimeout(r, retryDelayMs); });
         }
 
         if (!res.ok) {
-            var errText = await res.text();
+            // errBodyText is set when the retry loop already consumed the
+            // body (429/529 exhausted) — a Response body can only be read once.
+            var errText = (errBodyText !== null) ? errBodyText : await res.text();
             sink({ type: 'error', error: 'API error ' + res.status + ': ' + errText });
             sink({ type: 'done' });
             return;
         }
+
+        // Response is streaming from here — hold a semaphore slot until the
+        // finally below releases it, waking any parked "concurrents" 429s.
+        _claudeStreams.active++;
+        _slotHeld = true;
 
         var rlHeaders = {};
         res.headers.forEach(function(v, k) {
@@ -1955,6 +2149,10 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
         clearInterval(streamKeepAlive); streamKeepAlive = null;
         try { sink({ type: 'error', error: e.message }); } catch(e2) {}
         try { sink({ type: 'done' }); } catch(e2) {}
+    } finally {
+        // Release the stream slot (if held) and wake parked siblings. Fires
+        // on clean finish, stream error, AND abort — every exit path.
+        if (_slotHeld) { _slotHeld = false; _claudeStreamEnded(); }
     }
 }
 self.runClaudeOAuthStream = runClaudeOAuthStream;

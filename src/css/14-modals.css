@@ -23,6 +23,14 @@
 .modal-btn.danger:hover { background: var(--danger-hover); }
 .modal-btn.secondary { background: var(--secondary-light); color: var(--text-primary); }
 .modal-btn.secondary:hover { background: var(--secondary-border); }
+.modal-btn.warning { background: var(--warning); color: var(--text-inverse); }
+.modal-btn.warning:hover { background: var(--warning-hover); }
+
+/* Modal severity variants: normal (default, blue), warning (orange), danger/alert (red) */
+.modal-overlay.modal-variant-warning .modal-dialog { border-top: 4px solid var(--warning); }
+.modal-overlay.modal-variant-warning .modal-header { color: var(--warning-dark); }
+.modal-overlay.modal-variant-danger .modal-dialog { border-top: 4px solid var(--danger); }
+.modal-overlay.modal-variant-danger .modal-header { color: var(--danger); }
 
 /* Skill Asset Modal - Larger size */
 .modal-overlay.skill-asset-modal .modal-dialog { max-width: 800px; max-height: 85vh; display: flex; flex-direction: column; }

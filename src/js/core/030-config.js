@@ -1,75 +1,85 @@
+// Default named LLM endpoints (used on first load, then stored in IndexedDB).
+// Endpoints are first-class objects { id, name, url, apiKey }: the same URL
+// can appear under several names with different API keys. Providers (models)
+// reference an endpoint by `endpointId` instead of carrying inline
+// endpoint/apiKey fields. Claude-OAuth providers are the exception — they
+// keep their inline endpoint/apiKey ('oauth') and never use endpointId.
+var DEFAULT_LLM_ENDPOINTS = [
+    { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' }
+];
+
+// LLM endpoints (loaded from IndexedDB, initialized with defaults on first load)
+var llmEndpoints = [];
+
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES) so the
+// SW/offscreen streaming path resolves endpoints the same way the page does.
+function getLlmEndpointById(id) {
+    if (!id) return null;
+    return llmEndpoints.find(function(ep) { return ep.id === id; }) || null;
+}
+
+// THE single resolution point for a provider's connection details.
+// Returns { endpoint, apiKey, endpointName }. If provider.endpointId
+// resolves to a named endpoint, its url/apiKey/name win; otherwise fall
+// back to the provider's legacy inline endpoint/apiKey fields (OAuth
+// providers and not-yet-migrated entries), with an empty endpointName.
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
+function resolveProviderConnection(provider) {
+    if (provider && provider.endpointId) {
+        var ep = getLlmEndpointById(provider.endpointId);
+        if (ep) {
+            return { endpoint: ep.url, apiKey: ep.apiKey || '', endpointName: ep.name || '' };
+        }
+    }
+    return {
+        endpoint: (provider && provider.endpoint) || '',
+        apiKey: (provider && provider.apiKey) || '',
+        endpointName: ''
+    };
+}
+
 // Default API providers (used on first load, then stored in IndexedDB)
 var DEFAULT_API_PROVIDERS = [
     {
-        name: 'Kimi K2.5',
-        apiKey: '',
-        model: 'moonshotai/kimi-k2.5',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 262000,
+        name: 'GLM 5.2',
+        model: 'z-ai/glm-5.2',
+        endpointId: 'openrouter',
+        context_length: 1048576,
+        // Routing is pinned to first-party Z.AI (provider below), whose
+        // endpoint allows 131,072 completion tokens — 64k is safely under it
         maxTokens: 64000,
         thinkingBudget: 40000,
-        provider: 'moonshotai'
+        provider: 'z-ai'
     },
     {
-        // Opus 4.7+ is adaptive-thinking-only: effort replaces thinkingBudget
-        // (budget_tokens returns 400). xhigh is the documented recommended
-        // starting point for coding/agentic work on Opus 4.8.
-        name: 'opus-4.8',
-        apiKey: '',
-        model: 'anthropic/claude-opus-4.8',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 200000,
-        maxTokens: 64000,
-        effort: 'xhigh'
-    },
-    {
-        // Sonnet 4.6 supports adaptive thinking via effort (xhigh is Opus/Fable-only)
-        name: 'sonnet-4.6',
-        apiKey: '',
-        model: 'anthropic/claude-sonnet-4.6',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 200000,
+        // Sonnet 5 (2026-06-30) is adaptive-thinking-only like Opus 4.7+:
+        // effort replaces thinkingBudget (budget_tokens returns 400), and
+        // adaptive thinking is ON by default. xhigh/max are supported on
+        // Sonnet 5 too, but Opus 4.8 at low/medium generally beats Sonnet 5
+        // at xhigh for the same cost — 'high' is the sane default here.
+        name: 'sonnet-5',
+        model: 'anthropic/claude-sonnet-5',
+        endpointId: 'openrouter',
+        context_length: 1000000,
         maxTokens: 64000,
         effort: 'high'
     },
     {
-        name: 'haiku-4.5',
-        apiKey: '',
-        model: 'anthropic/claude-haiku-4.5',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 200000,
-        maxTokens: 64000,
-        // 32k is the documented budget ceiling (Anthropic recommends batch
-        // processing for budgets above 32k; the official migration example
-        // also uses 32000)
-        thinkingBudget: 32000
-    },
-    {
-        name: 'gpt-5.2',
-        apiKey: '',
-        model: 'openai/gpt-5.2',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 400000,
+        name: 'gpt-5.5',
+        model: 'openai/gpt-5.5',
+        endpointId: 'openrouter',
+        context_length: 1050000,
         maxTokens: 128000,
         effort: 'low'
     },
     {
-        name: 'Gemini 3 Flash Preview',
-        apiKey: '',
-        model: 'google/gemini-3-flash-preview',
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-        context_length: 1000000,
+        name: 'Gemini 3.5 Flash',
+        model: 'google/gemini-3.5-flash',
+        endpointId: 'openrouter',
+        context_length: 1048576,
+        // OpenRouter caps Gemini 3.5 Flash completions at 65,536 tokens
         maxTokens: 64000,
         thinkingBudget: 50000
-    },
-    {
-        name: 'Proxy',
-        model: 'anthropic/claude-opus-4-8',
-        endpoint: 'http://localhost:8000/api/v1/chat/completions',
-        apiKey: '----',
-        maxTokens: 100000,
-        context_length: 200000,
-        effort: 'xhigh'
     },
     {
         name: 'Opus-4-8 OAuth',
@@ -84,12 +94,14 @@ var DEFAULT_API_PROVIDERS = [
         isClaudeOAuth: true
     },
     {
-        name: 'Sonnet 4.6 OAuth',
-        model: 'claude-sonnet-4-6',
+        name: 'Sonnet 5 OAuth',
+        model: 'claude-sonnet-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
         maxTokens: 100000,
-        context_length: 200000,
+        // Sonnet 5 serves the 1M context window by default on the direct API
+        // (1M is both the default and the only size — no beta header needed)
+        context_length: 1000000,
         effort: 'high',
         isClaudeOAuth: true
     }
@@ -101,19 +113,18 @@ var apiProviders = [];
 // Default API provider template for adding new providers (based on haiku45)
 var DEFAULT_API_PROVIDER = {
     name: '',
-    apiKey: '',
     model: '',
-    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    endpointId: 'openrouter',
     context_length: 200000,
     maxTokens: 64000,
     // Doc-recommended budget ceiling (batch processing advised above 32k).
     // Ignored automatically for adaptive-only Claude models (Opus 4.7+,
-    // Fable/Mythos 5) — see callOpenRouterStreaming.
+    // Sonnet 5+, Fable/Mythos 5) — see callOpenRouterStreaming.
     thinkingBudget: 32000,
     provider: ''
 };
 
-// Adaptive-only Claude models (Opus 4.7+, Opus 5+, Fable 5, Mythos 5) reject
+// Adaptive-only Claude models (Opus 4.7+, Opus 5+, Sonnet 5+, Fable 5, Mythos 5) reject
 // budget-style thinking (`budget_tokens` → 400 error); the effort parameter is
 // the only thinking-depth control. Matches both '.' and '-' version separators,
 // dated ids (claude-opus-4-8-20260115), and future versions (opus-5, opus-4.10).
@@ -121,7 +132,7 @@ var DEFAULT_API_PROVIDER = {
 // visible to callOpenRouterStreaming everywhere. transformToAnthropic in
 // src/platform/extension/background.js keeps a related (4.8+ only) regex for
 // mid-conversation system support — keep the two in sync when models change.
-var ADAPTIVE_ONLY_CLAUDE_RE = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[7-9]|\d{2,})))/;
+var ADAPTIVE_ONLY_CLAUDE_RE = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[7-9]|\d{2,}))|sonnet-(?:[5-9]|\d{2,}))/;
 function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
@@ -138,8 +149,18 @@ var currentProvider = 'Opus-4-8 OAuth'; // Default provider name (must match a p
 // migration list in core/130-indexeddb.js. Loaded in BOTH bundles
 // (page core tier + WORKER_SHARED_FILES).
 var PROVIDER_RENAMES = {
-    'opus-4.6': 'opus-4.8',
-    'sonnet-4.5': 'sonnet-4.6'
+    // Removed defaults (July 2026 alignment) fall back to the config default
+    'opus-4.6': 'Opus-4-8 OAuth',
+    'opus-4.8': 'Opus-4-8 OAuth',
+    'haiku-4.5': 'Opus-4-8 OAuth',
+    'Proxy': 'Opus-4-8 OAuth',
+    // Renamed defaults → their July 2026 successors
+    'sonnet-4.5': 'sonnet-5',
+    'sonnet-4.6': 'sonnet-5',
+    'Kimi K2.5': 'GLM 5.2',
+    'gpt-5.2': 'gpt-5.5',
+    'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
+    'Sonnet 4.6 OAuth': 'Sonnet 5 OAuth'
 };
 var currentChatId = null;
 var chats = {};
@@ -177,6 +198,14 @@ var SUBAGENT_NUDGE_TOKEN_THRESHOLD = 70000;
 // context message — never mutates history, so the prompt cache stays intact).
 // Set to 0 to restore the old one-shot behavior.
 var SUBAGENT_NUDGE_REARM_TOKENS = 50000;
+// Progress-card nudge: when the current user turn has accumulated this many
+// tool calls with NO update_action_state among them, the agent loop rides a
+// one-line context reminder along with the next scheduled LLM call (no extra
+// endpoint round trip — see 030-agent-loop.js). Set to 0 to disable.
+var PROGRESS_NUDGE_TOOL_CALLS = 5;
+// After a progress nudge fires, it re-arms after this many FURTHER tool calls
+// if the model still has not created a progress card. Set to 0 for one-shot.
+var PROGRESS_NUDGE_REARM_CALLS = 25;
 var currentIframeUrl = '/'; // Track last browser tab URL for AI context
 var settingsPanelOpen = false; // Track settings panel state
 var llmConnectionStatus = 'unknown'; // 'connected', 'disconnected', 'unknown'

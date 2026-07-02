@@ -731,6 +731,58 @@ async function runAgent(overrideChatId) {
             }
         }
 
+        // Progress-card nudge: the PROGRESS UPDATES policy asks for an
+        // update_action_state card once a run exceeds ~3 tool calls, but that
+        // static system-prompt paragraph gets ignored on long runs (background
+        // Action chats comply because startAction() injects an explicit "You
+        // MUST" user instruction — foreground chats have no such enforcement,
+        // hence cards appearing inconsistently despite a multi-step plan).
+        // Mirror the sub-agent nudge above: when this user turn has accumulated
+        // PROGRESS_NUDGE_TOOL_CALLS tool calls with NO update_action_state among
+        // them, ride a one-line `context` reminder along with the NEXT scheduled
+        // LLM call (buildAPIMessages merges trailing context onto the end of the
+        // last user turn — after the prompt-cache breakpoints, so the cached
+        // prefix stays valid and NO extra endpoint round trip is spent). Re-arms
+        // every PROGRESS_NUDGE_REARM_CALLS further calls while the model still
+        // has not created a card; goes quiet for the rest of the turn the moment
+        // it has. Firings are counted statelessly by scanning for the tagged
+        // `_progressNudge` rows in this turn's history — no separate persisted
+        // counter to drift across SW restarts. Answer-card hook calls
+        // (set_chat_title/set_tldr/set_links) are excluded from the count so a
+        // failed-hook retry pass at the very end can never trip a useless nudge.
+        if (typeof PROGRESS_NUDGE_TOOL_CALLS === 'number' && PROGRESS_NUDGE_TOOL_CALLS > 0) {
+            var _pnToolCalls = 0, _pnHasCard = false, _pnNudges = 0;
+            var _pnSkip = { set_chat_title: true, set_tldr: true, set_links: true };
+            for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
+                var _pm = chat.messages[_pi];
+                if (!_pm) continue;
+                if (_pm.role === 'user') break; // start of this turn
+                if (_pm.role === 'context' && _pm._progressNudge) _pnNudges++;
+                if (_pm.role === 'assistant' && _pm.tool_calls && _pm.tool_calls.length) {
+                    for (var _pj = 0; _pj < _pm.tool_calls.length; _pj++) {
+                        var _ptn = _pm.tool_calls[_pj] && _pm.tool_calls[_pj].function
+                            && _pm.tool_calls[_pj].function.name;
+                        if (_ptn === 'update_action_state') { _pnHasCard = true; break; }
+                        if (!_pnSkip[_ptn]) _pnToolCalls++;
+                    }
+                    if (_pnHasCard) break;
+                }
+            }
+            var _pnRearm = (typeof PROGRESS_NUDGE_REARM_CALLS === 'number' && PROGRESS_NUDGE_REARM_CALLS > 0)
+                ? PROGRESS_NUDGE_REARM_CALLS : Infinity;
+            // _pnNudges > 0 guard: 0 * Infinity is NaN, which would poison the
+            // comparison and silently disable the very first firing when the
+            // re-arm is configured off.
+            var _pnDue = PROGRESS_NUDGE_TOOL_CALLS + (_pnNudges > 0 ? _pnNudges * _pnRearm : 0);
+            if (!_pnHasCard && _pnToolCalls >= _pnDue) {
+                chat.messages.push({
+                    role: 'context',
+                    _progressNudge: true,
+                    content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the PROGRESS UPDATES policy, create one NOW — batch the update_action_state call ALONGSIDE your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
+                });
+            }
+        }
+
         var assistantMsg = {
             role: 'assistant',
             content: '',
@@ -966,9 +1018,20 @@ async function runAgent(overrideChatId) {
         // `_answerCardOnlyTurn` break below. Any failure clears the flag so
         // the model still sees the error and can retry.
         var ANSWER_CARD_TOOLS = { set_chat_title: true, set_tldr: true, set_links: true };
+        // update_action_state is fire-and-forget too ({success:true} carries
+        // nothing the model needs), so a FINAL progress-card update batched with
+        // the answer-card hooks must not force an extra LLM pass: the turn also
+        // counts as answer-card-only when every call is a hook OR
+        // update_action_state AND at least one true hook is present. The
+        // hook-presence guard keeps mid-run turns that call ONLY
+        // update_action_state on today's path (results echoed, run continues) —
+        // ending the run there would abort unfinished work.
+        var _acSawHook = false;
         var _answerCardOnlyTurn = assistantMsg.tool_calls.every(function(_ac) {
-            return _ac.function && ANSWER_CARD_TOOLS[_ac.function.name];
-        });
+            var _acn = _ac.function && _ac.function.name;
+            if (ANSWER_CARD_TOOLS[_acn]) { _acSawHook = true; return true; }
+            return _acn === 'update_action_state';
+        }) && _acSawHook;
         for (var i = 0; i < assistantMsg.tool_calls.length; i++) {
             if (isChatPaused(streamingChatId)) break;
             // User pressed send mid-tool-batch — inject placeholder results for ALL
@@ -1107,7 +1170,18 @@ async function runAgent(overrideChatId) {
         // set_links, all succeeded, and no user message arrived mid-turn — end
         // the run here; the results are recorded in the transcript but no extra
         // LLM round-trip is made just to acknowledge them.
-        if (_answerCardOnlyTurn && !_injectedDuringTools) break;
+        // Guard: only skip the round-trip on an after-response HOOK turn, or
+        // when the assistant already streamed visible text. A user-requested
+        // rename answered with a lone content-less set_chat_title call must
+        // still round-trip so the user gets a verbal reply.
+        if (_answerCardOnlyTurn && !_injectedDuringTools) {
+            var _acHasText = typeof assistantMsg.content === 'string' && assistantMsg.content.trim().length > 0;
+            var _acHookTurn = false;
+            for (var _hi = chat.messages.length - 1; _hi >= 0; _hi--) {
+                if (chat.messages[_hi].role === 'user') { _acHookTurn = !!chat.messages[_hi].isHookMessage; break; }
+            }
+            if (_acHookTurn || _acHasText) break;
+        }
     }
 
     // Show aggregate summary if there were multiple API calls
@@ -1217,16 +1291,33 @@ async function runAgent(overrideChatId) {
         var _finishReason = _runApiError ? 'errored' : 'completed';
         try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: _runApiError || null }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
     }
-    // Reset silent hook flag before the UI handler runs the final render so
-    // messages are properly displayed. Capture the pre-reset value for the
-    // notification gate (notifyFinish below).
-    var wasSilentHook = _silentHookRunning;
-    _silentHookRunning = false;
-    // If a silent hook just finished streaming, tell the page to clear its
-    // mirrored flag so the upcoming runFinished render shows the real final
-    // state. Emitted BEFORE runFinished so the port preserves ordering and the
-    // page flag is false by the time renderMessages runs.
-    if (wasSilentHook && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+    // Reset THIS chat's silent hook flag before the UI handler runs the final
+    // render so messages are properly displayed. Per-chat map, not a global
+    // boolean: chats run concurrently in the SW, and the old shared flag let
+    // one chat's finish steal another chat's silent-hook window — a NORMAL
+    // run finishing during another chat's hook got wasSilentHook=true (its
+    // notification + unseen bell were suppressed) while the hook chat itself
+    // then never emitted {active:false}.
+    var _hadSilentHookFlag = !!(typeof _silentHookRunningByChat !== 'undefined' && _silentHookRunningByChat[streamingChatId]);
+    if (_hadSilentHookFlag) delete _silentHookRunningByChat[streamingChatId];
+    // wasSilentHook additionally requires the turn we just answered to STILL
+    // be the hook instruction: when a user's interrupting send merges a REAL
+    // message into the hook run, the answer the user is actually waiting for
+    // would otherwise finish under the hook flag and its notification /
+    // unseen bell would be wrongly suppressed (036:notifyFinish gates).
+    var _lastUserMsgForHook = null;
+    if (chat && chat.messages) {
+        for (var _hui = chat.messages.length - 1; _hui >= 0; _hui--) {
+            if (chat.messages[_hui].role === 'user') { _lastUserMsgForHook = chat.messages[_hui]; break; }
+        }
+    }
+    var wasSilentHook = _hadSilentHookFlag && !!(_lastUserMsgForHook && _lastUserMsgForHook.isHookMessage);
+    // If a silent hook was running for THIS chat, tell the page to clear its
+    // mirrored per-chat flag so the upcoming runFinished render shows the real
+    // final state. Emitted BEFORE runFinished so the port preserves ordering
+    // and the page flag is clear by the time renderMessages runs. Keyed on the
+    // raw flag (not wasSilentHook) so an interrupted hook still cleans up.
+    if (_hadSilentHookFlag && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
         AgentEvents.emit('silentHookState', { active: false, chatId: streamingChatId });
     }
 
@@ -1249,7 +1340,10 @@ async function runAgent(overrideChatId) {
     // Sub-agent chats are invisible to the human and run in service of a parent;
     // PM-facing hooks (auto-title, etc.) would burn tokens and surface nothing.
     if (!isChatPaused(streamingChatId) && !_runApiError && !(chat && chat.isSubAgent)) {
-        executeAfterResponseHooks(streamingChatId);
+        // typeof guard: the page bundle no longer carries a (dead) copy of
+        // executeAfterResponseHooks — only the SW bundle defines it
+        // (worker/020-page-stubs.js), and only the SW runs this loop.
+        if (typeof executeAfterResponseHooks === 'function') executeAfterResponseHooks(streamingChatId);
     }
     // Hook decision made: executeAfterResponseHooks' recursive runAgent (if it
     // fired) has already synchronously re-set runningChatIds[streamingChatId].

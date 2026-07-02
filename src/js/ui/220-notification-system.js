@@ -496,13 +496,24 @@ document.addEventListener('mousedown', function(e) {
 }, true);
 
 var modalResolve = null;
-function showModal(title, message, buttons) {
+// Map a variant/color name to the canonical modal variant.
+// 'danger' | 'alert' | 'red' -> danger (red), 'warning' | 'orange' -> warning (orange),
+// anything else -> normal (default blue).
+function normalizeModalVariant(variant) {
+    if (variant === 'danger' || variant === 'alert' || variant === 'red' || variant === 'error') return 'danger';
+    if (variant === 'warning' || variant === 'orange') return 'warning';
+    return 'normal';
+}
+function showModal(title, message, buttons, variant) {
     return new Promise(function(resolve) {
         modalResolve = resolve;
         var overlay = document.getElementById('modal-overlay');
         var header = document.getElementById('modal-header');
         var body = document.getElementById('modal-body');
         var actions = document.getElementById('modal-actions');
+        overlay.classList.remove('modal-variant-warning', 'modal-variant-danger');
+        var v = normalizeModalVariant(variant);
+        if (v !== 'normal') overlay.classList.add('modal-variant-' + v);
         header.textContent = title;
         body.innerHTML = message;
         actions.innerHTML = buttons.map(function(btn) {
@@ -515,6 +526,8 @@ function showModal(title, message, buttons) {
 function closeModal() {
     var modal = document.getElementById('modal-overlay');
     modal.classList.remove('show');
+    modal.classList.remove('modal-variant-warning');
+    modal.classList.remove('modal-variant-danger');
     modal.classList.remove('skill-asset-modal');
     modal.classList.remove('request-body-modal');
     modal.classList.remove('screenshot-modal');

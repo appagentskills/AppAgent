@@ -481,18 +481,17 @@
    card with a robot icon, name + state, a live tool-call counter, and a
    real-time context-length ring (mirrors the main chat's .context-circle). */
 .sidebar-workers {
-    flex-shrink: 0;
-    /* Top padding clears the absolutely-positioned .version-sidebar-close
-       button (top:8px, 28px tall) — same trick .version-history-list uses. */
-    padding: var(--space-12, 40px) var(--space-4, 8px) var(--space-3, 6px);
+    /* Rendered INSIDE the scrolling .version-sidebar-content (below the PRs
+       and progress sections — placeholder emitted by renderVersionSidebar in
+       120-ui-utils.js), so it's a regular section sharing the sidebar's
+       single scrollbar: no sticky positioning, no internal scroll. */
+    padding: var(--space-5, 10px) var(--space-4, 8px);
     border-bottom: 1px solid var(--border, #e1e4ea);
     display: flex;
     flex-direction: column;
     gap: var(--space-3, 6px);
 }
 .sidebar-workers-header {
-    /* Keep the header text clear of the close button on the right. */
-    padding-right: 32px;
     font-size: var(--text-caption, 11px);
     font-weight: var(--font-semibold, 600);
     color: var(--text-muted, #6b7280);
@@ -503,14 +502,8 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-3, 6px);
-    /* Cap the workers list so a long roster scrolls internally instead of
-       growing tall and squeezing the parent's progress / version history
-       below it in the version sidebar. */
-    max-height: 34vh;
-    min-height: 88px;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    padding-right: 2px;
+    /* No max-height / internal overflow: the panel flows in the sidebar's
+       shared scroll along with the PRs and progress sections. */
 }
 .worker-card {
     display: flex;

@@ -192,6 +192,22 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                         } else {
                             chunks.push(encoded);
                         }
+                    } else if (env.type === 'status') {
+                        // Transport-level progress (429/529 backoff, concurrents
+                        // slot park) from the SW streamer — NOT part of the SSE
+                        // stream, so never queued into chunks. Relay via the agent
+                        // event bus: in the SW the broadcast bridge (worker/100)
+                        // forwards every emit to all connected panels; in page
+                        // context the local 036 handler fires directly.
+                        try {
+                            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+                                // chatId lets the page-side handler mirror the
+                                // status INLINE into the owning chat's status row
+                                // (compact "Thinking…" bar / spinner text) instead
+                                // of only the transient snackbar.
+                                AgentEvents.emit('llmTransportStatus', { message: env.message, status: env.status, reason: env.reason, waitMs: env.waitMs, chatId: chatId });
+                            }
+                        } catch (e) {}
                     } else if (env.type === 'done') {
                         streamDone = true;
                         if (resolveRead) {
@@ -243,11 +259,13 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             });
         })();
     } else {
-        // Standard fetch path
+        // Standard fetch path — resolve endpoint URL + API key through the
+        // named LLM-endpoint registry (falls back to legacy inline fields).
+        var conn = resolveProviderConnection(provider);
         var fetchOpts = {
             method: 'POST',
             headers: {
-                'Authorization': 'Bearer ' + provider.apiKey,
+                'Authorization': 'Bearer ' + conn.apiKey,
                 'Content-Type': 'application/json',
                 // Worker-safe: getReferer() returns a stable string in offscreen
                 // (window.location.href there is offscreen.html, not useful).
@@ -258,7 +276,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             body: JSON.stringify(requestBody)
         };
         if (abortController && abortController.signal) fetchOpts.signal = abortController.signal;
-        var res = await fetch(provider.endpoint, fetchOpts);
+        var res = await fetch(conn.endpoint, fetchOpts);
 
         if (!res.ok) {
             setLLMConnectionStatus('disconnected');
@@ -266,7 +284,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             var requestBodyStr = JSON.stringify(requestBody);
             console.error('API Error Response:', errorText);
             console.error('Request size:', Math.round(requestBodyStr.length / 1024) + 'KB, messages:', requestBody.messages.length);
-            console.error('Provider config:', JSON.stringify({ model: provider.model, provider: provider.provider, endpoint: provider.endpoint }));
+            console.error('Provider config:', JSON.stringify({ model: provider.model, provider: provider.provider, endpoint: conn.endpoint }));
             console.error('Request provider setting:', JSON.stringify(requestBody.provider));
             var lastMsgs = requestBody.messages.slice(-5).map(function(m) {
                 return { role: m.role, hasToolCalls: !!m.tool_calls, hasContent: !!(m.content && (typeof m.content === 'string' ? m.content.length : m.content.length) > 0), hasReasoning: !!m.reasoning_details };

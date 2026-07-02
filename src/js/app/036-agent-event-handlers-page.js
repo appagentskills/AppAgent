@@ -68,9 +68,20 @@ if (typeof window !== 'undefined' && window.addEventListener) {
 // 030-agent-loop.js for the source.
 // =============================================================
 
+// Unread-email semantics for the jobs lists: ANY user-visible action landing
+// on a chat the user is not viewing (assistant message, tool call, error,
+// parked approval, injected message, run start/crash) marks it unread — bold
+// title until the user opens it. Thin guard wrapper around markChatActivity
+// (tools/120-actions.js), safe to call from every handler.
+function _stampChatActivity(chatId) {
+    if (!chatId) return;
+    if (typeof markChatActivity === 'function') { try { markChatActivity(chatId); } catch (e) {} }
+}
+
 // runStarted — initial hidden snapshot, chat-list refresh, foreground UI flags.
 AgentEvents.on('runStarted', function(e) {
     var chatId = e.chatId;
+    _stampChatActivity(chatId);
     _agentEventsHiddenDuringRun[chatId] = !!document.hidden ||
         (typeof document.hasFocus === 'function' && !document.hasFocus());
     if (typeof renderChatList === 'function') renderChatList();
@@ -82,9 +93,19 @@ AgentEvents.on('runStarted', function(e) {
         lastApiError = null;
         hideRetryButton();
         hideContinueButton();
-        showPauseButton();
-        var messagesEl = document.getElementById('messages');
-        if (messagesEl) messagesEl.classList.add('is-streaming');
+        // Silent-hook runs (auto title/tldr/links) are invisible work: the
+        // user-facing answer already landed, so don't re-show the Pause
+        // button or re-add .is-streaming for them — the chat would look
+        // "running" for a couple of seconds after it visibly finished.
+        // silentHookState{active:true} is emitted BEFORE the hook's
+        // runAgent (worker/020-page-stubs.js), so the per-chat map is
+        // already set when this runStarted arrives (port preserves order).
+        var _rsHook = (typeof _isChatInSilentHook === 'function') && _isChatInSilentHook(chatId);
+        if (!_rsHook) {
+            showPauseButton();
+            var messagesEl = document.getElementById('messages');
+            if (messagesEl) messagesEl.classList.add('is-streaming');
+        }
         activeStreamingChatId = chatId;
         var _rsFocused = (typeof chats !== 'undefined') ? chats[chatId] : null;
         if (_rsFocused) _rsFocused._lastApiError = null; // focused chat starting fresh
@@ -104,12 +125,17 @@ AgentEvents.on('turnStarted', function(e) {
 });
 
 AgentEvents.on('assistantMessageStarted', function(e) {
+    // Stream is producing output again — drop any lingering inline
+    // transport-backoff status ("Rate-limited — retrying now…").
+    if (e && e.chatId) _clearTransportInlineStatus(e.chatId);
     if (e.chatId === currentChatId) renderMessages();
     hideSpinner(e.chatId);
 });
 
 AgentEvents.on('streamDelta', function(e) {
     try {
+        // Real stream progress — clear the inline transport-backoff status.
+        if (e && e.chatId) _clearTransportInlineStatus(e.chatId);
         updateStreamingMessage(e.msgIndex, e.message, e.chatId);
     } catch (err) {
         var label;
@@ -180,6 +206,7 @@ function _flushFinalizedStreamingText(chatId) {
 }
 
 AgentEvents.on('assistantMessage', function(e) {
+    _stampChatActivity(e.chatId);
     if (e.chatId === currentChatId) renderMessages();
     // FLUSH-TAIL: after the render (the full-rebuild path may recreate an
     // EMPTY #streaming-text whose REG-F4 repopulation skips finalized tails).
@@ -197,6 +224,7 @@ AgentEvents.on('toolCallStarted', function(e) {
 });
 
 AgentEvents.on('toolCallResult', function(e) {
+    _stampChatActivity(e.chatId);
     hideSpinner(e.chatId);
     if (e.force || e.chatId === currentChatId) renderMessages();
 });
@@ -216,6 +244,7 @@ AgentEvents.on('userInjected', function(e) {
     if (e.chatId && typeof pendingInjectionsByChatId !== 'undefined') {
         delete pendingInjectionsByChatId[e.chatId];
     }
+    _stampChatActivity(e.chatId);
     if (e.chatId === currentChatId) renderMessages();
     // INT-B1: the render above PRESERVES #streaming-text (same chat, still
     // running), so entries painted for the pre-interrupt turn are still inside
@@ -241,6 +270,7 @@ AgentEvents.on('userInjected', function(e) {
 });
 
 AgentEvents.on('messagesAppended', function(e) {
+    _stampChatActivity(e.chatId);
     // Honor e.force like the toolCallResult handler above — _repaintParent
     // (097-sub-agent-registry.js) emits force:true so the page repaints even
     // when the event originated for another chat id; renderMessages always
@@ -285,6 +315,7 @@ AgentEvents.on('paused', function(e) {
 });
 
 AgentEvents.on('streamAborted', function(e) {
+    if (e && e.chatId) _clearTransportInlineStatus(e.chatId);
     hideSpinner(e.chatId);
     // INT-B5: drop the paced-reveal buffer entries for this chat. After a
     // user abort the partial assistant message may be popped from the
@@ -299,6 +330,124 @@ AgentEvents.on('streamAborted', function(e) {
             if (_sk.indexOf(e.chatId + ':') === 0) delete streamingDisplayLen[_sk];
         }
     }
+});
+
+// Transport-level rate-limit status from the SW streamer (429/529 backoff,
+// concurrents slot park — see runClaudeOAuthStream in background.js). Without
+// this the user sees a silent spinner for up to ~30s while the transport
+// waits. Transient by design: shown as a warning snackbar (shared element, so
+// repeated updates replace in place) and auto-hidden shortly after the wait
+// window ends — but ONLY if our snackbar is still the one showing (tracked
+// via a data-transport-token attribute on the message element, since a timed
+// countdown mutates textContent), so a newer snackbar is never clobbered.
+// Timed 429/529 backoffs ("retrying in Ns") get a live per-second countdown;
+// concurrents parks are event-driven (cleared when a sibling stream ends),
+// so they show a static message instead — "waiting for another agent" when a
+// local sibling stream holds the slot, "AI endpoint saturated" when none does.
+var _transportSnackbarSeq = 0;
+var _transportCountdownTimers = {}; // per-chat countdown intervals (one global timer let a second chat's backoff kill the first chat's ticker)
+
+// INLINE transport status (stuck-"Thinking…" fix): the snackbar above is
+// transient and easy to miss — during a long 429/529 backoff (or a doomed
+// credit-exhausted retry loop) the chat itself showed only a bare "Thinking…"
+// bar with no hint of what was happening. Mirror the live transport message
+// into the running block's status row: the compact-mode summary line
+// (.compact-tools-status) and the classic loading spinner text. Keyed by
+// chatId (the SW emit now includes it); entries self-expire via holdUntil and
+// are cleared eagerly on stream progress so the status reverts the moment
+// the transport recovers. 250-message-render.js consults _transportStatusText
+// when computing the status line so re-renders during backoff keep the
+// message instead of resetting it to "Thinking…".
+var _transportInlineStatus = {};
+function _transportStatusText(chatId) {
+    var ent = chatId && _transportInlineStatus[chatId];
+    if (!ent) return null;
+    if (Date.now() > ent.holdUntil) { delete _transportInlineStatus[chatId]; return null; }
+    return ent.text;
+}
+function _clearTransportInlineStatus(chatId) {
+    if (chatId && _transportInlineStatus[chatId]) delete _transportInlineStatus[chatId];
+}
+function _paintTransportInlineStatus(chatId) {
+    if (chatId && chatId !== currentChatId) return;
+    var text = _transportStatusText(chatId);
+    if (!text) return;
+    try {
+        // Compact mode: the streaming block's summary status line.
+        var el = document.querySelector('.compact-tools-area.streaming .compact-tools-status');
+        if (el) el.textContent = text;
+        // Non-compact mode: the "Thinking…" loading spinner.
+        var sp = document.querySelector('#loading-spinner .spinner-text');
+        if (sp) sp.textContent = text;
+    } catch (err) {}
+}
+
+AgentEvents.on('llmTransportStatus', function(e) {
+    if (!e || !e.message) return;
+    try {
+        var token = String(++_transportSnackbarSeq);
+        var _tChat = e.chatId || currentChatId;
+        // Clear only THIS chat's ticker — a concurrent backoff in another
+        // chat keeps its own countdown alive.
+        if (_tChat && _transportCountdownTimers[_tChat]) { clearInterval(_transportCountdownTimers[_tChat]); delete _transportCountdownTimers[_tChat]; }
+        // Inline mirror of the snackbar text. holdMs keeps the entry alive a
+        // little past the wait window so "retrying now…" stays visible until
+        // real stream progress clears it (or it self-expires).
+        var setInline = function(text, holdMs) {
+            if (!_tChat) return;
+            _transportInlineStatus[_tChat] = { text: text, holdUntil: Date.now() + (holdMs || 20000) };
+            _paintTransportInlineStatus(_tChat);
+        };
+        var show = function(text) {
+            showSnackbar(text, 'warning');
+            var sb = document.getElementById('snackbar');
+            var msgEl = sb && sb.querySelector('.snackbar-message');
+            if (msgEl) msgEl.setAttribute('data-transport-token', token);
+        };
+        // Returns our message element while our snackbar is still the one
+        // showing (not dismissed, not replaced by a newer snackbar), else null.
+        var ours = function() {
+            var sb = document.getElementById('snackbar');
+            var msgEl = sb && sb.querySelector('.snackbar-message');
+            return (msgEl && sb.classList.contains('show') && msgEl.getAttribute('data-transport-token') === token) ? msgEl : null;
+        };
+        var canCount = e.waitMs && e.reason !== 'concurrents' && /in \d+s/.test(e.message);
+        if (canCount) {
+            var until = Date.now() + e.waitMs;
+            var withRemaining = function() {
+                var remain = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+                return e.message.replace(/in \d+s/, 'in ' + remain + 's');
+            };
+            show(withRemaining());
+            setInline(withRemaining(), e.waitMs + 15000);
+            // The countdown keeps ticking for the INLINE status even when the
+            // snackbar has been dismissed/replaced (previously it stopped with
+            // the snackbar, which would freeze the inline text mid-count).
+            var _tTimer = setInterval(function() {
+                if (Date.now() >= until) {
+                    clearInterval(_tTimer);
+                    if (_tChat && _transportCountdownTimers[_tChat] === _tTimer) delete _transportCountdownTimers[_tChat];
+                    var doneText = e.message.replace(/retrying in \d+s/, 'retrying now');
+                    var msgEl = ours();
+                    if (msgEl) msgEl.textContent = doneText;
+                    setInline(doneText, 15000);
+                    return;
+                }
+                var t = withRemaining();
+                var msgEl2 = ours();
+                if (msgEl2) msgEl2.textContent = t;
+                setInline(t, e.waitMs + 15000);
+            }, 1000);
+            if (_tChat) _transportCountdownTimers[_tChat] = _tTimer;
+        } else {
+            show(e.message);
+            setInline(e.message, Math.min((e.waitMs || 8000) + 4000, 44000));
+        }
+        var ttl = Math.min((e.waitMs || 8000) + 2000, 40000);
+        setTimeout(function() {
+            if (ours()) hideSnackbar();
+        }, ttl);
+    } catch (err) {}
 });
 
 AgentEvents.on('error', function(e) {
@@ -343,6 +492,8 @@ AgentEvents.on('error', function(e) {
             chat._lastApiError = { message: msg, chatId: e.chatId, timestamp: Date.now() };
         }
     }
+    // An error while the user is away is activity too — bold the jobs row.
+    _stampChatActivity(e.chatId);
     if (e.chatId === currentChatId) renderMessages();
 });
 
@@ -538,6 +689,7 @@ AgentEvents.on('runCrashed', function(e) {
             });
         } catch (err) { console.warn('runCrashed: onSubAgentRunFinished hook threw', err); }
     }
+    if (e && e.chatId) _stampChatActivity(e.chatId);
     if (e && e.chatId && typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(e.chatId); } catch (err) {} }
     // A crashed hook run never emits silentHookState{active:false} — clear the
     // per-chat flag here too (same self-heal as the runFinished handler).
@@ -628,6 +780,8 @@ function _showParkedToolMessage(chatId, toolCallId, name) {
 }
 
 AgentEvents.on('toolParked', function(e) {
+    // A tool parked on approval needs the user — that's unseen activity.
+    _stampChatActivity(e.chatId);
     var chat = chats[e.chatId];
     if (!chat || !chat.messages) return;
     // Schedule, don't push immediately. The toolUnparked handler clears
@@ -768,16 +922,15 @@ AgentEvents.on('linksChanged', function(e) {
 });
 
 // silentHookState: a silent (hidden) after-response hook — e.g. auto-title —
-// runs its OWN agent loop in the SW and sets `_silentHookRunning` THERE. The
-// page bundle has a separate copy of that flag which would otherwise stay
-// false, so the streamDelta broadcasts for the hook render briefly and then
-// get hidden on the final renderMessages → a visible flash of lines that
-// appear then disappear. Mirror the SW flag onto the page so the existing
-// render gates (renderMessages / updateStreamingMessage) suppress the hook's
-// output while it streams.
+// runs its OWN agent loop in the SW and flags the chat THERE
+// (_silentHookRunningByChat). Mirror it onto the page's per-chat
+// _silentHookChats map (tools/120-actions.js) so the render gates
+// (renderMessages / _updateStreamingMessageNow / showSpinner) suppress the
+// hook's output while it streams — scoped to the hook's OWN chat, so a
+// background chat's hook never freezes the foreground chat's spinner or
+// streaming render (the old global boolean did exactly that).
 AgentEvents.on('silentHookState', function(e) {
-    _silentHookRunning = !!(e && e.active);
-    // Per-chat mirror (tools/120-actions.js): while a chat's silent hooks run,
+    // While a chat's silent hooks run,
     // its jobs rows must NOT show "Running…" — the user-visible answer already
     // landed, so the unseen bell should light up on the row immediately instead
     // of waiting a couple of seconds for the hook run to finish. Re-render the

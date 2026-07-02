@@ -6,7 +6,9 @@ var dbName = STORAGE_PREFIX + 'AppAgentDB';
 // lightweight refs (path, sha, flags) + dirty overlay content only.
 // v13 also runs an eager row migration inside the versionchange
 // transaction (see onupgradeneeded).
-var dbVersion = 13;
+// Bumped to 14 for the `llmEndpoints` store: named endpoint objects
+// { id, name, url, apiKey } that providers reference by endpointId.
+var dbVersion = 14;
 var workspaceMetaStoreName = 'workspace_meta';
 var workspaceFilesStoreName = 'workspace_files';
 // Content-addressed blob store: { sha, content }. Shared across all
@@ -17,6 +19,7 @@ var settingsStoreName = 'settings';
 var skillsStoreName = 'skills';
 var dashboardWidgetsStoreName = 'dashboardWidgets';
 var apiProvidersStoreName = 'apiProviders';
+var llmEndpointsStoreName = 'llmEndpoints';
 var documentsStoreName = 'documents';
 var actionStateStoreName = 'action_state';
 // agent_runs: per-chat run state for the offscreen runtime. Written
@@ -114,6 +117,9 @@ function openDatabase() {
             }
             if (!database.objectStoreNames.contains(apiProvidersStoreName)) {
                 database.createObjectStore(apiProvidersStoreName, { keyPath: 'name' });
+            }
+            if (!database.objectStoreNames.contains(llmEndpointsStoreName)) {
+                database.createObjectStore(llmEndpointsStoreName, { keyPath: 'id' });
             }
             if (!database.objectStoreNames.contains(workspaceMetaStoreName)) {
                 database.createObjectStore(workspaceMetaStoreName, { keyPath: 'repo' });
@@ -243,6 +249,139 @@ function getAllProviders() {
     return apiProviders;
 }
 
+// WIPE-GUARD: mirrors the chats-store flag. saveAllLlmEndpoints is forbidden
+// until a load has SUCCEEDED — an unhydrated save would overwrite the user's
+// stored endpoints (API keys!) with the empty/default in-memory array. Set
+// ONLY in the loadLlmEndpoints onsuccess below.
+var _llmEndpointsHydrated = false;
+
+// LLM Endpoints Management (mirrors the provider functions below).
+// Safe to call twice (page + SW realm): once hydrated, a re-call just
+// refreshes from the store and never re-seeds over in-memory entries.
+async function loadLlmEndpoints() {
+    try {
+        var database = await openDatabase();
+        var transaction = database.transaction([llmEndpointsStoreName], 'readonly');
+        var store = transaction.objectStore(llmEndpointsStoreName);
+        var request = store.getAll();
+        return new Promise(function(resolve) {
+            request.onsuccess = function() {
+                var loaded = request.result || [];
+                // Hydration succeeded — unblock saves BEFORE the seeding/merge
+                // branches below, which legitimately save.
+                _llmEndpointsHydrated = true;
+                if (loaded.length === 0) {
+                    if (llmEndpoints.length === 0) {
+                        // First load — seed with COPIES of the defaults (the
+                        // migration below may donate a key into an entry; the
+                        // pristine DEFAULT_LLM_ENDPOINTS must stay untouched).
+                        llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
+                        saveAllLlmEndpoints();
+                    }
+                    // else: in-memory entries exist but the store is empty
+                    // (save still in flight) — keep them, never re-seed.
+                } else {
+                    llmEndpoints = loaded;
+                    // Merge any new default endpoints not yet in IndexedDB
+                    var added = false;
+                    DEFAULT_LLM_ENDPOINTS.forEach(function(def) {
+                        var exists = llmEndpoints.some(function(ep) { return ep.id === def.id; });
+                        if (!exists) {
+                            llmEndpoints.push(Object.assign({}, def));
+                            added = true;
+                        }
+                    });
+                    if (added) saveAllLlmEndpoints();
+                }
+                resolve();
+            };
+            request.onerror = function() {
+                console.error('Failed to load LLM endpoints:', request.error);
+                // Never clobber hydrated in-memory state on a failed RE-load.
+                if (!_llmEndpointsHydrated && llmEndpoints.length === 0) {
+                    llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
+                }
+                resolve();
+            };
+        });
+    } catch (e) {
+        console.error('IndexedDB error loading LLM endpoints:', e);
+        if (!_llmEndpointsHydrated && llmEndpoints.length === 0) {
+            llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
+        }
+        return Promise.resolve();
+    }
+}
+
+async function saveAllLlmEndpoints() {
+    // WIPE-GUARD: never persist before a successful hydration (see flag above).
+    if (!_llmEndpointsHydrated) {
+        console.error('saveAllLlmEndpoints blocked: endpoints not hydrated — refusing to overwrite stored endpoints');
+        return;
+    }
+    try {
+        var database = await openDatabase();
+        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
+        var store = transaction.objectStore(llmEndpointsStoreName);
+        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
+        // vanished from memory, upsert the rest.
+        var keysRequest = store.getAllKeys();
+        keysRequest.onerror = function() {
+            console.error('saveAllLlmEndpoints: getAllKeys failed — save skipped', keysRequest.error);
+        };
+        transaction.onabort = function() {
+            console.error('saveAllLlmEndpoints: transaction aborted — save lost', transaction.error);
+        };
+        keysRequest.onsuccess = function() {
+            var existingKeys = keysRequest.result || [];
+            var desiredIds = {};
+            llmEndpoints.forEach(function(ep) { if (ep && ep.id) desiredIds[ep.id] = true; });
+            existingKeys.forEach(function(key) {
+                if (!Object.prototype.hasOwnProperty.call(desiredIds, key)) {
+                    try { store.delete(key); } catch (e) { console.error('saveAllLlmEndpoints: delete failed', key, e); }
+                }
+            });
+            llmEndpoints.forEach(function(ep) {
+                if (!ep || !ep.id) { console.warn('saveAllLlmEndpoints: skipping endpoint without an id', ep); return; }
+                try { store.put(ep); } catch (e) { console.error('saveAllLlmEndpoints: put failed', ep.id, e); }
+            });
+        };
+    } catch (e) {
+        console.error('Failed to save all LLM endpoints:', e);
+    }
+}
+
+async function saveLlmEndpoint(endpoint) {
+    try {
+        var database = await openDatabase();
+        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
+        var store = transaction.objectStore(llmEndpointsStoreName);
+        store.put(endpoint);
+        // Update in-memory array
+        var existingIndex = llmEndpoints.findIndex(function(ep) { return ep.id === endpoint.id; });
+        if (existingIndex >= 0) {
+            llmEndpoints[existingIndex] = endpoint;
+        } else {
+            llmEndpoints.push(endpoint);
+        }
+    } catch (e) {
+        console.error('Failed to save LLM endpoint:', e);
+    }
+}
+
+async function deleteLlmEndpoint(endpointId) {
+    try {
+        var database = await openDatabase();
+        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
+        var store = transaction.objectStore(llmEndpointsStoreName);
+        store.delete(endpointId);
+        // Remove from in-memory array
+        llmEndpoints = llmEndpoints.filter(function(ep) { return ep.id !== endpointId; });
+    } catch (e) {
+        console.error('Failed to delete LLM endpoint:', e);
+    }
+}
+
 // WIPE-GUARD: mirrors the chats-store flag. saveAllApiProviders is forbidden
 // until a load has SUCCEEDED — the load failure paths reset `apiProviders` to
 // DEFAULTS, so an unhydrated save would overwrite the user's configured
@@ -251,6 +390,9 @@ var _apiProvidersHydrated = false;
 
 // API Providers Management
 async function loadApiProviders() {
+    // Endpoints must be hydrated first: the endpoint migration below and
+    // resolveProviderConnection() both read the llmEndpoints array.
+    await loadLlmEndpoints();
     try {
         var database = await openDatabase();
         var transaction = database.transaction([apiProvidersStoreName], 'readonly');
@@ -269,22 +411,39 @@ async function loadApiProviders() {
                     saveAllApiProviders();
                 } else {
                     apiProviders = loaded;
-                    // One-shot migration for renamed/retuned defaults (the Opus 4.8
-                    // alignment renamed opus-4.6 → opus-4.8 and sonnet-4.5 →
-                    // sonnet-4.6 and bumped the Opus-4-8 OAuth effort high → xhigh
-                    // without migrating stored providers — upgraders got keyless
-                    // duplicates and stale effort). Only UNCUSTOMIZED legacy
-                    // entries (every field equal to the old default, apiKey
-                    // excepted) are touched; runs BEFORE the default-merge below so
-                    // a rename prevents the duplicate from being added.
+                    // One-shot migration for renamed/removed/retuned defaults.
+                    // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
+                    // sonnet-5, gpt-5.2 → gpt-5.5, Gemini 3 Flash Preview →
+                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5 OAuth; the
+                    // opus-4.8 (OpenRouter), haiku-4.5 and Proxy defaults were
+                    // REMOVED (to: null deletes an untouched copy). Only
+                    // UNCUSTOMIZED legacy entries (every field equal to the old
+                    // default — apiKey excepted for renames, but REQUIRED to match
+                    // for deletions so a keyed entry is never dropped) are touched;
+                    // runs BEFORE the default-merge below so a rename prevents the
+                    // duplicate from being added.
                     // KEEP the from/to names IN SYNC with PROVIDER_RENAMES
                     // (core/030-config.js) — the page-side fallback in
                     // loadProviderFromStorage relies on it when the SW runs this
                     // migration first and the appStorage rewrite below cannot fire.
                     var migratedDefaults = false;
                     [
-                        { to: 'opus-4.8', from: { name: 'opus-4.6', apiKey: '', model: 'anthropic/claude-opus-4-6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
-                        { to: 'sonnet-4.6', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } }
+                        // Deletions — defaults removed in the July 2026 alignment
+                        // (opus-4.6 never got its 4.8 successor either: that
+                        // OpenRouter entry is gone too, so untouched copies drop)
+                        { to: null, from: { name: 'opus-4.6', apiKey: '', model: 'anthropic/claude-opus-4-6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
+                        { to: null, from: { name: 'opus-4.8', apiKey: '', model: 'anthropic/claude-opus-4.8', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'xhigh' } },
+                        { to: null, from: { name: 'haiku-4.5', apiKey: '', model: 'anthropic/claude-haiku-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 32000 } },
+                        { to: null, from: { name: 'Proxy', model: 'anthropic/claude-opus-4-8', endpoint: 'http://localhost:8000/api/v1/chat/completions', apiKey: '----', maxTokens: 100000, context_length: 200000, effort: 'xhigh' } },
+                        // Renames — legacy default → its July 2026 successor
+                        // (sonnet-4.5 chain-collapses straight to sonnet-5: the old
+                        // sonnet-4.6 target no longer exists in the defaults)
+                        { to: 'sonnet-5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
+                        { to: 'sonnet-5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
+                        { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
+                        { to: 'gpt-5.5', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
+                        { to: 'Sonnet 5 OAuth', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } }
                     ].forEach(function(mig) {
                         var idx = -1;
                         for (var i = 0; i < apiProviders.length; i++) {
@@ -292,14 +451,28 @@ async function loadApiProviders() {
                         }
                         if (idx === -1) return;
                         var legacy = apiProviders[idx];
-                        // Uncustomized = exact same shape/values as the old default
-                        // (apiKey excepted — it is carried over).
+                        // Uncustomized = exact same shape/values as the old default.
+                        // Renames except apiKey (it is carried over); deletions
+                        // (to: null) require apiKey to equal the old default too,
+                        // so an entry holding a real key is never dropped.
                         var untouched = Object.keys(mig.from).every(function(k) {
-                            return k === 'apiKey' || legacy[k] === mig.from[k];
+                            return (mig.to && k === 'apiKey') || legacy[k] === mig.from[k];
                         }) && Object.keys(legacy).every(function(k) {
                             return Object.prototype.hasOwnProperty.call(mig.from, k);
                         });
                         if (!untouched) return;
+                        if (!mig.to) {
+                            // Removed default — drop the untouched copy and repoint
+                            // any persisted selection at the config default.
+                            apiProviders.splice(idx, 1);
+                            if (currentProvider === mig.from.name) currentProvider = 'Opus-4-8 OAuth';
+                            if (typeof appStorage !== 'undefined'
+                                && appStorage.getItem('appagent_provider') === mig.from.name) {
+                                try { appStorage.setItem('appagent_provider', 'Opus-4-8 OAuth'); } catch (e) {}
+                            }
+                            migratedDefaults = true;
+                            return;
+                        }
                         var newDef = DEFAULT_API_PROVIDERS.find(function(d) { return d.name === mig.to; });
                         if (!newDef) return;
                         var existingNew = apiProviders.find(function(p) { return p.name === mig.to; });
@@ -355,6 +528,91 @@ async function loadApiProviders() {
                         }
                     });
                     if (migrated) saveAllApiProviders();
+                    // ---------------------------------------------------------
+                    // One-shot endpoint migration (idempotent — it may run in
+                    // BOTH the page and the SW realm; the second run finds
+                    // endpointId already set and only strips leftovers).
+                    // Providers historically carried inline endpoint/apiKey
+                    // fields; endpoints are now first-class NAMED objects in
+                    // the llmEndpoints store and providers reference them by
+                    // endpointId. Each legacy provider's url+key is folded
+                    // into a matching llmEndpoints entry — donating its key
+                    // to a keyless endpoint with the same url (this collapses
+                    // the common single-OpenRouter-key case into the seeded
+                    // 'OpenRouter' entry) — or a new named endpoint is created
+                    // from the url's hostname. Claude-OAuth providers are
+                    // exempt: they keep inline endpoint/apiKey ('oauth') and
+                    // never get an endpointId. No key is ever dropped.
+                    // ---------------------------------------------------------
+                    var epProvidersChanged = false;
+                    var epEndpointsChanged = false;
+                    var epDefaultUrl = 'https://openrouter.ai/api/v1/chat/completions';
+                    apiProviders.forEach(function(p) {
+                        if (!p || p.isClaudeOAuth) return;
+                        if (p.endpointId && getLlmEndpointById(p.endpointId)) {
+                            // Already migrated — strip any leftover inline
+                            // fields (e.g. the default-rename path above
+                            // copies a legacy apiKey onto the new default
+                            // shape). Donate a leftover key to the referenced
+                            // endpoint if it is still keyless, so no key is
+                            // ever lost.
+                            if (Object.prototype.hasOwnProperty.call(p, 'apiKey')) {
+                                var refEp = getLlmEndpointById(p.endpointId);
+                                if (p.apiKey && p.apiKey !== 'oauth' && !(refEp.apiKey || '')) {
+                                    refEp.apiKey = p.apiKey;
+                                    epEndpointsChanged = true;
+                                }
+                                delete p.apiKey;
+                                epProvidersChanged = true;
+                            }
+                            if (Object.prototype.hasOwnProperty.call(p, 'endpoint')) {
+                                delete p.endpoint;
+                                epProvidersChanged = true;
+                            }
+                            return;
+                        }
+                        var epUrl = p.endpoint || epDefaultUrl;
+                        var epKey = p.apiKey || '';
+                        // Reuse an endpoint with the same url whose key matches
+                        // (or which has no key yet — the provider donates its
+                        // key into it).
+                        var ep = null;
+                        for (var ei = 0; ei < llmEndpoints.length; ei++) {
+                            var cand = llmEndpoints[ei];
+                            if (cand.url === epUrl && ((cand.apiKey || '') === epKey || (cand.apiKey || '') === '')) {
+                                ep = cand;
+                                break;
+                            }
+                        }
+                        if (ep) {
+                            if (!(ep.apiKey || '') && epKey) {
+                                ep.apiKey = epKey;
+                                epEndpointsChanged = true;
+                            }
+                        } else {
+                            // No match — create a named endpoint from the
+                            // url's hostname (unique id slug + unique name).
+                            var epHost = '';
+                            try { epHost = new URL(epUrl).hostname.replace(/^www\./, ''); } catch (eHost) { epHost = ''; }
+                            var epBaseId = (epHost || 'endpoint').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'endpoint';
+                            var epId = epBaseId;
+                            var epIdSuffix = 2;
+                            while (getLlmEndpointById(epId)) { epId = epBaseId + '-' + epIdSuffix; epIdSuffix++; }
+                            var epBaseName = epHost || 'Endpoint';
+                            var epName = epBaseName;
+                            var epNameSuffix = 2;
+                            while (llmEndpoints.some(function(x) { return x.name === epName; })) { epName = epBaseName + ' (' + epNameSuffix + ')'; epNameSuffix++; }
+                            ep = { id: epId, name: epName, url: epUrl, apiKey: epKey };
+                            llmEndpoints.push(ep);
+                            epEndpointsChanged = true;
+                        }
+                        p.endpointId = ep.id;
+                        delete p.endpoint;
+                        delete p.apiKey;
+                        epProvidersChanged = true;
+                    });
+                    if (epEndpointsChanged) saveAllLlmEndpoints();
+                    if (epProvidersChanged) saveAllApiProviders();
                 }
                 resolve();
             };
@@ -484,6 +742,15 @@ async function loadSkillsFromStorage() {
     }
 }
 
+// Base64 → UTF-8 string. Embedded skill bodies/assets are encoded as UTF-8
+// bytes (btoa(unescape(encodeURIComponent(s))) in the build); a plain atob()
+// decode reads those bytes as Latin-1 and mangles every multibyte char
+// (e.g. "—" → "â" + control chars, "é" → "Ã©").
+function _b64DecodeUtf8(b64) {
+    var raw = atob(b64);
+    try { return decodeURIComponent(escape(raw)); } catch (e) { return raw; }
+}
+
 async function importEmbeddedSkills() {
     if (!EMBEDDED_SKILLS || !EMBEDDED_SKILLS.length) return;
     try {
@@ -504,6 +771,24 @@ async function importEmbeddedSkills() {
                     needsSaveActive = true;
                     await loadSkillTools(embedded.id);
                 }
+                // Self-heal: older builds decoded the embedded body with plain
+                // atob(), storing mojibake ("—" → "â"+controls). The build hash
+                // still matches (it's computed from the clean source), so without
+                // this check the corrupted copy would never be repaired.
+                if (existing && !existing.userModified) {
+                    var healedBody = _b64DecodeUtf8(embedded.body);
+                    if (existing.body !== healedBody) {
+                        existing.body = healedBody;
+                        existing.updatedAt = Date.now();
+                        await saveSkill(existing);
+                        await deleteSkillAssets(embedded.id);
+                        var healAssets = embedded.assets || [];
+                        for (var hk = 0; hk < healAssets.length; hk++) {
+                            await saveSkillAsset(embedded.id, healAssets[hk].filename, healAssets[hk].type, _b64DecodeUtf8(healAssets[hk].content));
+                        }
+                        await loadSkillTools(embedded.id);
+                    }
+                }
                 // Backfill: users who installed via an older build that dropped
                 // actions entirely have stored actions=[]. Even though the hash
                 // matches, refresh from the embedded frontmatter so their
@@ -512,7 +797,7 @@ async function importEmbeddedSkills() {
                 // we don't want to clobber legitimately-empty user edits.
                 if (existing && (!Array.isArray(existing.actions) || existing.actions.length === 0) && embedded.frontmatter && !existing.userModified) {
                     try {
-                        var fmDecodedBackfill = atob(embedded.frontmatter);
+                        var fmDecodedBackfill = _b64DecodeUtf8(embedded.frontmatter);
                         var parsedBackfill = _parseFrontmatter(fmDecodedBackfill);
                         var backfilled = (parsedBackfill.actions || []).map(sanitizeAction).filter(function(a){ return a; });
                         if (backfilled.length) {
@@ -527,12 +812,12 @@ async function importEmbeddedSkills() {
 
             // New or updated content — save/update skill
             if (existing) await deleteSkillAssets(embedded.id);
-            var decodedBody = atob(embedded.body);
+            var decodedBody = _b64DecodeUtf8(embedded.body);
             // Parse actions from the raw frontmatter if provided by the build
             var embeddedActions = [];
             if (embedded.frontmatter) {
                 try {
-                    var fmDecoded = atob(embedded.frontmatter);
+                    var fmDecoded = _b64DecodeUtf8(embedded.frontmatter);
                     var parsed = _parseFrontmatter(fmDecoded);
                     embeddedActions = (parsed.actions || []).map(sanitizeAction).filter(function(a){ return a; });
                 } catch (e) { /* non-fatal */ }
@@ -551,7 +836,7 @@ async function importEmbeddedSkills() {
             });
             var assets = embedded.assets || [];
             for (var j = 0; j < assets.length; j++) {
-                await saveSkillAsset(embedded.id, assets[j].filename, assets[j].type, atob(assets[j].content));
+                await saveSkillAsset(embedded.id, assets[j].filename, assets[j].type, _b64DecodeUtf8(assets[j].content));
             }
             // Activate if not already active
             if (!activeSkills[embedded.id]) {

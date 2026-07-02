@@ -896,7 +896,7 @@ function renderDocumentsPage() {
 async function sdocDeleteFromPage(docId) {
     var doc = smartDocuments[docId];
     var title = doc ? doc.title : 'this document';
-    if (!await showConfirmModal('Delete Document', 'Delete "' + title + '" and all its versions? This cannot be undone.')) return;
+    if (!await showConfirmModal('Delete Document', 'Delete "' + title + '" and all its versions? This cannot be undone.', 'danger')) return;
     await deleteDocumentById(docId);
     renderDocumentsPage();
     renderVersionSidebar();

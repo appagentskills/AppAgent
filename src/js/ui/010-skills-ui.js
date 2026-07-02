@@ -118,7 +118,7 @@ async function addSkillAsset() {
 
 async function removeSkillAsset(filename) {
     if (!currentEditingSkill) return;
-    var confirmed = await showConfirmModal('Remove File', 'Remove ' + filename + ' from this skill?');
+    var confirmed = await showConfirmModal('Remove File', 'Remove ' + filename + ' from this skill?', 'danger');
     if (!confirmed) return;
     await deleteSkillAsset(currentEditingSkill, filename);
     await renderSkillAssets();
@@ -367,7 +367,7 @@ async function saveCurrentSkill() {
 
 async function deleteCurrentSkill() {
     if (!currentEditingSkill) return;
-    var confirmed = await showConfirmModal('Delete Skill', 'Delete this skill? This cannot be undone.');
+    var confirmed = await showConfirmModal('Delete Skill', 'Delete this skill? This cannot be undone.', 'danger');
     if (!confirmed) return;
     await deleteSkill(currentEditingSkill);
     showSnackbar('Skill deleted', 'success');

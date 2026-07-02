@@ -246,8 +246,13 @@ function updateInputPosition() {
 function showSpinner(text, chatId) {
     // In compact mode, skip the spinner - the collapsible area shows status
     if (compactToolCalls) return;
-    // Skip spinner during silent hook runs
-    if (_silentHookRunning) return;
+    // Skip spinner while the TARGET chat's silent after-response hook runs.
+    // Per-chat (tools/120-actions.js _silentHookChats): a background chat's
+    // hook must not suppress the foreground chat's spinner — the old global
+    // flag hid the visible chat's "Thinking…" whenever ANY chat ran its
+    // hidden title/tldr/links turn.
+    var _spTarget = chatId || currentChatId;
+    if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(_spTarget)) return;
     // Per-chat scoping: callers running in a background chat (chatId !== currentChatId)
     // must NOT inject their spinner into the foreground container. Without this guard,
     // a background `runAgent` calling showSpinner('Waiting for response...') would

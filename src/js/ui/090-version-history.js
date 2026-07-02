@@ -843,7 +843,7 @@ async function redoAllInlineChanges(userMsgIdx) {
 
 // Delete a newly created record
 async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.')) return;
+    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
 
     try {
         showSpinner('Deleting ' + displayName + '...');

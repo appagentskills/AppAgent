@@ -209,7 +209,7 @@ var hooksEnabled = (typeof hooksEnabled === 'object' && hooksEnabled) || {
     autoLinks: true,
     showHookMessages: false
 };
-var _silentHookRunning = (typeof _silentHookRunning !== 'undefined') ? _silentHookRunning : false;
+var _silentHookRunningByChat = (typeof _silentHookRunningByChat !== 'undefined') ? _silentHookRunningByChat : {};
 
 // Hydrate hooksEnabled from IDB. Matches the page-side `loadHooksSettings`
 // in core/040-hooks-history.js. Without this the SW always sees the defaults
@@ -345,12 +345,17 @@ function executeAfterResponseHooks(chatId) {
         instruction = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: ' + numbered + '.';
     }
 
-    _silentHookRunning = !hooksEnabled.showHookMessages;
+    var _hookIsSilent = !hooksEnabled.showHookMessages;
+    // Per-chat flag (see worker/000-runtime-globals.js): only THIS chat's
+    // finish may consume/clear it — concurrent chats no longer clobber each
+    // other's silent-hook window.
+    if (_hookIsSilent) _silentHookRunningByChat[chatId] = true;
     // Tell the page to mirror the silent-hook flag so its render gates
     // suppress this hook's streaming output (prevents the flash of lines
     // that appear then disappear). Cleared via silentHookState(false) at the
-    // agent-loop reset. No-op when the hook isn't silent.
-    if (_silentHookRunning && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+    // agent-loop reset. No-op when the hook isn't silent. The page keeps a
+    // per-chat _silentHookChats map, so other chats' UI is unaffected.
+    if (_hookIsSilent && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
         AgentEvents.emit('silentHookState', { active: true, chatId: chatId });
     }
     chat.messages.push({

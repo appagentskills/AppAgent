@@ -425,7 +425,12 @@ function isChatInterrupted(chat) {
     while (lastIdx >= 0) {
         var _wm = msgs[lastIdx];
         if (_AUX_ROLES_FOR_INTERRUPTION.indexOf(_wm.role) >= 0) { lastIdx--; continue; }
-        if (_wm.role === 'tool' && _wm.name && _ANSWER_CARD_TOOLS_FOR_INTERRUPTION[_wm.name] && !_wm._placeholder) { lastIdx--; continue; }
+        // Only skip GENUINE results: abandoned/interrupted markers (written by
+        // recordToolResult on pause/interrupt, which deletes _placeholder) start
+        // with '[Tool call ' — those mean the hook turn was cut short and MUST
+        // count as an interruption so Continue is offered.
+        if (_wm.role === 'tool' && _wm.name && _ANSWER_CARD_TOOLS_FOR_INTERRUPTION[_wm.name] && !_wm._placeholder &&
+            !(typeof _wm.content === 'string' && _wm.content.indexOf('[Tool call ') === 0)) { lastIdx--; continue; }
         break;
     }
     if (lastIdx < 0) return false;

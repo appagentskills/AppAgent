@@ -1657,8 +1657,33 @@
     color: var(--primary);
     font-size: var(--text-caption); font-weight: var(--font-semibold);
 }
-.jobs-expand-close {
+/* Layout toggle (columns vs sections) — a two-button segmented control pushed
+   to the right of the header, just before the close button (which therefore no
+   longer needs its own auto margin — the toggle is always rendered). */
+.jobs-expand-layout-toggle {
     margin-left: auto;
+    display: inline-flex;
+    border: 1px solid var(--secondary-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    flex-shrink: 0;
+}
+.jobs-expand-layout-btn {
+    width: 32px; height: 28px;
+    border: none; background: transparent;
+    color: var(--text-muted); cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0;
+}
+.jobs-expand-layout-btn + .jobs-expand-layout-btn { border-left: 1px solid var(--secondary-border); }
+.jobs-expand-layout-btn:hover { background: var(--secondary-border); color: var(--text-primary); }
+.jobs-expand-layout-btn.active {
+    background: var(--primary-lighter, rgba(37, 99, 235, 0.12));
+    color: var(--primary);
+}
+.jobs-expand-layout-btn svg { width: 15px; height: 15px; }
+.jobs-expand-close {
+    margin-left: 0;
     width: 32px; height: 32px;
     border: 1px solid transparent; background: transparent;
     color: var(--text-muted); cursor: pointer;
@@ -1699,6 +1724,21 @@
     flex: 1; min-height: 0; overflow-y: auto;
     display: flex; flex-direction: column; gap: var(--space-3);
     padding-right: 2px;
+}
+/* Sections layout: buckets stack vertically (Active first) and the WHOLE body
+   scrolls — unlike the columns layout where each column scrolls on its own.
+   Cards sit in a grid capped at two per row. */
+.jobs-expand-body.layout-sections { overflow-y: auto; display: block; }
+.jobs-expand-sections {
+    display: flex; flex-direction: column; gap: var(--space-5);
+    width: 100%;
+}
+.jobs-expand-section { min-width: 0; }
+.jobs-expand-section-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
+    align-items: start;
 }
 .jobs-expand-col-empty {
     color: var(--text-muted); opacity: 0.7;

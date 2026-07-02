@@ -5,7 +5,11 @@ var hooksEnabled = {
     autoLinks: true, // Hook to ask the agent for relevant links after each answer
     showHookMessages: false // Show hook messages in chat UI
 };
-var _silentHookRunning = false; // Suppress UI updates during silent hook runs
+// Per-chat silent-hook flags for the shared agent loop (app/030-agent-loop.js).
+// The SW bundle declares its own copy in worker/000-runtime-globals.js; on the
+// page this stays dormant (the authoritative loop runs in the SW, and the
+// page's UI gates use the _silentHookChats map in tools/120-actions.js).
+var _silentHookRunningByChat = {};
 
 // Browser History Management
 function getHistoryTitle(view, chatId, skillId) {
@@ -69,13 +73,14 @@ function handlePopState(event) {
         if (targetView === 'chat' && targetChatId && chats[targetChatId]) {
             // Close any open view first
             hideAllPanels();
-            showChatView();
+            // Set currentView/currentChatId BEFORE showChatView() so its gated
+            // lastViewedAt stamp applies to the chat being opened — otherwise
+            // the jobs row stays bold/unread (same ordering as SWM2-T3 below).
             currentView = 'chat';
             appStorage.setItem('currentView', 'chat');
-            
-            // Select the chat
             currentChatId = targetChatId;
             appStorage.setItem('lastChatId', targetChatId);
+            showChatView();
             // Viewing the chat via Back/Forward consumes its finished-chat bell
             // entry (ui/165-finished-chat-badge.js) — this entry point bypasses
             // both selectChat() and showChatView()'s gated clear.
@@ -299,135 +304,9 @@ async function toggleHook(hookName) {
     renderSettingsPage();
 }
 
-// The final-answer target search for the TL;DR / Links hook gating lives in
-// findHookAnswerTarget (tools/020-tool-execution.js) — shared with the SW
-// bundle, the executeSetTldr / executeSetLinks implementations, and the
-// page-side mirror handlers, so gating and attachment always agree on the
-// same target message.
-
-// Execute hooks after agent completes. autoTitle + autoTldr share ONE
-// combined hook run (single extra LLM call) when both are needed.
-function executeAfterResponseHooks(chatId) {
-    var chat = chats[chatId];
-    if (!chat) return;
-
-    // Auto-title hook: generate title if chat has no real title yet
-    // (none, default, or the provisional first-message snippet set by
-    // updateChatTitle — the hook upgrades that to a model-generated one).
-    var needsTitle = false;
-    if (hooksEnabled.autoTitle && (!chat.title || chat.title === 'New Chat' || chat.titleProvisional)) {
-        // Retry cap: each pass here means the previous hook run (if any) failed
-        // to call set_chat_title (success sets a real title and clears
-        // titleProvisional, making this condition false). After 2 failed
-        // attempts, accept the provisional snippet as final instead of burning
-        // an extra LLM run on every subsequent response.
-        chat._titleHookTries = (chat._titleHookTries || 0) + 1;
-        if (chat._titleHookTries > 2) {
-            delete chat.titleProvisional;
-            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
-        } else {
-            needsTitle = true;
-        }
-    }
-
-    // TLDR hook: ask for a TL;DR card on the final answer of the last real
-    // turn. Single attempt per answer (_tldrAsked, set BEFORE firing)
-    // prevents hook loops when the model fails to call set_tldr.
-    // Skipped on background chats (actions / sub-agents): the TL;DR card is
-    // never rendered there, so the extra hook LLM run would be pure waste.
-    var needsTldr = false;
-    if (hooksEnabled.autoTldr && !chat.isBackground && chat.messages && chat.messages.length) {
-        var tldrTarget = findHookAnswerTarget(chat);
-        if (tldrTarget && !tldrTarget.tldr && relocateAnswerCard(chat, 'tldr')) {
-            // A spontaneous mid-run set_tldr attached the card to an earlier
-            // message of this turn — relocateAnswerCard moved it onto the
-            // final answer. The hook is satisfied; no extra LLM run. Emit so
-            // mirrors/renders pick up the relocated card.
-            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
-            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
-                AgentEvents.emit('tldrChanged', { chatId: chatId, tldr: tldrTarget.tldr });
-            }
-        } else if (tldrTarget && !tldrTarget.tldr && !tldrTarget._tldrAsked) {
-            // Retry cap mirroring _titleHookTries: a successful set_tldr
-            // resets the counter (executeSetTldr); repeated failures stop
-            // burning an extra LLM run on every subsequent response.
-            chat._tldrHookTries = (chat._tldrHookTries || 0) + 1;
-            if (chat._tldrHookTries <= 2) {
-                tldrTarget._tldrAsked = true;
-                needsTldr = true;
-            }
-        }
-    }
-
-    // Links hook: ask for a list of relevant links (PRs, diffs, records, docs)
-    // on the final answer of the last real turn. Single attempt per answer
-    // (_linksAsked, set BEFORE firing) prevents hook loops when the model fails
-    // to call set_links. Skipped on background chats: the links card is never
-    // rendered there, so the extra hook LLM run would be pure waste.
-    var needsLinks = false;
-    if (hooksEnabled.autoLinks && !chat.isBackground && chat.messages && chat.messages.length) {
-        var linksTarget = findHookAnswerTarget(chat);
-        if (linksTarget && !linksTarget.links && relocateAnswerCard(chat, 'links')) {
-            // Spontaneous mid-run set_links — same relocation as the TLDR
-            // branch above; hook satisfied without an extra LLM run.
-            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
-            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
-                AgentEvents.emit('linksChanged', { chatId: chatId, links: linksTarget.links });
-            }
-        } else if (linksTarget && !linksTarget.links && !linksTarget._linksAsked) {
-            // Retry cap mirroring _tldrHookTries: a successful set_links resets
-            // the counter (executeSetLinks); repeated failures stop burning an
-            // extra LLM run on every subsequent response.
-            chat._linksHookTries = (chat._linksHookTries || 0) + 1;
-            if (chat._linksHookTries <= 2) {
-                linksTarget._linksAsked = true;
-                needsLinks = true;
-            }
-        }
-    }
-
-    if (!needsTitle && !needsTldr && !needsLinks) return;
-
-    // Build ONE combined instruction so title + TL;DR + links share a single
-    // extra LLM run when more than one is needed.
-    var tasks = [];
-    if (needsTitle) tasks.push('set a concise chat title (max 50 chars) using the set_chat_title tool');
-    if (needsTldr) tasks.push('provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars)');
-    if (needsLinks) tasks.push('provide any relevant links using the set_links tool — an array of {title, url} for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty array if there is nothing worth linking');
-    var instruction;
-    if (tasks.length === 1) {
-        instruction = 'Now ' + tasks[0] + '. Do NOT say anything else.';
-    } else {
-        var numbered = tasks.map(function(t, i) { return (i + 1) + ') ' + t; }).join('; ');
-        instruction = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: ' + numbered + '.';
-    }
-    executeHookRun(chatId, instruction);
-}
-
-// Generic hook-run implementation — appends ONE hidden hook message and
-// re-runs the agent. (Replaces the old executeAutoTitleHook; shared by the
-// autoTitle + autoTldr hooks.)
-function executeHookRun(chatId, instruction) {
-    var chat = chats[chatId];
-    if (!chat || !chat.messages || chat.messages.length < 2) {
-        return;
-    }
-
-    // Suppress UI updates during hook if hook messages are hidden
-    _silentHookRunning = !hooksEnabled.showHookMessages;
-
-    chat.messages.push({
-        role: 'user',
-        content: instruction,
-        isHookMessage: true
-    });
-    saveChatsToStorage();
-    if (hooksEnabled.showHookMessages) {
-        renderMessages();
-    }
-
-    // Pass chatId explicitly — matches the SW stub in worker/020-page-stubs.js.
-    // A bare runAgent() falls back to currentChatId, which targets the WRONG
-    // chat when the completed run was a background chat.
-    runAgent(chatId);
-}
+// The after-response hook implementations (executeAfterResponseHooks /
+// executeHookRun) live in worker/020-page-stubs.js — the agent loop runs in
+// the SERVICE WORKER, so the SW copy is the only live one. The page-bundle
+// duplicates that used to live here were dead code (the page's runAgent is
+// replaced by the port bridge in app/045-agent-port-bridge-page.js) and had
+// drifted from the SW copy; they were removed to prevent further drift.

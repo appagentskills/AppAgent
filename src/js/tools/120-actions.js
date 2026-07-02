@@ -1778,6 +1778,19 @@ var RECENT_CHAT_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 // runFinished / runCrashed handlers (app/036-agent-event-handlers-page.js).
 var _recentlyFinishedChats = {};
 
+// True only when the user is genuinely LOOKING at this chat: it is the focused
+// chat AND the chat view is the active view. On home/history/settings/dashboard
+// views currentChatId still points at the last-opened chat, but the user cannot
+// see its messages — activity/finishes there must count as UNSEEN (bell + bold),
+// mirroring noteChatFinishedUnseen (ui/165-finished-chat-badge.js). Before this
+// check, a chat finishing while the user sat on the Home view (e.g. watching the
+// expanded jobs modal) was stamped 'seen' via the bare currentChatId comparison,
+// so its card/row never showed the bell in real time.
+function _isChatViewFocused(chatId) {
+    if (typeof currentChatId === 'undefined' || chatId !== currentChatId) return false;
+    return (typeof currentView === 'undefined' || currentView === 'chat');
+}
+
 // Helper for renderers: is this chat actually streaming right now (vs lingering)?
 function isChatActivelyRunning(chatId) {
     return !!(typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]);
@@ -1827,8 +1840,49 @@ function _isChatUnseen(chatId) {
     // Running / approval-blocked chats are handled by isChatBusy; this predicate
     // is only about an idle chat with an unread response.
     if (typeof isChatBusy === 'function' && isChatBusy(chatId)) return false;
-    return !!(c.lastResponseAt && c.lastResponseAt > (c.lastViewedAt || 0) &&
-        (typeof currentChatId === 'undefined' || chatId !== currentChatId));
+    var _lastAct = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+    return !!(_lastAct && _lastAct > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId));
+}
+
+// True when the chat has ANY activity (finished response OR mid-run event —
+// assistant message, tool call, error, approval request…) newer than the
+// user's last view. This is the 'unread email' predicate for BOLD rows: unlike
+// _isChatUnseen it deliberately ignores running/error state — a chat producing
+// output while the user is away must read as unread until they open it.
+function _chatHasUnseenActivity(chatId) {
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || c.isBackground || c.isSubAgent) return false;
+    if (_isChatViewFocused(chatId)) return false;
+    var last = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+    return !!(last && last > (c.lastViewedAt || 0));
+}
+
+// Stamp user-visible activity on a chat. Called from the page-side agent event
+// handlers (036-agent-event-handlers-page.js) for anything that lands on a chat:
+// assistant messages, tool calls, injected user messages, errors, parked
+// approvals, run starts/crashes. If the user is NOT viewing the chat, the stamp
+// flips it to 'unread' (bold in the jobs lists) until they open it. The focused
+// chat sees its own activity, so its lastViewedAt is refreshed instead. Silent
+// after-response hooks (auto title/tldr) are invisible work, not new activity.
+function markChatActivity(chatId) {
+    if (!chatId) return;
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || c.isBackground || c.isSubAgent) return;
+    if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId)) return;
+    var now = Date.now();
+    if (_isChatViewFocused(chatId)) {
+        c.lastViewedAt = now; // watching — seen as it happens
+        return;
+    }
+    var wasUnread = _chatHasUnseenActivity(chatId);
+    c.lastActivityAt = now;
+    if (wasUnread) return; // already bold — no repaint/save churn per event
+    try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (e) {}
+    try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
+    try {
+        var _jdAct = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+        if (_jdAct && typeof renderJobsDropdown === 'function') renderJobsDropdown(_jdAct);
+    } catch (e) {}
 }
 
 // True when this chat (as root or direct parent) still owns a sub-agent that is
@@ -1873,7 +1927,7 @@ function markChatRecentlyFinished(chatId) {
         c.lastResponseAt = Date.now();
         // A re-run un-hides a chat the user previously removed from the jobs list.
         if (c._jobsHidden) delete c._jobsHidden;
-        if (typeof currentChatId !== 'undefined' && chatId === currentChatId) c.lastViewedAt = Date.now();
+        if (_isChatViewFocused(chatId)) c.lastViewedAt = Date.now();
         if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     }
     _recentlyFinishedChats[chatId] = Date.now();
@@ -1945,8 +1999,9 @@ function getActiveChatsList() {
         Object.keys(chats).forEach(function(cid) {
             var c = chats[cid];
             if (!c || !Array.isArray(c.messages) || !c.messages.length) return;
-            var unseen = !!(c.lastResponseAt && c.lastResponseAt > (c.lastViewedAt || 0) &&
-                (typeof currentChatId === 'undefined' || cid !== currentChatId));
+            var _uLast = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+            var unseen = !!(_uLast && _uLast > (c.lastViewedAt || 0) &&
+                (typeof _isChatViewFocused !== 'function' || !_isChatViewFocused(cid)));
             var young = !!(c.createdAt && (now - c.createdAt) < RECENT_CHAT_WINDOW_MS);
             if (unseen || young) consider(cid);
         });
@@ -2051,7 +2106,12 @@ function renderJobsBadge() {
     // NOT add a spinner or force a 'running' colour — only actively-streaming
     // chats do.
     var runningChats = 0;
-    chatList.forEach(function(c){ if (isChatActivelyRunning(c.id) || chatHasRunningSubAgents(c.id)) runningChats++; });
+    // Silent-hook window: rows already show the finished bell (PR #486) — the
+    // badge must not keep a running spinner for the same chat.
+    chatList.forEach(function(c){
+        if ((isChatActivelyRunning(c.id) || chatHasRunningSubAgents(c.id)) &&
+            !(typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(c.id))) runningChats++;
+    });
     var count = list.length + chatList.length;
     var running = getRunningActionsCount() + runningChats;
     var agg = _getAggregateActionState();
@@ -2262,14 +2322,16 @@ function renderJobsDropdown(dropdown) {
         // Unseen: the chat got a response after the user last viewed it (the
         // focused chat is always seen) — flag it so the user knows to catch up.
         var _cUnseen = !_cRunning && !_cErr && c.lastResponseAt &&
-            c.lastResponseAt > (c.lastViewedAt || 0) &&
-            (typeof currentChatId === 'undefined' || c.id !== currentChatId);
+            c.lastResponseAt > (c.lastViewedAt || 0) && !_isChatViewFocused(c.id);
+        // Unread (bold) is BROADER than the bell: ANY activity — including on a
+        // still-running or errored chat — the user hasn't viewed yet counts.
+        var _cUnread = _cUnseen || _chatHasUnseenActivity(c.id);
         var _cLabel = _cApproval ? 'Awaiting approval' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished')));
         if (_cUnseen) _cIcon = '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>';
         var _cCur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
         // Unseen finished response → bold the title like an unread email (the
         // .jobs-unread CSS rule), until the user opens the chat.
-        return '<div class="jobs-dropdown-row state-' + _cState + _cCur + (_cUnseen ? ' jobs-unread' : '') + '" ' +
+        return '<div class="jobs-dropdown-row state-' + _cState + _cCur + (_cUnread ? ' jobs-unread' : '') + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
             '<span class="jobs-row-icon">' + _cIcon + '</span>' +
@@ -2361,8 +2423,8 @@ function _jobsChatState(chatId) {
     var paused = (typeof isChatPaused === 'function') ? isChatPaused(chatId) : false;
     if (running && !paused) return 'running';
     if (c && c._lastApiError) return 'error';
-    if (c && c.lastResponseAt && c.lastResponseAt > (c.lastViewedAt || 0) &&
-        (typeof currentChatId === 'undefined' || chatId !== currentChatId)) return 'unseen';
+    var _stLast = c ? Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0) : 0;
+    if (_stLast && _stLast > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId)) return 'unseen';
     return 'done';
 }
 // Recent = non-empty chats touched in the last week (7 days), newest first,
@@ -2483,7 +2545,7 @@ function _jobsPinnedRowHtml(c, timeW) {
         ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
         : '<span class="jobs-row-pin-dot">' + UI_ICONS.pinFilled + '</span>';
     var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" ' +
+    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div></div>' +
@@ -2505,7 +2567,7 @@ function _jobsChatRowHtml(c, mode, timeW) {
     var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
     // No per-state row tint on Recent/Done rows — the status dot already conveys
     // state; only the current chat gets a highlight (.is-current).
-    return '<div class="jobs-dropdown-row jobs-chat-row' + cur + (st === 'unseen' ? ' jobs-unread' : '') + '" ' +
+    return '<div class="jobs-dropdown-row jobs-chat-row' + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main">' +
@@ -2523,7 +2585,7 @@ function _jobsTodayRowHtml(c, timeW) {
     var st = _jobsChatState(c.id);
     // Unread = a finished response the user hasn't opened yet. Show a bell + bold
     // title (like an unread email) until they view the chat; otherwise a green check.
-    var _unread = (st === 'unseen');
+    var _unread = (st === 'unseen') || _chatHasUnseenActivity(c.id);
     var _todayIndicator = _unread
         ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
         : '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
@@ -2755,6 +2817,17 @@ function expandJobsDropdown() {
         try { renderJobsExpandModal(); } catch (e) {}
     }, 1000);
 }
+// Layout preference for the expand modal: 'columns' (kanban, like the
+// dropdown) or 'sections' (stacked sections — Active first with all its cards
+// in a 2-per-row grid, then the next section). Persisted across sessions.
+function _getJobsExpandLayout() {
+    try { if (localStorage.getItem('jobs_expand_layout') === 'sections') return 'sections'; } catch (e) {}
+    return 'columns';
+}
+function setJobsExpandLayout(mode) {
+    try { localStorage.setItem('jobs_expand_layout', mode === 'sections' ? 'sections' : 'columns'); } catch (e) {}
+    renderJobsExpandModal();
+}
 function _jobsExpandEscHandler(e) {
     if (e && e.key === 'Escape') { e.stopPropagation(); closeJobsExpandModal(); }
 }
@@ -2801,6 +2874,7 @@ function renderJobsExpandModal() {
     var todayChats = (typeof getCompletedTodayChats === 'function') ? getCompletedTodayChats() : [];
     var total = activeChats.length + pinnedChats.length + todayChats.length;
     var closeIcon = UI_ICONS.close || '\u00d7';
+    var layout = _getJobsExpandLayout();
     // Three fixed columns side by side — Active, then Completed Today, then
     // Pinned (kanban-style). Each column keeps its own header and stacks its
     // cards vertically. Empty columns still render (with a placeholder) so the
@@ -2815,9 +2889,28 @@ function renderJobsExpandModal() {
             '<div class="jobs-expand-col-cards">' + cards + '</div>' +
         '</div>';
     }
+    // Sections layout: each bucket becomes a full-width section (Active first),
+    // its cards laid out in a grid of at most two per row. Empty sections are
+    // skipped — the section list flows vertically and the whole body scrolls.
+    function section(label, arr) {
+        if (!arr.length) return '';
+        return '<div class="jobs-expand-section">' +
+            '<div class="jobs-expand-subhead">' + escapeHtml(label) +
+                ' <span class="jobs-expand-col-count">' + arr.length + '</span></div>' +
+            '<div class="jobs-expand-section-cards">' +
+                arr.map(function(c) { return _jobsExpandCardHtml(c); }).join('') +
+            '</div>' +
+        '</div>';
+    }
     var body;
     if (!total) {
         body = '<div class="jobs-expand-empty">No active chats right now</div>';
+    } else if (layout === 'sections') {
+        body = '<div class="jobs-expand-sections">' +
+            section('Active', activeChats) +
+            section('Completed Today', todayChats) +
+            section('Pinned', pinnedChats) +
+        '</div>';
     } else {
         body = '<div class="jobs-expand-columns">' +
             column('Active', activeChats) +
@@ -2825,14 +2918,23 @@ function renderJobsExpandModal() {
             column('Pinned', pinnedChats) +
         '</div>';
     }
+    // Header toggle: switch between the kanban columns view and the stacked
+    // sections view. Rendered as a two-button segmented control.
+    var colIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"></rect><rect x="9.5" y="4" width="5" height="16" rx="1"></rect><rect x="16" y="4" width="5" height="16" rx="1"></rect></svg>';
+    var secIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1"></rect><rect x="3" y="14" width="18" height="7" rx="1"></rect></svg>';
+    var layoutToggle = '<div class="jobs-expand-layout-toggle" role="group" aria-label="Card layout">' +
+        '<button class="jobs-expand-layout-btn' + (layout === 'columns' ? ' active' : '') + '" title="Column view" aria-label="Column view" onclick="setJobsExpandLayout(\'columns\')">' + colIcon + '</button>' +
+        '<button class="jobs-expand-layout-btn' + (layout === 'sections' ? ' active' : '') + '" title="Section view" aria-label="Section view" onclick="setJobsExpandLayout(\'sections\')">' + secIcon + '</button>' +
+    '</div>';
     var html =
         '<div class="jobs-expand-modal" role="dialog" aria-label="Active chats">' +
             '<div class="jobs-expand-head">' +
                 '<span class="jobs-expand-title">Active Chats</span>' +
                 '<span class="jobs-expand-count">' + total + '</span>' +
+                layoutToggle +
                 '<button class="jobs-expand-close" aria-label="Close" onclick="closeJobsExpandModal()">' + closeIcon + '</button>' +
             '</div>' +
-            '<div class="jobs-expand-body">' + body + '</div>' +
+            '<div class="jobs-expand-body' + (layout === 'sections' ? ' layout-sections' : '') + '">' + body + '</div>' +
         '</div>';
     // Diff: skip the repaint (and its flicker) when nothing changed.
     if (overlay._jobsLastHtml === html) {
@@ -2869,7 +2971,7 @@ function _jobsExpandCardHtml(c) {
     // data-worker-toggle listener.
     var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(c.id) : null;
     var workers = (typeof _jobsAccWorkersHtml === 'function') ? _jobsAccWorkersHtml(c.id) : '';
-    return '<div class="jobs-expand-card' + cur + (st === 'unseen' ? ' jobs-unread' : '') + (workers ? ' has-workers' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
+    return '<div class="jobs-expand-card' + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
         '<div class="jobs-expand-card-head">' +
             indicator +
             '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +

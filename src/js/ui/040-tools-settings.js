@@ -147,6 +147,14 @@ function renderSettingsPage() {
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
+                '<span>' + UI_ICONS.api + ' LLM Endpoints</span>' +
+                '<button class="skills-action-btn" onclick="showLlmEndpointModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' Add Endpoint</button>' +
+            '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Named endpoint URL + API key pairs. Each model below picks one — update a key here once and every model using it follows. The same URL can appear under different names with different keys.</div>' +
+            '<div id="llm-endpoints-list"></div>' +
+        '</div>' +
+        '<div class="settings-page-section">' +
+            '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
                 '<span>' + UI_ICONS.api + ' API Providers</span>' +
                 '<button class="skills-action-btn" onclick="showAddApiProviderModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' Add</button>' +
             '</div>' +
@@ -253,7 +261,8 @@ function renderSettingsPage() {
     // Render system prompt editor
     renderSystemPromptEditor();
 
-    // Render API providers list
+    // Render LLM endpoints + API providers lists
+    renderLlmEndpointsList();
     renderApiProvidersList();
 
     // Render GitHub settings
@@ -747,8 +756,17 @@ async function updateWorkspaceHeaderStatus() {
     }
 }
 
-// Full sync with remote for all workspaces + update header (awaitable)
-async function syncAndUpdateWorkspaceHeader() {
+// Full sync with remote for all workspaces + update header (awaitable).
+// Single-flight: concurrent callers (nav/focus/chat-switch triggers plus the
+// dropdown Pull button) share ONE in-flight run instead of interleaving
+// _wsHeaderCaches wipes/writes (each run starts by resetting the cache).
+var _syncHdrInFlight = null;
+function syncAndUpdateWorkspaceHeader() {
+    if (_syncHdrInFlight) return _syncHdrInFlight;
+    _syncHdrInFlight = _syncAndUpdateWorkspaceHeaderInner().finally(function() { _syncHdrInFlight = null; });
+    return _syncHdrInFlight;
+}
+async function _syncAndUpdateWorkspaceHeaderInner() {
     try {
         var summaries = await getAllWorkspaceSummaries();
         _wsHeaderCaches = {};
@@ -969,7 +987,94 @@ function _wsSectionChangeCount(cache) {
     return d + c + b;
 }
 
-// Shared row builder for a dirty file (status badge + optional PR link).
+// Deterministic hue (0-359) hashed from a chat id. The same chat always gets
+// the same color, across renders and reloads, with no coordination needed —
+// this is how edits from MULTIPLE chats are differentiated in the workspace
+// dropdown: color groups files visually, the tooltip names the chat, and
+// clicking the chip jumps straight to that chat.
+function _wsChatHue(id) {
+    var h = 0;
+    for (var i = 0; i < id.length; i++) h = ((h * 31) + id.charCodeAt(i)) >>> 0;
+    return h % 360;
+}
+
+// Lazy PR-url → pushing-chat index, rebuilt by scanning chats' recorded push
+// tool results. Retroactive fallback for dirty files pushed BEFORE the
+// pushed_by_chat_id stamp existed (or whose stamp was lost). Memoized; a
+// lookup miss triggers a rebuild at most once per 5s.
+var _wsPrChatIdx = null;
+var _wsPrChatIdxAt = 0;
+function _wsPrChatLookup(prUrl) {
+    if (!prUrl || typeof chats === 'undefined' || !chats) return null;
+    var now = Date.now();
+    // Rebuild on a miss (throttled to 5s) OR when the index is older than 60s
+    // even on a hit — so renamed chats / later pushes refresh chip attribution.
+    if (!_wsPrChatIdx || ((!_wsPrChatIdx[prUrl] || now - _wsPrChatIdxAt > 60000) && now - _wsPrChatIdxAt > 5000)) {
+        _wsPrChatIdxAt = now;
+        var idx = {};
+        Object.keys(chats).forEach(function(cid) {
+            var chat = chats[cid];
+            if (!chat || !chat.messages) return;
+            chat.messages.forEach(function(msg) {
+                if (msg.role !== 'tool' || typeof msg.content !== 'string') return;
+                if (msg.content.indexOf('pr_url') === -1) return; // cheap prefilter
+                try {
+                    var r = JSON.parse(msg.content);
+                    // Later pushes overwrite — the LAST pusher owns the chip.
+                    // Only actual pushes — workspace-status auto-delete results
+                    // also carry pr_url/pr_number but are NOT this chat's push.
+                    if (r && r.success && r.pr_url && r.pr_number && !r.auto_deleted) idx[r.pr_url] = { chatId: cid, chatTitle: chat.title || '' };
+                } catch (e) { /* not JSON — skip */ }
+            });
+        });
+        _wsPrChatIdx = idx;
+    }
+    return _wsPrChatIdx[prUrl] || null;
+}
+
+// Small color-coded chat chip for a dirty file row whose changes are tied to
+// a chat: live uncommitted ownership (last_modified_by_chat_id, see cross-chat
+// ownership in 020-tool-execution.js), or — after a push released that stamp —
+// the pushing chat (pushed_by_chat_id, with a retroactive scan of recorded
+// push results as last resort). Click → open that chat. No chip is rendered
+// for the CURRENT chat (its files are already grouped under the "This chat"
+// section); a chip for a deleted chat renders muted/inert.
+function _wsChatChip(f) {
+    var cid = f.last_modified_by_chat_id;
+    var stampTitle = f.last_modified_by_chat_title;
+    var pushed = false;
+    if (!cid && f.pushed_by_chat_id) {
+        cid = f.pushed_by_chat_id;
+        stampTitle = f.pushed_by_chat_title;
+        pushed = true;
+    }
+    if (!cid && f.pushed_pr && f.pushed_pr.url) {
+        var hit = _wsPrChatLookup(f.pushed_pr.url);
+        if (hit) { cid = hit.chatId; stampTitle = hit.chatTitle; pushed = true; }
+    }
+    if (!cid) return null;
+    if (typeof currentChatId !== 'undefined' && currentChatId === cid) return null;
+    var known = !!(typeof chats !== 'undefined' && chats && chats[cid]);
+    var title = stampTitle || (known && chats[cid].title) || 'Untitled chat';
+    var chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'ws-file-chat' + (!known ? ' gone' : '');
+    chip.style.setProperty('--chat-hue', String(_wsChatHue(cid)));
+    var verb = pushed ? ('Pushed' + (f.pushed_pr && f.pushed_pr.number ? ' (PR #' + f.pushed_pr.number + ')' : '')) : 'Edited';
+    chip.title = known ? verb + ' by chat \u201c' + title + '\u201d \u2014 click to open' :
+        verb + ' by a deleted chat \u2014 ' + title;
+    chip.innerHTML = (typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '\ud83d\udcac';
+    chip.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        if (!known) return;
+        if (typeof hideWorkspaceDropdown === 'function') hideWorkspaceDropdown();
+        if (typeof selectChat === 'function') selectChat(cid);
+    });
+    return chip;
+}
+
+// Shared row builder for a dirty file (status badge + optional PR link +
+// color-coded owning-chat chip).
 function _dirtyFileRow(f) {
     var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
         (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
@@ -981,6 +1086,8 @@ function _dirtyFileRow(f) {
     var row = document.createElement('div');
     row.className = 'ws-file-row';
     row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' + badge + prLink;
+    var chip = _wsChatChip(f);
+    if (chip) row.appendChild(chip);
     return row;
 }
 
@@ -1112,15 +1219,19 @@ function _renderDropdownSection(section, cache) {
 }
 
 // Build one workspace section (header + collapsible body) from the current
-// cache. Default expand state: only the top 3 workspaces (idx) start expanded,
-// and even a top-3 workspace starts collapsed when it has more than 5 changes.
-// User toggles and background re-renders preserve the class afterwards.
+// cache. Default expand state: when the CURRENT chat owns uncommitted changes
+// (a "This chat" section is pinned on top), every workspace section starts
+// collapsed so the this-chat files get the focus. Otherwise only the top 3
+// workspaces (idx) start expanded, and even a top-3 workspace starts collapsed
+// when it has more than 5 changes. User toggles and background re-renders
+// preserve the class afterwards.
 function _createDropdownSection(wk, idx) {
     var cache = _wsHeaderCaches[wk];
     var section = document.createElement('div');
     section.className = 'ws-dropdown-section';
     section.setAttribute('data-ws', wk);
-    if (idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
+    var thisChatHasChanges = _thisChatChanges().length > 0;
+    if (thisChatHasChanges || idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
     var header = document.createElement('div');
     header.className = 'ws-dropdown-header';
     section.appendChild(header);
@@ -1232,6 +1343,141 @@ function getEndpointDomain(endpoint) {
     }
 }
 
+// LLM Endpoints UI Functions
+function renderLlmEndpointsList() {
+    var container = document.getElementById('llm-endpoints-list');
+    if (!container) return;
+
+    if (llmEndpoints.length === 0) {
+        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">No endpoints configured. Add one to use API-key models (Claude OAuth models don\'t need one).</div>';
+        return;
+    }
+
+    var html = '';
+    llmEndpoints.forEach(function(ep) {
+        var domain = getEndpointDomain(ep.url);
+        var domainTag = domain ? '<span class="provider-tag">' + escapeHtml(domain) + '</span>' : '';
+        var keyTag = (ep.apiKey || '') ? '<span class="provider-tag">key set</span>' : '<span class="provider-tag">no key</span>';
+        var useCount = apiProviders.filter(function(p) { return !p.isClaudeOAuth && p.endpointId === ep.id; }).length;
+        var usageTag = '<span class="provider-tag">' + useCount + ' model' + (useCount === 1 ? '' : 's') + '</span>';
+
+        html += '<div class="api-provider-row">' +
+            '<span class="api-provider-name">' + escapeHtml(ep.name) + '</span>' +
+            '<div class="api-provider-tags">' + domainTag + keyTag + usageTag + '</div>' +
+            '<div class="api-provider-actions">' +
+                '<button class="api-provider-btn" onclick="editLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
+                '<button class="api-provider-btn danger" onclick="confirmDeleteLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
+            '</div>' +
+        '</div>';
+    });
+    container.innerHTML = html;
+}
+
+function editLlmEndpoint(endpointId) {
+    var ep = getLlmEndpointById(endpointId);
+    if (ep) showLlmEndpointModal(ep);
+}
+
+function showLlmEndpointModal(editingEndpoint) {
+    // Remove any existing modal first
+    var existingModal = document.getElementById('llm-endpoint-modal');
+    if (existingModal) existingModal.remove();
+
+    var isEditing = !!editingEndpoint;
+    var ep = editingEndpoint || { id: '', name: '', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' };
+
+    var overlay = document.createElement('div');
+    overlay.id = 'llm-endpoint-modal';
+    overlay.className = 'modal-overlay show';
+    overlay.onclick = function(e) { if (e.target === overlay) closeLlmEndpointModal(); };
+
+    overlay.innerHTML =
+        '<div class="modal-dialog" style="max-width:480px;">' +
+            '<div class="modal-header">' + (isEditing ? 'Edit' : 'Add') + ' LLM Endpoint</div>' +
+            '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">' +
+                '<div class="form-field">' +
+                    '<label class="form-label">Name <span class="required">*</span></label>' +
+                    '<input type="text" id="llm-endpoint-name" class="form-input" value="' + escapeHtml(ep.name) + '" placeholder="e.g. OpenRouter (work key)">' +
+                '</div>' +
+                '<div class="form-field">' +
+                    '<label class="form-label">Endpoint URL <span class="required">*</span></label>' +
+                    '<input type="text" id="llm-endpoint-url" class="form-input" value="' + escapeHtml(ep.url) + '" placeholder="https://openrouter.ai/api/v1/chat/completions">' +
+                '</div>' +
+                '<div class="form-field">' +
+                    '<label class="form-label">API Key</label>' +
+                    '<input type="password" id="llm-endpoint-apikey" class="form-input" value="' + escapeHtml(ep.apiKey || '') + '" placeholder="sk-or-...">' +
+                '</div>' +
+            '</div>' +
+            '<div class="modal-actions">' +
+                '<button class="modal-btn secondary" onclick="closeLlmEndpointModal()">Cancel</button>' +
+                '<button class="modal-btn primary" onclick="saveLlmEndpointFromModal(\'' + escapeJsString(isEditing ? ep.id : '') + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
+            '</div>' +
+        '</div>';
+
+    document.body.appendChild(overlay);
+}
+
+function closeLlmEndpointModal() {
+    var modal = document.getElementById('llm-endpoint-modal');
+    if (modal) modal.remove();
+}
+
+async function saveLlmEndpointFromModal(editingId) {
+    var name = document.getElementById('llm-endpoint-name').value.trim();
+    var url = document.getElementById('llm-endpoint-url').value.trim();
+    var apiKey = document.getElementById('llm-endpoint-apikey').value.trim();
+
+    if (!name || !url) {
+        showSnackbar('Please fill in all required fields (Name, Endpoint URL)', 'error');
+        return;
+    }
+    var nameClash = llmEndpoints.some(function(ep) { return ep.name === name && ep.id !== editingId; });
+    if (nameClash) {
+        showSnackbar('An endpoint named "' + name + '" already exists', 'error');
+        return;
+    }
+
+    var endpoint;
+    if (editingId) {
+        var existing = getLlmEndpointById(editingId);
+        if (!existing) {
+            showSnackbar('Endpoint not found', 'error');
+            return;
+        }
+        // Keep the id stable so provider endpointId references survive renames
+        endpoint = Object.assign({}, existing, { name: name, url: url, apiKey: apiKey });
+    } else {
+        var baseId = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'endpoint';
+        var newId = baseId;
+        var suffix = 2;
+        while (getLlmEndpointById(newId)) { newId = baseId + '-' + suffix; suffix++; }
+        endpoint = { id: newId, name: name, url: url, apiKey: apiKey };
+    }
+
+    await saveLlmEndpoint(endpoint);
+    closeLlmEndpointModal();
+    renderLlmEndpointsList();
+    renderApiProvidersList();
+    showSnackbar(editingId ? 'Endpoint updated' : 'Endpoint added', 'success');
+}
+
+async function confirmDeleteLlmEndpoint(endpointId) {
+    var ep = getLlmEndpointById(endpointId);
+    if (!ep) return;
+
+    var inUse = apiProviders.filter(function(p) { return !p.isClaudeOAuth && p.endpointId === endpointId; }).length;
+    if (inUse > 0) {
+        showSnackbar('In use by ' + inUse + ' model' + (inUse === 1 ? '' : 's') + ' — reassign them first', 'error');
+        return;
+    }
+
+    if (await showConfirmModal('Delete Endpoint', 'Delete endpoint "' + ep.name + '"? This cannot be undone.', 'danger')) {
+        await deleteLlmEndpoint(endpointId);
+        renderLlmEndpointsList();
+        showSnackbar('Endpoint deleted', 'success');
+    }
+}
+
 function renderApiProvidersList() {
     var container = document.getElementById('custom-api-providers-list');
     if (!container) return;
@@ -1248,8 +1494,11 @@ function renderApiProvidersList() {
         var isActive = provider.name === currentProvider;
         var statusBadge = isNew ? '<span class="provider-badge new">custom</span>' : (isCustomized ? '<span class="provider-badge">modified</span>' : '');
         var activeTag = isActive ? '<span class="provider-tag active">Active</span>' : '';
-        var domain = getEndpointDomain(provider.endpoint);
-        var domainTag = domain ? '<span class="provider-tag">' + escapeHtml(domain) + '</span>' : '';
+        // Endpoint NAME tag (falls back to the resolved URL's domain for
+        // legacy inline entries and OAuth providers).
+        var conn = resolveProviderConnection(provider);
+        var endpointLabel = conn.endpointName || getEndpointDomain(conn.endpoint);
+        var domainTag = endpointLabel ? '<span class="provider-tag">' + escapeHtml(endpointLabel) + '</span>' : '';
         var providerTag = provider.provider ? '<span class="provider-tag">' + escapeHtml(provider.provider) + '</span>' : '';
         
         html += '<div class="api-provider-row' + (isActive ? ' active' : '') + '">' +
@@ -1271,13 +1520,6 @@ function selectApiProvider(providerName) {
     renderApiProvidersList();
 }
 
-function getDefaultApiKey() {
-    // Get API key from first default provider or existing providers
-    if (apiProviders.length > 0 && apiProviders[0].apiKey) return apiProviders[0].apiKey;
-    if (DEFAULT_API_PROVIDERS.length > 0) return DEFAULT_API_PROVIDERS[0].apiKey;
-    return '';
-}
-
 function showAddApiProviderModal(editingProvider) {
     // Remove any existing modal first
     var existingModal = document.getElementById('api-provider-modal');
@@ -1285,16 +1527,27 @@ function showAddApiProviderModal(editingProvider) {
     
     var isEditing = !!editingProvider;
     var originalName = isEditing ? editingProvider.name : '';
-    var defaultApiKey = getDefaultApiKey();
     var provider = editingProvider || { 
         name: '', 
         model: '', 
-        endpoint: 'https://openrouter.ai/api/v1/chat/completions', 
-        apiKey: defaultApiKey, 
+        endpointId: 'openrouter',
         maxTokens: 64000, 
         context_length: 200000,
         provider: ''
     };
+
+    // Endpoint dropdown: preselect the provider's endpoint, else the seeded
+    // 'openrouter' entry, else the first configured endpoint.
+    var selectedEndpointId = (provider.endpointId && getLlmEndpointById(provider.endpointId)) ? provider.endpointId
+        : (getLlmEndpointById('openrouter') ? 'openrouter' : (llmEndpoints.length > 0 ? llmEndpoints[0].id : ''));
+    var endpointOptions = llmEndpoints.map(function(ep) {
+        var epDomain = getEndpointDomain(ep.url);
+        var epLabel = ep.name + (epDomain ? ' (' + epDomain + ')' : '');
+        return '<option value="' + escapeHtml(ep.id) + '"' + (ep.id === selectedEndpointId ? ' selected' : '') + '>' + escapeHtml(epLabel) + '</option>';
+    }).join('');
+    var endpointFieldInner = llmEndpoints.length > 0
+        ? '<select id="provider-endpoint-select" class="form-input">' + endpointOptions + '</select>'
+        : '<div class="settings-page-row-hint">No LLM endpoints configured — add one in the LLM Endpoints section of Settings first (Claude OAuth models don\'t need one).</div>';
     
     var overlay = document.createElement('div');
     overlay.id = 'api-provider-modal';
@@ -1321,13 +1574,9 @@ function showAddApiProviderModal(editingProvider) {
                     '<input type="checkbox" id="provider-oauth"' + (provider.isClaudeOAuth ? ' checked' : '') + ' onchange="toggleOAuthProvider(this.checked)">' +
                     '<span>Use Claude OAuth (no API key needed)</span>' +
                 '</label>' +
-                '<div class="form-field" id="provider-endpoint-field"' + (provider.isClaudeOAuth ? ' style="display:none"' : '') + '>' +
-                    '<label class="form-label">API Endpoint</label>' +
-                    '<input type="text" id="provider-endpoint" class="form-input" value="' + escapeHtml(provider.endpoint) + '" placeholder="https://openrouter.ai/api/v1/chat/completions">' +
-                '</div>' +
-                '<div class="form-field" id="provider-apikey-field"' + (provider.isClaudeOAuth ? ' style="display:none"' : '') + '>' +
-                    '<label class="form-label">API Key <span class="required">*</span></label>' +
-                    '<input type="password" id="provider-apikey" class="form-input" value="' + escapeHtml(provider.apiKey) + '" placeholder="sk-or-...">' +
+                '<div class="form-field" id="provider-endpoint-select-field"' + (provider.isClaudeOAuth ? ' style="display:none"' : '') + '>' +
+                    '<label class="form-label">Endpoint <span class="required">*</span></label>' +
+                    endpointFieldInner +
                 '</div>' +
                 '<div style="display:flex;gap:var(--space-6);">' +
                     '<div class="form-field" style="flex:1;">' +
@@ -1360,7 +1609,7 @@ function showAddApiProviderModal(editingProvider) {
 }
 
 function toggleOAuthProvider(checked) {
-    ['provider-endpoint-field', 'provider-apikey-field', 'provider-provider-field'].forEach(function(id) {
+    ['provider-endpoint-select-field', 'provider-provider-field'].forEach(function(id) {
         var el = document.getElementById(id);
         if (el) el.style.display = checked ? 'none' : '';
     });
@@ -1377,15 +1626,19 @@ async function saveApiProviderFromModal(originalName) {
     var providerField = document.getElementById('provider-provider').value.trim();
     var oauthCheckbox = document.getElementById('provider-oauth');
     var isOAuth = oauthCheckbox && oauthCheckbox.checked;
-    var endpoint = isOAuth ? 'https://api.anthropic.com/v1/messages' : (document.getElementById('provider-endpoint').value.trim() || 'https://openrouter.ai/api/v1/chat/completions');
-    var apiKey = isOAuth ? 'oauth' : document.getElementById('provider-apikey').value.trim();
+    var endpointSelect = document.getElementById('provider-endpoint-select');
+    var endpointId = endpointSelect ? endpointSelect.value : '';
     var maxTokens = parseInt(document.getElementById('provider-maxtokens').value) || 16000;
     var contextLength = parseInt(document.getElementById('provider-context').value) || 200000;
     var effortField = document.getElementById('provider-effort');
     var effort = effortField ? effortField.value : '';
 
-    if (!name || !model || (!isOAuth && !apiKey)) {
-        showSnackbar('Please fill in all required fields (Name, Model ID' + (isOAuth ? '' : ', API Key') + ')', 'error');
+    if (!name || !model) {
+        showSnackbar('Please fill in all required fields (Name, Model ID)', 'error');
+        return;
+    }
+    if (!isOAuth && !endpointId) {
+        showSnackbar('Please select an Endpoint — add one in the LLM Endpoints section of Settings first', 'error');
         return;
     }
     
@@ -1412,14 +1665,20 @@ async function saveApiProviderFromModal(originalName) {
     var provider = {
         name: name,
         model: model,
-        endpoint: endpoint,
-        apiKey: apiKey,
         maxTokens: maxTokens,
         context_length: contextLength,
         thinkingBudget: 40000
     };
+    if (isOAuth) {
+        // Claude OAuth providers keep their inline endpoint/apiKey and do
+        // NOT reference a named LLM endpoint.
+        provider.endpoint = 'https://api.anthropic.com/v1/messages';
+        provider.apiKey = 'oauth';
+        provider.isClaudeOAuth = true;
+    } else {
+        provider.endpointId = endpointId;
+    }
     if (providerField && !isOAuth) provider.provider = providerField;
-    if (isOAuth) provider.isClaudeOAuth = true;
     if (effort) provider.effort = effort;
 
     // If renaming, update in-place to preserve list order
@@ -1439,6 +1698,7 @@ async function saveApiProviderFromModal(originalName) {
     }
     closeApiProviderModal();
     renderApiProvidersList();
+    renderLlmEndpointsList();
     populateProviderDropdown();
     showSnackbar(originalName ? 'Provider updated' : 'Provider added', 'success');
 }
@@ -1454,7 +1714,7 @@ async function confirmDeleteApiProvider(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
     
-    if (await showConfirmModal('Delete Provider', 'Delete provider "' + provider.name + '"? This cannot be undone.')) {
+    if (await showConfirmModal('Delete Provider', 'Delete provider "' + provider.name + '"? This cannot be undone.', 'danger')) {
         deleteApiProviderAndRefresh(providerName);
     }
 }
@@ -1463,12 +1723,13 @@ async function deleteApiProviderAndRefresh(providerName) {
     // Check if this provider is currently selected
     if (currentProvider === providerName) {
         // Switch to first available provider
-        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'opus-4.8';
+        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus-4-8 OAuth';
         saveProviderToStorage();
     }
     
     await deleteApiProvider(providerName);
     renderApiProvidersList();
+    renderLlmEndpointsList();
     populateProviderDropdown();
     updateModelDisplay();
     showSnackbar('Provider deleted', 'success');
@@ -1809,6 +2070,41 @@ function renderSettingsToolPermissions() {
     });
 }
 
+// NAV-SYNC: one async remote workspace sync per page navigation (fire-and-
+// forget). Guarded so at most ONE sync is in flight at a time — navigating
+// rapidly while a sync is still running does NOT stack additional syncs;
+// the next navigation after it settles triggers a fresh one.
+var _navWsSyncInFlight = false;
+function triggerNavWorkspaceSync() {
+    if (_navWsSyncInFlight) return;
+    if (typeof syncAndUpdateWorkspaceHeader !== 'function') return;
+    _navWsSyncInFlight = true;
+    Promise.resolve()
+        .then(function() { return syncAndUpdateWorkspaceHeader(); })
+        .catch(function() {})
+        .then(function() { _navWsSyncInFlight = false; });
+}
+
+// NAV-SYNC: also sync when the user comes back to the extension tab/window
+// (tab switch, window focus, side-panel re-open). Same guard — at most one
+// sync in flight; returning while one runs is a no-op.
+// Credits are fetched once at init and otherwise never refreshed — piggyback
+// a throttled refresh here too (60s min interval so window-focus churn
+// doesn't hammer the credits endpoint; the OAuth path is header-cache only).
+var _creditsFocusLastFetch = 0;
+function _onExtensionTabReturn() {
+    try { triggerNavWorkspaceSync(); } catch (e) {}
+    var now = Date.now();
+    if (now - _creditsFocusLastFetch > 60000 && typeof fetchCredits === 'function') {
+        _creditsFocusLastFetch = now;
+        try { fetchCredits(); } catch (e) {}
+    }
+}
+document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') _onExtensionTabReturn();
+});
+window.addEventListener('focus', _onExtensionTabReturn);
+
 // Helper to hide all panels
 function hideAllPanels() {
     var panels = ['main-area', 'skills-panel', 'dashboard-panel', 'home-panel', 'settings-page-panel', 'docs-panel', 'history-panel', 'documents-panel'];
@@ -1825,6 +2121,9 @@ function hideAllPanels() {
     if (!sidebarCollapsed && (document.body.classList.contains('sidepanel-mode') || window.innerWidth <= 480)) {
         toggleSidebar();
     }
+    // NAV-SYNC: every page/view transition funnels through hideAllPanels —
+    // kick exactly one async GitHub workspace sync (no-op if one is running).
+    try { triggerNavWorkspaceSync(); } catch (e) {}
 }
 
 // Show chat view with browser controls
@@ -1842,6 +2141,18 @@ function showChatView() {
     // home/history → back-to-chat path, which bypasses selectChat().
     if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId && typeof clearUnseenFinishedChat === 'function') {
         try { clearUnseenFinishedChat(currentChatId); } catch (e) {}
+    }
+    // ...and stamp lastViewedAt for the same reason: the jobs rows/cards bell +
+    // unread-bold predicates compare lastResponseAt/lastActivityAt against
+    // lastViewedAt, and activity that landed while the user was on the home/
+    // history view (where the focused chat does NOT count as viewed — see
+    // _isChatViewFocused in tools/120-actions.js) must be consumed when the
+    // user returns to the chat view and can actually see the messages.
+    if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId &&
+        typeof chats !== 'undefined' && chats[currentChatId]) {
+        chats[currentChatId].lastViewedAt = Date.now();
+        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+        if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     }
 }
 

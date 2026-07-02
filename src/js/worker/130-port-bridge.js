@@ -647,6 +647,22 @@ function _handlePanelMessage(port, msg) {
                 }, port);
             }
             return;
+
+        case 'relay-agent-event':
+            // WSM-RELAY: a panel relays a PAGE-LOCAL emit here so it reaches
+            // the other panels — re-emitting on the SW bus hands it to the
+            // worker/100 broadcast patch, which forwards it to every connected
+            // panel (including the origin; its handlers are idempotent
+            // renders). The _relayed stamp stops the origin's relay hook from
+            // bouncing it back. Whitelisted event types only — this is a
+            // broadcast amplifier, keep it to workspace-level events.
+            if (msg.eventType === 'workspaceMutated' && msg.detail &&
+                typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+                try {
+                    AgentEvents.emit('workspaceMutated', Object.assign({}, msg.detail, { _relayed: true }));
+                } catch (e) {}
+            }
+            return;
     }
 }
 

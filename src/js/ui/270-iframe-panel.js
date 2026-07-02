@@ -59,7 +59,7 @@ async function reloadExtension() {
         var msg = runningCount === 1
             ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
             : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
-        if (!(await showConfirmModal('Reload extension?', escapeHtml(msg)))) return;
+        if (!(await showConfirmModal('Reload extension?', escapeHtml(msg), 'warning'))) return;
     }
 
     // Fire the reload exactly once, and never let anything strand it.
@@ -135,9 +135,9 @@ async function _rebuildBeforeReload() {
         // Build/deploy failed — let the user decide whether to reload the
         // previously built files instead of silently shipping a broken build.
         var err = (res && (res.error || (res.deploy && res.deploy.error))) || 'no files were built/deployed (is the repo cloned?)';
-        return await showConfirmModal('Extension rebuild failed', 'Extension rebuild failed:<br>' + escapeHtml(err) + '<br><br>Reload with the previously built files anyway?');
+        return await showConfirmModal('Extension rebuild failed', 'Extension rebuild failed:<br>' + escapeHtml(err) + '<br><br>Reload with the previously built files anyway?', 'danger');
     } catch (e) {
-        return await showConfirmModal('Extension rebuild error', 'Extension rebuild error:<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>Reload with the previously built files anyway?');
+        return await showConfirmModal('Extension rebuild error', 'Extension rebuild error:<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>Reload with the previously built files anyway?', 'danger');
     }
 }
 

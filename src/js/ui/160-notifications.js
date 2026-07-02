@@ -455,8 +455,8 @@ function updateModelDisplay() {
     if (provider && provider.isClaudeOAuth) {
         updateClaudeOAuthStatus();
     } else {
-        // Non-OAuth providers: assume connected if API key is set
-        setLLMConnectionStatus(provider && provider.apiKey ? 'connected' : 'disconnected');
+        // Non-OAuth providers: assume connected if the resolved endpoint has a key
+        setLLMConnectionStatus(provider && resolveProviderConnection(provider).apiKey ? 'connected' : 'disconnected');
     }
 }
 
@@ -506,7 +506,7 @@ function updateModelConnectionDot() {
 // the header pill) rather than a per-vendor guess — guessed vendor icons read
 // as arbitrary and inconsistent.
 function _modelRowMeta(p) {
-    var ep = ((p && p.endpoint) || '').toLowerCase();
+    var ep = (p ? (resolveProviderConnection(p).endpoint || '') : '').toLowerCase();
     var conn = '';
     if (ep.indexOf('openrouter') >= 0) conn = 'OpenRouter';
     else if (ep.indexOf('localhost') >= 0 || ep.indexOf('127.0.0.1') >= 0) conn = 'Proxy';

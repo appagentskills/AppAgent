@@ -1706,6 +1706,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return await executeUpdateActionState(args, options);
     } else if (name === 'show_action_button') {
         return executeShowActionButton(args, messageIndex, options);
+    } else if (name === 'github_setup') {
+        // Page-only (headless: false) — the SW routes this to a connected panel
+        // before the dispatcher runs, so executeGitHubSetup (tools/130-github-setup.js,
+        // page bundle only) is always defined here.
+        return await executeGitHubSetup(args);
     } else if (name === 'html_widget') {
         return executeHtmlWidget(args, messageIndex, options);
     } else if (name === 'take_screenshot') {
@@ -3120,7 +3125,9 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, 
     var MAX_MATCHES = 5;
     if (typeof limit === 'number' && isFinite(limit) && limit > 0) MAX_MATCHES = Math.min(Math.floor(limit), 100);
     var _gUnscanned = 0;
-    for (var i = 0; i < files.length && matches.length < MAX_MATCHES; i++) {
+    // Scan one match PAST the cap so `truncated` is accurate when the repo
+    // contains exactly MAX_MATCHES matches (no false 'Results capped' hint).
+    for (var i = 0; i < files.length && matches.length <= MAX_MATCHES; i++) {
         var f = files[i];
         if (f.deleted || isIgnored(f.path)) continue;
         if (f.content == null) {
@@ -3132,14 +3139,16 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, 
         if (f.content.indexOf('::binary::') === 0) continue;
         if (pathPrefix && f.path.indexOf(pathPrefix) !== 0) continue;
         var lines = f.content.split('\n');
-        for (var ln = 0; ln < lines.length && matches.length < MAX_MATCHES; ln++) {
+        for (var ln = 0; ln < lines.length && matches.length <= MAX_MATCHES; ln++) {
             regex.lastIndex = 0;
             if (regex.test(lines[ln])) {
                 matches.push({ file: f.path, line: ln + 1, text: lines[ln].substring(0, 200) });
             }
         }
     }
-    var _gRes = { success: true, pattern: pattern, matches: matches, total: matches.length, truncated: matches.length >= MAX_MATCHES };
+    var _gTruncated = matches.length > MAX_MATCHES;
+    if (_gTruncated) matches = matches.slice(0, MAX_MATCHES);
+    var _gRes = { success: true, pattern: pattern, matches: matches, total: matches.length, truncated: _gTruncated };
     if (_gRes.truncated) _gRes.hint = 'Results capped at ' + MAX_MATCHES + ' matches. Pass a higher `limit` (max 100) or narrow the pattern/path to see more.';
     // Cross-chat ownership: tell the agent when matched files have uncommitted
     // changes owned by another chat (same warning read/status/diff surface).
@@ -4473,6 +4482,13 @@ async function wsPush(wk, args) {
     var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name };
     for (var k = 0; k < dirtyFiles.length; k++) {
         dirtyFiles[k].pushed_pr = prInfo;
+        // Preserve the pushing chat for DISPLAY (workspace dropdown chat chip)
+        // before the blocking ownership stamp is released below. An append push
+        // from a chat that didn't re-edit keeps the earlier pushed_by stamp.
+        if (dirtyFiles[k].last_modified_by_chat_id) {
+            dirtyFiles[k].pushed_by_chat_id = dirtyFiles[k].last_modified_by_chat_id;
+            dirtyFiles[k].pushed_by_chat_title = dirtyFiles[k].last_modified_by_chat_title || null;
+        }
         // Track pushed blob shas so sync can distinguish "my PR merged" from "someone else changed it"
         // For deleted files, track '::deleted::' sentinel since no blob is created
         if (!dirtyFiles[k].pushed_shas) dirtyFiles[k].pushed_shas = [];

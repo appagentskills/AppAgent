@@ -117,20 +117,22 @@ async function sendMessage() {
         // SWM-T4: supersede any pause(true)/interrupt(false) retry chain armed during a port-down window so it can't re-pause or abort this fresh send on reconnect.
         if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
         if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
-        // SILENT-HOOK-QUEUE-FIX: if the chat is mid silent after-response hook
-        // (set_chat_title / set_tldr — _silentHookRunning is mirrored from the SW
-        // via the silentHookState event), BOTH showSpinner() (ui/240-layout.js)
-        // and renderMessages() (ui/250-message-render.js) early-return on that
-        // flag — the anti-flash gate. So the two calls just below are no-ops and
-        // the "Queued" bubble + "Interrupting…" spinner stay hidden until the hook
-        // finishes and silentHookState{active:false} clears the flag: the user
-        // perceives a long delay before their just-sent message shows. The user
-        // is explicitly interrupting that hook, so the suppression no longer
-        // applies — clear the page mirror now. Safe: silentHookState{active:true}
-        // is emitted ONCE at hook start (already past), and the loop-reset's
-        // {active:false} later just re-confirms false.
-        if (typeof _silentHookRunning !== 'undefined' && _silentHookRunning) {
-            _silentHookRunning = false;
+        // SILENT-HOOK-QUEUE-FIX: if THIS chat is mid silent after-response hook
+        // (set_chat_title / set_tldr — mirrored from the SW into the per-chat
+        // _silentHookChats map via the silentHookState event), BOTH showSpinner()
+        // (ui/240-layout.js) and renderMessages() (ui/250-message-render.js)
+        // early-return on that flag — the anti-flash gate. So the two calls just
+        // below would be no-ops and the "Queued" bubble + "Interrupting…" spinner
+        // would stay hidden until the hook finishes: the user perceives a long
+        // delay before their just-sent message shows. The user is explicitly
+        // interrupting that hook, so the suppression no longer applies — clear
+        // this chat's mirror entry now. Safe: silentHookState{active:true} is
+        // emitted ONCE at hook start (already past), and the loop-reset's
+        // {active:false} later just re-confirms the cleared state. Hook TEXT
+        // stays hidden regardless via the isHookMessage / _hiddenHookTurn
+        // filters (core/050-streaming.js).
+        if (typeof _silentHookChats !== 'undefined' && _silentHookChats[currentChatId]) {
+            delete _silentHookChats[currentChatId];
         }
         // Update spinner immediately so the user sees instant acknowledgement.
         showSpinner('Interrupting…', currentChatId);

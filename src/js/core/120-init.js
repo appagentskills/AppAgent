@@ -314,7 +314,9 @@ async function init() {
     setSetting('defaultWorkspaceRepo', null); // migration: remove stale default pointer
     refreshWorkspaceContext(); // async, no await — non-blocking
     updateWorkspaceHeaderStatus(); // show local state immediately
-    syncAndUpdateWorkspaceHeader(); // then sync with remote in background
+    // NAV-SYNC: guarded trigger (ui/040-tools-settings.js) — dedupes against the
+    // nav-driven sync fired by hideAllPanels() during this same startup path.
+    triggerNavWorkspaceSync(); // then sync with remote in background
 
     // Restore pending images and text from IndexedDB
     await restorePendingImagesFromSession();

@@ -44,16 +44,25 @@ function downloadRequestBodyJson() {
 }
 
 function resolveModal(value) {
-    document.getElementById('modal-overlay').classList.remove('show');
+    var overlay = document.getElementById('modal-overlay');
+    overlay.classList.remove('show');
+    overlay.classList.remove('modal-variant-warning');
+    overlay.classList.remove('modal-variant-danger');
     if (modalResolve) { modalResolve(value); modalResolve = null; }
 }
 
-// Helper function for confirm dialogs - returns true if confirmed
-async function showConfirmModal(title, message) {
+// Helper function for confirm dialogs - returns true if confirmed.
+// Optional variant colors the dialog + confirm button by severity:
+//   'danger' / 'alert' / 'red'  -> red    (destructive, irreversible)
+//   'warning' / 'orange'        -> orange (disruptive, proceed with care)
+//   omitted                     -> blue   (normal confirmation)
+async function showConfirmModal(title, message, variant) {
+    var v = normalizeModalVariant(variant);
+    var confirmClass = v === 'danger' ? 'danger' : (v === 'warning' ? 'warning' : 'primary');
     var result = await showModal(title, message, [
         { label: 'Cancel', value: 'cancel', class: 'secondary' },
-        { label: 'Confirm', value: 'confirm', class: 'primary' }
-    ]);
+        { label: 'Confirm', value: 'confirm', class: confirmClass }
+    ], variant);
     return result === 'confirm';
 }
 
@@ -91,7 +100,9 @@ document.addEventListener('keydown', function(e) {
     if (e.target && e.target.tagName === 'TEXTAREA') return;
     // Let focused buttons/links activate natively (e.g. Tab to Cancel, then Enter)
     if (e.target && (e.target.tagName === 'BUTTON' || e.target.tagName === 'A')) return;
-    var primary = document.querySelector('#modal-actions .modal-btn.primary');
+    // The confirm button carries the severity class of the dialog variant
+    // (primary = blue/normal, warning = orange, danger = red) — accept any of them.
+    var primary = document.querySelector('#modal-actions .modal-btn.primary, #modal-actions .modal-btn.warning, #modal-actions .modal-btn.danger');
     if (!primary) return;
     e.preventDefault();
     primary.click();

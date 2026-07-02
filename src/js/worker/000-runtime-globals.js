@@ -59,7 +59,14 @@ var isFollowingScroll = false;       // No UI scroll here — kept so loop assig
 var isFollowingStreamingScroll = false;
 var pendingInjection = null;         // Used by send-message; offscreen owns these via runQueue
 var pendingInjectionImages = null;
-var _silentHookRunning = false;
+// Per-chat silent-hook flags. Chats run CONCURRENTLY in the SW, so the old
+// single boolean was clobbered across chats: a normal run finishing during
+// another chat's silent hook inherited wasSilentHook=true (its finish
+// notification + unseen bell were suppressed) and cleared the other chat's
+// window out from under it. Keyed by chatId; set in executeAfterResponseHooks
+// (worker/020-page-stubs.js), read + cleared per-chat at the loop finish
+// (app/030-agent-loop.js).
+var _silentHookRunningByChat = {};
 
 // --- Per-chat agent-run state (mirrors page bundle 030-agent-loop.js) ---
 var runningChatIds = {};

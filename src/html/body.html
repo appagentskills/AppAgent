@@ -130,10 +130,11 @@
                 <!-- Version History Sidebar (inline with messages) -->
                 <div class="version-sidebar" id="version-sidebar">
                     <button class="version-sidebar-close" id="version-sidebar-close" onclick="closeVersionSidebar()" title="Close panel" aria-label="Close version history panel"></button>
-                    <!-- Live sub-agent "Workers" cards (robot icon, tool-call
-                         counter, real-time context circle). Populated by
-                         renderWorkersStrip() in src/js/ui/175-sub-agent-ui.js. -->
-                    <div class="sidebar-workers" id="sidebar-workers" style="display:none;" aria-label="Active sub-agents"></div>
+                    <!-- Live sub-agent "Workers" cards live INSIDE the
+                         scrolling sidebar content now (placeholder emitted by
+                         renderVersionSidebar() in 120-ui-utils.js, populated by
+                         renderWorkersStrip() in src/js/ui/175-sub-agent-ui.js)
+                         so PRs / progress / workers share one scrollbar. -->
                     <div class="version-history-list" id="version-history-list" role="list" aria-label="Version history">
                         <div class="version-empty">No changes tracked yet</div>
                     </div>

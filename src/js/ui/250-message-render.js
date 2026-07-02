@@ -259,17 +259,15 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
 }
 
 function renderMessages() {
-    // Skip DOM rebuilds during silent hook runs (prevents flash) — but ONLY
-    // when the container already shows the current chat. _silentHookRunning
-    // is a GLOBAL flag (set while ANY chat runs its hidden after-response
-    // hooks: title/tldr/links), so an unconditional bail here broke chat
-    // SWITCHING during that window: selectChat() → renderMessages() returned
-    // without painting, leaving the PREVIOUS chat's messages on screen while
-    // the header/title already showed the new chat. A switch is detected by
-    // _lastRenderState.chatId !== currentChatId and must always rebuild —
-    // safe against hook flash, because the full render path filters hook
-    // messages and their responses (isHookMessage checks below).
-    if (_silentHookRunning && _lastRenderState.chatId === currentChatId) return;
+    // Skip DOM rebuilds while the CURRENT chat's silent hooks run (prevents
+    // flash) — per-chat gate (_isChatInSilentHook, tools/120-actions.js), so
+    // another chat's hidden title/tldr/links turn never blocks re-renders of
+    // the chat the user is viewing. Still only bail when the container
+    // already shows the current chat: a chat SWITCH (detected by
+    // _lastRenderState.chatId !== currentChatId) must always rebuild — safe
+    // against hook flash, because the full render path filters hook messages
+    // and their responses (isHookMessage checks below).
+    if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(currentChatId) && _lastRenderState.chatId === currentChatId) return;
 
     // B-B1: widget chat mode (the dashboard widget editor running inline) reuses
     // the #messages container via renderWidgetInChat. If a background agent loop
@@ -700,7 +698,13 @@ function renderMessages() {
                     } else {
                         streamingPlaceholder = 'Awaiting response…';
                     }
-                    var statusText = agentDone ? (block.toolCalls.length + ' tool call' + (block.toolCalls.length > 1 ? 's' : '')) : (block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
+                    // Live transport-level status (429/529 backoff, concurrents
+                    // park) takes precedence over the generic placeholder while
+                    // the run is live — without this, a re-render during backoff
+                    // reset the status line to a bare "Thinking…" and the user
+                    // stared at a silent spinner for the whole retry window.
+                    var liveTransport = (!agentDone && typeof _transportStatusText === 'function') ? _transportStatusText(currentChatId) : null;
+                    var statusText = agentDone ? (block.toolCalls.length + ' tool call' + (block.toolCalls.length > 1 ? 's' : '')) : (liveTransport || block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
                     var spinnerClass = agentDone ? '' : ' streaming';
 
                     html += '<details class="compact-tools-area' + spinnerClass + '"' + (isExpanded ? ' open' : '') + ' ontoggle="toggleCompactAreaState(' + index + ', this)">';
@@ -1304,8 +1308,12 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
         return; // Streaming continues in background
     }
 
-    // Skip DOM updates during silent hook runs
-    if (_silentHookRunning) return;
+    // Skip DOM updates while THIS chat's silent hook runs. Per-chat gate:
+    // the old global flag froze the foreground stream whenever ANY
+    // background chat ran its hidden hook turn. The guard above already
+    // ensures streamingChatId is falsy or === currentChatId, so gating on
+    // currentChatId covers the streaming chat.
+    if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(currentChatId)) return;
     
     var msgEl = document.getElementById('msg-' + index);
     if (!msgEl) {

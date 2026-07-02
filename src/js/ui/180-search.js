@@ -443,7 +443,11 @@ function renderChatItem(c) {
         // OR the chat is paused (paused chats keep `runningChatIds[id]=true` because the
         // loop is awaiting user input — the dot would visually lie about "running" work).
         var chatPaused = typeof isChatPaused === 'function' ? isChatPaused(c.id) : false;
-        var streamingIndicator = (!hasApproval && !chatPaused && typeof isChatRunning === 'function' && isChatRunning(c.id)) ? '<span class="chat-streaming-dot" title="Agent is running"></span>' : '';
+        // Silent hook runs (auto title/tldr/links) keep runningChatIds set but
+        // are invisible work — the user-facing answer already landed, so the
+        // dot would lie about "running" for a couple of extra seconds.
+        var chatHookSilent = typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(c.id);
+        var streamingIndicator = (!hasApproval && !chatPaused && !chatHookSilent && typeof isChatRunning === 'function' && isChatRunning(c.id)) ? '<span class="chat-streaming-dot" title="Agent is running"></span>' : '';
         var pendingIndicator = chatHasPendingItems(c.id) ? '<span class="chat-pending-dot" title="Has pending draft"></span>' : '';
         // Sub-agent breadcrumb: "↳ parent-title" pill so the user can see
         // at a glance that this chat is a delegated worker, not a top-level

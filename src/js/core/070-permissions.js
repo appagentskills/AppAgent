@@ -86,7 +86,8 @@ var GLOBAL_WRITE_KEYS = [
     'document:edit',
     'document:delete',
     'update_action_state',
-    'show_action_button'
+    'show_action_button',
+    'github_setup'
 ];
 
 var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);

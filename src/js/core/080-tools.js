@@ -884,6 +884,24 @@ var TOOLS = [
                 required: ['action']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'github_setup',
+            description: 'Open the GitHub setup popup in the extension UI to help the user connect a GitHub account and/or add (clone) repositories. If no account is connected yet, the popup shows the Personal Access Token form with a direct link to the GitHub token-creation page (pre-scoped to repo); pass open_token_page:true to also open that page in a new tab immediately. Pass repo (owner/repo) and optional branch to prefill the clone form so the user only has to click Clone. NON-BLOCKING: returns immediately after opening the popup — it does NOT wait for the user. Verify the outcome afterwards with workspace {action:"list"} or by asking the user.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    repo: { type: 'string', description: 'Repository to prefill in the clone form, e.g. "owner/repo". Optional.' },
+                    branch: { type: 'string', description: 'Branch to prefill in the clone form. Optional.' },
+                    open_token_page: { type: 'boolean', description: 'If true and no GitHub account is connected yet, also opens the GitHub personal-access-token creation page (repo scope preselected) in a new tab. Default: false.' },
+                    instance_url: { type: 'string', description: 'GitHub instance URL to prefill for GitHub Enterprise (default: https://github.com or the previously saved instance).' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: []
+            }
+        }
     }
 ];
 
@@ -948,7 +966,10 @@ var HEADLESS_TOOLS = {
     take_screenshot: false,
     html_widget: false,
     display: false,
-    prompt_user: false
+    prompt_user: false,
+    // github_setup opens a modal in the side panel DOM (impl in
+    // tools/130-github-setup.js, page bundle only — not in WORKER_SHARED_FILES).
+    github_setup: false
 };
 for (var _ti = 0; _ti < TOOLS.length; _ti++) {
     var _tn = TOOLS[_ti].function && TOOLS[_ti].function.name;

@@ -43,6 +43,29 @@
         configurable: true
     });
 
+    // --- Override outerHTML ---
+    // Same treatment as innerHTML: replacing a node via outerHTML must not let
+    // raw on* attributes reach the DOM (e.g. the incremental message renderer
+    // patches the tail message with tailEl.outerHTML = ...). Transform the
+    // markup, then scan ONLY the replacement nodes (the span between the old
+    // node's siblings) so we never re-traverse the whole parent subtree.
+    var _outerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
+    Object.defineProperty(Element.prototype, 'outerHTML', {
+        set: function(html) {
+            var parent = this.parentNode;
+            var prev = this.previousSibling, next = this.nextSibling;
+            _outerDesc.set.call(this, txHTML(html));
+            if (!parent || !parent.querySelectorAll) return;
+            var n = prev ? prev.nextSibling : parent.firstChild;
+            while (n && n !== next) {
+                if (n.nodeType === 1) { _scanEl(n); _scanAll(n); }
+                n = n.nextSibling;
+            }
+        },
+        get: _outerDesc.get,
+        configurable: true
+    });
+
     // --- Override insertAdjacentHTML ---
     var _origInsertAdj = Element.prototype.insertAdjacentHTML;
     Element.prototype.insertAdjacentHTML = function(pos, html) {

@@ -221,38 +221,8 @@ function openVersionSidebar() {
     resizeAllWidgets();
 }
 
-// Render user messages list for navigation
-function renderUserMessagesList() {
-    var chat = chats[currentChatId];
-    if (!chat || !chat.messages) return '';
-
-    var userMessages = [];
-    chat.messages.forEach(function(msg, idx) {
-        // Skip hook messages (like auto-title) unless showHookMessages is enabled
-        if (msg.role === 'user' && !(msg.isHookMessage && !hooksEnabled.showHookMessages)) {
-            userMessages.push({ index: idx, content: msg.content });
-        }
-    });
-    
-    if (userMessages.length === 0) return '';
-    
-    var html = '<div class="user-messages-section">';
-    html += '<div class="user-messages-header">Your Messages (' + userMessages.length + ')</div>';
-    html += '<div class="user-messages-list">';
-    
-    userMessages.forEach(function(msg, i) {
-        var preview = msg.content.substring(0, 60) + (msg.content.length > 60 ? '...' : '');
-        html += '<div class="user-message-item" onclick="scrollToMessage(' + msg.index + ')" title="' + escapeHtml(msg.content.substring(0, 200)) + '">';
-        html += '<span class="user-message-num">' + (i + 1) + '</span>';
-        html += '<span class="user-message-preview">' + escapeHtml(preview) + '</span>';
-        html += '</div>';
-    });
-    
-    html += '</div>';
-    html += '<button class="scroll-to-bottom-btn" onclick="scrollToBottom()"><span class="btn-icon">' + UI_ICONS.chevronDown + '</span>Scroll to Bottom</button>';
-    html += '</div>';
-    return html;
-}
+// "Your Messages" navigation section removed from the version sidebar
+// (renderUserMessagesList + its append in renderVersionSidebar).
 
 function getLastBrowserUrl() {
     var chat = chats[currentChatId];
@@ -292,7 +262,7 @@ function reopenBrowser() {
 }
 
 // Collect PRs pushed from this chat (workspace push tool calls + their results).
-// Returns [{url, number, title, branch}] deduped by URL. A later push to the
+// Returns [{url, number, title, branch, base}] deduped by URL. A later push to the
 // same PR (append) replaces the tracked entry, but only overwrites the title
 // when the later push actually passed a pr_title (it is optional on append).
 function getPushedPRsForChat(chat) {
@@ -320,7 +290,8 @@ function getPushedPRsForChat(chat) {
                     url: r.pr_url,
                     number: r.pr_number,
                     title: args.title,
-                    branch: r.branch || args.branch || ''
+                    branch: r.branch || args.branch || '',
+                    base: r.base_branch || ''
                 };
                 if (byUrl[entry.url] !== undefined) {
                     var prev = prs[byUrl[entry.url]];
@@ -338,24 +309,215 @@ function getPushedPRsForChat(chat) {
     return prs;
 }
 
+// ---- Sidebar PR merge support ----
+// In-memory PR state per URL: 'open' | 'merging' | 'merged' | 'closed'.
+// Not persisted — _refreshSidebarPRStates() re-derives merged/closed from
+// GitHub in the background, so state survives reloads without extra storage.
+var _sidebarPRState = {};
+var _sidebarPRCheckedAt = {}; // url -> last background state check (throttle)
+
+// Parse "https://<host>/owner/repo/pull/123" (github.com and GHE) into
+// { repo: 'owner/repo', number: 123 }. Returns null on anything else.
+function parsePrUrl(url) {
+    try {
+        var u = new URL(url);
+        var m = u.pathname.match(/^\/(.+?\/.+?)\/pull\/(\d+)(\/|$)/);
+        if (!m) return null;
+        return { repo: m[1], number: parseInt(m[2], 10) };
+    } catch (e) { return null; }
+}
+
+// Background: fetch real PR state from GitHub for sidebar PRs whose state we
+// don't know yet (or knew as open >60s ago), then re-render once if changed.
+// Keeps the merge button honest across reloads and external merges.
+function _refreshSidebarPRStates(prs) {
+    if (typeof githubApi !== 'function') return;
+    var now = Date.now();
+    var toCheck = (prs || []).filter(function(pr) {
+        var st = _sidebarPRState[pr.url];
+        if (st === 'merged' || st === 'merging' || st === 'closed') return false;
+        return (now - (_sidebarPRCheckedAt[pr.url] || 0)) > 60000;
+    });
+    if (toCheck.length === 0) return;
+    var changed = false;
+    Promise.all(toCheck.map(function(pr) {
+        var info = parsePrUrl(pr.url);
+        if (!info) return Promise.resolve();
+        _sidebarPRCheckedAt[pr.url] = now;
+        return githubApi('GET', '/repos/' + info.repo + '/pulls/' + info.number).then(function(res) {
+            // Re-check CURRENT state before writing: a merge may have started/
+            // finished while this GET was in flight — never downgrade
+            // 'merging'/'merged' with a stale response.
+            var cur = _sidebarPRState[pr.url];
+            if (cur === 'merging' || cur === 'merged') return;
+            if (res && res.ok && res.body && typeof res.body === 'object') {
+                var st = res.body.merged ? 'merged' : (res.body.state === 'closed' ? 'closed' : 'open');
+                if (_sidebarPRState[pr.url] !== st) { _sidebarPRState[pr.url] = st; changed = true; }
+            }
+        }).catch(function() {});
+    })).then(function() {
+        if (changed) renderVersionSidebar();
+    });
+}
+
+// Merge button click handler (sidebar PR item). Confirms, merges the PR via
+// the GitHub API, then syncs local workspaces — the merged head-branch
+// workspace auto-deletes (wsMaybeAutoDeleteMerged) and its base pulls the
+// merged commits, exactly like the header sync path.
+async function mergeSidebarPR(event, btn) {
+    event.preventDefault();
+    event.stopPropagation();
+    var url = btn.getAttribute('data-pr-url');
+    var info = parsePrUrl(url);
+    if (!info) { showSnackbar('Could not parse PR URL: ' + url, 'error'); return; }
+    var ok = await showConfirmModal('Merge PR #' + info.number,
+        'Merge pull request #' + info.number + ' (' + info.repo + ') on GitHub and sync the local workspace?', 'warning');
+    if (!ok) return;
+    _sidebarPRState[url] = 'merging';
+    renderVersionSidebar();
+    var finalState = 'open';
+    try {
+        // Pre-check: may already be merged (or closed) since last state refresh.
+        var pre = await githubApi('GET', '/repos/' + info.repo + '/pulls/' + info.number);
+        var preBody = (pre && pre.ok && pre.body && typeof pre.body === 'object') ? pre.body : null;
+        if (preBody && preBody.merged) {
+            finalState = 'merged';
+            showSnackbar('PR #' + info.number + ' was already merged \u2014 syncing workspace\u2026', 'success');
+        } else if (preBody && preBody.state === 'closed') {
+            _sidebarPRState[url] = 'closed';
+            renderVersionSidebar();
+            showSnackbar('PR #' + info.number + ' is closed and cannot be merged', 'error');
+            return;
+        } else {
+            // Squash-merge with the PR title as the commit title: the whole PR
+            // lands as ONE clean commit on the base branch (simplest history for
+            // non-technical users). Fall back to a regular merge commit if the
+            // repo has squash merging disabled (GitHub returns 405).
+            var mergePayload = { merge_method: 'squash' };
+            if (preBody && preBody.title) {
+                mergePayload.commit_title = preBody.title + ' (#' + info.number + ')';
+            }
+            var res = await githubApi('PUT', '/repos/' + info.repo + '/pulls/' + info.number + '/merge', mergePayload);
+            if (res && res.status === 405 && res.body && /not (allowed|enabled)/i.test(res.body.message || '')) {
+                // Squash disabled on this repo — retry as a plain merge commit,
+                // still titled after the PR.
+                mergePayload.merge_method = 'merge';
+                res = await githubApi('PUT', '/repos/' + info.repo + '/pulls/' + info.number + '/merge', mergePayload);
+            }
+            if (res && res.ok && res.body && res.body.merged) {
+                finalState = 'merged';
+                showSnackbar('PR #' + info.number + ' merged \u2014 syncing workspace\u2026', 'success');
+            } else {
+                var msg = (res && res.body && res.body.message) ? res.body.message
+                    : (res && res.error) ? res.error : ('HTTP ' + (res && res.status));
+                _sidebarPRState[url] = 'open';
+                renderVersionSidebar();
+                showSnackbar('Merge failed: ' + msg, 'error');
+                return;
+            }
+        }
+        _sidebarPRState[url] = finalState;
+        renderVersionSidebar();
+        // Sync workspaces so the merged changes land locally. Prefer the full
+        // header sync (updates badge/caches + handles auto-deleted forks);
+        // fall back to targeted per-repo sync.
+        try {
+            if (typeof syncAndUpdateWorkspaceHeader === 'function') {
+                await syncAndUpdateWorkspaceHeader();
+            } else if (typeof wsSyncWithRemote === 'function' && typeof getAllWorkspaceMetas === 'function') {
+                var metas = await getAllWorkspaceMetas();
+                await Promise.all(metas.filter(function(m) {
+                    return (m.github_repo || parseWsKey(m.repo).repo) === info.repo;
+                }).map(function(m) { return wsSyncWithRemote(m.repo).catch(function() {}); }));
+            }
+            // syncAndUpdateWorkspaceHeader swallows errors (marks repos 'offline'
+            // in _wsHeaderCaches instead) — check the cache before claiming success.
+            var _syncOffline = false;
+            try {
+                if (typeof _wsHeaderCaches === 'object' && _wsHeaderCaches) {
+                    _syncOffline = Object.keys(_wsHeaderCaches).some(function(k) {
+                        var c = _wsHeaderCaches[k];
+                        var repoOf = (c && c.meta && c.meta.github_repo) || parseWsKey(k).repo;
+                        return repoOf === info.repo && c && c.syncStatus === 'offline';
+                    });
+                }
+            } catch (e) { /* cache unavailable — assume synced */ }
+            if (_syncOffline) {
+                showSnackbar('PR merged, but workspace sync could not reach GitHub \u2014 it will retry on the next sync', 'error');
+            } else {
+                showSnackbar('Workspace synced', 'success');
+            }
+        } catch (syncErr) {
+            showSnackbar('PR merged, but workspace sync failed: ' + (syncErr && syncErr.message ? syncErr.message : syncErr), 'error');
+        }
+    } catch (e) {
+        _sidebarPRState[url] = 'open';
+        renderVersionSidebar();
+        showSnackbar('Merge failed: ' + (e && e.message ? e.message : e), 'error');
+    }
+}
+
 function renderVersionSidebar() {
     var container = document.getElementById('version-history-list');
     if (!container) return;
     
     var changedFiles = getAllChangedFiles();
     var revertedFiles = getRevertedFiles();
-    var userMessagesHtml = renderUserMessagesList();
     var lastBrowserUrl = getLastBrowserUrl();
     var actionUpdatesHtml = (typeof renderActionUpdatesSection === 'function') ? renderActionUpdatesSection(chats[currentChatId]) : '';
     
     var html = '<div class="version-sidebar-content">';
     
-    // Action Updates Section — shown above everything else so the PM sees
+    // Pull Requests Section — PRs pushed from this chat via workspace push.
+    // Derived from the chat's tool calls/results, so it works retroactively
+    // for existing chats with no extra persistence. Shown FIRST, followed by
+    // progress (action updates), then the Workers panel.
+    var pushedPRs = getPushedPRsForChat(chats[currentChatId]);
+    if (pushedPRs.length > 0) {
+        html += '<div class="version-prs-section">';
+        html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' Pull Requests (' + pushedPRs.length + ')</div>';
+        html += '<div class="pr-sidebar-list">';
+        pushedPRs.forEach(function(pr) {
+            var prState = _sidebarPRState[pr.url] || 'open';
+            html += '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '">';
+            html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
+            html += '<span class="pr-sidebar-info">';
+            html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
+            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + '</span>';
+            html += '</span>';
+            if (prState === 'merged') {
+                html += '<span class="pr-sidebar-state merged" title="Merged">' + UI_ICONS.gitMerge + ' Merged</span>';
+            } else if (prState === 'merging') {
+                html += '<span class="pr-sidebar-state merging" title="Merging\u2026">' + UI_ICONS.spinner + '</span>';
+            } else if (prState === 'closed') {
+                html += '<span class="pr-sidebar-state closed" title="Closed without merging">' + UI_ICONS.close + ' Closed</span>';
+            } else {
+                html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="Merge PR #' + escapeHtml(String(pr.number)) + ' and sync workspace">' + UI_ICONS.gitMerge + '</button>';
+            }
+            html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
+            html += '</a>';
+        });
+        html += '</div>';
+        html += '</div>';
+        // Fire-and-forget: reconcile shown merge buttons with real GitHub PR
+        // state (merged in a previous session / externally). Re-renders once
+        // if anything changed; throttled per URL inside.
+        _refreshSidebarPRStates(pushedPRs);
+    }
+    
+    // Action Updates (progress) Section — below PRs so the PM sees
     // background Action progress/results at a glance. Empty string when the
     // chat has no update_action_state calls.
     if (actionUpdatesHtml) {
         html += '<div class="version-action-updates-section">' + actionUpdatesHtml + '</div>';
     }
+    
+    // Workers panel placeholder — populated by renderWorkersStrip()
+    // (175-sub-agent-ui.js). Lives INSIDE the scrolling sidebar content (below
+    // PRs and progress) so all sections share one scrollbar. Because this
+    // innerHTML rebuild wipes it, renderWorkersStrip() is re-invoked at the
+    // end of this function.
+    html += '<div class="sidebar-workers" id="sidebar-workers" style="display:none;" aria-label="Active sub-agents"></div>';
     
     // Actions Section - Group all action buttons together
     var hasActions = lastBrowserUrl || changedFiles.length > 0;
@@ -384,28 +546,6 @@ function renderVersionSidebar() {
             html += '<div class="version-action-hint">' + changedFiles.length + ' file' + (changedFiles.length > 1 ? 's' : '') + ' changed</div>';
         }
         
-        html += '</div>';
-        html += '</div>';
-    }
-    
-    // Pull Requests Section — PRs pushed from this chat via workspace push.
-    // Derived from the chat's tool calls/results, so it works retroactively
-    // for existing chats with no extra persistence.
-    var pushedPRs = getPushedPRsForChat(chats[currentChatId]);
-    if (pushedPRs.length > 0) {
-        html += '<div class="version-prs-section">';
-        html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' Pull Requests (' + pushedPRs.length + ')</div>';
-        html += '<div class="pr-sidebar-list">';
-        pushedPRs.forEach(function(pr) {
-            html += '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '">';
-            html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
-            html += '<span class="pr-sidebar-info">';
-            html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
-            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.branch ? ' \u00b7 ' + escapeHtml(pr.branch) : '') + '</span>';
-            html += '</span>';
-            html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
-            html += '</a>';
-        });
         html += '</div>';
         html += '</div>';
     }
@@ -555,6 +695,13 @@ function renderVersionSidebar() {
         html += '</div>';
     }
     
+    // Workspace Files Section — files edited via the workspace tool in this
+    // chat, shown as artifacts (view / diff / versions / discard). Rendered by
+    // ui/115-workspace-files-sidebar.js from the chat's recorded tool calls.
+    if (typeof renderWorkspaceFilesSection === 'function') {
+        try { html += renderWorkspaceFilesSection(chat); } catch (e) { console.error('workspace files section failed', e); }
+    }
+
     // Documents Section (only documents referenced in current chat)
     var chatDocIds = {};
     if (chat && chat.messages) {
@@ -593,12 +740,13 @@ function renderVersionSidebar() {
 
     html += '</div>'; // end version-sidebar-content
     
-    // Show user messages list at the bottom (always, using flexbox to push to bottom)
-    if (userMessagesHtml) {
-        html += userMessagesHtml;
-    }
-    
     container.innerHTML = html;
+    
+    // The Workers placeholder was just recreated empty by the innerHTML
+    // rebuild above — repopulate it from the live sub-agent registry.
+    if (typeof renderWorkersStrip === 'function') {
+        try { renderWorkersStrip(); } catch (e) {}
+    }
 }
 
 // Redo changes that were previously reverted

@@ -31,7 +31,7 @@ async function downloadSingleFile(table, sysId, displayName) {
 
 // Delete a new record from the sidebar (simpler version without userMsgIdx)
 async function deleteNewRecordFromSidebar(table, sysId, displayName) {
-    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.')) return;
+    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
 
     try {
         showSpinner('Deleting ' + displayName + '...');

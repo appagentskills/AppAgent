@@ -112,6 +112,16 @@
     --diff-remove-word-text: #fecaca;
 }
 
+/* Dark theme: workspace owning-chat chip — lift lightness so per-chat hues
+   stay readable on dark backgrounds (chip itself is defined in 04-header.css) */
+:root[data-theme="dark"] .ws-file-chat {
+    color: hsl(var(--chat-hue), 75%, 70%);
+    background: hsla(var(--chat-hue), 70%, 60%, 0.18);
+}
+:root[data-theme="dark"] .ws-file-chat:hover {
+    background: hsla(var(--chat-hue), 70%, 60%, 0.32);
+}
+
 /* Dark theme: native form elements */
 :root[data-theme="dark"] select,
 :root[data-theme="dark"] input:not([type="checkbox"]):not([type="radio"]) {

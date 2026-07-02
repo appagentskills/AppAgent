@@ -396,7 +396,7 @@ async function revertFromDiffViewer() {
 
     if (currentDiffFile.isNew) {
         // Delete new record
-        if (!await showConfirmModal('Delete Record', 'Delete "' + currentDiffFile.displayName + '"? This will permanently delete this newly created record.')) return;
+        if (!await showConfirmModal('Delete Record', 'Delete "' + currentDiffFile.displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
 
         showSpinner('Deleting...');
         try {

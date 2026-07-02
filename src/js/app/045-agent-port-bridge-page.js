@@ -249,6 +249,28 @@ function _sendPanelHello() {
     }
 }
 
+// WSM-RELAY: page-local `workspaceMutated` emits (user-clicked restore/discard
+// in the files sidebar run executeWorkspaceTool in THIS page bundle) only fire
+// on this panel's local bus — other open panels (side panel + tab) never hear
+// them and keep a stale header badge / files sidebar. Relay them to the SW,
+// which re-emits on its bus; the worker/100 broadcast patch then forwards to
+// every connected panel. Guards: _relayed (stamped by the SW re-emit) and
+// _fromBus (stamped by the passthrough re-emit in _handleAgentBusMessage)
+// prevent ping-pong for events that originated in the SW or already made a
+// relay round-trip.
+var _wsRelayHooked = false;
+function _hookLocalWorkspaceRelay() {
+    if (_wsRelayHooked) return;
+    if (typeof AgentEvents === 'undefined' || !AgentEvents || !AgentEvents.on) return;
+    _wsRelayHooked = true;
+    AgentEvents.on('workspaceMutated', function(ev) {
+        if (!ev || ev._relayed || ev._fromBus) return;
+        try {
+            if (_agentBusPort) _agentBusPort.postMessage({ type: 'relay-agent-event', eventType: 'workspaceMutated', detail: ev });
+        } catch (e) { /* stale port — the reconnect path reopens the bus */ }
+    });
+}
+
 function _openAgentBus() {
     // Idempotency guard: several independent retry chains can call this
     // concurrently after a long SW outage (onDisconnect's 250ms reconnect, the
@@ -268,6 +290,7 @@ function _openAgentBus() {
         return;
     }
     _agentBusPort.onMessage.addListener(_handleAgentBusMessage);
+    _hookLocalWorkspaceRelay();
     _agentBusPort.onDisconnect.addListener(function() {
         _agentBusPort = null;
         // RETRY-F2: an SW eviction disconnects the bus WITHOUT emitting a terminal
@@ -537,7 +560,11 @@ function _handleAgentBusMessage(msg) {
             // Re-emit on the local bus so app/036 handlers fire as if
             // the loop ran in this page.
             try {
-                AgentEvents.emit(msg.eventType, msg.detail || {});
+                var _busDetail = msg.detail || {};
+                // WSM-RELAY: mark bus-delivered workspaceMutated so the local
+                // relay hook doesn't bounce it back to the SW (echo loop).
+                if (msg.eventType === 'workspaceMutated') _busDetail = Object.assign({}, _busDetail, { _fromBus: true });
+                AgentEvents.emit(msg.eventType, _busDetail);
             } catch (e) {
                 console.error('[agent-bus] re-emit failed', msg.eventType, e);
             }

@@ -44,6 +44,15 @@
 .pr-sidebar-meta { font-size: var(--text-caption); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pr-sidebar-open { display: inline-flex; align-items: center; flex-shrink: 0; color: var(--text-muted); opacity: 0; transition: opacity var(--transition-fast); }
 .pr-sidebar-open .ui-icon { width: 12px; height: 12px; }
+.pr-sidebar-merge-btn { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 22px; height: 22px; padding: 0; border: 1px solid var(--secondary-border); border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; opacity: 0.6; transition: opacity var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast); }
+.pr-sidebar-item:hover .pr-sidebar-merge-btn { opacity: 1; }
+.pr-sidebar-merge-btn:hover { color: var(--success); border-color: var(--success); background: var(--success-lighter); }
+.pr-sidebar-merge-btn .ui-icon { width: 13px; height: 13px; }
+.pr-sidebar-state { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; font-size: var(--text-caption); font-weight: var(--font-medium); }
+.pr-sidebar-state .ui-icon { width: 12px; height: 12px; }
+.pr-sidebar-state.merged { color: var(--success); }
+.pr-sidebar-state.closed { color: var(--text-muted); }
+.pr-sidebar-state.merging { color: var(--text-muted); }
 .pr-sidebar-item:hover .pr-sidebar-open { opacity: 1; }
 
 /* File List in Sidebar */

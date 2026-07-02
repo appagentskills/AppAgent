@@ -130,19 +130,26 @@ function createStreamingTextEl() {
 // silently no-ops instead of corrupting the foreground DOM.
 function updateStreamingText(msg, index, streamingChatId) {
     if (streamingChatId && streamingChatId !== currentChatId) return;
-    var el = document.getElementById('streaming-text');
-    if (!el) {
-        var container = document.getElementById('messages');
-        if (!container) return;
-        el = createStreamingTextEl();
-        container.appendChild(el);
-    }
     var chat = chats[currentChatId];
     if (!chat) return;
     // Find last user message to scope to current response
     var lastUserIdx = -1;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         if (chat.messages[i].role === 'user') { lastUserIdx = i; break; }
+    }
+    var el = document.getElementById('streaming-text');
+    // INT-B3 (checked BEFORE lazy-create): a hidden hook turn must never
+    // CREATE an empty streaming container — see the full comment below. When
+    // the container already exists we still prune + resize it, matching the
+    // pre-existing order (prune, then gate).
+    var _hiddenHookTurn = lastUserIdx >= 0 && chat.messages[lastUserIdx].isHookMessage &&
+        !(typeof hooksEnabled !== 'undefined' && hooksEnabled && hooksEnabled.showHookMessages);
+    if (_hiddenHookTurn && !el) return;
+    if (!el) {
+        var container = document.getElementById('messages');
+        if (!container) return;
+        el = createStreamingTextEl();
+        container.appendChild(el);
     }
     // INT-B1: prune stale entries from a PREVIOUS turn. When the user
     // interrupts mid-stream by sending a message, renderMessages preserves
@@ -162,12 +169,11 @@ function updateStreamingText(msg, index, streamingChatId) {
     // INT-B3: hidden after-response hook turn (set_chat_title / set_tldr with
     // showHookMessages off) — never paint the hook's streamed chatter into
     // #streaming-text. Matters after SILENT-HOOK-QUEUE-FIX (040-send-message.js)
-    // clears the page's _silentHookRunning on an interrupting send: that flag
-    // was the only gate keeping hook output invisible here. The spinner /
+    // clears this chat's _silentHookChats entry on an interrupting send: that
+    // flag was the only gate keeping hook output invisible here. The spinner /
     // queued-bubble behavior that fix wanted is untouched — only the hook
     // TEXT stays hidden, consistent with renderMessages' own hook filtering.
-    if (lastUserIdx >= 0 && chat.messages[lastUserIdx].isHookMessage &&
-        !(typeof hooksEnabled !== 'undefined' && hooksEnabled && hooksEnabled.showHookMessages)) {
+    if (_hiddenHookTurn) {
         updateStreamingContainerHeight();
         return;
     }

@@ -52,9 +52,12 @@ async function fetchCredits() {
         }
     }
 
-    // Derive credits URL from current provider's endpoint (extract base up to /v1/)
+    // Derive credits URL from current provider's endpoint (extract base up to /v1/).
+    // Resolved through the named LLM-endpoint registry (legacy inline fallback).
     var provider = getProviderByName(currentProvider);
-    if (!provider || !provider.endpoint) return;
+    if (!provider) return;
+    var conn = resolveProviderConnection(provider);
+    if (!conn.endpoint) return;
 
     // Claude OAuth: read rate limit headers cached from last API response (no extra network call)
     if (provider.isClaudeOAuth && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
@@ -123,13 +126,13 @@ async function fetchCredits() {
         return;
     }
 
-    var v1Idx = provider.endpoint.indexOf('/v1/');
+    var v1Idx = conn.endpoint.indexOf('/v1/');
     if (v1Idx === -1) return;
-    var creditsUrl = provider.endpoint.substring(0, v1Idx) + '/v1/credits';
+    var creditsUrl = conn.endpoint.substring(0, v1Idx) + '/v1/credits';
 
     try {
         var headers = {};
-        if (provider.apiKey) headers['Authorization'] = 'Bearer ' + provider.apiKey;
+        if (conn.apiKey) headers['Authorization'] = 'Bearer ' + conn.apiKey;
         var res = await fetch(creditsUrl, { method: 'GET', headers: headers, cache: 'no-store' });
 
         if (!res.ok) {
@@ -312,6 +315,11 @@ function attachUsageTooltip(el, rl) {
     if (!el._usageTooltipWired) {
         el._usageTooltipWired = true;
         el.addEventListener('click', function() { showUsageTooltip(el); });
+        // Keyboard access: the pill has role=button/tabindex — Enter/Space must
+        // open the dropdown like a click does.
+        el.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showUsageTooltip(el); }
+        });
     }
     // Live-update an open dropdown when fresh data arrives after the click
     if (_usageTooltipEl && _usageTooltipOwner === el && _usageTooltipEl.style.display === 'block') {
@@ -334,6 +342,12 @@ function showUsageTooltip(el) {
             if (!_usageTooltipEl || _usageTooltipEl.style.display !== 'block') return;
             if (_usageTooltipEl.contains(e.target)) return;
             if (_usageTooltipOwner && _usageTooltipOwner.contains(e.target)) return;
+            hideUsageTooltipNow();
+        });
+        // Escape closes the dropdown (keyboard parity with click-outside)
+        document.addEventListener('keydown', function(e) {
+            if (e.key !== 'Escape') return;
+            if (!_usageTooltipEl || _usageTooltipEl.style.display !== 'block') return;
             hideUsageTooltipNow();
         });
     }
@@ -745,11 +759,19 @@ function selectChat(chatId, options) {
     if (runningChatIds[chatId]) {
         isRunning = true;
         activeStreamingChatId = chatId;
-        if (_messagesEl) _messagesEl.classList.add('is-streaming');
-        // Pass chatId explicitly — currentChatId hasn't been updated yet (line below)
-        // so showPauseButton's syncPauseButtonUI call would otherwise read the
-        // previous chat's pausedChats flag and mislabel the button.
-        showPauseButton(chatId);
+        // Silent-hook runs (auto title/tldr/links) are invisible work — don't
+        // show Pause / .is-streaming for them (same gate as runStarted in
+        // 036-agent-event-handlers-page.js).
+        var _selHook = typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId);
+        if (_selHook) {
+            if (typeof hidePauseButton === 'function') hidePauseButton();
+        } else {
+            if (_messagesEl) _messagesEl.classList.add('is-streaming');
+            // Pass chatId explicitly — currentChatId hasn't been updated yet (line below)
+            // so showPauseButton's syncPauseButtonUI call would otherwise read the
+            // previous chat's pausedChats flag and mislabel the button.
+            showPauseButton(chatId);
+        }
         hideContinueButton();
         var stored = pendingInjectionsByChatId[chatId];
         if (stored) {
@@ -827,6 +849,11 @@ function selectChat(chatId, options) {
     } else if (!sidebarCollapsed && (document.body.classList.contains('sidepanel-mode') || window.innerWidth <= 480)) {
         toggleSidebar();
     }
+    // NAV-SYNC: chat→chat switches stay in the 'chat' view and bypass
+    // hideAllPanels above — trigger the guarded sync here too. Safe to call
+    // unconditionally: the in-flight flag is set synchronously, so a sync
+    // already kicked by hideAllPanels makes this a no-op.
+    if (typeof triggerNavWorkspaceSync === 'function') { try { triggerNavWorkspaceSync(); } catch (e) {} }
     // Restore pending state for the target chat
     restorePendingImagesForContext(chatId);
     restorePendingTextForContext(chatId);
@@ -896,7 +923,7 @@ function updateChatTitleHeader(includeToolCallId) {
                 + '<span class="chat-title-parent-nav-label">' + escapeHtml(navShort) + '</span>'
                 + '</span>';
         }
-        subAgentBadgeHtml = ' <span class="chat-title-subagent-pill' + (navSeg ? ' split' : '') + '">'
+        subAgentBadgeHtml = ' <span class="chat-title-subagent-pill">'
             + badgeSeg + navSeg
             + '</span>';
     }
@@ -959,7 +986,7 @@ async function deleteChat(chatId, e) {
     var result = await showModal('Delete Chat', message, [
         { label: 'Cancel', value: 'cancel', class: 'secondary' },
         { label: 'Delete', value: 'delete', class: 'danger' }
-    ]);
+    ], 'danger');
     if (result !== 'delete') return;
     delete chats[chatId];
     // SWM-TOKENLEAK: prune the per-chat pause/interrupt latest-wins token maps so a

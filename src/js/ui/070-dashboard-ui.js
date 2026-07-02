@@ -1361,7 +1361,7 @@ async function confirmDeleteDashboardWidget(widgetId) {
     var widget = dashboardWidgets[widgetId];
     if (!widget) return;
     
-    var confirmed = await showConfirmModal('Delete Widget', 'Are you sure you want to delete "' + escapeHtml(widget.title) + '"?');
+    var confirmed = await showConfirmModal('Delete Widget', 'Are you sure you want to delete "' + escapeHtml(widget.title) + '"?', 'danger');
     if (!confirmed) return;
     
     // Close widget editor if open for this widget
