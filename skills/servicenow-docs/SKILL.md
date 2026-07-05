@@ -1,10 +1,6 @@
 ---
 name: servicenow-docs
 description: Search and read ServiceNow documentation and community posts
-actions:
-  - name: Search Docs
-    icon: search
-    show: [home]
 ---
 
 # ServiceNow Docs Search
@@ -13,15 +9,6 @@ Search official ServiceNow documentation and community posts. No API key needed.
 
 - **Docs** (default): Official documentation via Fluid Topics API — 216K+ topics across all products and versions (ITSM, SecOps, App Engine, API Reference, etc.). Returns latest version by default.
 - **Community**: Forum posts, blogs, and events via Khoros LiQL API — real-world questions, solutions, and best practices from 1M+ members.
-
-## Action Lifecycle: Search Docs
-
-1. `update_action_state({ state: 'running', icon: 'search', label: 'What to search?' })`
-2. Call `prompt_user` with a single text field "query"
-3. `update_action_state({ state: 'running', icon: 'search', label: 'Searching…' })`
-4. Call `search_docs({ query: <user input> })`
-5. Render results using the `display` tool with the `card_list` template
-6. `update_action_state({ state: 'done', icon: 'check', label: 'N results' })`
 
 ## How to Use
 

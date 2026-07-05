@@ -1,6 +1,6 @@
 ---
 name: extension-dev
-description: "Develop the AppAgent Chrome extension using the workspace tool. Clone, browse, and edit source files; the user clicks Reload to rebuild, redeploy, and restart."
+description: "Develop the AppAgent Chrome extension using the workspace tool. Clone, browse, and edit source files. Finish every task by pushing the PR YOURSELF in the same turn as the final edit (never gate the push on user confirmation/testing), THEN ask the user to click Reload to rebuild, redeploy, and restart."
 ---
 
 # Extension Development Skill

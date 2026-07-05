@@ -153,6 +153,10 @@ async function updateReloadBtnVisibility() {
             show = await _reloadRebuildsFromWorkspace();
         }
     } catch (e) { show = false; }
+    // runtime_inspect: mirror the freshly computed dev-mode gate to the page
+    // flag + the SW so the tool's visibility and devOnly skills flip with the
+    // same condition (tools/140-runtime-inspect.js).
+    try { if (typeof _pushDevModeToSW === 'function') _pushDevModeToSW(show); } catch (e2) { /* non-fatal */ }
     ['ext-reload-btn', 'home-ext-reload-btn'].forEach(function(id) {
         var btn = document.getElementById(id);
         if (btn) btn.style.display = show ? '' : 'none';

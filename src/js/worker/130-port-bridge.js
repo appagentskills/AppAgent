@@ -386,6 +386,16 @@ function _handlePanelMessage(port, msg) {
                 (self._swBootReady || Promise.resolve())
                     .then(function() { return Platform.ready; })
                     .then(function() { return loadApiProviders(); })
+                    // Orchestrator §1: refresh the sub-agent tier-alias map
+                    // (small|medium|large → provider name) so a spawn_sub_agent
+                    // with `tier` during this run resolves against the user's
+                    // latest settings. Non-fatal — resolveTierAlias falls back
+                    // to DEFAULT_TIER_ALIASES until hydrated.
+                    .then(function() { return (typeof loadTierAliases === 'function') ? loadTierAliases() : null; })
+                    // Refresh the assumed-context-window setting the same way,
+                    // so a Settings change reaches an already-booted SW before
+                    // the next run's context warnings / saturation gauges.
+                    .then(function() { return (typeof loadAssumedContextTokens === 'function') ? loadAssumedContextTokens() : null; })
                     .then(function() {
                         if (!runningChatIds[msg.chatId]) {
                             try { runAgent(msg.chatId); }
@@ -564,6 +574,45 @@ function _handlePanelMessage(port, msg) {
             }
             return;
 
+        case 'dev-mode':
+            // runtime_inspect dev-mode flag. Pushed by the page's
+            // _pushDevModeToSW (tools/140-runtime-inspect.js) on bus connect
+            // and whenever updateReloadBtnVisibility recomputes the gate.
+            // Consumed by getEnabledTools (worker/025-permissions-helpers.js)
+            // and the devOnly skill gate (_devModeActiveSync).
+            self._swDevModeActive = !!msg.active;
+            return;
+
+        case 'pull-debug-state':
+            // runtime_inspect action:'sw_state' — reply with a summary of the
+            // SW's live run/tool state. Every global is typeof-guarded: this
+            // handler must never throw on a partially-initialized SW.
+            try {
+                var _dbgParked = {};
+                if (typeof parkedToolCallsByChatId !== 'undefined') {
+                    Object.keys(parkedToolCallsByChatId).forEach(function(cid) {
+                        var _pArr = parkedToolCallsByChatId[cid];
+                        if (_pArr && _pArr.length) _dbgParked[cid] = _pArr.length;
+                    });
+                }
+                var _dbgPending = [];
+                if (typeof _pendingUIToolCalls !== 'undefined') {
+                    Object.keys(_pendingUIToolCalls).forEach(function(tcid) {
+                        var _pe = _pendingUIToolCalls[tcid];
+                        _dbgPending.push({ toolCallId: tcid, startedAt: (_pe && _pe.startedAt) || null });
+                    });
+                }
+                port.postMessage({ type: 'debug-state', requestId: msg.requestId, state: {
+                    runningChatIds: (typeof runningChatIds !== 'undefined') ? Object.keys(runningChatIds).filter(function(c) { return runningChatIds[c]; }) : [],
+                    pendingUIToolCalls: _dbgPending,
+                    parkedToolCalls: _dbgParked,
+                    connectedPorts: (typeof _swPanelPorts !== 'undefined') ? _swPanelPorts.size : null,
+                    resumeScanSettled: (typeof _swResumeScanSettled !== 'undefined') ? !!_swResumeScanSettled : null,
+                    devMode: !!self._swDevModeActive
+                } });
+            } catch (e) { /* port died — the page side times out after 5s */ }
+            return;
+
         case 'update-chat':
             // Panel-side mutations OUTSIDE a run (title rename, manual edit).
             // Same authoritative-writer rule as `run-agent`: never replace
@@ -592,6 +641,16 @@ function _handlePanelMessage(port, msg) {
             if (msg.hooksEnabled && typeof msg.hooksEnabled === 'object') {
                 hooksEnabled = msg.hooksEnabled;
             }
+            return;
+
+        case 'deferred-tools-setting':
+            // Panel toggled deferred tool loading (Settings). Mirror so the
+            // SW's getEnabledTools / getToolCatalogForPrompt observe it
+            // immediately, without waiting for SW restart — same pattern as
+            // 'hooks-settings'. The global lives in core/030-config.js
+            // (WORKER_SHARED_FILES); pushed by
+            // pushDeferredToolsSettingToOffscreen (045-agent-port-bridge-page.js).
+            deferredToolsEnabled = !!msg.enabled;
             return;
 
         case 'permissions-update':

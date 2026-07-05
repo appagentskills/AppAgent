@@ -267,6 +267,16 @@ function processToolResultForCache(chatId, toolCallId, toolName, result) {
         structure: outlineResult.outline
     };
 
+    // Orchestration guardrail: an oversized tool result landing in the
+    // ORCHESTRATOR'S OWN context is exactly what delegation is meant to avoid —
+    // ride a directive along with the cached-result message telling the agent
+    // to delegate this kind of heavy read to a worker next time. Caching
+    // behavior itself is unchanged (same threshold, same outline, same tools);
+    // sub-agent chats are skipped (workers cannot spawn workers by default).
+    if (!chat.isSubAgent) {
+        truncated._cached.orchestrator_directive = 'ORCHESTRATION: this oversized result just consumed orchestrator context. Next time, delegate this kind of heavy read (bulk fetch, grep/file dump, log scan) to a sub-agent worker on a cheap tier and consume only its distilled report.';
+    }
+
     // Add stats summary
     var statsSummary = [];
     if (outlineResult.stats.totalKeys > 0) statsSummary.push(outlineResult.stats.totalKeys + ' keys');
@@ -873,7 +883,21 @@ function getSystemPromptWithContext(chatId) {
     // loop's streaming path passes the active chatId so subs get their
     // preamble.
     var template = getSystemPromptTemplate();
-    var expanded = expandSystemPromptPlaceholders(template);
+    // chatId scopes the {{TOOL_CATALOG}} render (deferred tool loading) to
+    // the chat's enabled tool list (sub-agent rosters, parent-only tools).
+    var expanded = expandSystemPromptPlaceholders(template, chatId);
+    // Restore the always-on orchestrator/delegation policy for CUSTOM system
+    // prompts (the DEFAULT template already embeds it inline). Runs BEFORE the
+    // sub-agent preamble so a sub's ROLE PRECEDENCE preamble still lands last.
+    if (typeof _maybeAppendOrchestratorPolicy === 'function') {
+        expanded = _maybeAppendOrchestratorPolicy(expanded, chatId);
+    }
+    // Custom-prompt fallback for the deferred-tool catalog (no-op when the
+    // default template is active or the flag is OFF) — before the sub
+    // preamble so a sub's ROLE PRECEDENCE note still lands last.
+    if (typeof _maybeAppendToolCatalog === 'function') {
+        expanded = _maybeAppendToolCatalog(expanded, chatId);
+    }
     if (typeof _maybeAppendSubAgentPreamble === 'function') {
         expanded = _maybeAppendSubAgentPreamble(expanded, chatId);
     }

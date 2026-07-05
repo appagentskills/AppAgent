@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.1.13
+
+### Features
+- Orchestrator mode: the main agent plans and delegates work to smaller, faster sub-agent workers instead of doing everything itself, with sensible per-task model tiers.
+- Experimental: tools now load on demand instead of all upfront, shrinking the core tool set and freeing up context for the agent.
+- Active chats now show live state badges — waiting for input, awaiting approval, waiting for sub-agents, or PR merged — so you can tell at a glance what each chat is doing.
+- New global settings for context window, max tokens, and thinking budget, plus context-usage warnings and sub-agent saturation gauges so long runs don't quietly overflow.
+- The sidebar tracks merged PRs with a MERGED badge and preserves the original diff for files edited in a merged PR.
+- Updated Help page documenting sub-agents, tiers, saturation, permissions modes, and LLM endpoints.
+
+### Fixes
+- Fixed several cross-chat leaks where one chat's PRs, edited files, or streaming text could show up in another chat's sidebar.
+- Hardened the cross-chat workspace file lock against silent overwrites, with per-file ownership attribution and clearer warnings.
+- PRs no longer go missing from the sidebar, and sub-agent PRs and edited files now roll up into the parent chat.
+- Jobs dropdown fixes: unread bold no longer reverts, "Completed Today" no longer counts chats that merely started today, and the phantom notification bell is gone.
+- Many design and consistency fixes across chat cards, the active-chats dropdown, and the New Chat page.
+
+---
+
 ## v1.1.12
 
 ### Fixes

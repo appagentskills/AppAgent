@@ -84,6 +84,9 @@ async function executePromptUser(args, options) {
             if (first) first.focus();
         }, 80);
     }
+    // Live needs_input badge on jobs rows / expand cards / header pill — covers
+    // both the fresh push above and the adopted-row replay path.
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
 
     // Block until PM submits or cancels
     var result = await new Promise(function(resolve) {
@@ -274,6 +277,8 @@ function submitPromptUser(promptId) {
         injectPromptToolResult(chat, promptId, { success: true, values: values });
     }
 
+    // Clear the live needs_input badge on jobs rows / header pill.
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
     renderMessages();
     scrollToBottomIfAllowed();
     return true;
@@ -303,6 +308,8 @@ function cancelPromptUser(promptId) {
         injectPromptToolResult(chat, promptId, { success: false, cancelled: true, message: 'User cancelled the form' });
     }
 
+    // Clear the live needs_input badge on jobs rows / header pill.
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
     renderMessages();
     scrollToBottomIfAllowed();
 }

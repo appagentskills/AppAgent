@@ -38,17 +38,113 @@ function resolveProviderConnection(provider) {
     };
 }
 
-// Default API providers (used on first load, then stored in IndexedDB)
+// ── Global token-budget settings ────────────────────────────────────────
+// ONE GLOBAL user-editable value each for max output tokens and reasoning
+// budget — set on the Settings page next to Context Window
+// (ui/040-tools-settings.js), persisted in the IDB settings store under
+// MAX_TOKENS_SETTING_KEY / THINKING_BUDGET_SETTING_KEY, hydrated by
+// loadAssumedContextTokens() below (same mechanism + hydration points as
+// the assumed context window). Providers carry NO per-provider maxTokens /
+// thinkingBudget (pure-global design): the request builder
+// (callOpenRouterStreaming in app/010-llm-streaming.js) reads
+// getGlobalMaxTokens() / getGlobalThinkingBudget(), which fall back to the
+// DEFAULT_* constants below until hydration / when the setting is unset.
+// Legacy providers stored in IndexedDB may still carry maxTokens /
+// thinkingBudget — those are IGNORED (global wins), except the
+// adaptive-only-Claude legacy branch in app/010-llm-streaming.js which
+// keys off the RAW stored thinkingBudget to send an explicit default
+// effort.
+// 64000 = highest safe universal max_tokens: it sits under Gemini 3.5
+// Flash's 65,536 completion cap on OpenRouter — endpoints 400-error rather
+// than clamp when max_tokens exceeds the model's limit, so the default must
+// be under the lowest cap among the default models.
+// 32000 = doc-recommended reasoning budget ceiling (batch processing is
+// advised above 32k). Ignored by adaptive-only Claude models (Opus 4.7+,
+// Sonnet 5+, Fable/Mythos 5) which use `effort` instead — see
+// isAdaptiveOnlyClaude below.
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
+// src/platform/extension/background.js keeps a literal 64000 fallback in
+// transformToAnthropic (it can't see these globals) — keep in sync.
+var DEFAULT_MAX_TOKENS = 64000;
+var DEFAULT_THINKING_BUDGET = 32000;
+var MAX_TOKENS_SETTING_KEY = 'globalMaxTokens';
+var THINKING_BUDGET_SETTING_KEY = 'globalThinkingBudget';
+var globalMaxTokens = DEFAULT_MAX_TOKENS;
+var globalThinkingBudget = DEFAULT_THINKING_BUDGET;
+
+// THE accessors the request builder reads. Always return a sane positive
+// number (default until hydration / on bad input).
+function getGlobalMaxTokens() {
+    var v = parseInt(globalMaxTokens, 10);
+    return (isFinite(v) && v > 0) ? v : DEFAULT_MAX_TOKENS;
+}
+function getGlobalThinkingBudget() {
+    var v = parseInt(globalThinkingBudget, 10);
+    return (isFinite(v) && v > 0) ? v : DEFAULT_THINKING_BUDGET;
+}
+
+// Persist new values (Settings page onchange handlers in
+// ui/040-tools-settings.js). Same settings store as the assumed context
+// window below.
+async function saveGlobalMaxTokens(value) {
+    globalMaxTokens = parseInt(value, 10) || DEFAULT_MAX_TOKENS;
+    if (typeof setSetting === 'function') {
+        await setSetting(MAX_TOKENS_SETTING_KEY, globalMaxTokens);
+    }
+    return getGlobalMaxTokens();
+}
+async function saveGlobalThinkingBudget(value) {
+    globalThinkingBudget = parseInt(value, 10) || DEFAULT_THINKING_BUDGET;
+    if (typeof setSetting === 'function') {
+        await setSetting(THINKING_BUDGET_SETTING_KEY, globalThinkingBudget);
+    }
+    return getGlobalThinkingBudget();
+}
+
+// ── Deferred tool loading (experimental) ────────────────────────────────────────
+// When ON, each request declares only the CORE tools with full schemas;
+// every other enabled tool is listed by name + one-liner in a
+// {{TOOL_CATALOG}} system-prompt block and its full schema is fetched on
+// demand via the get_tool_schema meta-tool (the schema travels in the
+// tool_result / message history, so the request prefix — and provider
+// prompt caches — stay stable). Split/catalog helpers live in
+// core/080-tools.js (shared). Default OFF: the legacy full-array request
+// stays byte-identical.
+// Declared here (shared: page core tier + WORKER_SHARED_FILES) like the
+// token-budget globals above; hydrated by loadAssumedContextTokens() at
+// the same three hydration points, and mirrored into a LIVE SW via the
+// 'deferred-tools-setting' port message (worker/130-port-bridge.js +
+// pushDeferredToolsSettingToOffscreen in app/045-agent-port-bridge-page.js),
+// same pattern as 'hooks-settings'.
+var DEFERRED_TOOLS_SETTING_KEY = 'deferredToolsEnabled';
+var deferredToolsEnabled = false;
+
+// THE accessor every consumer reads (getEnabledTools twins, catalog
+// renderer, deferred-arg validation).
+function isDeferredToolsActive() {
+    return !!deferredToolsEnabled;
+}
+
+// Persist a new value (Settings page toggle in ui/040-tools-settings.js).
+async function saveDeferredToolsEnabled(value) {
+    deferredToolsEnabled = !!value;
+    if (typeof setSetting === 'function') {
+        await setSetting(DEFERRED_TOOLS_SETTING_KEY, deferredToolsEnabled);
+    }
+    return deferredToolsEnabled;
+}
+
+// Default API providers (used on first load, then stored in IndexedDB).
+// Providers never carry maxTokens / thinkingBudget — the GLOBAL settings
+// above (getGlobalMaxTokens / getGlobalThinkingBudget) apply to all.
 var DEFAULT_API_PROVIDERS = [
     {
         name: 'GLM 5.2',
         model: 'z-ai/glm-5.2',
         endpointId: 'openrouter',
-        context_length: 1048576,
         // Routing is pinned to first-party Z.AI (provider below), whose
-        // endpoint allows 131,072 completion tokens — 64k is safely under it
-        maxTokens: 64000,
-        thinkingBudget: 40000,
+        // endpoint allows 131,072 completion tokens — the global 64k default
+        // is safely under it
         provider: 'z-ai'
     },
     {
@@ -60,48 +156,44 @@ var DEFAULT_API_PROVIDERS = [
         name: 'sonnet-5',
         model: 'anthropic/claude-sonnet-5',
         endpointId: 'openrouter',
-        context_length: 1000000,
-        maxTokens: 64000,
         effort: 'high'
     },
     {
         name: 'gpt-5.5',
         model: 'openai/gpt-5.5',
         endpointId: 'openrouter',
-        context_length: 1050000,
-        maxTokens: 128000,
         effort: 'low'
     },
     {
         name: 'Gemini 3.5 Flash',
         model: 'google/gemini-3.5-flash',
-        endpointId: 'openrouter',
-        context_length: 1048576,
-        // OpenRouter caps Gemini 3.5 Flash completions at 65,536 tokens
-        maxTokens: 64000,
-        thinkingBudget: 50000
+        endpointId: 'openrouter'
+        // OpenRouter caps Gemini 3.5 Flash completions at 65,536 tokens —
+        // the global 64k default was chosen to fit under exactly this cap
     },
     {
-        name: 'Opus-4-8 OAuth',
+        name: 'Opus-4-8',
         model: 'claude-opus-4-8',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
-        maxTokens: 100000,
-        context_length: 200000,
         // xhigh is supported on Opus 4.8 (and Fable/Mythos 5) and is the
         // documented recommended starting point for coding/agentic work
         effort: 'xhigh',
         isClaudeOAuth: true
     },
     {
-        name: 'Sonnet 5 OAuth',
+        name: 'Sonnet 5',
         model: 'claude-sonnet-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
-        maxTokens: 100000,
-        // Sonnet 5 serves the 1M context window by default on the direct API
-        // (1M is both the default and the only size — no beta header needed)
-        context_length: 1000000,
+        effort: 'high',
+        isClaudeOAuth: true
+    },
+    {
+        name: 'Fable 5',
+        model: 'claude-fable-5',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        apiKey: 'oauth',
         effort: 'high',
         isClaudeOAuth: true
     }
@@ -115,12 +207,8 @@ var DEFAULT_API_PROVIDER = {
     name: '',
     model: '',
     endpointId: 'openrouter',
-    context_length: 200000,
-    maxTokens: 64000,
-    // Doc-recommended budget ceiling (batch processing advised above 32k).
-    // Ignored automatically for adaptive-only Claude models (Opus 4.7+,
-    // Sonnet 5+, Fable/Mythos 5) — see callOpenRouterStreaming.
-    thinkingBudget: 32000,
+    // maxTokens / thinkingBudget intentionally absent — the GLOBAL settings
+    // (getGlobalMaxTokens / getGlobalThinkingBudget above) apply.
     provider: ''
 };
 
@@ -137,7 +225,7 @@ function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
 
-var currentProvider = 'Opus-4-8 OAuth'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
+var currentProvider = 'Opus-4-8'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
 
 // Old default-provider names → their renamed successors (the Opus 4.8
 // alignment). Used by loadProviderFromStorage (ui/070-dashboard-ui.js) as a
@@ -150,18 +238,198 @@ var currentProvider = 'Opus-4-8 OAuth'; // Default provider name (must match a p
 // (page core tier + WORKER_SHARED_FILES).
 var PROVIDER_RENAMES = {
     // Removed defaults (July 2026 alignment) fall back to the config default
-    'opus-4.6': 'Opus-4-8 OAuth',
-    'opus-4.8': 'Opus-4-8 OAuth',
-    'haiku-4.5': 'Opus-4-8 OAuth',
-    'Proxy': 'Opus-4-8 OAuth',
+    'opus-4.6': 'Opus-4-8',
+    'opus-4.8': 'Opus-4-8',
+    'haiku-4.5': 'Opus-4-8',
+    'Proxy': 'Opus-4-8',
     // Renamed defaults → their July 2026 successors
     'sonnet-4.5': 'sonnet-5',
     'sonnet-4.6': 'sonnet-5',
     'Kimi K2.5': 'GLM 5.2',
     'gpt-5.2': 'gpt-5.5',
     'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
-    'Sonnet 4.6 OAuth': 'Sonnet 5 OAuth'
+    'Sonnet 4.6 OAuth': 'Sonnet 5',
+    // July 2026: the ' OAuth' suffix was dropped from the user-facing
+    // default names (same providers, friendlier labels)
+    'Opus-4-8 OAuth': 'Opus-4-8',
+    'Sonnet 5 OAuth': 'Sonnet 5'
 };
+
+// ─── Per-spawn model selection (Orchestrator §1) ────────────────────
+// Tier aliases map the abstract sizes small|medium|large onto provider
+// NAMES from `apiProviders`. Overrides are stored in the IDB settings
+// store (key: subagentTierAliases) and hydrated into the in-memory
+// `subAgentTierAliases` global by loadTierAliases() — spawn-time tier
+// resolution must be synchronous, so callers read the cached global and
+// fall back to DEFAULT_TIER_ALIASES until hydration completes.
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
+var SUBAGENT_TIER_NAMES = ['small', 'medium', 'large'];
+var TIER_ALIASES_SETTING_KEY = 'subagentTierAliases';
+// Defaults derived from DEFAULT_API_PROVIDERS: cheapest/fastest → small,
+// balanced → medium, strongest → large. Keep names in sync with the
+// DEFAULT_API_PROVIDERS entries above when models are renamed.
+var DEFAULT_TIER_ALIASES = {
+    small: 'Sonnet 5',
+    medium: 'Opus-4-8',
+    large: 'Fable 5'
+};
+var subAgentTierAliases = null; // null = not yet hydrated from IDB
+
+// Merged view: stored overrides win, defaults fill the gaps.
+function getTierAliasMap() {
+    var out = {};
+    for (var _ta = 0; _ta < SUBAGENT_TIER_NAMES.length; _ta++) {
+        var t = SUBAGENT_TIER_NAMES[_ta];
+        out[t] = (subAgentTierAliases && subAgentTierAliases[t]) || DEFAULT_TIER_ALIASES[t];
+    }
+    return out;
+}
+
+// tier → provider name, or null when the tier is unknown.
+function resolveTierAlias(tier) {
+    if (!tier) return null;
+    var key = String(tier).toLowerCase();
+    if (SUBAGENT_TIER_NAMES.indexOf(key) === -1) return null;
+    return getTierAliasMap()[key] || null;
+}
+
+// Hydrate the alias overrides from the IDB settings store. Called from the
+// SW port bridge's run-agent gate (so spawn-time resolution sees fresh
+// values) and lazily by the settings UI. getSetting lives in
+// core/130-indexeddb.js — shared in both bundles, called at runtime only.
+async function loadTierAliases() {
+    try {
+        if (typeof getSetting === 'function') {
+            var stored = await getSetting(TIER_ALIASES_SETTING_KEY, null);
+            subAgentTierAliases = (stored && typeof stored === 'object') ? stored : {};
+            // Recover stored aliases that still point at RENAMED default
+            // provider names (e.g. 'Sonnet 5 OAuth' → 'Sonnet 5') — provider
+            // lookups are exact-string, so a stale name would silently break
+            // tier resolution after a default rename.
+            for (var _tm in subAgentTierAliases) {
+                var _tv = subAgentTierAliases[_tm];
+                if (_tv && PROVIDER_RENAMES[_tv]) subAgentTierAliases[_tm] = PROVIDER_RENAMES[_tv];
+            }
+        } else if (subAgentTierAliases === null) {
+            subAgentTierAliases = {};
+        }
+    } catch (e) {
+        if (subAgentTierAliases === null) subAgentTierAliases = {};
+    }
+    return getTierAliasMap();
+}
+
+// Persist an updated alias map (full small/medium/large map expected).
+async function saveTierAliases(map) {
+    subAgentTierAliases = map || {};
+    if (typeof setSetting === 'function') {
+        await setSetting(TIER_ALIASES_SETTING_KEY, subAgentTierAliases);
+    }
+}
+
+// ── Assumed context window ──────────────────────────────────────────────
+// EVERY model is measured against the SAME assumed context window —
+// deliberately model-independent (the agent never sees model names, so it
+// can't reason about real windows, and thresholds stay stable across tier
+// escalations). User-editable global setting (Settings → Context Window),
+// default 200k tokens. Consumers: the per-tool-result context warnings in
+// app/030-agent-loop.js (appendContextNotice), the context ring in
+// ui/240-layout.js (updateContextIndicator), the worker-card rings in
+// ui/175-sub-agent-ui.js (_subContextLimit), and the saturation gauges in
+// core/097-sub-agent-registry.js.
+// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES); hydrated
+// from the IDB settings store by loadAssumedContextTokens() at page boot
+// (core/120-init.js), SW boot (worker/190-entry.js) and the SW run-agent
+// gate (worker/130-port-bridge.js). Until hydration, the default applies.
+var ASSUMED_CONTEXT_TOKENS_DEFAULT = 200000;
+var ASSUMED_CONTEXT_SETTING_KEY = 'assumedContextTokens';
+var assumedContextTokens = ASSUMED_CONTEXT_TOKENS_DEFAULT;
+
+// THE accessor every consumer reads. Always returns a sane positive number.
+function getAssumedContextTokens() {
+    var v = parseInt(assumedContextTokens, 10);
+    return (isFinite(v) && v > 0) ? v : ASSUMED_CONTEXT_TOKENS_DEFAULT;
+}
+
+// Hydrate from the IDB settings store (getSetting lives in
+// core/130-indexeddb.js — shared in both bundles, called at runtime only).
+// ALSO hydrates the global token-budget settings (globalMaxTokens /
+// globalThinkingBudget, declared with the token-budget block above) so
+// every existing hydration point — page boot (core/120-init.js), SW boot
+// (worker/190-entry.js) and the SW run-agent gate
+// (worker/130-port-bridge.js) — picks all three settings up in one call.
+async function loadAssumedContextTokens() {
+    try {
+        if (typeof getSetting === 'function') {
+            var stored = await getSetting(ASSUMED_CONTEXT_SETTING_KEY, null);
+            if (stored !== null && stored !== undefined && stored !== '') {
+                assumedContextTokens = parseInt(stored, 10) || ASSUMED_CONTEXT_TOKENS_DEFAULT;
+            }
+            var storedMax = await getSetting(MAX_TOKENS_SETTING_KEY, null);
+            if (storedMax !== null && storedMax !== undefined && storedMax !== '') {
+                globalMaxTokens = parseInt(storedMax, 10) || DEFAULT_MAX_TOKENS;
+            }
+            var storedBudget = await getSetting(THINKING_BUDGET_SETTING_KEY, null);
+            if (storedBudget !== null && storedBudget !== undefined && storedBudget !== '') {
+                globalThinkingBudget = parseInt(storedBudget, 10) || DEFAULT_THINKING_BUDGET;
+            }
+            var storedDeferred = await getSetting(DEFERRED_TOOLS_SETTING_KEY, null);
+            if (storedDeferred !== null && storedDeferred !== undefined) {
+                deferredToolsEnabled = !!storedDeferred;
+            }
+        }
+    } catch (e) {}
+    return getAssumedContextTokens();
+}
+
+// Persist a new value (Settings page onchange handler).
+async function saveAssumedContextTokens(value) {
+    assumedContextTokens = parseInt(value, 10) || ASSUMED_CONTEXT_TOKENS_DEFAULT;
+    if (typeof setSetting === 'function') {
+        await setSetting(ASSUMED_CONTEXT_SETTING_KEY, assumedContextTokens);
+    }
+    return getAssumedContextTokens();
+}
+
+// THE per-run provider resolution point (Orchestrator §1). A chat stamped
+// with `chat.provider` (sub-agents pinned at spawn time) uses that provider;
+// everything else falls back to the global `currentProvider` — behavior is
+// byte-identical to the old global read when chat.provider is unset. A
+// stamped-but-unknown provider (deleted from apiProviders later) logs and
+// falls back rather than failing the run.
+function resolveChatProviderName(chatId) {
+    return _resolveChatProviderNameFollow(chatId, null);
+}
+// Internal: resolve the effective provider for a chat, following tier:'same'
+// dynamic-follow pointers. A sub spawned/woken with tier:'same' pins NO
+// provider of its own; instead chats[chatId].same_as points at its spawner's
+// chat, and we resolve THAT chat's current provider at call time — so the sub
+// tracks the spawner's live model, including later switches / escalations.
+// Recurses when the spawner is itself a 'same' sub, with a visited-set cycle
+// guard; a missing spawner or a detected cycle falls back to currentProvider.
+function _resolveChatProviderNameFollow(chatId, seen) {
+    try {
+        if (chatId && typeof chats !== 'undefined' && chats[chatId]) {
+            var ch = chats[chatId];
+            if (ch.same_as) {
+                seen = seen || {};
+                if (seen[chatId]) {
+                    console.warn('[provider] tier:"same" follow cycle at chat ' + chatId + ' — falling back to "' + currentProvider + '"');
+                    return currentProvider;
+                }
+                seen[chatId] = true;
+                return _resolveChatProviderNameFollow(ch.same_as, seen);
+            }
+            if (ch.provider) {
+                var pinned = ch.provider;
+                if (typeof getProviderById === 'function' && getProviderById(pinned)) return pinned;
+                console.warn('[provider] chat ' + chatId + ' pinned to unknown provider "' + pinned + '" — falling back to "' + currentProvider + '"');
+            }
+        }
+    } catch (_) { /* fall through to the global */ }
+    return currentProvider;
+}
+
 var currentChatId = null;
 var chats = {};
 var paused = false; // LEGACY: kept for backwards compat with bits that still read it. Do NOT consult in isChatPaused — it would cross-pollute pause across concurrent chats.
@@ -187,7 +455,7 @@ var activeStreamingChatId = null; // Track which chat has active streaming (the 
 function isChatRunning(chatId) { return !!runningChatIds[chatId]; }
 var sidebarCollapsed = false;
 var historyExpanded = true; // History section expanded by default
-var showApiStats = true;
+var showApiStats = false; // Hidden by default; user can enable in Settings (persisted via appStorage 'showApiStats')
 var lastRequestMetrics = null; // Track token usage and performance
 // When the running context (last reported prompt size) crosses this many tokens,
 // the agent loop appends a reminder to delegate heavy work to sub-agents

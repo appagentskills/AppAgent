@@ -60,6 +60,7 @@
 .sn-status-new { background: var(--success-light); color: var(--success); }
 .sn-status-modified { background: var(--warning-light); color: var(--warning); }
 .sn-status-reverted { background: var(--secondary-light); color: var(--text-secondary); }
+.sn-status-merged { background: var(--success-light); color: var(--success); }
 .sn-changes-badge { display: inline-block; font-size: var(--text-sm); font-weight: var(--font-medium); padding: var(--space-1) var(--space-3); border-radius: var(--radius-xl); background: var(--secondary-light); color: var(--text-secondary); margin-left: var(--space-2); }
 
 /* Artifact Actions */

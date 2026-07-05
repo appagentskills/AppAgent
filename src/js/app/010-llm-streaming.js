@@ -6,7 +6,10 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     try {
         // Thread chatId through so the system prompt builder can append the
         // sub-agent preamble when the chat is a sub-agent (see 100-cached-results.js).
-        return await callOpenRouterStreaming(currentProvider, apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId, metrics);
+        // Per-run provider resolution (Orchestrator §1): a chat stamped with
+        // chat.provider (sub-agents pinned at spawn) uses it; everything else
+        // gets the global currentProvider exactly as before.
+        return await callOpenRouterStreaming(resolveChatProviderName(chatId), apiMsgs, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId, metrics);
     } finally {
         if (chatId && currentStreamAbortControllers[chatId] === abortController) {
             delete currentStreamAbortControllers[chatId];
@@ -105,7 +108,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         stream: true,
         //top_p: 0.95,
         //top_k: 40,
-        max_tokens: provider.maxTokens,
+        // GLOBAL user setting (Settings → Context Window & Token Budgets),
+        // falling back to DEFAULT_MAX_TOKENS (core/030-config.js). Legacy
+        // per-provider maxTokens still stored on old providers in IndexedDB
+        // is deliberately IGNORED — pure-global design, global wins.
+        max_tokens: getGlobalMaxTokens(),
         usage: { include: true }  // Required to get cache info in response
     };
     // Claude 4.7+ returns 400 on any non-default sampling param (temperature/
@@ -125,9 +132,19 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // template doesn't 400. Detection lives in core/030-config.js
     // (isAdaptiveOnlyClaude) so the page and SW bundles share one pattern.
     var isAdaptiveOnly = isAdaptiveOnlyClaude(modelLower);
-    // Enable reasoning - OpenRouter handles the format normalization
-    if (provider.thinkingBudget && !isAdaptiveOnly) {
-        requestBody.reasoning = { max_tokens: provider.thinkingBudget };
+    // Enable reasoning - OpenRouter handles the format normalization.
+    // GLOBAL user setting (Settings → Context Window & Token Budgets),
+    // falling back to DEFAULT_THINKING_BUDGET (core/030-config.js) — but do
+    // NOT inject the budget onto effort-style providers: OpenRouter treats
+    // reasoning.effort and reasoning.max_tokens as alternative controls,
+    // and stacking an uninvited budget onto e.g. gpt-5.5 (effort-only) is
+    // an untested shape that may 400 on some routes. Legacy per-provider
+    // thinkingBudget still stored on old providers is IGNORED here (global
+    // wins) — only the adaptive-only legacy branch below reads the raw
+    // stored value.
+    var thinkingBudget = provider.effort ? 0 : getGlobalThinkingBudget();
+    if (thinkingBudget && !isAdaptiveOnly) {
+        requestBody.reasoning = { max_tokens: thinkingBudget };
     }
     if (provider.effort) {
         if (!requestBody.reasoning) requestBody.reasoning = {};
@@ -159,6 +176,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
     // Store request body in metrics for debugging
     reqMetrics.requestBody = requestBody;
+
+    // Prompt-cache heartbeat: stamp the finalized request body per chat so the
+    // SW alarm (background.js) can re-send an identical-prefix 1-token request
+    // when the chat sits waiting on sub-agents past the cache-TTL window.
+    _stampCacheHeartbeat(chatId, requestBody, currentProvider);
 
     var reader;
 
@@ -611,3 +633,97 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         reasoning_details: reasoningDetails.length > 0 ? reasoningDetails : null
     });
 }
+
+// ─── Prompt-cache heartbeat ─────────────────────────────────────────────
+// The Anthropic prompt cache expires ~5 minutes after the last request. When
+// a parent chat is waiting on sub-agents (blocked in await_handle, or turn
+// ended waiting for wake_parent), the 30s `agent-heartbeat` alarm in
+// background.js calls sendCacheHeartbeat(chatId) after 4 idle minutes to
+// re-send the EXACT same prompt prefix with max_tokens:1, refreshing the
+// cache TTL. The response is discarded entirely — it never touches
+// chat.messages, metrics, or the UI.
+//
+// Registry is SW-scope global state keyed by chatId. The body is stored as a
+// JSON string at stamp time so later in-place mutations of message objects
+// elsewhere can never drift the heartbeat body away from what was sent.
+
+function _stampCacheHeartbeat(chatId, requestBody, providerName) {
+    if (!chatId) return;
+    try {
+        var reg = self._cacheHeartbeat = self._cacheHeartbeat || {};
+        reg[chatId] = {
+            at: Date.now(),
+            bodyJson: JSON.stringify(requestBody),
+            provider: providerName,
+            chatId: chatId
+        };
+    } catch (e) { /* best-effort — never break the real request path */ }
+}
+
+function sendCacheHeartbeat(chatId) {
+    var reg = (typeof self !== 'undefined') ? self._cacheHeartbeat : null;
+    var entry = reg && reg[chatId];
+    if (!entry || !entry.bodyJson) return false;
+    // Re-stamp NOW, before dispatch: prevents double-fire from overlapping
+    // alarm ticks, and doubles as retry-storm suppression on hard failure
+    // (next attempt is another 4 minutes out either way).
+    entry.at = Date.now();
+    try {
+        var body = JSON.parse(entry.bodyJson);
+        body.max_tokens = 1;
+        body.stream = false;
+        // Thinking budgets require max_tokens > budget — a heartbeat with
+        // max_tokens:1 + reasoning would 400. Stripping `reasoning` does not
+        // change the cached prefix (system/messages/tools stay untouched);
+        // for the OAuth path it also stops transformToAnthropic from adding
+        // a `thinking` block.
+        delete body.reasoning;
+        // usage accounting is pointless for a discarded 1-token response.
+        delete body.usage;
+
+        var provider = getProviderById(entry.provider);
+        if (!provider) return false;
+
+        if (provider.isClaudeOAuth) {
+            // transformToAnthropic hardcodes stream:true, so send streaming
+            // and discard every envelope — a 1-token stream ends immediately,
+            // no abort needed. Only reachable in the SW (the alarm lives
+            // there); in page context we simply skip.
+            if (typeof self !== 'undefined' && typeof self.runClaudeOAuthStream === 'function') {
+                body.stream = true;
+                self.runClaudeOAuthStream(body, function discard() {}, null);
+                return true;
+            }
+            return false;
+        }
+
+        // Non-OAuth providers: plain fetch with the same headers as the real
+        // path (callOpenRouterStreaming's fetch branch). Fire-and-forget.
+        var conn = resolveProviderConnection(provider);
+        fetch(conn.endpoint, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + conn.apiKey,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': (typeof Platform !== 'undefined' && Platform.getReferer)
+                    ? Platform.getReferer()
+                    : (Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : ''))
+            },
+            body: JSON.stringify(body)
+        }).then(function(res) {
+            if (!res.ok) console.warn('[cache-heartbeat] non-OK response for chat', chatId, res.status);
+            // Drain/cancel so the connection is released.
+            try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e2) {}
+        }).catch(function(e2) {
+            console.warn('[cache-heartbeat] fetch failed for chat', chatId, e2 && e2.message);
+        });
+        return true;
+    } catch (e) {
+        console.warn('[cache-heartbeat] failed for chat', chatId, e && e.message);
+        return false;
+    }
+}
+
+// Expose for the SW alarm handler in background.js (importScripts shares the
+// worker global scope, but be explicit like Handles/SubAgents are).
+if (typeof self !== 'undefined') { self.sendCacheHeartbeat = sendCacheHeartbeat; }

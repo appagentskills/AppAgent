@@ -37,6 +37,7 @@ var GLOBAL_READ_KEYS = [
     'cached_content_search',
     'cached_content_read',
     'get_skill',
+    'get_tool_schema',
     'display',
     'prompt_user',
     'take_screenshot',
@@ -56,7 +57,7 @@ var GLOBAL_READ_KEYS = [
     'list_instances'
 ];
 
-// Modifying: default 'auto' (except web_fetch → 'ask')
+// Modifying: default 'auto' (except web_fetch → 'ask', workspace:push → 'allow')
 var GLOBAL_WRITE_KEYS = [
     'js_eval',
     'html_widget',
@@ -64,6 +65,7 @@ var GLOBAL_WRITE_KEYS = [
     'set_chat_title',
     'set_tldr',
     'set_links',
+    'set_caveat',
     'manage_skill:create',
     'manage_skill:update',
     'manage_skill:edit',
@@ -87,7 +89,8 @@ var GLOBAL_WRITE_KEYS = [
     'document:delete',
     'update_action_state',
     'show_action_button',
-    'github_setup'
+    'github_setup',
+    'runtime_inspect'
 ];
 
 var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);

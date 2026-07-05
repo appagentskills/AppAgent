@@ -557,7 +557,6 @@
     color: var(--text-muted, #6b7280);
     white-space: nowrap;
 }
-.worker-tools-sep { opacity: 0.55; margin: 0 1px; }
 /* Per-sub context-length ring — mirrors .context-circle in 06-input.css. */
 .worker-ctx {
     position: relative;
@@ -635,6 +634,22 @@
 }
 .worker-progress-open .worker-progress-open-icon { width: 14px; height: 14px; flex-shrink: 0; }
 .worker-progress-open:hover { text-decoration: underline; }
+/* Second row action: "chat view" (opens the sub's chat card in a modal) sits
+   next to "open chat" on the same line. */
+.worker-progress-chat-view { margin-left: 12px; }
+
+/* ---------- Worker chat-view modal ----------
+   Variant class on the global #modal-overlay (same pattern as
+   .skill-asset-modal / .request-body-modal in 14-modals.css). The body
+   hosts the renderSubReport card, so give it room and its own scrollbar. */
+.modal-overlay.worker-chat-modal .modal-dialog { max-width: 760px; width: 92%; max-height: 85vh; display: flex; flex-direction: column; }
+.modal-overlay.worker-chat-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6, 12px); }
+.modal-overlay.worker-chat-modal .modal-title-text { flex: 1; font-size: var(--text-body-lg, 15px); font-weight: var(--font-semibold, 600); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-overlay.worker-chat-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-4, 8px); }
+.modal-overlay.worker-chat-modal .modal-body { flex: 1; overflow-y: auto; }
+/* The card is a chat .message — neutralize chat-flow margins/width caps
+   inside the modal so it fills the dialog. */
+.modal-overlay.worker-chat-modal .modal-body details.message.sub-report { margin: 0; max-width: none; width: auto; }
 
 /* ---------- Dark theme overrides ----------
    Most colors already come from themed tokens (--bg-light, --bg-white,
@@ -794,10 +809,33 @@
 .sub-report-body pre.sub-md {
     white-space: normal;
     word-break: normal;
-    overflow-wrap: break-word;
+    overflow-wrap: anywhere;
     font-family: inherit;
     line-height: var(--leading-normal, 1.5);
+    min-width: 0;
+    max-width: 100%;
 }
+/* ── Horizontal-overflow containment for the sub-report input/output panels ──
+   Long unbreakable tokens (URLs, sys_ids, dot-walk field paths, JSON keys)
+   used to spill past the panel's right edge. Fixes, all scoped to
+   .sub-report-body so chat-message rendering is untouched:
+   1. code.inline-code is globally white-space:nowrap (07-markdown.css:15); in
+      the narrow panels — and especially the .sub-report-progress-text rows,
+      which have NO horizontal scroll — a long inline token could not wrap and
+      overflowed to the right. Let inline code wrap here.
+   2. min-width:0 on the wrappers/pre so they can shrink below their content's
+      intrinsic width (a flex item defaults to min-width:auto) and let
+      overflow-wrap / the pre's overflow-x:auto actually engage. */
+.sub-report-body code.inline-code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.sub-report-body .tool-args-wrapper,
+.sub-report-body .tool-result-section,
+.sub-report-body .tool-result-wrapper,
+.sub-report-body .code-block-wrapper { min-width: 0; }
+.sub-report-body .tool-args { min-width: 0; max-width: 100%; }
 /* The expanded markdown body is block-level so it sits on its own line below
    the −/+ toggle (block children would interleave awkwardly with the inline
    toggle otherwise). The delegated [data-sub-collapse] listener restores
@@ -827,3 +865,118 @@
 .sub-report-body .sub-md h3:first-child,
 .sub-report-body .sub-md h4:first-child,
 .sub-report-body .sub-md h5:first-child { margin-top: 0; }
+
+/* ── Orchestrator §6: per-sub model provenance ──
+   .worker-model — own row on a worker card (sidebar Workers panel / jobs
+   dropdown): 'provider (tier)', muted + ellipsized.
+   .sub-report-model — same string as a small pill in the sub_report card
+   header, styled like .sub-report-status but accent-tinted so it reads as
+   metadata, not lifecycle state. Both render ONLY when the live registry
+   record carries provider/tier (legacy + GC'd records → no element). */
+.worker-model {
+    font-size: var(--text-caption, 11px);
+    color: var(--text-muted, #6b7280);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    max-width: 100%;
+}
+/* .worker-files / .worker-prs — collapsed-card work counters (files edited,
+   PRs opened by the sub's chat). Same muted single-line styling as
+   .worker-tools; hidden via [hidden] when the count is 0. */
+.worker-files,
+.worker-prs {
+    font-size: var(--text-xs, 10px);
+    color: var(--text-muted, #6b7280);
+    white-space: nowrap;
+}
+.sub-report-model {
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm, 4px);
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-normal, 400);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    color: var(--accent, #6c63ff);
+    background: rgba(108, 99, 255, 0.10);
+}
+
+/* ── Orchestrator §4: threaded parent⇄worker dialogue ──
+   Nested <details> at the top of a sub_report card body. Collapsed by
+   default; each row = role label (parent→ / worker→) + kind pill (spawn /
+   wake / update / notice / report · status / queued) + one-line preview +
+   hh:mm:ss timestamp. */
+.sub-thread {
+    margin-bottom: var(--space-4, 8px);
+    border: 1px solid var(--border, #e1e4ea);
+    border-radius: var(--radius-md, 6px);
+    background: var(--bg-secondary, #f6f8fa);
+}
+.sub-thread-summary {
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 10px;
+    font-size: var(--text-caption, 11px);
+    font-weight: var(--font-semibold, 600);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted, #6b7280);
+    list-style: none;
+}
+.sub-thread-summary::-webkit-details-marker { display: none; }
+.sub-thread-summary::before {
+    content: '\203a';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.15s ease;
+}
+.sub-thread[open] > .sub-thread-summary::before { transform: rotate(90deg); }
+.sub-thread-body {
+    padding: var(--space-2, 4px) var(--space-5, 10px) var(--space-4, 8px);
+    border-top: 1px dashed var(--border, #e1e4ea);
+}
+.sub-thread-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3, 6px);
+    padding: 2px 0;
+    font-size: var(--text-caption, 12px);
+    min-width: 0;
+}
+.sub-thread-role {
+    flex-shrink: 0;
+    width: 64px;
+    font-size: 10px;
+    font-weight: var(--font-semibold, 600);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+}
+.sub-thread-parent .sub-thread-role { color: var(--accent, #6c63ff); }
+.sub-thread-worker .sub-thread-role { color: var(--success, #2da44e); }
+.sub-thread-kind {
+    flex-shrink: 0;
+    padding: 0 5px;
+    border-radius: var(--radius-sm, 4px);
+    font-size: 10px;
+    white-space: nowrap;
+    color: var(--text-muted, #6b7280);
+    background: var(--bg-hover, #e7e9ee);
+}
+.sub-thread-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary, #1f2328);
+}
+.sub-thread-time {
+    flex-shrink: 0;
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--text-muted, #6b7280);
+    font-variant-numeric: tabular-nums;
+}

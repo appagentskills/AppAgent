@@ -50,7 +50,10 @@ var appStorage = {
 // Panels read from their own copy and update via emitted events.
 var chats = {};
 var currentChatId = null;            // No "current" chat in offscreen; routes by chatId
-var currentProvider = '';            // Set per-run from chat.provider or persisted default
+var currentProvider = '';            // Global default, adopted from the panel (port-bridge run-agent).
+                                     // Per-run the loop resolves chats[chatId].provider || currentProvider
+                                     // via resolveChatProviderName (core/030-config.js) — sub-agents
+                                     // pinned to a provider/tier at spawn override this global.
 var lastApiError = null;
 var lastRequestMetrics = null;
 var activeStreamingChatId = null;

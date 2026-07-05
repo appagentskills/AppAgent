@@ -32,7 +32,9 @@ function getDisabledTools() {
     return disabled;
 }
 
-function getEnabledTools(chatId) {
+// opts.includeDeferred: return the FULL enabled list even when deferred
+// tool loading is ON — same contract as the page twin (ui/140-dropdowns.js).
+function getEnabledTools(chatId, opts) {
     var baseTools = TOOLS.filter(function(tool) {
         var name = tool.function.name;
         if (name === 'servicenow_api') {
@@ -49,6 +51,11 @@ function getEnabledTools(chatId) {
         if (name === 'set_chat_title' && !hooksEnabled.autoTitle) return false;
         if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
         if (name === 'set_links' && !hooksEnabled.autoLinks) return false;
+        if (name === 'set_caveat' && !hooksEnabled.autoCaveat) return false;
+        // runtime_inspect is dev-mode-only: hidden from the LLM unless the
+        // panel pushed dev-mode active ('dev-mode' case in 130-port-bridge.js).
+        // Keep in sync with the page twin in src/js/ui/140-dropdowns.js.
+        if (name === 'runtime_inspect' && !self._swDevModeActive) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });
@@ -92,6 +99,19 @@ function getEnabledTools(chatId) {
         }
     }
 
+    // Deferred tool loading: SHARED split + strip helpers from
+    // core/080-tools.js (WORKER_SHARED_FILES) — do NOT fork the logic here.
+    // Matches the page-side getEnabledTools in src/js/ui/140-dropdowns.js.
+    var _deferredActive = (typeof isDeferredToolsActive === 'function') && isDeferredToolsActive();
+    if (_deferredActive && !(opts && opts.includeDeferred)) {
+        allTools = getDeferredSplit(allTools).core;
+    }
+    // Strip non-wire fields: `short` always, `headless` only in deferred
+    // mode (flag OFF stays byte-identical to the legacy wire shape).
+    if (typeof prepareToolsForRequest === 'function') {
+        allTools = prepareToolsForRequest(allTools, _deferredActive);
+    }
+
     // Cache control: anthropic-style trailing cache point so the tools
     // block hits the prompt cache. Matches the page-side getEnabledTools.
     if (allTools.length > 0) {
@@ -109,6 +129,8 @@ function getToolPermission(toolName, methodOrAction) {
     }
     if (sessionPermissions[permKey] === 'allow') return 'allow';
     if (toolPermissions[permKey]) return toolPermissions[permKey];
+    // workspace:push defaults to 'allow' — PR pushes never prompt unless overridden
+    if (permKey === 'workspace:push') return 'allow';
     return isReadPermissionKey(permKey) ? 'allow' : 'auto';
 }
 

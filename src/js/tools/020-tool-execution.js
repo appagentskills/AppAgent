@@ -318,6 +318,31 @@ function executeSetLinks(args, options) {
     return { success: true, message: 'Links set (' + links.length + ')' };
 }
 
+// Execute set_caveat tool (autoCaveat hook). Headless — runs in the SW.
+// Attaches a single must-read warning to the final-answer assistant message of
+// the last REAL (non-hook) turn via the same shared helpers as executeSetTldr;
+// rendered as an amber warning card ABOVE the TL;DR (renderCaveatCard).
+function executeSetCaveat(args, options) {
+    if (!args.caveat || typeof args.caveat !== 'string') return { success: false, error: 'caveat is required' };
+    var text = args.caveat.trim().substring(0, 300);
+    if (!text) return { success: false, error: 'caveat cannot be empty' };
+    var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    var chat = chats[targetChatId];
+    if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
+    var attached = attachAnswerCard(chat, 'caveat', text);
+    if (!attached.success) return attached;
+    // Success — reset the per-turn caveat hook retry cap (mirrors executeSetTldr).
+    chat._caveatHookTries = 0;
+    saveChatsToStorage();
+    // Sync page mirror + re-render (mirrors tldrChanged pattern)
+    if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+        AgentEvents.emit('caveatChanged', { chatId: targetChatId, caveat: text });
+    } else if (typeof renderMessages === 'function') {
+        renderMessages();
+    }
+    return { success: true, message: 'Caveat set' };
+}
+
 // Apply search-and-replace edits to content (no line numbers needed)
 function applySearchReplaceEdits(content, edits) {
     var errors = [];
@@ -834,9 +859,14 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (_subRec && Array.isArray(_subRec.tool_roster)) {
                 var _alwaysAllowed = (name === 'report_to_parent'
                     || name === 'sleep_self'
-                    || name === 'agent_message');
+                    || name === 'agent_message'
+                    // get_tool_schema: pure metadata read (deferred tool
+                    // loading). Persisted rosters from before the feature
+                    // existed don't contain it, and a sub must always be
+                    // able to fetch a cataloged tool's schema.
+                    || name === 'get_tool_schema');
                 if (!_alwaysAllowed && _subRec.tool_roster.indexOf(name) === -1) {
-                    return { success: false, error: 'Tool "' + name + '" is not available to this sub-agent. Nested-delegation tools (spawn_sub_agent, stop_sub_agent, wake_sub_agent) require `allow_nested:true` at spawn.', _roster_denied: true };
+                    return { success: false, error: 'Tool "' + name + '" is not available to this sub-agent. Nested-delegation tools (' + ((typeof SUBAGENT_NESTED_DELEGATION_TOOLS !== 'undefined') ? SUBAGENT_NESTED_DELEGATION_TOOLS.join(', ') : 'spawn_sub_agent, stop_sub_agent, wake_sub_agent') + ') require `allow_nested:true` at spawn.', _roster_denied: true };
                 }
             }
         }
@@ -863,6 +893,29 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (!_ok) {
                 return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped.', _budget_exhausted: true };
             }
+        }
+    }
+
+    // -------- Deferred-tool argument validation --------
+    // In deferred mode a cataloged tool can be called NATIVELY without its
+    // schema ever having been declared in the request. Lightweight checks
+    // (required params + primitive types — validateArgsAgainstToolSchema in
+    // core/080-tools.js) catch schema-blind calls; the failure carries the
+    // FULL schema so the model self-corrects from the tool_result without a
+    // get_tool_schema round-trip. Runs AFTER the approval + roster gates
+    // (no permission bypass) and only when the flag is ON — flag-OFF
+    // behavior is untouched.
+    if (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive()
+        && typeof isDeferredToolName === 'function' && isDeferredToolName(name)
+        && typeof validateArgsAgainstToolSchema === 'function') {
+        var _deferredArgCheck = validateArgsAgainstToolSchema(name, args);
+        if (_deferredArgCheck) {
+            return {
+                success: false,
+                error: 'Invalid arguments for "' + name + '": ' + _deferredArgCheck.error
+                    + ' The full schema is included in this result — correct the call and retry.',
+                schema: _deferredArgCheck.schema
+            };
         }
     }
 
@@ -1683,6 +1736,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return executeSetTldr(args, options);
     } else if (name === 'set_links') {
         return executeSetLinks(args, options);
+    } else if (name === 'set_caveat') {
+        return executeSetCaveat(args, options);
     } else if (name === 'cached_content_outline') {
         var ccoChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
         return executeCachedContentOutline(ccoChatId, args);
@@ -1748,7 +1803,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             // override a caller-supplied header. No token / non-match => no-op.
             try {
                 var _wfAuth = await getGitHubApiAuthForUrl(args.url);
-                if (_wfAuth) {
+                // _wfAuth.token is null for approval-only matches (web/raw/gist
+                // hosts): those get NO auth headers — only the REST base does.
+                if (_wfAuth && _wfAuth.token) {
                     // Case-insensitive presence check so caller-set headers win.
                     var _wfHasHeader = function(headerName) {
                         headerName = headerName.toLowerCase();
@@ -1788,6 +1845,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
         } catch (e) {
             return { success: false, error: e.message };
         }
+    } else if (name === 'get_tool_schema') {
+        // Deferred tool loading meta-tool — impl in core/080-tools.js
+        // (shared in both bundles; headless:true so it runs SW-local).
+        return executeGetToolSchema(args, options);
     } else if (name === 'workspace') {
         return await executeWorkspaceTool(args, options);
     } else if (name === 'eval_runner') {
@@ -1795,54 +1856,85 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (isSkillTool(name)) {
         return await executeSkillTool(name, args, options);
     }
-    return { success: false, error: 'Unknown tool' };
+    return { success: false, error: 'Unknown tool "' + name + '". If it is listed in the tool catalog (system prompt), call get_tool_schema with its exact name to fetch its schema; otherwise check the catalog / your declared tools for the closest available tool.' };
 }
 
 // =============================================
-// GitHub REST API URL matching (shared)
+// GitHub URL matching (shared)
 // =============================================
-// Single source of truth for "does this URL target the CONFIGURED GitHub REST
-// API base?". Used by web_fetch token-injection (to attach the stored token)
-// AND by the permission gate (to make these calls confirm-governed instead of
-// always prompting). The base is derived EXACTLY like githubApi() in
-// core/130-indexeddb.js:
-//   - https://github.com -> https://api.github.com   (any path on host)
-//   - GHE <instanceUrl>  -> <instanceUrl>/api/v3      (only /api/v3 paths)
-// Matching the configured host+path guarantees we treat the RIGHT GitHub, and
-// never leak the token to another host or to the GHE web UI (which shares the
-// API host but not the /api/v3 path prefix).
+// Single source of truth answering TWO distinct questions:
+//   1. TOKEN ATTACH — may web_fetch attach the stored Authorization token?
+//      Only for the EXACT configured REST API base, derived like githubApi()
+//      in core/130-indexeddb.js:
+//        - https://github.com -> https://api.github.com   (any path on host)
+//        - GHE <instanceUrl>  -> <instanceUrl>/api/v3      (only /api/v3 paths)
+//      Never leak the token to another host or to the GHE web UI (which
+//      shares the API host but not the /api/v3 path prefix).
+//   2. APPROVAL GOVERNANCE — is this URL agent-governed (confirm-flag) in the
+//      permission gates instead of always prompting? Broader than token
+//      attach, and works WITHOUT a stored token: for the cloud config it also
+//      covers the GitHub web/content hosts (github.com,
+//      raw.githubusercontent.com, gist.github.com, codeload.github.com,
+//      objects.githubusercontent.com); for GHE it covers the whole configured
+//      origin.
 //
-// Returns { token, apiBase } when `url` matches AND a token is stored;
-// otherwise null. Lives here because this file is bundled into BOTH the page
-// and the worker (service-worker) bundles, so both approval gates can call it.
+// Returns null for a non-match; otherwise { token, apiBase } where `token` is
+// the stored token ONLY when the URL targets the REST base — and null (even
+// with a token stored) for approval-only matches, so callers MUST check
+// auth.token before attaching an Authorization header. Lives here because
+// this file is bundled into BOTH the page and the worker (service-worker)
+// bundles, so both approval gates can call it.
+
+// Cloud web/content hosts that are approval-governed but NEVER get the token.
+var GITHUB_CLOUD_WEB_HOSTS = ['github.com', 'raw.githubusercontent.com', 'gist.github.com', 'codeload.github.com', 'objects.githubusercontent.com'];
+
 async function getGitHubApiAuthForUrl(url) {
     try {
         if (!url) return null;
         var gh = await new Promise(function(resolve) {
             chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
         });
-        var tok = gh && gh.githubToken;
-        if (!tok) return null;
-        var instance = gh.githubInstanceUrl || 'https://github.com';
-        var apiBase = instance === 'https://github.com'
-            ? 'https://api.github.com'
-            : instance.replace(/\/$/, '') + '/api/v3';
+        var tok = (gh && gh.githubToken) || null;
+        // normalizeGitHubInstanceUrl lives in core/130-indexeddb.js — part of
+        // both the page bundle (core tier) and the SW bundle (WORKER_SHARED_FILES).
+        var instance = normalizeGitHubInstanceUrl(gh && gh.githubInstanceUrl);
+        var isCloud = instance === 'https://github.com';
+        var apiBase = isCloud ? 'https://api.github.com' : instance + '/api/v3';
         var req = new URL(url);
         var base = new URL(apiBase);
+        var reqHost = req.hostname.toLowerCase();
         var reqPath = req.pathname.toLowerCase();
         var basePath = base.pathname.replace(/\/$/, '').toLowerCase(); // '' for cloud, '/api/v3' for GHE
         var pathOk = basePath === '' || reqPath === basePath || reqPath.indexOf(basePath + '/') === 0;
         var hostOk = req.protocol === base.protocol
-            && req.hostname.toLowerCase() === base.hostname.toLowerCase()
+            && reqHost === base.hostname.toLowerCase()
             && req.port === base.port;
+        // Exact REST base: approval-governed AND token-attached (when stored).
         if (hostOk && pathOk) return { token: tok, apiBase: apiBase };
+        // Approval-governed matches below NEVER carry the token.
+        if (isCloud) {
+            // GitHub cloud web/content hosts (https only).
+            if (req.protocol === 'https:' && GITHUB_CLOUD_WEB_HOSTS.indexOf(reqHost) !== -1) {
+                return { token: null, apiBase: apiBase };
+            }
+        } else {
+            // GHE: the whole configured origin (web UI, raw paths outside /api/v3).
+            var inst = new URL(instance);
+            if (req.protocol === inst.protocol
+                && reqHost === inst.hostname.toLowerCase()
+                && req.port === inst.port) {
+                return { token: null, apiBase: apiBase };
+            }
+        }
         return null;
     } catch (e) {
         return null; // malformed URL or storage read error: treat as non-match
     }
 }
 
-// Boolean convenience for the permission gate.
+// Boolean convenience for the permission gates — TRUE for any approval-governed
+// GitHub URL. Deliberately does NOT require a stored token: governance must
+// work tokenless (token presence only affects the Authorization header).
 async function isConfiguredGitHubApiUrl(url) {
     return !!(await getGitHubApiAuthForUrl(url));
 }
@@ -1871,25 +1963,100 @@ function _wsFormatAgo(ms) {
     return d + (d === 1 ? ' day ago' : ' days ago');
 }
 
+// Ownership stamps this fresh are treated as "likely still in progress" even
+// when the owner chat is not currently running: isChatRunning reads an
+// IN-MEMORY map (runningChatIds, core/030-config.js) that does not survive a
+// service-worker restart, so "not running" alone is not proof of dormancy.
+var WS_RECENT_MS = 15 * 60 * 1000;
+
+function _wsRecentlyModified(when) {
+    return !!(when && (Date.now() - when) < WS_RECENT_MS);
+}
+
+// Resolve a chat id to its ROOT chat id via the sub-agent registry — a
+// sub-agent's edits belong to the same lineage as its parent/root chat, so
+// parent and sub must never cross-chat-block each other. SubAgents
+// (core/097-sub-agent-registry.js) loads BEFORE this file in both the page
+// bundle (prefix sort 097 < tools) and the SW bundle (WORKER_SHARED_FILES
+// order). Records carry root_chat_id directly; the parent walk is a fallback
+// for legacy records, capped at depth 5 (max nesting). Missing/GC'd registry
+// entries resolve to the id itself.
+function _wsRootChatId(chatId) {
+    if (!chatId) return chatId;
+    try {
+        if (typeof SubAgents === 'undefined' || !SubAgents.getByChatId) return chatId;
+        var cur = chatId;
+        for (var i = 0; i < 5; i++) {
+            var rec = SubAgents.getByChatId(cur);
+            if (!rec) break;
+            if (rec.root_chat_id) return rec.root_chat_id;
+            if (!rec.parent_chat_id || rec.parent_chat_id === cur) break;
+            cur = rec.parent_chat_id;
+        }
+        return cur;
+    } catch (e) { return chatId; }
+}
+
+// Same-lineage check: two chat ids share ownership when they resolve to the
+// same root chat (parent ↔ sub, or two subs of the same root chat).
+function _wsSameChatLineage(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return _wsRootChatId(a) === _wsRootChatId(b);
+}
+
+// Owner-running check that also considers the owner's ROOT chat — a sub may
+// be parked while its parent orchestrator is actively driving the work.
+function _wsOwnerChatRunning(ownerChatId) {
+    if (!ownerChatId || typeof isChatRunning !== 'function') return false;
+    if (isChatRunning(ownerChatId)) return true;
+    var root = _wsRootChatId(ownerChatId);
+    return !!(root && root !== ownerChatId && isChatRunning(root));
+}
+
 function _wsCheckCrossChatConflict(file, chatId) {
     if (!file || !file.dirty) return null;
     var lastChat = file.last_modified_by_chat_id;
-    if (!lastChat) return null;
-    if (chatId && lastChat === chatId) return null;
-    var otherTitle = file.last_modified_by_chat_title || '(untitled chat)';
     var when = file.last_modified_at || null;
     var ago = _wsFormatAgo(when);
-    var stillRunning = (typeof isChatRunning === 'function') && isChatRunning(lastChat);
-    // hard=true: other chat is actively running — block to avoid clobbering an in-flight agent.
-    // hard=false: other chat is dormant/closed — surface as warning only; current chat takes over.
-    var hard = !!stillRunning;
-    var headline = stillRunning
-        ? '\u26A0 ANOTHER AGENT IS ACTIVELY RUNNING in chat "' + otherTitle + '" (' + lastChat + ')'
-        : '\u26A0 This file has uncommitted changes from another (dormant) chat "' + otherTitle + '" (' + lastChat + ')';
-    if (ago) headline += ' \u2014 last edited ' + ago;
-    headline += hard
-        ? '. Coordinate with the other chat, or pass {"force": true} to override and clobber their work.'
-        : '. The other chat is no longer running, so this mutation will silently take over ownership.';
+    var recent = _wsRecentlyModified(when);
+    if (!lastChat) {
+        // Unknown owner. Old rows keep the historical no-conflict behavior; a
+        // RECENT unowned edit is likely still in progress (stamp lost to a
+        // crash/SW restart) — hard-block for EVERYONE until the window passes.
+        if (!recent) return null;
+        return {
+            cross_chat_conflict: true,
+            hard: true,
+            last_modified_by_chat_id: null,
+            last_modified_by_chat_title: null,
+            last_modified_at: when,
+            last_modified_ago: ago,
+            last_modified_iso: when ? new Date(when).toISOString() : null,
+            other_chat_running: false,
+            message: '\u26A0 This file has uncommitted changes with NO recorded owner, edited ' + (ago || 'just now') + ' \u2014 likely still in progress by an unknown agent. Pass {"force": true} to take over.'
+        };
+    }
+    if (chatId && _wsSameChatLineage(lastChat, chatId)) return null;
+    var otherTitle = file.last_modified_by_chat_title || '(untitled chat)';
+    var stillRunning = _wsOwnerChatRunning(lastChat);
+    // hard=true: the owner chat (or its root) is actively running, OR the stamp
+    // is fresh (< WS_RECENT_MS) — a fresh stamp after a SW restart still means
+    // "likely in progress" even though runningChatIds was wiped.
+    // hard=false: dormant AND old — surface as warning only; current chat takes over.
+    var hard = !!(stillRunning || recent);
+    var headline;
+    if (stillRunning) {
+        headline = '\u26A0 ANOTHER AGENT IS ACTIVELY RUNNING in chat "' + otherTitle + '" (' + lastChat + ')';
+        if (ago) headline += ' \u2014 last edited ' + ago;
+        headline += '. Coordinate with the other chat, or pass {"force": true} to override and clobber their work.';
+    } else if (recent) {
+        headline = '\u26A0 This file was recently edited ' + (ago || 'just now') + ' by another chat "' + otherTitle + '" (' + lastChat + ') \u2014 likely still in progress; pass {"force": true} to take over.';
+    } else {
+        headline = '\u26A0 This file has uncommitted changes from another (dormant) chat "' + otherTitle + '" (' + lastChat + ')';
+        if (ago) headline += ' \u2014 last edited ' + ago;
+        headline += '. The other chat is no longer running, so this mutation will silently take over ownership.';
+    }
     return {
         cross_chat_conflict: true,
         hard: hard,
@@ -1910,17 +2077,21 @@ function _wsCheckCrossChatConflict(file, chatId) {
 // clean files, unstamped files, and files owned by THIS chat.
 function _wsForeignOwnership(f, chatId) {
     if (!f || !f.dirty || !f.last_modified_by_chat_id) return null;
-    if (chatId && f.last_modified_by_chat_id === chatId) return null;
-    var running = (typeof isChatRunning === 'function') && isChatRunning(f.last_modified_by_chat_id);
+    if (chatId && _wsSameChatLineage(f.last_modified_by_chat_id, chatId)) return null;
+    var running = _wsOwnerChatRunning(f.last_modified_by_chat_id);
+    var recent = _wsRecentlyModified(f.last_modified_at);
     var ago = _wsFormatAgo(f.last_modified_at);
     var who = f.last_modified_by_chat_title ? ' "' + f.last_modified_by_chat_title + '"' : '';
     var msg = running
         ? '\u26a0 WORK IN PROGRESS by another agent \u2014 chat' + who + ' (' + f.last_modified_by_chat_id + ') is STILL RUNNING and has uncommitted edits to this file' + (ago ? ' (' + ago + ')' : '') + '. Leave it alone: mutations are blocked unless you pass {"force": true}.'
+        : recent
+        ? '\u26a0 RECENTLY EDITED ' + (ago || 'just now') + ' by another chat' + who + ' (' + f.last_modified_by_chat_id + ') \u2014 likely still in progress; mutations are blocked unless you pass {"force": true}.'
         : 'Uncommitted changes by another (now dormant) chat' + who + ' (' + f.last_modified_by_chat_id + ')' + (ago ? ' \u2014 last edited ' + ago : '') + '. Mutating this file will silently take over ownership.';
     return {
         path: f.path,
         foreign_chat: true,
         other_chat_running: running,
+        recently_modified: recent,
         last_modified_by_chat_id: f.last_modified_by_chat_id,
         last_modified_by_chat_title: f.last_modified_by_chat_title || null,
         last_modified_at: f.last_modified_at || null,
@@ -2032,7 +2203,7 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'diff') {
             result = await wsDiff(wk, args.path, _incIgnored, chatId);
         } else if (action === 'push') {
-            result = await wsPush(wk, args);
+            result = await wsPush(wk, args, chatId, chatTitle);
         } else if (action === 'deploy') {
             result = await wsDeploy(wk, args.path, args.dest);
         } else if (action === 'discard') {
@@ -2045,10 +2216,10 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'branch') {
             // Local fork: copy this workspace's rows into owner/repo::<branch>.
             // The remote branch is created lazily by the first push.
-            result = await wsBranch(wk, args.branch, args.move_dirty !== false, chatId, chatTitle);
+            result = await wsBranch(wk, args.branch, args.move_dirty !== false, chatId, chatTitle, force);
         } else if (action === 'move') {
             // Move dirty edits from this workspace onto another workspace.
-            result = await wsMove(wk, args.to, args.files, force, chatId, chatTitle);
+            result = await wsMove(wk, args.to, args.files, force, chatId, chatTitle, false);
         } else if (action === 'hydrate') {
             // Internal-ish action: bulk-hydrate lazy stubs (optionally limited
             // to a path prefix). Used by the extension_build skill tool.
@@ -2792,7 +2963,8 @@ async function setWorkspacePin(wk, unpin) {
 // Local fork: create workspace owner/repo::<newBranch> by COPYING the source
 // workspace's rows. Post-blob-store the rows are light sha refs, so the copy
 // is cheap — sha/stub/size/flags are preserved, ids and file_ids are fresh,
-// and pushed_pr/pushed_shas/cross-chat stamps are NOT copied. Dirty rows'
+// and pushed_pr/pushed_shas are NOT copied (cross-chat ownership stamps ARE
+// preserved on the fork copies, so the mutation lock survives the fork). Dirty rows'
 // overlay content travels to the fork (that is the point: work already
 // started on the source branch moves to the fork). With moveDirty (default)
 // the SOURCE's dirty files are then reverted clean (discard semantics) so
@@ -2801,7 +2973,7 @@ async function setWorkspacePin(wk, unpin) {
 // the first push, cutting it from the fork's base branch (meta.base_branch).
 // The fork is pinned automatically (it is the workspace the user is about
 // to work/build on).
-async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle) {
+async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     if (!newBranch || typeof newBranch !== 'string') return { success: false, error: 'branch (the new branch name) is required for the branch action' };
     newBranch = newBranch.replace(/^\s+|\s+$/g, '');
     if (!newBranch || newBranch.indexOf('::') !== -1 || /\s/.test(newBranch)) return { success: false, error: 'Invalid branch name: "' + newBranch + '"' };
@@ -2816,6 +2988,35 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle) {
     // Copy rows RAW (no blob resolution) — clean rows carry only sha refs;
     // dirty rows keep their inline overlay content, which must travel.
     var allRows = await getAllWorkspaceFilesAllRepos();
+
+    // Cross-chat guard: forking sweeps EVERY dirty file into the fork and (with
+    // moveDirty, the default) force-discards them from the source — which would
+    // bypass the per-file mutation lock. Fail the WHOLE branch action when any
+    // dirty file hard-conflicts with another owner (unless force).
+    if (!force) {
+        var blockedDirty = [];
+        for (var gi = 0; gi < allRows.length; gi++) {
+            var gr = allRows[gi];
+            if (!gr || gr.repo !== wk || !gr.dirty) continue;
+            var gDec = await _wsConflictDecision(wk, gr.path, gr, chatId, false);
+            if (gDec.block) {
+                blockedDirty.push({
+                    path: gr.path,
+                    owner_chat_id: gDec.block.last_modified_by_chat_id,
+                    owner_chat_title: gDec.block.last_modified_by_chat_title,
+                    last_modified_ago: gDec.block.last_modified_ago
+                });
+            }
+        }
+        if (blockedDirty.length > 0) {
+            return {
+                success: false,
+                error: 'branch blocked — ' + blockedDirty.length + ' dirty file(s) have uncommitted changes owned by another chat that is running or recently active: ' + blockedDirty.map(function(b) { return b.path; }).join(', ') + '. Coordinate with the owning chat(s), or pass {"force": true} to fork anyway.',
+                blocking_files: blockedDirty
+            };
+        }
+    }
+
     var copied = 0;
     var dirtyCopied = [];
     for (var i = 0; i < allRows.length; i++) {
@@ -2827,9 +3028,12 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle) {
         copy.file_id = newFileId();
         copy.pushed_pr = null;
         copy.pushed_shas = null;
-        copy.last_modified_by_chat_id = null;
-        copy.last_modified_by_chat_title = null;
-        copy.last_modified_at = null;
+        // Preserve cross-chat ownership stamps on the fork copies — stripping
+        // them would let anyone silently take over another chat's in-progress
+        // edits simply by forking the workspace.
+        copy.last_modified_by_chat_id = src.last_modified_by_chat_id || null;
+        copy.last_modified_by_chat_title = src.last_modified_by_chat_title || null;
+        copy.last_modified_at = src.last_modified_at || null;
         await setWorkspaceFile(copy);
         registerFile(copy.file_id, { type: 'workspace', workspace: targetWk, path: copy.path });
         copied++;
@@ -2887,7 +3091,7 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle) {
 //   - target base sha differs from source base sha → allowed, but reported
 //     in base_diverged.
 // Returns { success, moved: [...], skipped: [...], base_diverged: [...] }.
-async function wsMove(wk, targetWk, paths, force, chatId, chatTitle) {
+async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAutoMove) {
     if (!targetWk) return { success: false, error: '"to" (target workspace key) is required for move' };
     if (targetWk === wk) return { success: false, error: 'Source and target workspaces are identical.' };
     var srcMeta = await getWorkspaceMeta(wk);
@@ -2919,9 +3123,29 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle) {
     // (unless force), so a half-moved state never exists.
     var plan = [];
     var conflicts = [];
+    var foreignBlocked = [];
     var baseDiverged = [];
     for (var si = 0; si < selected.length; si++) {
         var srcRow = selected[si];
+        // Cross-chat guard on SOURCE rows: moving a file discards it from the
+        // source workspace, which would bypass the per-file mutation lock.
+        // Only the internal merge-lifecycle auto-move (wsSync) passes
+        // internalAutoMove=true and is exempt — it preserves the ownership
+        // stamps onto the target. A user-initiated move still runs the guard
+        // even when chatId is unresolvable (null): a null owner vs a foreign
+        // owner counts as a conflict per _wsCheckCrossChatConflict's semantics.
+        if (!internalAutoMove && !force) {
+            var srcDec = await _wsConflictDecision(wk, srcRow.path, srcRow, chatId, false);
+            if (srcDec.block) {
+                foreignBlocked.push({
+                    path: srcRow.path,
+                    owner_chat_id: srcDec.block.last_modified_by_chat_id,
+                    owner_chat_title: srcDec.block.last_modified_by_chat_title,
+                    last_modified_ago: srcDec.block.last_modified_ago
+                });
+                continue;
+            }
+        }
         var tgtRow = await getWorkspaceFile(targetWk, srcRow.path);
         if (srcRow.deleted && (!tgtRow || tgtRow.deleted)) {
             // Moving a deletion needs an existing, not-already-deleted target.
@@ -2934,6 +3158,16 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle) {
         }
         if (tgtRow && srcRow.sha && tgtRow.sha && tgtRow.sha !== srcRow.sha) baseDiverged.push(srcRow.path);
         plan.push({ src: srcRow, tgt: tgtRow });
+    }
+    if (foreignBlocked.length > 0) {
+        return {
+            success: false,
+            error: 'Move blocked — ' + foreignBlocked.length + ' source file(s) have uncommitted changes owned by another chat that is running or recently active: ' + foreignBlocked.map(function(b) { return b.path; }).join(', ') + '. Coordinate with the owning chat(s), or pass {"force": true} to move them anyway.',
+            foreign_blocked: foreignBlocked,
+            moved: [],
+            skipped: skipped,
+            base_diverged: []
+        };
     }
     if (conflicts.length > 0) {
         return {
@@ -3286,6 +3520,7 @@ async function wsStatus(wk, includeIgnored, chatId) {
     var isIgnored = includeIgnored ? function() { return false; } : await wsGetIgnoreFilter(wk);
     var foreignCount = 0;
     var foreignRunningCount = 0;
+    var foreignRecentCount = 0;
     var dirty = files.filter(function(f) { return f.dirty && !isIgnored(f.path); }).map(function(f) {
         var entry = { path: f.path, isNew: !f.sha && !f.deleted, isDeleted: !!f.deleted, size: f.deleted ? 0 : (f.content != null ? f.content.length : (f.size || 0)), pushed_pr: f.pushed_pr || null };
         if (f.last_modified_by_chat_id) {
@@ -3298,16 +3533,18 @@ async function wsStatus(wk, includeIgnored, chatId) {
             // (the owning chat/agent id) and that it is uncommitted WIP — instead
             // of having to infer it from the foreign_chat/other_chat_running flags.
             var _wAgo = entry.last_modified_ago ? (' (' + entry.last_modified_ago + ')') : '';
-            var _wWho = entry.last_modified_by_chat_title ? (' titled "' + entry.last_modified_by_chat_title + '"') : '';
-            if (chatId && f.last_modified_by_chat_id !== chatId) {
+            // Reuse _wsForeignOwnership so the per-file WIP message honours the
+            // same three-state semantics as the mutators (running / recently
+            // modified / dormant) and the same lineage-aware owner detection.
+            // Returns null for files owned by THIS chat's lineage.
+            var _fOwn = _wsForeignOwnership(f, chatId);
+            if (_fOwn) {
                 entry.foreign_chat = true;
-                if ((typeof isChatRunning === 'function') && isChatRunning(f.last_modified_by_chat_id)) {
-                    entry.other_chat_running = true;
-                    foreignRunningCount++;
-                    entry.message = '\u26a0 WORK IN PROGRESS by another agent \u2014 chat/agent ' + f.last_modified_by_chat_id + _wWho + ' is STILL RUNNING and has uncommitted edits to this file' + _wAgo + '. Leave it alone: any mutation is blocked unless you pass {"force": true}, and forcing would clobber their unsaved work.';
-                } else {
-                    entry.message = 'Work in progress by another (now dormant) agent \u2014 chat/agent ' + f.last_modified_by_chat_id + _wWho + ' last edited this file' + _wAgo + '. Editing it will silently take over ownership from that agent.';
-                }
+                entry.other_chat_running = _fOwn.other_chat_running;
+                entry.recently_modified = _fOwn.recently_modified;
+                entry.message = _fOwn.message;
+                if (_fOwn.other_chat_running) foreignRunningCount++;
+                else if (_fOwn.recently_modified) foreignRecentCount++;
                 foreignCount++;
             } else {
                 entry.message = 'Work in progress by THIS agent (chat/agent ' + f.last_modified_by_chat_id + ')' + _wAgo + ' \u2014 uncommitted local changes, not yet pushed.';
@@ -3324,8 +3561,11 @@ async function wsStatus(wk, includeIgnored, chatId) {
     if (foreignCount > 0) {
         result.foreign_dirty_count = foreignCount;
         result.foreign_running_count = foreignRunningCount;
-        if (foreignRunningCount > 0) {
-            result.foreign_warning = foreignRunningCount + ' of ' + foreignCount + ' foreign dirty file(s) belong to a chat that is still running. Mutating those is blocked unless you pass {"force": true}. The remaining ' + (foreignCount - foreignRunningCount) + ' belong to dormant chats and will be silently taken over on next mutation.';
+        if (foreignRecentCount > 0) result.foreign_recent_count = foreignRecentCount;
+        var foreignBlockedCount = foreignRunningCount + foreignRecentCount;
+        if (foreignBlockedCount > 0) {
+            var foreignDormantCount = foreignCount - foreignBlockedCount;
+            result.foreign_warning = foreignBlockedCount + ' of ' + foreignCount + ' foreign dirty file(s) belong to a chat that is still running or was recently active \u2014 mutating those is blocked unless you pass {"force": true}.' + (foreignDormantCount > 0 ? ' The remaining ' + foreignDormantCount + ' belong to dormant chats and will be silently taken over on next mutation.' : '');
         } else {
             result.foreign_warning = foreignCount + ' dirty file(s) were last modified by other (now dormant) chats. Mutating any will silently take over ownership.';
         }
@@ -3649,7 +3889,7 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
             // Pass the ignore-filtered paths explicitly — a bare null would make
             // wsMove select ALL dirty rows including gitignored artefacts (e.g.
             // dist/ build output), which could spuriously block the whole move.
-            try { moveRes = await wsMove(wk, baseWk, dirty.map(function(f) { return f.path; }), false, null, null); } catch (e) { moveRes = { success: false, error: e && e.message }; }
+            try { moveRes = await wsMove(wk, baseWk, dirty.map(function(f) { return f.path; }), false, null, null, true); } catch (e) { moveRes = { success: false, error: e && e.message }; }
             if (!moveRes || !moveRes.success) {
                 return {
                     deleted: false,
@@ -3692,6 +3932,46 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
             } catch (e) {}
         }
 
+        // 3.5 Preserve this fork's PR records (incl. their per-file diff
+        //     snapshots — see _prFiles in wsPush) on the BASE workspace's meta
+        //     before the fork meta is deleted, stamped state:'merged' +
+        //     merged_at. The sidebar reads these to badge merged edits and
+        //     show the original pre-merge diff after the fork is gone.
+        //     Best-effort — merge cleanup must never fail on bookkeeping.
+        try {
+            var _forkPrs = (meta.prs || []).filter(function(p) {
+                return p && (p.number === mergedPr.number || p.url === mergedPr.html_url || p.branch === branch);
+            });
+            if (_forkPrs.length) {
+                var _baseMeta = await getWorkspaceMeta(baseWk);
+                if (_baseMeta) {
+                    if (!_baseMeta.prs) _baseMeta.prs = [];
+                    _forkPrs.forEach(function(p) {
+                        // Flip the originating chat's progress card to 'pr_merged'
+                        // (context-safe — works in both SW and page bundles, see
+                        // wsNotifyPrMerged).
+                        if (p.chatId) {
+                            try { wsNotifyPrMerged(p.chatId, p); } catch (e) {}
+                        }
+                        var _copy = Object.assign({}, p, { state: 'merged', merged_at: mergedPr.merged_at || new Date().toISOString() });
+                        var _dupIdx = -1;
+                        for (var _d = 0; _d < _baseMeta.prs.length; _d++) {
+                            var _bp = _baseMeta.prs[_d];
+                            if (_bp && ((_bp.url && _bp.url === p.url) || (_bp.number && _bp.number === p.number))) { _dupIdx = _d; break; }
+                        }
+                        if (_dupIdx >= 0) {
+                            // Keep the richer record — never lose an existing files snapshot.
+                            if (!_copy.files && _baseMeta.prs[_dupIdx].files) _copy.files = _baseMeta.prs[_dupIdx].files;
+                            _baseMeta.prs[_dupIdx] = _copy;
+                        } else {
+                            _baseMeta.prs.push(_copy);
+                        }
+                    });
+                    await setWorkspaceMeta(_baseMeta);
+                }
+            }
+        } catch (e) {}
+
         // 4. Safe to remove the redundant head-branch workspace.
         await deleteWorkspaceFiles(wk);
         await deleteWorkspaceMeta(wk);
@@ -3706,6 +3986,91 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
     } finally {
         delete _wsAutoDelInProgress[wk];
     }
+}
+
+// Notify the originating chat that its pushed PR merged — flips the chat's
+// progress card from 'pr_opened' to the internal 'pr_merged' display state.
+//
+// Context-safe: the workspace tool is HEADLESS (HEADLESS_TOOLS in
+// core/080-tools.js), so merge detection normally runs in the SERVICE WORKER,
+// where tools/120-actions.js (markChatPrMerged / activeActions) is NOT loaded
+// (not in WORKER_SHARED_FILES — build/build.js). In that context, replicate
+// markChatPrMerged's DATA behavior only, on the authoritative chats[chatId]
+// (worker/000-runtime-globals.js, hydrated by worker/115-storage.js): same
+// pr_opened → pr_merged guard, same override shape, persist via the SW
+// saveChatsToStorage (worker/115-storage.js), then emit actionStateChanged —
+// the broadcast patch in worker/100-agent-event-broadcast.js forwards the
+// emit to every connected panel, whose page bridge re-emits it locally and
+// the page handler (app/036-agent-event-handlers-page.js) hydrates its chats
+// mirror + repaints the badge surfaces. In PAGE context (e.g. a files-sidebar
+// sync running this code in the page bundle) markChatPrMerged exists —
+// delegate to it for the full flip incl. activeActions + repaints.
+function wsNotifyPrMerged(chatId, prRef) {
+    if (!chatId) return;
+    prRef = prRef || {};
+    if (typeof markChatPrMerged === 'function') {
+        try { markChatPrMerged(chatId, prRef); } catch (e) {}
+        return;
+    }
+    try {
+        var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        if (!chat) return;
+        // Conservative guard (mirrors markChatPrMerged): only a chat currently
+        // showing 'pr_opened' flips — done/error/running cards keep their state.
+        if (_wsChatProgressState(chat) !== 'pr_opened') return;
+        chat.progressStateOverride = {
+            state: 'pr_merged',
+            at: Date.now(),
+            pr_number: prRef.number || null,
+            pr_url: prRef.url || prRef.html_url || null
+        };
+        try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (e) {}
+        try {
+            if (typeof AgentEvents !== 'undefined' && AgentEvents && typeof AgentEvents.emit === 'function') {
+                AgentEvents.emit('actionStateChanged', {
+                    chatId: chatId,
+                    actionId: null,
+                    status: 'pr_merged',
+                    pr_number: prRef.number || null,
+                    pr_url: prRef.url || prRef.html_url || null,
+                    progressStateOverride: chat.progressStateOverride
+                });
+            }
+        } catch (e) {}
+    } catch (e) {}
+}
+
+// SW-side mini-derivation of a chat's current progress state — the data
+// subset of getChatProgressStateFor + collectAllActionUpdates (tools/
+// 120-actions.js, page-only): the persisted override wins, else the LAST
+// EXECUTED update_action_state's state. A tool_call counts as executed only
+// once a matching role:'tool' result row exists later in the chat — same
+// guard as collectAllActionUpdates (see the rationale comment there).
+function _wsChatProgressState(chat) {
+    if (!chat) return null;
+    var ov = chat.progressStateOverride;
+    if (ov && ov.state) return ov.state;
+    if (!Array.isArray(chat.messages)) return null;
+    var completed = {};
+    for (var i = 0; i < chat.messages.length; i++) {
+        var m = chat.messages[i];
+        if (m && m.role === 'tool' && m.tool_call_id) completed[m.tool_call_id] = true;
+    }
+    var last = null;
+    for (var j = 0; j < chat.messages.length; j++) {
+        var mm = chat.messages[j];
+        if (!mm || !Array.isArray(mm.tool_calls)) continue;
+        for (var t = 0; t < mm.tool_calls.length; t++) {
+            var tc = mm.tool_calls[t];
+            if (!tc || !tc.function || tc.function.name !== 'update_action_state') continue;
+            if (tc.id && !completed[tc.id]) continue;
+            try {
+                var args = JSON.parse(tc.function.arguments || '{}');
+                if (args.state) last = args.state;
+            } catch (e) { /* partial/streaming JSON — skip */ }
+        }
+    }
+    return last;
 }
 
 async function wsSyncWithRemote(wk) {
@@ -3776,6 +4141,12 @@ async function wsSyncWithRemote(wk) {
     var files = await getAllWorkspaceFiles(wk);
     var isIgnored = await wsGetIgnoreFilter(wk);
     var synced = 0;
+    // PRs whose pushed work is detected below as landed on the cloned branch —
+    // collected from BOTH the step-3 clean-match path (local content equals the
+    // remote blob byte-for-byte — the normal post-merge case) and the step-4
+    // pushed-sha match path. Stamped state:'merged' on meta.prs after the late
+    // meta re-check (which REPLACES `meta`, so stamping earlier would be lost).
+    var _mergedPrRefs = [];
 
     for (var i = 0; i < files.length; i++) {
         var f = files[i];
@@ -3805,6 +4176,15 @@ async function wsSyncWithRemote(wk) {
         if (remoteTree[f.path] && remoteTree[f.path] === localSha) {
             // File content matches remote — mark as clean, update original_content and sha,
             // and clear cross-chat ownership (no longer dirty, so no claim).
+            // If this file was pushed to a PR, the remote now matching our local
+            // content byte-for-byte means that PR landed (the normal post-merge
+            // sync case) — record it BEFORE pushed_pr is nulled below so the
+            // meta.prs 'merged' stamping (after the late meta re-check) runs.
+            // Same false-positive guard as the pushed-sha path: skip when this
+            // workspace's cloned branch IS the PR's own head branch (fork
+            // self-sync after push — the match is the push itself, not a merge).
+            var _cleanPrRef = f.pushed_pr || null;
+            if (_cleanPrRef && _cleanPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_cleanPrRef) === -1) _mergedPrRefs.push(_cleanPrRef);
             f.original_content = f.content;
             f.sha = localSha;
             f.dirty = false;
@@ -3837,6 +4217,9 @@ async function wsSyncWithRemote(wk) {
                 // Check if this remote sha matches one of our pushed shas (our PR was merged)
                 var _isOurWork = cf.pushed_shas && cf.pushed_shas.indexOf(_remoteSha) !== -1;
                 if (_isOurWork) {
+                    // Capture before pushed_pr is cleared below — needed to stamp
+                    // the tracked meta.prs entry as merged.
+                    var _mergedPrRef = cf.pushed_pr || null;
                     // Our PR was merged — safe to update base pointer.
                     // Fetch remote content so original_content reflects the new base.
                     try {
@@ -3849,7 +4232,20 @@ async function wsSyncWithRemote(wk) {
                             // Only keep shas pushed AFTER the match — those have newer content.
                             var _idx = cf.pushed_shas.indexOf(_remoteSha);
                             if (_idx !== -1) cf.pushed_shas = cf.pushed_shas.slice(_idx + 1);
-                            if (!cf.pushed_shas.length) { cf.pushed_shas = null; cf.pushed_pr = null; }
+                            if (!cf.pushed_shas.length) {
+                                cf.pushed_shas = null; cf.pushed_pr = null;
+                                // The FINAL pushed content landed on the cloned branch
+                                // — the PR merged. Pushes made from the base workspace
+                                // itself have no fork to auto-delete, so THIS is where
+                                // the merge is learned (wsMaybeAutoDeleteMerged handles
+                                // the fork path).
+                                // ...but NOT when this workspace's cloned branch IS the
+                                // PR's own head branch (fork self-sync after push +
+                                // further edits): the pushed sha appearing there is the
+                                // push itself, not a merge — stamping would falsely
+                                // badge a still-OPEN PR as merged.
+                                if (_mergedPrRef && _mergedPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_mergedPrRef) === -1) _mergedPrRefs.push(_mergedPrRef);
+                            }
                             await setWorkspaceFile(cf);
                             synced++;
                         } else {
@@ -3911,10 +4307,36 @@ async function wsSyncWithRemote(wk) {
     }
     meta = _metaNow;
 
+    // Stamp state:'merged' (+merged_at) on tracked meta.prs entries whose
+    // pushed work was detected on the cloned branch above. Done on the FRESH
+    // meta so the late re-check reassignment cannot drop the stamps.
+    var _metaPrsDirty = false;
+    if (_mergedPrRefs.length && Array.isArray(meta.prs)) {
+        for (var _mr = 0; _mr < _mergedPrRefs.length; _mr++) {
+            var _ref = _mergedPrRefs[_mr];
+            for (var _mp = 0; _mp < meta.prs.length; _mp++) {
+                var _tp = meta.prs[_mp];
+                if (_tp && ((_tp.url && _tp.url === _ref.url) || (_tp.number && _tp.number === _ref.number)) && _tp.state !== 'merged') {
+                    _tp.state = 'merged';
+                    if (!_tp.merged_at) _tp.merged_at = new Date().toISOString();
+                    _metaPrsDirty = true;
+                    // Flip the originating chat's progress card to 'pr_merged'
+                    // (context-safe — works in both SW and page bundles, see
+                    // wsNotifyPrMerged).
+                    if (_tp.chatId) {
+                        try { wsNotifyPrMerged(_tp.chatId, _tp); } catch (e) {}
+                    }
+                }
+            }
+        }
+    }
+
     // Only advance HEAD if fully in sync
     if (!behind) {
         meta.head_sha = remoteHead;
         meta.tree_sha = treeRes.body.sha;
+        await setWorkspaceMeta(meta);
+    } else if (_metaPrsDirty) {
         await setWorkspaceMeta(meta);
     }
 
@@ -4052,7 +4474,7 @@ async function wsPull(wk) {
     return result;
 }
 
-async function wsPush(wk, args) {
+async function wsPush(wk, args, chatId, chatTitle) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
     // A local fork (created via the `branch` action) defaults branch_name to
@@ -4161,6 +4583,47 @@ async function wsPush(wk, args) {
         }
         _filesSkipped = dirtyFiles.length - _matched.length;
         dirtyFiles = _matched;
+    }
+
+    // Cross-chat guard: an UNSCOPED push would sweep other chats' in-progress
+    // dirty files into the PR (and release their ownership stamps below).
+    // Unscoped: EXCLUDE hard-conflicted foreign files from the commit set and
+    // report them. Scoped: a push that explicitly lists a hard-conflicted
+    // foreign file errors instead (unless force).
+    var _scopedPush = !!(Array.isArray(args.files) && args.files.length);
+    var _excludedForeign = [];
+    if (!args.force) {
+        var _keptFiles = [];
+        for (var _fg = 0; _fg < dirtyFiles.length; _fg++) {
+            var _fgc = _wsCheckCrossChatConflict(dirtyFiles[_fg], chatId);
+            if (_fgc && _fgc.hard) {
+                _excludedForeign.push({
+                    path: dirtyFiles[_fg].path,
+                    owner_chat_id: _fgc.last_modified_by_chat_id,
+                    owner_chat_title: _fgc.last_modified_by_chat_title,
+                    last_modified_ago: _fgc.last_modified_ago
+                });
+            } else {
+                _keptFiles.push(dirtyFiles[_fg]);
+            }
+        }
+        if (_excludedForeign.length > 0) {
+            if (_scopedPush) {
+                return {
+                    success: false,
+                    error: 'Push blocked — these explicitly requested files have uncommitted changes owned by another chat that is running or recently active: ' + _excludedForeign.map(function(b) { return b.path; }).join(', ') + '. Coordinate with the owning chat(s), or pass {"force": true} to push them anyway.',
+                    foreign_files: _excludedForeign
+                };
+            }
+            dirtyFiles = _keptFiles;
+            if (dirtyFiles.length === 0) {
+                return {
+                    success: false,
+                    error: 'Nothing to push — every dirty file is owned by another chat that is running or recently active. Pass files:[...] scoped to your own work, wait for the other chats to finish, or pass {"force": true}.',
+                    excluded_foreign_files: _excludedForeign
+                };
+            }
+        }
     }
 
     // Separate modified/new files from deleted files
@@ -4479,44 +4942,179 @@ async function wsPush(wk, args) {
     //    but cross-chat ownership is released since the work has been published to a PR.
     //    Without this, the pusher's chat would keep blocking other chats from editing
     //    the same files until sync replaces them with merged remote content.
-    var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name };
-    for (var k = 0; k < dirtyFiles.length; k++) {
-        dirtyFiles[k].pushed_pr = prInfo;
-        // Preserve the pushing chat for DISPLAY (workspace dropdown chat chip)
-        // before the blocking ownership stamp is released below. An append push
-        // from a chat that didn't re-edit keeps the earlier pushed_by stamp.
-        if (dirtyFiles[k].last_modified_by_chat_id) {
-            dirtyFiles[k].pushed_by_chat_id = dirtyFiles[k].last_modified_by_chat_id;
-            dirtyFiles[k].pushed_by_chat_title = dirtyFiles[k].last_modified_by_chat_title || null;
+    //    From here on the PR EXISTS on GitHub (created or reused above), so a failure
+    //    in this LOCAL bookkeeping (IndexedDB quota, per-file writes, meta save) must
+    //    NOT flip the result to success:false — that would hide a real PR from the
+    //    caller and the sidebar. Persist what we can and report a warning instead.
+    //    Errors BEFORE this point (blob/tree/commit/branch/PR creation) still fail
+    //    the push normally — they return above and never reach this try.
+    // prInfo is tracked both on each dirty file (pushed_pr) and durably in
+    // workspace meta.prs. Include the PR title so OTHER chats — which surface
+    // this PR only via the meta.prs fallback in renderVersionSidebar, not the
+    // per-chat message scan — display the real title instead of the branch name.
+    // pr_title is optional on an append push, so fall back to the reused PR's
+    // live title; the tracked-entry update below preserves a prior title too.
+    var _prInfoTitle = (typeof args.pr_title === 'string' && args.pr_title !== '') ? args.pr_title
+        : ((prReused && existingPr && existingPr.title) ? existingPr.title : '');
+    var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name, title: _prInfoTitle, chatId: chatId || null };
+    // Per-file ownership attribution for the push RESULT (same fields + helpers
+    // as wsStatus: last_modified_by_chat_id/_title/_at/_ago, pushed_pr, message).
+    // Captured HERE — after the commit set is final and the target PR is known,
+    // but BEFORE the stamp loop below overwrites pushed_pr and releases the
+    // last_modified_by_* stamps — so the result says to WHOM each committed file
+    // belonged. Also collects prominent cross_chat_warnings (mirroring the
+    // ls/grep/diff style) when a committed file (a) was edited by a DIFFERENT
+    // chat, or (b) was already pushed to a DIFFERENT PR/branch (its changes
+    // belong to that other chat's PR — the "unscoped push swept in another
+    // chat's already-pushed files" incident). Warnings only, never a block:
+    // pushing another chat's work can be intentional.
+    var _pushCrossChatWarnings = [];
+    var _pushedFileOwnership = dirtyFiles.map(function(f) {
+        var entry = { path: f.path, isNew: !f.sha && !f.deleted, isDeleted: !!f.deleted, pushed_pr: f.pushed_pr || null };
+        if (f.last_modified_by_chat_id) {
+            entry.last_modified_by_chat_id = f.last_modified_by_chat_id;
+            entry.last_modified_by_chat_title = f.last_modified_by_chat_title || null;
+            entry.last_modified_at = f.last_modified_at || null;
+            entry.last_modified_ago = _wsFormatAgo(f.last_modified_at);
+            var _pOwn = _wsForeignOwnership(f, chatId);
+            if (_pOwn) {
+                entry.foreign_chat = true;
+                entry.other_chat_running = _pOwn.other_chat_running;
+                entry.message = 'Edited by ANOTHER chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '.';
+                _pushCrossChatWarnings.push({
+                    path: f.path,
+                    owner_chat_id: entry.last_modified_by_chat_id,
+                    owner_chat_title: entry.last_modified_by_chat_title,
+                    message: '\u26a0 "' + f.path + '" was committed to PR #' + prNumber + ' but its uncommitted changes belong to ANOTHER chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '. If that was unintended, revert it with a follow-up commit and scope future pushes with files:[...].'
+                });
+            } else {
+                entry.message = 'Edited by THIS chat (chat/agent ' + f.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' (' + entry.last_modified_ago + ')' : '') + '.';
+            }
+        } else if (f.pushed_pr) {
+            entry.message = 'No ownership stamp \u2014 released by an earlier push to PR #' + f.pushed_pr.number + (f.pushed_pr.chatId ? ' by chat ' + f.pushed_pr.chatId : '') + '.';
+        } else {
+            entry.message = 'No recorded owner (the editing chat was not recorded for this file).';
         }
-        // Track pushed blob shas so sync can distinguish "my PR merged" from "someone else changed it"
-        // For deleted files, track '::deleted::' sentinel since no blob is created
-        if (!dirtyFiles[k].pushed_shas) dirtyFiles[k].pushed_shas = [];
-        var _pushSha = blobShas[dirtyFiles[k].path] || (dirtyFiles[k].deleted ? '::deleted::' : null);
-        if (_pushSha && dirtyFiles[k].pushed_shas.indexOf(_pushSha) === -1) {
-            dirtyFiles[k].pushed_shas.push(_pushSha);
-            // Keep only the last 20 pushed shas — older ones are unlikely to match
-            if (dirtyFiles[k].pushed_shas.length > 20) dirtyFiles[k].pushed_shas = dirtyFiles[k].pushed_shas.slice(-20);
+        var _prevPr = f.pushed_pr;
+        if (_prevPr && (_prevPr.number !== prNumber || _prevPr.branch !== args.branch_name)) {
+            _pushCrossChatWarnings.push({
+                path: f.path,
+                other_pr_number: _prevPr.number || null,
+                other_pr_branch: _prevPr.branch || null,
+                other_pr_url: _prevPr.url || null,
+                other_pr_chat_id: _prevPr.chatId || null,
+                message: '\u26a0 "' + f.path + '" already belongs to a DIFFERENT PR #' + _prevPr.number + ' (branch "' + _prevPr.branch + '"' + (_prevPr.chatId ? ', pushed by chat ' + _prevPr.chatId : '') + ') \u2014 its changes were now ALSO committed to PR #' + prNumber + '. If that was unintended, revert it here with a follow-up commit and let PR #' + _prevPr.number + ' carry it.'
+            });
         }
-        // Release cross-chat ownership now that the work is in a PR
-        dirtyFiles[k].last_modified_by_chat_id = null;
-        dirtyFiles[k].last_modified_by_chat_title = null;
-        dirtyFiles[k].last_modified_at = null;
-        await setWorkspaceFile(dirtyFiles[k]);
+        return entry;
+    });
+    var _postPrWarning = null;
+    try {
+        // Durable per-file diff snapshots for this PR: the pre-merge base and
+        // the pushed content are stored as content-addressed blobs and
+        // referenced from the meta.prs entry ({path, old_sha, new_sha,
+        // deleted, is_new}). After the PR merges (and a fork workspace is
+        // auto-deleted / the base syncs past the merge), the sidebar uses
+        // these to badge the file MERGED and show the ORIGINAL edited diff
+        // instead of resolving against the live workspace. Best-effort: a
+        // failed snapshot never fails the push bookkeeping.
+        var _prFiles = [];
+        for (var k = 0; k < dirtyFiles.length; k++) {
+            dirtyFiles[k].pushed_pr = prInfo;
+            // Preserve the pushing chat for DISPLAY (workspace dropdown chat chip)
+            // before the blocking ownership stamp is released below. An append push
+            // from a chat that didn't re-edit keeps the earlier pushed_by stamp.
+            if (dirtyFiles[k].last_modified_by_chat_id) {
+                dirtyFiles[k].pushed_by_chat_id = dirtyFiles[k].last_modified_by_chat_id;
+                dirtyFiles[k].pushed_by_chat_title = dirtyFiles[k].last_modified_by_chat_title || null;
+            } else if (chatId && !dirtyFiles[k].pushed_by_chat_id) {
+                // No editor stamp on this file and no earlier pushed_by stamp — attribute
+                // the push to the pusher's chat so meta.prs / the display chip aren't left
+                // blank. (An append push that already carries an earlier pushed_by stamp
+                // keeps it — the !pushed_by_chat_id guard preserves that semantic.)
+                dirtyFiles[k].pushed_by_chat_id = chatId;
+                dirtyFiles[k].pushed_by_chat_title = chatTitle || null;
+            }
+            // Track pushed blob shas so sync can distinguish "my PR merged" from "someone else changed it"
+            // For deleted files, track '::deleted::' sentinel since no blob is created
+            if (!dirtyFiles[k].pushed_shas) dirtyFiles[k].pushed_shas = [];
+            var _pushSha = blobShas[dirtyFiles[k].path] || (dirtyFiles[k].deleted ? '::deleted::' : null);
+            if (_pushSha && dirtyFiles[k].pushed_shas.indexOf(_pushSha) === -1) {
+                dirtyFiles[k].pushed_shas.push(_pushSha);
+                // Keep only the last 20 pushed shas — older ones are unlikely to match
+                if (dirtyFiles[k].pushed_shas.length > 20) dirtyFiles[k].pushed_shas = dirtyFiles[k].pushed_shas.slice(-20);
+            }
+            // Release cross-chat ownership now that the work is in a PR
+            dirtyFiles[k].last_modified_by_chat_id = null;
+            dirtyFiles[k].last_modified_by_chat_title = null;
+            dirtyFiles[k].last_modified_at = null;
+            await setWorkspaceFile(dirtyFiles[k]);
+            // Snapshot old/new content for the durable PR diff (see _prFiles
+            // above). old_sha reuses the row's base sha when present — its blob
+            // is already durable via setWorkspaceFile; new content is keyed by
+            // the GitHub blob sha computed for this push. Blob puts are
+            // idempotent (content-addressed).
+            try {
+                var _snapOldSha = null, _snapNewSha = null;
+                if (dirtyFiles[k].original_content != null) {
+                    _snapOldSha = dirtyFiles[k].sha || await computeGitBlobSha(dirtyFiles[k].original_content);
+                    await putWorkspaceBlob(_snapOldSha, dirtyFiles[k].original_content);
+                }
+                if (!dirtyFiles[k].deleted && dirtyFiles[k].content != null) {
+                    _snapNewSha = blobShas[dirtyFiles[k].path] || await computeGitBlobSha(dirtyFiles[k].content);
+                    await putWorkspaceBlob(_snapNewSha, dirtyFiles[k].content);
+                }
+                _prFiles.push({ path: dirtyFiles[k].path, old_sha: _snapOldSha, new_sha: _snapNewSha, deleted: !!dirtyFiles[k].deleted, is_new: dirtyFiles[k].original_content == null });
+            } catch (_snapErr) { /* snapshot is best-effort */ }
+        }
+        // Attach AFTER the stamp loop: pushed_pr references the same prInfo
+        // object, but the rows were persisted above without the files array —
+        // keeping per-file rows light (blobs + meta.prs carry the snapshots).
+        if (_prFiles.length) prInfo.files = _prFiles;
+
+        // Add (or refresh) the PR in the workspace meta prs list. When we appended to an
+        // existing PR branch we update the tracked entry instead of pushing a duplicate.
+        // The entry now carries a title (see prInfo above) so other chats show the real
+        // PR name via the sidebar fallback, not the branch name.
+        if (!meta.prs) meta.prs = [];
+        var _trackedIdx = -1;
+        for (var _p = 0; _p < meta.prs.length; _p++) {
+            if (meta.prs[_p] && (meta.prs[_p].number === prNumber || meta.prs[_p].branch === args.branch_name)) { _trackedIdx = _p; break; }
+        }
+        if (_trackedIdx >= 0) {
+            // Append push without a pr_title: keep the previously tracked title
+            // instead of wiping it (mirrors getPushedPRsForChat's message scan).
+            if (!prInfo.title && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].title) prInfo.title = meta.prs[_trackedIdx].title;
+            // Cumulative snapshot set on append pushes: keep prior per-file
+            // snapshots for paths NOT in this commit (a scoped args.files push
+            // would otherwise drop earlier files from the PR's diff record);
+            // paths pushed again are replaced by their latest snapshot.
+            var _prevPrFiles = meta.prs[_trackedIdx] && meta.prs[_trackedIdx].files;
+            if (Array.isArray(_prevPrFiles) && _prevPrFiles.length) {
+                var _nowPaths = {};
+                (prInfo.files || []).forEach(function(pf) { if (pf) _nowPaths[pf.path] = true; });
+                prInfo.files = _prevPrFiles.filter(function(pf) { return pf && !_nowPaths[pf.path]; }).concat(prInfo.files || []);
+            }
+            meta.prs[_trackedIdx] = prInfo;
+        } else {
+            meta.prs.push(prInfo);
+        }
+        await setWorkspaceMeta(meta);
+    } catch (_postErr) {
+        _postPrWarning = 'PR ' + (prReused ? 'updated' : 'created') + ' but local workspace state update failed: '
+            + (_postErr && _postErr.message ? _postErr.message : String(_postErr));
     }
 
-    // Add (or refresh) the PR in the workspace meta prs list. When we appended to an
-    // existing PR branch we update the tracked entry instead of pushing a duplicate.
-    if (!meta.prs) meta.prs = [];
-    var _trackedIdx = -1;
-    for (var _p = 0; _p < meta.prs.length; _p++) {
-        if (meta.prs[_p] && (meta.prs[_p].number === prNumber || meta.prs[_p].branch === args.branch_name)) { _trackedIdx = _p; break; }
+    // Context refresh + panel notification are also post-PR bookkeeping — never
+    // let them fail the push either.
+    try {
+        refreshWorkspaceContext();
+        AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: args.branch_name });
+    } catch (_notifyErr) {
+        var _notifyMsg = 'workspace UI refresh failed: ' + (_notifyErr && _notifyErr.message ? _notifyErr.message : String(_notifyErr));
+        _postPrWarning = _postPrWarning ? (_postPrWarning + '; also: ' + _notifyMsg)
+            : ('PR ' + (prReused ? 'updated' : 'created') + ' but ' + _notifyMsg);
     }
-    if (_trackedIdx >= 0) meta.prs[_trackedIdx] = prInfo; else meta.prs.push(prInfo);
-    await setWorkspaceMeta(meta);
-
-    refreshWorkspaceContext();
-    AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: args.branch_name });
     return {
         success: true,
         workspace: wk,
@@ -4524,15 +5122,21 @@ async function wsPush(wk, args) {
         pr_number: prNumber,
         files_pushed: dirtyFiles.length,
         files_skipped: _filesSkipped,
+        files: _pushedFileOwnership,
+        cross_chat_warnings: _pushCrossChatWarnings.length ? _pushCrossChatWarnings : undefined,
+        excluded_foreign_files: _excludedForeign.length ? _excludedForeign : undefined,
         branch: args.branch_name,
         base_branch: (prReused && existingPr && existingPr.base && existingPr.base.ref) ? existingPr.base.ref : baseBranch,
         pr_reused: prReused,
         stale_branch_recreated: staleBranchRecreated,
         base_advanced: baseAdvanced,
         base_override_warning: _baseOverrideWarning || undefined,
-        message: prReused
+        warning: _postPrWarning || undefined,
+        message: (prReused
             ? ('Added a commit (' + dirtyFiles.length + ' file(s)) to existing PR #' + prNumber + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : ''))
-            : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)' + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : ''))
+            : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)' + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : '')))
+            + (_excludedForeign.length ? ('; ' + _excludedForeign.length + ' foreign in-progress file(s) excluded from the commit — see excluded_foreign_files') : '')
+            + (_pushCrossChatWarnings.length ? ('; \u26a0 ' + _pushCrossChatWarnings.length + ' cross-chat warning(s) — committed file(s) belonging to another chat or another PR, see cross_chat_warnings') : '')
     };
 }
 

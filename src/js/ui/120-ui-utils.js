@@ -309,6 +309,94 @@ function getPushedPRsForChat(chat) {
     return prs;
 }
 
+// ---- Sub-agent chat aggregation (sidebar) ----
+// Chats of the given chat's sub-agents whose chat objects still exist in the
+// global `chats` map (any state — running/sleeping/stopped). Built on
+// subAgentsForChatTree (175-sub-agent-ui.js, loads later in the ui tier —
+// guarded by typeof at call time): for a REGULAR chat this covers the whole
+// subtree (nested subs carry root_chat_id = the root chat); when VIEWING a
+// sub's own chat it covers its direct children only.
+// Returns [{chatId, name, chat}].
+function getSubAgentChatsForChat(chatId) {
+    var out = [];
+    if (!chatId || typeof chats === 'undefined' || !chats) return out;
+    if (typeof subAgentsForChatTree !== 'function') return out;
+    var recs;
+    try { recs = subAgentsForChatTree(chatId) || []; } catch (e) { return out; }
+    var seen = {};
+    recs.forEach(function(r) {
+        if (!r || !r.chat_id || r.chat_id === chatId || seen[r.chat_id]) return;
+        var c = chats[r.chat_id];
+        if (!c) return;
+        seen[r.chat_id] = true;
+        out.push({ chatId: r.chat_id, name: r.name || r.agent_id || 'worker', chat: c });
+    });
+    return out;
+}
+
+// ---- Sidebar PR durable fallback (workspace meta.prs) ----
+// The message scan above misses a PR when its push tool-result never made it
+// into the chat (e.g. the push created the PR on GitHub but the local
+// persistence failed and the result carried no pr_url, or the message was
+// truncated/lost). wsPush durably tracks every PR in workspace meta.prs
+// ({url, number, branch, title}), so the sidebar merges those in as a fallback
+// and can show the real PR title (not just the branch) in other chats.
+// Scoped to the DEFAULT workspace (pin > MRU — same resolution as
+// resolveWorkspace in 130-indexeddb.js, read-only) rather than dumping every
+// workspace's PR history into every chat.
+// renderVersionSidebar is synchronous and meta lives in IDB, so the list is
+// cached here and refreshed async (lazily on first render + on every
+// workspaceMutated event); a refresh that changes the list re-renders once.
+var _sidebarMetaPRs = null; // null = never loaded; [] = loaded, none
+var _sidebarMetaPRsLoading = false;
+
+function _refreshSidebarMetaPRs() {
+    if (_sidebarMetaPRsLoading) return;
+    if (typeof getAllWorkspaceMetas !== 'function' || typeof parseWsKey !== 'function') return;
+    _sidebarMetaPRsLoading = true;
+    getAllWorkspaceMetas().then(function(all) {
+        // Pick the default workspace: most-recently-used, overridden by a
+        // pinned sibling of the same owner/repo (mirrors resolveWorkspace,
+        // but read-only — no last_used_at bump).
+        var chosen = null;
+        (all || []).forEach(function(m) {
+            if (!m || !m.repo) return;
+            if (!chosen || (m.last_used_at || m.cloned_at || 0) > (chosen.last_used_at || chosen.cloned_at || 0)) chosen = m;
+        });
+        if (chosen) {
+            var chosenRepo = chosen.github_repo || parseWsKey(chosen.repo).repo;
+            for (var i = 0; i < all.length; i++) {
+                var pm = all[i];
+                if (pm && pm.pinned && (pm.github_repo || parseWsKey(pm.repo).repo) === chosenRepo) { chosen = pm; break; }
+            }
+        }
+        var prs = (chosen && chosen.prs) ? chosen.prs.filter(function(p) { return p && p.url; }) : [];
+        var changed = JSON.stringify(prs) !== JSON.stringify(_sidebarMetaPRs);
+        _sidebarMetaPRs = prs;
+        _sidebarMetaPRsLoading = false;
+        if (changed) renderVersionSidebar();
+    }).catch(function() { _sidebarMetaPRsLoading = false; });
+}
+
+// Keep the cache warm: meta.prs changes on push, and the default workspace
+// changes on clone/pin/branch/delete. AgentEvents (app tier) may load after
+// this file — retry briefly, same pattern as _wsfHookMutations
+// (115-workspace-files-sidebar.js). The re-render itself is triggered by
+// _refreshSidebarMetaPRs when the list actually changed.
+(function _sidebarMetaPRsHook() {
+    var tries = 0;
+    function hook() {
+        if (typeof AgentEvents === 'undefined' || !AgentEvents || !AgentEvents.on) {
+            if (++tries < 15) setTimeout(hook, 2000);
+            return;
+        }
+        AgentEvents.on('workspaceMutated', function(ev) {
+            try { _refreshSidebarMetaPRs(); } catch (e) { /* sidebar not ready */ }
+        });
+    }
+    setTimeout(hook, 0);
+})();
+
 // ---- Sidebar PR merge support ----
 // In-memory PR state per URL: 'open' | 'merging' | 'merged' | 'closed'.
 // Not persisted — _refreshSidebarPRStates() re-derives merged/closed from
@@ -473,6 +561,58 @@ function renderVersionSidebar() {
     // for existing chats with no extra persistence. Shown FIRST, followed by
     // progress (action updates), then the Workers panel.
     var pushedPRs = getPushedPRsForChat(chats[currentChatId]);
+    var _prSeenUrls = {};
+    pushedPRs.forEach(function(pr) { _prSeenUrls[pr.url] = true; });
+    // Sub-agent aggregation: PRs pushed from this chat's sub-agent chats
+    // surface in the parent sidebar too, attributed with the worker name
+    // (pr.worker → chip in the item meta). De-duped by URL — the parent's
+    // own message-scan entry wins (no worker chip).
+    var _subChats = getSubAgentChatsForChat(currentChatId);
+    var _subChatNames = {};
+    _subChats.forEach(function(sc) {
+        _subChatNames[sc.chatId] = sc.name;
+        getPushedPRsForChat(sc.chat).forEach(function(pr) {
+            if (_prSeenUrls[pr.url]) return;
+            _prSeenUrls[pr.url] = true;
+            pr.worker = sc.name;
+            pushedPRs.push(pr);
+        });
+    });
+    // Durable fallback: append PRs tracked in the default workspace's meta.prs
+    // that the message scan missed (see _refreshSidebarMetaPRs). Message-scan
+    // entries win (they also carry base); meta entries now carry a title too, so
+    // other chats show the real PR title. Entries are deduped by URL and skipped
+    // once known merged/closed — the fallback surfaces actionable PRs, not the
+    // workspace's whole PR history.
+    if (_sidebarMetaPRs === null) _refreshSidebarMetaPRs();
+    (_sidebarMetaPRs || []).forEach(function(pr) {
+        if (_prSeenUrls[pr.url]) return;
+        var st = _sidebarPRState[pr.url];
+        if (st === 'merged' || st === 'closed') return;
+        // Scope the durable meta.prs fallback to the current chat OR one of its
+        // sub-agent chats (the parent sidebar aggregates its workers' PRs).
+        // Resolve the owner: explicit chatId stamp (see wsPush -> prInfo), else
+        // the legacy message-scan lookup. UNATTRIBUTED entries (no stamp AND no
+        // lookup hit) are skipped — rendering them in EVERY chat was the
+        // cross-chat leak; they remain visible in the per-repo workspace/settings
+        // views, which are intentionally unscoped.
+        var _ownerChatId = pr.chatId || null;
+        if (!_ownerChatId && typeof _wsPrChatLookup === 'function') {
+            var _o = _wsPrChatLookup(pr.url);
+            if (_o && _o.chatId) _ownerChatId = _o.chatId;
+        }
+        if (!_ownerChatId) return; // unattributed — no per-chat sidebar shows it
+        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]) return;
+        _prSeenUrls[pr.url] = true;
+        pushedPRs.push({
+            url: pr.url,
+            number: pr.number,
+            title: pr.title || pr.branch || ('PR #' + pr.number),
+            branch: pr.branch || '',
+            base: '',
+            worker: _ownerChatId !== currentChatId ? _subChatNames[_ownerChatId] : null
+        });
+    });
     if (pushedPRs.length > 0) {
         html += '<div class="version-prs-section">';
         html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' Pull Requests (' + pushedPRs.length + ')</div>';
@@ -483,7 +623,7 @@ function renderVersionSidebar() {
             html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
             html += '<span class="pr-sidebar-info">';
             html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
-            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + '</span>';
+            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + (pr.worker ? ' <span class="wsf-ws" title="Pushed by worker ' + escapeHtml(pr.worker) + '">' + escapeHtml(pr.worker) + '</span>' : '') + '</span>';
             html += '</span>';
             if (prState === 'merged') {
                 html += '<span class="pr-sidebar-state merged" title="Merged">' + UI_ICONS.gitMerge + ' Merged</span>';

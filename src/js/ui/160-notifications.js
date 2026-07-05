@@ -19,6 +19,18 @@ function chatHasPendingApproval(chatId) {
     });
 }
 
+// Check if a chat has a pending prompt_user form the user hasn't answered.
+// Mirror of chatHasPendingApproval — prompt rows are persisted chat.messages
+// entries pushed by executePromptUser (tools/100-prompt-user.js) and flipped
+// to 'submitted' / 'cancelled' by submitPromptUser / cancelPromptUser.
+function chatHasPendingPrompt(chatId) {
+    var chat = chats[chatId];
+    if (!chat || !chat.messages) return false;
+    return chat.messages.some(function(m) {
+        return m.role === 'prompt_user' && m.status === 'pending';
+    });
+}
+
 // Show notifications for pending approvals when opening a chat (e.g., after page reload)
 function showPendingApprovalNotifications(chatId) {
     var chat = chats[chatId];
@@ -168,6 +180,8 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
         }
         // Always update chat list to show attention indicator
         renderChatList();
+        // Live needs_permission badge on jobs rows / expand cards / header pill.
+        if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
     });
 }
 
@@ -217,6 +231,9 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
         // PR383-F3: carry toolCallId (same rationale as showToolApprovalPrompt).
         var approvalKey = chatId + ':' + approvalIndex;
         pendingToolApprovals[approvalKey] = { resolve: resolve, approvalIndex: approvalIndex, chatId: chatId, toolCallId: toolCallId };
+        // Live needs_permission badge (batch path — caller renders messages/
+        // notifications later, but the badge surfaces refresh here).
+        if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
 
         // Queue notification (will be shown after all approvals are added)
         // Always show notification popup (not just when on different chat/view)
@@ -367,6 +384,8 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
 
     renderChatList(); // Update chat list to remove attention indicator
+    // Clear the live needs_permission badge on jobs rows / header pill.
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
 
     // Clear any notifications for this chat since approval was handled from chat
     // Skip if called from notification (notification handles its own state)

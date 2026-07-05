@@ -2,6 +2,8 @@
 
 AppAgent is an AI Agent for your ServiceNow instance. It helps you query data, edit records, browse pages, and automate tasks using natural language.
 
+AppAgent **auto-detects every ServiceNow instance** you have open in the same Chrome profile — no setup or connection string needed. Open a tab on an instance and the Agent can target it; ask it to *list instances* to see them all (with your roles and connection status).
+
 :::tip
 **Quick Start:** Type a message in the chat and press Enter. The Agent will understand your request and use the right tools automatically.
 :::
@@ -64,7 +66,7 @@ The main conversation interface where you interact with the Agent. [Start New Ch
 - **Input Box** — Type your messages here
 - **Pause Button** — Stop Agent execution if needed
 - **Context Indicator** — Shows how full the context is (click to summarize)
-- **Version Sidebar** — Track all changes made (right panel)
+- **Chat Sidebar** — Version history plus pushed PRs, workspace files, and sub-agent workers (right panel)
 
 ## Dashboard {#page-dashboard}
 
@@ -79,6 +81,10 @@ Unlike traditional dashboards, widgets are generated through natural language pr
 - **Import/Export** — Save and share dashboards
 
 Widgets are also **dynamic at runtime** — they have access to your ServiceNow instance and can fetch live data, making your dashboard always up-to-date.
+
+## Documents {#page-documents}
+
+**Smart Documents** — persistent, versioned Markdown documents the Agent builds and updates — are listed here. In the sidebar, **Documents** is grouped under **Dashboard**.
 
 ## Skills {#page-skills}
 
@@ -108,6 +114,7 @@ Per-tool permissions and source/schema viewers are available in [Settings → To
 - **Smart Documents** — Build and query structured documents
 - **Prompt User** — Ask the user for structured input via inline forms
 - **Web Fetch** — Fetch and read pages from the public web
+- **GitHub Setup** — Open a popup to connect a GitHub account or clone a repo into a workspace
 - **Action Updates** — Show live progress pills and one-click action buttons
 - **Read Attached File** — Read text files attached by the user
 
@@ -117,7 +124,11 @@ Configure AppAgent preferences. [Open Settings →](app:openSettingsPageView)
 
 - **Agent Model** — Choose which LLM to use
 - **API Providers** — Add or edit providers (Anthropic, OpenRouter, custom). Supports API-key and OAuth (Claude Code sign-in) providers
+- **LLM Endpoints** — Named `URL + API key` pairs; point the extension at any OpenAI-compatible LLM API
+- **Sub-Agent Model Tiers** — Map the small / medium / large tiers to concrete models
 - **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. `xhigh` is accepted on Opus 4.7/4.8 and Fable/Mythos 5 on Anthropic directly (other models top out at `high`/`max`); OpenRouter maps unsupported values to the nearest supported level
+- **Max Tokens & Thinking Budget** — Global caps on response length (64k default) and extended-thinking budget (32k default)
+- **Context Window** — Set the assumed context-window size that drives the context indicator and saturation warnings
 - **App Scope** — Set the scope for new records
 - **Display** — Toggle API stats, compact mode, and keep-display-awake
 - **Hooks** — Enable auto-title generation, "Agent finished" notifications, and other automation
@@ -136,9 +147,9 @@ View and manage all your conversations. [Open History →](app:openHistoryView)
 - **Stats** — View total conversations, pinned count, and accumulated cost
 - **Preview** — See chat previews with user/agent messages
 
-## Documentation {#page-docs}
+## Help {#page-docs}
 
-This page! Browse the full documentation for AppAgent. [Open Docs →](app:openDocsView)
+This page! Browse the full documentation for AppAgent. The sidebar nav item is labeled **Help** (❓ icon). [Open Docs →](app:openDocsView)
 
 - **Table of Contents** — Navigate sections via the right sidebar
 - **Download** — Export the documentation as a Markdown file
@@ -165,6 +176,7 @@ The Agent has access to powerful tools:
 | **Smart Documents** | Build and query structured documents that the Agent can navigate without flooding the context |
 | **Prompt User** | Show inline forms (text, select, multi-select, confirm) to collect structured input or confirm plans |
 | **Web Fetch** | Fetch and read pages from the public web |
+| **GitHub Setup** | Open a popup to connect a GitHub account or clone a repo into a workspace |
 | **Action Updates** | Render live progress pills (running / stuck / done / error) and one-click action buttons in the chat |
 | **Read Attached File** | Read text files attached by the user in the conversation |
 
@@ -176,11 +188,20 @@ Control how tools execute. Configure in [Settings](app:openSettingsPageView):
 - **Ask First** — Shows approval prompt before running
 - **Disabled** — Tool cannot be used
 
+**Per-instance mode:** Each connected instance has a permission tier that sets its write defaults:
+
+- **Manual** — You approve each write operation (create / update / delete, form fills). Writes default to *Ask First*
+- **Auto** — The Agent runs write operations without asking
+
+Switch modes from the instance dropdown or [Settings](app:openSettingsPageView). Reads are always allowed; the per-tool controls below override the tier.
+
 **Granular Controls:**
 
 - **ServiceNow API** — Separate permissions per HTTP method (GET, POST, PUT, PATCH, DELETE)
 - **Browser Control** — Separate permissions per action (navigate, click, fill, select option, dispatch event, scroll, resize, impersonate, and more)
 - **Manage Skills** — Separate permissions per action (create, update, add/update/delete files, activate, deactivate)
+
+Confirmation dialogs are color-coded by severity — **blue** (routine), **orange** (caution), **red** (destructive).
 
 :::tip
 Set destructive tools (DELETE, PUT) to "Ask First" for safety. Skill activation is disabled by default.
@@ -223,6 +244,38 @@ Long-running agent workflows surface live state in the chat instead of going sil
 - **Header action pills** — The header auto-renders any active actions, with icon-only responsive collapse
 - **Streaming dot** — The chat list shows a per-chat agent-running indicator (suppressed when paused)
 - **"Agent finished" notification** — If you tab away or switch Chrome windows mid-run, a desktop notification fires when the Agent finishes
+- **Answer cards** — After a response the Agent can attach a **TL;DR** summary card and a **Links** card of relevant links (records, PRs, docs) below the answer
+
+## Active Chats & Jobs {#feature-jobs}
+
+A header pill opens the **jobs dropdown** — a live view of your chats and background work:
+
+- **Active chats** — Running or unread-finished chats, each with a **context-usage ring**; unread chats are emphasized in **bold** (email-style) after any activity while you're away
+- **Sub-agent cards** — Worker sub-agents nest under their parent chat, with a chat-view modal to read their transcript
+- **Expand modal** — Pop the list out to a full modal with a **columns / sections** layout toggle
+- **New Chat page** — The expanded Active Chats panel is also embedded on the New Chat page for an at-a-glance overview
+
+## Usage & Limits {#feature-usage}
+
+A **usage pill** in the header tracks your API usage and remaining limits. Hover for a native tooltip, or click to open a dropdown with a rich breakdown of usage limits and remaining credits. Credit balances refresh automatically when you return to the tab.
+
+## Rate-Limit Handling {#feature-ratelimit}
+
+When a provider returns a **429 / 529** (rate limit or overload), AppAgent retries automatically instead of failing:
+
+- **Automatic backoff** — Transport-level jittered backoff with escalating retries; sub-agents throttle back under a shared stream semaphore
+- **Live status** — The chat shows an inline rate-limit status with a **retry countdown** instead of a stuck *Thinking…*, and distinguishes provider saturation from waiting on sibling agents
+- **Credit exhaustion** — Ambiguous 429s that actually mean "out of credits" are detected via the usage API and surfaced clearly
+
+## Sub-Agents {#feature-subagents}
+
+The Agent can spawn **background worker agents** to handle heavy or parallel work without cluttering the main chat. Each sub runs in its own chat and context, then reports a distilled result back to the parent.
+
+- **Spawn** — Delegate searches, audits, bulk edits, or deep investigations to a sub-agent
+- **Model tiers** — Each sub runs on a **small / medium / large** tier, or `same` to match the parent's model. Map tiers to models in [Settings → Sub-Agent Model Tiers](app:openSettingsPageView)
+- **Workers strip** — Running subs appear as live chips above the chat input; open one to watch its progress or transcript
+- **Manage** — The Agent can check a sub's status, wake it with follow-up work, or stop it
+- **Pool** — Concurrent subs are capped by a shared worker pool; extras queue automatically
 
 ## Workspace {#feature-workspace}
 
@@ -235,6 +288,16 @@ Each chat has its own **workspace** — a per-chat file scratchpad the Agent can
 - `read` and `status` surface the owner and a human-readable "X minutes ago" timestamp
 
 This prevents two parallel chats from silently clobbering each other's work.
+
+**GitHub sync:** Cloned workspaces auto-sync with GitHub on page navigation, chat switch, and tab focus, so merged or updated branches stay current.
+
+## Chat Sidebar {#feature-sidebar}
+
+The right-hand chat sidebar gathers the artifacts of the current chat in a single scroll — **pushed PRs**, **workspace files**, **version history**, and **sub-agent workers**:
+
+- **Pushed PRs** — Each PR the Agent opens from this chat shows as a row with its title and **target branch**. Click **Merge** to squash-merge it (the PR title becomes the commit title) and auto-sync the affected workspace
+- **Workspace files** — Files the Agent created or changed appear as rows; open one to **view** it, see a **diff** (diff-first, with file-nav arrows), or browse prior **versions**. A color-coded chip marks the owning chat, and pushed rows link to their PR
+- **Workers** — Running and finished sub-agents appear as cards; open one to watch its live progress or read its chat in a modal. Collapsed cards show tool-call, files-edited, and PRs-opened counters
 
 ## Pause & Send-During-Stream {#feature-streaming}
 
@@ -267,6 +330,15 @@ When data is too large to fit in the conversation (over 4K tokens by default), i
 :::tip
 **Why this matters:** Caching keeps conversations fast and focused. The Agent works smarter by only pulling in the specific data it needs, rather than flooding the context with huge responses.
 :::
+
+## Context Saturation {#feature-saturation}
+
+The **context indicator** by the chat input tracks how full the conversation is. As it fills, the Agent receives escalating nudges:
+
+- **Past 50%** — A warning to wrap up the current step and delegate remaining heavy work to fresh sub-agents (model quality degrades as context grows)
+- **Full (100%)** — A stop-now prompt to report conclusions immediately and hand off unfinished work to a new chat or sub-agent
+
+Click the context indicator to summarize the conversation into a fresh chat.
 
 # Tips & Shortcuts {#tips}
 
@@ -526,6 +598,18 @@ AppAgent runs as a **Chrome extension**. AI API calls go directly from your brow
 
 :::tip
 **Privacy:** Your API key and conversation data are handled client-side. AI API calls go directly to the provider from your browser. Tool calls that interact with your instance use your existing session credentials.
+:::
+
+## LLM Endpoints {#adv-endpoints}
+
+Models connect through **named LLM endpoints** — reusable `URL + API key` pairs. This lets you point AppAgent at **any OpenAI-compatible chat-completions API**: OpenRouter, a local gateway, a proxy, or your own hosted model.
+
+1. In [Settings → LLM Endpoints](app:openSettingsPageView), click **Add Endpoint**
+2. Give it a name, the API URL, and an API key
+3. Each model (API Provider) picks an endpoint — update a key once and every model using it is updated
+
+:::tip
+Claude **OAuth** providers don't use endpoints — they talk to `api.anthropic.com` directly.
 :::
 
 ## Sign in with Claude (OAuth) {#adv-oauth}

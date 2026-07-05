@@ -8,9 +8,10 @@
 /* Collapsed sidebar styles */
 .sidebar:not(.expanded) .sidebar-toggle-row { justify-content: center; }
 .sidebar:not(.expanded) .sidebar-search-wrapper { display: none; }
-.sidebar:not(.expanded) .sidebar-nav-btn span:not(.sidebar-nav-icon):not(.chat-pending-dot) { display: none; }
-.sidebar:not(.expanded) .sidebar-nav-btn { justify-content: center; padding: var(--space-5); }
+.sidebar:not(.expanded) .sidebar-nav-btn { flex-direction: column; justify-content: center; align-items: center; gap: 3px; padding: var(--space-4) var(--space-2); }
 .sidebar:not(.expanded) .sidebar-nav-icon { margin: 0; }
+/* Collapsed: show a tiny page-name label under the icon (truncated with ellipsis if too long) */
+.sidebar:not(.expanded) .sidebar-nav-btn span:not(.sidebar-nav-icon):not(.chat-pending-dot) { display: block; width: 100%; max-width: 100%; font-size: 9px; line-height: 1.15; font-weight: var(--font-medium); letter-spacing: 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar:not(.expanded) .sidebar-history-row { flex-direction: column; }
 .sidebar:not(.expanded) .sidebar-history-row .sidebar-nav-btn { border-radius: var(--radius-lg); }
 .sidebar:not(.expanded) .sidebar-history-toggle { display: none; }

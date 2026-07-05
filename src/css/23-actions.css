@@ -482,6 +482,36 @@
 .action-btn.state-error .action-btn-label { color: var(--danger, #ef4444); }
 .action-btn.state-error .action-btn-badge { background: var(--danger, #ef4444); }
 
+/* Terminal success variants — same treatment as done (pr_opened purple). */
+.action-btn.state-finished { border-color: var(--success-light, rgba(16,185,129,0.4)); background: var(--success-lighter, rgba(16,185,129,0.08)); }
+.action-btn.state-finished .action-btn-primary,
+.action-btn.state-finished .action-btn-label { color: var(--success, #10b981); }
+.action-btn.state-finished .action-btn-badge { background: var(--success, #10b981); }
+.action-btn.state-pr_opened { border-color: var(--purple-light, rgba(124,58,237,0.4)); background: var(--purple-lighter, rgba(124,58,237,0.08)); }
+.action-btn.state-pr_opened .action-btn-primary,
+.action-btn.state-pr_opened .action-btn-label { color: var(--purple, #7c3aed); }
+.action-btn.state-pr_opened .action-btn-badge { background: var(--purple, #7c3aed); }
+
+/* waiting — non-terminal sibling of running: indigo, pulsing hourglass badge */
+.action-btn.state-waiting { border-color: var(--indigo-light, rgba(79,70,229,0.4)); background: var(--indigo-lighter, rgba(79,70,229,0.08)); }
+.action-btn.state-waiting .action-btn-primary,
+.action-btn.state-waiting .action-btn-label { color: var(--indigo, #4f46e5); }
+.action-btn.state-waiting .action-btn-badge { background: var(--indigo, #4f46e5); }
+.action-btn.state-waiting .action-btn-badge svg { animation: waiting-pulse 1.6s ease-in-out infinite; }
+
+/* pr_merged — internal terminal state: merged-purple git-merge badge */
+.action-btn.state-pr_merged { border-color: var(--merged-light, rgba(130,80,223,0.4)); background: var(--merged-lighter, rgba(130,80,223,0.08)); }
+.action-btn.state-pr_merged .action-btn-primary,
+.action-btn.state-pr_merged .action-btn-label { color: var(--merged, #8250df); }
+.action-btn.state-pr_merged .action-btn-badge { background: var(--merged, #8250df); }
+
+/* Shared pulse for every 'waiting' hourglass (also used by 04-header pill) */
+@keyframes waiting-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.action-btn.state-finished_with_caveat { border-color: var(--warning-light, rgba(245,158,11,0.4)); background: var(--warning-lighter, rgba(245,158,11,0.08)); }
+.action-btn.state-finished_with_caveat .action-btn-primary,
+.action-btn.state-finished_with_caveat .action-btn-label { color: var(--warning, #b45309); }
+.action-btn.state-finished_with_caveat .action-btn-badge { background: var(--warning, #f59e0b); }
+
 .action-btn.state-stopped {
     border-color: var(--secondary-border);
     background: var(--secondary-lighter);
@@ -539,6 +569,11 @@
 .action-result-icon svg { width: 18px; height: 18px; }
 .action-result-popover.state-done .action-result-icon { background: var(--success-lighter, rgba(16,185,129,0.15)); color: var(--success, #10b981); }
 .action-result-popover.state-error .action-result-icon { background: var(--danger-lighter, rgba(239,68,68,0.15)); color: var(--danger, #ef4444); }
+.action-result-popover.state-finished .action-result-icon { background: var(--success-lighter, rgba(16,185,129,0.15)); color: var(--success, #10b981); }
+.action-result-popover.state-pr_opened .action-result-icon { background: var(--purple-light, #ede9fe); color: var(--purple, #7c3aed); }
+.action-result-popover.state-pr_merged .action-result-icon { background: var(--merged-light, #ece2fd); color: var(--merged, #8250df); }
+.action-result-popover.state-waiting .action-result-icon { background: var(--indigo-light, #e0e7ff); color: var(--indigo, #4f46e5); }
+.action-result-popover.state-finished_with_caveat .action-result-icon { background: var(--warning-light, #fef3c7); color: var(--warning, #f59e0b); }
 .action-result-popover.state-stopped .action-result-icon { background: var(--secondary-light); color: var(--text-muted); }
 
 .action-result-title { flex: 1; min-width: 0; }
@@ -717,6 +752,8 @@
 .action-update.state-running .action-update-dot { border-color: var(--primary); background: var(--primary-light); }
 .action-update.state-stuck   .action-update-dot { border-color: var(--warning, #f59e0b); background: var(--warning-light, #fef3c7); }
 .action-update.state-done    .action-update-dot { border-color: var(--success, #10b981); background: var(--success-light, #d1fae5); }
+.action-update.state-waiting .action-update-dot { border-color: var(--indigo, #4f46e5); background: var(--indigo-light, #e0e7ff); }
+.action-update.state-pr_merged .action-update-dot { border-color: var(--merged, #8250df); background: var(--merged-light, #ece2fd); }
 .action-update.state-error   .action-update-dot { border-color: var(--danger, #ef4444); background: var(--danger-lighter, #fee2e2); }
 
 .action-update-body {
@@ -747,6 +784,11 @@
 .action-update.state-stuck   .action-update-state { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .action-update.state-done    .action-update-state { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
 .action-update.state-error   .action-update-state { background: var(--danger-lighter, #fee2e2); color: var(--danger, #b91c1c); }
+.action-update.state-finished .action-update-state { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
+.action-update.state-pr_opened .action-update-state { background: var(--purple-light, #ede9fe); color: var(--purple, #6d28d9); }
+.action-update.state-waiting .action-update-state { background: var(--indigo-light, #e0e7ff); color: var(--indigo, #4f46e5); }
+.action-update.state-pr_merged .action-update-state { background: var(--merged-light, #ece2fd); color: var(--merged, #8250df); }
+.action-update.state-finished_with_caveat .action-update-state { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 
 .action-update-statusmsg {
     font-size: var(--text-caption);
@@ -809,6 +851,12 @@
 .action-updates-state-badge.state-stuck   { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .action-updates-state-badge.state-done    { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
 .action-updates-state-badge.state-error   { background: var(--danger-lighter, #fee2e2); color: var(--danger, #b91c1c); }
+.action-updates-state-badge.state-finished { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
+.action-updates-state-badge.state-pr_opened { background: var(--purple-light, #ede9fe); color: var(--purple, #6d28d9); }
+.action-updates-state-badge.state-waiting { background: var(--indigo-light, #e0e7ff); color: var(--indigo, #4f46e5); }
+.action-updates-state-badge.state-waiting .action-updates-state-icon .ui-icon { animation: waiting-pulse 1.6s ease-in-out infinite; }
+.action-updates-state-badge.state-pr_merged { background: var(--merged-light, #ece2fd); color: var(--merged, #8250df); }
+.action-updates-state-badge.state-finished_with_caveat { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 /* spinner animation only for running state */
 .action-updates-state-badge.state-running .action-updates-state-icon .ui-icon {
     animation: action-spin 1.2s linear infinite;
@@ -896,6 +944,11 @@
 .action-update-history-item.state-stuck   .action-update-history-dot { border-color: var(--warning, #f59e0b); }
 .action-update-history-item.state-done    .action-update-history-dot { border-color: var(--success, #10b981); }
 .action-update-history-item.state-error   .action-update-history-dot { border-color: var(--danger, #ef4444); }
+.action-update-history-item.state-finished .action-update-history-dot { border-color: var(--success, #10b981); }
+.action-update-history-item.state-pr_opened .action-update-history-dot { border-color: var(--purple, #7c3aed); }
+.action-update-history-item.state-waiting .action-update-history-dot { border-color: var(--indigo, #4f46e5); }
+.action-update-history-item.state-pr_merged .action-update-history-dot { border-color: var(--merged, #8250df); }
+.action-update-history-item.state-finished_with_caveat .action-update-history-dot { border-color: var(--warning, #f59e0b); }
 .action-update-history-label { flex: 1; }
 .action-update-history-state {
     text-transform: uppercase;
@@ -1463,6 +1516,38 @@
     background: var(--warning, #f59e0b);
     box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
 }
+/* Terminal progress badge on chat rows / expand cards (icon + short label,
+   e.g. "PR opened") — rendered by _jobsProgressBadgeHtml when the chat's
+   latest update_action_state is terminal. Additive to the activity dot. */
+.jobs-row-state-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    margin-top: 2px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px; font-weight: 600; line-height: 1.4;
+    max-width: 100%;
+    width: fit-content;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    background: var(--surface-2, rgba(0,0,0,0.05));
+    color: var(--text-muted);
+}
+.jobs-row-state-badge .ui-icon,
+.jobs-row-state-badge svg { width: 10px; height: 10px; flex-shrink: 0; }
+.jobs-row-state-badge-label { overflow: hidden; text-overflow: ellipsis; }
+.jobs-row-state-badge.state-done { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
+.jobs-row-state-badge.state-finished { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
+.jobs-row-state-badge.state-pr_opened { background: var(--purple-light, #ede9fe); color: var(--purple, #6d28d9); }
+.jobs-row-state-badge.state-waiting { background: var(--indigo-light, #e0e7ff); color: var(--indigo, #4f46e5); }
+.jobs-row-state-badge.state-pr_merged { background: var(--merged-light, #ece2fd); color: var(--merged, #8250df); }
+.jobs-row-state-badge.state-finished_with_caveat { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+.jobs-row-state-badge.state-error { background: var(--danger-lighter, #fee2e2); color: var(--danger, #b91c1c); }
+/* Live waiting states — the chat is blocked on the USER (pending prompt_user
+   form / tool call parked on the approval modal). Amber, matching the
+   .state-attention dot family. */
+.jobs-row-state-badge.state-needs_input { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+.jobs-row-state-badge.state-needs_permission { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+/* Expand-modal card head: badge sits inline between title and buttons. */
+.jobs-expand-card-head .jobs-row-state-badge { margin-top: 0; flex-shrink: 1; min-width: 0; }
 /* Bell shown when a finished chat has an unviewed response. */
 .jobs-row-bell {
     display: inline-flex; align-items: center; justify-content: center;
@@ -1558,34 +1643,73 @@
     background: var(--bg-white);
     border-bottom: 1px solid var(--secondary-border);
     box-shadow: inset 3px 0 0 var(--primary);
+    animation: jobsAccIn 0.16s ease;
 }
+@keyframes jobsAccIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: none; }
+}
+/* Restored (not user-toggled) accordions skip the entrance animation. */
+.jobs-row-accordion.no-anim { animation: none; }
 .jobs-dropdown-row.acc-open .jobs-row-title { font-weight: var(--font-semibold, 600); }
-.jobs-row-accordion .jobs-acc-label {
+/* Expand-affordance chevron on Active rows: faint until hover, rotates (and
+   goes primary) while the row's accordion is open. */
+.jobs-row-chevron {
+    flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--text-muted);
+    opacity: 0.45;
+    transition: transform 0.15s ease, opacity 0.12s, color 0.12s;
+}
+.jobs-row-chevron svg { width: 14px; height: 14px; }
+.jobs-dropdown-row:hover .jobs-row-chevron { opacity: 1; }
+.jobs-dropdown-row.acc-open .jobs-row-chevron {
+    opacity: 1;
+    color: var(--primary);
+    transform: rotate(180deg);
+}
+/* ---- Shared progress-body typography ----
+   One rule set for BOTH hosts of _jobsAccordionBodyHtml: the dropdown
+   accordion (.jobs-row-accordion) and the expand-modal / home cards
+   (.jobs-expand-card-body). */
+.jobs-acc-label {
     font-weight: var(--font-semibold);
     color: var(--text-primary);
     font-size: var(--text-body-sm);
     margin-bottom: 2px;
 }
-.jobs-row-accordion .jobs-acc-status {
+.jobs-acc-status {
     color: var(--text-secondary);
     font-size: var(--text-caption);
     margin-bottom: var(--space-2);
 }
-.jobs-row-accordion .jobs-acc-empty {
+/* Deliberate 'no progress yet' empty state: muted clock icon + italic text. */
+.jobs-acc-empty {
+    display: flex; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) 0;
     color: var(--text-muted);
-    font-size: var(--text-body-sm);
+    font-size: var(--text-caption);
+    font-style: italic;
 }
+.jobs-acc-empty-icon {
+    display: inline-flex; align-items: center;
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+.jobs-acc-empty-icon svg { width: 14px; height: 14px; }
 .jobs-row-accordion .action-result-tasks { margin-top: var(--space-1); }
 .jobs-row-accordion .action-result-output { margin-bottom: var(--space-2); }
-/* Sub-agent worker cards listed inside a chat-row accordion, just below the
-   chat's own progress. Reuses the .worker-card component (24-sub-agents.css);
-   this block only titles + spaces the list. */
-.jobs-row-accordion .jobs-acc-workers {
+/* ---- Shared Workers drawer chrome ----
+   Header (label + count pill) + card list, used by the dropdown accordion
+   (.jobs-acc-workers) and the expand/home card drawer (.jobs-expand-card-workers).
+   The cards themselves are the .worker-card component from 24-sub-agents.css. */
+.jobs-acc-workers {
     margin-top: var(--space-2);
     padding-top: var(--space-2);
-    border-top: 1px dashed var(--secondary-border);
+    border-top: 1px solid var(--secondary-border);
 }
-.jobs-row-accordion .jobs-acc-workers-header {
+.jobs-acc-workers-header {
+    display: flex; align-items: center; gap: var(--space-2);
     font-size: var(--text-caption, 11px);
     font-weight: var(--font-semibold, 600);
     color: var(--text-muted, #6b7280);
@@ -1593,10 +1717,33 @@
     letter-spacing: 0.04em;
     margin-bottom: var(--space-2);
 }
-.jobs-row-accordion .jobs-acc-workers-list {
+.jobs-acc-workers-count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px;
+    border-radius: 999px;
+    background: var(--secondary-light);
+    color: var(--text-secondary);
+    font-size: 10px;
+    letter-spacing: 0;
+}
+.jobs-acc-workers-list {
     display: flex;
     flex-direction: column;
     gap: var(--space-2, 4px);
+}
+/* Elbow connector for nested (depth 2/3) workers inside the jobs lists only —
+   the sidebar Workers strip keeps its plain margin indent. */
+.jobs-acc-workers-list .worker-card-wrap[data-depth="2"],
+.jobs-acc-workers-list .worker-card-wrap[data-depth="3"] { position: relative; }
+.jobs-acc-workers-list .worker-card-wrap[data-depth="2"]::before,
+.jobs-acc-workers-list .worker-card-wrap[data-depth="3"]::before {
+    content: '';
+    position: absolute;
+    left: -7px; top: -4px; bottom: 50%;
+    width: 7px;
+    border-left: 1px solid var(--secondary-border);
+    border-bottom: 1px solid var(--secondary-border);
+    border-bottom-left-radius: 4px;
 }
 /* Compact context ring for the (non-expanded) jobs chat rows — smaller than
    the sidebar worker ring so it fits the dense row beside the action buttons. */
@@ -1628,7 +1775,7 @@
 }
 .jobs-expand-modal {
     display: flex; flex-direction: column;
-    width: min(960px, 92vw);
+    width: min(1200px, 94vw);
     /* Fixed size: the modal is always the same dimensions regardless of how
        many cards it holds — the body (.jobs-expand-body) scrolls internally. */
     height: 85vh;
@@ -1701,7 +1848,7 @@
    column owns a header (subhead) and a vertically-scrolling stack of cards, so
    the three headers stay aligned at the top regardless of how full a column is. */
 .jobs-expand-columns {
-    display: flex; gap: var(--space-4);
+    display: flex; gap: var(--space-6);
     flex: 1; min-height: 0; width: 100%;
 }
 .jobs-expand-column {
@@ -1709,20 +1856,29 @@
     flex: 1 1 0; min-width: 0;
 }
 .jobs-expand-subhead {
+    display: flex; align-items: center; gap: var(--space-2);
     font-size: var(--text-caption);
     font-weight: var(--font-semibold);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--text-muted);
     margin: 0 0 var(--space-2);
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--secondary-border);
     flex-shrink: 0;
 }
 .jobs-expand-col-count {
-    color: var(--text-muted); opacity: 0.7; font-weight: var(--font-semibold);
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px;
+    border-radius: 999px;
+    background: var(--secondary-light);
+    color: var(--text-secondary);
+    font-size: 10px; font-weight: var(--font-semibold);
+    letter-spacing: 0;
 }
 .jobs-expand-col-cards {
     flex: 1; min-height: 0; overflow-y: auto;
-    display: flex; flex-direction: column; gap: var(--space-3);
+    display: flex; flex-direction: column; gap: var(--space-6);
     padding-right: 2px;
 }
 /* Sections layout: buckets stack vertically (Active first) and the WHOLE body
@@ -1735,10 +1891,13 @@
 }
 .jobs-expand-section { min-width: 0; }
 .jobs-expand-section-cards {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--space-3);
-    align-items: start;
+    column-count: 2;
+    column-gap: var(--space-6);
+}
+.jobs-expand-section-cards > .jobs-expand-card {
+    break-inside: avoid;
+    margin-bottom: var(--space-6);
+    display: block;
 }
 .jobs-expand-col-empty {
     color: var(--text-muted); opacity: 0.7;
@@ -1750,8 +1909,10 @@
     margin: auto;
 }
 /* Card: a single flat surface — the title sits ON the card (slightly bold),
-   with no separate header band/background. */
+   with no separate header band/background. A ::before left accent bar carries
+   the chat's state color (running/attention/error); done stays neutral. */
 .jobs-expand-card {
+    position: relative;
     display: flex; flex-direction: column;
     border: 1px solid var(--secondary-border);
     border-radius: var(--radius-md);
@@ -1759,7 +1920,26 @@
     padding: var(--space-3) var(--space-4);
     min-width: 0;
     flex-shrink: 0;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    transition: border-color 0.12s, box-shadow 0.12s;
 }
+.jobs-expand-card:hover {
+    border-color: var(--text-muted);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.07);
+}
+.jobs-expand-card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    border-radius: var(--radius-md) 0 0 var(--radius-md);
+    background: transparent;
+    pointer-events: none;
+}
+.jobs-expand-card.state-running::before { background: var(--success, #10b981); }
+.jobs-expand-card.state-attention::before,
+.jobs-expand-card.state-unseen::before { background: var(--warning, #f59e0b); }
+.jobs-expand-card.state-error::before { background: var(--danger, #ef4444); }
 .jobs-expand-card.is-current { box-shadow: inset 3px 0 0 var(--success, #10b981); }
 .jobs-expand-card.is-current .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
 .jobs-expand-card-head {
@@ -1780,48 +1960,57 @@
     color: var(--text-primary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* Unread (unopened finished) chat: bold like an unread email. */
+/* Unread (unopened finished) chat: bold like an unread email, plus a small
+   primary dot after the title (hidden when the title truncates — the bold
+   weight still carries the signal). */
 .jobs-expand-card.jobs-unread .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
-.jobs-expand-card-body { min-width: 0; max-height: 260px; overflow-y: auto; }
-.jobs-expand-card-body .jobs-acc-label {
-    font-weight: var(--font-semibold); color: var(--text-primary);
-    font-size: var(--text-body-sm); margin-bottom: 2px;
+.jobs-expand-card.jobs-unread .jobs-expand-card-title::after {
+    content: '';
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--primary);
+    margin-left: 6px;
+    vertical-align: middle;
 }
-.jobs-expand-card-body .jobs-acc-status {
-    color: var(--text-secondary); font-size: var(--text-caption);
-    margin-bottom: var(--space-2);
+/* Progress body: adaptive height (viewport-relative, clamped) instead of a
+   hardcoded cap; thin scrollbar + scroll-shadow hints (Lea Verou technique:
+   the shadows only appear when there IS hidden content on that edge).
+   Typography (.jobs-acc-label/-status/-empty) is shared — see the dropdown
+   accordion section above. */
+.jobs-expand-card-body {
+    --jobs-scroll-fade: rgba(0, 0, 0, 0.14);
+    min-width: 0;
+    max-height: clamp(160px, 32vh, 340px);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--secondary-border) transparent;
+    background:
+        linear-gradient(var(--bg-white) 30%, transparent),
+        linear-gradient(transparent, var(--bg-white) 70%) 0 100%,
+        radial-gradient(farthest-side at 50% 0, var(--jobs-scroll-fade), transparent),
+        radial-gradient(farthest-side at 50% 100%, var(--jobs-scroll-fade), transparent) 0 100%;
+    background-repeat: no-repeat;
+    background-size: 100% 24px, 100% 24px, 100% 8px, 100% 8px;
+    background-attachment: local, local, scroll, scroll;
 }
-.jobs-expand-card-body .jobs-acc-empty {
-    color: var(--text-muted); font-size: var(--text-body-sm);
-}
+:root[data-theme="dark"] .jobs-expand-card-body { --jobs-scroll-fade: rgba(0, 0, 0, 0.45); }
 .jobs-expand-card-body .action-result-tasks { margin-top: var(--space-1); }
 .jobs-expand-card-body .action-result-output { margin-bottom: 0; }
 /* Sub-agent drawer: INSIDE the card but BELOW (outside) the card-body scroll,
    so the worker rows stay pinned while the progress body scrolls on its own
    and expand via data-worker-toggle. Negative margins stretch it across the
-   card's padding so it reads as a docked footer band. Reuses .worker-card
-   from 24-sub-agents.css. */
+   card's padding so it reads as a docked footer band. Header + list chrome is
+   shared (.jobs-acc-workers-* above); cards are .worker-card from
+   24-sub-agents.css. */
 .jobs-expand-card-workers {
-    border-top: 1px dashed var(--secondary-border);
+    border-top: 1px solid var(--secondary-border);
     border-radius: 0 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px);
     background: var(--bg-secondary, var(--bg-white));
     padding: var(--space-2) var(--space-4) var(--space-3);
     margin: var(--space-2) calc(-1 * var(--space-4)) calc(-1 * var(--space-3));
     min-width: 0;
     flex-shrink: 0;
-}
-.jobs-expand-card-workers .jobs-acc-workers-header {
-    font-size: var(--text-caption, 11px);
-    font-weight: var(--font-semibold, 600);
-    color: var(--text-muted, #6b7280);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-bottom: var(--space-2);
-}
-.jobs-expand-card-workers .jobs-acc-workers-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2, 4px);
 }
 /* Only when truly cramped do the three columns stack vertically (cards get too
    narrow to read otherwise); the body then scrolls as a whole instead of each
@@ -1832,6 +2021,62 @@
     .jobs-expand-column { flex: 0 0 auto; }
     .jobs-expand-col-cards { overflow: visible; }
     .jobs-expand-modal { width: 96vw; height: 90vh; }
+}
+
+/* =============================================
+   EMBEDDED ACTIVE CHATS PANEL (home / new-chat page)
+   The SAME cards + columns/sections layout as the expand modal, but rendered
+   inline under the home Actions row instead of in a fixed overlay. Sizes to
+   content (capped) and shares the layout toggle + localStorage preference.
+   ============================================= */
+.home-active-chats {
+    width: 100%;
+    max-width: 1200px;
+    margin: var(--space-8) auto 0;
+    text-align: left;
+}
+.home-active-chats-inner {
+    border: 1px solid var(--secondary-border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-primary);
+    padding: var(--space-3) var(--space-4) var(--space-4);
+}
+.home-active-chats-head {
+    display: flex; align-items: center; gap: var(--space-3);
+    margin-bottom: var(--space-3);
+}
+.home-active-chats-title {
+    font-size: var(--text-caption);
+    font-weight: var(--font-semibold);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+/* Columns mode: bounded height so the panel never dominates the home page; each
+   column scrolls internally exactly like the modal. When the panel is too narrow
+   for three columns the whole body scrolls horizontally (min column width). */
+.home-active-chats-body {
+    display: flex;
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-height: min(46vh, 440px);
+}
+.home-active-chats-body .jobs-expand-columns { min-width: min-content; }
+.home-active-chats-body .jobs-expand-column { min-width: 210px; }
+/* Sections mode: the whole body scrolls (matches .jobs-expand-body.layout-sections). */
+.home-active-chats-body.layout-sections {
+    display: block;
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-height: min(60vh, 620px);
+}
+@media (max-width: 560px) {
+    .home-active-chats { max-width: 100%; padding: 0 8px; }
+    /* The modal media query stacks the shared .jobs-expand-columns vertically and
+       sets .jobs-expand-col-cards { overflow: visible } on small screens, so the
+       embedded body must scroll vertically (not clip) in columns mode too. */
+    .home-active-chats-body { overflow-x: hidden; overflow-y: auto; }
+    .home-active-chats-body .jobs-expand-section-cards { column-count: 1; }
 }
 
 

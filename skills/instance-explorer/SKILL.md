@@ -2,15 +2,6 @@
 name: instance-explorer
 description: "Quick access to ServiceNow instance structure — tables, business rules, pages, and roles. Renders inline widgets for fast inspection."
 actions:
-  - name: Show Tables
-    icon: database
-    show: [home]
-  - name: Show Business Rules
-    icon: code
-    show: [home]
-  - name: Show Pages
-    icon: browser
-    show: [home]
   - name: Show Roles
     icon: shield
     show: [sidebar]
@@ -25,28 +16,6 @@ Fast, one-click inspection of an instance's structure. Each action queries Servi
 - When the PM asks "what tables are in this instance?"
 - When inspecting business rules, UI pages, or roles
 - As a starting point before deeper analysis
-
-## Action Lifecycle: Show Tables
-
-1. `update_action_state({ state: 'running', icon: 'database', label: 'Loading tables…' })`
-2. Call `servicenow_api` GET on `sys_db_object` with `limit: 200`, fields `name,label,sys_scope`
-3. `update_action_state({ state: 'running', icon: 'list', label: 'Building table' })`
-4. Use `display` tool with `template: 'table'` columns `[Name, Label, Scope]`
-5. `update_action_state({ state: 'done', icon: 'check', label: 'N tables' })`
-
-## Action Lifecycle: Show Business Rules
-
-1. `update_action_state({ state: 'running', icon: 'code', label: 'Loading business rules…' })`
-2. Call `servicenow_api` GET on `sys_script` with query `active=true`, fields `name,collection,when,action_insert,action_update,action_delete,active`
-3. Render via `display` table
-4. `update_action_state({ state: 'done', icon: 'check', label: 'N active business rules' })`
-
-## Action Lifecycle: Show Pages
-
-1. `update_action_state({ state: 'running', icon: 'browser', label: 'Loading UI pages…' })`
-2. Call `servicenow_api` GET on `sys_ui_page`, fields `name,category,description,sys_updated_on`
-3. Render via `display` card_list
-4. `update_action_state({ state: 'done', icon: 'check', label: 'N pages' })`
 
 ## Action Lifecycle: Show Roles
 

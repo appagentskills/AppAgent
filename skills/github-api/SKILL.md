@@ -32,18 +32,28 @@ Notes:
 
 ## Permissions: agent-governed (no prompt on reads)
 
-`web_fetch` normally prompts the user on **every** call. The one exception is a
-request to the **configured GitHub REST API base** (the same match that triggers
-auto-auth above): those are treated like `servicenow_api` — **governed by the
-`confirm` flag**, not a forced prompt.
+`web_fetch` normally prompts the user on **every** call. The exception is the
+**connected GitHub host family**, which is treated like `servicenow_api` —
+**governed by the `confirm` flag**, not a forced prompt:
+
+- The **REST API base** (`api.github.com`, or GHE `<instanceUrl>/api/v3`) —
+  agent-governed **and** token auto-attached (see above).
+- For the default `github.com` config, also the **web/content hosts**:
+  `github.com`, `raw.githubusercontent.com`, `gist.github.com`,
+  `codeload.github.com`, `objects.githubusercontent.com` — agent-governed, but
+  the token is **only** sent to the API base, never to these hosts.
+- For **GitHub Enterprise**, the whole configured origin is agent-governed;
+  the token is only attached under `/api/v3`.
+
+Governance works even with **no token stored** — host matching alone decides it.
 
 - **Reads** (`GET`, and any call without `confirm:true`) run **silently** — no
   approval prompt. Loop over commits / PRs / files without interrupting the user.
 - **Writes** — merging a PR, posting a comment/review, creating a branch, GraphQL
   mutations — set **`confirm: true`** so the user reviews before it runs.
 
-This only applies to the connected GitHub host; every other `web_fetch` URL still
-prompts. If the user has explicitly set `web_fetch` to *disabled* or *allow* in
+This only applies to the connected GitHub host family; every other `web_fetch`
+URL still prompts. If the user has explicitly set `web_fetch` to *disabled* or *allow* in
 settings, that override wins (only the default *ask* is downgraded).
 
 ## Reusable helper (use inside one js_eval)

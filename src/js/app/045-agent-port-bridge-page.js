@@ -247,6 +247,10 @@ function _sendPanelHello() {
     } catch (e) {
         console.error('[agent-bus] panel-hello post failed', e);
     }
+    // runtime_inspect dev-mode handshake: (re)push the dev-mode flag on every
+    // bus (re)connect so a restarted SW relearns it — the SW keeps it only in
+    // memory (tools/140-runtime-inspect.js).
+    try { if (typeof _pushDevModeToSW === 'function') _pushDevModeToSW(); } catch (e2) { /* non-fatal */ }
 }
 
 // WSM-RELAY: page-local `workspaceMutated` emits (user-clicked restore/discard
@@ -479,6 +483,30 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
     }
 }
 
+// JOBS-UNREAD: page-owned jobs-list metadata must survive SW chat-snapshot
+// replaces. The unread/bold + linger predicates (tools/120-actions.js) read
+// lastResponseAt / lastActivityAt / lastViewedAt, and the dropdown's 'remove
+// from list' uses _jobsHidden — ALL of them are stamped PAGE-side only
+// (markChatActivity / markChatRecentlyFinished / selectChat / showChatView),
+// so the SW's snapshot never carries fresh values (at best stale ones loaded
+// from IDB at SW boot). The wholesale `chats[chatId] = snapshot` assignment
+// dropped the stamps: a jobs row went bold on markChatActivity, then the next
+// inlined snapshot (e.g. the silent title/tldr hook's runStarted ~1s after
+// the run finished) wiped lastResponseAt/lastActivityAt and the repaint
+// un-bolded it. Keep the NEWEST value of each timestamp and preserve the
+// page's _jobsHidden flag when the snapshot lacks it (deleting the flag
+// page-side leaves it undefined on prev, so a re-run's un-hide sticks).
+function _mergePageChatMeta(prevChat, inChat) {
+    if (!prevChat || !inChat) return;
+    ['lastResponseAt', 'lastActivityAt', 'lastViewedAt'].forEach(function(f) {
+        var pv = prevChat[f] || 0;
+        if (pv && pv > (inChat[f] || 0)) inChat[f] = pv;
+    });
+    if (inChat._jobsHidden === undefined && prevChat._jobsHidden !== undefined) {
+        inChat._jobsHidden = prevChat._jobsHidden;
+    }
+}
+
 function _handleAgentBusMessage(msg) {
     if (!msg || !msg.type) return;
     switch (msg.type) {
@@ -517,6 +545,8 @@ function _handleAgentBusMessage(msg) {
                 // RES-5: keep pending prompt_user / approval rows the SW
                 // snapshot can't know about (see _mergePagePendingRows).
                 _mergePagePendingRows(_prevChat, _inChat, msg.detail.chatId); // PR383-F3: chatId for approval re-key
+                // JOBS-UNREAD: carry page-owned unread/seen stamps across the replace.
+                _mergePageChatMeta(_prevChat, _inChat);
                 chats[msg.detail.chatId] = _inChat;
                 // Re-point the active-chat versionHistory mirror: it referenced
                 // the replaced chat object's array, so sidebar/inline renders
@@ -617,6 +647,9 @@ function _handleAgentBusMessage(msg) {
                     // (RES-5 / _mergePagePendingRows) — the wholesale replace here
                     // wiped page-only pending rows on every reconnect hello.
                     _mergePagePendingRows(chats[cid], msg.chatsSnapshot[cid], cid);
+                    // JOBS-UNREAD: same page-owned stamp preservation as the
+                    // agent-event inline-snapshot path.
+                    _mergePageChatMeta(chats[cid], msg.chatsSnapshot[cid]);
                     chats[cid] = msg.chatsSnapshot[cid];
                     if (typeof currentChatId !== 'undefined' && cid === currentChatId) _helloRerenderCurrent = true;
                 });
@@ -705,6 +738,13 @@ function _handleAgentBusMessage(msg) {
             if (msg.subAgentRecords && typeof SubAgents !== 'undefined' && SubAgents.applySnapshot) {
                 SubAgents.applySnapshot(msg.subAgentRecords);
             }
+            // An open workspace dropdown may have painted BEFORE this hello
+            // repopulated `chats` + the sub-agent mirror (post-reload race) —
+            // its owning-chat chips resolved as "gone". Re-render it now that
+            // both are authoritative (self-guards when no dropdown is open).
+            if (typeof _reconcileDropdownSections === 'function') {
+                try { _reconcileDropdownSections(); } catch (e) { /* non-fatal */ }
+            }
             return;
 
         case 'resume-scan-done':
@@ -729,11 +769,21 @@ function _handleAgentBusMessage(msg) {
                 // RES-5: same pending-row preservation as the agent-event
                 // inline-snapshot path above.
                 _mergePagePendingRows(chats[msg.chatId], msg.chat, msg.chatId); // PR383-F3: chatId for approval re-key
+                // JOBS-UNREAD: same page-owned stamp preservation as the
+                // agent-event inline-snapshot path.
+                _mergePageChatMeta(chats[msg.chatId], msg.chat);
                 chats[msg.chatId] = msg.chat;
                 if (msg.chatId === currentChatId && typeof renderMessages === 'function') {
                     renderMessages();
                 }
             }
+            return;
+
+        case 'debug-state':
+            // runtime_inspect action:'sw_state' reply (see the
+            // 'pull-debug-state' case in worker/130-port-bridge.js). Resolver
+            // lives in tools/140-runtime-inspect.js (page bundle).
+            if (typeof _riResolveDebugState === 'function') _riResolveDebugState(msg);
             return;
 
         case 'exec-tool':
@@ -993,6 +1043,20 @@ function pushHooksSettingsToOffscreen(hooks) {
         _agentBusPort.postMessage({
             type: 'hooks-settings',
             hooksEnabled: hooks
+        });
+    } catch (e) {}
+}
+
+// Push the deferred-tool-loading flag to the SW after the user toggles it
+// in Settings — same reasoning as pushHooksSettingsToOffscreen: without
+// this the SW keeps the boot-time value until the next SW restart, so the
+// slim tools array / {{TOOL_CATALOG}} wouldn't apply to background runs.
+function pushDeferredToolsSettingToOffscreen(enabled) {
+    if (!_agentBusPort) return;
+    try {
+        _agentBusPort.postMessage({
+            type: 'deferred-tools-setting',
+            enabled: !!enabled
         });
     } catch (e) {}
 }

@@ -33,7 +33,13 @@ if (typeof getSkillsSummaryForPrompt !== 'function') {
         if (typeof skills !== 'object' || !skills) return '';
         var list = Object.values(skills);
         if (list.length === 0) return '';
-        var active = list.filter(function(s) { return (typeof activeSkills === 'object') && activeSkills && activeSkills[s.id]; });
+        var active = list.filter(function(s) {
+            if (!((typeof activeSkills === 'object') && activeSkills && activeSkills[s.id])) return false;
+            // devOnly skills are hidden from the prompt outside dev mode —
+            // keep in sync with the page original in ui/070-dashboard-ui.js.
+            if (typeof isSkillDevHidden === 'function' && isSkillDevHidden(s.id)) return false;
+            return true;
+        });
         if (active.length === 0) return '';
         var out = '\n\nACTIVE SKILLS:\n';
         active.forEach(function(s) {
@@ -207,7 +213,9 @@ if (typeof isChatPaused !== 'function') {
 var hooksEnabled = (typeof hooksEnabled === 'object' && hooksEnabled) || {
     autoTitle: true,
     autoTldr: true,
-    autoLinks: true,
+    autoLinks: false,
+    autoCaveat: true,
+    autoProgress: true,
     showHookMessages: false
 };
 var _silentHookRunningByChat = (typeof _silentHookRunningByChat !== 'undefined') ? _silentHookRunningByChat : {};
@@ -223,8 +231,13 @@ async function loadHooksSettings() {
         hooksEnabled = saved;
         // Migration: autoTldr was added after users may have saved settings.
         if (hooksEnabled.autoTldr === undefined) hooksEnabled.autoTldr = true;
-        // Migration: autoLinks was added after users may have saved settings.
-        if (hooksEnabled.autoLinks === undefined) hooksEnabled.autoLinks = true;
+        // Migration: autoLinks now defaults OFF — users without the key get the
+        // new default (an explicit saved `true` is preserved; only undefined→false).
+        if (hooksEnabled.autoLinks === undefined) hooksEnabled.autoLinks = false;
+        // Migration: autoCaveat was added later — default ON for existing users.
+        if (hooksEnabled.autoCaveat === undefined) hooksEnabled.autoCaveat = true;
+        // Migration: autoProgress was added later — default ON for existing users.
+        if (hooksEnabled.autoProgress === undefined) hooksEnabled.autoProgress = true;
     }
 }
 
@@ -330,6 +343,101 @@ function executeAfterResponseHooks(chatId) {
         }
     }
 
+    // Caveat hook (OPTIONAL, piggyback-only): let the model flag a single
+    // must-read warning on the final answer (off-plan deviation, unverified
+    // assumption, incomplete work, or a trailing question/requested action the
+    // user might overlook). Unlike tldr/links it NEVER triggers its own extra
+    // LLM run — the caveat task is appended to the combined instruction ONLY
+    // when at least one other hook (title/tldr/links) is already firing (see the
+    // `caveatEligible && tasks.length > 0` gate below), so a normal answer with
+    // nothing to flag costs zero extra round-trips. Skipped on background chats
+    // (the card is never rendered there).
+    var caveatEligible = false;
+    var caveatTarget = null;
+    if (hooksEnabled.autoCaveat && !chat.isBackground) {
+        caveatTarget = findHookAnswerTarget(chat);
+        if (caveatTarget && !caveatTarget.caveat && relocateAnswerCard(chat, 'caveat')) {
+            // Spontaneous mid-run set_caveat — relocate onto the final answer,
+            // same as the tldr/links branches; hook satisfied, no extra LLM run.
+            chat._caveatHookTries = 0;
+            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+                AgentEvents.emit('caveatChanged', { chatId: chatId, caveat: caveatTarget.caveat });
+            }
+        } else if (caveatTarget && !caveatTarget.caveat && !caveatTarget._caveatAsked) {
+            // Reaching a fresh (not-yet-asked) answer target = a NEW answer.
+            // Clear any try-count carried over from earlier answers: a caveat
+            // "skip" is a valid outcome (not a failure), so — unlike tldr's
+            // chat-wide cap — it must NOT accumulate across answers and
+            // permanently suppress the offer. The per-message _caveatAsked flag
+            // (set only when the task is actually pushed) is the once-per-answer
+            // guard; _caveatHookTries stays a within-answer safety ceiling.
+            if ((chat._caveatHookTries || 0) >= 2) chat._caveatHookTries = 0;
+            caveatEligible = true;
+        }
+    }
+
+    // Chat-progress hook (OPTIONAL, piggyback-only): ask the model to finalize
+    // the progress card by calling the EXISTING update_action_state tool with a
+    // terminal display state (finished / pr_opened / finished_with_caveat /
+    // error). Modeled on the caveat hook above: it NEVER triggers its own LLM
+    // run — the task is only appended when title/tldr/links already need one.
+    // Skipped on background chats (their action buttons already carry terminal
+    // state) and when the latest card already shows a terminal display state.
+    // NOTE: getChatProgressStateFor (tools/120-actions.js) is NOT in the SW
+    // bundle, so the latest state + tool-usage check is a cheap inline backward
+    // walk over chat.messages (the SW owns the authoritative copy).
+    var progressEligible = false;
+    var progressTarget = null;
+    if (hooksEnabled.autoProgress && !chat.isBackground) {
+        progressTarget = findHookAnswerTarget(chat);
+        if (progressTarget && !progressTarget._progressAsked) {
+            var _progLatestState = null;   // state of the LATEST update_action_state call
+            var _progHasCard = false;      // chat has ANY update_action_state call
+            var _progTurnUsedTools = false;// the last turn (after the last real user msg) used tools
+            var _progSeenBoundary = false;
+            for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
+                var _pm = chat.messages[_pi];
+                if (!_pm) continue;
+                if (!_progSeenBoundary && _pm.role === 'user' && !_pm.isHookMessage) _progSeenBoundary = true;
+                if (_pm.role === 'assistant' && Array.isArray(_pm.tool_calls) && _pm.tool_calls.length) {
+                    if (!_progSeenBoundary) _progTurnUsedTools = true;
+                    if (!_progHasCard) {
+                        for (var _pj = _pm.tool_calls.length - 1; _pj >= 0; _pj--) {
+                            var _ptc = _pm.tool_calls[_pj];
+                            if (_ptc && _ptc.function && _ptc.function.name === 'update_action_state') {
+                                _progHasCard = true;
+                                try { _progLatestState = (JSON.parse(_ptc.function.arguments || '{}') || {}).state || null; } catch (e) {}
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (_progSeenBoundary && _progHasCard) break;
+            }
+            var _progAlreadyFinal = _progLatestState &&
+                // pr_merged is an INTERNAL display state (set by workspace merge-
+                // detection, never via the tool) — included defensively so the
+                // finalize hook never re-fires on an already-merged card. 'done'
+                // and 'error' are terminal too: without them a card that ended
+                // in done/error stays "eligible" and the hook re-appends the
+                // finalize request on every subsequent answer (churn).
+                ['finished', 'pr_opened', 'finished_with_caveat', 'pr_merged', 'done', 'error'].indexOf(_progLatestState) >= 0;
+            // Eligible when there's a progress card in any non-final state, or
+            // no card at all but the run actually used tools (a pure
+            // conversational answer has nothing to finalize).
+            if (!_progAlreadyFinal && (_progHasCard || _progTurnUsedTools)) {
+                // Same per-answer reset semantics as the caveat hook: a "skip"
+                // is a valid outcome, so the try-count must not accumulate
+                // across answers. _progressAsked is the once-per-answer guard.
+                if ((chat._progressHookTries || 0) >= 2) chat._progressHookTries = 0;
+                progressEligible = true;
+            }
+        }
+    }
+
+    // Caveat / progress are piggyback-only: they must NEVER force a run on
+    // their own, so they are deliberately excluded from this early-return guard.
     if (!needsTitle && !needsTldr && !needsLinks) return;
 
     // Build ONE combined instruction so title + TL;DR + links share a single
@@ -338,12 +446,47 @@ function executeAfterResponseHooks(chatId) {
     if (needsTitle) tasks.push('set a concise chat title (max 50 chars) using the set_chat_title tool');
     if (needsTldr) tasks.push('provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars)');
     if (needsLinks) tasks.push('provide any relevant links using the set_links tool — an array of {title, url} for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty array if there is nothing worth linking');
+    // Piggyback the OPTIONAL caveat task — only when another hook is already
+    // firing (tasks.length > 0) and the retry ceiling isn't hit — and set the
+    // per-message asked flag / bump the try-count ONLY here, when it is really
+    // pushed. This guarantees a caveat-only turn never burns an extra LLM run.
+    var caveatPushed = false;
+    var caveatTaskNum = 0;
+    if (caveatEligible && tasks.length > 0 && (chat._caveatHookTries || 0) < 2) {
+        tasks.push('OPTIONALLY call the set_caveat tool with a short warning (1-2 sentences) ONLY IF your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; do NOT flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, do NOT call set_caveat');
+        caveatTarget._caveatAsked = true;
+        chat._caveatHookTries = (chat._caveatHookTries || 0) + 1;
+        caveatPushed = true;
+        caveatTaskNum = tasks.length;
+    }
+    // Piggyback the OPTIONAL chat-progress task — same pattern as the caveat:
+    // only when another hook is already firing, flags/tries bumped only when
+    // the task is really pushed.
+    var progressPushed = false;
+    var progressTaskNum = 0;
+    if (progressEligible && tasks.length > 0 && (chat._progressHookTries || 0) < 2) {
+        tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary; SKIP this call entirely if no substantive work was done (pure conversational answer)');
+        progressTarget._progressAsked = true;
+        chat._progressHookTries = (chat._progressHookTries || 0) + 1;
+        progressPushed = true;
+        progressTaskNum = tasks.length;
+    }
     var instruction;
     if (tasks.length === 1) {
         instruction = 'Now ' + tasks[0] + '. Do NOT say anything else.';
     } else {
         var numbered = tasks.map(function(t, i) { return (i + 1) + ') ' + t; }).join('; ');
         instruction = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: ' + numbered + '.';
+        if (caveatPushed) {
+            // The caveat item is OPTIONAL — the model must skip it when there is
+            // nothing to flag, so soften the "calling ALL the tools" wording.
+            // caveatTaskNum (captured at push time) — NOT tasks.length — because
+            // the progress task may have been pushed after it.
+            instruction += ' (Item ' + caveatTaskNum + ' — set_caveat — is OPTIONAL: call it only if your answer has a genuine must-read warning; if not, skip it and just call the other tool(s).)';
+        }
+        if (progressPushed) {
+            instruction += ' (Item ' + progressTaskNum + ' — update_action_state — is also conditional: skip it ONLY when no substantive work was done this turn.)';
+        }
     }
 
     var _hookIsSilent = !hooksEnabled.showHookMessages;

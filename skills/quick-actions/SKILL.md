@@ -8,9 +8,6 @@ actions:
   - name: Recent Changes
     icon: clock
     show: [home]
-  - name: Find Defects
-    icon: bug
-    show: [home]
 ---
 
 # Quick Actions
@@ -37,20 +34,6 @@ Shows what's been changed in the instance in the last 24 hours.
 2. `servicenow_api` GET on `sys_update_xml` with `query: sys_updated_on>javascript:gs.hoursAgoStart(24)` and fields `name,target_name,type,sys_updated_on,sys_updated_by`
 3. Render via `display` `table` sorted by `sys_updated_on` desc
 4. `update_action_state({ state: 'done', icon: 'check', label: 'N changes in 24h' })`
-
-## Action Lifecycle: Find Defects
-
-Looks for common configuration defects across the instance.
-
-Use `tasks` to show progress:
-- Check business rule errors (syslog)
-- Check inactive required fields
-- Check duplicate ACLs
-- Check orphaned catalog items
-
-1. Initial: `update_action_state({ state: 'running', icon: 'bug', label: 'Scanning for defects…', tasks: [...all 4 pending] })`
-2. For each check, mark task `running`, run the query, mark `done` (or `error`), then update again
-3. Final: render `display` `card_list` with one card per defect category; `update_action_state({ state: 'done', icon: 'check', label: 'N defects found' })`
 
 ## Notes
 

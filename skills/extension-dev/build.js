@@ -190,10 +190,15 @@ async function extension_build(args) {
             var skillMd = await readFile('skills/' + skillName + '/SKILL.md');
             if (!skillMd) return null;
 
-            var name = skillName, description = '', body = skillMd;
+            var name = skillName, description = '', body = skillMd, devOnly = false;
             var fmMatch = skillMd.match(/^---\s*\n([\s\S]*?)\n---/);
             if (fmMatch) {
                 var fm = fmMatch[1];
+                // devOnly skills are hidden at runtime outside extension dev
+                // mode (isSkillDevHidden in src/js/core/140-skills-engine.js).
+                // Mirrors the same parse in build/build.js. fmRaw is already
+                // hashed, so toggling devOnly bumps the hash.
+                devOnly = /^devOnly:\s*true\s*$/m.test(fm);
                 var nameMatch = fm.match(/^name:\s*(.+)$/m);
                 var descMatch = fm.match(/^description:\s*(.+)$/m);
                 if (nameMatch) name = nameMatch[1].trim().replace(/^"|"$/g, '');
@@ -238,6 +243,7 @@ async function extension_build(args) {
                 id: name,
                 name: name,
                 description: description,
+                devOnly: devOnly,
                 body: btoa(unescape(encodeURIComponent(body))),
                 frontmatter: btoa(unescape(encodeURIComponent(fmRaw))),
                 hash: hash,

@@ -1499,8 +1499,14 @@ function getSkillsSummaryForPrompt() {
     var skillList = Object.values(skills);
     if (skillList.length === 0) return '';
 
-    // Only include active skills in the system prompt
-    var activeList = skillList.filter(function(s) { return activeSkills[s.id]; });
+    // Only include active skills in the system prompt — and hide devOnly
+    // skills outside extension dev mode (isSkillDevHidden, core/140-skills-
+    // engine.js). Keep in sync with the SW stub in worker/020-page-stubs.js.
+    var activeList = skillList.filter(function(s) {
+        if (!activeSkills[s.id]) return false;
+        if (typeof isSkillDevHidden === 'function' && isSkillDevHidden(s.id)) return false;
+        return true;
+    });
 
     if (activeList.length === 0) return '';
 
@@ -1702,6 +1708,16 @@ async function updateCacheTokenLimit(value) {
     await saveCacheTokenLimit();
 }
 
+// Settings page onchange handler for the assumed-context-window field.
+// Persists via saveAssumedContextTokens (core/030-config.js) and writes the
+// normalized value back into the input (bad input snaps to the default).
+async function updateAssumedContextTokens(value) {
+    var normalized = await saveAssumedContextTokens(value);
+    var input = document.getElementById('settings-page-context-window');
+    if (input) input.value = normalized;
+    if (typeof updateContextIndicator === 'function') updateContextIndicator();
+}
+
 async function updateCacheTokenLimitFromK(valueInK) {
     var k = parseInt(valueInK) || 4;
     k = Math.max(1, Math.min(100, k)); // Clamp between 1K and 100K
@@ -1718,6 +1734,23 @@ async function loadToolPermissions() {
 
     // Reset to new defaults (clean slate for new permission system)
     initDefaultToolPermissions();
+
+    // One-time migration: earlier builds seeded workspace:push's default as
+    // 'auto'; the baked-in default is now 'allow' (PR pushes never prompt
+    // unless the user overrides). Flip a stored 'auto' → 'allow' exactly once,
+    // guarded by a persisted permMigrations flag so a user who later
+    // deliberately re-selects 'auto' is never re-migrated. saveToolPermissions
+    // persists to IDB and mirrors to the SW.
+    var permMigrations = await getSetting('permMigrations', {});
+    if (!permMigrations.workspacePushAllow) {
+        if (toolPermissions['workspace:push'] === 'auto') {
+            toolPermissions['workspace:push'] = 'allow';
+            saveToolPermissions();
+        }
+        permMigrations.workspacePushAllow = true;
+        setSetting('permMigrations', permMigrations);
+    }
+
     // Mirror to SW now that IDB load is complete. initDefaultToolPermissions
     // ends in saveToolPermissions which pushes ONLY toolPermissions — so
     // without an explicit instancePermissions push, the SW never learns about
@@ -1749,6 +1782,8 @@ function initDefaultToolPermissions() {
                 toolPermissions[key] = 'disabled';
             } else if (key === 'web_fetch') {
                 toolPermissions[key] = 'ask';
+            } else if (key === 'workspace:push') {
+                toolPermissions[key] = 'allow';
             } else {
                 toolPermissions[key] = 'auto';
             }
@@ -1761,6 +1796,7 @@ function _getGlobalDefault(key) {
     if (GLOBAL_READ_KEYS.indexOf(key) !== -1) return 'allow';
     if (key === 'manage_skill:activate') return 'disabled';
     if (key === 'web_fetch') return 'ask';
+    if (key === 'workspace:push') return 'allow';
     return 'auto';
 }
 
@@ -1799,6 +1835,8 @@ function resetAllPermissionsToDefaults() {
             toolPermissions[key] = 'disabled';
         } else if (key === 'web_fetch') {
             toolPermissions[key] = 'ask';
+        } else if (key === 'workspace:push') {
+            toolPermissions[key] = 'allow';
         } else {
             toolPermissions[key] = 'auto';
         }

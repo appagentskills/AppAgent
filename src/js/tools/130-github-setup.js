@@ -136,7 +136,10 @@ async function connectGitHubFromSetupModal() {
         return;
     }
     var token = tokenInput.value.trim();
-    var instanceUrl = (instInput && instInput.value.trim()) || 'https://github.com';
+    // Normalize before validate/save so the stored githubInstanceUrl is
+    // canonical — trailing-slash/case variants break the strict-equality API
+    // base derivations (normalizeGitHubInstanceUrl: core/130-indexeddb.js).
+    var instanceUrl = normalizeGitHubInstanceUrl(instInput && instInput.value);
     if (btn) btn.disabled = true;
     if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Validating...'; }
     var result = await validateGitHubToken(token, instanceUrl);

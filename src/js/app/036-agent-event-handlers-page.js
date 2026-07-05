@@ -870,6 +870,26 @@ AgentEvents.on('workspaceMutated', function(e) {
 // recordMutated entries). The action button itself is driven by
 // notifyActionStateChanged listeners in tools/120-actions.js — independent.
 AgentEvents.on('actionStateChanged', function(e) {
+    // PR-MERGED relay: wsNotifyPrMerged (tools/020-tool-execution.js) ran in
+    // the SERVICE WORKER (the workspace tool is headless), where it wrote the
+    // authoritative chats[chatId].progressStateOverride and persisted — but
+    // this page's chats mirror is stale (actionStateChanged does NOT inline
+    // the chat snapshot). Hydrate the mirror from the event payload, run the
+    // full page-side flip via markChatPrMerged (background action card +
+    // title pill + popover — idempotent, so a page-originated emit settles on
+    // the second pass), then repaint the badge surfaces that read
+    // getChatProgressStateFor (home cards / jobs dropdown / chat list rows).
+    if (e && e.chatId && e.status === 'pr_merged') {
+        if (e.progressStateOverride && typeof chats !== 'undefined' && chats[e.chatId] &&
+            !chats[e.chatId].progressStateOverride) {
+            chats[e.chatId].progressStateOverride = e.progressStateOverride;
+        }
+        if (typeof markChatPrMerged === 'function') {
+            try { markChatPrMerged(e.chatId, { number: e.pr_number || null, url: e.pr_url || null }); } catch (err) {}
+        }
+        try { if (typeof renderChatList === 'function') renderChatList(); } catch (err) {}
+        try { if (typeof _refreshWaitingBadges === 'function') _refreshWaitingBadges(e.chatId); } catch (err) {}
+    }
     if (typeof renderVersionSidebar === 'function') {
         try { renderVersionSidebar(); } catch (err) {}
     }
@@ -916,6 +936,19 @@ AgentEvents.on('linksChanged', function(e) {
     if (!e || !e.chatId || !Array.isArray(e.links)) return;
     var chat = chats[e.chatId];
     if (chat && chat.messages) attachAnswerCard(chat, 'links', e.links);
+    if (e.chatId === currentChatId && typeof renderMessages === 'function') {
+        try { renderMessages(); } catch (err) {}
+    }
+});
+
+// caveatChanged: set_caveat (headless tool) attached a must-read warning to the
+// final-answer assistant message in the SW. Hydrate the page's stale chats
+// mirror via the SAME shared attachAnswerCard helper, then re-render so the
+// amber caveat card appears immediately in the currently viewed chat.
+AgentEvents.on('caveatChanged', function(e) {
+    if (!e || !e.chatId || !e.caveat) return;
+    var chat = chats[e.chatId];
+    if (chat && chat.messages) attachAnswerCard(chat, 'caveat', e.caveat);
     if (e.chatId === currentChatId && typeof renderMessages === 'function') {
         try { renderMessages(); } catch (err) {}
     }

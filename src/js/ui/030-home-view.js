@@ -562,6 +562,10 @@ function renderHome() {
                 return actionsHtml ? '<div class="home-actions-row" id="home-actions-row">' + actionsHtml + '</div>' : '';
             })() +
         '</div>' +
+        // Embedded live "Active chats" panel -- populated by renderHomeActiveChats()
+        // (tools tier) just under the Actions row. Hidden until there are
+        // active / pinned / completed-today chats.
+        '<div class="home-active-chats" id="home-active-chats" style="display:none;"></div>' +
         '<div class="home-cards" id="home-cards"></div>' +
         '<div class="home-stats" id="home-stats"></div>';
     
@@ -573,6 +577,12 @@ function renderHome() {
     // that the home DOM exists. Subsequent state changes refresh both rows
     // automatically via the onActionStateChange listener in 53e-actions.js.
     if (typeof renderLiveActionPills === 'function') renderLiveActionPills();
+
+    // Embedded "Active chats" panel under the Actions row -- same cards as the
+    // expand modal (columns/sections toggle shared via localStorage). Guarded:
+    // renderHomeActiveChats lives in the tools tier (loads after this ui tier)
+    // and no-ops cheaply when its container is absent / all buckets are empty.
+    if (typeof renderHomeActiveChats === 'function') { try { renderHomeActiveChats(); } catch (e) {} }
 
     // Calculate stats
     var chatCount = Object.keys(chats).length;
@@ -604,9 +614,9 @@ function renderHome() {
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.skill + '</div>' +
             '<div class="home-card-title">AI Skills</div>' +
         '</div>' +
-        '<div class="home-card" onclick="toggleDashboardView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleDashboardView()" role="button" tabindex="0" aria-label="Open Smart Dashboard">' +
+        '<div class="home-card" onclick="toggleDashboardView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleDashboardView()" role="button" tabindex="0" aria-label="Open Dashboard">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.widget + '</div>' +
-            '<div class="home-card-title">Smart Dashboard</div>' +
+            '<div class="home-card-title">Dashboard</div>' +
         '</div>' +
         '<div class="home-card" onclick="openBrowser()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openBrowser()" role="button" tabindex="0" aria-label="Open Browse with AI">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.api + '</div>' +

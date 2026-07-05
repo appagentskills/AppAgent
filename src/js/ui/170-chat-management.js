@@ -931,24 +931,40 @@ function updateChatTitleHeader(includeToolCallId) {
     // Append a small progress state pill (running/stuck/done/error) when the
     // current chat has any update_action_state calls. Visible always — no need
     // to open the right sidebar to see what state the agent is in.
+    // Live WAITING states (pending prompt_user form / tool call parked on the
+    // approval modal) outrank the derived progress state — a chat waiting on
+    // the user is more urgent than "finished". chatWaitingStateFor lives in
+    // tools/120-actions.js (later tier, global at runtime) — typeof-guarded
+    // like progressStateMeta below.
     var pillHtml = '';
-    if (typeof getCurrentChatProgressState === 'function') {
+    var pillState = null;
+    if (typeof chatWaitingStateFor === 'function') {
+        try { pillState = chatWaitingStateFor(currentChatId); } catch (e) {}
+    }
+    if (!pillState && typeof getCurrentChatProgressState === 'function') {
         try {
             var current = getCurrentChatProgressState(includeToolCallId);
-            if (current && current.state) {
-                var s = current.state;
-                var icon = s === 'done' ? UI_ICONS.check :
-                           s === 'error' ? UI_ICONS.close :
-                           s === 'stuck' ? UI_ICONS.alert :
-                           UI_ICONS.spinner;
+            if (current && current.state) pillState = current.state;
+        } catch (e) {}
+    }
+    if (pillState) {
+        try {
+            {
+                var s = pillState;
+                // Shared state meta (icon + friendly label) — progressStateMeta
+                // lives in tools/120-actions.js (later tier, global scope at
+                // runtime); fall back to a spinner if it's ever missing.
+                var _pillMeta = (typeof progressStateMeta === 'function') ? progressStateMeta(s) : null;
+                var icon = _pillMeta ? _pillMeta.icon : UI_ICONS.spinner;
+                var pillLabel = _pillMeta ? _pillMeta.label : s;
                 pillHtml = ' <span class="chat-title-state-pill state-' + s + '" ' +
-                    'title="Progress: ' + s + ' — click for details" ' +
-                    'aria-label="Progress: ' + s + ' — click for details" ' +
+                    'title="Progress: ' + escapeHtml(pillLabel) + ' — click for details" ' +
+                    'aria-label="Progress: ' + escapeHtml(pillLabel) + ' — click for details" ' +
                     'role="button" tabindex="0" ' +
                     'onclick="onChatTitleStatePillClick(this, event)" ' +
                     'onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027)onChatTitleStatePillClick(this, event)">' +
                     '<span class="chat-title-state-icon">' + icon + '</span>' +
-                    '<span class="chat-title-state-label">' + s + '</span>' +
+                    '<span class="chat-title-state-label">' + escapeHtml(pillLabel) + '</span>' +
                 '</span>';
             }
         } catch (e) {}

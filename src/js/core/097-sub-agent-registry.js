@@ -27,10 +27,10 @@
 //   • Sidebar breadcrumb / Workers strip: src/js/ui/170-chat-management.js
 //
 // Pool behavior:
-//   • Pool size = 2 concurrent running sub-agents (SUBAGENT_POOL_SIZE).
-//     Conservatively low: Anthropic enforces an account-level concurrent-
-//     request cap above us, and 4 parallel sub loops reliably trips 429 on
-//     fresh tiers. Two is the empirical safe default.
+//   • Pool limits are PER CONNECTION GROUP (Orchestrator §5): 2 concurrent
+//     for Anthropic-OAuth-backed subs (account-level concurrent-request cap
+//     — 4 parallel loops reliably trip 429), SUBAGENT_POOL_SIZE_RELAXED per
+//     endpoint for everything else, SUBAGENT_POOL_GLOBAL_MAX overall.
 //   • spawn_sub_agent always creates the record + chat immediately. If
 //     there is a free slot, it kicks runAgent(chatId) now; otherwise the
 //     sub stays in `running` state but its loop has not been started — it
@@ -55,11 +55,38 @@
 // ---------- Constants ----------
 
 var SUBAGENT_POOL_SIZE          = 2;
+// ───── Per-provider pool sizing (Orchestrator §5) ─────────────────
+// SUBAGENT_POOL_SIZE=2 exists because PARALLEL FRONTIER LOOPS on the same
+// Anthropic-OAuth connection trip the account-level concurrent-request cap
+// (429s) — but small OpenRouter-routed models don't share that ceiling.
+// The effective limit is therefore PER CONNECTION GROUP (_poolGroupFor):
+//   • Anthropic-OAuth-backed subs (provider.isClaudeOAuth / apiKey 'oauth')
+//     share one group capped at SUBAGENT_POOL_SIZE (the empirical safe 2).
+//   • Every other provider groups by its resolved endpoint URL, capped at
+//     SUBAGENT_POOL_SIZE_RELAXED per endpoint.
+//   • Unknown/unresolvable provider → the conservative OAuth group (2).
+// A hard global ceiling (SUBAGENT_POOL_GLOBAL_MAX) bounds total parallelism
+// regardless of how many distinct groups are active.
+var SUBAGENT_POOL_SIZE_RELAXED  = 4;
+var SUBAGENT_POOL_GLOBAL_MAX    = 6;
 var SUBAGENT_DEFAULT_MAX_TOOLS  = 300;
 // Soft-cap warning threshold: once a sub has used this fraction of its
 // tool budget, every subsequent tool result carries a budget warning so
 // the model wraps up and reports instead of being hard-killed mid-task.
 var SUBAGENT_BUDGET_WARN_RATIO  = 0.9;
+// Worker-saturation policy (system prompt "WORKER SATURATION" rule): context
+// occupancy is measured against the SAME assumed window for EVERY sub,
+// REGARDLESS of the actual model behind its tier. Deliberate: the agent
+// never sees model/provider names (so it can't reason about real windows)
+// and the threshold stays stable across tier escalations. The window is the
+// user-editable global setting (default 200k) resolved via
+// getAssumedContextTokens in core/030-config.js — 030 loads before this
+// file in BOTH bundles, and _subAssumedContextTokens() reads it at call
+// time with a hard 200k fallback. The tool budget uses the same 50% ratio.
+function _subAssumedContextTokens() {
+    return (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
+}
+var SUBAGENT_SATURATION_RATIO       = 0.5;
 // Absolute force-stop ceiling, as a multiple of max_tool_calls. The band
 // between the cap and the ceiling is soft (escalating warnings only), but
 // a runaway sub that ignores every warning must not hold a pool slot and
@@ -96,6 +123,26 @@ var SUBAGENT_NESTED_DELEGATION_TOOLS = ['spawn_sub_agent', 'stop_sub_agent', 'wa
 // per-sub `max_tool_calls` budgets. Default 5 levels (root → 5 descendants).
 var SUBAGENT_MAX_DEPTH = 5;
 
+// ───── Standard worker-report template (Orchestrator §3) ─────────
+// Default shape for report_to_parent's `data` when the parent did not pass
+// an explicit output_schema at spawn. Documented in SUB_AGENT_PREAMBLE below
+// so every worker structures its findings the same way; parents that need a
+// custom shape still pass `output_schema` (which wins — the spawn-time
+// injection in spawnSubAgent tells the sub to conform to it EXACTLY).
+// Exposed as SubAgents.REPORT_SCHEMA for parents that want to pass it
+// explicitly (e.g. to make it `required` in their own eyes).
+var SUBAGENT_REPORT_SCHEMA = {
+    type: 'object',
+    properties: {
+        task: { type: 'string', description: 'One-line restatement of the task as understood.' },
+        findings: { type: 'string', description: 'The distilled result / answer, in markdown.' },
+        evidence: { type: 'array', items: { type: 'string' }, description: 'Concrete pointers backing each claim: sys_ids, file paths + line numbers, URLs, record numbers.' },
+        confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+        open_questions: { type: 'array', items: { type: 'string' } }
+    },
+    required: ['task', 'findings', 'confidence']
+};
+
 // ---------- Sub-agent preamble (appended to parent system prompt) ----------
 // Used by src/js/core/110-system-prompt.js when the active chat is a sub-agent.
 // Keep this short — every sub spends tokens on it.
@@ -107,10 +154,14 @@ var SUB_AGENT_PREAMBLE = [
     '',
     'You were spawned by a parent agent to do focused, context-heavy work without polluting the parent\'s context window. Your task is in the first user message.',
     '',
+    'ROLE PRECEDENCE: the "SUB-AGENT DELEGATION & ORCHESTRATION" section above describes your PARENT\'s job, not yours. You are the worker/executor: do the substantive work yourself, inline, and report — do not orchestrate or delegate (nested spawning is denied unless the parent passed `allow_nested:true`).',
+    '',
     'CRITICAL RULES for sub-agents:',
     '  • DO NOT echo raw tool outputs back to the parent. Summarize.',
     '  • When the work is complete, call `report_to_parent` with a concise distilled result (≤ 4 KB summary). This is what the parent sees — it never reads your transcript. Write the summary in markdown — it is rendered as markdown to the user in the parent chat.',
     '  • If you need parent input mid-task, call `report_to_parent({status:"need_input", ...})`. That settles the parent\'s handle and parks you — the parent will wake you with new instructions.',
+    '  • STANDARD REPORT SHAPE: unless your task declares an explicit "Expected output schema" (which then wins), structure report_to_parent\'s `data` as {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers backing each claim (sys_ids, file paths + line numbers, URLs), open_questions = anything you could not resolve.',
+    '  • PLAN-APPROVAL GATE: if your report proposes a plan for FURTHER work (beyond the task you were given), report it with `status:"need_input"` and WAIT for the parent to approve — NEVER self-approve your own plan and continue executing it.',
     '  • If you are idle and waiting, call `sleep_self` to free the worker pool slot.',
     '  • Use `artifacts: [doc_id, file_id, ...]` in your report for larger payloads — never inline a long list/dump into `summary`.',
     '  • SCRATCHPAD: stage a long result in a smart doc (`document` tool) and return its doc_id in `artifacts` instead of inlining it — `shared` scope lets the parent read it, `chat` keeps it private to you.',
@@ -311,6 +362,7 @@ async function loadAllSubAgents() {
                     // onSubApprovalEvent's `=== 1` park-notice gate. No
                     // approval modal survives a reboot — zero it at load.
                     rec._pending_approvals = 0;
+                    rec.awaiting_approval = null;
                     // PR383-R5: a persisted retry-delay stamp can't survive a
                     // reboot either (its setTimeout died with the SW) — clear.
                     delete rec._retry_delayed_until;
@@ -436,7 +488,9 @@ function _resumeOrOrphanSubAtBoot(rec) {
         if (rec.state !== 'running' || _subPool.running[rec.agent_id]) return;
         var resumable = !!(cp && (cp.status === 'running' || cp.status === 'parked'));
         if (resumable) {
-            _subPool.running[rec.agent_id] = true; // soft over-cap on resume — by design
+            // Orchestrator §5: stamp the connection-group key (not `true`) so
+            // per-group counting stays accurate across the soft over-cap.
+            _subPool.running[rec.agent_id] = _poolGroupFor(rec).key; // soft over-cap on resume — by design
             rec.last_activity_at = Date.now();
             _subAgentsPersist(rec);
             return;
@@ -542,10 +596,73 @@ function _rehydrateSpawnHandle(rec) {
 
 // ---------- Pool ----------
 
-function _poolSlotsFree() {
+function _poolTotalRunning() {
     var n = 0;
     for (var _k in _subPool.running) n++;
-    return SUBAGENT_POOL_SIZE - n;
+    return n;
+}
+
+// Global-ceiling headroom (Orchestrator §5). Per-group caps are enforced
+// separately in _drainPool via _poolGroupFor/_poolGroupRunningCount.
+function _poolSlotsFree() {
+    return SUBAGENT_POOL_GLOBAL_MAX - _poolTotalRunning();
+}
+
+// Orchestrator §5: resolve the connection GROUP a sub's LLM traffic lands on,
+// with that group's concurrency limit. Derived from the sub's pinned provider
+// (record.provider, else the global currentProvider) through the provider
+// config: Claude-OAuth providers (isClaudeOAuth / apiKey 'oauth' — see
+// DEFAULT_API_PROVIDERS in core/030-config.js) all share the SAME Anthropic
+// account-level concurrency cap, so they pool into one conservative group.
+// Everything else groups by its resolveProviderConnection endpoint URL.
+// Unknown provider → conservative OAuth-sized group (safe default).
+function _poolGroupFor(rec) {
+    try {
+        // Provider-less subs (no explicit pin) inherit the GLOBAL default
+        // provider at run time — and the user can switch that default
+        // mid-flight. They still GROUP with whatever endpoint the default
+        // resolves to (so total per-endpoint traffic is counted correctly),
+        // but the relaxed per-endpoint cap (SUBAGENT_POOL_SIZE_RELAXED)
+        // applies ONLY to subs EXPLICITLY pinned to a non-OAuth provider —
+        // plain spawns keep the conservative pre-Orchestrator limit.
+        var pinned = !!(rec && rec.provider);
+        // tier:'same' subs pin no provider — resolve the endpoint they actually
+        // follow (their spawner's current model) so per-endpoint concurrency is
+        // grouped correctly. They stay 'unpinned' (conservative cap) via `pinned`.
+        var provName = (rec && rec.provider)
+            || (rec && rec.same_as && typeof resolveChatProviderName === 'function'
+                ? resolveChatProviderName(rec.same_as)
+                : (typeof currentProvider !== 'undefined' ? currentProvider : null));
+        var prov = (provName && typeof getProviderById === 'function') ? getProviderById(provName) : null;
+        if (!prov) return { key: 'unknown', limit: SUBAGENT_POOL_SIZE };
+        var conn = (typeof resolveProviderConnection === 'function') ? resolveProviderConnection(prov) : null;
+        var isOAuth = !!(prov.isClaudeOAuth || prov.apiKey === 'oauth' || (conn && conn.apiKey === 'oauth'));
+        if (isOAuth) return { key: 'anthropic-oauth', limit: SUBAGENT_POOL_SIZE };
+        var endpoint = (conn && conn.endpoint) || prov.endpoint || prov.name || 'unknown-endpoint';
+        return { key: 'ep:' + endpoint, limit: pinned ? SUBAGENT_POOL_SIZE_RELAXED : SUBAGENT_POOL_SIZE };
+    } catch (_) {
+        return { key: 'unknown', limit: SUBAGENT_POOL_SIZE };
+    }
+}
+
+// Running count for one group. _subPool.running maps agent_id → group key
+// (a non-empty string, so every legacy truthiness check still holds).
+function _poolGroupRunningCount(key) {
+    var n = 0;
+    for (var aid in _subPool.running) {
+        if (_subPool.running[aid] === key) n++;
+    }
+    return n;
+}
+
+// Per-group running breakdown for pool snapshots (agent_status / broadcast).
+function _poolGroupsSnapshot() {
+    var groups = {};
+    for (var aid in _subPool.running) {
+        var k = (typeof _subPool.running[aid] === 'string') ? _subPool.running[aid] : 'unknown';
+        groups[k] = (groups[k] || 0) + 1;
+    }
+    return groups;
 }
 
 function _drainPool() {
@@ -575,8 +692,17 @@ function _drainPool() {
             i++;
             continue;
         }
+        // Orchestrator §5: per-group cap. A sub whose connection group is at
+        // capacity is SKIPPED (keeps its queue position — fairness preserved,
+        // FIFO across parents), letting later subs on OTHER groups start.
+        // It is retried on the next drain (slot release / new spawn / wake).
+        var _grp = _poolGroupFor(rec);
+        if (_poolGroupRunningCount(_grp.key) >= _grp.limit) {
+            i++;
+            continue;
+        }
         _subPool.queue.splice(i, 1);
-        _subPool.running[aid] = true;
+        _subPool.running[aid] = _grp.key;
         try {
             if (typeof runAgent === 'function') {
                 // Fire-and-forget. The agent loop is its own driver; we just
@@ -792,13 +918,107 @@ function _newSubChatId() {
 
 var SUB_ONLY_TOOLS = ['report_to_parent', 'sleep_self', 'agent_message'];
 
+// ───── Spawn-time provider/tier resolution (Orchestrator §1) ─────────
+// Precedence: explicit provider > explicit tier > null (inherit the
+// global currentProvider at run time).
+// Returns { ok:true, provider, tier } or { ok:false, error }.
+function _resolveSpawnProvider(args, toolLabel, callerChatId) {
+    var providerNames = [];
+    if (typeof apiProviders !== 'undefined' && Array.isArray(apiProviders)) {
+        for (var i = 0; i < apiProviders.length; i++) providerNames.push(apiProviders[i].name);
+    }
+    function checkProvider(name, origin) {
+        if (typeof getProviderById === 'function' && getProviderById(name)) {
+            return { ok: true, provider: name, tier: null };
+        }
+        return { ok: false, error: toolLabel + ': unknown provider "' + name + '"' + origin + '. Available providers: ' + (providerNames.join(', ') || '(none loaded)') + '.' };
+    }
+    function checkTier(tier, origin) {
+        var key = String(tier).toLowerCase();
+        // tier:'same' — the sub does NOT pin a provider of its own; it
+        // DYNAMICALLY follows the spawning/waking agent's current model,
+        // resolved at EACH LLM call. We return provider:null plus a `same_as`
+        // pointer to the caller's chat id; the caller stamps that on the sub's
+        // chat row (chats[chatId].same_as) and resolveChatProviderName follows
+        // it per call (core/030-config.js). So if the spawner later switches
+        // models the 'same' sub follows, and a nested 'same' sub chains up to
+        // its own spawner (cycle-guarded, currentProvider fallback).
+        if (key === 'same') {
+            return { ok: true, provider: null, tier: 'same', same_as: callerChatId || null };
+        }
+        if (typeof resolveTierAlias !== 'function' || SUBAGENT_TIER_NAMES.indexOf(key) === -1) {
+            return { ok: false, error: toolLabel + ': unknown tier "' + tier + '"' + origin + '. Valid tiers: small, medium, large, same.' };
+        }
+        var mapped = resolveTierAlias(key);
+        var res = checkProvider(mapped, ' (tier "' + key + '" maps to it — fix the tier aliases in Settings)');
+        if (res.ok) res.tier = key;
+        return res;
+    }
+    if (args.provider != null) return checkProvider(String(args.provider), '');
+    if (args.tier != null) return checkTier(args.tier, '');
+    return { ok: true, provider: null, tier: null };
+}
+
+// Stamp a chat row's model routing from a resolved {provider, tier, same_as}.
+// Concrete tier/provider → pin chats[chatId].provider (and clear any stale
+// same_as follow). tier:'same' → clear the provider pin and set same_as so
+// resolveChatProviderName (core/030-config.js) dynamically follows the spawner
+// per LLM call. tier omitted (provider null, tier null) → no-op: the chat keeps
+// inheriting the global currentProvider. Safe no-op if the chat row is absent.
+function _applyChatModelStamp(chatId, resolved) {
+    if (typeof chats === 'undefined' || !chatId || !chats[chatId]) return;
+    var ch = chats[chatId];
+    if (resolved && resolved.tier === 'same') {
+        ch.same_as = resolved.same_as || null;
+        delete ch.provider;
+    } else if (resolved && resolved.provider) {
+        ch.provider = resolved.provider;
+        delete ch.same_as;
+    }
+}
+
+// ───── provider→tier sanitization (agent-facing results) ─────────────────────────
+// Model/provider NAMES must never reach the agent (only the three tiers).
+// These helpers convert internal provider bookkeeping into tier language
+// for agent-facing tool RESULTS. User-facing UI (175-sub-agent-ui.js,
+// Settings) keeps real names — only executeTool results are sanitized.
+function _providerToTier(prov) {
+    if (!prov) return null;
+    var aliasMap = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
+    for (var t in aliasMap) { if (aliasMap[t] === prov) return t; }
+    return null;
+}
+function _sanitizeUsageForAgent(usage) {
+    if (!usage) return null;
+    var aliasMap = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
+    var provToTier = {};
+    for (var t in aliasMap) provToTier[aliasMap[t]] = t;
+    var byTier = {};
+    var bp = usage.by_provider || {};
+    for (var k in bp) {
+        var tier = provToTier[k] || 'default';
+        var slot = byTier[tier];
+        if (!slot) slot = byTier[tier] = { calls: 0, input_tokens: 0, output_tokens: 0, cost: 0 };
+        slot.calls += bp[k].calls || 0;
+        slot.input_tokens += bp[k].input_tokens || 0;
+        slot.output_tokens += bp[k].output_tokens || 0;
+        slot.cost += bp[k].cost || 0;
+    }
+    return {
+        calls: usage.calls || 0,
+        input_tokens: usage.input_tokens || 0,
+        output_tokens: usage.output_tokens || 0,
+        cost: usage.cost || 0,
+        by_tier: byTier
+    };
+}
+
 function _computeToolRoster(allowNested) {
-    // Subs inherit the parent's full tool roster. The only filter is the
-    // nested-delegation gate: spawn/stop/wake_sub_agent are denied unless
-    // the caller passed `allow_nested:true` at spawn time. This keeps the
-    // sub's tools-cache slot byte-identical across every default spawn in
-    // a session (no per-sub whitelist churn), so Anthropic's prompt cache
-    // reuses it.
+    // Subs inherit the parent's full tool roster, with one filter: the
+    // nested-delegation gate — spawn/stop/wake_sub_agent are denied unless
+    // the caller passed `allow_nested:true` at spawn time. The roster stays
+    // byte-identical across every spawn in a session, so Anthropic's prompt
+    // cache reuses it.
     var allNames = [];
     if (typeof TOOLS !== 'undefined' && Array.isArray(TOOLS)) {
         for (var i = 0; i < TOOLS.length; i++) {
@@ -840,6 +1060,22 @@ function _computeToolRoster(allowNested) {
         if (out.indexOf(SUB_ONLY_TOOLS[k]) === -1) out.push(SUB_ONLY_TOOLS[k]);
     }
     return out;
+}
+
+// ───── Structured-brief heuristic (Orchestrator §3) ─────────────
+// Cheap check that spawn `instructions` read like a structured brief: an
+// objective, an expected output, and boundaries/scope. Deliberately loose
+// (keyword presence + length) — it must never reject a spawn. Callers append
+// a gentle directive to the sub's first message and surface a `brief_warning`
+// in the spawn result so the parent can tighten its next brief.
+function _spawnBriefGaps(instructions) {
+    var text = String(instructions || '');
+    var gaps = [];
+    if (!/(objective|goal|task|purpose|implement|investigate|analy[sz]e|find|fix|build|audit|review|scan|create|write)/i.test(text)) gaps.push('objective');
+    if (!/(return|report|output|expected|deliverable|result|summar|respond)/i.test(text)) gaps.push('expected output');
+    if (!/(only|scope|boundar|do not|don't|avoid|limit|must not|never|stay|except)/i.test(text)) gaps.push('boundaries');
+    if (gaps.length === 0 && text.length < 80) gaps.push('detail (very short brief)');
+    return gaps;
 }
 
 // ---------- Core API: spawn ----------
@@ -886,6 +1122,15 @@ function spawnSubAgent(args, ctx) {
         return { success: false, error: 'spawn_sub_agent: nesting depth ' + depth + ' exceeds SUBAGENT_MAX_DEPTH (' + SUBAGENT_MAX_DEPTH + '). Refusing to spawn — if you genuinely need deeper trees, raise the constant.' };
     }
 
+    // ── Per-spawn model selection (Orchestrator §1) ──
+    // Provider/tier resolution — fail fast with a clear error BEFORE any
+    // handle/record allocation. resolved.provider === null means "inherit
+    // the global currentProvider at run time" (behavior unchanged).
+    var resolved = _resolveSpawnProvider(args, 'spawn_sub_agent', parentChatId);
+    if (!resolved.ok) {
+        return { success: false, error: resolved.error };
+    }
+
     var toolRoster = _computeToolRoster(args.allow_nested === true);
 
     // Allocate the spawn handle now. The agent loop / report_to_parent will
@@ -926,6 +1171,19 @@ function spawnSubAgent(args, ctx) {
         state: 'running',
         spawn_args: args,
         spawn_handle_id: spawn_handle_id,
+        // Per-spawn model selection (Orchestrator §1): resolved provider NAME
+        // (from apiProviders) this sub is pinned to, and the tier it was
+        // requested through (if any). provider=null ⇒ the sub inherits the
+        // global currentProvider like any other chat. wakeSubAgent re-stamps
+        // chat.provider from record.provider so the pin survives
+        // wake/resurrect.
+        provider: resolved.provider,
+        tier: resolved.tier,
+        // tier:'same' dynamic-follow pointer: the spawner chat this sub tracks
+        // for its model at each LLM call (null for all other tiers). Mirrored
+        // onto chats[chat_id].same_as below; kept on the record so wake/resurrect
+        // can re-stamp the chat row.
+        same_as: resolved.same_as || null,
         tool_roster: toolRoster,
         auto_report: (args.auto_report === false) ? false : true,
         // Wake the parent when this sub reports (default ON, opt-out via
@@ -945,7 +1203,24 @@ function spawnSubAgent(args, ctx) {
         created_at: now,
         last_activity_at: now,
         tool_calls_used: 0,
+        // Orchestrator §5: per-sub LLM usage rollup. Updated on EVERY LLM call
+        // by the agent loop's metrics-capture block (030-agent-loop.js →
+        // SubAgents.recordLLMUsage). by_provider keys on the actual model /
+        // provider the call landed on. Read back via agent_status + shown on
+        // the Workers-strip card (175-sub-agent-ui.js).
+        usage: { calls: 0, input_tokens: 0, output_tokens: 0, cost: 0, by_provider: {} },
+        // Orchestrator §5: count of parent 'revision_requested' verdicts
+        // (wake_sub_agent review_state). At SUBAGENT_ESCALATE_AFTER_REVISIONS
+        // agent_status / wake results carry an escalation_suggestion —
+        // suggestion ONLY, never auto-applied.
+        revisions_requested: 0,
         last_report: null,
+        // Orchestrator §3 — deliverable review flow: null until the first
+        // report, then 'pending' (auto, on every report_to_parent) →
+        // 'accepted' | 'revision_requested' (parent verdict via
+        // wake_sub_agent's `review_state` arg) | 'cross_checked' (auto, when
+        // an independent reviewer sub is aimed at it). Read back via agent_status.
+        review_state: null,
         inbox: [],
         pending_handles: [spawn_handle_id],
         settled_at: null
@@ -973,6 +1248,12 @@ function spawnSubAgent(args, ctx) {
         // sub-agents don't inherit the parent's pause state; they manage
         // their own lifecycle via sleep_self / wake_sub_agent / stop_sub_agent.
     };
+    // Route the sub to its model (Orchestrator §1). resolveChatProviderName
+    // (core/030-config.js) reads these per LLM call: a concrete tier
+    // (small/medium/large) pins chats[chatId].provider; tier:'same' pins NO
+    // provider and instead stamps `same_as` (the spawner chat id) so the sub
+    // DYNAMICALLY follows the spawner's current model at each call.
+    _applyChatModelStamp(chat_id, resolved);
 
     // First user message = the task + optional context seed, as plain
     // markdown (no XML wrapper — the sub's transcript should read naturally).
@@ -992,6 +1273,16 @@ function spawnSubAgent(args, ctx) {
         catch (e) { schemaStr = String(args.output_schema); }
         firstMsg += '\n\n## Expected output schema\n\n```json\n' + schemaStr + '\n```'
             + '\nWhen you call report_to_parent, the `data` field MUST be a JSON object that conforms EXACTLY to the schema above — same keys, same types, no extra keys, no prose inside data. Put any human-readable narration in `summary`; put the schema-conformant structured result in `data`. The parent parses `data` programmatically, so a mismatched shape will break it.';
+    }
+    // Structured-brief nudge (Orchestrator §3): a thin brief is NOT rejected —
+    // the sub gets a gentle directive to reconstruct the missing pieces, and
+    // the spawn result carries `brief_warning` so the parent can do better
+    // next time. Kept after the output-schema block so the schema directive
+    // (when present) stays adjacent to the task text.
+    var _briefGaps = _spawnBriefGaps(instructions);
+    if (_briefGaps.length > 0) {
+        firstMsg += '\n\n## Note on this brief\n\nYour brief may be missing: ' + _briefGaps.join(', ')
+            + '. Before diving in, state briefly the objective, the expected output shape, and the boundaries you infer from the task. If the task is genuinely ambiguous, call report_to_parent({status:"need_input"}) and ask — do not guess on high-impact decisions.';
     }
     chats[chat_id].messages.push({ role: 'user', content: firstMsg });
     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -1041,6 +1332,14 @@ function spawnSubAgent(args, ctx) {
         agent_id: agent_id,
         chat_id: chat_id,
         handle: spawn_handle_id,
+        tier: (resolved.tier || _providerToTier(resolved.provider)) || undefined,
+        // Orchestrator §3: non-blocking heads-up when the instructions don't
+        // look like a structured brief (objective / expected output /
+        // boundaries). The sub was still spawned — and was told to fill the
+        // gaps itself — this just tells the parent what was missing.
+        brief_warning: (_briefGaps.length > 0)
+            ? ('instructions look unstructured — missing: ' + _briefGaps.join(', ') + '. A good brief states the objective, the expected output, and the boundaries.')
+            : undefined,
         note: 'Sub-agent spawned. Use `await_handle("' + spawn_handle_id + '")` to collect the result, or `agent_status` for live state.'
     };
 }
@@ -1427,6 +1726,46 @@ function _isThrottleSubError(msg) {
 var SUBAGENT_THROTTLE_MAX_RETRIES = 3;
 var SUBAGENT_THROTTLE_RETRY_DELAYS_MS = [8000, 20000, 45000];
 
+// ───── Auto-escalation policy (Orchestrator §5) ────────────────────
+// After this many 'revision_requested' verdicts on a sub's deliverables,
+// agent_status snapshots and wake_sub_agent results include an
+// escalation_suggestion. SUGGESTION ONLY — nothing is ever auto-respawned
+// or auto-escalated; the parent decides.
+var SUBAGENT_ESCALATE_AFTER_REVISIONS = 2;
+
+// Compute the escalation suggestion for a repeatedly-revised sub, or null
+// below the threshold. Ladder: next tier up from the sub's current tier
+// (explicit rec.tier, else the provider reverse-mapped through the tier
+// alias map). Already at 'large' — or on a provider outside the ladder —
+// → suggest an independent fresh-context reviewer sub instead.
+function _escalationSuggestion(rec) {
+    if (!rec || (rec.revisions_requested || 0) < SUBAGENT_ESCALATE_AFTER_REVISIONS) return null;
+    var aliasMap = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
+    var curProv = rec.provider || (typeof currentProvider !== 'undefined' ? currentProvider : null);
+    var curTier = rec.tier || null;
+    if (!curTier && curProv) {
+        for (var _t in aliasMap) { if (aliasMap[_t] === curProv) { curTier = _t; break; } }
+    }
+    var out = {
+        reason: (rec.revisions_requested || 0) + ' revision_requested verdict(s) on this sub\'s deliverables',
+        current_tier: curTier || null
+    };
+    var ladder = ['small', 'medium', 'large'];
+    var idx = curTier ? ladder.indexOf(curTier) : -1;
+    if (idx >= 0 && idx < ladder.length - 1) {
+        var nextTier = ladder[idx + 1];
+        out.action = 'escalate_tier';
+        out.suggested_tier = nextTier;
+        out.note = 'Suggestion only (never auto-applied): wake_sub_agent({agent_id, tier: "' + nextTier + '", instruction: …}) re-runs the sub one tier up.';
+    } else {
+        out.action = 'cross_check';
+        out.note = 'Suggestion only (never auto-applied): the sub already runs at the top tier'
+            + (idx === -1 ? ' (or an unmapped tier)' : '')
+            + ' — instead of escalating, spawn a FRESH single-turn reviewer sub (spawn_sub_agent, a different or higher tier) given ONLY the task + deliverable + rubric, never the transcript, to cross-check its deliverable.';
+    }
+    return out;
+}
+
 // RES-6: push a short structured lifecycle notice to the PARENT so it is
 // never blind to unsolicited sub events (crash, stuck, approval park, user
 // interference). Two delivery surfaces, both reusing existing mechanics:
@@ -1515,11 +1854,21 @@ function onSubApprovalEvent(subChatId, phase, info) {
         var tool = (info && info.displayName) || 'a tool call';
         if (phase === 'requested') {
             rec._pending_approvals = (rec._pending_approvals || 0) + 1;
+            // Orchestrator §5: persistent "awaiting approval" marker — read by
+            // agent_status snapshots and the sub card / Workers-strip badge in
+            // 175-sub-agent-ui.js. `since` sticks to the episode start when
+            // several asks stack. Cleared when the pending counter drains (or
+            // is reset at wake / run finish / boot).
+            rec.awaiting_approval = {
+                tool: tool,
+                since: (rec.awaiting_approval && rec.awaiting_approval.since) || Date.now()
+            };
             if (rec._pending_approvals === 1) {
                 _notifySubLifecycle(rec, 'parked waiting for USER APPROVAL of "' + tool + '" — it cannot proceed until the user responds');
             }
         } else {
             rec._pending_approvals = Math.max(0, (rec._pending_approvals || 0) - 1);
+            if (rec._pending_approvals === 0) rec.awaiting_approval = null;
             if (phase === 'approved' || phase === 'denied') {
                 rec.user_interactions = rec.user_interactions || {};
                 rec.user_interactions.last_user_approval_at = Date.now();
@@ -1672,6 +2021,10 @@ function reportToParent(args, ctx) {
     };
     rec.last_report = report;
     rec.last_activity_at = Date.now();
+    // Orchestrator §3: every fresh report is an unreviewed deliverable. The
+    // parent moves it on via wake_sub_agent({review_state:'accepted'|
+    // 'revision_requested'}) or an independent reviewer sub (→ 'cross_checked').
+    rec.review_state = 'pending';
     // Fresh report — not yet collected by the parent (see markReportCollected).
     rec.report_collected = false;
     // RES-6: a successful report completes the turn — reset the per-crash
@@ -1863,6 +2216,49 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             return { success: false, error: 'wake_sub_agent: ACL denied — caller does not own this sub-agent\'s subtree.', _acl_denied: true };
         }
     }
+    // ── Optional provider/tier escalation (Orchestrator §1) ──
+    // wake_sub_agent may carry provider/tier to move the sub to a different
+    // model for the next phase (e.g. escalate small → large after a failure).
+    // Validated HERE — before any resurrect bookkeeping mutates the record —
+    // so an invalid escalation is a clean no-op error. Applied below, after
+    // the no-op-if-running gate.
+    var _wakeEscalation = null;
+    if (args.provider != null || args.tier != null) {
+        // tier:'same' inherits the WAKING agent's own current model, so resolve
+        // the caller chat id (same fallback chain as the ACL gate) and pass it
+        // to _resolveSpawnProvider.
+        var _wkCallerChatId = (ctx && ctx.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var _wkResolved = _resolveSpawnProvider(args, 'wake_sub_agent', _wkCallerChatId);
+        if (!_wkResolved.ok) return { success: false, error: _wkResolved.error };
+        // 'same' escalation carries provider:null (dynamic follow) but must
+        // still apply, so accept it explicitly alongside concrete providers.
+        if (_wkResolved.provider || _wkResolved.tier === 'same') _wakeEscalation = _wkResolved;
+    }
+    // ── Optional deliverable review verdict (Orchestrator §3) ──
+    // Explicit parent judgment on the sub's LAST report: accepted /
+    // revision_requested. ('pending' is stamped automatically on every
+    // report_to_parent; 'cross_checked' automatically when an independent
+    // reviewer sub is aimed at it — neither is settable here.) Applied immediately —
+    // the verdict concerns the already-delivered report, so it sticks even
+    // when the wake itself turns out to be a no-op (sub already running).
+    if (args.review_state != null) {
+        var _rvArg = String(args.review_state);
+        if (_rvArg !== 'accepted' && _rvArg !== 'revision_requested') {
+            return { success: false, error: 'wake_sub_agent: `review_state` must be "accepted" or "revision_requested" ("pending" and "cross_checked" are set automatically).' };
+        }
+        rec.review_state = _rvArg;
+        // Orchestrator §5: cascade-on-failed-review counter. Each parent
+        // 'revision_requested' verdict increments; at
+        // SUBAGENT_ESCALATE_AFTER_REVISIONS the wake result + agent_status
+        // carry an escalation_suggestion (see _escalationSuggestion).
+        if (_rvArg === 'revision_requested') {
+            rec.revisions_requested = (rec.revisions_requested || 0) + 1;
+        }
+        _subAgentsPersist(rec);
+        _notifyListeners();
+    }
     // RES-6 (resurrect, post-ACL so unauthorized callers can't mutate): revive
     // bookkeeping for a terminal sub.
     //   • settled_at → null: un-tombstone, or the GC sweep would reap a live sub.
@@ -1914,11 +2310,25 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // a legitimate user-pause), re-queue the loop, and drain the inbox into
     // an extra user message even though the live loop is already consuming it.
     if (rec.state === 'running' && !args.instruction && !(rec.inbox && rec.inbox.length)) {
+        // A validated escalation still applies to a live sub (Orchestrator §1):
+        // per-call provider resolution reads chats[chatId].provider, so the
+        // NEXT LLM call of the in-flight loop picks up the new model.
+        if (_wakeEscalation) {
+            rec.provider = _wakeEscalation.provider;
+            rec.tier = _wakeEscalation.tier;
+            rec.same_as = _wakeEscalation.same_as || null;
+            _applyChatModelStamp(rec.chat_id, _wakeEscalation);
+            _subAgentsPersist(rec);
+            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        }
         // Even on a no-op, hand back an awaitable handle for the in-flight run
         // so the caller can await the sub's eventual report. The documented
         // contract is "always returns {handle}". _mintNewSpawnHandle reuses the
         // still-pending spawn handle (or mints a fresh one if it had settled).
-        return { success: true, ok: true, state: 'running', note: 'already running', handle: _mintNewSpawnHandle(rec) };
+        // WORKER SATURATION: even a no-op wake means the caller intends to
+        // keep using this sub — surface the warning so it re-tasks a fresh
+        // successor instead. Non-blocking (undefined when not saturated).
+        return { success: true, ok: true, state: 'running', note: 'already running', handle: _mintNewSpawnHandle(rec), tier: (rec.tier || _providerToTier(rec.provider)) || undefined, escalation_suggestion: _escalationSuggestion(rec) || undefined, saturation_warning: _saturationWarning(rec) || undefined };
     }
 
     // If the wake carries an instruction, deliver it. Otherwise drain the
@@ -1980,6 +2390,29 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // A wake (normal or resurrect — this point is common to both) starts a
     // fresh run, so no approval episode can carry across it: reset.
     rec._pending_approvals = 0;
+    rec.awaiting_approval = null;
+    // ── Provider stickiness + escalation (Orchestrator §1) ──
+    // Apply a validated escalation to the record, then ALWAYS re-stamp the
+    // sub's chat from the record — the chat row may have been reloaded from
+    // IDB or the wake may be a resurrect, and the per-call provider
+    // resolution reads chats[chatId].provider. Without a record provider the
+    // sub keeps inheriting the global currentProvider (unchanged behavior).
+    if (_wakeEscalation) {
+        rec.provider = _wakeEscalation.provider;
+        rec.tier = _wakeEscalation.tier;
+        rec.same_as = _wakeEscalation.same_as || null;
+    }
+    // Restore/refresh the chat row's model routing from the record — covers an
+    // escalation just applied above AND a plain wake/resurrect whose chat row
+    // lost its pin. tier:'same' restores the dynamic-follow pointer; a concrete
+    // tier/provider restores the pin.
+    _applyChatModelStamp(rec.chat_id, rec);
+    // Review fix: persist the chat-row pin unconditionally. A provider/tier
+    // escalation wake with NO pending messages skips the inbox-drain block
+    // above (the only other saveChatsToStorage on this path), so the
+    // re-stamped chats[chat_id].provider would only live in memory until
+    // some other write happened to flush it.
+    try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (_) { /* best-effort persist */ }
     rec.state = 'running';
     rec.last_activity_at = Date.now();
     if (typeof pausedChats !== 'undefined') delete pausedChats[rec.chat_id];
@@ -2091,7 +2524,15 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         _notifySubLifecycle(rec, (_resurrectedFrom ? 'resurrected from \'' + _resurrectedFrom + '\'' : 'woken') + ' by a caller outside its parent chat (' + _wakeCallerChatId + ')');
     }
     _notifyListeners();
-    return { success: true, ok: true, state: 'running', handle: newHandleId, resurrected_from: _resurrectedFrom || undefined };
+    // Orchestrator §5: after repeated revision_requested verdicts the wake
+    // result surfaces the escalation suggestion (suggestion only — the
+    // caller decides whether to escalate or cross-check).
+    // WORKER SATURATION: when this wake delivered new work (an instruction
+    // and/or a drained inbox re-tasks the sub), warn — non-blocking — if the
+    // sub is past 50% of the assumed 200k context window or its tool budget,
+    // so the caller spawns a FRESH successor instead of piling on.
+    var _satWarn = (args.instruction || pendingMsgs.length) ? _saturationWarning(rec) : null;
+    return { success: true, ok: true, state: 'running', handle: newHandleId, resurrected_from: _resurrectedFrom || undefined, escalation_suggestion: _escalationSuggestion(rec) || undefined, saturation_warning: _satWarn || undefined };
 }
 
 // Mint a fresh spawn handle for a sub that has already settled its previous
@@ -2341,6 +2782,11 @@ function agentMessage(args, ctx) {
     _notifyListeners();
     var out = { success: true, ok: true };
     if (_newHandle) out.handle = _newHandle;
+    // WORKER SATURATION: messaging a saturated recipient gets the same
+    // non-blocking warning as wake_sub_agent (identical _saturationInfo
+    // math) — the message is still delivered/queued either way.
+    var _msgSatWarn = _saturationWarning(dst);
+    if (_msgSatWarn) out.saturation_warning = _msgSatWarn;
     return out;
 }
 
@@ -2489,7 +2935,9 @@ function unparkAfterAwait(agentId) {
     // re-occupy a pool slot for it, because the loop isn't actually
     // executing. Terminal states (stopped/errored) are also ignored.
     if (rec.state === 'running') {
-        _subPool.running[agentId] = true; // soft over-cap on resume — by design
+        // Orchestrator §5: stamp the connection-group key (not `true`) so
+        // per-group counting stays accurate across the soft over-cap.
+        _subPool.running[agentId] = _poolGroupFor(rec).key; // soft over-cap on resume — by design
     }
     _notifyListeners();
     return true;
@@ -2622,11 +3070,44 @@ function _markErrored(agentId, errMsg) {
     _notifyListeners();
 }
 
+// ---------- Worker saturation (system prompt "WORKER SATURATION" rule) ----------
+
+// Shared by agentStatus.snap(), _wakeSubAgentImpl and agentMessage so all
+// three surfaces report IDENTICAL saturation math. Context occupancy is the
+// last LLM call's input tokens (rec.last_input_tokens, recorded by
+// recordSubLLMUsage) measured against the assumed context window
+// (_subAssumedContextTokens — user-editable setting, model-independent).
+function _saturationInfo(rec) {
+    var contextTokens = (rec && rec.last_input_tokens) || 0;
+    var used = (rec && rec.tool_calls_used) || 0;
+    var cap = (rec && rec.max_tool_calls) || 0;
+    var assumedCtx = _subAssumedContextTokens();
+    return {
+        context_tokens: contextTokens,
+        context_pct: Math.round(100 * contextTokens / assumedCtx),
+        tool_budget_pct: cap ? Math.round(100 * used / cap) : 0,
+        saturated: contextTokens >= assumedCtx * SUBAGENT_SATURATION_RATIO
+            || !!(cap && used >= cap * SUBAGENT_SATURATION_RATIO)
+    };
+}
+
+// Non-blocking warning string attached by _wakeSubAgentImpl / agentMessage
+// when the caller delivers work to a saturated sub. Null when not saturated.
+// Warn, NEVER block — the caller decides whether to spawn a successor.
+function _saturationWarning(rec) {
+    var s = _saturationInfo(rec);
+    if (!s.saturated) return null;
+    return 'Recipient sub is at ~' + s.context_pct + '% of the assumed 200k context window ('
+        + Math.round(s.context_tokens / 1000) + 'k tokens) and ' + s.tool_budget_pct
+        + '% of its tool budget — per the WORKER SATURATION rule, spawn a FRESH sub seeded with a handover instead of piling on.';
+}
+
 // ---------- agent_status ----------
 
 function agentStatus(args, ctx) {
     args = args || {};
     function snap(rec) {
+        var sat = _saturationInfo(rec);
         return {
             agent_id: rec.agent_id,
             chat_id: rec.chat_id,
@@ -2652,6 +3133,36 @@ function agentStatus(args, ctx) {
             in_pool_queue: _subPool.queue.indexOf(rec.agent_id) >= 0,
             parked_for_await: !!rec._parked_for_await,
             last_report: rec.last_report || null,
+            // Orchestrator §3 — deliverable review flow: null | 'pending'
+            // (auto on report) | 'accepted' / 'revision_requested' (parent
+            // verdict via wake_sub_agent) | 'cross_checked' (an independent reviewer sub).
+            review_state: rec.review_state || null,
+            // Orchestrator §6: per-spawn model provenance — the tier alias the
+            // sub is pinned to (rec.tier, else the tier its pinned provider
+            // reverse-maps to, else null = inherits the global default).
+            // Provider/model NAMES are never exposed to the agent. Null on
+            // legacy records.
+            tier: rec.tier || _providerToTier(rec.provider) || null,
+            // Orchestrator §5: per-sub LLM usage rollup ({calls, input_tokens,
+            // output_tokens, cost, by_tier}) — internal by_provider (keyed by
+            // model) is folded to by_tier for the agent. null on legacy records.
+            usage: _sanitizeUsageForAgent(rec.usage),
+            // WORKER SATURATION instrumentation: context occupancy proxy (last
+            // LLM call's input tokens) against the FIXED assumed 200k window,
+            // tool-budget %, and the combined 50% `saturated` flag. Same math
+            // as the wake/message saturation_warning (_saturationInfo).
+            context_tokens: sat.context_tokens,
+            context_pct: sat.context_pct,
+            tool_budget_pct: sat.tool_budget_pct,
+            saturated: sat.saturated,
+            // Orchestrator §5: parent revision verdicts + the resulting
+            // suggestion (null below SUBAGENT_ESCALATE_AFTER_REVISIONS).
+            revisions_requested: rec.revisions_requested || 0,
+            escalation_suggestion: _escalationSuggestion(rec),
+            // Orchestrator §5: live approval-park state ({tool, since} while a
+            // permission modal blocks the sub, else null).
+            pending_approvals: rec._pending_approvals || 0,
+            awaiting_approval: rec.awaiting_approval || null,
             // The sub's live update_action_state progress card (state, label,
             // tasks checklist, output), mirrored by recordSubActionState.
             // Null until the sub posts its first update / after a wake reset.
@@ -2693,7 +3204,7 @@ function agentStatus(args, ctx) {
         || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
         || (typeof currentChatId !== 'undefined' ? currentChatId : null);
     if (args.parent_chat_id !== '*' && !parentChatId) {
-        return { success: true, agents: [], pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE }, note: 'no parent chat context resolvable; pass parent_chat_id explicitly or "*" for all' };
+        return { success: true, agents: [], pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot() }, note: 'no parent chat context resolvable; pass parent_chat_id explicitly or "*" for all' };
     }
     var out = [];
     for (var aid in _subAgents) {
@@ -2718,7 +3229,7 @@ function agentStatus(args, ctx) {
         if (ra !== rb) return ra - rb;
         return b.last_activity_at - a.last_activity_at;
     });
-    var resp = { success: true, agents: out, pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE } };
+    var resp = { success: true, agents: out, pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot() } };
     // Optional tree assembly (Phase 5). When `include_tree:true`, attach a
     // parent_agent_id-keyed map of children agent_ids so callers can render
     // a hierarchy without re-walking the flat list. Top-level roots are
@@ -2736,6 +3247,48 @@ function agentStatus(args, ctx) {
 }
 
 // ---------- Hooks called by the agent loop ----------
+
+// Orchestrator §5: per-sub token/cost accounting. Called by the agent loop's
+// metrics-capture block (030-agent-loop.js, right after each LLM call's
+// reqMetrics is finalized) for sub-agent chats — the simplest reliable
+// hookpoint: every call is counted exactly once, including calls in runs
+// that later crash before reporting. Aggregates onto record.usage and keys
+// by_provider on the ACTUAL model the call landed on (reqMetrics.actualModel,
+// stamped by the stream parser) falling back to the configured provider name.
+// Persists per call (cheap — the record is already re-put on every tool
+// call); page mirrors pick it up with the next registry broadcast tick.
+function recordSubLLMUsage(chatId, m) {
+    try {
+        if (!chatId || !m) return false;
+        if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return false;
+        var rec = _subAgents[chats[chatId].subAgentId];
+        if (!rec) return false;
+        var u = rec.usage;
+        if (!u) u = rec.usage = { calls: 0, input_tokens: 0, output_tokens: 0, cost: 0, by_provider: {} };
+        u.calls++;
+        u.input_tokens += m.input_tokens || 0;
+        u.output_tokens += m.output_tokens || 0;
+        u.cost += m.cost || 0;
+        // Live context proxy: the MOST RECENT call's input tokens ≈ the sub's
+        // current context occupancy (every request re-sends the whole
+        // transcript). Overwritten on each call; read by _saturationInfo
+        // (agent_status snap + wake/message saturation warnings).
+        rec.last_input_tokens = m.input_tokens || 0;
+        var pkey = m.actualModel || m.providerName || 'unknown';
+        if (!u.by_provider) u.by_provider = {};
+        var bp = u.by_provider[pkey];
+        if (!bp) bp = u.by_provider[pkey] = { calls: 0, input_tokens: 0, output_tokens: 0, cost: 0 };
+        bp.calls++;
+        bp.input_tokens += m.input_tokens || 0;
+        bp.output_tokens += m.output_tokens || 0;
+        bp.cost += m.cost || 0;
+        _subAgentsPersist(rec);
+        return true;
+    } catch (e) {
+        console.warn('[sub-agents] recordSubLLMUsage failed', e);
+        return false;
+    }
+}
 
 // Called by 030-agent-loop.js whenever a tool call is dispatched inside a
 // sub-agent chat. Increments the budget counter. The budget is a SOFT cap:
@@ -2859,7 +3412,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
             }
         } catch (_e6) { /* unreachable Handles — fall back to resetting */ }
     }
-    if (!_approvalParked) rec._pending_approvals = 0;
+    if (!_approvalParked) { rec._pending_approvals = 0; rec.awaiting_approval = null; }
     // finishCtx (optional, supplied by agent-loop) signals whether the run
     // ended in an API/loop error. If so, the auto_report fallback below
     // synthesizes status:'error' instead of status:'done' to avoid lying
@@ -3133,11 +3686,18 @@ var SubAgents = {
     stop:    stopSubAgent,
     message: agentMessage,
     status:  agentStatus,
+    // Orchestrator §3: the standard worker-report template ({task, findings,
+    // evidence[], confidence, open_questions[]}), for parents that want to
+    // pass it as an explicit output_schema.
+    REPORT_SCHEMA: SUBAGENT_REPORT_SCHEMA,
     // SW tool-routing hook — persists a sub's update_action_state snapshot
     // (see recordSubActionState above; the page-side tool can't write it).
     recordActionState: recordSubActionState,
     // Agent-loop hooks
     onToolCallInSubAgent: onToolCallInSubAgent,
+    // Orchestrator §5: per-sub LLM usage rollup (called from the loop's
+    // metrics-capture block after every LLM call in a sub-agent chat).
+    recordLLMUsage: recordSubLLMUsage,
     consumeBudgetNotice: consumeBudgetNotice,
     onSubAgentRunFinished: onSubAgentRunFinished,
     // RES-6: unsolicited-event hooks — called by the SW port bridge when the
@@ -3235,7 +3795,10 @@ var SubAgents = {
         return {
             running: Object.keys(_subPool.running).length,
             queued:  _subPool.queue.length,
-            size:    SUBAGENT_POOL_SIZE
+            size:    SUBAGENT_POOL_SIZE,
+            // Orchestrator §5: per-connection-group pool limits.
+            global_max: SUBAGENT_POOL_GLOBAL_MAX,
+            groups:  _poolGroupsSnapshot()
         };
     },
     // Pool-deadlock prevention hooks (Phase 5). Called by the await_handle

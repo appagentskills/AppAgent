@@ -21,7 +21,11 @@
             </button>
             <button class="sidebar-nav-btn" id="dashboard-btn" onclick="toggleDashboardView()" data-tooltip="Dashboard">
                 <span class="sidebar-nav-icon" id="dashboard-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/><circle cx="6" cy="6" r="1" fill="currentColor"/></svg></span>
-                <span>Smart Dashboard</span>
+                <span>Dashboard</span>
+            </button>
+            <button class="sidebar-nav-btn" id="documents-btn" onclick="toggleDocumentsView()" data-tooltip="Documents">
+                <span class="sidebar-nav-icon" id="documents-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
+                <span>Documents</span>
             </button>
             <button class="sidebar-nav-btn" id="skills-btn" onclick="toggleSkillsView()" data-tooltip="Skills">
                 <span class="sidebar-nav-icon" id="skills-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></span>
@@ -31,13 +35,9 @@
                 <span class="sidebar-nav-icon" id="settings-page-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></span>
                 <span>Settings</span>
             </button>
-            <button class="sidebar-nav-btn" id="documents-btn" onclick="toggleDocumentsView()" data-tooltip="Documents">
-                <span class="sidebar-nav-icon" id="documents-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
-                <span>Documents</span>
-            </button>
-            <button class="sidebar-nav-btn" id="docs-btn" onclick="toggleDocsView()" data-tooltip="Docs">
-                <span class="sidebar-nav-icon" id="docs-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
-                <span>Documentation</span>
+            <button class="sidebar-nav-btn" id="docs-btn" onclick="toggleDocsView()" data-tooltip="Help">
+                <span class="sidebar-nav-icon" id="docs-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>
+                <span>Help</span>
             </button>
             <div class="sidebar-history-row" id="history-toggle-btn">
                 <button class="sidebar-nav-btn sidebar-history-btn" onclick="toggleHistoryView()" data-tooltip="History">
@@ -74,7 +74,7 @@
         <div class="settings-section">
             <div class="settings-section-title"><span class="section-icon" id="section-icon-display"></span>Display</div>
             <label class="settings-checkbox">
-                <input type="checkbox" id="show-api-stats" checked="checked" onchange="toggleApiStats()"/>
+                <input type="checkbox" id="show-api-stats" onchange="toggleApiStats()"/>
                 <span>Show API call statistics</span>
             </label>
             <label class="settings-checkbox">
@@ -244,7 +244,7 @@
         <div class="dashboard-panel" id="dashboard-panel" style="display:none;">
             <div class="dashboard-header">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="dashboard-title">Smart Dashboard</span>
+                <span class="dashboard-title">Dashboard</span>
                 <div class="dashboard-actions" id="dashboard-actions">
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
                     <button class="skills-action-btn dashboard-action-collapsible" id="dashboard-toggle-headers-btn" onclick="toggleDashboardHeaders()" title="Toggle Headers"><span class="action-icon" id="headers-toggle-icon"></span>Headers</button>

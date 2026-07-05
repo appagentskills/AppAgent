@@ -78,10 +78,119 @@ function getWsEditedFilesForChat(chat) {
     });
 }
 
+// --- Merged-PR diff snapshots -------------------------------------------------
+
+// Durable per-file snapshots of merged PRs (meta.prs[].files — written by
+// wsPush, stamped state:'merged' by wsMaybeAutoDeleteMerged / wsSyncWithRemote;
+// see 020-tool-execution.js). They let the sidebar badge a file as MERGED and
+// show the ORIGINAL pre-merge diff even after the fork workspace was
+// auto-deleted on merge. Old PR entries without a files array are simply
+// never matched — behavior is unchanged for them.
+
+// Build path → [{pr, file, repo}] from all workspace metas. Candidates keep
+// the owning meta's repo so a same-path file in a DIFFERENT repo can never
+// match a wsKey-scoped lookup (see _wsfPickSnap).
+function _wsfCollectMergedSnaps(metas) {
+    var byPath = {};
+    (metas || []).forEach(function(m) {
+        var prs = (m && Array.isArray(m.prs)) ? m.prs : [];
+        var repo = m ? (m.github_repo || (typeof parseWsKey === 'function' && m.repo ? parseWsKey(m.repo).repo : null)) : null;
+        prs.forEach(function(pr) {
+            if (!pr || pr.state !== 'merged' || !Array.isArray(pr.files)) return;
+            pr.files.forEach(function(pf) {
+                if (!pf || !pf.path) return;
+                if (!byPath[pf.path]) byPath[pf.path] = [];
+                byPath[pf.path].push({ pr: pr, file: pf, repo: repo });
+            });
+        });
+    });
+    return byPath;
+}
+
+// Pick the snapshot for a sidebar entry from its per-path candidate list:
+// when the entry carries a wsKey, ONLY snapshots from that wsKey's repo
+// match; without one, any repo. Several merged PRs may have touched the
+// path — the most recently merged wins.
+function _wsfPickSnap(list, wsKey) {
+    if (!Array.isArray(list) || !list.length) return null;
+    var cands = list;
+    if (wsKey && typeof parseWsKey === 'function') {
+        var repo = parseWsKey(wsKey).repo;
+        cands = list.filter(function(s) { return s && s.repo === repo; });
+    }
+    var best = null;
+    cands.forEach(function(s) {
+        if (s && (!best || (s.pr.merged_at || '') > (best.pr.merged_at || ''))) best = s;
+    });
+    return best;
+}
+
+// renderWorkspaceFilesSection is synchronous and meta lives in IDB, so the
+// lookup is cached here and refreshed async (lazily on first render + on
+// every workspaceMutated event); a refresh that changes the map re-renders
+// once. null = never loaded.
+var _wsfMergedSnaps = null;
+var _wsfMergedSnapsLoading = false;
+
+function _wsfRefreshMergedSnaps() {
+    if (_wsfMergedSnapsLoading) return;
+    if (typeof getAllWorkspaceMetas !== 'function') return;
+    _wsfMergedSnapsLoading = true;
+    getAllWorkspaceMetas().then(function(metas) {
+        var byPath = _wsfCollectMergedSnaps(metas);
+        function sig(map) {
+            if (!map) return 'null';
+            return JSON.stringify(Object.keys(map).sort().map(function(p) {
+                return [p].concat(map[p].map(function(s) { return [s.repo, s.file.old_sha, s.file.new_sha, s.pr.number]; }));
+            }));
+        }
+        var changed = sig(byPath) !== sig(_wsfMergedSnaps);
+        _wsfMergedSnaps = byPath;
+        _wsfMergedSnapsLoading = false;
+        if (changed && typeof renderVersionSidebar === 'function') renderVersionSidebar();
+    }).catch(function() { _wsfMergedSnapsLoading = false; });
+}
+
+// Sync lookup for render time; kicks the first load when never loaded.
+function _wsfMergedSnapFor(path, wsKey) {
+    if (_wsfMergedSnaps === null) { _wsfRefreshMergedSnaps(); return null; }
+    return _wsfPickSnap(_wsfMergedSnaps[path], wsKey);
+}
+
 // --- Sidebar section renderer (called from renderVersionSidebar) ------------
 
 function renderWorkspaceFilesSection(chat) {
     var files = getWsEditedFilesForChat(chat);
+    // Sub-agent aggregation: files edited from this chat's sub-agent chats
+    // surface in the parent sidebar too, attributed with a worker-name chip
+    // (f.workers). De-duped by path — when both the parent and a worker
+    // touched the same file the change lists are merged (change-count badge
+    // includes both) but the parent's status flags win: cross-chat ordering
+    // is not derivable from per-chat message indexes. Uses the global
+    // currentChatId (renderVersionSidebar always passes chats[currentChatId]);
+    // getSubAgentChatsForChat (120-ui-utils.js) never returns siblings, so
+    // sibling chats cannot leak into each other.
+    var _subChats = (chat && typeof currentChatId !== 'undefined' && typeof getSubAgentChatsForChat === 'function')
+        ? getSubAgentChatsForChat(currentChatId) : [];
+    if (_subChats.length) {
+        var _byPath = {};
+        files.forEach(function(f) { _byPath[f.path] = f; });
+        _subChats.forEach(function(sc) {
+            getWsEditedFilesForChat(sc.chat).forEach(function(sf) {
+                var own = _byPath[sf.path];
+                if (own) {
+                    own.changes = own.changes.concat(sf.changes);
+                    if (sf.isNew) own.isNew = true;
+                    if (!own.workers) own.workers = [];
+                    if (own.workers.indexOf(sc.name) === -1) own.workers.push(sc.name);
+                } else {
+                    sf.workers = [sc.name];
+                    _byPath[sf.path] = sf;
+                    files.push(sf);
+                }
+            });
+        });
+    }
     _wsfSectionFiles = files;
     if (files.length === 0) return '';
 
@@ -92,18 +201,26 @@ function renderWorkspaceFilesSection(chat) {
         var name = f.path.split('/').pop();
         var dir = f.path.slice(0, f.path.length - name.length).replace(/\/$/, '');
         var badge;
+        // A merged-PR snapshot overrides MODIFIED/NEW (the edit landed — that
+        // is the more useful state), but never DELETED/DISCARDED which reflect
+        // an explicit later local action.
+        var mergedSnap = (!f.isDeleted && !f.isDiscarded) ? _wsfMergedSnapFor(f.path, f.wsKey) : null;
         if (f.isDeleted) badge = '<span class="sn-status-badge sn-status-deleted">DELETED</span>';
         else if (f.isDiscarded) badge = '<span class="sn-status-badge sn-status-reverted">DISCARDED</span>';
+        else if (mergedSnap) badge = '<span class="sn-status-badge sn-status-merged" title="Merged in PR #' + mergedSnap.pr.number + '">MERGED</span>';
         else if (f.isNew) badge = '<span class="sn-status-badge sn-status-new">NEW</span>';
         else badge = '<span class="sn-status-badge sn-status-modified">MODIFIED</span>';
         var changesBadge = f.changes.length > 1 ? '<span class="sn-changes-badge">' + f.changes.length + ' changes</span>' : '';
         var wsLabel = f.wsKey ? escapeHtml(f.wsKey.split('/').pop()) : '';
+        var workerChips = (f.workers && f.workers.length)
+            ? f.workers.map(function(w) { return '<span class="wsf-ws" title="Edited by worker ' + escapeHtml(w) + '">' + escapeHtml(w) + '</span>'; }).join('')
+            : '';
 
         // Diff-first: the most useful view of an edited file is what changed.
         html += '<div class="sn-artifact-card sidebar-card wsf-card" onclick="wsfOpenDiff(' + i + ')" title="' + escapeHtml(f.path) + '">';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">' + escapeHtml(name) + '</div>';
-        html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + badge + changesBadge + '</div>';
+        html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + workerChips + badge + changesBadge + '</div>';
         html += '</div>';
         html += '</div>';
     });
@@ -246,7 +363,12 @@ async function wsfOpenViewer(i) {
     var f = _wsfSectionFiles[i];
     if (!f) return;
     var res = await _wsfResolve(f);
-    if (!res) { _wsfNotFoundMsg(f); return; }
+    if (!res) {
+        // Live record gone (fork auto-deleted on merge, repo re-cloned) —
+        // show the merged PR's pushed content when a snapshot exists.
+        if (await _wsfOpenMergedView(f, i)) return;
+        _wsfNotFoundMsg(f); return;
+    }
     var rec = res.rec;
     var status = rec.deleted ? 'Deleted' : (rec.dirty ? 'Modified (uncommitted)' : 'Clean (matches base)');
     var body = '<div class="wsf-file-meta">' + escapeHtml(res.wsKey) + ' \u00b7 ' + status + ' \u00b7 ' + _wsfFmtSize(rec.content) + '</div>';
@@ -309,12 +431,69 @@ async function wsfOpenDiff(i) {
     var f = _wsfSectionFiles[i];
     if (!f) return;
     var res = await _wsfResolve(f);
+    // Fall back to the durable merged-PR snapshot (pre-merge base → pushed
+    // content) when the live record is GONE (fork auto-deleted on merge) or
+    // resolves CLEAN (workspace synced past the merge — the live diff would
+    // show "No differences"). A genuinely dirty live record still wins: those
+    // are newer, uncommitted edits.
+    if (!res || !(res.rec && res.rec.dirty)) {
+        if (await _wsfOpenMergedDiff(f, i)) return;
+    }
     if (!res) { _wsfNotFoundMsg(f); return; }
     var rec = res.rec;
     var oldText = rec.original_content != null ? rec.original_content : '';
     var newText = rec.deleted ? '' : (rec.content || '');
     var note = rec.dirty ? '' : '<div class="wsf-file-meta">File has no uncommitted changes \u2014 it matches its base.</div>';
     _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">base \u2192 current</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+}
+
+// Render the merged-PR snapshot diff for a section entry. Returns true when a
+// snapshot existed (with durable blobs) and the modal was shown; false falls
+// through to the caller's default behavior (old chats / PRs pushed before
+// snapshots existed, or snapshot blobs lost).
+async function _wsfOpenMergedDiff(f, i) {
+    try {
+        if (typeof getAllWorkspaceMetas !== 'function' || typeof getWorkspaceBlobsBySha !== 'function') return false;
+        var snap = _wsfPickSnap(_wsfCollectMergedSnaps(await getAllWorkspaceMetas())[f.path], f.wsKey);
+        if (!snap) return false;
+        var shas = [];
+        if (snap.file.old_sha) shas.push(snap.file.old_sha);
+        if (snap.file.new_sha) shas.push(snap.file.new_sha);
+        var blobs = await getWorkspaceBlobsBySha(shas);
+        // A referenced blob may be gone (pre-fix GC, quota failure at push
+        // time) — fall through rather than render a half-empty diff that
+        // pretends the file was created or deleted.
+        if (snap.file.old_sha && blobs[snap.file.old_sha] == null) return false;
+        if (snap.file.new_sha && blobs[snap.file.new_sha] == null) return false;
+        var oldText = snap.file.old_sha ? blobs[snap.file.old_sha] : '';
+        var newText = snap.file.new_sha ? blobs[snap.file.new_sha] : '';
+        var note = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">MERGED</span> Merged in <a href="' + escapeHtml(snap.pr.url || '#') + '" target="_blank" rel="noopener">PR #' + snap.pr.number + '</a>'
+            + (snap.pr.merged_at ? ' \u00b7 ' + escapeHtml(String(snap.pr.merged_at).slice(0, 10)) : '')
+            + ' \u2014 original edited diff (pre-merge base \u2192 pushed content).</div>';
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">merged \u00b7 PR #' + snap.pr.number + '</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+        return true;
+    } catch (e) {
+        console.error('wsf merged snapshot diff failed', e);
+        return false;
+    }
+}
+
+// Viewer counterpart: show the merged PR's PUSHED content when the live
+// record is unresolvable. Deletions have no pushed content — return false
+// (the diff view covers them).
+async function _wsfOpenMergedView(f, i) {
+    try {
+        if (typeof getAllWorkspaceMetas !== 'function' || typeof getWorkspaceBlobsBySha !== 'function') return false;
+        var snap = _wsfPickSnap(_wsfCollectMergedSnaps(await getAllWorkspaceMetas())[f.path], f.wsKey);
+        if (!snap || !snap.file.new_sha) return false;
+        var blobs = await getWorkspaceBlobsBySha([snap.file.new_sha]);
+        var content = blobs[snap.file.new_sha];
+        if (content == null) return false;
+        var body = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">MERGED</span> PR #' + snap.pr.number + ' \u00b7 pushed content \u00b7 ' + _wsfFmtSize(content) + '</div>'
+            + '<pre class="wsf-code">' + escapeHtml(content) + '</pre>';
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">merged \u00b7 PR #' + snap.pr.number + '</span>', body, { fileIndex: i, active: 'view' });
+        return true;
+    } catch (e) { return false; }
 }
 
 // --- Versions ---------------------------------------------------------------
@@ -536,6 +715,11 @@ async function wsfDiscardFile(i) {
                 // background chats or relayed from other panels — leaving the
                 // sidebar stale exactly when someone else changed the workspace.
                 if (!ev) return;
+                // Keep the merged-PR snapshot cache fresh (push adds snapshots,
+                // sync/merge stamps state:'merged'). Async — the render below
+                // uses the current cache; a refresh that changes the map
+                // re-renders once more by itself.
+                try { _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
                 if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
             } catch (e) { /* sidebar not ready */ }
         });

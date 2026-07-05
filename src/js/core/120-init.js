@@ -292,6 +292,7 @@ async function init() {
     await loadProviderFromStorage();
     await loadToolPermissions();
     await loadCacheTokenLimit();
+    await loadAssumedContextTokens();
     await loadCustomSystemPrompt();
     await loadHooksSettings();
     await loadSkillsFromStorage();
@@ -616,7 +617,11 @@ function updateSkillsButtonState() {
 async function renderSkillsList() {
     var container = document.getElementById('skills-list');
     if (!container) return;
-    var skillList = Object.values(skills);
+    // devOnly skills stay invisible in the list outside extension dev mode
+    // (isSkillDevHidden, core/140-skills-engine.js).
+    var skillList = Object.values(skills).filter(function(s) {
+        return !(typeof isSkillDevHidden === 'function' && isSkillDevHidden(s.id));
+    });
     if (skillList.length === 0) {
         container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>No skills yet</p><p class="skills-empty-hint">Create skills to give your AI agent specialized knowledge.</p></div>';
         return;

@@ -1,7 +1,7 @@
 /* Tablet breakpoint (768px and below) */
 @media screen and (max-width: 768px) {
     /* Sidebar - icons only (collapsed) by default, stays in place */
-    .sidebar { width: 56px !important; min-width: 56px !important; position: relative; z-index: 100; }
+    .sidebar { width: 68px !important; min-width: 68px !important; position: relative; z-index: 100; }
     .sidebar.expanded { width: 260px !important; min-width: 260px !important; }
     .sidebar.expanded.searching { width: 260px !important; }
 

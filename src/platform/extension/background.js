@@ -893,8 +893,13 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                 var ghData = await chrome.storage.local.get(['githubToken', 'githubInstanceUrl']);
                 var token = message.token || ghData.githubToken;
                 var instanceUrl = message.instanceUrl || ghData.githubInstanceUrl || 'https://github.com';
+                // Normalize (trim, strip trailing slashes, lowercase protocol+host) so
+                // the strict-equality cloud check matches slash/case variants — keep in
+                // sync with normalizeGitHubInstanceUrl() in core/130-indexeddb.js.
+                instanceUrl = instanceUrl.trim().replace(/\/+$/, '') || 'https://github.com';
+                try { var _nu = new URL(instanceUrl); instanceUrl = _nu.protocol + '//' + _nu.host + _nu.pathname.replace(/\/+$/, ''); } catch (e) { /* keep trimmed */ }
                 if (!token) { sendResponse({ error: 'No GitHub token configured' }); return; }
-                var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl.replace(/\/$/, '') + '/api/v3';
+                var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl + '/api/v3';
                 var url = apiBase + message.path;
                 var headers = {
                     'Authorization': 'Bearer ' + token,
@@ -921,7 +926,11 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         (async function() {
             try {
                 var instanceUrl = message.instanceUrl || 'https://github.com';
-                var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl.replace(/\/$/, '') + '/api/v3';
+                // Same normalization as the github-api proxy above (sync with
+                // normalizeGitHubInstanceUrl() in core/130-indexeddb.js).
+                instanceUrl = instanceUrl.trim().replace(/\/+$/, '') || 'https://github.com';
+                try { var _nv = new URL(instanceUrl); instanceUrl = _nv.protocol + '//' + _nv.host + _nv.pathname.replace(/\/+$/, ''); } catch (e) { /* keep trimmed */ }
+                var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl + '/api/v3';
                 var res = await fetch(apiBase + '/user', {
                     headers: {
                         'Authorization': 'Bearer ' + message.token,
@@ -2303,7 +2312,12 @@ function transformToAnthropic(body) {
 
     var result = {
         model: body.model,
-        max_tokens: body.max_tokens || 8192,
+        // body.max_tokens is always set by the request builder
+        // (callOpenRouterStreaming in src/js/app/010-llm-streaming.js, from
+        // the global Max Tokens setting) — the literal below is a
+        // last-resort fallback. 64000 = DEFAULT_MAX_TOKENS in
+        // src/js/core/030-config.js (not importable here) — keep in sync.
+        max_tokens: body.max_tokens || 64000,
         stream: true,
         messages: merged
     };
@@ -2718,7 +2732,69 @@ chrome.alarms.onAlarm.addListener(function(alarm) {
     chrome.storage.local.get('agent-heartbeat-tick', function() {});
     maybeCloseOffscreenIfIdle();
     _swResumeIfNeeded();
+    // Prompt-cache heartbeat (see sendCacheHeartbeat in
+    // src/js/app/010-llm-streaming.js). Fully guarded — must never break
+    // the SW keepalive above.
+    try { _cacheHeartbeatTick(); } catch (e) { /* non-fatal */ }
 });
+
+// ─── Prompt-cache heartbeat trigger ─────────────────────────────────────
+// Anthropic's prompt cache expires ~5 min after the last request. For every
+// chat that is WAITING ON SUB-AGENTS and idle > 4 min, re-send its last
+// request body (stamped by callOpenRouterStreaming into self._cacheHeartbeat)
+// as a discarded 1-token request so the cache TTL rolls forward. Runs on the
+// existing 30s agent-heartbeat alarm tick.
+var CACHE_HEARTBEAT_AFTER_MS = 4 * 60 * 1000;      // idle threshold
+var CACHE_HEARTBEAT_MAX_AGE_MS = 2 * 60 * 60 * 1000; // stale-run safety stop
+
+function _cacheHeartbeatTick() {
+    var reg = self._cacheHeartbeat;
+    if (!reg) return;
+    var now = Date.now();
+    for (var chatId in reg) {
+        try {
+            var entry = reg[chatId];
+            if (!entry || !entry.at) continue;
+            var idle = now - entry.at;
+            if (idle < CACHE_HEARTBEAT_AFTER_MS) continue;
+            // Safety stop: a run idle for 2h+ is dead — drop the entry so we
+            // never heartbeat a stale conversation forever.
+            if (idle > CACHE_HEARTBEAT_MAX_AGE_MS) { delete reg[chatId]; continue; }
+            // Only chats actually waiting on sub-agent work get heartbeats.
+            if (!_chatWaitingOnSubAgents(chatId)) continue;
+            // Skip if a REAL stream is currently in flight for this chat —
+            // it refreshes the cache itself (and will re-stamp on dispatch).
+            if (typeof currentStreamAbortControllers !== 'undefined'
+                && currentStreamAbortControllers[chatId]) continue;
+            if (typeof self.sendCacheHeartbeat === 'function') {
+                self.sendCacheHeartbeat(chatId);
+            }
+        } catch (e) { /* per-chat, non-fatal */ }
+    }
+}
+
+// "Waiting on sub-agents" = (a) a RUNNING sub whose parent is this chat
+// (covers turn-ended-waiting-for-wake_parent), OR (b) a pending
+// spawn_sub_agent handle for this chat (covers blocked-in-await_handle).
+// Both registries live in sw-bundle.js (core tier), imported above.
+function _chatWaitingOnSubAgents(chatId) {
+    try {
+        if (self.SubAgents && typeof self.SubAgents.listAll === 'function') {
+            var subs = self.SubAgents.listAll();
+            for (var i = 0; i < subs.length; i++) {
+                var r = subs[i];
+                if (r && r.parent_chat_id === chatId && r.state === 'running') return true;
+            }
+        }
+        if (self.Handles && typeof self.Handles.list === 'function') {
+            var hs = self.Handles.list(chatId);
+            for (var j = 0; j < hs.length; j++) {
+                if (hs[j] && hs[j].status === 'pending' && hs[j].tool === 'spawn_sub_agent') return true;
+            }
+        }
+    } catch (e) { /* registries not hydrated yet — treat as not waiting */ }
+    return false;
+}
 
 async function _swResumeIfNeeded() {
     try {

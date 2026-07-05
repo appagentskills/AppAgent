@@ -117,9 +117,17 @@ function updateContextIndicator() {
         }
     }
 
-    // Get context limit for current model (default 128k)
-    var provider = (typeof currentProvider !== 'undefined' && getProviderById(currentProvider)) ? getProviderById(currentProvider) : null;
-    var contextLimit = (provider && provider.context_length) || (provider && provider.maxTokens ? provider.maxTokens * 2 : 128000);
+    // Fall back to the per-call estimate the agent loop stores on the chat
+    // row (app/030-agent-loop.js) — covers chats whose metrics rows were
+    // trimmed but whose _ctxTokens survived the last run.
+    if (!totalTokens && chat && typeof chat._ctxTokens === 'number') {
+        totalTokens = chat._ctxTokens;
+    }
+
+    // Fixed assumed context window for ALL models — user-editable global
+    // setting, default 200k (getAssumedContextTokens in core/030-config.js).
+    // Per-model windows are no longer tracked.
+    var contextLimit = (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
 
     // Hide indicator if tokens < 10k (for new/empty chats)
     if (totalTokens < 10000) {

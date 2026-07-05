@@ -414,7 +414,9 @@ async function loadApiProviders() {
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
                     // sonnet-5, gpt-5.2 → gpt-5.5, Gemini 3 Flash Preview →
-                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5 OAuth; the
+                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5, and the
+                    // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
+                    // Sonnet 5 OAuth → Sonnet 5); the
                     // opus-4.8 (OpenRouter), haiku-4.5 and Proxy defaults were
                     // REMOVED (to: null deletes an untouched copy). Only
                     // UNCUSTOMIZED legacy entries (every field equal to the old
@@ -443,7 +445,13 @@ async function loadApiProviders() {
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
                         { to: 'gpt-5.5', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
-                        { to: 'Sonnet 5 OAuth', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } }
+                        { to: 'Sonnet 5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
+                        // OAuth-suffix drop — same providers, friendlier names.
+                        // Two Opus snapshots: effort was 'high' before the xhigh
+                        // retune below, 'xhigh' after — match both vintages.
+                        { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
+                        { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Sonnet 5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } }
                     ].forEach(function(mig) {
                         var idx = -1;
                         for (var i = 0; i < apiProviders.length; i++) {
@@ -465,10 +473,10 @@ async function loadApiProviders() {
                             // Removed default — drop the untouched copy and repoint
                             // any persisted selection at the config default.
                             apiProviders.splice(idx, 1);
-                            if (currentProvider === mig.from.name) currentProvider = 'Opus-4-8 OAuth';
+                            if (currentProvider === mig.from.name) currentProvider = 'Opus-4-8';
                             if (typeof appStorage !== 'undefined'
                                 && appStorage.getItem('appagent_provider') === mig.from.name) {
-                                try { appStorage.setItem('appagent_provider', 'Opus-4-8 OAuth'); } catch (e) {}
+                                try { appStorage.setItem('appagent_provider', 'Opus-4-8'); } catch (e) {}
                             }
                             migratedDefaults = true;
                             return;
@@ -498,8 +506,9 @@ async function loadApiProviders() {
                         }
                         migratedDefaults = true;
                     });
-                    // Opus-4-8 OAuth: bump effort high → xhigh only when the entry
-                    // still matches the old default shape (i.e. not user-tuned).
+                    // Opus-4-8 OAuth (legacy name — untouched copies were renamed to
+                    // 'Opus-4-8' with xhigh above): bump effort high → xhigh only when
+                    // the entry still matches the old default shape (i.e. not user-tuned).
                     apiProviders.forEach(function(p) {
                         if (p.isClaudeOAuth && p.name === 'Opus-4-8 OAuth' && p.effort === 'high'
                             && p.model === 'claude-opus-4-8' && p.maxTokens === 100000) {
@@ -963,6 +972,23 @@ async function getAllWorkspaceMetas() {
     } catch (e) { return []; }
 }
 
+// Normalize a stored/typed GitHub instance URL so strict-equality checks
+// against the canonical 'https://github.com' work for trailing-slash and
+// case variants: trim, strip trailing slashes, lowercase protocol+host (URL
+// parsing does the lowercasing; path case is preserved for GHE instances
+// served under a path). Empty/missing input yields the cloud default.
+// Kept in sync with the inline copies in platform/extension/background.js
+// (separate script, not part of this bundle).
+function normalizeGitHubInstanceUrl(u) {
+    var s = String(u || '').trim().replace(/\/+$/, '');
+    if (!s) return 'https://github.com';
+    try {
+        var p = new URL(s);
+        s = p.protocol + '//' + p.host + p.pathname.replace(/\/+$/, '');
+    } catch (e) { /* not an absolute URL — keep the trimmed string */ }
+    return s;
+}
+
 // GitHub API call helper. Calls fetch() directly from whichever context invokes
 // it (SW or panel). Previously this round-tripped through background.js via
 // chrome.runtime.sendMessage, but a SW cannot deliver messages to its own
@@ -975,9 +1001,9 @@ async function githubApi(method, path, body) {
             chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
         });
         var token = ghData.githubToken;
-        var instanceUrl = ghData.githubInstanceUrl || 'https://github.com';
+        var instanceUrl = normalizeGitHubInstanceUrl(ghData.githubInstanceUrl);
         if (!token) return { error: 'No GitHub token configured' };
-        var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl.replace(/\/$/, '') + '/api/v3';
+        var apiBase = instanceUrl === 'https://github.com' ? 'https://api.github.com' : instanceUrl + '/api/v3';
         var headers = {
             'Authorization': 'Bearer ' + token,
             'Accept': 'application/vnd.github+json',
@@ -1006,11 +1032,11 @@ async function githubGraphql(query) {
             chrome.storage.local.get(['githubToken', 'githubInstanceUrl'], function(d) { resolve(d || {}); });
         });
         var token = ghData.githubToken;
-        var instanceUrl = ghData.githubInstanceUrl || 'https://github.com';
+        var instanceUrl = normalizeGitHubInstanceUrl(ghData.githubInstanceUrl);
         if (!token) return { error: 'No GitHub token configured' };
         var gqlUrl = instanceUrl === 'https://github.com'
             ? 'https://api.github.com/graphql'
-            : instanceUrl.replace(/\/$/, '') + '/api/graphql';
+            : instanceUrl + '/api/graphql';
         var res = await fetch(gqlUrl, {
             method: 'POST',
             headers: {
@@ -1119,14 +1145,38 @@ async function gcWorkspaceBlobs() {
         // setWorkspaceFile (which writes the blob BEFORE its row) could have its
         // just-written, not-yet-referenced blob swept by a mark snapshot taken a
         // moment earlier.
-        var tx = database.transaction([workspaceFilesStoreName, workspaceBlobsStoreName], 'readwrite');
+        var tx = database.transaction([workspaceFilesStoreName, workspaceMetaStoreName, workspaceBlobsStoreName], 'readwrite');
         var filesStore = tx.objectStore(workspaceFilesStoreName);
+        var metaStore = tx.objectStore(workspaceMetaStoreName);
         var blobStore = tx.objectStore(workspaceBlobsStoreName);
         var deleted = 0;
         return await new Promise(function(resolve, reject) {
             // MARK: keep every sha referenced by ANY workspace_files row
-            // (stubs and dirty rows included — their blobs stay reusable).
+            // (stubs and dirty rows included — their blobs stay reusable),
+            // PLUS every PR diff-snapshot sha referenced from workspace_meta
+            // (meta.prs[].files[].old_sha/new_sha — written by wsPush, read
+            // by the sidebar's merged-PR diff). Those blobs have no
+            // workspace_files row once the fork workspace is deleted on
+            // merge, so sweeping by files alone would collect them.
             var keep = {};
+            var metasReq = metaStore.getAll();
+            metasReq.onsuccess = function() {
+                var metas = metasReq.result || [];
+                for (var mi = 0; mi < metas.length; mi++) {
+                    var prs = metas[mi] && metas[mi].prs;
+                    if (!Array.isArray(prs)) continue;
+                    for (var pi = 0; pi < prs.length; pi++) {
+                        var pfs = prs[pi] && prs[pi].files;
+                        if (!Array.isArray(pfs)) continue;
+                        for (var fi = 0; fi < pfs.length; fi++) {
+                            if (!pfs[fi]) continue;
+                            if (pfs[fi].old_sha) keep[pfs[fi].old_sha] = true;
+                            if (pfs[fi].new_sha) keep[pfs[fi].new_sha] = true;
+                        }
+                    }
+                }
+            };
+            metasReq.onerror = function() { reject(metasReq.error); };
             var filesReq = filesStore.getAll();
             filesReq.onsuccess = function() {
                 var rows = filesReq.result || [];
@@ -1134,6 +1184,9 @@ async function gcWorkspaceBlobs() {
                     if (rows[i] && rows[i].sha) keep[rows[i].sha] = true;
                 }
                 // SWEEP: delete blobs not in the keep-set within the SAME tx.
+                // (Request ordering guarantees the metasReq.onsuccess above ran
+                // first — IDB delivers results in request-issue order — so the
+                // keep-set already contains the PR snapshot shas here.)
                 var cursorReq = blobStore.openCursor();
                 cursorReq.onsuccess = function(ev) {
                     var cursor = ev.target.result;

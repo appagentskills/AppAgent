@@ -28,6 +28,18 @@ function getUnseenFinishedChatsInfo() {
             delete _unseenFinishedChats[cid];
             return;
         }
+        // Read-side gating: only count entries the per-row bell predicate would
+        // actually render. renderJobsBadge()'s row bell is _cUnseen = !running
+        // && !error && unseen-activity, and _jobsChatState() resolves to
+        // 'running'/'error' BEFORE 'unseen'. Without this gate an errored (or
+        // re-running) chat — stamped into the map by noteChatFinishedUnseen()
+        // for BOTH success and error finishes — would put a bell on the pill
+        // with no matching row bell. Merely SKIP (do NOT delete) so a chat whose
+        // state later flips back to genuinely-unseen is counted on a later
+        // render instead of being permanently lost. typeof-guard: _jobsChatState
+        // lives in the tools tier (loaded after this ui-tier file), so it can be
+        // undefined at early call times — fall through to the legacy count then.
+        if (typeof _jobsChatState === 'function' && _jobsChatState(cid) !== 'unseen') return;
         count++;
         if (_unseenFinishedChats[cid].hasError) hasError = true;
     });

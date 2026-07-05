@@ -28,11 +28,15 @@ function buildEmbeddedSkills() {
 
         const skillMd = fs.readFileSync(skillMdPath, 'utf-8');
 
-        let name = folder, description = '', body = skillMd, fmRaw = '';
+        let name = folder, description = '', body = skillMd, fmRaw = '', devOnly = false;
         const fmMatch = skillMd.match(/^---\s*\n([\s\S]*?)\n---/);
         if (fmMatch) {
             const fm = fmMatch[1];
             fmRaw = fm;
+            // devOnly skills are hidden at runtime outside extension dev mode
+            // (isSkillDevHidden in src/js/core/140-skills-engine.js). fmRaw is
+            // already part of the hash, so toggling devOnly bumps it.
+            devOnly = /^devOnly:\s*true\s*$/m.test(fm);
             const nameMatch = fm.match(/^name:\s*(.+)$/m);
             const descMatch = fm.match(/^description:\s*(.+)$/m);
             if (nameMatch) name = nameMatch[1].trim();
@@ -68,6 +72,7 @@ function buildEmbeddedSkills() {
             id: name,
             name,
             description,
+            devOnly,
             body: Buffer.from(body).toString('base64'),
             // Keep the raw frontmatter in a separate field so the runtime
             // (importEmbeddedSkills in 15-indexeddb.js) can parse the actions list
@@ -368,14 +373,23 @@ function scanSwBundleGaps(raw) {
     }
 
     var gaps = [];
+    // typeof-guarded identifiers that are CALLED but not declared in the SW
+    // bundle: not a hard failure (the guard makes the call safe at runtime),
+    // but each one is a silent no-op in the worker context — exactly how the
+    // markChatPrMerged pr_merged bug evaded detection. Collected for a
+    // non-fatal warning list at the call site. Intentional dual-context
+    // guards (e.g. wsNotifyPrMerged's page-only markChatPrMerged delegate)
+    // will show up here — that's the point: the list documents them.
+    var guardedGaps = [];
     called.forEach(function(ctx, name) {
         if (declared.has(name)) return;
         if (SW_SCANNER_BUILTINS.has(name)) return;
-        if (guarded.has(name)) return;
+        if (guarded.has(name)) { guardedGaps.push({ name: name, ctx: ctx }); return; }
         gaps.push({ name: name, ctx: ctx });
     });
     gaps.sort(function(a, b) { return a.name.localeCompare(b.name); });
-    return gaps;
+    guardedGaps.sort(function(a, b) { return a.name.localeCompare(b.name); });
+    return { gaps: gaps, guardedGaps: guardedGaps };
 }
 
 // ─── MV3 CSP HTML Transformation ───
@@ -582,7 +596,7 @@ ${processedBody}
     // dist/extension/ without manifest.json/background.js — an unloadable
     // extension that looks like total data loss to the user.)
     if (workerJS) {
-        const gaps = scanSwBundleGaps(workerJS);
+        const { gaps, guardedGaps } = scanSwBundleGaps(workerJS);
         if (gaps.length > 0) {
             console.error('\n  SW-bundle gaps — identifiers called but not declared:');
             gaps.forEach(g => console.error('    - ' + g.name + '  (near: ' + g.ctx + ')'));
@@ -590,6 +604,16 @@ ${processedBody}
             throw new Error('SW-bundle has ' + gaps.length + ' undeclared identifier(s); aborting build (dist/ untouched).');
         }
         console.log(`  SW-bundle: no undeclared identifiers`);
+        // Non-fatal: typeof-guarded calls whose target is undefined in the
+        // worker context. Each is a silent no-op in the SW — fine when the
+        // guard is an intentional dual-context branch (page delegate + SW
+        // fallback, e.g. wsNotifyPrMerged → markChatPrMerged), a BUG when the
+        // guarded call is the only path (how the pr_merged flag was silently
+        // never written). Review new entries; they never fail the build.
+        if (guardedGaps.length > 0) {
+            console.warn(`  SW-bundle: ${guardedGaps.length} typeof-guarded identifier(s) undefined in worker context (guarded calls silently no-op in the SW):`);
+            guardedGaps.forEach(g => console.warn('    - ' + g.name + '  (near: ' + g.ctx + ')'));
+        }
     }
 
     // 7. Write output files

@@ -48,6 +48,11 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     var loadCustom = (typeof loadCustomSystemPrompt === 'function') ? loadCustomSystemPrompt() : Promise.resolve();
     var loadHooks = (typeof loadHooksSettings === 'function') ? loadHooksSettings() : Promise.resolve();
     var loadPerms = (typeof loadToolPermissionsInWorker === 'function') ? loadToolPermissionsInWorker() : Promise.resolve();
+    // Assumed-context-window setting (core/030-config.js). The SW agent loop's
+    // appendContextNotice and the registry's saturation gauges read it via
+    // getAssumedContextTokens; without hydration the SW would always use the
+    // 200k default even after the user changed the setting.
+    var loadCtxWindow = (typeof loadAssumedContextTokens === 'function') ? loadAssumedContextTokens() : Promise.resolve();
     // Smart documents tool runs in SW (HEADLESS_TOOLS.document = true), but its
     // in-memory smartDocuments cache is only hydrated by loadAllDocuments. The
     // page calls this from 120-init.js; the SW must do the same or the tool's
@@ -72,6 +77,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         safe(loadCustom, 'customSystemPrompt'),
         safe(loadHooks, 'hooksEnabled'),
         safe(loadPerms, 'toolPermissions'),
+        safe(loadCtxWindow, 'assumedContextTokens'),
         safe(loadDocs, 'smartDocuments'),
         safe(loadSubs, 'subAgents'),
         safe(Platform.ready, 'platform')

@@ -222,6 +222,21 @@ var TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'set_caveat',
+            description: 'Flag a single must-read caveat/warning about your final answer, shown to the user as a prominent amber warning card next to the TL;DR. Do NOT call this on your own or spontaneously — the after-response hook asks for it. Call it ONLY when your answer contains something the user must not miss: you deviated from the plan or the user\'s instructions, you made an assumption that needs double-checking, you left the work partially incomplete, or you ended with a question or requested action the user might overlook. Do NOT flag routine always-visible follow-ups — e.g. "the extension needs to be reloaded" or "the PR is not merged yet" — those are already shown to the user; only flag things the user would otherwise miss. If there is nothing like that, do NOT call it.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    caveat: { type: 'string', description: 'A short must-read warning (1-2 sentences, max ~300 chars): what the user must not miss — an off-plan deviation, an unverified assumption, incomplete work, or a trailing question/requested action.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['caveat']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'cached_content_outline',
             description: 'View structural outline of large cached tool results. When a tool returns data > 4k tokens, it is cached and an outline is shown. Use this to explore the cached content at different detail levels or focus on specific paths.',
             parameters: {
@@ -455,11 +470,11 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'update_action_state',
-            description: 'Maintain a live progress card with a state and todo list, visible to the user as either an action-button (background chats) or a sidebar timeline (foreground chats).\n\nWHEN TO CALL (concrete triggers — do not wait to be asked):\n  • Background Action chat (user message starts with "Run action: <name>") — ALWAYS, on the very first response. The PM only sees the button, not the chat transcript.\n  • Foreground chat — call as soon as ANY of these is true: (a) you expect to make 3+ tool calls before your final reply; (b) the user\'s request has 2+ named phases (e.g. implement → test → push, audit → fix → verify, build → embed → walkthrough); (c) the work spans multiple turns of a conversation working toward one goal; (d) you would naturally write a numbered plan in your reply.\n\nForeground triggers apply EQUALLY to background — "foreground" does not mean "optional". If you find yourself partway through a multi-phase task with no progress card, you already missed the trigger; create one now and backfill the completed steps as `done` tasks.\n\nFREQUENCY after the first call: every new step, task change, or result. State transitions: running (working), stuck (blocked/need input), done (success), error (failed). Call with state=done as soon as the work succeeds. Always pass the FULL `tasks` array (not a delta). On done/error always include `output` (markdown) — that is the headline summary the user sees.\n\nALWAYS also set `status_message` — a short human-friendly description of what THIS specific call is doing (e.g. "Marking audit complete", "Queuing render step"). `label` is the sticky card text; `status_message` is the per-call narration shown in the chat transcript. They are different fields.',
+            description: 'Maintain a live progress card with a state and todo list, visible to the user as either an action-button (background chats) or a sidebar timeline (foreground chats).\n\nWHEN TO CALL (concrete triggers — do not wait to be asked):\n  • Background Action chat (user message starts with "Run action: <name>") — ALWAYS, on the very first response. The PM only sees the button, not the chat transcript.\n  • Foreground chat — call as soon as ANY of these is true: (a) you expect to make 3+ tool calls before your final reply; (b) the user\'s request has 2+ named phases (e.g. implement → test → push, audit → fix → verify, build → embed → walkthrough); (c) the work spans multiple turns of a conversation working toward one goal; (d) you would naturally write a numbered plan in your reply.\n\nForeground triggers apply EQUALLY to background — "foreground" does not mean "optional". If you find yourself partway through a multi-phase task with no progress card, you already missed the trigger; create one now and backfill the completed steps as `done` tasks.\n\nFREQUENCY after the first call: every new step, task change, or result. State transitions: running (working), waiting (idle until dispatched sub-agents report back — non-terminal), stuck (blocked/need input), done (success), error (failed). Terminal success variants (all treated like done): finished = task fully completed; pr_opened = task completed AND a PR was opened/pushed; finished_with_caveat = completed but a caveat was flagged (pairs with set_caveat). Call with a terminal state as soon as the work succeeds. Always pass the FULL `tasks` array (not a delta). On done/error always include `output` (markdown) — that is the headline summary the user sees.\n\nALWAYS also set `status_message` — a short human-friendly description of what THIS specific call is doing (e.g. "Marking audit complete", "Queuing render step"). `label` is the sticky card text; `status_message` is the per-call narration shown in the chat transcript. They are different fields.',
             parameters: {
                 type: 'object',
                 properties: {
-                    state: { type: 'string', enum: ['running', 'stuck', 'done', 'error'], description: 'running = working, stuck = blocked or needs user attention, done = success, error = failed' },
+                    state: { type: 'string', enum: ['running', 'waiting', 'stuck', 'done', 'error', 'finished', 'pr_opened', 'finished_with_caveat'], description: 'running = working, waiting = idle until dispatched sub-agents report back (non-terminal, the task is still in progress), stuck = blocked or needs user attention, done = success, error = failed. Terminal success variants (treated like done): finished = task fully completed, pr_opened = task completed and a PR was opened/pushed, finished_with_caveat = completed but a caveat was flagged (pairs with set_caveat)' },
                     icon: { type: 'string', enum: ['search','shield','eye','play','check','close','spinner','lock','pause','stop','bell','code','database','stats','zap','alert','list','clipboard','rocket','bug'], description: 'Icon shown on the action button' },
                     label: { type: 'string', description: 'Short status text shown on the button (<= 60 chars)' },
                     tasks: {
@@ -558,7 +573,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'workspace',
-            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files. Returns up to 5 matches by default — pass `limit` (max 100) for more.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. Pass `files` (array of workspace paths) to push ONLY those dirty files — other dirty files stay modified locally and are left out of the commit/PR (use this to keep unrelated changes, e.g. from another chat, out of your PR). If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated).\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n- pin: Pin a workspace (pass `workspace`; `{unpin: true}` to clear). At most ONE pinned workspace per owner/repo — pinning clears any sibling pin. The pinned workspace wins default-workspace resolution (over MRU) and extension_build auto-detect, so Reload builds it. `list` exposes `pinned`/`forked_from`; `status` adds a `pin_notice` when a sibling holds the pin.\n- branch: LOCAL fork — creates workspace owner/repo::<branch> by cheaply copying the source workspace (args: `branch` = new branch name; optional `workspace` = source; `move_dirty` default true moves dirty edits to the fork and reverts the source clean, false copies them to both). The remote branch does NOT exist until the first push from the fork, which cuts it from the fork base. The fork is pinned automatically.\n- move: Move dirty edits between workspaces (args: `to` = target workspace key; optional `files` = paths, default all dirty; `workspace` = source). Writes the source content onto the target row (dirty recomputed vs the target own original) then discards the source. Blocks the WHOLE move when a target file is itself dirty with different content (unless `force`); reports `base_diverged` paths when the two bases differ.\n- hydrate: Pre-fetch lazy-clone file contents from GitHub (optionally limited to a `path` prefix). read/grep/edit hydrate on demand automatically — use this only to bulk-prefetch before many reads.\n\nMerge lifecycle: when the branch of a workspace is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the workspace — dirty files are moved to the base first (a blocked move keeps the workspace with a warning), the base is synced, and the pin follows the merge onto the base when the deleted workspace held it.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. Read-only actions surface ownership too: read and status include ownership metadata, and ls, grep, and diff attach cross_chat_warnings / per-entry flags when a listed, matched, or diffed file has uncommitted changes owned by another chat. Pass {"force": true} to override a hard block.',
+            description: 'Work with GitHub repositories: clone, browse, edit files, and push PRs. All data is stored locally in IndexedDB.\n\nWorkflow: clone a repo → browse/read/edit files → push changes as a PR.\n\nActions:\n- clone: Clone a repo (replaces existing clone). Fetches full tree + blobs.\n- ls: List files/directories at a path.\n- read: Read file content (optional offset/limit for large files).\n- write: Create or overwrite a file.\n- edit: Search-and-replace edits (same as servicenow_diff_edit — each find must be unique).\n- delete: Delete a file from the workspace.\n- grep: Regex search across files. Returns up to 5 matches by default — pass `limit` (max 100) for more.\n- status: List all modified files.\n- diff: Show diffs of modified files.\n- push: Commit dirty files and push them to a PR. Pass `files` (array of workspace paths) to push ONLY those dirty files — other dirty files stay modified locally and are left out of the commit/PR (use this to keep unrelated changes, e.g. from another chat, out of your PR). If branch_name does NOT exist yet, a new branch is created and a new PR is opened against the base branch we worked from. If branch_name ALREADY exists (a previous push), the commit is appended to that branch and the existing open PR is reused (its title is refreshed; the body is updated only when you pass a non-empty pr_body, so an append without pr_body keeps the existing description) — this is how you add more commits to the same PR. Each commit contains the full current changes against the base. Files stay modified locally on the base branch. Do NOT set base_branch — it auto-defaults to the source branch. The return value includes pr_reused (true when an existing PR was updated), a per-file `files` list with the same ownership fields as status (who edited each committed file, prior pushed_pr), and prominent `cross_chat_warnings` when a committed file belonged to ANOTHER chat or was already pushed to a DIFFERENT PR.\n- discard: Discard changes to a file (or all files if no path given). Resets to original cloned content. New files are removed, deleted files are restored.\n- pin: Pin a workspace (pass `workspace`; `{unpin: true}` to clear). At most ONE pinned workspace per owner/repo — pinning clears any sibling pin. The pinned workspace wins default-workspace resolution (over MRU) and extension_build auto-detect, so Reload builds it. `list` exposes `pinned`/`forked_from`; `status` adds a `pin_notice` when a sibling holds the pin.\n- branch: LOCAL fork — creates workspace owner/repo::<branch> by cheaply copying the source workspace (args: `branch` = new branch name; optional `workspace` = source; `move_dirty` default true moves dirty edits to the fork and reverts the source clean, false copies them to both). The remote branch does NOT exist until the first push from the fork, which cuts it from the fork base. The fork is pinned automatically.\n- move: Move dirty edits between workspaces (args: `to` = target workspace key; optional `files` = paths, default all dirty; `workspace` = source). Writes the source content onto the target row (dirty recomputed vs the target own original) then discards the source. Blocks the WHOLE move when a target file is itself dirty with different content (unless `force`); reports `base_diverged` paths when the two bases differ.\n- hydrate: Pre-fetch lazy-clone file contents from GitHub (optionally limited to a `path` prefix). read/grep/edit hydrate on demand automatically — use this only to bulk-prefetch before many reads.\n\nMerge lifecycle: when the branch of a workspace is the head of a MERGED PR and its base branch is cloned locally, sync auto-deletes the workspace — dirty files are moved to the base first (a blocked move keeps the workspace with a warning), the base is synced, and the pin follows the merge onto the base when the deleted workspace held it.\n\nCross-chat safety: every mutating action (write/edit/delete/copy/discard) is stamped with the current chat id. If a *currently running* chat has uncommitted changes on the same file, the next mutation from a different chat is blocked with a cross_chat_conflict error so two live agents do not silently clobber each other. If the other chat is dormant/closed, the mutation proceeds and a `cross_chat_warning` is attached to the response. Gitignored paths (dist/, .env, etc.) are exempt from the lock entirely — generated artefacts never block cross-chat work. After a successful push, ownership stamps are released. Read-only actions surface ownership too: read and status include ownership metadata, and ls, grep, and diff attach cross_chat_warnings / per-entry flags when a listed, matched, or diffed file has uncommitted changes owned by another chat. Pass {"force": true} to override a hard block.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -750,23 +765,26 @@ var TOOLS = [
     // Spawn background sub-agents to offload context-heavy work (file scans,
     // multi-record audits, log scraping). Each sub gets its own chat + context
     // window, runs to completion, and reports back a distilled summary via
-    // `report_to_parent`. Pool size = 2 concurrent; excess spawns queue.
+    // `report_to_parent`. Pool limits are per connection group (Orchestrator
+    // §5): 2 concurrent for Anthropic-OAuth-backed subs, 4 per endpoint for
+    // other providers, 6 overall; excess spawns queue.
     {
         type: 'function',
         function: {
             name: 'spawn_sub_agent',
-            description: 'Spawn a background sub-agent in a fresh chat to do focused, context-heavy work without polluting your context window. Returns immediately with {agent_id, chat_id, handle}. The sub runs in its own chat with its own context, calls `report_to_parent` when done, and the spawn handle resolves with the distilled summary — collect via `await_handle(handle)`. If the sub reports `status:"error"` or crashes (auto_report fallback), the OUTER handle settles as `status:"error"` too (snapshot.error = headline, snapshot.result = full report). Use for: file/grep dumps, multi-record audits, deep log scans, iterative debugging. Do NOT use for: single small Table API calls or work whose result must flow into the very next tool call. Pass `output_schema` to declare the exact shape the sub must return in report_to_parent\'s `data` — handy when you spawn and parse the result programmatically (e.g. inside js_eval).',
+            description: 'Spawn a background sub-agent in a fresh chat to do focused, context-heavy work without polluting your context window. Returns immediately with {agent_id, chat_id, handle}. The sub runs in its own chat with its own context, calls `report_to_parent` when done, and the spawn handle resolves with the distilled summary — collect via `await_handle(handle)`. If the sub reports `status:"error"` or crashes (auto_report fallback), the OUTER handle settles as `status:"error"` too (snapshot.error = headline, snapshot.result = full report). Use for: ALL substantive work — file/grep dumps, multi-record audits, deep log scans, iterative debugging, and EVERY workspace file edit or implementation task no matter how small (a 2-line edit is still implementation). Do NOT use for: orchestration mechanics (reviewing deliverables, progress cards, user prompts, the orchestrator-only irreversible writes) or work whose result must flow into the very next tool call. Pass `output_schema` to declare the exact shape the sub must return in report_to_parent\'s `data` — handy when you spawn and parse the result programmatically (e.g. inside js_eval). ALWAYS pick a model explicitly via `tier` (small|medium|large|same) — never omit it (omitting silently inherits the default tier). small/medium/large are size tiers the user maps to concrete models in Settings (the agent never sees model/provider names); `tier:"same"` instead makes the sub DYNAMICALLY follow the spawner\'s current model — resolved at each call, so it tracks later model switches — bypassing the tier→model mapping. Default to `tier:"small"` for discovery, search, and audit fan-outs; `tier:"medium"` for code-review fan-outs and synthesis/triage/moderate implementation; reserve `large` for heavy implementation or subtle reasoning; escalate later with wake_sub_agent({tier}) if the sub struggles.',
             parameters: {
                 type: 'object',
                 properties: {
-                    instructions: { type: 'string', description: 'The task. Becomes the sub\'s first user message. Be specific about what should be returned (e.g. "return only sys_ids and names, no script bodies"). Write in markdown — it is rendered as markdown in the parent chat\'s sub-agent panel.' },
+                    instructions: { type: 'string', description: 'The task. Becomes the sub\'s first user message. Be specific about what should be returned (e.g. "return only sys_ids and names, no script bodies"). Write in markdown — it is rendered as markdown in the parent chat\'s sub-agent panel. If any active skills are relevant to the task, name them here and tell the sub to read them with get_skill before starting (e.g. "Read the atf-testing skill first").' },
                     name: { type: 'string', description: 'Short label shown in the sidebar / Workers strip. Defaults to a generated id.' },
                     allow_nested: { type: 'boolean', description: 'If true, the sub may spawn/stop/wake its own sub-agents (default: false). Use only when you genuinely need the sub to delegate further — multi-stage research, recursive audits, etc. Max nesting depth is 5.' },
                     context_seed: { type: 'object', description: 'Small JSON blob copied into the sub\'s first message (record ids, queries, etc.).' },
                     output_schema: { type: 'object', description: 'Optional JSON-Schema-ish object describing the EXACT shape the sub must return in report_to_parent\'s `data` field. Injected into the sub\'s first message with a directive to conform (same keys/types, no extras). Use when you spawn + parse the result programmatically (e.g. inside one js_eval) and want a predictable structure to destructure. The root should be an object (report_to_parent\'s `data` is itself an object) — wrap arrays in a named property, e.g. {items:[...]}, rather than using a root-level array.' },
                     auto_report: { type: 'boolean', description: 'If true (default), a fallback report is synthesized from the last assistant message if the sub finishes without calling report_to_parent.' },
-                    wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash, budget force-stop): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Pass false for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
+                    wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash, budget force-stop): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Keeping the DEFAULT true is the RECOMMENDED pattern for fan-outs — end your turn and react to each report as it wakes you. Pass false ONLY for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
                     max_tool_calls: { type: 'number', description: 'Soft tool-call budget for the sub. Default: 300. From 90% usage onward (and on every call past the budget) an escalating warning is appended to its tool results telling it to wrap up and report_to_parent. Safety backstop: a sub that ignores every warning is force-stopped at 2x the budget.' },
+                    tier: { type: 'string', enum: ['small', 'medium', 'large', 'same'], description: 'Pick the sub\'s model size tier. There are three size tiers — small | medium | large (plus `same`) — which the user maps to concrete models in Settings → Sub-Agent Model Tiers; the agent never sees or chooses model/provider names. small = cheap fan-outs (searches, summaries, discovery/scoping); medium = code-review passes and synthesis/triage/moderate implementation; large = heavy implementation or subtle reasoning. same = the sub DYNAMICALLY follows the spawner\'s current model (resolved per LLM call, so it tracks later model switches), bypassing the tier→model mapping — use when the sub must always run on exactly the model you are on, e.g. a self-evaluation. Set this explicitly on EVERY spawn.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['instructions']
@@ -795,7 +813,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'agent_status',
-            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, tool_calls_used, inbox size, pool position, and action_state — the sub\'s live update_action_state progress card ({state, label, tasks[], output}), i.e. how to check a running sub\'s progress and its current todo list without reading its chat. Each sub also carries lifecycle diagnostics: last_error {message, at, transient, retried}, crash_cause, retries_used (transient network/timeout crashes are auto-retried once before the sub is declared errored), resurrectable (true when an errored/stopped sub can be revived via wake_sub_agent with its full prior context intact), and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
+            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, tool_calls_used, inbox size, pool position, and action_state — the sub\'s live update_action_state progress card ({state, label, tasks[], output}), i.e. how to check a running sub\'s progress and its current todo list without reading its chat. Each sub also carries `usage` (per-sub LLM cost rollup: {calls, input_tokens, output_tokens, cost, by_tier}), saturation gauges `context_tokens`/`context_pct`/`tool_budget_pct`/`saturated` (measured against a FIXED assumed 200k-token window, model-independent — threshold is 100k = 50% of context, and tool budget saturates at 50% too; check these before re-tasking a sub), `revisions_requested` + `escalation_suggestion` (after 2 revision_requested verdicts: the next tier up, or an independent fresh-context reviewer sub when already at the top — suggestion only, never auto-applied), and `pending_approvals`/`awaiting_approval` ({tool, since} while a tool call is parked on a permission modal in the sub\'s chat). Each sub also carries lifecycle diagnostics: last_error {message, at, transient, retried}, crash_cause, retries_used (transient network/timeout crashes are auto-retried once before the sub is declared errored), resurrectable (true when an errored/stopped sub can be revived via wake_sub_agent with its full prior context intact), and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -810,12 +828,14 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'wake_sub_agent',
-            description: 'Resume a sleeping sub-agent — or RESURRECT an errored/stopped one — optionally with a new instruction. Resurrection revives the sub with its FULL prior chat context (a crashed sub continues where it left off instead of redoing the work), as long as its record/transcript still exists (terminal subs are garbage-collected ~1h after settling). If the sub has queued inbox messages, they are drained into a combined user turn on wake. Returns `{handle}` — an awaitable spawn handle for the resumed run (a fresh handle if the previous one already settled, or the existing one if it\'s still pending), plus `resurrected_from` when a terminal sub was revived. The parent should `await_handle(result.handle)` to collect the next `report_to_parent` payload. No-op if the sub is already running.',
+            description: 'Resume a sleeping sub-agent — or RESURRECT an errored/stopped one — optionally with a new instruction. Resurrection revives the sub with its FULL prior chat context (a crashed sub continues where it left off instead of redoing the work), as long as its record/transcript still exists (terminal subs are garbage-collected ~1h after settling). If the sub has queued inbox messages, they are drained into a combined user turn on wake. Returns `{handle}` — an awaitable spawn handle for the resumed run (a fresh handle if the previous one already settled, or the existing one if it\'s still pending), plus `resurrected_from` when a terminal sub was revived. The parent should `await_handle(result.handle)` to collect the next `report_to_parent` payload. No-op if the sub is already running. After 2 `revision_requested` verdicts the result also carries `escalation_suggestion` (next tier up, or an independent fresh-context reviewer sub when already at the top tier) — a suggestion only, never auto-applied. The result may also carry a non-blocking `saturation_warning` when the woken sub is past 50% of the assumed 200k-token context window or its tool budget — treat it as the signal to let this sub wrap up and spawn a FRESH successor instead of piling on more work.',
             parameters: {
                 type: 'object',
                 properties: {
                     agent_id: { type: 'string', description: 'Sub agent_id to wake.' },
                     instruction: { type: 'string', description: 'Optional new user message. Drained with any pending inbox into the sub\'s next turn.' },
+                    tier: { type: 'string', enum: ['small', 'medium', 'large', 'same'], description: 'Optional escalation by size tier (small | medium | large | same) — e.g. escalate a failing small-model sub to large for its next phase. `same` switches the sub to DYNAMICALLY follow the waking agent\'s current model (tracked per call). By default a woken/resurrected sub stays on its spawn-time tier.' },
+                    review_state: { type: 'string', enum: ['accepted', 'revision_requested'], description: 'Optional review verdict for the sub\'s LAST reported deliverable (Orchestrator review flow): "accepted" = the parent accepts it as-is, "revision_requested" = the accompanying `instruction` asks for changes. Applied even when the wake is otherwise a no-op. ("pending" is stamped automatically on every report; "cross_checked" automatically when an independent reviewer sub is aimed at it.) Read back via agent_status.review_state.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['agent_id']
@@ -856,7 +876,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'agent_message',
-            description: 'Send a message between agents. From a parent: `to:"sub_xxx"` pushes to that sub (auto-wakes if sleeping unless wake:false; the response includes a fresh `handle` the parent can `await_handle` for the resumed run\'s next report). From a sub: `to:"parent"` pushes a mid-flight status update to the parent chat (renders as an inline callout, does NOT settle the spawn handle, the sub keeps running). For terminal sub→parent results that should settle the handle, use `report_to_parent`.',
+            description: 'Send a message between agents. From a parent: `to:"sub_xxx"` pushes to that sub (auto-wakes if sleeping unless wake:false; the response includes a fresh `handle` the parent can `await_handle` for the resumed run\'s next report). Avoid piling new requirements onto a sub past ~50% of the assumed FIXED 200k-token context window (or its tool budget) — the result carries a non-blocking `saturation_warning` when it is; have the sub wrap up and spawn a fresh successor instead. From a sub: `to:"parent"` pushes a mid-flight status update to the parent chat (renders as an inline callout, does NOT settle the spawn handle, the sub keeps running). For terminal sub→parent results that should settle the handle, use `report_to_parent`.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -902,6 +922,61 @@ var TOOLS = [
                 required: []
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'runtime_inspect',
+            description: 'DEV-MODE ONLY: introspect and drive the AppAgent extension\'s OWN runtime (panel page, IndexedDB, service worker) while developing the extension. Available only when Reload rebuilds from the workspace (extension-dev skill active AND deploy folder connected); every call errors otherwise. Actions: \'ui_state\' (snapshot of page state: current chat/view, running+paused chats, chat list summary, pending tool approvals, widgets, lastApiError, LLM connection status, theme, active skills, dev-mode flag); \'get\' {path} (CSP-safe read of any page global/path, e.g. "chats[\'chat_123\'].messages[0]" or "currentChatId"); \'call\' {path, args} (CSP-safe invocation of an existing page function with its parent object as `this`, e.g. path:"renderChatList"); \'set\' {path, value, call_after} (CSP-safe UI-state WRITE + re-render path: resolves the PARENT of the path and assigns the final segment to value — any JSON value; optional call_after is a function path invoked with no args afterwards, e.g. "renderChatList", so the UI re-renders from the new state); \'dispatch\' {target, event, payload, selector, options} (event-trigger path with three targets. target:\'bus\' — the default — emits on the page AgentEvents bus: AgentEvents.emit(event, payload), invoking the REAL page-side handlers (event names are the AgentEvents.emit vocabulary, e.g. messagesAppended, actionStateChanged, runFinished); target:\'sw\' posts {type: event, ...payload} to the service worker over the agent bus port, hitting the SW inbound handlers (port-bridge switch: pull-chat, toggle-pause, interrupt, focus-chat, update-chat, …); target:\'dom\' {selector, event, options} fires a DOM event on an element of the PANEL PAGE\'s own document — NOT the ServiceNow iframe (plain click uses el.click(); otherwise the proper class: MouseEvent, KeyboardEvent with options.key, InputEvent/Event with bubbles:true; matched:false — success, not an error — when the selector matches nothing). WARNING: bus/sw dispatch invokes REAL handlers and can mutate run state (interrupt / toggle-pause are live controls). Together with \'get\'/\'call\', set + dispatch cover CSP-safe state reads, writes and event triggering); \'db\' {op:\'list\'|\'get\'|\'query\'|\'count\'|\'grep\', store, key, path, pattern, flags, limit} (inspect the extension\'s own IndexedDB: list store names; get one record by key — optional path drills into the record with the same dot/bracket syntax (e.g. "messages[3].content") and returns {exists, value}, exists:false for a missing intermediate; query up to `limit` records; count all records; or grep {store, pattern, flags?, key?, path?, limit?} — regex-search STRING leaves record-by-record via an IDB cursor, each match {key, path, excerpt: match ±60 chars}, default flags \'i\', limit = max matches (default 20, cap 100), ~1MB of string scanned per record, returns {matches, truncated, records_scanned, records_capped} — plus key_found when key was passed); \'sw_state\' (pull live service-worker state over the port: running chats, pending/parked tool calls, connected panel count, resume-scan flag); \'screenshot\' (capture the panel via chrome.tabs.captureVisibleTab — LIMITATION: fails with an explanatory error when the panel runs in the side panel, because it has no tab of its own; open the panel as a full tab first); \'new_chat\' {focus} (create a chat; focus:false creates in background); \'focus_chat\' {chatId} (navigate to a chat from anywhere); \'set_view\' {view} (switch main view: home|chat|dashboard|skills|documents|history|docs|settings). All results are safe-serialized (depth 6, 4KB per string, 64KB total) — except \'screenshot\', whose base64 is returned in full.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    action: { type: 'string', enum: ['ui_state', 'get', 'call', 'set', 'dispatch', 'db', 'sw_state', 'screenshot', 'new_chat', 'focus_chat', 'set_view'], description: 'What to inspect or do.' },
+                    path: { type: 'string', description: 'For get/call/set: dot/bracket path resolved from window, e.g. "chats[\'id\'].title" or "SubAgents.getById". For db get/grep: sub-path INSIDE the record to drill into / search under (walked over the plain record, not window).' },
+                    args: { type: 'array', description: 'For call: arguments array applied to the resolved function.' },
+                    value: { description: 'For set: the new value to assign at the path (any JSON value).' },
+                    call_after: { type: 'string', description: 'For set: optional function path invoked with no args after the write (e.g. "renderChatList") so the UI re-renders from the new state.' },
+                    target: { type: 'string', enum: ['bus', 'sw', 'dom'], description: 'For dispatch: where to send the event — bus (AgentEvents page bus, default), sw (service-worker port message), dom (panel-page DOM element).' },
+                    event: { type: 'string', description: 'For dispatch: event name. bus: an AgentEvents type (e.g. messagesAppended); sw: an SW port message type (e.g. pull-chat, toggle-pause); dom: a DOM event (click, keydown, input, …).' },
+                    payload: { type: 'object', description: 'For dispatch bus/sw: event payload — bus: passed as the emit detail; sw: merged into the port message beside type (e.g. {chatId: "chat_123"}).' },
+                    selector: { type: 'string', description: 'For dispatch target dom: CSS selector of the panel-page element (document.querySelector).' },
+                    options: { type: 'object', description: 'For dispatch target dom: event init options (e.g. {key: "Enter"} for keydown). bubbles/cancelable default to true.' },
+                    op: { type: 'string', enum: ['list', 'get', 'query', 'count', 'grep'], description: 'For db: operation. Default: list.' },
+                    pattern: { type: 'string', description: 'For db grep: regex source tested against every string leaf of each record.' },
+                    flags: { type: 'string', description: "For db grep: regex flags (default 'i')." },
+                    store: { type: 'string', description: 'For db get/query: object store name (see op:list).' },
+                    key: { type: ['string', 'number'], description: 'For db get/grep: record key — string OR numeric (IDB keys can be numeric); passed as-is to store.get (grep: restricts the search to that one record).' },
+                    limit: { type: 'number', description: 'For db query: max records; for db grep: max matches (default 20, cap 100).' },
+                    chatId: { type: 'string', description: 'For focus_chat: chat id to open.' },
+                    view: { type: 'string', enum: ['home', 'chat', 'dashboard', 'skills', 'documents', 'history', 'docs', 'settings'], description: 'For set_view: target view.' },
+                    focus: { type: 'boolean', description: 'For new_chat: false creates the chat without navigating to it. Default: true.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['action']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_tool_schema',
+            description: 'Fetch the full JSON schema + description for one or more tools listed in the deferred tool catalog (system prompt). Read this BEFORE calling a catalog tool whose parameters you do not already know — the schema arrives in this tool_result and stays in the conversation history for the rest of the chat. Nothing is loaded or registered: this is a read, not a setup step. Batch several names in one call to save round-trips.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    names: {
+                        description: 'Tool name(s) from the catalog to fetch — an array of names (a single name string is also accepted).',
+                        type: 'array',
+                        items: { type: 'string' }
+                    },
+                    status_message: {
+                        description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)',
+                        type: 'string'
+                    }
+                },
+                required: ['names']
+            }
+        }
     }
 ];
 
@@ -920,9 +995,13 @@ var HEADLESS_TOOLS = {
     set_chat_title: true,
     set_tldr: true,
     set_links: true,
+    set_caveat: true,
     cached_content_outline: true,
     cached_content_search: true,
     cached_content_read: true,
+    // get_tool_schema is pure metadata (reads TOOLS + the skillTools
+    // registry, both present in the SW bundle) — fully headless.
+    get_tool_schema: true,
     // get_skill / manage_skill / update_action_state / show_action_button
     // live in tools/080-widget-tools.js + tools/120-actions.js — neither is
     // in WORKER_SHARED_FILES, and the impls reach into page-only globals
@@ -969,10 +1048,362 @@ var HEADLESS_TOOLS = {
     prompt_user: false,
     // github_setup opens a modal in the side panel DOM (impl in
     // tools/130-github-setup.js, page bundle only — not in WORKER_SHARED_FILES).
-    github_setup: false
+    github_setup: false,
+    // runtime_inspect reads page globals + drives the panel UI (impl in
+    // tools/140-runtime-inspect.js, page bundle only) — must be routed to a
+    // connected panel executor, never run headless in the SW.
+    runtime_inspect: false
+};
+// ─── short catalog descriptions ─────────────────────────────────────────────
+// One-liners for the deferred-tool catalog ({{TOOL_CATALOG}} in the system
+// prompt): "what + when to use me" in ≤ ~20 words. Co-located map (same
+// pattern as HEADLESS_TOOLS above) stamped onto each entry as `.short`.
+// Render-time fallback: first sentence of the full description
+// (getToolShortDescription below). NON-WIRE: `short` is stripped from the
+// request array by prepareToolsForRequest — it must never ship to the API.
+var TOOL_SHORT_DESCRIPTIONS = {
+    js_eval: 'Run JavaScript in a sandbox to chain multiple tool calls (executeTool) in one step.',
+    servicenow_api: 'Read/write ServiceNow records via the Table API — the preferred path for record CRUD.',
+    servicenow_run_script: 'Run server-side JavaScript on a ServiceNow instance (admin only) for things the Table API cannot do.',
+    servicenow_diff_edit: 'Edit a ServiceNow record field with search-and-replace — for surgical script/code changes.',
+    iframe_tool: 'Drive the instance UI in an iframe — navigate, click, fill, inspect — for genuine UI work only.',
+    set_chat_title: 'Set the chat title; normally requested by the after-response hook.',
+    set_tldr: 'Set the TL;DR summary card for the final answer; requested by the after-response hook.',
+    set_links: 'Provide relevant links for the answer card; requested by the after-response hook.',
+    set_caveat: 'Flag one must-read caveat about the final answer; requested by the after-response hook.',
+    cached_content_outline: 'View the structural outline of a large cached tool result.',
+    cached_content_search: 'Regex-search inside a large cached tool result.',
+    cached_content_read: 'Read a specific path or line range of a large cached tool result.',
+    get_skill: 'Read an AI skill body or one of its files before starting related work.',
+    manage_skill: 'Create, update, edit, activate, or delete AI skills and their files (live runtime copy).',
+    html_widget: 'Render a custom interactive HTML widget inline in chat when no display template fits.',
+    take_screenshot: 'Capture a PNG screenshot of the browser panel, a widget, or an element for visual analysis.',
+    screenshot_by_id: 'Retrieve a previously taken screenshot by its ID.',
+    get_file: 'Retrieve any stored file by ID — view it (attach) or hand the user a download.',
+    display: 'Render structured data with a predefined template: table, chart, code, diff, timeline, cards, checklist.',
+    update_action_state: 'Maintain the live progress card (state + todo list) for multi-step work.',
+    show_action_button: 'Render a one-click skill Action button inline in chat.',
+    prompt_user: 'Show a blocking inline form to collect structured user input or confirm a plan.',
+    web_fetch: 'Fetch a URL (GET/POST); for HTML pages, fetch and parse via js_eval instead.',
+    workspace: 'Clone, browse, edit, and push GitHub repos — the code-editing workspace.',
+    read_attached_file: 'Read a text file the user attached to this conversation.',
+    document: 'Create, read, edit, and manage persistent versioned Smart Documents rendered inline.',
+    list_instances: 'List connected ServiceNow instances with status and user info.',
+    await_handle: 'Block until one async tool handle settles and return its snapshot.',
+    poll_handle: 'Non-blocking peek at an async tool handle status.',
+    await_any: 'Wait for the first of several async handles to settle.',
+    await_all: 'Wait for all of several async handles to settle.',
+    cancel_handle: 'Cancel an in-flight async tool handle and discard its result.',
+    spawn_sub_agent: 'Spawn a sub-agent chat on a chosen tier to do focused delegated work.',
+    report_to_parent: 'Sub-agent only: push the distilled result to the parent and park.',
+    agent_status: 'Read-only snapshot of sub-agents: progress, saturation, reports, approvals.',
+    wake_sub_agent: 'Wake a parked sub-agent with follow-up instructions; returns a fresh handle.',
+    stop_sub_agent: 'Terminate a sub-agent and cancel its pending work.',
+    sleep_self: 'Sub-agent only: park yourself until the parent wakes you.',
+    agent_message: 'Send a message between agents (parent↔sub) without settling the spawn handle.',
+    eval_runner: 'Sandboxed grader for the ServiceNow eval skill lifecycle (init, setup, verify, teardown).',
+    github_setup: 'Open the GitHub setup popup to connect an account or clone a repo.',
+    runtime_inspect: 'Dev-mode only: introspect and drive the AppAgent extension runtime itself.',
+    get_tool_schema: 'Fetch full JSON schemas for catalog tools before calling one whose parameters you do not know.'
 };
 for (var _ti = 0; _ti < TOOLS.length; _ti++) {
     var _tn = TOOLS[_ti].function && TOOLS[_ti].function.name;
     TOOLS[_ti].headless = !!HEADLESS_TOOLS[_tn];
+    TOOLS[_ti].short = TOOL_SHORT_DESCRIPTIONS[_tn] || '';
 }
 function isHeadlessTool(name) { return !!HEADLESS_TOOLS[name]; }
+
+// ─── Deferred tool loading (tools-as-skills) ─────────────────────────────────
+// Shared by BOTH getEnabledTools twins (page: ui/140-dropdowns.js, worker:
+// worker/025-permissions-helpers.js), the {{TOOL_CATALOG}} renderer
+// (core/110-system-prompt.js) and the get_tool_schema meta-tool. This file
+// is loaded in both bundles (core tier + WORKER_SHARED_FILES) — the split
+// is implemented HERE ONLY; never fork it into the twins.
+//
+// CORE_TOOL_NAMES = tools whose full schemas are always declared in the
+// request when deferred mode is ON (agreed list — see the design handoff):
+// workhorses, discovery, hook tools, progress, and the orchestrator loop
+// (+ report_to_parent on the sub-agent side; parent chats filter it out of
+// the enabled list anyway). EVERYTHING else — including active-skill tools
+// — is deferred: cataloged by name + one-liner, schema fetched on demand
+// via get_tool_schema, then called natively (dispatch in
+// tools/020-tool-execution.js routes by name, not by the declared array).
+var CORE_TOOL_NAMES = {
+    js_eval: true,
+    get_tool_schema: true,
+    get_skill: true,
+    set_tldr: true,
+    set_chat_title: true,
+    update_action_state: true,
+    spawn_sub_agent: true,
+    await_handle: true,
+    report_to_parent: true
+};
+
+function isDeferredToolName(name) {
+    return !CORE_TOOL_NAMES[name];
+}
+
+// Split an (already permission/hook/dev-mode/roster-filtered) tool list
+// into { core, deferred }, PRESERVING input order — determinism matters
+// for prompt-cache byte-stability across turns.
+function getDeferredSplit(allTools) {
+    var core = [], deferred = [];
+    for (var i = 0; i < allTools.length; i++) {
+        var t = allTools[i];
+        var n = t && t.function && t.function.name;
+        if (n && CORE_TOOL_NAMES[n]) core.push(t); else deferred.push(t);
+    }
+    return { core: core, deferred: deferred };
+}
+
+// Strip non-wire fields before entries are serialized into a request.
+// `short` is ALWAYS stripped (new field — must never ship). `headless` is
+// stripped only in deferred mode: the legacy (flag OFF) request must stay
+// BYTE-IDENTICAL to today's wire shape, and today's requests already ship
+// the stamped `headless` key. Shallow copies — the TOOLS source objects
+// are never mutated.
+//
+// Flag OFF also excludes get_tool_schema from the DECLARED array — the
+// meta-tool is a new TOOLS entry, so shipping it would make the flag-OFF
+// request differ from the pre-upgrade wire shape (43 tools instead of 42,
+// and the Anthropic cache_control tail landing on a new last entry). The
+// IMPLEMENTATION stays callable regardless (executor routes by name;
+// js_eval executeTool falls through the same dispatch). Gate lives HERE
+// ONLY — both getEnabledTools twins call this; never fork it into them.
+function prepareToolsForRequest(allTools, deferredActive) {
+    if (!deferredActive) {
+        allTools = allTools.filter(function(t) {
+            return !(t && t.function && t.function.name === 'get_tool_schema');
+        });
+    }
+    return allTools.map(function(t) {
+        var copy = Object.assign({}, t);
+        delete copy.short;
+        if (deferredActive) delete copy.headless;
+        return copy;
+    });
+}
+
+// One-liner for a tool: curated map first (survives prepareToolsForRequest
+// stripping), then a stamped/skill-def `short`, then the first sentence of
+// the full description.
+function getToolShortDescription(tool) {
+    var fn = tool && tool.function;
+    var name = fn && fn.name;
+    if (name && TOOL_SHORT_DESCRIPTIONS[name]) return TOOL_SHORT_DESCRIPTIONS[name];
+    if (tool && tool.short) return tool.short;
+    if (fn && fn.short) return fn.short;
+    var desc = (fn && fn.description) || '';
+    var m = desc.match(/^[\s\S]*?[.!?](?=\s|$)/);
+    var s = (m ? m[0] : desc).replace(/\s+/g, ' ').trim();
+    if (s.length > 200) s = s.slice(0, 197) + '...';
+    return s;
+}
+
+// Render the {{TOOL_CATALOG}} block from a DEFERRED tool list. Returns ''
+// for an empty list. The heading doubles as the dedupe marker for the
+// custom-system-prompt auto-append (_maybeAppendToolCatalog in
+// core/110-system-prompt.js) — keep them in sync.
+var TOOL_CATALOG_HEADING = 'ADDITIONAL AVAILABLE TOOLS (deferred schemas):';
+function buildToolCatalog(tools) {
+    if (!tools || tools.length === 0) return '';
+    var lines = [];
+    for (var i = 0; i < tools.length; i++) {
+        var t = tools[i];
+        var n = t && t.function && t.function.name;
+        if (!n) continue;
+        lines.push('- ' + n + ' — ' + getToolShortDescription(t));
+    }
+    if (lines.length === 0) return '';
+    return TOOL_CATALOG_HEADING + '\n'
+        + 'The tools below exist and are callable, but their schemas are not loaded into this request. '
+        + 'Before calling any tool below whose parameters you do not already know, call get_tool_schema '
+        + 'with its name(s) — the full schema arrives in the tool_result and stays in the conversation '
+        + 'history for the rest of the chat (nothing is loaded or registered). Then call the tool '
+        + 'directly, exactly like a declared tool. Once the schema is fetched (or when you already '
+        + 'know the parameters), these tools are called NATIVELY as top-level tool calls — do NOT '
+        + 'route them through js_eval executeTool(), except when genuinely chaining several calls '
+        + 'in one script.\n'
+        + lines.join('\n');
+}
+
+// Shared catalog renderer for the system prompt. Empty string when the
+// deferred flag is OFF (so the {{TOOL_CATALOG}} placeholder renders to
+// nothing) or when nothing is deferred. Uses the SAME filtered list as the
+// request build — the getEnabledTools twin of the current realm, with
+// includeDeferred so the split happens here — which means permission/
+// hook/dev-mode disabled tools appear in neither the slim array nor the
+// catalog, and sub-agent rosters scope the catalog too.
+function getToolCatalogForPrompt(chatId) {
+    try {
+        if (typeof isDeferredToolsActive !== 'function' || !isDeferredToolsActive()) return '';
+        if (typeof getEnabledTools !== 'function') return '';
+        var all = getEnabledTools(chatId, { includeDeferred: true });
+        return buildToolCatalog(getDeferredSplit(all).deferred);
+    } catch (e) {
+        // A silent '' here would make every deferred tool undiscoverable
+        // with no trace — always leave a breadcrumb.
+        console.warn('[deferred-tools] catalog render failed', e);
+        return '';
+    }
+}
+
+// get_tool_schema implementation (dispatch arm in
+// tools/020-tool-execution.js; headless — runs SW-local). Read-only
+// metadata: returns the full JSON schema + description for cataloged
+// tools. Only exposes tools that pass the same permission/enabled filters
+// as the request build — a disabled tool is absent from the catalog AND
+// from here.
+function executeGetToolSchema(args, options) {
+    var names = args && (args.names !== undefined && args.names !== null ? args.names : args.name);
+    if (typeof names === 'string') names = [names];
+    if (!Array.isArray(names) || names.length === 0) {
+        return { success: false, error: 'Provide `names`: an array of tool names from the tool catalog (a single name string is also accepted).' };
+    }
+    var chatId = (options && options.chatId)
+        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    // FAIL CLOSED: resolve against the chat's enabled/filtered list only.
+    // Never fall back to the raw TOOLS array — that would expose schema
+    // text of permission-disabled or roster-excluded tools.
+    if (typeof getEnabledTools !== 'function') {
+        return { success: false, error: 'Could not resolve enabled tools: getEnabledTools is unavailable in this context.' };
+    }
+    var enabled;
+    try {
+        enabled = getEnabledTools(chatId, { includeDeferred: true });
+    } catch (e) {
+        return { success: false, error: 'Could not resolve enabled tools: ' + (e && e.message ? e.message : String(e)) };
+    }
+    var byName = {};
+    for (var i = 0; i < enabled.length; i++) {
+        var t = enabled[i];
+        if (t && t.function && t.function.name) byName[t.function.name] = t;
+    }
+    var schemas = [];
+    var errors = [];
+    for (var j = 0; j < names.length; j++) {
+        var n = names[j];
+        if (typeof n !== 'string' || !n) { errors.push('Invalid name at index ' + j + '.'); continue; }
+        var hit = byName[n];
+        if (hit) {
+            schemas.push({
+                name: n,
+                description: (hit.function && hit.function.description) || '',
+                parameters: (hit.function && hit.function.parameters) || { type: 'object', properties: {} }
+            });
+        } else {
+            var lower = n.toLowerCase();
+            var close = Object.keys(byName).filter(function(k) {
+                var kl = k.toLowerCase();
+                return kl.indexOf(lower) !== -1 || lower.indexOf(kl) !== -1;
+            });
+            errors.push('Unknown or unavailable tool "' + n + '".'
+                + (close.length ? ' Close matches: ' + close.join(', ') + '.' : '')
+                + ' Check the tool catalog in the system prompt for the available tools.');
+        }
+    }
+    var result = { success: errors.length === 0, schemas: schemas };
+    if (errors.length > 0) result.error = errors.join(' ');
+    if (schemas.length > 0) {
+        result.note = 'These schemas are now part of the conversation history — CALL THE TOOL(S) NATIVELY as top-level tool calls with these parameters. No loading or registration step is needed. Do NOT wrap these tools in js_eval executeTool() — that is a fallback reserved for genuine multi-call chaining in one script, never the default. If a native call fails validation, fix the arguments and retry natively; do not fall back to js_eval.';
+    }
+    return result;
+}
+
+// Lightweight argument validation for NATIVE calls to deferred tools
+// (required params present + primitive type check). Returns null when OK,
+// else { error, schema } — the executeTool caller returns the FULL schema
+// in the failure so the model self-corrects from the tool_result without a
+// get_tool_schema round-trip. Deliberately shallow: no nested/enum/format
+// checks — the executor + provider remain the real validators.
+// LENIENT COERCION: some providers/harnesses stringify scalar args (e.g.
+// start_line: "200"). On a type mismatch we first try to coerce the string
+// to the declared type and MUTATE the args object in place so downstream
+// execution receives the proper type — only impossible coercions error.
+function validateArgsAgainstToolSchema(name, args) {
+    try {
+        // FAIL CLOSED: resolve the definition ONLY from the same enabled/
+        // filtered list executeGetToolSchema uses — never raw TOOLS or the
+        // skillTools registry, which would echo schema text of permission-
+        // disabled / roster-excluded tools into the validation error
+        // payload. If the enabled list can't be resolved, skip validation
+        // (return null) and let normal dispatch continue.
+        if (typeof getEnabledTools !== 'function') return null;
+        var chatId = (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var enabled = getEnabledTools(chatId, { includeDeferred: true });
+        var def = null;
+        for (var i = 0; i < enabled.length; i++) {
+            var t = enabled[i];
+            if (t && t.function && t.function.name === name) { def = t.function; break; }
+        }
+        if (!def || !def.parameters || typeof def.parameters !== 'object') return null;
+        var params = def.parameters;
+        var a = (args && typeof args === 'object') ? args : {};
+        var problems = [];
+        var required = Array.isArray(params.required) ? params.required : [];
+        for (var r = 0; r < required.length; r++) {
+            if (a[required[r]] === undefined || a[required[r]] === null) {
+                problems.push('Missing required parameter "' + required[r] + '".');
+            }
+        }
+        var props = (params.properties && typeof params.properties === 'object') ? params.properties : {};
+        Object.keys(a).forEach(function(k) {
+            var p = props[k];
+            if (!p || !p.type || typeof p.type !== 'string') return;
+            var v = a[k];
+            if (v === undefined || v === null) return;
+            var actual = Array.isArray(v) ? 'array' : typeof v;
+            var expected = (p.type === 'integer') ? 'number' : p.type;
+            if (expected === 'array' || expected === 'object' || expected === 'string'
+                || expected === 'number' || expected === 'boolean') {
+                if (actual !== expected) {
+                    // Try lenient coercion of stringified values before failing.
+                    // Successful coercions write back into `a` (=== args) so
+                    // the executor sees the properly typed value.
+                    if (actual === 'string') {
+                        var s = v.trim();
+                        if (expected === 'number' && s !== '') {
+                            var num = Number(s);
+                            if (isFinite(num) && (p.type !== 'integer' || num % 1 === 0)) {
+                                a[k] = num;
+                                return;
+                            }
+                        } else if (expected === 'boolean') {
+                            var lc = s.toLowerCase();
+                            if (lc === 'true' || lc === 'false') {
+                                a[k] = (lc === 'true');
+                                return;
+                            }
+                        } else if (expected === 'array' || expected === 'object') {
+                            try {
+                                var parsed = JSON.parse(s);
+                                var parsedActual = Array.isArray(parsed)
+                                    ? 'array'
+                                    : (parsed !== null ? typeof parsed : 'null');
+                                if (parsedActual === expected) {
+                                    a[k] = parsed;
+                                    return;
+                                }
+                            } catch (coerceErr) { /* fall through to error */ }
+                        }
+                    }
+                    problems.push('Parameter "' + k + '" should be ' + p.type + ' but got ' + actual + '.');
+                }
+            }
+        });
+        if (problems.length === 0) return null;
+        return {
+            error: problems.join(' '),
+            schema: {
+                name: name,
+                description: def.description || '',
+                parameters: params
+            }
+        };
+    } catch (e) {
+        return null;
+    }
+}

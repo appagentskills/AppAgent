@@ -2,7 +2,9 @@
 var hooksEnabled = {
     autoTitle: true, // Hook to auto-generate chat title after agent completes
     autoTldr: true, // Hook to ask the agent for a TL;DR card after each answer
-    autoLinks: true, // Hook to ask the agent for relevant links after each answer
+    autoLinks: false, // Hook to ask the agent for relevant links after each answer (OFF by default)
+    autoCaveat: true, // Hook to let the agent flag a must-read caveat/warning after an answer
+    autoProgress: true, // Hook to ask the agent to finalize the chat progress card (update_action_state terminal state)
     showHookMessages: false // Show hook messages in chat UI
 };
 // Per-chat silent-hook flags for the shared agent loop (app/030-agent-loop.js).
@@ -281,8 +283,13 @@ async function loadHooksSettings() {
         hooksEnabled = saved;
         // Migration: autoTldr was added after users may have saved settings.
         if (hooksEnabled.autoTldr === undefined) hooksEnabled.autoTldr = true;
-        // Migration: autoLinks was added after users may have saved settings.
-        if (hooksEnabled.autoLinks === undefined) hooksEnabled.autoLinks = true;
+        // Migration: autoLinks now defaults OFF — users without the key get the
+        // new default (an explicit saved `true` is preserved; only undefined→false).
+        if (hooksEnabled.autoLinks === undefined) hooksEnabled.autoLinks = false;
+        // Migration: autoCaveat was added later — default ON for existing users.
+        if (hooksEnabled.autoCaveat === undefined) hooksEnabled.autoCaveat = true;
+        // Migration: autoProgress was added later — default ON for existing users.
+        if (hooksEnabled.autoProgress === undefined) hooksEnabled.autoProgress = true;
     }
 }
 

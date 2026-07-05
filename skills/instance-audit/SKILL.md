@@ -2,14 +2,8 @@
 name: instance-audit
 description: "Comprehensive ServiceNow instance audit covering security, health, performance, and best practices. Identifies issues with users, roles, stale records, SLAs, errors, and configuration."
 actions:
-  - name: Quick Audit
-    icon: zap
-    show: [home]
   - name: Full Audit
     icon: shield
-    show: [home]
-  - name: Security Scan
-    icon: lock
     show: [home]
 ---
 
@@ -28,24 +22,9 @@ A comprehensive audit tool for ServiceNow instances that checks security, health
 
 When an Action button is clicked, call `update_action_state` frequently to show progress. Use `tasks` for multi-step flows so the PM sees a live checklist on hover.
 
-### Action Lifecycle: Quick Audit
-
-1. `update_action_state({ state: 'running', icon: 'search', label: 'Scanning…', tasks: [{label: 'Run audit', status: 'running'}, {label: 'Render report', status: 'pending'}] })`
-2. Call `run_audit({ category: 'all' })`
-3. `update_action_state({ state: 'running', icon: 'list', label: 'Building report', tasks: [{label: 'Run audit', status: 'done'}, {label: 'Render report', status: 'running'}] })`
-4. Build an `html_widget` summarizing findings (stats grid + per-severity sections, see example below)
-5. `update_action_state({ state: 'done', icon: 'check', label: 'N findings', tasks: [{label: 'Run audit', status: 'done'}, {label: 'Render report', status: 'done'}] })`
-
 ### Action Lifecycle: Full Audit
 
 Same as Quick Audit but more detailed — include full findings for every category and render a rich dashboard widget. Use tasks for each category: Security, Users, ITSM, System, Config.
-
-### Action Lifecycle: Security Scan
-
-1. `update_action_state({ state: 'running', icon: 'shield', label: 'Checking security…' })`
-2. Call `run_audit({ category: 'security' })`
-3. For each critical finding, call `update_action_state` with `icon: 'alert'` briefly
-4. `update_action_state({ state: 'done', icon: 'check', label: 'Security scan complete' })`
 
 ## How to Run Audits
 

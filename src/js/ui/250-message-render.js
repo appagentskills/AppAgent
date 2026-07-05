@@ -7,7 +7,7 @@ function isAttachmentRole(role) {
 // treatment: their calls/results are hidden unless API stats are shown, and a
 // hook-only tool message still counts as a final answer.
 function isHookToolName(n) {
-    return n === 'set_chat_title' || n === 'set_tldr' || n === 'set_links';
+    return n === 'set_chat_title' || n === 'set_tldr' || n === 'set_links' || n === 'set_caveat';
 }
 
 // TL;DR card rendered at the end of an answer (set by the autoTldr hook via
@@ -15,6 +15,16 @@ function isHookToolName(n) {
 function renderTldrCard(msg) {
     if (!msg || !msg.tldr) return '';
     return '<div class="tldr-card"><div class="tldr-card-label">TL;DR</div><div class="tldr-card-text">' + formatContent(msg.tldr) + '</div></div>';
+}
+
+// Caveat card — a MUST-READ warning rendered ABOVE the TL;DR at the end of an
+// answer (set by the autoCaveat hook via the set_caveat tool — see
+// executeSetCaveat in tools/020-tool-execution.js). Amber/warning-styled so the
+// user sees it first: off-plan deviations, unverified assumptions, incomplete
+// work, or a trailing question/requested action the user might miss.
+function renderCaveatCard(msg) {
+    if (!msg || !msg.caveat) return '';
+    return '<div class="caveat-card"><div class="caveat-card-label">⚠ Caveat — read this</div><div class="caveat-card-text">' + formatContent(msg.caveat) + '</div></div>';
 }
 
 // Links card rendered just below the TL;DR at the end of an answer (set by the
@@ -819,6 +829,7 @@ function renderMessages() {
                 // Old completed blocks always render their content normally
                 if (msg.content && !msg.isStreaming && isLastAssistant && !(isRunning && block && block.isLastBlock)) {
                     html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+                    if (msg.caveat) html += renderCaveatCard(msg);
                     if (msg.tldr) html += renderTldrCard(msg);
                     if (msg.links) html += renderLinksCard(msg);
                 }
@@ -859,6 +870,7 @@ function renderMessages() {
             }
             if (msg.content && !msg.isStreaming && !isRunning) {
                 html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
+                if (msg.caveat) html += renderCaveatCard(msg);
                 if (msg.tldr) html += renderTldrCard(msg);
                 if (msg.links) html += renderLinksCard(msg);
             }

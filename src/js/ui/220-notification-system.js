@@ -533,6 +533,10 @@ function closeModal() {
     modal.classList.remove('screenshot-modal');
     modal.classList.remove('pdf-modal');
     modal.classList.remove('file-modal');
+    modal.classList.remove('worker-chat-modal');
+    // Detach the worker chat-view modal's live-refresh listener (guarded:
+    // defined in ui/175-sub-agent-ui.js, a no-op when no such modal is open).
+    if (typeof _teardownWorkerChatModal === 'function') _teardownWorkerChatModal();
     document.removeEventListener('keydown', screenshotModalKeyHandler);
     screenshotNav.list = [];
     screenshotNav.index = -1;

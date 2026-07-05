@@ -95,6 +95,34 @@ function assertAnthropicShape(messages) {
 // placeholder invariant (every tool_use has a matching tool_result in the
 // next slot, persisted before tool execution begins) is preserved across
 // SW eviction.
+// JSON-safe notice injection. Tool-result content is (nearly always) a JSON
+// object string — processToolResultForCache stringifies the result (or the
+// _cached outline stub). Naively doing `content + '\n\n' + notice` makes the
+// stored msg.content invalid JSON, silently breaking every later
+// JSON.parse(msg.content) consumer (PR link extraction ui/120-ui-utils.js:286,
+// doc-id tracking ui/120-ui-utils.js:860, PR chip attribution
+// ui/040-tools-settings.js:1125 — all try/catch and skip, so PR chips/links
+// and doc chips vanish exactly in long chats where the notices fire). When
+// the content looks like a JSON object, splice the notice in as a trailing
+// string field instead (no parse/re-stringify round-trip — avoids number-
+// precision drift on big payloads); any other shape falls back to the plain
+// string append. The model reads the notice either way — it sits at the tail
+// of the result in both forms.
+function appendNoticeToContent(content, notice, key) {
+    if (typeof content === 'string' && content.charAt(0) === '{' && content.charAt(content.length - 1) === '}') {
+        // Only splice when the content genuinely parses as JSON — a brace-
+        // wrapped non-JSON string (e.g. a code snippet in a tool result) must
+        // fall through to the plain append below, not get corrupted.
+        var isJson = false;
+        try { JSON.parse(content); isJson = true; } catch (e) {}
+        if (isJson) {
+            var body = content.slice(1, -1).trim();
+            return '{' + (body ? body + ',' : '') + JSON.stringify(key || '_agent_notice') + ':' + JSON.stringify(notice) + '}';
+        }
+    }
+    return content + '\n\n' + notice;
+}
+
 // Sub-agent soft tool-budget: if the SubAgents registry staged a budget
 // notice for this chat (>=90% used, or past the cap), append it to the
 // tool-result content so the model sees the warning inline on its very
@@ -105,7 +133,62 @@ function appendBudgetNotice(chatId, content) {
         if (typeof SubAgents === 'undefined' || !SubAgents.consumeBudgetNotice) return content;
         var notice = SubAgents.consumeBudgetNotice(chatId);
         if (!notice) return content;
-        return content + '\n\n' + notice;
+        return appendNoticeToContent(content, notice, '_tool_budget_notice');
+    } catch (_) { return content; }
+}
+
+// Latest context occupancy for a chat: the newest non-aggregate assistant
+// message's reported input_tokens — the same scan the sub-agent nudge below
+// and updateContextIndicator (ui/240-layout.js) use. Returns 0 when no
+// assistant message carries metrics yet (first turns) — callers treat 0 as
+// "unknown, no warning".
+function getChatContextTokens(chat) {
+    if (!chat || !chat.messages) return 0;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m && m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) {
+            return m.metrics.input_tokens;
+        }
+    }
+    return 0;
+}
+
+// Escalating context-occupancy warning appended to EVERY tool result once
+// the chat is past 50% of the assumed context window (user-editable global
+// setting — getAssumedContextTokens, core/030-config.js). Three tiers:
+// >=50% warns (main: delegate to sub-agents; sub: wrap up + report_to_parent
+// suggesting a fresh successor); >=60% is the FINAL WARNING (the agent has
+// ignored the 50% tier — stop all work and report/wrap up IMMEDIATELY);
+// >=100% has NO hard stop but maximum urgency
+// (stop and report NOW). Exactly ONE tier fires per tool result (highest
+// matching wins — no double warnings). No one-shot/re-arm logic — fires on every tool
+// result while over threshold, goes quiet if occupancy drops. Wording is
+// deliberately PERCENTAGE-ONLY (never absolute token counts — the model
+// must not reason about real window sizes). Composes with appendBudgetNotice
+// at all three tool-result write sites.
+function appendContextNotice(chat, content) {
+    try {
+        var limit = (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
+        var tokens = getChatContextTokens(chat);
+        if (!limit || !tokens) return content;
+        var pct = Math.round(100 * tokens / limit);
+        if (pct < 50) return content;
+        var isSub = !!(chat && chat.isSubAgent);
+        var notice;
+        if (pct >= 100) {
+            notice = isSub
+                ? '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). STOP immediately and call report_to_parent NOW with everything you have, recommending a handoff to a fresh sub-agent for the remainder.'
+                : '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). Stop working now: give the user your conclusion/report immediately with what you have. Delegate anything unfinished to a sub-agent.';
+        } else if (pct >= 60) {
+            notice = isSub
+                ? '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP all work NOW and call report_to_parent immediately with what you have; the parent must hand remaining work to a fresh sub-agent.'
+                : '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP taking on new work NOW: wrap up and give the user your conclusion this turn, and delegate anything unfinished to sub-agents (spawn_sub_agent).';
+        } else {
+            notice = isSub
+                ? '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step NOW and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.'
+                : '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Model quality degrades from here. Delegate ALL remaining heavy or verbose work to sub-agents (spawn_sub_agent) and keep this thread lean \u2014 orchestrate, don\'t do.';
+        }
+        return appendNoticeToContent(content, notice, '_context_notice');
     } catch (_) { return content; }
 }
 
@@ -401,7 +484,7 @@ async function executePendingApprovedTools(chat) {
                 var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
-                processed.content = appendBudgetNotice(chat.id, processed.content);
+                processed.content = appendContextNotice(chat, appendBudgetNotice(chat.id, processed.content));
                 // recordToolResult overwrites the seeded placeholder in-place. Main's
                 // push-to-end was correct because end-of-array == slot-after-assistant
                 // (no placeholders). With approval messages + atomic placeholders
@@ -621,7 +704,7 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            processed.content = appendBudgetNotice(streamingChatId, processed.content);
+            processed.content = appendContextNotice(chat, appendBudgetNotice(streamingChatId, processed.content));
             recordToolResult(chat, tc.id, toolName, processed.content);
             // Defer screenshot messages so they don't interleave between tool results
             if (screenshotMsg) deferredScreenshots.push(screenshotMsg);
@@ -682,8 +765,10 @@ async function runAgent(overrideChatId) {
         AgentEvents.emit('turnStarted', { chatId: streamingChatId, turn: lastUserMsgIndex, callNumber: callNumber + 1 });
         callNumber++;
 
-        // Reset metrics and start timing for this request.
-        var currentProviderObj = getProviderById(currentProvider);
+        // Reset metrics and start timing for this request. Provider is
+        // resolved per-chat (chat.provider — sub-agents pinned at spawn —
+        // else the global currentProvider), matching callLLMStreaming.
+        var currentProviderObj = getProviderById(resolveChatProviderName(streamingChatId));
         // PER-CALL metrics object: the SW runs multiple chats concurrently and the
         // old shared `lastRequestMetrics` global got clobbered across interleaved
         // streams (chat A's usage landing on chat B's assistant message — which
@@ -709,14 +794,13 @@ async function runAgent(overrideChatId) {
         // at the threshold".
         if (!chat.isSubAgent &&
             typeof SUBAGENT_NUDGE_TOKEN_THRESHOLD === 'number' && SUBAGENT_NUDGE_TOKEN_THRESHOLD > 0) {
-            var _ctxTokens = 0;
-            for (var _ci = chat.messages.length - 1; _ci >= 0; _ci--) {
-                var _cm = chat.messages[_ci];
-                if (_cm && _cm.role === 'assistant' && _cm.metrics && _cm.metrics.input_tokens && !_cm.metrics.isAggregate) {
-                    _ctxTokens = _cm.metrics.input_tokens;
-                    break;
-                }
-            }
+            var _ctxTokens = getChatContextTokens(chat);
+            // Context-size surfacing: store the estimate on the chat row so
+            // the page header can render the context-budget chip (see
+            // updateContextIndicator in ui/240-layout.js). Updated once per
+            // LLM call, persisted with the next saveChatsToStorage — no
+            // timers, no extra events.
+            chat._ctxTokens = _ctxTokens;
             var _nudgedAt = (typeof chat._ctxSubAgentNudgedAt === 'number') ? chat._ctxSubAgentNudgedAt
                 : (chat._ctxSubAgentNudgeSent ? SUBAGENT_NUDGE_TOKEN_THRESHOLD : 0);
             var _rearmStep = (typeof SUBAGENT_NUDGE_REARM_TOKENS === 'number' && SUBAGENT_NUDGE_REARM_TOKENS > 0)
@@ -752,7 +836,7 @@ async function runAgent(overrideChatId) {
         // failed-hook retry pass at the very end can never trip a useless nudge.
         if (typeof PROGRESS_NUDGE_TOOL_CALLS === 'number' && PROGRESS_NUDGE_TOOL_CALLS > 0) {
             var _pnToolCalls = 0, _pnHasCard = false, _pnNudges = 0;
-            var _pnSkip = { set_chat_title: true, set_tldr: true, set_links: true };
+            var _pnSkip = { set_chat_title: true, set_tldr: true, set_links: true, set_caveat: true };
             for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
                 var _pm = chat.messages[_pi];
                 if (!_pm) continue;
@@ -969,6 +1053,16 @@ async function runAgent(overrideChatId) {
             var metricsToStore = Object.assign({}, reqMetrics);
             delete metricsToStore.requestBody;
             assistantMsg.metrics = metricsToStore;
+
+            // Orchestrator §5: roll this call's usage onto the sub-agent
+            // record ({calls, input/output tokens, cost, by_provider}) so
+            // agent_status and the Workers-strip card can show per-sub cost
+            // without reading the transcript. One call per LLM request —
+            // this block runs exactly once per finished stream.
+            if (chat.isSubAgent && typeof SubAgents !== 'undefined' && SubAgents.recordLLMUsage) {
+                try { SubAgents.recordLLMUsage(streamingChatId, reqMetrics); }
+                catch (e) { console.warn('recordLLMUsage hook threw', e); }
+            }
         }
 
         if (!assistantMsg.thinking) delete assistantMsg.thinking;
@@ -1017,7 +1111,7 @@ async function runAgent(overrideChatId) {
         // back to the LLM for one more (pure-waste) round-trip — see the
         // `_answerCardOnlyTurn` break below. Any failure clears the flag so
         // the model still sees the error and can retry.
-        var ANSWER_CARD_TOOLS = { set_chat_title: true, set_tldr: true, set_links: true };
+        var ANSWER_CARD_TOOLS = { set_chat_title: true, set_tldr: true, set_links: true, set_caveat: true };
         // update_action_state is fire-and-forget too ({success:true} carries
         // nothing the model needs), so a FINAL progress-card update batched with
         // the answer-card hooks must not force an extra LLM pass: the turn also
@@ -1128,7 +1222,7 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            processed.content = appendBudgetNotice(streamingChatId, processed.content);
+            processed.content = appendContextNotice(chat, appendBudgetNotice(streamingChatId, processed.content));
             var resultMsg = recordToolResult(chat, tc.id, toolName, processed.content);
             var toolResultIdx = chat.messages.indexOf(resultMsg);
             // Correct widget msgIndex if approval messages shifted it

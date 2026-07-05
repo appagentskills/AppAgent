@@ -89,6 +89,7 @@ function getToolFunctionSource(toolName) {
         'set_chat_title': executeSetChatTitle,
         'set_tldr': executeSetTldr,
         'set_links': executeSetLinks,
+        'set_caveat': executeSetCaveat,
         'get_skill': executeGetSkill,
         'manage_skill': executeManageSkill,
         'html_widget': executeHtmlWidget
@@ -162,6 +163,11 @@ function renderSettingsPage() {
             '<div id="custom-api-providers-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
+            '<div class="settings-page-section-title">' + UI_ICONS.api + ' Sub-Agent Model Tiers</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Map the abstract <code>small</code> / <code>medium</code> / <code>large</code> tiers to providers above. The agent uses these when spawning sub-agents with <code>tier</code> (e.g. small for cheap search fan-outs, large for heavy implementation work).</div>' +
+            '<div id="tier-aliases-list"></div>' +
+        '</div>' +
+        '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.scope + ' Application Scope</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Current Scope</div><div class="settings-page-row-hint">Scope for creating new records</div></div>' +
@@ -197,6 +203,10 @@ function renderSettingsPage() {
                     '<option value="display-media"' + (screenshotMethod === 'display-media' ? ' selected' : '') + '>Browser Display Media</option>' +
                 '</select>' +
             '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Deferred tool loading (experimental)</div><div class="settings-page-row-hint">Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.</div></div>' +
+                '<input type="checkbox" ' + (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive() ? 'checked' : '') + ' onchange="toggleDeferredTools(this.checked)">' +
+            '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.hook + ' Hooks</div>' +
@@ -214,6 +224,14 @@ function renderSettingsPage() {
                 '<input type="checkbox" ' + (hooksEnabled.autoLinks ? 'checked' : '') + ' onchange="toggleHook(\'autoLinks\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Caveat Warning</div><div class="settings-page-row-hint">Agent flags anything you must not miss (off-plan changes, assumptions, questions at the end) as a warning card. Optional per answer — only shown when there is something to flag.</div></div>' +
+                '<input type="checkbox" ' + (hooksEnabled.autoCaveat ? 'checked' : '') + ' onchange="toggleHook(\'autoCaveat\')">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Auto chat progress</div><div class="settings-page-row-hint">Ask the agent to finalize the chat progress card after each answer with a terminal state (finished, PR opened, finished with caveat, or failed), shown as a badge on chat cards and the header pill. Skipped for purely conversational answers.</div></div>' +
+                '<input type="checkbox" ' + (hooksEnabled.autoProgress ? 'checked' : '') + ' onchange="toggleHook(\'autoProgress\')">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Show Hook Messages</div><div class="settings-page-row-hint">Display hook messages and responses in chat</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.showHookMessages ? 'checked' : '') + ' onchange="toggleHook(\'showHookMessages\')">' +
             '</div>' +
@@ -226,6 +244,31 @@ function renderSettingsPage() {
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-cache-limit" class="settings-number-input" min="1" max="100" value="' + Math.round(cacheTokenLimit / 1000) + '" onchange="updateCacheTokenLimitFromK(this.value)" />' +
                     '<span class="settings-input-suffix">K tokens</span>' +
+                '</div>' +
+            '</div>' +
+        '</div>' +
+        '<div class="settings-page-section">' +
+            '<div class="settings-page-section-title">' + UI_ICONS.stats + ' Context Window & Token Budgets</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Assumed context window for all models. At 50% usage, agents get a warning with every tool result \u2014 the main agent is nudged to delegate to sub-agents; sub-agents are nudged to wrap up and report to their parent suggesting a handoff. At 100% there is no hard stop, but the agent is urged to stop and report to the user (main agent) or to its parent (sub-agent).</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Context Window (tokens)</div><div class="settings-page-row-hint">Default: 200000</div></div>' +
+                '<div class="settings-input-group">' +
+                    '<input type="number" id="settings-page-context-window" class="settings-number-input" min="1000" step="1000" value="' + getAssumedContextTokens() + '" onchange="updateAssumedContextTokens(this.value)" />' +
+                    '<span class="settings-input-suffix">tokens</span>' +
+                '</div>' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Max Tokens</div><div class="settings-page-row-hint">Max output tokens per request, for all providers. Default: 64000</div></div>' +
+                '<div class="settings-input-group">' +
+                    '<input type="number" id="settings-page-max-tokens" class="settings-number-input" min="1" step="1000" value="' + getGlobalMaxTokens() + '" onchange="updateGlobalMaxTokens(this.value)" />' +
+                    '<span class="settings-input-suffix">tokens</span>' +
+                '</div>' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). Default: 32000</div></div>' +
+                '<div class="settings-input-group">' +
+                    '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="1" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
+                    '<span class="settings-input-suffix">tokens</span>' +
                 '</div>' +
             '</div>' +
         '</div>' +
@@ -265,8 +308,80 @@ function renderSettingsPage() {
     renderLlmEndpointsList();
     renderApiProvidersList();
 
+    // Render sub-agent tier alias mapping (Orchestrator §1)
+    renderTierAliasSettings();
+
     // Render GitHub settings
     renderGitHubSettings();
+}
+
+// Settings page onchange handlers for the global token-budget fields.
+// Persist via saveGlobalMaxTokens / saveGlobalThinkingBudget
+// (core/030-config.js — same IDB settings store as Context Window) and
+// write the normalized value back into the input (bad input snaps to the
+// default, mirroring updateAssumedContextTokens in ui/070-dashboard-ui.js).
+async function updateGlobalMaxTokens(value) {
+    var normalized = await saveGlobalMaxTokens(value);
+    var input = document.getElementById('settings-page-max-tokens');
+    if (input) input.value = normalized;
+}
+
+async function updateGlobalThinkingBudget(value) {
+    var normalized = await saveGlobalThinkingBudget(value);
+    var input = document.getElementById('settings-page-thinking-budget');
+    if (input) input.value = normalized;
+}
+
+// Sub-agent tier alias settings (Orchestrator §1). Renders one row per
+// tier (small/medium/large) with a provider dropdown over apiProviders.
+// The map lives in the IDB settings store (TIER_ALIASES_SETTING_KEY, see
+// core/030-config.js); the SW re-hydrates it on every run-agent gate so
+// spawn-time tier resolution picks changes up on the next run.
+var TIER_ALIAS_HINTS = {
+    small: 'Cheap + fast — search fan-outs, summaries, doc lookups',
+    medium: 'Balanced — general delegated work',
+    large: 'Strongest — heavy implementation / debugging subs'
+};
+function renderTierAliasSettings() {
+    var container = document.getElementById('tier-aliases-list');
+    if (!container) return;
+    var doRender = function() {
+        var map = getTierAliasMap();
+        var html = '';
+        SUBAGENT_TIER_NAMES.forEach(function(tier) {
+            var current = map[tier];
+            var options = '';
+            var found = false;
+            (apiProviders || []).forEach(function(p) {
+                if (p.name === current) found = true;
+                options += '<option value="' + escapeHtml(p.name) + '"' + (p.name === current ? ' selected' : '') + '>' + escapeHtml(p.name) + '</option>';
+            });
+            // Mapped provider no longer exists (deleted/renamed) — keep it
+            // visible + selected so the user sees the stale mapping.
+            if (!found && current) {
+                options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + ' (missing)</option>' + options;
+            }
+            html += '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label" style="text-transform:capitalize;">' + tier + '</div>' +
+                '<div class="settings-page-row-hint">' + (TIER_ALIAS_HINTS[tier] || '') + '</div></div>' +
+                '<select onchange="setTierAlias(\'' + tier + '\', this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
+                    options +
+                '</select>' +
+            '</div>';
+        });
+        container.innerHTML = html;
+    };
+    // First render on this page load: hydrate the stored overrides, then paint.
+    if (subAgentTierAliases === null && typeof loadTierAliases === 'function') {
+        loadTierAliases().then(doRender);
+    } else {
+        doRender();
+    }
+}
+function setTierAlias(tier, providerName) {
+    var map = getTierAliasMap();
+    map[tier] = providerName;
+    saveTierAliases(map);
 }
 
 // GitHub settings UI
@@ -343,7 +458,10 @@ async function connectGitHub() {
         return;
     }
     var token = tokenInput.value.trim();
-    var instanceUrl = (instanceInput && instanceInput.value.trim()) || 'https://github.com';
+    // Normalize before validate/save so the stored githubInstanceUrl is
+    // canonical — trailing-slash/case variants break the strict-equality API
+    // base derivations (normalizeGitHubInstanceUrl: core/130-indexeddb.js).
+    var instanceUrl = normalizeGitHubInstanceUrl(instanceInput && instanceInput.value);
     if (btn) btn.disabled = true;
     if (statusMsg) { statusMsg.style.color = 'var(--text-muted)'; statusMsg.textContent = 'Validating...'; }
     var result = await validateGitHubToken(token, instanceUrl);
@@ -444,20 +562,9 @@ async function renderGitHubReposList() {
 
             // File rows (same style as header dropdown)
             var detailHtml = '<div id="repo-detail-' + ri + '" style="margin-top:var(--space-2);">';
-            if (rd.dirtyCount > 0) {
-                detailHtml += rd.dirtyFiles.map(function(f) {
-                    var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
-                        (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
-                        '<span class="ws-file-badge modified">modified</span>';
-                    var prLink = '';
-                    if (f.pushed_pr && f.pushed_pr.url) {
-                        prLink = '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank">PR #' + f.pushed_pr.number + '</a>';
-                    }
-                    return '<div class="ws-file-row">' +
-                        '<span class="ws-file-path" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' +
-                        badge + prLink + '</div>';
-                }).join('');
-            }
+            // Rows are DOM-built after container.innerHTML below (via the shared
+            // _dirtyFileRow, so the owning-chat chip + its click handler match
+            // the header dropdown) — the div starts empty here.
             detailHtml += '</div>';
 
             html += '<div class="settings-page-row" data-wk="' + escapeHtml(rd.wk) + '" style="padding:var(--space-4) 0;border-bottom:1px solid var(--border);align-items:flex-start;">' +
@@ -482,6 +589,14 @@ async function renderGitHubReposList() {
             '</div>';
         }
         container.innerHTML = html;
+
+        // Fill dirty-file rows with the shared DOM row builder (_dirtyFileRow):
+        // string HTML can't carry the chat chip's click listener.
+        for (var fi = 0; fi < repoData.length; fi++) {
+            var fillEl = document.getElementById('repo-detail-' + fi);
+            if (!fillEl) continue;
+            repoData[fi].dirtyFiles.forEach(function(f) { fillEl.appendChild(_dirtyFileRow(f)); });
+        }
 
         // Smart sync for ALL repos (async, update in place)
         for (var ci = 0; ci < repoData.length; ci++) {
@@ -525,16 +640,11 @@ async function renderGitHubReposList() {
                             }
                             var detailEl = document.getElementById('repo-detail-' + idx);
                             if (detailEl) {
-                                var rows = freshDirty.map(function(f) {
-                                    var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
-                                        (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
-                                        '<span class="ws-file-badge modified">modified</span>';
-                                    var prLink = f.pushed_pr && f.pushed_pr.url ?
-                                        '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank">PR #' + f.pushed_pr.number + '</a>' : '';
-                                    return '<div class="ws-file-row">' +
-                                        '<span class="ws-file-path" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' +
-                                        badge + prLink + '</div>';
-                                }).join('');
+                                // Same shared DOM row builder as the initial render —
+                                // keeps the owning-chat chip on refreshed rows too.
+                                detailEl.innerHTML = '';
+                                freshDirty.forEach(function(f) { detailEl.appendChild(_dirtyFileRow(f)); });
+                                var rows = '';
                                 // Add behind/conflict files
                                 if (syncResult.behindFiles) {
                                     rows += syncResult.behindFiles.map(function(bf) {
@@ -547,7 +657,7 @@ async function renderGitHubReposList() {
                                         return '<div class="ws-file-row"><span class="ws-file-path" title="' + escapeHtml(cf.path) + '">' + escapeHtml(cf.path) + '</span><span class="ws-file-badge conflict">conflict</span></div>';
                                     }).join('');
                                 }
-                                detailEl.innerHTML = rows;
+                                detailEl.insertAdjacentHTML('beforeend', rows);
                             }
                         });
                     });
@@ -1038,7 +1148,39 @@ function _wsPrChatLookup(prUrl) {
 // the pushing chat (pushed_by_chat_id, with a retroactive scan of recorded
 // push results as last resort). Click → open that chat. No chip is rendered
 // for the CURRENT chat (its files are already grouped under the "This chat"
-// section); a chip for a deleted chat renders muted/inert.
+// section); a chip for an unresolvable chat renders muted/inert.
+//
+// Chat resolution falls back to the sub-agent registry: a worker chat can be
+// missing from the in-memory `chats` map (never-persisted / reaped sub, or a
+// post-reload race where the dropdown paints before the SW hello snapshot
+// repopulates `chats`) while its registry record still exists — those chips
+// stay clickable and name the worker instead of rendering as "gone".
+function _wsResolveChatRef(cid) {
+    if (typeof chats !== 'undefined' && chats && chats[cid]) {
+        return { title: chats[cid].title || '', isSub: !!chats[cid].isSubAgent };
+    }
+    try {
+        if (typeof SubAgents !== 'undefined' && SubAgents && SubAgents.getByChatId) {
+            var rec = SubAgents.getByChatId(cid);
+            if (rec) return { title: rec.name || '', isSub: true };
+        }
+    } catch (e) { /* registry unavailable — treat as unknown */ }
+    return null;
+}
+
+// UI-side same-lineage check (current chat ↔ its own subs / sibling subs of
+// one root). Reuses the tool-layer _wsSameChatLineage when the bundle has it
+// (the page bundle includes tools/020-tool-execution.js); otherwise falls
+// back to exact equality.
+function _wsUiSameLineage(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    try {
+        if (typeof _wsSameChatLineage === 'function') return _wsSameChatLineage(a, b);
+    } catch (e) { /* fall through */ }
+    return false;
+}
+
 function _wsChatChip(f) {
     var cid = f.last_modified_by_chat_id;
     var stampTitle = f.last_modified_by_chat_title;
@@ -1054,15 +1196,17 @@ function _wsChatChip(f) {
     }
     if (!cid) return null;
     if (typeof currentChatId !== 'undefined' && currentChatId === cid) return null;
-    var known = !!(typeof chats !== 'undefined' && chats && chats[cid]);
-    var title = stampTitle || (known && chats[cid].title) || 'Untitled chat';
+    var ref = _wsResolveChatRef(cid);
+    var known = !!ref;
+    var isWorker = !!(ref && ref.isSub);
+    var title = stampTitle || (ref && ref.title) || 'Untitled chat';
     var chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'ws-file-chat' + (!known ? ' gone' : '');
     chip.style.setProperty('--chat-hue', String(_wsChatHue(cid)));
     var verb = pushed ? ('Pushed' + (f.pushed_pr && f.pushed_pr.number ? ' (PR #' + f.pushed_pr.number + ')' : '')) : 'Edited';
-    chip.title = known ? verb + ' by chat \u201c' + title + '\u201d \u2014 click to open' :
-        verb + ' by a deleted chat \u2014 ' + title;
+    chip.title = !known ? verb + ' by chat \u201c' + title + '\u201d \u2014 chat not loaded (may be deleted or a background worker)' :
+        verb + ' by ' + (isWorker ? 'worker' : 'chat') + ' \u201c' + title + '\u201d \u2014 click to open';
     chip.innerHTML = (typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '\ud83d\udcac';
     chip.addEventListener('click', function(ev) {
         ev.stopPropagation();
@@ -1100,15 +1244,18 @@ function _wsGroupLabel(text) {
 }
 
 // Aggregate dirty files whose uncommitted changes were stamped by the CURRENT
-// chat (cross-chat ownership, see 020-tool-execution.js), grouped by
-// workspace. Returns [{wk, files:[...]}] in _wsHeaderCaches order.
+// chat OR one of its own sub-agents (same lineage — mirrors the cross-chat
+// ownership rules in 020-tool-execution.js), grouped by workspace. Files
+// stamped by a lineage sub still get a worker chip via _dirtyFileRow (only
+// the exact current chat is chip-less). Returns [{wk, files:[...]}] in
+// _wsHeaderCaches order.
 function _thisChatChanges() {
     var cid = (typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
     if (!cid) return [];
     var out = [];
     Object.keys(_wsHeaderCaches).forEach(function(wk) {
         var c = _wsHeaderCaches[wk];
-        var files = ((c && c.dirtyFiles) || []).filter(function(f) { return f.last_modified_by_chat_id === cid; });
+        var files = ((c && c.dirtyFiles) || []).filter(function(f) { return _wsUiSameLineage(f.last_modified_by_chat_id, cid); });
         if (files.length > 0) out.push({ wk: wk, files: files });
     });
     return out;
@@ -1531,8 +1678,8 @@ function showAddApiProviderModal(editingProvider) {
         name: '', 
         model: '', 
         endpointId: 'openrouter',
-        maxTokens: 64000, 
-        context_length: 200000,
+        // No maxTokens / thinkingBudget — token budgets are GLOBAL settings
+        // (Settings → Context Window & Token Budgets), never per-provider.
         provider: ''
     };
 
@@ -1578,16 +1725,6 @@ function showAddApiProviderModal(editingProvider) {
                     '<label class="form-label">Endpoint <span class="required">*</span></label>' +
                     endpointFieldInner +
                 '</div>' +
-                '<div style="display:flex;gap:var(--space-6);">' +
-                    '<div class="form-field" style="flex:1;">' +
-                        '<label class="form-label">Max Tokens</label>' +
-                        '<input type="number" id="provider-maxtokens" class="form-input" value="' + (provider.maxTokens || 16000) + '">' +
-                    '</div>' +
-                    '<div class="form-field" style="flex:1;">' +
-                        '<label class="form-label">Context Length</label>' +
-                        '<input type="number" id="provider-context" class="form-input" value="' + (provider.context_length || 200000) + '">' +
-                    '</div>' +
-                '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">Reasoning Effort</label>' +
                     '<select id="provider-effort" class="form-input">' +
@@ -1628,8 +1765,6 @@ async function saveApiProviderFromModal(originalName) {
     var isOAuth = oauthCheckbox && oauthCheckbox.checked;
     var endpointSelect = document.getElementById('provider-endpoint-select');
     var endpointId = endpointSelect ? endpointSelect.value : '';
-    var maxTokens = parseInt(document.getElementById('provider-maxtokens').value) || 16000;
-    var contextLength = parseInt(document.getElementById('provider-context').value) || 200000;
     var effortField = document.getElementById('provider-effort');
     var effort = effortField ? effortField.value : '';
 
@@ -1662,12 +1797,11 @@ async function saveApiProviderFromModal(originalName) {
         }
     }
     
+    // No maxTokens / thinkingBudget on the saved provider — token budgets
+    // are GLOBAL settings (core/030-config.js), pure-global design.
     var provider = {
         name: name,
-        model: model,
-        maxTokens: maxTokens,
-        context_length: contextLength,
-        thinkingBudget: 40000
+        model: model
     };
     if (isOAuth) {
         // Claude OAuth providers keep their inline endpoint/apiKey and do
@@ -1723,7 +1857,7 @@ async function deleteApiProviderAndRefresh(providerName) {
     // Check if this provider is currently selected
     if (currentProvider === providerName) {
         // Switch to first available provider
-        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus-4-8 OAuth';
+        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus-4-8';
         saveProviderToStorage();
     }
     
@@ -1783,7 +1917,8 @@ function renderSystemPromptEditor() {
             '<strong>Available Placeholders:</strong> ' +
             '<code>{{SCOPE_CONTEXT}}</code> - Current app scope info, ' +
             '<code>{{DISABLED_TOOLS}}</code> - List of disabled tools, ' +
-            '<code>{{SKILLS_SUMMARY}}</code> - Available skills list' +
+            '<code>{{SKILLS_SUMMARY}}</code> - Available skills list, ' +
+            '<code>{{TOOL_CATALOG}}</code> - Deferred-tool catalog (empty when deferred tool loading is off)' +
         '</div>' +
     '</div>';
     
@@ -1830,6 +1965,19 @@ async function revertSystemPromptToDefault() {
     systemPromptEditMode = false;
     renderSystemPromptEditor();
     showSnackbar('Reverted to default system prompt', 'success');
+}
+
+// Settings toggle for deferred tool loading (core/030-config.js). Persists
+// the flag and mirrors it into a live SW so background runs pick it up
+// immediately (same pattern as toggleHook → pushHooksSettingsToOffscreen).
+async function toggleDeferredTools(enabled) {
+    await saveDeferredToolsEnabled(!!enabled);
+    if (typeof pushDeferredToolsSettingToOffscreen === 'function') {
+        pushDeferredToolsSettingToOffscreen(!!enabled);
+    }
+    if (typeof showSnackbar === 'function') {
+        showSnackbar('Deferred tool loading ' + (enabled ? 'enabled' : 'disabled'), 'success');
+    }
 }
 
 function updateSystemPromptTokenCount() {
@@ -2065,7 +2213,7 @@ function renderSettingsToolPermissions() {
     // Render global permission radios
     GLOBAL_PERMISSION_KEYS.concat(skillToolKeys).forEach(function(key) {
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
-        var perm = toolPermissions[key] || (isReadPermissionKey(key) ? 'allow' : 'auto');
+        var perm = toolPermissions[key] || (isReadPermissionKey(key) || key === 'workspace:push' ? 'allow' : 'auto');
         _renderPermRadio(containerId, perm, key, false, false);
     });
 }

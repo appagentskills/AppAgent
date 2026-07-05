@@ -26,3 +26,13 @@
 .links-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 768px) { .links-card { margin-right: 0; } }
 
+/* Caveat card — a MUST-READ warning rendered ABOVE the TL;DR by the autoCaveat
+   hook via the set_caveat tool (executeSetCaveat). Warning-styled (amber) so it
+   stands out from the neutral tldr/links cards; uses --warning* tokens so it
+   stays readable in both light and dark themes. */
+.caveat-card { position: relative; margin: var(--space-6) 20% var(--space-2) 0; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--warning-bg); border: 1px solid var(--warning-light); border-left: 3px solid var(--warning); border-radius: var(--radius-md); }
+.caveat-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--warning-bg); color: var(--warning-text); border: 1px solid var(--warning); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.caveat-card-text { font-size: var(--text-body-sm); color: var(--text-primary); line-height: var(--leading-normal); }
+.caveat-card-text .md-paragraph { margin: 0; }
+@media (max-width: 768px) { .caveat-card { margin-right: 0; } }
+

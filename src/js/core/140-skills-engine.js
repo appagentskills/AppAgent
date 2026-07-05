@@ -245,9 +245,48 @@ function unloadSkillTools(skillId) {
     delete skillTools[skillId];
 }
 
+// ---- devOnly skills (runtime_inspect feature) ----
+// A skill with `devOnly: true` in its frontmatter is hidden (from the system
+// prompt, the skills list UI and skill-tool rosters) unless extension dev
+// mode is active — the same gate as the runtime_inspect tool. This file is
+// in WORKER_SHARED_FILES, so the helpers exist in BOTH realms.
+function _skillIsDevOnly(skillId) {
+    try {
+        if (typeof skills === 'object' && skills && skills[skillId] && skills[skillId].devOnly) return true;
+        if (typeof EMBEDDED_SKILLS !== 'undefined' && EMBEDDED_SKILLS && EMBEDDED_SKILLS.length) {
+            for (var i = 0; i < EMBEDDED_SKILLS.length; i++) {
+                var e = EMBEDDED_SKILLS[i];
+                if (!e || e.id !== skillId) continue;
+                if (e.devOnly) return true;
+                // Fallback: parse the embedded frontmatter (base64) — covers a
+                // build path that didn't stamp the devOnly field.
+                try {
+                    if (e.frontmatter && /^devOnly:\s*true\s*$/m.test(decodeURIComponent(escape(atob(e.frontmatter))))) return true;
+                } catch (e2) { /* malformed frontmatter — treat as not devOnly */ }
+            }
+        }
+    } catch (e3) { /* fail open: not devOnly */ }
+    return false;
+}
+
+// Realm-aware dev-mode check. The SW flag is pushed via the 'dev-mode' bus
+// message (worker/130-port-bridge.js); the page flag is set by
+// _pushDevModeToSW (tools/140-runtime-inspect.js).
+function _devModeActiveSync() {
+    try {
+        if (typeof Platform !== 'undefined' && Platform && Platform.isWorker) return !!self._swDevModeActive;
+        return !!(typeof window !== 'undefined' && window._pageDevModeActive);
+    } catch (e) { return false; }
+}
+
+function isSkillDevHidden(skillId) {
+    return _skillIsDevOnly(skillId) && !_devModeActiveSync();
+}
+
 function getActiveSkillTools() {
     var tools = [];
     for (var skillId in activeSkills) {
+        if (isSkillDevHidden(skillId)) continue;
         if (skillTools[skillId]) {
             for (var toolName in skillTools[skillId]) {
                 tools.push(skillTools[skillId][toolName].definition);

@@ -274,7 +274,7 @@ function renderToolPermissions() {
     // Render radio groups for global permissions
     GLOBAL_PERMISSION_KEYS.concat(skillToolKeys).forEach(function(key) {
         var containerId = 'perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
-        var perm = toolPermissions[key] || (isReadPermissionKey(key) ? 'allow' : 'auto');
+        var perm = toolPermissions[key] || (isReadPermissionKey(key) || key === 'workspace:push' ? 'allow' : 'auto');
         _renderPermRadio(containerId, perm, key, false, false);
     });
 }
@@ -392,7 +392,11 @@ function getDisabledTools() {
     return disabled;
 }
 
-function getEnabledTools(chatId) {
+// opts.includeDeferred: return the FULL enabled list even when deferred
+// tool loading is ON (used by the {{TOOL_CATALOG}} renderer and
+// get_tool_schema — core/080-tools.js). Request builders omit it and get
+// the slim (core-only) array in deferred mode.
+function getEnabledTools(chatId, opts) {
     var baseTools = TOOLS.filter(function(tool) {
         var name = tool.function.name;
         // For servicenow_api, check if ALL CRUD ops are disabled
@@ -415,6 +419,13 @@ function getEnabledTools(chatId) {
         if (name === 'set_tldr' && !hooksEnabled.autoTldr) return false;
         // Hide set_links when autoLinks hook is disabled
         if (name === 'set_links' && !hooksEnabled.autoLinks) return false;
+        // Hide set_caveat when autoCaveat hook is disabled
+        if (name === 'set_caveat' && !hooksEnabled.autoCaveat) return false;
+        // runtime_inspect is dev-mode-only: hidden from the LLM unless the
+        // reload-rebuilds gate is active (window._pageDevModeActive, set by
+        // _pushDevModeToSW). Keep in sync with the worker twin in
+        // src/js/worker/025-permissions-helpers.js.
+        if (name === 'runtime_inspect' && !window._pageDevModeActive) return false;
         var perm = getToolPermission(name);
         return perm !== 'disabled';
     });
@@ -461,6 +472,25 @@ function getEnabledTools(chatId) {
         }
     }
 
+    // Deferred tool loading (experimental): when the flag is ON the request
+    // declares only the CORE tools with full schemas; every other enabled
+    // tool is discoverable via the {{TOOL_CATALOG}} system-prompt block +
+    // get_tool_schema. Split + strip logic is SHARED (core/080-tools.js:
+    // getDeferredSplit / prepareToolsForRequest) — do NOT fork it here.
+    // Permission/hook/dev-mode/roster filtering above ran BEFORE this split,
+    // so a disabled tool appears in neither the slim array nor the catalog.
+    // Keep in sync with the worker twin in src/js/worker/025-permissions-helpers.js.
+    var _deferredActive = (typeof isDeferredToolsActive === 'function') && isDeferredToolsActive();
+    if (_deferredActive && !(opts && opts.includeDeferred)) {
+        allTools = getDeferredSplit(allTools).core;
+    }
+    // Strip non-wire fields: `short` always (must never ship), `headless`
+    // only in deferred mode — the flag-OFF array stays byte-identical to
+    // the legacy wire shape (which ships the stamped `headless` key).
+    if (typeof prepareToolsForRequest === 'function') {
+        allTools = prepareToolsForRequest(allTools, _deferredActive);
+    }
+
     // Add cache_control on the last tool so Anthropic caches the entire tools block
     if (allTools.length > 0) {
         var last = Object.assign({}, allTools[allTools.length - 1]);
@@ -487,7 +517,8 @@ function getToolPermission(toolName, methodOrAction) {
         return toolPermissions[permKey];
     }
 
-    // Defaults: read → allow, write → auto
+    // Defaults: read → allow, write → auto (workspace:push → allow)
+    if (permKey === 'workspace:push') return 'allow';
     return isReadPermissionKey(permKey) ? 'allow' : 'auto';
 }
 

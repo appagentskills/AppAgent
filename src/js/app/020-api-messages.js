@@ -413,7 +413,7 @@ var _AUX_ROLES_FOR_INTERRUPTION = ['screenshot', 'pdf', 'file', 'context', 'brow
 // answer-card results in the walk-back so they don't read as an interrupted
 // run; placeholders (`_placeholder: true`, hook never actually ran) still
 // count as interruption.
-var _ANSWER_CARD_TOOLS_FOR_INTERRUPTION = { set_chat_title: true, set_tldr: true, set_links: true };
+var _ANSWER_CARD_TOOLS_FOR_INTERRUPTION = { set_chat_title: true, set_tldr: true, set_links: true, set_caveat: true };
 function isChatInterrupted(chat) {
     if (!chat || !chat.id || !Array.isArray(chat.messages) || chat.messages.length === 0) return false;
     if (typeof runningChatIds !== 'undefined' && runningChatIds[chat.id]) return false;

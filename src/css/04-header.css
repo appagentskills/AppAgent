@@ -31,7 +31,19 @@
 .chat-title-state-pill.state-stuck   { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .chat-title-state-pill.state-done    { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
 .chat-title-state-pill.state-error   { background: var(--danger-lighter, #fee2e2); color: var(--danger, #b91c1c); }
+/* Terminal success variants — finished/pr_opened in the success family
+   (pr_opened with a distinct purple hue), finished_with_caveat amber. */
+.chat-title-state-pill.state-finished { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
+.chat-title-state-pill.state-pr_opened { background: var(--purple-light, #ede9fe); color: var(--purple, #6d28d9); }
+.chat-title-state-pill.state-waiting { background: var(--indigo-light, #e0e7ff); color: var(--indigo, #4f46e5); }
+.chat-title-state-pill.state-pr_merged { background: var(--merged-light, #ece2fd); color: var(--merged, #8250df); }
+.chat-title-state-pill.state-finished_with_caveat { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+/* Live waiting states — pending prompt_user form / parked tool approval. */
+.chat-title-state-pill.state-needs_input { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+.chat-title-state-pill.state-needs_permission { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .chat-title-state-pill.state-running .chat-title-state-icon .ui-icon { animation: action-spin 1.2s linear infinite; }
+/* waiting pulses instead of spinning — keyframes live in 23-actions.css (one CSS bundle) */
+.chat-title-state-pill.state-waiting .chat-title-state-icon .ui-icon { animation: waiting-pulse 1.6s ease-in-out infinite; }
 .header-rename-btn { background: transparent; border: none; cursor: pointer; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--text-muted); transition: all var(--transition-fast); opacity: 0; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
 .header-rename-btn:hover { background: var(--secondary-light); color: var(--text-primary); }
 .header-rename-btn .ui-icon { width: 14px; height: 14px; }

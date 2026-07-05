@@ -54,9 +54,9 @@ var _agentSubscribers = new Set();
 // (app/045-agent-port-bridge-page.js) assigns chats[chatId] = envelope.
 // chat before re-emitting so the existing handlers Just Work.
 //
-// State-only events (runStarted, runFinished, paused, error, etc.) do
-// not include the chat — the page's chats mirror has nothing to sync
-// for them. The streamDelta event ALSO inlines the chat: although the
+// State-only events (paused, etc.) do not include the chat — the
+// page's chats mirror has nothing to sync for them. The streamDelta
+// event ALSO inlines the chat: although the
 // delta itself carries the current assistant message, the page handler
 // (updateStreamingMessage) needs to write to chats[chatId].messages
 // [msgIndex] and that array must exist with the right length first.
@@ -83,7 +83,24 @@ var EVENTS_WITH_CHAT_INLINE = {
     'tldrChanged': true,
     // linksChanged's page handler writes the links array onto
     // chats[chatId].messages — a stale mirror would drop the links card.
-    'linksChanged': true
+    'linksChanged': true,
+    // caveatChanged's page handler writes the caveat string onto
+    // chats[chatId].messages — a stale mirror would drop the caveat card.
+    'caveatChanged': true,
+    // STALE-MIRROR-HEAL: terminal events inline the chat so the LAST
+    // broadcast of every run always carries the authoritative snapshot.
+    // Without this, a page that missed/raced any chat-inlining event during
+    // the finish→hook-rerun churn (or a sub-agent's report to an idle
+    // parent) kept a mirror WITHOUT the final assistant answer; the user's
+    // next send then rendered from that stale mirror (040-send-message.js
+    // renderMessages) — the answer vanished — and the idle run-agent
+    // adoption (worker/130-port-bridge.js `chats[msg.chatId] = msg.chat`)
+    // could even persist the stale shape. The page assign path
+    // (app/045-agent-port-bridge-page.js 'agent-event' case) is
+    // event-agnostic and merge-guarded (pending rows / versionHistory /
+    // meta), so inlining here needs no page-side changes.
+    'runFinished': true,
+    'runCrashed': true
 };
 
 function broadcastAgentEvent(type, detail) {

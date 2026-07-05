@@ -31,10 +31,12 @@ var TOOL_DISPLAY_NAMES = {
     'set_chat_title': 'Set Chat Title',
     'set_tldr': 'Set TLDR',
     'set_links': 'Set Links',
+    'set_caveat': 'Set Caveat',
     'cached_content_outline': 'Cached Outline',
     'cached_content_search': 'Cached Search',
     'cached_content_read': 'Cached Read',
     'get_skill': 'Get Agent Skill',
+    'get_tool_schema': 'Get Tool Schema',
     'manage_skill': 'Manage Agent Skill',
     'manage_skill:create': 'Create Skill',
     'manage_skill:update': 'Update Skill',
@@ -313,6 +315,7 @@ var UI_ICONS = {
     panelLeftClose: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M16 15l-3-3 3-3"/></svg>',
     panelLeftOpen: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M14 9l3 3-3 3"/></svg>',
     moreHorizontal: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>',
+    hourglass: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h12"/><path d="M6 22h12"/><path d="M7 2v3.5c0 2 2.5 3.5 5 6.5-2.5 3-5 4.5-5 6.5V22"/><path d="M17 2v3.5c0 2-2.5 3.5-5 6.5 2.5 3 5 4.5 5 6.5V22"/></svg>',
     clock: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
     arrowLeft: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>',
     arrowRight: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>',
@@ -345,6 +348,7 @@ var UI_ICONS = {
     agentEdit: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 1l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7z"/><circle cx="20" cy="5" r="2" fill="currentColor" stroke="none"/><circle cx="21" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="16" cy="21" r="2" fill="currentColor" stroke="none"/></svg>',
     bell_filled: '<svg class="ui-icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
     bell: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+    question: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
     attach: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>',
     image: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>',
     lock: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
@@ -368,6 +372,7 @@ function getToolIcon(toolName) {
     if (toolName === 'set_chat_title') return UI_ICONS.title;
     if (toolName === 'set_tldr') return UI_ICONS.list;
     if (toolName === 'set_links') return UI_ICONS.externalLink;
+    if (toolName === 'set_caveat') return UI_ICONS.alert;
     if (toolName === 'cached_content_outline') return UI_ICONS.file;
     if (toolName === 'cached_content_search') return UI_ICONS.search;
     if (toolName === 'cached_content_read') return UI_ICONS.file;

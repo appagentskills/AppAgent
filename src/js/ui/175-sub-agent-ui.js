@@ -24,6 +24,20 @@
 // stays safe.
 var SUB_REPORT_STATUSES = { done: 1, error: 1, partial: 1, need_input: 1, cancelled: 1, running: 1, waiting: 1 };
 
+// Review-state badge palette (Orchestrator §3 deliverable review flow).
+// Keys = the review_state values the registry persists on a sub record:
+// 'pending' (auto on every report_to_parent) → 'accepted' /
+// 'revision_requested' (parent verdict via wake_sub_agent's review_state
+// arg) / 'cross_checked' (independent reviewer sub aimed at it). Unknown or
+// missing values render no badge. Inline styles keep the badge
+// self-contained (no companion CSS edit needed).
+var SUB_REVIEW_BADGES = {
+    pending:            { label: 'review pending',     bg: '#5c4d10', fg: '#ffe289' },
+    accepted:           { label: 'accepted',           bg: '#1d5c2e', fg: '#a9f5c1' },
+    revision_requested: { label: 'revision requested', bg: '#6b271d', fg: '#ffbfae' },
+    cross_checked:      { label: 'cross-checked',      bg: '#1d3f6b', fg: '#aecdf5' }
+};
+
 // User open/collapse choices for sub-report cards, keyed by a stable
 // per-card key. renderMessages rebuilds the chat
 // innerHTML on every repaint (each progress append / live-state change),
@@ -201,6 +215,120 @@ function _subReportLiveStatus(msg) {
     return 'running';
 }
 
+// ---------- Threaded dialogue view (Orchestrator §4) ----------
+// Compact chronological parent⇄worker exchange, reconstructed ONLY from
+// fields the sub_report card actually persists (097-sub-agent-registry.js):
+//   • msg.spawnArgs.instructions — the spawn brief (parent→, first entry)
+//   • msg.phases[] — archived wake cycles: {input (parent→ wake
+//     instruction), progress[] (worker→ agent_message pushes + lifecycle
+//     notices), report {status, summary, at} (worker→ report_to_parent)}
+//   • msg.currentInput / msg.progress / msg.report — the live phase
+// plus, when the LIVE registry record still exists, its queued inbox
+// (parent→ messages a sleeping sub has not consumed yet). Nothing is
+// invented: a GC'd record simply contributes no inbox entries and legacy
+// rows with none of these fields render no thread at all.
+
+// hh:mm:ss for thread rows (dates would just repeat the chat's day).
+function _subThreadTime(at) {
+    try {
+        var d = new Date(at);
+        if (isNaN(d.getTime())) return '';
+        return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+    } catch (_) { return ''; }
+}
+
+function _subThreadEntries(msg, liveRec) {
+    var entries = [];
+    function push(role, kind, text, at) {
+        if (text == null || String(text) === '') return;
+        entries.push({ role: role, kind: kind, text: String(text), at: (typeof at === 'number' ? at : null) });
+    }
+    function pushProgress(progArr) {
+        var arr = Array.isArray(progArr) ? progArr : [];
+        for (var j = 0; j < arr.length; j++) {
+            var p = arr[j];
+            if (p) push('worker', p.lifecycle ? 'notice' : 'update', p.text, p.at);
+        }
+    }
+    var phases = Array.isArray(msg.phases) ? msg.phases : [];
+    // Wake inputs carry no timestamp of their own — a wake fires right after
+    // the previous phase's report, so that report's `at` is the closest
+    // honest approximation. The very first input is stamped msg.createdAt.
+    var prevAt = (typeof msg.createdAt === 'number') ? msg.createdAt : null;
+    for (var i = 0; i < phases.length; i++) {
+        var ph = phases[i] || {};
+        // phases[0].input IS the spawn brief (the wake path archives
+        // currentInput || spawnArgs.instructions) — unless earlier phases
+        // were trimmed by the 10-phase cap, in which case it's a wake.
+        push('parent', (i === 0 && !msg.phasesDropped) ? 'spawn' : 'wake', ph.input, prevAt);
+        pushProgress(ph.progress);
+        if (ph.report) {
+            push('worker', 'report \u00b7 ' + (ph.report.status || 'done'), ph.report.summary || '(no summary)', ph.report.at);
+            if (typeof ph.report.at === 'number') prevAt = ph.report.at;
+        }
+    }
+    // Live phase: after a wake msg.currentInput carries the latest
+    // instruction; before any wake the spawn brief is the input.
+    var sa = msg.spawnArgs;
+    var curInput = msg.currentInput || (sa && sa.instructions) || '';
+    var curIsSpawn = !phases.length && !msg.phasesDropped && !msg.currentInput;
+    push('parent', curIsSpawn ? 'spawn' : 'wake', curInput, prevAt);
+    pushProgress(msg.progress);
+    var rep = msg.report;
+    if (rep && rep.status && rep.status !== 'running' && rep.status !== 'partial') {
+        push('worker', 'report \u00b7 ' + rep.status, rep.summary || '(no summary)', rep.at);
+    }
+    // Queued inbox (live record only): parent→ messages waiting for the next
+    // wake/drain. Sub→sub senders keep their agent_id as the role label
+    // detail via the kind pill.
+    if (liveRec && Array.isArray(liveRec.inbox)) {
+        for (var k = 0; k < liveRec.inbox.length; k++) {
+            var it = liveRec.inbox[k];
+            if (!it) continue;
+            push(it.from === 'parent' ? 'parent' : 'worker',
+                'queued' + (it.kind && it.kind !== 'message' ? ' \u00b7 ' + it.kind : ''),
+                it.content, it.at);
+        }
+    }
+    return entries;
+}
+
+// Truncate a thread entry to one compact line (the full text already lives
+// in the card's input/output panels — the thread is an overview, not a
+// second copy of every payload).
+function _subThreadPreview(text) {
+    var s = String(text).replace(/\s+/g, ' ').trim();
+    return s.length > 220 ? (s.slice(0, 220) + '\u2026') : s;
+}
+
+function _subThreadHtml(msg, liveRec, cardKey) {
+    var entries;
+    try { entries = _subThreadEntries(msg, liveRec); } catch (_) { entries = []; }
+    if (!entries || entries.length < 2) return ''; // spawn alone ≠ a dialogue
+    var rows = '';
+    for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        var isParent = (e.role === 'parent');
+        var time = e.at ? _subThreadTime(e.at) : '';
+        rows += '<div class="sub-thread-row sub-thread-' + (isParent ? 'parent' : 'worker') + '">' +
+            '<span class="sub-thread-role">' + (isParent ? 'parent \u2192' : 'worker \u2192') + '</span>' +
+            (e.kind ? '<span class="sub-thread-kind">' + escapeHtml(e.kind) + '</span>' : '') +
+            '<span class="sub-thread-text">' + escapeHtml(_subThreadPreview(e.text)) + '</span>' +
+            (time ? '<span class="sub-thread-time">' + escapeHtml(time) + '</span>' : '') +
+        '</div>';
+    }
+    // Collapsed by default; the user's toggle survives repaints via the SAME
+    // data-sub-report-toggle recorder the outer card uses (capture-phase
+    // 'toggle' listener + _subReportOpenPref), keyed 'thread:'+cardKey.
+    var prefKey = 'thread:' + cardKey;
+    var pref = _subReportOpenPref[prefKey];
+    var open = (pref != null) ? pref : false;
+    return '<details' + (open ? ' open' : '') + ' class="sub-thread" data-sub-report-toggle="' + escapeHtml(prefKey) + '" data-rendered-open="' + (open ? '1' : '0') + '">' +
+        '<summary class="sub-thread-summary">dialogue (' + entries.length + ')</summary>' +
+        '<div class="sub-thread-body">' + rows + '</div>' +
+    '</details>';
+}
+
 function renderSubReport(msg, index) {
     var report = msg.report || {};
     var status = _subReportLiveStatus(msg);
@@ -222,6 +350,39 @@ function renderSubReport(msg, index) {
     var iconHtml = isRunning
         ? '<span class="sub-report-spinner" aria-hidden="true"></span>'
         : '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>';
+    // ── Review-state badge (Orchestrator §3) ──
+    // Live-record read only: a GC'd/expired record simply shows no badge
+    // (review_state is a workflow hint, not part of the archived report).
+    var reviewHtml = '';
+    if (msg.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+        var _rvRec = SubAgents.getById(msg.subAgentId);
+        var _rvBadge = (_rvRec && _rvRec.review_state) ? SUB_REVIEW_BADGES[_rvRec.review_state] : null;
+        if (_rvBadge) {
+            reviewHtml = '<span class="sub-report-review" title="deliverable review state"'
+                + ' style="margin-left:6px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
+                + 'background:' + _rvBadge.bg + ';color:' + _rvBadge.fg + ';">'
+                + escapeHtml(_rvBadge.label) + '</span>';
+        }
+        // Orchestrator §6: model-provenance badge — which provider/tier
+        // this worker runs on. Live-record read only (same GC
+        // rationale as the review badge — provenance is shown while the
+        // record exists; the archived report itself never claimed it).
+        var _mdlLine = _subModelLine(_rvRec);
+        if (_mdlLine) {
+            reviewHtml += '<span class="sub-report-model" title="model this worker runs on \u2014 provider (tier)">'
+                + escapeHtml(_mdlLine) + '</span>';
+        }
+        // Orchestrator §5: awaiting-approval badge — a tool call in the sub's
+        // chat is parked on a permission modal (rec.awaiting_approval, stamped
+        // by onSubApprovalEvent). The card repaints on the same lifecycle
+        // notice that announces the park, so the badge appears immediately.
+        if (_subAwaitingApproval(_rvRec)) {
+            var _apTool = (_rvRec.awaiting_approval && _rvRec.awaiting_approval.tool) || 'a tool call';
+            reviewHtml += '<span class="sub-report-approval" title="' + escapeHtml(_apTool) + ' is awaiting user approval in the sub\u2019s chat"'
+                + ' style="margin-left:6px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
+                + 'background:#5c4d10;color:#ffe289;">awaiting approval</span>';
+        }
+    }
     var summary = report.summary || '';
     var name = msg.subAgentName || report.from_name || msg.subAgentId || 'sub-agent';
     // Stable per-card key — drives the open/collapse pref maps and the
@@ -437,7 +598,7 @@ function renderSubReport(msg, index) {
         // white-space:nowrap on the button (CSS) keep it on one line even
         // when the preview text would otherwise push it to wrap.
         var chatIconSvg = '<svg class="sub-report-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
-        openLink = '<button type="button" class="sub-report-open" data-sub-chat-id="' + escapeHtml(targetChatId) + '" title="Open this sub-agent\u2019s chat">' + chatIconSvg + '<span class="sub-report-open-label">open chat</span></button>';
+        openLink = '<button type="button" class="sub-report-open" data-sub-chat-id="' + escapeHtml(targetChatId) + '" title="Open this sub-agent\u2019s chat">' + chatIconSvg + '<span class="sub-report-open-label">Open chat</span></button>';
     }
     var synth = report._synthesized ? '<span class="sub-report-synth" title="No explicit report_to_parent — fallback summary from last assistant message">auto</span>' : '';
     // Phase-5 follow-up: the sub_report panel is now COLLAPSED by default —
@@ -483,7 +644,13 @@ function renderSubReport(msg, index) {
     var cardPref = _subReportOpenPref[cardKey];
     var openNow = (cardPref != null) ? cardPref : (isLive || status === 'error' || status === 'need_input');
     var defaultOpen = openNow ? ' open' : '';
-    var bodyHtml = phasesHtml + inputsHtml + progressHtml + actionStateHtml + outputHtml;
+    // Orchestrator §4: compact parent⇄worker dialogue thread at the top of
+    // the body (collapsed by default). Live record is optional — a GC'd sub
+    // still gets a thread from the persisted card fields alone.
+    var threadRec = (msg.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById)
+        ? SubAgents.getById(msg.subAgentId) : null;
+    var threadHtml = _subThreadHtml(msg, threadRec, cardKey);
+    var bodyHtml = threadHtml + phasesHtml + inputsHtml + progressHtml + actionStateHtml + outputHtml;
     // data-rendered-open stamps the state this render PRODUCED. Chrome fires
     // a (trusted) 'toggle' event even when a <details open> is merely inserted
     // via innerHTML, so the pref recorder below compares against this stamp to
@@ -495,6 +662,7 @@ function renderSubReport(msg, index) {
             iconHtml +
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
             '<span class="sub-report-status">' + escapeHtml(statusLabel) + '</span>' +
+            reviewHtml +
             synth +
             previewHtml +
             openLink +
@@ -591,12 +759,16 @@ function renderSubAgentBreadcrumb(chat) {
 // see updateContextIndicator in 240-layout.js). Click a card to open the
 // sub's transcript. Moved here from the old above-input "Workers strip".
 
-// Context limit for the active model (same lookup as updateContextIndicator).
-function _subContextLimit() {
+// Context limit for any chat: the FIXED assumed window applied to every
+// model (user-editable global setting, default 200k — see
+// getAssumedContextTokens in core/030-config.js). Per-model windows are no
+// longer tracked; every ring measures against the same assumed window,
+// matching the saturation gauges in core/097-sub-agent-registry.js.
+// (chatId kept for signature compatibility with callers.)
+function _subContextLimit(chatId) {
     try {
-        var provider = (typeof currentProvider !== 'undefined' && typeof getProviderById === 'function' && getProviderById(currentProvider)) ? getProviderById(currentProvider) : null;
-        return (provider && provider.context_length) || (provider && provider.maxTokens ? provider.maxTokens * 2 : 128000) || 128000;
-    } catch (_) { return 128000; }
+        return (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
+    } catch (_) { return 200000; }
 }
 
 // Derive a sub-agent's current context size from its chat. Sub-agent chats
@@ -615,7 +787,7 @@ function _subContextInfo(chatId) {
             }
         }
     }
-    var limit = _subContextLimit();
+    var limit = _subContextLimit(chatId);
     var pct = (limit > 0) ? Math.min(100, Math.round((tokens / limit) * 100)) : 0;
     return { tokens: tokens, pct: pct };
 }
@@ -623,6 +795,58 @@ function _subContextInfo(chatId) {
 function _fmtTokens(t) {
     t = t || 0;
     return t >= 1000 ? (Math.round(t / 1000) + 'k') : String(t);
+}
+
+// Collapsed-card work counters: files edited + PRs opened by the sub's chat.
+// Derived from the SAME synchronous message-scan helpers the version sidebar
+// uses — getWsEditedFilesForChat (115-workspace-files-sidebar.js) and
+// getPushedPRsForChat (120-ui-utils.js) — so there is no extra persistence
+// and the counts survive registry GC (sub chats live in the global `chats`
+// map). Memoized on messages.length: both scans JSON.parse every workspace
+// tool call, too heavy to redo on every updateSidebarWorkerMetrics heartbeat.
+var _subWorkStatsCache = Object.create(null);
+function _subWorkStats(chatId) {
+    var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || !Array.isArray(c.messages)) return { n: 0, files: 0, prs: 0 };
+    var cached = _subWorkStatsCache[chatId];
+    if (cached && cached.n === c.messages.length) return cached;
+    var files = 0, prs = 0;
+    try { if (typeof getWsEditedFilesForChat === 'function') files = getWsEditedFilesForChat(c).length; } catch (_) { /* count stays 0 */ }
+    try { if (typeof getPushedPRsForChat === 'function') prs = getPushedPRsForChat(c).length; } catch (_) { /* count stays 0 */ }
+    var out = { n: c.messages.length, files: files, prs: prs };
+    _subWorkStatsCache[chatId] = out;
+    return out;
+}
+
+// Singular/plural label for the collapsed-card work counters.
+function _subCountLabel(n, singular, plural) {
+    return n + ' ' + (n === 1 ? singular : plural);
+}
+
+// Orchestrator §5: true while the sub is parked on a permission modal
+// (mirrors rec.awaiting_approval / _pending_approvals stamped by
+// onSubApprovalEvent in the registry).
+function _subAwaitingApproval(rec) {
+    return !!(rec && (rec.awaiting_approval || (rec._pending_approvals || 0) > 0));
+}
+
+// Orchestrator §6: per-sub model provenance line for worker cards and the
+// sub-report card header — 'provider (tier)'. rec.provider is the
+// resolved provider NAME pinned at spawn, rec.tier the alias it was
+// requested through. '' for legacy / reconstructed records that carry
+// neither field (no badge rendered — GC-safe).
+function _subModelLine(rec) {
+    if (!rec) return '';
+    var prov = rec.provider || null;
+    // tier:'same' subs pin no provider — they dynamically follow their spawner.
+    // Resolve the CURRENT followed model for display (best-effort; page ctx).
+    if (!prov && rec.tier === 'same' && rec.same_as && typeof resolveChatProviderName === 'function') {
+        try { prov = resolveChatProviderName(rec.same_as); } catch (_) { /* leave null */ }
+    }
+    if (!prov && !rec.tier) return '';
+    var line = prov || 'inherit';
+    if (rec.tier) line += ' (' + rec.tier + ')';
+    return line;
 }
 
 // Lightweight per-tick refresh of the live metrics (context circle + tool-call
@@ -653,9 +877,26 @@ function updateSidebarWorkerMetrics() {
             var rec = _resolveSubRec(aid);
             if (rec) {
                 var used = rec.tool_calls_used || 0;
-                var cap = rec.max_tool_calls || '?';
-                toolsEl.innerHTML = escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools';
+                toolsEl.textContent = String(used) + ' tool calls';
+                // Orchestrator §5: live approval badge refresh.
+                var apEl = card.querySelector('[data-worker-approval]');
+                if (apEl) apEl.hidden = !_subAwaitingApproval(rec);
             }
+        }
+        // Work counters — files edited / PRs opened by the sub's chat
+        // (memoized message scan; only repainted when the count changes).
+        var work = _subWorkStats(card.getAttribute('data-worker-chat'));
+        var filesEl = card.querySelector('[data-worker-files]');
+        if (filesEl) {
+            var filesTxt = _subCountLabel(work.files, 'file', 'files');
+            if (filesEl.textContent !== filesTxt) filesEl.textContent = filesTxt;
+            filesEl.hidden = !work.files;
+        }
+        var prsEl = card.querySelector('[data-worker-prs]');
+        if (prsEl) {
+            var prsTxt = _subCountLabel(work.prs, 'PR', 'PRs');
+            if (prsEl.textContent !== prsTxt) prsEl.textContent = prsTxt;
+            prsEl.hidden = !work.prs;
         }
         // Live-refresh an expanded card's progress panel when the sub's
         // action_state advances — keyed on `at` so we rebuild only on a real
@@ -702,7 +943,16 @@ function _workerProgressInner(rec) {
     if (openAttr) {
         inner += '<a class="worker-progress-open" ' + openAttr + ' role="button" tabindex="0" title="Open chat">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
-            '<span>open chat</span></a>';
+            '<span>Open chat</span></a>';
+    }
+    // "Chat view" affordance — opens the sub's inline chat card (the SAME
+    // renderSubReport card shown in the parent chat: inputs + progress +
+    // outputs) inside the global modal overlay. Only offered when a
+    // persisted sub_report card for this agent can actually be located.
+    if (rec && rec.agent_id && _findSubReportMsg(rec.agent_id)) {
+        inner += '<a class="worker-progress-open worker-progress-chat-view" data-worker-modal="' + escapeHtml(rec.agent_id) + '" role="button" tabindex="0" title="View this sub-agent\'s inputs and outputs in a modal">' +
+            '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>' +
+            '<span>View more</span></a>';
     }
     return inner;
 }
@@ -724,6 +974,135 @@ function toggleWorkerProgress(agentId, cardEl) {
     panel.hidden = !open;
     cardEl.classList.toggle('worker-card-expanded', open);
     cardEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+// ---------- Worker chat-view modal ----------
+// Locate the persisted sub_report message for an agent — the SAME message
+// object renderSubReport paints inline in the parent chat. Live records
+// carry parent_chat_id; reconstructed records were mined from the current
+// chat's messages, so currentChatId is the fallback. A last-resort scan of
+// every chat covers records revealed from another chat's subtree.
+function _findSubReportMsg(agentId) {
+    if (!agentId || typeof chats === 'undefined') return null;
+    function scan(chatId) {
+        var c = chatId ? chats[chatId] : null;
+        if (!c || !Array.isArray(c.messages)) return null;
+        for (var i = c.messages.length - 1; i >= 0; i--) {
+            var m = c.messages[i];
+            if (m && m.role === 'sub_report' && m.subAgentId === agentId) return m;
+        }
+        return null;
+    }
+    var rec = _resolveSubRec(agentId);
+    var msg = (rec && rec.parent_chat_id) ? scan(rec.parent_chat_id) : null;
+    if (!msg && typeof currentChatId !== 'undefined') msg = scan(currentChatId);
+    if (!msg) {
+        for (var cid in chats) {
+            msg = scan(cid);
+            if (msg) break;
+        }
+    }
+    return msg;
+}
+
+// Modal state: which agent is showing, the last-rendered content key (skip
+// no-op repaints on registry heartbeat ticks), and the live listener that
+// refreshes the modal body while the sub keeps running.
+var _workerModalAgentId = null;
+var _workerModalKey = null;
+var _workerModalListener = null;
+var _workerModalRefreshScheduled = false;
+
+// Cheap change-key over everything the modal body renders — mirrors the
+// _subReportKey fields (status / progress / phases / live state) plus the
+// action-state timestamp and live inbox length the thread view shows.
+function _workerModalContentKey(msg, rec) {
+    var st = (msg.report && msg.report.status) || 'partial';
+    var prog = Array.isArray(msg.progress) ? msg.progress.length : 0;
+    var phn = Array.isArray(msg.phases) ? msg.phases.length : 0;
+    var act = (msg.actionState && msg.actionState.at) || 0;
+    var live = rec ? (rec.state + ':' + ((rec.action_state && rec.action_state.at) || 0) + ':' + (Array.isArray(rec.inbox) ? rec.inbox.length : 0)) : '';
+    return st + ':' + prog + ':' + phn + ':' + (msg.phasesDropped | 0) + ':' + act + ':' + live;
+}
+
+// (Re)paint the modal body via renderSubReport — the EXACT renderer the
+// inline sub_report card uses. index 'wkmodal' keeps the DOM ids
+// ('msg-wkmodal', 'sub-str-wkmodal…') distinct from the inline card's
+// numeric ids so getElementById-driven toggles never cross-target; the
+// cardKey-derived pref/copy keys are intentionally SHARED with the inline
+// card (same content, same raw-copy store, same expand prefs).
+function _renderWorkerChatModalBody() {
+    _workerModalRefreshScheduled = false;
+    var body = document.getElementById('modal-body');
+    if (!body || !_workerModalAgentId) return;
+    var msg = _findSubReportMsg(_workerModalAgentId);
+    if (!msg) return;
+    var rec = _resolveSubRec(_workerModalAgentId);
+    var key = _workerModalContentKey(msg, rec);
+    if (key === _workerModalKey) return;
+    _workerModalKey = key;
+    var html;
+    try { html = renderSubReport(msg, 'wkmodal'); }
+    catch (_) { html = '<div class="worker-progress-empty">Failed to render chat view.</div>'; }
+    body.innerHTML = html;
+    // Force the card open inside the modal (a modal showing a collapsed
+    // header is useless). Pre-stamp data-rendered-open='1' BEFORE flipping
+    // .open so the capture-phase 'toggle' pref recorder sees a render echo
+    // and does NOT record this as a user choice on the shared cardKey pref.
+    var det = body.querySelector('details.sub-report');
+    if (det && !det.open) {
+        det.setAttribute('data-rendered-open', '1');
+        det.open = true;
+    }
+}
+
+// Open the modal for a worker's chat card. Reuses the global #modal-overlay
+// scaffolding (backdrop click -> closeModal via the overlay's own onclick,
+// Escape via the global handler in core/120-init.js). While open, a
+// SubAgents listener live-refreshes the body exactly like the inline card.
+function openWorkerChatModal(agentId) {
+    var msg = _findSubReportMsg(agentId);
+    if (!msg) {
+        if (typeof showSnackbar === 'function') showSnackbar('No chat card found for this sub-agent', 'error');
+        return;
+    }
+    var overlay = document.getElementById('modal-overlay');
+    var header = document.getElementById('modal-header');
+    var body = document.getElementById('modal-body');
+    var actions = document.getElementById('modal-actions');
+    if (!overlay || !header || !body) return;
+    var name = msg.subAgentName || agentId;
+    header.innerHTML = '<span class="modal-title-text">' + escapeHtml(name) + '</span>' +
+        '<div class="modal-header-actions">' +
+        '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    if (actions) actions.innerHTML = '';
+    _workerModalAgentId = agentId;
+    _workerModalKey = null; // force first paint
+    _renderWorkerChatModalBody();
+    overlay.classList.add('show');
+    overlay.classList.add('worker-chat-modal');
+    if (!_workerModalListener && typeof SubAgents !== 'undefined' && SubAgents.addListener) {
+        _workerModalListener = function() {
+            if (_workerModalRefreshScheduled) return;
+            _workerModalRefreshScheduled = true;
+            if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_renderWorkerChatModalBody);
+            else setTimeout(_renderWorkerChatModalBody, 16);
+        };
+        SubAgents.addListener(_workerModalListener);
+    }
+}
+
+// Teardown hook — called by closeModal() (220-notification-system.js) on
+// EVERY close path (close button, backdrop click, Escape) so the live
+// listener never outlives the modal.
+function _teardownWorkerChatModal() {
+    if (_workerModalListener && typeof SubAgents !== 'undefined' && SubAgents.removeListener) {
+        try { SubAgents.removeListener(_workerModalListener); } catch (_) {}
+    }
+    _workerModalListener = null;
+    _workerModalAgentId = null;
+    _workerModalKey = null;
+    _workerModalRefreshScheduled = false;
 }
 
 // Whitelist worker state for class-name interpolation (defense-in-depth,
@@ -797,6 +1176,16 @@ function _workerCardHtml(r) {
     // document-level delegated listener handles data-worker-toggle / -reveal.
     var wkExpanded = !!_workerExpanded[r.agent_id];
     var progAt = r.action_state ? (r.action_state.at || 0) : 0;
+    // Orchestrator §5: awaiting-approval badge, refreshed in place by
+    // updateSidebarWorkerMetrics; inline styles keep the badge self-contained
+    // (matches SUB_REVIEW_BADGES).
+    var awaitingAp = _subAwaitingApproval(r);
+    // Collapsed-card work counters (files edited / PRs opened) — rendered
+    // only when > 0, refreshed in place by updateSidebarWorkerMetrics.
+    var work = _subWorkStats(r.chat_id);
+    // Orchestrator §6: the model this worker actually runs on (spawn-pinned
+    // provider + tier). '' on legacy/reconstructed records → hidden.
+    var modelLine = _subModelLine(r);
     return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
         '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
         'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
@@ -808,11 +1197,21 @@ function _workerCardHtml(r) {
             '<span class="worker-card-row">' +
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
                 '<span class="worker-name">' + escapeHtml(label) + '</span>' +
+                '<span class="worker-approval-badge" data-worker-approval title="a tool call is awaiting user approval in this sub\u2019s chat"' +
+                ' style="margin-left:4px;padding:0 5px;border-radius:8px;font-size:9px;font-weight:600;white-space:nowrap;background:#5c4d10;color:#ffe289;"' +
+                (awaitingAp ? '' : ' hidden') + '>approval</span>' +
             '</span>' +
             '<span class="worker-card-row worker-card-sub">' +
                 '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
-                '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + '<span class="worker-tools-sep">/</span>' + escapeHtml(String(cap)) + ' tools</span>' +
+                '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + ' tool calls</span>' +
+                '<span class="worker-files" data-worker-files title="workspace files edited by this sub"' + (work.files ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.files, 'file', 'files')) + '</span>' +
+                '<span class="worker-prs" data-worker-prs title="PRs opened by this sub"' + (work.prs ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.prs, 'PR', 'PRs')) + '</span>' +
             '</span>' +
+            // Orchestrator §6: own row — the provider/tier string is long
+            // and would crush the state/tools row into ellipsis.
+            (modelLine
+                ? '<span class="worker-card-row worker-card-sub"><span class="worker-model" data-worker-model title="model this worker runs on \u2014 provider (tier)">' + escapeHtml(modelLine) + '</span></span>'
+                : '') +
         '</span>' +
         _contextCircleHtml(r.chat_id) +
         '<span class="worker-card-caret" aria-hidden="true">\u203a</span>' +
@@ -1125,6 +1524,14 @@ function renderWorkersStrip() {
                         evt.preventDefault();
                         return;
                     }
+                    // "Chat view" link inside an expanded worker card —
+                    // opens the sub's inline chat card in the global modal.
+                    var wkModal = t.getAttribute('data-worker-modal');
+                    if (wkModal) {
+                        openWorkerChatModal(wkModal);
+                        evt.preventDefault();
+                        return;
+                    }
                     // data-sub-agent-reveal carries an agent_id (resolved
                     // via registry); data-sub-chat-id carries a direct
                     // chat id (used for sub_report links so they keep
@@ -1133,6 +1540,14 @@ function renderWorkersStrip() {
                     var cid = t.getAttribute('data-sub-chat-id');
                     if (aid || cid) {
                         revealSubAgentChat(aid || cid);
+                        // A reveal clicked INSIDE the worker chat-view modal
+                        // (the card's own "open chat" button) navigates the
+                        // chat BEHIND the overlay — close the modal so the
+                        // user actually sees the chat they asked for.
+                        var _ovl = document.getElementById('modal-overlay');
+                        if (_ovl && _ovl.classList.contains('worker-chat-modal') && _ovl.contains(t) && typeof closeModal === 'function') {
+                            closeModal();
+                        }
                         evt.preventDefault();
                         return;
                     }
