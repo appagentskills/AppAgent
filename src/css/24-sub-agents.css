@@ -882,6 +882,21 @@
     min-width: 0;
     max-width: 100%;
 }
+/* .worker-profiles / .worker-profile-tag — tool-profile chips on a worker
+   card (spawn_sub_agent `profiles` param, stamped on the registry record).
+   Rendered ONLY when the record carries a non-empty profiles array (legacy
+   full-roster + reconstructed records → no row). Same accent tint as
+   .sub-report-model so profile metadata reads consistently across surfaces. */
+.worker-profiles { gap: 4px; flex-wrap: wrap; }
+.worker-profile-tag {
+    padding: 0 5px;
+    border-radius: var(--radius-sm, 4px);
+    font-size: var(--text-xs, 10px);
+    line-height: 15px;
+    white-space: nowrap;
+    color: var(--accent, #6c63ff);
+    background: rgba(108, 99, 255, 0.10);
+}
 /* .worker-files / .worker-prs — collapsed-card work counters (files edited,
    PRs opened by the sub's chat). Same muted single-line styling as
    .worker-tools; hidden via [hidden] when the count is 0. */

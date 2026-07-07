@@ -53,13 +53,16 @@ async function saveChatsToStorage() {
     }
     _workerSavePending = true;
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([chatStoreName], 'readwrite');
+        // withStore (core/130-indexeddb.js, shared into this bundle): retries
+        // ONCE on a fresh connection if the cached one was force-closed by
+        // the browser. Safe to retry: the diff-save re-derives everything
+        // from in-memory state.
+        await withStore([chatStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
         // vanished from memory, upsert the rest.
         var keysRequest = store.getAllKeys();
-        await new Promise(function(_resolve) {
+        return new Promise(function(_resolve) {
             // WS-1 (B16/B17): settle-guard so the commit promise resolves EXACTLY
             // once and can't wedge. A put-error can ABORT the whole txn; without the
             // onabort safety-net AND a zero-crossing resolve on the put-error path,
@@ -104,6 +107,7 @@ async function saveChatsToStorage() {
             };
             keysRequest.onerror = function() { resolve(); };
         });
+        }); // end withStore fn
     } catch (e) {
         console.error('[worker-storage] save failed', e);
     } finally {
@@ -124,8 +128,9 @@ async function saveChatsToStorage() {
 
 async function loadChatsFromStorage() {
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([chatStoreName], 'readonly');
+        // withStore (core/130-indexeddb.js, shared into this bundle): retries
+        // ONCE on a fresh connection if the cached one was force-closed.
+        return await withStore([chatStoreName], 'readonly', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         var request = store.getAll();
         return new Promise(function(resolve) {
@@ -151,8 +156,12 @@ async function loadChatsFromStorage() {
                 resolve();
             };
         });
+        }); // end withStore fn
     } catch (e) {
-        console.error('[worker-storage] open failed', e);
+        // Post-retry failure — no DOM in this realm, so log loudly; the page
+        // realm surfaces its own user-visible notice, and the wipe-guard
+        // (_chatsHydrated stays false) keeps saves blocked so nothing is lost.
+        console.error('[worker-storage] open failed (post-retry) — chat storage unavailable in the worker realm', e);
     }
 }
 

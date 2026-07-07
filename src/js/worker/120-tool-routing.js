@@ -502,78 +502,10 @@ function pickExecutorPort() {
 // reassigned here. The wrapper:
 //   • for headless tools → calls the original locally
 //   • for UI tools → routes to a panel; parks if no panel
-//
-// ASYNC HANDLE INTERCEPT (await: false) — see the matching block in
-// tools/020-tool-execution.js for the headless-tool wrap. UI-routed
-// tools have to be intercepted HERE instead, because the SW wrapper
-// short-circuits the call BEFORE _executeToolLocal runs — meaning
-// the in-dispatcher wrap path never fires for non-headless tools.
-// Symptom of the missing intercept: caller gets a handle back from
-// the page's own dispatcher (which DID wrap), but the handle lives
-// in the page-side Handles registry while await_handle/poll_handle
-// run in the SW and look up the SW-side registry → "unknown handle".
 // =============================================================
 var _executeToolLocal = executeTool;
 executeTool = async function(name, args, messageIndex, options) {
-    // ASYNC WRAP for UI tools — must run BEFORE the headless short-circuit
-    // so headless tools keep their existing in-dispatcher wrap (they go
-    // through _executeToolLocal which handles `await:false` itself).
     var _isHeadless = (typeof isHeadlessTool === 'function') && isHeadlessTool(name);
-    if (!_isHeadless
-        && args && Object.prototype.hasOwnProperty.call(args, 'await')
-        && args.await === false
-        && !(options && options._asyncWrapping)
-        && typeof Handles !== 'undefined'
-        && !(Handles.ALWAYS_SYNC_TOOLS && Handles.ALWAYS_SYNC_TOOLS[name])) {
-        // Strip the meta-key so the recursive call goes to the panel without it.
-        var _strippedAsync = {};
-        for (var _ak in args) { if (_ak !== 'await') _strippedAsync[_ak] = args[_ak]; }
-        var _chatIdForHandle = (options && options.chatId)
-            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
-        var _displayName = (typeof getToolDisplayName === 'function')
-            ? getToolDisplayName(name, _strippedAsync.method || _strippedAsync.action)
-            : name;
-        var _nextOptions = {};
-        for (var _ok in (options || {})) _nextOptions[_ok] = options[_ok];
-        _nextOptions._asyncWrapping = true;
-        var _started = Handles.start(_chatIdForHandle, name, _strippedAsync, _displayName, function() {
-            // Recurse through the wrapped executeTool so the call is routed
-            // to the panel as a normal sync UI tool call (the recursive
-            // invocation has `_asyncWrapping` set, so this block is skipped).
-            return executeTool(name, _strippedAsync, messageIndex, _nextOptions);
-        });
-        _nextOptions._handleId = _started.handleId;
-        _nextOptions._handleChatId = _chatIdForHandle;
-        // Track on the owning sub-agent so stop_sub_agent can cancel — same
-        // bookkeeping as the in-dispatcher wrap in tools/020-tool-execution.js.
-        try {
-            if (_chatIdForHandle && typeof chats !== 'undefined' && chats[_chatIdForHandle]
-                && chats[_chatIdForHandle].isSubAgent
-                && typeof SubAgents !== 'undefined' && SubAgents.getById) {
-                var _ownerSub = SubAgents.getById(chats[_chatIdForHandle].subAgentId);
-                if (_ownerSub) {
-                    _ownerSub.pending_handles = _ownerSub.pending_handles || [];
-                    if (_ownerSub.pending_handles.indexOf(_started.handleId) === -1) {
-                        _ownerSub.pending_handles.push(_started.handleId);
-                    }
-                    if (Handles.await) {
-                        Handles.await(_chatIdForHandle, _started.handleId, 0).then(function() {
-                            var _idx = _ownerSub.pending_handles.indexOf(_started.handleId);
-                            if (_idx >= 0) _ownerSub.pending_handles.splice(_idx, 1);
-                        });
-                    }
-                }
-            }
-        } catch (_) { /* best-effort; never break async wrap */ }
-        return {
-            success: true,
-            handle: _started.handleId,
-            status: 'pending',
-            tool: name,
-            note: 'Async tool call — use await_handle("' + _started.handleId + '") to collect the result.'
-        };
-    }
 
     // Headless tools run in offscreen directly. The original
     // dispatcher already does its own permission check via
@@ -593,10 +525,7 @@ executeTool = async function(name, args, messageIndex, options) {
     // also runs _executeToolLocal's gate when it executes the routed tool, but
     // that mutates its read-only mirror, which the next SW snapshot clobbers —
     // harmless, never the authoritative count.) All UI tools are productive work;
-    // none are in the lifecycle/handle exempt set (those are all headless). Runs
-    // only on the real execution: the await:false async-wrap above returns the
-    // handle before reaching here, and the deferred recursive call (_asyncWrapping)
-    // skips the wrap block and lands here exactly once.
+    // none are in the lifecycle/handle exempt set (those are all headless).
     if (typeof SubAgents !== 'undefined' && SubAgents.onToolCallInSubAgent) {
         var _budgetChatId = (options && options.chatId)
             || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
@@ -923,8 +852,8 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             });
         });
 
-        // If we're inside an async-wrapped handle, mark awaitingApproval so
-        // the agent's poll_handle / await_handle can see that the tool is
+        // If this call runs inside a background handle (options._handleId —
+        // legacy plumbing), mark awaitingApproval so a handle snapshot shows the tool is
         // blocked on user input rather than slow network work. Mirrors the
         // page-side wiring in ui/150-tool-approval.js.
         if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {

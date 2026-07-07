@@ -131,6 +131,9 @@ async function extension_build(args) {
         'src/js/core/030-config.js',
         'src/js/core/060-ui-constants.js',
         'src/js/core/070-permissions.js',
+        // 078-tool-profiles — TOOL_PROFILES table + profile helpers used by
+        // the roster filter (097) and worker/025. Before 080-tools/097.
+        'src/js/core/078-tool-profiles.js',
         'src/js/core/080-tools.js',
         'src/js/core/085-eval-runner.js',
         'src/js/core/090-codemap.js',

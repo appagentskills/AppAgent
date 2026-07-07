@@ -12,6 +12,14 @@ var EVAL_RUNNER_RESULTS_PROP = 'x_eval.session.results';
 var EVAL_RUNNER_PRE_SLEEP_MS = { T6: 2000, T7: 2000, T18: 2000 };
 
 function evalRunnerParseScriptResult(res) {
+    // Surface tool-level failures (arg validation, auth, fetch errors) instead
+    // of collapsing them into an empty {_raw:""} — without this, a rejected
+    // servicenow_run_script call (e.g. missing required `instance` under
+    // deferred-mode arg validation) looked like an empty script output and
+    // every verdict came back UNPARSEABLE with no clue why.
+    if (res && res.success === false && res.error) {
+        return { _error: String(res.error).slice(0, 300) };
+    }
     var raw = ((res && (res.output || (res.result && res.result.output))) || '')
         .replace(/&quot;/g, '"')
         .replace(/&amp;/g, '&')
@@ -31,12 +39,22 @@ function evalRunnerParseScriptResult(res) {
     return { _raw: raw.slice(-400) };
 }
 
-async function evalRunnerRunScript(script, msg, options) {
-    var res = await executeTool('servicenow_run_script', {
+async function evalRunnerRunScript(script, msg, options, instance) {
+    // servicenow_run_script's schema REQUIRES `instance` — deferred-mode arg
+    // validation (tools/020-tool-execution.js → validateArgsAgainstToolSchema)
+    // rejects the call outright when it is missing, and the legacy no-instance
+    // relative-URL fallback doesn't work from the service worker anyway.
+    // Resolve explicitly: caller-supplied value first, then the active
+    // instance URL (Platform.resolveInstanceUrl accepts full URLs too).
+    var callArgs = {
         script: script,
         confirm: false,
         status_message: msg
-    }, null, {
+    };
+    var inst = instance
+        || (typeof Platform !== 'undefined' && Platform.instanceUrl) || null;
+    if (inst) callArgs.instance = inst;
+    var res = await executeTool('servicenow_run_script', callArgs, null, {
         chatId: options && options.chatId,
         fromSandbox: true,
         parentToolCallId: options && options.toolCallId
@@ -62,6 +80,9 @@ function evalRunnerGetTask(spec, id) {
 async function executeEvalRunner(args, options) {
     try {
         var action = args && args.action;
+        // Optional explicit target instance (short name or URL); defaults to
+        // the active instance inside evalRunnerRunScript.
+        var evalInstance = (args && args.instance) || null;
 
         if (action === 'init') {
             var spec = await evalRunnerLoadSpec();
@@ -74,7 +95,7 @@ async function executeEvalRunner(args, options) {
                 "upsert('" + EVAL_RUNNER_RUNS_PROP + "', '{}');\n" +
                 "upsert('" + EVAL_RUNNER_RESULTS_PROP + "', '{}');\n" +
                 "gs.print(JSON.stringify({session: 'reset'}));",
-                'Eval grader: resetting session', options);
+                'Eval grader: resetting session', options, evalInstance);
             return {
                 success: true,
                 session: initOut,
@@ -108,7 +129,7 @@ async function executeEvalRunner(args, options) {
                 "  if (found) { gr.update(); } else { gr.insert(); }\n" +
                 "  (function() {\n" + (task.setup_script || "gs.print('ready');") + "\n  })();\n" +
                 "}";
-            var setupOut = await evalRunnerRunScript(setupScript, 'Eval grader: setup ' + task.id, options);
+            var setupOut = await evalRunnerRunScript(setupScript, 'Eval grader: setup ' + task.id, options, evalInstance);
             if (setupOut && setupOut.error === 'DUPLICATE_SETUP') {
                 return { success: true, task_id: task.id, error: 'DUPLICATE_SETUP', cheated: true };
             }
@@ -173,7 +194,7 @@ async function executeEvalRunner(args, options) {
                 "  } catch (e5) { /* audit failure must not mask the verdict */ }\n" +
                 "  gs.print(__verifier_out);\n" +
                 "}";
-            var verdictOut = await evalRunnerRunScript(verifyScript, 'Eval grader: verify+cleanup ' + task2.id, options);
+            var verdictOut = await evalRunnerRunScript(verifyScript, 'Eval grader: verify+cleanup ' + task2.id, options, evalInstance);
             if (verdictOut && typeof verdictOut.pass !== 'undefined') {
                 return {
                     success: true,
@@ -198,7 +219,7 @@ async function executeEvalRunner(args, options) {
                 "var n = 0; while (d.next()) { d.deleteRecord(); n++; }\n" +
                 "out.deleted = n;\n" +
                 "gs.print(JSON.stringify(out));",
-                'Eval grader: teardown + audit readout', options);
+                'Eval grader: teardown + audit readout', options, evalInstance);
             return { success: true, audit: tdOut.audit || tdOut, deleted: tdOut.deleted };
         }
 

@@ -1,21 +1,23 @@
 // =============================================================
 // Handle Registry — async tool layer (Phase 1, Sub-Agent spec §4)
 //
-// In-memory store of in-flight / settled tool handles. A handle is the
-// receipt a caller gets back when they invoke a tool with `await: false`.
-// The actual tool execution runs as a background promise; the agent can
-// poll, await, await_any/all, or cancel via the helper tools registered
-// in src/js/core/080-tools.js and dispatched in src/js/tools/020-tool-execution.js.
+// In-memory store of in-flight / settled handles. A handle is the receipt
+// a caller gets back from a sub-agent operation (spawn_sub_agent /
+// wake_sub_agent / agent_message); the work runs in the background and the
+// agent collects via await_handle / await_any / await_all (registered in
+// src/js/core/080-tools.js, dispatched in src/js/tools/020-tool-execution.js).
+// Internal code can also poll / cancel via Handles.poll / Handles.cancel.
 //
 // Design notes for Phase 1:
 //   • In-memory only. Handles do NOT survive page/SW reload. (Spec §8.3
 //     mentions an IndexedDB backing — deferred.)
 //   • Per-chat scoping: a handle issued in chat A is NOT visible from chat
 //     B. This is the same scoping the spec calls out in §4.4.
-//   • Cancellation is cooperative. We cannot actually abort an in-flight
-//     fetch / GlideRecord / iframe interaction. cancel_handle marks the
-//     entry as cancelled; the underlying promise keeps running and its
-//     result is discarded on settle. The handle stays in state `cancelled`.
+//   • Cancellation is cooperative. We cannot actually abort in-flight
+//     background work. Handles.cancel (used internally, e.g. by
+//     stop_sub_agent) marks the entry as cancelled; the underlying promise
+//     keeps running and its result is discarded on settle. The handle
+//     stays in state `cancelled`.
 //   • GC: settled or cancelled handles are evicted 24h after they settle.
 //     A small periodic sweep runs on every Handles.* call.
 //
@@ -89,7 +91,7 @@ function _snapshot(entry) {
         // True while the inner tool call is blocked on a user-approval
         // modal. Lets the agent distinguish "running slowly" from "user
         // hasn't clicked yet" — if awaitingApproval stays true for too
-        // long, cancel_handle is the right move. Cleared automatically
+        // long, cancelling (Handles.cancel) is the right move. Cleared automatically
         // once the user responds (or denies, which settles the handle).
         //
         // Force false once the handle has settled: the flag was set by
@@ -184,7 +186,7 @@ function _startHandle(chatId, name, args, displayName, runFn) {
 // in-memory by design (see header), so an MV3 service-worker restart wipes
 // `_handles` — but sub-agent records persist `spawn_handle_id` + `last_report`
 // in IDB. SYMPTOM this fixes: after a SW restart the parent's `await_handle`
-// / `poll_handle` against a persisted spawn handle returned `unknown handle`,
+// against a persisted spawn handle returned `unknown handle`,
 // so a sub's report was unreachable even though the record still carried it.
 // The sub-agent registry calls this at boot (loadAllSubAgents) to rebuild:
 //   • settled subs   → a PRE-SETTLED entry (opts.status done/error/cancelled,
@@ -455,49 +457,7 @@ var Handles = {
     cancel: _cancel,
     errorWith: _settleError,
     pendingCount: _pendingCount,
-    markAwaitingApproval: _markAwaitingApproval,
-    // Tools that should NEVER be wrapped in a handle, even if the caller
-    // passes `await: false`. Three buckets:
-    //   1. The handle helpers themselves (wrapping deadlocks).
-    //   2. Cheap reads — no point in async-wrapping.
-    //   3. Tools with eager UI side effects bound to the calling
-    //      tool_result slot (display, html_widget). The async wrap
-    //      severs the slot binding (the agent gets a handle ID instead
-    //      of the placeholder / widgetId it needs to emit in its reply
-    //      text), and the underlying render fires through a separate
-    //      channel so the handle ends up carrying no useful payload.
-    //      Result: silently broken behavior the user can't easily
-    //      diagnose. Force these synchronous.
-    ALWAYS_SYNC_TOOLS: {
-        await_handle: true,
-        poll_handle: true,
-        await_any: true,
-        await_all: true,
-        cancel_handle: true,
-        // Cheap reads — no point in async-wrapping.
-        list_instances: true,
-        set_chat_title: true,
-        set_tldr: true,
-        set_links: true,
-        set_caveat: true,
-        // Cache navigators are pure in-memory reads.
-        cached_content_outline: true,
-        cached_content_read: true,
-        cached_content_search: true,
-        // Eager-render tools — see comment above.
-        display: true,
-        html_widget: true,
-        // Sub-agent runtime tools — cheap registry ops. Their *result* is
-        // the spawn handle / status payload, not the tool execution time;
-        // async-wrapping them adds a hop without buying anything.
-        spawn_sub_agent: true,
-        report_to_parent: true,
-        agent_status: true,
-        wake_sub_agent: true,
-        stop_sub_agent: true,
-        sleep_self: true,
-        agent_message: true
-    }
+    markAwaitingApproval: _markAwaitingApproval
 };
 
 // Expose for SW context too (worker bundle runs as a module/script).

@@ -41,6 +41,11 @@ var agentRunsStoreName = 'agent_runs';
 //     auto_report, max_tool_calls, summary_cap_bytes }
 var subAgentsStoreName = 'sub_agents';
 var db = null;
+// Dedupe concurrent openDatabase() calls: all callers racing while no live
+// connection is cached share ONE in-flight open request. Cleared on failure
+// (error / blocked timeout) so a later call can retry, and on success (the
+// cached `db` takes over as the fast path).
+var _dbOpenPromise = null;
 var skills = {};
 var EMBEDDED_SKILLS = /*EMBEDDED_SKILLS_START*/[]/*EMBEDDED_SKILLS_END*/;
 var currentView = 'chat';
@@ -92,12 +97,97 @@ var gridState = {
     maxZIndex: 1             // Track highest z-index for bringing widgets to front
 };
 
+// Liveness probe for a cached connection. Chrome can force-close an IDB
+// connection at any time (long sessions, IDB backend crash/restart) and the
+// dead handle then throws InvalidStateError on EVERY transaction() forever.
+// A no-op readonly transaction detects this synchronously; an unused
+// transaction just auto-commits empty, so the probe is cheap.
+function _isDbConnectionAlive(database) {
+    try {
+        database.transaction([settingsStoreName], 'readonly');
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 function openDatabase() {
-    return new Promise(function(resolve, reject) {
-        if (db) { resolve(db); return; }
+    // Fast path: cached connection — but verify it's still alive so every
+    // `await openDatabase()` call site (~60 across the bundles, in three
+    // realms: panel page, service worker, offscreen doc) gets a usable
+    // handle without needing individual connection-loss retry logic. This
+    // is the shared transaction-creation choke point.
+    if (db) {
+        if (_isDbConnectionAlive(db)) return Promise.resolve(db);
+        try { db.close(); } catch (e) {}
+        db = null;
+    }
+    if (_dbOpenPromise) return _dbOpenPromise;
+    // Identity guard: capture the promise created for THIS open attempt so a
+    // late-settling old request (e.g. after the onblocked timeout rejected and
+    // a retry created a NEW _dbOpenPromise) can't clobber the newer in-flight
+    // dedupe promise or cache a stale connection over a live one.
+    var myOpenPromise = new Promise(function(resolve, reject) {
         var request = indexedDB.open(dbName, dbVersion);
-        request.onerror = function() { reject(request.error); };
-        request.onsuccess = function() { db = request.result; resolve(db); };
+        var settled = false;
+        var blockedTimer = null;
+        function settle(fn, arg) {
+            if (settled) return;
+            settled = true;
+            if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+            fn(arg);
+        }
+        request.onerror = function() {
+            if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null; // let a later call retry
+            settle(reject, request.error);
+        };
+        // Another connection (old realm/tab) still holds an older version and
+        // hasn't closed. Without this handler the open request stays pending
+        // FOREVER and wedges init (core/120-init.js awaits the first load).
+        // Warn, give the other side 10s to comply (our own onversionchange
+        // handler below closes promptly), then reject so callers fail visibly
+        // instead of hanging. If the open later succeeds anyway, onsuccess
+        // still caches the connection for the next caller.
+        request.onblocked = function() {
+            console.warn('[indexeddb] open of ' + dbName + ' is blocked by another connection holding an older version — waiting up to 10s');
+            if (blockedTimer) return;
+            blockedTimer = setTimeout(function() {
+                if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null; // let a later call retry
+                settle(reject, new Error('IndexedDB open blocked by another connection that did not close. Close other extension views or restart Chrome.'));
+            }, 10000);
+        };
+        request.onsuccess = function() {
+            var result = request.result;
+            // Stale attempt: a newer open superseded us (our blocked-timeout
+            // rejection already cleared _dbOpenPromise and a retry replaced
+            // it) AND a different live connection is already cached. Close
+            // our connection instead of caching over the live one.
+            if (_dbOpenPromise !== myOpenPromise && db && db !== result) {
+                try { result.close(); } catch (e) {}
+                settle(resolve, result);
+                return;
+            }
+            // Lifecycle: the browser force-closed this connection (storage
+            // pressure, IDB backend crash). Drop the cache so the NEXT
+            // openDatabase() reopens instead of handing out a dead handle
+            // (which would throw InvalidStateError in this realm forever,
+            // until a full Chrome restart).
+            result.onclose = function() {
+                console.warn('[indexeddb] connection to ' + dbName + ' was closed by the browser — will reopen on next access');
+                if (db === result) db = null;
+            };
+            // Lifecycle: another realm is opening with a NEWER version and
+            // needs us to close. Comply immediately (so its open is not
+            // blocked) and drop the cache so we reopen at the new version.
+            result.onversionchange = function() {
+                console.warn('[indexeddb] versionchange on ' + dbName + ' — closing this connection so the upgrade can proceed');
+                try { result.close(); } catch (e) {}
+                if (db === result) db = null;
+            };
+            db = result;
+            if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null;
+            settle(resolve, result);
+        };
         request.onupgradeneeded = function(e) {
             var database = e.target.result;
             if (!database.objectStoreNames.contains(chatStoreName)) {
@@ -205,32 +295,72 @@ function openDatabase() {
             }
         };
     });
+    _dbOpenPromise = myOpenPromise;
+    return myOpenPromise;
+}
+
+// True for the DOMException shapes a dead / force-closed connection throws:
+// InvalidStateError, or the "database connection is closing" message some
+// Chrome versions raise while teardown is in progress.
+function _isDbConnectionError(e) {
+    if (!e) return false;
+    if (e.name === 'InvalidStateError') return true;
+    return typeof e.message === 'string' && e.message.toLowerCase().indexOf('database connection is closing') !== -1;
+}
+
+// Retry-once transaction wrapper for the high-traffic read/write paths
+// (settings get/set, chat load/save in page + worker realms). `fn` receives
+// a freshly created transaction and returns a value or promise. If the
+// transaction fails because the connection died (see _isDbConnectionError)
+// — e.g. Chrome force-closed it in the window between openDatabase()'s
+// liveness probe and the transaction() call here — the dead connection is
+// dropped and `fn` is retried EXACTLY once on a fresh connection. NOTE:
+// `_dbOpenPromise` is deliberately NOT cleared here: if one is in flight it
+// already refers to a NEW connection attempt (not the dead handle), and
+// clearing it would fork duplicate opens. Only pass idempotent bodies (all
+// current callers are: get/getAll reads, and diff-saves re-derived from
+// in-memory state).
+async function withStore(storeNames, mode, fn) {
+    var database = await openDatabase();
+    try {
+        return await Promise.resolve(fn(database.transaction(storeNames, mode)));
+    } catch (e) {
+        if (!_isDbConnectionError(e)) throw e;
+        console.warn('[indexeddb] transaction on ' + storeNames + ' hit a dead connection — reopening and retrying once', e);
+        try { database.close(); } catch (e2) {}
+        if (db === database) db = null;
+        database = await openDatabase();
+        return await Promise.resolve(fn(database.transaction(storeNames, mode)));
+    }
 }
 
 // Generic settings get/set for IndexedDB
 async function getSetting(key, defaultValue) {
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([settingsStoreName], 'readonly');
-        var store = transaction.objectStore(settingsStoreName);
-        var request = store.get(key);
-        return new Promise(function(resolve) {
-            request.onsuccess = function() {
-                resolve(request.result ? request.result.value : defaultValue);
-            };
-            request.onerror = function() { resolve(defaultValue); };
+        return await withStore([settingsStoreName], 'readonly', function(transaction) {
+            var store = transaction.objectStore(settingsStoreName);
+            var request = store.get(key);
+            return new Promise(function(resolve) {
+                request.onsuccess = function() {
+                    resolve(request.result ? request.result.value : defaultValue);
+                };
+                request.onerror = function() { resolve(defaultValue); };
+            });
         });
     } catch (e) {
+        // Post-retry failure — log loudly instead of silently defaulting so a
+        // storage outage is diagnosable from the console.
+        console.error('getSetting failed (returning default):', key, e);
         return defaultValue;
     }
 }
 
 async function setSetting(key, value) {
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([settingsStoreName], 'readwrite');
-        var store = transaction.objectStore(settingsStoreName);
-        store.put({ key: key, value: value });
+        await withStore([settingsStoreName], 'readwrite', function(transaction) {
+            var store = transaction.objectStore(settingsStoreName);
+            store.put({ key: key, value: value });
+        });
     } catch (e) {
         console.error('Failed to save setting:', key, e);
     }

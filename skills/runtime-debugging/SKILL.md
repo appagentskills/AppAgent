@@ -1,6 +1,6 @@
 ---
 name: runtime-debugging
-description: Inspect and drive the AppAgent extension's OWN runtime with the runtime_inspect tool while developing the extension. Dev-mode only — the tool and this skill are hidden unless the extension-dev workflow is active (deploy folder connected).
+description: Inspect and drive the AppAgent extension's OWN runtime with the runtime_inspect tool while developing the extension; also the ONLY way to read PAST CHAT transcripts/history (IndexedDB 'chats' store) — use it when the user asks about previous chats, past messages, or anything they typed earlier. Dev-mode only — the tool and this skill are hidden unless the extension-dev workflow is active (deploy folder connected).
 devOnly: true
 ---
 
@@ -72,6 +72,10 @@ The `chats` store is far too big to `query` and eyeball. Instead:
 1. `{action:'db', op:'grep', store:'chats', pattern:'cache heartbeat', limit:5}` → matches like `{key:'chat_1783194987859_mgdqggqyp', path:'messages[12].content', excerpt:'…keep the prompt cache warm…'}`.
 2. `{action:'db', op:'get', store:'chats', key:'chat_1783194987859_mgdqggqyp', path:'messages[12]'}` → read the exact message (or a parent path for surrounding context) without pulling the whole multi-MB record through the 64KB serialization cap.
 3. Narrow long scans with `path` (e.g. `path:'title'` greps only titles) or `key` (one record).
+
+### Reading past chats
+
+User-typed messages in a chat record are `role:"user"` entries in `messages` WITHOUT `isHookMessage` (hook-injected) and not sub-agent report notices (`injected` flag + content starting "Sub-agent"). Workflow: `{action:'db', op:'grep', store:'chats', key:'chat_…', pattern:'^user$', flags:'', path:'messages'}` → the matching `messages[i].role` paths give the indexes, then `{action:'db', op:'get', store:'chats', key:'chat_…', path:'messages[i]'}` to read each one.
 
 ## Safe UI-driving recipe
 

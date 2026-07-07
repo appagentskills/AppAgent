@@ -1186,6 +1186,12 @@ function _workerCardHtml(r) {
     // Orchestrator §6: the model this worker actually runs on (spawn-pinned
     // provider + tier). '' on legacy/reconstructed records → hidden.
     var modelLine = _subModelLine(r);
+    // Tool-profile chips (spawn_sub_agent `profiles` — stamped on the registry
+    // record at spawn). null/absent on legacy full-roster + reconstructed
+    // records → no row rendered at all.
+    var profileTags = Array.isArray(r.profiles)
+        ? r.profiles.filter(function(p) { return typeof p === 'string' && p; })
+        : [];
     return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
         '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
         'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
@@ -1211,6 +1217,12 @@ function _workerCardHtml(r) {
             // and would crush the state/tools row into ellipsis.
             (modelLine
                 ? '<span class="worker-card-row worker-card-sub"><span class="worker-model" data-worker-model title="model this worker runs on \u2014 provider (tier)">' + escapeHtml(modelLine) + '</span></span>'
+                : '') +
+            // Tool-profile chips — own row (same rationale as the model line).
+            (profileTags.length
+                ? '<span class="worker-card-row worker-card-sub worker-profiles" title="tool profiles this worker was spawned with">' +
+                    profileTags.map(function(p) { return '<span class="worker-profile-tag">' + escapeHtml(p) + '</span>'; }).join('') +
+                  '</span>'
                 : '') +
         '</span>' +
         _contextCircleHtml(r.chat_id) +

@@ -192,6 +192,14 @@ function generateSmartOutline(data, maxDepth, options) {
 function processToolResultForCache(chatId, toolCallId, toolName, result) {
     var resultStr = JSON.stringify(result);
 
+    // NEVER cache get_tool_schema results, regardless of size: the tool's
+    // description (core/080-tools.js get_tool_schema definition) promises the
+    // schema "arrives in this tool_result and stays in the conversation
+    // history" — an outline stub would strip the parameters the model needs.
+    if (toolName === 'get_tool_schema') {
+        return { content: resultStr, cached: false };
+    }
+
     // If small enough, return as-is
     if (resultStr.length <= getCacheCharLimit()) {
         return { content: resultStr, cached: false };

@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.14
+
+### Features
+- Tool profiles: the main agent and each sub-agent now get a tool roster tailored to their role, with a profile chip shown on sub-agent worker cards.
+- Leaner system prompt: tool guidance now lives in the tool descriptions themselves, and the main agent follows a pure-orchestrator policy in orchestrator mode.
+- Sub-agent handling was simplified: runs are always awaited, so results come back without extra polling.
+
+### Fixes
+- Fixed an intermittent bug where the extension lost IndexedDB access until Chrome was restarted.
+- Multi-line sub-agent report summaries are no longer cut to their first line in parent-chat notices.
+
+---
+
 ## v1.1.13
 
 ### Features

@@ -276,7 +276,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'cached_content_read',
-            description: 'Read specific parts of large cached tool results. Navigate to a path and optionally read line ranges for code fields.',
+            description: 'Read specific parts of large cached tool results. Navigate to a path and optionally read line ranges for code fields. Each read is capped at ~16KB — for big string/code fields use start_line/end_line; if a read is rejected, narrow the range or search first.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -294,7 +294,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'get_skill',
-            description: 'Retrieve AI skill content and files. Actions: "get" returns SKILL.md content and lists available files. "read_file" reads a specific file from the skill.',
+            description: 'Retrieve AI skill content and files. Actions: "get" returns SKILL.md content and lists available files. "read_file" reads a specific file from the skill. IMPORTANT — before starting any task, check whether a relevant skill exists and read it first: skills contain best practices, patterns, and learnings that improve work quality.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -519,7 +519,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'prompt_user',
-            description: 'Show an inline form to collect structured input from the user. BLOCKING — the agent waits until the user submits or cancels. Use this when you need specific parameters before proceeding (e.g. which format to export, which specs to include, date range). Generate the form dynamically based on context — options should come from the instance or conversation, not be hardcoded.\n\nField types: text, textarea, select, multi-select, date, boolean, number.\nModes:\n- Empty: you need info ("which specs to export?")\n- Prefilled: confirming ("here\'s what I understood, correct?")\n- Partially filled: you know some, need the rest',
+            description: 'Show an inline form to collect structured input from the user. ALWAYS PREFERRED over asking questions in plain text. BLOCKING — the agent waits until the user submits or cancels. Use this when you need specific parameters before proceeding (e.g. which format to export, which specs to include, date range). Generate the form dynamically based on context — options should come from the instance or conversation, not be hardcoded.\n\nField types: text, textarea, select, multi-select, date, boolean, number.\nModes:\n- Empty: you need info ("which specs to export?")\n- Prefilled: confirming ("here\'s what I understood, correct?")\n- Partially filled: you know some, need the rest\n\nPLAN CONFIRMATION: before a long or risky sequence of WRITE operations (building apps/dashboards, bulk changes, multi-record modifications), present your plan here and get approval — do not silently execute it. Read-only or exploratory work needs NO plan confirmation.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -645,7 +645,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'document',
-            description: 'Create, read, update, and manage Smart Documents. Documents are persistent, versioned markdown files that render inline in chat. They support embedded display templates (table, chart, etc.) and non-blocking user prompts. Multiple references to the same document always show the latest version.\n\nVisibility: \'scope\' is \'shared\' by default (global) or \'chat\' (private to the creating chat); fixed at creation.\n\nActions:\n- create: Create a new document. Args: title, content (markdown), scope? (\'shared\' default | \'chat\'), prompts? (non-blocking questions).\n- update: Update document content/title (creates new version). Args: doc_id, content?, title?, prompts?.\n- edit: Search-and-replace edits on document content (creates new version). Args: doc_id, edits (array of {find, replace}). Each find must be unique in the document.\n- read: Read current version + prompt responses. Args: doc_id.\n- list: List documents visible to you.\n- list_versions: List version history. Args: doc_id.\n- read_version: Read a specific version. Args: doc_id, version.\n- delete: Delete a document. Args: doc_id.\n\nTo embed display templates: call the display tool first, get the placeholder, include it in the document content.\nTo add prompts: pass a prompts array with fields (same schema as prompt_user fields).\nThe user can edit documents inline — read the document to see their changes.',
+            description: 'Create, read, update, and manage Smart Documents. Documents are persistent, versioned markdown files that render inline in chat. They support embedded display templates (table, chart, etc.) and non-blocking user prompts. Multiple references to the same document always show the latest version.\n\nVisibility: \'scope\' is \'shared\' by default (global) or \'chat\' (private to the creating chat); fixed at creation.\n\nSCRATCHPAD: a private `scope: "chat"` document is your working scratchpad — it is also shared between a sub-agent and its parent agent without crowding the shared document list.\n\nActions:\n- create: Create a new document. Args: title, content (markdown), scope? (\'shared\' default | \'chat\'), prompts? (non-blocking questions).\n- update: Update document content/title (creates new version). Args: doc_id, content?, title?, prompts?.\n- edit: Search-and-replace edits on document content (creates new version). Args: doc_id, edits (array of {find, replace}). Each find must be unique in the document.\n- read: Read current version + prompt responses. Args: doc_id.\n- list: List documents visible to you.\n- list_versions: List version history. Args: doc_id.\n- read_version: Read a specific version. Args: doc_id, version.\n- delete: Delete a document. Args: doc_id.\n\nTo embed display templates: call the display tool first, get the placeholder, include it in the document content.\nTo add prompts: pass a prompts array with fields (same schema as prompt_user fields).\nThe user can edit documents inline — read the document to see their changes.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -678,15 +678,16 @@ var TOOLS = [
             }
         }
     },
-    // ─── Async tool layer (Sub-Agent spec §4) ───────────────────────────
-    // Any tool call may pass `await: false` to fire-and-forget — the call
-    // returns immediately with `{ handle: "h_...", status: "pending" }` and
-    // the work runs in the background. Use the tools below to collect.
+    // ─── Handle collection (Sub-Agent spec §4) ──────────────────────────
+    // Handles are issued by sub-agent operations — spawn_sub_agent,
+    // wake_sub_agent, and agent_message return `{ handle: "h_..." }`
+    // receipts that settle when the sub reports. Use the tools below to
+    // collect them.
     {
         type: 'function',
         function: {
             name: 'await_handle',
-            description: 'Block (on the scheduler, not the model) until an async tool handle resolves. Returns the snapshot {status: done|error|cancelled|pending, result?, error?}. If status is still "pending" after timeout_ms, the handle is left in-flight — you can poll or await again.',
+            description: 'Block (on the scheduler, not the model) until an async handle resolves. Handles are issued by sub-agent operations — spawn_sub_agent, wake_sub_agent, and agent_message return {handle} receipts that settle when the sub reports. Returns the snapshot {status: done|error|cancelled|pending, result?, error?}. If status is still "pending" after timeout_ms, the handle is left in-flight — you can await it again. Handles are per-chat and do not survive a page reload.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -701,23 +702,8 @@ var TOOLS = [
     {
         type: 'function',
         function: {
-            name: 'poll_handle',
-            description: 'Non-blocking peek at an async tool handle. Returns the current snapshot {status, result?, error?} without waiting. Status "pending" means the work is still running.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    handle: { type: 'string', description: 'Handle id returned by a previous async tool call.' },
-                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
-                },
-                required: ['handle']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
             name: 'await_any',
-            description: 'Wait for the FIRST of several async handles to settle. Returns {handle, snapshot, timeout:false} on win, or {handle:null, snapshot:null, timeout:true, pendingSnapshots:[...]} on timeout. Useful when you launched several speculative tool calls and want whichever finishes first.',
+            description: 'Wait for the FIRST of several async handles to settle. Returns {handle, snapshot, timeout:false} on win, or {handle:null, snapshot:null, timeout:true, pendingSnapshots:[...]} on timeout. Useful when several sub-agents are in flight (spawn_sub_agent / wake_sub_agent handles) and you want whichever reports first.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -733,7 +719,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'await_all',
-            description: 'Wait for ALL of several async handles to settle. Returns {snapshots: [...], timedOut} in the same order as the input. `timedOut` is true when at least one handle never settled within timeout_ms (its snapshot is still status:"pending") — a single flag for detecting a partial result without scanning every snapshot. Useful to fan out tool calls and collect when every one is done.',
+            description: 'Wait for ALL of several async handles to settle. Returns {snapshots: [...], timedOut} in the same order as the input. `timedOut` is true when at least one handle never settled within timeout_ms (its snapshot is still status:"pending") — a single flag for detecting a partial result without scanning every snapshot. Useful to fan out several sub-agents and collect when every spawn handle is done.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -742,22 +728,6 @@ var TOOLS = [
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['handles']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'cancel_handle',
-            description: 'Mark an in-flight async tool handle as cancelled. The underlying tool may still finish in the background (we cannot abort fetches / GlideRecord calls), but the result will be DISCARDED and the handle moves to status "cancelled". No effect if the handle has already settled.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    handle: { type: 'string', description: 'Handle id to cancel.' },
-                    reason: { type: 'string', description: 'Optional human-readable reason recorded on the handle.' },
-                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
-                },
-                required: ['handle']
             }
         }
     },
@@ -772,7 +742,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'spawn_sub_agent',
-            description: 'Spawn a background sub-agent in a fresh chat to do focused, context-heavy work without polluting your context window. Returns immediately with {agent_id, chat_id, handle}. The sub runs in its own chat with its own context, calls `report_to_parent` when done, and the spawn handle resolves with the distilled summary — collect via `await_handle(handle)`. If the sub reports `status:"error"` or crashes (auto_report fallback), the OUTER handle settles as `status:"error"` too (snapshot.error = headline, snapshot.result = full report). Use for: ALL substantive work — file/grep dumps, multi-record audits, deep log scans, iterative debugging, and EVERY workspace file edit or implementation task no matter how small (a 2-line edit is still implementation). Do NOT use for: orchestration mechanics (reviewing deliverables, progress cards, user prompts, the orchestrator-only irreversible writes) or work whose result must flow into the very next tool call. Pass `output_schema` to declare the exact shape the sub must return in report_to_parent\'s `data` — handy when you spawn and parse the result programmatically (e.g. inside js_eval). ALWAYS pick a model explicitly via `tier` (small|medium|large|same) — never omit it (omitting silently inherits the default tier). small/medium/large are size tiers the user maps to concrete models in Settings (the agent never sees model/provider names); `tier:"same"` instead makes the sub DYNAMICALLY follow the spawner\'s current model — resolved at each call, so it tracks later model switches — bypassing the tier→model mapping. Default to `tier:"small"` for discovery, search, and audit fan-outs; `tier:"medium"` for code-review fan-outs and synthesis/triage/moderate implementation; reserve `large` for heavy implementation or subtle reasoning; escalate later with wake_sub_agent({tier}) if the sub struggles.',
+            description: 'Spawn a background sub-agent in a fresh chat to do focused, context-heavy work without polluting your context window. Returns immediately with {agent_id, chat_id, handle}. The sub runs in its own chat with its own context, calls `report_to_parent` when done, and the spawn handle resolves with the distilled summary — collect via `await_handle(handle)`. If the sub reports `status:"error"` or crashes (auto_report fallback), the OUTER handle settles as `status:"error"` too (snapshot.error = headline, snapshot.result = full report). Use for: ALL substantive work — file/grep dumps, multi-record audits, deep log scans, iterative debugging, and EVERY workspace file edit or implementation task no matter how small (a 2-line edit is still implementation). Do NOT use for: orchestration mechanics (reviewing deliverables, progress cards, user prompts, rendering reviewed results) or work whose result must flow into the very next tool call. Pass `output_schema` to declare the exact shape the sub must return in report_to_parent\'s `data` — handy when you spawn and parse the result programmatically (e.g. inside js_eval). ALWAYS pick a model explicitly via `tier` (small|medium|large|same) — never omit it (omitting silently inherits the default tier). small/medium/large are size tiers the user maps to concrete models in Settings (the agent never sees model/provider names); `tier:"same"` instead makes the sub DYNAMICALLY follow the spawner\'s current model — resolved at each call, so it tracks later model switches — bypassing the tier→model mapping. Default to `tier:"small"` for discovery, search, and audit fan-outs; `tier:"medium"` for code-review fan-outs and synthesis/triage/moderate implementation; reserve `large` for heavy implementation or subtle reasoning; escalate later with wake_sub_agent({tier}) if the sub struggles.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -784,6 +754,7 @@ var TOOLS = [
                     auto_report: { type: 'boolean', description: 'If true (default), a fallback report is synthesized from the last assistant message if the sub finishes without calling report_to_parent.' },
                     wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash, budget force-stop): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Keeping the DEFAULT true is the RECOMMENDED pattern for fan-outs — end your turn and react to each report as it wakes you. Pass false ONLY for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
                     max_tool_calls: { type: 'number', description: 'Soft tool-call budget for the sub. Default: 300. From 90% usage onward (and on every call past the budget) an escalating warning is appended to its tool results telling it to wrap up and report_to_parent. Safety backstop: a sub that ignores every warning is force-stopped at 2x the budget.' },
+                    profiles: { type: 'array', items: { type: 'string', enum: ['servicenow', 'browser', 'research', 'code', 'extension-dev', 'skill-manager', 'eval-runner', 'audit-runner', 'orchestrator'] }, description: 'Tool profiles for the sub — the sub\'s tool list is narrowed to the base tools plus ONLY these profiles, cutting its context size. Mix freely, e.g. ["servicenow","browser"]. Omit = full legacy toolset. Choices: servicenow (ServiceNow record CRUD, server scripts, code edits); browser (drive/inspect the ServiceNow UI in the iframe, screenshots); research (web search/fetch, ServiceNow docs, repo browsing — read-only research); code (GitHub repo work: clone/read/edit/diff via workspace); extension-dev (AppAgent extension development: workspace edits + runtime introspection); skill-manager (create/update/manage AI skills); eval-runner (ServiceNow eval grader + the ServiceNow tools the eval tasks need); audit-runner (instance audits: audit tool + ServiceNow read access); orchestrator (spawning/managing its own subs, async handles, prompts, rendering — pair with allow_nested). The core toolset (js_eval, cached-result readers, get_file, get_skill, progress card) and the sub-agent reporting tools are ALWAYS included — never list them.' },
                     tier: { type: 'string', enum: ['small', 'medium', 'large', 'same'], description: 'Pick the sub\'s model size tier. There are three size tiers — small | medium | large (plus `same`) — which the user maps to concrete models in Settings → Sub-Agent Model Tiers; the agent never sees or chooses model/provider names. small = cheap fan-outs (searches, summaries, discovery/scoping); medium = code-review passes and synthesis/triage/moderate implementation; large = heavy implementation or subtle reasoning. same = the sub DYNAMICALLY follows the spawner\'s current model (resolved per LLM call, so it tracks later model switches), bypassing the tier→model mapping — use when the sub must always run on exactly the model you are on, e.g. a self-evaluation. Set this explicitly on EVERY spawn.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
@@ -899,6 +870,7 @@ var TOOLS = [
                 properties: {
                     action: { type: 'string', enum: ['init', 'setup', 'verify', 'teardown'], description: 'Lifecycle phase to run.' },
                     task_id: { type: 'string', description: 'Task ID (e.g. \'T6\'). Required for setup and verify.' },
+                    instance: { type: 'string', description: 'Target ServiceNow instance by short name or URL. Optional — defaults to the active instance.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['action']
@@ -927,7 +899,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'runtime_inspect',
-            description: 'DEV-MODE ONLY: introspect and drive the AppAgent extension\'s OWN runtime (panel page, IndexedDB, service worker) while developing the extension. Available only when Reload rebuilds from the workspace (extension-dev skill active AND deploy folder connected); every call errors otherwise. Actions: \'ui_state\' (snapshot of page state: current chat/view, running+paused chats, chat list summary, pending tool approvals, widgets, lastApiError, LLM connection status, theme, active skills, dev-mode flag); \'get\' {path} (CSP-safe read of any page global/path, e.g. "chats[\'chat_123\'].messages[0]" or "currentChatId"); \'call\' {path, args} (CSP-safe invocation of an existing page function with its parent object as `this`, e.g. path:"renderChatList"); \'set\' {path, value, call_after} (CSP-safe UI-state WRITE + re-render path: resolves the PARENT of the path and assigns the final segment to value — any JSON value; optional call_after is a function path invoked with no args afterwards, e.g. "renderChatList", so the UI re-renders from the new state); \'dispatch\' {target, event, payload, selector, options} (event-trigger path with three targets. target:\'bus\' — the default — emits on the page AgentEvents bus: AgentEvents.emit(event, payload), invoking the REAL page-side handlers (event names are the AgentEvents.emit vocabulary, e.g. messagesAppended, actionStateChanged, runFinished); target:\'sw\' posts {type: event, ...payload} to the service worker over the agent bus port, hitting the SW inbound handlers (port-bridge switch: pull-chat, toggle-pause, interrupt, focus-chat, update-chat, …); target:\'dom\' {selector, event, options} fires a DOM event on an element of the PANEL PAGE\'s own document — NOT the ServiceNow iframe (plain click uses el.click(); otherwise the proper class: MouseEvent, KeyboardEvent with options.key, InputEvent/Event with bubbles:true; matched:false — success, not an error — when the selector matches nothing). WARNING: bus/sw dispatch invokes REAL handlers and can mutate run state (interrupt / toggle-pause are live controls). Together with \'get\'/\'call\', set + dispatch cover CSP-safe state reads, writes and event triggering); \'db\' {op:\'list\'|\'get\'|\'query\'|\'count\'|\'grep\', store, key, path, pattern, flags, limit} (inspect the extension\'s own IndexedDB: list store names; get one record by key — optional path drills into the record with the same dot/bracket syntax (e.g. "messages[3].content") and returns {exists, value}, exists:false for a missing intermediate; query up to `limit` records; count all records; or grep {store, pattern, flags?, key?, path?, limit?} — regex-search STRING leaves record-by-record via an IDB cursor, each match {key, path, excerpt: match ±60 chars}, default flags \'i\', limit = max matches (default 20, cap 100), ~1MB of string scanned per record, returns {matches, truncated, records_scanned, records_capped} — plus key_found when key was passed); \'sw_state\' (pull live service-worker state over the port: running chats, pending/parked tool calls, connected panel count, resume-scan flag); \'screenshot\' (capture the panel via chrome.tabs.captureVisibleTab — LIMITATION: fails with an explanatory error when the panel runs in the side panel, because it has no tab of its own; open the panel as a full tab first); \'new_chat\' {focus} (create a chat; focus:false creates in background); \'focus_chat\' {chatId} (navigate to a chat from anywhere); \'set_view\' {view} (switch main view: home|chat|dashboard|skills|documents|history|docs|settings). All results are safe-serialized (depth 6, 4KB per string, 64KB total) — except \'screenshot\', whose base64 is returned in full.',
+            description: 'DEV-MODE ONLY: introspect and drive the AppAgent extension\'s OWN runtime (panel page, IndexedDB, service worker) while developing the extension. Available only when Reload rebuilds from the workspace (extension-dev skill active AND deploy folder connected); every call errors otherwise. Actions: \'ui_state\' (snapshot of page state: current chat/view, running+paused chats, chat list summary, pending tool approvals, widgets, lastApiError, LLM connection status, theme, active skills, dev-mode flag); \'get\' {path} (CSP-safe read of any page global/path, e.g. "chats[\'chat_123\'].messages[0]" or "currentChatId"); \'call\' {path, args} (CSP-safe invocation of an existing page function with its parent object as `this`, e.g. path:"renderChatList"); \'set\' {path, value, call_after} (CSP-safe UI-state WRITE + re-render path: resolves the PARENT of the path and assigns the final segment to value — any JSON value; optional call_after is a function path invoked with no args afterwards, e.g. "renderChatList", so the UI re-renders from the new state); \'dispatch\' {target, event, payload, selector, options} (event-trigger path with three targets. target:\'bus\' — the default — emits on the page AgentEvents bus: AgentEvents.emit(event, payload), invoking the REAL page-side handlers (event names are the AgentEvents.emit vocabulary, e.g. messagesAppended, actionStateChanged, runFinished); target:\'sw\' posts {type: event, ...payload} to the service worker over the agent bus port, hitting the SW inbound handlers (port-bridge switch: pull-chat, toggle-pause, interrupt, focus-chat, update-chat, …); target:\'dom\' {selector, event, options} fires a DOM event on an element of the PANEL PAGE\'s own document — NOT the ServiceNow iframe (plain click uses el.click(); otherwise the proper class: MouseEvent, KeyboardEvent with options.key, InputEvent/Event with bubbles:true; matched:false — success, not an error — when the selector matches nothing). WARNING: bus/sw dispatch invokes REAL handlers and can mutate run state (interrupt / toggle-pause are live controls). Together with \'get\'/\'call\', set + dispatch cover CSP-safe state reads, writes and event triggering); \'db\' {op:\'list\'|\'get\'|\'query\'|\'count\'|\'grep\', store, key, path, pattern, flags, limit} (inspect the extension\'s own IndexedDB: list store names; get one record by key — optional path drills into the record with the same dot/bracket syntax (e.g. "messages[3].content") and returns {exists, value}, exists:false for a missing intermediate; query up to `limit` records; count all records; or grep {store, pattern, flags?, key?, path?, limit?} — regex-search STRING leaves record-by-record via an IDB cursor, each match {key, path, excerpt: match ±60 chars}, default flags \'i\', limit = max matches (default 20, cap 100), ~1MB of string scanned per record, returns {matches, truncated, records_scanned, records_capped} — plus key_found when key was passed — e.g. read past chat transcripts/history from the \'chats\' store); \'sw_state\' (pull live service-worker state over the port: running chats, pending/parked tool calls, connected panel count, resume-scan flag); \'screenshot\' (capture the panel via chrome.tabs.captureVisibleTab — LIMITATION: fails with an explanatory error when the panel runs in the side panel, because it has no tab of its own; open the panel as a full tab first); \'new_chat\' {focus} (create a chat; focus:false creates in background); \'focus_chat\' {chatId} (navigate to a chat from anywhere); \'set_view\' {view} (switch main view: home|chat|dashboard|skills|documents|history|docs|settings). All results are safe-serialized (depth 6, 4KB per string, 64KB total) — except \'screenshot\', whose base64 is returned in full.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -1019,12 +991,10 @@ var HEADLESS_TOOLS = {
     read_attached_file: true,
     document: true,
     list_instances: true,
-    // Async tool layer helpers — pure in-memory registry reads, fully headless
+    // Handle-await helpers — pure in-memory registry reads, fully headless
     await_handle: true,
-    poll_handle: true,
     await_any: true,
     await_all: true,
-    cancel_handle: true,
     // Sub-agent runtime tools — the registry is in-memory + IDB, fully
     // headless. All seven dispatch through tools/020-tool-execution.js to
     // SubAgents.* helpers. Side-effects (chat creation, runAgent kick) work
@@ -1089,11 +1059,9 @@ var TOOL_SHORT_DESCRIPTIONS = {
     read_attached_file: 'Read a text file the user attached to this conversation.',
     document: 'Create, read, edit, and manage persistent versioned Smart Documents rendered inline.',
     list_instances: 'List connected ServiceNow instances with status and user info.',
-    await_handle: 'Block until one async tool handle settles and return its snapshot.',
-    poll_handle: 'Non-blocking peek at an async tool handle status.',
-    await_any: 'Wait for the first of several async handles to settle.',
-    await_all: 'Wait for all of several async handles to settle.',
-    cancel_handle: 'Cancel an in-flight async tool handle and discard its result.',
+    await_handle: 'Block until one sub-agent handle settles and return its snapshot.',
+    await_any: 'Wait for the first of several sub-agent handles to settle.',
+    await_all: 'Wait for all of several sub-agent handles to settle.',
     spawn_sub_agent: 'Spawn a sub-agent chat on a chosen tier to do focused delegated work.',
     report_to_parent: 'Sub-agent only: push the distilled result to the parent and park.',
     agent_status: 'Read-only snapshot of sub-agents: progress, saturation, reports, approvals.',
@@ -1103,7 +1071,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     agent_message: 'Send a message between agents (parent↔sub) without settling the spawn handle.',
     eval_runner: 'Sandboxed grader for the ServiceNow eval skill lifecycle (init, setup, verify, teardown).',
     github_setup: 'Open the GitHub setup popup to connect an account or clone a repo.',
-    runtime_inspect: 'Dev-mode only: introspect and drive the AppAgent extension runtime itself.',
+    runtime_inspect: 'Dev-mode only: introspect and drive the AppAgent extension runtime itself — page state, service worker, and IndexedDB incl. past chat transcripts.',
     get_tool_schema: 'Fetch full JSON schemas for catalog tools before calling one whose parameters you do not know.'
 };
 for (var _ti = 0; _ti < TOOLS.length; _ti++) {
@@ -1121,13 +1089,16 @@ function isHeadlessTool(name) { return !!HEADLESS_TOOLS[name]; }
 // is implemented HERE ONLY; never fork it into the twins.
 //
 // CORE_TOOL_NAMES = tools whose full schemas are always declared in the
-// request when deferred mode is ON (agreed list — see the design handoff):
-// workhorses, discovery, hook tools, progress, and the orchestrator loop
-// (+ report_to_parent on the sub-agent side; parent chats filter it out of
-// the enabled list anyway). EVERYTHING else — including active-skill tools
-// — is deferred: cataloged by name + one-liner, schema fetched on demand
-// via get_tool_schema, then called natively (dispatch in
+// request when deferred mode is ON: js_eval, the deferred-mode bootstrap
+// pair (get_tool_schema, get_skill), the after-response hook tools
+// (set_tldr, set_chat_title), progress (update_action_state), and the
+// orchestrator loop (spawn_sub_agent, await_handle; + report_to_parent on
+// the sub-agent side — parent chats filter it out of the enabled list
+// anyway). EVERYTHING else — including active-skill tools — is deferred:
+// cataloged by name + one-liner, schema fetched on demand via
+// get_tool_schema, then called natively (dispatch in
 // tools/020-tool-execution.js routes by name, not by the declared array).
+// NOTE: this file ships in BOTH the page and SW bundles (WORKER_SHARED_FILES).
 var CORE_TOOL_NAMES = {
     js_eval: true,
     get_tool_schema: true,
@@ -1222,9 +1193,8 @@ function buildToolCatalog(tools) {
         + 'with its name(s) — the full schema arrives in the tool_result and stays in the conversation '
         + 'history for the rest of the chat (nothing is loaded or registered). Then call the tool '
         + 'directly, exactly like a declared tool. Once the schema is fetched (or when you already '
-        + 'know the parameters), these tools are called NATIVELY as top-level tool calls — do NOT '
-        + 'route them through js_eval executeTool(), except when genuinely chaining several calls '
-        + 'in one script.\n'
+        + 'know the parameters), call these tools NATIVELY as top-level tool calls, exactly like '
+        + 'any other tool.\n'
         + lines.join('\n');
 }
 
@@ -1307,7 +1277,7 @@ function executeGetToolSchema(args, options) {
     var result = { success: errors.length === 0, schemas: schemas };
     if (errors.length > 0) result.error = errors.join(' ');
     if (schemas.length > 0) {
-        result.note = 'These schemas are now part of the conversation history — CALL THE TOOL(S) NATIVELY as top-level tool calls with these parameters. No loading or registration step is needed. Do NOT wrap these tools in js_eval executeTool() — that is a fallback reserved for genuine multi-call chaining in one script, never the default. If a native call fails validation, fix the arguments and retry natively; do not fall back to js_eval.';
+        result.note = 'These schemas are now part of the conversation history — CALL THE TOOL(S) NATIVELY as top-level tool calls with these parameters. No loading or registration step is needed. If a native call fails validation, fix the arguments and retry natively.';
     }
     return result;
 }
@@ -1322,7 +1292,10 @@ function executeGetToolSchema(args, options) {
 // start_line: "200"). On a type mismatch we first try to coerce the string
 // to the declared type and MUTATE the args object in place so downstream
 // execution receives the proper type — only impossible coercions error.
-function validateArgsAgainstToolSchema(name, args) {
+// `options.chatId` (optional) pins the enabled-tools resolution to the
+// caller's chat — preferred over the global fallback, which can point at a
+// different chat when several agents run concurrently.
+function validateArgsAgainstToolSchema(name, args, options) {
     try {
         // FAIL CLOSED: resolve the definition ONLY from the same enabled/
         // filtered list executeGetToolSchema uses — never raw TOOLS or the
@@ -1331,7 +1304,8 @@ function validateArgsAgainstToolSchema(name, args) {
         // payload. If the enabled list can't be resolved, skip validation
         // (return null) and let normal dispatch continue.
         if (typeof getEnabledTools !== 'function') return null;
-        var chatId = (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+        var chatId = (options && options.chatId)
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
             || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         var enabled = getEnabledTools(chatId, { includeDeferred: true });
         var def = null;

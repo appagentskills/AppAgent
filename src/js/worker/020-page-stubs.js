@@ -445,7 +445,7 @@ function executeAfterResponseHooks(chatId) {
     var tasks = [];
     if (needsTitle) tasks.push('set a concise chat title (max 50 chars) using the set_chat_title tool');
     if (needsTldr) tasks.push('provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars)');
-    if (needsLinks) tasks.push('provide any relevant links using the set_links tool — an array of {title, url} for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty array if there is nothing worth linking');
+    if (needsLinks) tasks.push('provide any relevant links using the set_links tool — call it as set_links({links: [{title, url}, ...]}) for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty links array if there is nothing worth linking');
     // Piggyback the OPTIONAL caveat task — only when another hook is already
     // firing (tasks.length > 0) and the retry ceiling isn't hit — and set the
     // per-message asked flag / bump the try-count ONLY here, when it is really
@@ -453,7 +453,7 @@ function executeAfterResponseHooks(chatId) {
     var caveatPushed = false;
     var caveatTaskNum = 0;
     if (caveatEligible && tasks.length > 0 && (chat._caveatHookTries || 0) < 2) {
-        tasks.push('OPTIONALLY call the set_caveat tool with a short warning (1-2 sentences) ONLY IF your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; do NOT flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, do NOT call set_caveat');
+        tasks.push('OPTIONALLY call the set_caveat tool — set_caveat({caveat: "..."}) with a short warning (1-2 sentences) — ONLY IF your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; do NOT flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, do NOT call set_caveat');
         caveatTarget._caveatAsked = true;
         chat._caveatHookTries = (chat._caveatHookTries || 0) + 1;
         caveatPushed = true;

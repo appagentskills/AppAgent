@@ -629,21 +629,11 @@ async function executeDiffEdit(args, messageIndex, options) {
 // Single entry point for all tool execution - always checks permissions
 // options: { batch, toolCallId, chatId } - passed through to requestProgrammaticToolApproval
 //
-// Async tool layer (Sub-Agent spec §4):
-//   • If `args.await === false` AND the tool is not in Handles.ALWAYS_SYNC_TOOLS
-//     AND we are not already wrapping (`options._asyncWrapping`), this call
-//     returns IMMEDIATELY with `{ success: true, handle: 'h_...', status: 'pending', tool: name }`.
-//     The underlying tool runs in the background; the agent retrieves the
-//     real result by calling `await_handle` / `poll_handle` / `await_all` / `await_any`.
-//   • If `args.await` is true or undefined → existing synchronous behavior
-//     (the caller's await on the returned Promise blocks until the real result).
-//   • The `await` meta-key is stripped from `args` ONCE up front so per-tool
-//     branches and the handle entry never see a stray `await` property.
-//   • Approval runs INSIDE the background promise (after the wrap), so a slow
-//     user prompt doesn't block the agent loop — that's the whole point of
-//     `await: false`. The trade-off: the handle stays `pending` while the
-//     user decides, indistinguishable from "tool actively running". A future
-//     `status_message` channel can surface "awaiting approval" to the UI.
+// Every tool call executes synchronously — the caller's await on the
+// returned Promise blocks until the real result. The only producers of
+// async handles are the sub-agent operations (spawn_sub_agent /
+// wake_sub_agent / agent_message); the await_handle / await_any /
+// await_all dispatch arms below collect them.
 
 // ---------- Pool-deadlock prevention helpers (Phase 5) ----------
 // If the caller is a sub-agent and the target handle is a spawn handle owned
@@ -690,9 +680,9 @@ var _sandboxActivity = {};
 // is busy awaiting that call. Cleaned up alongside _sandboxActivity.
 var _sandboxPending = {};
 
-// PR383-F1: number of js_eval invocations currently LIVE per chatId. js_eval
-// is not in ALWAYS_SYNC_TOOLS, so two evals can overlap in one chat (await:false
-// fan-out, nested sandbox eval). The per-chat watchdog maps above must only be
+// PR383-F1: number of js_eval invocations currently LIVE per chatId. Two
+// evals can overlap in one chat (nested sandbox eval). The per-chat
+// watchdog maps above must only be
 // torn down when the LAST eval for the chat finishes — a per-invocation delete
 // stripped a sibling sandbox's in-flight protection (the exact regression RES-1
 // fixed). _sandboxGen invalidates orphaned decrements that settle after a
@@ -761,69 +751,6 @@ async function executeTool(name, args, messageIndex, options) {
 }
 
 async function _executeToolInner(name, args, messageIndex, options) {
-    // Strip the meta-key once. Both the wrap path and the sync path operate
-    // on the cleaned args from here on.
-    if (args && Object.prototype.hasOwnProperty.call(args, 'await')) {
-        var hadAwaitFalse = args.await === false;
-        var _stripped = {};
-        for (var _sk in args) { if (_sk !== 'await') _stripped[_sk] = args[_sk]; }
-        args = _stripped;
-        // Async-mode wrap: bounce the call into a handle and return the receipt.
-        if (hadAwaitFalse
-            && !(options && options._asyncWrapping)
-            && typeof Handles !== 'undefined'
-            && !(Handles.ALWAYS_SYNC_TOOLS && Handles.ALWAYS_SYNC_TOOLS[name])) {
-            var chatIdForHandle = (options && options.chatId) || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null);
-            var displayName = (typeof getToolDisplayName === 'function') ? getToolDisplayName(name, args.method || args.action) : name;
-            var nextOptions = {};
-            for (var _ok in (options || {})) nextOptions[_ok] = options[_ok];
-            nextOptions._asyncWrapping = true;
-            var asyncArgs = args; // already stripped
-            var started = Handles.start(chatIdForHandle, name, asyncArgs, displayName, function() {
-                return executeTool(name, asyncArgs, messageIndex, nextOptions);
-            });
-            // Plumb handle identity so the inner approval call can flip
-            // awaitingApproval on the entry while the user-prompt modal
-            // is up. See Handles.markAwaitingApproval (registry §) and
-            // the requestProgrammaticToolApproval implementations.
-            nextOptions._handleId = started.handleId;
-            nextOptions._handleChatId = chatIdForHandle;
-            // If the caller is a sub-agent, register this handle so
-            // stop_sub_agent can cancel it on terminate. Without this,
-            // a stopped sub's in-flight async tool calls keep running
-            // and burning resources until they naturally finish.
-            try {
-                if (chatIdForHandle && typeof chats !== 'undefined' && chats[chatIdForHandle]
-                    && chats[chatIdForHandle].isSubAgent
-                    && typeof SubAgents !== 'undefined' && SubAgents.getById) {
-                    var _ownerSub = SubAgents.getById(chats[chatIdForHandle].subAgentId);
-                    if (_ownerSub) {
-                        _ownerSub.pending_handles = _ownerSub.pending_handles || [];
-                        if (_ownerSub.pending_handles.indexOf(started.handleId) === -1) {
-                            _ownerSub.pending_handles.push(started.handleId);
-                        }
-                        // Best-effort cleanup when the handle settles — prevents
-                        // pending_handles from growing without bound over the
-                        // sub's lifetime.
-                        if (Handles.await) {
-                            Handles.await(chatIdForHandle, started.handleId, 0).then(function() {
-                                var _idx = _ownerSub.pending_handles.indexOf(started.handleId);
-                                if (_idx >= 0) _ownerSub.pending_handles.splice(_idx, 1);
-                            });
-                        }
-                    }
-                }
-            } catch (_) { /* tracking is best-effort; don't break async wrap */ }
-            return {
-                success: true,
-                handle: started.handleId,
-                status: 'pending',
-                tool: name,
-                note: 'Async tool call — use await_handle("' + started.handleId + '") to collect the result.'
-            };
-        }
-    }
-
     var approval = await requestProgrammaticToolApproval(name, args, options);
     if (!approval.allowed) {
         return { success: false, error: approval.error, _denied: true };
@@ -878,11 +805,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             || name === 'report_to_parent'
             || name === 'sleep_self'
             || name === 'agent_message'
-            || name === 'poll_handle'
             || name === 'await_handle'
             || name === 'await_any'
-            || name === 'await_all'
-            || name === 'cancel_handle');
+            || name === 'await_all');
         if (!_exemptBudget) {
             // Soft cap: onToolCallInSubAgent counts usage and stages a budget
             // warning (>=90% / past cap) that the agent loop appends to the
@@ -908,7 +833,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
     if (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive()
         && typeof isDeferredToolName === 'function' && isDeferredToolName(name)
         && typeof validateArgsAgainstToolSchema === 'function') {
-        var _deferredArgCheck = validateArgsAgainstToolSchema(name, args);
+        var _deferredArgCheck = validateArgsAgainstToolSchema(name, args, options);
         if (_deferredArgCheck) {
             return {
                 success: false,
@@ -919,12 +844,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
         }
     }
 
-    // -------- Handle helper tools (always-sync) --------
-    if (name === 'await_handle' || name === 'poll_handle'
-        || name === 'await_any' || name === 'await_all'
-        || name === 'cancel_handle') {
+    // -------- Handle helper tools (sub-agent spawn handles) --------
+    if (name === 'await_handle'
+        || name === 'await_any' || name === 'await_all') {
         if (typeof Handles === 'undefined') {
-            return { success: false, error: 'Handle registry not loaded — async tool layer unavailable.' };
+            return { success: false, error: 'Handle registry not loaded — handle collection unavailable.' };
         }
         var chatIdH = (options && options.chatId) || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         // P1d: when a TERMINAL snapshot for a sub-agent spawn handle is handed
@@ -943,12 +867,6 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 }
             } catch (_) { /* best-effort bookkeeping */ }
         };
-        if (name === 'poll_handle') {
-            if (!args || !args.handle) return { success: false, error: 'poll_handle requires `handle`.' };
-            var snapPH = Handles.poll(chatIdH, args.handle);
-            _stampCollected(snapPH);
-            return { success: true, snapshot: snapPH };
-        }
         if (name === 'await_handle') {
             if (!args || !args.handle) return { success: false, error: 'await_handle requires `handle`.' };
             var timeoutMsAH = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
@@ -1009,58 +927,6 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     try { SubAgents.unparkAfterAwait(_parkedAidAA); } catch (_) {}
                 }
             }
-        }
-        if (name === 'cancel_handle') {
-            if (!args || !args.handle) return { success: false, error: 'cancel_handle requires `handle`.' };
-            // If the handle is a spawn_sub_agent handle, plain Handles.cancel
-            // only flips the entry state — the sub-agent itself keeps
-            // running, consuming a pool slot and tool budget, until it
-            // naturally finishes (whose payload is then silently discarded).
-            // Route through SubAgents.stop so the sub is actually terminated
-            // and its own pending handles are cancelled.
-            try {
-                var _entry = Handles.get ? Handles.get(chatIdH, args.handle) : null;
-                if (_entry && _entry.name === 'spawn_sub_agent'
-                    && typeof SubAgents !== 'undefined' && SubAgents.listAll && SubAgents.stop) {
-                    var _subs = SubAgents.listAll();
-                    for (var _si = 0; _si < _subs.length; _si++) {
-                        if (_subs[_si].spawn_handle_id === args.handle) {
-                            // stop() will resolve the spawn handle as cancelled
-                            // (via _resolveSpawnHandle → Handles.cancel) so the
-                            // parent's await_handle returns status:'cancelled'.
-                            // Pass ctx (with chatIdH) so the ACL check in
-                            // SubAgents.stop can resolve the caller. The
-                            // previous call omitted ctx — _callerChatId
-                            // resolved to null, the gate silently skipped,
-                            // and a chat could theoretically cancel any
-                            // spawn handle it learned the id of (currently
-                            // hard to exploit because handles are chat-
-                            // scoped, but the boundary should hold by
-                            // construction, not by accident).
-                            var _stopRes = SubAgents.stop(
-                                { agent_id: _subs[_si].agent_id, reason: args.reason || 'cancelled via cancel_handle' },
-                                { chatId: chatIdH }
-                            );
-                            // Preserve the cancel_handle status contract — a caller
-                            // who used cancel_handle should get back status:'cancelled',
-                            // not status:'stopped' (which is what SubAgents.stop
-                            // returns). Previously Object.assign was {…cancelled,
-                            // _stopRes} which let _stopRes.status='stopped' clobber
-                            // ours. Spread _stopRes FIRST, our base SECOND so our
-                            // cancelled status wins. The handle itself already
-                            // resolves with status:'cancelled' via _resolveSpawnHandle
-                            // — this just makes the immediate tool return shape match.
-                            return Object.assign({}, _stopRes || {}, { success: true, ok: true, status: 'cancelled' });
-                        }
-                    }
-                }
-            } catch (_) { /* fall through to plain cancel */ }
-            var cancelRes = Handles.cancel(chatIdH, args.handle, args.reason);
-            // cancelRes is { ok, status?, reason?, error? }. We always return
-            // success:true at the tool boundary — "handle already settled" or
-            // "unknown handle" is information, not a tool failure. The agent
-            // reads `ok`/`status`/`error` from the flattened body.
-            return Object.assign({ success: true }, cancelRes);
         }
     }
 
@@ -1906,9 +1772,15 @@ async function getGitHubApiAuthForUrl(url) {
         var reqPath = req.pathname.toLowerCase();
         var basePath = base.pathname.replace(/\/$/, '').toLowerCase(); // '' for cloud, '/api/v3' for GHE
         var pathOk = basePath === '' || reqPath === basePath || reqPath.indexOf(basePath + '/') === 0;
+        // Port compare must treat an EXPLICIT scheme-default port as equal to
+        // an omitted one (URL keeps '443' in https://api.github.com:443/ but
+        // '' in https://api.github.com/) — otherwise the matcher misses.
+        var _normPort = function(u) {
+            return u.port || (u.protocol === 'https:' ? '443' : (u.protocol === 'http:' ? '80' : ''));
+        };
         var hostOk = req.protocol === base.protocol
             && reqHost === base.hostname.toLowerCase()
-            && req.port === base.port;
+            && _normPort(req) === _normPort(base);
         // Exact REST base: approval-governed AND token-attached (when stored).
         if (hostOk && pathOk) return { token: tok, apiBase: apiBase };
         // Approval-governed matches below NEVER carry the token.
@@ -1922,7 +1794,7 @@ async function getGitHubApiAuthForUrl(url) {
             var inst = new URL(instance);
             if (req.protocol === inst.protocol
                 && reqHost === inst.hostname.toLowerCase()
-                && req.port === inst.port) {
+                && _normPort(req) === _normPort(inst)) {
                 return { token: null, apiBase: apiBase };
             }
         }

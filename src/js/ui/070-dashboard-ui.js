@@ -1525,10 +1525,25 @@ function getSkillsSummaryForPrompt() {
 // handler below.
 var _chatsHydrated = false;
 
+// Post-retry storage failure: chat history genuinely could not be read in
+// this realm (dead connection that survived the withStore retry, blocked
+// open, quota/IO error). Surface a persistent error snackbar instead of
+// silently rendering an empty chat list — the wipe-guard keeps saves blocked
+// so nothing is lost, but the user must know WHY their history is missing.
+function showStorageUnavailableNotice(err) {
+    console.error('Chat storage unavailable:', err);
+    try {
+        if (typeof showSnackbar === 'function') {
+            showSnackbar('Storage unavailable — chat history could not be loaded. Try restarting Chrome.', 'error');
+        }
+    } catch (e) { /* notice must never break init */ }
+}
+
 async function loadChatsFromStorage() {
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([chatStoreName], 'readonly');
+        // withStore (core/130-indexeddb.js): retries ONCE on a fresh
+        // connection if the cached one was force-closed by the browser.
+        return await withStore([chatStoreName], 'readonly', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         var request = store.getAll();
         
@@ -1551,12 +1566,13 @@ async function loadChatsFromStorage() {
                 resolve();
             };
             request.onerror = function() {
-                console.error('Failed to load chats from IndexedDB:', request.error);
+                showStorageUnavailableNotice(request.error);
                 resolve();
             };
         });
+        });
     } catch (e) {
-        console.error('IndexedDB error:', e);
+        showStorageUnavailableNotice(e);
     }
 }
 
@@ -1585,8 +1601,10 @@ async function saveChatsToStorage() {
     saveChatsPending = true;
     
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([chatStoreName], 'readwrite');
+        // withStore (core/130-indexeddb.js): retries ONCE on a fresh
+        // connection if the cached one was force-closed by the browser. Safe
+        // to retry: the diff-save re-derives everything from in-memory state.
+        await withStore([chatStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         
         // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
@@ -1594,7 +1612,7 @@ async function saveChatsToStorage() {
         // longer mass-erase the store in one transaction.
         var keysRequest = store.getAllKeys();
         
-        await new Promise(function(_resolve) {
+        return new Promise(function(_resolve) {
             // WS1F-1: settle-guard so the commit promise resolves EXACTLY once and
             // can't wedge if the transaction aborts. A put-error can abort the whole
             // txn; if that happens before a zero-crossing resolve() fires, `pending`
@@ -1657,6 +1675,7 @@ async function saveChatsToStorage() {
                 resolve();
             };
         });
+        }); // end withStore fn
     } catch (e) {
         console.error('Failed to save chats to IndexedDB:', e);
     } finally {

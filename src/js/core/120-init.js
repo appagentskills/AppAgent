@@ -273,12 +273,25 @@ async function init() {
     // WIPE-GUARD: ask the browser to mark this origin's storage as persistent
     // so IndexedDB (chats, skills, files) is exempt from best-effort eviction
     // under disk pressure. Paired with the manifest's `unlimitedStorage`
-    // permission (lifts the per-origin quota). Best-effort — failures are
-    // non-fatal and logged only.
+    // permission (lifts the per-origin quota AND exempts the extension origin
+    // from quota eviction). Best-effort — failures are non-fatal and logged
+    // only. NOTE: Chrome does not flip the Storage-API persist bit for
+    // chrome-extension:// origins — the site-engagement/notification
+    // heuristics it uses for web origins don't apply — so persist() normally
+    // resolves `false` in the extension even though the data is ALREADY
+    // eviction-exempt via `unlimitedStorage`. That result is expected and
+    // harmless: log it as info there, and keep the real warning for
+    // non-extension origins where eviction is a genuine risk.
     try {
         if (navigator.storage && navigator.storage.persist) {
             navigator.storage.persist().then(function(granted) {
-                if (!granted) console.warn('[init] storage.persist() not granted — origin data remains best-effort evictable');
+                if (granted) return;
+                var isExtensionOrigin = typeof location !== 'undefined' && location.protocol === 'chrome-extension:';
+                if (isExtensionOrigin) {
+                    console.info('[init] storage.persist() not granted — expected for chrome-extension:// origins; data remains eviction-exempt via the manifest unlimitedStorage permission');
+                } else {
+                    console.warn('[init] storage.persist() not granted — origin data remains best-effort evictable');
+                }
             }).catch(function() {});
         }
     } catch (e) {}

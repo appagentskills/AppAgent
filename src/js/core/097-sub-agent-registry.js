@@ -161,6 +161,7 @@ var SUB_AGENT_PREAMBLE = [
     '  • When the work is complete, call `report_to_parent` with a concise distilled result (≤ 4 KB summary). This is what the parent sees — it never reads your transcript. Write the summary in markdown — it is rendered as markdown to the user in the parent chat.',
     '  • If you need parent input mid-task, call `report_to_parent({status:"need_input", ...})`. That settles the parent\'s handle and parks you — the parent will wake you with new instructions.',
     '  • STANDARD REPORT SHAPE: unless your task declares an explicit "Expected output schema" (which then wins), structure report_to_parent\'s `data` as {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers backing each claim (sys_ids, file paths + line numbers, URLs), open_questions = anything you could not resolve.',
+    '  • VERIFY DIRECTLY: you are the executor, so verification is YOUR job — confirm the end state yourself before reporting (read the record back, re-run the query, take a screenshot) and include that evidence in report_to_parent.',
     '  • PLAN-APPROVAL GATE: if your report proposes a plan for FURTHER work (beyond the task you were given), report it with `status:"need_input"` and WAIT for the parent to approve — NEVER self-approve your own plan and continue executing it.',
     '  • If you are idle and waiting, call `sleep_self` to free the worker pool slot.',
     '  • Use `artifacts: [doc_id, file_id, ...]` in your report for larger payloads — never inline a long list/dump into `summary`.',
@@ -423,7 +424,7 @@ async function loadAllSubAgents() {
         // get a PENDING handle re-armed with a fresh deferred, settled by the
         // normal push paths once the resumed loop reports. SYMPTOM: handles are in-memory by
         // design (095-handle-registry.js), so after an MV3 SW restart the
-        // parent's await_handle/poll_handle on a persisted spawn_handle_id
+        // parent's await_handle on a persisted spawn_handle_id
         // returned `unknown handle` and an already-produced report became
         // unreachable. spawn_handle_id + last_report ARE persisted — enough
         // to rebuild the handle under the SAME id. Gated to the
@@ -1013,7 +1014,7 @@ function _sanitizeUsageForAgent(usage) {
     };
 }
 
-function _computeToolRoster(allowNested) {
+function _computeToolRoster(allowNested, profiles) {
     // Subs inherit the parent's full tool roster, with one filter: the
     // nested-delegation gate — spawn/stop/wake_sub_agent are denied unless
     // the caller passed `allow_nested:true` at spawn time. The roster stays
@@ -1039,6 +1040,33 @@ function _computeToolRoster(allowNested) {
             }
         }
     } catch (_) { /* skill subsystem unavailable — fall through */ }
+
+    // Tool Profiles (spawn_sub_agent `profiles` param — see
+    // core/078-tool-profiles.js): when the parent picked profiles, keep
+    // only tools in union(core, sub-agent, chosen profiles) — plus
+    // skill-provided tools listed in NO profile, which keep their legacy
+    // always-on behavior. Registry tools absent from every profile
+    // (e.g. github_setup) are dropped. `profiles` null/omitted ⇒ legacy
+    // full roster (backward compatible).
+    if (Array.isArray(profiles) && typeof getToolNamesForProfiles === 'function') {
+        var unionSet = Object.create(null);
+        var unionNames = getToolNamesForProfiles(['sub-agent'].concat(profiles));
+        for (var ui = 0; ui < unionNames.length; ui++) unionSet[unionNames[ui]] = true;
+        var registrySet = Object.create(null);
+        if (typeof TOOLS !== 'undefined' && Array.isArray(TOOLS)) {
+            for (var ti = 0; ti < TOOLS.length; ti++) {
+                var tn = TOOLS[ti] && TOOLS[ti].function && TOOLS[ti].function.name;
+                if (tn) registrySet[tn] = true;
+            }
+        }
+        var profiledSet = getProfiledToolNameSet();
+        allNames = allNames.filter(function(n) {
+            if (unionSet[n]) return true;
+            // Unlisted SKILL tool → legacy always-on. Registry tools and
+            // profile-listed skill tools outside the union are dropped.
+            return !registrySet[n] && !profiledSet[n];
+        });
+    }
 
     var denySet = Object.create(null);
     if (!allowNested) {
@@ -1131,7 +1159,26 @@ function spawnSubAgent(args, ctx) {
         return { success: false, error: resolved.error };
     }
 
-    var toolRoster = _computeToolRoster(args.allow_nested === true);
+    // ── Tool Profiles (context slimming) ──
+    // Optional `profiles` array narrows the sub's roster to
+    // core + sub-agent + these profiles (core/078-tool-profiles.js).
+    // Omitted ⇒ legacy full roster.
+    var profiles = null;
+    if (args.profiles !== undefined && args.profiles !== null) {
+        if (!Array.isArray(args.profiles)) {
+            return { success: false, error: 'spawn_sub_agent: `profiles` must be an array of profile names.' };
+        }
+        if (typeof TOOL_PROFILES === 'undefined') {
+            return { success: false, error: 'spawn_sub_agent: profiles table unavailable in this runtime.' };
+        }
+        var _badProfiles = args.profiles.filter(function(p) { return !TOOL_PROFILES[p]; });
+        if (_badProfiles.length) {
+            return { success: false, error: 'spawn_sub_agent: unknown profile(s): ' + _badProfiles.join(', ') + '. Valid profiles: ' + Object.keys(TOOL_PROFILES).join(', ') + '.' };
+        }
+        profiles = args.profiles;
+    }
+
+    var toolRoster = _computeToolRoster(args.allow_nested === true, profiles);
 
     // Allocate the spawn handle now. The agent loop / report_to_parent will
     // settle it later. The handle is owned by the PARENT chat (so the
@@ -1185,6 +1232,10 @@ function spawnSubAgent(args, ctx) {
         // can re-stamp the chat row.
         same_as: resolved.same_as || null,
         tool_roster: toolRoster,
+        // Tool-profile names this sub was spawned with (null = legacy full
+        // roster). Informational — the roster above already encodes the
+        // filter; kept for agent_status / diagnostics.
+        profiles: profiles,
         auto_report: (args.auto_report === false) ? false : true,
         // Wake the parent when this sub reports (default ON, opt-out via
         // wake_parent:false). SYMPTOM this fixes: a sub's report_to_parent
@@ -1193,7 +1244,7 @@ function spawnSubAgent(args, ctx) {
         // the user's next message. See _wakeParentOnReport.
         wake_parent: (args.wake_parent === false) ? false : true,
         // Flipped true when the parent actually collects the report via
-        // await_handle / poll_handle / await_any / await_all (see
+        // await_handle / await_any / await_all (see
         // markReportCollected). Persisted, so an undelivered report can be
         // identified — and replayed/queried — after an MV3 SW restart.
         report_collected: false,
@@ -1446,7 +1497,7 @@ function _spawnHandleHasAwaiters(rec) {
 }
 
 // Mark a sub's report as collected by the parent. Called from the
-// await_handle / poll_handle / await_any / await_all dispatch arms
+// await_handle / await_any / await_all dispatch arms
 // (src/js/tools/020-tool-execution.js) when a TERMINAL snapshot for a
 // spawn handle is handed to the caller. Persisted so that, after an MV3
 // SW restart, `report_collected:false` identifies reports the parent
@@ -1514,9 +1565,18 @@ function _wakeParentOnReport(rec, report, opts) {
         }
         // (1) Parent blocked in await_handle — the settle delivers; skip.
         if (opts.hadAwaiters && live) return false;
-        var oneLine = String((report && report.summary) || '').split('\n')[0].slice(0, 300);
+        // NL-FIX: keep the summary's LINE STRUCTURE in the notice. The old
+        // first-line-only cut (split('\n')[0]) silently dropped every line
+        // after the first from multi-line report summaries, which read as
+        // "newlines not rendered" in the parent-chat notice bubble. The
+        // bubble renders \n as <br> via formatContent (user rows and
+        // sub-report callouts share that pipeline), so a multi-line snippet
+        // displays with real line breaks. Still cap at 300 chars ('…' marks
+        // the cut) — the full report stays one await_handle/agent_status away.
+        var _sum = String((report && report.summary) || '').trim();
+        var snippet = _sum.length > 300 ? _sum.slice(0, 300) + '…' : _sum;
         var notice = 'Sub-agent "' + (rec.name || rec.agent_id) + '" (' + rec.agent_id + ') reported ('
-            + ((report && report.status) || 'done') + ')' + (oneLine ? ': ' + oneLine : '')
+            + ((report && report.status) || 'done') + ')' + (snippet ? ': ' + snippet : '')
             + ' — full report via await_handle("' + rec.spawn_handle_id + '") or agent_status.';
         if (live) {
             // (3) Mid-run: queue for flushPendingInjection; coalesce with any
@@ -3395,8 +3455,8 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     // PR383-R2: run completion ends every approval episode for this run —
     // reset the gate counter so a stranded value (SW killed mid-approval,
     // decrement callbacks never fired) can't mute future park notices.
-    // PR384-FIX-6: but a sub can park via report_to_parent while an await:false
-    // tool call is STILL awaiting approval — that approval belongs to the HANDLE,
+    // PR384-FIX-6: but a sub can park via report_to_parent while a handle-
+    // wrapped tool call is STILL awaiting approval — that approval belongs to the HANDLE,
     // not the loop. Zeroing the counter here re-opens onSubApprovalEvent's
     // `=== 1` park-notice gate, so the next 'requested' event re-emits a park
     // notice while the old approval is still pending. Only reset when no handle

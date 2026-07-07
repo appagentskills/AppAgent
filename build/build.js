@@ -134,6 +134,11 @@ const WORKER_SHARED_FILES = [
     'js/core/030-config.js',
     'js/core/060-ui-constants.js',
     'js/core/070-permissions.js',
+    // 078-tool-profiles declares TOOL_PROFILES + getToolNamesForProfiles,
+    // used by 097-sub-agent-registry (spawn-time tool_roster filter) and
+    // worker/025-permissions-helpers (main-chat profile filter). Must load
+    // before 080-tools/097.
+    'js/core/078-tool-profiles.js',
     'js/core/080-tools.js',
     'js/core/085-eval-runner.js',
     // 090-codemap.js is DOM-free and is called by 100-cached-results.js's
