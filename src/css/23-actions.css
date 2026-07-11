@@ -1883,7 +1883,7 @@
 }
 /* Sections layout: buckets stack vertically (Active first) and the WHOLE body
    scrolls — unlike the columns layout where each column scrolls on its own.
-   Cards sit in a grid capped at two per row. */
+   Cards sit in a grid capped at three per row (two on narrow widths). */
 .jobs-expand-body.layout-sections { overflow-y: auto; display: block; }
 .jobs-expand-sections {
     display: flex; flex-direction: column; gap: var(--space-5);
@@ -1891,8 +1891,11 @@
 }
 .jobs-expand-section { min-width: 0; }
 .jobs-expand-section-cards {
-    column-count: 2;
+    column-count: 3;
     column-gap: var(--space-6);
+}
+@media (max-width: 860px) {
+    .jobs-expand-section-cards { column-count: 2; }
 }
 .jobs-expand-section-cards > .jobs-expand-card {
     break-inside: avoid;
@@ -2059,7 +2062,7 @@
     display: flex;
     overflow-x: auto;
     overflow-y: hidden;
-    max-height: min(46vh, 440px);
+    max-height: min(70vh, 720px);
 }
 .home-active-chats-body .jobs-expand-columns { min-width: min-content; }
 .home-active-chats-body .jobs-expand-column { min-width: 210px; }
@@ -2068,7 +2071,7 @@
     display: block;
     overflow-x: hidden;
     overflow-y: auto;
-    max-height: min(60vh, 620px);
+    max-height: min(75vh, 800px);
 }
 @media (max-width: 560px) {
     .home-active-chats { max-width: 100%; padding: 0 8px; }

@@ -527,7 +527,7 @@ async function summarizeAndStartNewChat() {
     renderMessages();
     
     // Run the agent to generate the summary
-    isFollowingScroll = true;
+    stickToBottom = true;
     paused = false;
     document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
     await runAgent();
@@ -603,7 +603,7 @@ function completeSummaryAndCreateNewChat() {
     showSnackbar('New chat created with summary', 'success');
     
     // Auto-start agent to get AI response
-    isFollowingScroll = true;
+    stickToBottom = true;
     paused = false;
     document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
     runAgent();
@@ -800,6 +800,18 @@ function selectChat(chatId, options) {
     loadVersionHistory();
     renderChatList();
     renderMessages();
+    // MEMFIX: non-recent chats are loaded with their inline base64 payloads
+    // evicted (see loadChatsFromStorage). The sync render above shows text
+    // immediately (images show placeholders); rehydrate from IDB and re-render
+    // once — only if the user is still viewing this chat. No-op for hydrated,
+    // running, or new chats. ensureChatPayloads never rejects.
+    if (typeof ensureChatPayloads === 'function' && chats[chatId] && chats[chatId]._payloadsEvicted) {
+        ensureChatPayloads(chatId).then(function() {
+            if (currentChatId === chatId) {
+                try { renderMessages(); } catch (e) {}
+            }
+        });
+    }
     updateInputPosition();
     updateChatTitleHeader();
     // Re-verify the header connection badge on chat switch. The chat page is
@@ -1009,6 +1021,27 @@ async function deleteChat(chatId, e) {
     // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
     // (the runFinished cleanup in app/045 only prunes on a NON-paused terminal event).
     try { if (typeof _pruneChatPauseTokens === 'function') _pruneChatPauseTokens(chatId); } catch (ePt) {}
+    // MEMFIX (leak prunes): drop per-chat caches that used to survive deletion.
+    // chatWidgets map (tools/080-widget-tools.js) holds the chat's widget array.
+    try { if (typeof chatWidgets !== 'undefined' && chatWidgets) delete chatWidgets[chatId]; } catch (eCw) {}
+    // Expanded-state maps (core/030-config.js) are keyed by chatId+':'+…
+    try {
+        var _pfx = chatId + ':';
+        [typeof compactAreaExpandedState !== 'undefined' ? compactAreaExpandedState : null,
+         typeof thinkingExpandedState !== 'undefined' ? thinkingExpandedState : null,
+         typeof userMsgExpandedState !== 'undefined' ? userMsgExpandedState : null].forEach(function(map) {
+            if (!map) return;
+            Object.keys(map).forEach(function(k) { if (k.indexOf(_pfx) === 0) delete map[k]; });
+        });
+    } catch (eEs) {}
+    // fileIndex pointers (tools/040-file-store.js) into the deleted chat are dead.
+    try {
+        if (typeof fileIndex !== 'undefined' && fileIndex && fileIndex.forEach) {
+            var _deadFids = [];
+            fileIndex.forEach(function(ptr, fid) { if (ptr && ptr.chatId === chatId) _deadFids.push(fid); });
+            _deadFids.forEach(function(fid) { fileIndex.delete(fid); });
+        }
+    } catch (eFi) {}
     saveChatsToStorage();
     if (currentChatId === chatId) {
         var ids = Object.keys(chats);
@@ -1022,7 +1055,14 @@ function togglePinChat(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
     chat.pinned = !chat.pinned;
-    saveChatsToStorage();
+    // MEMFIX: a payload-evicted chat is skipped by the diff-save put-loop, so
+    // a pin toggle on a non-recent chat would silently never persist —
+    // rehydrate first, then save. ensureChatPayloads never rejects.
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
+    } else {
+        saveChatsToStorage();
+    }
     renderChatList();
     renderVersionSidebar();
 }

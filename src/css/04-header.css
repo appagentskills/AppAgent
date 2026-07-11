@@ -225,12 +225,16 @@
 .toggle-sidebar-btn:focus { outline: 2px solid var(--secondary-border-dark); outline-offset: 2px; }
 .toggle-sidebar-btn:focus:not(:focus-visible) { outline: none; }
 
-.messages { flex: 1; overflow-y: auto; padding: var(--space-10); display: flex; flex-direction: column; scrollbar-gutter: stable; }
+/* overflow-anchor: none — the stick-to-bottom mechanism (050-streaming.js)
+   owns all chat scrolling; browser scroll anchoring's own scrollTop
+   adjustments (on content shrink above the anchor) are indistinguishable
+   from user scroll-ups and silently released the follow flag. */
+.messages { flex: 1; overflow-y: auto; overflow-anchor: none; padding: var(--space-10); display: flex; flex-direction: column; scrollbar-gutter: stable; }
 /* While a run is streaming, reserve extra bottom space so the streaming tail
    isn't flush against the input area (class maintained by chat-management /
    agent-event handlers). */
 .messages.is-streaming { padding-bottom: var(--space-13); }
-.streaming-answer { max-height: 50vh; min-height: 33vh; overflow-y: auto; scrollbar-width: none; position: relative; }
+.streaming-answer { max-height: 50vh; min-height: 33vh; overflow-y: auto; overflow-anchor: none; scrollbar-width: none; position: relative; }
 .streaming-answer::-webkit-scrollbar { display: none; }
 .streaming-answer.has-top-shadow { box-shadow: var(--shadow-inset); }
 .messages-content { width: 100%; max-width: 800px; margin: 0 auto; }

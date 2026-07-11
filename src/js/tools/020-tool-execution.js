@@ -472,6 +472,28 @@ function trackRecordMutation(evt) {
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         }
     } catch (e) { /* tracking must never break the tool result */ }
+    // SW-BACKED PAGE TIER (widget executeTool in ui/070-dashboard-ui.js, or
+    // any other panel-side execution of servicenow_api/servicenow_diff_edit):
+    // the write above only landed in the page's NON-authoritative chats
+    // mirror — the SW owns chats[chatId], so the next chat-inlined snapshot
+    // broadcast / SW saveChatsToStorage would drop the entry and the record
+    // would vanish from the sidebar Artifacts list after reload. Forward the
+    // entry over the agent bus so the SW appends it to the authoritative
+    // chat too (worker/130-port-bridge.js 'record-mutation' handler, deduped
+    // by entry.id). Platform.isWorker is true only in the SW bundle and
+    // _agentBusPort exists only in the page bundle
+    // (app/045-agent-port-bridge-page.js), so this is a no-op everywhere
+    // except the SW-backed page tier. The local write above + the
+    // recordMutated emit below stay for instant UI — the page handler
+    // dedupes by entry id (app/036-agent-event-handlers-page.js →
+    // addVersionHistoryEntryForChat in ui/090-version-history.js).
+    try {
+        if (evt.chatId
+            && !(typeof Platform !== 'undefined' && Platform.isWorker === true)
+            && typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+            _agentBusPort.postMessage({ type: 'record-mutation', chatId: evt.chatId, entry: entry });
+        }
+    } catch (e) { /* stale port — the entry still lives in the page mirror + its IDB save above */ }
     evt.entryId = entry.id;
     evt.messageIndex = entry.messageIndex;
     AgentEvents.emit('recordMutated', evt);
@@ -758,10 +780,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
 
     // -------- Sub-agent enforcement (roster + budget) --------
     // Two gates for sub-agent chats:
-    //   1. tool_roster: the deterministic per-sub roster set at spawn. Subs
-    //      inherit the parent's full tool list minus the nested-delegation
-    //      tools (spawn/stop/wake_sub_agent), which are denied unless the
-    //      caller passed `allow_nested:true`. The model-visible list is
+    //   1. tool_roster: the deterministic per-sub roster set at spawn — the
+    //      parent's full tool list, optionally narrowed by tool `profiles`
+    //      (core/078-tool-profiles.js), minus the nested-delegation tools
+    //      (spawn/stop/wake_sub_agent), which are denied unless the caller
+    //      passed `allow_nested:true`. The model-visible list is
     //      already filtered by getEnabledTools, but the dispatch arm is the
     //      defense-in-depth boundary — if a denied tool slips through
     //      (skill tool, cache lag, js_eval bridge), this rejects it.
@@ -793,7 +816,16 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     // able to fetch a cataloged tool's schema.
                     || name === 'get_tool_schema');
                 if (!_alwaysAllowed && _subRec.tool_roster.indexOf(name) === -1) {
-                    return { success: false, error: 'Tool "' + name + '" is not available to this sub-agent. Nested-delegation tools (' + ((typeof SUBAGENT_NESTED_DELEGATION_TOOLS !== 'undefined') ? SUBAGENT_NESTED_DELEGATION_TOOLS.join(', ') : 'spawn_sub_agent, stop_sub_agent, wake_sub_agent') + ') require `allow_nested:true` at spawn.', _roster_denied: true };
+                    var _nestedTools = (typeof SUBAGENT_NESTED_DELEGATION_TOOLS !== 'undefined') ? SUBAGENT_NESTED_DELEGATION_TOOLS : ['spawn_sub_agent', 'stop_sub_agent', 'wake_sub_agent'];
+                    var _rosterErr;
+                    if (_nestedTools.indexOf(name) !== -1) {
+                        _rosterErr = 'Tool "' + name + '" is not available to this sub-agent. Nested-delegation tools (' + _nestedTools.join(', ') + ') require `allow_nested:true` at spawn.';
+                    } else {
+                        _rosterErr = 'Tool "' + name + '" is not in this sub-agent\'s tool roster'
+                            + (Array.isArray(_subRec.profiles) && _subRec.profiles.length ? ' (spawn profiles: ' + _subRec.profiles.join(', ') + ')' : '')
+                            + '. The parent chose the roster at spawn time — work within it, or report_to_parent if the task genuinely needs this tool.';
+                    }
+                    return { success: false, error: _rosterErr, _roster_denied: true };
                 }
             }
         }
@@ -1705,6 +1737,60 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 _wfResult.file_name = _wfName;
                 _wfResult.file_size = _wfBody ? _wfBody.length : 0;
             } else {
+                // --- HTML text extraction ------------------------------------
+                // For HTML responses, surface page_title, meta_description and
+                // extracted_text (script/style-stripped visible text) BEFORE the
+                // raw body. Without this, a large server-rendered page gets
+                // cached/sliced as raw HTML and the slice often lands in inline
+                // JS/CSS, so the agent misreads a real content page as an empty
+                // "SPA shell". Extraction is regex-based (this code also runs in
+                // the service worker, which has no DOMParser) and best-effort —
+                // the raw body is ALWAYS returned unchanged.
+                if (typeof _wfBody === 'string' && _wfBody &&
+                    (/text\/html|application\/xhtml/i.test(_wfCT) || /^\s*(<!DOCTYPE\s+html|<html[\s>])/i.test(_wfBody))) {
+                    try {
+                        // Entity decode — &amp; LAST so '&amp;lt;' decodes to '&lt;'
+                        // (one level), not all the way to '<'.
+                        var _wfDecode = function(s) {
+                            return String(s)
+                                .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+                                .replace(/&quot;/gi, '"').replace(/&#0*39;/g, "'").replace(/&amp;/gi, '&');
+                        };
+                        var _wfTitleM = _wfBody.match(/<title[^>]*>([\s\S]*?)<\/title\s*>/i);
+                        if (_wfTitleM) _wfResult.page_title = _wfDecode(_wfTitleM[1]).replace(/\s+/g, ' ').trim();
+                        var _wfDescTag = _wfBody.match(/<meta\b[^>]*\bname\s*=\s*["']description["'][^>]*>/i);
+                        if (_wfDescTag) {
+                            var _wfDescC = _wfDescTag[0].match(/\bcontent\s*=\s*("([^"]*)"|'([^']*)')/i);
+                            if (_wfDescC) _wfResult.meta_description = _wfDecode(_wfDescC[2] !== undefined ? _wfDescC[2] : _wfDescC[3]).replace(/\s+/g, ' ').trim();
+                        }
+                        // Strip non-content elements FIRST (comments, script, style,
+                        // noscript, template, svg, head), then tags, then decode the
+                        // few entities that matter, then collapse whitespace.
+                        var _wfTxt = _wfBody
+                            .replace(/<!--[\s\S]*?-->/g, ' ')
+                            .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
+                            .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
+                            .replace(/<noscript\b[\s\S]*?<\/noscript\s*>/gi, ' ')
+                            .replace(/<template\b[\s\S]*?<\/template\s*>/gi, ' ')
+                            .replace(/<svg\b[\s\S]*?<\/svg\s*>/gi, ' ')
+                            .replace(/<head\b[\s\S]*?<\/head\s*>/i, ' ');
+                        _wfTxt = _wfTxt
+                            .replace(/<\/(p|div|li|tr|h[1-6]|section|article|table|ul|ol|blockquote|pre|header|footer|nav|aside)\s*>/gi, '\n')
+                            .replace(/<br\s*\/?\s*>/gi, '\n')
+                            .replace(/<[^>]+>/g, ' ');
+                        _wfTxt = _wfDecode(_wfTxt)
+                            .replace(/[ \t\r]+/g, ' ')
+                            .replace(/ ?\n ?/g, '\n')
+                            .replace(/\n{3,}/g, '\n\n')
+                            .trim();
+                        var _WF_TEXT_CAP = 60000;
+                        if (_wfTxt.length > _WF_TEXT_CAP) {
+                            _wfTxt = _wfTxt.slice(0, _WF_TEXT_CAP) + '\n... [extracted_text truncated, ' + (_wfTxt.length - _WF_TEXT_CAP) + ' more chars — full raw HTML in body]';
+                        }
+                        if (_wfTxt) _wfResult.extracted_text = _wfTxt;
+                    } catch (_wfExErr) { /* best-effort — raw body below is untouched */ }
+                }
+                // --------------------------------------------------------------
                 _wfResult.body = _wfBody;
             }
             return _wfResult;
@@ -1720,7 +1806,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'eval_runner') {
         return await executeEvalRunner(args, options);
     } else if (isSkillTool(name)) {
-        return await executeSkillTool(name, args, options);
+        // Pass messageIndex so nested tool calls from inside the skill
+        // sandbox stamp real per-message indexes on version-history entries
+        // (core/140-skills-engine.js plumbs it into both the offscreen
+        // helper payload and the page-tier sandbox bridge).
+        return await executeSkillTool(name, args, options, messageIndex);
     }
     return { success: false, error: 'Unknown tool "' + name + '". If it is listed in the tool catalog (system prompt), call get_tool_schema with its exact name to fetch its schema; otherwise check the catalog / your declared tools for the closest available tool.' };
 }
@@ -2271,7 +2361,6 @@ async function wsClone(repo, branch) {
     // nearly every other workspace action.
     try { await wsHydrate(wk, ['.gitignore']); } catch (e) { /* non-fatal */ }
 
-    refreshWorkspaceContext(); // update system prompt context
     AgentEvents.emit('workspaceMutated', { action: 'clone', repo: wk, branch: branch });
     // Best-effort orphan blob GC (fire-and-forget): the new rows are already
     // stored, so their shas are in the KEEP set.
@@ -2825,7 +2914,6 @@ async function setWorkspacePin(wk, unpin) {
     }
     meta.pinned = !unpin;
     await setWorkspaceMeta(meta);
-    try { refreshWorkspaceContext(); } catch (e) {}
     try { AgentEvents.emit('workspaceMutated', { action: 'pin', repo: wk, pinned: !unpin }); } catch (e) {}
     var res = { success: true, workspace: wk, pinned: !unpin };
     if (cleared.length) res.unpinned = cleared;
@@ -2938,7 +3026,6 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     var pinRes = null;
     try { pinRes = await setWorkspacePin(targetWk, false); } catch (e) {}
 
-    try { refreshWorkspaceContext(); } catch (e) {}
     return {
         success: true,
         workspace: targetWk,
@@ -3124,7 +3211,6 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
         moved.push(src.path);
     }
 
-    try { refreshWorkspaceContext(); } catch (e) {}
     var result = {
         success: true,
         from: wk,
@@ -3848,7 +3934,6 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
         await deleteWorkspaceFiles(wk);
         await deleteWorkspaceMeta(wk);
         try { gcWorkspaceBlobs(); } catch (e) {}
-        try { refreshWorkspaceContext(); } catch (e) {}
         try { AgentEvents.emit('workspaceMutated', { action: 'auto_delete_merged', repo: wk, branch: branch, base: baseBranch, base_workspace: baseWk, pr: mergedPr.number, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced }); } catch (e) {}
         var delResult = { deleted: true, workspace: wk, branch: branch, base_branch: baseBranch, base_workspace: baseWk, pr_number: mergedPr.number, pr_url: mergedPr.html_url, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced };
         if (!baseSynced) delResult.sync_warning = 'The base workspace "' + baseWk + '" could not be fully synced with the remote — pull it before building (the pin was NOT flipped onto it).';
@@ -4339,7 +4424,6 @@ async function wsPull(wk) {
         await setWorkspaceMeta(meta);
     }
 
-    refreshWorkspaceContext();
     var result = { success: true, message: 'Pulled ' + pulled + ' file(s) from remote', pulled: pulled };
     if (conflicts.length > 0) result.conflicts = conflicts;
     if (failedPulls.length > 0) result.failed = failedPulls;
@@ -4980,7 +5064,6 @@ async function wsPush(wk, args, chatId, chatTitle) {
     // Context refresh + panel notification are also post-PR bookkeeping — never
     // let them fail the push either.
     try {
-        refreshWorkspaceContext();
         AgentEvents.emit('workspaceMutated', { action: 'push', repo: wk, branch: args.branch_name });
     } catch (_notifyErr) {
         var _notifyMsg = 'workspace UI refresh failed: ' + (_notifyErr && _notifyErr.message ? _notifyErr.message : String(_notifyErr));

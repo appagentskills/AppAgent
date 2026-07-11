@@ -61,6 +61,40 @@ if (typeof window !== 'undefined' && window.addEventListener) {
     window.addEventListener('blur', _agentEventsMarkAllRunningHidden);
 }
 
+// UNREAD-MISS counterpart: returning to a visible+focused panel while the chat
+// view is on screen counts as SEEING the focused chat — stamp lastViewedAt so
+// activity that landed while the user was away (marked unread now that
+// _isChatViewFocused checks document.hidden/hasFocus) is consumed the moment
+// they actually look at it, instead of leaving the jobs row bold forever.
+function _consumeFocusedChatUnread() {
+    try {
+        if (document.hidden) return;
+        if (typeof document.hasFocus === 'function' && !document.hasFocus()) return;
+        if (typeof currentView !== 'undefined' && currentView !== 'chat') return;
+        if (typeof currentChatId === 'undefined' || !currentChatId) return;
+        var c = (typeof chats !== 'undefined') ? chats[currentChatId] : null;
+        if (!c) return;
+        var last = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+        if (!last || last <= (c.lastViewedAt || 0)) return; // nothing unread
+        c.lastViewedAt = Date.now();
+        if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(currentChatId); } catch (e) {} }
+        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+        if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+        if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+            var _jd = _getOpenJobsDropdown();
+            if (_jd) renderJobsDropdown(_jd);
+        }
+    } catch (e) {}
+}
+if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('focus', _consumeFocusedChatUnread);
+}
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) _consumeFocusedChatUnread();
+    });
+}
+
 // =============================================================
 // Page-side handlers. Each handler MIRRORS the UI calls the loop
 // used to make inline. Order of side effects within a handler
@@ -89,7 +123,6 @@ AgentEvents.on('runStarted', function(e) {
     if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdStart = _getOpenJobsDropdown(); if (_jdStart) renderJobsDropdown(_jdStart); }
     if (chatId === currentChatId) {
         isRunning = true;
-        isFollowingStreamingScroll = true;
         lastApiError = null;
         hideRetryButton();
         hideContinueButton();
@@ -305,12 +338,8 @@ AgentEvents.on('paused', function(e) {
         if (!_isSubAgentChat) {
             showSnackbar('Agent paused. Click Resume to continue.');
         }
-        // SF-3: derive the flag from the user's actual position instead of
-        // forcing true. Since SF-2, isFollowingScroll directly drives the
-        // per-chunk outer pin during streaming — a stale forced-true here
-        // (user scrolled up to read, then paused) yanked them to the bottom
-        // on the first chunk after resume.
-        isFollowingScroll = isNearBottom();
+        // (Scroll-follow intent is tracked continuously by handleChatScroll —
+        // see 050-streaming.js — nothing to derive here.)
     }
 });
 
@@ -623,8 +652,6 @@ AgentEvents.on('runFinished', function(e) {
         if (chatId === _fgElse) {
             hidePauseButton();
             refreshContinueButtonForChat(chatId);
-            // SF-3: same as the 'paused' handler — derive, don't force (see above).
-            isFollowingScroll = isNearBottom();
         }
     }
 });

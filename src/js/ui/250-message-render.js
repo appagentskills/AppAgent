@@ -149,7 +149,7 @@ function _attachRowScrollShadow(row) {
 // subtree. Returns true when the patch was applied; false = caller must do
 // the full rebuild. Every structural assumption is verified against the live
 // DOM before mutating — any surprise falls back to the full render.
-function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop, wasAtBottom) {
+function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop) {
     var prev = _lastRenderState;
     var newCount = mappedParts.length;
     var oldCount = prev.count;
@@ -192,8 +192,6 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
     // check (e.g. the widget editor swapped out #messages content earlier).
     var tailEl = document.getElementById('msg-' + tailIdx);
     if (!tailEl || tailEl.parentNode !== root) return false;
-
-    var preScrollHeight = container.scrollHeight; // SF-1: growth delta for streaming follow
 
     var newTailEl = tailEl;
     if (tailChanged) {
@@ -244,24 +242,13 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
     renderWidgetSidebar();
     initDisplayChecklists();
 
-    // Scroll restore — same policy as the full render.
-    if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2
-    if (streamingElNow) {
-        // SF-1: advance by the growth delta (see the full render's streaming
-        // restore) so appended tool rows don't push the streaming container
-        // below the fold for an at-bottom user.
-        var _sfGrowthInc = container.scrollHeight - preScrollHeight;
-        container.scrollTop = (wasAtBottom && _sfGrowthInc > 0) ? savedScrollTop + _sfGrowthInc : savedScrollTop;
-        // SF-2: route through the choke point — re-pins the outer container
-        // for a following user (recovering any drift the in-place streaming
-        // paths produced before this render) and still owns the streaming
-        // container's height + inner scroll. Non-following users keep the
-        // absolute restore above (the pin is gated on isFollowingScroll).
-        scrollToBottomIfAllowed(container);
-    } else if (wasAtBottom || isFollowingScroll) {
-        container.scrollTop = container.scrollHeight;
+    // Scroll restore — single stick-to-bottom mechanism (see 050-streaming.js):
+    // sticking users are pinned via the one choke point; everyone else keeps
+    // their absolute position.
+    if (stickToBottom) {
+        scrollToBottomIfAllowed();
     } else {
-        container.scrollTop = savedScrollTop;
+        restoreChatScrollTop(container, savedScrollTop);
     }
 
     if (typeof gcRawCopyStore === 'function') gcRawCopyStore();
@@ -502,8 +489,6 @@ function renderMessages() {
     
     // Save scroll position before DOM rebuild - widgets will temporarily lose height
     var savedScrollTop = container.scrollTop;
-    var savedScrollHeight = container.scrollHeight; // SF-1: growth delta for streaming follow
-    var wasAtBottom = isNearBottom(container);
 
     // Save collapsed state of attachment groups so re-render doesn't re-expand them
     var closedAttachmentGroups = {};
@@ -1057,7 +1042,7 @@ function renderMessages() {
     // before falling through to the full innerHTML rebuild below.
     var newSigs = new Array(mappedParts.length);
     for (var sgi = 0; sgi < mappedParts.length; sgi++) newSigs[sgi] = _renderSig(mappedParts[sgi]);
-    if (_tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop, wasAtBottom)) {
+    if (_tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop)) {
         _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
         return;
     }
@@ -1216,35 +1201,13 @@ function renderMessages() {
     // Initialize display template checklists (update summaries after innerHTML)
     initDisplayChecklists();
 
-    // Restore scroll position after widgets are rendered
-    var streamingEl = document.getElementById('streaming-text');
-    if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2: these scrollTop writes must not count as user scrolls
-    if (streamingEl) {
-        // During streaming: #streaming-text was never removed from DOM, scroll is intact.
-        // SF-1: tool rows appended ABOVE the streaming container grow the outer
-        // scrollHeight while the absolute restore pinned scrollTop, pushing the
-        // container (and the live text tail) below the fold for an at-bottom user —
-        // updateStreamingContainerHeight's shrink-to-fit bottoms out at the CSS
-        // min-height (33vh). Advance the restore by the growth delta so the
-        // container keeps its viewport position; users who scrolled up keep their
-        // absolute position. NOTE (SF-2): scrollToBottomIfAllowed no longer
-        // early-returns on .streaming-answer — the call below re-pins the outer
-        // container to the bottom for FOLLOWING users, overwriting this delta
-        // restore. The delta math still matters for the non-following window
-        // (isFollowingScroll false but wasAtBottom true — e.g. content shrank
-        // under a disengaged user): those users get position-preservation here
-        // and are NOT pinned.
-        var _sfGrowth = container.scrollHeight - savedScrollHeight;
-        container.scrollTop = (wasAtBottom && _sfGrowth > 0) ? savedScrollTop + _sfGrowth : savedScrollTop;
-        // SF-2: same choke-point routing as the incremental path — see
-        // _tryIncrementalRender. Recovers drift for following users; the
-        // pin inside scrollToBottomIfAllowed is gated on isFollowingScroll
-        // so scrolled-up users keep the absolute restore above.
-        scrollToBottomIfAllowed(container);
-    } else if (wasAtBottom || isFollowingScroll) {
-        container.scrollTop = container.scrollHeight;
+    // Restore scroll after the rebuild — single stick-to-bottom mechanism (see
+    // 050-streaming.js): sticking users are pinned via the one choke point;
+    // everyone else keeps their absolute position.
+    if (stickToBottom) {
+        scrollToBottomIfAllowed();
     } else {
-        container.scrollTop = savedScrollTop;
+        restoreChatScrollTop(container, savedScrollTop);
     }
 
     // R1: record what this full render produced so the next render can diff.
@@ -1665,14 +1628,13 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
 
     // Preserve scroll position if user has scrolled away - browser may auto-scroll when details elements expand
     var container = document.getElementById('messages');
-    var savedScrollTop = (!isFollowingScroll && container) ? container.scrollTop : null;
+    var savedScrollTop = (!stickToBottom && container) ? container.scrollTop : null;
     
     msgEl.innerHTML = html;
     
     // Restore scroll position if user had scrolled away (prevents browser auto-scroll on details expansion)
     if (savedScrollTop !== null && container) {
-        if (typeof markProgrammaticScroll === 'function') markProgrammaticScroll(); // R2
-        container.scrollTop = savedScrollTop;
+        restoreChatScrollTop(container, savedScrollTop);
     }
     
     // Set up sticky observers for any expanded tool panels

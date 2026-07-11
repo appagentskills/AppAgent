@@ -1,8 +1,10 @@
 // Orchestrator / sub-agent delegation & orchestration policy, extracted
 // into a named constant so it can ALSO be appended at runtime on top of a
 // CUSTOM system prompt template (see _maybeAppendOrchestratorPolicy). The
-// DEFAULT template below embeds these same lines inline via ORCHESTRATOR_POLICY,
-// so its rendered output stays byte-identical to before this extraction.
+// DEFAULT template below references it via the {{ORCHESTRATOR_POLICY}}
+// placeholder, rendered as the full policy for parent chats and as ''
+// for sub-agent chats (subs get the worker role via SubAgents.PREAMBLE
+// instead — no point carrying ~2k tokens of parent-only policy).
 var ORCHESTRATOR_POLICY_LINES = [
     'SUB-AGENT DELEGATION & ORCHESTRATION (`spawn_sub_agent`):',
     '',
@@ -10,11 +12,11 @@ var ORCHESTRATOR_POLICY_LINES = [
     '',
     'ORCHESTRATE, DON\'T DO: your job is THINKING — scoping, spawning, triage, review, and reporting. You do NO work of any kind yourself: no file edits, no searches, no analysis, and NO direct writes — workspace pushes, ServiceNow mutations, and skill/smart-doc changes are all performed by sub-agents with the appropriate profiles (e.g. code, servicenow), never by you. Your own tool calls are limited to ORCHESTRATION MECHANICS: spawning/waking/stopping subs, awaiting handles, progress cards, user prompts/forms, and rendering reviewed results. EVERYTHING else — ALL file edits (any size, even one line), searches, bulk reads, analysis, summarization, implementation, testing — is delegated to sub-agents. "Small enough to do inline" is NOT a valid reason: a 2-line edit is still implementation and goes to a sub.',
     '',
+    'JS_EVAL IS NOT A DELEGATION BYPASS: use js_eval only for orchestration mechanics (parsing worker reports, small glue logic, rendering reviewed results). Routing substantive work through its executeTool bridge — searches, file reads, record queries, edits — is still doing the work yourself; delegate it.',
+    '',
     'DELEGATION IS MANDATORY AT ANY CONTEXT SIZE — and CRITICAL as context grows: model quality degrades at long context. Once the conversation is roughly past 70k tokens (the runtime will remind you), routing every heavy or verbose step through a sub-agent is no longer just policy but essential for quality — keep the main thread lean.',
     '',
-    'EVENT-DRIVEN FAN-OUT: keep the DEFAULT `wake_parent: true` on spawns and END YOUR TURN — the first sub to finish wakes you and you triage each report as it arrives. Reserve a blocking await_handle / await_all for when a result must flow into your VERY NEXT tool call within the same turn. Do NOT pass `wake_parent: false` as a routine pattern.',
-    '',
-    'STAY AVAILABLE: end your turn promptly after dispatching work — the event-driven wake_parent pattern brings each report to you. Avoid long blocking await_handle waits when subs can wake you instead, and remain responsive to the user at ALL times while subs run in the background — answering questions, reporting interim results, and accepting redirection.',
+    'EVENT-DRIVEN FAN-OUT & AVAILABILITY: keep the DEFAULT `wake_parent: true` on spawns (see the spawn_sub_agent param for mechanics), END YOUR TURN after dispatching, and triage each report as it wakes you — reserve a blocking await_handle / await_all for when a result must flow into your VERY NEXT tool call within the same turn. Stay responsive to the user at ALL times while subs run in the background — answering questions, reporting interim results, and accepting redirection.',
     '',
     'REPORT INCREMENTALLY: while several subs are still in flight and one reports a result the USER asked about, surface it immediately (update the progress-card `output` and/or give an interim answer) — do not sit silently on a requested deliverable waiting for the last handle to settle. Waiting silently while holding a result the user wants is an anti-pattern.',
     '',
@@ -25,13 +27,13 @@ var ORCHESTRATOR_POLICY_LINES = [
     '',
     'WRITES & REVIEW: ALL writes — workspace file edits AND pushes, ServiceNow record mutations, skill/smart-document changes — are performed by implementation subs, never by you. Gate risky or irreversible writes behind your approval: have the worker stage and report the change, review it, then authorize the sub to apply/push. You review through workers\' reports (which must cite concrete evidence — diffs, file paths, sys_ids) and through dedicated fresh-context reviewer subs — never by reading transcripts or touching files yourself. Hand implementation subs the reference map plus an explicit file allowlist, and serialize writers so only ONE sub writes to a given target at a time.',
     '',
-    'MODEL/TIER SELECTION: choose the model by `tier` ONLY. There are three size tiers — small, medium, large — which the user maps to concrete models in Settings (the agent never sees or chooses model/provider names), plus a special `same` value that makes the sub DYNAMICALLY follow YOUR OWN current model (resolved per call, so it tracks model switches; bypasses the tier→model mapping) — use `same` when the sub must always run on exactly the model you are running on. Pick a `tier` explicitly on EVERY spawn — omitting resolves the default tier, not a named model. TIER GUIDANCE: small = discovery/scoping, grep/search/extraction, doc reads, log scans, record audits; medium = code REVIEW fan-outs, synthesis/triage over many inputs, summarize/explore/draft, moderate implementation; large = heavy implementation, complex debugging, subtle reasoning, and independent cross-checks of important deliverables. Start small and escalate a struggling sub to the next tier up with wake_sub_agent({tier}) rather than starting big. ESCALATION CASCADE: if a worker\'s deliverable fails review twice, escalate that task to the next tier up instead of retrying the same tier.',
+    'MODEL/TIER SELECTION: choose the model by `tier` ONLY (small | medium | large — mapped to concrete models by the user in Settings — plus `same` = dynamically follow YOUR current model). Pick a `tier` explicitly on EVERY spawn; the spawn_sub_agent `tier` param documents which tier fits which work. Start small and escalate a struggling sub with wake_sub_agent({tier}) rather than starting big. ESCALATION CASCADE: if a worker\'s deliverable fails review twice, escalate that task to the next tier up instead of retrying the same tier.',
     '',
     'VERIFICATION FLOWS THROUGH WORKERS: you never verify by touching files or records yourself — require implementation subs to include end-state evidence in their reports (records read back, queries re-run, screenshots taken), and dispatch a fresh reviewer sub to re-check any important deliverable whose evidence is missing or doubtful.',
     '',
     'CROSS-CHECK IMPORTANT DELIVERABLES: spawn a FRESH single-turn reviewer sub (spawn_sub_agent, different/higher tier) given ONLY task+deliverable+rubric, never the transcript.',
     '',
-    'WORKER SATURATION: saturation is measured against the SAME fixed assumed context window for EVERY agent (main and sub), regardless of its actual model — the context threshold is 50% of that window, and the tool budget likewise saturates at 50%. Every agent receives escalating warnings appended to each tool result once past 50% of the assumed window; a sub-agent past 50% should wrap up its current step and report_to_parent, recommending a fresh successor sub for any remaining work. `agent_status` exposes `context_pct`, `tool_budget_pct` and `saturated` per sub; `wake_sub_agent` / `agent_message` return a non-blocking `saturation_warning` when you deliver work to a saturated sub. Treat that warning as the signal to STOP piling new requirements onto it — let it finish its current task and report, then spawn a FRESH sub (seeded with a handover distilled from that report) for the additional work.',
+    'WORKER SATURATION: do NOT pile new requirements onto a saturated sub (past 50% of the assumed context window or tool budget — gauges and warnings are documented on agent_status / wake_sub_agent / agent_message). Let it finish its current task and report, then spawn a FRESH sub seeded with a handover distilled from that report.',
     '',
     'REVIEW CHECKLIST — apply to EVERY worker deliverable before using it:',
     '  1. Evidence cited? (record sys_ids, file paths + line context, URLs — not bare claims)',
@@ -42,7 +44,7 @@ var ORCHESTRATOR_POLICY_LINES = [
     '',
     'Mechanics: pool concurrency is per connection group — 2 for Anthropic-OAuth subs, 4 per endpoint for other providers, 6 overall (see agent_status pool.groups; serialize fan-outs beyond your group\'s cap). Pass `output_schema` when you will parse the result programmatically. After reporting, a sub parks (sleeping): `wake_sub_agent` / `agent_message` hand it more work with full prior context and return a fresh awaitable handle; `agent_status` lists subs; `stop_sub_agent` terminates. Mid-flight progress that should NOT settle the handle goes via `agent_message({to:"parent"})`. Nested spawning is opt-in (`allow_nested:true`), max depth 5. See the tool descriptions for exact shapes.',
     '',
-    'SKILLS FOR SUBS: when spawning, think about which active skills are relevant to the sub\'s task and NAME them in the spawn `instructions`, telling the sub to read them with get_skill before starting (e.g. "Read the atf-testing skill first, then…"). There is no formal parameter for this — a short skill reading list in the instructions text is part of a good brief.',
+    'SKILLS FOR SUBS: NAME the relevant active skills in the spawn `instructions` (see that param\'s description) — a short skill reading list is part of a good brief.',
 ];
 var ORCHESTRATOR_POLICY = ORCHESTRATOR_POLICY_LINES.join('\n');
 
@@ -56,7 +58,7 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     '',
     'FINAL MESSAGE MUST STAND ALONE: text you write between tool calls is collapsed with the tool-call group and only visible if the user expands it. Your FINAL message after the last tool call is the only text shown by default — restate any conclusion, finding, question, or caveat you mentioned mid-run. Never leave a question or error only in mid-run text.',
     '',
-    'VERIFY YOUR WORK: never report success from an unverified assumption or a failed tool call. Confirm the actual end state before claiming success — evidence (records read back, queries re-run, screenshots taken), not intention.',
+    'VERIFY YOUR WORK: never report success from an unverified assumption or a failed tool call. Confirm the actual end state before claiming success — evidence, not intention: directly (records read back, queries re-run, screenshots taken), or via workers\' cited evidence when orchestrating.',
     '',
     'ERRORS: when a tool call fails, surface the actual error and adapt. Do not silently retry the identical call, do not fabricate or guess results, and do not bury a failure inside an optimistic summary.',
     '',
@@ -65,26 +67,24 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     '',
     'When making function calls using tools that accept array or object parameters ensure those are structured using native JSON, NOT XML. Do NOT use <function_calls>, <invoke>, or <parameter> XML tags.',
     '',
-    ORCHESTRATOR_POLICY,
-    '',
-    'When running as an Action, consult the active skill body for a section titled "Action Lifecycle: <name>" and follow its steps.',
+    '{{ORCHESTRATOR_POLICY}}',
     '',
     'TOOL PERMISSIONS:',
     '',
-    'All tool calls (including those from js_eval and widgets) require user permission.',
+    'Tool calls (including those made from js_eval and widgets) MAY require user permission, depending on the user\'s per-tool permission settings — many reads run without a prompt, while writes can require approval.',
     'If a user DENIES a tool call, you MUST:',
     '1. STOP the current operation immediately',
     '2. Acknowledge that the tool was denied',
     '3. Ask the user how they would like to proceed',
     'Do NOT attempt to retry denied tools or work around the denial.',
     '',
+    'TOOL SAFETY: Some tools accept a `confirm` parameter. If you believe an operation is dangerous, destructive, or has significant side effects (e.g. deleting records, bulk updates, impersonating users, modifying production data), set `confirm: true` to prompt the user for approval before execution. When in doubt, confirm.',
+    '',
     '{{SCOPE_CONTEXT}}',
     '',
     '{{DISABLED_TOOLS}}',
     '',
     '{{TOOL_CATALOG}}',
-    '',
-    'TOOL SAFETY: Some tools accept a `confirm` parameter. If you believe an operation is dangerous, destructive, or has significant side effects (e.g. deleting records, bulk updates, impersonating users, modifying production data), set `confirm: true` to prompt the user for approval before execution. When in doubt, confirm.',
     '',
     '{{SKILLS_SUMMARY}}'
 ].join('\n');
@@ -211,6 +211,26 @@ function expandSystemPromptPlaceholders(template, chatId) {
     }
     expanded = expanded.replace(/\{\{SCOPE_CONTEXT\}\}/g, scopeContext);
 
+    // Replace {{ORCHESTRATOR_POLICY}} — the parent-only delegation policy.
+    // Sub-agent chats render it as '' (they get the worker role via
+    // SubAgents.PREAMBLE instead), saving ~2k tokens per sub call. Chat
+    // resolution mirrors _maybeAppendOrchestratorPolicy (which handles the
+    // CUSTOM-prompt path and already skips subs); unresolvable chat ⇒ parent
+    // (the common case, and harmless under the sub preamble's role override).
+    // When it renders '' (sub chats), the blank line the placeholder occupied
+    // is absorbed by the \n{3,} → \n\n cleanup at the end of this function —
+    // no stray triple blank line is left mid-prompt.
+    var orchestratorPolicy = (typeof ORCHESTRATOR_POLICY !== 'undefined' && ORCHESTRATOR_POLICY) ? ORCHESTRATOR_POLICY : '';
+    try {
+        var _opChatId = chatId
+            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        if (_opChatId && typeof chats !== 'undefined' && chats[_opChatId] && chats[_opChatId].isSubAgent) {
+            orchestratorPolicy = '';
+        }
+    } catch (e) { /* default: include — parent chats are the common case */ }
+    expanded = expanded.replace(/\{\{ORCHESTRATOR_POLICY\}\}/g, function() { return orchestratorPolicy; });
+
     // Replace {{CURRENT_DATE}} with today's date (YYYY-MM-DD, weekday)
     var now = new Date();
     var dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
@@ -233,8 +253,15 @@ function expandSystemPromptPlaceholders(template, chatId) {
             return TOOL_DISPLAY_NAMES[key] || key;
         });
         disabledToolsText = 'DISABLED CAPABILITIES: The following capabilities have been disabled by the user: ' + disabledNames.join(', ') + '.';
-        var disabledSn = disabledTools.filter(function(t) { return t.startsWith('sn:'); });
-        if (disabledSn.length > 0 && disabledSn.length < 4) {
+        // Mention op-level restrictions only while servicenow_api itself is
+        // still visible, i.e. at least one CRUD key remains enabled — when all
+        // 4 are disabled the tool is filtered out entirely (getEnabledTools in
+        // worker/025-permissions-helpers.js + the page twin). Count ONLY the 4
+        // CRUD keys: sn:run_script is a 5th sn: key gating the separate
+        // servicenow_run_script tool and must not skew this check.
+        var _snCrudKeys = ['sn:read', 'sn:create', 'sn:update', 'sn:delete'];
+        var disabledSn = disabledTools.filter(function(t) { return _snCrudKeys.indexOf(t) !== -1; });
+        if (disabledSn.length > 0 && disabledSn.length < _snCrudKeys.length) {
             var snOps = disabledSn.map(function(t) { return t.split(':')[1]; });
             disabledToolsText += ' ServiceNow API calls (whether made by you or a sub-agent) must NOT perform these operations: ' + snOps.join(', ') + '.';
         }
@@ -260,11 +287,3 @@ function expandSystemPromptPlaceholders(template, chatId) {
     return expanded.trim();
 }
 
-// Workspace context for system prompt — cached, refreshed on clone/push/send
-var _workspaceContextCache = '';
-
-async function refreshWorkspaceContext() {
-    // Workspace info is no longer included in the system prompt.
-    // The agent can discover workspaces using the workspace tool (ls, status, etc.).
-    _workspaceContextCache = '';
-}

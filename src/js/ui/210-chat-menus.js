@@ -70,7 +70,14 @@ function confirmRenameChat(chatId) {
         // A user-chosen name is authoritative — clear the provisional flag so
         // the auto-title hook doesn't overwrite the manual rename later.
         delete chat.titleProvisional;
-        saveChatsToStorage();
+        // MEMFIX: a payload-evicted chat is skipped by the diff-save put-loop,
+        // so a rename of a non-recent chat would silently never persist —
+        // rehydrate first, then save. ensureChatPayloads never rejects.
+        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
+        } else {
+            saveChatsToStorage();
+        }
         renderChatList();
         if (chatId === currentChatId) updateChatTitleHeader();
         showSnackbar('Chat renamed', 'success');
@@ -80,9 +87,13 @@ function confirmRenameChat(chatId) {
 }
 
 // Download chat as JSON
-function downloadChat(chatId) {
+async function downloadChat(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
+    // MEMFIX: rehydrate evicted base64 payloads so the export is complete.
+    if (typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
     
     var exportData = {
         exportType: 'single_chat',

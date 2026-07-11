@@ -21,6 +21,18 @@ Everything below (and in `select2.md` / `native-inputs.md` / …) targets **ligh
 - **🔢 `match_count` is reliable on the current build:** `get_properties` pierces shadow, so `0` means **genuinely absent** (e.g. the editable fields are 0 on the read-only **Overview** tab — click **Details** first) and `N` means present. ⚠️ it **counts hidden matches**, so read the **`visible`** property for visibility. (*Historical:* an older build computed the count from a non-piercing `querySelectorAll` while resolving `properties` via piercing `findElement`, so `0` could be a false negative — that's fixed; this once made an attempt think selectors were dead and detour to coordinates.)
 - **🔑 Stable selectors only:** element ids (`now-id`, `form-field-…`, `tab_…`, option ids) are **regenerated every load** — anchor on **`aria-label`** / **`role`** / stable **`now-*` class** (`button.now-tab`, `input.now-input-native`, `button.now-select-trigger`, `input.now-typeahead-native-input`). Read a choice's value from the **trigger's `textContent`**, a text field's from **`.value`**. Full recipes (tabs/views, record picker, now-input/textarea, choice, pills, switch, grid row-open, read-back) live in **`now-experience.md`** — **no coordinates needed**.
 
+## ⚠️ ALWAYS pin the tab first (`tab_id`)
+
+Without a pinned tab, `iframe_tool` can silently read the **WRONG browser tab** — observed live: `get_visible_text` returned an unrelated GitHub page instead of the incident form. Every driver script MUST pin its tab:
+
+1. `list_instances` → read `activeTabs[].id` for the instance.
+2. The `navigate` result **message contains the tab id** ("…background tab (id N)") — capture it.
+3. Pass `tab_id` on **EVERY** subsequent call — bake it into the helper so it can't be forgotten:
+   ```javascript
+   const ift = a => executeTool("iframe_tool", Object.assign({instance, tab_id: TAB}, a));
+   ```
+4. If reads look unrelated to the page you think you're on → **STOP**, `list_instances refresh:true`, re-pin.
+
 ## The approach: write a disposable driver script each time
 
 We do **not** ship a generic "fill any form" function. Instead, for each task you **compose a small `js_eval` script** that calls `iframe_tool` actions to drive the specific controls in front of you, assembling the per-component recipes below. Why:
@@ -116,6 +128,23 @@ Each component file states: what it is, the selectors, the open/commit/close mec
 
 - **Catalog stack** — `sc_cat_item`, order guides, `ticket`, `sc_request` (the bulk of forms).
 - **Custom SP widgets** — non-catalog pages (`/esc?id=<widget_id>`): the same controls with different anchoring/flow (see `select2.md` custom-widget note + `modals.md`). ⚠️ Page/widget availability is **build-specific** — the “same” flow on another instance may not exist as a custom page at all and instead be a **record producer with an MRVS modal** (standard catalog world, `modals.md` §6). Probe the page first; don't assume a remembered URL exists.
+
+## Detecting form errors & blocked submits (classic UI16) — verified selectors
+
+Verified live on a classic UI16 `incident.do` empty-form submit (blocked by mandatory fields):
+
+| Selector | What it is |
+|---|---|
+| `#output_messages` | Messages container — **anchor on this ID** and check `visible`; the `.outputmsg_container` CLASS also matches hidden spares carrying `outputmsg_hide`. |
+| `.outputmsg_error` | Error banner — `role="alert"`, classList `outputmsg outputmsg_error notification notification-error` (so `.notification-error` matches the **same** node). |
+| `.outputmsg_info` / `.notification-info` | Info banner. |
+| `.outputmsg_text` | Message text span (one per banner). |
+
+**Do NOT use for this scenario** (0 matches when verified): `.fieldmsg`, `.sn-notification`, `#field_msg_incident.caller_id` — field-level `g_form.showFieldMsg` messages are a **different mechanism**.
+
+**Read pattern:** `get_properties` on `.outputmsg_error` → `match_count > 0` ⇒ submit blocked; `get_dom` on `#output_messages` for the message text. Dialog/modal fallback: see `modals.md`.
+
+**GROUND TRUTH:** screenshot + Table API read-back (`ORDERBYDESCsys_created_on` + a distinguishing typed value) — record present ⇒ saved, absent ⇒ blocked; a blocked classic submit stays on the form.
 
 ## Post-submit: find the record you just created
 

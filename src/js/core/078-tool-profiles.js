@@ -16,14 +16,20 @@
 //
 // A tool listed in NO profile: if it's a REGISTRY tool (core/080-
 // tools.js TOOLS) it is treated as not loaded for profile-filtered
-// agents (e.g. github_setup, extension_build's registry twin); if
-// it's a SKILL-provided tool it keeps legacy behavior (loaded while
-// its skill is active) so future skills don't break.
+// agents (e.g. github_setup); if it's a SKILL-provided tool it keeps
+// legacy behavior (loaded while its skill is active) so future
+// skills don't break. NOTE: skill-provided tools that ARE listed in
+// a profile (web_search, search_docs, run_audit, …) still require
+// their skill to be ACTIVE in the spawning chat — the profile can
+// only narrow, never conjure a tool the parent context doesn't have.
 //
-// Filtering only affects the tool list assembled for the LLM
-// (getEnabledTools twins + the spawn-time tool_roster). executeTool
-// dispatch and permissions are untouched. The filter runs on the
-// BASE list, before (and independent of) deferred-tools splitting.
+// Filtering shapes the tool list assembled for the LLM (getEnabledTools
+// twins) AND the spawn-time tool_roster, which IS enforced at dispatch
+// for sub-agents (tools/020-tool-execution.js roster gate) — a tool
+// outside the roster is rejected even when invoked via the js_eval
+// executeTool bridge. Permission checks are separate and untouched.
+// The filter runs on the BASE list, before (and independent of)
+// deferred-tools splitting.
 //
 // Loaded in BOTH bundles: page core tier (numeric prefix, before
 // 080-tools.js) + WORKER_SHARED_FILES (build/build.js and
@@ -32,14 +38,14 @@
 
 var TOOL_PROFILES = {
     core:        { description: 'Base tools every agent needs (eval/chaining, cached results, files, skills, progress card)', tools: ['js_eval', 'cached_content_outline', 'cached_content_search', 'cached_content_read', 'get_file', 'get_tool_schema', 'get_skill', 'update_action_state'] },
-    'sub-agent': { description: 'Tools every spawned sub-agent needs to report back and communicate', tools: ['report_to_parent', 'agent_message', 'sleep_self'] },
+    'sub-agent': { description: 'Tools every spawned sub-agent needs to report back, communicate, and stage scratchpad docs', tools: ['report_to_parent', 'agent_message', 'sleep_self', 'document'] },
     orchestrator: { description: 'Main-agent orchestration and user-facing I/O: spawning/managing subs, async handles, prompts, rendering, answer cards', tools: ['spawn_sub_agent', 'agent_status', 'wake_sub_agent', 'stop_sub_agent', 'agent_message', 'await_handle', 'await_any', 'await_all', 'prompt_user', 'show_action_button', 'set_chat_title', 'set_tldr', 'set_links', 'set_caveat', 'display', 'html_widget', 'document', 'screenshot_by_id', 'read_attached_file'] },
     'skill-manager': { description: 'Create/update/manage AI skills (live runtime copies)', tools: ['manage_skill'] },
     servicenow:  { description: 'ServiceNow record CRUD, server scripts, code edits', tools: ['servicenow_api', 'servicenow_run_script', 'servicenow_diff_edit', 'list_instances'] },
     browser:     { description: 'Drive and inspect the ServiceNow UI in the iframe, screenshots', tools: ['iframe_tool', 'take_screenshot', 'screenshot_by_id', 'list_instances'] },
-    research:    { description: 'Web search/fetch and ServiceNow docs (read-only research)', tools: ['web_fetch', 'search_docs', 'web_search', 'list_instances'] },
+    research:    { description: 'Web research: web_fetch (all HTTP methods) + docs/web search (search_docs/web_search are skill-provided — present only while their skill is active)', tools: ['web_fetch', 'search_docs', 'web_search', 'list_instances'] },
     code:        { description: 'GitHub repo work: clone/browse/read/edit/diff via workspace', tools: ['workspace', 'web_fetch'] },
-    'extension-dev': { description: 'AppAgent extension development: workspace edits + runtime introspection', tools: ['workspace', 'runtime_inspect', 'take_screenshot'] },
+    'extension-dev': { description: 'AppAgent extension development: the code tools (workspace, web_fetch) + runtime_inspect and screenshots', tools: ['workspace', 'web_fetch', 'runtime_inspect', 'take_screenshot', 'screenshot_by_id'] },
     'eval-runner':   { description: 'Run the ServiceNow eval: grader + the ServiceNow tools the eval tasks need', tools: ['eval_runner', 'servicenow_api', 'servicenow_run_script', 'servicenow_diff_edit', 'list_instances'] },
     'audit-runner':  { description: 'Run instance audits: audit tool + ServiceNow read access', tools: ['run_audit', 'servicenow_api', 'list_instances'] }
 };

@@ -299,7 +299,7 @@ function getActiveSkillTools() {
 var LARGE_RESPONSE_LINE_LIMIT = 50; // Max lines to show for large responses
 
 // Execute skill tool in isolated sandbox (same security model as js_eval)
-async function executeSkillTool(toolName, args, options) {
+async function executeSkillTool(toolName, args, options, messageIndex) {
     var toolInfo = null;
     for (var skillId in skillTools) {
         if (skillTools[skillId][toolName]) {
@@ -329,7 +329,14 @@ async function executeSkillTool(toolName, args, options) {
                 chatId: chatId,
                 // Plumb the skill-tool toolCallId so display calls from inside
                 // the skill render eagerly attached to this tool's result slot.
-                parentToolCallId: options && options.toolCallId
+                parentToolCallId: options && options.toolCallId,
+                // Plumb the OUTER tool call's message index so nested
+                // servicenow_api / servicenow_diff_edit calls stamp a real
+                // messageIndex on their version-history entries instead of -1
+                // (offscreen-helper.js runSkillSandbox → sw-exec-tool payload
+                // → background.js executeTool). NOT `messageIndex || null` —
+                // index 0 is a legitimate value.
+                messageIndex: (typeof messageIndex === 'number' && messageIndex >= 0) ? messageIndex : null
             }, 5 * 60 * 1000);
             var swResultStr = JSON.stringify(swResult, null, 2);
             var swLines = swResultStr.split('\n');
@@ -370,7 +377,11 @@ async function executeSkillTool(toolName, args, options) {
                     // Pass the OUTER skill-tool toolCallId as parentToolCallId
                     // so display from inside a skill renders eagerly attached
                     // to the skill's tool_result slot. See executeDisplay.
-                    var toolPromise = executeTool(e.data.name, e.data.args, null, {
+                    // Pass the OUTER tool call's messageIndex (not null) so
+                    // nested record mutations get per-message artifact
+                    // attribution — same plumbing as the SW path above.
+                    var toolPromise = executeTool(e.data.name, e.data.args,
+                        (typeof messageIndex === 'number' && messageIndex >= 0) ? messageIndex : null, {
                         chatId: chatId,
                         fromSandbox: true,
                         parentToolCallId: options && options.toolCallId
@@ -384,6 +395,22 @@ async function executeSkillTool(toolName, args, options) {
                                     if (ssChat) {
                                         if (!ssChat.screenshots) ssChat.screenshots = {};
                                         ssChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
+                                        // MEMFIX: cap the per-chat screenshots map (~20, LRU by
+                                        // timestamp) — an unbounded map grows the chat record by
+                                        // ~1-2MB per sandbox screenshot forever. Oldest entries
+                                        // (and their base64) are dropped; screenshot_by_id on a
+                                        // dropped id returns not-found, same as pre-existing
+                                        // behavior for deleted chats.
+                                        try {
+                                            var _ssKeys = Object.keys(ssChat.screenshots);
+                                            var _SS_CAP = 20;
+                                            if (_ssKeys.length > _SS_CAP) {
+                                                _ssKeys.sort(function(a, b) { return (ssChat.screenshots[a].timestamp || 0) - (ssChat.screenshots[b].timestamp || 0); });
+                                                for (var _ei = 0; _ei < _ssKeys.length - _SS_CAP; _ei++) {
+                                                    delete ssChat.screenshots[_ssKeys[_ei]];
+                                                }
+                                            }
+                                        } catch (eCap) {}
                                         if (ssMsg.file_id) registerFile(ssMsg.file_id, { type: 'screenshots_map', chatId: chatId });
                                         saveChatsToStorage();
                                     }

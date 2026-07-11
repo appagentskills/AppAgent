@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.15
+
+### Features
+- Active Chats can now be viewed as a wider grid, showing three cards per row.
+
+### Fixes
+- Chat auto-scroll is reliable again: the view sticks to the bottom while streaming and re-pins when late content arrives.
+- Tool-approval popups are no longer lost when you act in another chat, and background tabs now flag pending approvals.
+- Sub-agent completions now reliably wake their parent chat, even across extension restarts.
+- Fixed memory leaks from screenshots and other large payloads staying in memory; they now load on demand when a chat is opened.
+- Record changes made by widgets no longer vanish from the sidebar Artifacts list.
+- Web page extraction no longer includes script and style text, and browser actions are guarded against targeting the wrong tab.
+- Jobs rows now show unread bold for activity that lands while the panel is hidden, and multi-line Recent prompt chips paste correctly.
+- A prompt and tool-roster audit fixed two dozen small consistency issues across agent roles.
+
+---
+
 ## v1.1.14
 
 ### Features

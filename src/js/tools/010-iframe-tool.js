@@ -46,7 +46,40 @@ async function executeIframeTool(args) {
         catch (e) { return { success: false, error: 'tab_id ' + args.tab_id + ' is not an open tab. Use list_instances to see open tab ids.' }; }
         _pinTab = args.tab_id;
     }
+    // No-pin guard: when NO tab is targeted (neither an explicit tab_id nor a
+    // chat targetTabId), non-navigate browser actions silently fall back to
+    // the ACTIVE tab (background.js getActiveTabId) — which can be a totally
+    // unrelated tab the user happens to be looking at. Detect that case up
+    // front, stamp the result with which tab/URL was actually used
+    // (unpinned_tab), and add a prominent tab_warning when that tab is not on
+    // the connected instance. Full-tab mode only — in sidepanel mode the
+    // active tab IS the intended target. Pinning behavior is unchanged.
+    var _noPinTab = null;
+    var _NOPIN_ACTIONS = ['get_visible_text', 'get_dom', 'click', 'fill', 'type', 'wait_for',
+        'scroll', 'get_console_logs', 'get_network_requests', 'dispatch_event', 'select_option',
+        'get_properties', 'set_style', 'get_page_info'];
+    if (args && !args.widget_id && args.tab_id == null && _NOPIN_ACTIONS.indexOf(args.action) !== -1 &&
+        typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query &&
+        typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode') &&
+        !(typeof chats !== 'undefined' && typeof currentChatId !== 'undefined' &&
+          chats[currentChatId] && chats[currentChatId].targetTabId)) {
+        try {
+            // Same query background.js getActiveTabId uses (currentWindow), so
+            // the stamped unpinned_tab matches the tab the action actually hit.
+            var _actTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (_actTabs && _actTabs[0] && _actTabs[0].url) _noPinTab = { id: _actTabs[0].id, url: _actTabs[0].url };
+        } catch (e) { /* tabs API unavailable — skip the guard */ }
+    }
     var _ftResult = await _executeIframeToolImpl(args);
+    if (_noPinTab && _ftResult && typeof _ftResult === 'object' && _ftResult.success) {
+        _ftResult.unpinned_tab = { tab_id: _noPinTab.id, url: _noPinTab.url };
+        var _instOrigin = null, _tabOrigin = null;
+        try { if (typeof Platform !== 'undefined' && Platform.instanceUrl) _instOrigin = new URL(Platform.instanceUrl).origin; } catch (e) {}
+        try { _tabOrigin = new URL(_noPinTab.url).origin; } catch (e) {}
+        if (_instOrigin && _tabOrigin && _tabOrigin !== _instOrigin) {
+            _ftResult.tab_warning = 'WARNING: no tab is pinned for this chat, so this action ran against the ACTIVE browser tab (tab_id ' + _noPinTab.id + ', ' + _noPinTab.url + '), which is NOT on the connected instance (' + _instOrigin + '). If this is the wrong tab, pass tab_id (see list_instances activeTabs) or navigate first to pin the right tab.';
+        }
+    }
     if (_pinTab != null && _ftResult && typeof _ftResult === 'object' && _ftResult._target_tab_persist == null) {
         _ftResult._target_tab_persist = _pinTab;
     }

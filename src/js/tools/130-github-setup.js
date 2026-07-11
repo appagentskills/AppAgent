@@ -188,7 +188,6 @@ async function cloneGitHubRepoFromSetupModal() {
             if (branchInput) branchInput.value = '';
             // Keep the rest of the UI in sync with the new workspace.
             if (typeof renderGitHubReposList === 'function') renderGitHubReposList();
-            if (typeof refreshWorkspaceContext === 'function') refreshWorkspaceContext();
             if (typeof updateWorkspaceHeaderStatus === 'function') updateWorkspaceHeaderStatus();
         } else {
             if (status) { status.style.color = 'var(--danger)'; status.textContent = result.error; }

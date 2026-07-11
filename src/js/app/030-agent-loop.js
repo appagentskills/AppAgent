@@ -405,6 +405,14 @@ function flushPendingInjection(chat) {
         });
     }
     if (chatId) delete pendingInjectionsByChatId[chatId];
+    // WAKE-DUR: drop the durable mirror of any wake notice contained in the
+    // text just flushed into chat.messages (checkpointed at the next tool
+    // boundary). Targeted clear — notices persisted AFTER an SW death wiped
+    // this in-memory queue are NOT in this flush and must survive for the
+    // heartbeat drain (drainPendingWakes, core/097-sub-agent-registry.js).
+    if (chatId && text && typeof clearDeliveredPendingWakes === 'function') {
+        try { clearDeliveredPendingWakes(chatId, text); } catch (e) { /* best-effort */ }
+    }
     // Only clear the globals if they belong to THIS chat (foreground stream).
     // Otherwise another chat's queue is sitting in the globals — don't drop it.
     if (chatId === activeStreamingChatId || !entry) {
@@ -597,9 +605,6 @@ async function runAgent(overrideChatId) {
         }
     }
 
-    // Initialize scroll flag based on current position before streaming starts
-    isFollowingScroll = isNearBottom();
-    
     // Check if there are unprocessed tool calls from a previous pause
     // Find the last assistant message with tool_calls and check which ones need processing
     var pendingToolCalls = null;
@@ -735,7 +740,7 @@ async function runAgent(overrideChatId) {
 
         if (isChatPaused(streamingChatId)) {
             // Paused during pending tool processing - exit cleanly. The 'paused'
-            // handler owns isRunning / isFollowingScroll writes. Do NOT bare-
+            // handler owns the isRunning write. Do NOT bare-
             // return here: that skipped runFinished entirely, so the finally
             // emitted a spurious runCrashed, the checkpoint stayed 'running'
             // (the resume scan then re-armed a user-paused chat after SW
@@ -986,11 +991,6 @@ async function runAgent(overrideChatId) {
                 continue; // Restart the loop with the user's queued message in context
             }
 
-            // Match main verbatim: isFollowingScroll=true is set BEFORE lastApiError
-            // (main line 577, before line 578). Keeping it in the loop body — instead
-            // of folding it into the 'error' handler — preserves the original write
-            // order of state vs. lastApiError around the emit.
-            isFollowingScroll = true;
             console.error('[agent-loop] caught during stream for chat ' + streamingChatId + ':', e);
             // Build a safe error envelope: structured clone strips non-Error
             // properties, so capture message/name/stack into a plain object
@@ -1419,8 +1419,6 @@ async function runAgent(overrideChatId) {
     // Handler in 035-agent-events.js does: hideSpinner, renderChatList,
     // remove is-streaming class, renderMessages, updateContextIndicator,
     // and the paused-vs-finished pause-button branch.
-    // The 'runFinished' handler owns the isFollowingScroll reset now (matching
-    // main's ordering: after the pause-vs-finish UI branch, before hooks).
     AgentEvents.emit('runFinished', {
         chatId: streamingChatId,
         reason: _runApiError ? 'errored' : (isChatPaused(streamingChatId) ? 'paused' : 'completed'),
@@ -1461,16 +1459,29 @@ async function runAgent(overrideChatId) {
     // still parked, start a follow-up run so the parent actually sees the
     // report. Mirrors _wakeParentOnReport's idle top-level arm.
     try {
-        if (chat && !chat.isSubAgent && !_runApiError
-            && !isChatPaused(streamingChatId)
-            && !runningChatIds[streamingChatId]
+        if (chat && !chat.isSubAgent
             && typeof pendingInjectionsByChatId !== 'undefined') {
             var _pendFollow = pendingInjectionsByChatId[streamingChatId];
-            if (_pendFollow && (_pendFollow.text || (_pendFollow.images && _pendFollow.images.length))
+            var _pendHas = !!(_pendFollow && (_pendFollow.text || (_pendFollow.images && _pendFollow.images.length)));
+            if (_pendHas && !_runApiError
+                && !isChatPaused(streamingChatId)
+                && !runningChatIds[streamingChatId]
                 && typeof runAgent === 'function') {
                 Promise.resolve()
                     .then(function() { return runAgent(streamingChatId); })
                     .catch(function(err) { console.warn('[agent-loop] follow-up run for parked report failed', streamingChatId, err); });
+            } else if (_pendHas && _pendFollow.text
+                && (_runApiError || isChatPaused(streamingChatId))
+                && typeof persistPendingWake === 'function') {
+                // WAKE-DUR (Mode B): a run that ended in an API error (429/
+                // overload) or paused skips the follow-up run above — the
+                // queued report would sit in volatile SW memory until the
+                // user's next message (or die with the SW). Persist it
+                // durably; the agent-heartbeat drain (drainPendingWakes,
+                // core/097) delivers it once the chat is idle/unpaused.
+                // persistPendingWake dedupes by text containment against the
+                // copy the live-parent branch already persisted (Mode A).
+                persistPendingWake(streamingChatId, _pendFollow.text, null);
             }
         }
     } catch (e) { console.warn('[agent-loop] end-of-run report drain check threw', e); }

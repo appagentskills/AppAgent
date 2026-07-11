@@ -4,6 +4,10 @@ function showSnackbar(message, type, duration) {
     var snackbar = document.getElementById('snackbar');
     if (!snackbar) return;
 
+    // NOTE: the tool-approval card renders into its OWN element
+    // (#approval-card, see getApprovalCardEl below) — toasts here can no
+    // longer displace a pending approval, so no requeue logic is needed.
+
     // Handle both string type ('error'/'success'/'warning') and legacy boolean isError
     var isError = type === 'error' || type === true;
     var isWarning = type === 'warning';
@@ -28,12 +32,23 @@ function hideSnackbar() {
     var snackbar = document.getElementById('snackbar');
     if (snackbar) snackbar.classList.remove('show');
     if (snackbarTimeout) clearTimeout(snackbarTimeout);
+    // Note: hideSnackbar only affects toasts — the approval card lives in its
+    // own #approval-card element and is only hidden by its own dismiss/approve
+    // paths (dismissApprovalNotification / approveFromNotification / etc).
 }
 
 // Notification queue for tool approvals
 var approvalNotificationQueue = [];
 var isShowingApprovalNotification = false;
 var currentApprovalNotification = null; // Track which notification is currently showing
+var _dismissedApprovalKeys = {}; // chatId:approvalIndex -> true when the user X-ed the card (resurface watchdog skips these; cleared on chat navigation)
+
+// Dedicated DOM element for the approval card (#approval-card in
+// src/html/body.html). Separate from #snackbar so toasts, hideSnackbar and
+// pinned error toasts can NEVER displace a pending approval prompt.
+function getApprovalCardEl() {
+    return document.getElementById('approval-card');
+}
 
 // Get context labels (instance, repo) for tool approval notifications
 function getToolContextLabels(args) {
@@ -87,6 +102,9 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
             message: (statusMessage || toolName) + ' — ' + chatTitle,
             chatId: chatId
         });
+        // Flash the tab title until the approval is handled or the tab
+        // becomes visible (ui/225-approval-attention.js).
+        if (typeof startApprovalTitleFlash === 'function') { try { startApprovalTitleFlash(); } catch (e) {} }
     }
 
     if (!isShowingApprovalNotification) {
@@ -108,8 +126,8 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
 function rerenderCurrentNotification() {
     if (!Array.isArray(currentApprovalNotification) || currentApprovalNotification.length === 0) return;
 
-    var snackbar = document.getElementById('snackbar');
-    if (!snackbar) return;
+    var card = getApprovalCardEl();
+    if (!card) return;
 
     var chatNotifications = currentApprovalNotification;
     var chatId = chatNotifications[0].chatId;
@@ -203,7 +221,7 @@ function rerenderCurrentNotification() {
     }
 
     var expandBtn = '<button class="notification-expand" onclick="toggleNotificationExpand()" title="Expand">' + UI_ICONS.expand + '</button>';
-    snackbar.innerHTML =
+    card.innerHTML =
         '<div class="notification-header">' +
             '<span class="notification-icon">' + UI_ICONS.bell + '</span>' +
             '<span class="notification-title">Permission Required</span>' +
@@ -213,17 +231,20 @@ function rerenderCurrentNotification() {
         '</div>' +
         '<div class="notification-body">' + bodyHtml + '</div>' +
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
+    // Match the show path (showNextApprovalNotification) — also drops any
+    // notification-expanded state from a previous card.
+    card.className = 'approval-card notification-card show';
 }
 
 function toggleNotificationExpand() {
-    var snackbar = document.getElementById('snackbar');
-    if (!snackbar) return;
-    snackbar.classList.toggle('notification-expanded');
-    var btn = snackbar.querySelector('.notification-expand');
-    if (btn) btn.title = snackbar.classList.contains('notification-expanded') ? 'Collapse' : 'Expand';
+    var card = getApprovalCardEl();
+    if (!card) return;
+    card.classList.toggle('notification-expanded');
+    var btn = card.querySelector('.notification-expand');
+    if (btn) btn.title = card.classList.contains('notification-expanded') ? 'Collapse' : 'Expand';
     // Auto-open params when expanding
-    if (snackbar.classList.contains('notification-expanded')) {
-        snackbar.querySelectorAll('.notification-params:not([open])').forEach(function(d) { d.open = true; });
+    if (card.classList.contains('notification-expanded')) {
+        card.querySelectorAll('.notification-params:not([open])').forEach(function(d) { d.open = true; });
     }
 }
 
@@ -247,6 +268,17 @@ function updateNotificationQueueBadge() {
 }
 
 function showNextApprovalNotification() {
+    // Don't advance the queue while a card is actively displayed — callers
+    // that legitimately advance (dismiss/approve) clear
+    // currentApprovalNotification first. Prevents a delayed chained call
+    // (dismiss timeout vs watchdog) from double-advancing and orphaning the
+    // currently shown group.
+    var visibleEl = getApprovalCardEl();
+    if (isShowingApprovalNotification &&
+        Array.isArray(currentApprovalNotification) && currentApprovalNotification.length > 0 &&
+        visibleEl && visibleEl.classList.contains('show')) {
+        return;
+    }
     if (approvalNotificationQueue.length === 0) {
         isShowingApprovalNotification = false;
         currentApprovalNotification = null;
@@ -272,8 +304,8 @@ function showNextApprovalNotification() {
 
     currentApprovalNotification = chatNotifications; // Store array of notifications
     var isCurrentChat = chatId === currentChatId;
-    var snackbar = document.getElementById('snackbar');
-    if (!snackbar) return;
+    var card = getApprovalCardEl();
+    if (!card) return;
 
     // Count remaining notifications from OTHER chats
     var otherChatsCount = approvalNotificationQueue.length;
@@ -362,7 +394,7 @@ function showNextApprovalNotification() {
     }
 
     var expandBtn = '<button class="notification-expand" onclick="toggleNotificationExpand()" title="Expand">' + UI_ICONS.expand + '</button>';
-    snackbar.innerHTML =
+    card.innerHTML =
         '<div class="notification-header">' +
             '<span class="notification-icon">' + UI_ICONS.bell + '</span>' +
             '<span class="notification-title">Permission Required</span>' +
@@ -372,14 +404,21 @@ function showNextApprovalNotification() {
         '</div>' +
         '<div class="notification-body">' + bodyHtml + '</div>' +
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
-    snackbar.className = 'snackbar notification-card show';
-
-    if (snackbarTimeout) clearTimeout(snackbarTimeout);
+    card.className = 'approval-card notification-card show';
 }
 
 function dismissApprovalNotification() {
-    var snackbar = document.getElementById('snackbar');
-    if (snackbar) snackbar.classList.remove('show');
+    // Record the dismissal so the resurface watchdog
+    // (ui/225-approval-attention.js) doesn't instantly re-show what the user
+    // just closed. Explicit chat navigation clears these keys.
+    if (Array.isArray(currentApprovalNotification)) {
+        for (var di = 0; di < currentApprovalNotification.length; di++) {
+            var dn = currentApprovalNotification[di];
+            _dismissedApprovalKeys[dn.chatId + ':' + dn.approvalIndex] = true;
+        }
+    }
+    var cardEl = getApprovalCardEl();
+    if (cardEl) cardEl.classList.remove('show');
     currentApprovalNotification = null;
     // Show next notification after a brief delay
     setTimeout(showNextApprovalNotification, 300);
@@ -402,17 +441,12 @@ function clearApprovalNotificationsForChat(chatId) {
 }
 
 function goToApprovalChat(chatId) {
-    var snackbar = document.getElementById('snackbar');
-    if (snackbar) snackbar.classList.remove('show');
-    currentApprovalNotification = null;
-    isShowingApprovalNotification = false;
-    selectChat(chatId, { skipApprovalNotifications: true });
-    // Clear notifications for this chat since user is going to handle them
-    approvalNotificationQueue = approvalNotificationQueue.filter(function(n) {
-        return n.chatId !== chatId;
-    });
-    // Show next notification if any remain
-    setTimeout(showNextApprovalNotification, 300);
+    // Don't destroy the prompt: approval rows have NO inline rendering
+    // (250-message-render.js renders them display:none), so the old
+    // clear-queue + skipApprovalNotifications left a pending approval with
+    // zero UI. selectChat → showPendingApprovalNotifications re-shows the
+    // card in the target chat (it dedups/clears this chat's entries itself).
+    selectChat(chatId);
 }
 
 // Handle approval directly from notification without navigating to chat
@@ -445,8 +479,8 @@ async function approveFromNotification(approvalIndex, chatId, action) {
     }
 
     // All notifications for this chat handled, show next from queue
-    var snackbar = document.getElementById('snackbar');
-    if (snackbar) snackbar.classList.remove('show');
+    var cardEl = getApprovalCardEl();
+    if (cardEl) cardEl.classList.remove('show');
     currentApprovalNotification = null;
     setTimeout(showNextApprovalNotification, 300);
 
@@ -475,8 +509,8 @@ async function approveAllFromNotification(approvalIndices, chatId, action) {
     });
 
     // Clear and show next
-    var snackbar = document.getElementById('snackbar');
-    if (snackbar) snackbar.classList.remove('show');
+    var cardEl = getApprovalCardEl();
+    if (cardEl) cardEl.classList.remove('show');
     currentApprovalNotification = null;
     setTimeout(showNextApprovalNotification, 300);
 

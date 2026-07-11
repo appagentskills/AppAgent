@@ -244,7 +244,25 @@
         if (v === 'undefined') return undefined;
         if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
         if ((v[0] === '\'' || v[0] === '"') && v[v.length - 1] === v[0]) {
-            return v.slice(1, -1).replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+            // Single-pass unescape — the inverse of escapeJsString() (tools/120-actions.js).
+            // Handles \n \r \t, the \x22 \x3c \x3e \x26 hex escapes, and \' \" \\.
+            // MUST be a single pass: sequential .replace() chains mis-decode
+            // "\\n" (escaped backslash + n, i.e. the user literally typed \n) —
+            // and the old chain never decoded \n at all, so multi-line strings
+            // passed through inline handlers arrived with literal \n sequences
+            // (e.g. clicking a Recent prompt chip on the home page).
+            return v.slice(1, -1).replace(/\\(x22|x3c|x3e|x26|n|r|t|['"\\])/g, function(m, g) {
+                switch (g) {
+                    case 'n': return '\n';
+                    case 'r': return '\r';
+                    case 't': return '\t';
+                    case 'x22': return '"';
+                    case 'x3c': return '<';
+                    case 'x3e': return '>';
+                    case 'x26': return '&';
+                    default: return g; // \' \" \\ → quote/backslash itself
+                }
+            });
         }
         // this.property (e.g. this.value, this.checked)
         if (v.indexOf('this.') === 0) {

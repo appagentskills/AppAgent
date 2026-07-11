@@ -161,13 +161,6 @@ function scrollToFirstToolCall(msgIdx) {
     }
 }
 
-function scrollToBottom() {
-    var container = document.getElementById('messages');
-    if (container) {
-        container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-    }
-}
-
 function toggleFileChanges(fileKey) {
     var el = document.getElementById('changes-' + fileKey);
     if (!el) return;

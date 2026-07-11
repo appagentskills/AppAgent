@@ -1,92 +1,134 @@
-// Track whether user has scrolled up inside the streaming text container.
-// B5: per-chat. The global getter/setter below preserves the legacy reads while
-// scoping mutation to currentChatId. Switching chats no longer resets the
-// scroll-follow intent of the chat you came from.
-var isFollowingStreamingScrollByChatId = {};
-Object.defineProperty(window, 'isFollowingStreamingScroll', {
+// ── Chat auto-scroll: the single stick-to-bottom mechanism ──────────────────
+//
+// One per-chat boolean drives ALL chat auto-scrolling:
+//
+//   • stickToBottom (per-chat, default true). While true, every content-growth
+//     path (new messages, streaming tokens, tool rows, spinner, widgets)
+//     funnels through scrollToBottomIfAllowed(), which pins BOTH chat scroll
+//     containers (#messages and the inner #streaming-text) to their bottom in
+//     a single rAF-batched pass that runs after layout.
+//   • The flag is flipped ONLY by handleChatScroll(), attached to the scroll
+//     events of both containers. Classification is by position + direction —
+//     no gesture heuristics, no programmatic-scroll windows, no debounce:
+//       - event lands AT the bottom WITHOUT having moved up → stick (covers
+//         our own instant pin echoes and the user deliberately reaching the
+//         bottom via wheel / scrollbar / keyboard / touch). A DOWNWARD gate:
+//         clamp events (content or maxHeight shrink forces scrollTop DOWN to
+//         the new max, landing "at the bottom") must NOT re-stick a user who
+//         had scrolled away — before this gate, the streaming el's maxHeight
+//         recalc while a released user scrolled the outer container clamped
+//         the inner el to its bottom and spuriously re-stuck, yanking the
+//         user back down on the next chunk.
+//       - scrollTop DECREASED and the position is above the bottom → the user
+//         scrolled up (wheel, scrollbar drag, middle-click autoscroll,
+//         selection drag, PageUp — all of them) → release.
+//     Programmatic pins are always instant scrollTop writes to the exact
+//     bottom, and programmatic RESTORES seed _agLastScrollTop (see
+//     restoreChatScrollTop), so neither can be misread as a user scroll.
+//   • Growth that happens with NO explicit call site — widget iframes
+//     resizing via widgetResize postMessage, images finishing to load,
+//     smart-document re-renders, font swaps — is caught by a ResizeObserver
+//     on the container's direct children (see ensureChatGrowthObservers):
+//     any child border-box change while following re-pins through the same
+//     choke point. Before this observer the view silently drifted off-bottom
+//     whenever content grew after the last explicit pin.
+//   • The chat scroll containers opt out of BROWSER scroll anchoring
+//     (overflow-anchor: none in 04-header.css): anchoring adjusts scrollTop
+//     on its own when content above the anchor grows/shrinks, and a shrink
+//     adjustment (scrollTop decreased, above bottom) is indistinguishable
+//     from a user scroll-up — it silently released the follow flag.
+//   • Sending a message re-sticks explicitly (040-send-message.js), and
+//     opening a chat derives the flag from the restored position (120-init.js).
+var stickToBottomByChatId = {};
+Object.defineProperty(window, 'stickToBottom', {
     configurable: true,
     get: function() {
         var k = currentChatId || '_';
-        // Default to true on first read (matches legacy default).
-        if (!(k in isFollowingStreamingScrollByChatId)) isFollowingStreamingScrollByChatId[k] = true;
-        return isFollowingStreamingScrollByChatId[k];
+        // Default to true on first read (new/unseen chats follow the bottom).
+        if (!(k in stickToBottomByChatId)) stickToBottomByChatId[k] = true;
+        return stickToBottomByChatId[k];
     },
     set: function(v) {
-        var k = currentChatId || '_';
-        isFollowingStreamingScrollByChatId[k] = !!v;
+        stickToBottomByChatId[currentChatId || '_'] = !!v;
     }
 });
-// R2: programmatic scrolls (smooth scrollTo / scrollTop writes from the render
-// and streaming helpers) fire the same document-level scroll events as real user
-// scrolls, so the capture-phase listener in 010-skills-ui.js would record them as
-// user activity and randomly disengage auto-follow mid-run. Every programmatic
-// scroll site calls markProgrammaticScroll() first; the listener early-returns
-// while the window is open. A real user gesture (wheel / touchmove / keydown)
-// clears the window immediately so deliberate scrolls still disengage.
-window._programmaticScrollUntil = 0;
-function markProgrammaticScroll(ms) {
-    window._programmaticScrollUntil = Date.now() + (ms || 600);
+
+// Classify a scroll event on a chat scroll container and update stickToBottom.
+// Direction is tracked per-element (multiple scrollTop changes within one
+// frame coalesce into one event at the final position, so a rebuild's
+// clamp + absolute restore never produces a phantom scroll-up).
+function handleChatScroll(el) {
+    var top = el.scrollTop;
+    var last = (el._agLastScrollTop !== undefined) ? el._agLastScrollTop : top;
+    el._agLastScrollTop = top;
+    var distFromBottom = el.scrollHeight - top - el.clientHeight;
+    if (distFromBottom <= 2) {
+        // At the bottom — but only re-stick when the position did NOT move up.
+        // top >= last covers pin echoes (pinToBottom pre-seeds last = top) and
+        // real downward scrolls that reach the bottom. top < last here is a
+        // CLAMP (scrollHeight shrank, browser forced scrollTop down to the new
+        // max) — keep the current state: a following user stays following, a
+        // released user is NOT yanked back by a shrink they never asked for.
+        if (top >= last) stickToBottom = true;
+    } else if (top < last - 1) {
+        stickToBottom = false;  // user moved up, away from the bottom → release
+    }
+    // Downward scrolls that stop above the bottom keep the current state.
 }
-(function() {
-    function clearProgrammaticScrollFlag() {
-        window._programmaticScrollUntil = 0;
+
+// Pin an element to its bottom with an instant write (no smooth glide — rapid
+// per-chunk calls must not race an animation, and the echo event must land
+// exactly at the bottom so handleChatScroll classifies it as "following").
+function pinToBottom(el) {
+    el.scrollTop = el.scrollHeight;
+    el._agLastScrollTop = el.scrollTop;
+}
+
+// Programmatic absolute scroll restore (chat open, post-rebuild position keep
+// for released users). Seeds _agLastScrollTop so the coalesced scroll event
+// that follows compares against the RESTORED position — not a stale value
+// from the previous chat / pre-rebuild DOM — and can't misclassify the
+// restore as a user scroll (which would clobber the follow flag).
+function restoreChatScrollTop(el, top) {
+    el.scrollTop = top;
+    el._agLastScrollTop = el.scrollTop;
+}
+
+// ── Growth observers ─────────────────────────────────────────────────────────
+// Re-pin on content growth that has NO explicit scrollToBottomIfAllowed call
+// site: widget iframes resized by their height reporter (080-widget-tools.js
+// onWidgetResize → iframe.style.height), images/attachments finishing to
+// load, smart-document card re-renders, details toggles, font swaps. A
+// ResizeObserver on the container's DIRECT CHILDREN is exactly equivalent to
+// "scrollHeight changed" in this block layout: any descendant growth
+// propagates to a direct child's border-box. Children are re-registered via a
+// childList MutationObserver whenever a rebuild replaces them (#messages is a
+// static element — see body.html — so one-time setup lasts the app lifetime;
+// inner.innerHTML swaps keep the observed #messages-inner node itself alive).
+// The callback only acts while following — it never fights a released user —
+// and routes through the rAF-batched choke point, so bursts coalesce and
+// pinning (a scrollTop write, not a resize) can't retrigger the observer.
+var _agGrowthRO = null;
+var _agChildMO = null;
+function _agObserveChildren(container) {
+    if (!_agGrowthRO) return;
+    _agGrowthRO.disconnect();
+    for (var i = 0; i < container.children.length; i++) {
+        _agGrowthRO.observe(container.children[i]);
     }
-    document.addEventListener('wheel', clearProgrammaticScrollFlag, { capture: true, passive: true });
-    document.addEventListener('touchmove', clearProgrammaticScrollFlag, { capture: true, passive: true });
-    document.addEventListener('keydown', clearProgrammaticScrollFlag, true);
-    // REG-F3 (revised): scrollbar drags and middle-click autoscroll produce
-    // NO wheel/touchmove/keydown — only scroll events — so those gestures
-    // were swallowed by the continuously re-armed window and could never
-    // disengage auto-follow. But the first cut (clear on ANY pointer-down)
-    // reintroduced the original R2 bug for plain clicks: the smooth glide
-    // (scrollToBottomIfAllowed emits trailing scroll events for ~600ms) was
-    // mid-flight when the user clicked a copy/expand button anywhere on the
-    // page, the cleared window let the glide's own events register as user
-    // scrolls at a not-near-bottom position, and auto-follow disengaged.
-    // Clear ONLY for gestures that can actually begin a manual scroll:
-    //   • middle button (autoscroll) — anywhere;
-    //   • a press on a scrollable container ITSELF — a scrollbar/track hit
-    //     targets the element, while content clicks target a descendant, so
-    //     button/text clicks no longer kill the window.
-    function _scrollGestureDown(e) {
-        if (e.button === 1) { clearProgrammaticScrollFlag(); return; }
-        var t = e.target;
-        // REG-AUDIT-3: 'messages' only — the flag is only consulted by the
-        // #messages scroll listener (ui/010-skills-ui.js); #streaming-text's
-        // own handler applies hysteresis directly and never reads it.
-        if (t && t.nodeType === 1 &&
-            t.id === 'messages' &&
-            t.scrollHeight > t.clientHeight) {
-            clearProgrammaticScrollFlag();
-        }
-    }
-    document.addEventListener('mousedown', _scrollGestureDown, { capture: true, passive: true });
-    document.addEventListener('pointerdown', _scrollGestureDown, { capture: true, passive: true });
-    // SF-3: selection-drag autoscroll (primary-button press on message CONTENT,
-    // then drag past the container edge) emits ONLY scroll events — no wheel/
-    // touchmove/keydown, and _scrollGestureDown above deliberately ignores
-    // content-targeted presses (REG-AUDIT-3). With the SF-2 streaming pin
-    // re-arming the programmatic window every chunk, those drag scrolls were
-    // swallowed by the #messages listener (010-skills-ui.js), isFollowingScroll
-    // never disengaged, and every chunk yanked the selection back to the
-    // bottom. Clear the window while a primary-button DRAG is in flight; the
-    // 4px slop keeps plain clicks (the original R2 false positive — click
-    // during the smooth glide) from clearing it. A drag that never scrolls
-    // may let a concurrent glide's trailing events register as user activity,
-    // which is acceptable: the user IS gesturing, and the listener only
-    // disengages follow when they are genuinely away from the bottom.
-    var _sfDragStart = null;
-    document.addEventListener('mousedown', function(e) {
-        if (e.button === 0) _sfDragStart = { x: e.clientX, y: e.clientY };
-    }, { capture: true, passive: true });
-    document.addEventListener('mousemove', function(e) {
-        if (!_sfDragStart || !(e.buttons & 1)) return;
-        if (Math.abs(e.clientX - _sfDragStart.x) > 4 || Math.abs(e.clientY - _sfDragStart.y) > 4) {
-            clearProgrammaticScrollFlag();
-        }
-    }, { capture: true, passive: true });
-    document.addEventListener('mouseup', function() { _sfDragStart = null; }, { capture: true, passive: true });
-})();
+}
+function ensureChatGrowthObservers() {
+    var container = document.getElementById('messages');
+    if (!container || container._agGrowthObserved) return;
+    if (typeof ResizeObserver !== 'function' || typeof MutationObserver !== 'function') return;
+    container._agGrowthObserved = true;
+    _agGrowthRO = new ResizeObserver(function() {
+        if (stickToBottom) scrollToBottomIfAllowed();
+    });
+    _agChildMO = new MutationObserver(function() { _agObserveChildren(container); });
+    _agChildMO.observe(container, { childList: true });
+    _agObserveChildren(container);
+}
 
 // Create and configure the #streaming-text container element
 function createStreamingTextEl() {
@@ -106,17 +148,8 @@ function createStreamingTextEl() {
     // streamingChatId === currentChatId) create the element FOR the
     // currently-viewed chat, so currentChatId is the owner at creation time.
     el.dataset.chatId = currentChatId || '';
-    // Reset only the foreground chat's flag (B5). Other chats keep their intent.
-    isFollowingStreamingScroll = true;
     el.addEventListener('scroll', function() {
-        var distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-        // Hysteresis: only disengage when user deliberately scrolls far up,
-        // re-engage when near bottom. Prevents layout-induced scroll jitter from disabling auto-scroll.
-        if (distFromBottom < 30) {
-            isFollowingStreamingScroll = true;
-        } else if (distFromBottom > 150) {
-            isFollowingStreamingScroll = false;
-        }
+        handleChatScroll(el);
         el.classList.toggle('has-top-shadow', el.scrollTop > 10);
     });
     return el;
@@ -200,70 +233,45 @@ function updateStreamingText(msg, index, streamingChatId) {
             prevMsgDiv = msgDiv;
         }
     }
-    updateStreamingContainerHeight();
-    if (isFollowingStreamingScroll) {
-        el.scrollTop = el.scrollHeight;
-    }
+    scrollToBottomIfAllowed();
 }
 
-// Calculate and set the streaming container height to fill remaining viewport space
+// Calculate and set the streaming container height to fill remaining viewport
+// space. Pure layout — the pin (if any) is owned by scrollToBottomIfAllowed;
+// a maxHeight shrink self-clamps scrollTop to the new max.
 function updateStreamingContainerHeight() {
     var streamingEl = document.querySelector('.streaming-answer');
     if (!streamingEl) return;
-    var savedScroll = streamingEl.scrollTop;
     var rect = streamingEl.getBoundingClientRect();
     var viewportHeight = window.innerHeight;
     var availableHeight = viewportHeight - rect.top - 16;
     streamingEl.style.maxHeight = Math.max(availableHeight, 100) + 'px';
-    // After maxHeight change: if following, go to the new bottom; otherwise restore position
-    if (isFollowingStreamingScroll) {
-        streamingEl.scrollTop = streamingEl.scrollHeight;
-    } else {
-        streamingEl.scrollTop = savedScroll;
-    }
 }
 
-function scrollToBottomIfAllowed(container) {
-    container = container || document.getElementById('messages');
-    if (!container) return;
-
-    // During streaming, scroll the inner container independently of outer scroll state
-    var streamingEl = container.querySelector('.streaming-answer');
-    if (streamingEl) {
-        // SF-2: in-place streaming growth (tool-args textContent, appended
-        // tool-call/thinking details, spinner) raises the OUTER scrollHeight
-        // without ever passing through renderMessages, so SF-1's render-time
-        // growth delta never saw it and the streaming container slid below the
-        // fold for an at-bottom user. This function is the single choke point
-        // every incremental path already calls — keep the outer container
-        // pinned to the bottom here while the user is following. Direct
-        // scrollTop write (no smooth glide) so rapid per-chunk calls can't
-        // race a 600ms animation; markProgrammaticScroll so the #messages
-        // listener (010-skills-ui.js) doesn't count it as user activity;
-        // gated on isFollowingScroll + the user-scroll debounce so a user who
-        // deliberately scrolled up is never fought (the listener re-arms the
-        // flag when they return near the bottom).
-        //
-        // SF-3 ordering: height BEFORE pin. updateStreamingContainerHeight can
-        // raise the streaming el's maxHeight (its input, rect.top, depends on
-        // the current scrollTop) and thereby grow the outer scrollHeight —
-        // pinning first left the pin short by that growth until the next
-        // chunk. Computing the height at the pre-pin position only makes the
-        // cap momentarily conservative, which the next call corrects.
-        updateStreamingContainerHeight();
-        if (isFollowingScroll && Date.now() - lastUserScrollTime >= SCROLL_DEBOUNCE_MS) {
-            markProgrammaticScroll();
-            container.scrollTop = container.scrollHeight;
-        }
-        if (isFollowingStreamingScroll) {
-            streamingEl.scrollTop = streamingEl.scrollHeight;
-        }
-        return;
-    }
-
-    // For non-streaming: only scroll if user is following and hasn't scrolled recently
-    if (!isFollowingScroll) return;
-    if (Date.now() - lastUserScrollTime < SCROLL_DEBOUNCE_MS) return;
-    markProgrammaticScroll(); // R2: smooth scroll emits many scroll events over ~600ms
-    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+// THE single scroll code path. Every content-growth site (renders, streaming
+// chunks, spinner, prompt widgets, notifications, widget loads) calls this;
+// nothing else in the chat UI scrolls to the bottom. rAF-batched so bursts of
+// per-chunk calls collapse into one pin that runs after layout (never before
+// the DOM has its final height) and before the next paint (no flicker).
+var _pinScheduled = false;
+function scrollToBottomIfAllowed() {
+    // Lazy one-time setup (guarded by a flag on the static #messages element) —
+    // every pin call site funnels here, so the observers are installed the
+    // first time the chat UI scrolls at all.
+    ensureChatGrowthObservers();
+    if (_pinScheduled) return;
+    _pinScheduled = true;
+    requestAnimationFrame(function() {
+        _pinScheduled = false;
+        var container = document.getElementById('messages');
+        if (!container) return;
+        // Height BEFORE pin: updateStreamingContainerHeight can raise the
+        // streaming el's maxHeight and thereby grow the outer scrollHeight —
+        // pinning first would leave the pin short by that growth.
+        var streamingEl = container.querySelector('.streaming-answer');
+        if (streamingEl) updateStreamingContainerHeight();
+        if (!stickToBottom) return; // user scrolled up — never fight them
+        pinToBottom(container);
+        if (streamingEl) pinToBottom(streamingEl);
+    });
 }

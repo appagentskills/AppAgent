@@ -762,7 +762,6 @@ async function deleteGitHubRepo(repo) {
         // Storage cleanup failed — re-render so the list matches reality.
         renderGitHubReposList();
     }
-    refreshWorkspaceContext();
     updateWorkspaceHeaderStatus();
 }
 
@@ -1915,6 +1914,8 @@ function renderSystemPromptEditor() {
         '</div>' +
         '<div class="system-prompt-placeholders-help">' +
             '<strong>Available Placeholders:</strong> ' +
+            '<code>{{CURRENT_DATE}}</code> - Today\'s date, ' +
+            '<code>{{ORCHESTRATOR_POLICY}}</code> - Delegation policy (main chats only; empty for sub-agents), ' +
             '<code>{{SCOPE_CONTEXT}}</code> - Current app scope info, ' +
             '<code>{{DISABLED_TOOLS}}</code> - List of disabled tools, ' +
             '<code>{{SKILLS_SUMMARY}}</code> - Available skills list, ' +

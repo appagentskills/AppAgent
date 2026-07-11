@@ -2322,9 +2322,13 @@ function transformToAnthropic(body) {
         messages: merged
     };
 
-    // Prepend Claude Code identity (required for OAuth token access)
+    // Prepend Claude Code identity (required for OAuth token access). Keep the
+    // identity block byte-identical — the OAuth backend expects it verbatim —
+    // and add a separate bridging block so the jump from "you are a CLI" to the
+    // AppAgent role below doesn't read as two contradictory identities.
     var ccIdentity = { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." };
-    result.system = [ccIdentity].concat(systemBlocks);
+    var ccBridge = { type: 'text', text: 'In this session you are running inside the AppAgent browser extension; the instructions below define your actual role, tools, and behavior.' };
+    result.system = [ccIdentity, ccBridge].concat(systemBlocks);
 
     if (body.tools && body.tools.length > 0) {
         result.tools = body.tools.map(function(t) {
@@ -2732,6 +2736,16 @@ chrome.alarms.onAlarm.addListener(function(alarm) {
     chrome.storage.local.get('agent-heartbeat-tick', function() {});
     maybeCloseOffscreenIfIdle();
     _swResumeIfNeeded();
+    // WAKE-DUR: deliver durably-persisted sub-agent parent wakes
+    // (pending_wakes store) user-independently. _swResumeIfNeeded only
+    // resumes 'running' checkpoints — a parent waiting on subs has none,
+    // so without this a wake lost to SW death stalled until the user
+    // typed. drainPendingWakes (core/097, in sw-bundle.js) awaits
+    // self._swBootReady itself, dedupes against the transcript, and is
+    // single-flight. Fully guarded — must never break the keepalive.
+    try {
+        if (typeof drainPendingWakes === 'function') drainPendingWakes();
+    } catch (e) { /* non-fatal */ }
     // Prompt-cache heartbeat (see sendCacheHeartbeat in
     // src/js/app/010-llm-streaming.js). Fully guarded — must never break
     // the SW keepalive above.

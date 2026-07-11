@@ -152,8 +152,8 @@ async function sendMessage() {
         return;
     }
 
-    // Reset scroll flag when user sends a new message
-    isFollowingScroll = true;
+    // Re-stick when the user sends a new message (single stick-to-bottom mechanism)
+    stickToBottom = true;
 
     // Clear pending input since we're sending it
     delete chatPendingTexts[getCurrentPendingContext()];

@@ -314,6 +314,34 @@ async function executeUpdateActionState(args, options) {
     if (['running','waiting','stuck','done','error','finished','pr_opened','finished_with_caveat'].indexOf(state) < 0) {
         return { success: false, error: 'Invalid state: \'' + rawState + '\'. Must be one of: running, waiting, stuck, done, error, finished, pr_opened, finished_with_caveat (aliases: success, failed).' };
     }
+    // Terminal SUCCESS states are rejected while this chat still has sub-agents
+    // in flight. A sub is "in flight" when its registry record has
+    // state === 'running' (spawned, pool-queued, or parked-for-await — anything
+    // not yet settled). Subs that already settled — reported (state 'sleeping'),
+    // 'stopped', or 'errored' — never block. `error` and the non-terminal states
+    // stay unaffected so a failing parent can always report, and 'waiting' remains
+    // the documented way to park while subs run. Reads the SubAgents registry
+    // (on the page this is the read-only broadcast mirror of the SW's
+    // authoritative state — the same data agent_status reads). Fail-OPEN when
+    // the registry is unavailable: a progress card must never be lost to a
+    // guard-infrastructure hiccup.
+    if (['done', 'finished', 'pr_opened', 'finished_with_caveat'].indexOf(state) >= 0
+        && typeof SubAgents !== 'undefined' && typeof SubAgents.listAll === 'function') {
+        var _runningSubs = [];
+        try {
+            _runningSubs = SubAgents.listAll().filter(function(r) {
+                return r && r.parent_chat_id === chatId && r.state === 'running';
+            });
+        } catch (e) { _runningSubs = []; }
+        if (_runningSubs.length) {
+            var _subNames = _runningSubs.map(function(r) { return r.name || r.agent_id; }).join(', ');
+            return {
+                success: false,
+                error: 'Cannot set terminal state \'' + state + '\': ' + _runningSubs.length
+                    + ' sub-agent(s) still running (' + _subNames + '). Use state \'waiting\' (or \'running\'), or stop the sub-agents first.'
+            };
+        }
+    }
     var icon = args.icon || 'spinner';
     // Coerce off-list icons to spinner so the agent can't sneak in icons outside the tool def enum.
     if (ALLOWED_ACTION_ICONS.indexOf(icon) < 0) icon = 'spinner';
@@ -1933,7 +1961,20 @@ var _recentlyFinishedChats = {};
 // so its card/row never showed the bell in real time.
 function _isChatViewFocused(chatId) {
     if (typeof currentChatId === 'undefined' || chatId !== currentChatId) return false;
-    return (typeof currentView === 'undefined' || currentView === 'chat');
+    if (typeof currentView !== 'undefined' && currentView !== 'chat') return false;
+    // UNREAD-MISS: being ON the chat view is not enough — the user can't see
+    // the chat when the panel tab is hidden or the window lost focus (side
+    // panels stay document-visible on window switch, so check hasFocus too —
+    // same away-rule as _agentEventsMarkAllRunningHidden in
+    // app/036-agent-event-handlers-page.js). Without this, activity landing
+    // while the user is in another tab/window re-stamped lastViewedAt via
+    // markChatActivity's focused branch, so the chat NEVER read as unread
+    // (no bold title in the jobs rows) even though the user never saw it.
+    if (typeof document !== 'undefined') {
+        if (document.hidden) return false;
+        if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false;
+    }
+    return true;
 }
 
 // Helper for renderers: is this chat actually streaming right now (vs lingering)?
@@ -3153,7 +3194,7 @@ function _jobsExpandBodyHtml(layout, buckets) {
         '</div>';
     }
     // Sections: full-width stacked sections (empty ones skipped), cards in a
-    // two-per-row grid.
+    // three-per-row grid (see .jobs-expand-section-cards).
     function section(label, arr) {
         if (!arr.length) return '';
         return '<div class="jobs-expand-section">' +
@@ -3213,8 +3254,14 @@ function renderHomeActiveChats() {
             try { renderHomeActiveChats(); } catch (e) {}
         }, 1000);
     }
-    // Snapshot scroll (per-column + per-card body) like the modal, so a live
-    // repaint doesn't yank the user mid-scroll.
+    // Snapshot scroll (panel body + per-column + per-card body) like the modal,
+    // so a live repaint doesn't yank the user mid-scroll. The BODY is the
+    // vertical scroller in sections layout and on narrow widths (side panel,
+    // <=560px media query), so it must be captured too — otherwise every
+    // repaint (1s poll tick or a card expand) resets the list to the top.
+    var prevBodyEl = container.querySelector('.home-active-chats-body');
+    var prevBodyTop = prevBodyEl ? prevBodyEl.scrollTop : 0;
+    var prevBodyLeft = prevBodyEl ? prevBodyEl.scrollLeft : 0;
     var prevColScroll = [];
     container.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { prevColScroll[i] = el.scrollTop; });
     var prevCardScroll = {};
@@ -3249,7 +3296,13 @@ function renderHomeActiveChats() {
     container._homeLastHtml = html;
     container.innerHTML = html;
     container.style.display = total ? '' : 'none';
-    // Restore scroll positions after the repaint.
+    // Restore scroll positions after the repaint (body first — it's the outer
+    // scroller; columns/cards scroll independently inside it).
+    var newBodyEl = container.querySelector('.home-active-chats-body');
+    if (newBodyEl) {
+        newBodyEl.scrollTop = prevBodyTop;
+        newBodyEl.scrollLeft = prevBodyLeft;
+    }
     container.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) {
         if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i];
     });

@@ -53,14 +53,22 @@ function showPendingApprovalNotifications(chatId) {
         return n.chatId !== chatId;
     });
 
+    // Explicit navigation to the chat re-surfaces even user-dismissed cards —
+    // clear the dismissal marks so the watchdog can manage them again.
+    if (typeof _dismissedApprovalKeys !== 'undefined') {
+        for (var dk in _dismissedApprovalKeys) {
+            if (dk.indexOf(chatId + ':') === 0) delete _dismissedApprovalKeys[dk];
+        }
+    }
+
     // If currently showing notifications for this chat, clear them
     if (Array.isArray(currentApprovalNotification) &&
         currentApprovalNotification.length > 0 &&
         currentApprovalNotification[0].chatId === chatId) {
         currentApprovalNotification = null;
         isShowingApprovalNotification = false;
-        var snackbar = document.getElementById('snackbar');
-        if (snackbar) snackbar.classList.remove('show');
+        var approvalCard = typeof getApprovalCardEl === 'function' ? getApprovalCardEl() : document.getElementById('approval-card');
+        if (approvalCard) approvalCard.classList.remove('show');
     }
 
     // Now add notifications for each pending approval
@@ -89,15 +97,45 @@ function findExistingApprovalRow(chat, toolCallId) {
     return null;
 }
 
+// BOOT-RACE FIX: the SW replays parked exec-approval-prompt calls on panel
+// hello (worker/130-port-bridge.js → replayParkedToolCalls) and they can reach
+// the page BEFORE loadChatsFromStorage has hydrated the `chats` map. The old
+// `if (!chat) resolve(false)` silently auto-denied those. Wait briefly for
+// hydration before deciding; only give up once the map is loaded (grace
+// period) or after a hard timeout, when the chat is genuinely absent.
+function _retryApprovalWhenChatLoads(chatId, retryFn, giveUpFn) {
+    var waited = 0;
+    var timer = setInterval(function() {
+        waited += 250;
+        if (chats[chatId]) {
+            clearInterval(timer);
+            retryFn();
+            return;
+        }
+        var hydrated = (typeof _chatsHydrated === 'undefined') || _chatsHydrated;
+        if ((hydrated && waited >= 3000) || waited >= 15000) {
+            clearInterval(timer);
+            console.warn('[approval] chat ' + chatId + ' not found after ' + waited + 'ms — denying tool approval');
+            giveUpFn();
+        }
+    }, 250);
+}
+
 function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, targetChatId, options) {
     options = options || {};
     return new Promise(function(resolve) {
         // Use targetChatId if provided (for background streaming), otherwise currentChatId
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
-        // Unknown/deleted chatId: degrade to a denial instead of throwing an
-        // uncaught TypeError inside the Promise (which would hang the caller).
-        if (!chat) { resolve(false); return; }
+        // Unknown chatId: likely the boot replay race (chats not hydrated
+        // yet) — retry briefly instead of silently auto-denying. Only a chat
+        // still absent AFTER hydration is treated as deleted → denial.
+        if (!chat) {
+            _retryApprovalWhenChatLoads(chatId, function() {
+                showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, chatId, options).then(resolve);
+            }, function() { resolve(false); });
+            return;
+        }
 
         // DOUBLE-APPROVAL FIX: if a prior dispatch of this exact call already
         // created an approval row, do NOT append a second prompt. A terminal
@@ -192,8 +230,14 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
     return new Promise(function(resolve) {
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
-        // Same guard as showToolApprovalPrompt: degrade to denial, don't throw.
-        if (!chat) { resolve(false); return; }
+        // Same guard as showToolApprovalPrompt: wait for chat hydration
+        // before denying (boot replay race), deny only if genuinely absent.
+        if (!chat) {
+            _retryApprovalWhenChatLoads(chatId, function() {
+                showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallId, actualToolName, chatId, options).then(resolve);
+            }, function() { resolve(false); });
+            return;
+        }
 
         // DOUBLE-APPROVAL FIX (batch mirror): reuse/short-circuit an existing
         // approval row for this toolCallId instead of appending a duplicate.
@@ -368,6 +412,12 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
 
     saveChatsToStorage();
+
+    // Stop the hidden-tab title flash if this was the last pending approval
+    // (deferred so the resolver delete / queue clear below happen first).
+    setTimeout(function() {
+        if (typeof syncApprovalTitleFlash === 'function') { try { syncApprovalTitleFlash(); } catch (e) {} }
+    }, 0);
 
     // If this was a background Action chat, clear the needs_permission state
     if (chat.isBackground && chat.actionId && typeof clearActionNeedsPermission === 'function') {

@@ -396,6 +396,15 @@ function _handlePanelMessage(port, msg) {
                     // so a Settings change reaches an already-booted SW before
                     // the next run's context warnings / saturation gauges.
                     .then(function() { return (typeof loadAssumedContextTokens === 'function') ? loadAssumedContextTokens() : null; })
+                    // MEMFIX: the SW loader evicts inline base64 payloads from
+                    // every chat (worker/115-storage.js) and a panel snapshot
+                    // adopted above may itself be payload-evicted (the page
+                    // strips non-recent chats too). Rehydrate BEFORE runAgent so
+                    // (a) buildApiMessages can inline vision blocks and (b) the
+                    // loop's saves aren't skipped by the evicted-put guard — a
+                    // skipped put here would lose the run's new messages on SW
+                    // death. ensureChatPayloads never rejects.
+                    .then(function() { return (typeof ensureChatPayloads === 'function') ? ensureChatPayloads(msg.chatId) : null; })
                     .then(function() {
                         if (!runningChatIds[msg.chatId]) {
                             try { runAgent(msg.chatId); }
@@ -568,9 +577,22 @@ function _handlePanelMessage(port, msg) {
 
         case 'pull-chat':
             if (msg.chatId && chats[msg.chatId]) {
-                try {
-                    port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: chats[msg.chatId] });
-                } catch (e) {}
+                // MEMFIX: the SW's copy may be payload-evicted (worker loader
+                // strips all chats). The page assigns this snapshot WHOLESALE
+                // (app/045), which would clobber a hydrated page copy with an
+                // evicted one — rehydrate before replying. ensureChatPayloads
+                // never rejects and is a fast no-op for hydrated chats.
+                var _pcSend = function() {
+                    if (!chats[msg.chatId]) return;
+                    try {
+                        port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: chats[msg.chatId] });
+                    } catch (e) {}
+                };
+                if (chats[msg.chatId]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                    ensureChatPayloads(msg.chatId).then(_pcSend);
+                } else {
+                    _pcSend();
+                }
             }
             return;
 
@@ -623,6 +645,36 @@ function _handlePanelMessage(port, msg) {
                 && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[msg.chatId])) {
                 chats[msg.chatId] = msg.chat;
             }
+            return;
+
+        case 'record-mutation':
+            // A PAGE-TIER tool execution (widget executeTool in
+            // ui/070-dashboard-ui.js runs servicenow_api / servicenow_diff_edit
+            // in the panel) appended a versionHistory entry to the page's
+            // NON-authoritative chats mirror only (trackRecordMutation in
+            // tools/020-tool-execution.js). The SW owns chats[chatId], so
+            // without this append the next chat-inlined snapshot broadcast /
+            // SW saveChatsToStorage drops the entry and the record vanishes
+            // from the sidebar Artifacts list. Append it to the authoritative
+            // copy — deduped by entry.id, because the page may also round-trip
+            // the same entry back inside a run-agent / update-chat snapshot —
+            // and persist. Gated on the boot promise so a cold-boot arrival
+            // doesn't touch an un-hydrated `chats` (same rationale as the
+            // 'send-message' gate above; a missing chat after boot means the
+            // SW never saw it — the page's own IDB save already carries the
+            // entry in that case).
+            (self._swBootReady || Promise.resolve()).then(function() {
+                try {
+                    var rmEntry = msg.entry;
+                    var rmChat = msg.chatId ? chats[msg.chatId] : null;
+                    if (!rmChat || !rmEntry || !rmEntry.id) return;
+                    if (!Array.isArray(rmChat.versionHistory)) rmChat.versionHistory = [];
+                    var rmDup = rmChat.versionHistory.some(function(v) { return v && v.id === rmEntry.id; });
+                    if (rmDup) return;
+                    rmChat.versionHistory.push(rmEntry);
+                    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                } catch (e) { console.error('[port-bridge] record-mutation append failed', msg.chatId, e); }
+            });
             return;
 
         case 'exec-tool-result':
@@ -884,6 +936,15 @@ async function _handlePanelSendMessage(msg) {
     if (!chatId) return;
     if (!chats[chatId]) chats[chatId] = msg.chat || { id: chatId, messages: [] };
 
+    // MEMFIX: rehydrate a payload-evicted chat BEFORE the idle branch pushes
+    // the user's message and awaits saveChatsToStorage — the save put-loop
+    // skips evicted chats, so without this the just-typed message would never
+    // persist (lost on SW death). Also needed so the run that follows can
+    // inline vision blocks. ensureChatPayloads never rejects.
+    if (typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
+
     // B10: the user sending a message means they intend this chat to run now —
     // clear any stale SW-side pause flag (mirrors the run-agent handler @:172).
     // Without this, sending to a chat the SW still considers paused trips the
@@ -979,6 +1040,17 @@ function resumeRunningCheckpoints(checkpoints) {
         .then(function() { return self._swResumeGate || Promise.resolve(); })
         .then(function() { return Platform.ready; })
         .then(function() { return loadApiProviders(); })
+        // MEMFIX: the SW loader evicts inline base64 payloads from every chat
+        // (worker/115-storage.js). Rehydrate each checkpoint's chat BEFORE
+        // runAgent so the resumed loop can inline vision blocks and its saves
+        // aren't skipped by the evicted-put guard. ensureChatPayloads never
+        // rejects, so this can't fail the gate chain.
+        .then(function() {
+            if (typeof ensureChatPayloads !== 'function') return;
+            return Promise.all(checkpoints.map(function(cp) {
+                return ensureChatPayloads(cp.chatId);
+            }));
+        })
         .then(function() {
             checkpoints.forEach(function(cp) {
                 // Do NOT repopulate parkedToolCallsByChatId here. The persisted

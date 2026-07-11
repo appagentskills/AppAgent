@@ -58,8 +58,6 @@ var lastApiError = null;
 var lastRequestMetrics = null;
 var activeStreamingChatId = null;
 var isRunning = false;
-var isFollowingScroll = false;       // No UI scroll here — kept so loop assignments don't throw
-var isFollowingStreamingScroll = false;
 var pendingInjection = null;         // Used by send-message; offscreen owns these via runQueue
 var pendingInjectionImages = null;
 // Per-chat silent-hook flags. Chats run CONCURRENTLY in the SW, so the old

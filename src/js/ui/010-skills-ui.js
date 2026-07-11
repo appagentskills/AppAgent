@@ -950,34 +950,21 @@ async function importSkills() {
     return importSkillsFromFolder();
 }
 
-// Save scroll position periodically and track user scroll-away during streaming
+// Save scroll position periodically and track scroll-follow intent
 (function() {
     var saveScrollTimeout = null;
     document.addEventListener('scroll', function(e) {
         if (e.target && e.target.id === 'messages' && currentChatId) {
-            // R2: ignore scroll events caused by our own programmatic scrolls
-            // (scrollToBottomIfAllowed / renderMessages restore). They are not
-            // user activity — recording them disengaged auto-follow mid-run.
-            // A real gesture (wheel/touchmove/keydown) clears the flag instantly,
-            // so deliberate user scrolls still pass through (see 050-streaming.js).
-            if (Date.now() < (window._programmaticScrollUntil || 0)) return;
-
-            // Record user scroll time for debounce
-            lastUserScrollTime = Date.now();
+            // Single stick-to-bottom mechanism (see 050-streaming.js): classify
+            // this event by position + direction and update stickToBottom.
+            handleChatScroll(e.target);
 
             clearTimeout(saveScrollTimeout);
             saveScrollTimeout = setTimeout(function() {
                 appStorage.setItem('scrollPos_' + currentChatId, e.target.scrollTop);
             }, 200);
 
-            // Track scroll following: disable when user scrolls away, re-enable when they scroll back to bottom
-            if (isNearBottom(e.target)) {
-                isFollowingScroll = true;
-            } else {
-                isFollowingScroll = false;
-            }
-
-            // Recalculate streaming container height when user scrolls (more/less space available)
+            // Recalculate streaming container height when the user scrolls (more/less space available)
             if (isRunning) updateStreamingContainerHeight();
         }
     }, true);

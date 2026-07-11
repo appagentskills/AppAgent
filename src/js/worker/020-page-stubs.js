@@ -502,15 +502,39 @@ function executeAfterResponseHooks(chatId) {
     if (_hookIsSilent && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
         AgentEvents.emit('silentHookState', { active: true, chatId: chatId });
     }
-    chat.messages.push({
-        role: 'user',
-        content: instruction,
-        isHookMessage: true
-    });
-    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
-    // Recursive runAgent — passes chatId explicitly because the SW has no
-    // currentChatId fallback (unlike the page bundle's hook).
-    runAgent(chatId);
+    // MEMFIX-FU (M1): normally the chat was hydrated by the run-agent gate
+    // (worker/130-port-bridge.js) before the turn that just finished, so this
+    // tail stays fully synchronous — the loop's guard-preservation logic in
+    // app/030-agent-loop.js relies on the recursive runAgent re-setting
+    // runningChatIds synchronously in the common case. But when the finished
+    // run was started through an ungated path on a payload-evicted chat, the
+    // push + save below would be silently skipped by the evicted-put guard
+    // (hook row lost on SW restart) and the recursive run would build
+    // image_url:{url: undefined} vision blocks — hydrate first in that (rare)
+    // case. ensureChatPayloads never rejects by contract
+    // (core/130-indexeddb.js); the rejection arm is purely defensive and
+    // still delivers the hook run.
+    var _hookDeliver = function() {
+        var hchat = chats[chatId];
+        if (!hchat || !Array.isArray(hchat.messages)) return;
+        hchat.messages.push({
+            role: 'user',
+            content: instruction,
+            isHookMessage: true
+        });
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        // Recursive runAgent — passes chatId explicitly because the SW has no
+        // currentChatId fallback (unlike the page bundle's hook).
+        runAgent(chatId);
+    };
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        ensureChatPayloads(chatId).then(_hookDeliver, function(err) {
+            console.warn('[hooks] after-response hydration failed for', chatId, err);
+            _hookDeliver();
+        });
+    } else {
+        _hookDeliver();
+    }
 }
 
 // Action engine bridge — finishActionIfDone updates Action button state

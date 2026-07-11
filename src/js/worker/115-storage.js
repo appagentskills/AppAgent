@@ -98,6 +98,11 @@ async function saveChatsToStorage() {
                     }
                 });
                 Object.keys(desired).forEach(function(id) {
+                    // MEMFIX: NEVER put a payload-evicted chat — its in-memory
+                    // copy is missing base64 blobs and putting it would overwrite
+                    // the only durable copy in IDB. It stays in `desired` so the
+                    // delete-pass above cannot remove its record either.
+                    if (desired[id]._payloadsEvicted) return;
                     pending++;
                     var putRequest = store.put(desired[id]);
                     putRequest.onsuccess = settleOne;
@@ -139,6 +144,15 @@ async function loadChatsFromStorage() {
                 chats = {};
                 results.forEach(function(chat) {
                     if (chat.messages && chat.messages.length > 0) {
+                        // MEMFIX: the SW strips inline base64 payloads from EVERY
+                        // chat at load (K=0 — the SW has no UI; run entry points
+                        // rehydrate via ensureChatPayloads in core/130-indexeddb.js
+                        // before a chat is run/persisted). Evicted chats stay in
+                        // `chats` (delete-pass safety) and are skipped by the
+                        // put-loop in saveChatsToStorage above (put safety).
+                        if (typeof stripChatPayloadsInPlace === 'function') {
+                            try { stripChatPayloadsInPlace(chat); } catch (e) {}
+                        }
                         chats[chat.id] = chat;
                     }
                 });

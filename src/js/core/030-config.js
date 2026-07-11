@@ -493,7 +493,6 @@ var chatSearchQuery = ''; // Track chat search query
 var activeSkills = {}; // Track active skills with their XML backups: { skillId: { xmlBackups: { table_sysId: versionSysId } } }
 var skillAssetsStoreName = 'skillAssets'; // IndexedDB store for skill assets
 var chatWidgets = {}; // Track widgets per chat: { chatId: [{ id, title, html, height, width, createdAt, msgIndex }] }
-var isFollowingScroll = true; // Track if user is following scroll (turned off when user scrolls away from bottom)
 var streamingDisplayLen = {}; // Buffered display length keyed by chatId+':'+msgIndex (B1: per-chat to avoid cross-chat index collisions during concurrent streaming)
 var STREAM_CHARS_PER_TICK = 40; // Base chars revealed per 50ms tick (~800 chars/sec readable pace)
 var lastLargeResponse = null; // DEPRECATED: retained only for back-compat (always null now); superseded by lastLargeResponseByChatId
@@ -516,8 +515,6 @@ function setLastLargeResponse(chatId, value) {
     }
     lastLargeResponseByChatId[chatId] = value;
 }
-var lastUserScrollTime = 0; // Track when user last scrolled (for debounce)
-var SCROLL_DEBOUNCE_MS = 1000; // 1 second debounce before auto-scroll can take over
 var compactToolCalls = true; // Display option: collapse all tool calls in one area
 var screenshotMethod = 'html-to-image'; // Screenshot method: 'html-to-image' or 'display-media'
 var appTheme = 'system'; // Theme: 'light', 'dark', or 'system' (follows OS preference)

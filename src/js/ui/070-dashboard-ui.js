@@ -1556,6 +1556,21 @@ async function loadChatsFromStorage() {
                         chats[chat.id] = chat;
                     }
                 });
+                // MEMFIX: keep the newest K chats fully hydrated, strip inline
+                // base64 payloads from the rest (rehydrated on demand by
+                // ensureChatPayloads — see core/130-indexeddb.js). Evicted
+                // chats stay in `chats` (delete-pass safety) and are skipped
+                // by the put-loop below (put safety).
+                try {
+                    var KEEP_HYDRATED = 8;
+                    if (typeof stripChatPayloadsInPlace === 'function') {
+                        var _ids = Object.keys(chats);
+                        _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
+                        for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
+                            stripChatPayloadsInPlace(chats[_ids[_si]]);
+                        }
+                    }
+                } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
                 // WIPE-GUARD follow-up: a throw here previously prevented
                 // resolve() — wedging init() at the awaited load — and now
                 // would also leave _chatsHydrated false (saves blocked all
@@ -1660,6 +1675,11 @@ async function saveChatsToStorage() {
                     }
                 });
                 Object.keys(desired).forEach(function(id) {
+                    // MEMFIX: NEVER put a payload-evicted chat — its in-memory
+                    // copy is missing base64 blobs and putting it would overwrite
+                    // the only durable copy in IDB. It stays in `desired` so the
+                    // delete-pass above cannot remove its record either.
+                    if (desired[id]._payloadsEvicted) return;
                     pending++;
                     var putRequest = store.put(desired[id]);
                     putRequest.onsuccess = settleOne;

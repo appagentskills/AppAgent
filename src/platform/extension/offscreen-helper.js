@@ -158,7 +158,13 @@
     function runJsEvalSandbox(payload) {
         var code = String(payload.code || '');
         var globals = payload.globals || {};
-        return runSandboxWithCode(code, globals, payload.chatId || null, payload.messageIndex || null, payload.parentToolCallId || null);
+        // messageIndex: type-checked (not `|| null`) because index 0 is a
+        // legitimate value — `payload.messageIndex || null` coerced the first
+        // message's index to null, so nested record mutations from js_eval at
+        // message 0 were stamped -1 and dropped from the inline Artifacts block.
+        return runSandboxWithCode(code, globals, payload.chatId || null,
+            (typeof payload.messageIndex === 'number' && payload.messageIndex >= 0) ? payload.messageIndex : null,
+            payload.parentToolCallId || null);
     }
 
     function runSkillSandbox(payload) {
@@ -166,6 +172,11 @@
         var toolName = String(payload.toolName || '');
         var args = payload.args || {};
         var code = toolCode + ';\nreturn await ' + toolName + '(' + JSON.stringify(args) + ');';
-        return runSandboxWithCode(code, {}, payload.chatId || null, null, payload.parentToolCallId || null);
+        // messageIndex: plumbed from core/140-skills-engine.js so nested
+        // record mutations stamp a real per-message index instead of -1.
+        // Type-checked (not `|| null`) because index 0 is a legitimate value.
+        return runSandboxWithCode(code, {}, payload.chatId || null,
+            (typeof payload.messageIndex === 'number' && payload.messageIndex >= 0) ? payload.messageIndex : null,
+            payload.parentToolCallId || null);
     }
 })();

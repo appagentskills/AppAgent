@@ -13,8 +13,13 @@
 .snackbar.warning .snackbar-action { background: rgba(0,0,0,0.15); }
 .snackbar.warning .snackbar-action:hover { background: rgba(0,0,0,0.25); }
 
-/* Notification Card (enhanced snackbar for approvals) */
-.snackbar.notification-card { flex-direction: column; align-items: stretch; padding: 0; background: var(--bg-white); color: var(--text-primary); border: 1px solid var(--warning); max-width: 360px; text-align: left; border-radius: var(--radius-xl); overflow: hidden; }
+/* Approval Card — dedicated element #approval-card (ui/220-notification-system.js
+   renders tool-approval prompts here so #snackbar toasts can never displace them). */
+.approval-card { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px); z-index: var(--z-snackbar); opacity: 0; pointer-events: none; transition: transform 0.3s ease, opacity 0.3s ease, bottom 0.3s ease; box-shadow: var(--shadow-lg); font-size: var(--text-body-lg); display: flex; flex-direction: column; align-items: stretch; padding: 0; background: var(--bg-white); color: var(--text-primary); border: 1px solid var(--warning); max-width: 360px; text-align: left; border-radius: var(--radius-xl); overflow: hidden; }
+.approval-card.show { transform: translateX(-50%) translateY(0); opacity: 1; pointer-events: auto; }
+/* Toast + approval card visible together: lift the card above the toast
+   (DOM order in body.html: #snackbar first, then #approval-card). */
+#snackbar.show ~ .approval-card.show { bottom: 96px; }
 .notification-header { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-6); background: var(--warning); color: var(--text-inverse); }
 .notification-icon { display: flex; align-items: center; justify-content: center; }
 .notification-icon svg { width: 18px; height: 18px; }
@@ -26,9 +31,9 @@
 .notification-expand { background: none; border: none; color: inherit; cursor: pointer; padding: var(--space-2); opacity: 0.8; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-sm); margin-left: auto; }
 .notification-expand:hover { opacity: 1; background: rgba(255,255,255,0.15); }
 .notification-expand svg { width: 16px; height: 16px; }
-.snackbar.notification-expanded.notification-card { max-width: 680px; }
-.snackbar.notification-expanded .notification-params-content { max-height: 400px; }
-.snackbar.notification-expanded .notification-params-compact .notification-params-content { position: relative; left: auto; right: auto; border: none; box-shadow: none; margin-top: 0; }
+.approval-card.notification-expanded { max-width: 680px; }
+.approval-card.notification-expanded .notification-params-content { max-height: 400px; }
+.approval-card.notification-expanded .notification-params-compact .notification-params-content { position: relative; left: auto; right: auto; border: none; box-shadow: none; margin-top: 0; }
 .notification-body { padding: var(--space-6) var(--space-7); font-size: var(--text-body); line-height: var(--leading-relaxed); }
 .notification-message { color: var(--text-primary); }
 .notification-message strong { font-weight: var(--font-semibold); }

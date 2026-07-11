@@ -154,7 +154,20 @@ async function getFileAsync(fileId) {
             return result;
         } catch (e) { return null; }
     }
-    return resolveFilePointer(fileId, ptr);
+    var res = resolveFilePointer(fileId, ptr);
+    // MEMFIX: a chat/screenshots_map pointer can resolve to a message whose
+    // base64 was evicted at load (stripChatPayloadsInPlace) — res is then
+    // null or has empty data. Rehydrate the chat from IDB and re-resolve.
+    // The sync getFile() stays as-is: the OPEN chat is hydrated by selectChat.
+    if ((!res || res.data == null) && (ptr.type === 'chat' || ptr.type === 'screenshots_map')
+        && typeof ensureChatPayloads === 'function') {
+        var _evChat = (typeof chats !== 'undefined' && chats) ? chats[ptr.chatId] : null;
+        if (_evChat && _evChat._payloadsEvicted) {
+            try { await ensureChatPayloads(ptr.chatId); } catch (e) {}
+            return resolveFilePointer(fileId, ptr);
+        }
+    }
+    return res;
 }
 
 function guessMimeFromExt(name) {

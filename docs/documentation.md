@@ -569,8 +569,11 @@ The system prompt defines the Agent's behavior and capabilities. You can customi
 
 | Placeholder | Description |
 |-------------|-------------|
+| `{{CURRENT_DATE}}` | Today's date (weekday, month, day, year) |
+| `{{ORCHESTRATOR_POLICY}}` | Sub-agent delegation & orchestration policy — rendered for main (parent) chats, empty (`''`) for sub-agent chats, which get their worker role via the sub-agent preamble instead |
 | `{{SCOPE_CONTEXT}}` | Current app scope information |
 | `{{DISABLED_TOOLS}}` | List of disabled tools |
+| `{{TOOL_CATALOG}}` | Deferred-tool catalog (empty when deferred tool loading is off) |
 | `{{SKILLS_SUMMARY}}` | Active skills content |
 
 Placeholders are automatically replaced with actual values when sending to the AI. The token count display shows both the template size and expanded size.

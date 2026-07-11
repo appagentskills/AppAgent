@@ -472,9 +472,14 @@ function clearHistorySearch() {
     renderHistoryPage();
 }
 
-function exportChatFromHistory(chatId) {
+async function exportChatFromHistory(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
+    // MEMFIX: rehydrate evicted base64 payloads so the export contains the
+    // full messages, not stripped ones. Never rejects.
+    if (typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
     var exportData = {
         title: chat.title || 'Untitled Chat',
         messages: chat.messages || [],
@@ -495,7 +500,14 @@ function exportChatFromHistory(chatId) {
     showSnackbar('Chat exported', 'success');
 }
 
-function downloadChatHistory() {
+async function downloadChatHistory() {
+    // MEMFIX: rehydrate every evicted chat first so the export contains full
+    // base64 payloads, not stripped messages. Never rejects.
+    if (typeof ensureChatPayloads === 'function') {
+        try {
+            await Promise.all(Object.keys(chats).map(function(id) { return ensureChatPayloads(id); }));
+        } catch (e) {}
+    }
     var exportData = {
         exportedAt: new Date().toISOString(),
         totalChats: Object.keys(chats).length,

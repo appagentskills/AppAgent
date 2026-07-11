@@ -326,7 +326,6 @@ async function init() {
     }
     cleanupStaleWorkspaces(); // remove old-format workspace metas with no files
     setSetting('defaultWorkspaceRepo', null); // migration: remove stale default pointer
-    refreshWorkspaceContext(); // async, no await — non-blocking
     updateWorkspaceHeaderStatus(); // show local state immediately
     // NAV-SYNC: guarded trigger (ui/040-tools-settings.js) — dedupes against the
     // nav-driven sync fired by hideAllPanels() during this same startup path.
@@ -398,7 +397,13 @@ async function init() {
     if (savedScrollPos) {
         var messagesContainer = document.getElementById('messages');
         if (messagesContainer) {
-            messagesContainer.scrollTop = parseInt(savedScrollPos, 10);
+            // restoreChatScrollTop seeds _agLastScrollTop so the coalesced
+            // scroll event from this restore isn't misread as a user
+            // scroll-up (which would clobber the derived flag below).
+            restoreChatScrollTop(messagesContainer, parseInt(savedScrollPos, 10));
+            // Derive this chat's follow intent from the restored position
+            // (single stick-to-bottom mechanism — see 050-streaming.js).
+            stickToBottom = isNearBottom(messagesContainer);
         }
     }
 
