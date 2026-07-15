@@ -77,6 +77,39 @@ function setAppTheme(value) {
     applyTheme();
 }
 
+// Mutual exclusion for the header pill dropdowns: gear settings panel, model
+// menu, jobs dropdown, workspace dropdown, usage (credits pill) dropdown and
+// the ServiceNow instance picker. Every toggle calls this with its own name
+// before opening, so opening any one closes all the others.
+// NOTE: hideInstancePicker lives in platform-bridge.js (extension-only IIFE)
+// and is exposed on window there; the typeof guards keep every closer optional.
+function closeAllHeaderMenus(except) {
+    if (except !== 'settings' && typeof closeSettingsPanel === 'function') closeSettingsPanel();
+    if (except !== 'model' && typeof _closeModelMenu === 'function') _closeModelMenu();
+    if (except !== 'jobs' && typeof closeJobsDropdown === 'function') closeJobsDropdown();
+    if (except !== 'workspace' && typeof hideWorkspaceDropdown === 'function') hideWorkspaceDropdown();
+    if (except !== 'usage' && typeof hideUsageTooltipNow === 'function') hideUsageTooltipNow();
+    if (except !== 'instances' && typeof window.hideInstancePicker === 'function') window.hideInstancePicker();
+}
+
+// Gear-dropdown theme toggle — same mechanism as the settings page
+// (setAppTheme persists appTheme); this just refreshes the segmented control.
+function setAppThemeFromPanel(value) {
+    setAppTheme(value);
+    syncSettingsPanelTheme();
+}
+
+// Reflect the persisted appTheme onto the gear-dropdown radio group
+// (#settings-panel-theme in body.html). Called on panel open so the control
+// stays in sync with changes made from the settings page.
+function syncSettingsPanelTheme() {
+    var group = document.getElementById('settings-panel-theme');
+    if (!group) return;
+    group.querySelectorAll('.radio-option').forEach(function(o) {
+        o.classList.toggle('selected', o.getAttribute('data-value') === appTheme);
+    });
+}
+
 // Listen for OS theme changes (only matters when set to 'system')
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
     if (appTheme === 'system') applyTheme();
@@ -177,6 +210,13 @@ function toggleSidebar() {
         sidebar.classList.remove('expanded');
     } else {
         sidebar.classList.add('expanded');
+        // Refresh the chat list on expand. While collapsed the list is
+        // display:none (.sidebar:not(.expanded) .chat-list, 02-layout.css) and
+        // only event-driven renderChatList() calls keep it current — any state
+        // change that missed an event (or a programmatic toggle right after a
+        // mutation) would surface a stale list the moment it becomes visible.
+        // Collapse needs no render: the list is hidden anyway.
+        if (typeof renderChatList === 'function') renderChatList();
     }
     updateSidebarToggleIcon();
     updateMobileSidebarOverlay();
@@ -273,7 +313,7 @@ function showSpinner(text, chatId) {
         '</div>';
     hideSpinner();
     container.insertAdjacentHTML('beforeend', spinnerHtml);
-    scrollToBottomIfAllowed(container);
+    scrollToBottomIfAllowed();
 }
 
 function hideSpinner(chatId) {

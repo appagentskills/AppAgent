@@ -32,8 +32,27 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     // a missing provider list, missing skills, etc. degrades gracefully,
     // but a stuck SW with running checkpoints sitting in IDB is far worse
     // than running with partial state for a few seconds.
+    // BOOT-DEADLINE (SLEEP-WEDGE): .catch only covers loaders that REJECT.
+    // After a suspend-wedged IDB backend, a loader can instead hang forever
+    // (request callbacks never fire) — then the Promise.all below never
+    // settles, _swBootReady never resolves, and every resume path awaiting it
+    // wedges until Chrome restarts. Race each loader against a deadline so
+    // boot ALWAYS completes, degraded if necessary. (The open watchdog and
+    // transaction deadline in core/130-indexeddb.js bound each layer too —
+    // this is the last-resort gate for the whole loader.)
+    var SW_LOADER_DEADLINE_MS = 20000;
+    var SW_LOADER_TIMEOUT = { _swLoaderTimeout: true };
     function safe(p, label) {
-        return Promise.resolve(p).catch(function(e) {
+        var deadline = new Promise(function(resolve) {
+            setTimeout(function() { resolve(SW_LOADER_TIMEOUT); }, SW_LOADER_DEADLINE_MS);
+        });
+        return Promise.race([Promise.resolve(p), deadline]).then(function(v) {
+            if (v === SW_LOADER_TIMEOUT) {
+                console.error('[sw-runtime] loader timed out after ' + SW_LOADER_DEADLINE_MS + 'ms: ' + label + ' — continuing boot degraded');
+                return null;
+            }
+            return v;
+        }).catch(function(e) {
             console.error('[sw-runtime] loader failed: ' + label, e);
             return null;
         });

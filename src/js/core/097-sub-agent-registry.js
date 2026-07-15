@@ -518,6 +518,74 @@ function _orphanErrorSubAtBoot(rec) {
     _finalizeSubAgentCard(rec, rec.last_report);
 }
 
+// REG-MISS-1: targeted single-record rehydration from the sub_agents IDB
+// store — fallback when a lookup misses the in-memory map in the
+// AUTHORITATIVE context (SW/headless). SYMPTOM this fixes: after an MV3 SW
+// restart whose boot-time SubAgents.loadAll() was degraded (the 20s
+// SW_LOADER_DEADLINE_MS race in worker/190-entry.js resolved null on a slow/
+// wedged IDB open, or loadAll's own catch swallowed an openDatabase failure),
+// `_subAgents` stays empty for the whole SW session while the records are
+// still safely persisted in IDB — so wake_sub_agent returned "unknown
+// agent_id" for a sub the Workers strip (page mirror, correctly hydrated
+// from ITS OWN IDB read and shielded from the empty snapshot by the
+// isLoaded() broadcast gate) still visibly renders as ERRORED/resurrectable.
+// Returns a Promise<record|null>:
+//   • null — not persisted (genuinely unknown), past the tombstone TTL
+//     (honor the GC contract: expired tombstones are NOT resurrectable),
+//     non-authoritative context (page mirror is read-only), or IDB failure.
+//   • record — normalized (same backfills as loadAllSubAgents), inserted
+//     into `_subAgents`, spawn handle rehydrated, listeners notified.
+function _rehydrateSubAgentRecordById(agentId) {
+    var _authoritative = (typeof Platform === 'undefined') || (Platform.isWorker === true);
+    if (!_authoritative || !agentId || typeof openDatabase !== 'function') return Promise.resolve(null);
+    return openDatabase().then(function(database) {
+        return new Promise(function(resolve) {
+            try {
+                var tx = database.transaction(['sub_agents'], 'readonly');
+                var req = tx.objectStore('sub_agents').get(agentId);
+                req.onsuccess = function() { resolve(req.result || null); };
+                req.onerror = function() { resolve(null); };
+            } catch (e) { resolve(null); }
+        });
+    }).then(function(rec) {
+        if (!rec) return null;
+        // Raced with a concurrent loadAll()/rehydrate — in-memory record wins
+        // (it may carry newer live state than the persisted row we just read).
+        if (_subAgents[agentId]) return _subAgents[agentId];
+        var now = Date.now();
+        // Honor the GC contract: an expired tombstone would have been reaped
+        // at boot had loadAll succeeded — do not resurrect past the TTL.
+        if ((rec.state === 'stopped' || rec.state === 'errored')
+            && rec.settled_at && (now - rec.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS) {
+            return null;
+        }
+        // Same normalizations as loadAllSubAgents (legacy backfill + fields
+        // that cannot survive a SW reboot).
+        if (rec.depth == null)        rec.depth = 1;
+        if (rec.root_chat_id == null) rec.root_chat_id = rec.parent_chat_id;
+        rec._pending_approvals = 0;
+        rec.awaiting_approval = null;
+        delete rec._retry_delayed_until;
+        // A persisted 'running' record reached ONLY via this fallback is a
+        // pre-restart orphan: its loop died with the old SW, the boot resume
+        // scan is long decided, and nothing holds a pool slot or deferred for
+        // it. Mirror the boot orphan-rewrite (mark errored, resurrectable)
+        // BEFORE handle rehydration so _rehydrateSpawnHandle pre-settles the
+        // parent's handle from the terminal snapshot instead of re-arming a
+        // pending handle nothing will ever settle.
+        if (rec.state === 'running'
+            && !_spawnDeferreds[rec.spawn_handle_id]
+            && !_subPool.running[agentId] && _subPool.queue.indexOf(agentId) === -1) {
+            _orphanErrorSubAtBoot(rec);
+        }
+        _subAgents[agentId] = rec;
+        _subAgentsPersist(rec);
+        try { _rehydrateSpawnHandle(rec); } catch (_) { /* non-fatal — wake can still resurrect */ }
+        _notifyListeners();
+        return rec;
+    }).catch(function() { return null; });
+}
+
 // Rebuild the Handles-registry entry for a persisted sub-agent record after
 // an MV3 SW restart wiped the in-memory handle map. See the loadAllSubAgents
 // call site for the symptom. Mapping (mirrors _resolveSpawnHandle's live
@@ -1793,10 +1861,15 @@ function _drainOnePendingWake(rec) {
                 });
             }
         }).then(function() {
+            // Chat deleted during the async hydrate — nothing to deliver to.
+            if (typeof chats === 'undefined' || !chats[pcid]) return clearPendingWake(pcid);
             // PR626-FU (L1): a run may have started during the async hydrate
             // above — keep the record and retry on the next tick instead of
-            // injecting a bare user row mid-stream.
+            // injecting a bare user row mid-stream. Same nested-sub guard as
+            // the normal path below (a pool-tracked parent sub may not be in
+            // runningChatIds yet while queued).
             if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return;
+            if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return;
             return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return clearPendingWake(pcid); });
         });
     }
@@ -1817,6 +1890,10 @@ function _drainOnePendingWake(rec) {
         // breaking safe alternation). Abort and KEEP the durable record: the
         // live run's flushPendingInjection clears delivered notices itself,
         // or the next heartbeat tick retries once the chat is idle again.
+        // Chat deleted during the async attempt-bump/hydrate — abort: the
+        // post-push tail would otherwise runAgent() a dead chat id / read the
+        // stale pchat reference. Clear the record; nothing to deliver to.
+        if (typeof chats === 'undefined' || !chats[pcid]) { clearPendingWake(pcid); return true; }
         if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return true;
         if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return true;
         return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return false; });
@@ -1918,26 +1995,53 @@ function _wakeParentOnReport(rec, report, opts) {
         // NL-FIX: keep the summary's LINE STRUCTURE in the notice. The old
         // first-line-only cut (split('\n')[0]) silently dropped every line
         // after the first from multi-line report summaries, which read as
-        // "newlines not rendered" in the parent-chat notice bubble. The
-        // bubble renders \n as <br> via formatContent (user rows and
-        // sub-report callouts share that pipeline), so a multi-line snippet
-        // displays with real line breaks. Still cap at 300 chars ('…' marks
-        // the cut) — the full report stays one await_handle/agent_status away.
+        // "newlines not rendered" in the parent-chat notice bubble.
+        // NOTICE-MD: the parent-chat renderer (renderSubReportNotices,
+        // ui/175-sub-agent-ui.js) parses this EXACT shape into a designed
+        // callout — header row (icon + name + id + status pill), the summary
+        // through formatContent (the same markdown pipeline assistant
+        // messages use), and the await_handle boilerplate as a muted footer.
+        // FULL-SUMMARY (no clamp): the parent receives the ENTIRE trimmed
+        // summary inline — the old ~300-char snippet forced an
+        // await_handle/agent_status round-trip to read what the sub already
+        // said. Size is still bounded upstream: reportToParent soft-caps the
+        // STORED summary at rec.summary_cap_bytes (4KB default) BEFORE this
+        // notice is built, so that cap is the effective notice bound; and a
+        // genuinely oversized user row would be cached by
+        // processUserMessageForCache (core/100-cached-results.js →
+        // maybeCacheUserContent in app/020-api-messages.js) like any long
+        // pasted user message.
+        // The summary and the boilerplate stay on their OWN LINES (single
+        // '\n', NOT '\n\n' — the notice must stay compact and the renderer
+        // regex eats the line breaks).
+        // The trailing '— full report via await_handle(…)' line is KEPT
+        // deliberately: it is the STRUCTURAL TERMINATOR that SUB_NOTICE_RE
+        // (renderSubReportNotices, ui/175-sub-agent-ui.js) anchors the end of
+        // the summary capture on. A footerless notice body has no intrinsic
+        // end, so any text coalesced AFTER it into the same injected row
+        // (e.g. user text typed mid-run — app/040-send-message.js appends
+        // '\n\n' + newText AFTER the queued notice) would be swallowed into
+        // the sub's card body. The card hides the line visually, and it stays
+        // truthful: await_handle returns the full STRUCTURED report (data +
+        // artifacts), not just this summary.
         var _sum = String((report && report.summary) || '').trim();
-        var snippet = _sum.length > 300 ? _sum.slice(0, 300) + '…' : _sum;
         var notice = 'Sub-agent "' + (rec.name || rec.agent_id) + '" (' + rec.agent_id + ') reported ('
-            + ((report && report.status) || 'done') + ')' + (snippet ? ': ' + snippet : '')
-            + ' — full report via await_handle("' + rec.spawn_handle_id + '") or agent_status.';
+            + ((report && report.status) || 'done') + ')' + (_sum ? ':\n' + _sum : '')
+            + '\n— full report via await_handle("' + rec.spawn_handle_id + '") or agent_status.';
         if (live) {
             // (3) Mid-run: queue for flushPendingInjection; coalesce with any
             // earlier reporter / lifecycle notice already waiting.
             if (opts.noticeDelivered) {
-                // WAKE-DUR (Mode A): the lifecycle notice _notifySubLifecycle
-                // queued lives only in SW memory — persist THIS report's notice
-                // durably so an SW death before the flush still delivers via
-                // the heartbeat drain (drainPendingWakes).
-                persistPendingWake(pcid, notice, rec.agent_id);
-                return false; // _notifySubLifecycle already queued one
+                // WAKE-DUR (Mode A): _notifySubLifecycle already queued its
+                // lifecycle notice AND persisted that EXACT text durably (its
+                // live arm). Do NOT persist THIS report's differently-worded
+                // notice here: the text actually flushed to the transcript is
+                // the lifecycle text, so clearDeliveredPendingWakes'
+                // containment check would never match this report notice —
+                // the durable record would survive every normal flush and the
+                // heartbeat drain would inject a DUPLICATE row + spurious run
+                // once the parent went idle.
+                return false; // _notifySubLifecycle already queued + persisted one
             }
             if (typeof pendingInjectionsByChatId !== 'undefined') {
                 var ex = pendingInjectionsByChatId[pcid];
@@ -2209,6 +2313,33 @@ function _isThrottleSubError(msg) {
     return /rate.?limit|too many requests|overloaded|temporarily unavailable|\b(429|529)\b/i.test(String(msg));
 }
 
+// Human-facing error headline. Belt-and-braces companion to the streaming
+// layer's conciseApiErrorBody (background.js): strip any inline raw JSON
+// payload (provider bodies used to be appended verbatim, flooding the
+// parent's notice card, the lifecycle retry row and agent_status) and
+// hard-cap the length. Generic: ANY long error is shortened, short errors
+// pass through untouched. The full raw message is logged to the console
+// whenever shortening occurred, so nothing is lost for debugging.
+function _shortSubErrorHeadline(msg, cap) {
+    var raw = String(msg == null ? '' : msg);
+    var t = raw.replace(/\s+/g, ' ').trim();
+    // Drop a trailing parenthesized JSON blob: 'Headline. ({"type":"error",…)'
+    t = t.replace(/\s*\(\s*[\[{][\s\S]*$/, '');
+    // Inline JSON without parens: cut at the first brace when what follows
+    // looks like a JSON object ('"key":'), keeping the prose prefix.
+    var br = t.search(/[\[{]/);
+    if (br > 20 && /"[\w-]+"\s*:/.test(t.slice(br))) t = t.slice(0, br).trim();
+    // Tidy dangling separators left by a strip ('…failed:', '…reached —').
+    t = t.replace(/[\s:;,\u2014\u2013-]+$/, '');
+    cap = cap || 240;
+    if (t.length > cap) t = t.slice(0, cap).trim() + '\u2026';
+    if (!t) t = 'unknown error';
+    if (t !== raw.trim()) {
+        try { console.warn('[SubAgents] error headline shortened; full error:', raw); } catch (_) {}
+    }
+    return t;
+}
+
 // Throttle-class crashes get a DEEPER retry budget than the single generic
 // transient retry — the provider is shedding load (429/529), so patience
 // wins where a lone replay burns out. Delays escalate per attempt; the
@@ -2300,6 +2431,15 @@ function _notifySubLifecycle(rec, headline) {
                 text: ((ex && ex.text) ? ex.text + '\n\n' : '') + text,
                 images: (ex && ex.images) ? ex.images : []
             };
+            // WAKE-DUR (Mode A): the in-memory queue above dies with the MV3
+            // SW. Mirror the EXACT queued text durably — on normal delivery
+            // the flushed injection contains this text, so
+            // clearDeliveredPendingWakes' containment check drops it; after
+            // an SW death the heartbeat drain (drainPendingWakes) delivers
+            // it. Persisting the exact queued text (not _wakeParentOnReport's
+            // differently-worded report notice) is what keeps the targeted
+            // clear matching.
+            if (typeof persistPendingWake === 'function') persistPendingWake(pcid, text, rec.agent_id);
         } else if (Array.isArray(chats[pcid].messages)) {
             chats[pcid].messages.push({ role: 'user', content: text, injected: true });
         }
@@ -2324,8 +2464,26 @@ function onUserMessageToSubChat(subChatId) {
         rec.user_interactions = rec.user_interactions || {};
         rec.user_interactions.last_user_message_at = Date.now();
         rec.last_activity_at = Date.now();
+        // WAKE-FIX (Arm A): a direct user message into a SLEEPING sub starts
+        // the loop via the port bridge while rec.state stayed 'sleeping' and
+        // the spawn deferred stayed consumed (the park settled it). The sub's
+        // later report_to_parent then hit the FIX#6 idempotency guard
+        // (state==='sleeping' || no live deferred → already_settled) and was
+        // REFUSED — _wakeParentOnReport never fired, so the parent got no
+        // notice and an idle parent never started a run. Mirror the errored
+        // self-revive bookkeeping in reportToParent: mark the sub running,
+        // clear the settle stamp, and re-arm a fresh spawn deferred so THIS
+        // resumed turn's report settles a live handle. Deliberately NOT gated
+        // inside reportToParent on runningChatIds — that would break FIX#6's
+        // same-batch double-settle protection.
+        var _prevState = rec.state;
+        if (rec.state === 'sleeping') {
+            rec.state = 'running';
+            rec.settled_at = null;
+            _mintNewSpawnHandle(rec); // re-arms _spawnDeferreds + pending_handles (persists)
+        }
         _subAgentsPersist(rec);
-        _notifySubLifecycle(rec, 'the user sent a message directly into this sub-agent\'s chat (state: ' + rec.state + ')');
+        _notifySubLifecycle(rec, 'the user sent a message directly into this sub-agent\'s chat (state: ' + _prevState + (_prevState === 'sleeping' ? ' \u2192 running; spawn handle re-armed' : '') + ')');
         _notifyListeners();
         return true;
     } catch (e) { console.warn('[sub-agents] onUserMessageToSubChat failed', e); return false; }
@@ -2458,9 +2616,22 @@ function reportToParent(args, ctx) {
         // again") and the parent never learns the work actually succeeded.
         // Self-revive instead: mirror _wakeSubAgentImpl's resurrect
         // bookkeeping, re-arm the spawn deferred, and accept the report.
-        // 'stopped' stays refused — that is an explicit stop_sub_agent /
-        // user cancellation, not a stale crash record.
-        if (rec.state === 'errored') {
+        // 'stopped' stays refused ONLY when explicit (stop_sub_agent / user
+        // cancellation — _stoppedByUser is set): that is a deliberate kill,
+        // not a stale crash record.
+        // BUDGET-STOP WRAP-UP: the hard-ceiling backstop (onToolCallInSubAgent)
+        // sets state='stopped' + crash_cause='budget_exhausted' WITHOUT
+        // _stoppedByUser, while the sub's live loop usually survives long
+        // enough to attempt one wrap-up report (report_to_parent is
+        // budget-exempt in the dispatch gate). Refusing it here stranded the
+        // sub's actual findings — the parent only ever saw the force-stop
+        // error. Treat a budget backstop stop like a stale crash record and
+        // self-revive; the report below settles the re-armed handle and parks
+        // the sub (state 'sleeping'), so this is a bounded one-shot revival,
+        // not a revive loop (FIX #6 still refuses a second settle).
+        var _budgetBackstopStop = (rec.state === 'stopped' && !rec._stoppedByUser
+            && rec.crash_cause === 'budget_exhausted');
+        if (rec.state === 'errored' || _budgetBackstopStop) {
             rec.settled_at = null;
             delete rec._retry_used;
             delete rec._throttle_retries;
@@ -2525,6 +2696,19 @@ function reportToParent(args, ctx) {
     // auto-retry latch so a future transient crash gets its own retry.
     if (rec._retry_used || rec._throttle_retries) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; } // PR383-R3: drop the recovered error too
     _subAgentsPersist(rec);
+
+    // AUTOLINK-PR: a report that carries a pull-request URL surfaces it on
+    // the parent's answer LINKS card even when the parent model never calls
+    // set_links. queueChatAutoLinks (tools/020-tool-execution.js) walks to
+    // the nearest non-sub ancestor; executeAfterResponseHooks merges the
+    // queue into that chat's final answer at the end of its run.
+    if (typeof queueChatAutoLinks === 'function' && typeof extractPrUrls === 'function'
+        && chats[rec.parent_chat_id]) {
+        try {
+            var _alUrls = extractPrUrls(summary + ' ' + (data ? JSON.stringify(data) : ''));
+            if (_alUrls.length) queueChatAutoLinks(chats[rec.parent_chat_id], _alUrls);
+        } catch (_alErr) { /* non-fatal — the report itself must never fail on this */ }
+    }
 
     // Push a styled callout row into the parent chat so the human reading
     // the parent transcript can see the report inline.
@@ -2675,7 +2859,27 @@ function sleepSelf(args, ctx) {
 }
 
 function wakeSubAgent(args, ctx) {
-    return _wakeSubAgentImpl(args, ctx, false);
+    var res = _wakeSubAgentImpl(args, ctx, false);
+    // REG-MISS-1: in-memory registry miss != "the sub never existed". After an
+    // MV3 SW restart whose boot loadAll() was degraded (20s loader deadline in
+    // worker/190-entry.js timed out, or openDatabase failed — e.g. the
+    // post-sleep IDB wedge), the SW's `_subAgents` map is EMPTY while the
+    // record still sits in IDB and the page mirror still renders it in the
+    // Workers strip (the isLoaded() broadcast gate deliberately preserves the
+    // mirror). A resurrectable errored/stopped/sleeping sub then failed
+    // wake_sub_agent with `unknown agent_id` — resurrection impossible even
+    // though the design keeps tombstones revivable until the ~1h GC. Fall
+    // back to a TARGETED IDB read and retry the wake once.
+    if (res && !res.success && res._registry_miss) {
+        return _rehydrateSubAgentRecordById(args && args.agent_id).then(function(rec) {
+            if (!rec) { delete res._registry_miss; return res; }
+            var retry = _wakeSubAgentImpl(args, ctx, false);
+            if (retry && retry._registry_miss) delete retry._registry_miss;
+            return retry;
+        });
+    }
+    if (res && res._registry_miss) delete res._registry_miss;
+    return res;
 }
 
 // Internal cascade entry point — used by agentMessage's auto-wake. The third
@@ -2688,7 +2892,7 @@ function wakeSubAgent(args, ctx) {
 function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     args = args || {};
     var rec = _subAgents[args.agent_id];
-    if (!rec) return { success: false, error: 'wake_sub_agent: unknown agent_id ' + args.agent_id };
+    if (!rec) return { success: false, error: 'wake_sub_agent: unknown agent_id ' + args.agent_id, _registry_miss: true };
     // RES-6 (resurrect): errored/stopped subs are now revivable — their chat
     // transcript (full prior context) survives until the tombstone GC reaps
     // the record, so a crashed sub can be woken and continue where it left
@@ -2879,7 +3083,11 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
                 images: (_wExisting && _wExisting.images) ? _wExisting.images : []
             };
         } else {
-            chats[rec.chat_id].messages.push({ role: 'user', content: combined });
+            // injected:true is a RENDER gate (250-message-render.js) — it lets
+            // renderSubReportNotices upgrade this parent→sub row to the
+            // .sub-notice-inbound card. Content is unchanged; the live-loop
+            // branch above gets the same flag from flushPendingInjection.
+            chats[rec.chat_id].messages.push({ role: 'user', content: combined, injected: true });
         }
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
     }
@@ -3083,7 +3291,7 @@ function _formatInboxDrain(items) {
 
 // ---------- agent_message ----------
 
-function agentMessage(args, ctx) {
+function agentMessage(args, ctx, _regMissRetried) {
     args = args || {};
     var to = args.to;
     var content = String(args.content || '');
@@ -3140,7 +3348,112 @@ function agentMessage(args, ctx) {
                     createdAt: Date.now()
                 });
             }
+            // Standalone transcript callout: the progress-stream entry above
+            // lives INSIDE the (often collapsed) sub_report card, so a
+            // mid-flight message used to be invisible unless the card was
+            // expanded — breaking the tool contract ("renders as an inline
+            // callout in the parent chat"). Push a dedicated UI-only row at
+            // the current transcript position. role:'sub_msg' is rendered by
+            // renderSubAgentMessage (ui/175-sub-agent-ui.js) and, like
+            // sub_report, is dropped from API payloads (unknown roles map to
+            // null in buildAPIMessages, app/020-api-messages.js) so the
+            // parent MODEL's context is unchanged.
+            chats[rec.parent_chat_id].messages.push({
+                role: 'sub_msg',
+                subAgentId: rec.agent_id,
+                subAgentName: rec.name,
+                subChatId: rec.chat_id,
+                text: _ptext,
+                createdAt: Date.now()
+            });
             _repaintParent(rec.parent_chat_id);
+            // WAKE-FIX (Arm B): everything above is UI-only — role:'sub_msg'
+            // rows are dropped from API payloads and the progress entry lives
+            // inside the (often collapsed) card, so the parent MODEL never saw
+            // mid-flight messages and an IDLE parent never started a run to
+            // read them. Deliver a model-visible notice with
+            // _wakeParentOnReport's live/idle split (same wake_parent opt-out
+            // + REG391-1 pause respect). The notice reuses the lifecycle
+            // format so renderSubReportNotices (SUB_LIFECYCLE_RE,
+            // ui/175-sub-agent-ui.js) renders it as a designed card, not a
+            // plain bubble; newlines are flattened because that regex is
+            // single-line ([^\n]) — the full text stays in the card's
+            // progress stream above.
+            try {
+                if (rec.wake_parent !== false) {
+                    var _amPcid = rec.parent_chat_id;
+                    var _amNotice = '[sub-agent lifecycle] ' + (rec.name || rec.agent_id) + ' (' + rec.agent_id + '): sent a message: '
+                        + _ptext.replace(/\s*\n+\s*/g, ' ').slice(0, 3800);
+                    var _amLive = !!(typeof runningChatIds !== 'undefined' && runningChatIds[_amPcid]);
+                    var _amParentSub = null;
+                    if (chats[_amPcid].isSubAgent && chats[_amPcid].subAgentId) {
+                        _amParentSub = _subAgents[chats[_amPcid].subAgentId] || null;
+                        if (!_amLive && _amParentSub) _amLive = !!_subPool.running[_amParentSub.agent_id];
+                    }
+                    if (_amLive) {
+                        // Live parent: coalesce into the mid-run injection
+                        // queue + durable mirror (WAKE-DUR Mode A), exactly
+                        // like _notifySubLifecycle's live arm.
+                        if (typeof pendingInjectionsByChatId !== 'undefined') {
+                            var _amEx = pendingInjectionsByChatId[_amPcid];
+                            pendingInjectionsByChatId[_amPcid] = {
+                                text: ((_amEx && _amEx.text) ? _amEx.text + '\n\n' : '') + _amNotice,
+                                images: (_amEx && _amEx.images) ? _amEx.images : []
+                            };
+                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id);
+                        }
+                    } else if (_amParentSub) {
+                        // Idle NESTED parent: cascade wake (pool-accounted —
+                        // never a raw runAgent for a sub chat); the
+                        // instruction carries the notice.
+                        var _amWakeRes = _wakeSubAgentImpl({ agent_id: _amParentSub.agent_id, instruction: _amNotice }, null, true);
+                        if (_amWakeRes && _amWakeRes.success === false) {
+                            console.warn('[sub-agents] agent_message(parent): nested parent wake refused for', _amParentSub.agent_id, _amWakeRes.error);
+                        }
+                    } else {
+                        // Idle TOP-LEVEL parent: push the model-visible row,
+                        // persist durably, start a run. REG391-1: respect an
+                        // explicit user pause — the row stays parked and is
+                        // consumed on manual resume. MEMFIX-FU: hydrate an
+                        // evicted chat first (same guard as
+                        // _wakeParentOnReport) so the row-persist isn't
+                        // silently skipped.
+                        var _amPaused = false;
+                        try {
+                            if (typeof isChatPaused === 'function' && isChatPaused(_amPcid)) _amPaused = true;
+                            if (typeof pausedChats !== 'undefined' && pausedChats[_amPcid] === true) _amPaused = true;
+                            if (typeof pausedChatIds !== 'undefined' && pausedChatIds[_amPcid] === true) _amPaused = true;
+                        } catch (_) { /* unreadable pause state — treat as not paused */ }
+                        var _amDeliver = function() {
+                            var _amChat = chats[_amPcid];
+                            if (!_amChat || !Array.isArray(_amChat.messages)) return;
+                            _amChat.messages.push({ role: 'user', content: _amNotice, injected: true });
+                            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                            // WAKE-DUR (Mode C): persist BEFORE the async run
+                            // start — the heartbeat drain retries a lost run.
+                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id);
+                            if (_amPaused) return;
+                            if (typeof runAgent === 'function') {
+                                Promise.resolve()
+                                    .then(function() { return runAgent(_amPcid); })
+                                    .catch(function(err) {
+                                        console.warn('[sub-agents] agent_message(parent): wake run failed for', _amPcid, err, '— durable pending wake kept for heartbeat retry');
+                                    });
+                            }
+                        };
+                        if (chats[_amPcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                            ensureChatPayloads(_amPcid).then(_amDeliver, function(err) {
+                                console.warn('[sub-agents] agent_message(parent): hydration failed for', _amPcid, err);
+                                _amDeliver();
+                            });
+                        } else {
+                            _amDeliver();
+                        }
+                    }
+                }
+            } catch (_amErr) {
+                console.warn('[sub-agents] agent_message(parent): wake delivery failed', _amErr);
+            }
         }
         rec.last_activity_at = Date.now();
         _subAgentsPersist(rec);
@@ -3151,7 +3464,20 @@ function agentMessage(args, ctx) {
     // Recipient is a specific agent_id (parent → sub OR sibling → sibling
     // via the parent's authority).
     var dst = _subAgents[to];
-    if (!dst) return { success: false, error: 'agent_message: unknown recipient agent_id ' + to };
+    if (!dst) {
+        // REG-MISS-1: same degraded-boot registry-miss fallback as wakeSubAgent
+        // — targeted IDB rehydration, then ONE retry (positional guard, not
+        // model-reachable via args). A rehydrated errored/stopped recipient
+        // then gets the correct "use wake_sub_agent to resurrect" guidance
+        // below instead of a false "unknown recipient".
+        if (!_regMissRetried) {
+            return _rehydrateSubAgentRecordById(to).then(function(r) {
+                if (!r) return { success: false, error: 'agent_message: unknown recipient agent_id ' + to };
+                return agentMessage(args, ctx, true);
+            });
+        }
+        return { success: false, error: 'agent_message: unknown recipient agent_id ' + to };
+    }
     if (dst.state === 'stopped' || dst.state === 'errored') {
         // RES-6: point callers at the resurrection path instead of a dead end.
         return { success: false, error: 'agent_message: recipient is ' + dst.state + '. Use wake_sub_agent to resurrect it with its full prior context (optionally passing your message as `instruction`).' };
@@ -3200,9 +3526,11 @@ function agentMessage(args, ctx) {
                 }
             } catch (_) { /* fall through to direct push */ }
         } else {
-            // No live loop — queued or idle. Direct push is safe.
+            // No live loop — queued or idle. Direct push is safe. injected:true
+            // is the render gate that upgrades the row to the inbound notice
+            // card (renderSubReportNotices, ui/175) — content is unchanged.
             if (chats[dst.chat_id]) {
-                chats[dst.chat_id].messages.push({ role: 'user', content: combined });
+                chats[dst.chat_id].messages.push({ role: 'user', content: combined, injected: true });
                 if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
             }
         }
@@ -3313,7 +3641,21 @@ function _cascadeStopDescendants(rec, reason) {
 }
 
 function stopSubAgent(args, ctx) {
-    return _stopSubAgentImpl(args, ctx, false);
+    var res = _stopSubAgentImpl(args, ctx, false);
+    // REG-MISS-1: same degraded-boot registry-miss fallback as wakeSubAgent —
+    // a targeted IDB rehydration, then ONE retry. A rehydrated terminal record
+    // correctly returns the 'already terminal' no-op instead of a false
+    // "unknown agent_id".
+    if (res && !res.success && res._registry_miss) {
+        return _rehydrateSubAgentRecordById(args && args.agent_id).then(function(rec) {
+            if (!rec) { delete res._registry_miss; return res; }
+            var retry = _stopSubAgentImpl(args, ctx, false);
+            if (retry && retry._registry_miss) delete retry._registry_miss;
+            return retry;
+        });
+    }
+    if (res && res._registry_miss) delete res._registry_miss;
+    return res;
 }
 
 // Internal cascade entry point — see _wakeSubAgentImpl above for the
@@ -3322,7 +3664,7 @@ function stopSubAgent(args, ctx) {
 function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     args = args || {};
     var rec = _subAgents[args.agent_id];
-    if (!rec) return { success: false, error: 'stop_sub_agent: unknown agent_id ' + args.agent_id };
+    if (!rec) return { success: false, error: 'stop_sub_agent: unknown agent_id ' + args.agent_id, _registry_miss: true };
     if (rec.state === 'stopped' || rec.state === 'errored') {
         return { success: true, ok: true, status: rec.state, note: 'already terminal' };
     }
@@ -3460,6 +3802,10 @@ function unparkAfterAwait(agentId) {
 // settled terminal unconditionally, making agent_status's promised
 // auto-retry unreachable for pool-driven crashes.
 function _queueTransientRetry(rec, errMsg) {
+    // Shorten ONCE up front — everything downstream (last_error, the
+    // injected lifecycle retry row, agent_status) gets the concise headline;
+    // the raw payload is console-logged by the shortener.
+    errMsg = _shortSubErrorHeadline(errMsg);
     var throttled = _isThrottleSubError(errMsg);
     var attemptNo = 1, attemptMax = 1;
     if (throttled) {
@@ -3549,6 +3895,9 @@ function _markErrored(agentId, errMsg) {
     rec.settled_at = Date.now();
     // RES-6: structured error diagnostics for agent_status / the parent.
     var _meTransient = _isTransientSubError(errMsg);
+    // Concise headline for every surface below (last_error, last_report,
+    // spawn-handle settle, parent notice) — raw payload goes to the console.
+    errMsg = _shortSubErrorHeadline(errMsg);
     // PR383-R3: unconditional — the old `crash_cause || 'run_error'` guard let
     // a stale pre-resurrect cause (e.g. 'budget_exhausted') survive a NEW
     // crash and corrupt diagnostics. Each terminal event owns these fields.
@@ -3607,7 +3956,7 @@ function _saturationWarning(rec) {
 
 function agentStatus(args, ctx) {
     args = args || {};
-    function snap(rec) {
+    function snap(rec, full) {
         var sat = _saturationInfo(rec);
         return {
             agent_id: rec.agent_id,
@@ -3634,6 +3983,12 @@ function agentStatus(args, ctx) {
             in_pool_queue: _subPool.queue.indexOf(rec.agent_id) >= 0,
             parked_for_await: !!rec._parked_for_await,
             last_report: rec.last_report || null,
+            // The sub's most recent assistant CHAT message ({text, at} | null)
+            // — what the sub last said in its own chat, visible while it is
+            // still running / before any report. Maintained by
+            // recordSubAssistantMessage (agent-loop hook); list view clips to
+            // ~600 chars, single-agent view to ~2000 ('… [truncated]').
+            last_assistant_message: _lastAssistantSnap(rec, full),
             // Orchestrator §3 — deliverable review flow: null | 'pending'
             // (auto on report) | 'accepted' / 'revision_requested' (parent
             // verdict via wake_sub_agent) | 'cross_checked' (an independent reviewer sub).
@@ -3691,7 +4046,7 @@ function agentStatus(args, ctx) {
     if (args.agent_id) {
         var rec = _subAgents[args.agent_id];
         if (!rec) return { success: false, error: 'unknown agent_id: ' + args.agent_id };
-        return { success: true, agent: snap(rec) };
+        return { success: true, agent: snap(rec, true) };
     }
     // List — optionally filter by parent_chat_id so the parent sees its own subs.
     // Explicit '*' returns every sub on the instance. Otherwise default to the
@@ -3791,6 +4146,53 @@ function recordSubLLMUsage(chatId, m) {
     }
 }
 
+// agent_status live-output pointer: the sub's most recent ASSISTANT chat
+// message. Called by the agent loop (030-agent-loop.js, right after each
+// assistant message in a sub-agent chat is finalized) so the parent's
+// agent_status can show what the sub last SAID while it runs / before it
+// reports — last_report only carries the distilled report_to_parent summary.
+// A cheap pointer on the record (capped at SUBAGENT_LAST_MSG_SINGLE_MAX at
+// write time) — agent_status never loads the sub's transcript. Persisted
+// with the record; page mirrors pick it up via the registry broadcast
+// (worker/105-subagent-broadcast.js ships full records).
+// Tool-call-only turns (empty content) keep the previous text.
+var SUBAGENT_LAST_MSG_SINGLE_MAX = 2000; // stored + single-agent view cap
+var SUBAGENT_LAST_MSG_LIST_MAX = 600;    // list-view cap (keeps list results small)
+function recordSubAssistantMessage(chatId, text) {
+    try {
+        if (!chatId || typeof text !== 'string') return false;
+        var t = text.trim();
+        if (!t) return false; // tool-call-only turn — keep previous text
+        if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return false;
+        var rec = _subAgents[chats[chatId].subAgentId];
+        if (!rec) return false;
+        rec.last_assistant_text = t.length > SUBAGENT_LAST_MSG_SINGLE_MAX
+            ? t.slice(0, SUBAGENT_LAST_MSG_SINGLE_MAX) + '… [truncated]'
+            : t;
+        rec.last_assistant_at = Date.now();
+        _subAgentsPersist(rec);
+        return true;
+    } catch (e) {
+        console.warn('[sub-agents] recordSubAssistantMessage failed', e);
+        return false;
+    }
+}
+
+// Snapshot shape for snap(): {text, at} or null before the sub's first
+// non-empty assistant turn (and on legacy records). List view re-clips to
+// SUBAGENT_LAST_MSG_LIST_MAX (with an explicit '… [truncated]' marker) so a
+// many-sub agent_status result stays under the cached-outline threshold;
+// the single-agent view (agent_id given) returns the stored text as-is
+// (already capped at SUBAGENT_LAST_MSG_SINGLE_MAX at write time).
+function _lastAssistantSnap(rec, full) {
+    var t = rec.last_assistant_text;
+    if (!t) return null;
+    if (!full && t.length > SUBAGENT_LAST_MSG_LIST_MAX) {
+        t = t.slice(0, SUBAGENT_LAST_MSG_LIST_MAX) + '… [truncated]';
+    }
+    return { text: t, at: rec.last_assistant_at || null };
+}
+
 // Called by 030-agent-loop.js whenever a tool call is dispatched inside a
 // sub-agent chat. Increments the budget counter. The budget is a SOFT cap:
 // once usage crosses SUBAGENT_BUDGET_WARN_RATIO (and on every call past
@@ -3807,6 +4209,22 @@ function onToolCallInSubAgent(chatId) {
     if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return true;
     var rec = _subAgents[chats[chatId].subAgentId];
     if (!rec) return true;
+    // BUDGET-LOOP FIX (straggler latch): after the hard-ceiling force-stop
+    // below runs ONCE, in-flight work can still dispatch more tool calls —
+    // e.g. a js_eval sandbox looping over nested executeTool calls keeps
+    // going after the stop (observed: 31 → 109 tool_calls_used in ~6s, ~78
+    // duplicate 'force-stopped — hard tool-budget ceiling exceeded' parent
+    // notices, one per straggler call, each re-running the WHOLE termination
+    // path and inflating the counter past any wake-rebase). A budget-stopped
+    // sub does no further work: refuse stragglers SILENTLY — no increment,
+    // no notice, no handle settle, no cascade. Scoped to the budget backstop
+    // (crash_cause 'budget_exhausted') so explicit user/parent stops keep
+    // their pre-existing wind-down behavior, and a proper wake_sub_agent
+    // resurrection (state → 'running', counter rebased, crash_cause
+    // archived) is unaffected.
+    if ((rec.state === 'stopped' || rec.state === 'errored') && rec.crash_cause === 'budget_exhausted') {
+        return false;
+    }
     rec.tool_calls_used = (rec.tool_calls_used || 0) + 1;
     var now = Date.now();
     rec.last_activity_at = now;
@@ -3922,6 +4340,11 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     var _runErrorMsg = (finishCtx && finishCtx.error && (finishCtx.error.message || String(finishCtx.error))) || '';
     // RES-6: classify the crash for the auto-retry path + structured report.
     var _runErrTransient = _runErrored ? _isTransientSubError(_runErrorMsg) : false;
+    // Concise headline for every downstream surface (synth report, last_error,
+    // lifecycle notice) — the raw payload is console-logged by the shortener.
+    // Classify BEFORE shortening (above) so status-code words stripped with a
+    // JSON blob can never flip the transient verdict.
+    if (_runErrorMsg) _runErrorMsg = _shortSubErrorHeadline(_runErrorMsg);
     // A clean (non-errored) finish completes the turn — reset the per-crash
     // retry latch (belt-and-braces with the onToolCallInSubAgent reset).
     if (!_runErrored && (rec._retry_used || rec._throttle_retries)) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; } // PR383-R3: drop the recovered error too
@@ -4199,6 +4622,10 @@ var SubAgents = {
     // Orchestrator §5: per-sub LLM usage rollup (called from the loop's
     // metrics-capture block after every LLM call in a sub-agent chat).
     recordLLMUsage: recordSubLLMUsage,
+    // agent_status live-output pointer — the sub's most recent assistant
+    // chat message (called by the loop after each finalized assistant
+    // message in a sub-agent chat; see recordSubAssistantMessage).
+    recordAssistantMessage: recordSubAssistantMessage,
     consumeBudgetNotice: consumeBudgetNotice,
     onSubAgentRunFinished: onSubAgentRunFinished,
     // RES-6: unsolicited-event hooks — called by the SW port bridge when the

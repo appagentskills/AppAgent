@@ -250,6 +250,9 @@ function svgToPng(svgUrl, width, height, ratio) {
             canvas.width = width * ratio;
             canvas.height = height * ratio;
             var ctx = canvas.getContext('2d');
+            // High-quality resampling in case the SVG raster is scaled
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
             ctx.scale(ratio, ratio);
             ctx.drawImage(img, 0, 0);
             var result = canvas.toDataURL('image/png');

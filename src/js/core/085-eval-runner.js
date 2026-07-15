@@ -5,6 +5,9 @@
 // happens HERE, never in model context. Verification is single-use and
 // every verdict is persisted server-side to an audit property.
 
+// Lock state lives in ONE property PER TASK ('<runs prop>.<task id>') so
+// concurrent eval_runner calls for different tasks never read-modify-write
+// the same shared row and cannot clobber each other's setup/verified flags.
 var EVAL_RUNNER_RUNS_PROP = 'x_eval.session.runs';
 var EVAL_RUNNER_RESULTS_PROP = 'x_eval.session.results';
 // Cache-settle sleeps for tasks creating server-side executable artifacts.
@@ -92,7 +95,10 @@ async function executeEvalRunner(args, options) {
                 "  if (gr.get('name', name)) { gr.value = val; gr.update(); }\n" +
                 "  else { gr.initialize(); gr.name = name; gr.value = val; gr.insert(); }\n" +
                 "}\n" +
-                "upsert('" + EVAL_RUNNER_RUNS_PROP + "', '{}');\n" +
+                "var od = new GlideRecord('sys_properties');\n" +
+                "od.addQuery('name', 'STARTSWITH', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
+                "od.query();\n" +
+                "while (od.next()) od.deleteRecord();\n" +
                 "upsert('" + EVAL_RUNNER_RESULTS_PROP + "', '{}');\n" +
                 "gs.print(JSON.stringify({session: 'reset'}));",
                 'Eval grader: resetting session', options, evalInstance);
@@ -112,26 +118,49 @@ async function executeEvalRunner(args, options) {
             var spec2 = await evalRunnerLoadSpec();
             var task = evalRunnerGetTask(spec2, args.task_id);
             if (!task) return { success: false, error: 'unknown task_id: ' + args.task_id };
+            var setupLock = EVAL_RUNNER_RUNS_PROP + '.' + task.id;
             var setupScript =
-                "var pName = '" + EVAL_RUNNER_RUNS_PROP + "';\n" +
+                "var pName = '" + setupLock + "';\n" +
                 "var gr = new GlideRecord('sys_properties');\n" +
-                "var runs = {};\n" +
+                "var st = {};\n" +
                 "var found = gr.get('name', pName);\n" +
-                "if (found) { try { runs = JSON.parse(gr.value + '') || {}; } catch(e) {} }\n" +
-                "else { gr.initialize(); gr.name = pName; }\n" +
-                "var taskId = '" + task.id + "';\n" +
-                "var st = runs[taskId] || {};\n" +
+                "if (found) { try { st = JSON.parse(gr.value + '') || {}; } catch(e) {} }\n" +
                 "if (st.setup) {\n" +
-                "  gs.print(JSON.stringify({error: 'DUPLICATE_SETUP', message: 'Setup already run for ' + taskId}));\n" +
+                "  gs.print(JSON.stringify({error: 'DUPLICATE_SETUP', message: 'Setup already run for " + task.id + "'}));\n" +
                 "} else {\n" +
-                "  st.setup = 1; runs[taskId] = st;\n" +
-                "  gr.value = JSON.stringify(runs);\n" +
-                "  if (found) { gr.update(); } else { gr.insert(); }\n" +
-                "  (function() {\n" + (task.setup_script || "gs.print('ready');") + "\n  })();\n" +
+                "  st.setup = 1;\n" +
+                "  if (found) { gr.value = JSON.stringify(st); gr.update(); }\n" +
+                "  else { gr.initialize(); gr.name = pName; gr.value = JSON.stringify(st); gr.insert(); }\n" +
+                "  try {\n" +
+                "    (function() {\n" + (task.setup_script || "gs.print('ready');") + "\n    })();\n" +
+                "  } catch (eS) {\n" +
+                "    // Roll back the lock: a THROWING setup must stay retryable instead\n" +
+                "    // of branding the next attempt DUPLICATE_SETUP/cheated.\n" +
+                "    try { delete st.setup; gr.value = JSON.stringify(st); gr.update(); } catch (eRb) {}\n" +
+                "    gs.print(JSON.stringify({error: 'SETUP_FAILED', message: String((eS && eS.message) || eS).slice(0, 200)}));\n" +
+                "  }\n" +
                 "}";
             var setupOut = await evalRunnerRunScript(setupScript, 'Eval grader: setup ' + task.id, options, evalInstance);
+            if (setupOut && setupOut._error) {
+                // Tool/client-level failure: the server script never ran and the
+                // setup lock was not taken — retryable, not a setup result.
+                return { success: false, task_id: task.id, error: setupOut._error, retryable: true };
+            }
             if (setupOut && setupOut.error === 'DUPLICATE_SETUP') {
                 return { success: true, task_id: task.id, error: 'DUPLICATE_SETUP', cheated: true };
+            }
+            if (setupOut && setupOut.error === 'SETUP_FAILED') {
+                return { success: false, task_id: task.id, error: 'SETUP_FAILED', message: setupOut.message, retryable: true };
+            }
+            // ANSWER-LEAK GUARD: never forward seeded expected values to the graded
+            // model — redact any key that looks like an answer, and scrub _raw.
+            if (setupOut && typeof setupOut === 'object') {
+                for (var sk in setupOut) {
+                    if (/expected|answer/i.test(sk)) delete setupOut[sk];
+                }
+                if (typeof setupOut._raw === 'string' && /expected|answer/i.test(setupOut._raw)) {
+                    setupOut._raw = '[redacted: possible answer leak]';
+                }
             }
             return { success: true, task_id: task.id, setup_output: setupOut };
         }
@@ -149,27 +178,45 @@ async function executeEvalRunner(args, options) {
             // the IIFE return as a fallback.
             var __vscript = (task2.verifier_script || "__emit(JSON.stringify({pass:false,expected:'',actual:'no verifier'}));");
             __vscript = __vscript.replace(/gs\s*\.\s*print\s*\(/g, '__emit(');
+            var verifyLock = EVAL_RUNNER_RUNS_PROP + '.' + task2.id;
             var verifyScript =
-                "var pName = '" + EVAL_RUNNER_RUNS_PROP + "';\n" +
+                "var pName = '" + verifyLock + "';\n" +
                 "var gr = new GlideRecord('sys_properties');\n" +
-                "var runs = {};\n" +
+                "var st = {};\n" +
                 "var found = gr.get('name', pName);\n" +
-                "if (found) { try { runs = JSON.parse(gr.value + '') || {}; } catch(e) {} }\n" +
+                "if (found) { try { st = JSON.parse(gr.value + '') || {}; } catch(e) {} }\n" +
                 "var taskId = '" + task2.id + "';\n" +
-                "var st = runs[taskId] || {};\n" +
                 "if (st.verified) {\n" +
-                "  gs.print(JSON.stringify({pass: false, expected: '', actual: 'ALREADY_VERIFIED: single-use verification for ' + taskId}));\n" +
+                "  // IDEMPOTENT REPLAY: sys.scripts.do is a GET — the network stack can\n" +
+                "  // transparently retry it and re-execute this script after the first\n" +
+                "  // run already verified (observed live on T11). Replay the recorded\n" +
+                "  // verdict instead of returning a spurious ALREADY_VERIFIED fail.\n" +
+                "  var rp = null;\n" +
+                "  try {\n" +
+                "    var rgr = new GlideRecord('sys_properties');\n" +
+                "    if (rgr.get('name', '" + EVAL_RUNNER_RESULTS_PROP + "')) { rp = (JSON.parse(rgr.value + '') || {})[taskId] || null; }\n" +
+                "  } catch (eRp) {}\n" +
+                "  if (rp && typeof rp.pass !== 'undefined') {\n" +
+                "    rp.replayed = true;\n" +
+                "    gs.print(JSON.stringify(rp));\n" +
+                "  } else {\n" +
+                "    gs.print(JSON.stringify({pass: false, expected: '', actual: 'ALREADY_VERIFIED: single-use verification for ' + taskId}));\n" +
+                "  }\n" +
                 "} else {\n" +
                 "  // SINGLE-USE: mark verified BEFORE executing the verifier\n" +
-                "  st.verified = 1; runs[taskId] = st;\n" +
-                "  if (found) { gr.value = JSON.stringify(runs); gr.update(); }\n" +
-                "  else { gr.initialize(); gr.name = pName; gr.value = JSON.stringify(runs); gr.insert(); }\n" +
+                "  st.verified = 1;\n" +
+                "  if (found) { gr.value = JSON.stringify(st); gr.update(); }\n" +
+                "  else { gr.initialize(); gr.name = pName; gr.value = JSON.stringify(st); gr.insert(); }\n" +
                 (pre ? "  gs.sleep(" + pre + ");\n" : "") +
-                "  var __verifier_out = JSON.stringify({pass:false, expected:'', actual:'verifier produced no output'});\n" +
+                "  var __sentinel = JSON.stringify({pass:false, expected:'', actual:'verifier produced no output'});\n" +
+                "  var __verifier_out = __sentinel;\n" +
                 "  function __emit(__x){ __verifier_out = String(__x); }\n" +
                 "  try {\n" +
                 "    var __ret = (function() {\n" + __vscript + "\n    })();\n" +
-                "    if (__ret !== undefined && __ret !== null && String(__ret).length) { __verifier_out = String(__ret); }\n" +
+                "    // Fallback ONLY: honor the IIFE return value when __emit captured\n" +
+                "    // nothing — a verifier that both emits and returns must keep the\n" +
+                "    // emitted verdict.\n" +
+                "    if (__verifier_out === __sentinel && __ret !== undefined && __ret !== null && String(__ret).length) { __verifier_out = String(__ret); }\n" +
                 "  } catch (e) {\n" +
                 "    __verifier_out = JSON.stringify({pass: false, expected: '', actual: 'Error during verification: ' + e.message});\n" +
                 "  }\n" +
@@ -195,14 +242,22 @@ async function executeEvalRunner(args, options) {
                 "  gs.print(__verifier_out);\n" +
                 "}";
             var verdictOut = await evalRunnerRunScript(verifyScript, 'Eval grader: verify+cleanup ' + task2.id, options, evalInstance);
+            if (verdictOut && verdictOut._error) {
+                // Tool/client-level failure: the verifier never executed server-side,
+                // so the single-use lock was NOT burned — return a retryable error,
+                // never a pass:false verdict.
+                return { success: false, task_id: task2.id, error: verdictOut._error, retryable: true };
+            }
             if (verdictOut && typeof verdictOut.pass !== 'undefined') {
-                return {
+                var vres = {
                     success: true,
                     task_id: task2.id,
                     pass: !!verdictOut.pass,
                     expected: String(verdictOut.expected === undefined ? '' : verdictOut.expected),
                     actual: String(verdictOut.actual === undefined ? '' : verdictOut.actual)
                 };
+                if (verdictOut.replayed) vres.replayed = true;
+                return vres;
             }
             return { success: true, task_id: task2.id, pass: false, expected: '', actual: 'UNPARSEABLE: ' + JSON.stringify(verdictOut).slice(0, 200) };
         }
@@ -213,7 +268,7 @@ async function executeEvalRunner(args, options) {
                 "var agr = new GlideRecord('sys_properties');\n" +
                 "if (agr.get('name', '" + EVAL_RUNNER_RESULTS_PROP + "')) { try { out.audit = JSON.parse(agr.value + ''); } catch(e) {} }\n" +
                 "var d = new GlideRecord('sys_properties');\n" +
-                "var q = d.addQuery('name', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
+                "var q = d.addQuery('name', 'STARTSWITH', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
                 "q.addOrCondition('name', '" + EVAL_RUNNER_RESULTS_PROP + "');\n" +
                 "d.query();\n" +
                 "var n = 0; while (d.next()) { d.deleteRecord(); n++; }\n" +

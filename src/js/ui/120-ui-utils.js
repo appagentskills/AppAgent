@@ -173,6 +173,10 @@ function toggleFileChanges(fileKey) {
     }
 }
 
+// RIGHT chat/version sidebar (#version-sidebar) manual-hide state — driven by
+// openVersionSidebar()/closeVersionSidebar(), persisted as appStorage key
+// 'versionSidebarHidden' (do NOT rename the key — existing users' saved prefs).
+// NOT the LEFT nav rail — that is sidebarCollapsed in core/030-config.js.
 var versionSidebarManuallyHidden = false;
 
 function loadVersionSidebarState() {
@@ -545,9 +549,23 @@ function renderVersionSidebar() {
     var changedFiles = getAllChangedFiles();
     var revertedFiles = getRevertedFiles();
     var lastBrowserUrl = getLastBrowserUrl();
-    var actionUpdatesHtml = (typeof renderActionUpdatesSection === 'function') ? renderActionUpdatesSection(chats[currentChatId]) : '';
+    // A sub-agent's OWN progress is rendered inside the worker self-card below
+    // (updateSubAgentSelfCard, 175-sub-agent-ui.js), styled like the parent's
+    // Workers-panel card. Skip the generic in-place progress section here for
+    // sub-agent chats so the same action-state / todo list is not shown twice.
+    var _vsCurChat = (typeof chats !== 'undefined' && typeof currentChatId !== 'undefined') ? chats[currentChatId] : null;
+    var actionUpdatesHtml = (_vsCurChat && _vsCurChat.isSubAgent)
+        ? ''
+        : ((typeof renderActionUpdatesSection === 'function') ? renderActionUpdatesSection(chats[currentChatId]) : '');
     
     var html = '<div class="version-sidebar-content">';
+
+    // Sub-agent "Back to parent" button host — pinned to the VERY TOP of the
+    // sidebar (above PRs/artifacts) so it is always the topmost control in a
+    // sub-agent chat. Placeholder only: populated by updateSubAgentSelfCard()
+    // (175-sub-agent-ui.js), re-invoked at the end of this function (this
+    // innerHTML rebuild wipes it). Hidden for regular chats.
+    html += '<div class="sub-self-parent-host" id="sub-self-parent-host" style="display:none" aria-label="Back to parent chat"></div>';
     
     // Pull Requests Section — PRs pushed from this chat via workspace push.
     // Derived from the chat's tool calls/results, so it works retroactively
@@ -644,6 +662,15 @@ function renderVersionSidebar() {
     if (actionUpdatesHtml) {
         html += '<div class="version-action-updates-section">' + actionUpdatesHtml + '</div>';
     }
+    
+    // Sub-agent self card host — when the OPEN chat is a sub-agent chat, the
+    // SAME live worker card the parent chat shows (progress + "View more") is
+    // mirrored here, immediately below the Progress (action updates) card,
+    // ("Back to parent" now lives in its own top host). Placeholder: populated
+    // by updateSubAgentSelfCard() (175-sub-agent-ui.js), re-invoked at the
+    // end of this function because this innerHTML rebuild wipes it (same
+    // pattern as the Workers panel below). Hidden for regular chats.
+    html += '<div class="sub-self-card-host" id="sub-self-card-host" style="display:none" aria-label="Sub-agent status"></div>';
     
     // Workers panel placeholder — populated by renderWorkersStrip()
     // (175-sub-agent-ui.js). Lives INSIDE the scrolling sidebar content (below
@@ -879,6 +906,11 @@ function renderVersionSidebar() {
     // rebuild above — repopulate it from the live sub-agent registry.
     if (typeof renderWorkersStrip === 'function') {
         try { renderWorkersStrip(); } catch (e) {}
+    }
+    // Same deal for the sub-agent self card host (sub-agent chats only):
+    // the rebuild recreated it empty + hidden, repopulate it.
+    if (typeof updateSubAgentSelfCard === 'function') {
+        try { updateSubAgentSelfCard(); } catch (e) {}
     }
 }
 

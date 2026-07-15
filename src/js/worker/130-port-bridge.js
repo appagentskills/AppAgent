@@ -375,7 +375,7 @@ function _handlePanelMessage(port, msg) {
                 // immediately and the just-sent run is silently dropped
                 // (runFinished{reason:'paused'}). Keep pausedChatIds in sync — we
                 // are intentionally NOT removing it (SWM1F-2 deferred).
-                if (!isRunning) { pausedChats[msg.chatId] = false; pausedChatIds[msg.chatId] = false; }
+                if (!isRunning) { setChatPausedPersistent(msg.chatId, false); pausedChatIds[msg.chatId] = false; }
                 // Same gate order as resumeRunningCheckpoints: chats/providers
                 // loaded, Platform session/instance ready, providers refreshed.
                 // The panel inlines the chat snapshot above so chats[chatId]
@@ -548,7 +548,11 @@ function _handlePanelMessage(port, msg) {
             // mirror below, `while (!isChatPaused(chatId))` never trips: Pause
             // aborts the in-flight step, the loop catches the AbortError and
             // `continue`s straight into a fresh LLM call. Mirror into pausedChats.
-            pausedChats[msg.chatId] = !!msg.paused;
+            // setChatPausedPersistent also stamps chat.pausedByUser on the SW's
+            // chat copy — both realms do full-record puts to the chats store, so
+            // the SW's next post-tool-result save must carry the flag or it would
+            // clobber the page-side write (pause survives a panel reload).
+            setChatPausedPersistent(msg.chatId, !!msg.paused);
             // POST-SW-RELOCATION FIX: the in-flight LLM stream's AbortController and
             // the tool interrupt resolver live HERE in the SW now, not on the panel.
             // The panel-side togglePause still calls abort()/resolver() but its copies
@@ -774,6 +778,25 @@ function _handlePanelMessage(port, msg) {
                 } catch (e) {}
             }
             return;
+
+        case 'prepare-reload':
+            // RELOAD-DB: the panel is about to call chrome.runtime.reload(). Close
+            // THIS service worker's cached IDB connection cleanly before the abrupt
+            // context teardown -- an abandoned open connection can make Chrome
+            // force-close the origin's IndexedDB backing store, wedging the DB
+            // (open() hangs / UnknownError) until a full browser restart. Also close
+            // the offscreen doc (best-effort) so it isn't torn down mid-flight.
+            try { if (typeof closeDatabase === 'function') closeDatabase(); } catch (e) {}
+            try {
+                if (typeof chrome !== 'undefined' && chrome.offscreen && chrome.offscreen.closeDocument) {
+                    Promise.resolve(
+                        chrome.offscreen.hasDocument ? chrome.offscreen.hasDocument() : true
+                    ).then(function(has) {
+                        if (has) { try { chrome.offscreen.closeDocument(); } catch (e) {} }
+                    }).catch(function() {});
+                }
+            } catch (e) {}
+            return;
     }
 }
 
@@ -951,7 +974,7 @@ async function _handlePanelSendMessage(msg) {
     // loop's `while (!isChatPaused)` gate immediately and silently drops the run
     // (runFinished{reason:'paused'}). Covers both the idle restart below and the
     // running-branch case where the loop is about to exit on a stale pause.
-    pausedChats[chatId] = false;
+    setChatPausedPersistent(chatId, false); // also clears persisted pausedByUser
     pausedChatIds[chatId] = false;
 
     // RES-6: a user send into a SUB-AGENT chat is an unsolicited lifecycle

@@ -473,8 +473,6 @@ function changeProvider(providerId) {
         currentProvider = providerId;
         saveProviderToStorage();
         updateModelDisplay();
-        // Re-render the provider dropdown to update selection
-        populateProviderDropdown();
     }
 }
 
@@ -600,22 +598,9 @@ function _modelMenuRowHtml(p) {
             '<div class="model-row-title">' + escapeHtml(p.name) + badges + '</div>' +
             (sub ? '<div class="model-row-sub">' + sub + '</div>' : '') +
         '</div>' +
+        '<button class="model-row-edit" title="Edit model" aria-label="Edit model" onclick="event.stopPropagation();editModelFromMenu(\'' + escapeJsString(p.name) + '\')">' + UI_ICONS.edit + '</button>' +
         check +
     '</div>';
-}
-
-// Reasoning-effort level meter (signal-bar style) — fills `level` of 5 bars so
-// the dropdown conveys intensity at a glance instead of plain text.
-function _effortMeterIcon(level) {
-    var heights = [5, 8, 11, 14, 17];
-    var bars = '';
-    for (var i = 0; i < 5; i++) {
-        var x = 2.5 + i * 4.2;
-        var h = heights[i];
-        var op = i < level ? '1' : '0.22';
-        bars += '<rect x="' + x + '" y="' + (21 - h) + '" width="2.8" height="' + h + '" rx="1" fill="currentColor" opacity="' + op + '"/>';
-    }
-    return '<svg viewBox="0 0 24 24">' + bars + '</svg>';
 }
 
 // The effort the system applies for a provider when nothing is overridden.
@@ -630,52 +615,170 @@ function _providerDefaultEffort(p) {
     return def || 'high';
 }
 
-var _MODEL_CHECK_SVG = '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>';
+// Discrete reasoning-effort levels — same values the settings page's provider
+// modal writes (provider.effort via saveApiProvider); slider index = position.
+var _EFFORT_LEVELS = [
+    { v: 'low', label: 'Low' },
+    { v: 'medium', label: 'Medium' },
+    { v: 'high', label: 'High' },
+    { v: 'xhigh', label: 'X-High' },
+    { v: 'max', label: 'Max' }
+];
 
-function _effortRowHtml(e, curEffort, defEffort) {
-    var sel = curEffort === e.v;
-    var isDef = defEffort === e.v;
-    return '<div class="model-menu-row effort' + (sel ? ' selected' : '') + '" onclick="setProviderEffort(\'' + e.v + '\')">' +
-        '<span class="model-row-icon">' + _effortMeterIcon(e.level) + '</span>' +
-        '<div class="model-row-main"><div class="model-row-title">' + e.label +
-            (isDef ? '<span class="model-row-badge">default</span>' : '') +
-        '</div></div>' +
-        (sel ? _MODEL_CHECK_SVG : '') +
-    '</div>';
+// Dynamic label under the effort slider: level name + 'default' badge when
+// the level equals the provider's seed default.
+function _effortSliderLabelHtml(idx) {
+    var e = _EFFORT_LEVELS[idx] || _EFFORT_LEVELS[2];
+    var provider = getProviderById(currentProvider);
+    var isDef = e.v === _providerDefaultEffort(provider);
+    return '<span class="model-menu-effort-name">' + e.label + '</span>' +
+        (isDef ? '<span class="model-row-badge">default</span>' : '');
 }
 
-// Pill click now opens a dropdown (reasoning effort + model picker + optional
-// OAuth login/logout row). It NO LONGER logs in/out on a single click.
+// Live refresh while dragging (does not persist): label text, level circles
+// (filled up to the current one, the current one shrinks under the disc) and
+// the morphing disc — --pos on the track drives the disc glide + track fill
+// (CSS transitions), and re-adding .is-morph restarts the squash-stretch
+// keyframes. _lastIdx guards against a no-move restart (e.g. the change
+// event re-running the same index after release).
+function onEffortSliderInput(v) {
+    var idx = parseInt(v, 10);
+    var el = document.getElementById('model-menu-effort-label');
+    if (el) el.innerHTML = _effortSliderLabelHtml(idx);
+    var track = document.querySelector('#model-menu .model-menu-effort-track');
+    if (track) track.style.setProperty('--pos', String(idx / 4));
+    document.querySelectorAll('#model-menu .effort-dot').forEach(function(d, i) {
+        d.classList.toggle('active', i <= idx);
+        d.classList.toggle('current', i === idx);
+    });
+    var disc = document.getElementById('model-menu-effort-disc');
+    if (disc && disc._lastIdx !== idx) {
+        disc._lastIdx = idx;
+        disc.classList.remove('is-morph');
+        void disc.offsetWidth; // reflow so the keyframe animation restarts
+        disc.classList.add('is-morph');
+    }
+}
+
+// Commit: persist provider.effort (same storage as before — saveApiProvider).
+// Menu stays open, like the tier selects.
+function commitEffortSlider(v) {
+    var idx = parseInt(v, 10);
+    var e = _EFFORT_LEVELS[idx];
+    var provider = getProviderById(currentProvider);
+    if (!e || !provider) return;
+    provider.effort = e.v;
+    if (typeof saveApiProvider === 'function') saveApiProvider(provider);
+    onEffortSliderInput(idx);
+    showSnackbar('Reasoning effort: ' + e.label, 'info');
+}
+
+// Sub-agent tier rows for the model pill menu. Mirrors the settings page's
+// Sub-Agent Model Tiers section (renderTierAliasSettings in
+// ui/040-tools-settings.js): same alias map (getTierAliasMap / setTierAlias →
+// IDB key subagentTierAliases) and same provider option list (apiProviders),
+// so both UIs stay consistent.
+function _tierMenuRowsHtml() {
+    var map = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
+    var html = '';
+    ['large', 'medium', 'small'].forEach(function(tier) {
+        var current = map[tier];
+        var options = '';
+        var found = false;
+        (apiProviders || []).forEach(function(p) {
+            if (p.name === current) found = true;
+            options += '<option value="' + escapeHtml(p.name) + '"' + (p.name === current ? ' selected' : '') + '>' + escapeHtml(p.name) + '</option>';
+        });
+        // Mapped provider no longer exists (deleted/renamed) — keep it
+        // visible + selected so the user sees the stale mapping.
+        if (!found && current) {
+            options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + ' (missing)</option>' + options;
+        }
+        html += '<div class="model-menu-tier-row">' +
+            '<span class="model-menu-tier-label">' + tier + '</span>' +
+            '<select class="model-menu-tier-select" data-tier="' + tier + '" onchange="setTierAliasFromMenu(\'' + tier + '\', this.value)">' + options + '</select>' +
+        '</div>';
+    });
+    return html;
+}
+
+// Persist a tier → provider mapping picked from the model pill menu.
+// setTierAlias (ui/040-tools-settings.js) writes the same IDB setting the
+// settings page uses. Menu stays open so several tiers can be set at once.
+function setTierAliasFromMenu(tier, providerName) {
+    if (typeof setTierAlias === 'function') setTierAlias(tier, providerName);
+    showSnackbar('Sub-agent ' + tier + ' tier: ' + providerName, 'info');
+}
+
+// Pill click now opens a dropdown (reasoning effort + model picker + sub-agent
+// tier mapping + optional OAuth login/logout row). It NO LONGER logs in/out on
+// a single click.
 function toggleModelMenu(event) {
     if (event) { event.stopPropagation(); event.preventDefault(); }
     var existing = document.getElementById('model-menu');
     if (existing) { existing.remove(); document.removeEventListener('click', _closeModelMenuOnOutside); return; }
+    // Only one header dropdown open at a time
+    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('model');
 
     var anchor = (event && event.currentTarget) || document.getElementById('model-name') || document.getElementById('home-model-name');
     var provider = getProviderById(currentProvider);
     var menu = document.createElement('div');
     menu.id = 'model-menu';
-    menu.className = 'model-menu';
+    menu.className = 'header-menu model-menu';
 
-    var html = '<div class="model-menu-section-title">Reasoning effort</div>';
+    var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>Reasoning effort</div>';
     var defEffort = _providerDefaultEffort(provider);
     var curEffort = (provider && provider.effort) || defEffort;
-    [
-        { v: 'low', label: 'Low', level: 1 },
-        { v: 'medium', label: 'Medium', level: 2 },
-        { v: 'high', label: 'High', level: 3 },
-        { v: 'xhigh', label: 'X-High', level: 4 },
-        { v: 'max', label: 'Max', level: 5 }
-    ].forEach(function(e) { html += _effortRowHtml(e, curEffort, defEffort); });
-    html += '<div class="model-menu-section-title">Model</div>';
+    var effortIdx = _EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(curEffort);
+    if (effortIdx < 0) effortIdx = 2; // unknown stored value — show High
+    var effortDots = '';
+    for (var di = 0; di < 5; di++) {
+        effortDots += '<span class="effort-dot' + (di <= effortIdx ? ' active' : '') + (di === effortIdx ? ' current' : '') + '" data-level="' + (di + 1) + '"></span>';
+    }
+    html += '<div class="model-menu-effort">' +
+        '<div class="model-menu-effort-track" style="--pos: ' + (effortIdx / 4) + '">' + effortDots +
+            '<span class="effort-track-fill"></span>' +
+            '<input type="range" class="model-menu-effort-slider" id="model-menu-effort-slider" min="0" max="4" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onEffortSliderInput(this.value)" onchange="commitEffortSlider(this.value)">' +
+            '<span class="effort-disc" id="model-menu-effort-disc"></span>' +
+        '</div>' +
+        '<div class="model-menu-effort-label" id="model-menu-effort-label">' + _effortSliderLabelHtml(effortIdx) + '</div>' +
+    '</div>';
+    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.model + '</span><span>Model</span>' +
+        '<button class="menu-title-btn" title="Add model" aria-label="Add model" onclick="addModelFromMenu(event)">' + UI_ICONS.plus + '</button></div>';
     getAllProviders().forEach(function(p) { html += _modelMenuRowHtml(p); });
+    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.bot + '</span>Sub-Agent Tiers</div>';
+    html += _tierMenuRowsHtml();
     if (provider && provider.isClaudeOAuth) {
-        html += '<div class="model-menu-section-title">Claude OAuth</div>';
+        html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>Claude OAuth</div>';
         var oauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
         html += '<div class="custom-dropdown-option" onclick="modelMenuOAuthToggle()">' + oauthLabel + '</div>';
     }
     menu.innerHTML = html;
     document.body.appendChild(menu);
+
+    // Tier aliases hydrate lazily from IDB (subAgentTierAliases === null until
+    // loadTierAliases runs). First open: kick hydration, then refresh the tier
+    // selects in place if the menu is still up.
+    if (typeof subAgentTierAliases !== 'undefined' && subAgentTierAliases === null && typeof loadTierAliases === 'function') {
+        loadTierAliases().then(function(map) {
+            var m = document.getElementById('model-menu');
+            if (!m || !map) return;
+            m.querySelectorAll('.model-menu-tier-select').forEach(function(sel) {
+                var t = sel.getAttribute('data-tier');
+                var v = map[t];
+                if (!v) return;
+                sel.value = v;
+                if (sel.value !== v) {
+                    // Stored alias not in the provider list — surface it as missing.
+                    var opt = document.createElement('option');
+                    opt.value = v;
+                    opt.textContent = v + ' (missing)';
+                    sel.insertBefore(opt, sel.firstChild);
+                    sel.value = v;
+                }
+            });
+        });
+    }
 
     var r = anchor.getBoundingClientRect();
     menu.style.position = 'fixed';
@@ -698,18 +801,24 @@ function _closeModelMenu() {
     document.removeEventListener('click', _closeModelMenuOnOutside);
 }
 
-function setProviderEffort(value) {
-    var provider = getProviderById(currentProvider);
-    if (!provider) return;
-    if (value) { provider.effort = value; } else { delete provider.effort; }
-    if (typeof saveApiProvider === 'function') saveApiProvider(provider);
-    _closeModelMenu();
-    showSnackbar('Reasoning effort: ' + (value || 'default'), 'info');
-}
-
 function selectModelFromMenu(name) {
     changeProvider(name);
     _closeModelMenu();
+}
+
+// Pencil on a model row — reuse the settings page's edit flow
+// (editApiProvider → showAddApiProviderModal, ui/040-tools-settings.js).
+// The modal overlays document.body, so it works from any view.
+function editModelFromMenu(name) {
+    _closeModelMenu();
+    if (typeof editApiProvider === 'function') editApiProvider(name);
+}
+
+// Plus next to the Model section title — reuse the settings page's add flow.
+function addModelFromMenu(event) {
+    if (event) event.stopPropagation();
+    _closeModelMenu();
+    if (typeof showAddApiProviderModal === 'function') showAddApiProviderModal();
 }
 
 function modelMenuOAuthToggle() {

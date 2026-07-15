@@ -41,15 +41,13 @@ function renderHistoryPage() {
     // one (the original design — keeps short one-shot action runs out of
     // the history list).
     //
-    // Sub-agent chats are ALSO `isBackground:true`, but historically that
-    // meant they were hidden too — a user could spawn a dozen subs and only
-    // see the ones they had clicked through to. The new rule: sub-agent
-    // chats are ALWAYS visible in history (they carry their own "Sub-agent"
-    // badge + breadcrumb so the user can still tell them apart from
-    // top-level chats). Background action chats keep the reveal-gate.
+    // Sub-agent chats are ALSO `isBackground:true`. They are delegated
+    // workers spawned by a parent agent, not user-facing runs, so they are
+    // hidden from the history page unconditionally (regardless of the
+    // _revealed flag). Background action chats keep the reveal-gate.
     function _isVisibleHistoryChat(c) {
         if (!c) return false;
-        if (c.isSubAgent) return true;
+        if (c.isSubAgent) return false;
         return !(c.isBackground && !c._revealed);
     }
     var visibleChatIds = Object.keys(chats).filter(function(id) { return _isVisibleHistoryChat(chats[id]); });
@@ -223,7 +221,7 @@ function renderHistoryChatCard(chatId) {
     statsHtml += '</div>';
     
     // Preview with user message and Agent answer
-    var previewHtml = '<div class="history-chat-preview-area" onclick="openChatFromHistory(\'' + chatId + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openChatFromHistory(\'' + chatId + '\')" role="button" tabindex="0" aria-label="Open chat: ' + escapeHtml(title) + '">';
+    var previewHtml = '<div class="history-chat-preview-area">';
     if (preview.user) {
         previewHtml += '<div class="history-preview-msg user"><span class="history-preview-label">' + UI_ICONS.user + 'You:</span><span class="history-preview-text">' + escapeHtml(preview.user) + '</span></div>';
     }
@@ -252,9 +250,12 @@ function renderHistoryChatCard(chatId) {
     // accent) so the row stands out even before the badge is read.
     var subAgentCardClass = chat.isSubAgent ? ' subagent' : '';
 
-    return '<div class="history-chat-card' + (isActive ? ' active' : '') + subAgentCardClass + '">' +
+    // The WHOLE card is the click target (it already hover-highlights as one
+    // clickable unit) — openChatCardFromHistory guards against clicks on inner
+    // interactive controls (action buttons, breadcrumb links).
+    return '<div class="history-chat-card' + (isActive ? ' active' : '') + subAgentCardClass + '" onclick="openChatCardFromHistory(\'' + chatId + '\', event)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openChatCardFromHistory(\'' + chatId + '\', event)" role="button" tabindex="0" aria-label="Open chat: ' + escapeHtml(title) + '">' +
         '<div class="history-chat-header">' +
-        '<div class="history-chat-title-row" onclick="openChatFromHistory(\'' + chatId + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openChatFromHistory(\'' + chatId + '\')" role="button" tabindex="0">' +
+        '<div class="history-chat-title-row">' +
         '<span class="history-chat-title">' + escapeHtml(title) + '</span>' +
         '<div class="history-chat-badges">' + badgesHtml + '</div>' +
         '</div>' + actionsHtml + '</div>' +
@@ -326,6 +327,16 @@ function formatHistoryDate(timestamp) {
     if (diffHours < 24) return diffHours + 'h ago';
     if (diffDays < 7) return diffDays + 'd ago';
     return date.toLocaleDateString();
+}
+
+// Whole-card click target for history cards (see renderHistoryChatCard). The
+// inner action buttons and breadcrumb links stopPropagation() themselves; the
+// closest() guard is a second belt so a click on any inner interactive control
+// (or a future one that forgets stopPropagation) never hijacks navigation.
+function openChatCardFromHistory(chatId, event) {
+    if (event && event.target && event.target.closest &&
+        event.target.closest('button, a, .history-chat-actions')) return;
+    openChatFromHistory(chatId);
 }
 
 function openChatFromHistory(chatId) {
@@ -447,11 +458,11 @@ function handleHistorySearch(e) {
 function filterHistoryChats(query) {
     var q = (query || '').toLowerCase().trim();
     // Always apply the visibility predicate — see renderHistoryPage for the
-    // long-form rationale. Sub-agent chats are always visible in history
-    // (they carry their own breadcrumb/badge), action chats stay reveal-gated.
+    // long-form rationale. Sub-agent chats are hidden from history
+    // unconditionally, action chats stay reveal-gated.
     function _vis(c) {
         if (!c) return false;
-        if (c.isSubAgent) return true;
+        if (c.isSubAgent) return false;
         return !(c.isBackground && !c._revealed);
     }
     if (!q || q.length < 2) {

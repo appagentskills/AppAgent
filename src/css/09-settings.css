@@ -3,15 +3,31 @@
 .settings-btn .ui-icon { width: 16px; height: 16px; }
 .settings-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .settings-btn:focus { outline: 2px solid var(--text-link); outline-offset: 2px; }
-.settings-panel { display: none; position: fixed; width: 320px; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: var(--z-overlay-base); }
+/* Panel chrome (bg/border/radius/shadow) comes from the shared .header-menu
+   class (04-header.css) so all header pill dropdowns match. */
+.settings-panel { display: none; position: fixed; width: 320px; z-index: var(--z-overlay-base); overflow: hidden; }
 .settings-panel.visible { display: block; }
-.settings-panel-header { display: flex; align-items: center; justify-content: space-between; padding: var(--space-6) var(--space-6) var(--space-5) var(--space-6); border-bottom: 1px solid var(--border); }
-.settings-panel-title { font-size: var(--text-body-lg); font-weight: var(--font-semibold); color: var(--text-primary); }
-.settings-close-btn { background: none; border: none; font-size: var(--text-3xl); line-height: 1; color: var(--text-muted); cursor: pointer; padding: 0 var(--space-2); transition: color var(--transition-fast); }
-.settings-close-btn:hover { color: var(--text-primary); }
-.settings-section { padding: var(--space-6); border-bottom: 1px solid var(--border); }
+/* Panel title row + close button removed: no other header dropdown repeats its
+   pill's name or has an X — outside-click / Escape / gear re-click close it. */
+.settings-section { padding: var(--space-6); border-bottom: 1px solid var(--secondary-border); }
 .settings-section:last-child { border-bottom: none; }
-.settings-section-title { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; margin-bottom: var(--space-5); display: flex; align-items: center; gap: var(--space-3); }
+.settings-theme-row { display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-5); }
+.settings-theme-row-label { font-size: var(--text-body-sm); color: var(--text-primary); flex-shrink: 0; }
+.settings-panel-footer { padding: var(--space-2); display: flex; flex-direction: column; gap: 1px; } /* divider comes from the preceding .settings-section's border-bottom */
+/* Footer navigation rows: leading glyph + label + trailing external-link glyph
+   (all four items navigate to the full settings page). Same hover treatment
+   as the other header-menu rows. */
+.settings-link-item { display: flex; align-items: center; gap: var(--space-3); width: 100%; text-align: left; background: none; border: none; border-radius: var(--radius-md); cursor: pointer; padding: var(--space-3) var(--space-4); font-size: var(--text-body-sm); color: var(--text-primary); transition: background var(--transition-fast); }
+.settings-link-item:hover { background: var(--bg-hover); }
+.settings-link-icon { display: inline-flex; align-items: center; color: var(--text-secondary); flex-shrink: 0; }
+.settings-link-icon .ui-icon { width: 15px; height: 15px; }
+.settings-link-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-link-external { display: inline-flex; align-items: center; color: var(--text-muted); flex-shrink: 0; }
+.settings-link-external .ui-icon { width: 13px; height: 13px; }
+.settings-all-link { color: var(--text-link); font-weight: var(--font-medium); }
+.settings-all-link .settings-link-icon { color: var(--text-link); }
+/* Band, padding, icon size and typography ALL come from the shared
+   .menu-section-title class (04-header.css) — no overrides here. */
 .section-icon { display: inline-flex; align-items: center; justify-content: center; }
 .section-icon .ui-icon { width: 14px; height: 14px; }
 .data-icon { display: inline-flex; align-items: center; justify-content: center; margin-right: var(--space-3); }

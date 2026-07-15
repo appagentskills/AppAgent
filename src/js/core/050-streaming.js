@@ -25,6 +25,17 @@
 //     Programmatic pins are always instant scrollTop writes to the exact
 //     bottom, and programmatic RESTORES seed _agLastScrollTop (see
 //     restoreChatScrollTop), so neither can be misread as a user scroll.
+//     INVARIANT (clamp-escape): any same-task DOM mutation that can
+//     transiently SHRINK a chat scroll container (innerHTML rebuilds with
+//     widgets parked off-DOM, row swaps) MUST be followed, in the SAME task,
+//     by a seeding write — pinToBottom for sticking users,
+//     restoreChatScrollTop for released ones. Scroll events are dispatched
+//     in the rendering steps BEFORE rAF callbacks, so a bare
+//     scrollToBottomIfAllowed() after such a mutation loses the race: the
+//     clamp's scroll event fires first at the clamped-low position, is
+//     classified as a user scroll-up, releases the stick, and the rAF pin
+//     then refuses to run — stranding the chat at the TOP (this was the
+//     historical scroll-to-top bug in renderMessages' stick branch).
 //   • Growth that happens with NO explicit call site — widget iframes
 //     resizing via widgetResize postMessage, images finishing to load,
 //     smart-document re-renders, font swaps — is caught by a ResizeObserver
@@ -55,8 +66,10 @@ Object.defineProperty(window, 'stickToBottom', {
 
 // Classify a scroll event on a chat scroll container and update stickToBottom.
 // Direction is tracked per-element (multiple scrollTop changes within one
-// frame coalesce into one event at the final position, so a rebuild's
-// clamp + absolute restore never produces a phantom scroll-up).
+// task coalesce into one event at the final position, so a rebuild's
+// clamp + same-task seeding write — pinToBottom or restoreChatScrollTop,
+// see the clamp-escape INVARIANT above — never produces a phantom
+// scroll-up).
 function handleChatScroll(el) {
     var top = el.scrollTop;
     var last = (el._agLastScrollTop !== undefined) ? el._agLastScrollTop : top;

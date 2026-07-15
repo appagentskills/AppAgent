@@ -36,6 +36,42 @@ async function _blobToBase64DataUrl(blob) {
     return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(binary);
 }
 
+
+// Width-priority fit for model-bound images (screenshots, js_eval _images,
+// file-store image reads). Shared by take_screenshot (060) and
+// resizeImageIfNeeded below; defined HERE because this file is bundled into
+// BOTH the page and the SW/offscreen worker, while 060 is page-only.
+// Rules:
+//   - never upscale (scale <= 1)
+//   - cap width at maxWidth
+//   - allow height up to 2*maxWidth so tall pages keep full-width text
+//   - readability floor: never scale the width below
+//     SCREENSHOT_MIN_READABLE_WIDTH (1024, or an explicitly smaller maxWidth)
+//   - HARD CLAMP: the floor may leave the height unbounded, but the Anthropic
+//     API rejects images over 8000px on either edge — the clamp WINS over the
+//     floor when they conflict (a 948px-wide image beats an API rejection).
+var SCREENSHOT_MIN_READABLE_WIDTH = 1024;
+var SCREENSHOT_MAX_LONG_EDGE = 7900; // safety margin under the 8000px API hard limit
+function fitScreenshotScale(w, h, maxWidth) {
+    if (!w || !h) return 1;
+    var maxHeight = maxWidth * 2;
+    var scale = Math.min(1, maxWidth / w, maxHeight / h);
+    // Floor never exceeds the explicit width cap: a caller passing a SMALL
+    // max_width (deliberate token saving) keeps it; the floor only rescues
+    // width crushed by the HEIGHT allowance.
+    var floor = Math.min(1, Math.min(SCREENSHOT_MIN_READABLE_WIDTH, maxWidth) / w);
+    var fitted = Math.max(scale, floor);
+    // NEAR-1 RESAMPLE SKIP: a fractional downscale close to 1 (e.g. a 1710px
+    // widget capture squeezed to the 1600px cap = 0.936x) smears small text —
+    // glyphs land on fractional pixel positions and lose their hard edges —
+    // for a negligible payload saving. Keep the image at native size instead.
+    // The API hard clamp below still wins when the long edge is over the limit.
+    if (fitted < 1 && fitted > 0.9) fitted = 1;
+    var longEdge = Math.max(w, h) * fitted;
+    if (longEdge > SCREENSHOT_MAX_LONG_EDGE) fitted = SCREENSHOT_MAX_LONG_EDGE / Math.max(w, h);
+    return fitted;
+}
+
 // Compress a base64 image if its decoded size exceeds maxBytes.
 // Re-encodes as JPEG with decreasing quality until under limit.
 // Returns the original base64 if already under limit.
@@ -55,39 +91,101 @@ async function compressBase64Image(base64, maxBytes) {
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
 
-    var result = base64;
-    var qualities = [0.85, 0.7, 0.5, 0.3];
+    // Quality ladder floor raised 0.3 -> 0.55: heavy JPEG artifacts at q=0.3
+    // destroyed small UI text. If q=0.55 is still over budget, shrink the
+    // DIMENSIONS instead (0.8x steps at q=0.7, width floor 640px) — a moderate
+    // downscale keeps text far more legible than blockier compression.
+    var qualities = [0.85, 0.7, 0.55];
+    var outBlob = null;
     for (var i = 0; i < qualities.length; i++) {
-        var outBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: qualities[i] });
-        if (outBlob.size <= maxBytes || i === qualities.length - 1) {
-            result = await _blobToBase64DataUrl(outBlob);
-            break;
-        }
+        outBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: qualities[i] });
+        if (outBlob.size <= maxBytes) break;
     }
-    return result;
+    // Dimension steps resample ONCE from the decoded source each attempt
+    // (createImageBitmap resizeQuality 'high' = Lanczos-class) — the old code
+    // cascaded canvas→canvas 0.8x hops, so attempt N was resampled N times and
+    // small text smeared progressively.
+    var srcW = canvas.width, srcH = canvas.height;
+    var attempts = 0;
+    var shrink = 1;
+    while (outBlob.size > maxBytes && attempts < 5 && Math.round(srcW * shrink) > 640) {
+        shrink *= 0.8;
+        var nw = Math.max(640, Math.round(srcW * shrink));
+        var nh = Math.max(1, Math.round(srcH * (nw / srcW)));
+        var next = new OffscreenCanvas(nw, nh);
+        var nctx = next.getContext('2d');
+        var smallBitmap = null;
+        try {
+            smallBitmap = await createImageBitmap(blob, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high' });
+        } catch (shrinkErr) { /* fall back to canvas scaler below */ }
+        if (smallBitmap) {
+            nctx.drawImage(smallBitmap, 0, 0); // 1:1 blit — no second resample
+            smallBitmap.close();
+        } else {
+            nctx.imageSmoothingEnabled = true;
+            nctx.imageSmoothingQuality = 'high';
+            nctx.drawImage(canvas, 0, 0, nw, nh);
+        }
+        outBlob = await next.convertToBlob({ type: 'image/jpeg', quality: 0.7 });
+        attempts++;
+    }
+    return await _blobToBase64DataUrl(outBlob);
 }
 
-// Resize a base64 image so neither dimension exceeds maxDim.
-// Also compresses if the result exceeds 5MB API limit.
+// READBACK PASSTHROUGH: model-bound images (js_eval _images, get_file attach,
+// file-store reads) go to the model at EXACTLY the pixels they were captured
+// or stored at — NO default resample. The old default (1568 long-edge cap via
+// fitScreenshotScale) pre-smeared small text with a client-side fractional
+// downscale; the provider resamples server-side anyway, and does it better
+// than a second client resample stacked on top. Objective evidence (Laplacian
+// variance / mid-gray blur fraction on a text row of a 990x1970 DPR-2 widget
+// capture): native 2x midFrac 0.319 vs 0.367 after a 0.796x 1568-cap resample
+// vs 0.364 for freshly-rendered crisp text — the cap alone pushed the capture
+// from crisper-than-reference to visibly smeared.
+// Downscale ONLY when strictly unavoidable, always with a single UNIFORM
+// scale (aspect ratio preserved) + high-quality smoothing:
+//   - long edge > SCREENSHOT_MAX_LONG_EDGE (7900px; the API hard-rejects
+//     images over 8000px on either edge)
+//   - payload over the ~5MB API limit -> compressBase64Image (JPEG quality
+//     ladder, then moderate dimension steps) — unchanged
+// An explicitly passed maxDim is still honored as a deliberate caller cap on
+// the LONG edge (no caller passes one today).
 // Returns Promise<{ base64, width, height }>. No-op if already within limits.
 async function resizeImageIfNeeded(base64, maxDim) {
-    maxDim = maxDim || 1600;
     try {
         var blob = _b64DataUrlToBlob(base64);
         var bitmap = await createImageBitmap(blob);
         var w = bitmap.width;
         var h = bitmap.height;
-        if (w <= maxDim && h <= maxDim) {
+        var longEdge = Math.max(w, h);
+        var cap = Math.min(maxDim || SCREENSHOT_MAX_LONG_EDGE, SCREENSHOT_MAX_LONG_EDGE);
+        var scale = longEdge > cap ? cap / longEdge : 1;
+        if (scale >= 1) {
             bitmap.close();
             var compressed = await compressBase64Image(base64);
             return { base64: compressed, width: w, height: h };
         }
-        var scale = Math.min(maxDim / w, maxDim / h);
         var newW = Math.round(w * scale);
         var newH = Math.round(h * scale);
+        // ONE resample, straight from the DECODED SOURCE to the final size.
+        // createImageBitmap's resizeQuality:'high' is Chrome's Lanczos-class
+        // scaler — measurably crisper on small text than canvas drawImage
+        // (even with imageSmoothingQuality 'high'), and a single hop means no
+        // stacked resample chains (never 3420→1710→1568).
+        var resizedBitmap = null;
+        try {
+            resizedBitmap = await createImageBitmap(blob, { resizeWidth: newW, resizeHeight: newH, resizeQuality: 'high' });
+        } catch (bitmapResizeErr) { /* fall back to canvas scaler below */ }
         var canvas = new OffscreenCanvas(newW, newH);
         var ctx = canvas.getContext('2d');
-        ctx.drawImage(bitmap, 0, 0, newW, newH);
+        if (resizedBitmap) {
+            ctx.drawImage(resizedBitmap, 0, 0); // 1:1 blit — no second resample
+            resizedBitmap.close();
+        } else {
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(bitmap, 0, 0, newW, newH);
+        }
         bitmap.close();
         var resizedBlob = await canvas.convertToBlob({ type: 'image/png' });
         var resizedDataUrl = await _blobToBase64DataUrl(resizedBlob);
@@ -293,6 +391,125 @@ function sanitizeHookLinks(rawLinks) {
         links.push({ title: title, url: url });
     }
     return links;
+}
+
+// ---- Auto PR links (AUTOLINK-PR) -----------------------------------------
+// Deterministically surface pull-request URLs on the answer LINKS card
+// without burning an LLM run. Two sources feed it:
+//   1. queueChatAutoLinks — called by the sub-agent registry (reportToParent,
+//      core/097-sub-agent-registry.js) when a sub's report summary/data
+//      carries a PR URL. Queued on the nearest NON-SUB ancestor chat — the
+//      chat whose transcript (and links card) the user actually reads.
+//   2. mergeChatAutoLinks' own scan of the current real-turn's
+//      update_action_state tool calls: a `pr_opened` progress card whose
+//      output/label mentions a PR URL. Args are read from chat.messages
+//      (SW-owned) because update_action_state itself executes on the page
+//      (HEADLESS_TOOLS.update_action_state = false) — same pattern as the
+//      chat-progress hook walk in worker/020-page-stubs.js.
+// Both are merged (deduped, capped at 12) into the final answer's links card
+// by executeAfterResponseHooks (worker/020-page-stubs.js) — deliberately
+// OUTSIDE the autoLinks/isBackground gating, since no LLM run is involved.
+
+// Extract normalized GitHub(-Enterprise) pull-request URLs from free text.
+// Matches are cut at the /pull/<n> root (deep links like /pull/7/files
+// collapse to the PR) and trailing punctuation is stripped.
+function extractPrUrls(text) {
+    if (!text) return [];
+    var out = [], seen = {}, m;
+    var re = /https?:\/\/[^\s<>"'()\[\]]+\/pull\/\d+/g;
+    var s = String(text);
+    while ((m = re.exec(s))) {
+        var url = m[0].replace(/[.,;:!?]+$/, '');
+        if (!seen[url]) { seen[url] = true; out.push(url); }
+    }
+    return out;
+}
+
+function _prLinkTitle(url) {
+    var m = url.match(/([^\/]+)\/([^\/]+)\/pull\/(\d+)$/);
+    return m ? ('PR #' + m[3] + ' \u2014 ' + m[1] + '/' + m[2]) : url;
+}
+
+// Walk a sub-agent chat up to the nearest non-sub ancestor (hop cap guards
+// against a corrupted parent cycle). Returns null when no such chat exists.
+function _autoLinkTargetChat(chat) {
+    var hops = 0;
+    while (chat && chat.isSubAgent && chat.parentChatId && typeof chats !== 'undefined'
+           && chats[chat.parentChatId] && hops < 10) {
+        chat = chats[chat.parentChatId];
+        hops++;
+    }
+    return (chat && !chat.isSubAgent) ? chat : null;
+}
+
+// Queue PR urls for delivery onto `chat`'s (or its nearest non-sub
+// ancestor's) next answer links card. Deduped, queue capped at 12.
+function queueChatAutoLinks(chat, urls) {
+    chat = _autoLinkTargetChat(chat);
+    if (!chat || !urls || !urls.length) return false;
+    if (!Array.isArray(chat.autoLinkQueue)) chat.autoLinkQueue = [];
+    var queued = false;
+    for (var i = 0; i < urls.length && chat.autoLinkQueue.length < 12; i++) {
+        var url = urls[i];
+        if (!/^https?:\/\//i.test(url)) continue;
+        var dup = chat.autoLinkQueue.some(function(l) { return l && l.url === url; });
+        if (!dup) { chat.autoLinkQueue.push({ title: _prLinkTitle(url), url: url }); queued = true; }
+    }
+    return queued;
+}
+
+// Merge queued auto links + current-turn pr_opened URLs into the final
+// answer's links card. Returns true when the card changed (caller emits
+// linksChanged + persists). The queue is retained when no answer target
+// exists yet — delivered at the end of the next run instead.
+function mergeChatAutoLinks(chat) {
+    if (!chat || !chat.messages) return false;
+    var pending = Array.isArray(chat.autoLinkQueue) ? chat.autoLinkQueue.slice() : [];
+    var span = findHookAnswerSpan(chat);
+    if (span) {
+        // Scan the whole tail from the last REAL user message (deliberately
+        // past span.endIdx: the finalize-progress hook run — where pr_opened
+        // is most often set — lives AFTER the hook boundary).
+        for (var i = span.lastUserIdx + 1; i < chat.messages.length; i++) {
+            var am = chat.messages[i];
+            if (!am || am.role !== 'assistant' || !Array.isArray(am.tool_calls)) continue;
+            for (var j = 0; j < am.tool_calls.length; j++) {
+                var tc = am.tool_calls[j];
+                if (!tc || !tc.function || tc.function.name !== 'update_action_state') continue;
+                var a = null;
+                try { a = JSON.parse(tc.function.arguments || '{}'); } catch (e) { a = null; }
+                if (!a || a.state !== 'pr_opened') continue;
+                extractPrUrls(String(a.output || '') + ' ' + String(a.label || '')).forEach(function(u) {
+                    if (!pending.some(function(l) { return l && l.url === u; })) {
+                        pending.push({ title: _prLinkTitle(u), url: u });
+                    }
+                });
+            }
+        }
+    }
+    if (!pending.length) return false;
+    var target = span && span.target;
+    if (!target) return false; // keep chat.autoLinkQueue for the next run
+    // Pull any spontaneous mid-run set_links card onto the target FIRST so
+    // appending here never strands an orphan card on an earlier message
+    // (the hook gating's own relocate branch is skipped once target.links
+    // is set by this merge).
+    if (!target.links) relocateAnswerCard(chat, 'links');
+    var links = Array.isArray(target.links) ? target.links : [];
+    var seen = {};
+    links.forEach(function(l) { if (l && l.url) seen[l.url] = true; });
+    var added = false;
+    for (var k = 0; k < pending.length && links.length < 12; k++) {
+        if (pending[k] && pending[k].url && !seen[pending[k].url]) {
+            seen[pending[k].url] = true;
+            links.push(pending[k]);
+            added = true;
+        }
+    }
+    chat.autoLinkQueue = [];
+    if (!added) return false;
+    target.links = links;
+    return true;
 }
 
 // Execute set_links tool (Links hook). Headless — runs in the SW. Attaches a
@@ -848,7 +1065,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             // returns false — short-circuit so the stopped sub does no work.
             var _ok = SubAgents.onToolCallInSubAgent(_budgetChatId);
             if (!_ok) {
-                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped.', _budget_exhausted: true };
+                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped. Do NOT retry work tools — every further call will be refused. Call report_to_parent NOW with your findings so far (it is budget-exempt and will be delivered).', _budget_exhausted: true };
             }
         }
     }

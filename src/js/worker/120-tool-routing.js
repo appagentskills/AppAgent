@@ -20,14 +20,24 @@
 //   3. Implements parking: a UI tool that cannot be run right now
 //      because no panel is connected gets persisted to IDB and the
 //      promise stays unresolved. When a panel connects, parked
-//      tools replay in order. TTL: 24h.
+//      tools replay in order. Max lifetime: bounded (see
+//      PARKED_TOOL_MAX_LIFETIME_MS) — not 24h.
 //
 // The page bundle never loads this file (it lives in src/js/worker/
 // which is excluded from the page tier list). Panels run UI tools
 // directly via the unwrapped executeTool.
 // =============================================================
 
-var PARKED_TOOL_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+// PARK-LIFETIME (empty-chat-list root fix): a UI tool call parked with no panel
+// used to live for 24h. That kept the SW warm (heartbeat) for a full day
+// holding an IDB connection that an abrupt kill / OS sleep could abandon and
+// wedge (the empty-chat-list bug), and let a run hang for a day. Bounded to a
+// short max lifetime: on expiry we checkpoint the errored state, fail the call
+// so the run surfaces an error instead of hanging, then release the SW DB
+// connection. A genuine panel reconnect within the window still replays
+// normally.
+var PARKED_TOOL_MAX_LIFETIME_MS = 12 * 60 * 1000; // 12 min
+var PARKED_TOOL_TTL_MS = PARKED_TOOL_MAX_LIFETIME_MS; // back-compat alias
 
 // Pending tool-call requests sent over port to a panel executor.
 // Key: toolCallId → { resolve, reject, startedAt, executorPortId }
@@ -281,7 +291,7 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
         parkedAt: Date.now()
     };
     // F4: if an entry for this toolCallId is already parked (re-park), clear its stale
-    // 24h TTL timer first so we don't stack a second never-cleared closure.
+    // park-lifetime TTL timer first so we don't stack a second never-cleared closure.
     try {
         parkedToolCallsByChatId[chatId].forEach(function(_e) {
             if (_e.toolCallId === toolCallId && _e._ttlTimer) { clearTimeout(_e._ttlTimer); _e._ttlTimer = null; }
@@ -293,8 +303,32 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
     // cancel can clearTimeout it — otherwise the 24h closure outlives the parked entry
     // and a re-park stacks a second timer.
     entry._ttlTimer = setTimeout(function() {
-        cancelParkedToolCall(chatId, toolCallId, 'TTL expired (24h with no panel)');
-    }, PARKED_TOOL_TTL_MS);
+        // PARK-LIFETIME expiry (see PARKED_TOOL_MAX_LIFETIME_MS): the parked call
+        // outlived its bound with no panel to run it. Checkpoint the errored run
+        // state (so a resume scan won't keep it 'parked' forever), fail the call
+        // (cancelParkedToolCall resolves it with a failure result — the loop
+        // surfaces an error instead of hanging), then release the SW DB
+        // connection so it is not held while idle.
+        var _cpDone = Promise.resolve();
+        try {
+            if (typeof _buildCheckpointSnapshotFor === 'function' && typeof writeAgentCheckpoint === 'function') {
+                var _expSnap = _buildCheckpointSnapshotFor(chatId) || { chatId: chatId };
+                _expSnap.status = 'errored';
+                _cpDone = writeAgentCheckpoint(chatId, _expSnap) || Promise.resolve();
+            }
+        } catch (errCp) {}
+        cancelParkedToolCall(chatId, toolCallId, 'parked tool call exceeded max lifetime (' + Math.round(PARKED_TOOL_MAX_LIFETIME_MS / 60000) + ' min) with no panel connected');
+        // Release the SW DB connection only AFTER the errored checkpoint has
+        // committed. Closing it synchronously here would abort the checkpoint's
+        // transaction: when `db` is cached, openDatabase() resolves on a
+        // microtask, so writeAgentCheckpoint's db.transaction() runs after this
+        // sync block — on a connection we'd already have closed (InvalidStateError,
+        // silently swallowed by writeAgentCheckpoint's .catch). Chaining defers
+        // the close past commit.
+        Promise.resolve(_cpDone).then(function() {
+            try { if (typeof releaseIdleDbConnection === 'function') releaseIdleDbConnection(); } catch (errRel) {}
+        });
+    }, PARKED_TOOL_MAX_LIFETIME_MS);
 }
 
 function cancelParkedToolCall(chatId, toolCallId, reason) {
@@ -539,7 +573,7 @@ executeTool = async function(name, args, messageIndex, options) {
             // returns false — short-circuit so the stopped sub does no work.
             var _budgetOk = SubAgents.onToolCallInSubAgent(_budgetChatId);
             if (!_budgetOk) {
-                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped.', _budget_exhausted: true };
+                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped. Do NOT retry work tools — every further call will be refused. Call report_to_parent NOW with your findings so far (it is budget-exempt and will be delivered).', _budget_exhausted: true };
             }
         }
     }

@@ -12,7 +12,7 @@
 .sidebar:not(.expanded) .sidebar-nav-icon { margin: 0; }
 /* Collapsed: show a tiny page-name label under the icon (truncated with ellipsis if too long) */
 .sidebar:not(.expanded) .sidebar-nav-btn span:not(.sidebar-nav-icon):not(.chat-pending-dot) { display: block; width: 100%; max-width: 100%; font-size: 9px; line-height: 1.15; font-weight: var(--font-medium); letter-spacing: 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar:not(.expanded) .sidebar-history-row { flex-direction: column; }
+.sidebar:not(.expanded) .sidebar-history-row { flex-direction: column; width: 100%; }
 .sidebar:not(.expanded) .sidebar-history-row .sidebar-nav-btn { border-radius: var(--radius-lg); }
 .sidebar:not(.expanded) .sidebar-history-toggle { display: none; }
 .sidebar:not(.expanded) .chat-list { display: none; }
@@ -102,6 +102,9 @@ mark.search-highlight-current { background: var(--warning); padding: var(--space
 .chat-item { display: flex; align-items: center; padding: var(--space-5) var(--space-6); border-radius: var(--radius-md); cursor: pointer; margin-bottom: var(--space-2); position: relative; z-index: 1; }
 .chat-item:hover, .chat-item.active { background: var(--secondary-border); }
 .chat-item:has(.chat-dropdown.open) { z-index: 100; }
+/* Small zap badge marking background action chats in the chat list */
+.chat-action-badge { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-right: var(--space-3); color: var(--text-muted); flex-shrink: 0; }
+.chat-action-badge svg { width: 12px; height: 12px; }
 .chat-title { flex: 1; font-size: var(--text-body-lg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); padding-right: var(--space-2); }
 .pin-icon { font-size: var(--text-body-sm); margin-right: var(--space-3); flex-shrink: 0; }
 .chat-attention-dot { display: inline-block; width: 8px; height: 8px; background: var(--warning, #f59e0b); border-radius: var(--radius-full); margin-right: var(--space-4); flex-shrink: 0; animation: pulse-attention 2s ease-in-out infinite; }

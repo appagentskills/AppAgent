@@ -317,6 +317,22 @@ function executeAfterResponseHooks(chatId) {
         }
     }
 
+    // AUTOLINK-PR: deterministic delivery of pull-request links — queued by
+    // sub-agent reports (reportToParent, core/097-sub-agent-registry.js) or
+    // extracted from this turn's own update_action_state(pr_opened) card —
+    // onto the answer links card. No LLM run involved, so it deliberately
+    // runs OUTSIDE the autoLinks/isBackground gating below (background
+    // action chats get the link too; their transcript is user-visible via
+    // History). Runs BEFORE the links-hook gating so a delivered PR link
+    // also satisfies the hook (no extra LLM run to ask for links).
+    if (typeof mergeChatAutoLinks === 'function' && mergeChatAutoLinks(chat)) {
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        var _alTarget = findHookAnswerTarget(chat);
+        if (_alTarget && _alTarget.links && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
+            AgentEvents.emit('linksChanged', { chatId: chatId, links: _alTarget.links });
+        }
+    }
+
     // Links hook: ask for a list of relevant links (PRs, diffs, records, docs)
     // on the final answer of the last real turn. Single attempt per answer
     // (_linksAsked, set BEFORE firing) prevents hook loops when the model fails

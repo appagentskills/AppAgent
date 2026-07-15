@@ -233,7 +233,7 @@ function rerenderCurrentNotification() {
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
     // Match the show path (showNextApprovalNotification) — also drops any
     // notification-expanded state from a previous card.
-    card.className = 'approval-card notification-card show';
+    card.className = 'approval-card show';
 }
 
 function toggleNotificationExpand() {
@@ -404,7 +404,7 @@ function showNextApprovalNotification() {
         '</div>' +
         '<div class="notification-body">' + bodyHtml + '</div>' +
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
-    card.className = 'approval-card notification-card show';
+    card.className = 'approval-card show';
 }
 
 function dismissApprovalNotification() {

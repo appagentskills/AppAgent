@@ -1241,6 +1241,31 @@ function computeWordDiff(oldText, newText) {
         }
     }
 
+    // Similarity gating (GitHub-like): only emit intra-line highlights when
+    // the paired lines share at least half of their non-whitespace tokens.
+    // Dissimilar pairs (rewritten lines, unbalanced-run pairings) fall back to
+    // plain line-level coloring instead of boxing nearly every word.
+    var oldNonWs = 0, newNonWs = 0, sameNonWs = 0;
+    oldResult.forEach(function(it) { if (/\S/.test(it.word)) { oldNonWs++; if (!it.changed) sameNonWs++; } });
+    newResult.forEach(function(it) { if (/\S/.test(it.word)) newNonWs++; });
+    var denom = Math.max(oldNonWs, newNonWs);
+    if (denom > 0 && sameNonWs / denom < 0.5) {
+        return { oldHtml: escapeHtml(oldText), newHtml: escapeHtml(newText) };
+    }
+
+    // Merge highlight runs: an unchanged whitespace token sitting BETWEEN two
+    // changed tokens joins the highlight, so consecutive changed words render
+    // as ONE contiguous span (like GitHub) instead of separate boxes.
+    function bridgeWhitespace(result) {
+        for (var k = 1; k < result.length - 1; k++) {
+            if (!result[k].changed && !/\S/.test(result[k].word) && result[k-1].changed && result[k+1].changed) {
+                result[k].changed = true;
+            }
+        }
+    }
+    bridgeWhitespace(oldResult);
+    bridgeWhitespace(newResult);
+
     // Build HTML with highlights (whole words highlighted)
     function buildHtml(result, highlightClass) {
         var html = '';
@@ -1263,4 +1288,33 @@ function computeWordDiff(oldText, newText) {
         oldHtml: buildHtml(oldResult, 'diff-word-remove'),
         newHtml: buildHtml(newResult, 'diff-word-add')
     };
+}
+
+// Pair up remove/add runs in a line diff (computeDiff output) and compute
+// word-level highlight HTML for each paired line. The k-th removed line of a
+// remove-run is paired with the k-th added line of the immediately following
+// add-run. Returns a map of diff-index -> already-escaped HTML for lines that
+// received an intra-line (word-level) highlight. Shared by the record diff
+// viewer (100-diff-viewer.js) and the workspace files diff
+// (115-workspace-files-sidebar.js).
+function computeWordDiffsForLines(diff) {
+    var wordDiffs = {};
+    var i = 0;
+    while (i < diff.length) {
+        if (diff[i].type === 'remove') {
+            var removeStart = i;
+            while (i < diff.length && diff[i].type === 'remove') i++;
+            var addStart = i;
+            while (i < diff.length && diff[i].type === 'add') i++;
+            var pairs = Math.min(addStart - removeStart, i - addStart);
+            for (var k = 0; k < pairs; k++) {
+                var wd = computeWordDiff(diff[removeStart + k].text, diff[addStart + k].text);
+                wordDiffs[removeStart + k] = wd.oldHtml;
+                wordDiffs[addStart + k] = wd.newHtml;
+            }
+        } else {
+            i++;
+        }
+    }
+    return wordDiffs;
 }

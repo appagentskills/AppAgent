@@ -36,6 +36,7 @@ var ORCHESTRATOR_POLICY_LINES = [
     'WORKER SATURATION: do NOT pile new requirements onto a saturated sub (past 50% of the assumed context window or tool budget — gauges and warnings are documented on agent_status / wake_sub_agent / agent_message). Let it finish its current task and report, then spawn a FRESH sub seeded with a handover distilled from that report.',
     '',
     'REVIEW CHECKLIST — apply to EVERY worker deliverable before using it:',
+    '  0. INSTRUCTION FIDELITY: when a sub-agent reports on work the user requested, QUOTE the user\'s literal instruction verbatim in your triage.',
     '  1. Evidence cited? (record sys_ids, file paths + line context, URLs — not bare claims)',
     '  2. Does it actually answer the question asked?',
     '  3. Hallucination markers? (symbols/tables/APIs that were never verified, suspiciously round numbers, missing error mentions)',
@@ -79,8 +80,6 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     'Do NOT attempt to retry denied tools or work around the denial.',
     '',
     'TOOL SAFETY: Some tools accept a `confirm` parameter. If you believe an operation is dangerous, destructive, or has significant side effects (e.g. deleting records, bulk updates, impersonating users, modifying production data), set `confirm: true` to prompt the user for approval before execution. When in doubt, confirm.',
-    '',
-    '{{SCOPE_CONTEXT}}',
     '',
     '{{DISABLED_TOOLS}}',
     '',
@@ -202,14 +201,11 @@ function _maybeAppendToolCatalog(expanded, chatId) {
 function expandSystemPromptPlaceholders(template, chatId) {
     var expanded = template;
     
-    // Replace {{SCOPE_CONTEXT}}
-    var scopeContext = '';
-    if (currentScope && currentScope !== 'global') {
-        scopeContext = 'CURRENT APP SCOPE: You are working in application scope "' + currentScope + '". When creating new records (POST requests), they will be created in this scope. This is important for Script Includes, UI Pages, Business Rules, and other application artifacts.';
-    } else {
-        scopeContext = 'CURRENT APP SCOPE: You are working in the Global scope. New records will be created in Global unless specified otherwise.';
-    }
-    expanded = expanded.replace(/\{\{SCOPE_CONTEXT\}\}/g, scopeContext);
+    // Strip the legacy {{SCOPE_CONTEXT}} placeholder. The App Scope feature
+    // was removed (record scope is passed per-call via the `scope` param on
+    // servicenow_api / servicenow_run_script), but saved CUSTOM prompts may
+    // still contain the literal placeholder — keep replacing it with ''.
+    expanded = expanded.replace(/\{\{SCOPE_CONTEXT\}\}/g, '');
 
     // Replace {{ORCHESTRATOR_POLICY}} — the parent-only delegation policy.
     // Sub-agent chats render it as '' (they get the worker role via

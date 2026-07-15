@@ -112,7 +112,7 @@ function toggleSettingsView() {
     openSettingsPageView();
 }
 
-function openSettingsPageView() {
+function openSettingsPageView(scrollToId) {
     currentView = 'settings-page';
     appStorage.setItem('currentView', 'settings-page');
     // SWM2-F3: left the chat view — clear this panel's focus entry so the SW
@@ -121,6 +121,16 @@ function openSettingsPageView() {
     hideAllPanels();
     var settingsPanel = document.getElementById('settings-page-panel');
     if (settingsPanel) { settingsPanel.style.display = 'flex'; renderSettingsPage(); }
+    // Optional deep-link: scroll to a section container (e.g. 'llm-endpoints-list',
+    // 'settings-tool-permissions', 'system-prompt-editor-container',
+    // 'github-settings-container'). Deferred a tick so the freshly rendered
+    // (and partly async) sections have laid out.
+    if (scrollToId && typeof scrollToId === 'string') {
+        setTimeout(function() {
+            var el = document.getElementById(scrollToId);
+            if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 50);
+    }
     updateAllButtonStates();
     renderChatList();
     // Push browser history state
@@ -168,13 +178,6 @@ function renderSettingsPage() {
             '<div id="tier-aliases-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.scope + ' Application Scope</div>' +
-            '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Current Scope</div><div class="settings-page-row-hint">Scope for creating new records</div></div>' +
-                '<div id="settings-page-scope-container" class="settings-page-dropdown-container"></div>' +
-            '</div>' +
-        '</div>' +
-        '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.display + ' Display</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Theme</div><div class="settings-page-row-hint">Choose light, dark, or follow your system preference</div></div>' +
@@ -196,13 +199,7 @@ function renderSettingsPage() {
                 '<div><div class="settings-page-row-label">Keep Display Awake</div><div class="settings-page-row-hint">Prevent the screen from sleeping while the agent is actively running a task, and after 5 minutes of inactivity in AppAgent. Released when the task ends or the page is closed.</div></div>' +
                 '<input type="checkbox" id="settings-keep-awake" ' + ((typeof window.getKeepAwakeForeverDisabled === 'function' && window.getKeepAwakeForeverDisabled()) ? '' : 'checked') + ' onchange="toggleKeepAwake(this.checked)">' +
             '</div>' +
-            '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Screenshot Method</div><div class="settings-page-row-hint">Method used by the Agent to capture screenshots</div></div>' +
-                '<select onchange="setScreenshotMethod(this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
-                    '<option value="html-to-image"' + (screenshotMethod === 'html-to-image' ? ' selected' : '') + '>html-to-image</option>' +
-                    '<option value="display-media"' + (screenshotMethod === 'display-media' ? ' selected' : '') + '>Browser Display Media</option>' +
-                '</select>' +
-            '</div>' +
+
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Deferred tool loading (experimental)</div><div class="settings-page-row-hint">Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.</div></div>' +
                 '<input type="checkbox" ' + (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive() ? 'checked' : '') + ' onchange="toggleDeferredTools(this.checked)">' +
@@ -274,7 +271,7 @@ function renderSettingsPage() {
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.chat + ' System Prompt</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Customize the system prompt sent to the AI. Use placeholders like <code>{{SCOPE_CONTEXT}}</code>, <code>{{DISABLED_TOOLS}}</code>, <code>{{SKILLS_SUMMARY}}</code> which get replaced with actual values.</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Customize the system prompt sent to the AI. Use placeholders like <code>{{DISABLED_TOOLS}}</code>, <code>{{SKILLS_SUMMARY}}</code> which get replaced with actual values.</div>' +
             '<div id="system-prompt-editor-container"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
@@ -295,9 +292,6 @@ function renderSettingsPage() {
             '<div style="margin-top: var(--space-2);"><strong>License:</strong> Private and Commercial use. Internal modification permitted. Distribution and resale prohibited. All rights reserved.</div>' +
         '</div>';
     
-    // Render scope dropdown - fetch scopes async
-    fetchAndPopulateSettingsPageScopeDropdown();
-
     // Render tool permissions in settings
     renderSettingsToolPermissions();
 
@@ -917,6 +911,8 @@ async function _syncAndUpdateWorkspaceHeaderInner() {
 
 async function toggleWorkspaceDropdown() {
     if (_wsDropdown) { hideWorkspaceDropdown(); return; }
+    // Only one header dropdown open at a time
+    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('workspace');
     // Open INSTANTLY from the cached header state (_wsHeaderCaches is kept warm
     // by startup + every sync). The user mostly wants dirty files / PR links,
     // which the cache already has — everything else refreshes lazily below.
@@ -1107,6 +1103,24 @@ function _wsChatHue(id) {
     return h % 360;
 }
 
+// Hue for a chat id ROLLED UP to its root (main/parent) chat: a sub-agent's
+// chip hashes the ROOT chat id, so all workers of one parent task share one
+// color (a PR pushed by worker A with files edited by sibling worker B no
+// longer renders two hues). Resolution reuses the tool-layer _wsRootChatId
+// (tools/020-tool-execution.js — synchronous, in-memory sub-agent registry
+// lookup with root_chat_id fast path + capped parent walk for nesting). NOT
+// memoized on purpose: getByChatId is a small linear scan, and the registry
+// can populate AFTER the first dropdown paint (SW hello snapshot race) — a
+// cache would pin the un-rolled hue forever. Falls back to the chat's own
+// hue when the resolver is unavailable or the chat is not a sub.
+function _wsChatHueRoot(id) {
+    var root = id;
+    try {
+        if (typeof _wsRootChatId === 'function') root = _wsRootChatId(id) || id;
+    } catch (e) { /* resolver unavailable — use the chat's own hue */ }
+    return _wsChatHue(root);
+}
+
 // Lazy PR-url → pushing-chat index, rebuilt by scanning chats' recorded push
 // tool results. Retroactive fallback for dirty files pushed BEFORE the
 // pushed_by_chat_id stamp existed (or whose stamp was lost). Memoized; a
@@ -1148,6 +1162,11 @@ function _wsPrChatLookup(prUrl) {
 // push results as last resort). Click → open that chat. No chip is rendered
 // for the CURRENT chat (its files are already grouped under the "This chat"
 // section); a chip for an unresolvable chat renders muted/inert.
+//
+// COLOR encodes the MAIN (root/parent) chat of the attributed chat's lineage,
+// not the individual worker: files touched by different sub-agents of the
+// same parent task share ONE hue (see _wsChatHueRoot). The tooltip keeps the
+// worker's name for provenance — only the color rolls up.
 //
 // Chat resolution falls back to the sub-agent registry: a worker chat can be
 // missing from the in-memory `chats` map (never-persisted / reaped sub, or a
@@ -1202,10 +1221,22 @@ function _wsChatChip(f) {
     var chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'ws-file-chat' + (!known ? ' gone' : '');
-    chip.style.setProperty('--chat-hue', String(_wsChatHue(cid)));
-    var verb = pushed ? ('Pushed' + (f.pushed_pr && f.pushed_pr.number ? ' (PR #' + f.pushed_pr.number + ')' : '')) : 'Edited';
-    chip.title = !known ? verb + ' by chat \u201c' + title + '\u201d \u2014 chat not loaded (may be deleted or a background worker)' :
-        verb + ' by ' + (isWorker ? 'worker' : 'chat') + ' \u201c' + title + '\u201d \u2014 click to open';
+    chip.style.setProperty('--chat-hue', String(_wsChatHueRoot(cid)));
+    // Truthful verb: when the attributed chat is the EDITOR but a DIFFERENT
+    // chat pushed the PR (pushed_pr.chatId is the actual pusher, stamped in
+    // prInfo at push time), say "Edited … · pushed in PR #N" instead of the
+    // misleading "Pushed by" (the editor never pushed anything).
+    var who = (isWorker ? 'worker' : 'chat') + ' \u201c' + title + '\u201d';
+    var prNumLabel = (f.pushed_pr && f.pushed_pr.number) ? 'PR #' + f.pushed_pr.number : '';
+    var head;
+    if (!pushed) {
+        head = 'Edited by ' + who;
+    } else if (f.pushed_pr && f.pushed_pr.chatId && f.pushed_pr.chatId !== cid) {
+        head = 'Edited by ' + who + (prNumLabel ? ' \u00b7 pushed in ' + prNumLabel : ' \u00b7 pushed by another chat');
+    } else {
+        head = 'Pushed' + (prNumLabel ? ' (' + prNumLabel + ')' : '') + ' by ' + who;
+    }
+    chip.title = head + (!known ? ' \u2014 chat not loaded (may be deleted or a background worker)' : ' \u2014 click to open');
     chip.innerHTML = (typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '\ud83d\udcac';
     chip.addEventListener('click', function(ev) {
         ev.stopPropagation();
@@ -1277,14 +1308,18 @@ function _reconcileThisChatSection() {
         var bdy = document.createElement('div');
         bdy.className = 'ws-dropdown-body';
         sec.appendChild(bdy);
-        _wsDropdown.insertBefore(sec, _wsDropdown.firstChild);
+        // Pin below the "Repositories" title band (the band stays the first
+        // child of the dropdown; "This chat" leads the section list).
+        var band = _wsDropdown.querySelector('.ws-menu-title');
+        _wsDropdown.insertBefore(sec, band ? band.nextSibling : _wsDropdown.firstChild);
     }
     var total = 0;
     groups.forEach(function(g) { total += g.files.length; });
     var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
     var countChip = '<span class="ws-change-count" title="' + total + ' uncommitted change' + (total > 1 ? 's' : '') + ' by this chat">' + total + '</span>';
     var header = sec.querySelector('.ws-dropdown-header');
-    header.innerHTML = '<span class="ws-dd-title">' + chevron + 'This chat' + countChip + '</span><span class="ws-sync">uncommitted</span>';
+    var chatIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '') + '</span>';
+    header.innerHTML = '<span class="ws-dd-title">' + chevron + chatIcon + 'This chat' + countChip + '</span><span class="ws-sync">uncommitted</span>';
     var body = sec.querySelector('.ws-dropdown-body');
     body.innerHTML = '';
     groups.forEach(function(g) {
@@ -1305,7 +1340,8 @@ function _renderDropdownSection(section, cache) {
         var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
         var changeCount = _wsSectionChangeCount(cache);
         var countChip = changeCount > 0 ? '<span class="ws-change-count" title="' + changeCount + ' change' + (changeCount > 1 ? 's' : '') + '">' + changeCount + '</span>' : '';
-        header.innerHTML = '<span class="ws-dd-title">' + chevron + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + '</span>' + _getSyncLabel(cache.syncStatus);
+        var repoIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>';
+        header.innerHTML = '<span class="ws-dd-title">' + chevron + repoIcon + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + '</span>' + _getSyncLabel(cache.syncStatus);
     }
     var body = section.querySelector('.ws-dropdown-body');
     if (!body) return;
@@ -1429,7 +1465,15 @@ async function showWorkspaceDropdown() {
     });
 
     var dd = document.createElement('div');
-    dd.className = 'ws-dropdown';
+    dd.className = 'header-menu ws-dropdown';
+
+    // Canonical section-title band (same .menu-section-title chrome as the
+    // model / gear / jobs / usage / instance menus). Content-appropriate label
+    // — the pill already says "workspace", the menu lists cloned repositories.
+    var titleBand = document.createElement('div');
+    titleBand.className = 'menu-section-title ws-menu-title';
+    titleBand.innerHTML = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>Repositories';
+    dd.appendChild(titleBand);
 
     keys.forEach(function(wk, idx) {
         dd.appendChild(_createDropdownSection(wk, idx));
@@ -1916,7 +1960,6 @@ function renderSystemPromptEditor() {
             '<strong>Available Placeholders:</strong> ' +
             '<code>{{CURRENT_DATE}}</code> - Today\'s date, ' +
             '<code>{{ORCHESTRATOR_POLICY}}</code> - Delegation policy (main chats only; empty for sub-agents), ' +
-            '<code>{{SCOPE_CONTEXT}}</code> - Current app scope info, ' +
             '<code>{{DISABLED_TOOLS}}</code> - List of disabled tools, ' +
             '<code>{{SKILLS_SUMMARY}}</code> - Available skills list, ' +
             '<code>{{TOOL_CATALOG}}</code> - Deferred-tool catalog (empty when deferred tool loading is off)' +
@@ -1999,47 +2042,6 @@ function updateSystemPromptTokenCount() {
     tokenDisplay.textContent = totalTokenCount.toLocaleString() + ' tokens';
     if (detailDisplay) {
         detailDisplay.textContent = '(prompt: ' + tokenCount.toLocaleString() + ' + tools: ' + toolsTokenCount.toLocaleString() + ')';
-    }
-}
-
-async function fetchAndPopulateSettingsPageScopeDropdown() {
-    var container = document.getElementById('settings-page-scope-container');
-    if (!container) return;
-    
-    // Show current scope from local storage immediately (no loading message)
-    // Include enough options to render as dropdown, not radio buttons
-    var currentSelectedScope = localScopeOverride !== null ? localScopeOverride : platformScope;
-    var currentLabel = currentSelectedScope === 'global' ? 'Global' : (window.currentScopeName || currentSelectedScope);
-    var initialOptions = [{ value: 'global', label: 'Global' }];
-    if (currentSelectedScope !== 'global') {
-        initialOptions.push({ value: currentSelectedScope, label: currentLabel });
-    }
-    // Add placeholder options to ensure dropdown rendering (>3 options)
-    initialOptions.push({ value: '_placeholder1', label: 'Loading scopes...' });
-    initialOptions.push({ value: '_placeholder2', label: '' });
-    initialOptions.push({ value: '_placeholder3', label: '' });
-    renderCustomSelect('settings-page-scope-container', initialOptions, currentSelectedScope, changeLocalScope, 'Select scope...');
-    
-    try {
-        var response = await fetch('/api/now/table/sys_scope?sysparm_query=sys_class_name=sys_app^ORsys_class_name=sys_store_app&sysparm_fields=scope,name,sys_id&sysparm_limit=500', {
-            headers: { 'Accept': 'application/json', 'X-UserToken': window.sessionToken }
-        });
-        var data = await response.json();
-        
-        var options = [{ value: 'global', label: 'Global' }];
-        if (data.result && data.result.length > 0) {
-            data.result.forEach(function(scope) {
-                if (scope.scope && scope.scope !== 'global') {
-                    options.push({ value: scope.scope, label: scope.name || scope.scope });
-                }
-            });
-        }
-        
-        var selectedScope = localScopeOverride !== null ? localScopeOverride : platformScope;
-        renderCustomSelect('settings-page-scope-container', options, selectedScope, changeLocalScope, 'Select scope...');
-    } catch (e) {
-        console.error('Failed to fetch scopes:', e);
-        renderCustomSelect('settings-page-scope-container', [{ value: 'global', label: 'Global' }], 'global', changeLocalScope, 'Select scope...');
     }
 }
 

@@ -37,22 +37,31 @@ function _agentRunsStore(mode) {
 
 function writeAgentCheckpoint(chatId, snapshot) {
     if (!chatId) return Promise.resolve();
-    return _agentRunsStore('readwrite').then(function(store) {
-        return new Promise(function(resolve) {
-            var record = Object.assign({}, snapshot, {
-                chatId: chatId,
-                lastEventAt: Date.now()
-            });
-            var req = store.put(record);
+    var record = Object.assign({}, snapshot, {
+        chatId: chatId,
+        lastEventAt: Date.now()
+    });
+    // SW-IDLE-CLOSE hardening: route through withStore() instead of holding
+    // the DB handle directly (as _agentRunsStore does). Checkpoint writes can
+    // race the idle connection release (releaseIdleDbConnection, fired from
+    // ANOTHER chat's parked-checkpoint path or the 30s heartbeat) — a bare
+    // db.transaction() would then throw InvalidStateError and the checkpoint
+    // would be dropped. withStore classifies that via _isDbConnectionError,
+    // reopens a fresh connection and retries the put EXACTLY once (put is
+    // idempotent on keyPath chatId, so a retry is safe). We still honour the
+    // never-reject contract — a checkpoint miss must never break the run — but
+    // a failure that survives the retry is now logged LOUDLY instead of being
+    // dropped silently.
+    return withStore([agentRunsStoreName], 'readwrite', function(tx) {
+        return new Promise(function(resolve, reject) {
+            var req = tx.objectStore(agentRunsStoreName).put(record);
             req.onsuccess = function() { resolve(); };
-            req.onerror = function() {
-                // Checkpoint failure is non-fatal — log and continue.
-                console.error('[checkpoint] write failed for chat ' + chatId, req.error);
-                resolve();
-            };
+            // Reject so withStore can classify a connection-shaped error and
+            // drive its reopen-and-retry-once path.
+            req.onerror = function() { reject(req.error); };
         });
     }).catch(function(e) {
-        console.error('[checkpoint] tx open failed', e);
+        console.warn('[checkpoint] write failed for chat ' + chatId + ' (dropped after connection-error retry)', e);
     });
 }
 
@@ -198,5 +207,14 @@ AgentEvents.on('runFinished', function(e) {
 AgentEvents.on('toolParked', function(e) {
     var snap = _buildCheckpointSnapshotFor(e.chatId) || { chatId: e.chatId };
     snap.status = 'parked';
-    writeAgentCheckpoint(e.chatId, snap);
+    // SW-IDLE-CLOSE (empty-chat-list root fix): a parked run waits — possibly for
+    // the whole park lifetime — with no further DB writes. Release the SW's
+    // cached IDB connection right after the parked checkpoint commits so it is
+    // not held (and later abandoned by an abrupt SW kill / OS sleep, wedging the
+    // backing store). The heartbeat alarm would release it within ~30s anyway;
+    // this just does it promptly at the natural idle boundary. The panel's
+    // reconnect/replay reopens transparently.
+    writeAgentCheckpoint(e.chatId, snap).then(function() {
+        try { if (typeof releaseIdleDbConnection === 'function') releaseIdleDbConnection(); } catch (err) {}
+    });
 });

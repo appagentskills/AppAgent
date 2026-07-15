@@ -47,7 +47,6 @@ async function init() {
     }
 
     // Load localStorage preferences first (synchronous)
-    loadLocalScopeOverride();
     loadVersionSidebarState();
 
     var savedShowApiStats = appStorage.getItem('showApiStats');
@@ -153,25 +152,28 @@ async function init() {
     var headerRenameBtn = document.getElementById('header-rename-btn');
     if (headerRenameBtn) headerRenameBtn.innerHTML = UI_ICONS.edit;
 
-    // Initialize settings panel icons
-    var sectionIconModel = document.getElementById('section-icon-model');
-    var sectionIconScope = document.getElementById('section-icon-scope');
-    var sectionIconPermissions = document.getElementById('section-icon-permissions');
+    // Initialize settings panel icons (gear dropdown now only has the Display
+    // section — Model/Permissions/Data Management moved to the full settings page)
     var sectionIconDisplay = document.getElementById('section-icon-display');
     var sectionIconCache = document.getElementById('section-icon-cache');
-    var sectionIconData = document.getElementById('section-icon-data');
-    var dataIconExport = document.getElementById('data-icon-export');
-    var dataIconImport = document.getElementById('data-icon-import');
-    var dataIconDelete = document.getElementById('data-icon-delete');
-    if (sectionIconModel) sectionIconModel.innerHTML = UI_ICONS.model;
-    if (sectionIconScope) sectionIconScope.innerHTML = UI_ICONS.scope;
-    if (sectionIconPermissions) sectionIconPermissions.innerHTML = UI_ICONS.shield;
     if (sectionIconDisplay) sectionIconDisplay.innerHTML = UI_ICONS.display;
     if (sectionIconCache) sectionIconCache.innerHTML = UI_ICONS.cache;
-    if (sectionIconData) sectionIconData.innerHTML = UI_ICONS.database;
-    if (dataIconExport) dataIconExport.innerHTML = UI_ICONS.download;
-    if (dataIconImport) dataIconImport.innerHTML = UI_ICONS.upload;
-    if (dataIconDelete) dataIconDelete.innerHTML = UI_ICONS.trash;
+
+    // Gear-panel footer links: leading glyph per item + trailing external-link
+    // glyph signalling the click navigates to the full settings page.
+    var gearLinkIcons = {
+        'settings-link-icon-github': 'git',
+        'settings-link-icon-permissions': 'shield',
+        'settings-link-icon-sysprompt': 'code',
+        'settings-link-icon-all': 'settings'
+    };
+    Object.keys(gearLinkIcons).forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.innerHTML = UI_ICONS[gearLinkIcons[id]];
+    });
+    document.querySelectorAll('#settings-panel .settings-link-external').forEach(function(el) {
+        el.innerHTML = UI_ICONS.externalLink;
+    });
 
     // Initialize image attachment event listeners (paste, drag & drop)
     initImageAttachmentListeners();
@@ -295,7 +297,79 @@ async function init() {
             }).catch(function() {});
         }
     } catch (e) {}
-    await loadChatsFromStorage();
+    // BOOT-DEADLINE (SLEEP-WEDGE): after a multi-day suspend Chrome's IDB
+    // backend can wedge silently. The open watchdog + transaction deadline in
+    // core/130-indexeddb.js bound every layer, but hydration must NEVER wedge
+    // init — the composer is already visible (above) while the header pill,
+    // home content, chat list and action buttons all render below this await.
+    // Race hydration against a deadline: on timeout, surface the storage
+    // notice and continue init degraded (the wipe-guard _chatsHydrated stays
+    // false, so saves remain blocked and nothing is lost). If hydration
+    // completes late, merge back any chats created meanwhile (e.g. the temp
+    // New Chat the user may be typing in — the loader reassigns the `chats`
+    // map) and repaint the chat-dependent UI.
+    // Kept short so degraded mode paints the chrome.storage.local mirror fast
+    // (no long dead-air on a wedged store). loadChatsFromStorage reads the chats
+    // store in short-deadline batches, so a healthy load finishes well under this;
+    // a wedged one degrades here at ~10s and recovers in the background when the
+    // batched read's reopen-retry (~12s) finally succeeds (exitStorageDegradedMode
+    // via the _bootHydration.then below — the hydration promise is NOT cancelled).
+    var BOOT_HYDRATION_DEADLINE_MS = 10000;
+    var _bootHydrationSettled = false;
+    var _bootHydrationTimedOut = false;
+    var _bootPreHydrationChats = null;
+    var _bootHydration = loadChatsFromStorage().then(function() {
+        _bootHydrationSettled = true;
+        if (!_bootHydrationTimedOut) return;
+        console.warn('[init] chat hydration completed after the boot deadline — merging late chats and repainting');
+        if (_bootPreHydrationChats) {
+            try {
+                Object.keys(_bootPreHydrationChats).forEach(function(id) {
+                    if (!chats[id]) chats[id] = _bootPreHydrationChats[id];
+                });
+            } catch (e) {}
+        }
+        // GRACEFUL-DEGRADATION: if we degraded during the boot-deadline window
+        // AND hydration has now genuinely succeeded (_chatsHydrated), recover:
+        // exitStorageDegradedMode clears the flag and repaints the real
+        // list/actions/jobs. If hydration still failed, stay degraded — the
+        // retry loop owns the UI — and do NOT repaint (renderChatList would show
+        // the mirror anyway).
+        if (typeof _storageDegraded !== 'undefined' && _storageDegraded) {
+            if (_chatsHydrated && typeof exitStorageDegradedMode === 'function') {
+                try { exitStorageDegradedMode(); } catch (e) {}
+            }
+            return;
+        }
+        try { renderChatList(); } catch (e) {}
+        try { if (typeof renderAllActionPlacements === 'function') renderAllActionPlacements(); } catch (e) {}
+        try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
+    });
+    await Promise.race([
+        _bootHydration,
+        new Promise(function(resolve) {
+            setTimeout(function() {
+                if (!_bootHydrationSettled) {
+                    _bootHydrationTimedOut = true;
+                    // Snapshot the pre-hydration map object: it keeps receiving
+                    // chats created while degraded, until the loader reassigns
+                    // `chats` — exactly the entries to merge back above.
+                    _bootPreHydrationChats = chats;
+                    // GRACEFUL-DEGRADATION: don't render a silently-empty list.
+                    // Enter degraded mode — show the chrome.storage.local mirror
+                    // read-only under a banner and auto-retry opening the DB. If
+                    // hydration later completes, the _bootHydration.then above
+                    // calls exitStorageDegradedMode to swap in the real data.
+                    if (typeof enterStorageDegradedMode === 'function') {
+                        try { enterStorageDegradedMode(new Error('chat hydration exceeded ' + BOOT_HYDRATION_DEADLINE_MS + 'ms at boot — storage may be wedged')); } catch (e) {}
+                    } else if (typeof showStorageUnavailableNotice === 'function') {
+                        try { showStorageUnavailableNotice(new Error('chat hydration exceeded ' + BOOT_HYDRATION_DEADLINE_MS + 'ms at boot')); } catch (e) {}
+                    }
+                }
+                resolve();
+            }, BOOT_HYDRATION_DEADLINE_MS);
+        })
+    ]);
     // After the SW 'hello' has had a chance to repopulate runningChatIds for
     // genuinely-live runs, clear any stale status:'pending' tool-approval rows
     // left by an abandoned/reloaded run (else a permission bell shows forever
@@ -338,9 +412,7 @@ async function init() {
     // Now render UI that depends on IndexedDB data
     renderChatList();
     renderAllActionPlacements(); // render action buttons in home/header/chat/sidebar
-    populateProviderDropdown();
     updateModelDisplay();
-    renderToolPermissions();
 
     // Deep-link to a specific chat via ?chat= parameter (used by side panel expand)
     var deepLinkChatId = urlParams.get('chat');
@@ -364,7 +436,16 @@ async function init() {
         versionHistory = [];
         clearUpdateSet();
         if (!willShowNonChatView) {
-            renderChatList();
+            // GRACEFUL-DEGRADATION: when storage is degraded the chat LIST is
+            // owned by the read-only mirror + banner (renderChatList is
+            // degraded-aware), so this temp New Chat is only the composer
+            // target — it must NOT be painted as a healthy, empty chat list.
+            // Skip the list repaint here; the composer (renderMessages) still
+            // shows so the user isn't stuck. The retry loop swaps in real data
+            // on recovery.
+            if (!(typeof _storageDegraded !== 'undefined' && _storageDegraded)) {
+                renderChatList();
+            }
             renderMessages();
             renderVersionSidebar();
             updateInputPosition();
@@ -578,6 +659,19 @@ async function init() {
         window._claudeUsageVisibilityWired = true;
         document.addEventListener('visibilitychange', function() {
             if (document.visibilityState === 'visible') refreshClaudeOAuthUsage();
+        });
+    }
+
+    // SLEEP-WEDGE: on resume from a long suspend, proactively round-trip
+    // probe the cached IDB connection (probeDbAfterResume, core/130-
+    // indexeddb.js — single-flight + throttled) so a silently-dead
+    // connection is dropped and reopened BEFORE the next real read has to
+    // eat the full transaction deadline.
+    if (typeof document !== 'undefined' && !window._idbResumeProbeWired) {
+        window._idbResumeProbeWired = true;
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState !== 'visible') return;
+            try { if (typeof probeDbAfterResume === 'function') probeDbAfterResume(); } catch (e) {}
         });
     }
 }

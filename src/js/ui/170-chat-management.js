@@ -287,16 +287,19 @@ function buildUsageTooltipHtml(model) {
     var html = '';
     if (model.session) {
         var inStr = model.session.resetsAt ? fmtUsageResetIn(model.session.resetsAt) : '';
+        // Titled like the Weekly limits / Extra usage sections below, so all
+        // three sections of the dropdown read as parallel groups.
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>Session</div>';
         html += row('Current session', inStr ? 'Resets in ' + inStr : '', model.session.percent);
     }
     if (model.weekly.length) {
-        html += '<div class="usage-tt-section">Weekly limits</div>';
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.stats + '</span>Weekly limits</div>';
         model.weekly.forEach(function(w) {
             html += row(w.label, w.resetsAt ? 'Resets ' + fmtUsageResetAt(w.resetsAt) : '', w.percent);
         });
     }
     if (model.extra) {
-        html += '<div class="usage-tt-section">Extra usage</div>';
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.money + '</span>Extra usage</div>';
         html += row(model.extra.usedStr + ' / ' + model.extra.limitStr, '', model.extra.pct);
     }
     return html;
@@ -333,9 +336,13 @@ function showUsageTooltip(el) {
     if (!rl) return;
     var model = claudeUsageModelFromRl(rl);
     if (!model.session && !model.weekly.length && !model.extra) return;
+    // Only one header dropdown open at a time (shared registry in ui/240-layout.js)
+    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('usage');
     if (!_usageTooltipEl) {
         _usageTooltipEl = document.createElement('div');
-        _usageTooltipEl.className = 'usage-tooltip';
+        // Chrome (bg/border/radius/shadow) comes from the shared .header-menu
+        // class (04-header.css) so all header pill dropdowns match.
+        _usageTooltipEl.className = 'usage-tooltip header-menu';
         document.body.appendChild(_usageTooltipEl);
         // Dropdown behavior: close on any click outside the pill/dropdown
         document.addEventListener('click', function(e) {
@@ -353,17 +360,15 @@ function showUsageTooltip(el) {
     }
     _usageTooltipOwner = el;
     _usageTooltipEl.innerHTML = buildUsageTooltipHtml(model);
-    // Measure hidden, then position under the pill (right-aligned, clamped)
-    _usageTooltipEl.style.visibility = 'hidden';
-    _usageTooltipEl.style.display = 'block';
+    // Position exactly like the other header menus (model menu 160-notifications.js,
+    // settings panel 130-data-management.js, ws dropdown 040-tools-settings.js,
+    // instance picker platform-bridge.js): fixed, 4px below the pill, right edge
+    // aligned to the pill's right edge (clamped 8px from the viewport edge).
     var r = el.getBoundingClientRect();
-    var tw = _usageTooltipEl.offsetWidth, th = _usageTooltipEl.offsetHeight;
-    var left = Math.max(8, Math.min(r.right - tw, window.innerWidth - tw - 8));
-    var top = r.bottom + 8;
-    if (top + th > window.innerHeight - 8) top = Math.max(8, r.top - th - 8);
-    _usageTooltipEl.style.left = left + 'px';
-    _usageTooltipEl.style.top = top + 'px';
-    _usageTooltipEl.style.visibility = '';
+    _usageTooltipEl.style.display = 'block';
+    _usageTooltipEl.style.left = 'auto';
+    _usageTooltipEl.style.top = (r.bottom + 4) + 'px';
+    _usageTooltipEl.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
 }
 
 function hideUsageTooltipNow() {
@@ -898,45 +903,21 @@ function updateChatTitleHeader(includeToolCallId) {
 
     // Sub-agent badge — makes it instantly visible in the chat header that
     // the user is looking at a delegated worker chat, not a top-level
-    // conversation. The pill is SPLIT into two segments: a non-interactive
-    // identity badge ("Sub-agent") and a clickable navigation segment that
-    // shows the DESTINATION's real title ("↰ <parent title>") — showing where
-    // the click lands is clearer than a generic "parent chat" label sitting
-    // next to the sub-agent chat's own title. (The breadcrumb in the
-    // sidebar / history card still has the full parent chain.)
+    // conversation. Identity only: the "↰ <parent title>" navigation
+    // affordance moved onto the sub-agent self card at the top of the chat
+    // (updateSubAgentSelfCard, 175-sub-agent-ui.js) — the header pill no
+    // longer carries a nav segment. (The breadcrumb in the sidebar /
+    // history card still has the full parent chain.)
     var subAgentBadgeHtml = '';
     if (chat && chat.isSubAgent) {
-        var parentChatId = chat.parentChatId || '';
-        var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : '';
         var iconHtml = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
         // Identity segment — plain badge, not a button.
         var badgeSeg = '<span class="chat-title-subagent-badge" title="Delegated worker chat">'
             + '<span class="chat-title-subagent-icon">' + iconHtml + '</span>'
             + '<span class="chat-title-subagent-label">Sub-agent</span>'
             + '</span>';
-        // Navigation segment — "↰ <parent title>", truncated; full title in
-        // the tooltip. Data-attribute + delegated click handler (in
-        // 175-sub-agent-ui.js) instead of an inline onclick. escapeHtml does
-        // NOT escape single quotes, so a parentChatId containing one would
-        // break the inline JS string and could leak attribute context. The
-        // inline onkeydown only calls this.click() — no user data in inline
-        // JS — so Enter/Space on the focused span dispatches a real click
-        // event that the delegated handler picks up via the data-attribute.
-        var navSeg = '';
-        if (parentChatId) {
-            var navLabel = (parentTitle && parentTitle !== 'New Chat') ? parentTitle : 'Back';
-            var navShort = navLabel.length > 26 ? navLabel.slice(0, 25) + '\u2026' : navLabel;
-            var navTip = parentTitle ? 'Back to: ' + parentTitle : 'Back to the chat that spawned this sub-agent';
-            navSeg = '<span class="chat-title-parent-nav" role="button" tabindex="0"'
-                + ' data-open-parent-chat-id="' + escapeHtml(parentChatId) + '"'
-                + ' title="' + escapeHtml(navTip) + '"'
-                + ' onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027){this.click();event.preventDefault();}">'
-                + '<span class="chat-title-parent-nav-arrow">\u21B0</span>'
-                + '<span class="chat-title-parent-nav-label">' + escapeHtml(navShort) + '</span>'
-                + '</span>';
-        }
         subAgentBadgeHtml = ' <span class="chat-title-subagent-pill">'
-            + badgeSeg + navSeg
+            + badgeSeg
             + '</span>';
     }
 
@@ -952,6 +933,15 @@ function updateChatTitleHeader(includeToolCallId) {
     var pillState = null;
     if (typeof chatWaitingStateFor === 'function') {
         try { pillState = chatWaitingStateFor(currentChatId); } catch (e) {}
+    }
+    // User-paused chat (Pause button) outranks the derived progress state —
+    // otherwise pausing the currently-viewed chat leaves the pill showing the
+    // stale pre-pause state until the next run. _isChatUserPaused lives in
+    // tools/120-actions.js (same concatenated global bundle, so the function
+    // declaration is callable here) — typeof-guarded like chatWaitingStateFor
+    // above; progressStateMeta has a matching 'paused' arm.
+    if (!pillState && typeof _isChatUserPaused === 'function') {
+        try { if (_isChatUserPaused(currentChatId)) pillState = 'paused'; } catch (e) {}
     }
     if (!pillState && typeof getCurrentChatProgressState === 'function') {
         try {
@@ -986,6 +976,14 @@ function updateChatTitleHeader(includeToolCallId) {
         titleEl.innerHTML = (title ? escapeHtml(title) : '') + subAgentBadgeHtml + pillHtml;
     } else {
         titleEl.textContent = '';
+    }
+
+    // Keep the sub-agent self card (parent-link + live worker card above the
+    // messages scroller) in sync — this runs on every chat switch and header
+    // refresh, which is exactly when the card must appear/disappear.
+    // Later-tier global (175-sub-agent-ui.js), so typeof-guard it.
+    if (typeof updateSubAgentSelfCard === 'function') {
+        try { updateSubAgentSelfCard(); } catch (e) {}
     }
 }
 

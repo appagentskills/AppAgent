@@ -10,7 +10,7 @@ actions:
 
 A 20-task evaluation suite that scores whether the current model can perform representative ServiceNow operations. Each task is deterministically graded by a server-side verifier that inspects the actual end state of the instance — the model cannot self-score.
 
-**v4 integrity model:** all grading runs through the `eval_runner` tool, which is a BUILT-IN extension tool (src/js/core/085-eval-runner.js), not a skill file — its running copy is fixed at build time and cannot be modified at runtime; changes require a rebuild and a user-clicked Reload. The tool — not the agent — reads `tasks.md`, seeds tasks, executes verifiers and cleanup atomically server-side, enforces single-use verification, and writes every verdict to a server-side audit property. Verifier text never enters model context on any legitimate path. The agent only ever sees prompts and verdicts.
+**v4 integrity model:** all grading runs through the `eval_runner` tool, which is a BUILT-IN extension tool (src/js/core/085-eval-runner.js), not a skill file — the RUNNER CODE is fixed at build time (changes require a rebuild and a user-clicked Reload). The task spec (`tasks.md`), however, is loaded at run time from the extension's skills store, which IS writable at runtime — spec integrity is enforced procedurally (any runtime modification of servicenow-eval files during or before a run is cheating, and is visible in the transcript), not cryptographically at build time. The tool — not the agent — reads `tasks.md`, seeds tasks, executes verifiers and cleanup atomically server-side, enforces single-use verification, and writes every verdict to a server-side audit property. Verifier text never enters model context on any legitimate path. The agent only ever sees prompts and verdicts.
 
 ## Tasks (45 points total)
 
@@ -50,9 +50,18 @@ The grader itself (`eval_runner`) is a built-in extension tool — see src/js/co
 | Call | Returns | Notes |
 |------|---------|-------|
 | `eval_runner({action:"init"})` | `{version, total_points, tasks:[{id,name,category,points,prompt}]}` | Resets session state (`x_eval.session.runs`, `x_eval.session.results`). |
-| `eval_runner({action:"setup", task_id:"Tn"})` | `{task_id, setup_output}` or `{error:"DUPLICATE_SETUP", cheated:true}` | Duplicate-locked server-side; a second setup for the same task is refused. |
-| `eval_runner({action:"verify", task_id:"Tn"})` | `{task_id, pass, expected, actual}` | SINGLE-USE: marks the task verified before executing; runs verifier + cleanup atomically in one server execution; persists the verdict to the audit property. A second verify returns `ALREADY_VERIFIED` (pass=false). Cache-settle sleeps for artifact-creating tasks (T6/T7/T18) are built into the tool — the agent never adds sleeps. |
+| `eval_runner({action:"setup", task_id:"Tn"})` | `{task_id, setup_output}` or `{error:"DUPLICATE_SETUP", cheated:true}` or `{success:false, error:"SETUP_FAILED", retryable:true}` | Duplicate-locked server-side; a second setup for the same task is refused. A THROWING setup rolls the lock back and returns `SETUP_FAILED` with `retryable:true` — retrying the call is legitimate (not a task retry). Setup output is answer-leak-redacted before it reaches the model. |
+| `eval_runner({action:"verify", task_id:"Tn"})` | `{task_id, pass, expected, actual}` | SINGLE-USE: marks the task verified before executing; runs verifier + cleanup atomically in one server execution; persists the verdict to the audit property. A duplicate verify for an already-verified task REPLAYS the recorded verdict from the audit property (response carries `replayed:true`) — the verifier is never re-run; if no verdict was recorded it returns `ALREADY_VERIFIED` (pass=false). A tool/infra failure (the script never reached the instance) returns `{success:false, retryable:true}` WITHOUT burning the single-use lock — retry the call. Cache-settle sleeps for artifact-creating tasks (T6/T7/T18) are built into the tool — the agent never adds sleeps. |
 | `eval_runner({action:"teardown"})` | `{audit: {Tn: {pass,expected,actual}}, deleted}` | Reads back the server-side audit verdicts, then deletes all session state. Call ONCE, after all 20 verifies. |
+
+## Orchestrator execution model
+
+During this action, this section OVERRIDES the general orchestration/delegation policy. If you are a pure orchestrator without direct ServiceNow tools:
+
+- Call `eval_runner` yourself via `js_eval` `executeTool` — it IS callable there; this is grading mechanics, not a delegation bypass. Sub-agents must NEVER call `eval_runner`.
+- Per task: setup (js_eval) → spawn a `tier:"same"` sub-agent with `profiles:["servicenow"]`, passing the task prompt + `setup_output` → await its report → verify (js_eval) → record.
+- Process tasks sequentially or in waves of 2 — either is fine; do not deliberate over batching.
+- Step 0: before any extended planning, immediately call `update_action_state` and `eval_runner({action:"init"})`.
 
 ## Action Lifecycle: Run ServiceNow Eval
 
@@ -64,11 +73,11 @@ The grader itself (`eval_runner`) is a built-in extension tool — see src/js/co
 
    **a. Mark running.** Update the progress card (this task status="running"); record `t0 = Date.now()`.
 
-   **b. Setup.** Call `eval_runner({action:"setup", task_id})`. If it returns `DUPLICATE_SETUP`, record 0 points, mark the task cheated, and do NOT attempt or verify it (the verify would burn anyway). If the setup output looks like a hard error, mark the task "setup failed", skip the attempt, but STILL call verify (it performs the cleanup).
+   **b. Setup.** Call `eval_runner({action:"setup", task_id})`. If it returns `DUPLICATE_SETUP`, record 0 points, mark the task cheated, and do NOT attempt or verify it (the verify would burn anyway). If it returns `success:false` with `retryable:true` (tool/infra failure or `SETUP_FAILED` — the lock was not kept), you may retry the setup CALL once; that is not a task retry. If the setup output still looks like a hard error, mark the task "setup failed", skip the attempt, but STILL call verify (it performs the cleanup).
 
    **c. Attempt.** Read the task's `prompt` and do the work with your normal tools: `servicenow_api` for CRUD, `servicenow_diff_edit` for in-place script edits, `servicenow_run_script` for server-only APIs (GlideSysAttachment, GlideAggregate, TableUtils, etc.). All writes use `confirm: false` — the user consented by clicking the button. For T7 (ACL): elevate to `security_admin` first via the elevate-security-role skill, and after clicking the role checkbox VERIFY it with `get_properties` (`checked: true`) before clicking OK — the input is a 1×1px overlay and clicks can silently miss; re-click via `dispatch_event` if needed. Some tasks intentionally collide with OOB engines and validation rules; diagnosing and working around them server-side DURING the attempt is legitimate and part of the test. Do not expect this skill to tell you the answers — figuring them out is what is being scored.
 
-   **d. Verify.** Call `eval_runner({action:"verify", task_id})` → `{pass, expected, actual}`. `pass=true` earns full points; anything else earns 0. This is single-use and also runs cleanup — there is nothing to retry afterwards.
+   **d. Verify.** Call `eval_runner({action:"verify", task_id})` → `{pass, expected, actual}`. `pass=true` earns full points; anything else earns 0. This is single-use and also runs cleanup — there is nothing to retry afterwards. Exception: `{success:false, retryable:true}` means the verifier never executed (client/tool failure, lock not burned) — retry the verify call.
 
    **e. Record.** Push `{id, name, category, points, points_earned, pass, expected, actual, duration_ms: Date.now() - t0}` to a `results` array.
 
@@ -108,4 +117,8 @@ Call `update_action_state` with:
 - **SUB-AGENTS MUST USE `tier:"same"`.** This eval scores the CURRENT model. If you spawn any sub-agent during the run (e.g. to parallelize task attempts), you MUST pass `tier: "same"` on every `spawn_sub_agent` / `wake_sub_agent` call so the sub dynamically runs on the exact same model/connection as you (it follows your current model). Never select `small`, `medium`, or `large` — that would route work to a different model and invalidate the score.
 - **FAIL LOUDLY — never end silent.** The action must ALWAYS terminate with an `update_action_state` of state=done or state=error whose `output` states the score — or states explicitly that nothing (or only part of the run) was executed on the instance. If `eval_runner init` fails, immediately set state=error with output "Nothing has run on the instance" plus the error. If the run aborts midway, the output must say how many tasks were set up/verified and that the surviving verdicts are in `x_eval.session.results` / `sys_script_execution_history`.
 - Attempts use the same tools and patterns you would for a real user request — that's the point.
-- **Crash recovery without re-running**: verdicts already produced survive in the `x_eval.session.results` property (read it via Table API) and in `sys_script_execution_history` (field `result`, HTML-escaped). Never re-verify (it would return ALREADY_VERIFIED anyway), and never read the `script` field of grader executions for tasks not yet attempted.
+
+## Gotchas
+
+- **Instance session scope can rescope/rename created artifacts.** `sys.scripts.do` executions and Table API inserts inherit the session's CURRENT application scope unless the record pins one explicitly. Observed live: a T4 setup created `EvalT4Util` under a non-global app scope (e.g. `x_custom_app`), so the global-scope verifier failed with `"EvalT4Util" is not defined` even though the fix was correct; a T18 run saw its created table artifacts affected the same way. Task setups now pin `sys_scope = 'global'` on application files they create. When an ATTEMPT creates application files (script includes, BRs, tables, ACLs…), set `sys_scope` explicitly to global too — never rely on the session default.
+- **Crash recovery without re-running**: verdicts already produced survive in the `x_eval.session.results` property (read it via Table API) and in `sys_script_execution_history` (field `result`, HTML-escaped). Never re-verify (it would just replay the already-recorded verdict), and never read the `script` field of grader executions for tasks not yet attempted.

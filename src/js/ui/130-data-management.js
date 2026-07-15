@@ -280,6 +280,9 @@ function toggleSettingsPanel(e) {
     settingsPanelOpen = !settingsPanelOpen;
     var panel = document.getElementById('settings-panel');
     if (settingsPanelOpen) {
+        // Only one header dropdown open at a time
+        if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('settings');
+        settingsPanelOpen = true; // closeAllHeaderMenus('settings') skips this panel, but keep state explicit
         // Position panel under the clicked button
         var btn = e ? e.target.closest('.settings-btn') : document.querySelector('.settings-btn');
         if (btn) {
@@ -288,9 +291,17 @@ function toggleSettingsPanel(e) {
             panel.style.right = (window.innerWidth - rect.right) + 'px';
         }
         panel.classList.add('visible');
-        populateProviderDropdown();
-        renderToolPermissions();
-        fetchAndPopulateScopeDropdown();
+        // Sync the theme segmented control with the persisted pref (same
+        // mechanism as the settings page: appTheme + setAppTheme).
+        if (typeof syncSettingsPanelTheme === 'function') syncSettingsPanelTheme();
+        // "Connect GitHub" item: only shown when GitHub is NOT connected — same
+        // connected test as the settings page GitHub section (user + token).
+        var ghItem = document.getElementById('settings-github-connect');
+        if (ghItem && typeof loadGitHubSettings === 'function') {
+            loadGitHubSettings().then(function(gh) {
+                ghItem.style.display = (gh && gh.user && gh.token) ? 'none' : 'block';
+            }).catch(function() {});
+        }
         // Close on outside click
         setTimeout(function() {
             document.addEventListener('click', closeSettingsPanelOnOutsideClick);

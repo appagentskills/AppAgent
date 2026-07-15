@@ -383,9 +383,12 @@ async function wsfOpenViewer(i) {
 // --- Diff --------------------------------------------------------------------
 
 // Compact generic line-diff renderer reusing 16-diff.css classes.
-// computeDiff() (090-version-history.js) is a generic line LCS.
+// computeDiff() (090-version-history.js) is a generic line LCS;
+// computeWordDiffsForLines() (same file) adds word-level (intra-line)
+// highlights on paired remove/add lines, like the record diff viewer.
 function _wsfRenderDiffHtml(oldText, newText) {
     var diff = computeDiff(oldText || '', newText || '');
+    var wordDiffs = computeWordDiffsForLines(diff);
     var adds = 0, dels = 0;
     diff.forEach(function(d) {
         if (d.type === 'add') adds++;
@@ -419,7 +422,7 @@ function _wsfRenderDiffHtml(oldText, newText) {
             + '<span class="diff-line-num old">' + (d.oldLine || '') + '</span>'
             + '<span class="diff-line-num new">' + (d.newLine || '') + '</span>'
             + '<span class="diff-prefix">' + prefix + '</span>'
-            + '<span class="diff-text">' + escapeHtml(d.text) + '</span>'
+            + '<span class="diff-text">' + (wordDiffs[idx] || escapeHtml(d.text)) + '</span>'
             + '</div>';
     });
     flushHidden();

@@ -1068,6 +1068,16 @@ async function runAgent(overrideChatId) {
         if (!assistantMsg.thinking) delete assistantMsg.thinking;
         if (!assistantMsg.content) assistantMsg.content = '';
 
+        // agent_status live-output pointer: stamp the sub record with this
+        // turn's finalized assistant text (cheap pointer on the record, no
+        // transcript reads) so the parent's agent_status can show what the
+        // sub last SAID while it is still running / before it reports.
+        // Empty content (tool-call-only turn) is skipped inside the hook.
+        if (chat.isSubAgent && assistantMsg.content && typeof SubAgents !== 'undefined' && SubAgents.recordAssistantMessage) {
+            try { SubAgents.recordAssistantMessage(streamingChatId, assistantMsg.content); }
+            catch (e) { console.warn('recordAssistantMessage hook threw', e); }
+        }
+
         // Track model and accumulate cost on chat
         chat.model = currentProvider;
         chat.totalCost = (chat.totalCost || 0) + (reqMetrics.cost || 0);

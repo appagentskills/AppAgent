@@ -129,7 +129,6 @@ Configure AppAgent preferences. [Open Settings →](app:openSettingsPageView)
 - **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. `xhigh` is accepted on Opus 4.7/4.8 and Fable/Mythos 5 on Anthropic directly (other models top out at `high`/`max`); OpenRouter maps unsupported values to the nearest supported level
 - **Max Tokens & Thinking Budget** — Global caps on response length (64k default) and extended-thinking budget (32k default)
 - **Context Window** — Set the assumed context-window size that drives the context indicator and saturation warnings
-- **App Scope** — Set the scope for new records
 - **Display** — Toggle API stats, compact mode, and keep-display-awake
 - **Hooks** — Enable auto-title generation, "Agent finished" notifications, and other automation
 - **Large Content Caching** — Set when large results get cached (1K to 100K tokens)
@@ -571,7 +570,6 @@ The system prompt defines the Agent's behavior and capabilities. You can customi
 |-------------|-------------|
 | `{{CURRENT_DATE}}` | Today's date (weekday, month, day, year) |
 | `{{ORCHESTRATOR_POLICY}}` | Sub-agent delegation & orchestration policy — rendered for main (parent) chats, empty (`''`) for sub-agent chats, which get their worker role via the sub-agent preamble instead |
-| `{{SCOPE_CONTEXT}}` | Current app scope information |
 | `{{DISABLED_TOOLS}}` | List of disabled tools |
 | `{{TOOL_CATALOG}}` | Deferred-tool catalog (empty when deferred tool loading is off) |
 | `{{SKILLS_SUMMARY}}` | Active skills content |

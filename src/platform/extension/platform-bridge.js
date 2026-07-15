@@ -668,6 +668,8 @@
 
     function showInstancePicker() {
         if (_instanceDropdown) { hideInstancePicker(); return; }
+        // Only one header dropdown open at a time (shared registry in ui/240-layout.js)
+        if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('instances');
         // Open INSTANTLY from the last-known instance list so the dropdown never
         // waits on the network-heavy detailed probe. Prefer our persisted picker
         // cache, then the live Platform.instances registry; only show a brief
@@ -731,6 +733,9 @@
         _instancePickerLastSig = '';
         _teardownDropdownDom();
     }
+    // Expose for the shared header-menu mutual-exclusion registry
+    // (closeAllHeaderMenus in ui/240-layout.js) — this file is an IIFE.
+    window.hideInstancePicker = hideInstancePicker;
 
     // Tear down ONLY the dropdown DOM + its element-scoped listeners. Used both
     // by hideInstancePicker (full close) and by renderInstanceDropdown (swap the
@@ -796,10 +801,16 @@
         }
 
         var dd = document.createElement('div');
-        dd.className = 'ext-instance-dropdown';
+        // Chrome (bg/border/radius/shadow) comes from the shared .header-menu
+        // class (04-header.css) so all header pill dropdowns match.
+        dd.className = 'ext-instance-dropdown header-menu';
+        // Shared banded section title (round-5 unification): same band + icon
+        // pattern as every other header pill dropdown.
+        var _instTitleIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.globe) ? UI_ICONS.globe : '';
+        dd.innerHTML = '<div class="menu-section-title"><span class="section-icon">' + _instTitleIcon + '</span>Instances</div>';
 
         if (instances.length === 0) {
-            dd.innerHTML = isLoading
+            dd.innerHTML += isLoading
                 ? '<div class="ext-instance-empty">Checking ServiceNow connections…</div>'
                 : '<div class="ext-instance-empty">No ServiceNow tabs open.<br>Open a ServiceNow page to connect.</div>';
         } else {

@@ -1,6 +1,28 @@
 // TAKE SCREENSHOT TOOL - Capture real PNG screenshots for AI vision
 // =============================================
 
+// Width-priority fit for model-bound screenshots.
+// The old rule scaled by Math.min(maxWidth/w, maxWidth/h) — i.e. it capped the
+// HEIGHT at max_width too. A tall capture (widget/page with a large
+// scrollHeight, e.g. 1440x5000) was squeezed to fit its HEIGHT under 1600px,
+// crushing the width to a few hundred pixels and making text unreadable.
+// New rule:
+//   - never upscale (scale <= 1)
+//   - cap width at maxWidth (default 1568 — Anthropic's vision long-edge limit)
+//   - when a downscale IS needed, resample ONCE at high quality via
+//     downscaleImageHighQuality (createImageBitmap resizeQuality:'high',
+//     Lanczos-class) — canvas drawImage bilinear was smearing small text
+//   - allow height up to 2*maxWidth so tall pages keep full-width text
+//   - readability floor: never scale the width below
+//     SCREENSHOT_MIN_READABLE_WIDTH (1024, or the native width if smaller)
+//     even when the height allowance is exceeded — a somewhat-too-tall image
+//     beats an unreadable sliver.
+//   - hard 7900px long-edge clamp (Anthropic rejects >8000px) that WINS over
+//     the readability floor when they conflict.
+// fitScreenshotScale() and SCREENSHOT_MIN_READABLE_WIDTH are DEFINED in
+// tools/020-tool-execution.js (shared with resizeImageIfNeeded and bundled
+// into both the page and the SW/offscreen worker).
+
 // Overlay a coordinate grid on a screenshot for identifying click/fill coordinates.
 // Labels show viewport CSS pixel values matching elementFromPoint coordinates.
 async function overlayGrid(base64Data, viewportWidth, viewportHeight) {
@@ -59,11 +81,65 @@ async function overlayGrid(base64Data, viewportWidth, viewportHeight) {
     return result;
 }
 
+// HIGH-QUALITY one-hop downscale for model-bound screenshots.
+// ROOT-CAUSE FIX for blurry screenshots: the resize paths below used to shrink
+// the DPR-scaled capture with canvas drawImage. Canvas drawImage is a
+// bilinear/box scaler even with imageSmoothingQuality:'high', so a fractional
+// downscale (e.g. a 2880px DPR-2 capture -> 1568px cap = 0.544x) lands glyph
+// edges between pixels and smears small text. createImageBitmap with
+// resizeQuality:'high' is Chrome's Lanczos-class scaler and is measurably
+// crisper on small text (same evidence as the READBACK PASSTHROUGH note in
+// tools/020-tool-execution.js). This resamples ONCE, straight from the decoded
+// source to the capped size, with that high-quality filter.
+// `source` may be a base64 data URL string, Blob, canvas, image, or ImageBitmap.
+// `scale` is the (<1) factor the caller already derived via fitScreenshotScale.
+// Uses _b64DataUrlToBlob / _blobToBase64DataUrl (globals from 020-tool-execution).
+// Returns { base64, width, height }. Caller should skip the call when scale>=1.
+async function downscaleImageHighQuality(source, scale) {
+    var resizeSrc = (typeof source === 'string') ? _b64DataUrlToBlob(source) : source;
+    // Probe decode for native dimensions (caller only knows the scale factor).
+    var probe = await createImageBitmap(resizeSrc);
+    var newW = Math.max(1, Math.round(probe.width * scale));
+    var newH = Math.max(1, Math.round(probe.height * scale));
+    var bitmap = null;
+    try {
+        // Lanczos-class resample: ONE hop, decoded source -> final size.
+        bitmap = await createImageBitmap(resizeSrc, { resizeWidth: newW, resizeHeight: newH, resizeQuality: 'high' });
+        probe.close();
+    } catch (e) { /* fall back to canvas drawImage of the probe bitmap below */ }
+    var canvas = (typeof OffscreenCanvas !== 'undefined') ? new OffscreenCanvas(newW, newH) : document.createElement('canvas');
+    canvas.width = newW; canvas.height = newH;
+    var ctx = canvas.getContext('2d');
+    if (bitmap) {
+        ctx.drawImage(bitmap, 0, 0); // 1:1 blit — no second resample
+        bitmap.close();
+    } else {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(probe, 0, 0, newW, newH);
+        probe.close();
+    }
+    var out;
+    if (canvas.convertToBlob) {
+        out = await _blobToBase64DataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+    } else {
+        out = canvas.toDataURL('image/png');
+        canvas.width = 0; canvas.height = 0;
+    }
+    return { base64: out, width: newW, height: newH };
+}
+
 async function executeTakeScreenshot(args) {
     var target = args.target;
     var widgetId = args.widget_id;
     var selector = args.selector;
-    var maxWidth = args.max_width || 1600;
+    // 1568 = Anthropic vision long-edge limit. Captures arrive at full native
+    // DPR (captureVisibleTab / html-to-image render at devicePixelRatio); when
+    // a capture exceeds this cap it is downscaled ONCE at high quality via
+    // downscaleImageHighQuality (createImageBitmap resizeQuality:'high') so
+    // small text stays sharp — the previous canvas-drawImage resize smeared it.
+    // Callers may pass an explicit max_width to cap tighter for token savings.
+    var maxWidth = args.max_width || 1568;
 
     if (!target) {
         return { success: false, error: 'target is required. Use "browser", "widget", or "element"' };
@@ -91,20 +167,14 @@ async function executeTakeScreenshot(args) {
             await new Promise(function(resolve, reject) { ssImg.onload = resolve; ssImg.onerror = reject; ssImg.src = ssBase64; });
             var ssWidth = ssImg.naturalWidth;
             var ssHeight = ssImg.naturalHeight;
-            if (ssWidth > maxWidth || ssHeight > maxWidth) {
-                var ssScale = Math.min(maxWidth / ssWidth, maxWidth / ssHeight);
-                var newW = Math.round(ssWidth * ssScale);
-                var newH = Math.round(ssHeight * ssScale);
-                var ssCanvas = document.createElement('canvas');
-                ssCanvas.width = newW;
-                ssCanvas.height = newH;
-                var ssCtx = ssCanvas.getContext('2d');
-                ssCtx.drawImage(ssImg, 0, 0, newW, newH);
-                ssBase64 = ssCanvas.toDataURL('image/png');
-                ssWidth = newW;
-                ssHeight = newH;
-                ssCanvas.width = 0;
-                ssCanvas.height = 0;
+            var ssScale = fitScreenshotScale(ssWidth, ssHeight, maxWidth);
+            if (ssScale < 1) {
+                // High-quality one-hop downscale (Lanczos-class). Canvas
+                // drawImage bilinear smeared small text even at 'high' quality.
+                var _ssDs = await downscaleImageHighQuality(ssBase64, ssScale);
+                ssBase64 = _ssDs.base64;
+                ssWidth = _ssDs.width;
+                ssHeight = _ssDs.height;
             }
             ssImg.src = '';
 
@@ -515,25 +585,22 @@ async function executeTakeScreenshot(args) {
         if (screenshotMethod === 'display-media') {
             // Browser Display Media capture (requires user permission dialog)
             var canvas = await captureElementToCanvas(elementToCapture);
-            var finalCanvas = canvas;
-            if (canvas.width > maxWidth || canvas.height > maxWidth) {
-                var scale = Math.min(maxWidth / canvas.width, maxWidth / canvas.height);
-                var resizedCanvas = document.createElement('canvas');
-                resizedCanvas.width = Math.round(canvas.width * scale);
-                resizedCanvas.height = Math.round(canvas.height * scale);
-                var ctx = resizedCanvas.getContext('2d');
-                ctx.drawImage(canvas, 0, 0, resizedCanvas.width, resizedCanvas.height);
-                finalCanvas = resizedCanvas;
-                // Release original canvas memory
-                canvas.width = 0;
-                canvas.height = 0;
+            var scale = fitScreenshotScale(canvas.width, canvas.height, maxWidth);
+            if (scale < 1) {
+                // High-quality one-hop downscale straight from the full-res
+                // capture canvas (Lanczos-class), not smeary canvas drawImage.
+                var _dmDs = await downscaleImageHighQuality(canvas, scale);
+                base64Data = _dmDs.base64;
+                finalWidth = _dmDs.width;
+                finalHeight = _dmDs.height;
+            } else {
+                base64Data = canvas.toDataURL('image/png');
+                finalWidth = canvas.width;
+                finalHeight = canvas.height;
             }
-            base64Data = finalCanvas.toDataURL('image/png');
-            finalWidth = finalCanvas.width;
-            finalHeight = finalCanvas.height;
-            // Release final canvas memory
-            finalCanvas.width = 0;
-            finalCanvas.height = 0;
+            // Release capture canvas memory
+            canvas.width = 0;
+            canvas.height = 0;
         } else {
             // html-to-image capture (default, no permission dialog)
             var containerEl = elementToCapture;
@@ -546,6 +613,21 @@ async function executeTakeScreenshot(args) {
             var w = iframeEl ? iframeEl.clientWidth : containerEl.scrollWidth;
             var h = iframeEl ? iframeEl.clientHeight : containerEl.scrollHeight;
             var ratio = window.devicePixelRatio || 1;
+            // Readability bump: small widgets on 1x displays rasterize at native
+            // CSS size (e.g. a 480px-wide widget -> 480px image), which is
+            // low-res for vision models. Since html-to-image RE-RENDERS the DOM
+            // (vector-sharp, not a blurry upscale), raise the pixel ratio so the
+            // output is at least SCREENSHOT_MIN_READABLE_WIDTH wide, capped at
+            // 3x to bound the base64 payload.
+            if (w > 0 && w * ratio < SCREENSHOT_MIN_READABLE_WIDTH) {
+                // INTEGER SNAP: a fractional pixelRatio (e.g. 1024/480 = 2.133x)
+                // rasterizes glyphs at fractional pixel positions — visibly soft
+                // text even though html-to-image re-renders the DOM. Round the
+                // bump UP to a whole multiple (still capped at 3) so small text
+                // scales cleanly (11px -> 22px/33px, not 23.47px).
+                // Math.max: never LOWER an already-high devicePixelRatio (>3 zoom)
+                ratio = Math.max(ratio, Math.min(3, Math.ceil(SCREENSHOT_MIN_READABLE_WIDTH / w)));
+            }
             var htiOpts = {
                 width: w, height: h, pixelRatio: ratio,
                 filter: screenshotFilter
@@ -584,30 +666,19 @@ async function executeTakeScreenshot(args) {
                     else item.el.style.removeProperty('flex-direction');
                 });
             }
-            // Resize if either dimension exceeds maxWidth
-            // (Anthropic limits to 2000px per dimension for many-image requests)
+            // Width-priority resize (see fitScreenshotScale): cap width at
+            // maxWidth, allow tall content up to 2*maxWidth height, never crush
+            // the width below the 1024px readability floor.
             finalWidth = Math.round(w * ratio);
             finalHeight = Math.round(h * ratio);
-            if (finalWidth > maxWidth || finalHeight > maxWidth) {
-                var resizeScale = Math.min(maxWidth / finalWidth, maxWidth / finalHeight);
-                var resizedCanvas = document.createElement('canvas');
-                resizedCanvas.width = Math.round(finalWidth * resizeScale);
-                resizedCanvas.height = Math.round(finalHeight * resizeScale);
-                var rctx = resizedCanvas.getContext('2d');
-                var img = new Image();
-                await new Promise(function(resolve, reject) {
-                    img.onload = resolve;
-                    img.onerror = reject;
-                    img.src = base64Data;
-                });
-                rctx.drawImage(img, 0, 0, resizedCanvas.width, resizedCanvas.height);
-                base64Data = resizedCanvas.toDataURL('image/png');
-                finalWidth = resizedCanvas.width;
-                finalHeight = resizedCanvas.height;
-                // Release memory
-                resizedCanvas.width = 0;
-                resizedCanvas.height = 0;
-                img.src = '';
+            var resizeScale = fitScreenshotScale(finalWidth, finalHeight, maxWidth);
+            if (resizeScale < 1) {
+                // High-quality one-hop downscale (Lanczos-class). Canvas
+                // drawImage bilinear smeared small text even at 'high' quality.
+                var _htiDs = await downscaleImageHighQuality(base64Data, resizeScale);
+                base64Data = _htiDs.base64;
+                finalWidth = _htiDs.width;
+                finalHeight = _htiDs.height;
             }
         }
 

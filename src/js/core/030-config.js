@@ -159,8 +159,8 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high'
     },
     {
-        name: 'gpt-5.5',
-        model: 'openai/gpt-5.5',
+        name: 'gpt-5.6-sol',
+        model: 'openai/gpt-5.6-sol',
         endpointId: 'openrouter',
         effort: 'low'
     },
@@ -246,7 +246,10 @@ var PROVIDER_RENAMES = {
     'sonnet-4.5': 'sonnet-5',
     'sonnet-4.6': 'sonnet-5',
     'Kimi K2.5': 'GLM 5.2',
-    'gpt-5.2': 'gpt-5.5',
+    // (gpt-5.2 chain-collapses straight to gpt-5.6-sol: the old gpt-5.5
+    // target no longer exists in the defaults)
+    'gpt-5.2': 'gpt-5.6-sol',
+    'gpt-5.5': 'gpt-5.6-sol',
     'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
     'Sonnet 4.6 OAuth': 'Sonnet 5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
@@ -435,6 +438,25 @@ var chats = {};
 var paused = false; // LEGACY: kept for backwards compat with bits that still read it. Do NOT consult in isChatPaused — it would cross-pollute pause across concurrent chats.
 var pausedChats = {}; // Per-chat pause flags (for background Action chats the user paused via button)
 function isChatPaused(chatId) { return chatId ? pausedChats[chatId] === true : false; }
+// Set/clear a chat's pause flag in BOTH the live map and the persisted chat
+// record (chat.pausedByUser) so a user-pause survives a panel reload —
+// loadChatsFromStorage rehydrates pausedChats from the persisted field.
+// Shared into the worker bundle too: each realm updates its own chats copy
+// (both realms do full-record puts to the chats store, so whichever saves
+// last must carry the flag). Lifecycle pauses (sub-agent park, action
+// dismiss) intentionally do NOT use this helper — they set only the live map.
+function setChatPausedPersistent(chatId, isPaused) {
+    if (!chatId) return;
+    pausedChats[chatId] = isPaused === true;
+    try {
+        var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        if (!c) return;
+        var changed = (isPaused === true) ? (c.pausedByUser !== true) : (c.pausedByUser === true);
+        if (isPaused === true) c.pausedByUser = true;
+        else if (c.pausedByUser) delete c.pausedByUser;
+        if (changed && typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    } catch (e) { /* persistence is best-effort */ }
+}
 var isRunning = false;
 // PR390-FU-3: the five per-chat run-state maps below are ALSO declared in
 // src/js/worker/000-runtime-globals.js, which executes BEFORE this file in the
@@ -453,6 +475,10 @@ var interruptResolversByChatId = (typeof interruptResolversByChatId !== 'undefin
 var currentStreamingMsgIndex = -1;
 var activeStreamingChatId = null; // Track which chat has active streaming (the one the UI is focused on)
 function isChatRunning(chatId) { return !!runningChatIds[chatId]; }
+// LEFT nav rail (chat-list sidebar) collapsed state — toggled by toggleSidebar()
+// (ui/240-layout.js), persisted as appStorage key 'sidebarCollapsed'. NOT the
+// RIGHT chat/version sidebar — that is versionSidebarManuallyHidden in
+// ui/120-ui-utils.js (persisted as 'versionSidebarHidden').
 var sidebarCollapsed = false;
 var historyExpanded = true; // History section expanded by default
 var showApiStats = false; // Hidden by default; user can enable in Settings (persisted via appStorage 'showApiStats')
@@ -482,12 +508,8 @@ var instancePermissions = {}; // Per-instance permissions: { 'host': { tier: 'ma
 var cacheTokenLimit = 4000; // Cache limit in tokens (default ~4k tokens = ~16KB)
 var sessionPermissions = {}; // Session-only permissions (cleared on page reload)
 var pendingToolApprovals = {}; // Track pending tool approval requests by chatId:approvalIndex
-var currentScope = 'global'; // Current app scope (used for API calls)
-var platformScope = 'global'; // Last known platform scope
-var localScopeOverride = null; // User's local scope override (null = use platform scope)
 var cachedUserSysId = null; // Cache user sys_id to avoid repeated API calls
 var impersonateOriginalUserSysId = null; // Store original user sys_id before impersonation
-var scopeFetched = false; // Track if scope has been fetched (lazy load for POST)
 var versionHistory = []; // Track all record changes with before/after versions
 var chatSearchQuery = ''; // Track chat search query
 var activeSkills = {}; // Track active skills with their XML backups: { skillId: { xmlBackups: { table_sysId: versionSysId } } }

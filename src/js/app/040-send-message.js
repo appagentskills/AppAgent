@@ -186,7 +186,8 @@ async function sendMessage() {
         // User is sending a new message — clear any per-chat pause flag too,
         // otherwise the next runAgent's `while (!isChatPaused(currentChatId))`
         // gate fails immediately and the message is silently dropped.
-        if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
+        // (setChatPausedPersistent also clears the persisted pausedByUser flag.)
+        if (currentChatId && pausedChats) setChatPausedPersistent(currentChatId, false);
         // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
         if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
         // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
@@ -264,7 +265,8 @@ async function sendMessage() {
     // Clear the per-chat pause flag too — without this, runAgent's outer
     // `while (!isChatPaused(currentChatId))` gate trips immediately and the
     // user's freshly-sent message is silently dropped on a previously-paused chat.
-    if (currentChatId && pausedChats) pausedChats[currentChatId] = false;
+    // (setChatPausedPersistent also clears the persisted pausedByUser flag.)
+    if (currentChatId && pausedChats) setChatPausedPersistent(currentChatId, false);
     // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
     if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
     // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.

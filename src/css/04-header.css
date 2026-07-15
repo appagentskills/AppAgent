@@ -29,6 +29,9 @@
 .chat-title-state-pill .chat-title-state-icon .ui-icon { width: 10px; height: 10px; }
 .chat-title-state-pill.state-running { background: var(--primary-light); color: var(--primary); }
 .chat-title-state-pill.state-stuck   { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+/* User-paused chat (Pause button) — same amber as .jobs-row-state-badge.state-paused
+   / .jobs-row-dot.state-paused (23-actions.css) so every paused surface matches. */
+.chat-title-state-pill.state-paused  { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .chat-title-state-pill.state-done    { background: var(--success-light, #d1fae5); color: var(--success, #047857); }
 .chat-title-state-pill.state-error   { background: var(--danger-lighter, #fee2e2); color: var(--danger, #b91c1c); }
 /* Terminal success variants — finished/pr_opened in the success family
@@ -64,12 +67,88 @@
 .model-login-icon .ui-icon { width: 13px; height: 13px; }
 .header-controls { display: flex; align-items: center; gap: var(--space-6); align-self: center; }
 /* OAuth button styles removed — model-name pill handles connection status */
+/* ---- Shared header pill dropdown chrome (.header-menu) ----
+   One surface language for ALL six header menus: model menu, gear settings
+   panel, jobs dropdown, workspace dropdown, usage (credits pill) dropdown,
+   ServiceNow instance picker. Each menu keeps its own positioning / sizing /
+   z-index; only the chrome is unified here. */
+.header-menu { background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+/* The grey band now lives ON .menu-section-title itself (below) so every
+   menu's section header is pixel-identical. The ws-dropdown-header (functional
+   repo header) keeps the same band treatment. */
+.header-menu .ws-dropdown-header { background: var(--bg-light); border-bottom: 1px solid var(--secondary-border); }
+/* ONE canonical section-title pattern for every header pill dropdown:
+   full-bleed grey band, same padding rhythm, bottom hairline, uppercase
+   caption + semibold secondary text, and a small muted leading icon
+   (<span class="section-icon">UI_ICONS.x</span>). Menu-specific classes may
+   only add stickiness or a top hairline — never padding/band overrides. */
+.menu-section-title { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-4); background: var(--bg-light); border-bottom: 1px solid var(--secondary-border); font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+/* Shared leading icon: same size + muted color in every menu (also covers the
+   ws-dropdown-header's leading repo icon). */
+.header-menu .section-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--text-secondary); flex-shrink: 0; }
+.header-menu .section-icon .ui-icon { width: 13px; height: 13px; }
+/* Trailing action button (e.g. + add model) pins to the right edge of the band. */
+.menu-section-title .menu-title-btn { margin-left: auto; }
+/* Small icon-only action button inside a section title (e.g. + add model). */
+.menu-title-btn { display: inline-flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; padding: 2px; border-radius: var(--radius-sm); color: var(--text-secondary); transition: background var(--transition-fast), color var(--transition-fast); }
+.menu-title-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.menu-title-btn .ui-icon { width: 14px; height: 14px; }
+
 /* Model pill dropdown menu (reasoning effort + model picker) */
-/* Model pill dropdown menu — same visual language as the jobs/Action dropdown:
-   white surface, grey banded section headers, full-width divided rows, plain
-   --primary icons, green selected state (matches the header connection pill). */
-.model-menu { z-index: var(--z-overlay-base); min-width: 286px; max-width: 360px; max-height: 72vh; overflow-y: auto; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); padding: 0; }
-.model-menu-section-title { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; padding: var(--space-3) var(--space-4); background: var(--bg-light); border-bottom: 1px solid var(--secondary-border); position: sticky; top: 0; z-index: 1; }
+.model-menu { z-index: var(--z-overlay-base); min-width: 286px; max-width: 360px; max-height: 72vh; overflow-y: auto; padding: 0; }
+/* Typography comes from the shared .menu-section-title class above. */
+.model-menu-section-title { position: sticky; top: 0; z-index: 1; }
+/* ---- Reasoning-effort slider: stepped circles + morphing disc ----
+   5 level circles (rings that grow with the level) sit behind a transparent
+   native range input; a custom disc (.effort-disc) glides between positions
+   with a springy left transition and a squash-stretch morph keyframe that JS
+   restarts on every value change. The native thumb is INVISIBLE but keeps its
+   14px size so click/drag/keyboard value mapping is untouched.
+   Geometry: thumb centers travel from 7px to calc(100% - 7px); the custom
+   property --pos (0..1, set by JS on the track) drives disc + fill.
+   Paint order (explicit z-index, bottom to top): rail ::before (0) →
+   .effort-track-fill (1) → .effort-dot (2) → .effort-disc (3) → <input> (4).
+   The input is visually transparent but topmost so it owns pointer events;
+   every circle keeps an opaque core so the rail can never slice through it. */
+.model-menu-effort { padding: var(--space-4) var(--space-5) var(--space-3); border-bottom: 1px solid var(--secondary-border); }
+.model-menu-effort-track { position: relative; height: 26px; display: flex; align-items: center; --pos: 0.5; }
+/* Base rail + progress fill (fill width follows the disc with the same easing) */
+.model-menu-effort-track::before { content: ''; position: absolute; left: 7px; right: 7px; top: 50%; height: 2px; transform: translateY(-50%); border-radius: 1px; background: var(--secondary-border); z-index: 0; }
+.effort-track-fill { position: absolute; left: 7px; top: 50%; height: 2px; transform: translateY(-50%); border-radius: 1px; background: var(--primary); width: calc((100% - 14px) * var(--pos)); transition: width 340ms cubic-bezier(0.3, 1.1, 0.3, 1); pointer-events: none; z-index: 1; }
+/* Level circles: hollow rings that grow with the level; active = filled.
+   Positions match the native 14px thumb's center travel. Always painted above
+   the rail + fill (z-index 2) with an opaque --bg-white core under the ring
+   (opaque in dark theme too — --bg-white maps to the dark surface). */
+.model-menu-effort-track .effort-dot { position: absolute; top: 50%; transform: translate(-50%, -50%); border-radius: 50%; background: var(--bg-white); border: 1.5px solid var(--secondary-border); box-sizing: border-box; pointer-events: none; z-index: 2; transition: background 220ms ease, border-color 220ms ease, transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+.model-menu-effort-track .effort-dot.active { background: var(--primary); border-color: var(--primary); }
+/* The circle under the disc shrinks — visually absorbed by the landing disc. */
+.model-menu-effort-track .effort-dot.current { transform: translate(-50%, -50%) scale(0.35); }
+.model-menu-effort-track .effort-dot[data-level="1"] { width: 6px; height: 6px; left: 7px; }
+.model-menu-effort-track .effort-dot[data-level="2"] { width: 8px; height: 8px; left: calc(7px + (100% - 14px) * 0.25); }
+.model-menu-effort-track .effort-dot[data-level="3"] { width: 10px; height: 10px; left: calc(7px + (100% - 14px) * 0.5); }
+.model-menu-effort-track .effort-dot[data-level="4"] { width: 12px; height: 12px; left: calc(7px + (100% - 14px) * 0.75); }
+.model-menu-effort-track .effort-dot[data-level="5"] { width: 14px; height: 14px; left: calc(100% - 7px); }
+/* Native input: real interaction surface (click + drag + keyboard). Track and
+   thumb are transparent — visuals come from the rail/fill/dots/disc below. */
+.model-menu-effort-slider { -webkit-appearance: none; appearance: none; display: block; width: 100%; height: 26px; margin: 0; background: transparent; cursor: pointer; position: relative; z-index: 4; }
+.model-menu-effort-slider::-webkit-slider-runnable-track { height: 2px; border-radius: 1px; background: transparent; }
+.model-menu-effort-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; margin-top: -6px; border-radius: 50%; background: transparent; border: none; box-shadow: none; }
+/* Morphing disc — the visible "thumb". Centered on the native thumb's center
+   via margins (transform is reserved for the morph animation). */
+.effort-disc { position: absolute; top: 50%; left: calc(7px + (100% - 14px) * var(--pos)); width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; background: var(--primary); border: 2px solid var(--bg-white); box-shadow: 0 1px 4px rgba(0,0,0,0.35); pointer-events: none; z-index: 3; transition: left 340ms cubic-bezier(0.3, 1.1, 0.3, 1); }
+/* Soft halo that breathes while the disc morphs/settles */
+.effort-disc::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; background: var(--primary); opacity: 0; transform: scale(0.6); }
+.effort-disc.is-morph { animation: effort-disc-morph 380ms cubic-bezier(0.36, 0.07, 0.19, 0.97); }
+.effort-disc.is-morph::after { animation: effort-disc-halo 380ms ease-out; }
+@keyframes effort-disc-morph { 0% { transform: scale(1); } 35% { transform: scaleX(1.45) scaleY(0.7); } 70% { transform: scaleX(0.82) scaleY(1.18); } 100% { transform: scale(1); } }
+@keyframes effort-disc-halo { 0% { opacity: 0; transform: scale(0.6); } 55% { opacity: 0.22; transform: scale(1); } 100% { opacity: 0; transform: scale(1.15); } }
+/* Keyboard focus ring rendered on the custom disc (native thumb is invisible) */
+.model-menu-effort-slider:focus-visible ~ .effort-disc { box-shadow: 0 1px 4px rgba(0,0,0,0.35), 0 0 0 3px var(--primary-light, rgba(59, 130, 246, 0.35)); }
+@media (prefers-reduced-motion: reduce) {
+  .effort-disc, .effort-track-fill, .model-menu-effort-track .effort-dot { transition: none; }
+  .effort-disc.is-morph, .effort-disc.is-morph::after { animation: none; }
+}
+.model-menu-effort-label { display: flex; align-items: center; justify-content: center; gap: var(--space-2); margin-top: var(--space-2); font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); }
 .model-menu .model-menu-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; border-bottom: 1px solid var(--secondary-border); transition: background var(--transition-fast); }
 .model-menu .model-menu-row:hover { background: var(--bg-hover); }
 .model-menu .model-menu-row:last-child { border-bottom: none; }
@@ -83,19 +162,30 @@
 .model-row-sub { font-size: var(--text-caption); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
 .model-row-badge { font-size: 9px; line-height: 1; text-transform: uppercase; letter-spacing: 0.04em; font-weight: var(--font-semibold); padding: 2px 5px; border-radius: var(--radius-sm); background: var(--secondary-light); color: var(--text-secondary); border: 1px solid var(--border); flex-shrink: 0; }
 .model-row-badge.oauth { background: var(--success-light); color: var(--success-hover); border-color: var(--success-light); }
+.model-row-edit { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; background: none; border: none; cursor: pointer; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--text-muted); opacity: 0; transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast); }
+.model-menu-row:hover .model-row-edit { opacity: 1; }
+.model-row-edit:hover { background: var(--bg-hover); color: var(--text-primary); }
+.model-row-edit .ui-icon { width: 13px; height: 13px; }
 .model-row-check { width: 16px; height: 16px; flex-shrink: 0; color: var(--success); display: inline-flex; align-items: center; justify-content: center; }
 .model-row-check svg { width: 16px; height: 16px; }
 /* OAuth login/logout row reuses .custom-dropdown-option — keep it full-width + divided to match the rows above */
 .model-menu .custom-dropdown-option { padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); color: var(--text-primary); border-bottom: 1px solid var(--secondary-border); transition: background var(--transition-fast); }
 .model-menu .custom-dropdown-option:last-child { border-bottom: none; }
 .model-menu .custom-dropdown-option:hover { background: var(--bg-hover); }
+/* Sub-agent tier mapping rows (label + compact provider select) */
+.model-menu .model-menu-tier-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--secondary-border); }
+.model-menu .model-menu-tier-row:last-of-type { border-bottom: none; }
+.model-menu-tier-label { font-size: var(--text-body-sm); color: var(--text-primary); text-transform: capitalize; }
+.model-menu-tier-select { max-width: 168px; padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-caption); background: var(--bg-white); color: var(--text-primary); cursor: pointer; }
+.model-menu-tier-select:focus { outline: none; border-color: var(--text-muted); }
 .credits-display { font-size: var(--text-body-sm); color: var(--success-hover); background: var(--success-lighter); padding: var(--space-2) var(--space-5); border-radius: var(--radius-xl); cursor: pointer; border: 1px solid var(--success-light); transition: all var(--transition-normal); min-width: 70px; text-align: center; display: inline-flex; align-items: center; justify-content: center; }
 .credits-display:hover { background: var(--success-light); color: var(--success-hover); }
 .credits-display.loading { color: var(--text-secondary); background: var(--bg-code); border-color: var(--border); }
 .credits-display.error { color: var(--danger-hover); background: var(--danger-lighter); border-color: var(--danger-light); }
 /* Rich usage tooltip on the credits pill (session / weekly / per-model bars) */
-.usage-tooltip { position: fixed; z-index: var(--z-overlay-base); width: 264px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: 0 10px 30px rgba(0,0,0,0.18); padding: var(--space-4) var(--space-5); display: none; }
-.usage-tt-row { padding: var(--space-2) 0; }
+/* Chrome (bg/border/radius/shadow) comes from the shared .header-menu class above. */
+.usage-tooltip { position: fixed; z-index: var(--z-overlay-base); width: 286px; padding: 0 0 var(--space-2); display: none; overflow: hidden; }
+.usage-tt-row { padding: var(--space-2) var(--space-4); }
 .usage-tt-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); margin-bottom: 4px; }
 .usage-tt-label { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-tt-pct { font-size: var(--text-caption); color: var(--text-secondary); white-space: nowrap; }
@@ -104,7 +194,9 @@
 .usage-tt-fill.warn { background: var(--warning, #b45309); }
 .usage-tt-fill.crit { background: var(--danger); }
 .usage-tt-sub { font-size: var(--text-caption); color: var(--text-muted); margin-top: 3px; }
-.usage-tt-section { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--secondary-border); }
+/* Band + typography come from the shared .menu-section-title class above.
+   Mid-menu bands get a top hairline (rows here have no border-bottom). */
+.usage-tt-section:not(:first-child) { border-top: 1px solid var(--secondary-border); }
 .storage-display { font-size: var(--text-body-sm); color: var(--primary); background: var(--primary-lighter); padding: var(--space-2) var(--space-5); border-radius: var(--radius-xl); cursor: pointer; border: 1px solid var(--primary-light); transition: all var(--transition-normal); }
 .storage-display:hover { background: var(--primary-light); color: var(--primary-hover); }
 .storage-display.warning { color: var(--warning-hover); background: var(--warning-lighter); border-color: var(--warning-light); }
@@ -118,7 +210,8 @@
 .ext-sn-status.disconnected .ext-status-dot { background: var(--danger); }
 .ext-status-tier { font-size: 10px; opacity: 0.7; margin-left: var(--space-1); }
 .ext-browser-status .ext-status-dot { background: var(--primary); }
-.ext-instance-dropdown { position: fixed; z-index: var(--z-dropdown); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 220px; padding: var(--space-1) 0; }
+/* Chrome (bg/border/radius/shadow) comes from the shared .header-menu class above. */
+.ext-instance-dropdown { position: fixed; z-index: var(--z-dropdown); min-width: 220px; padding: 0 0 var(--space-1); overflow: hidden; }
 .ext-instance-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); transition: background 0.1s; }
 .ext-instance-row:hover { background: var(--bg-hover); }
 .ext-instance-row.active { background: var(--success-lighter); }
@@ -173,8 +266,11 @@
 .ws-header-status.modified { color: var(--warning-hover); background: var(--warning-lighter); border-color: var(--warning-light); }
 .ws-header-status .ws-icon { display: inline-flex; align-items: center; }
 .ws-header-status .ws-icon .ui-icon { width: 12px; height: 12px; }
-.ws-dropdown { position: fixed; z-index: var(--z-overlay); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.15); min-width: 320px; max-width: 420px; max-height: 400px; overflow-y: auto; }
-.ws-dropdown-header { padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--border); font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; cursor: pointer; user-select: none; }
+.ws-dropdown { position: fixed; z-index: var(--z-overlay); min-width: 320px; max-width: 420px; max-height: 400px; overflow-y: auto; }
+/* "Repositories" title band — chrome comes from the shared .menu-section-title
+   (04-header.css:82); this class only adds stickiness (the dropdown scrolls). */
+.ws-menu-title { position: sticky; top: 0; z-index: 1; }
+.ws-dropdown-header { padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--secondary-border); font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; cursor: pointer; user-select: none; }
 .ws-dropdown-header .ws-dd-title { display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; }
 .ws-dropdown-header .ws-collapse-chevron { display: inline-flex; align-items: center; color: var(--text-muted); flex-shrink: 0; transition: transform var(--transition-normal); }
 .ws-dropdown-header .ws-collapse-chevron .ui-icon { width: 12px; height: 12px; }
@@ -205,13 +301,15 @@
 .ws-file-chat .ui-icon { width: 11px; height: 11px; }
 .ws-file-chat:hover { background: hsla(var(--chat-hue), 70%, 50%, 0.3); }
 .ws-file-chat.gone { cursor: default; opacity: 0.45; }
-.ws-file-group-label { padding: var(--space-2) var(--space-5); font-size: 10px; font-weight: var(--font-semibold); text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); background: var(--bg-tertiary); border-bottom: 1px solid var(--border-light); }
+/* Sub-group label (repo · branch): follows the shared title language (bg-light
+   band, 0.05em tracking) one hierarchy level down — smaller + muted on purpose. */
+.ws-file-group-label { padding: var(--space-2) var(--space-5); font-size: 10px; font-weight: var(--font-semibold); text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); background: var(--bg-light); border-bottom: 1px solid var(--border-light); }
 .ws-this-chat-section { border-bottom: 2px solid var(--border); }
 .ws-this-chat-section .ws-file-group-label { text-transform: none; letter-spacing: 0; font-family: var(--font-mono); }
 .ws-this-chat-section .ws-dd-title { color: var(--primary); }
 .ws-file-pr:hover { text-decoration: underline; }
 .ws-dropdown-empty { padding: var(--space-6); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); }
-.ws-dropdown-section { border-bottom: 1px solid var(--border); }
+.ws-dropdown-section { border-bottom: 1px solid var(--secondary-border); }
 .ws-dropdown-section:last-child { border-bottom: none; }
 .ws-dropdown-body { }
 .ext-instance-tier { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; padding: 2px 4px; border-radius: var(--radius-sm); transition: background 0.15s; color: var(--text-muted); font-size: var(--text-caption); white-space: nowrap; }

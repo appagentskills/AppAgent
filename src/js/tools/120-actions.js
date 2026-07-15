@@ -42,6 +42,8 @@ function progressStateMeta(state) {
         // until dispatched sub-agents report back. Still "in progress".
         case 'waiting': return { icon: UI_ICONS.hourglass || UI_ICONS.clock, label: 'Waiting for sub-agents', cls: 'state-waiting' };
         case 'stuck': return { icon: UI_ICONS.alert, label: 'Needs attention', cls: 'state-stuck' };
+        // User-paused chat (Pause button) — halted mid-run until the user resumes.
+        case 'paused': return { icon: UI_ICONS.pause, label: 'Paused', cls: 'state-paused' };
         case 'done': return { icon: UI_ICONS.check, label: 'Done', cls: 'state-done' };
         case 'error': return { icon: UI_ICONS.close, label: 'Failed', cls: 'state-error' };
         case 'finished': return { icon: UI_ICONS.check, label: 'Finished', cls: 'state-finished' };
@@ -416,6 +418,48 @@ async function executeUpdateActionState(args, options) {
     // new state shows up everywhere (inline pill next to chat title is always visible).
     // The sidebar refresh goes through the event bus per architecture-events.md;
     // the page subscriber calls renderVersionSidebar.
+    // Sub-agent chat: build the normalized snapshot BEFORE the emit below and
+    // optimistically apply it to the page's SubAgents mirror record. The
+    // authoritative commit happens later, in the SW (worker/120-tool-routing.js
+    // reads the _sub_action_state marker off this tool's RESULT and calls
+    // SubAgents.recordActionState) — but the actionStateChanged emit below
+    // synchronously repaints the version sidebar / workers strip, and without
+    // this write that repaint reads the PRE-update mirror: the mirrored worker
+    // progress card lagged one update_action_state behind, self-correcting only
+    // on the next render. The SW's subagent-snapshot broadcast overwrites the
+    // mirror with the identical committed record moments later (idempotent).
+    var _subSnap = null;
+    if (chat.isSubAgent) {
+        _subSnap = {
+            state: state,
+            icon: icon,
+            label: label,
+            tasks: normTasks,
+            output: (typeof args.output === 'string') ? args.output.substring(0, 4000) : null,
+            clearOutput: args.output === null,
+            at: Date.now()
+        };
+        try {
+            var _mirrorRec = (chat.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById)
+                ? SubAgents.getById(chat.subAgentId) : null;
+            if (_mirrorRec) {
+                var _prevAS = _mirrorRec.action_state || {};
+                // Same merge semantics as recordSubActionState (097): tasks only
+                // replace when provided; output sets on string, clears on
+                // clearOutput, otherwise keeps the previous value.
+                _mirrorRec.action_state = {
+                    state: _subSnap.state,
+                    icon: _subSnap.icon,
+                    label: _subSnap.label,
+                    tasks: Array.isArray(_subSnap.tasks) ? _subSnap.tasks : (_prevAS.tasks || null),
+                    output: (typeof _subSnap.output === 'string') ? _subSnap.output
+                          : (_subSnap.clearOutput ? null : (_prevAS.output != null ? _prevAS.output : null)),
+                    at: _subSnap.at
+                };
+                _mirrorRec.last_activity_at = _subSnap.at;
+            }
+        } catch (e) { /* best-effort — the SW broadcast corrects the mirror */ }
+    }
     AgentEvents.emit('actionStateChanged', {
         chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
         actionId: null,
@@ -444,16 +488,8 @@ async function executeUpdateActionState(args, options) {
     // explicit clearOutput marker for the output:null "clear" signal so the
     // merge in recordSubActionState can tell clear apart from absent.
     var _uasResult = { success: true };
-    if (chat.isSubAgent) {
-        _uasResult._sub_action_state = {
-            state: state,
-            icon: icon,
-            label: label,
-            tasks: normTasks,
-            output: (typeof args.output === 'string') ? args.output.substring(0, 4000) : null,
-            clearOutput: args.output === null,
-            at: Date.now()
-        };
+    if (_subSnap) {
+        _uasResult._sub_action_state = _subSnap;
     }
     return _uasResult;
 }
@@ -972,6 +1008,16 @@ function renderInlineActionButton(msg, index) {
 // and collects every `update_action_state` tool call. Renders a compact timeline that
 // appears in the chat artifacts area, so the PM sees the state history when they reveal
 // a background Action chat — or just track state changes in a normal chat.
+//
+// Expanded/collapsed state of the "Previous steps" history <details>, keyed by
+// chat id. The whole sidebar section is rebuilt via innerHTML on every live
+// update, which resets a plain <details> to collapsed — persist the user's
+// choice in `actionUpdateHistoryOpen` and reapply it on re-render.
+var actionUpdateHistoryOpen = {};
+function onActionHistoryToggle(chatId, isOpen) {
+    actionUpdateHistoryOpen[chatId] = !!isOpen;
+}
+
 function renderActionUpdatesSection(chat) {
     var updates = collectAllActionUpdates(chat);
     if (!updates.length) return '';
@@ -1034,7 +1080,10 @@ function renderActionUpdatesSection(chat) {
             trail.push(u);
         });
         if (trail.length) {
-            historyHtml = '<details class="action-update-history">' +
+            var histKey = (chat && chat.id) || 'current';
+            historyHtml = '<details class="action-update-history"' +
+                (actionUpdateHistoryOpen[histKey] ? ' open' : '') +
+                ' ontoggle="onActionHistoryToggle(\'' + escapeJsString(histKey) + '\', this.open)">' +
                 '<summary class="action-update-history-summary">' +
                     '<span class="action-update-history-toggle">▸</span>' +
                     'Previous steps <span class="action-update-history-count">(' + trail.length + ')</span>' +
@@ -1543,6 +1592,14 @@ function onActionButtonClick(btn) {
         case 'done':
         case 'error':
         case 'stopped':
+        // Terminal SUCCESS variants (finished / pr_opened / finished_with_caveat)
+        // were added to update_action_state but never routed here — clicking a
+        // completed pill in one of those states silently did nothing (the
+        // switch fell through). Route them to the result popover exactly like
+        // 'done', matching onChatTitleStatePillClick's switch.
+        case 'finished':
+        case 'pr_opened':
+        case 'finished_with_caveat':
             openResultPopover(btn, actionId);
             return;
     }
@@ -2030,6 +2087,35 @@ function _isChatUnseen(chatId) {
     return !!(_lastAct && _lastAct > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId));
 }
 
+// True when this chat sits in an UNRESOLVED FAILED state: its last run ended
+// with an API error (chats[id]._lastApiError — set by the runCrashed/apiError
+// handler in app/036-agent-event-handlers-page.js, cleared on retry, on the
+// next run start, and by dismissChatNotifications/dismissChatFromJobs). Such a
+// chat is still open work the user needs to triage, so it must keep showing
+// under "Active Chats" regardless of age or seen-state — mirroring the
+// _isChatUnseen rule — until the error is retried, cleared, or dismissed.
+// Same scoping as _isChatUnseen: background Action chats and sub-agents have
+// their own surfaces and never qualify here.
+function _isChatErrored(chatId) {
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || c.isBackground || c.isSubAgent) return false;
+    if (!c._lastApiError) return false;
+    // Success outranks a stale error: a chat whose progress card reached a
+    // terminal-SUCCESS state (done / finished / pr_opened / pr_merged /
+    // finished_with_caveat) demonstrably recovered from whatever transient API
+    // error was stamped mid-run (_lastApiError survives until the NEXT run
+    // start), so it must not read as errored. This predicate is the ONE shared
+    // error derivation for the card dot/left-border (_jobsChatState), the
+    // header "Active chats" pill (renderJobsBadge), the Active dropdown row
+    // (_cErr) and the home filter (_homeChatFilterKey) — funnel any new error
+    // surface through here so they can never disagree.
+    var prog = null;
+    try { prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null; } catch (e) {}
+    var st = prog && prog.state;
+    if (st && st !== 'error' && isTerminalProgressState(st)) return false;
+    return true;
+}
+
 // True when the chat has ANY activity (finished response OR mid-run event —
 // assistant message, tool call, error, approval request…) newer than the
 // user's last view. This is the 'unread email' predicate for BOLD rows: unlike
@@ -2209,6 +2295,24 @@ function getActiveChatsList() {
             if (chatHasPendingApproval(cid)) consider(cid);
         });
     }
+    // 7) User-paused chats — a paused run is unfinished work waiting on the
+    //    user to resume it, so it must never age out of Active Chats while
+    //    paused (without this it drops off once the 5-min linger expires,
+    //    since a paused chat leaves runningChatIds).
+    if (typeof chats !== 'undefined' && chats) {
+        Object.keys(chats).forEach(function(cid) {
+            if (_isChatUserPaused(cid)) consider(cid);
+        });
+    }
+    // 8) Errored chats (_lastApiError still set) — failed work the user hasn't
+    //    retried or dismissed yet needs triage, so it belongs under Active
+    //    Chats no matter how old or already-seen it is (same "until resolved"
+    //    rule as unseen chats). Dismissing the card clears the flag.
+    if (typeof chats !== 'undefined' && chats) {
+        Object.keys(chats).forEach(function(cid) {
+            if (_isChatErrored(cid)) consider(cid);
+        });
+    }
     // Order by chat creation time, MOST RECENT FIRST, so the newest active chat
     // sits at the top of the Active list.
     out.sort(function(a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
@@ -2319,7 +2423,10 @@ function renderJobsBadge() {
     // colour the badge 'error' so the failure isn't silent. Ranks below 'attention'
     // (a pending approval is more urgent) but above running/done.
     var erroredChats = 0;
-    chatList.forEach(function(c){ if (!isChatActivelyRunning(c.id) && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError) erroredChats++; });
+    // Same derivation as the card dot and the dropdown row (_jobsChatState →
+    // _isChatErrored): the pill may only go red when at least one chat's ROW
+    // would also render red — a red pill over all-green rows is unexplainable.
+    chatList.forEach(function(c){ if (_jobsChatState(c.id) === 'error') erroredChats++; });
     if (erroredChats && agg !== 'attention') agg = 'error';
     // A chat blocked on a pending tool-approval needs the user — surface it as
     // 'attention' (orange) on the badge, outranking running/done/error.
@@ -2421,6 +2528,8 @@ function toggleJobsDropdown(badgeEl) {
     var dropdown = wrapper ? wrapper.querySelector('.jobs-dropdown') : _getVisibleJobsDropdown();
     if (!dropdown) return;
     var willShow = dropdown.style.display !== 'block';
+    // Only one header dropdown open at a time (gear panel, model menu, ws dropdown)
+    if (willShow && typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('jobs');
     // Close any other open dropdowns first
     document.querySelectorAll('.jobs-dropdown').forEach(function(d) {
         if (d !== dropdown) d.style.display = 'none';
@@ -2492,7 +2601,7 @@ function renderJobsDropdown(dropdown) {
     // passes it KEEPS showing — regardless of age, even days old — as long as the
     // user still hasn't opened it (_isChatUnseen). It only leaves Active when the
     // user views it (clearing unseen) or removes it.
-    var runningChats = chatList.filter(function(_rc) { return isChatBusy(_rc.id) || _isChatLingering(_rc.id) || _isChatUnseen(_rc.id); });
+    var runningChats = chatList.filter(function(_rc) { return isChatBusy(_rc.id) || _isChatLingering(_rc.id) || _isChatUnseen(_rc.id) || _isChatErrored(_rc.id) || (typeof _isChatUserPaused === 'function' && _isChatUserPaused(_rc.id)); });
     // Per-row try/catch: one bad chat (corrupt state, throwing helper) must not
     // blank the whole Active list.
     var chatRowsHtml = runningChats.map(function(c) { try {
@@ -2502,9 +2611,16 @@ function renderJobsDropdown(dropdown) {
         var _cRunning = (isChatActivelyRunning(c.id) && !_isChatInSilentHook(c.id)) || chatHasRunningSubAgents(c.id);
         // B15: an errored, non-running chat shows an explicit error row (icon + msg)
         // and a Retry button instead of a green "Finished".
-        var _cErr = !_cRunning && typeof chats !== 'undefined' && chats[c.id] && chats[c.id]._lastApiError;
+        var _cErr = !_cRunning && _isChatErrored(c.id);
         var _cApproval = (typeof chatHasPendingApproval === 'function') && chatHasPendingApproval(c.id);
-        var _cState = _cApproval ? 'attention' : (_cRunning ? 'running' : (_cErr ? 'error' : 'done'));
+        // Canonical row state — the SAME _jobsChatState the expand cards and
+        // home panel use, so the dot/label can never contradict the amber
+        // Paused badge painted by _jobsProgressBadgeHtml. 'unseen' maps back
+        // to the legacy done-dot + bell rendering below (there is no
+        // state-unseen dot CSS; the bell icon carries that signal).
+        var _cState = _jobsChatState(c.id);
+        var _cPaused = (_cState === 'paused');
+        if (_cState === 'unseen') _cState = 'done';
         var _cIcon = '<span class="jobs-row-dot state-' + _cState + '"></span>';
         // Show the chat's current progress task under its title (latest
         // update_action_state: the running task label, falling back to the
@@ -2521,12 +2637,12 @@ function renderJobsDropdown(dropdown) {
         var _cProgText = _cTask || (_cProg && (_cProg.label || _cProg.status_message)) || null;
         // Unseen: the chat got a response after the user last viewed it (the
         // focused chat is always seen) — flag it so the user knows to catch up.
-        var _cUnseen = !_cRunning && !_cErr && c.lastResponseAt &&
+        var _cUnseen = !_cRunning && !_cErr && !_cPaused && c.lastResponseAt &&
             c.lastResponseAt > (c.lastViewedAt || 0) && !_isChatViewFocused(c.id);
         // Unread (bold) is BROADER than the bell: ANY activity — including on a
         // still-running or errored chat — the user hasn't viewed yet counts.
         var _cUnread = _cUnseen || _chatHasUnseenActivity(c.id);
-        var _cLabel = _cApproval ? 'Awaiting approval' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished')));
+        var _cLabel = _cApproval ? 'Awaiting approval' : (_cState === 'attention' && !_cApproval) ? 'Awaiting input' : (_cPaused ? 'Paused' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished'))));
         if (_cUnseen) _cIcon = '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>';
         var _cCur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
         // Unseen finished response → bold the title like an unread email (the
@@ -2629,6 +2745,16 @@ function _jobsChatTs(c) { return (c && (c.updatedAt || c.lastResponseAt || c.cre
 // Canonical row state: orange ('attention') when a tool-call approval is pending,
 // green while actively running (not paused), red on error, 'unseen' (bell) for an
 // unviewed finished response, else 'done'.
+// True when the USER paused this chat via the Pause button. Requires BOTH the
+// live pausedChats flag AND the persisted chat.pausedByUser field (stamped by
+// setChatPausedPersistent in core/030-config.js) — lifecycle pauses (sub-agent
+// natural park, action dismiss) set only the former and must not read as
+// user-paused.
+function _isChatUserPaused(chatId) {
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c || c.pausedByUser !== true) return false;
+    return (typeof isChatPaused === 'function') ? isChatPaused(chatId) : true;
+}
 function _jobsChatState(chatId) {
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) return 'attention';
@@ -2641,7 +2767,16 @@ function _jobsChatState(chatId) {
         ((isChatActivelyRunning(chatId) && !_isChatInSilentHook(chatId)) || chatHasRunningSubAgents(chatId));
     var paused = (typeof isChatPaused === 'function') ? isChatPaused(chatId) : false;
     if (running && !paused) return 'running';
-    if (c && c._lastApiError) return 'error';
+    // User-paused chat (Pause button): amber Paused state until resumed — both
+    // during the abort window (running && paused) and after the loop exits
+    // (!running && paused). _isChatUserPaused requires the persisted
+    // chat.pausedByUser flag, so lifecycle pauses (sub-agent park, action
+    // dismiss) that set only the live pausedChats map don't paint rows amber.
+    if (_isChatUserPaused(chatId)) return 'paused';
+    // Canonical error predicate (shared with the pill + dropdown rows): raw
+    // _lastApiError is NOT read here so a terminal-success chat with a stale
+    // mid-run error can't paint a red dot under a green "Done" badge.
+    if (_isChatErrored(chatId)) return 'error';
     var _stLast = c ? Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0) : 0;
     if (_stLast && _stLast > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId)) return 'unseen';
     return 'done';
@@ -2666,11 +2801,18 @@ function getDoneChatsList() {
 // markChatRecentlyFinished when a run ends), with lastActivityAt as a backstop.
 // Background Action chats never get those stamps (markChatRecentlyFinished /
 // markChatActivity skip them), so use the owning action's updatedAt once it
-// reached done/error. Final fallback for either kind: the timestamp of the
-// last assistant message (covers dismissed actions and chats finished before
-// lastResponseAt existed). Returns 0 when the chat has no detectable finish —
-// a chat that merely STARTED today must NOT read as "completed today" (the
-// old createdAt fallback caused exactly that bug).
+// reached done/error. Final fallback for either kind: the FINISH STAMP of the
+// last assistant message — metrics.endTime (metrics.startTime as backstop),
+// set in app/030-agent-loop.js:1037/783. Assistant messages never carry a
+// top-level .timestamp, so the previous m.timestamp check was DEAD and this
+// returned 0 for a reply-bearing chat whose finish hooks never stamped
+// lastResponseAt (e.g. the extension was reloaded mid-finish, so no
+// runFinished reached the page → markChatRecentlyFinished never ran). Last
+// resort for such an orphan: a chat-level signal (updatedAt/lastViewedAt/
+// createdAt). Still returns 0 when the chat has no ASSISTANT reply — a chat
+// that merely STARTED today must NOT read as "completed today" (the old
+// createdAt-for-started fallback caused exactly that bug), so the chat-level
+// fallback is gated on having seen an assistant message.
 function _jobsChatDoneTs(c) {
     if (!c) return 0;
     var t = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
@@ -2679,10 +2821,26 @@ function _jobsChatDoneTs(c) {
         if (a && isTerminalProgressState(a.state)) t = Math.max(t, a.updatedAt || 0);
     }
     if (!t && Array.isArray(c.messages)) {
+        var _sawAssistant = false;
         for (var i = c.messages.length - 1; i >= 0; i--) {
             var m = c.messages[i];
-            if (m && m.role === 'assistant' && m.timestamp) { t = m.timestamp; break; }
+            if (!m || m.role !== 'assistant') continue;
+            _sawAssistant = true;
+            // Real per-message finish stamp: metrics.endTime (startTime backstop).
+            // m.timestamp is kept first only for the rare message kinds that DO
+            // carry one (user attachment pdf/file/screenshot); assistant replies
+            // never do, which is why the old m.timestamp-only check was dead.
+            var mt = m.timestamp || (m.metrics && (m.metrics.endTime || m.metrics.startTime)) || 0;
+            if (mt) { t = mt; break; }
         }
+        // Reload-before-hooks / interrupted-run recovery: a chat that produced an
+        // assistant reply but whose metrics never landed (or whose finish hooks
+        // never stamped lastResponseAt) has no usable per-message timestamp. Fall
+        // back to a chat-level signal so it resolves a real finish time and lands
+        // in Completed Today instead of vanishing from BOTH Active and Completed
+        // Today. Gated on an actual assistant reply so a merely-STARTED chat still
+        // returns 0 (see header note).
+        if (!t && _sawAssistant) t = c.updatedAt || c.lastViewedAt || c.createdAt || 0;
     }
     return t;
 }
@@ -2693,7 +2851,7 @@ function getCompletedTodayChats() {
     var start = new Date(); start.setHours(0, 0, 0, 0);
     var t0 = start.getTime();
     return _jobsAllUserChats()
-        .filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id) && !c.pinned && _jobsChatDoneTs(c) >= t0; })
+        .filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id) && !_isChatErrored(c.id) && !c.pinned && _jobsChatDoneTs(c) >= t0; })
         .sort(function(a, b) { return _jobsChatDoneTs(b) - _jobsChatDoneTs(a); });
 }
 // Pinned = chats the user pinned (chat.pinned), newest first. They surface in
@@ -2799,6 +2957,10 @@ function chatWaitingStateFor(chatId) {
 function chatBadgeStateFor(chatId) {
     var waiting = chatWaitingStateFor(chatId);
     if (waiting) return waiting;
+    // User-paused chat: amber "Paused" badge on rows AND expand cards (the
+    // amber dot alone is easy to miss). Live waiting states outrank it — a
+    // chat blocked on the user is more urgent than "paused".
+    if (_isChatUserPaused(chatId)) return 'paused';
     if (typeof getChatProgressStateFor !== 'function') return null;
     var prog = null;
     try { prog = getChatProgressStateFor(chatId); } catch (e) { return null; }
@@ -2925,25 +3087,24 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount) {
     var pinnedToShow = pinnedChats.filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id); });
     if (pinnedToShow.length) {
         var _pinW = _jobsTimeColWidth(pinnedToShow.map(_jobsHistTimeStr));
-        pinnedHtml = '<div class="jobs-subhead jobs-subhead-pinned">Pinned</div>' +
+        pinnedHtml = '<div class="jobs-subhead menu-section-title jobs-subhead-pinned"><span class="section-icon">' + UI_ICONS.pin + '</span>Pinned</div>' +
             // Per-row try/catch: one bad chat must not blank the section.
             pinnedToShow.map(function(c) { try { return _jobsPinnedRowHtml(c, _pinW); } catch (e) { console.warn('jobs: pinned row render failed', e); return ''; } }).join('');
     }
     var todayHtml = '';
     if (todayChats.length) {
         var _todayW = _jobsTimeColWidth(todayChats.map(_jobsTodayTimeStr));
-        todayHtml = '<div class="jobs-subhead">Completed Today</div>' +
+        todayHtml = '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.check + '</span>Completed Today</div>' +
             // Per-row try/catch: one bad chat must not blank the section.
             todayChats.map(function(c) { try { return _jobsTodayRowHtml(c, _todayW); } catch (e) { console.warn('jobs: today row render failed', e); return ''; } }).join('');
     }
     var h = '';
-    h += '<div class="jobs-panel-head">' +
-            '<span class="jobs-panel-title">Active Chats</span>' +
-            '<span class="jobs-panel-expand" onclick="expandJobsDropdown()" title="Expand to full screen">Expand <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></span>' +
-        '</div>';
+    // Title row removed (no dropdown repeats its pill's name); the functional
+    // Expand control moved into the tabs row as a compact icon button.
     h += '<div class="jobs-tabs" role="tablist">' +
             '<button class="jobs-tab active" data-tab="active" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
             '<button class="jobs-tab" data-tab="done" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
+            '<button type="button" class="jobs-expand-btn" onclick="expandJobsDropdown()" title="Expand to full screen" aria-label="Expand to full screen"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>' +
         '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active">' + activePanel + pinnedHtml + todayHtml + '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done" style="display:none">' +
@@ -3035,7 +3196,7 @@ function _renderJobsGroupedRows(chatsArr, mode) {
         var arr = groups[g[0]];
         if (!arr.length) return;
         var _gw = _jobsTimeColWidth(arr.map(_jobsHistTimeStr));
-        h += '<div class="jobs-subhead">' + g[1] + '</div>' +
+        h += '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>' + g[1] + '</div>' +
             // Per-row try/catch: one bad chat must not blank the History group.
             arr.map(function(c) { try { return _jobsChatRowHtml(c, 'list', _gw); } catch (e) { console.warn('jobs: history row render failed', e); return ''; } }).join('');
     });
@@ -3129,20 +3290,10 @@ function expandJobsDropdown() {
         try { renderJobsExpandModal(); } catch (e) {}
     }, 1000);
 }
-// Layout preference for the expand modal: 'columns' (kanban, like the
-// dropdown) or 'sections' (stacked sections — Active first with all its cards
-// in a 2-per-row grid, then the next section). Persisted across sessions.
-function _getJobsExpandLayout() {
-    try { if (localStorage.getItem('jobs_expand_layout') === 'sections') return 'sections'; } catch (e) {}
-    return 'columns';
-}
-function setJobsExpandLayout(mode) {
-    try { localStorage.setItem('jobs_expand_layout', mode === 'sections' ? 'sections' : 'columns'); } catch (e) {}
-    // Shared preference (same localStorage key) -- re-render BOTH surfaces: the
-    // modal (no-op when closed) and the embedded home panel (no-op off home).
-    renderJobsExpandModal();
-    if (typeof renderHomeActiveChats === 'function') { try { renderHomeActiveChats(); } catch (e) {} }
-}
+// Sections-only now: the old columns/sections layout toggle (and its persisted
+// localStorage 'jobs_expand_layout' preference) was removed. Any stored value
+// is deliberately IGNORED — both the expand modal and the embedded home panel
+// always render stacked sections (_jobsExpandBodyHtml).
 function _jobsExpandEscHandler(e) {
     if (e && e.key === 'Escape') { e.stopPropagation(); closeJobsExpandModal(); }
 }
@@ -3165,7 +3316,9 @@ function _refreshJobsExpandModal() {
 // (under Active). Returned in render order.
 function _jobsExpandBuckets() {
     var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
-    var activeChats = chatList.filter(function(c) { return isChatBusy(c.id) || _isChatLingering(c.id) || _isChatUnseen(c.id); });
+    var activeChats = chatList.filter(function(c) { return isChatBusy(c.id) || _isChatLingering(c.id) || _isChatUnseen(c.id) || _isChatErrored(c.id) || (typeof _isChatUserPaused === 'function' && _isChatUserPaused(c.id)); });
+    // Pinned chats sort (stably) to the top of the Active bucket and stay there.
+    activeChats.sort(function(a, b) { return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0); });
     var activeIds = {};
     activeChats.forEach(function(c) { activeIds[c.id] = true; });
     var pinnedChats = (typeof getPinnedChatsList === 'function' ? getPinnedChatsList() : [])
@@ -3176,25 +3329,13 @@ function _jobsExpandBuckets() {
         total: activeChats.length + pinnedChats.length + todayChats.length
     };
 }
-// Build the columns/sections body markup for a layout from precomputed buckets.
-// Shared verbatim by the modal and the home panel so both render identical
-// cards. Callers own the empty-state (total === 0) decision.
-function _jobsExpandBodyHtml(layout, buckets) {
+// Build the stacked-sections body markup from precomputed buckets. Shared
+// verbatim by the modal and the home panel so both render identical cards.
+// Callers own the empty-state (total === 0) decision. Sections-only: empty
+// sections are skipped, cards flow in a three-per-row grid (see
+// .jobs-expand-section-cards).
+function _jobsExpandBodyHtml(buckets) {
     var activeChats = buckets.active, todayChats = buckets.today, pinnedChats = buckets.pinned;
-    // Columns (kanban): each bucket a column with its own header + scroll. Empty
-    // columns still render (placeholder) so the layout stays stable.
-    function column(label, arr) {
-        var cards = arr.length
-            ? arr.map(function(c) { try { return _jobsExpandCardHtml(c); } catch (e) { console.warn('jobs: expand card render failed', e); return ''; } }).join('')
-            : '<div class="jobs-expand-col-empty">None</div>';
-        return '<div class="jobs-expand-column">' +
-            '<div class="jobs-expand-subhead">' + escapeHtml(label) +
-                ' <span class="jobs-expand-col-count">' + arr.length + '</span></div>' +
-            '<div class="jobs-expand-col-cards">' + cards + '</div>' +
-        '</div>';
-    }
-    // Sections: full-width stacked sections (empty ones skipped), cards in a
-    // three-per-row grid (see .jobs-expand-section-cards).
     function section(label, arr) {
         if (!arr.length) return '';
         return '<div class="jobs-expand-section">' +
@@ -3205,28 +3346,92 @@ function _jobsExpandBodyHtml(layout, buckets) {
             '</div>' +
         '</div>';
     }
-    if (layout === 'sections') {
-        return '<div class="jobs-expand-sections">' +
-            section('Active', activeChats) +
-            section('Completed Today', todayChats) +
-            section('Pinned', pinnedChats) +
-        '</div>';
-    }
-    return '<div class="jobs-expand-columns">' +
-        column('Active', activeChats) +
-        column('Completed Today', todayChats) +
-        column('Pinned', pinnedChats) +
+    return '<div class="jobs-expand-sections">' +
+        section('Active', activeChats) +
+        section('Completed Today', todayChats) +
+        section('Pinned', pinnedChats) +
     '</div>';
 }
-// The columns/sections segmented toggle, shared by the modal head and the home
-// panel head. Both buttons call setJobsExpandLayout(), which re-renders BOTH
-// surfaces and shares the localStorage preference.
-function _jobsExpandLayoutToggleHtml(layout) {
-    var colIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"></rect><rect x="9.5" y="4" width="5" height="16" rx="1"></rect><rect x="16" y="4" width="5" height="16" rx="1"></rect></svg>';
-    var secIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1"></rect><rect x="3" y="14" width="18" height="7" rx="1"></rect></svg>';
-    return '<div class="jobs-expand-layout-toggle" role="group" aria-label="Card layout">' +
-        '<button class="jobs-expand-layout-btn' + (layout === 'columns' ? ' active' : '') + '" title="Column view" aria-label="Column view" onclick="setJobsExpandLayout(\'columns\')">' + colIcon + '</button>' +
-        '<button class="jobs-expand-layout-btn' + (layout === 'sections' ? ' active' : '') + '" title="Section view" aria-label="Section view" onclick="setJobsExpandLayout(\'sections\')">' + secIcon + '</button>' +
+// ---- Home panel state filter (replaces the old columns/sections toggle) ----
+// Pills in the home panel head that narrow the listed chats to one progress-
+// state group. Groups map the canonical update_action_state values (see
+// ACTION_STATES / progressStateMeta / TERMINAL_PROGRESS_STATES):
+//   active -> running, waiting (live run, incl. busy chats with no card)
+//   stuck  -> stuck, needs_input, needs_permission (blocked on the user)
+//   pr_opened -> pr_opened
+//   pr_merged -> pr_merged (internal state set by markChatPrMerged)
+//   done   -> done, finished, finished_with_caveat (+ stopped / no card)
+//   error  -> error (+ chats whose last API call failed)
+// Session-only (deliberately NOT persisted); 'all' is the default.
+var HOME_CHATS_FILTERS = [
+    { key: 'all',    label: 'All' },
+    { key: 'active', label: 'Active' },
+    { key: 'stuck',  label: 'Stuck' },
+    { key: 'pr_opened', label: 'PR opened' },
+    { key: 'pr_merged', label: 'PR merged' },
+    { key: 'done',   label: 'Done' },
+    { key: 'error',  label: 'Errored' }
+];
+var _homeChatsFilter = 'all';
+function setHomeChatsFilter(key) {
+    var ok = HOME_CHATS_FILTERS.some(function(f) { return f.key === key; });
+    _homeChatsFilter = ok ? key : 'all';
+    _homeChatsPointerHeld = false; // our own repaint must not be deferred
+    renderHomeActiveChats();
+}
+// Classify one chat into a filter group. Precedence: blocked-on-you
+// conditions, then a live run, then the latest progress-card state.
+function _homeChatFilterKey(chatId) {
+    if ((typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) ||
+        (typeof chatHasPendingPrompt === 'function' && chatHasPendingPrompt(chatId))) return 'stuck';
+    var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null;
+    var st = prog && prog.state;
+    if (st === 'stuck' || st === 'needs_input' || st === 'needs_permission') return 'stuck';
+    // A live run wins over a stale non-terminal card (and over no card at all).
+    var busy = (typeof isChatBusy === 'function') && isChatBusy(chatId);
+    if (busy && !isTerminalProgressState(st)) return 'active';
+    if (st === 'pr_opened') return 'pr_opened';
+    if (st === 'pr_merged') return 'pr_merged';
+    if (st === 'error') return 'error';
+    if (isTerminalProgressState(st)) return 'done'; // done / finished / finished_with_caveat
+    if (_isChatErrored(chatId)) return 'error';
+    // Run over without a terminal card (stale running/waiting, stopped, none).
+    return 'done';
+}
+// Apply the current filter to _jobsExpandBuckets() output. Returns fresh
+// bucket arrays (never mutates the input) with a recomputed total.
+function _homeChatsApplyFilter(buckets) {
+    if (_homeChatsFilter === 'all') return buckets;
+    function match(c) { try { return _homeChatFilterKey(c.id) === _homeChatsFilter; } catch (e) { return true; } }
+    var out = {
+        active: buckets.active.filter(match),
+        today: buckets.today.filter(match),
+        pinned: buckets.pinned.filter(match)
+    };
+    out.total = out.active.length + out.today.length + out.pinned.length;
+    return out;
+}
+// The pill bar (right-aligned in the panel head). Pills for empty groups are
+// hidden — unless that group is the currently selected filter, which stays
+// visible so the user can see why the list is empty and switch back to All.
+function _homeChatsFilterBarHtml(buckets) {
+    var all = buckets.active.concat(buckets.today, buckets.pinned);
+    var counts = {};
+    all.forEach(function(c) {
+        var k; try { k = _homeChatFilterKey(c.id); } catch (e) { k = 'done'; }
+        counts[k] = (counts[k] || 0) + 1;
+    });
+    counts.all = all.length;
+    return '<div class="home-chats-filters" role="group" aria-label="Filter chats by state">' +
+        HOME_CHATS_FILTERS.map(function(f) {
+            var n = counts[f.key] || 0;
+            if (!n && f.key !== 'all' && _homeChatsFilter !== f.key) return '';
+            return '<button class="home-chats-filter-btn f-' + f.key + (_homeChatsFilter === f.key ? ' active' : '') + '"' +
+                ' title="' + escapeHtml(f.label) + '" onclick="setHomeChatsFilter(\'' + f.key + '\')">' +
+                escapeHtml(f.label) +
+                (f.key === 'all' ? '' : '<span class="home-chats-filter-count">' + n + '</span>') +
+            '</button>';
+        }).join('') +
     '</div>';
 }
 // ---- Embedded "Active chats" panel on the New Chat / Home page --------------
@@ -3234,9 +3439,27 @@ function _jobsExpandLayoutToggleHtml(layout) {
 // home Actions row (container #home-active-chats). No overlay/backdrop/fixed
 // size. Renders nothing (hidden) when all three buckets are empty. Kept live by
 // a lightweight self-clearing 1s poll (only while the home view is visible) plus
-// the renderJobsBadge() hook. Shares the columns/sections layout preference
-// (localStorage 'jobs_expand_layout') with the modal.
+// the renderJobsBadge() hook. Always sections layout; the head hosts the
+// state-filter pills (setHomeChatsFilter) instead of the old layout toggle.
 var _homeActiveChatsTimer = null;
+// A live innerHTML repaint that lands between mousedown and mouseup destroys
+// the pressed element, so the browser never dispatches the click — while chats
+// stream, renderJobsBadge() + the 1s poll repaint this panel near-continuously
+// and the card buttons (pin / dismiss / open) read as dead. Track "pointer
+// held inside the panel" and DEFER repaints until release; the poll (or the
+// clicked action's own re-render, which clears the hold) repaints right after.
+var _homeChatsPointerHeld = false;
+document.addEventListener('pointerdown', function(e) {
+    var el = document.getElementById('home-active-chats');
+    _homeChatsPointerHeld = !!(el && e.target && el.contains(e.target));
+}, true);
+document.addEventListener('pointerup', function() {
+    // Clear AFTER the click event dispatches (input events beat 0ms timers),
+    // so a queued repaint timer can't destroy the target between mouseup and
+    // click either. Click handlers that re-render clear the hold themselves.
+    setTimeout(function() { _homeChatsPointerHeld = false; }, 0);
+}, true);
+document.addEventListener('pointercancel', function() { _homeChatsPointerHeld = false; }, true);
 function renderHomeActiveChats() {
     var container = document.getElementById('home-active-chats');
     var homeContent = document.getElementById('home-content');
@@ -3262,8 +3485,6 @@ function renderHomeActiveChats() {
     var prevBodyEl = container.querySelector('.home-active-chats-body');
     var prevBodyTop = prevBodyEl ? prevBodyEl.scrollTop : 0;
     var prevBodyLeft = prevBodyEl ? prevBodyEl.scrollLeft : 0;
-    var prevColScroll = [];
-    container.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { prevColScroll[i] = el.scrollTop; });
     var prevCardScroll = {};
     container.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
         var cid = cardEl.getAttribute('data-chat-id');
@@ -3271,31 +3492,40 @@ function renderHomeActiveChats() {
         if (cid && bodyEl && bodyEl.scrollTop) prevCardScroll[cid] = bodyEl.scrollTop;
     });
     var buckets = _jobsExpandBuckets();
-    var total = buckets.total;
-    var layout = _getJobsExpandLayout();
-    // Empty -> render nothing (no chrome) and hide the container entirely.
+    var rawTotal = buckets.total;
+    // Filter pills reflect the UNFILTERED buckets (so per-group counts stay
+    // truthful); the body renders the FILTERED set (empty sections skipped by
+    // section() inside _jobsExpandBodyHtml, so headers/counts follow along).
+    var filterBar = _homeChatsFilterBarHtml(buckets);
+    var shown = _homeChatsApplyFilter(buckets);
+    var total = shown.total;
+    // No chats at all -> render nothing (no chrome) and hide the container
+    // entirely. A filter that matches nothing keeps the chrome + pills visible
+    // with an inline empty message instead (so the user can switch back).
     var html = '';
-    if (total) {
+    if (rawTotal) {
         html = '<div class="home-active-chats-inner">' +
             '<div class="home-active-chats-head">' +
                 '<span class="home-active-chats-title">Active chats</span>' +
                 '<span class="jobs-expand-count">' + total + '</span>' +
-                _jobsExpandLayoutToggleHtml(layout) +
+                filterBar +
             '</div>' +
-            '<div class="home-active-chats-body' + (layout === 'sections' ? ' layout-sections' : '') + '">' +
-                _jobsExpandBodyHtml(layout, buckets) +
+            '<div class="home-active-chats-body layout-sections">' +
+                (total ? _jobsExpandBodyHtml(shown)
+                       : '<div class="jobs-expand-empty">No chats in this state</div>') +
             '</div>' +
         '</div>';
     }
     // Diff (last HTML stored on the container node, like the modal) -- skip the
     // repaint + flicker when nothing changed.
-    if (container._homeLastHtml === html) {
-        container.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i]; });
-        return;
-    }
+    if (container._homeLastHtml === html) return;
+    // Pointer pressed inside the panel: skip this repaint WITHOUT updating
+    // _homeLastHtml, so the press target stays alive and the click actually
+    // fires; the deferred content lands on the next poll tick / action render.
+    if (_homeChatsPointerHeld) return;
     container._homeLastHtml = html;
     container.innerHTML = html;
-    container.style.display = total ? '' : 'none';
+    container.style.display = rawTotal ? '' : 'none';
     // Restore scroll positions after the repaint (body first — it's the outer
     // scroller; columns/cards scroll independently inside it).
     var newBodyEl = container.querySelector('.home-active-chats-body');
@@ -3303,9 +3533,6 @@ function renderHomeActiveChats() {
         newBodyEl.scrollTop = prevBodyTop;
         newBodyEl.scrollLeft = prevBodyLeft;
     }
-    container.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) {
-        if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i];
-    });
     container.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
         var cid = cardEl.getAttribute('data-chat-id');
         if (cid && prevCardScroll[cid] != null) {
@@ -3319,10 +3546,6 @@ function renderJobsExpandModal() {
     if (!overlay) return;
     var prevBody = overlay.querySelector('.jobs-expand-body');
     var prevScroll = prevBody ? prevBody.scrollTop : 0;
-    // Each column scrolls on its own now, so snapshot per-column scroll (by
-    // index — column order is stable) to restore it after the live repaint.
-    var prevColScroll = [];
-    overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) { prevColScroll[i] = el.scrollTop; });
     // Card bodies scroll too (progress content, max-height capped). Snapshot
     // their scrollTop keyed by chat id so a live repaint doesn't yank the user
     // back to the top of the card they were reading.
@@ -3337,21 +3560,17 @@ function renderJobsExpandModal() {
     var buckets = _jobsExpandBuckets();
     var total = buckets.total;
     var closeIcon = UI_ICONS.close || '\u00d7';
-    var layout = _getJobsExpandLayout();
     var body = total
-        ? _jobsExpandBodyHtml(layout, buckets)
+        ? _jobsExpandBodyHtml(buckets)
         : '<div class="jobs-expand-empty">No active chats right now</div>';
-    // Header toggle: shared with the embedded home panel via _jobsExpandLayoutToggleHtml.
-    var layoutToggle = _jobsExpandLayoutToggleHtml(layout);
     var html =
         '<div class="jobs-expand-modal" role="dialog" aria-label="Active chats">' +
             '<div class="jobs-expand-head">' +
                 '<span class="jobs-expand-title">Active Chats</span>' +
                 '<span class="jobs-expand-count">' + total + '</span>' +
-                layoutToggle +
                 '<button class="jobs-expand-close" aria-label="Close" onclick="closeJobsExpandModal()">' + closeIcon + '</button>' +
             '</div>' +
-            '<div class="jobs-expand-body' + (layout === 'sections' ? ' layout-sections' : '') + '">' + body + '</div>' +
+            '<div class="jobs-expand-body layout-sections">' + body + '</div>' +
         '</div>';
     // Diff: skip the repaint (and its flicker) when nothing changed.
     if (overlay._jobsLastHtml === html) {
@@ -3362,9 +3581,6 @@ function renderJobsExpandModal() {
     overlay.innerHTML = html;
     var newBody = overlay.querySelector('.jobs-expand-body');
     if (newBody) newBody.scrollTop = prevScroll;
-    overlay.querySelectorAll('.jobs-expand-col-cards').forEach(function(el, i) {
-        if (prevColScroll[i] != null) el.scrollTop = prevColScroll[i];
-    });
     overlay.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
         var cid = cardEl.getAttribute('data-chat-id');
         if (cid && prevCardScroll[cid] != null) {
@@ -3388,13 +3604,22 @@ function _jobsExpandCardHtml(c) {
     // data-worker-toggle listener.
     var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(c.id) : null;
     var workers = (typeof _jobsAccWorkersHtml === 'function') ? _jobsAccWorkersHtml(c.id) : '';
+    // Pin toggle (shared with the dropdown rows — same chat.pinned flag) +
+    // dismiss (hover-revealed; hidden on pinned cards, matching _jobsRowButtons:
+    // pinned chats are never hidden, unpin first).
+    var pinned = !!c.pinned;
+    var pinBtn = (typeof _jobsPinBtnHtml === 'function') ? _jobsPinBtnHtml(c) : '';
+    var dismissBtn = pinned ? '' :
+        '<button class="jobs-row-btn danger jobs-card-dismiss" title="Remove from list" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
     return '<div class="jobs-expand-card state-' + escapeHtml(st) + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
         '<div class="jobs-expand-card-head">' +
             indicator +
             '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
             _jobsProgressBadgeHtml(c.id) +
+            pinBtn +
             (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
             '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
+            dismissBtn +
         '</div>' +
         '<div class="jobs-expand-card-body">' + _jobsAccordionBodyHtml(prog) + '</div>' +
         (workers ? '<div class="jobs-expand-card-workers" data-workers-for="' + escapeHtml(c.id) + '">' + workers + '</div>' : '') +
@@ -3684,6 +3909,7 @@ function _rerenderOpenJobsDropdown() {
 // Pin/unpin a chat from a jobs row. Pinning un-hides a previously removed chat
 // (pinned always wins). Reuses togglePinChat so History + sidebar stay in sync.
 function toggleJobsPin(chatId) {
+    _homeChatsPointerHeld = false; // our own repaint must not be deferred
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!c) return;
     if (!c.pinned && c._jobsHidden) delete c._jobsHidden;
@@ -3695,6 +3921,8 @@ function toggleJobsPin(chatId) {
     }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     _rerenderOpenJobsDropdown();
+    _refreshJobsExpandModal();
+    if (typeof renderHomeActiveChats === 'function') { try { renderHomeActiveChats(); } catch (e) {} }
 }
 
 // Flip a chat's leftover status:'pending' tool-approval rows to a terminal
@@ -3739,6 +3967,7 @@ function dismissChatNotifications(chatId) {
 // Remove a chat from the jobs-dropdown lists (Active/Recent/Done/Today) without
 // deleting it from History. Pinned chats are never hidden — unpin first.
 function dismissChatFromJobs(chatId) {
+    _homeChatsPointerHeld = false; // our own repaint must not be deferred
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!c || c.pinned) return;
     c._jobsHidden = true;
@@ -3752,6 +3981,8 @@ function dismissChatFromJobs(chatId) {
     if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     _rerenderOpenJobsDropdown();
+    _refreshJobsExpandModal();
+    if (typeof renderHomeActiveChats === 'function') { try { renderHomeActiveChats(); } catch (e) {} }
 }
 
 // One-shot boot reconciliation: a status:'pending' approval row that survives a

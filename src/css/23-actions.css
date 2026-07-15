@@ -1265,7 +1265,9 @@
 
 .jobs-dropdown {
     position: absolute;
-    top: calc(100% + 6px);
+    /* 4px gap below the pill — same offset as every other header menu
+       (model menu, settings panel, ws dropdown, usage dropdown, instance picker). */
+    top: calc(100% + 4px);
     right: 0;
     z-index: var(--z-jobs-dropdown);
     /* Fixed footprint: at least 40% of the viewport, clamped so it can't
@@ -1274,10 +1276,8 @@
     height: max(40vh, 360px);
     max-width: 90vw;
     max-height: 85vh;
-    background: var(--bg-primary);
-    border: 1px solid var(--secondary-border);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+    /* bg/border/radius/shadow come from the shared .header-menu class
+       (04-header.css) so all header pill dropdowns match. */
     overflow: hidden;
 }
 /* Inner flex column gives the scroll panel a bounded height even though the
@@ -1287,14 +1287,6 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-}
-.jobs-dropdown-header {
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--secondary-border);
-    font-weight: var(--font-semibold);
-    color: var(--text-primary);
-    font-size: var(--text-body-sm);
-    flex-shrink: 0;
 }
 .jobs-dropdown-empty {
     padding: var(--space-6);
@@ -1316,7 +1308,7 @@
     transition: background 0.12s;
 }
 .jobs-dropdown-row:last-child { border-bottom: none; }
-.jobs-dropdown-row:hover { background: var(--secondary-light); }
+.jobs-dropdown-row:hover { background: var(--bg-hover); }
 .jobs-dropdown-row.state-running { background: var(--primary-lighter); }
 .jobs-dropdown-row.state-needs_input,
 .jobs-dropdown-row.state-needs_permission { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
@@ -1377,32 +1369,29 @@
 /* =============================================
    TABBED JOBS DROPDOWN (Active / Recent / Done)
    ============================================= */
-.jobs-panel-head {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: var(--space-2);
-    padding: var(--space-3) var(--space-4) var(--space-2);
-    flex-shrink: 0;
-}
-.jobs-panel-title {
-    font-weight: var(--font-semibold);
-    color: var(--text-primary);
-    font-size: var(--text-body-sm);
-}
-.jobs-panel-viewall {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: var(--text-caption);
-    color: var(--primary);
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.jobs-panel-viewall:hover { text-decoration: underline; }
-.jobs-panel-viewall svg { width: 12px; height: 12px; }
-
+/* Title row ("Active Chats") removed — the ⚡ pill already names the menu.
+   Expand lives in the tabs row now (.jobs-expand-btn). */
 .jobs-tabs {
     display: flex; gap: var(--space-1);
-    padding: 0 var(--space-3) var(--space-2);
+    padding: var(--space-3) var(--space-3) var(--space-2);
     flex-shrink: 0;
 }
+/* Compact icon-only Expand button at the right of the tabs row — same border/
+   radius language as the tabs, same hover as all header-menu rows. */
+.jobs-expand-btn {
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px;
+    padding: 6px;
+    border: 1px solid var(--secondary-border);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+}
+.jobs-expand-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.jobs-expand-btn svg { width: 13px; height: 13px; }
 .jobs-tab {
     flex: 1;
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -1416,7 +1405,7 @@
     cursor: pointer;
     transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
-.jobs-tab:hover { color: var(--text-primary); background: var(--secondary-light); }
+.jobs-tab:hover { color: var(--text-primary); background: var(--bg-hover); }
 .jobs-tab.active { color: var(--success, #059669); background: rgba(5, 150, 105, 0.16); border-color: var(--success, #059669); }
 /* Count rendered as a rounded pill in every state. */
 .jobs-tab-count {
@@ -1516,6 +1505,8 @@
     background: var(--warning, #f59e0b);
     box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
 }
+/* User-paused chat (Pause button) — amber, no halo: paused is calm, not urgent. */
+.jobs-row-dot.state-paused { background: var(--warning, #f59e0b); }
 /* Terminal progress badge on chat rows / expand cards (icon + short label,
    e.g. "PR opened") — rendered by _jobsProgressBadgeHtml when the chat's
    latest update_action_state is terminal. Additive to the activity dot. */
@@ -1546,6 +1537,8 @@
    .state-attention dot family. */
 .jobs-row-state-badge.state-needs_input { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 .jobs-row-state-badge.state-needs_permission { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
+/* User-paused chat — amber "Paused" badge (matches the .state-paused dot). */
+.jobs-row-state-badge.state-paused { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 /* Expand-modal card head: badge sits inline between title and buttons. */
 .jobs-expand-card-head .jobs-row-state-badge { margin-top: 0; flex-shrink: 1; min-width: 0; }
 /* Bell shown when a finished chat has an unviewed response. */
@@ -1580,15 +1573,10 @@
 .jobs-chat-row .jobs-row-btn.jobs-open-btn,
 .jobs-today-row .jobs-row-btn.jobs-open-btn { opacity: 1; }
 
+/* Band, padding, icon and typography come from the shared .menu-section-title
+   class (04-header.css); only the mid-list top hairline is added here. */
 .jobs-subhead {
-    padding: var(--space-3) var(--space-4) var(--space-1);
-    font-size: var(--text-caption);
-    font-weight: var(--font-semibold);
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--text-muted);
     border-top: 1px solid var(--secondary-border);
-    margin-top: var(--space-1);
 }
 .jobs-today-row .jobs-row-check {
     width: 20px; height: 20px;
@@ -1608,11 +1596,8 @@
 .jobs-dropdown-row.jobs-unread .jobs-row-time { color: var(--text-secondary); }
 
 /* ---- Pinned section + per-row pin / dismiss controls ---- */
-/* Accent the 'Pinned' subhead so it reads as its own group above Completed Today. */
-.jobs-subhead.jobs-subhead-pinned {
-    color: var(--primary);
-    border-top-color: var(--primary-lighter, rgba(37, 99, 235, 0.18));
-}
+/* The Pinned subhead uses the SAME shared band as every other menu section
+   (round-5 unification); its leading pin icon is the group marker. */
 /* Pin indicator at the left of a pinned row (when it isn't running/unseen). */
 .jobs-pinned-row .jobs-row-pin-dot {
     width: 20px; height: 20px;
@@ -1754,16 +1739,6 @@
 /* =============================================
    EXPAND: centered modal of active-chat cards
    ============================================= */
-/* 'Expand' control in the panel head (replaces the old 'View all' link). */
-.jobs-panel-expand {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: var(--text-caption);
-    color: var(--primary);
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.jobs-panel-expand:hover { text-decoration: underline; }
-.jobs-panel-expand svg { width: 12px; height: 12px; }
 
 /* Centered modal (sized like the other extension modals, NOT full-screen). */
 .jobs-expand-overlay {
@@ -1804,33 +1779,8 @@
     color: var(--primary);
     font-size: var(--text-caption); font-weight: var(--font-semibold);
 }
-/* Layout toggle (columns vs sections) — a two-button segmented control pushed
-   to the right of the header, just before the close button (which therefore no
-   longer needs its own auto margin — the toggle is always rendered). */
-.jobs-expand-layout-toggle {
-    margin-left: auto;
-    display: inline-flex;
-    border: 1px solid var(--secondary-border);
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    flex-shrink: 0;
-}
-.jobs-expand-layout-btn {
-    width: 32px; height: 28px;
-    border: none; background: transparent;
-    color: var(--text-muted); cursor: pointer;
-    display: inline-flex; align-items: center; justify-content: center;
-    padding: 0;
-}
-.jobs-expand-layout-btn + .jobs-expand-layout-btn { border-left: 1px solid var(--secondary-border); }
-.jobs-expand-layout-btn:hover { background: var(--secondary-border); color: var(--text-primary); }
-.jobs-expand-layout-btn.active {
-    background: var(--primary-lighter, rgba(37, 99, 235, 0.12));
-    color: var(--primary);
-}
-.jobs-expand-layout-btn svg { width: 15px; height: 15px; }
 .jobs-expand-close {
-    margin-left: 0;
+    margin-left: auto;
     width: 32px; height: 32px;
     border: 1px solid transparent; background: transparent;
     color: var(--text-muted); cursor: pointer;
@@ -1844,17 +1794,7 @@
     padding: var(--space-4) var(--space-5) var(--space-5);
     display: flex;
 }
-/* Three fixed columns side by side — Active | Completed Today | Pinned. Each
-   column owns a header (subhead) and a vertically-scrolling stack of cards, so
-   the three headers stay aligned at the top regardless of how full a column is. */
-.jobs-expand-columns {
-    display: flex; gap: var(--space-6);
-    flex: 1; min-height: 0; width: 100%;
-}
-.jobs-expand-column {
-    display: flex; flex-direction: column;
-    flex: 1 1 0; min-width: 0;
-}
+/* Section headers — Active / Completed Today / Pinned. */
 .jobs-expand-subhead {
     display: flex; align-items: center; gap: var(--space-2);
     font-size: var(--text-caption);
@@ -1876,14 +1816,9 @@
     font-size: 10px; font-weight: var(--font-semibold);
     letter-spacing: 0;
 }
-.jobs-expand-col-cards {
-    flex: 1; min-height: 0; overflow-y: auto;
-    display: flex; flex-direction: column; gap: var(--space-6);
-    padding-right: 2px;
-}
-/* Sections layout: buckets stack vertically (Active first) and the WHOLE body
-   scrolls — unlike the columns layout where each column scrolls on its own.
-   Cards sit in a grid capped at three per row (two on narrow widths). */
+/* Sections layout (the only layout): buckets stack vertically (Active first)
+   and the WHOLE body scrolls. Cards sit in a grid capped at three per row
+   (two on narrow widths). */
 .jobs-expand-body.layout-sections { overflow-y: auto; display: block; }
 .jobs-expand-sections {
     display: flex; flex-direction: column; gap: var(--space-5);
@@ -1901,10 +1836,6 @@
     break-inside: avoid;
     margin-bottom: var(--space-6);
     display: block;
-}
-.jobs-expand-col-empty {
-    color: var(--text-muted); opacity: 0.7;
-    font-size: var(--text-body-sm); padding: var(--space-3) 0;
 }
 .jobs-expand-empty {
     text-align: center; color: var(--text-muted);
@@ -1941,6 +1872,7 @@
 }
 .jobs-expand-card.state-running::before { background: var(--success, #10b981); }
 .jobs-expand-card.state-attention::before,
+.jobs-expand-card.state-paused::before,
 .jobs-expand-card.state-unseen::before { background: var(--warning, #f59e0b); }
 .jobs-expand-card.state-error::before { background: var(--danger, #ef4444); }
 .jobs-expand-card.is-current { box-shadow: inset 3px 0 0 var(--success, #10b981); }
@@ -1955,6 +1887,15 @@
 .jobs-expand-card-head .jobs-row-ctx { width: 22px; height: 22px; flex-shrink: 0; }
 .jobs-expand-card-head .jobs-row-ctx .worker-ctx-circle { width: 22px; height: 22px; }
 .jobs-expand-card-head .jobs-row-ctx .worker-ctx-pct { font-size: 7px; }
+/* Pin / dismiss controls on expand cards (modal + embedded home panel): hover-
+   revealed like the dropdown-row buttons (see .jobs-chat-row rules above); the
+   open-chat button stays always visible, and a pinned pin stays lit so the
+   pinned state reads at a glance (color comes from .jobs-pin-btn.pinned). */
+.jobs-expand-card .jobs-row-btn.jobs-pin-btn,
+.jobs-expand-card .jobs-row-btn.jobs-card-dismiss { opacity: 0; transition: opacity 0.12s; flex-shrink: 0; }
+.jobs-expand-card:hover .jobs-row-btn.jobs-pin-btn,
+.jobs-expand-card:hover .jobs-row-btn.jobs-card-dismiss { opacity: 1; }
+.jobs-expand-card .jobs-row-btn.jobs-pin-btn.pinned { opacity: 1; }
 .jobs-expand-card-title {
     flex: 1; min-width: 0;
     font-size: var(--text-body-sm);
@@ -2015,22 +1956,16 @@
     min-width: 0;
     flex-shrink: 0;
 }
-/* Only when truly cramped do the three columns stack vertically (cards get too
-   narrow to read otherwise); the body then scrolls as a whole instead of each
-   column scrolling on its own. Above this they stay side by side as columns. */
 @media (max-width: 560px) {
-    .jobs-expand-body { overflow-y: auto; }
-    .jobs-expand-columns { flex-direction: column; }
-    .jobs-expand-column { flex: 0 0 auto; }
-    .jobs-expand-col-cards { overflow: visible; }
     .jobs-expand-modal { width: 96vw; height: 90vh; }
 }
 
 /* =============================================
    EMBEDDED ACTIVE CHATS PANEL (home / new-chat page)
-   The SAME cards + columns/sections layout as the expand modal, but rendered
+   The SAME cards + sections layout as the expand modal, but rendered
    inline under the home Actions row instead of in a fixed overlay. Sizes to
-   content (capped) and shares the layout toggle + localStorage preference.
+   content (uncapped — the home page scrolls, the panel itself never does).
+   The head hosts the state-filter pills (.home-chats-filters).
    ============================================= */
 .home-active-chats {
     width: 100%;
@@ -2055,30 +1990,70 @@
     letter-spacing: 0.04em;
     color: var(--text-muted);
 }
-/* Columns mode: bounded height so the panel never dominates the home page; each
-   column scrolls internally exactly like the modal. When the panel is too narrow
-   for three columns the whole body scrolls horizontally (min column width). */
+/* The panel auto-sizes to its content — NO internal scrolling (the home page
+   itself scrolls via .home-content), unlike the modal's
+   .jobs-expand-body.layout-sections. */
 .home-active-chats-body {
-    display: flex;
-    overflow-x: auto;
-    overflow-y: hidden;
-    max-height: min(70vh, 720px);
-}
-.home-active-chats-body .jobs-expand-columns { min-width: min-content; }
-.home-active-chats-body .jobs-expand-column { min-width: 210px; }
-/* Sections mode: the whole body scrolls (matches .jobs-expand-body.layout-sections). */
-.home-active-chats-body.layout-sections {
     display: block;
     overflow-x: hidden;
-    overflow-y: auto;
-    max-height: min(75vh, 800px);
+}
+/* State filter pills (top-right of the panel head) — replace the old
+   columns/sections layout toggle. Uppercase caption-sized chips; the active
+   pill takes the state palette used elsewhere (.action-btn.state-*, dots). */
+.home-chats-filters {
+    margin-left: auto;
+    display: inline-flex; align-items: center;
+    gap: var(--space-1);
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.home-chats-filter-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    height: 22px; padding: 0 9px;
+    border: 1px solid var(--secondary-border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 10px; font-weight: var(--font-semibold);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.home-chats-filter-btn:hover { background: var(--secondary-light); color: var(--text-primary); }
+.home-chats-filter-count { opacity: 0.7; }
+.home-chats-filter-btn.active.f-all,
+.home-chats-filter-btn.active.f-active {
+    background: var(--primary-lighter, rgba(37, 99, 235, 0.12));
+    border-color: var(--primary-light, rgba(37, 99, 235, 0.4));
+    color: var(--primary);
+}
+.home-chats-filter-btn.active.f-stuck {
+    background: var(--warning-lighter, rgba(245, 158, 11, 0.12));
+    border-color: var(--warning-light, rgba(245, 158, 11, 0.4));
+    color: var(--warning, #b45309);
+}
+.home-chats-filter-btn.active.f-pr_opened {
+    background: var(--purple-lighter, rgba(124, 58, 237, 0.08));
+    border-color: var(--purple-light, rgba(124, 58, 237, 0.4));
+    color: var(--purple, #7c3aed);
+}
+.home-chats-filter-btn.active.f-pr_merged {
+    background: var(--merged-lighter, rgba(130, 80, 223, 0.08));
+    border-color: var(--merged-light, rgba(130, 80, 223, 0.4));
+    color: var(--merged, #8250df);
+}
+.home-chats-filter-btn.active.f-done {
+    background: var(--success-lighter, rgba(16, 185, 129, 0.15));
+    border-color: var(--success-light, rgba(16, 185, 129, 0.4));
+    color: var(--success, #10b981);
+}
+.home-chats-filter-btn.active.f-error {
+    background: var(--danger-lighter, rgba(239, 68, 68, 0.15));
+    border-color: var(--danger-light, rgba(239, 68, 68, 0.4));
+    color: var(--danger, #ef4444);
 }
 @media (max-width: 560px) {
     .home-active-chats { max-width: 100%; padding: 0 8px; }
-    /* The modal media query stacks the shared .jobs-expand-columns vertically and
-       sets .jobs-expand-col-cards { overflow: visible } on small screens, so the
-       embedded body must scroll vertically (not clip) in columns mode too. */
-    .home-active-chats-body { overflow-x: hidden; overflow-y: auto; }
     .home-active-chats-body .jobs-expand-section-cards { column-count: 1; }
 }
 

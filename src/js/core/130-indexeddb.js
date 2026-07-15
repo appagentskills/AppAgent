@@ -61,6 +61,15 @@ var db = null;
 // (error / blocked timeout) so a later call can retry, and on success (the
 // cached `db` takes over as the fast path).
 var _dbOpenPromise = null;
+// Module ref to the in-flight open watchdog timer so closeDatabase() can
+// cancel a pending open before a context teardown (reload / pagehide).
+var _dbOpenWatchdogTimer = null;
+// SLEEP-WEDGE: watchdog for a SILENTLY hung indexedDB.open() — after a long
+// suspend Chrome's IDB backend can wedge such that the open request fires
+// NONE of onsuccess/onerror/onblocked. Without an unconditional timer the
+// promise above stays pending forever and poisons the realm (every caller
+// dedupes onto it). See openDatabase().
+var DB_OPEN_WATCHDOG_MS = 15000;
 var skills = {};
 var EMBEDDED_SKILLS = /*EMBEDDED_SKILLS_START*/[]/*EMBEDDED_SKILLS_END*/;
 var currentView = 'chat';
@@ -112,6 +121,44 @@ var gridState = {
     maxZIndex: 1             // Track highest z-index for bringing widgets to front
 };
 
+// RELOAD-DB latch: timestamp of the last closeDatabase() call. closeDatabase
+// only runs on teardown paths (reloadExtension 'prepare-reload', page
+// pagehide, SW onSuspend), all of which precede an abrupt context teardown.
+// While the latch is FRESH (< DB_RELOAD_LATCH_MS) openDatabase() refuses to
+// start a new open and an already-in-flight open's onsuccess closes its
+// connection instead of caching it — otherwise a racer inside
+// _prepareRealmsForReload's ~250ms settle window re-establishes a live
+// connection that chrome.runtime.reload() then abandons un-closed,
+// re-creating the exact IDB wedge closeDatabase() exists to prevent. The
+// latch is time-boxed and cleared by the next openDatabase() call after the
+// window, so if the teardown never actually happened (reload aborted,
+// bfcache restore) normal reopening self-heals.
+var DB_RELOAD_LATCH_MS = 2000;
+var _dbClosingForReload = 0;
+
+// SW-IDLE-CLOSE (empty-chat-list root fix): in the SERVICE-WORKER realm the
+// cached IDB connection must not outlive active work. A parked tool call (see
+// worker/120-tool-routing.js) keeps the SW warm for its whole lifetime; if the
+// SW is then abruptly killed or the OS sleeps, an un-closed connection is
+// abandoned mid-teardown and Chromium can wedge the origin's IDB backing store
+// — the next reload's open() hangs and the app renders an empty chat list until
+// a full Chrome restart. onSuspend is best-effort and does NOT fire on OS sleep
+// / process kill, so we proactively drop the cached SW connection once it has
+// been idle for DB_SW_IDLE_CLOSE_MS. Driven by the 30s heartbeat alarm
+// (background.js) — an MV3-durable timer, unlike setTimeout in a SW — plus an
+// explicit release on run-park (worker/110-agent-checkpoint.js) and on
+// parked-call expiry (worker/120-tool-routing.js). The next
+// withStore()/openDatabase() reopens transparently. The PAGE realm keeps its
+// connection (pagehide -> closeDatabase covers its teardown); only the SW is
+// bounded here. Last-access time is the activity signal: an active run
+// checkpoints/saves often enough to stay warm; a parked/idle SW lapses.
+var DB_SW_IDLE_CLOSE_MS = 15000;
+var _dbLastAccessAt = 0;
+// SW realm == no document (the panel page AND the offscreen doc both have a
+// document; the service worker does not). Computed once; gates the idle-close so
+// it never fights the page's long-lived connection.
+var _dbIsWorkerRealm = (typeof document === 'undefined');
+
 // Liveness probe for a cached connection. Chrome can force-close an IDB
 // connection at any time (long sessions, IDB backend crash/restart) and the
 // dead handle then throws InvalidStateError on EVERY transaction() forever.
@@ -127,13 +174,23 @@ function _isDbConnectionAlive(database) {
 }
 
 function openDatabase() {
+    // RELOAD-DB latch (see _dbClosingForReload above): while a for-reload
+    // close is pending, fail fast instead of opening a doomed connection.
+    // Past the window, clear the latch so this (intentional) call reopens
+    // normally.
+    if (_dbClosingForReload) {
+        if (Date.now() - _dbClosingForReload < DB_RELOAD_LATCH_MS) {
+            return Promise.reject(new Error('IndexedDB is closed for an imminent extension reload'));
+        }
+        _dbClosingForReload = 0;
+    }
     // Fast path: cached connection — but verify it's still alive so every
     // `await openDatabase()` call site (~60 across the bundles, in three
     // realms: panel page, service worker, offscreen doc) gets a usable
     // handle without needing individual connection-loss retry logic. This
     // is the shared transaction-creation choke point.
     if (db) {
-        if (_isDbConnectionAlive(db)) return Promise.resolve(db);
+        if (_isDbConnectionAlive(db)) { _dbLastAccessAt = Date.now(); return Promise.resolve(db); }
         try { db.close(); } catch (e) {}
         db = null;
     }
@@ -146,10 +203,26 @@ function openDatabase() {
         var request = indexedDB.open(dbName, dbVersion);
         var settled = false;
         var blockedTimer = null;
+        // SLEEP-WEDGE: unconditional open watchdog, armed at request creation
+        // (the onblocked timer below only covers ANNOUNCED blocks — a
+        // post-suspend wedged backend fires no event at all). On expiry:
+        // identity-guarded clear of the dedupe slot + reject, so the NEXT
+        // caller retries a fresh open instead of sharing a dead promise
+        // forever. If the open later succeeds anyway, onsuccess still caches
+        // the connection for the next caller.
+        var openWatchdogTimer = _dbOpenWatchdogTimer = setTimeout(function() {
+            openWatchdogTimer = null;
+            if (settled) return;
+            console.warn('[indexeddb] open of ' + dbName + ' hung for ' + DB_OPEN_WATCHDOG_MS + 'ms with no success/error/blocked event — rejecting so callers can retry');
+            if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null; // let a later call retry
+            settle(reject, new Error('IndexedDB open timed out after ' + DB_OPEN_WATCHDOG_MS + 'ms — storage backend may be wedged. Try restarting Chrome if this persists.'));
+        }, DB_OPEN_WATCHDOG_MS);
         function settle(fn, arg) {
             if (settled) return;
             settled = true;
             if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+            if (openWatchdogTimer) { clearTimeout(openWatchdogTimer); openWatchdogTimer = null; }
+            _dbOpenWatchdogTimer = null;
             fn(arg);
         }
         request.onerror = function() {
@@ -173,6 +246,18 @@ function openDatabase() {
         };
         request.onsuccess = function() {
             var result = request.result;
+            // RELOAD-DB latch: closeDatabase() ran while THIS open was in
+            // flight — the realm is about to be torn down. Close the fresh
+            // connection instead of caching it (caching would re-create the
+            // abandoned-connection wedge the close was preventing) and reject
+            // so racing callers fail fast. settle() clears the watchdog and
+            // blocked timers, so nothing leaks.
+            if (_dbClosingForReload) {
+                try { result.close(); } catch (e) {}
+                if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null;
+                settle(reject, new Error('IndexedDB open abandoned: closed for an imminent extension reload'));
+                return;
+            }
             // Stale attempt: a newer open superseded us (our blocked-timeout
             // rejection already cleared _dbOpenPromise and a retry replaced
             // it) AND a different live connection is already cached. Close
@@ -200,6 +285,7 @@ function openDatabase() {
                 if (db === result) db = null;
             };
             db = result;
+            _dbLastAccessAt = Date.now(); // SW-IDLE-CLOSE activity stamp
             if (_dbOpenPromise === myOpenPromise) _dbOpenPromise = null;
             settle(resolve, result);
         };
@@ -317,12 +403,72 @@ function openDatabase() {
     return myOpenPromise;
 }
 
+// Cleanly close the cached IDB connection and reset all open state. Safe to
+// call repeatedly and when nothing was ever opened. Called before a full
+// extension reload (reloadExtension -> 'prepare-reload') and on page pagehide
+// so a live connection is never abandoned when the context is torn down: an
+// un-closed connection killed mid-reload can make Chrome force-close the
+// origin's IndexedDB backing store, wedging the DB (open() hangs / throws
+// UnknownError) until a full browser restart. Shared into the page + worker
+// (SW) bundles via WORKER_SHARED_FILES, so both realms expose it.
+function closeDatabase() {
+    // Arm the RELOAD-DB latch (see _dbClosingForReload) so an in-flight or
+    // freshly-started openDatabase() inside the pre-reload settle window
+    // cannot re-establish a live connection the reload would then abandon.
+    _dbClosingForReload = Date.now();
+    if (_dbOpenWatchdogTimer) {
+        try { clearTimeout(_dbOpenWatchdogTimer); } catch (e) {}
+        _dbOpenWatchdogTimer = null;
+    }
+    // Drop the in-flight dedupe promise so the next openDatabase() starts a
+    // fresh open instead of handing out a promise for a connection we closed.
+    _dbOpenPromise = null;
+    if (db) {
+        try { db.close(); } catch (e) {}
+        db = null;
+    }
+}
+
+// SW-IDLE-CLOSE soft release: drop the cached connection WITHOUT arming the
+// RELOAD-DB latch. closeDatabase() sets _dbClosingForReload, which makes the
+// next openDatabase() REJECT for DB_RELOAD_LATCH_MS — correct before a reload,
+// but wrong for a routine idle release where the very next access must reopen
+// immediately. This is the idle-path twin: close + null the cache so the next
+// openDatabase() starts a fresh open, nothing else. Safe with an in-flight
+// transaction: IDB's db.close() defers the actual close until pending
+// transactions commit; it only blocks NEW ones.
+function releaseIdleDbConnection() {
+    // Never yank the connection out from under an in-flight open — let that
+    // open finish; the next idle check releases the resulting connection.
+    if (_dbOpenPromise) return;
+    if (db) {
+        try { db.close(); } catch (e) {}
+        db = null;
+    }
+}
+
+// Called from the SW heartbeat alarm (background.js, every 30s). Releases the
+// cached SW connection once it has been idle >= DB_SW_IDLE_CLOSE_MS. No-op in
+// the page realm, when nothing is cached, or while an open is in flight.
+function maybeReleaseIdleDbConnection() {
+    if (!_dbIsWorkerRealm) return;
+    if (!db || _dbOpenPromise) return;
+    if (!_dbLastAccessAt || (Date.now() - _dbLastAccessAt) < DB_SW_IDLE_CLOSE_MS) return;
+    releaseIdleDbConnection();
+}
+
 // True for the DOMException shapes a dead / force-closed connection throws:
 // InvalidStateError, or the "database connection is closing" message some
 // Chrome versions raise while teardown is in progress.
 function _isDbConnectionError(e) {
     if (!e) return false;
     if (e.name === 'InvalidStateError') return true;
+    // SLEEP-WEDGE: post-suspend backend failures also surface as UnknownError
+    // (internal IDB error), AbortError (our transaction deadline aborts the
+    // wedged transaction), or the deadline sentinel itself — all mean "drop
+    // this connection and retry on a fresh one".
+    if (e.name === 'UnknownError' || e.name === 'AbortError' || e.name === 'TimeoutError') return true;
+    if (e._dbTxTimeout) return true;
     return typeof e.message === 'string' && e.message.toLowerCase().indexOf('database connection is closing') !== -1;
 }
 
@@ -338,17 +484,120 @@ function _isDbConnectionError(e) {
 // clearing it would fork duplicate opens. Only pass idempotent bodies (all
 // current callers are: get/getAll reads, and diff-saves re-derived from
 // in-memory state).
-async function withStore(storeNames, mode, fn) {
+// SLEEP-WEDGE: deadline for a single withStore transaction body. A
+// post-suspend wedged backend accepts transaction()/getAll() calls whose
+// callbacks then NEVER fire — nothing throws, so without a deadline the
+// retry path never engages and the caller awaits forever. The deadline
+// turns the silent hang into a connection-shaped error (TimeoutError, see
+// _isDbConnectionError) so withStore drops the dead connection, reopens and
+// retries once. Readwrite gets a longer budget: large diff-saves of the
+// chats store can be legitimately slow on cold disk.
+var DB_TX_DEADLINE_READ_MS = 15000;
+var DB_TX_DEADLINE_WRITE_MS = 30000;
+
+function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) {
+    return new Promise(function(resolve, reject) {
+        // A sync throw here (dead connection) rejects this promise and is
+        // classified by _isDbConnectionError in withStore, same as before.
+        var tx = database.transaction(storeNames, mode);
+        // A caller may pass a shorter per-call deadline (withStore opts.deadlineMs)
+        // — e.g. the boot chats hydration uses ~6s so first-try + one reopen-retry
+        // (~12s) still fits under init's BOOT_HYDRATION_DEADLINE_MS budget.
+        var deadlineMs = (deadlineOverrideMs > 0)
+            ? deadlineOverrideMs
+            : ((mode === 'readwrite') ? DB_TX_DEADLINE_WRITE_MS : DB_TX_DEADLINE_READ_MS);
+        var settled = false;
+        var timer = setTimeout(function() {
+            if (settled) return;
+            settled = true;
+            // Best-effort abort — on a truly wedged backend even abort may
+            // no-op, but the caller is already unblocked by the rejection.
+            try { tx.abort(); } catch (e) {}
+            var err = new Error('IndexedDB transaction on [' + storeNames + '] (' + mode + ') timed out after ' + deadlineMs + 'ms');
+            err.name = 'TimeoutError';
+            err._dbTxTimeout = true;
+            reject(err);
+        }, deadlineMs);
+        Promise.resolve().then(function() { return fn(tx); }).then(function(value) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(value);
+        }, function(e) {
+            // Also swallows the late settlement of a body whose transaction
+            // the deadline already aborted (settled guard) — no double-settle,
+            // no unhandled rejection.
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(e);
+        });
+    });
+}
+
+async function withStore(storeNames, mode, fn, opts) {
+    // opts.deadlineMs (optional): override the per-transaction deadline for
+    // BOTH the first attempt and the reopen-retry. Used by the boot chats
+    // hydration to keep first-try + retry under the init boot deadline.
+    var deadlineOverrideMs = (opts && opts.deadlineMs > 0) ? opts.deadlineMs : 0;
     var database = await openDatabase();
     try {
-        return await Promise.resolve(fn(database.transaction(storeNames, mode)));
+        return await _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs);
     } catch (e) {
         if (!_isDbConnectionError(e)) throw e;
         console.warn('[indexeddb] transaction on ' + storeNames + ' hit a dead connection — reopening and retrying once', e);
         try { database.close(); } catch (e2) {}
         if (db === database) db = null;
         database = await openDatabase();
-        return await Promise.resolve(fn(database.transaction(storeNames, mode)));
+        return await _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs);
+    }
+}
+
+// =============================================================
+// SLEEP-WEDGE resume probe.
+// _isDbConnectionAlive above is a SYNC check of the renderer-side closed
+// flag only — after a long suspend the browser-side backend can be wedged
+// with the flag unset, so the sync probe passes while every actual request
+// hangs forever. This is a REAL round-trip probe: a tiny read with its own
+// deadline. On failure/hang it drops the cached connection so the next
+// access reopens (itself bounded by the open watchdog). Called on page
+// visibilitychange→visible (core/120-init.js) and on the SW 30s heartbeat
+// alarm (src/platform/extension/background.js). Single-flight + throttled.
+// =============================================================
+var DB_RESUME_PROBE_TIMEOUT_MS = 5000;
+var DB_RESUME_PROBE_MIN_INTERVAL_MS = 10000;
+var _dbResumeProbeInFlight = false;
+var _dbResumeProbeLastAt = 0;
+function probeDbAfterResume() {
+    if (_dbResumeProbeInFlight) return;
+    var database = db;
+    // Nothing cached: nothing to probe — the next openDatabase() starts a
+    // fresh open, bounded by the open watchdog.
+    if (!database) return;
+    var now = Date.now();
+    if (now - _dbResumeProbeLastAt < DB_RESUME_PROBE_MIN_INTERVAL_MS) return;
+    _dbResumeProbeLastAt = now;
+    _dbResumeProbeInFlight = true;
+    var settled = false;
+    var timer = null;
+    function finish(ok, why, err) {
+        if (settled) return;
+        settled = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        _dbResumeProbeInFlight = false;
+        if (ok) return;
+        console.warn('[indexeddb] resume probe failed (' + why + ') — dropping cached connection so the next access reopens', err || '');
+        try { database.close(); } catch (e) {}
+        if (db === database) db = null;
+    }
+    timer = setTimeout(function() { finish(false, 'timeout after ' + DB_RESUME_PROBE_TIMEOUT_MS + 'ms'); }, DB_RESUME_PROBE_TIMEOUT_MS);
+    try {
+        var tx = database.transaction([settingsStoreName], 'readonly');
+        var req = tx.objectStore(settingsStoreName).count();
+        req.onsuccess = function() { finish(true); };
+        req.onerror = function() { finish(false, 'request error', req.error); };
+    } catch (e) {
+        finish(false, 'sync throw', e);
     }
 }
 
@@ -729,7 +978,8 @@ async function loadApiProviders() {
                     apiProviders = loaded;
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
-                    // sonnet-5, gpt-5.2 → gpt-5.5, Gemini 3 Flash Preview →
+                    // sonnet-5, gpt-5.2 → gpt-5.6-sol (chain-collapsed through the
+                    // retired gpt-5.5 default), Gemini 3 Flash Preview →
                     // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5, and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
@@ -759,7 +1009,8 @@ async function loadApiProviders() {
                         { to: 'sonnet-5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
                         { to: 'sonnet-5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
-                        { to: 'gpt-5.5', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpointId: 'openrouter', effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.

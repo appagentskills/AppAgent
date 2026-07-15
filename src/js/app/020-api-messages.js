@@ -153,7 +153,10 @@ function togglePause() {
     // a fresh runAgent() the user never asked for (B-2).
     var wasPaused = pausedChats[chatId] === true;
     var nowPaused = !wasPaused;
-    pausedChats[chatId] = nowPaused;
+    // Persist the user-pause on the chat record too (chat.pausedByUser) so the
+    // paused state survives a panel reload — see setChatPausedPersistent
+    // (core/030-config.js); loadChatsFromStorage rehydrates pausedChats from it.
+    setChatPausedPersistent(chatId, nowPaused);
     // Mirror foreground state into the legacy global so legacy reads (after-response
     // hooks, browser-notification gate) reflect the focused chat. Background chats
     // that pause/resume independently do NOT touch the global — their loops only
@@ -277,7 +280,9 @@ function retryLastCall() {
     // single difference that made Continue "work" where Retry didn't.
     paused = false;
     if (targetChatId && typeof pausedChats !== 'undefined') {
-        pausedChats[targetChatId] = false;
+        // Clear the persisted pausedByUser flag too so the pause doesn't
+        // resurrect on the next panel reload.
+        setChatPausedPersistent(targetChatId, false);
     }
     if (typeof syncPauseButtonUI === 'function') {
         syncPauseButtonUI(targetChatId);
@@ -351,7 +356,8 @@ function continueAgent() {
     // Defensive: skip if no chat is selected. (`pausedChats` is module-level and
     // always defined — the previous `&& pausedChats` guard was dead code.)
     if (!currentChatId) return;
-    pausedChats[currentChatId] = false;
+    // Clears the persisted pausedByUser flag too (survives-reload pause state).
+    setChatPausedPersistent(currentChatId, false);
     // Use the single source of truth for the label rather than a manual innerHTML
     // write — keeps every render path consistent (e.g. if syncPauseButtonUI is
     // ever extended with extra state, continueAgent picks it up for free).

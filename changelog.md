@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.16
+
+### Features
+- Home Active Chats: state-filter pills, per-card pin/dismiss, auto-sizing panel.
+- Sub-agent chats get a sidebar card with a "Back to parent" button, and nicer report cards.
+- Word-level highlighting in file diffs.
+
+### Fixes
+- Fixed storage going silently unreachable after sleep, Reload, or a busy boot — no more empty chat list.
+- Sub-agent fixes: reports wake an idle parent, waking works after a cold restart, out-of-budget subs report instead of looping errors.
+- Chat no longer jumps to the top when an answer lands.
+
+---
+
 ## v1.1.15
 
 ### Features

@@ -244,8 +244,12 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
 
     // Scroll restore — single stick-to-bottom mechanism (see 050-streaming.js):
     // sticking users are pinned via the one choke point; everyone else keeps
-    // their absolute position.
+    // their absolute position. CLAMP-ESCAPE: the tail swap / appends above can
+    // transiently clamp container.scrollTop while the DOM is mid-mutation, so
+    // sticking users ALSO get a same-task seeding pin (see the full render's
+    // scroll-restore comment for the mechanism) before the rAF re-pin.
     if (stickToBottom) {
+        pinToBottom(container);
         scrollToBottomIfAllowed();
     } else {
         restoreChatScrollTop(container, savedScrollTop);
@@ -572,6 +576,7 @@ function renderMessages() {
             // Before rendering user message, check if we need to show changes from previous block
             // If the message was cached (long paste), show a collapsed scrollable preview with an expand toggle.
             var userBodyHtml;
+            var isSubNoticeRow = false;
             if (msg.cachedContentId) {
                 var sizeKB = Math.round((msg.content || '').length / 1024);
                 var lines = (msg.content || '').split('\n').length;
@@ -589,9 +594,25 @@ function renderMessages() {
                 // elements (headers, lists, code blocks) need a div, not a span.
                 // Sub-agent task messages ("## Task") benefit directly.
                 var rawUser = (typeof msg.content === 'string') ? msg.content : String(msg.content == null ? '' : msg.content);
-                userBodyHtml = '<div class="user-text user-text-md">' + formatContent(rawUser) + '</div>';
+                // Agent-communication notices — sub→parent final reports
+                // (_wakeParentOnReport), mid-flight lifecycle updates
+                // (_notifySubLifecycle) and parent→sub inbox drains
+                // (_formatInboxDrain), all core/097 — render as designed
+                // callout cards (final / progress / inbound variants) via
+                // renderSubReportNotices (175-sub-agent-ui.js). Gated on
+                // msg.injected so a USER quoting a notice keeps the normal
+                // bubble; mixed injected rows (notice coalesced with other
+                // queued text) keep non-notice segments on the normal path.
+                var subNoticeHtml = (msg.injected && typeof renderSubReportNotices === 'function')
+                    ? renderSubReportNotices(rawUser) : null;
+                if (subNoticeHtml != null) {
+                    isSubNoticeRow = true;
+                    userBodyHtml = subNoticeHtml;
+                } else {
+                    userBodyHtml = '<div class="user-text user-text-md">' + formatContent(rawUser) + '</div>';
+                }
             }
-            return '<div class="message user" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="Edit and branch">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="Copy message">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
+            return '<div class="message user' + (isSubNoticeRow ? ' sub-notice-msg' : '') + '" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="Edit and branch">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="Copy message">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
         } else if (msg.role === 'assistant') {
             // Hide assistant responses to hook messages unless showHookMessages is enabled
             if (!hooksEnabled.showHookMessages) {
@@ -1020,6 +1041,11 @@ function renderMessages() {
             return renderInlineActionButton(msg, index);
         } else if (msg.role === 'sub_report') {
             return renderSubReport(msg, index);
+        } else if (msg.role === 'sub_msg') {
+            // Standalone mid-flight sub→parent message callout (UI-only row
+            // pushed by agentMessage(to:'parent'), core/097). Renderer lives
+            // in 175-sub-agent-ui.js next to the other .sub-notice cards.
+            return renderSubAgentMessage(msg, index);
         } else if (msg.role === 'browser_context' || msg.role === 'context') {
             // Context messages are hidden from UI - they're only for API context
             // But we still need the ID for scrolling to work correctly
@@ -1204,7 +1230,24 @@ function renderMessages() {
     // Restore scroll after the rebuild — single stick-to-bottom mechanism (see
     // 050-streaming.js): sticking users are pinned via the one choke point;
     // everyone else keeps their absolute position.
+    // CLAMP-ESCAPE FIX: sticking users need a SYNCHRONOUS same-task pin here,
+    // not just the rAF-deferred one. The innerHTML rebuild above runs while
+    // the new DOM is momentarily SHORT (live widgets parked on document.body,
+    // iframes/images not yet sized) — any forced layout in that window clamps
+    // container.scrollTop toward 0, and the content then grows back leaving
+    // scrollTop stranded low. Scroll events are dispatched in the rendering
+    // steps BEFORE animation-frame callbacks, so with only the rAF pin the
+    // coalesced scroll event fires FIRST, at the clamped-low position, with
+    // _agLastScrollTop still holding the pre-rebuild value: handleChatScroll
+    // misreads it as a user scroll-up (top < last, above bottom), releases
+    // stickToBottom, and the rAF pin then refuses to run — the chat is left
+    // at the TOP. pinToBottom is a seeding write (sets _agLastScrollTop), so
+    // the clamp + pin coalesce into ONE event that lands AT the bottom and
+    // keeps the stick; the rAF pin then corrects for any post-layout growth
+    // (streaming maxHeight, async widget sizing). This mirrors what the
+    // released branch always did synchronously via restoreChatScrollTop.
     if (stickToBottom) {
+        pinToBottom(container);
         scrollToBottomIfAllowed();
     } else {
         restoreChatScrollTop(container, savedScrollTop);
@@ -1635,6 +1678,13 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
     // Restore scroll position if user had scrolled away (prevents browser auto-scroll on details expansion)
     if (savedScrollTop !== null && container) {
         restoreChatScrollTop(container, savedScrollTop);
+    } else if (container && stickToBottom) {
+        // CLAMP-ESCAPE: same-task seeding pin for sticking users — the
+        // innerHTML swap above can clamp container.scrollTop if the row
+        // transiently shrinks; without a seeding write the clamp's scroll
+        // event (dispatched before rAF callbacks) is misread as a user
+        // scroll-up and releases the stick (see renderMessages' restore).
+        pinToBottom(container);
     }
     
     // Set up sticky observers for any expanded tool panels
@@ -1998,10 +2048,16 @@ function renderQueuedUserBubble(container) {
     // be visually indistinguishable from the real message that replaces it.
     // The 'queued' class is kept purely as the selector for the idempotent
     // removal above; it no longer carries any special styling.
-    bubble.className = 'message user queued';
+    // A queued injection can BE a sub-agent report notice (mid-run notices
+    // ride pendingInjectionsByChatId) — give the optimistic bubble the same
+    // designed-callout treatment as the flushed row so it doesn't flash
+    // plain-blob first (renderSubReportNotices, 175-sub-agent-ui.js).
+    var _qNoticeHtml = (text && typeof renderSubReportNotices === 'function') ? renderSubReportNotices(text) : null;
+    bubble.className = 'message user queued' + (_qNoticeHtml != null ? ' sub-notice-msg' : '');
     var inner = '<div class="message-content">';
     if (text) {
-        inner += '<div class="user-text user-text-md">' + (typeof formatContent === 'function' ? formatContent(text) : escapeHtml(text)) + '</div>';
+        inner += (_qNoticeHtml != null) ? _qNoticeHtml
+            : '<div class="user-text user-text-md">' + (typeof formatContent === 'function' ? formatContent(text) : escapeHtml(text)) + '</div>';
     }
     if (images && images.length > 0) {
         inner += '<div class="queued-attachments">' + images.length + ' attachment' + (images.length === 1 ? '' : 's') + '</div>';

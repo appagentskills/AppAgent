@@ -326,7 +326,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 throw new Error(errorData.error?.message || 'API request failed');
             } catch (e) {
                 if (e.message && !e.message.includes('JSON')) throw e;
-                throw new Error('API request failed: ' + errorText);
+                // Cap the raw body — full text is already console.error'd above;
+                // a multi-KB provider payload must not flood downstream UIs.
+                throw new Error('API request failed: ' + String(errorText).slice(0, 300));
             }
         }
 

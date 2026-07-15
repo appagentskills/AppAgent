@@ -103,7 +103,42 @@ async function reloadExtension() {
     // picks up the freshly built files from disk. Without a connected folder (or
     // build tool) there is nothing on disk to update, so we just reload.
     _rebuildBeforeReload().then(function(proceed) {
-        if (proceed) _startReloadSequence();
+        if (!proceed) return;
+        // Cleanly close every realm's IDB connection BEFORE chrome.runtime.reload()
+        // tears the contexts down. An abrupt teardown of an un-closed connection can
+        // make Chrome force-close the origin's IndexedDB backing store, which then
+        // wedges the DB until a full browser restart (see closeDatabase). Fail-open:
+        // this only ever delays the reload by a fixed settle, never blocks it.
+        _prepareRealmsForReload().then(_startReloadSequence);
+    });
+}
+
+// Best-effort pre-reload cleanup across realms. Signals the service worker to
+// close its own IDB connection (and its offscreen doc), closes this page's
+// connection, then resolves after a short settle so the closes can land. Never
+// rejects and never hangs -- the settle timer is the only gate, so a reload
+// always proceeds even if the SW never answers (fail-open).
+function _prepareRealmsForReload() {
+    return new Promise(function(resolve) {
+        try {
+            if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} }
+            if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+                _agentBusPort.postMessage({ type: 'prepare-reload' });
+            }
+        } catch (e) { /* best-effort -- page still closes its own DB below */ }
+        // Close THIS (page) realm's connection.
+        try { if (typeof closeDatabase === 'function') closeDatabase(); } catch (e) {}
+        // Give the SW ~250ms to run its own closeDatabase() before teardown.
+        setTimeout(resolve, 250);
+    });
+}
+
+// Backstop: on page teardown (reload, tab close, navigation) close the IDB
+// connection cleanly even if the reload didn't originate from our button --
+// same force-close-avoidance rationale as _prepareRealmsForReload.
+if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pagehide', function() {
+        try { if (typeof closeDatabase === 'function') closeDatabase(); } catch (e) {}
     });
 }
 

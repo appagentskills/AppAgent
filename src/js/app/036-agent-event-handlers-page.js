@@ -586,7 +586,11 @@ AgentEvents.on('runFinished', function(e) {
                 // running. A togglePause from the chat view set only the page's
                 // pausedChats flag — clear that stale flag, or finishActionIfDone's
                 // isChatPaused guard refuses and the button spins forever anyway.
-                if (typeof pausedChats !== 'undefined' && pausedChats[chatId] === true) pausedChats[chatId] = false;
+                if (typeof pausedChats !== 'undefined' && pausedChats[chatId] === true) {
+                    // Also clears the persisted pausedByUser flag (survives-reload pause).
+                    if (typeof setChatPausedPersistent === 'function') setChatPausedPersistent(chatId, false);
+                    else pausedChats[chatId] = false;
+                }
                 if (typeof finishActionIfDone === 'function') finishActionIfDone(chatId);
             } catch (err) { console.error('PR383-F4 deferred action finalize failed', err); }
         }

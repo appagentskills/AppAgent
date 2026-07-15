@@ -1539,55 +1539,229 @@ function showStorageUnavailableNotice(err) {
     } catch (e) { /* notice must never break init */ }
 }
 
+// =============================================================
+// GRACEFUL-DEGRADATION (empty-chat-list root fix).
+// IDB is the source of truth for chat history, but after a long OS suspend
+// Chromium can wedge the origin's IDB backing store so open() hangs. The old
+// fallback rendered a SILENTLY EMPTY chat list — the user thought their history
+// was gone. Instead we (1) mirror a lightweight {id,title,updatedAt} index of
+// every chat to chrome.storage.local on each successful save, and (2) on a load
+// failure / boot-deadline timeout render THAT mirror as a READ-ONLY list under
+// a clear banner, auto-retry opening the DB with backoff, and swap in the real
+// data on recovery.
+// =============================================================
+var CHAT_INDEX_MIRROR_KEY = 'appagent_chat_index';
+var _storageDegraded = false;          // true while IDB is unavailable
+var _degradedChatIndex = null;         // cached mirror array while degraded
+var _storageRetryTimer = null;
+var _storageRetryDelay = 0;
+var STORAGE_RETRY_BASE_MS = 2000;      // first retry after 2s
+var STORAGE_RETRY_MAX_MS = 60000;      // backoff cap: 2s,4s,8s,…,60s
+
+// Mirror a lightweight index of every persisted chat to chrome.storage.local.
+// Called after each successful save. Best-effort — never throws into the save
+// path. Visibility matches renderChatList (hide sub-agent + un-revealed
+// background chats) so the degraded list shows the same set the user sees.
+function mirrorChatIndexToLocal() {
+    try {
+        if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+        var idx = [];
+        Object.keys(chats).forEach(function(id) {
+            var c = chats[id];
+            if (!c || !c.messages || c.messages.length === 0) return;
+            if (c.isSubAgent) return;
+            if (c.isBackground && !c._revealed && !c.actionId) return;
+            idx.push({
+                id: id,
+                title: String(c.title || 'Untitled').slice(0, 120),
+                updatedAt: c.updatedAt || c.createdAt || 0,
+                pinned: !!c.pinned
+            });
+        });
+        var payload = {};
+        payload[CHAT_INDEX_MIRROR_KEY] = idx;
+        chrome.storage.local.set(payload);
+    } catch (e) { /* mirror is best-effort — never break save */ }
+}
+
+// Enter degraded mode: show the mirror read-only + banner, start the retry
+// loop. Idempotent — a second call while already degraded is a no-op (the retry
+// loop is already running), so loadChatsFromStorage's catch can call it on every
+// failed retry without resetting the backoff.
+function enterStorageDegradedMode(err) {
+    if (_storageDegraded) return; // idempotent — retry loop already running; fire the notice once
+    _storageDegraded = true;
+    showStorageUnavailableNotice(err);
+    try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+            chrome.storage.local.get(CHAT_INDEX_MIRROR_KEY, function(res) {
+                _degradedChatIndex = (res && Array.isArray(res[CHAT_INDEX_MIRROR_KEY])) ? res[CHAT_INDEX_MIRROR_KEY] : [];
+                try { renderChatList(); } catch (e) {}
+            });
+        } else {
+            _degradedChatIndex = [];
+            try { renderChatList(); } catch (e) {}
+        }
+    } catch (e) {
+        _degradedChatIndex = [];
+        try { renderChatList(); } catch (e2) {}
+    }
+    _storageRetryDelay = STORAGE_RETRY_BASE_MS;
+    _scheduleStorageRetry();
+}
+
+function _scheduleStorageRetry() {
+    if (_storageRetryTimer) { try { clearTimeout(_storageRetryTimer); } catch (e) {} }
+    _storageRetryTimer = setTimeout(function() {
+        _storageRetryTimer = null;
+        // Retry a real load. loadChatsFromStorage reopens the DB (its withStore
+        // drops a dead cached handle first) and sets _chatsHydrated on success.
+        Promise.resolve().then(function() { return loadChatsFromStorage(); }).then(function() {
+            if (_chatsHydrated) { exitStorageDegradedMode(); return; }
+            _storageRetryDelay = Math.min(_storageRetryDelay * 2, STORAGE_RETRY_MAX_MS);
+            _scheduleStorageRetry();
+        }).catch(function() {
+            _storageRetryDelay = Math.min(_storageRetryDelay * 2, STORAGE_RETRY_MAX_MS);
+            _scheduleStorageRetry();
+        });
+    }, _storageRetryDelay);
+}
+
+function exitStorageDegradedMode() {
+    if (!_storageDegraded) return;
+    _storageDegraded = false;
+    _degradedChatIndex = null;
+    if (_storageRetryTimer) { try { clearTimeout(_storageRetryTimer); } catch (e) {} _storageRetryTimer = null; }
+    try { if (typeof showSnackbar === 'function') showSnackbar('Storage recovered — chat history restored.', 'success'); } catch (e) {}
+    try { renderChatList(); } catch (e) {}
+    try { if (typeof renderAllActionPlacements === 'function') renderAllActionPlacements(); } catch (e) {}
+    try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
+    mirrorChatIndexToLocal();
+}
+
+// Build the read-only degraded chat-list markup (banner + mirror rows). Called
+// by renderChatList while _storageDegraded. Rows are non-interactive (no
+// selectChat / dropdown wiring) — history is view-only until the DB recovers.
+function buildDegradedChatListHtml() {
+    var banner =
+        '<div class="storage-degraded-banner" style="padding:12px;margin:8px;border-radius:8px;background:rgba(230,150,30,0.12);border:1px solid rgba(230,150,30,0.4);color:var(--text-primary,inherit);font-size:var(--text-sm,13px);line-height:1.4;">' +
+            '<div style="font-weight:600;margin-bottom:4px;">Storage unavailable — your history is safe, retrying…</div>' +
+            '<div style="color:var(--text-muted,#999);">Your chats are shown read-only below. If this persists, restart Chrome to clear the storage wedge.</div>' +
+        '</div>';
+    var rows = '';
+    var items = (_degradedChatIndex || []).slice().sort(function(a, b) {
+        if (a.pinned && !b.pinned) return -1;
+        if (!a.pinned && b.pinned) return 1;
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+    if (items.length === 0) {
+        rows = '<div class="empty-state" style="padding:16px;color:var(--text-muted,#999);">Checking storage…</div>';
+    } else {
+        items.forEach(function(it) {
+            rows += '<div class="chat-item chat-item-degraded" style="opacity:0.6;cursor:default;padding:8px 12px;border-radius:6px;" title="Read-only until storage recovers">' +
+                escapeHtml(it.title || 'Untitled') +
+            '</div>';
+        });
+    }
+    return banner + rows;
+}
+
+// BOOT-RACE: read the chats store in bounded batches — each its own short-
+// deadline transaction — instead of one getAll() over the whole store. A
+// single getAll() of a large / screenshot-heavy history can legitimately
+// exceed the tx deadline on cold disk and trip withStore's false "dead
+// connection" retry; batching keeps every transaction well under the
+// deadline. The per-call deadline is shortened (BOOT_CHATS_TX_DEADLINE_MS)
+// so first-try + one reopen-retry (~12s) still fits under init's
+// BOOT_HYDRATION_DEADLINE_MS, rather than racing a single 15s timeout.
+var CHATS_LOAD_CHUNK_SIZE = 25;       // records per read transaction
+var BOOT_CHATS_TX_DEADLINE_MS = 6000; // per-tx deadline override for the boot read
+
 async function loadChatsFromStorage() {
     try {
-        // withStore (core/130-indexeddb.js): retries ONCE on a fresh
-        // connection if the cached one was force-closed by the browser.
-        return await withStore([chatStoreName], 'readonly', function(transaction) {
-        var store = transaction.objectStore(chatStoreName);
-        var request = store.getAll();
-        
-        return new Promise(function(resolve) {
-            request.onsuccess = function() {
-                var results = request.result || [];
-                chats = {};
-                results.forEach(function(chat) {
-                    if (chat.messages && chat.messages.length > 0) {
-                        chats[chat.id] = chat;
-                    }
+        // Phase 1 — keys only (cheap, no payloads). Bounds a wedged backend to
+        // the short deadline before we pull a single byte of chat data. withStore
+        // (core/130-indexeddb.js) still reopens + retries ONCE on a dead
+        // connection, now under the shortened per-call deadline.
+        var allKeys = await withStore([chatStoreName], 'readonly', function(transaction) {
+            var store = transaction.objectStore(chatStoreName);
+            var req = store.getAllKeys();
+            return new Promise(function(resolve, reject) {
+                req.onsuccess = function() { resolve(req.result || []); };
+                // SLEEP-WEDGE: REJECT (do not resolve-empty) so withStore's
+                // connection-error retry engages on a fresh connection.
+                req.onerror = function() { reject(req.error || new Error('chats getAllKeys failed')); };
+            });
+        }, { deadlineMs: BOOT_CHATS_TX_DEADLINE_MS });
+
+        // Phase 2 — fetch records in bounded, disjoint key-range batches.
+        // getAllKeys() returns keys in ascending order, so consecutive slices map
+        // to non-overlapping IDBKeyRange.bound(first, last) windows. Build into a
+        // local map and swap `chats` in ONE assignment at the end (the same atomic
+        // reassignment the old single getAll did) so no reader sees a half-loaded
+        // map, and init's late-merge snapshot stays valid.
+        var loaded = {};
+        for (var _start = 0; _start < allKeys.length; _start += CHATS_LOAD_CHUNK_SIZE) {
+            var batchKeys = allKeys.slice(_start, _start + CHATS_LOAD_CHUNK_SIZE);
+            var range = IDBKeyRange.bound(batchKeys[0], batchKeys[batchKeys.length - 1]);
+            var batch = await withStore([chatStoreName], 'readonly', (function(_range) {
+                return function(transaction) {
+                    var store = transaction.objectStore(chatStoreName);
+                    var req = store.getAll(_range);
+                    return new Promise(function(resolve, reject) {
+                        req.onsuccess = function() { resolve(req.result || []); };
+                        req.onerror = function() { reject(req.error || new Error('chats getAll batch failed')); };
+                    });
+                };
+            })(range), { deadlineMs: BOOT_CHATS_TX_DEADLINE_MS });
+            for (var _bi = 0; _bi < batch.length; _bi++) {
+                var chat = batch[_bi];
+                if (chat && chat.messages && chat.messages.length > 0) loaded[chat.id] = chat;
+            }
+        }
+        chats = loaded;
+
+        // Rehydrate per-chat pause flags from the persisted record field
+        // (chat.pausedByUser, stamped by setChatPausedPersistent) so a
+        // user-paused chat still reads as paused after a panel reload —
+        // Pause button shows Resume, jobs rows keep the amber Paused state.
+        try {
+            if (typeof pausedChats !== 'undefined') {
+                Object.keys(chats).forEach(function(_pcid) {
+                    if (chats[_pcid] && chats[_pcid].pausedByUser === true) pausedChats[_pcid] = true;
                 });
-                // MEMFIX: keep the newest K chats fully hydrated, strip inline
-                // base64 payloads from the rest (rehydrated on demand by
-                // ensureChatPayloads — see core/130-indexeddb.js). Evicted
-                // chats stay in `chats` (delete-pass safety) and are skipped
-                // by the put-loop below (put safety).
-                try {
-                    var KEEP_HYDRATED = 8;
-                    if (typeof stripChatPayloadsInPlace === 'function') {
-                        var _ids = Object.keys(chats);
-                        _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
-                        for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
-                            stripChatPayloadsInPlace(chats[_ids[_si]]);
-                        }
-                    }
-                } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
-                // WIPE-GUARD follow-up: a throw here previously prevented
-                // resolve() — wedging init() at the awaited load — and now
-                // would also leave _chatsHydrated false (saves blocked all
-                // session) even though `chats` hydrated fine. The file index
-                // is a derived cache; its failure must not block hydration.
-                try { rebuildFileIndexAll(); } catch (e) { console.error('rebuildFileIndexAll failed during hydration:', e); }
-                _chatsHydrated = true;
-                resolve();
-            };
-            request.onerror = function() {
-                showStorageUnavailableNotice(request.error);
-                resolve();
-            };
-        });
-        });
+            }
+        } catch (e) { /* rehydration is best-effort */ }
+        // MEMFIX: keep the newest K chats fully hydrated, strip inline
+        // base64 payloads from the rest (rehydrated on demand by
+        // ensureChatPayloads — see core/130-indexeddb.js). Evicted
+        // chats stay in `chats` (delete-pass safety) and are skipped
+        // by the put-loop in saveChatsToStorage (put safety).
+        try {
+            var KEEP_HYDRATED = 8;
+            if (typeof stripChatPayloadsInPlace === 'function') {
+                var _ids = Object.keys(chats);
+                _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
+                for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
+                    stripChatPayloadsInPlace(chats[_ids[_si]]);
+                }
+            }
+        } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
+        // WIPE-GUARD follow-up: the file index is a derived cache; its failure
+        // must not block hydration or leave _chatsHydrated false (which would
+        // block saves all session even though `chats` hydrated fine).
+        try { rebuildFileIndexAll(); } catch (e) { console.error('rebuildFileIndexAll failed during hydration:', e); }
+        _chatsHydrated = true;
     } catch (e) {
-        showStorageUnavailableNotice(e);
+        // GRACEFUL-DEGRADATION: a post-retry load failure (dead connection that
+        // survived withStore's retry, blocked/wedged open, quota/IO error) must
+        // NOT fall through to a silently-empty chat list. Enter degraded mode:
+        // render the chrome.storage.local mirror read-only under a banner and
+        // auto-retry opening the DB. Covers the FAST-failure path (open watchdog
+        // rejects before the init boot-deadline); the slow-timeout path is
+        // covered by core/120-init.js. Idempotent, so the retry loop's own
+        // failed loads re-enter harmlessly.
+        enterStorageDegradedMode(e);
     }
 }
 
@@ -1696,6 +1870,10 @@ async function saveChatsToStorage() {
             };
         });
         }); // end withStore fn
+        // GRACEFUL-DEGRADATION: refresh the chrome.storage.local chat index
+        // mirror after a successful commit so the boot path has a recent
+        // read-only snapshot to show if IDB later wedges. Best-effort.
+        mirrorChatIndexToLocal();
     } catch (e) {
         console.error('Failed to save chats to IndexedDB:', e);
     } finally {

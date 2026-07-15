@@ -235,15 +235,9 @@ async function updateDiffView() {
 
         var diff = computeDiff(oldContent, newContent);
 
-        // Find pairs of adjacent remove/add lines for word-level diff
-        var wordDiffs = {};
-        for (var i = 0; i < diff.length - 1; i++) {
-            if (diff[i].type === 'remove' && diff[i+1].type === 'add') {
-                var wordDiff = computeWordDiff(diff[i].text, diff[i+1].text);
-                wordDiffs[i] = wordDiff.oldHtml;
-                wordDiffs[i+1] = wordDiff.newHtml;
-            }
-        }
+        // Word-level highlights for paired remove/add lines
+        // (shared helper in 090-version-history.js)
+        var wordDiffs = computeWordDiffsForLines(diff);
 
         // Build context set - which "same" lines are within ±5 of a change
         var CONTEXT_LINES = 5;

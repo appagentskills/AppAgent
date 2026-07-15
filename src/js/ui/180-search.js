@@ -78,6 +78,23 @@ function clearGlobalSearch() {
 function renderChatList() {
     var list = document.getElementById('chat-list');
     if (!list) return;
+
+    // GRACEFUL-DEGRADATION (empty-chat-list root fix): while IDB is unavailable,
+    // render the read-only chrome.storage.local mirror + banner instead of the
+    // (empty) live `chats` map, so history never silently disappears. See
+    // enterStorageDegradedMode / buildDegradedChatListHtml in
+    // ui/070-dashboard-ui.js.
+    if (typeof _storageDegraded !== 'undefined' && _storageDegraded && typeof buildDegradedChatListHtml === 'function') {
+        list.innerHTML = buildDegradedChatListHtml();
+        return;
+    }
+    
+    // Preserve any open ⋯ chat dropdown across the rebuild. Live chat events
+    // (background runs, title updates) re-render this list frequently, and the
+    // innerHTML replacement below would otherwise destroy an open menu the
+    // moment the user opens it.
+    var _openDropdown = list.querySelector('.chat-dropdown.open');
+    var _openDropdownId = _openDropdown ? _openDropdown.id : null;
     
     var html = '';
     var q = chatSearchQuery ? chatSearchQuery.toLowerCase() : '';
@@ -140,12 +157,12 @@ function renderChatList() {
     }
     
     // Only show non-empty chats, filtered by search.
-    // Background action chats are hidden from the main chat list unless the
-    // PM explicitly revealed one via the jobs dropdown (chat._revealed = true).
-    // Sub-agent chats follow the same rule (they ARE background chats), so
-    // they only appear after revealSubAgentChat() flips _revealed.
+    // Background ACTION chats (isBackground + actionId, created by "Run action:"
+    // buttons) are listed like normal chats — renderChatItem marks them with a
+    // small zap badge. Sub-agent chats are hidden from the sidebar
+    // unconditionally (they are delegated workers, not user-facing runs).
     var sorted = Object.values(chats)
-        .filter(function(c) { return c.messages && c.messages.length > 0 && chatMatchesSearch(c, chatSearchQuery) && !(c.isBackground && !c._revealed); })
+        .filter(function(c) { return c.messages && c.messages.length > 0 && chatMatchesSearch(c, chatSearchQuery) && (!(c.isBackground && !c._revealed) || (c.actionId && !c.isSubAgent)) && !c.isSubAgent; })
         .sort(function(a, b) {
             // Pinned chats first, then by date
             if (a.pinned && !b.pinned) return -1;
@@ -173,6 +190,13 @@ function renderChatList() {
     });
     
     list.innerHTML = html;
+
+    // Re-open the dropdown that was open before the rebuild (if its chat is
+    // still rendered in the list).
+    if (_openDropdownId) {
+        var _dd = document.getElementById(_openDropdownId);
+        if (_dd) _dd.classList.add('open');
+    }
 
     // Documents now rendered in version sidebar (right sidebar)
 }
@@ -454,7 +478,11 @@ function renderChatItem(c) {
         // conversation. Rendered AFTER the title so the dots stay first.
         var subAgentBreadcrumb = (c.isSubAgent && typeof renderSubAgentBreadcrumb === 'function')
             ? renderSubAgentBreadcrumb(c) : '';
-        displayContent = attentionIndicator + streamingIndicator + pendingIndicator + '<span class="chat-title">' + escapeHtml(c.title) + '</span>' + subAgentBreadcrumb;
+        // Action chats get a small zap badge so they're distinguishable from
+        // normal conversations at a glance (isBackground + actionId, never set
+        // on sub-agent chats — those get the breadcrumb instead).
+        var actionBadge = (c.actionId && !c.isSubAgent) ? '<span class="chat-action-badge" title="Background action chat">' + UI_ICONS.zap + '</span>' : '';
+        displayContent = attentionIndicator + streamingIndicator + pendingIndicator + actionBadge + '<span class="chat-title">' + escapeHtml(c.title) + '</span>' + subAgentBreadcrumb;
     }
 
     return '<div class="chat-item ' + active + '" onclick="selectChat(\'' + c.id + '\')">'+

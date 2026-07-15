@@ -523,6 +523,10 @@
     transition: background 0.12s ease, border-color 0.12s ease;
 }
 .worker-card:hover { background: var(--bg-hover, #e7e9ee); }
+/* Self-card variant (sub-agent's OWN chat sidebar, _workerCardHtml selfCard)
+   renders as a static non-interactive <div> — pin the resting background on
+   hover and keep the default cursor so it doesn't look clickable. */
+.worker-card-self, .worker-card-self:hover { background: var(--bg-white, #fff); cursor: default; }
 .worker-card.worker-running { border-color: var(--success, #2da44e); }
 .worker-card.worker-running .worker-state { color: var(--success, #2da44e); }
 .worker-card.worker-errored { border-color: var(--danger, #cf222e); }
@@ -695,6 +699,8 @@
     background: var(--bg-secondary, #1a1d24);
 }
 :root[data-theme="dark"] .worker-card:hover { background: var(--bg-hover, #1f2228); }
+:root[data-theme="dark"] .worker-card-self,
+:root[data-theme="dark"] .worker-card-self:hover { background: var(--bg-secondary, #1a1d24); }
 :root[data-theme="dark"] .worker-card.worker-running { border-color: var(--success, #2da44e); }
 :root[data-theme="dark"] .worker-card.worker-errored { border-color: var(--danger, #cf222e); }
 :root[data-theme="dark"] .worker-card-wrap[data-depth="2"] .worker-card,
@@ -727,11 +733,9 @@
 
 /* ---------- Chat-title sub-agent pill (header) ---------- */
 /* Mirrors the look of `.chat-title-state-pill` so the two pills sit side-
-   by-side in the header. The pill is split into two segments (see
-   updateChatTitleHeader in 170-chat-management.js):
-     .chat-title-subagent-badge — non-interactive identity ("Sub-agent")
-     .chat-title-parent-nav     — clickable "↰ <parent title>" that jumps
-                                  to the immediate parent chat. */
+   by-side in the header. Identity only (see updateChatTitleHeader in
+   170-chat-management.js) — the "↰ parent" navigation moved to the
+   sub-agent self card in the right sidebar (.sub-self-parent-link below). */
 .chat-title-subagent-pill {
     display: inline-flex;
     align-items: center;
@@ -755,27 +759,31 @@
 }
 .chat-title-subagent-pill .chat-title-subagent-icon { display: inline-flex; }
 .chat-title-subagent-pill .chat-title-subagent-icon .ui-icon { width: 11px; height: 11px; }
-.chat-title-parent-nav {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 9px 2px 7px;
-    max-width: 220px;
-    border-left: 1px solid rgba(108, 99, 255, 0.25);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-}
-.chat-title-parent-nav:hover { background: rgba(108, 99, 255, 0.12); }
-.chat-title-parent-nav:active { filter: brightness(0.92); }
-.chat-title-parent-nav:focus-visible { outline: 2px solid var(--accent, #6c63ff); outline-offset: -2px; }
-.chat-title-parent-nav-arrow { font-size: 12px; line-height: 1; }
-.chat-title-parent-nav-label { overflow: hidden; text-overflow: ellipsis; }
 :root[data-theme="dark"] .chat-title-subagent-pill {
     background: rgba(108, 99, 255, 0.18);
     color: var(--accent, #a5b4fc);
 }
-:root[data-theme="dark"] .chat-title-parent-nav { border-left-color: rgba(165, 180, 252, 0.3); }
-:root[data-theme="dark"] .chat-title-parent-nav:hover { background: rgba(165, 180, 252, 0.14); }
+
+/* ---------- Sub-agent self card (right sidebar, below the Progress card) ---------- */
+/* Host section inside the scrolling .version-sidebar-content (placeholder
+   emitted by renderVersionSidebar in 120-ui-utils.js right after the
+   .version-action-updates-section, populated by updateSubAgentSelfCard in
+   175-sub-agent-ui.js). Hosts the worker-card progress component
+   (_workerCardHtml, selfCard variant); the "go to parent chat" button on
+   top reuses the sidebar's own .version-action-btn chrome (11-version.css)
+   — no bespoke pill here.
+   Padding matches .version-action-updates-section (23-actions.css). */
+.sub-self-card-host {
+    padding: var(--space-4) var(--space-5) 0;
+}
+/* "Back to parent" button host — pinned to the very top of the sidebar (above
+   the PR/artifact cards). Same padding as the self-card host below it. */
+.sub-self-parent-host {
+    padding: var(--space-4) var(--space-5) 0;
+}
+/* .version-action-btn is built for the full-width actions list — keep that
+   geometry here (full row, left-aligned label). */
+.sub-self-parent-host .sub-self-parent-link { width: 100%; text-align: left; }
 
 /* ---------- Parked-tool indicator ---------- */
 /* Shown when a UI-required tool is waiting for a panel to attach. The
@@ -995,3 +1003,230 @@
     color: var(--text-muted, #6b7280);
     font-variant-numeric: tabular-nums;
 }
+
+/* ---------- sub-agent report NOTICE (injected user row) ----------
+   _wakeParentOnReport (core/097-sub-agent-registry.js) pushes a model-
+   visible user row when a sub reports; renderSubReportNotices
+   (175-sub-agent-ui.js) upgrades it to this callout. Same visual language
+   as the sub_report card at the top of this file (status-colored left
+   border, status-tinted .sub-report-icon disc, .sub-report-status pill)
+   but non-collapsible — the notice is a compact announcement; the full
+   evolving card already lives elsewhere in the transcript. The outer row
+   modifier (.sub-notice-msg) strips the right-aligned user bubble so the
+   callout spans the full message column. */
+.message.user.sub-notice-msg { justify-content: stretch; }
+.message.user.sub-notice-msg .message-content {
+    background: none;
+    padding: 0;
+    /* border:none is load-bearing — the base user bubble
+       (.message.user .message-content, 04-header.css) draws its own 1px
+       border, which nested a SECOND border around the .sub-notice card. */
+    border: none;
+    border-radius: 0;
+    max-width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.sub-notice {
+    background: var(--bg-light);
+    border: 1px solid var(--border, #e1e4ea);
+    border-left: 3px solid var(--text-muted, #8a93a6);
+    border-radius: var(--radius-md, 6px);
+    padding: var(--space-5, 10px) var(--space-7, 14px);
+    margin: var(--space-3, 6px) 0;
+    font-size: var(--text-body, 13px);
+    /* Containment: nothing (long unbroken tokens, raw payloads) may ever
+       render outside the card's bounding box. */
+    overflow: hidden;
+    min-width: 0;
+}
+/* Clip-guard for STACKED top-level notice rows. The standalone sub->parent
+   "Message to parent" callouts (renderSubAgentMessage, 175-sub-agent-ui.js)
+   render as <div class="message sub-notice ...">, i.e. they are DIRECT flex
+   items of the .messages column (04-header.css: display:flex;
+   flex-direction:column). The overflow:hidden above sets a flex item's
+   automatic minimum size to 0 (CSS Flexbox section 4.5) -- so under the transcript's
+   normal scroll-overflow pressure flexbox shrinks these rows below their
+   content height (default flex-shrink:1) and overflow:hidden then clips them
+   to a sliver, worst on the earlier of two+ stacked cards (the reported bug).
+   Every other .message row survives only because its overflow is visible
+   (auto-min-size = content height). Pin flex-shrink so these rows keep full
+   height and the column scrolls instead. Only matches rows that are ALSO a
+   top-level .message -- nested .sub-notice cards are not flex items here. */
+.message.sub-notice { flex-shrink: 0; }
+/* Mid-flight (progress / lifecycle) variant — softer than a final report:
+   dashed muted left border, no fill. */
+.sub-notice.sub-notice-mid {
+    background: transparent;
+    border-left-style: dashed;
+}
+/* Inbound parent→sub message (rendered in the SUB's transcript). */
+.sub-notice.sub-notice-inbound { border-left-color: var(--accent, #6c63ff); }
+.sub-notice-inbound .sub-report-icon {
+    background: rgba(108, 99, 255, 0.15);
+    color: var(--accent, #6c63ff);
+}
+/* Outbound sub→parent mid-flight message (rendered in the PARENT's
+   transcript as a standalone role:'sub_msg' row — renderSubAgentMessage,
+   175-sub-agent-ui.js). Same accent family as inbound, ← icon. */
+.sub-notice.sub-notice-outbound { border-left-color: var(--accent, #6c63ff); }
+.sub-notice-outbound .sub-report-icon {
+    background: rgba(108, 99, 255, 0.15);
+    color: var(--accent, #6c63ff);
+}
+.sub-notice.sub-report-done       { border-left-color: var(--success, #2da44e); }
+.sub-notice.sub-report-error      { border-left-color: var(--danger, #cf222e); }
+.sub-notice.sub-report-need_input { border-left-color: var(--warning, #bf8700); }
+.sub-notice.sub-report-waiting    { border-left-color: var(--warning, #bf8700); }
+.sub-notice.sub-report-running    { border-left-color: var(--accent, #6c63ff); }
+.sub-notice-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4, 8px);
+    min-width: 0;
+    font-weight: var(--font-semibold, 600);
+}
+.sub-notice-header .sub-report-icon { flex-shrink: 0; }
+/* Kind badge — FILLED for final reports (status-colored), outline/muted for
+   mid-flight progress updates and inbound parent messages. */
+.sub-notice-badge {
+    margin-left: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: var(--font-semibold, 600);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--bg-hover, #e7e9ee);
+    color: var(--text-muted, #6b7280);
+}
+.sub-notice-final.sub-report-done       .sub-notice-badge { background: var(--success, #2da44e); color: #fff; }
+.sub-notice-final.sub-report-error      .sub-notice-badge { background: var(--danger, #cf222e);  color: #fff; }
+.sub-notice-final.sub-report-need_input .sub-notice-badge,
+.sub-notice-final.sub-report-waiting    .sub-notice-badge { background: var(--warning, #bf8700); color: #fff; }
+.sub-notice-final.sub-report-cancelled  .sub-notice-badge,
+.sub-notice-final.sub-report-partial    .sub-notice-badge { background: var(--text-muted, #8a93a6); color: #fff; }
+.sub-notice-mid .sub-notice-badge,
+.sub-notice-inbound .sub-notice-badge {
+    background: transparent;
+    border: 1px solid var(--border, #e1e4ea);
+}
+/* "View agent" button — inherits the .sub-report-open button chrome
+   (background/border/hover, 24-sub-agents.css above); the badge already
+   carries margin-left:auto, so the button sits flush after it. */
+.sub-notice-header .sub-report-open.sub-notice-view { margin-left: var(--space-3, 6px); }
+.sub-notice-body {
+    margin-top: var(--space-3, 6px);
+    padding-top: var(--space-3, 6px);
+    border-top: 1px dashed var(--border, #e1e4ea);
+    font-weight: var(--font-normal, 400);
+}
+.sub-notice-body > :first-child { margin-top: 0; }
+.sub-notice-body > :last-child { margin-bottom: 0; }
+/* Long-token containment: raw JSON / request ids / URLs have no natural
+   break points — without this they overflowed the card and painted below
+   it as unstyled page text. */
+.sub-notice-body {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    min-width: 0;
+}
+/* Inline code chips (file paths, symbols): code.inline-code is globally
+   white-space:nowrap (07-markdown.css:15) — inside the narrow notice card a
+   long path chip overflowed instead of wrapping. Same fix as
+   .sub-report-body code.inline-code above. */
+.sub-notice-body code.inline-code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+/* ── Section headings in sub-agent markdown surfaces ──
+   formatContent (250-message-render.js) emits <h2>–<h5> for #–####, but
+   heading styles exist only under .message-content (07-markdown.css:17-21) —
+   in the notice body and the collapsible report/task bodies (pre.sub-md,
+   renderSubReport) headings rendered as bare body text. Same recipe
+   (semibold, heading color, tight line-height), tighter margins to fit the
+   compact cards. */
+.sub-notice-body h2, .sub-report-body .sub-md h2 { font-size: 1.15em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
+.sub-notice-body h3, .sub-report-body .sub-md h3 { font-size: 1.05em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
+.sub-notice-body h4, .sub-report-body .sub-md h4 { font-size: 1em; font-weight: var(--font-semibold); margin: var(--space-4) 0 var(--space-2); color: var(--text-primary); line-height: var(--leading-tight); }
+.sub-notice-body h5, .sub-report-body .sub-md h5 { font-size: 0.95em; font-weight: var(--font-semibold); margin: var(--space-4) 0 var(--space-1); color: var(--text-heading); line-height: var(--leading-tight); }
+.sub-notice-body h2:first-child, .sub-notice-body h3:first-child, .sub-notice-body h4:first-child, .sub-notice-body h5:first-child,
+.sub-report-body .sub-md h2:first-child, .sub-report-body .sub-md h3:first-child, .sub-report-body .sub-md h4:first-child, .sub-report-body .sub-md h5:first-child { margin-top: 0; }
+/* Leading section icon (emoji or GitHub :shortcode:) lifted into a span by
+   _applySectionIcons (175-sub-agent-ui.js). Grayscale + reduced opacity for
+   the muted line-icon look — reads well on both light and dark themes. */
+.sub-notice-body .section-icon,
+.sub-report-body .section-icon {
+    display: inline-block;
+    margin-right: var(--space-3, 6px);
+    filter: grayscale(1);
+    opacity: .75;
+}
+/* Collapsed long-error body (_subNoticeCardHtml): one-line preview inside
+   the <summary>, full payload behind it — escaped, pre-wrapped and
+   scroll-capped so even a multi-KB provider body stays inside the card. */
+.sub-notice-collapse summary {
+    cursor: pointer;
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3, 6px);
+    list-style: none;
+    min-width: 0;
+}
+.sub-notice-collapse summary::-webkit-details-marker { display: none; }
+.sub-notice-err-preview {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text, #24292f);
+}
+.sub-notice-collapse-more {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted, #8a93a6);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+}
+.sub-notice-collapse[open] .sub-notice-err-preview { display: none; }
+.sub-notice-collapse[open] .sub-notice-collapse-more { text-decoration: none; }
+.sub-notice-collapse-full {
+    margin-top: var(--space-3, 6px);
+    padding: var(--space-3, 6px) var(--space-4, 8px);
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--bg, #fff);
+    border: 1px dashed var(--border, #e1e4ea);
+    border-radius: var(--radius-sm, 4px);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+/* Muted footer hint on error notices ('Resurrectable via wake_sub_agent'). */
+.sub-notice-hint {
+    margin-top: var(--space-3, 6px);
+    padding-top: var(--space-3, 6px);
+    border-top: 1px dashed var(--border, #e1e4ea);
+    font-size: 11px;
+    font-weight: var(--font-normal, 400);
+    color: var(--text-muted, #8a93a6);
+}
+/* Mid-flight error badge: tint it like the danger accent instead of the
+   neutral outline the 'Progress update' badge uses. */
+.sub-notice-mid.sub-report-error .sub-notice-badge {
+    background: transparent;
+    border: 1px solid var(--danger, #cf222e);
+    color: var(--danger, #cf222e);
+}
+/* .sub-notice-foot / .sub-notice-id removed — the await_handle footer and
+   the raw sub_… id are no longer rendered (display-only removal; the notice
+   TEXT the model sees is unchanged — see _wakeParentOnReport, core/097). The
+   agent id lives on the card's data-sub-agent-id attribute instead. */

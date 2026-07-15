@@ -138,7 +138,7 @@ async function loadChatsFromStorage() {
         return await withStore([chatStoreName], 'readonly', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         var request = store.getAll();
-        return new Promise(function(resolve) {
+        return new Promise(function(resolve, reject) {
             request.onsuccess = function() {
                 var results = request.result || [];
                 chats = {};
@@ -156,6 +156,19 @@ async function loadChatsFromStorage() {
                         chats[chat.id] = chat;
                     }
                 });
+                // Rehydrate per-chat pause flags from the persisted record field
+                // (chat.pausedByUser — see setChatPausedPersistent in
+                // core/030-config.js) so a user-paused chat stays paused across an
+                // SW restart: the loop's `while (!isChatPaused)` gate reads THIS
+                // realm's pausedChats copy. Cleared on resume/toggle-pause(false),
+                // on run-agent for an idle chat, and on a fresh user send.
+                try {
+                    if (typeof pausedChats !== 'undefined') {
+                        Object.keys(chats).forEach(function(_pcid) {
+                            if (chats[_pcid] && chats[_pcid].pausedByUser === true) pausedChats[_pcid] = true;
+                        });
+                    }
+                } catch (e) { /* rehydration is best-effort */ }
                 if (typeof rebuildFileIndexAll === 'function') {
                     // WS-T1: surface a boot file-index rebuild failure instead of
                     // swallowing it — a silent failure here leaves file_id lookups
@@ -166,8 +179,10 @@ async function loadChatsFromStorage() {
                 resolve();
             };
             request.onerror = function() {
-                console.error('[worker-storage] load failed', request.error);
-                resolve();
+                // SLEEP-WEDGE: REJECT (do not resolve-empty) so withStore's
+                // connection-error retry engages on a fresh connection. The
+                // outer catch below logs only after the retry has also failed.
+                reject(request.error || new Error('chats getAll failed'));
             };
         });
         }); // end withStore fn

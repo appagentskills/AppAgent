@@ -94,6 +94,199 @@ function _renderSubCollapsibleText(text, prefKey, domId) {
         '<span id="' + escapeHtml(domId) + '-collapsed" class="json-collapsed json-str"' + (collapsed ? '' : ' style="display:none"') + '>' + preview + '</span>';
 }
 
+// ── Section icons for sub-agent markdown surfaces ──
+// Curated GitHub-style shortcode → emoji map for section headings in
+// report_to_parent summaries / spawn instructions. Applied ONLY on the
+// sub-agent surfaces (notice card body + collapsible report/task bodies),
+// never on regular chat messages. Unknown shortcodes are left untouched
+// (graceful degradation).
+var SECTION_ICON_SHORTCODES = {
+    mag: '\uD83D\uDD0D', mag_right: '\uD83D\uDD0E', wrench: '\uD83D\uDD27',
+    hammer: '\uD83D\uDD28', hammer_and_wrench: '\uD83D\uDEE0\uFE0F',
+    gear: '\u2699\uFE0F', bug: '\uD83D\uDC1B', warning: '\u26A0\uFE0F',
+    white_check_mark: '\u2705', heavy_check_mark: '\u2714\uFE0F',
+    x: '\u274C', no_entry: '\u26D4', rocket: '\uD83D\uDE80',
+    memo: '\uD83D\uDCDD', clipboard: '\uD83D\uDCCB', bulb: '\uD83D\uDCA1',
+    fire: '\uD83D\uDD25', lock: '\uD83D\uDD12', unlock: '\uD83D\uDD13',
+    key: '\uD83D\uDD11', package: '\uD83D\uDCE6',
+    bar_chart: '\uD83D\uDCCA', chart_with_upwards_trend: '\uD83D\uDCC8',
+    chart_with_downwards_trend: '\uD83D\uDCC9',
+    stopwatch: '\u23F1\uFE0F', hourglass: '\u231B',
+    hourglass_flowing_sand: '\u23F3', alarm_clock: '\u23F0',
+    question: '\u2753', exclamation: '\u2757', pushpin: '\uD83D\uDCCC',
+    link: '\uD83D\uDD17', file_folder: '\uD83D\uDCC1',
+    open_file_folder: '\uD83D\uDCC2', card_file_box: '\uD83D\uDDC3\uFE0F',
+    file_cabinet: '\uD83D\uDDC4\uFE0F', floppy_disk: '\uD83D\uDCBE',
+    mailbox: '\uD83D\uDCEB', inbox_tray: '\uD83D\uDCE5',
+    outbox_tray: '\uD83D\uDCE4', bell: '\uD83D\uDD14', zap: '\u26A1',
+    sparkles: '\u2728', tada: '\uD83C\uDF89', construction: '\uD83D\uDEA7',
+    shield: '\uD83D\uDEE1\uFE0F', telescope: '\uD83D\uDD2D',
+    microscope: '\uD83D\uDD2C', test_tube: '\uD83E\uDDEA',
+    dart: '\uD83C\uDFAF', checkered_flag: '\uD83C\uDFC1',
+    triangular_flag_on_post: '\uD83D\uDEA9',
+    arrows_counterclockwise: '\uD83D\uDD04', recycle: '\u267B\uFE0F',
+    broom: '\uD83E\uDDF9', label: '\uD83C\uDFF7\uFE0F',
+    bookmark: '\uD83D\uDD16', book: '\uD83D\uDCD6', books: '\uD83D\uDCDA',
+    pencil: '\u270F\uFE0F', pencil2: '\u270F\uFE0F',
+    speech_balloon: '\uD83D\uDCAC', thought_balloon: '\uD83D\uDCAD',
+    eyes: '\uD83D\uDC40', brain: '\uD83E\uDDE0', robot: '\uD83E\uDD16',
+    art: '\uD83C\uDFA8', wastebasket: '\uD83D\uDDD1\uFE0F',
+    information_source: '\u2139\uFE0F',
+    page_facing_up: '\uD83D\uDCC4', page_with_curl: '\uD83D\uDCC3',
+    scroll: '\uD83D\uDCDC', newspaper: '\uD83D\uDCF0',
+    bookmark_tabs: '\uD83D\uDCD1', mailbox_with_mail: '\uD83D\uDCEC',
+    envelope: '\u2709\uFE0F', email: '\u2709\uFE0F', 'e-mail': '\uD83D\uDCE7',
+    incoming_envelope: '\uD83D\uDCE8', calendar: '\uD83D\uDCC6',
+    date: '\uD83D\uDCC5', stethoscope: '\uD83E\uDE7A',
+    receipt: '\uD83E\uDDFE', notebook: '\uD83D\uDCD3',
+    ballot_box_with_check: '\u2611\uFE0F',
+    // ── Expanded gemoji coverage (fix: :abacus: was not detected; audit of
+    // commonly-used GitHub shortcodes missing from the original curated set).
+    // Names follow the canonical gemoji shortcode list; values are UTF-16
+    // escapes like the entries above. Aliases (+1/thumbsup, phone/telephone,
+    // boom/collision) map to the same emoji, matching gemoji.
+    abacus: '\uD83E\uDDEE', '100': '\uD83D\uDCAF', '1234': '\uD83D\uDD22',
+    heavy_plus_sign: '\u2795', heavy_minus_sign: '\u2796', heavy_multiplication_x: '\u2716\uFE0F',
+    heavy_division_sign: '\u2797', infinity: '\u267E\uFE0F', '+1': '\uD83D\uDC4D',
+    thumbsup: '\uD83D\uDC4D', '-1': '\uD83D\uDC4E', thumbsdown: '\uD83D\uDC4E',
+    ok_hand: '\uD83D\uDC4C', wave: '\uD83D\uDC4B', clap: '\uD83D\uDC4F',
+    muscle: '\uD83D\uDCAA', pray: '\uD83D\uDE4F', raised_hands: '\uD83D\uDE4C',
+    handshake: '\uD83E\uDD1D', crossed_fingers: '\uD83E\uDD1E', v: '\u270C\uFE0F',
+    writing_hand: '\u270D\uFE0F', point_right: '\uD83D\uDC49', point_left: '\uD83D\uDC48',
+    point_up_2: '\uD83D\uDC46', point_down: '\uD83D\uDC47', eye: '\uD83D\uDC41\uFE0F',
+    speaking_head: '\uD83D\uDDE3\uFE0F', bust_in_silhouette: '\uD83D\uDC64', busts_in_silhouette: '\uD83D\uDC65',
+    detective: '\uD83D\uDD75\uFE0F', smile: '\uD83D\uDE04', smiley: '\uD83D\uDE03',
+    grin: '\uD83D\uDE01', joy: '\uD83D\uDE02', wink: '\uD83D\uDE09',
+    sweat_smile: '\uD83D\uDE05', thinking: '\uD83E\uDD14', sunglasses: '\uD83D\uDE0E',
+    neutral_face: '\uD83D\uDE10', confused: '\uD83D\uDE15', grimacing: '\uD83D\uDE2C',
+    roll_eyes: '\uD83D\uDE44', cry: '\uD83D\uDE22', sob: '\uD83D\uDE2D',
+    scream: '\uD83D\uDE31', heart: '\u2764\uFE0F', broken_heart: '\uD83D\uDC94',
+    heart_eyes: '\uD83D\uDE0D', star: '\u2B50', star2: '\uD83C\uDF1F',
+    dizzy: '\uD83D\uDCAB', boom: '\uD83D\uDCA5', collision: '\uD83D\uDCA5',
+    sweat_drops: '\uD83D\uDCA6', zzz: '\uD83D\uDCA4', bangbang: '\u203C\uFE0F',
+    interrobang: '\u2049\uFE0F', grey_question: '\u2754', grey_exclamation: '\u2755',
+    no_entry_sign: '\uD83D\uDEAB', stop_sign: '\uD83D\uDED1', vertical_traffic_light: '\uD83D\uDEA6',
+    name_badge: '\uD83D\uDCDB', signal_strength: '\uD83D\uDCF6', sos: '\uD83C\uDD98',
+    new: '\uD83C\uDD95', ok: '\uD83C\uDD97', up: '\uD83C\uDD99',
+    cool: '\uD83C\uDD92', free: '\uD83C\uDD93', top: '\uD83D\uDD1D',
+    arrow_right: '\u27A1\uFE0F', arrow_left: '\u2B05\uFE0F', arrow_up: '\u2B06\uFE0F',
+    arrow_down: '\u2B07\uFE0F', arrows_clockwise: '\uD83D\uDD03', repeat: '\uD83D\uDD01',
+    fast_forward: '\u23E9', rewind: '\u23EA', arrow_forward: '\u25B6\uFE0F',
+    pause_button: '\u23F8\uFE0F', stop_button: '\u23F9\uFE0F', record_button: '\u23FA\uFE0F',
+    trophy: '\uD83C\uDFC6', medal_sports: '\uD83C\uDFC5', '1st_place_medal': '\uD83E\uDD47',
+    '2nd_place_medal': '\uD83E\uDD48', '3rd_place_medal': '\uD83E\uDD49', crown: '\uD83D\uDC51',
+    gem: '\uD83D\uDC8E', moneybag: '\uD83D\uDCB0', money_with_wings: '\uD83D\uDCB8',
+    credit_card: '\uD83D\uDCB3', dollar: '\uD83D\uDCB5', chart: '\uD83D\uDCB9',
+    shopping_cart: '\uD83D\uDED2', computer: '\uD83D\uDCBB', desktop_computer: '\uD83D\uDDA5\uFE0F',
+    keyboard: '\u2328\uFE0F', printer: '\uD83D\uDDA8\uFE0F', iphone: '\uD83D\uDCF1',
+    telephone: '\u260E\uFE0F', phone: '\u260E\uFE0F', telephone_receiver: '\uD83D\uDCDE',
+    satellite: '\uD83D\uDCE1', globe_with_meridians: '\uD83C\uDF10', earth_africa: '\uD83C\uDF0D',
+    earth_americas: '\uD83C\uDF0E', earth_asia: '\uD83C\uDF0F', world_map: '\uD83D\uDDFA\uFE0F',
+    compass: '\uD83E\uDDED', round_pushpin: '\uD83D\uDCCD', paperclip: '\uD83D\uDCCE',
+    paperclips: '\uD83D\uDD87\uFE0F', scissors: '\u2702\uFE0F', straight_ruler: '\uD83D\uDCCF',
+    triangular_ruler: '\uD83D\uDCD0', pen: '\uD83D\uDD8A\uFE0F', fountain_pen: '\uD83D\uDD8B\uFE0F',
+    black_nib: '\u2712\uFE0F', paintbrush: '\uD83D\uDD8C\uFE0F', crayon: '\uD83D\uDD8D\uFE0F',
+    spiral_calendar: '\uD83D\uDDD3\uFE0F', spiral_notepad: '\uD83D\uDDD2\uFE0F', ledger: '\uD83D\uDCD2',
+    card_index: '\uD83D\uDCC7', card_index_dividers: '\uD83D\uDDC2\uFE0F', mega: '\uD83D\uDCE3',
+    loudspeaker: '\uD83D\uDCE2', mute: '\uD83D\uDD07', sound: '\uD83D\uDD09',
+    loud_sound: '\uD83D\uDD0A', battery: '\uD83D\uDD0B', electric_plug: '\uD83D\uDD0C',
+    flashlight: '\uD83D\uDD26', candle: '\uD83D\uDD6F\uFE0F', camera: '\uD83D\uDCF7',
+    video_camera: '\uD83D\uDCF9', movie_camera: '\uD83C\uDFA5', clapper: '\uD83C\uDFAC',
+    film_strip: '\uD83C\uDF9E\uFE0F', tv: '\uD83D\uDCFA', radio: '\uD83D\uDCFB',
+    headphones: '\uD83C\uDFA7', microphone: '\uD83C\uDFA4', musical_note: '\uD83C\uDFB5',
+    notes: '\uD83C\uDFB6', lock_with_ink_pen: '\uD83D\uDD0F', closed_lock_with_key: '\uD83D\uDD10',
+    old_key: '\uD83D\uDDDD\uFE0F', bomb: '\uD83D\uDCA3', skull: '\uD83D\uDC80',
+    skull_and_crossbones: '\u2620\uFE0F', radioactive: '\u2622\uFE0F', biohazard: '\u2623\uFE0F',
+    crossed_swords: '\u2694\uFE0F', bow_and_arrow: '\uD83C\uDFF9', pill: '\uD83D\uDC8A',
+    syringe: '\uD83D\uDC89', dna: '\uD83E\uDDEC', petri_dish: '\uD83E\uDDEB',
+    thermometer: '\uD83C\uDF21\uFE0F', magnet: '\uD83E\uDDF2', alembic: '\u2697\uFE0F',
+    crystal_ball: '\uD83D\uDD2E', balance_scale: '\u2696\uFE0F', toolbox: '\uD83E\uDDF0',
+    screwdriver: '\uD83E\uDE9B', nut_and_bolt: '\uD83D\uDD29', chains: '\u26D3\uFE0F',
+    hammer_and_pick: '\u2692\uFE0F', pick: '\u26CF\uFE0F', axe: '\uD83E\uDE93',
+    carpentry_saw: '\uD83E\uDE9A', ladder: '\uD83E\uDE9C', hook: '\uD83E\uDE9D',
+    bricks: '\uD83E\uDDF1', door: '\uD83D\uDEAA', house: '\uD83C\uDFE0',
+    office: '\uD83C\uDFE2', bank: '\uD83C\uDFE6', hospital: '\uD83C\uDFE5',
+    factory: '\uD83C\uDFED', classical_building: '\uD83C\uDFDB\uFE0F', car: '\uD83D\uDE97',
+    truck: '\uD83D\uDE9A', airplane: '\u2708\uFE0F', ship: '\uD83D\uDEA2',
+    anchor: '\u2693', fuelpump: '\u26FD', game_die: '\uD83C\uDFB2',
+    jigsaw: '\uD83E\uDDE9', joystick: '\uD83D\uDD79\uFE0F', video_game: '\uD83C\uDFAE',
+    '8ball': '\uD83C\uDFB1', performing_arts: '\uD83C\uDFAD', ticket: '\uD83C\uDFAB',
+    gift: '\uD83C\uDF81', balloon: '\uD83C\uDF88', confetti_ball: '\uD83C\uDF8A',
+    popcorn: '\uD83C\uDF7F', ghost: '\uD83D\uDC7B', alien: '\uD83D\uDC7D',
+    space_invader: '\uD83D\uDC7E', seedling: '\uD83C\uDF31', herb: '\uD83C\uDF3F',
+    evergreen_tree: '\uD83C\uDF32', deciduous_tree: '\uD83C\uDF33', sunny: '\u2600\uFE0F',
+    cloud: '\u2601\uFE0F', cyclone: '\uD83C\uDF00', rainbow: '\uD83C\uDF08',
+    snowflake: '\u2744\uFE0F', droplet: '\uD83D\uDCA7', ocean: '\uD83C\uDF0A',
+    comet: '\u2604\uFE0F', crescent_moon: '\uD83C\uDF19', snail: '\uD83D\uDC0C',
+    turtle: '\uD83D\uDC22', snake: '\uD83D\uDC0D', penguin: '\uD83D\uDC27',
+    whale: '\uD83D\uDC33', octopus: '\uD83D\uDC19', unicorn: '\uD83E\uDD84',
+    owl: '\uD83E\uDD89', fox_face: '\uD83E\uDD8A', spider: '\uD83D\uDD77\uFE0F',
+    spider_web: '\uD83D\uDD78\uFE0F', watch: '\u231A', timer_clock: '\u23F2\uFE0F',
+    coffee: '\u2615'
+};
+
+// Leading-emoji matcher: a run of pictographic codepoints incl. ZWJ
+// sequences, VS16, skin tones and keycap. Prefers the Unicode
+// property-escape form; falls back to explicit ranges on engines without
+// \p{...} support (the codebase has no other u-flag property escapes, so
+// keep the fallback arm).
+var _SECTION_EMOJI_RE = (function() {
+    try {
+        return new RegExp('^((?:\\p{Extended_Pictographic}|[\\u200D\\uFE0F\\u20E3\\u{1F3FB}-\\u{1F3FF}])+)', 'u');
+    } catch (_) {
+        return /^((?:[\u2190-\u2BFF\u2600-\u27BF\uFE0F\u200D\u20E3]|[\uD83C-\uDBFF][\uDC00-\uDFFF])+)/;
+    }
+})();
+
+// Lift a leading :shortcode: or emoji off already-rendered (escaped)
+// heading/bold inner HTML into <span class="section-icon">…</span>.
+// XSS-safe by construction: the emoji comes from the curated map above or
+// is a pictographic-only match from HTML that formatContent already
+// escaped (emoji contain no <, >, & or quotes); the remaining inner HTML
+// is re-emitted unchanged.
+function _liftSectionIcon(inner) {
+    var m = inner.match(/^:([a-z0-9_+-]+):\s*/);
+    if (m) {
+        // OWN-property guard: a bare [m[1]] lookup walks the prototype
+        // chain, so :constructor: / :__proto__: / :hasOwnProperty: would
+        // render Object.prototype members as "icon" text. Only curated
+        // string values from the map itself count.
+        var emoji = Object.prototype.hasOwnProperty.call(SECTION_ICON_SHORTCODES, m[1])
+            ? SECTION_ICON_SHORTCODES[m[1]] : null;
+        if (typeof emoji !== 'string' || !emoji) return inner; // unknown shortcode — leave text as-is
+        return '<span class="section-icon">' + emoji + '</span>' + inner.slice(m[0].length);
+    }
+    var e = inner.match(_SECTION_EMOJI_RE);
+    if (e && e[1]) {
+        var rest = inner.slice(e[1].length).replace(/^\s+/, '');
+        return '<span class="section-icon">' + e[1] + '</span>' + rest;
+    }
+    return inner;
+}
+
+// Post-pass over formatContent() output for the sub-agent surfaces only:
+// lifts leading emoji / GitHub-style shortcodes on <h2>–<h5> headings and
+// on bold-line pseudo-headings (a <strong> that OPENS an md-paragraph —
+// the exact shape flushParagraph in 250-message-render.js emits for a
+// line starting with **…**). Regular chat messages never pass through
+// here, so global rendering is unaffected.
+function _applySectionIcons(html) {
+    if (!html) return html;
+    html = html.replace(/<(h[2-5])>([\s\S]*?)<\/\1>/g, function(m0, tag, inner) {
+        return '<' + tag + '>' + _liftSectionIcon(inner) + '</' + tag + '>';
+    });
+    // Bold-line pseudo-headings: a <strong> that opens a rendered LINE.
+    // formatContent merges blank-line-separated text lines between block
+    // elements into ONE md-paragraph joined with <br> (flushParagraph,
+    // 250-message-render.js:1902), so the real anchor is EITHER the
+    // paragraph opening OR a preceding <br> — anchoring on the paragraph
+    // shape alone missed nearly every real bold heading.
+    html = html.replace(/(<span class="md-paragraph">|<br>)(<strong>)([\s\S]*?)(<\/strong>)/g, function(m0, pre, open, inner, close) {
+        return pre + open + _liftSectionIcon(inner) + close;
+    });
+    return html;
+}
+
 // Markdown variant of _renderSubCollapsibleText — same structure (collapse
 // toggle + expanded element + collapsed preview, SAME ids/classes/data
 // attributes so the delegated [data-sub-collapse] listener and _subPanelPref
@@ -109,7 +302,7 @@ function _renderSubCollapsibleMarkdown(text, prefKey, domId) {
     }
     var rendered;
     try {
-        rendered = formatContent(text);
+        rendered = _applySectionIcons(formatContent(text));
     } catch (_) {
         // Same fallback shape as _subProgressHtml, with newlines preserved
         // (the surrounding pre.sub-md resets white-space to normal).
@@ -673,6 +866,251 @@ function renderSubReport(msg, index) {
     '</details>';
 }
 
+// ---------- report-notice renderer (called from 250-message-render.js) ----------
+// _wakeParentOnReport (core/097-sub-agent-registry.js) pushes a model-visible
+// USER row into the parent chat when a sub reports (and queues the same text
+// mid-run via pendingInjectionsByChatId → flushPendingInjection). Those rows
+// used to render as one plain markdown blob — header prose, summary and the
+// await_handle boilerplate jammed together. renderSubReportNotices parses the
+// exact notice shape the builder emits and renders each notice as a designed
+// callout: header row (status icon + name + monospace id + status pill), the
+// summary through formatContent (the SAME markdown pipeline assistant
+// messages use), and the handle boilerplate as a muted footer. The regex
+// matches BOTH the current multi-line layout (':\n' summary '\n— full
+// report…') and the legacy single-line one (': summary — full report…') so
+// historical transcripts upgrade too. Returns null when the text contains no
+// notice — the caller falls back to the normal user-row markdown path.
+var SUB_NOTICE_RE = /Sub-agent "([^"\n]{1,200})" \(([A-Za-z0-9_-]{1,80})\) reported \(([a-z_]{1,24})\)(?::\s?([\s\S]*?))?\s*\u2014 full report via await_handle\("([^"\n]{1,120})"\) or agent_status\./g;
+
+// kind: 'final' (report_to_parent — settles the handle) vs 'mid' (lifecycle /
+// progress notice while the sub keeps running). The two variants get clearly
+// distinct chrome: final = solid status-colored left border + FILLED
+// .sub-notice-badge ("Final report · done"), mid = dashed muted left border +
+// outline badge ("Progress update"). The raw sub_… id is display-hidden
+// (kept on data-sub-agent-id for tooling); the await_handle boilerplate
+// footer is display-dropped too — both remain in the model-visible notice
+// text, this is render-time only. The "View agent" button carries
+// data-worker-modal, handled by the existing delegated click listener
+// (_wireSubAgentUi) → openWorkerChatModal(agentId) — the same modal the
+// Workers strip / sidebar cards open (input + progress + report).
+function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
+    // Class stays whitelist-sanitized (same defense as renderSubReport);
+    // the LABEL may show the raw — escaped — status so an unknown value is
+    // still readable. The regex restricts status to [a-z_]{1,24} anyway.
+    var st = SUB_REPORT_STATUSES[status] ? status : 'partial';
+    var labelMap = { done: 'done', error: 'error', need_input: 'needs input',
+        cancelled: 'cancelled', running: 'working', waiting: 'waiting', partial: 'partial' };
+    var label = SUB_REPORT_STATUSES[status] ? labelMap[status] : status;
+    var iconChar = (st === 'done') ? '✓'
+             : (st === 'error') ? '✕'
+             : (st === 'need_input') ? '?'
+             : (st === 'cancelled') ? '⊘'
+             : '…';
+    var mdOk = (typeof formatContent === 'function');
+    var body = '';
+    if (summary) {
+        var rendered;
+        try {
+            rendered = mdOk ? _applySectionIcons(formatContent(summary))
+                            : escapeHtml(summary).replace(/\n/g, '<br>');
+        } catch (_) {
+            rendered = escapeHtml(summary).replace(/\n/g, '<br>');
+        }
+        // Long ERROR payloads collapse behind a one-line preview — the
+        // construction layer already shortens crash headlines, so this is
+        // the defense-in-depth arm for anything that slips through (any
+        // provider, not just 429). Short errors render fully; non-error
+        // summaries (real reports) are never collapsed. The full text is
+        // shown escaped/pre-wrap inside the <details>, scroll-capped by CSS.
+        if (st === 'error' && summary.length > 280) {
+            var preview = summary.slice(0, 150).replace(/\s+\S*$/, '');
+            body = '<div class="sub-notice-body markdown-body">'
+                + '<details class="sub-notice-collapse">'
+                + '<summary><span class="sub-notice-err-preview">' + escapeHtml(preview) + '\u2026</span>'
+                + '<span class="sub-notice-collapse-more">show full error</span></summary>'
+                + '<div class="sub-notice-collapse-full">' + escapeHtml(summary) + '</div>'
+                + '</details></div>';
+        } else {
+            body = '<div class="sub-notice-body markdown-body">' + rendered + '</div>';
+        }
+    }
+    // Muted footer hint (e.g. 'Resurrectable via wake_sub_agent') — kept out
+    // of the headline so the error card stays compact.
+    var foot = (opts && opts.hint)
+        ? '<div class="sub-notice-hint">' + escapeHtml(opts.hint) + '</div>'
+        : '';
+    var isMid = (kind === 'mid');
+    // A mid-flight ERROR is not a 'progress update' — badge it honestly.
+    var midLabel = (st === 'error') ? 'Errored' : 'Progress update';
+    var badge = isMid
+        ? '<span class="sub-notice-badge">' + midLabel + '</span>'
+        : '<span class="sub-notice-badge">Final report · ' + escapeHtml(label) + '</span>';
+    var viewBtn = agentId
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        : '';
+    return '<div class="sub-notice sub-report-' + st + ' sub-notice-' + (isMid ? 'mid' : 'final') + '" data-sub-agent-id="' + escapeHtml(agentId || '') + '">' +
+        '<div class="sub-notice-header">' +
+            '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>' +
+            '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
+            badge + viewBtn +
+        '</div>' + body + foot + '</div>';
+}
+
+// Eye icon for the notice card's "View agent" button.
+var SUB_NOTICE_VIEW_ICON = '<svg class="sub-report-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+// Inbound (parent → sub) card, rendered inside the SUB's own transcript for
+// the injected "[N message(s) from parent / inbox]" rows built by
+// _formatInboxDrain (core/097-sub-agent-registry.js). Same .sub-notice
+// family, direction-differentiated: arrow icon + accent left border +
+// "From parent" header.
+function _parentMsgCardHtml(count, bodyText, fmt) {
+    var body = bodyText ? '<div class="sub-notice-body markdown-body">' + fmt(bodyText) + '</div>' : '';
+    return '<div class="sub-notice sub-notice-inbound">' +
+        '<div class="sub-notice-header">' +
+            '<span class="sub-report-icon" aria-hidden="true">\u2192</span>' +
+            '<span class="sub-report-name">From parent</span>' +
+            '<span class="sub-notice-badge">' + (count > 1 ? count + ' messages' : 'Message') + '</span>' +
+        '</div>' + body + '</div>';
+}
+
+// Standalone mid-flight sub→parent message callout — renders the UI-only
+// role:'sub_msg' rows pushed by agentMessage(to:'parent') (core/097). Same
+// .sub-notice family as the other callouts, direction-differentiated from
+// _parentMsgCardHtml (→ From parent) with a ← icon + the sub's name. The
+// full history stays in the sub_report card's progress stream — this row is
+// the at-a-glance transcript surface. Called from 250-message-render.js.
+function renderSubAgentMessage(msg, index) {
+    var name = msg.subAgentName || msg.subAgentId || 'sub-agent';
+    var text = String(msg.text || '');
+    var body = '';
+    if (text) {
+        var rendered;
+        try {
+            rendered = (typeof formatContent === 'function')
+                ? formatContent(text)
+                : escapeHtml(text).replace(/\n/g, '<br>');
+        } catch (_) {
+            rendered = escapeHtml(text).replace(/\n/g, '<br>');
+        }
+        body = '<div class="sub-notice-body markdown-body">' + rendered + '</div>';
+    }
+    // Same delegated-click "View agent" affordance as _subNoticeCardHtml —
+    // data-worker-modal is handled by _wireSubAgentUi → openWorkerChatModal.
+    var viewBtn = msg.subAgentId
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(msg.subAgentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        : '';
+    return '<div class="message sub-notice sub-notice-mid sub-notice-outbound" id="msg-' + index + '" data-sub-agent-id="' + escapeHtml(msg.subAgentId || '') + '">' +
+        '<div class="sub-notice-header">' +
+            '<span class="sub-report-icon" aria-hidden="true">\u2190</span>' +
+            '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
+            '<span class="sub-notice-badge">Message to parent</span>' +
+            viewBtn +
+        '</div>' + body + '</div>';
+}
+
+// Mid-flight lifecycle notices from _notifySubLifecycle (core/097):
+// '[sub-agent lifecycle] NAME (ID): HEADLINE' — single line.
+// The headline capture is deliberately generous (4000): with the old 600
+// cap an over-long headline (raw provider JSON in a crash message) matched
+// only its first 600 chars and the TAIL leaked out of the card as plain
+// page text below it. Construction now shortens headlines, and
+// _subNoticeCardHtml collapses anything long — the wide cap keeps the
+// whole line INSIDE the card either way.
+var SUB_LIFECYCLE_RE = /\[sub-agent lifecycle\] ([^\n(]{1,200}?) \(([A-Za-z0-9_-]{1,80})\): ([^\n]{1,4000})/g;
+// Parent→sub inbox-drain header from _formatInboxDrain (core/097):
+// '[N message(s) from parent / inbox]' followed by '- (label) content' lines.
+var PARENT_INBOX_RE = /\[(\d{1,3}) message\(s\) from parent \/ inbox\]\n?/g;
+
+function renderSubReportNotices(text) {
+    if (typeof text !== 'string') return null;
+    // Cheap pre-checks before the heavy regexes — almost every user row skips.
+    var hasFinal = text.indexOf('Sub-agent "') !== -1 && text.indexOf('await_handle(') !== -1;
+    var hasLife = text.indexOf('[sub-agent lifecycle]') !== -1;
+    var hasInbox = text.indexOf('message(s) from parent / inbox]') !== -1;
+    if (!hasFinal && !hasLife && !hasInbox) return null;
+    var mdOk = (typeof formatContent === 'function');
+    var fmt = function(seg) {
+        try { return mdOk ? formatContent(seg) : escapeHtml(seg).replace(/\n/g, '<br>'); }
+        catch (_) { return escapeHtml(seg).replace(/\n/g, '<br>'); }
+    };
+    var matches = [], m;
+    if (hasFinal) {
+        SUB_NOTICE_RE.lastIndex = 0;
+        while ((m = SUB_NOTICE_RE.exec(text)) !== null) {
+            matches.push({ start: m.index, end: m.index + m[0].length,
+                html: _subNoticeCardHtml(m[1], m[2], m[3], String(m[4] || '').trim(), 'final') });
+        }
+    }
+    if (hasLife) {
+        SUB_LIFECYCLE_RE.lastIndex = 0;
+        while ((m = SUB_LIFECYCLE_RE.exec(text)) !== null) {
+            // Derive a status tint from the headline wording (best-effort —
+            // unknown headlines fall back to the neutral 'running' accent).
+            var hl = m[3];
+            var lst = /^errored|DENIED/.test(hl) ? 'error'
+                : /STUCK|APPROVAL/.test(hl) ? 'need_input'
+                : 'running';
+            // Error notices get the compact-card treatment: the standing
+            // 'resurrectable via wake_sub_agent' tail becomes a muted footer
+            // hint and the redundant 'errored — ' prefix is dropped (the
+            // badge + tint already say it) — what remains is the short
+            // headline built by _shortSubErrorHeadline (core/097).
+            var lopts = null;
+            if (lst === 'error') {
+                var hm = hl.match(/\s*(?:[\u2014\u2013-]\s*|\()resurrectable via wake_sub_agent[^)\n]*\)?\s*$/i);
+                if (hm) {
+                    lopts = { hint: 'Resurrectable via wake_sub_agent' };
+                    hl = hl.slice(0, hm.index).trim();
+                }
+                hl = hl.replace(/^errored\s*[\u2014\u2013-]\s*/i, '');
+            }
+            matches.push({ start: m.index, end: m.index + m[0].length,
+                html: _subNoticeCardHtml(m[1], m[2], lst, hl, 'mid', lopts) });
+        }
+    }
+    if (hasInbox) {
+        PARENT_INBOX_RE.lastIndex = 0;
+        var heads = [];
+        while ((m = PARENT_INBOX_RE.exec(text)) !== null) {
+            heads.push({ index: m.index, len: m[0].length, count: parseInt(m[1], 10) || 1 });
+        }
+        // An inbox body has no terminator of its own — it runs to the next
+        // recognized notice (another drain header, a report/lifecycle notice
+        // coalesced after it) or the end of the text.
+        var bounds = [];
+        for (var bi = 0; bi < matches.length; bi++) bounds.push(matches[bi].start);
+        for (var hj = 0; hj < heads.length; hj++) bounds.push(heads[hj].index);
+        bounds.sort(function(a, b) { return a - b; });
+        for (var hi = 0; hi < heads.length; hi++) {
+            var bodyStart = heads[hi].index + heads[hi].len;
+            var end = text.length;
+            for (var bk = 0; bk < bounds.length; bk++) {
+                if (bounds[bk] >= bodyStart) { end = bounds[bk]; break; }
+            }
+            matches.push({ start: heads[hi].index, end: end,
+                html: _parentMsgCardHtml(heads[hi].count, text.slice(bodyStart, end).trim(), fmt) });
+        }
+    }
+    if (!matches.length) return null;
+    matches.sort(function(a, b) { return a.start - b.start; });
+    // Injection coalescing joins several queued texts with '\n\n' — keep
+    // any non-notice segment (other notices, context nudges) on the
+    // normal markdown path between the cards.
+    var out = '', last = 0;
+    for (var mi = 0; mi < matches.length; mi++) {
+        var mt = matches[mi];
+        if (mt.start < last) continue; // overlap guard — keep the earlier card
+        var before = text.slice(last, mt.start).trim();
+        if (before) out += '<div class="user-text user-text-md">' + fmt(before) + '</div>';
+        out += mt.html;
+        last = mt.end;
+    }
+    var after = text.slice(last).trim();
+    if (after) out += '<div class="user-text user-text-md">' + fmt(after) + '</div>';
+    return out;
+}
+
 // Used by the "open transcript →" link on a sub_report callout and by the
 // Workers strip chips. Reveals the sub's background chat in the sidebar
 // (background chats are normally hidden) and switches into it.
@@ -926,9 +1364,14 @@ var _workerExpanded = Object.create(null);
 // .sub-report-action-state / .sub-report-task markup the parent's sub_report
 // card uses, so the checklist is already themed. Always appends an "open
 // transcript" link (data-sub-agent-reveal -> revealSubAgentChat).
-function _workerProgressInner(rec) {
+function _workerProgressInner(rec, opts) {
     var inner = rec ? _subActionStateHtml(rec.action_state) : '';
     if (!inner) inner = '<div class="worker-progress-empty">No progress reported yet.</div>';
+    // Self-card variant (the sub-agent's OWN chat sidebar) skips the "Open chat"
+    // affordance below ("you're already in this chat") but KEEPS "View more":
+    // the self card no longer renders the input/output card inline, so "View more"
+    // is how its full report/outputs are reached (opens the worker chat-view modal).
+    var selfCard = !!(opts && opts.selfCard);
     // Open-chat affordance. Live records reveal by agent_id (follows chat_id
     // changes); reconstructed/purged records use the persisted chat_id and only
     // when that chat still exists (GC deletes the sub's chat row too).
@@ -940,7 +1383,7 @@ function _workerProgressInner(rec) {
     } else if (rec && rec.agent_id) {
         openAttr = 'data-sub-agent-reveal="' + escapeHtml(rec.agent_id) + '"';
     }
-    if (openAttr) {
+    if (openAttr && !selfCard) {
         inner += '<a class="worker-progress-open" ' + openAttr + ' role="button" tabindex="0" title="Open chat">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
             '<span>Open chat</span></a>';
@@ -960,18 +1403,30 @@ function _workerProgressInner(rec) {
 // Toggle a worker card's inline progress panel. Re-renders the panel from the
 // live registry record on open so it shows current progress even if it changed
 // while the card was collapsed.
+// The panel node only exists while expanded: _workerCardHtml renders it for
+// expanded cards, expand here creates it on demand, and collapse REMOVES it
+// from the DOM (it used to be display-toggled via [hidden], retaining the
+// whole stale subtree for every collapsed card). Repeated expand/collapse
+// cycles can't duplicate nodes: expand only inserts when no panel follows
+// the card, collapse always removes the one panel that does.
 function toggleWorkerProgress(agentId, cardEl) {
     if (!cardEl) return;
     var panel = cardEl.nextElementSibling;
-    if (!panel || !panel.classList || !panel.classList.contains('worker-card-progress')) return;
+    if (panel && (!panel.classList || !panel.classList.contains('worker-card-progress'))) panel = null;
     var open = !_workerExpanded[agentId];
     _workerExpanded[agentId] = open;
     if (open) {
         var rec = _resolveSubRec(agentId);
+        if (!panel) {
+            cardEl.insertAdjacentHTML('afterend',
+                '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(agentId) + '" data-prog-at="0"></div>');
+            panel = cardEl.nextElementSibling;
+        }
         panel.innerHTML = _workerProgressInner(rec);
         panel.setAttribute('data-prog-at', String(rec && rec.action_state ? (rec.action_state.at || 0) : 0));
+    } else if (panel && panel.parentNode) {
+        panel.parentNode.removeChild(panel);
     }
-    panel.hidden = !open;
     cardEl.classList.toggle('worker-card-expanded', open);
     cardEl.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
@@ -1105,6 +1560,182 @@ function _teardownWorkerChatModal() {
     _workerModalRefreshScheduled = false;
 }
 
+// ---------- Self card (right sidebar of a sub-agent's OWN chat) ----------
+// When the open chat IS a sub-agent chat, mirror the SAME live card the
+// parent chat shows for this worker — renderSubReport over the persisted
+// sub_report row that lives in the PARENT chat's messages — in the right
+// (version) sidebar, immediately below the Progress (action updates) card,
+// with the "go to parent chat" button rendered above it (the link used to
+// sit next to the chat title; see updateChatTitleHeader).
+// The host div is a placeholder emitted by renderVersionSidebar()
+// (120-ui-utils.js) between the progress section and the Workers panel;
+// that innerHTML rebuild wipes it, so renderVersionSidebar() re-invokes
+// updateSubAgentSelfCard() at the end (same pattern as renderWorkersStrip).
+// Refresh paths:
+//   • renderVersionSidebar (120-ui-utils.js) — every sidebar rebuild
+//     recreates the host empty/hidden and repopulates it.
+//   • updateChatTitleHeader (170-chat-management.js) — runs on every chat
+//     switch / header refresh and calls updateSubAgentSelfCard (guarded).
+//   • the registry listener (_doRender below) — live progress / state /
+//     report mutations repaint the card in place, change-keyed exactly
+//     like the worker chat-view modal so heartbeat ticks are no-ops.
+var _selfCardKey = null;
+
+// Locate the sub_report row (in the PARENT chat) that represents THIS chat's
+// worker. Prefer the live registry record (exact agent_id → _findSubReportMsg
+// scan), fall back to scanning the parent chat for a sub_report whose
+// persisted subChatId is this chat (registry record GC'd).
+function _findOwnSubReportMsg(chatId, chat) {
+    if (!chatId || typeof chats === 'undefined') return null;
+    var all = (typeof SubAgents !== 'undefined' && SubAgents.listAll) ? SubAgents.listAll() : [];
+    for (var i = 0; i < all.length; i++) {
+        if (all[i] && all[i].chat_id === chatId) {
+            var m = _findSubReportMsg(all[i].agent_id);
+            if (m) return m;
+            break;
+        }
+    }
+    var pc = (chat && chat.parentChatId) ? chats[chat.parentChatId] : null;
+    if (!pc || !Array.isArray(pc.messages)) return null;
+    for (var j = pc.messages.length - 1; j >= 0; j--) {
+        var r = pc.messages[j];
+        if (r && r.role === 'sub_report' && r.subChatId === chatId) return r;
+    }
+    return null;
+}
+
+function updateSubAgentSelfCard() {
+    var host = document.getElementById('sub-self-card-host');
+    // The "Back to parent" button lives in its OWN host pinned to the very top
+    // of the sidebar (above the PR/artifact cards); the progress card stays in
+    // the self-card host below. Both placeholders are emitted by
+    // renderVersionSidebar (120-ui-utils.js) and repopulated here on refresh.
+    var phost = document.getElementById('sub-self-parent-host');
+    if (!host && !phost) return;
+    var chat = (typeof chats !== 'undefined' && typeof currentChatId !== 'undefined') ? chats[currentChatId] : null;
+    var msg = (chat && chat.isSubAgent) ? _findOwnSubReportMsg(currentChatId, chat) : null;
+    if (!msg) {
+        if (host && host.style.display !== 'none') { host.style.display = 'none'; host.innerHTML = ''; }
+        if (phost && phost.style.display !== 'none') { phost.style.display = 'none'; phost.innerHTML = ''; }
+        _selfCardKey = null;
+        return;
+    }
+    var rec = msg.subAgentId ? _resolveSubRec(msg.subAgentId) : null;
+    var parentChatId = chat.parentChatId || (rec && rec.parent_chat_id) || '';
+    var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : '';
+    // Change-key: same fields as the worker chat-view modal, plus chat id
+    // (chat switches between sub chats must repaint) and the parent title
+    // (the link label). Skipping identical keys keeps registry heartbeat
+    // ticks from restarting the card's CSS animations.
+    // The key also encodes whether the parent chat row EXISTS (the linkHtml
+    // gate below) — parentTitle alone is '' both when the parent chat is
+    // absent and when it exists with no title yet, so an absent→present flip
+    // would otherwise produce an identical key and the short-circuit would
+    // keep the "Back to parent" button from ever appearing.
+    var key = currentChatId + '|' + parentTitle + '|' + ((parentChatId && chats[parentChatId]) ? '1' : '0') + '|' + _workerModalContentKey(msg, rec);
+    // Short-circuit when the key is unchanged AND at least one host is already
+    // painted. A sub-agent with a reachable parent but NO live progress card
+    // keeps `host` hidden (display:none) while `phost` shows the "Back to
+    // parent" button; guarding on `host` alone would miss that case and
+    // re-render `phost` on every heartbeat tick (DOM churn + focus/hover reset).
+    var painted = (host && host.style.display !== 'none') || (phost && phost.style.display !== 'none');
+    if (key === _selfCardKey && painted) return;
+    _selfCardKey = key;
+    // "Go to parent chat" button — SAME chrome as the sidebar's other action
+    // buttons (.version-action-btn + .action-icon, 11-version.css: Open
+    // Browser / Download All / Revert All) and the SAME delegated
+    // data-open-parent-chat-id click handler below (→ selectChat). A real
+    // <button>, so Enter/Space activation is native — no inline onkeydown.
+    var linkHtml = '';
+    if (parentChatId && chats[parentChatId]) {
+        var navTip = parentTitle ? 'Back to parent: ' + parentTitle : 'Back to the chat that spawned this sub-agent';
+        var backIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.back) ? UI_ICONS.back : '\u2190';
+        linkHtml = '<button type="button" class="version-action-btn sub-self-parent-link"'
+            + ' data-open-parent-chat-id="' + escapeHtml(parentChatId) + '"'
+            + ' title="' + escapeHtml(navTip) + '">'
+            + '<span class="action-icon" aria-hidden="true">' + backIcon + '</span>'
+            + '<span class="sub-self-parent-label">Back to parent</span>'
+            + '</button>';
+    }
+    // Input/output report card removed from this view: its full detail is now
+    // reached via the "View more" link on the progress card below (opens
+    // openWorkerChatModal), exactly like the parent chat's Workers card.
+    // Progress card - the SAME worker-card component the parent chat's Workers
+    // panel renders (_workerCardHtml), in its self-card variant (no expand caret,
+    // always-open todo list). It carries a "View more" link (added in
+    // _workerProgressInner) opening the full
+    // input/output report in the worker chat-view modal. Reused verbatim so the
+    // two surfaces stay pixel-identical; '' when no live/reconstructed record is
+    // available (renderSubReport still carries an internal progress fallback).
+    var progressHtml = '';
+    if (rec) { try { progressHtml = _workerCardHtml(rec, { selfCard: true }); } catch (_) { progressHtml = ''; } }
+    // Top host: the "Back to parent" button, pinned above the PR/artifact cards
+    // so it is always the topmost control in the sidebar. Hidden (emptied) when
+    // there is no reachable parent chat.
+    if (phost) {
+        if (linkHtml) { phost.innerHTML = linkHtml; phost.style.display = ''; }
+        else { phost.innerHTML = ''; phost.style.display = 'none'; }
+    }
+    // Self-card host: the progress card only (the parent link moved to the top
+    // host above). Hidden when no live/reconstructed record produced a card.
+    if (host) {
+        if (progressHtml) { host.innerHTML = progressHtml; host.style.display = ''; }
+        else { host.innerHTML = ''; host.style.display = 'none'; }
+    }
+}
+
+// Heartbeat metrics pass for the self card — the selfCard variant of
+// _workerCardHtml is a static <div> with no data-worker-chat attribute, so
+// updateSidebarWorkerMetrics (scoped to #sidebar-workers card buttons) never
+// touches it, and updateSubAgentSelfCard's change-key deliberately omits
+// tool_calls_used / ctx tokens so heartbeat ticks stay no-op repaints. This
+// patches the live numbers (tool-call counter, context ring, files/PRs,
+// approval badge) in place WITHOUT rebuilding innerHTML, mirroring
+// updateSidebarWorkerMetrics, so the card's CSS animations never restart.
+function _updateSelfCardMetrics() {
+    var host = document.getElementById('sub-self-card-host');
+    if (!host || host.style.display === 'none') return;
+    var card = host.querySelector('.worker-card-self');
+    if (!card) return;
+    var chatId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
+    if (!chatId) return;
+    // Resolve the live registry record for THIS chat's own worker.
+    var rec = null;
+    var all = (typeof SubAgents !== 'undefined' && SubAgents.listAll) ? SubAgents.listAll() : [];
+    for (var i = 0; i < all.length; i++) {
+        if (all[i] && all[i].chat_id === chatId) { rec = all[i]; break; }
+    }
+    var ctx = _subContextInfo(chatId);
+    var fill = card.querySelector('[data-worker-ctx-fill]');
+    if (fill) fill.setAttribute('stroke-dasharray', ctx.pct + ', 100');
+    var pctEl = card.querySelector('[data-worker-ctx-pct]');
+    if (pctEl) pctEl.textContent = ctx.tokens ? (ctx.pct + '%') : '\u2014';
+    var ctxWrap = card.querySelector('[data-worker-ctx]');
+    if (ctxWrap) {
+        ctxWrap.classList.toggle('worker-ctx-danger', ctx.pct >= 90);
+        ctxWrap.classList.toggle('worker-ctx-warning', ctx.pct >= 70 && ctx.pct < 90);
+    }
+    if (rec) {
+        var toolsEl = card.querySelector('[data-worker-tools]');
+        if (toolsEl) toolsEl.textContent = String(rec.tool_calls_used || 0) + ' tool calls';
+        var apEl = card.querySelector('[data-worker-approval]');
+        if (apEl) apEl.hidden = !_subAwaitingApproval(rec);
+    }
+    var work = _subWorkStats(chatId);
+    var filesEl = card.querySelector('[data-worker-files]');
+    if (filesEl) {
+        var filesTxt = _subCountLabel(work.files, 'file', 'files');
+        if (filesEl.textContent !== filesTxt) filesEl.textContent = filesTxt;
+        filesEl.hidden = !work.files;
+    }
+    var prsEl = card.querySelector('[data-worker-prs]');
+    if (prsEl) {
+        var prsTxt = _subCountLabel(work.prs, 'PR', 'PRs');
+        if (prsEl.textContent !== prsTxt) prsEl.textContent = prsTxt;
+        prsEl.hidden = !work.prs;
+    }
+}
+
 // Whitelist worker state for class-name interpolation (defense-in-depth,
 // same rationale as SUB_REPORT_STATUSES).
 var WORKER_CARD_STATES = { running: 1, sleeping: 1, stopped: 1, errored: 1 };
@@ -1159,7 +1790,8 @@ function subAgentsForChatTree(chatId) {
 // tool-call counter, context-length ring) plus its expandable inline progress
 // panel. Shared by the sidebar Workers panel (renderWorkersStrip) and the jobs
 // dropdown chat-row accordion so both surfaces render the identical component.
-function _workerCardHtml(r) {
+function _workerCardHtml(r, opts) {
+    var selfCard = !!(opts && opts.selfCard);
     var label = r.name || r.agent_id;
     var stateClass = WORKER_CARD_STATES[r.state] ? r.state : 'unknown';
     var stateLabel = r.state;
@@ -1192,11 +1824,20 @@ function _workerCardHtml(r) {
     var profileTags = Array.isArray(r.profiles)
         ? r.profiles.filter(function(p) { return typeof p === 'string' && p; })
         : [];
-    return '<div class="worker-card-wrap" data-depth="' + renderDepth + '">' +
-        '<button class="worker-card worker-' + stateClass + (wkExpanded ? ' worker-card-expanded' : '') + '" ' +
-        'data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
-        'data-worker-chat="' + escapeHtml(r.chat_id || '') + '" ' +
-        'aria-expanded="' + (wkExpanded ? 'true' : 'false') + '" ' +
+    // Self-card variant renders as a static <div> (no toggle handler, no expand
+    // caret, always expanded) so it visually matches the parent's Workers-panel
+    // card while dropping the parent-only expand affordance. Inline cursor:default
+    // signals non-interactivity without editing the shared .worker-card CSS.
+    var wkTag = selfCard ? 'div' : 'button';
+    var wkExpandedNow = selfCard || wkExpanded;
+    var wkToggleAttrs = selfCard
+        ? 'style="cursor:default" '
+        : ('data-worker-toggle="' + escapeHtml(r.agent_id) + '" ' +
+           'data-worker-chat="' + escapeHtml(r.chat_id || '') + '" ' +
+           'aria-expanded="' + (wkExpanded ? 'true' : 'false') + '" ');
+    return '<div class="worker-card-wrap' + (selfCard ? ' worker-card-wrap-self' : '') + '" data-depth="' + renderDepth + '"' + (selfCard ? ' style="margin-top:var(--space-3,6px)"' : '') + '>' +
+        '<' + wkTag + ' class="worker-card worker-' + stateClass + (wkExpandedNow ? ' worker-card-expanded' : '') + (selfCard ? ' worker-card-self' : '') + '" ' +
+        wkToggleAttrs +
         'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(used)) + '/' + escapeHtml(String(cap)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
         '<span class="worker-card-icon" aria-hidden="true">' + botIcon + '</span>' +
         '<span class="worker-card-main">' +
@@ -1226,11 +1867,16 @@ function _workerCardHtml(r) {
                 : '') +
         '</span>' +
         _contextCircleHtml(r.chat_id) +
-        '<span class="worker-card-caret" aria-hidden="true">\u203a</span>' +
-    '</button>' +
-    '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(r.agent_id) + '" data-prog-at="' + progAt + '"' + (wkExpanded ? '' : ' hidden') + '>' +
-        (wkExpanded ? _workerProgressInner(r) : '') +
-    '</div>' +
+        (selfCard ? '' : '<span class="worker-card-caret" aria-hidden="true">\u203a</span>') +
+    '</' + wkTag + '>' +
+    // Progress panel node is only emitted while expanded — collapsed cards
+    // carry NO panel in the DOM (toggleWorkerProgress creates/removes it). The
+    // self-card is always expanded so its todo list is visible without a click.
+    (wkExpandedNow
+        ? '<div class="worker-card-progress" data-worker-progress="' + escapeHtml(r.agent_id) + '" data-prog-at="' + progAt + '">' +
+              _workerProgressInner(r, opts) +
+          '</div>'
+        : '') +
     '</div>';
 }
 
@@ -1475,6 +2121,13 @@ function renderWorkersStrip() {
                 if (typeof renderMessages === 'function') renderMessages();
             }
         } catch (_) {}
+        // Self card in a sub-agent chat's right sidebar — internally
+        // change-keyed (no-op on pure heartbeat ticks).
+        try { updateSubAgentSelfCard(); } catch (_) {}
+        // Heartbeat ticks the change-key above deliberately ignores (tool
+        // counter / ctx growth) still update the self card's live numbers —
+        // patched in place, no repaint (mirrors updateSidebarWorkerMetrics).
+        try { _updateSelfCardMetrics(); } catch (_) {}
     }
     function onChange() {
         if (_renderScheduled) return;
@@ -1563,8 +2216,8 @@ function renderWorkersStrip() {
                         evt.preventDefault();
                         return;
                     }
-                    // "Open parent" affordance on the chat-title sub-agent
-                    // pill (see updateChatTitleHeader in 170-chat-management.js).
+                    // "Go to parent chat" button on the sub-agent self card
+                    // in the right sidebar (see updateSubAgentSelfCard above).
                     // Routes via selectChat so the chat list expands / scrolls
                     // / etc. just like a normal click on the sidebar row.
                     var openParent = t.getAttribute('data-open-parent-chat-id');
@@ -1631,6 +2284,7 @@ function renderWorkersStrip() {
     if (typeof window !== 'undefined') {
         setTimeout(function() {
             try { renderWorkersStrip(); } catch (_) {}
+            try { updateSubAgentSelfCard(); } catch (_) {}
         }, 0);
     }
 })();

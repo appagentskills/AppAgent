@@ -1489,6 +1489,43 @@ function normalizeClaudeUsage(json) {
     return out;
 }
 
+// Distill a provider error body into a short human-readable headline.
+// Provider errors arrive as (often nested/escaped) JSON — e.g. Anthropic:
+// {"type":"error","error":{"type":"rate_limit_error","message":"{\"type\":\"exceeded_limit\",…}"},"request_id":"…"}.
+// Surfacing that verbatim floods every downstream UI (sub-agent notice
+// cards, lifecycle retry rows, snackbars, agent_status). Drill into the
+// innermost string message, collapse whitespace and hard-cap the result;
+// the FULL raw body is logged to the SW console so nothing is lost for
+// debugging. Generic on purpose: any long body (not just 429) gets the
+// same treatment, while short plain-text bodies pass through untouched.
+function conciseApiErrorBody(bodyText) {
+    var raw = String(bodyText == null ? '' : bodyText).trim();
+    if (!raw) return raw;
+    var t = raw;
+    for (var depth = 0; depth < 4; depth++) {
+        var c = t.charAt(0);
+        if (c !== '{' && c !== '[') break;
+        var obj;
+        try { obj = JSON.parse(t); } catch (e) { break; }
+        var msg = obj && (
+            (obj.error && typeof obj.error === 'object' && (obj.error.message || obj.error.type))
+            || (typeof obj.error === 'string' && obj.error)
+            || obj.message || obj.detail);
+        if (typeof msg !== 'string' || !msg.trim()) {
+            // JSON with no usable message field — fall back to a type/code
+            // hint (e.g. {"type":"exceeded_limit",…} → "exceeded limit").
+            var hint = obj && (obj.type || obj.code);
+            if (hint) t = String(hint).replace(/_/g, ' ');
+            break;
+        }
+        t = msg.trim(); // may itself be escaped JSON (Anthropic nests it) — loop
+    }
+    t = t.replace(/\s+/g, ' ').trim();
+    if (t.length > 240) t = t.slice(0, 240).trim() + '\u2026';
+    if (t !== raw) console.error('[AppAgent] full API error body:', raw);
+    return t || raw.slice(0, 240);
+}
+
 // Decide whether an ACCOUNT limit (credits / 5h window / weekly window /
 // extra-usage cap) is actually exhausted, from a flat claudeRateLimits-style
 // map — either headers scraped off a /v1/messages response or the output of
@@ -1971,7 +2008,12 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                     backoffLabel = exhaustion.label;
                     var resetIn = formatResetDelta(exhaustion.resetsAt);
                     if (exhaustion.hardStop || (exhaustion.resetsAt && exhaustion.resetsAt * 1000 - Date.now() > 60000)) {
-                        errBodyText = exhaustion.label + (resetIn ? ' — resets in ' + resetIn : '') + '. Retrying won\'t help until the limit resets.' + (errBodyText ? ' (' + errBodyText + ')' : '');
+                        // Concise headline ONLY — the raw provider body used
+                        // to be appended in parens here and flooded every
+                        // error surface downstream (sub-agent notice cards,
+                        // lifecycle retry rows). It goes to the console now.
+                        if (errBodyText) console.error('[AppAgent] 429 raw error body:', errBodyText);
+                        errBodyText = exhaustion.label + (resetIn ? ' — resets in ' + resetIn : '') + '. Retrying won\'t help until the limit resets.';
                         console.error('[AppAgent] 429 ' + exhaustion.label + (resetIn ? ', resets in ' + resetIn : '') + ' — not retrying');
                         break;
                     }
@@ -1987,7 +2029,10 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
             // errBodyText is set when the retry loop already consumed the
             // body (429/529 exhausted) — a Response body can only be read once.
             var errText = (errBodyText !== null) ? errBodyText : await res.text();
-            sink({ type: 'error', error: 'API error ' + res.status + ': ' + errText });
+            // conciseApiErrorBody: distill nested provider JSON into a short
+            // headline (full raw body goes to the console) so raw payloads
+            // never leak into transcripts, notice cards or status rows.
+            sink({ type: 'error', error: 'API error ' + res.status + ': ' + conciseApiErrorBody(errText) });
             sink({ type: 'done' });
             return;
         }
@@ -2597,6 +2642,18 @@ chrome.runtime.onStartup.addListener(function() {
     try { chrome.power.releaseKeepAwake(); } catch (e) {}
 });
 
+// RELOAD-DB backstop: when the MV3 service worker is about to be suspended,
+// close its cached IDB connection cleanly. closeDatabase() is defined in the
+// imported sw-bundle.js (WORKER_SHARED_FILES -> core/130-indexeddb.js). This
+// does NOT fire on an abrupt chrome.runtime.reload() (the 'prepare-reload'
+// port message covers that path), but it cleanly releases the connection on a
+// normal idle suspend so it is never abandoned mid-teardown.
+if (chrome.runtime.onSuspend && chrome.runtime.onSuspend.addListener) {
+    chrome.runtime.onSuspend.addListener(function() {
+        try { if (typeof closeDatabase === 'function') closeDatabase(); } catch (e) {}
+    });
+}
+
 // =============================================================
 // Offscreen helper — DOM ops + keep-alive ONLY.
 //
@@ -2750,6 +2807,20 @@ chrome.alarms.onAlarm.addListener(function(alarm) {
     // src/js/app/010-llm-streaming.js). Fully guarded — must never break
     // the SW keepalive above.
     try { _cacheHeartbeatTick(); } catch (e) { /* non-fatal */ }
+    // SLEEP-WEDGE: round-trip probe the SW realm's cached IDB connection so
+    // a silently-dead post-suspend connection is dropped and reopened instead
+    // of hanging the next checkpoint/chat save. probeDbAfterResume lives in
+    // core/130-indexeddb.js (inside sw-bundle.js) and is single-flight +
+    // throttled internally. Fully guarded — must never break the keepalive.
+    try { if (typeof probeDbAfterResume === 'function') probeDbAfterResume(); } catch (e) { /* non-fatal */ }
+    // SW-IDLE-CLOSE (empty-chat-list root fix): release the SW's cached IDB
+    // connection once it has been idle (see DB_SW_IDLE_CLOSE_MS) so it is never
+    // held long enough to be abandoned by an abrupt SW kill / OS sleep, which
+    // wedges the origin's IDB backing store and makes the next reload render an
+    // empty chat list. Alarm-driven because setTimeout is unreliable in an MV3
+    // SW. Lives in core/130-indexeddb.js (sw-bundle). Guarded — must never
+    // break the keepalive.
+    try { if (typeof maybeReleaseIdleDbConnection === 'function') maybeReleaseIdleDbConnection(); } catch (e) { /* non-fatal */ }
 });
 
 // ─── Prompt-cache heartbeat trigger ─────────────────────────────────────
