@@ -753,6 +753,14 @@ async function runAgent(overrideChatId) {
         }
     }
 
+    // THROTTLE-RETRY (main chats): budget for in-loop retries of transient
+    // shed-load stream errors — see the classifier in the catch below. Reset
+    // after every successful stream so a long run isn't capped by blips that
+    // happened dozens of calls ago; the budget only guards against a
+    // persistently saturated endpoint.
+    var throttleRetries = 0;
+    var AGENT_THROTTLE_MAX_RETRIES = 4;
+
     while (!isChatPaused(streamingChatId)) {
         // QUEUE-SYNC-FIX (defense-in-depth): a user send can land in the gap
         // between loop steps — no stream controller registered (deleted in
@@ -969,8 +977,9 @@ async function runAgent(overrideChatId) {
                 chat.id,
                 reqMetrics
             );
-            
+
             clearInterval(streamUpdateInterval);
+            throttleRetries = 0; // THROTTLE-RETRY: successful stream refills the budget
         } catch (e) {
             clearInterval(streamUpdateInterval);
 
@@ -989,6 +998,49 @@ async function runAgent(overrideChatId) {
                 }
                 AgentEvents.emit('streamAborted', { chatId: streamingChatId });
                 continue; // Restart the loop with the user's queued message in context
+            }
+
+            // THROTTLE-RETRY: Anthropic sheds load two ways — an HTTP 529
+            // BEFORE the stream (already retried with backoff at the transport,
+            // runClaudeOAuthStream in background.js) and an SSE error event
+            // MID-stream on an HTTP 200 ("Overloaded"), which reaches this
+            // catch and used to KILL the run on the first hit. Sub-agents
+            // survive this class via 097's throttle re-queue; this gives main
+            // chats parity. Retry in-loop with jittered exponential backoff:
+            // the partial assistant message is dropped first, so the request
+            // prefix is unchanged and the retry mostly re-hits the prompt
+            // cache. After the wait, `continue` re-enters through the loop
+            // head + while-gate, so a pause/stop/send during the backoff
+            // behaves exactly like one between turns. Non-OAuth providers
+            // benefit too (OpenRouter 429/502/503 bodies match the same
+            // classifier). Budget exhausted → fall through to the normal
+            // error path below.
+            var _throttleClass = /overloaded|rate.?limit|too many requests|temporarily unavailable|\b(429|502|503|529)\b/i
+                .test(String((e && e.message) || e));
+            if (_throttleClass && throttleRetries < AGENT_THROTTLE_MAX_RETRIES) {
+                throttleRetries++;
+                if (chat.messages[chat.messages.length - 1] === assistantMsg) {
+                    chat.messages.pop();
+                }
+                var _waitMs = Math.min(4000 * Math.pow(2, throttleRetries - 1), 30000);
+                // Jitter: concurrent chats shed at the same instant must not
+                // retry in lockstep (same rationale as the transport backoff).
+                _waitMs = Math.round(_waitMs * (0.7 + Math.random() * 0.6));
+                console.warn('[agent-loop] throttle-class stream error for chat ' + streamingChatId
+                    + ' ("' + String((e && e.message) || e).slice(0, 120) + '") — retry '
+                    + throttleRetries + '/' + AGENT_THROTTLE_MAX_RETRIES + ' in ' + _waitMs + 'ms');
+                // Same event shape as the transport-level backoff status, so the
+                // page renders the live "retrying in Ns" countdown in the chat's
+                // status row instead of a dead spinner.
+                AgentEvents.emit('llmTransportStatus', {
+                    message: 'AI endpoint saturated — retrying (' + throttleRetries + '/' + AGENT_THROTTLE_MAX_RETRIES + ')',
+                    status: 'backoff',
+                    reason: 'overloaded',
+                    waitMs: _waitMs,
+                    chatId: streamingChatId
+                });
+                await new Promise(function(r) { setTimeout(r, _waitMs); });
+                continue;
             }
 
             console.error('[agent-loop] caught during stream for chat ' + streamingChatId + ':', e);

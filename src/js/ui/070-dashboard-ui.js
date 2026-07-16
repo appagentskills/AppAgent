@@ -1737,6 +1737,14 @@ async function loadChatsFromStorage() {
         // ensureChatPayloads — see core/130-indexeddb.js). Evicted
         // chats stay in `chats` (delete-pass safety) and are skipped
         // by the put-loop in saveChatsToStorage (put safety).
+        // PAYLOAD-STORE: records saved since v16 arrive ALREADY stripped
+        // (payloads live in chat_payloads) — the strip loop below is a no-op
+        // for them and still bites on legacy-inline records (chats not yet
+        // re-saved since v16, imported backups; migration is lazy, at save
+        // time). "Keep the newest K hydrated" therefore needs the explicit
+        // hydration pass at the bottom — sequential and fire-and-forget; view
+        // call sites (switchToChat, history view) also hydrate on demand,
+        // this just front-loads the common case.
         try {
             var KEEP_HYDRATED = 8;
             if (typeof stripChatPayloadsInPlace === 'function') {
@@ -1744,6 +1752,26 @@ async function loadChatsFromStorage() {
                 _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
                 for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
                     stripChatPayloadsInPlace(chats[_ids[_si]]);
+                }
+                if (typeof ensureChatPayloads === 'function') {
+                    (function _hydrateRecent(recentIds) {
+                        var _hi = 0;
+                        (function _next() {
+                            if (_hi >= recentIds.length) return;
+                            var _hid = recentIds[_hi++];
+                            var _hp = (chats[_hid] && chats[_hid]._payloadsEvicted)
+                                ? ensureChatPayloads(_hid) : Promise.resolve();
+                            Promise.resolve(_hp).then(function() {
+                                // Repaint once the CURRENT chat's images arrive —
+                                // the boot render may have shown placeholders.
+                                if (typeof currentChatId !== 'undefined' && currentChatId === _hid
+                                    && typeof renderMessages === 'function') {
+                                    try { renderMessages(); } catch (e) {}
+                                }
+                                _next();
+                            }, _next);
+                        })();
+                    })(_ids.slice(0, KEEP_HYDRATED));
                 }
             }
         } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
@@ -1793,9 +1821,13 @@ async function saveChatsToStorage() {
         // withStore (core/130-indexeddb.js): retries ONCE on a fresh
         // connection if the cached one was force-closed by the browser. Safe
         // to retry: the diff-save re-derives everything from in-memory state.
-        await withStore([chatStoreName], 'readwrite', function(transaction) {
+        // PAYLOAD-STORE: the tx spans chat_payloads too — each hydrated chat
+        // is put as a payload-STRIPPED record (extractChatPayloadsForPut) and
+        // its new payloads become blob rows in the same atomic transaction,
+        // so a record never commits without its payloads being durable.
+        await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
-        
+
         // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
         // vanished from memory, upsert the rest. Even a buggy save can no
         // longer mass-erase the store in one transaction.
@@ -1820,6 +1852,9 @@ async function saveChatsToStorage() {
             };
             keysRequest.onsuccess = function() {
                 var existingKeys = keysRequest.result || [];
+                // PAYLOAD-STORE: refresh the known-durable blob id cache once per
+                // realm (key-only read) so unchanged payloads aren't re-put.
+                primeChatPayloadIdCache(transaction, function() {
                 // Persistable snapshot — same filter as before (drop 0-message chats)
                 var desired = {};
                 Object.keys(chats).forEach(function(id) {
@@ -1849,13 +1884,21 @@ async function saveChatsToStorage() {
                     }
                 });
                 Object.keys(desired).forEach(function(id) {
-                    // MEMFIX: NEVER put a payload-evicted chat — its in-memory
-                    // copy is missing base64 blobs and putting it would overwrite
-                    // the only durable copy in IDB. It stays in `desired` so the
-                    // delete-pass above cannot remove its record either.
+                    // MEMFIX: NEVER put a payload-evicted chat. Post-PAYLOAD-STORE
+                    // this protects legacy records whose payloads are still inline
+                    // (never migrated / imported) and skips pure write
+                    // amplification (an evicted chat's record hasn't changed).
+                    // It stays in `desired` so the delete-pass above cannot
+                    // remove its record either.
                     if (desired[id]._payloadsEvicted) return;
+                    // PAYLOAD-STORE: strip payloads into blob rows; the record
+                    // put carries flags instead of base64. All requests are
+                    // issued synchronously here, so `pending` cannot zero-cross
+                    // before the loop finishes.
+                    var extracted = extractChatPayloadsForPut(desired[id]);
+                    pending += queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
                     pending++;
-                    var putRequest = store.put(desired[id]);
+                    var putRequest = store.put(extracted.record);
                     putRequest.onsuccess = settleOne;
                     putRequest.onerror = settleOne;
                 });
@@ -1863,6 +1906,7 @@ async function saveChatsToStorage() {
                     updateStorageIndicator();
                     resolve();
                 }
+                }); // end primeChatPayloadIdCache
             };
             keysRequest.onerror = function() {
                 console.error('Failed to read chat store keys:', keysRequest.error);

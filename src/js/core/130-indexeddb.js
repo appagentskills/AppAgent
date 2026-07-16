@@ -12,7 +12,13 @@ var dbName = STORAGE_PREFIX + 'AppAgentDB';
 // wakes (WAKE-DUR — see core/097-sub-agent-registry.js). Volatile
 // pendingInjectionsByChatId entries died with the MV3 service worker,
 // stalling parents waiting on sub reports until the user typed.
-var dbVersion = 15;
+// Bumped to 16 for the `chat_payloads` store (PAYLOAD-STORE): inline
+// base64 file/screenshot payloads move OUT of chats records into
+// immutable per-id blob rows, so per-tool-boundary chat saves stop
+// rewriting every payload. The upgrade itself only creates the store —
+// row migration is LAZY, at save time (see the note in onupgradeneeded:
+// an eager in-upgrade migration crashed the browser on large stores).
+var dbVersion = 16;
 var workspaceMetaStoreName = 'workspace_meta';
 var workspaceFilesStoreName = 'workspace_files';
 // Content-addressed blob store: { sha, content }. Shared across all
@@ -30,9 +36,14 @@ var actionStateStoreName = 'action_state';
 // at every tool boundary by 110-agent-checkpoint.js so a crashed/idle
 // offscreen doc can resume by re-entering the loop from the latest
 // checkpoint. Key is chatId.
-// Schema: { chatId, turn, callNumber, messagesSnapshot, aggregateMetrics,
-//           lastEventAt, status: 'running'|'parked'|'finished'|'errored',
+// Schema: { chatId, turn, callNumber, lastEventAt,
+//           status: 'running'|'parked'|'finished'|'errored',
 //           parkedToolCalls: [{toolCallId, name, input, parkedAt}, ...] }
+// NOTE: records deliberately carry NO transcript. Legacy records also
+// held messagesSnapshot (full chat.messages, inline base64 included) —
+// a multi-MB structured-clone write per tool boundary that no reader
+// ever consumed (resume re-runs from the chats record; the registry
+// reads only cp.status). See 110-agent-checkpoint.js.
 var agentRunsStoreName = 'agent_runs';
 // sub_agents: persistent per-sub-agent runtime state. Keyed by agent_id.
 // Survives page/SW reload so the worker pool can resume orphaned subs and
@@ -55,6 +66,18 @@ var subAgentsStoreName = 'sub_agents';
 // A null-text notice is a "run-only" wake: the notice row is already in
 // the transcript, only the runAgent start needs to be (re)tried.
 var pendingWakesStoreName = 'pending_wakes';
+// chat_payloads (PAYLOAD-STORE): durable home of every chat file/screenshot
+// payload. Rows are { id, base64, at } keyed by the message's
+// file_id/screenshot_id — ids are unique per capture and their content is
+// immutable, so a payload is written to disk ONCE, not re-serialized by
+// every chat save at every tool boundary (the write amplification behind
+// the recurring 30s transaction timeouts). Chats records persist with
+// payload-bearing messages stripped and flagged (_b64Evicted on the
+// message/screenshot entry, _payloadsEvicted on the record — see
+// extractChatPayloadsForPut); hydration back into memory is
+// ensureChatPayloads. `at` (write time) is indexed for the boot-time
+// orphan sweep (sweepOrphanChatPayloads).
+var chatPayloadsStoreName = 'chat_payloads';
 var db = null;
 // Dedupe concurrent openDatabase() calls: all callers racing while no live
 // connection is cached share ONE in-flight open request. Cleared on failure
@@ -397,6 +420,24 @@ function openDatabase() {
             if (!database.objectStoreNames.contains(pendingWakesStoreName)) {
                 database.createObjectStore(pendingWakesStoreName, { keyPath: 'parentChatId' });
             }
+            if (!database.objectStoreNames.contains(chatPayloadsStoreName)) {
+                var cpStore = database.createObjectStore(chatPayloadsStoreName, { keyPath: 'id' });
+                // `at` (write time) drives the orphan sweep's age gate — key
+                // cursors on this index never materialize the base64 values.
+                cpStore.createIndex('at', 'at', { unique: false });
+            }
+            // v16 deliberately has NO eager row migration. Moving every chat's
+            // payloads inside the single versionchange transaction buffered the
+            // whole uncommitted journal (potentially GBs of base64 across all
+            // chats) in memory at once and CRASHED the browser on large stores.
+            // Migration is lazy instead: legacy records keep their inline
+            // base64 (ensureChatPayloads reads it as a fallback source) until
+            // the chat is next hydrated and saved — saveChatsToStorage's
+            // extractChatPayloadsForPut then moves its payloads into
+            // chat_payloads one chat per ordinary transaction. Untouched old
+            // chats stay legacy-inline forever, which is harmless: they are
+            // payload-evicted in memory, the save guard never re-puts them,
+            // and every read path handles both shapes.
         };
     });
     _dbOpenPromise = myOpenPromise;
@@ -467,7 +508,13 @@ function _isDbConnectionError(e) {
     // (internal IDB error), AbortError (our transaction deadline aborts the
     // wedged transaction), or the deadline sentinel itself — all mean "drop
     // this connection and retry on a fresh one".
-    if (e.name === 'UnknownError' || e.name === 'AbortError' || e.name === 'TimeoutError') return true;
+    if (e.name === 'UnknownError' || e.name === 'AbortError') return true;
+    // Deadline sentinel from a WEDGED backend (the liveness probe also failed).
+    // Deliberately NOT a bare name==='TimeoutError' check any more: the
+    // BUSY-sentinel (_dbTxSlow — backend responsive, transaction just slow /
+    // queued behind large writes) also carries name TimeoutError but must NOT
+    // trigger the close-reopen-retry path, which would abort a progressing
+    // write and re-do it from scratch — a livelock under write congestion.
     if (e._dbTxTimeout) return true;
     return typeof e.message === 'string' && e.message.toLowerCase().indexOf('database connection is closing') !== -1;
 }
@@ -487,13 +534,47 @@ function _isDbConnectionError(e) {
 // SLEEP-WEDGE: deadline for a single withStore transaction body. A
 // post-suspend wedged backend accepts transaction()/getAll() calls whose
 // callbacks then NEVER fire — nothing throws, so without a deadline the
-// retry path never engages and the caller awaits forever. The deadline
-// turns the silent hang into a connection-shaped error (TimeoutError, see
+// retry path never engages and the caller awaits forever. For READONLY
+// transactions (and for READWRITE ones whose liveness probe also fails —
+// see _probeBackendAlive) the deadline turns the silent hang into a
+// connection-shaped error (TimeoutError + _dbTxTimeout, see
 // _isDbConnectionError) so withStore drops the dead connection, reopens and
-// retries once. Readwrite gets a longer budget: large diff-saves of the
-// chats store can be legitimately slow on cold disk.
+// retries once. A READWRITE transaction that blows the deadline while the
+// backend still answers the probe is merely CONGESTED: it is left to commit
+// in the background and the caller gets a non-connection error instead
+// (TimeoutError + _dbTxSlow) — no abort, no retry, no livelock.
 var DB_TX_DEADLINE_READ_MS = 15000;
 var DB_TX_DEADLINE_WRITE_MS = 30000;
+
+// BUSY-vs-WEDGE probe budget: when a READWRITE transaction blows its deadline,
+// a tiny bounded readonly count() on the settings store decides whether the
+// backend is actually wedged (probe hangs/errors → abort + connection-shaped
+// sentinel → withStore reopens and retries) or merely CONGESTED — queued
+// behind other transactions / a slow disk. A congested transaction is left
+// running to commit in the background and the caller gets a NON-connection
+// error, because the old unconditional abort+reopen+retry rolled back a
+// progressing write only to re-issue it from scratch while new writes kept
+// arriving: a livelock that kept resurfacing as recurring 30s timeouts on
+// [chats]/[agent_runs] no matter how the connection lifecycle was hardened.
+var DB_TX_PROBE_TIMEOUT_MS = 5000;
+function _probeBackendAlive(database, cb) {
+    var done = false;
+    var timer = setTimeout(function() { finish(false); }, DB_TX_PROBE_TIMEOUT_MS);
+    function finish(ok) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        cb(ok);
+    }
+    try {
+        var tx = database.transaction([settingsStoreName], 'readonly');
+        var req = tx.objectStore(settingsStoreName).count();
+        req.onsuccess = function() { finish(true); };
+        req.onerror = function() { finish(false); };
+    } catch (e) {
+        finish(false);
+    }
+}
 
 function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) {
     return new Promise(function(resolve, reject) {
@@ -507,9 +588,7 @@ function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) 
             ? deadlineOverrideMs
             : ((mode === 'readwrite') ? DB_TX_DEADLINE_WRITE_MS : DB_TX_DEADLINE_READ_MS);
         var settled = false;
-        var timer = setTimeout(function() {
-            if (settled) return;
-            settled = true;
+        function rejectWedged() {
             // Best-effort abort — on a truly wedged backend even abort may
             // no-op, but the caller is already unblocked by the rejection.
             try { tx.abort(); } catch (e) {}
@@ -517,6 +596,36 @@ function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) 
             err.name = 'TimeoutError';
             err._dbTxTimeout = true;
             reject(err);
+        }
+        var timer = setTimeout(function() {
+            if (settled) return;
+            // READONLY keeps the old fast-fail semantics: aborting a read
+            // wastes no work, and the boot hydration path budgets on
+            // deadline + one retry fitting under its own boot deadline.
+            if (mode !== 'readwrite') {
+                settled = true;
+                rejectWedged();
+                return;
+            }
+            // READWRITE: decide busy-vs-wedged before nuking the transaction.
+            _probeBackendAlive(database, function(alive) {
+                if (settled) return; // tx finished while probing
+                settled = true;
+                if (alive) {
+                    // Congested, not wedged: do NOT abort — the transaction
+                    // stays queued and commits in the background (the settled
+                    // guard swallows its late fn-body settlement). The error is
+                    // deliberately NOT connection-shaped (no _dbTxTimeout), so
+                    // withStore neither drops the connection nor re-issues the
+                    // write — see the livelock note on _probeBackendAlive.
+                    var slow = new Error('IndexedDB transaction on [' + storeNames + '] (' + mode + ') exceeded ' + deadlineMs + 'ms but the backend is responsive — congestion, not a wedge; the transaction was left to complete in the background');
+                    slow.name = 'TimeoutError';
+                    slow._dbTxSlow = true;
+                    reject(slow);
+                    return;
+                }
+                rejectWedged();
+            });
         }, deadlineMs);
         Promise.resolve().then(function() { return fn(tx); }).then(function(value) {
             if (settled) return;
@@ -608,12 +717,20 @@ function probeDbAfterResume() {
 // (page + SW), including inline base64 screenshots/PDFs — ~150MB+
 // per realm on screenshot-heavy histories. Fix: at load time each
 // realm strips base64 payloads from non-recent chats (page keeps the
-// newest 8 intact, the SW strips all — see loadChatsFromStorage in
+// newest 8 hydrated — post-PAYLOAD-STORE via an explicit hydration
+// pass — the SW strips all; see loadChatsFromStorage in
 // ui/070-dashboard-ui.js and worker/115-storage.js) and rehydrates
-// on demand from the IDB chat record, which remains the only durable
-// copy of the payloads.
+// on demand via ensureChatPayloads.
 //
-// INVARIANTS (violating either DESTROYS the only durable copy):
+// PAYLOAD-STORE update: the durable copy of each payload now lives in
+// the chat_payloads blob store (see extractChatPayloadsForPut); a chat
+// RECORD's inline base64 survives only as a legacy fallback source
+// (un-migrated rows, imported backups). The invariants below keep
+// their exact shape — they now protect the legacy-inline records and
+// keep saves cheap (an evicted chat's record hasn't changed, so
+// re-putting it would be pure write amplification).
+//
+// INVARIANTS:
 //   1. A chat with `_payloadsEvicted` is NEVER put back to IDB —
 //      both realms' saveChatsToStorage put-loops skip it.
 //   2. An evicted chat STAYS in the in-memory `chats` map — the
@@ -666,100 +783,352 @@ function chatPayloadRecencyTs(chat) {
     return Math.max(chat.updatedAt || 0, chat.createdAt || 0, chat.lastViewedAt || 0);
 }
 
+// =============================================================
+// PAYLOAD-STORE persistence helpers (used by BOTH realms'
+// saveChatsToStorage — worker/115-storage.js and ui/070-dashboard-ui.js).
+//
+// Chats records are persisted with every identifiable base64 payload
+// stripped out; the payload bytes live once, immutably, in chat_payloads.
+// Records carry the same flags the MEMFIX in-memory eviction uses
+// (_b64Evicted per message/screenshot entry, _payloadsEvicted on the
+// record), so a loaded record is indistinguishable from an evicted chat
+// and hydrates through the one existing path: ensureChatPayloads.
+// =============================================================
+
+// Session cache of blob ids known durable in chat_payloads, so a hydrated
+// chat's unchanged payloads are not re-put on every save. REBUILT from
+// getAllKeys inside every save transaction (primeChatPayloadIdCache): a
+// once-per-realm prime went stale when the SW's orphan sweep deleted rows
+// after another realm had primed — that realm then skipped the blob puts
+// for a re-imported chat against rows that no longer existed, committing
+// a payload-stripped record with no payloads (silent loss). Extended only
+// on transaction COMMIT (see queueChatPayloadPuts).
+var _persistedPayloadIds = {};
+
+// Build the chats-store record for a chat: a clone with every payload that
+// carries a file_id/screenshot_id stripped and flagged, plus the blob rows
+// those payloads become. The live in-memory chat is NEVER mutated (clones
+// are per-container and per-entry; base64 strings are shared by reference,
+// not copied). Payloads without an id keep their base64 inline in the
+// record — no id means no blob key and no way to rehydrate (same rule as
+// stripChatPayloadsInPlace).
+function extractChatPayloadsForPut(chat) {
+    var payloads = [];
+    var now = Date.now();
+    var evicted = !!chat._payloadsEvicted;
+    var newMsgs = null;
+    if (Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (!m) continue;
+            var pid = m.file_id || m.screenshot_id;
+            if (pid && m.base64) {
+                if (!newMsgs) newMsgs = chat.messages.slice();
+                var mClone = Object.assign({}, m);
+                delete mClone.base64;
+                mClone._b64Evicted = true;
+                newMsgs[i] = mClone;
+                payloads.push({ id: pid, base64: m.base64, at: now });
+                evicted = true;
+            } else if (m._b64Evicted) {
+                // Already-evicted in memory: its blob is durable (or the
+                // payload was already lost) — the record just keeps the flag.
+                evicted = true;
+            }
+        }
+    }
+    var newSs = null;
+    if (chat.screenshots) {
+        var ssIds = Object.keys(chat.screenshots);
+        for (var j = 0; j < ssIds.length; j++) {
+            var ss = chat.screenshots[ssIds[j]];
+            if (ss && ss.base64) {
+                if (!newSs) newSs = Object.assign({}, chat.screenshots);
+                var ssClone = Object.assign({}, ss);
+                delete ssClone.base64;
+                ssClone._b64Evicted = true;
+                newSs[ssIds[j]] = ssClone;
+                payloads.push({ id: ssIds[j], base64: ss.base64, at: now });
+                evicted = true;
+            } else if (ss && ss._b64Evicted) {
+                evicted = true;
+            }
+        }
+    }
+    var record = chat;
+    if (newMsgs || newSs || (evicted && !chat._payloadsEvicted)) {
+        record = Object.assign({}, chat);
+        if (newMsgs) record.messages = newMsgs;
+        if (newSs) record.screenshots = newSs;
+        if (evicted) record._payloadsEvicted = true;
+    }
+    return { record: record, payloads: payloads };
+}
+
+// Per-save refresh of the known-durable blob id cache from the store's
+// keys, inside the caller's already-open transaction (which must include
+// chat_payloads). Key-only read — never materializes base64. REPLACES the
+// cache wholesale so ids whose rows were deleted since the last save (the
+// SW's orphan sweep — possibly a different realm) drop out and their
+// payloads get re-put instead of silently skipped. Calls cb() exactly
+// once, on success or failure.
+function primeChatPayloadIdCache(transaction, cb) {
+    var req;
+    try {
+        req = transaction.objectStore(chatPayloadsStoreName).getAllKeys();
+    } catch (e) {
+        cb();
+        return;
+    }
+    req.onsuccess = function() {
+        var keys = req.result || [];
+        var fresh = {};
+        for (var i = 0; i < keys.length; i++) fresh[keys[i]] = true;
+        _persistedPayloadIds = fresh;
+        cb();
+    };
+    req.onerror = function(ev) {
+        // Contain: must not abort the save tx. DROP the cache rather than
+        // keep trusting it — over-putting is idempotent (same id, same
+        // bytes); skipping against a deleted row is silent payload loss.
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        _persistedPayloadIds = {};
+        cb();
+    };
+}
+
+// Queue puts for the blob rows a record extraction produced, skipping ids
+// already known durable. Each request settles through `settle` (same
+// optimistic semantics as the chat-record puts around it: an error bubbles,
+// aborts the tx, and the tx.onabort safety-net resolves the save; the next
+// save repairs). Returns the number of requests issued so the caller can
+// add them to its pending count BEFORE any can settle. Ids are merged into
+// the session cache only on transaction COMMIT — a request-level success
+// can still be rolled back by a later abort, and caching a rolled-back id
+// would skip the re-put forever (silent payload loss on eviction).
+function queueChatPayloadPuts(transaction, payloads, settle) {
+    if (!payloads || !payloads.length) return 0;
+    var store = transaction.objectStore(chatPayloadsStoreName);
+    var txIds = [];
+    for (var i = 0; i < payloads.length; i++) {
+        var p = payloads[i];
+        if (!p || !p.id || !p.base64) continue;
+        if (_persistedPayloadIds[p.id]) continue;
+        var req = store.put(p);
+        req.onsuccess = settle;
+        req.onerror = settle;
+        txIds.push(p.id);
+    }
+    if (txIds.length) {
+        transaction.addEventListener('complete', function() {
+            for (var k = 0; k < txIds.length; k++) _persistedPayloadIds[txIds[k]] = true;
+        });
+    }
+    return txIds.length;
+}
+
+// Boot-time orphan sweep: delete chat_payloads rows referenced by NO chat.
+// Reference set = every file_id/screenshot_id in every in-memory chat
+// (ids survive eviction, so a stripped chat still contributes its refs) —
+// which is why this runs only in a realm that has hydrated ALL chats (the
+// SW; called from worker/190-entry.js after boot hydration) and is gated on
+// _chatsHydrated. The 24h age gate (via the `at` index, key-cursor only —
+// values never materialized) protects the cross-realm race where another
+// realm commits a record+blob after this realm hydrated its chats map.
+var DB_PAYLOAD_GC_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+function sweepOrphanChatPayloads() {
+    if (typeof _chatsHydrated === 'undefined' || !_chatsHydrated) return Promise.resolve(0);
+    if (typeof chats === 'undefined' || !chats) return Promise.resolve(0);
+    var referenced = {};
+    Object.keys(chats).forEach(function(cid) {
+        var c = chats[cid];
+        if (!c) return;
+        if (Array.isArray(c.messages)) {
+            for (var i = 0; i < c.messages.length; i++) {
+                var m = c.messages[i];
+                if (!m) continue;
+                if (m.file_id) referenced[m.file_id] = true;
+                if (m.screenshot_id) referenced[m.screenshot_id] = true;
+            }
+        }
+        if (c.screenshots) {
+            Object.keys(c.screenshots).forEach(function(k) { referenced[k] = true; });
+        }
+    });
+    var cutoff = Date.now() - DB_PAYLOAD_GC_MIN_AGE_MS;
+    return withStore([chatPayloadsStoreName], 'readwrite', function(transaction) {
+        return new Promise(function(resolve) {
+            var store = transaction.objectStore(chatPayloadsStoreName);
+            var deleted = 0;
+            var cursorReq;
+            try {
+                cursorReq = store.index('at').openKeyCursor(IDBKeyRange.upperBound(cutoff));
+            } catch (e) {
+                resolve(0);
+                return;
+            }
+            cursorReq.onsuccess = function(ev) {
+                var cur = ev.target.result;
+                if (!cur) { resolve(deleted); return; }
+                if (!referenced[cur.primaryKey]) {
+                    try {
+                        store.delete(cur.primaryKey);
+                        delete _persistedPayloadIds[cur.primaryKey];
+                        deleted++;
+                    } catch (e2) {}
+                }
+                cur.continue();
+            };
+            cursorReq.onerror = function() { resolve(deleted); };
+        });
+    }).catch(function(e) {
+        console.warn('[indexeddb] chat_payloads orphan sweep failed', e);
+        return 0;
+    });
+}
+
 // Per-chatId single-flight guard: concurrent callers share one hydration.
 var _chatHydrationPromises = {};
 
-// Rehydrate a payload-evicted chat from its IDB record. Idempotent —
-// no-op unless chats[chatId]._payloadsEvicted. NEVER rejects: a failed
-// hydration logs, keeps the eviction flags set (so the save guard keeps
-// protecting the durable record) and resolves; the next caller retries.
+// Rehydrate a payload-evicted chat. Idempotent — no-op unless
+// chats[chatId]._payloadsEvicted. NEVER rejects: a failed hydration logs,
+// keeps the eviction flags set (so the save guard keeps skipping this chat)
+// and resolves; the next caller retries.
+// PAYLOAD-STORE: the primary source is the chat_payloads blob store
+// (one get per flagged id, single readonly tx). The chat RECORD's inline
+// base64 remains the fallback for legacy records — chats never re-saved
+// since v16 (migration is lazy, at save time) or imported from a backup.
 async function ensureChatPayloads(chatId) {
     var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
     if (!chat || !chat._payloadsEvicted) return;
     if (_chatHydrationPromises[chatId]) return _chatHydrationPromises[chatId];
     var p = (async function() {
         try {
-            var record = await withStore([chatStoreName], 'readonly', function(transaction) {
-                var store = transaction.objectStore(chatStoreName);
-                var request = store.get(chatId);
+            // Collect the flagged payload ids BEFORE the async fetch, from the
+            // live chat object (ids are stable across realms; message indexes
+            // can drift during a run).
+            var wantIds = {};
+            if (Array.isArray(chat.messages)) {
+                for (var wi = 0; wi < chat.messages.length; wi++) {
+                    var wm = chat.messages[wi];
+                    if (wm && wm._b64Evicted) {
+                        var wid = wm.file_id || wm.screenshot_id;
+                        if (wid) wantIds[wid] = true;
+                    }
+                }
+            }
+            if (chat.screenshots) {
+                Object.keys(chat.screenshots).forEach(function(wk) {
+                    if (chat.screenshots[wk] && chat.screenshots[wk]._b64Evicted) wantIds[wk] = true;
+                });
+            }
+            var record = null;
+            var blobById = {};
+            // Ids whose blob GET errored (contained below): the row may well
+            // exist, so their flags must be KEPT for a later retry —
+            // "errored" is not "absent".
+            var failedIds = {};
+            await withStore([chatStoreName, chatPayloadsStoreName], 'readonly', function(transaction) {
                 return new Promise(function(resolve, reject) {
-                    request.onsuccess = function() { resolve(request.result || null); };
+                    var pending = 1; // the record get
+                    function done() { if (--pending === 0) resolve(); }
+                    var request = transaction.objectStore(chatStoreName).get(chatId);
+                    request.onsuccess = function() { record = request.result || null; done(); };
                     request.onerror = function() { reject(request.error); };
+                    var blobStore = transaction.objectStore(chatPayloadsStoreName);
+                    Object.keys(wantIds).forEach(function(id) {
+                        pending++;
+                        var breq = blobStore.get(id);
+                        breq.onsuccess = function() {
+                            if (breq.result && breq.result.base64) blobById[id] = breq.result.base64;
+                            done();
+                        };
+                        breq.onerror = function(bev) {
+                            // Best-effort per blob: contain the error so it can't
+                            // abort the tx; the record-inline fallback may still
+                            // cover this id. Remember the failure so the flag
+                            // handling below keeps this id retryable.
+                            if (bev && typeof bev.preventDefault === 'function') bev.preventDefault();
+                            failedIds[id] = true;
+                            done();
+                        };
+                    });
                 });
             });
             // Re-read the live object — it may have been replaced (e.g. the SW
-            // adopted a panel snapshot) while the IDB get was in flight.
+            // adopted a panel snapshot) while the IDB reads were in flight.
             chat = chats[chatId];
             if (!chat) return;
-            if (record) {
-                // Index the record's payloads by file id (ids are stable across
-                // realms; message indexes can drift during a run).
-                var byId = {};
-                if (Array.isArray(record.messages)) {
-                    for (var ri = 0; ri < record.messages.length; ri++) {
-                        var rm = record.messages[ri];
-                        if (!rm || !rm.base64) continue;
-                        var rid = rm.file_id || rm.screenshot_id;
-                        if (rid) byId[rid] = rm.base64;
-                    }
-                }
-                if (Array.isArray(chat.messages)) {
-                    for (var mi = 0; mi < chat.messages.length; mi++) {
-                        var m = chat.messages[mi];
-                        if (!m || !m._b64Evicted) continue;
-                        var fid = m.file_id || m.screenshot_id;
-                        if (fid && byId[fid]) {
-                            m.base64 = byId[fid];
-                        } else if (record.messages && record.messages[mi]
-                                   && record.messages[mi].base64
-                                   && (record.messages[mi].file_id || record.messages[mi].screenshot_id) === fid) {
-                            // Fallback: same index, same id (defensive — byId
-                            // should already have matched).
-                            m.base64 = record.messages[mi].base64;
-                        }
-                        // Clear the flag either way: if the record has no payload
-                        // for this id, the durable copy never had it — keeping the
-                        // flag would only block persistence forever.
-                        delete m._b64Evicted;
-                    }
-                }
-                if (chat.screenshots && record.screenshots) {
-                    var sIds = Object.keys(chat.screenshots);
-                    for (var si = 0; si < sIds.length; si++) {
-                        var cs = chat.screenshots[sIds[si]];
-                        if (!cs || !cs._b64Evicted) continue;
-                        var rs = record.screenshots[sIds[si]];
-                        if (rs && rs.base64) cs.base64 = rs.base64;
-                        delete cs._b64Evicted;
-                    }
-                } else if (chat.screenshots) {
-                    Object.keys(chat.screenshots).forEach(function(k) {
-                        if (chat.screenshots[k]) delete chat.screenshots[k]._b64Evicted;
-                    });
-                }
-            } else {
-                // L1: missing IDB record — clear the per-message / screenshots-map
-                // _b64Evicted flags too, not just the chat-level flag below.
-                // There is nothing durable to rehydrate from, and a stale
-                // _b64Evicted would misreport those payloads as "pending
-                // rehydration" forever after the chat resumes persisting.
-                if (Array.isArray(chat.messages)) {
-                    for (var ci = 0; ci < chat.messages.length; ci++) {
-                        if (chat.messages[ci]) delete chat.messages[ci]._b64Evicted;
-                    }
-                }
-                if (chat.screenshots) {
-                    Object.keys(chat.screenshots).forEach(function(sk) {
-                        if (chat.screenshots[sk]) delete chat.screenshots[sk]._b64Evicted;
-                    });
+            // Legacy fallback: index the record's remaining INLINE payloads by
+            // id, then let blob rows win.
+            var byId = {};
+            if (record && Array.isArray(record.messages)) {
+                for (var ri = 0; ri < record.messages.length; ri++) {
+                    var rm = record.messages[ri];
+                    if (!rm || !rm.base64) continue;
+                    var rid = rm.file_id || rm.screenshot_id;
+                    if (rid) byId[rid] = rm.base64;
                 }
             }
-            // No record at all ⇒ nothing durable to protect — clear the flag so
-            // the chat can persist again (first save re-creates the record).
-            delete chat._payloadsEvicted;
+            Object.keys(blobById).forEach(function(bid) { byId[bid] = blobById[bid]; });
+            // Set when an id's flag is deliberately KEPT (its blob get
+            // errored): the chat must then stay _payloadsEvicted so the save
+            // guard keeps skipping it and the next hydration retries.
+            var keptAny = false;
+            if (Array.isArray(chat.messages)) {
+                for (var mi = 0; mi < chat.messages.length; mi++) {
+                    var m = chat.messages[mi];
+                    if (!m || !m._b64Evicted) continue;
+                    var fid = m.file_id || m.screenshot_id;
+                    if (fid && byId[fid]) {
+                        m.base64 = byId[fid];
+                    } else if (record && record.messages && record.messages[mi]
+                               && record.messages[mi].base64
+                               && (record.messages[mi].file_id || record.messages[mi].screenshot_id) === fid) {
+                        // Fallback: same index, same id (defensive — byId
+                        // should already have matched).
+                        m.base64 = record.messages[mi].base64;
+                    } else if (fid && failedIds[fid]) {
+                        // The blob GET errored — the row may exist. Keep the
+                        // flag so a later hydration retries; clearing it here
+                        // stranded the payload forever (nothing rehydrates an
+                        // unflagged message).
+                        keptAny = true;
+                        continue;
+                    }
+                    // Clear the flag otherwise: if neither the blob store nor
+                    // the record has a payload for this id AND the reads did
+                    // not error, the durable copy never had it — keeping the
+                    // flag would only block persistence forever.
+                    delete m._b64Evicted;
+                }
+            }
+            if (chat.screenshots) {
+                var sIds = Object.keys(chat.screenshots);
+                for (var si = 0; si < sIds.length; si++) {
+                    var cs = chat.screenshots[sIds[si]];
+                    if (!cs || !cs._b64Evicted) continue;
+                    var rs = (record && record.screenshots) ? record.screenshots[sIds[si]] : null;
+                    var sb64 = blobById[sIds[si]] || (rs && rs.base64);
+                    if (sb64) {
+                        cs.base64 = sb64;
+                    } else if (failedIds[sIds[si]]) {
+                        // Same as above: errored ≠ absent — keep it retryable.
+                        keptAny = true;
+                        continue;
+                    }
+                    delete cs._b64Evicted;
+                }
+            }
+            // Hydrated (or nothing durable to hydrate from) — clear the flag so
+            // the chat persists again; the next save re-extracts its payloads.
+            // If any id was kept retryable, the chat stays evicted: durable
+            // copies stay intact, the save guard keeps skipping it, and the
+            // next ensureChatPayloads call retries just the flagged ids.
+            if (!keptAny) delete chat._payloadsEvicted;
         } catch (e) {
             // Keep the flags: the save guard keeps skipping this chat, the
-            // durable record stays intact, and the next call retries.
+            // durable copies stay intact, and the next call retries.
             console.error('[indexeddb] ensureChatPayloads failed for', chatId, e);
         } finally {
             delete _chatHydrationPromises[chatId];

@@ -2,26 +2,37 @@
 // AppAgent offscreen runtime — Layer C checkpoint persistence.
 //
 // At every tool-call boundary the agent loop emits `toolCallResult`.
-// We use that emission as the durable checkpoint: a chat's full
-// message list is snapshotted to the agent_runs store. If the
+// We use that emission as the durable checkpoint marker. If the
 // offscreen doc is killed (Chrome SW idle-timer, browser restart,
-// etc.) and re-spawned, 080-agent-resume.js reads checkpoints from
-// IDB and re-enters the loop from the saved state.
+// etc.) and re-spawned, the boot resume scan reads checkpoints from
+// IDB and re-enters the loop for every 'running'/'parked' record.
 //
-// IMPORTANT: the in-flight assistant message (the one currently
-// streaming when the doc died) is NOT durable — its content lives
-// only in chat.messages until persisted via saveChatsToStorage().
-// The checkpoint captures messages immediately AFTER a tool result
-// is appended, so on resume the last tool result IS present and
-// the model emits a fresh call.
+// CKPT-SLIM: records deliberately carry NO transcript. The transcript's
+// durability is the chats store's job — the agent loop calls
+// saveChatsToStorage() at the same tool boundaries that trigger these
+// checkpoints, and resume re-runs from the chats record
+// (resumeRunningCheckpoints → runAgent(chatId) reads chats[chatId]).
+// Records used to also carry messagesSnapshot (full chat.messages,
+// inline base64 screenshots included) that NO reader ever consumed —
+// making every tool boundary a multi-MB structured-clone readwrite
+// transaction on agent_runs. Under a screenshot-heavy run (or several
+// concurrent sub-agents) those queued up past the 30s transaction
+// deadline and surfaced as the recurring
+// "[checkpoint] write failed ... TimeoutError" spam.
+//
+// CKPT-COALESCE: writes are also single-flighted per chat with
+// latest-wins coalescing (a burst of runStarted/toolCallResult/
+// assistantMessage events collapses into at most one in-flight put +
+// one queued put). Deletes flow through the SAME per-chat channel so
+// a runFinished delete can never be overtaken by a still-queued
+// earlier write resurrecting the record ('running' zombie → bogus
+// boot resume).
 //
 // Schema (keyPath: chatId):
 //   {
 //     chatId: string,
 //     turn: number,                      // lastUserMsgIndex
 //     callNumber: number,                // current API call index
-//     messagesSnapshot: Array,           // full chat.messages
-//     aggregateMetrics: { ... },         // metrics rollup
 //     lastEventAt: number (ms),          // last checkpoint time
 //     status: 'running' | 'parked' | 'finished' | 'errored',
 //     parkedToolCalls: [ {toolCallId, name, input, parkedAt}, ... ]
@@ -35,12 +46,48 @@ function _agentRunsStore(mode) {
     });
 }
 
-function writeAgentCheckpoint(chatId, snapshot) {
-    if (!chatId) return Promise.resolve();
-    var record = Object.assign({}, snapshot, {
-        chatId: chatId,
-        lastEventAt: Date.now()
+// CKPT-COALESCE channels: chatId -> { op, draining, waiters }.
+//   op:      the NEXT operation to run ({ type: 'put', record } |
+//            { type: 'delete' }) — replaced in place by newer calls
+//            (latest wins) until the drain picks it up.
+//   waiters: resolvers for every caller whose op is represented by the
+//            current `op`; popped together with it, resolved when THAT
+//            operation settles. Callers arriving mid-flight go to the
+//            fresh waiters list and resolve on the next drain pass.
+var _ckptChannels = {};
+
+function _ckptEnqueue(chatId, op) {
+    var ch = _ckptChannels[chatId] || (_ckptChannels[chatId] = { op: null, draining: false, waiters: [] });
+    ch.op = op; // latest wins — a queued-but-unwritten older op is superseded
+    var done = new Promise(function(res) { ch.waiters.push(res); });
+    if (!ch.draining) {
+        ch.draining = true;
+        _ckptDrain(chatId, ch);
+    }
+    return done;
+}
+
+function _ckptDrain(chatId, ch) {
+    var op = ch.op;
+    ch.op = null;
+    var waiters = ch.waiters;
+    ch.waiters = [];
+    var run = (op.type === 'delete') ? _ckptDeleteNow(chatId) : _ckptPutNow(chatId, op.record);
+    // Both ops honour the never-reject contract, so this then() always runs.
+    run.then(function() {
+        for (var i = 0; i < waiters.length; i++) {
+            try { waiters[i](); } catch (e) {}
+        }
+        if (ch.op) {
+            _ckptDrain(chatId, ch);
+        } else {
+            ch.draining = false;
+            delete _ckptChannels[chatId];
+        }
     });
+}
+
+function _ckptPutNow(chatId, record) {
     // SW-IDLE-CLOSE hardening: route through withStore() instead of holding
     // the DB handle directly (as _agentRunsStore does). Checkpoint writes can
     // race the idle connection release (releaseIdleDbConnection, fired from
@@ -65,6 +112,27 @@ function writeAgentCheckpoint(chatId, snapshot) {
     });
 }
 
+function _ckptDeleteNow(chatId) {
+    return withStore([agentRunsStoreName], 'readwrite', function(tx) {
+        return new Promise(function(resolve) {
+            var req = tx.objectStore(agentRunsStoreName).delete(chatId);
+            req.onsuccess = function() { resolve(); };
+            req.onerror = function() { resolve(); };
+        });
+    }).catch(function(e) {
+        console.warn('[checkpoint] delete failed for chat ' + chatId, e);
+    });
+}
+
+function writeAgentCheckpoint(chatId, snapshot) {
+    if (!chatId) return Promise.resolve();
+    var record = Object.assign({}, snapshot, {
+        chatId: chatId,
+        lastEventAt: Date.now()
+    });
+    return _ckptEnqueue(chatId, { type: 'put', record: record });
+}
+
 function readAgentCheckpoint(chatId) {
     return _agentRunsStore('readonly').then(function(store) {
         return new Promise(function(resolve) {
@@ -76,13 +144,10 @@ function readAgentCheckpoint(chatId) {
 }
 
 function deleteAgentCheckpoint(chatId) {
-    return _agentRunsStore('readwrite').then(function(store) {
-        return new Promise(function(resolve) {
-            var req = store.delete(chatId);
-            req.onsuccess = function() { resolve(); };
-            req.onerror = function() { resolve(); };
-        });
-    });
+    if (!chatId) return Promise.resolve();
+    // Through the per-chat channel (NOT a direct delete): ordering with any
+    // queued/in-flight write must be preserved — see CKPT-COALESCE above.
+    return _ckptEnqueue(chatId, { type: 'delete' });
 }
 
 // Boot-time reaper. Deletes every checkpoint record that is not a LIVE
@@ -145,10 +210,11 @@ function listRunningAgentCheckpoints() {
 // so a resume can pick up token/duration totals.
 //
 // `runFinished` is the natural commit-and-clear point: a clean finish
-// DELETES the checkpoint outright (each record holds a full
-// messagesSnapshot — keeping them bloats IDB unboundedly). 'errored'
-// and 'paused' records are kept for diagnostics / resume-by-user and
-// reaped by sweepFinishedAgentCheckpoints after 24h on SW boot.
+// DELETES the checkpoint outright (dead records are pure clutter for the
+// resume scan, and LEGACY records still carry a full messagesSnapshot).
+// 'errored' and 'paused' records are kept for diagnostics /
+// resume-by-user and reaped by sweepFinishedAgentCheckpoints after 24h
+// on SW boot.
 function _buildCheckpointSnapshotFor(chatId) {
     var chat = chats[chatId];
     if (!chat) return null;
@@ -165,8 +231,9 @@ function _buildCheckpointSnapshotFor(chatId) {
             return -1;
         })(),
         callNumber: 0, // best-effort — recomputed on resume from message metrics
-        messagesSnapshot: chat.messages ? chat.messages.slice() : [],
-        aggregateMetrics: null, // recomputed from message metrics on resume
+        // CKPT-SLIM: no messagesSnapshot / aggregateMetrics — the transcript is
+        // durable in the chats store (saveChatsToStorage runs at the same tool
+        // boundaries) and resume re-runs from there; see the header comment.
         status: 'running',
         parkedToolCalls: (parkedToolCallsByChatId[chatId] || []).map(function(p) {
             return { toolCallId: p.toolCallId, name: p.name, input: p.input, parkedAt: p.parkedAt };

@@ -120,6 +120,23 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         } catch (eSweep) {
             console.warn('[sw-runtime] agent_runs sweep failed', eSweep);
         }
+        // PAYLOAD-STORE GC: reap chat_payloads blobs no chat references any
+        // more (deleted chats, truncated transcripts). Runs here because the
+        // SW is the realm that hydrates ALL chats (the reference set must be
+        // complete); internally gated on _chatsHydrated and a 24h age floor,
+        // so a failed/partial chats load can never mass-delete live payloads.
+        // Fire-and-forget, non-fatal.
+        try {
+            if (typeof sweepOrphanChatPayloads === 'function') {
+                sweepOrphanChatPayloads().then(function(n) {
+                    if (n > 0) console.log('[sw-runtime] swept ' + n + ' orphaned chat payload blob(s)');
+                }).catch(function(e) {
+                    console.warn('[sw-runtime] chat_payloads sweep failed', e);
+                });
+            }
+        } catch (eSweep2) {
+            console.warn('[sw-runtime] chat_payloads sweep failed', eSweep2);
+        }
         return listRunningAgentCheckpoints();
     }).then(function(checkpoints) {
         if (!checkpoints || checkpoints.length === 0) {

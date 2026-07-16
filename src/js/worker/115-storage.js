@@ -57,7 +57,11 @@ async function saveChatsToStorage() {
         // ONCE on a fresh connection if the cached one was force-closed by
         // the browser. Safe to retry: the diff-save re-derives everything
         // from in-memory state.
-        await withStore([chatStoreName], 'readwrite', function(transaction) {
+        // PAYLOAD-STORE: the tx spans chat_payloads too — each hydrated chat
+        // is put as a payload-STRIPPED record (extractChatPayloadsForPut) and
+        // its new payloads become blob rows in the same atomic transaction,
+        // so a record never commits without its payloads being durable.
+        await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
         // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
         // vanished from memory, upsert the rest.
@@ -76,6 +80,9 @@ async function saveChatsToStorage() {
             transaction.onabort = function() { resolve(); };
             keysRequest.onsuccess = function() {
                 var existingKeys = keysRequest.result || [];
+                // PAYLOAD-STORE: refresh the known-durable blob id cache once per
+                // realm (key-only read) so unchanged payloads aren't re-put.
+                primeChatPayloadIdCache(transaction, function() {
                 var desired = {};
                 Object.keys(chats).forEach(function(id) {
                     var c = chats[id];
@@ -98,17 +105,26 @@ async function saveChatsToStorage() {
                     }
                 });
                 Object.keys(desired).forEach(function(id) {
-                    // MEMFIX: NEVER put a payload-evicted chat — its in-memory
-                    // copy is missing base64 blobs and putting it would overwrite
-                    // the only durable copy in IDB. It stays in `desired` so the
-                    // delete-pass above cannot remove its record either.
+                    // MEMFIX: NEVER put a payload-evicted chat. Post-PAYLOAD-STORE
+                    // this protects legacy records whose payloads are still inline
+                    // (never migrated / imported) and skips pure write
+                    // amplification (an evicted chat's record hasn't changed).
+                    // It stays in `desired` so the delete-pass above cannot
+                    // remove its record either.
                     if (desired[id]._payloadsEvicted) return;
+                    // PAYLOAD-STORE: strip payloads into blob rows; the record
+                    // put carries flags instead of base64. All requests are
+                    // issued synchronously here, so `pending` cannot zero-cross
+                    // before the loop finishes.
+                    var extracted = extractChatPayloadsForPut(desired[id]);
+                    pending += queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
                     pending++;
-                    var putRequest = store.put(desired[id]);
+                    var putRequest = store.put(extracted.record);
                     putRequest.onsuccess = settleOne;
                     putRequest.onerror = settleOne;
                 });
                 if (pending === 0) resolve();
+                }); // end primeChatPayloadIdCache
             };
             keysRequest.onerror = function() { resolve(); };
         });
@@ -142,6 +158,7 @@ async function loadChatsFromStorage() {
             request.onsuccess = function() {
                 var results = request.result || [];
                 chats = {};
+                _legacyPayloadMigrationQueue = [];
                 results.forEach(function(chat) {
                     if (chat.messages && chat.messages.length > 0) {
                         // MEMFIX: the SW strips inline base64 payloads from EVERY
@@ -150,8 +167,16 @@ async function loadChatsFromStorage() {
                         // before a chat is run/persisted). Evicted chats stay in
                         // `chats` (delete-pass safety) and are skipped by the
                         // put-loop in saveChatsToStorage above (put safety).
+                        // LEGACY-MIGRATE: strip returning true means the RECORD
+                        // itself still held inline base64 — a legacy-inline row
+                        // (pre-v16 or an imported backup). Queue it for the
+                        // heartbeat trickle migrator below so the store converges
+                        // to the v16 shape instead of re-materializing these
+                        // payloads in this getAll on every SW boot.
                         if (typeof stripChatPayloadsInPlace === 'function') {
-                            try { stripChatPayloadsInPlace(chat); } catch (e) {}
+                            try {
+                                if (stripChatPayloadsInPlace(chat)) _legacyPayloadMigrationQueue.push(chat.id);
+                            } catch (e) {}
                         }
                         chats[chat.id] = chat;
                     }
@@ -197,3 +222,78 @@ async function loadChatsFromStorage() {
 // Stub for updateStorageIndicator. The page bundle uses it to update
 // a status pill; offscreen has no UI. No-op.
 function updateStorageIndicator() { /* offscreen: no UI */ }
+
+// =============================================================
+// LEGACY-MIGRATE: heartbeat-driven trickle migration of legacy-inline
+// chat records (payload base64 still inside the chats record — pre-v16
+// rows and imported backups).
+//
+// The v16 migration is lazy-at-save, so a chat the user never reopens
+// keeps its inline payloads in its record forever — and this realm's
+// boot getAll() above re-materializes ALL of that base64 on EVERY SW
+// start (MV3 restarts the SW constantly): a permanent per-boot memory
+// spike proportional to the legacy tail, the same class of blow-up that
+// crashed the abandoned eager in-upgrade migration. This migrator makes
+// the store converge instead: called from the 30s 'agent-heartbeat'
+// alarm (background.js), it migrates ONE chat per tick — hydrate
+// (ensureChatPayloads) → save (extracts payloads into chat_payloads and
+// puts the record stripped, one ordinary transaction) → re-evict — so
+// peak memory is one chat's payloads and every transaction stays small.
+// =============================================================
+var _legacyPayloadMigrationQueue = [];
+var _legacyPayloadMigrationBusy = false;
+var _legacyPayloadMigrationRetries = {};
+var LEGACY_PAYLOAD_MIGRATION_MAX_RETRIES = 3;
+
+async function migrateNextLegacyChatPayloads() {
+    if (_legacyPayloadMigrationBusy) return;
+    if (!_chatsHydrated || !_legacyPayloadMigrationQueue.length) return;
+    _legacyPayloadMigrationBusy = true;
+    try {
+        var chatId = _legacyPayloadMigrationQueue.shift();
+        var chat = chats[chatId];
+        // Deleted since boot — nothing to migrate.
+        if (!chat) return;
+        // Hydrated by a run since boot: its own at-boundary saves already
+        // migrate it (the put-loop extracts any non-evicted chat) — drop it.
+        if (!chat._payloadsEvicted) return;
+        // Never hydrate-then-re-evict under an active run — the loop needs
+        // the payloads it hydrated at run entry to stay in memory. Re-queue
+        // for a later tick.
+        if ((typeof isChatRunning === 'function' && isChatRunning(chatId))
+            || (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[chatId])) {
+            _legacyPayloadMigrationQueue.push(chatId);
+            return;
+        }
+        await ensureChatPayloads(chatId);
+        chat = chats[chatId];
+        if (!chat) return;
+        if (chat._payloadsEvicted) {
+            // Hydration failed (flags kept) — retry on a later tick, capped so
+            // a permanently unreadable chat can't wedge the queue forever.
+            var n = (_legacyPayloadMigrationRetries[chatId] || 0) + 1;
+            if (n <= LEGACY_PAYLOAD_MIGRATION_MAX_RETRIES) {
+                _legacyPayloadMigrationRetries[chatId] = n;
+                _legacyPayloadMigrationQueue.push(chatId);
+            } else {
+                console.warn('[worker-storage] legacy payload migration gave up on chat', chatId);
+            }
+            return;
+        }
+        // The actual migration: the save extracts this chat's payloads into
+        // chat_payloads blob rows and puts its record STRIPPED, atomically.
+        await saveChatsToStorage();
+        // Re-evict (K=0 in this realm) — unless a run started on it while the
+        // save was in flight, in which case it must stay hydrated for the loop.
+        if (!((typeof isChatRunning === 'function' && isChatRunning(chatId))
+              || (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[chatId]))) {
+            try { stripChatPayloadsInPlace(chats[chatId]); } catch (e) {}
+        }
+        console.log('[worker-storage] migrated legacy inline payloads for chat ' + chatId
+            + ' (' + _legacyPayloadMigrationQueue.length + ' left)');
+    } catch (e) {
+        console.warn('[worker-storage] legacy payload migration tick failed', e);
+    } finally {
+        _legacyPayloadMigrationBusy = false;
+    }
+}

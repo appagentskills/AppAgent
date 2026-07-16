@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.17
+
+### Fixes
+- Fixed the recurring 30-second storage timeouts: screenshots and other large payloads now live in their own store, saves are much slimmer, and older chats migrate to the new format quietly in the background.
+- Mid-stream "Overloaded" errors no longer kill a run — the agent now retries with a live countdown, like it already did for rate limits before the stream starts.
+- Long background scripts no longer fail from URL length limits, and scripts on the same instance run one at a time instead of racing.
+- Skill tools that wait or sleep are no longer throttled to once a minute when the panel is closed.
+- `servicenow-eval` runner hardening: guarded init, idempotent teardown, and loud failure when script execution is denied.
+
+---
+
 ## v1.1.16
 
 ### Features

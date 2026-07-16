@@ -16,6 +16,66 @@ window.executeTool = function(name, args) {
     });
 };
 
+// SW-backed sleep. This sandbox iframe is hosted by the always-hidden
+// offscreen document, where Chrome's intensive wake-up throttling aligns
+// chained setTimeout timers to 1/minute (page hidden >= 5 min + timer
+// nesting >= 5). postMessage is NOT throttled, so sleep(ms) round-trips to
+// the service worker (parent's '__sandbox_sleep' intercept in
+// offscreen-helper.js -> 'sw-sleep' handler in background.js) and resolves
+// on time — no local timers on the bridged path. Fallback: a parent that
+// does not implement the intercept (page-side sandbox hosts route it to
+// executeTool, which errors or returns a plain result without __sleep_ok)
+// -> wait locally with a SINGLE un-nested native timer (one-shot timers
+// below nesting depth 5 are not intensively throttled).
+var _nativeSetTimeout = window.setTimeout.bind(window);
+var _nativeClearTimeout = window.clearTimeout.bind(window);
+window.sleep = function(ms) {
+    ms = Math.max(0, Number(ms) || 0);
+    var started = Date.now();
+    function localRemainder() {
+        var remaining = ms - (Date.now() - started);
+        if (remaining <= 0) return { slept_ms: ms, bridged: false };
+        return new Promise(function(resolve) {
+            _nativeSetTimeout(function() { resolve({ slept_ms: ms, bridged: false }); }, remaining);
+        });
+    }
+    return window.executeTool('__sandbox_sleep', { ms: ms }).then(function(r) {
+        if (r && r.__sleep_ok) return { slept_ms: ms, bridged: true };
+        return localRemainder();
+    }, localRemainder);
+};
+window.delay = window.sleep;
+
+// setTimeout shim — best-effort mitigation for existing code that calls
+// setTimeout directly: delays >= 1000ms are transparently routed through the
+// SW-backed sleep; sub-second ones stay native. Semantics preserved: returns
+// a numeric id, clearTimeout cancels it, extra args are forwarded to the
+// callback. Limitations: shimmed ids come from a separate high range
+// (> 2^30) so they never collide with native ids; the callback fires on the
+// macrotask that delivers the bridge response (ordering across mixed
+// native/shimmed timers is not guaranteed); string-code and setInterval are
+// not shimmed.
+var _shimTimers = {};
+var _shimNextId = 1 << 30; // far above any native timer id
+window.setTimeout = function(fn, ms) {
+    if (typeof fn !== 'function' || (Number(ms) || 0) < 1000) {
+        return _nativeSetTimeout.apply(null, arguments);
+    }
+    var extra = Array.prototype.slice.call(arguments, 2);
+    var id = ++_shimNextId;
+    _shimTimers[id] = true;
+    window.sleep(Number(ms) || 0).then(function() {
+        if (!_shimTimers[id]) return; // cleared while sleeping
+        delete _shimTimers[id];
+        fn.apply(null, extra);
+    });
+    return id;
+};
+window.clearTimeout = function(id) {
+    if (_shimTimers[id]) { delete _shimTimers[id]; return; }
+    return _nativeClearTimeout(id);
+};
+
 window.addEventListener('message', function(e) {
     if (e.source !== window.parent) return;
     // Tool result from parent

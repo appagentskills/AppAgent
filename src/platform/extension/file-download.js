@@ -90,6 +90,19 @@
         });
     }
 
+    // PAYLOAD-STORE: post-v16, chats records persist with base64 payloads
+    // stripped into the chat_payloads store ({ id, base64 } keyed by
+    // file_id/screenshot_id). Direct keyed get — no cursor scan needed.
+    function getChatPayload(db, fid) {
+        if (!db.objectStoreNames.contains('chat_payloads')) return Promise.resolve(null);
+        return new Promise(function(resolve) {
+            var tx = db.transaction(['chat_payloads'], 'readonly');
+            var req = tx.objectStore('chat_payloads').get(fid);
+            req.onsuccess = function() { resolve((req.result && req.result.base64) || null); };
+            req.onerror = function() { resolve(null); };
+        });
+    }
+
     function findInChats(db, fid) {
         if (!db.objectStoreNames.contains('chats')) {
             log.push('  No chats store');
@@ -100,6 +113,17 @@
             var store = tx.objectStore('chats');
             var count = 0;
             var cursor = store.openCursor();
+            // The chats scan supplies the message METADATA (mime type); the
+            // bytes themselves may live in chat_payloads (records stripped by
+            // PAYLOAD-STORE) — fall back to a keyed blob get when the matched
+            // message carries no inline base64.
+            function resolveWithPayload(inline, mime) {
+                if (inline) return resolve({ data: inline, mime: mime });
+                getChatPayload(db, fid).then(function(b64) {
+                    if (b64) log.push('  Found payload in chat_payloads');
+                    resolve(b64 ? { data: b64, mime: mime } : null);
+                });
+            }
             cursor.onsuccess = function() {
                 var c = cursor.result;
                 if (!c) { log.push('  Scanned ' + count + ' chats'); return resolve(null); }
@@ -109,15 +133,15 @@
                     for (var i = 0; i < chat.messages.length; i++) {
                         var msg = chat.messages[i];
                         if (msg.file_id === fid || msg.screenshot_id === fid) {
-                            return resolve({
-                                data: msg.base64 || msg.content,
-                                mime: msg.mimeType || (msg.role === 'screenshot' ? 'image/png' : 'application/octet-stream')
-                            });
+                            return resolveWithPayload(
+                                msg.base64 || msg.content,
+                                msg.mimeType || (msg.role === 'screenshot' ? 'image/png' : 'application/octet-stream')
+                            );
                         }
                     }
                 }
                 if (chat.screenshots && chat.screenshots[fid]) {
-                    return resolve({ data: chat.screenshots[fid].base64, mime: 'image/png' });
+                    return resolveWithPayload(chat.screenshots[fid].base64, 'image/png');
                 }
                 c.continue();
             };

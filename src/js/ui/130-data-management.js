@@ -1,4 +1,68 @@
 // Data Management Functions
+
+// PAYLOAD-STORE: chats records persist with base64 payloads stripped into the
+// chat_payloads store (see extractChatPayloadsForPut in core/130-indexeddb.js).
+// A backup must be self-contained, so re-inline each record's payloads and
+// drop the eviction flags before writing it out. The resulting legacy-shape
+// chat round-trips through the import path unchanged: imported records keep
+// payloads inline, hydration falls back to record-inline base64, and the next
+// save re-extracts them into chat_payloads. Mutates and returns `chat`, which
+// is always a throwaway copy fetched from IDB — never the in-memory object.
+async function inlineChatPayloadsForExport(database, chat) {
+    if (!chat || !chat._payloadsEvicted) return chat;
+    var ids = {};
+    if (Array.isArray(chat.messages)) {
+        chat.messages.forEach(function(m) {
+            if (m && m._b64Evicted) {
+                var mid = m.file_id || m.screenshot_id;
+                if (mid) ids[mid] = true;
+            }
+        });
+    }
+    if (chat.screenshots) {
+        Object.keys(chat.screenshots).forEach(function(k) {
+            if (chat.screenshots[k] && chat.screenshots[k]._b64Evicted) ids[k] = true;
+        });
+    }
+    var idList = Object.keys(ids);
+    if (idList.length) {
+        var byId = {};
+        var tx = database.transaction([chatPayloadsStoreName], 'readonly');
+        var store = tx.objectStore(chatPayloadsStoreName);
+        await Promise.all(idList.map(function(id) {
+            return new Promise(function(resolve) {
+                var req = store.get(id);
+                req.onsuccess = function() {
+                    if (req.result && req.result.base64) byId[id] = req.result.base64;
+                    resolve();
+                };
+                req.onerror = function(ev) {
+                    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+                    resolve();
+                };
+            });
+        }));
+        if (Array.isArray(chat.messages)) {
+            chat.messages.forEach(function(m) {
+                if (!m || !m._b64Evicted) return;
+                var mid = m.file_id || m.screenshot_id;
+                if (mid && byId[mid]) m.base64 = byId[mid];
+                delete m._b64Evicted;
+            });
+        }
+        if (chat.screenshots) {
+            Object.keys(chat.screenshots).forEach(function(k) {
+                var s = chat.screenshots[k];
+                if (!s || !s._b64Evicted) return;
+                if (byId[k]) s.base64 = byId[k];
+                delete s._b64Evicted;
+            });
+        }
+    }
+    delete chat._payloadsEvicted;
+    return chat;
+}
+
 async function exportAllData() {
     try {
         // Use File System Access API for streaming large exports
@@ -39,6 +103,9 @@ async function exportAllData() {
             });
 
             if (chat) {
+                // PAYLOAD-STORE: re-inline this record's payloads from
+                // chat_payloads so the backup is self-contained.
+                try { chat = await inlineChatPayloadsForExport(database, chat); } catch (eInline) { console.error('export: payload inlining failed for', chat && chat.id, eInline); }
                 if (chatCount > 0) await writable.write(',\n');
                 // Pretty print each chat with 4-space indent, then add 4 spaces to each line
                 var prettyChat = JSON.stringify(chat, null, 4).split('\n').map(function(line) {
@@ -230,9 +297,12 @@ async function deleteAllData() {
     try {
         var database = await openDatabase();
 
-        // Clear chats
-        var chatTransaction = database.transaction([chatStoreName], 'readwrite');
+        // Clear chats (and their payload blobs — chat_payloads holds the
+        // base64 content the records reference; orphaning it here would
+        // leave the heaviest data behind after "delete ALL data")
+        var chatTransaction = database.transaction([chatStoreName, chatPayloadsStoreName], 'readwrite');
         chatTransaction.objectStore(chatStoreName).clear();
+        chatTransaction.objectStore(chatPayloadsStoreName).clear();
 
         // Clear settings
         var settingsTransaction = database.transaction([settingsStoreName], 'readwrite');

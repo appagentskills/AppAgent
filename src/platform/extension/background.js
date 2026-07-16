@@ -499,6 +499,27 @@ chrome.notifications.onClicked.addListener(function(notificationId) {
 
 // --- Message relay ---
 
+// ─── sw-sleep: unthrottled sandbox sleep ────────────────────────────
+// State + alarm listener for the 'sw-sleep' handler below (see the
+// comment on the handler for the full rationale).
+var SW_SLEEP_ALARM_MIN_MS = 30 * 1000;   // >= this uses chrome.alarms (MV3 alarm minimum)
+var SW_SLEEP_MAX_MS = 60 * 60 * 1000;    // sanity cap: 1 hour per bridged sleep request
+var _swSleepSeq = 0;
+var _swSleepPending = {};                // alarmName -> { respond, ms } (in-memory only)
+chrome.alarms.onAlarm.addListener(function(alarm) {
+    if (!alarm || !alarm.name || alarm.name.indexOf('sw-sleep_') !== 0) return;
+    try { chrome.alarms.clear(alarm.name); } catch (e) {}
+    var entry = _swSleepPending[alarm.name];
+    delete _swSleepPending[alarm.name];
+    // No entry = the SW was suspended/restarted mid-wait. The response
+    // channel died with it; the offscreen side's swSleep() re-arms for the
+    // remaining time (offscreen-helper.js), so the stale alarm's only job
+    // was to wake the SW — nothing else to do.
+    if (entry && typeof entry.respond === 'function') {
+        try { entry.respond({ ok: true, slept_ms: entry.ms }); } catch (e) {}
+    }
+});
+
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Show browser notification (from app when agent finishes in background)
@@ -579,6 +600,45 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
         });
         return true;
+    }
+
+    // Offscreen helper requests an UNTHROTTLED sleep on behalf of a sandbox
+    // (`sleep(ms)` global / setTimeout shim in sandbox.html). Rationale: the
+    // sandbox iframe lives inside the always-hidden offscreen document, where
+    // Chrome's intensive wake-up throttling aligns chained setTimeout timers
+    // to 1/minute (page hidden >= 5 min + timer nesting >= 5) — a nominal 10s
+    // sleep in agent code was measured at ~60s. Message delivery is NOT
+    // throttled, so the wait happens here in the SW instead:
+    //   • < 30s  — plain setTimeout. The SW idle timeout is ~30s and the 30s
+    //     'agent-heartbeat' alarm + the offscreen keep-alive port reset it,
+    //     so short timers are reliable here.
+    //   • >= 30s — chrome.alarms (survives SW suspension; 30s is also the
+    //     MV3 alarm minimum). sendResponse is kept in-memory only: if the SW
+    //     is suspended mid-wait the response channel is torn down anyway and
+    //     the offscreen side re-arms for the remaining time (swSleep in
+    //     offscreen-helper.js); the alarm still fires and wakes the SW.
+    if (message.type === 'sw-sleep') {
+        var reqMs = Math.max(0, Math.min(Number(message.payload && message.payload.ms) || 0, SW_SLEEP_MAX_MS));
+        // Feed the js_eval inactivity watchdog (tools/020-tool-execution.js
+        // kills an eval after 5 min without sandbox activity): the offscreen
+        // side chunks sleep requests to <= 4 min, so stamping the activity
+        // clock on every chunk arrival keeps long `await sleep(...)` calls
+        // alive. _sandboxActivity is a global from the imported sw-bundle.
+        try {
+            if (message.payload && message.payload.chatId && typeof _sandboxActivity !== 'undefined') {
+                _sandboxActivity[message.payload.chatId] = Date.now();
+            }
+        } catch (e) { /* watchdog feed is best-effort */ }
+        if (reqMs < SW_SLEEP_ALARM_MIN_MS) {
+            setTimeout(function() {
+                try { sendResponse({ ok: true, slept_ms: reqMs }); } catch (e) { /* channel gone — offscreen re-arms */ }
+            }, reqMs);
+        } else {
+            var sleepAlarmName = 'sw-sleep_' + (++_swSleepSeq) + '_' + Date.now();
+            _swSleepPending[sleepAlarmName] = { respond: sendResponse, ms: reqMs };
+            chrome.alarms.create(sleepAlarmName, { when: Date.now() + reqMs });
+        }
+        return true; // keep the response channel open for the async resolve
     }
 
     // Side panel requests browser action -> forward to content script in active tab
@@ -2821,6 +2881,12 @@ chrome.alarms.onAlarm.addListener(function(alarm) {
     // SW. Lives in core/130-indexeddb.js (sw-bundle). Guarded — must never
     // break the keepalive.
     try { if (typeof maybeReleaseIdleDbConnection === 'function') maybeReleaseIdleDbConnection(); } catch (e) { /* non-fatal */ }
+    // LEGACY-MIGRATE: move ONE legacy-inline chat record per tick into the
+    // v16 chat_payloads shape (see migrateNextLegacyChatPayloads in
+    // worker/115-storage.js, sw-bundle). Bounded work per tick — one chat's
+    // payloads hydrated, saved, re-evicted. No-op once the boot-time queue
+    // is drained. Guarded — must never break the keepalive.
+    try { if (typeof migrateNextLegacyChatPayloads === 'function') migrateNextLegacyChatPayloads(); } catch (e) { /* non-fatal */ }
 });
 
 // ─── Prompt-cache heartbeat trigger ─────────────────────────────────────

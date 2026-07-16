@@ -950,6 +950,24 @@ function _sandboxEvalCleanup(chatId) {
     _sandboxGen[chatId] = (_sandboxGen[chatId] || 0) + 1;
 }
 
+// --- sys.scripts.do serialization -----------------------------------------
+// The background-script output channel on /sys.scripts.do is PER-SESSION, not
+// per-request: two concurrent requests on the same session can receive each
+// other's output (swallowed/interleaved responses were reproduced live).
+// Serialize: at most ONE sys.scripts.do request in flight per instance —
+// later calls queue behind the in-flight one via a promise-chain mutex.
+// Keyed by target instance URL ('' = the active/attached instance).
+var _sysScriptsQueues = {};
+function _enqueueSysScripts(instanceKey, fn) {
+    var prev = _sysScriptsQueues[instanceKey] || Promise.resolve();
+    // Run fn after the previous request settles (success OR failure).
+    var next = prev.then(fn, fn);
+    // Store a rejection-swallowed tail so one failed run never poisons the
+    // chain for subsequent callers; `next` itself still propagates the result.
+    _sysScriptsQueues[instanceKey] = next.catch(function() {});
+    return next;
+}
+
 async function executeTool(name, args, messageIndex, options) {
     // Record inner-sandbox activity FIRST so the js_eval watchdogs see it
     // even if this call later parks on an approval or a slow network call.
@@ -1784,13 +1802,22 @@ async function _executeToolInner(name, args, messageIndex, options) {
         ];
         if (args.record_for_rollback !== false) _rsParams.push('record_for_rollback=on');
         if (args.sandbox === true) _rsParams.push('sandbox=on');
-        var _rsUrl = '/sys.scripts.do?' + _rsParams.join('&');
+        // POST with a form-encoded body (same fields the Background Scripts UI
+        // form submits). The old GET-with-query-string transport hit the ~8KB
+        // total-URL limit: any script >~8096 raw chars (far less once quotes/
+        // newlines %-encode 3x) deterministically failed with HTTP 414.
+        var _rsBody = _rsParams.join('&');
+        var _rsUrl = '/sys.scripts.do';
         if (_rsTargetUrl) _rsUrl = _rsTargetUrl + _rsUrl;
+        // Serialize per instance — see _enqueueSysScripts above.
+        var _rsQueueKey = _rsTargetUrl || '';
+        return await _enqueueSysScripts(_rsQueueKey, async function() {
         try {
             var _rsApiToken = _rsTargetToken || Platform.getSessionToken() || '';
             var _rsRes = await fetch(_rsUrl, {
-                method: 'GET',
-                headers: { 'Accept': 'text/html', 'X-UserToken': _rsApiToken }
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'X-UserToken': _rsApiToken },
+                body: _rsBody
             });
             var _rsText = await _rsRes.text();
             // Parse the response: extract output between <PRE>...</PRE> and execution history sys_id
@@ -1841,6 +1868,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
         } catch (e) {
             return { success: false, error: e.message };
         }
+        });
     } else if (name === 'servicenow_diff_edit') {
         return await executeDiffEdit(args, messageIndex, options);
     } else if (name === 'iframe_tool') {

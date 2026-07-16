@@ -42,6 +42,50 @@
     }
     openKeepAlive();
 
+    // ----- SW-backed sleep -----
+    // This offscreen document is permanently hidden, so Chrome's intensive
+    // wake-up throttling aligns chained setTimeout timers here (and inside
+    // the sandbox iframes we host) to 1/minute after ~5 min hidden. Message
+    // delivery is NOT throttled, so waits are delegated to the service
+    // worker ('sw-sleep' handler in background.js: setTimeout < 30s,
+    // chrome.alarms >= 30s). Deadline-based re-arm loop: if the SW suspends
+    // mid-wait the sendMessage channel rejects (or settles early after a
+    // restart) and we simply re-request the REMAINING time — the alarm
+    // survives suspension and wakes the SW for us. Never rejects; resolves
+    // once the deadline has passed.
+    //
+    // CHUNKING: each request is capped at 4 min. The js_eval inactivity
+    // watchdog (tools/020-tool-execution.js) kills an eval after 5 min
+    // without sandbox activity; every 'sw-sleep' arrival stamps the
+    // activity clock in the SW (see background.js), so chunked long sleeps
+    // (e.g. 10 min) keep the eval alive — with a single un-chunked request
+    // nothing would touch the clock between start and resolve.
+    var SW_SLEEP_CHUNK_MS = 4 * 60 * 1000;
+    function swSleep(totalMs, chatId) {
+        var deadline = Date.now() + Math.max(0, Number(totalMs) || 0);
+        function attempt() {
+            var remaining = deadline - Date.now();
+            if (remaining <= 0) return Promise.resolve({ ok: true });
+            return chrome.runtime.sendMessage({ type: 'sw-sleep', payload: { ms: Math.min(remaining, SW_SLEEP_CHUNK_MS), chatId: chatId || null } })
+                .then(function() {
+                    // More to wait (next chunk, or the channel settled early
+                    // after an SW restart)? Re-arm for the remaining time.
+                    // 500ms slack absorbs clock jitter.
+                    if (deadline - Date.now() > 500) return attempt();
+                    return { ok: true };
+                })
+                .catch(function() {
+                    // Channel dropped (SW suspended mid-wait / not up yet).
+                    // Small native backoff so a dead SW never causes a hot
+                    // retry loop, then re-arm for the remaining time. Worst
+                    // case the backoff itself is throttled to a minute —
+                    // still bounded by the deadline check above.
+                    return new Promise(function(res) { setTimeout(res, 250); }).then(attempt);
+                });
+        }
+        return attempt();
+    }
+
     // ----- request dispatcher (chrome.runtime.sendMessage from SW) -----
     chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         if (!message || !message.type) return;
@@ -87,6 +131,20 @@
                     return;
                 }
                 if (d.type === MSG_TOOL_CALL) {
+                    if (d.name === '__sandbox_sleep') {
+                        // sleep(ms) / setTimeout-shim bridge (sandbox.html):
+                        // local timers in this hidden doc are throttled to
+                        // 1/minute, so the wait runs in the SW (swSleep
+                        // above). Handled HERE — never forwarded to the SW
+                        // tool dispatcher: it is not a real tool (no approval,
+                        // no transcript entry, no prog_ id needed).
+                        var sleepMs = Math.max(0, Number(d.args && d.args.ms) || 0);
+                        swSleep(sleepMs, chatId).then(function() {
+                            if (!sandbox || !sandbox.contentWindow) return;
+                            sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, result: { __sleep_ok: true, slept_ms: sleepMs } }, '*');
+                        });
+                        return;
+                    }
                     // Forward sandbox-side tool call to the SW dispatcher.
                     // parentToolCallId is the OUTER tool's id (js_eval / skill)
                     // so display can eager-render attached to its result slot.
