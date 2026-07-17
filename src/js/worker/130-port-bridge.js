@@ -407,8 +407,15 @@ function _handlePanelMessage(port, msg) {
                     .then(function() { return (typeof ensureChatPayloads === 'function') ? ensureChatPayloads(msg.chatId) : null; })
                     .then(function() {
                         if (!runningChatIds[msg.chatId]) {
-                            try { runAgent(msg.chatId); }
-                            catch (e) { console.error('[port-bridge] runAgent threw', e); }
+                            // Not returned into the gate chain (the panel's
+                            // _pendingRunAgents settles on events, not on this
+                            // promise) — but the rejection must be handled
+                            // here: runAgent is async, so the old sync
+                            // try/catch let a loop crash surface as an
+                            // uncaught promise rejection.
+                            runAgent(msg.chatId).catch(function(e) {
+                                console.error('[port-bridge] runAgent failed', msg.chatId, e);
+                            });
                         }
                     })
                     .catch(function(e) {
@@ -1036,7 +1043,12 @@ async function _handlePanelSendMessage(msg) {
         try { await saveChatsToStorage(); } catch (e) {}
     }
 
-    runAgent(chatId);
+    // Deliberately not awaited (fire-and-forget run start), but the rejection
+    // must be handled — an unhandled async crash here surfaced as a raw
+    // uncaught TypeError in the SW console.
+    runAgent(chatId).catch(function(e) {
+        console.error('[port-bridge] runAgent failed after send', chatId, e);
+    });
 }
 
 // =============================================================
@@ -1138,6 +1150,25 @@ function resumeRunningCheckpoints(checkpoints) {
                         return;
                     }
                 }
+                // CKPT-POISON reaper: a NON-sub checkpoint whose chat row is
+                // gone. The sub branch above already handles its own missing-
+                // chat case (markOrphaned + reap); this one previously fell
+                // straight through to runAgent, which crashed on the missing
+                // chat — and because the crash's runStarted emit re-wrote the
+                // 'running' checkpoint, the record resurrected itself on every
+                // 30s heartbeat tick forever. Reap it — but ONLY when the
+                // chats store actually hydrated this boot (_chatsHydrated,
+                // worker/115-storage.js). On a failed hydration absence is
+                // not evidence: skip (no resume, no reap) and let a later
+                // tick retry after a successful load, mirroring the ZR1
+                // follow-up rule the sub branch uses.
+                if (!_chatRow && !_looksSub) {
+                    if (typeof _chatsHydrated !== 'undefined' && _chatsHydrated) {
+                        console.warn('[port-bridge] reaping checkpoint for missing chat', cp.chatId);
+                        try { deleteAgentCheckpoint(cp.chatId); } catch (e) {}
+                    }
+                    return;
+                }
                 if (!runningChatIds[cp.chatId]) {
                     if (_looksSub && _subRec) {
                         // ZR1-R1: the boot decision in 097 already claimed this
@@ -1180,8 +1211,14 @@ function resumeRunningCheckpoints(checkpoints) {
                                 } catch (e2) {}
                             });
                     } else {
-                        try { runAgent(cp.chatId); }
-                        catch (e) { console.error('[port-bridge] resume runAgent threw', cp.chatId, e); }
+                        // Promise chain (not bare try/catch): runAgent is async,
+                        // so a rejection here was an UNCAUGHT promise rejection —
+                        // the sync catch never fired. With the loop's entry guard
+                        // this now logs one descriptive line instead of spamming
+                        // a raw TypeError on every heartbeat tick.
+                        Promise.resolve()
+                            .then(function() { return runAgent(cp.chatId); })
+                            .catch(function(e) { console.error('[port-bridge] resume runAgent failed', cp.chatId, e); });
                     }
                 }
             });

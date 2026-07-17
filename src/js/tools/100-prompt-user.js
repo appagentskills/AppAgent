@@ -265,7 +265,18 @@ function submitPromptUser(promptId) {
                 break;
             }
         }
-        saveChatsToStorage();
+        // MEMFIX: rehydrate evicted payloads BEFORE persisting — the save
+        // put-loop skips _payloadsEvicted chats (worker/115-storage.js /
+        // ui/070-dashboard-ui.js), so this save would otherwise persist
+        // nothing and the submitted status/values would be lost on reload.
+        // Mirrors the run-agent gate in worker/130-port-bridge.js.
+        // ensureChatPayloads never rejects, but chain both arms defensively.
+        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); },
+                function() { saveChatsToStorage(); });
+        } else {
+            saveChatsToStorage();
+        }
     }
 
     // Resolve the blocking promise (live agent loop)
@@ -296,7 +307,14 @@ function cancelPromptUser(promptId) {
                 break;
             }
         }
-        saveChatsToStorage();
+        // MEMFIX: same as submitPromptUser — hydrate before the save or the
+        // put-loop guard skips this chat and the cancellation never persists.
+        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); },
+                function() { saveChatsToStorage(); });
+        } else {
+            saveChatsToStorage();
+        }
     }
 
     // Resolve with cancelled
@@ -323,6 +341,20 @@ function cancelPromptUser(promptId) {
 function injectPromptToolResult(chat, promptId, result) {
     if (!chat) return;
 
+    // MEMFIX: the resumed run below mutates + saves this chat repeatedly; if
+    // the chat is payload-evicted, EVERY one of those saves is skipped by the
+    // put-loop guard (worker/115-storage.js / ui/070-dashboard-ui.js) and the
+    // injected tool_result plus the whole resumed run persist NOTHING —
+    // silent transcript loss on the next SW death / reload. Hydrate first
+    // (mirrors the run-agent gate at worker/130-port-bridge.js), then inject
+    // + resume. ensureChatPayloads never rejects; both arms chained anyway.
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        ensureChatPayloads(chat.id || currentChatId).then(_doInject, _doInject);
+        return;
+    }
+    _doInject();
+
+    function _doInject() {
     var toolCallId = null;
     for (var i = 0; i < chat.messages.length; i++) {
         if (chat.messages[i].role === 'prompt_user' && chat.messages[i].promptId === promptId) {
@@ -336,8 +368,18 @@ function injectPromptToolResult(chat, promptId, result) {
         saveChatsToStorage();
         renderMessages();
         scrollToBottomIfAllowed();
-        runAgent(currentChatId);
+        // Resume the chat the prompt belongs to, NOT currentChatId: in the SW
+        // currentChatId is permanently null (worker/130-port-bridge.js), so
+        // runAgent(currentChatId) crashed on chats[null]. Handle the async
+        // rejection too — this was an uncaught-promise site.
+        var _resumeId = (chat && chat.id) || currentChatId;
+        if (_resumeId) {
+            Promise.resolve()
+                .then(function() { return runAgent(_resumeId); })
+                .catch(function(e) { console.error('[prompt-user] resume runAgent failed', _resumeId, e); });
+        }
     }
+    } // end _doInject
 }
 
 // Render a prompt_user message inline (called from renderMessages)

@@ -39,13 +39,6 @@
 //   }
 // =============================================================
 
-function _agentRunsStore(mode) {
-    return openDatabase().then(function(db) {
-        var tx = db.transaction([agentRunsStoreName], mode || 'readonly');
-        return tx.objectStore(agentRunsStoreName);
-    });
-}
-
 // CKPT-COALESCE channels: chatId -> { op, draining, waiters }.
 //   op:      the NEXT operation to run ({ type: 'put', record } |
 //            { type: 'delete' }) — replaced in place by newer calls
@@ -89,7 +82,8 @@ function _ckptDrain(chatId, ch) {
 
 function _ckptPutNow(chatId, record) {
     // SW-IDLE-CLOSE hardening: route through withStore() instead of holding
-    // the DB handle directly (as _agentRunsStore does). Checkpoint writes can
+    // the DB handle directly (as core/097-sub-agent-registry.js's
+    // _pendingWakesStore still does). Checkpoint writes can
     // race the idle connection release (releaseIdleDbConnection, fired from
     // ANOTHER chat's parked-checkpoint path or the 30s heartbeat) — a bare
     // db.transaction() would then throw InvalidStateError and the checkpoint
@@ -134,12 +128,21 @@ function writeAgentCheckpoint(chatId, snapshot) {
 }
 
 function readAgentCheckpoint(chatId) {
-    return _agentRunsStore('readonly').then(function(store) {
-        return new Promise(function(resolve) {
-            var req = store.get(chatId);
+    // FIX (691-R2): route through withStore (like _ckptPutNow) instead of a
+    // bare db.transaction — a read racing the idle connection release
+    // (releaseIdleDbConnection, fired from another chat's parked-checkpoint
+    // path or the 30s heartbeat) threw InvalidStateError with no retry.
+    // withStore reopens + retries once and we still honour the
+    // never-reject contract on top of it.
+    return withStore([agentRunsStoreName], 'readonly', function(tx) {
+        return new Promise(function(resolve, reject) {
+            var req = tx.objectStore(agentRunsStoreName).get(chatId);
             req.onsuccess = function() { resolve(req.result || null); };
-            req.onerror = function() { resolve(null); };
+            req.onerror = function() { reject(req.error); };
         });
+    }).catch(function(e) {
+        console.warn('[checkpoint] read failed for chat ' + chatId, e);
+        return null;
     });
 }
 
@@ -157,8 +160,12 @@ function deleteAgentCheckpoint(chatId) {
 // materialize the (potentially huge) records and never store.clear().
 function sweepFinishedAgentCheckpoints() {
     var cutoff = Date.now() - (24 * 60 * 60 * 1000);
-    return _agentRunsStore('readwrite').then(function(store) {
+    // FIX (691-R2): route through withStore — same idle-connection-release
+    // race as readAgentCheckpoint, plus a never-reject catch so a boot
+    // reaper failure cannot break boot.
+    return withStore([agentRunsStoreName], 'readwrite', function(tx) {
         return new Promise(function(resolve) {
+            var store = tx.objectStore(agentRunsStoreName);
             var deleted = 0;
             var req = store.openCursor();
             req.onsuccess = function(e) {
@@ -174,12 +181,19 @@ function sweepFinishedAgentCheckpoints() {
             };
             req.onerror = function() { resolve(deleted); };
         });
+    }).catch(function(e) {
+        console.warn('[checkpoint] sweep failed', e);
+        return 0;
     });
 }
 
 function listRunningAgentCheckpoints() {
-    return _agentRunsStore('readonly').then(function(store) {
+    // FIX (691-R2): route through withStore — same idle-connection-release
+    // race as readAgentCheckpoint, plus a never-reject catch (boot resume
+    // scan must never throw and abort boot).
+    return withStore([agentRunsStoreName], 'readonly', function(tx) {
         return new Promise(function(resolve) {
+            var store = tx.objectStore(agentRunsStoreName);
             var out = [];
             var req = store.openCursor();
             req.onsuccess = function(e) {
@@ -192,6 +206,9 @@ function listRunningAgentCheckpoints() {
             };
             req.onerror = function() { resolve(out); };
         });
+    }).catch(function(e) {
+        console.warn('[checkpoint] list failed', e);
+        return [];
     });
 }
 

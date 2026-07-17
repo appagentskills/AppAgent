@@ -2840,7 +2840,11 @@ function _jobsChatDoneTs(c) {
         // in Completed Today instead of vanishing from BOTH Active and Completed
         // Today. Gated on an actual assistant reply so a merely-STARTED chat still
         // returns 0 (see header note).
-        if (!t && _sawAssistant) t = c.updatedAt || c.lastViewedAt || c.createdAt || 0;
+        // FIX (P696-1): lastViewedAt tracks when the USER looked at the chat,
+        // not when the run finished -- re-viewing an old finished chat bumps
+        // lastViewedAt and made this fallback report a stale chat as done
+        // just now. Fall back to updatedAt/createdAt only.
+        if (!t && _sawAssistant) t = c.updatedAt || c.createdAt || 0;
     }
     return t;
 }

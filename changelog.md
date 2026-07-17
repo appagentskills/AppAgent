@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.18
+
+### Fixes
+- Fixed the storage stalls behind frozen tools and vanishing chats: the extension no longer shuts itself down mid-write, a wedged database is now detected and recovered automatically, and saves back off instead of piling up after a timeout.
+- The usage pill no longer shows a red 100% when session usage is actually 1%.
+
+---
+
 ## v1.1.17
 
 ### Fixes

@@ -625,7 +625,12 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         // clock on every chunk arrival keeps long `await sleep(...)` calls
         // alive. _sandboxActivity is a global from the imported sw-bundle.
         try {
-            if (message.payload && message.payload.chatId && typeof _sandboxActivity !== 'undefined') {
+            // FIX (SL-1): only stamp activity while a js_eval for this chat is
+            // actually live (mirrors tools/020-tool-execution.js:984-988) -- an
+            // orphaned sleep settling after eval cleanup must not resurrect the
+            // per-chat activity map for a run that already ended.
+            if (message.payload && message.payload.chatId && typeof _sandboxActivity !== 'undefined'
+                && typeof _sandboxEvalCount !== 'undefined' && _sandboxEvalCount[message.payload.chatId] > 0) {
                 _sandboxActivity[message.payload.chatId] = Date.now();
             }
         } catch (e) { /* watchdog feed is best-effort */ }
@@ -1484,15 +1489,18 @@ function normalizeClaudeUsage(json) {
     function applyBucket(bucket, label) {
         if (!bucket || typeof bucket !== 'object') return;
         var u = bucket.utilization;
-        if (u == null) u = bucket.used_fraction;
+        var isFraction = false;
+        if (u == null && bucket.used_fraction != null) { u = bucket.used_fraction; isFraction = true; }
         if (u == null) u = bucket.utilization_percent;
         var un = parseFloat(u);
         if (!isNaN(un)) {
-            // claude.ai reports utilization as a percent (0-100); the header shape
-            // the indicator parses (fetchCredits) expects a 0-1 fraction — it
-            // multiplies values <= 1 by 100. Canonicalize to a fraction here so
-            // sub-1% utilization doesn't render ~100x too large.
-            un = un > 1 ? un / 100 : un;
+            // claude.ai reports `utilization` / `utilization_percent` as a percent
+            // (0-100); `used_fraction` is already a 0-1 fraction. The header shape
+            // the indicator parses (fetchCredits) expects a 0-1 fraction, so convert
+            // by FIELD NAME, not by value: the old `un > 1 ? un / 100 : un` heuristic
+            // read a utilization of exactly 1 (= 1% used) as a 1.0 fraction, making
+            // the pill show 100% (red) while the per-limit popover showed 1%.
+            if (!isFraction) un = un / 100;
             out['anthropic-ratelimit-unified-' + label + '-utilization'] = String(un);
         }
         var r = bucket.resets_at;
@@ -2817,6 +2825,23 @@ async function maybeCloseOffscreenIfIdle() {
         }
     }
     if (Date.now() - _swOffscreenIdleSince < OFFSCREEN_IDLE_GRACE_MS) return;
+    // PERSIST-BUSY (root-cause fix): never reap the persistence realm while
+    // IndexedDB work is in flight. Closing the offscreen doc drops the SW
+    // keep-alive port; Chrome then kills THIS realm (~30s later) — the realm
+    // running every [chats, chat_payloads] transaction. A kill mid-write
+    // discarded the uncommitted transaction (chats missing from the store
+    // until a reload/restart re-saved them) and could wedge Chromium's IDB
+    // backend for the whole origin (reads AND writes hanging until a Chrome
+    // restart). Judging idle by runningChatIds alone is exactly how that
+    // fired on every idle cycle under save congestion. Defer instead — the
+    // 30s heartbeat re-checks and closes once the save channel is quiet.
+    if (typeof persistenceBusyReason === 'function') {
+        var _pbr = persistenceBusyReason();
+        if (_pbr) {
+            console.log('[sw] offscreen idle-close deferred: ' + _pbr);
+            return;
+        }
+    }
     try {
         if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) {
             await chrome.offscreen.closeDocument();

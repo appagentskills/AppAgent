@@ -893,9 +893,12 @@ function _idleSweepTick() {
             try {
                 if (typeof chats !== 'undefined' && r.chat_id && chats[r.chat_id]) {
                     delete chats[r.chat_id];
-                    // Persist the deletion via a full save — saveChatsToStorage does a
-                    // clear+rewrite of the chats store, so the removed row actually
-                    // leaves IDB. (deleteChatFromDB never existed.)
+                    // Persist the deletion via a full save — saveChatsToStorage
+                    // diff-saves: rows absent from the in-memory map are removed by
+                    // its delete-pass (capped at 5 deletions per save — wipe-guard-2
+                    // in worker/115-storage.js / ui/070-dashboard-ui.js — so larger
+                    // GC backlogs drain over successive saves). (deleteChatFromDB
+                    // never existed.)
                     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                 }
             } catch (e) { console.warn('subAgent GC: failed to delete chat row', r.chat_id, e); }
@@ -1622,7 +1625,9 @@ var PENDING_WAKE_MAX_ATTEMPTS = 5;
 var _drainPendingWakesInFlight = false;
 
 function _pendingWakesStore(mode) {
-    // Same store-access shape as _agentRunsStore (worker/110-agent-checkpoint.js).
+    // Direct store-access helper (openDatabase → transaction → objectStore);
+    // the checkpoint layer's writes moved to withStore — see _ckptPutNow in
+    // worker/110-agent-checkpoint.js.
     return openDatabase().then(function(idb) {
         var tx = idb.transaction([pendingWakesStoreName], mode || 'readonly');
         return tx.objectStore(pendingWakesStoreName);

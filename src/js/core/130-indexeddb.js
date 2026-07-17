@@ -557,7 +557,7 @@ var DB_TX_DEADLINE_WRITE_MS = 30000;
 // arriving: a livelock that kept resurfacing as recurring 30s timeouts on
 // [chats]/[agent_runs] no matter how the connection lifecycle was hardened.
 var DB_TX_PROBE_TIMEOUT_MS = 5000;
-function _probeBackendAlive(database, cb) {
+function _probeStoreAlive(database, storeName, cb) {
     var done = false;
     var timer = setTimeout(function() { finish(false); }, DB_TX_PROBE_TIMEOUT_MS);
     function finish(ok) {
@@ -567,20 +567,51 @@ function _probeBackendAlive(database, cb) {
         cb(ok);
     }
     try {
-        var tx = database.transaction([settingsStoreName], 'readonly');
-        var req = tx.objectStore(settingsStoreName).count();
+        var tx = database.transaction([storeName], 'readonly');
+        var req = tx.objectStore(storeName).count();
         req.onsuccess = function() { finish(true); };
         req.onerror = function() { finish(false); };
     } catch (e) {
         finish(false);
     }
 }
+function _probeBackendAlive(database, cb) {
+    _probeStoreAlive(database, settingsStoreName, cb);
+}
+
+// SCOPE-PROBE: the settings-store probe above answers "is the backend
+// process alive?" — it says NOTHING about the stalled transaction's OWN
+// store scope, because IDB queues are per-scope. A wedged [chats,
+// chat_payloads] scope (zombie transaction from a killed realm — reload
+// button, OS sleep, MV3 reap) therefore passed the probe and was classified
+// "congestion, not a wedge" FOREVER: no recovery ever engaged and the
+// extension froze until a Chrome restart. Track consecutive deadline
+// blowouts where the scope itself also refuses to answer a tiny readonly
+// probe; two in a row (≥60s of a scope that answers nothing) is treated as
+// a wedge → connection-shaped error → withStore drops the connection and
+// retries once on a fresh one, which clears connection-tied wedges
+// automatically. Streaks reset on ANY completed transaction for the scope,
+// so a genuinely long-but-progressing write can never be misclassified
+// twice in a row.
+var _scopeBlockStreak = {};
 
 function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) {
     return new Promise(function(resolve, reject) {
         // A sync throw here (dead connection) rejects this promise and is
         // classified by _isDbConnectionError in withStore, same as before.
         var tx = database.transaction(storeNames, mode);
+        // SCOPE-PROBE: a LATE commit must also reset the wedge streak. When
+        // the deadline path abandons a slow readwrite tx (rejectSlow — the tx
+        // is left queued, settled=true), its eventual commit was invisible:
+        // the fn-path streak reset below sits behind the settled guard, so
+        // two slow-but-live saves in a row classified the scope WEDGED and
+        // aborted a progressing write. A background commit proves the scope
+        // is alive — register OUTSIDE the settled guard.
+        try {
+            tx.addEventListener('complete', function() {
+                _scopeBlockStreak[storeNames.join(',')] = 0;
+            });
+        } catch (e) { /* defensive — the fn-path reset below still covers the settled case */ }
         // A caller may pass a shorter per-call deadline (withStore opts.deadlineMs)
         // — e.g. the boot chats hydration uses ~6s so first-try + one reopen-retry
         // (~12s) still fits under init's BOOT_HYDRATION_DEADLINE_MS budget.
@@ -608,29 +639,70 @@ function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) 
                 return;
             }
             // READWRITE: decide busy-vs-wedged before nuking the transaction.
+            var scopeKey = storeNames.join(',');
+            function rejectSlow(extra) {
+                var slow = new Error('IndexedDB transaction on [' + storeNames + '] (' + mode + ') exceeded ' + deadlineMs + 'ms but the backend is responsive — congestion, not a wedge; the transaction was left to complete in the background' + (extra || ''));
+                slow.name = 'TimeoutError';
+                slow._dbTxSlow = true;
+                reject(slow);
+            }
             _probeBackendAlive(database, function(alive) {
                 if (settled) return; // tx finished while probing
-                settled = true;
-                if (alive) {
-                    // Congested, not wedged: do NOT abort — the transaction
-                    // stays queued and commits in the background (the settled
-                    // guard swallows its late fn-body settlement). The error is
-                    // deliberately NOT connection-shaped (no _dbTxTimeout), so
-                    // withStore neither drops the connection nor re-issues the
-                    // write — see the livelock note on _probeBackendAlive.
-                    var slow = new Error('IndexedDB transaction on [' + storeNames + '] (' + mode + ') exceeded ' + deadlineMs + 'ms but the backend is responsive — congestion, not a wedge; the transaction was left to complete in the background');
-                    slow.name = 'TimeoutError';
-                    slow._dbTxSlow = true;
-                    reject(slow);
+                if (!alive) { settled = true; rejectWedged(); return; }
+                // SCOPE-PROBE: backend alive — but is THIS scope moving?
+                // Settings answering while the stalled scope answers nothing
+                // is the wedge signature the old classifier could not see.
+                var scopeStore = storeNames[0];
+                if (scopeStore === settingsStoreName) {
+                    // Scope IS the probe store and it just answered — plain
+                    // congestion, keep the old semantics.
+                    settled = true;
+                    _scopeBlockStreak[scopeKey] = 0;
+                    rejectSlow();
                     return;
                 }
-                rejectWedged();
+                _probeStoreAlive(database, scopeStore, function(scopeAlive) {
+                    if (settled) return; // tx finished while probing
+                    settled = true;
+                    if (scopeAlive) {
+                        // Scope is serving requests — genuinely congested, not
+                        // wedged. Do NOT abort — the transaction stays queued
+                        // and commits in the background; error deliberately
+                        // NOT connection-shaped (no _dbTxTimeout), so withStore
+                        // neither drops the connection nor re-issues the write
+                        // — see the livelock note on _probeBackendAlive.
+                        _scopeBlockStreak[scopeKey] = 0;
+                        rejectSlow();
+                        return;
+                    }
+                    var streak = (_scopeBlockStreak[scopeKey] || 0) + 1;
+                    _scopeBlockStreak[scopeKey] = streak;
+                    if (streak >= 2) {
+                        // Two consecutive deadline blowouts with a scope that
+                        // answers nothing: treat as WEDGED. Connection-shaped
+                        // rejection → withStore closes this connection and
+                        // retries ONCE on a fresh one — that alone clears a
+                        // connection-tied zombie (killed-realm transaction).
+                        // If even the retry stalls, the caller's own backoff
+                        // paces the next attempt, so this cannot livelock.
+                        _scopeBlockStreak[scopeKey] = 0;
+                        console.error('[indexeddb] scope [' + storeNames + '] blocked across ' + streak
+                            + ' consecutive deadlines while the backend answers — WEDGED scope; dropping the connection and retrying on a fresh one. If this message repeats, storage is stuck at the browser level: restart Chrome (data on disk is safe).');
+                        rejectWedged();
+                        return;
+                    }
+                    console.warn('[indexeddb] scope [' + storeNames + '] did not answer a probe (strike ' + streak
+                        + ' of 2) — leaving the transaction queued');
+                    rejectSlow(' (scope probe unanswered — strike ' + streak + ' of 2 toward wedge recovery)');
+                });
             });
         }, deadlineMs);
         Promise.resolve().then(function() { return fn(tx); }).then(function(value) {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            // SCOPE-PROBE: a completed transaction proves the scope is moving.
+            _scopeBlockStreak[storeNames.join(',')] = 0;
             resolve(value);
         }, function(e) {
             // Also swallows the late settlement of a body whose transaction
@@ -1095,6 +1167,17 @@ async function ensureChatPayloads(chatId) {
                         // unflagged message).
                         keptAny = true;
                         continue;
+                    } else if (fid && !wantIds[fid]) {
+                        // NEVER-FETCHED: the live chat object was replaced
+                        // while the reads were in flight (e.g. the SW adopted
+                        // a panel snapshot) and this id was not in the
+                        // pre-await wantIds set — no GET was even attempted
+                        // for it. Clearing here would strand the payload
+                        // forever; keep the flag (and, via keptAny, the
+                        // chat-level _payloadsEvicted) so the next hydration
+                        // pass fetches it.
+                        keptAny = true;
+                        continue;
                     }
                     // Clear the flag otherwise: if neither the blob store nor
                     // the record has a payload for this id AND the reads did
@@ -1114,6 +1197,12 @@ async function ensureChatPayloads(chatId) {
                         cs.base64 = sb64;
                     } else if (failedIds[sIds[si]]) {
                         // Same as above: errored ≠ absent — keep it retryable.
+                        keptAny = true;
+                        continue;
+                    } else if (!wantIds[sIds[si]]) {
+                        // NEVER-FETCHED (live chat replaced mid-await): this
+                        // id was not attempted this pass — keep the flag so
+                        // the next hydration fetches it.
                         keptAny = true;
                         continue;
                     }

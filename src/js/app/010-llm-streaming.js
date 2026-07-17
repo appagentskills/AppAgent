@@ -325,10 +325,16 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 }
                 throw new Error(errorData.error?.message || 'API request failed');
             } catch (e) {
-                if (e.message && !e.message.includes('JSON')) throw e;
+                // F5-1: attach the HTTP status to whatever error propagates so
+                // the agent-loop throttle classifier can detect a 429/502/503/529
+                // even when the proxy body is an HTML page whose markup the
+                // message-regex can't match (see app/030-agent-loop.js).
+                if (e.message && !e.message.includes('JSON')) { e._httpStatus = res.status; throw e; }
                 // Cap the raw body — full text is already console.error'd above;
                 // a multi-KB provider payload must not flood downstream UIs.
-                throw new Error('API request failed: ' + String(errorText).slice(0, 300));
+                var _apiErr = new Error('API request failed: ' + String(errorText).slice(0, 300));
+                _apiErr._httpStatus = res.status;
+                throw _apiErr;
             }
         }
 

@@ -85,7 +85,9 @@ async function fetchCredits() {
                     // Unix timestamp in seconds — convert to ms
                     var diffMs = (resetTs > 9999999999 ? resetTs : resetTs * 1000) - Date.now();
                     if (diffMs > 0) {
-                        var diffMin = Math.floor(diffMs / 60000);
+                        // Ceil to match fmtUsageResetIn in the popover (floor here
+                        // made the pill say 3h41mn while the popover said 3 hr 42 min)
+                        var diffMin = Math.ceil(diffMs / 60000);
                         var h = Math.floor(diffMin / 60);
                         var m = diffMin % 60;
                         resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
@@ -157,7 +159,8 @@ async function fetchCredits() {
                 var resetTime = new Date(data.five_hour.resets_at);
                 var diffMs = resetTime - Date.now();
                 if (diffMs > 0) {
-                    var diffMin = Math.floor(diffMs / 60000);
+                    // Ceil to match fmtUsageResetIn in the popover
+                    var diffMin = Math.ceil(diffMs / 60000);
                     var h = Math.floor(diffMin / 60);
                     var m = diffMin % 60;
                     resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';

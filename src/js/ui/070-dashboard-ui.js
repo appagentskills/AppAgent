@@ -1677,7 +1677,20 @@ function buildDegradedChatListHtml() {
 var CHATS_LOAD_CHUNK_SIZE = 25;       // records per read transaction
 var BOOT_CHATS_TX_DEADLINE_MS = 6000; // per-tx deadline override for the boot read
 
+var _chatsLoadInFlight = null;
 async function loadChatsFromStorage() {
+    // FIX (693-R1): single-flight guard -- a boot load, a degraded-mode
+    // retry, and a manual refresh can all call this concurrently; share ONE
+    // in-flight load instead of racing separate withStore transactions
+    // against the same store.
+    if (_chatsLoadInFlight) return _chatsLoadInFlight;
+    _chatsLoadInFlight = _loadChatsFromStorageImpl().finally(function() {
+        _chatsLoadInFlight = null;
+    });
+    return _chatsLoadInFlight;
+}
+
+async function _loadChatsFromStorageImpl() {
     try {
         // Phase 1 — keys only (cheap, no payloads). Bounds a wedged backend to
         // the short deadline before we pull a single byte of chat data. withStore
@@ -1701,6 +1714,12 @@ async function loadChatsFromStorage() {
         // reassignment the old single getAll did) so no reader sees a half-loaded
         // map, and init's late-merge snapshot stays valid.
         var loaded = {};
+        // STORE-ACCT: size what we actually read — record count, duration, and
+        // inline base64 still riding in records (the legacy tail). Decides
+        // whether boot slowness is data-size or transaction-queue starvation
+        // (a keys-only Phase 1 timing out = starvation, records can't be big).
+        var _loadT0 = Date.now();
+        var _acctB64 = 0, _acctTopB64 = 0, _acctTopId = null;
         for (var _start = 0; _start < allKeys.length; _start += CHATS_LOAD_CHUNK_SIZE) {
             var batchKeys = allKeys.slice(_start, _start + CHATS_LOAD_CHUNK_SIZE);
             var range = IDBKeyRange.bound(batchKeys[0], batchKeys[batchKeys.length - 1]);
@@ -1716,10 +1735,43 @@ async function loadChatsFromStorage() {
             })(range), { deadlineMs: BOOT_CHATS_TX_DEADLINE_MS });
             for (var _bi = 0; _bi < batch.length; _bi++) {
                 var chat = batch[_bi];
-                if (chat && chat.messages && chat.messages.length > 0) loaded[chat.id] = chat;
+                if (chat && chat.messages && chat.messages.length > 0) {
+                    loaded[chat.id] = chat;
+                    var _cb64 = 0;
+                    for (var _ci = 0; _ci < chat.messages.length; _ci++) {
+                        if (chat.messages[_ci] && chat.messages[_ci].base64) _cb64 += chat.messages[_ci].base64.length;
+                    }
+                    if (chat.screenshots) {
+                        for (var _ck in chat.screenshots) {
+                            if (chat.screenshots[_ck] && chat.screenshots[_ck].base64) _cb64 += chat.screenshots[_ck].base64.length;
+                        }
+                    }
+                    if (_cb64) {
+                        _acctB64 += _cb64;
+                        if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
+                    }
+                }
             }
         }
+        // FIX (691-R1): an unconditional swap drops any in-memory temp/
+        // degraded chat that never made it to disk (isTemporary chats,
+        // chats kept alive under _storageDegraded, or the chat currently
+        // being viewed) when this load is a fast-fail recovery pass. Carry
+        // those forward into `loaded` before the atomic swap.
+        Object.keys(chats).forEach(function(id){ var c=chats[id]; if(!loaded[id] && c && (c.isTemporary || (_storageDegraded && c.messages && c.messages.length) || id===currentChatId)) loaded[id]=c; });
         chats = loaded;
+        // WIPE-GUARD-3 (mirrors worker/115-storage.js): a full rehydration
+        // rebuilds the chats map from IDB, so the per-boot delete budget starts
+        // fresh here — without this reset the budget was never replenished and all
+        // chat-row deletes silently halted after WIPE_GUARD_MAX_DELETES_PER_BOOT
+        // cumulative deletes in one realm lifetime (F2-1).
+        _wipeGuardDeletedSinceLoad = 0;
+        console.log('[storage] loaded ' + Object.keys(loaded).length + ' chats in '
+            + (Date.now() - _loadT0) + 'ms — '
+            + (_acctB64
+                ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records (largest '
+                    + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
+                : 'records are v16-clean (no inline base64)'));
 
         // Rehydrate per-chat pause flags from the persisted record field
         // (chat.pausedByUser, stamped by setChatPausedPersistent) so a
@@ -1752,6 +1804,16 @@ async function loadChatsFromStorage() {
                 _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
                 for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
                     stripChatPayloadsInPlace(chats[_ids[_si]]);
+                    // WRITE-AMP root fix (mirrors worker/115-storage.js): strip
+                    // only flags chats it stripped base64 from, so pure-TEXT
+                    // chats stayed in the put set and the page re-wrote every
+                    // one of their unchanged records on every save — hundreds
+                    // of records, tens of MB, per save. Mark all non-recent
+                    // chats evicted; view/mutation sites hydrate on demand via
+                    // ensureChatPayloads (a single cheap get for text-only
+                    // chats), which clears the flag and re-admits the chat to
+                    // the put set.
+                    chats[_ids[_si]]._payloadsEvicted = true;
                 }
                 if (typeof ensureChatPayloads === 'function') {
                     (function _hydrateRecent(recentIds) {
@@ -1795,7 +1857,23 @@ async function loadChatsFromStorage() {
 
 var saveChatsPending = false;
 var saveChatsPendingAgain = false;
+// WIPE-GUARD-3 (mirrors worker/115-storage.js): cumulative per-boot delete
+// budget. The per-save cap (wipe-guard-2) rate-limits rather than blocks —
+// under a persistently partial in-memory map, 5 real chats would still be
+// deleted at EVERY save, draining the store over a long incident. Budget
+// total deletes per realm boot; once exhausted, stop deleting entirely
+// until a fresh load rebuilds the map.
+var _wipeGuardDeletedSinceLoad = 0;
+var WIPE_GUARD_MAX_DELETES_PER_BOOT = 25;
 var _saveChatsWaiters = [];
+// CONGESTION-BACKOFF (mirrors worker/115-storage.js): after a save blows the
+// 30s write deadline, withStore leaves the transaction queued and rejects.
+// Relaunching immediately queued the follow-up behind the abandoned one, so
+// every later save timed out too and the [chats, chat_payloads] queue never
+// drained — cross-realm too, since the SW's saves share the same store
+// scope. Hold off after a timeout so the backlog commits.
+var _saveChatsBackoffUntil = 0;
+var SAVE_CHATS_TIMEOUT_BACKOFF_MS = 15000;
 
 async function saveChatsToStorage() {
     // Prevent concurrent saves which can cause data loss. Callers that AWAIT
@@ -1816,8 +1894,16 @@ async function saveChatsToStorage() {
         return _commit;
     }
     saveChatsPending = true;
-    
+
     try {
+        // CONGESTION-BACKOFF: honour the hold-off armed by a previous
+        // timed-out save. Callers arriving during the wait coalesce via the
+        // single-flight gate above; the save that finally runs reads `chats`
+        // live inside the transaction, so it captures their mutations too.
+        var _boWait = _saveChatsBackoffUntil - Date.now();
+        if (_boWait > 0) await new Promise(function(r) { setTimeout(r, _boWait); });
+        var _saveT0 = Date.now();
+        var _putRecords = 0, _putBlobs = 0;
         // withStore (core/130-indexeddb.js): retries ONCE on a fresh
         // connection if the cached one was force-closed by the browser. Safe
         // to retry: the diff-save re-derives everything from in-memory state.
@@ -1875,13 +1961,46 @@ async function saveChatsToStorage() {
                         resolve();
                     }
                 }
+                // WIPE-GUARD-2 (mirrors worker/115-storage.js): cap the
+                // delete-pass. A partially-hydrated map turns the diff-save
+                // into a mass-delete of every chat this realm doesn't hold in
+                // memory. But legit flows CAN exceed a handful (sub-agent GC
+                // batches in core/097-sub-agent-registry.js backlog >5 rows),
+                // so do NOT skip entirely — that permanently disabled
+                // deletion (rows resurrected on reload, unbounded growth).
+                // Delete a BOUNDED batch per save (first 5): legit backlogs
+                // drain over successive saves, a partial-map incident stays
+                // capped at 5 rows per transaction.
+                var _delKeys = [];
                 existingKeys.forEach(function(key) {
-                    if (!Object.prototype.hasOwnProperty.call(desired, key)) {
-                        pending++;
-                        var delRequest = store.delete(key);
-                        delRequest.onsuccess = settleOne;
-                        delRequest.onerror = settleOne;
-                    }
+                    if (!Object.prototype.hasOwnProperty.call(desired, key)) _delKeys.push(key);
+                });
+                if (_delKeys.length > 5) {
+                    console.warn('[storage] delete-pass CAPPED (wipe-guard-2): '
+                        + _delKeys.length + ' of ' + existingKeys.length
+                        + ' stored chats are absent from memory (' + Object.keys(desired).length
+                        + ' held) — deleting only 5 this save; a legit backlog drains over the'
+                        + ' next saves, a partial in-memory map stays bounded');
+                    _delKeys = _delKeys.slice(0, 5);
+                }
+                // WIPE-GUARD-3: enforce the per-boot cumulative budget (see
+                // declaration above) — trim the batch to the budget still
+                // remaining instead of dropping it wholesale, so a partial
+                // budget is spent, not wasted (F2-2). When the budget is fully
+                // spent the slice is empty, so deletes still halt.
+                if (_delKeys.length && _wipeGuardDeletedSinceLoad + _delKeys.length > WIPE_GUARD_MAX_DELETES_PER_BOOT) {
+                    console.warn('[storage] delete-pass TRIMMED (wipe-guard-3): '
+                        + _wipeGuardDeletedSinceLoad + ' of a ' + WIPE_GUARD_MAX_DELETES_PER_BOOT
+                        + ' per-boot delete budget already used since load — trimming this save to the'
+                        + ' remaining budget (a reload/full rehydration rebuilds the map)');
+                    _delKeys = _delKeys.slice(0, Math.max(0, WIPE_GUARD_MAX_DELETES_PER_BOOT - _wipeGuardDeletedSinceLoad));
+                }
+                _wipeGuardDeletedSinceLoad += _delKeys.length;
+                _delKeys.forEach(function(key) {
+                    pending++;
+                    var delRequest = store.delete(key);
+                    delRequest.onsuccess = settleOne;
+                    delRequest.onerror = settleOne;
                 });
                 Object.keys(desired).forEach(function(id) {
                     // MEMFIX: NEVER put a payload-evicted chat. Post-PAYLOAD-STORE
@@ -1896,8 +2015,11 @@ async function saveChatsToStorage() {
                     // issued synchronously here, so `pending` cannot zero-cross
                     // before the loop finishes.
                     var extracted = extractChatPayloadsForPut(desired[id]);
-                    pending += queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
+                    var _nBlobs = queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
+                    pending += _nBlobs;
+                    _putBlobs += _nBlobs;
                     pending++;
+                    _putRecords++;
                     var putRequest = store.put(extracted.record);
                     putRequest.onsuccess = settleOne;
                     putRequest.onerror = settleOne;
@@ -1914,12 +2036,28 @@ async function saveChatsToStorage() {
             };
         });
         }); // end withStore fn
+        // Committed: clear any armed backoff and surface slow-but-successful
+        // saves so future congestion is diagnosable (which realm, how big).
+        _saveChatsBackoffUntil = 0;
+        var _saveDur = Date.now() - _saveT0;
+        if (_saveDur > 2000) {
+            console.warn('[storage] slow save: ' + _saveDur + 'ms ('
+                + _putRecords + ' records, ' + _putBlobs + ' payload blobs) — IDB congested');
+        }
         // GRACEFUL-DEGRADATION: refresh the chrome.storage.local chat index
         // mirror after a successful commit so the boot path has a recent
         // read-only snapshot to show if IDB later wedges. Best-effort.
         mirrorChatIndexToLocal();
     } catch (e) {
         console.error('Failed to save chats to IndexedDB:', e);
+        // CONGESTION-BACKOFF: the timed-out transaction is still queued and
+        // will commit in the background — hold the next save back so it
+        // drains instead of stacking another transaction on the jam.
+        if (e && e.name === 'TimeoutError') {
+            _saveChatsBackoffUntil = Date.now() + SAVE_CHATS_TIMEOUT_BACKOFF_MS;
+            console.warn('[storage] backing off ' + (SAVE_CHATS_TIMEOUT_BACKOFF_MS / 1000)
+                + 's before the next save so the queued transaction can drain');
+        }
     } finally {
         saveChatsPending = false;
         // If another save was requested while we were saving, do it now. That

@@ -1810,15 +1810,34 @@ async function _executeToolInner(name, args, messageIndex, options) {
         var _rsUrl = '/sys.scripts.do';
         if (_rsTargetUrl) _rsUrl = _rsTargetUrl + _rsUrl;
         // Serialize per instance — see _enqueueSysScripts above.
-        var _rsQueueKey = _rsTargetUrl || '';
+        // FIX (RS-1): resolve the ACTIVE instance URL when args.instance is
+        // unset instead of keying on '' -- an explicit args.instance call
+        // that resolves to the SAME url as the active instance must land on
+        // the same queue as a bare (no args.instance) call, or two
+        // concurrent requests can still hit the shared per-session
+        // sys.scripts.do output channel together.
+        var _rsQueueKey = _rsTargetUrl || Platform.resolveInstanceUrl(null) || '';
         return await _enqueueSysScripts(_rsQueueKey, async function() {
         try {
             var _rsApiToken = _rsTargetToken || Platform.getSessionToken() || '';
-            var _rsRes = await fetch(_rsUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'X-UserToken': _rsApiToken },
-                body: _rsBody
-            });
+            // FIX (RS-2): a wedged/hanging sys.scripts.do POST had no timeout,
+            // so a single stuck request could park the whole per-instance
+            // queue (_enqueueSysScripts) forever. Abort after ~120s with a
+            // clear timeout error; always clear the timer.
+            var _rsAbort = new AbortController();
+            var _rsTimedOut = false;
+            var _rsTimer = setTimeout(function() { _rsTimedOut = true; _rsAbort.abort(); }, 120000);
+            var _rsRes;
+            try {
+                _rsRes = await fetch(_rsUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'X-UserToken': _rsApiToken },
+                    body: _rsBody,
+                    signal: _rsAbort.signal
+                });
+            } finally {
+                clearTimeout(_rsTimer);
+            }
             var _rsText = await _rsRes.text();
             // Parse the response: extract output between <PRE>...</PRE> and execution history sys_id
             var _rsOutput = '';
@@ -1866,6 +1885,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (_rsTargetUrl) _rsResult.instance = args.instance;
             return _rsResult;
         } catch (e) {
+            if (_rsTimedOut) {
+                return { success: false, error: 'servicenow_run_script timed out after 120s waiting for /sys.scripts.do' };
+            }
             return { success: false, error: e.message };
         }
         });

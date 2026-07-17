@@ -219,7 +219,11 @@ async function executeEvalRunner(args, options) {
                 "  } catch (eS) {\n" +
                 "    // Roll back the lock: a THROWING setup must stay retryable instead\n" +
                 "    // of branding the next attempt DUPLICATE_SETUP/cheated.\n" +
-                "    try { delete st.setup; gr.value = JSON.stringify(st); gr.update(); } catch (eRb) {}\n" +
+                "    try {\n" +
+                "      delete st.setup;\n" +
+                "      var rbgr = new GlideRecord('sys_properties');\n" +
+                "      if (rbgr.get('name', '" + setupLock + "')) { rbgr.value = JSON.stringify(st); rbgr.update(); }\n" +
+                "    } catch (eRb) {}\n" +
                 "    __setupFailed = true;\n" +
                 "    gs.print(JSON.stringify({error: 'SETUP_FAILED', message: String((eS && eS.message) || eS).slice(0, 200)}));\n" +
                 "  }\n" +
@@ -228,13 +232,28 @@ async function executeEvalRunner(args, options) {
                 "    // same execution (GlideRecord, not the gs.getProperty cache); retry\n" +
                 "    // the write once if the read-back does not match.\n" +
                 "    st.setup_output = __setup_out;\n" +
-                "    try { gr.value = JSON.stringify(st); gr.update(); } catch (eStore) {}\n" +
+                "    // FIX (700-1): store setup_output via a FRESH GlideRecord keyed\n" +
+                "    // by the build-time lock name (mirrors the verify path's writeAudit /\n" +
+                "    // fresh 'agr') so a setup body that clobbers a bare global 'gr' cannot\n" +
+                "    // redirect this write to the wrong row and silently lose setup_output.\n" +
+                "    // FIX (704-1): resolve the row via the build-time LITERAL, not the\n" +
+                "    // runtime 'pName' var — a setup body assigning a bare global\n" +
+                "    // 'pName = ...' could otherwise redirect both the store AND the\n" +
+                "    // read-back to the same junk row (false-positive verification).\n" +
+                "    var __storeSetup = function () {\n" +
+                "      var sgr = new GlideRecord('sys_properties');\n" +
+                "      var sfound = sgr.get('name', '" + setupLock + "');\n" +
+                "      if (!sfound) { sgr.initialize(); sgr.name = '" + setupLock + "'; }\n" +
+                "      sgr.value = JSON.stringify(st);\n" +
+                "      if (sfound) { sgr.update(); } else { sgr.insert(); }\n" +
+                "    };\n" +
+                "    try { __storeSetup(); } catch (eStore) {}\n" +
                 "    var __persistedS = false;\n" +
                 "    try {\n" +
                 "      var vgr = new GlideRecord('sys_properties');\n" +
-                "      if (vgr.get('name', pName)) { var vst = JSON.parse(vgr.value + '') || {}; __persistedS = (vst.setup_output === __setup_out); }\n" +
+                "      if (vgr.get('name', '" + setupLock + "')) { var vst = JSON.parse(vgr.value + '') || {}; __persistedS = (vst.setup_output === __setup_out); }\n" +
                 "    } catch (eV) {}\n" +
-                "    if (!__persistedS) { try { gr.value = JSON.stringify(st); gr.update(); } catch (eR2) {} }\n" +
+                "    if (!__persistedS) { try { __storeSetup(); } catch (eR2) {} }\n" +
                 "    gs.print(__setup_out);\n" +
                 "  }\n" +
                 "}";
@@ -299,7 +318,7 @@ async function executeEvalRunner(args, options) {
                 "  var rp = null;\n" +
                 "  try {\n" +
                 "    var rgr = new GlideRecord('sys_properties');\n" +
-                "    if (rgr.get('name', '" + EVAL_RUNNER_RESULTS_PROP + "')) { rp = (JSON.parse(rgr.value + '') || {})[taskId] || null; }\n" +
+                "    if (rgr.get('name', '" + EVAL_RUNNER_RESULTS_PROP + "')) { rp = (JSON.parse(rgr.value + '') || {})['" + task2.id + "'] || null; }\n" +
                 "  } catch (eRp) {}\n" +
                 "  if (rp && typeof rp.pass !== 'undefined') {\n" +
                 "    rp.replayed = true;\n" +
@@ -349,7 +368,7 @@ async function executeEvalRunner(args, options) {
                 "      var audit = {};\n" +
                 "      if (afound) { try { audit = JSON.parse(agr.value + '') || {}; } catch(e4) {} }\n" +
                 "      else { agr.initialize(); agr.name = '" + EVAL_RUNNER_RESULTS_PROP + "'; }\n" +
-                "      audit[taskId] = slim;\n" +
+                "      audit['" + task2.id + "'] = slim;\n" +
                 "      agr.value = JSON.stringify(audit);\n" +
                 "      if (afound) { agr.update(); } else { agr.insert(); }\n" +
                 "    };\n" +
@@ -357,7 +376,7 @@ async function executeEvalRunner(args, options) {
                 "      var vgr = new GlideRecord('sys_properties');\n" +
                 "      if (!vgr.get('name', '" + EVAL_RUNNER_RESULTS_PROP + "')) return false;\n" +
                 "      var a; try { a = JSON.parse(vgr.value + '') || {}; } catch (eRb) { return false; }\n" +
-                "      var w = a[taskId];\n" +
+                "      var w = a['" + task2.id + "'];\n" +
                 "      return !!(w && (!!w.pass) === slim.pass && String(w.actual) === String(slim.actual));\n" +
                 "    };\n" +
                 "    writeAudit();\n" +
@@ -444,8 +463,14 @@ async function executeEvalRunner(args, options) {
                 "  }\n" +
                 "  out.snapshot_persisted = snapOK;\n" +
                 "  var d = new GlideRecord('sys_properties');\n" +
-                "  var q = d.addQuery('name', 'STARTSWITH', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
-                "  q.addOrCondition('name', '" + EVAL_RUNNER_RESULTS_PROP + "');\n" +
+                "  if (snapOK) {\n" +
+                "    var q = d.addQuery('name', 'STARTSWITH', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
+                "    q.addOrCondition('name', '" + EVAL_RUNNER_RESULTS_PROP + "');\n" +
+                "  } else {\n" +
+                "    d.addQuery('name', 'STARTSWITH', '" + EVAL_RUNNER_RUNS_PROP + "');\n" +
+                "    out.results_retained = true;\n" +
+                "    out.retryable = true;\n" +
+                "  }\n" +
                 "  d.query();\n" +
                 "  var n = 0; while (d.next()) { d.deleteRecord(); n++; }\n" +
                 "  out.deleted = n;\n" +
@@ -489,6 +514,8 @@ async function executeEvalRunner(args, options) {
                 replayed: !!(tdOut && tdOut.replayed)
             };
             if (tdOut && typeof tdOut.snapshot_persisted !== 'undefined') tdResp.snapshot_persisted = !!tdOut.snapshot_persisted;
+            if (tdOut && tdOut.results_retained) tdResp.results_retained = true;
+            if (tdOut && tdOut.retryable) tdResp.retryable = true;
             // FIX (d): surface diagnostics when the audit came back empty.
             if (tdOut && tdOut.diagnostics) tdResp.diagnostics = tdOut.diagnostics;
             return tdResp;

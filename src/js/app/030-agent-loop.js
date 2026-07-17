@@ -550,6 +550,20 @@ async function runAgent(overrideChatId) {
     // dot spinning forever AND block future sends via the early-return at top.
     try {
     chat = chats[streamingChatId];
+    // CKPT-POISON guard: refuse to start a run for a chat that is not loaded.
+    // This MUST happen before the runStarted emit below — the checkpoint
+    // listener (worker/110-agent-checkpoint.js) reacts to runStarted by
+    // writing a durable {status:'running'} record, and for a missing chat
+    // that record is a poison pill: the 30s agent-heartbeat resume scan
+    // re-runs it, crashes here again, and the crash's own runStarted
+    // refreshes the record forever (the recurring "Cannot read properties
+    // of undefined (reading 'messages')" class). Throwing routes through
+    // the catch/finally below: runningChatIds is cleared and runCrashed
+    // carries the real message, so pool/resume/wake callers still settle
+    // their records exactly as they do for any other loop crash.
+    if (!chat) {
+        throw new Error('runAgent: chat ' + streamingChatId + ' is not loaded in this context — refusing to start');
+    }
     isBackgroundRun = !!(chat && chat.isBackground);
     // Clear any stale API error left from a PREVIOUS run of THIS chat so the
     // finish path below can't misreport a fresh successful run as errored.
@@ -1015,7 +1029,21 @@ async function runAgent(overrideChatId) {
             // benefit too (OpenRouter 429/502/503 bodies match the same
             // classifier). Budget exhausted → fall through to the normal
             // error path below.
-            var _throttleClass = /overloaded|rate.?limit|too many requests|temporarily unavailable|\b(429|502|503|529)\b/i
+            // Numeric codes are anchored to a status/http/code/error/failed
+            // prefix (or start-of-string) — a bare \b(429|...)\b matched ANY
+            // standalone number in an error body (e.g. "row 502 not found")
+            // and burned retries on non-throttle errors. `failed` covers our
+            // own transport shape "API request failed: 502 Bad Gateway"
+            // (app/010-llm-streaming.js).
+            // F5-1: an HTML-bodied 5xx from the proxy reaches here as a generic
+            // "API request failed: <html…>" message the anchored numeric regex
+            // can't match, so trust the HTTP status stamped by
+            // app/010-llm-streaming.js FIRST, then fall back to the message
+            // regex. The regex is deliberately NOT loosened (its anchor kills
+            // false positives like "row 502 not found").
+            var _throttleStatus = e && e._httpStatus;
+            var _throttleClass = (_throttleStatus === 429 || _throttleStatus === 502 || _throttleStatus === 503 || _throttleStatus === 529)
+                || /overloaded|rate.?limit|too many requests|temporarily unavailable|(?:^|\b(?:status|http|code|error|failed)\s*[:=]?\s*)(?:429|502|503|529)\b/i
                 .test(String((e && e.message) || e));
             if (_throttleClass && throttleRetries < AGENT_THROTTLE_MAX_RETRIES) {
                 throttleRetries++;
