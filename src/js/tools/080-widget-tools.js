@@ -1,7 +1,7 @@
 // HTML WIDGET TOOL - Display interactive widgets inline
 // =============================================
 
-function executeHtmlWidget(args, messageIndex, options) {
+async function executeHtmlWidget(args, messageIndex, options) {
     var title = args.title || 'Widget';
     var html = args.html || '';
     var height = args.height || '400px';
@@ -88,6 +88,20 @@ function executeHtmlWidget(args, messageIndex, options) {
     
     // Ensure chat is saved with the widget (remove temporary flag if present)
     delete chat.isTemporary;
+    // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms' save
+    // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2035,
+    // worker/115-storage.js:178) and the page loader flags every chat outside the
+    // newest KEEP_HYDRATED chats (ui/070-dashboard-ui.js:1828-1839), so a widget
+    // created into a non-recent chat (sub-agent / background run) is dropped from
+    // disk and gone on reload. Hydrate AFTER the push above and immediately BEFORE
+    // the save. Same pattern as tools/100-prompt-user.js; ensureChatPayloads never
+    // rejects and is a no-op when the flag is clear (core/130-indexeddb.js:1075).
+    // Never `delete chat._payloadsEvicted` by hand — extractChatPayloadsForPut
+    // would then put a payload-STRIPPED record and destroy a legacy-inline row's
+    // only durable base64 (core/130-indexeddb.js:887-937).
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(widgetChatId); } catch (e) {}
+    }
     saveChatsToStorage();
     
     // If this is a regeneration, update the dashboard widget with new HTML.
@@ -109,10 +123,27 @@ function executeHtmlWidget(args, messageIndex, options) {
     
     // Update sidebar widget list
     renderWidgetSidebar();
-    
+
+    // Optional pin-at-creation: pin === 'main' (dashboard page) or 'home' (home page).
+    var pinnedTo = null;
+    var pinError = null;
+    if (args.pin === 'main' || args.pin === 'home') {
+        try {
+            // addWidgetToDashboard returns the dashboard record on success and
+            // undefined on its soft-fail paths (widget lookup / no-content guards).
+            var pinResult = await addWidgetToDashboard(widgetId, null, args.pin);
+            pinnedTo = pinResult ? args.pin : null;
+            if (!pinResult) pinError = 'Pin failed: widget could not be added to the dashboard';
+        } catch (e) {
+            pinError = e.message;
+        }
+    }
+
     return {
         success: true,
-        message: 'Widget "' + title + '" created successfully',
+        message: 'Widget "' + title + '" created successfully' + (pinnedTo ? ' and pinned to the ' + (pinnedTo === 'home' ? 'home dashboard' : 'dashboard page') : ''),
+        pinned: pinnedTo,
+        pin_error: pinError || undefined,
         // Normalized: `id` matches display / take_screenshot conventions.
         // `widgetId` kept for any caller still relying on it.
         id: widgetId,
@@ -123,6 +154,31 @@ function executeHtmlWidget(args, messageIndex, options) {
         // mutation on the next save and the widget is lost on reload.
         _widget_persist: widget
     };
+}
+
+// pin_widget tool — pin/move/unpin an EXISTING widget. dashboard: 'main' | 'home' | 'none'.
+// Page-side only (HEADLESS_TOOLS.pin_widget = false): dashboardWidgets + renderers live here.
+async function executePinWidget(args) {
+    var widgetId = args && args.widget_id;
+    var target = args && args.dashboard;
+    if (!widgetId) return { success: false, error: 'widget_id is required' };
+    if (['main', 'home', 'none'].indexOf(target) === -1) {
+        return { success: false, error: "dashboard must be 'main', 'home' or 'none'" };
+    }
+    var wasPinned = !!dashboardWidgets[widgetId];
+    if (target === 'none') {
+        if (!wasPinned) return { success: true, message: 'Widget was not pinned', pinned: null };
+        await removeWidgetFromDashboard(widgetId);
+        return { success: true, message: 'Widget unpinned', pinned: null };
+    }
+    if (!wasPinned && !getWidgetById(widgetId)) {
+        return { success: false, error: 'Widget not found: ' + widgetId };
+    }
+    await pinWidgetTo(widgetId, target);
+    if (!dashboardWidgets[widgetId]) {
+        return { success: false, error: 'Failed to pin widget ' + widgetId };
+    }
+    return { success: true, message: 'Widget pinned to ' + (target === 'home' ? 'the home dashboard' : 'the dashboard page'), pinned: target };
 }
 
 function getWidgetsForChat(chatId) {
@@ -161,6 +217,17 @@ function getWidgetById(widgetId) {
                 return widget;
             }
         }
+    }
+    // Dashboard records live in their OWN store (dashboardWidgets, seeded by
+    // loadDashboardWidgets / addWidgetToDashboard) and are a SEPARATE object from
+    // the chat copy. A widget whose source chat was deleted exists ONLY here, so
+    // without this fallback every getWidgetById caller (editWidgetCode:535,
+    // saveWidgetCodeEdit:585, screenshotWidget:482, printWidgetFullscreen:466...)
+    // reported 'Widget not found' for it. Checked LAST on purpose: while the chat
+    // copy still exists it stays authoritative, because the chat surface renders
+    // from chats[cid].widgets and saveWidgetCodeEdit persists into that array.
+    if (typeof dashboardWidgets !== 'undefined' && dashboardWidgets[widgetId]) {
+        return dashboardWidgets[widgetId];
     }
     return null;
 }
@@ -213,6 +280,16 @@ function toggleWidgetRunning(widgetId, event) {
     });
 }
 
+// FIX4b helper: append an injected script before </body> (or at the end when
+// the widget HTML has no body close tag) — shared by the thumbnail style
+// shim and the full height-reporter injection below.
+function _appendWidgetScript(widgetHtml, script) {
+    if (widgetHtml.match(/<\/body>/i)) {
+        return widgetHtml.replace(/<\/body>/i, script + '</body>');
+    }
+    return widgetHtml + script;
+}
+
 function renderWidgetInContainer(widget, container, options) {
     options = options || {};
     var isFullscreen = options.fullscreen || false;
@@ -225,12 +302,30 @@ function renderWidgetInContainer(widget, container, options) {
     var isThumbnail = container.closest('.widgets-container') !== null;
 
     // Build widget HTML with bridge
-    var widgetHtml = injectWidgetBridge(widget.html, widget.title);
+    var widgetHtml = injectWidgetBridge(widget.html, widget.title, widget.id);
 
+    if (isThumbnail) {
+        // FIX4b: thumbnails are fixed-size, CSS-scaled previews — the height
+        // reporter below (2 MutationObservers + a 2s interval) used to be
+        // injected into them anyway and ran forever per thumbnail, for zero
+        // benefit: the early thumbnail return below never attaches
+        // onWidgetResize, so every report was ignored. Inject only the body
+        // style normalization the reporter script used to apply.
+        widgetHtml = _appendWidgetScript(widgetHtml,
+            '<script>document.addEventListener("DOMContentLoaded",function(){' +
+            'if(document.body){document.body.style.margin="0";document.body.style.overflow="auto";}});<\/script>');
+    } else {
     // Inject a height reporter for cross-origin auto-resize via postMessage
-    // (widget-sandbox.html has a unique origin, so direct DOM access won't work)
+    // (widget-sandbox.html has a unique origin, so direct DOM access won't work).
+    // FIX4a: the 2s reporter interval pauses while the document is hidden
+    // (panel in a background tab / minimized) and resumes — with one catch-up
+    // report — on visibilitychange; _rh itself also no-ops while hidden so
+    // MutationObserver-driven calls cost nothing off-screen.
     var heightScript = '<script>(function(){' +
-        'function _rh(){var h=document.body?document.body.scrollHeight:0;if(h>0)window.parent.postMessage({type:"widgetResize",height:h},"*");}' +
+        'var _iv=null;' +
+        'function _rh(){if(document.hidden)return;var h=document.body?document.body.scrollHeight:0;if(h>0)window.parent.postMessage({type:"widgetResize",height:h},"*");}' +
+        'function _start(){if(!_iv)_iv=setInterval(_rh,2000);}' +
+        'function _stop(){if(_iv){clearInterval(_iv);_iv=null;}}' +
         'window.addEventListener("load",_rh);' +
         'if(document.body){try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});' +
         '}catch(e){}}document.addEventListener("DOMContentLoaded",function(){' +
@@ -240,12 +335,10 @@ function renderWidgetInContainer(widget, container, options) {
         // auto-resized to fit, but taller content can still scroll inside the iframe.
         'if(document.body){document.body.style.margin="0";document.body.style.overflow="auto";' +
         'try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});}catch(e){}_rh();}});' +
-        'setInterval(_rh,2000);' +
+        'document.addEventListener("visibilitychange",function(){if(document.hidden){_stop();}else{_start();_rh();}});' +
+        'if(!document.hidden)_start();' +
     '})();<\/script>';
-    if (widgetHtml.match(/<\/body>/i)) {
-        widgetHtml = widgetHtml.replace(/<\/body>/i, heightScript + '</body>');
-    } else {
-        widgetHtml += heightScript;
+    widgetHtml = _appendWidgetScript(widgetHtml, heightScript);
     }
 
     container.appendChild(iframe);
@@ -303,42 +396,6 @@ function renderWidgetInContainer(widget, container, options) {
     return iframe;
 }
 
-function toggleChatWidgetExpand(widgetId, event) {
-    if (event) {
-        event.stopPropagation();
-        event.preventDefault();
-    }
-    
-    var widgetEl = document.getElementById('widget-' + widgetId);
-    if (!widgetEl) {
-        console.warn('Widget element not found:', widgetId);
-        return;
-    }
-    
-    var content = widgetEl.querySelector('.widget-content');
-    if (!content) {
-        console.warn('Widget content not found for:', widgetId);
-        return;
-    }
-    
-    // Toggle collapsed state (widgets are expanded by default)
-    var isCollapsed = content.classList.toggle('collapsed');
-    widgetEl.classList.toggle('collapsed', isCollapsed);
-
-    // Persist collapsed state on the widget object so it survives re-renders
-    var widget = getWidgetById(widgetId);
-    if (widget) widget.collapsed = isCollapsed;
-
-    // Update button icon - show expand when collapsed, collapse when expanded
-    var expandBtn = widgetEl.querySelector('.widget-expand-btn');
-    if (expandBtn) {
-        expandBtn.innerHTML = isCollapsed
-            ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>'
-            : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 14h6v6M14 4h6v6M10 14l-7 7M21 3l-7 7"/></svg>';
-        expandBtn.title = isCollapsed ? 'Expand' : 'Collapse';
-    }
-}
-
 function openWidgetFullscreen(widgetId, event) {
     if (event) {
         event.stopPropagation();
@@ -363,18 +420,29 @@ function openWidgetFullscreen(widgetId, event) {
     var header = document.createElement('div');
     header.className = 'widget-fullscreen-header';
     var isOnDash = dashboardWidgets[widget.id] ? true : false;
-    var dashBtn = isOnDash
-        ? '<button class="widget-ctrl-btn widget-dashboard-btn on-dashboard" onclick="removeWidgetFromDashboard(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="Remove from Dashboard">' + UI_ICONS.pinFilled + '</button>'
-        : '<button class="widget-ctrl-btn widget-dashboard-btn" onclick="addWidgetToDashboard(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="Add to Dashboard">' + UI_ICONS.pin + '</button>';
+    var dashBtn = '<button class="widget-ctrl-btn widget-dashboard-btn' + (isOnDash ? ' on-dashboard' : '') + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + (isOnDash ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026') + '">' + (isOnDash ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
         '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
         '<div class="widget-modal-controls">' +
-            '<button class="widget-ctrl-btn widget-stop-btn" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+            // data-widget-id is the hook toggleWidgetRunning's refresh loop matches
+            // on ('.widget-stop-btn[data-widget-id="..."]', :276). Without it this chat
+            // fullscreen twin was the only .widget-stop-btn in the app the loop could
+            // not find - the dashboard expand-modal twin (ui/070-dashboard-ui.js:97)
+            // has always carried it.
+            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
             dashBtn +
             '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen()" title="Print">' + UI_ICONS.printer + '</button>' +
             '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
             '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="Open in New Tab">' + UI_ICONS.externalLink + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="Edit Code">' + UI_ICONS.edit + '</button>' +
+            '<button class="widget-ctrl-btn widget-panel-btn" onclick="openWidgetInIframePanel(\'' + widget.id + '\')" title="Open in Side Panel">' + UI_ICONS.panelRight + '</button>' +
+            '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
+            // Manual code editor (editWidgetCode -> saveWidgetCodeEdit), alongside the
+            // agent-edit button. closeWidgetFullscreen() FIRST is load-bearing, not
+            // cosmetic: the editor overlay is a .widget-modal-overlay at
+            // --z-widget-modal (10002) while this one sits at --z-fullscreen (10003)
+            // (css/00-tokens.css:174-175), so leaving it open would bury the editor
+            // behind this backdrop and desync the Escape order (core/120-init.js:209-211).
+            '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="Edit code">' + UI_ICONS.code + '</button>' +
             '<button class="widget-close-btn" onclick="closeWidgetFullscreen()">' + UI_ICONS.close + '</button>' +
         '</div>';
     
@@ -416,7 +484,12 @@ function printWidgetFullscreen() {
     if (!widget || !widget.html) return;
     var win = window.open('', '_blank');
     if (!win) return;
-    win.document.write(widget.html);
+    // Route the print window through the token injection too, otherwise every
+    // var(--...) in a token-based widget resolves to nothing on paper. This is a
+    // plain window.open document that never receives data-appagent-theme, so the
+    // LIGHT set applies regardless of the app theme - which is what you want for
+    // print. typeof-guarded because injectWidgetTokens lives in the ui tier.
+    win.document.write(typeof injectWidgetTokens === 'function' ? injectWidgetTokens(widget.html) : widget.html);
     win.document.close();
     win.focus();
     setTimeout(function() { win.print(); }, 500);
@@ -532,7 +605,18 @@ async function saveWidgetCodeEdit(widgetId) {
     var widget = getWidgetById(widgetId);
     if (!widget) { showSnackbar('Widget not found', 'error'); return; }
     
+    var _prevHtml = widget.html;
     widget.html = editor.value;
+    // Bump the monotonic content version on every html change, exactly like the
+    // AGENT edit path (tools/010-iframe-tool.js:906). take_screenshot cannot
+    // rasterize the widget's sandboxed cross-origin iframe, so it re-renders the
+    // widget in a temp tab via the ?widget= deep link and only accepts the frame
+    // whose broadcast contentVersion matches the one it requested
+    // (tools/060-take-screenshot.js:265 + :353). Without this bump a screenshot
+    // taken right after a MANUAL code edit can be satisfied by a stale frame.
+    // contentVersion is in DASHBOARD_CONTENT_FIELDS (ui/020-dashboard.js:45), so
+    // the saveDashboardWidget merge below persists it for dashboard copies too.
+    widget.contentVersion = (widget.contentVersion || 0) + 1;
     widget.updatedAt = Date.now();
     
     // Save to appropriate store.
@@ -541,21 +625,94 @@ async function saveWidgetCodeEdit(widgetId) {
     // viewing chat B previously updated chat B's array (or no-op'd if B had no
     // widget array of its own).
     if (dashboardWidgets[widgetId]) {
-        await saveDashboardWidget(widget);
+        // PLACEMENT: saveDashboardWidget MERGES the content fields onto the
+        // existing dashboard record (ui/020-dashboard.js DASHBOARD_CONTENT_FIELDS)
+        // instead of replacing it, so gridX/gridY/dashboard/prompt and the NUMERIC
+        // grid width/height survive even though `widget` here is usually the CHAT
+        // copy, which has none of them. _prevHtml is passed because the record may
+        // BE `widget` (a dashboard-only widget resolved by getWidgetById's
+        // dashboard fallback at :199): the in-place edit above would otherwise
+        // defeat the history diff.
+        await saveDashboardWidget(widget, false, _prevHtml);
     }
+    // CACHE-DETACH: write through to the owning chat's LIVE widgets array.
+    // `chatWidgets` only caches the array REFERENCE (:87, :179, :201) and goes
+    // DETACHED as soon as an SW chat-snapshot replaces the chat wholesale —
+    // app/045-agent-port-bridge-page.js:550 `chats[chatId] = _inChat` (a
+    // structured-clone with a brand-new array; its merge guards re-point
+    // versionHistory and carry pending rows/meta, but NOT `widgets`). Writing only
+    // into the cache therefore persisted NOTHING, because saveChatsToStorage
+    // serialises `chats` (ui/070-dashboard-ui.js:1969), and the old
+    // `if (chatWidgets[owningChatId])` guard skipped the save ENTIRELY when the
+    // owning chat had never been visited in this panel session. The agent route
+    // already writes the live array (tools/010-iframe-tool.js:913-914); this is
+    // the manual "edit widget code" route.
     var owningChatId = widget.chatId || currentChatId;
-    if (chatWidgets[owningChatId]) {
-        var idx = chatWidgets[owningChatId].findIndex(function(w) { return w.id === widgetId; });
-        if (idx >= 0) {
-            chatWidgets[owningChatId][idx] = widget;
-            await saveChatsToStorage();
+    var _holdsWidget = function(c) {
+        return !!(c && Array.isArray(c.widgets)
+            && c.widgets.some(function(w) { return w && w.id === widgetId; }));
+    };
+    var _owningChat = owningChatId ? chats[owningChatId] : null;
+    // widget.chatId is stamped at creation (:77), but legacy/imported widgets
+    // predate it and currentChatId is null outside a chat view
+    // (core/030-config.js:450) — so when the declared owner does not hold this id,
+    // fall back to the live chat that actually does.
+    if (!_holdsWidget(_owningChat)) {
+        var _cIds = Object.keys(chats);
+        for (var _ci = 0; _ci < _cIds.length; _ci++) {
+            if (_holdsWidget(chats[_cIds[_ci]])) {
+                owningChatId = _cIds[_ci];
+                _owningChat = chats[owningChatId];
+                break;
+            }
         }
+        // A DASHBOARD-ONLY widget (source chat deleted — resolvable only since
+        // getWidgetById gained its dashboardWidgets fallback at :199) has no chat
+        // home. Without this, the block below would graft it into whatever chat
+        // happens to be in view (chats[currentChatId]) and it would start
+        // rendering there. The dashboard write above is its durable copy.
+        if (!_holdsWidget(_owningChat) && dashboardWidgets[widgetId] === widget) {
+            _owningChat = null;
+        }
+    }
+    var _savedToChat = false;
+    if (_owningChat) {
+        if (!Array.isArray(_owningChat.widgets)) _owningChat.widgets = [];
+        var idx = _owningChat.widgets.findIndex(function(w) { return w && w.id === widgetId; });
+        if (idx !== -1) _owningChat.widgets[idx] = widget;
+        else _owningChat.widgets.push(widget);
+        chatWidgets[owningChatId] = _owningChat.widgets;   // re-point the stale cache
+        // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms' save
+        // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2035,
+        // worker/115-storage.js:178) and the page loader flags every chat outside
+        // the newest KEEP_HYDRATED chats, so the await below would otherwise commit
+        // NOTHING and the edit would be lost on reload. Same pattern as
+        // tools/100-prompt-user.js; ensureChatPayloads never rejects and is a no-op
+        // when the flag is clear. Never `delete _owningChat._payloadsEvicted` by
+        // hand — extractChatPayloadsForPut would put a payload-STRIPPED record and
+        // destroy a legacy-inline row's only durable base64
+        // (core/130-indexeddb.js:887-937).
+        if (_owningChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            try { await ensureChatPayloads(owningChatId); } catch (e) {}
+        }
+        await saveChatsToStorage();
+        _savedToChat = true;
+    } else {
+        // No live chat holds this widget: the pre-fix code fell through silently and
+        // still told the user "Widget saved" for an edit that was never persisted.
+        console.warn('[widgets] saveWidgetCodeEdit: no owning chat for ' + widgetId
+            + ' — chat edit NOT persisted (dashboard copy: '
+            + !!dashboardWidgets[widgetId] + ')');
     }
     
     closeWidgetCodeEdit();
     renderMessages();
-    renderDashboard();
-    showSnackbar('Widget saved', 'success');
+    refreshVisibleDashboards();
+    if (_savedToChat || dashboardWidgets[widgetId]) {
+        showSnackbar('Widget saved', 'success');
+    } else {
+        showSnackbar('Widget updated in memory only — no owning chat found', 'error');
+    }
 }
 
 function openWidgetModal(widgetId) {
@@ -623,15 +780,15 @@ function renderWidgetSidebar() {
     var html = '';
     widgets.forEach(function(widget) {
         var isOnDashboard = dashboardWidgets && dashboardWidgets[widget.id];
-        var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn on-dashboard' : 'widget-sidebar-btn';
-        var dashboardBtnTitle = isOnDashboard ? 'Remove from Dashboard' : 'Add to Dashboard';
+        var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn widget-dashboard-btn on-dashboard' : 'widget-sidebar-btn widget-dashboard-btn';
+        var dashboardBtnTitle = isOnDashboard ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026';
         var dashboardBtnIcon = isOnDashboard ? UI_ICONS.pinFilled : UI_ICONS.pin;
         html += '<div class="widget-sidebar-item" onclick="scrollToWidget(\'' + widget.id + '\')">' +
             '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
             '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
             '<div class="widget-sidebar-actions">' +
             '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Show in Panel">' + UI_ICONS.panelRight + '</button>' +
-            '<button class="' + dashboardBtnClass + '" onclick="event.stopPropagation();toggleWidgetOnDashboard(\'' + widget.id + '\')" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
+            '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
             '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
             '</div>' +
         '</div>';
@@ -655,6 +812,64 @@ function scrollToWidget(widgetId) {
     }
 }
 
+// Open a widget from a clickable ID chip in chat text (.id-mention-widget,
+// emitted by decorateIdMentions in ui/250-message-render.js). scrollToWidget is
+// the right default: it scrolls+highlights the inline card when that widget is
+// rendered in the message list on screen, and falls back to openWidgetModal
+// (:592) otherwise — e.g. an ID the user pasted from another chat.
+function openWidgetMention(widgetId, event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    if (!widgetId) return;
+    // Resolve FIRST: scrollToWidget -> openWidgetModal silently returns on an
+    // unknown id, which would look like a dead chip. Toast instead.
+    var widget = getWidgetById(widgetId);
+    if (!widget) {
+        if (typeof showSnackbar === 'function') showSnackbar('Widget ' + widgetId + ' not found', 'error');
+        else console.warn('[openWidgetMention] widget not found: ' + widgetId);
+        return;
+    }
+    scrollToWidget(widgetId);
+}
+
+// Edit a widget with the agent: opens a FRESH chat with the composer prefilled
+// with the widget id, so the user only has to type what they want changed.
+// Shared by the inline chat widget (card + fullscreen modal) and the dashboard
+// widget (card + fullscreen modal).
+function editWidgetWithAgent(widgetId, event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    if (!widgetId) return;
+
+    // The click can come from inside a modal — close any widget overlay first so
+    // the chat composer is actually visible. The inline fullscreen
+    // (closeWidgetFullscreen) and the dashboard fullscreen (closeExpandedWidget)
+    // share #widget-fullscreen-overlay; both calls are no-ops when it is absent.
+    if (typeof closeWidgetFullscreen === 'function') closeWidgetFullscreen();
+    if (typeof closeExpandedWidget === 'function') closeExpandedWidget();
+    if (typeof closeWidgetModal === 'function') closeWidgetModal();
+
+    // newChat() switches away from the dashboard/home/skills/settings view
+    // (closeDashboardView/closeHomeView call showChatView()) and clears
+    // #message-input at the end — so the prefill MUST happen after it.
+    newChat();
+
+    var input = document.getElementById('message-input');
+    if (input) {
+        // Newline (not a trailing space) after the colon: the user's edit request
+        // starts on line 2. autoResizeTextarea below runs AFTER the value is set so
+        // the textarea grows to 2 rows, and setSelectionRange puts the caret there.
+        input.value = 'Edit widget ' + widgetId + ':\n';
+        if (typeof autoResizeTextarea === 'function') autoResizeTextarea(input);
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
+}
+
 function getWidgetHtmlForMessage(msgIndex) {
     var widgets = getWidgetsForChat(currentChatId);
     var msgWidgets = widgets.filter(function(w) { return w.msgIndex === msgIndex; });
@@ -663,44 +878,17 @@ function getWidgetHtmlForMessage(msgIndex) {
     
     var html = '';
     msgWidgets.forEach(function(widget) {
-        var isOnDashboard = dashboardWidgets[widget.id] ? true : false;
-        var dashboardBtn = isOnDashboard 
-            ? '<button class="widget-ctrl-btn widget-dashboard-btn on-dashboard" onclick="removeWidgetFromDashboard(\'' + widget.id + '\', event)" title="Remove from Dashboard">' + UI_ICONS.pinFilled + '</button>'
-            : '<button class="widget-ctrl-btn widget-dashboard-btn" onclick="addWidgetToDashboard(\'' + widget.id + '\', event)" title="Add to Dashboard">' + UI_ICONS.pin + '</button>';
-        
-        var isCollapsed = widget.collapsed;
-        var collapsedClass = isCollapsed ? ' collapsed' : '';
-        var expandIcon = isCollapsed
-            ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>'
-            : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 14h6v6M14 4h6v6M10 14l-7 7M21 3l-7 7"/></svg>';
-        var expandTitle = isCollapsed ? 'Expand' : 'Collapse';
-        html += '<div class="widget-inline' + collapsedClass + '" id="widget-' + widget.id + '" data-widget-id="' + widget.id + '">' +
+        html += '<div class="widget-inline" id="widget-' + widget.id + '" data-widget-id="' + widget.id + '">' +
             '<div class="widget-header">' +
                 '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-controls">' +
-                    dashboardBtn +
-                    '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event)" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' +
-                        (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) +
-                    '</button>' +
-                    '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetCode(\'' + widget.id + '\')" title="Edit Code">' +
-                        UI_ICONS.edit +
-                    '</button>' +
-                    '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' +
-                        UI_ICONS.camera +
-                    '</button>' +
-                    '<button class="widget-ctrl-btn widget-panel-btn" onclick="openWidgetInIframePanel(\'' + widget.id + '\')" title="Open in New Tab">' +
-                        UI_ICONS.panelRight +
-                    '</button>' +
-                    '<button class="widget-ctrl-btn widget-expand-btn" onclick="toggleChatWidgetExpand(\'' + widget.id + '\', event)" title="' + expandTitle + '">' +
-                        expandIcon +
-                    '</button>' +
-                    '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="Fullscreen">' +
+                    '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="Expand">' +
                         UI_ICONS.maximize +
                     '</button>' +
                 '</div>' +
             '</div>' +
-            '<div class="widget-content' + collapsedClass + '" id="widget-content-' + widget.id + '"></div>' +
+            '<div class="widget-content" id="widget-content-' + widget.id + '"></div>' +
         '</div>';
     });
     

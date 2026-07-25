@@ -718,15 +718,15 @@ function renderVersionSidebar() {
         html += '<div id="widget-sidebar-list" class="widget-sidebar-list">';
         widgets.forEach(function(widget) {
             var isOnDashboard = dashboardWidgets && dashboardWidgets[widget.id];
-            var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn on-dashboard' : 'widget-sidebar-btn';
-            var dashboardBtnTitle = isOnDashboard ? 'Remove from Dashboard' : 'Add to Dashboard';
+            var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn widget-dashboard-btn on-dashboard' : 'widget-sidebar-btn widget-dashboard-btn';
+            var dashboardBtnTitle = isOnDashboard ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026';
             var dashboardBtnIcon = isOnDashboard ? UI_ICONS.pinFilled : UI_ICONS.pin;
             html += '<div class="widget-sidebar-item" onclick="scrollToWidget(\'' + widget.id + '\')">' +
                 '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-sidebar-actions">' +
                 '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Show in Panel">' + UI_ICONS.panelRight + '</button>' +
-                '<button class="' + dashboardBtnClass + '" onclick="event.stopPropagation();toggleWidgetOnDashboard(\'' + widget.id + '\')" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
+                '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
                 '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
                 '</div>' +
             '</div>';
@@ -831,7 +831,7 @@ function renderVersionSidebar() {
             html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
             html += '<div class="sn-artifact-content">';
             html += '<div class="sn-artifact-name">' + escapeHtml(file.displayName) + '</div>';
-            html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') ' + statusBadge + changesBadge + '</div>';
+            html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') ' + statusBadge + changesBadge + (file.worker ? ' <span class="wsf-ws" title="Edited by worker ' + escapeHtml(file.worker) + '">' + escapeHtml(file.worker) + '</span>' : '') + '</div>';
             html += '</div>';
             html += '<div class="sn-artifact-actions-row">';
             // View diff button
@@ -932,17 +932,11 @@ async function redoFileChanges(versionSysId, table, sysId, displayName) {
         hideSpinner();
 
         if (result.success) {
-            // Un-invalidate the original changes
-            versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId && v.action !== 'REVERT') {
-                    versionHistory[idx].invalidated = false;
-                }
-            });
-
-            // Remove the revert entry (or mark it as undone)
-            versionHistory = versionHistory.filter(function(v) {
-                return !(v.table === table && v.sysId === sysId && v.chatId === currentChatId && v.action === 'REVERT');
-            });
+            // Un-invalidate the original changes and drop the REVERT entry —
+            // across the active chat AND its sub-agent chats (the entries may
+            // be owned by a sub chat, see getVersionHistorySources).
+            setRecordEntriesInvalidated(table, sysId, false);
+            removeRevertEntriesForRecord(table, sysId);
 
             saveVersionHistory();
             renderVersionSidebar();
@@ -990,16 +984,10 @@ async function redoAllChanges() {
             var result = await uploadXml(xml, file.table, file.sysId);
             if (result.success) {
                 successCount++;
-                // Un-invalidate entries for this file
-                versionHistory.forEach(function(v, idx) {
-                    if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && v.action !== 'REVERT') {
-                        versionHistory[idx].invalidated = false;
-                    }
-                });
-                // Remove revert entries for this file
-                versionHistory = versionHistory.filter(function(v) {
-                    return !(v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && v.action === 'REVERT');
-                });
+                // Un-invalidate entries + drop REVERT markers for this file —
+                // across the active chat and its sub-agent chats.
+                setRecordEntriesInvalidated(file.table, file.sysId, false);
+                removeRevertEntriesForRecord(file.table, file.sysId);
             } else {
                 errors.push(file.displayName + ': ' + result.error);
             }
@@ -1038,12 +1026,10 @@ async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
         hideSpinner();
         
         if (result.success) {
-            // Mark all entries for this file as invalidated
-            versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId) {
-                    versionHistory[idx].invalidated = true;
-                }
-            });
+            // Mark all entries for this file as invalidated — across the
+            // active chat and its sub-agent chats (the owning chat may be a
+            // sub chat whose artifact rolled up into this sidebar).
+            setRecordEntriesInvalidated(table, sysId, true);
             
             // Add revert entry
             addVersionHistoryEntry({
@@ -1107,11 +1093,7 @@ async function revertAllChanges() {
                 });
                 
                 if (res.ok || res.status === 204) {
-                    versionHistory.forEach(function(v, idx) {
-                        if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId) {
-                            versionHistory[idx].invalidated = true;
-                        }
-                    });
+                    setRecordEntriesInvalidated(file.table, file.sysId, true);
                     successCount++;
                 } else {
                     failCount++;
@@ -1126,11 +1108,7 @@ async function revertAllChanges() {
                 
                 var result = await uploadXml(xml, file.table, file.sysId);
                 if (result.success) {
-                    versionHistory.forEach(function(v, idx) {
-                        if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId) {
-                            versionHistory[idx].invalidated = true;
-                        }
-                    });
+                    setRecordEntriesInvalidated(file.table, file.sysId, true);
                     successCount++;
                 } else {
                     failCount++;

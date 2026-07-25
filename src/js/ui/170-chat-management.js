@@ -113,6 +113,11 @@ async function fetchCredits() {
             }
             if (displayText) {
                 appStorage.setItem('cachedCredits', displayText);
+                // Refresh the home Credits stat card now that the cache changed —
+                // renderHome() only calls updateHomeCredits() synchronously with the
+                // stale cache, so a cold cache showed '—' until a full re-render.
+                // updateHomeCredits null-guards its element (no-op off-home).
+                if (typeof updateHomeCredits === 'function') { try { updateHomeCredits(); } catch (e) {} }
                 var creditHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + displayText;
                 if (creditsEl) { creditsEl.innerHTML = creditHtml; creditsEl.className = cssClass; creditsEl.title = creditTitle; creditsEl.style.display = ''; }
                 if (homeCreditsEl) { homeCreditsEl.innerHTML = creditHtml; homeCreditsEl.className = cssClass; homeCreditsEl.title = creditTitle; homeCreditsEl.style.display = ''; }
@@ -181,6 +186,9 @@ async function fetchCredits() {
         if (!displayText) return;
 
         appStorage.setItem('cachedCredits', displayText);
+        // Same as the OAuth path above: push the fresh value into the home
+        // Credits stat card (null-guarded no-op when home isn't rendered).
+        if (typeof updateHomeCredits === 'function') { try { updateHomeCredits(); } catch (e) {} }
         var creditHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + displayText;
 
         if (creditsEl) {
@@ -981,6 +989,25 @@ function updateChatTitleHeader(includeToolCallId) {
         titleEl.textContent = '';
     }
 
+    // Header pin button — mirrors the current chat's pinned flag (same flag
+    // the sidebar ⋯ menu and History cards toggle via togglePinChat). Filled
+    // + always-visible when pinned; outline + hover-revealed (CSS) when not.
+    // Hidden entirely when no chat is open (fresh New Chat before a message).
+    var pinBtn = document.getElementById('header-pin-btn');
+    if (pinBtn) {
+        if (chat) {
+            pinBtn.style.display = '';
+            pinBtn.innerHTML = chat.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin;
+            pinBtn.classList.toggle('pinned', !!chat.pinned);
+            var pinTip = chat.pinned ? 'Unpin chat' : 'Pin chat';
+            pinBtn.title = pinTip;
+            pinBtn.setAttribute('aria-label', pinTip);
+            pinBtn.setAttribute('aria-pressed', chat.pinned ? 'true' : 'false');
+        } else {
+            pinBtn.style.display = 'none';
+        }
+    }
+
     // Keep the sub-agent self card (parent-link + live worker card above the
     // messages scroller) in sync — this runs on every chat switch and header
     // refresh, which is exactly when the card must appear/disappear.
@@ -1066,6 +1093,10 @@ function togglePinChat(chatId) {
     }
     renderChatList();
     renderVersionSidebar();
+    // #720: pinning the CURRENTLY OPEN chat from the sidebar dropdown / History /
+    // Jobs rows must repaint the header pin button too (filled vs outline) —
+    // same follow-up togglePinCurrentChat performs (ui/210-chat-menus.js:43).
+    if (chatId === currentChatId) updateChatTitleHeader();
 }
 
 function deleteChatFromSidebar() {

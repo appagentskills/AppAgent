@@ -33,32 +33,57 @@ async function loadDashboardWidgets() {
     }
 }
 
-async function saveDashboardWidget(widget, skipHistory) {
+// Content fields a caller may push onto an EXISTING dashboard record. Anything
+// NOT listed here — gridX, gridY, width, height, zIndex, order, dashboard,
+// prompt, conversation, history, createdAt — is dashboard-owned PLACEMENT and
+// must survive the write. saveWidgetCodeEdit (tools/080-widget-tools.js:585)
+// hands us the CHAT copy of a pinned widget, which has no grid placement at all
+// and stores width/height as CSS strings ('100%' / '400px') rather than grid
+// spans; the old `dashboardWidgets[widget.id] = widget` replaced the record
+// wholesale, which relocated Home-pinned widgets to the Dashboard page and
+// produced 'grid-column: NaN / span 100%'.
+var DASHBOARD_CONTENT_FIELDS = ['html', 'title', 'error', 'chatId', 'msgIndex', 'contentVersion', 'deactivated'];
+
+// prevHtml (optional): the pre-edit HTML, for callers that mutate the dashboard
+// record IN PLACE before saving — the history diff below compares against the
+// stored record, which in that case already holds the NEW html.
+async function saveDashboardWidget(widget, skipHistory, prevHtml) {
     try {
-        widget.updatedAt = Date.now();
+        var existing = dashboardWidgets[widget.id];
+        var basisHtml = (prevHtml === undefined || prevHtml === null)
+            ? (existing ? existing.html : null)
+            : prevHtml;
+        // MERGE, don't replace (see DASHBOARD_CONTENT_FIELDS above).
+        var target = widget;
+        if (existing && existing !== widget) {
+            DASHBOARD_CONTENT_FIELDS.forEach(function(k) {
+                if (widget[k] !== undefined) existing[k] = widget[k];
+            });
+            target = existing;
+        }
+        target.updatedAt = Date.now();
         
         // Track HTML history (max 10 versions)
-        if (!skipHistory && widget.html) {
-            var oldWidget = dashboardWidgets[widget.id];
-            if (oldWidget && oldWidget.html && oldWidget.html !== widget.html) {
-                if (!widget.history) widget.history = [];
-                widget.history.push({
-                    html: oldWidget.html,
+        if (!skipHistory && target.html) {
+            if (basisHtml && basisHtml !== target.html) {
+                if (!target.history) target.history = [];
+                target.history.push({
+                    html: basisHtml,
                     timestamp: Date.now(),
-                    prompt: oldWidget.lastPrompt || ''
+                    prompt: target.lastPrompt || ''
                 });
                 // Keep only last 10 versions
-                if (widget.history.length > 10) {
-                    widget.history = widget.history.slice(-10);
+                if (target.history.length > 10) {
+                    target.history = target.history.slice(-10);
                 }
             }
         }
-        widget.lastPrompt = widget.prompt;
+        target.lastPrompt = target.prompt;
         
-        dashboardWidgets[widget.id] = widget;
+        dashboardWidgets[target.id] = target;
         
         // Create a copy without transient state for storage
-        var widgetToSave = Object.assign({}, widget);
+        var widgetToSave = Object.assign({}, target);
         delete widgetToSave.isLoading;
         delete widgetToSave.isStreaming;
 
@@ -92,6 +117,29 @@ async function deleteDashboardWidget(widgetId) {
     } catch (e) {
         console.error('Failed to delete dashboard widget:', e);
     }
+}
+
+// --- Multi-dashboard helpers ('main' = dashboard page, 'home' = home page) ---
+// Records without a `dashboard` field are legacy → 'main' (no migration needed).
+function widgetDashboardOf(widget) {
+    return (widget && widget.dashboard === 'home') ? 'home' : 'main';
+}
+
+function dashboardWidgetsFor(dashboard) {
+    var target = dashboard === 'home' ? 'home' : 'main';
+    return Object.values(dashboardWidgets).filter(function(w) { return widgetDashboardOf(w) === target; });
+}
+
+function dashboardGridEl(dashboard) {
+    return document.getElementById(dashboard === 'home' ? 'home-dashboard-grid' : 'dashboard-grid');
+}
+
+// Re-render whichever dashboard surfaces are currently visible.
+function refreshVisibleDashboards() {
+    var dashboardPanel = document.getElementById('dashboard-panel');
+    if (dashboardPanel && dashboardPanel.style.display === 'flex') renderDashboard('main');
+    var homePanel = document.getElementById('home-panel');
+    if (homePanel && homePanel.style.display !== 'none' && typeof renderHomeDashboard === 'function') renderHomeDashboard();
 }
 
 function generateWidgetId() {

@@ -895,7 +895,9 @@ async function _executeIframeToolImpl(args) {
                     return { success: false, error: 'Edit failed', validationErrors: editResult.messages };
                 }
                 
-                // Update widget HTML
+                // Update widget HTML (keep the pre-edit html: saveDashboardWidget's
+                // history diff needs it when the record IS `widget`, see below)
+                var _prevHtml = widget.html;
                 widget.html = editResult.content;
                 // Bump a monotonic content version whenever the HTML changes. The
                 // widget runs in a cross-origin (sandboxed, opaque-origin) iframe,
@@ -904,14 +906,74 @@ async function _executeIframeToolImpl(args) {
                 // deep link on this version (see 060-take-screenshot.js) guarantees a
                 // fresh render after edit_html instead of a stale cached frame.
                 widget.contentVersion = (widget.contentVersion || 0) + 1;
+                widget.updatedAt = Date.now();
                 
-                // Persist changes
-                var chat = chats[widget.chatId || currentChatId];
-                if (chat && chat.widgets) {
+                // DASHBOARD COPY (#737): a pinned widget's dashboard record is a
+                // SEPARATE object in its own store — update it through the same
+                // merge path the manual editor uses (tools/080-widget-tools.js:627-637).
+                // saveDashboardWidget MERGES DASHBOARD_CONTENT_FIELDS onto the existing
+                // record so grid placement survives; _prevHtml keeps the history diff
+                // working when the record IS `widget` (a dashboard-only widget resolved
+                // by getWidgetById's dashboardWidgets fallback, tools/080-widget-tools.js:229).
+                if (typeof dashboardWidgets !== 'undefined' && dashboardWidgets[widgetId]
+                    && typeof saveDashboardWidget === 'function') {
+                    try { await saveDashboardWidget(widget, false, _prevHtml); } catch (e) {}
+                }
+                
+                // Persist changes into the OWNING chat — mirror saveWidgetCodeEdit
+                // (tools/080-widget-tools.js:650-677): resolve the chat that actually
+                // HOLDS the widget (widget.chatId is stamped at creation, but legacy
+                // widgets predate it and the declared owner may be gone), push-if-
+                // missing, and for a DASHBOARD-ONLY widget (source chat deleted) skip
+                // the chat write — the dashboard write above is its durable copy —
+                // instead of silently dropping the edit while reporting success (#737).
+                var _owningChatId = widget.chatId || currentChatId;
+                var _holdsWidget = function(c) {
+                    return !!(c && Array.isArray(c.widgets)
+                        && c.widgets.some(function(w) { return w && w.id === widgetId; }));
+                };
+                var chat = _owningChatId ? chats[_owningChatId] : null;
+                if (!_holdsWidget(chat)) {
+                    var _cIds = Object.keys(chats);
+                    for (var _ci = 0; _ci < _cIds.length; _ci++) {
+                        if (_holdsWidget(chats[_cIds[_ci]])) {
+                            _owningChatId = _cIds[_ci];
+                            chat = chats[_owningChatId];
+                            break;
+                        }
+                    }
+                    if (!_holdsWidget(chat) && typeof dashboardWidgets !== 'undefined'
+                        && dashboardWidgets[widgetId] === widget) {
+                        chat = null;
+                    }
+                }
+                if (chat) {
+                    if (!Array.isArray(chat.widgets)) chat.widgets = [];
                     var idx = chat.widgets.findIndex(function(w) { return w.id === widgetId; });
                     if (idx !== -1) {
                         chat.widgets[idx].html = widget.html;
                         chat.widgets[idx].contentVersion = widget.contentVersion;
+                        chat.widgets[idx].updatedAt = widget.updatedAt;
+                    } else {
+                        chat.widgets.push(widget);
+                    }
+                    // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms'
+                    // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2011,
+                    // worker/115-storage.js:178), and the page loader flags every chat
+                    // outside the newest 8 (ui/070-dashboard-ui.js:1804-1815). Without this
+                    // the await below commits NOTHING for a cross-chat / non-recent owning
+                    // chat and the edit is lost on reload. Must run AFTER the mutation above
+                    // and immediately BEFORE the save: hydration awaits, so doing it earlier
+                    // lets an SW chat-snapshot replace (app/045-agent-port-bridge-page.js:550)
+                    // land mid-await and leave `chat` dangling; doing it after the save is
+                    // useless because the put has already been skipped.
+                    // Same pattern as tools/100-prompt-user.js:267-278 and
+                    // ui/170-chat-management.js:1086-1093. ensureChatPayloads never rejects
+                    // and is a cheap no-op when the flag is clear; never clear
+                    // _payloadsEvicted by hand — extractChatPayloadsForPut would then put a
+                    // stripped record and destroy a legacy-inline row's only durable base64.
+                    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                        try { await ensureChatPayloads(_owningChatId); } catch (e) {}
                     }
                     // Await the IndexedDB commit: a take_screenshot(widget) that runs
                     // right after this edit deep-links a temp tab that reads the widget
@@ -920,6 +982,11 @@ async function _executeIframeToolImpl(args) {
                     // never matches the capture guard, and falls back to a stale frame
                     // after the 5s safety-net.
                     await saveChatsToStorage();
+                } else if (typeof dashboardWidgets === 'undefined' || !dashboardWidgets[widgetId]) {
+                    // No chat holds it and it has no dashboard record: the edit is
+                    // in-memory only. Same loud warn as saveWidgetCodeEdit's no-home path.
+                    console.warn('[iframe-tool] edit_html: no owning chat or dashboard record for '
+                        + widgetId + ' — edit NOT persisted');
                 }
                 
                 // Refresh inline widget if visible

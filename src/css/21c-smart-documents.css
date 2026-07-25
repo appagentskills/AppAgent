@@ -64,6 +64,9 @@
 .sdoc-prompt-item { background: var(--bg-secondary); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); padding: var(--space-6); margin-bottom: var(--space-4); }
 .sdoc-prompt-item.answered { border-left: 3px solid var(--success); }
 .sdoc-prompt-item-title { font-weight: var(--font-semibold); color: var(--text-primary); margin-bottom: var(--space-3); }
+/* Prompt description renders MARKDOWN (formatContent) inside a .markdown-body
+   container — block rules (paragraph margins, lists, blockquotes) come from
+   07-markdown.css; code.inline-code / .code-block are global. */
 .sdoc-prompt-item-desc { font-size: var(--text-body-sm); color: var(--text-secondary); margin-bottom: var(--space-5); }
 .sdoc-prompt-form { display: flex; flex-direction: column; gap: var(--space-4); }
 .sdoc-prompt-field { display: flex; flex-direction: column; gap: var(--space-2); }

@@ -387,6 +387,7 @@ function sdocRender(doc) {
     }
     html += '</select>';
     html += '<button class="sdoc-action-btn" onclick="sdocToggleEdit(\'' + escDisplay(docId) + '\')" title="Edit">' + UI_ICONS.edit + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="editDocumentWithAgent(\'' + escDisplay(docId) + '\', event)" title="Edit with agent">' + UI_ICONS.agentEdit + '</button>';
     html += '<button class="sdoc-action-btn" onclick="sdocExportMd(\'' + escDisplay(docId) + '\')" title="Copy Markdown">' + UI_ICONS.copy + '</button>';
     html += '<button class="sdoc-action-btn" onclick="sdocOpenNewTab(\'' + escDisplay(docId) + '\')" title="Open in new tab">' + UI_ICONS.expand + '</button>';
     html += '<button class="sdoc-action-btn" onclick="sdocStartChat(\'' + escDisplay(docId) + '\')" title="New chat">' + UI_ICONS.chat + '</button>';
@@ -443,7 +444,15 @@ function sdocRenderPrompt(doc, prompt) {
 
     var html = '<div class="sdoc-prompt-item ' + (answered ? 'answered' : '') + '">';
     if (prompt.title) html += '<div class="sdoc-prompt-item-title">' + escDisplay(prompt.title) + '</div>';
-    if (prompt.description) html += '<div class="sdoc-prompt-item-desc">' + escDisplay(prompt.description) + '</div>';
+    // Description is markdown — same pipeline as chat messages and the prompt_user
+    // panel (formatContent in ui/250-message-render.js escapes HTML internally);
+    // .markdown-body scopes the 07-markdown.css block rules (lists, code, links).
+    if (prompt.description) {
+        var descInner = (typeof formatContent === 'function')
+            ? formatContent(String(prompt.description))
+            : escDisplay(prompt.description);
+        html += '<div class="sdoc-prompt-item-desc markdown-body">' + descInner + '</div>';
+    }
 
     html += '<form class="sdoc-prompt-form" id="' + fid + '" onsubmit="event.preventDefault(); sdocSubmitPrompt(\'' + escDisplay(doc.id) + '\', \'' + escDisplay(pid) + '\')">';
     (prompt.fields || []).forEach(function(field) {
@@ -623,7 +632,7 @@ function sdocExportMd(docId) {
     var doc = smartDocuments[docId];
     if (!doc) return;
     var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
-    navigator.clipboard.writeText(md).then(function() { showNotification('Markdown copied to clipboard'); }).catch(function() { sdocDownloadMd(docId); });
+    navigator.clipboard.writeText(md).then(function() { showSnackbar('Markdown copied to clipboard', 'success'); }).catch(function() { sdocDownloadMd(docId); });
 }
 
 function sdocDownloadMd(docId) {
@@ -693,6 +702,47 @@ function sdocStartChat(docId) {
     }
 }
 
+// Edit a document with the agent: opens a FRESH chat with the composer prefilled
+// with the document id, so the user only has to type what they want changed.
+// Deliberate mirror of editWidgetWithAgent (tools/080-widget-tools.js:715) — same
+// wording shape ('Edit document <id>:'), same NO-auto-send contract.
+function editDocumentWithAgent(docId, event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    if (!docId) return;
+
+    // The click can come from inside the preview modal (sdocOpenPreview) — remove
+    // it so the chat composer is actually visible. No-op for an inline doc.
+    var modal = document.getElementById('sdoc-preview-modal');
+    if (modal) modal.remove();
+
+    // The doc can also be open from the Documents panel, so switch to the chat
+    // view first — same pattern as sdocStartChat above.
+    if (currentView !== 'chat') {
+        currentView = 'chat';
+        appStorage.setItem('currentView', 'chat');
+        hideAllPanels();
+        showChatView();
+    }
+
+    // newChat() clears #message-input at the end, so the prefill MUST come after it.
+    newChat();
+
+    var input = document.getElementById('message-input');
+    if (input) {
+        // Newline (not a trailing space) after the colon: the user's edit request
+        // starts on line 2. autoResizeTextarea runs AFTER the value is set so the
+        // textarea grows to 2 rows, and setSelectionRange puts the caret there.
+        // NOT auto-sent — the user types what they want changed.
+        input.value = 'Edit document ' + docId + ':\n';
+        if (typeof autoResizeTextarea === 'function') autoResizeTextarea(input);
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
+}
+
 // Attach a document reference to the input area as a pending attachment
 function sdocAttachToInput(docId) {
     var doc = smartDocuments[docId];
@@ -729,7 +779,7 @@ function sdocSubmitPrompt(docId, promptId) {
     doc.updatedAt = Date.now();
     saveDocument(doc);
     sdocReRenderAll(docId);
-    showNotification('Response saved');
+    showSnackbar('Response saved', 'success');
 }
 
 // ─── Document Preview Modal ───
@@ -767,6 +817,26 @@ function sdocOpenPreview(docId) {
     modal.tabIndex = -1;
     modal.addEventListener('keydown', function(e) { if (e.key === 'Escape') modal.remove(); });
     modal.focus();
+}
+
+// Open a document from a clickable ID chip in chat text (.id-mention-doc, emitted
+// by decorateIdMentions in ui/250-message-render.js). smartDocuments is hydrated
+// by loadAllDocuments() at startup, but a doc created by the worker (or in another
+// chat since this page loaded) may not be cached yet — hydrate from IndexedDB
+// first. loadDocumentById is async and resolves to the doc or null (never rejects:
+// its own try/catch + request.onerror both fall through to null).
+function openDocumentMention(docId, event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    if (!docId) return;
+    if (smartDocuments[docId]) { sdocOpenPreview(docId); return; }
+    loadDocumentById(docId).then(function(doc) {
+        if (doc) { sdocOpenPreview(docId); return; }
+        if (typeof showSnackbar === 'function') showSnackbar('Document ' + docId + ' not found', 'error');
+        else console.warn('[openDocumentMention] document not found: ' + docId);
+    });
 }
 
 // ─── Re-render all instances of a document ───
@@ -900,7 +970,7 @@ async function sdocDeleteFromPage(docId) {
     await deleteDocumentById(docId);
     renderDocumentsPage();
     renderVersionSidebar();
-    showNotification('Document deleted');
+    showSnackbar('Document deleted', 'success');
 }
 
 // ─── Create from Page ───

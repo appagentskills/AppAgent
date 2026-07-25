@@ -2001,9 +2001,48 @@ function getActiveActionsList() {
 // How long a chat lingers under "Active Chats" after its run stops, so a chat
 // that just finished streaming doesn't vanish from the badge instantly.
 var ACTIVE_CHAT_LINGER_MS = 5 * 60 * 1000; // 5 minutes
-// Chats younger than this always show under "Active Chats" (recent work the
-// user may want to get back to), even when idle and already seen.
-var RECENT_CHAT_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+// (REMOVED) RECENT_CHAT_WINDOW_MS -- the old "chats younger than 2 h always show
+// under Active Chats, even when idle and already seen" rule. It was only ever
+// half-applied: getActiveChatsList() admitted such chats, but the Active
+// section's re-filter dropped every one of them again, so no card was ever
+// rendered for it. This panel is a RUN MONITOR, so an idle, already-read
+// 90-minute-old chat is NOT live work -- the rule is deleted rather than
+// honoured. See getActiveChatsList() step 4.
+// Hard age cap on the UNREAD rule (_isChatUnseen). "Active Chats" is a RUN
+// MONITOR, not an inbox: an unread chat nobody has opened for a whole day is no
+// longer live work, so it stops holding a slot under Active and is reached from
+// Completed Today / History instead.
+var UNSEEN_CHAT_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Max cards rendered per HISTORICAL bucket in the shared Active-chats surfaces
+// (_jobsExpandBuckets -> expand modal + home panel). Active is deliberately
+// UNCAPPED -- it is the run monitor, so every live/blocked run must be visible.
+// Completed Today and Pinned grow without bound, so they are truncated and the
+// remainder is disclosed as a muted "+N more" in the section head.
+var JOBS_BUCKET_MAX = 20;
+// THE ONE definition of which _homeChatFilterKey() keys put a chat in the run
+// monitor's "Active" section. _homeChatFilterKey is the SINGLE classifier for
+// this whole surface: _jobsExpandBuckets() buckets by it, _homeChatsFilterBarHtml()
+// counts the pills from the SAME per-render key map, and _homeChatsApplyFilter()
+// filters on it -- so the "Active" header and the pill counts cannot disagree.
+// PRODUCT DECISION (run monitor):
+//   'active' -- live work: streaming, running sub-agents, still inside the
+//               ACTIVE_CHAT_LINGER_MS linger window, or finished-but-unread
+//               (<= UNSEEN_CHAT_MAX_AGE_MS). Obviously in.
+//   'stuck'  -- IN, deliberately: a run blocked on a tool approval, a
+//               prompt_user form, an agent 'stuck'/'needs_input' card, or the
+//               user's own Pause is the single most urgent thing a run monitor
+//               can show -- it is the only state where the run cannot advance
+//               without the user. Hiding it under "Completed Today" would make
+//               the monitor silently stall. (Argument against: it is not
+//               literally executing. Rejected -- "in flight" for a monitor means
+//               "not finished", and a blocked run is emphatically not finished.)
+//   'error'  -- IN: an unresolved failed run is open work needing triage; see
+//               getActiveChatsList() step 8, which admits errored chats forever.
+//   NOT in: 'done', 'pr_opened', 'pr_merged' -- finished runs. They live in
+//   Completed Today / Pinned. Because those three keys are excluded here, the
+//   "Done" / "PR opened" / "PR merged" pills can never count a chat that is
+//   rendered under the Active header (the bug this replaced).
+var HOME_ACTIVE_SECTION_KEYS = { active: true, stuck: true, error: true };
 // chatId -> finishedAt (ms). Populated by markChatRecentlyFinished() from the
 // runFinished / runCrashed handlers (app/036-agent-event-handlers-page.js).
 var _recentlyFinishedChats = {};
@@ -2070,9 +2109,12 @@ function _isChatLingering(chatId) {
 }
 
 // True when this chat has a FINISHED response the user hasn't opened yet (an
-// "unread" chat). Such a chat must keep showing under "Active Chats" no matter
-// how old it is — past the 5-minute linger window, even days later — until the
-// user actually views it (which sets lastViewedAt and clears the unseen flag).
+// "unread" chat). Such a chat keeps showing under "Active Chats" past the
+// 5-minute linger window — but only while its last activity is younger than
+// UNSEEN_CHAT_MAX_AGE_MS (24 h). This surface is a RUN MONITOR, not an inbox:
+// an unread chat nobody has opened for a whole day is no longer live work, so it
+// ages out of Active on its own (and stays reachable from Completed Today /
+// History). Viewing it earlier (which sets lastViewedAt) clears the flag too.
 // Mirrors the 'unseen' branch of _jobsChatState. Scoped to regular user chats:
 // background Action chats live in their own strip and sub-agents in Workers, so
 // they never qualify here (keeps them out of Active and unaffected in
@@ -2084,7 +2126,11 @@ function _isChatUnseen(chatId) {
     // is only about an idle chat with an unread response.
     if (typeof isChatBusy === 'function' && isChatBusy(chatId)) return false;
     var _lastAct = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
-    return !!(_lastAct && _lastAct > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId));
+    // 24 h age cap (UNSEEN_CHAT_MAX_AGE_MS): a stale unread chat stops holding a
+    // slot in the run monitor. Measured from the last ACTIVITY (not lastViewedAt),
+    // so re-opening an old chat can never revive it as "unread".
+    if (!_lastAct || (Date.now() - _lastAct) > UNSEEN_CHAT_MAX_AGE_MS) return false;
+    return !!(_lastAct > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId));
 }
 
 // True when this chat sits in an UNRESOLVED FAILED state: its last run ended
@@ -2092,8 +2138,9 @@ function _isChatUnseen(chatId) {
 // handler in app/036-agent-event-handlers-page.js, cleared on retry, on the
 // next run start, and by dismissChatNotifications/dismissChatFromJobs). Such a
 // chat is still open work the user needs to triage, so it must keep showing
-// under "Active Chats" regardless of age or seen-state — mirroring the
-// _isChatUnseen rule — until the error is retried, cleared, or dismissed.
+// under "Active Chats" regardless of age or seen-state — and UNLIKE the unread
+// rule, which now ages out after UNSEEN_CHAT_MAX_AGE_MS, an errored chat is
+// never aged out — until the error is retried, cleared, or dismissed.
 // Same scoping as _isChatUnseen: background Action chats and sub-agents have
 // their own surfaces and never qualify here.
 function _isChatErrored(chatId) {
@@ -2196,9 +2243,21 @@ function markChatRecentlyFinished(chatId) {
     // getActiveChatsList(). If the user is currently looking at this chat the
     // response counts as seen immediately.
     if (c) {
-        c.lastResponseAt = Date.now();
+        // MONOTONIC (phase-2 follow-up 2): the service worker also stamps this
+        // field (worker/100-agent-event-broadcast.js _swStampChatFinished), so if
+        // the two ever land out of order the later, smaller value must not move
+        // the finish time backwards -- that would shorten the linger window and
+        // the unread age cap.
+        c.lastResponseAt = Math.max(c.lastResponseAt || 0, Date.now());
         // A re-run un-hides a chat the user previously removed from the jobs list.
-        if (c._jobsHidden) delete c._jobsHidden;
+        // Cleared to an explicit `false`, NOT deleted (phase-2 follow-up 1): the
+        // page-field merge in app/045-agent-port-bridge-page.js only preserves a
+        // page value when the incoming snapshot's field is `undefined`, so a
+        // deleted flag let the stale `true` win straight back on the next SW
+        // snapshot. A defined `false` survives the merge, and every reader tests
+        // truthiness (`if (c._jobsHidden && !c.pinned)`), so behaviour is
+        // unchanged locally while an SW-side un-hide is now expressible.
+        c._jobsHidden = false;
         if (_isChatViewFocused(chatId)) c.lastViewedAt = Date.now();
         if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     }
@@ -2217,12 +2276,30 @@ function markChatRecentlyFinished(chatId) {
     }, ACTIVE_CHAT_LINGER_MS + 250);
 }
 
+// Newest-activity stamp for a chat: the latest of its last response, its last
+// recorded activity, and its creation time. Drives the Active Chats ORDER --
+// creation time alone buried a chat that had just done something under newer but
+// idle ones, which is wrong for a run monitor (most recently active wins).
+function _chatActivityTs(c) {
+    if (!c) return 0;
+    return Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0, c.createdAt || 0);
+}
+
+// #743 PERF: memo for getActiveChatsList() pass 9. getChatProgressStateFor is a
+// full O(messages) walk (collectAllActionUpdates), and pass 9 ran it over EVERY
+// chat on EVERY getActiveChatsList() call — which the home panel polls ~2×/sec.
+// Keyed per chat on what actually changes the derived state: a newly executed
+// tool call appends a role:'tool' row (messages.length bumps), activity stamps
+// move (_chatActivityTs), and markChatPrMerged flips progressStateOverride.
+// Module-local and bounded: one tiny entry per live chat id; entries for
+// deleted chats are dropped in the pass itself.
+var _progressStateMemo = {};
+
 function getActiveChatsList() {
     var actionChatIds = {};
     getActiveActionsList().forEach(function(a){ if (a && a.chatId) actionChatIds[a.chatId] = true; });
     var out = [];
     var seen = {};
-    var now = Date.now();
     // NOTE: we intentionally DO NOT exclude currentChatId. The badge is a
     // truthful "active chats" indicator, so the chat you're currently viewing
     // shows here while it streams, and a previous chat still streaming after
@@ -2264,18 +2341,20 @@ function getActiveChatsList() {
         });
     }
     // 3) Chats the user hasn't caught up on (a response arrived after they last
-    //    viewed the chat — the chat in focus is always 'seen'), and
-    // 4) chats younger than RECENT_CHAT_WINDOW_MS with at least one message
-    //    (empty/temporary New Chats have nothing to show).
+    //    viewed the chat — the chat in focus is always 'seen'). Routed through
+    //    the SHARED _isChatUnseen() predicate instead of a private inline copy,
+    //    so this population (header badge + jobs dropdown) and the Active
+    //    *section* now age unread chats out at the same 24 h boundary
+    //    (UNSEEN_CHAT_MAX_AGE_MS) rather than disagreeing by design.
+    // 4) (REMOVED) "younger than RECENT_CHAT_WINDOW_MS" — see the tombstone at
+    //    the constant. It admitted idle, already-read chats that the Active
+    //    section then dropped, i.e. it only ever inflated the badge. A run
+    //    monitor does not list read, idle work, so it is deleted, not honoured.
     if (typeof chats !== 'undefined' && chats) {
         Object.keys(chats).forEach(function(cid) {
             var c = chats[cid];
             if (!c || !Array.isArray(c.messages) || !c.messages.length) return;
-            var _uLast = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
-            var unseen = !!(_uLast && _uLast > (c.lastViewedAt || 0) &&
-                (typeof _isChatViewFocused !== 'function' || !_isChatViewFocused(cid)));
-            var young = !!(c.createdAt && (now - c.createdAt) < RECENT_CHAT_WINDOW_MS);
-            if (unseen || young) consider(cid);
+            if (_isChatUnseen(cid)) consider(cid);
         });
     }
     // 5) Chats whose own agent loop has stopped but that still own a running
@@ -2313,9 +2392,49 @@ function getActiveChatsList() {
             if (_isChatErrored(cid)) consider(cid);
         });
     }
-    // Order by chat creation time, MOST RECENT FIRST, so the newest active chat
-    // sits at the top of the Active list.
-    out.sort(function(a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
+    // 9) Chats whose PROGRESS CARD is parked on the user (stuck / needs_input /
+    //    needs_permission). THE classifier (_homeChatFilterKey step 1) already
+    //    keys those 'stuck', and 'stuck' is in HOME_ACTIVE_SECTION_KEYS -- i.e.
+    //    the #743 product decision is "stuck stays in Active". Without this pass
+    //    that decision only held while the chat ALSO qualified through another
+    //    arm (running / lingering / unseen / approval / paused / errored), so a
+    //    card left on 'stuck' that the user had already read and whose linger
+    //    window had expired dropped out of the population every Active surface
+    //    is built from -- while the pill bar still counted it under "Stuck".
+    if (typeof chats !== 'undefined' && chats && typeof getChatProgressStateFor === 'function') {
+        var _liveIds = {};
+        Object.keys(chats).forEach(function(cid) {
+            _liveIds[cid] = true;
+            var _pc = chats[cid];
+            // Same scoping as consider(): background Action chats and sub-agents
+            // have their own surfaces. Checked here too so the O(messages)
+            // progress walk is skipped for them entirely.
+            if (!_pc || _pc.isBackground || _pc.isSubAgent) return;
+            // #743 PERF: reuse the memoized state while the invalidation key
+            // matches (see _progressStateMemo above for why these inputs).
+            var _ov = _pc.progressStateOverride;
+            var _mk = (Array.isArray(_pc.messages) ? _pc.messages.length : 0) + ':'
+                + _chatActivityTs(_pc) + ':' + ((_ov && _ov.state) || '');
+            var _me = _progressStateMemo[cid];
+            var _ps = null;
+            if (_me && _me.key === _mk) {
+                _ps = _me.state;
+            } else {
+                try { var _pp = getChatProgressStateFor(cid); _ps = (_pp && _pp.state) || null; } catch (e) {}
+                _progressStateMemo[cid] = { key: _mk, state: _ps };
+            }
+            if (_ps === 'stuck' || _ps === 'needs_input' || _ps === 'needs_permission') consider(cid);
+        });
+        // Bound the memo: drop entries whose chat no longer exists.
+        Object.keys(_progressStateMemo).forEach(function(cid) {
+            if (!_liveIds[cid]) delete _progressStateMemo[cid];
+        });
+    }
+    // Order by LAST ACTIVITY, MOST RECENT FIRST (see _chatActivityTs), so the
+    // chat that most recently did something sits at the top of the Active list.
+    // _jobsExpandBuckets() re-sorts pinned-first on top of this; Array#sort is
+    // stable (ES2019), so this activity order survives inside each pinned group.
+    out.sort(function(a, b) { return _chatActivityTs(b) - _chatActivityTs(a); });
     return out;
 }
 
@@ -2397,6 +2516,16 @@ function renderJobsBadge() {
     // clickable pill or dropdown row.
     var list = getActiveActionsList().filter(function(a){ return !_isOrphanActiveAction(a); });
     var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
+    // Route the population through the ONE shared section predicate
+    // (_isChatInActiveSection -> _homeChatFilterKey), the same funnel
+    // _jobsExpandBuckets():3423 uses for the Active bucket, so the header count
+    // can never drift from the list the user opens by clicking it. This is a
+    // NO-OP today -- every getActiveChatsList() admission arm classifies to an
+    // HOME_ACTIVE_SECTION_KEYS key ('active' / 'stuck' / 'error') -- and is here
+    // so a future arm added to one side cannot silently desynchronise them.
+    if (typeof _isChatInActiveSection === 'function') {
+        chatList = chatList.filter(function(_ac) { return _ac && _isChatInActiveSection(_ac.id); });
+    }
     // Lingering (recently-finished) chats count toward the visible total but must
     // NOT add a spinner or force a 'running' colour — only actively-streaming
     // chats do.
@@ -2598,10 +2727,14 @@ function renderJobsDropdown(dropdown) {
     // Active list = chats running right now, OR still inside the post-finish
     // linger window, OR with an UNREAD finished response. A just-finished chat
     // lingers here (bold if unseen) for ACTIVE_CHAT_LINGER_MS; once that window
-    // passes it KEEPS showing — regardless of age, even days old — as long as the
-    // user still hasn't opened it (_isChatUnseen). It only leaves Active when the
-    // user views it (clearing unseen) or removes it.
-    var runningChats = chatList.filter(function(_rc) { return isChatBusy(_rc.id) || _isChatLingering(_rc.id) || _isChatUnseen(_rc.id) || _isChatErrored(_rc.id) || (typeof _isChatUserPaused === 'function' && _isChatUserPaused(_rc.id)); });
+    // passes it KEEPS showing while the user still hasn't opened it — but only up
+    // to UNSEEN_CHAT_MAX_AGE_MS (24 h) after its last activity, per _isChatUnseen.
+    // It leaves Active when the user views it (clearing unread), when that 24 h
+    // window expires, or when the user removes it.
+    // Same single classifier as the home panel + expand modal
+    // (_isChatInActiveSection -> _homeChatFilterKey), so this list can no longer
+    // drift from them; it used to carry its own copy of the 5-predicate filter.
+    var runningChats = chatList.filter(function(_rc) { return _isChatInActiveSection(_rc.id); });
     // Per-row try/catch: one bad chat (corrupt state, throwing helper) must not
     // blank the whole Active list.
     var chatRowsHtml = runningChats.map(function(c) { try {
@@ -2761,6 +2894,19 @@ function _jobsChatState(chatId) {
     // A pending prompt_user form equally needs the user — same orange dot as a
     // pending approval (both are "blocked on you" conditions).
     if (typeof chatHasPendingPrompt === 'function' && chatHasPendingPrompt(chatId)) return 'attention';
+    // Card-'stuck' arm -- the SAME one THE classifier applies
+    // (_homeChatFilterKey step 1): a progress card parked on stuck /
+    // needs_input / needs_permission is blocked on the user, so it outranks the
+    // live-run arm here exactly as it does there. Without it this function had
+    // its OWN derivation that knew nothing about the card, so the home panel
+    // painted a grey 'done' dot on a chat the pill bar was simultaneously
+    // counting under "Stuck". 'attention' is this function's existing
+    // "blocked on you" key (orange .jobs-row-dot.state-attention + the
+    // "Awaiting input" row label at :2720), so no consumer needs a new state.
+    var _cardProg = null;
+    try { _cardProg = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null; } catch (e) {}
+    var _cardSt = _cardProg && _cardProg.state;
+    if (_cardSt === 'stuck' || _cardSt === 'needs_input' || _cardSt === 'needs_permission') return 'attention';
     // A run that only executes silent after-response hooks counts as finished
     // for display — the user's answer is already there (see _silentHookChats).
     var running = (typeof isChatActivelyRunning === 'function') &&
@@ -2855,7 +3001,11 @@ function getCompletedTodayChats() {
     var start = new Date(); start.setHours(0, 0, 0, 0);
     var t0 = start.getTime();
     return _jobsAllUserChats()
-        .filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id) && !_isChatErrored(c.id) && !c.pinned && _jobsChatDoneTs(c) >= t0; })
+        // Paused runs are unfinished work parked under Active Chats (see
+        // getActiveChatsList step 7 / _jobsExpandBuckets), so they must not ALSO
+        // appear here -- that rendered (and counted) the same chat twice. Guarded
+        // with typeof like the other _isChatUserPaused call sites.
+        .filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id) && !_isChatErrored(c.id) && !(typeof _isChatUserPaused === 'function' && _isChatUserPaused(c.id)) && !c.pinned && _jobsChatDoneTs(c) >= t0; })
         .sort(function(a, b) { return _jobsChatDoneTs(b) - _jobsChatDoneTs(a); });
 }
 // Pinned = chats the user pinned (chat.pinned), newest first. They surface in
@@ -3079,16 +3229,22 @@ function _jobsTodayRowHtml(c, timeW) {
 // there are no chats to show at all (keeps the dropdown clean for action-only runs).
 function _renderJobsChatTabs(activeRowsHtml, activeCount) {
     var doneChats = getDoneChatsList();
-    var todayChats = getCompletedTodayChats();
+    // #743: same Active-section dedupe as _jobsExpandBuckets' activeIds filter —
+    // a chat still in the Active section (lingering / unread / paused / stuck /
+    // errored) must not ALSO render under Completed Today.
+    var todayChats = getCompletedTodayChats().filter(function(c) { return !_isChatInActiveSection(c.id); });
     var pinnedChats = getPinnedChatsList();
     if (!activeCount && !doneChats.length && !pinnedChats.length) return '';
     var activePanel = (activeRowsHtml && activeRowsHtml.length) ? activeRowsHtml
         : '<div class="jobs-tab-empty">No chats running right now</div>';
     var pinnedHtml = '';
     // Don't duplicate a pinned chat that is ALSO in the Active list above — it
-    // already shows there (with a filled pin button). The Active list now keeps
-    // busy, lingering AND unread chats, so mirror that exact predicate here.
-    var pinnedToShow = pinnedChats.filter(function(c) { return !isChatBusy(c.id) && !_isChatLingering(c.id) && !_isChatUnseen(c.id); });
+    // already shows there (with a filled pin button). #743: use THE section
+    // classifier (_isChatInActiveSection, the same predicate the Active rows are
+    // built from at :2710) instead of a hand-rolled 3-predicate mirror that had
+    // drifted — the mirror knew nothing about errored / paused / stuck chats, so
+    // a pinned chat in one of those states rendered twice.
+    var pinnedToShow = pinnedChats.filter(function(c) { return !_isChatInActiveSection(c.id); });
     if (pinnedToShow.length) {
         var _pinW = _jobsTimeColWidth(pinnedToShow.map(_jobsHistTimeStr));
         pinnedHtml = '<div class="jobs-subhead menu-section-title jobs-subhead-pinned"><span class="section-icon">' + UI_ICONS.pin + '</span>Pinned</div>' +
@@ -3320,16 +3476,53 @@ function _refreshJobsExpandModal() {
 // (under Active). Returned in render order.
 function _jobsExpandBuckets() {
     var chatList = (typeof getActiveChatsList === 'function') ? getActiveChatsList() : [];
-    var activeChats = chatList.filter(function(c) { return isChatBusy(c.id) || _isChatLingering(c.id) || _isChatUnseen(c.id) || _isChatErrored(c.id) || (typeof _isChatUserPaused === 'function' && _isChatUserPaused(c.id)); });
+    // ONE classification per chat per render. The map is built here and handed
+    // back as `keys`, then reused VERBATIM by _homeChatsFilterBarHtml() (pill
+    // counts) and _homeChatsApplyFilter() (pill filtering): they read the very
+    // same map entry this bucketing decision was made from, so "Active" and the
+    // pills cannot disagree about a chat. It also keeps _homeChatFilterKey()'s
+    // O(messages) progress-card walk to once per chat instead of three times.
+    var keys = {};
+    function keyOf(c) {
+        if (!c || !c.id) return 'done';
+        var k = keys[c.id];
+        if (k === undefined) {
+            try { k = _homeChatFilterKey(c.id); } catch (e) { k = 'done'; }
+            keys[c.id] = k;
+        }
+        return k;
+    }
+    // Active = exactly the chats whose classifier key is in
+    // HOME_ACTIVE_SECTION_KEYS. This REPLACED a second, non-equivalent
+    // 5-predicate re-filter (busy || lingering || unseen || errored || paused)
+    // that silently dropped the young-chat rule and knew nothing about the pill
+    // keys. Every one of those five conditions now lives in the classifier.
+    var activeChats = chatList.filter(function(c) { return !!HOME_ACTIVE_SECTION_KEYS[keyOf(c)]; });
     // Pinned chats sort (stably) to the top of the Active bucket and stay there.
     activeChats.sort(function(a, b) { return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0); });
     var activeIds = {};
     activeChats.forEach(function(c) { activeIds[c.id] = true; });
-    var pinnedChats = (typeof getPinnedChatsList === 'function' ? getPinnedChatsList() : [])
+    var _pinnedAll = (typeof getPinnedChatsList === 'function' ? getPinnedChatsList() : [])
         .filter(function(c) { return !isChatBusy(c.id) && !activeIds[c.id]; });
-    var todayChats = (typeof getCompletedTodayChats === 'function') ? getCompletedTodayChats() : [];
+    // Completed Today needs the SAME activeIds dedupe as Pinned: without it a chat
+    // sitting in the Active bucket (lingering / unread / paused) was ALSO rendered
+    // as a Completed-Today card and double-counted in `total`.
+    var _todayAll = ((typeof getCompletedTodayChats === 'function') ? getCompletedTodayChats() : [])
+        .filter(function(c) { return !activeIds[c.id]; });
+    // Cap the two historical buckets (JOBS_BUCKET_MAX); Active stays UNCAPPED.
+    // The hidden remainder is disclosed as "+N more" by _jobsExpandBodyHtml.
+    var pinnedChats = _pinnedAll.slice(0, JOBS_BUCKET_MAX);
+    var todayChats = _todayAll.slice(0, JOBS_BUCKET_MAX);
+    // Classify the two historical buckets too, so `keys` covers every chat the
+    // pill bar counts (it concats all three buckets). Only the CAPPED slices are
+    // classified -- the hidden tail is never rendered or counted.
+    pinnedChats.forEach(function(c) { keyOf(c); });
+    todayChats.forEach(function(c) { keyOf(c); });
     return {
         active: activeChats, today: todayChats, pinned: pinnedChats,
+        keys: keys,
+        todayHidden: _todayAll.length - todayChats.length,
+        pinnedHidden: _pinnedAll.length - pinnedChats.length,
         total: activeChats.length + pinnedChats.length + todayChats.length
     };
 }
@@ -3340,28 +3533,37 @@ function _jobsExpandBuckets() {
 // .jobs-expand-section-cards).
 function _jobsExpandBodyHtml(buckets) {
     var activeChats = buckets.active, todayChats = buckets.today, pinnedChats = buckets.pinned;
-    function section(label, arr) {
+    function section(label, arr, hidden) {
         if (!arr.length) return '';
+        // Truncated bucket (JOBS_BUCKET_MAX): disclose the remainder as a muted
+        // "+N more" beside the count. Inline style rather than a new class -- the
+        // subhead is already a flex row and no CSS file is in scope for this fix.
+        var moreHtml = (hidden > 0)
+            ? ' <span class="jobs-expand-more" style="color:var(--text-muted);font-weight:400;text-transform:none;letter-spacing:0;">+' + hidden + ' more</span>'
+            : '';
         return '<div class="jobs-expand-section">' +
             '<div class="jobs-expand-subhead">' + escapeHtml(label) +
-                ' <span class="jobs-expand-col-count">' + arr.length + '</span></div>' +
+                ' <span class="jobs-expand-col-count">' + arr.length + '</span>' + moreHtml + '</div>' +
             '<div class="jobs-expand-section-cards">' +
                 arr.map(function(c) { try { return _jobsExpandCardHtml(c); } catch (e) { console.warn('jobs: expand card render failed', e); return ''; } }).join('') +
             '</div>' +
         '</div>';
     }
     return '<div class="jobs-expand-sections">' +
-        section('Active', activeChats) +
-        section('Completed Today', todayChats) +
-        section('Pinned', pinnedChats) +
+        section('Active', activeChats, 0) +
+        section('Completed Today', todayChats, buckets.todayHidden || 0) +
+        section('Pinned', pinnedChats, buckets.pinnedHidden || 0) +
     '</div>';
 }
 // ---- Home panel state filter (replaces the old columns/sections toggle) ----
 // Pills in the home panel head that narrow the listed chats to one progress-
 // state group. Groups map the canonical update_action_state values (see
 // ACTION_STATES / progressStateMeta / TERMINAL_PROGRESS_STATES):
-//   active -> running, waiting (live run, incl. busy chats with no card)
-//   stuck  -> stuck, needs_input, needs_permission (blocked on the user)
+//   active -> running, waiting (live run, incl. busy chats with no card), plus
+//             the run monitor's other still-open states: inside the post-finish
+//             linger window, and finished-but-unread within 24 h
+//   stuck  -> stuck, needs_input, needs_permission, pending approval / prompt,
+//             and USER-PAUSED (all "blocked on the user")
 //   pr_opened -> pr_opened
 //   pr_merged -> pr_merged (internal state set by markChatPrMerged)
 //   done   -> done, finished, finished_with_caveat (+ stopped / no card)
@@ -3383,34 +3585,92 @@ function setHomeChatsFilter(key) {
     _homeChatsPointerHeld = false; // our own repaint must not be deferred
     renderHomeActiveChats();
 }
-// Classify one chat into a filter group. Precedence: blocked-on-you
-// conditions, then a live run, then the latest progress-card state.
+// THE classifier for this surface. Returns exactly one key per chat, and that
+// key decides EVERYTHING: which section the chat is rendered under
+// (HOME_ACTIVE_SECTION_KEYS / _isChatInActiveSection), which pill counts it
+// (_homeChatsFilterBarHtml) and whether a selected pill keeps it
+// (_homeChatsApplyFilter). It replaced three non-equivalent derivations that
+// disagreed -- the old _jobsExpandBuckets()/renderJobsDropdown() 5-predicate
+// re-filters chose the population while this function chose the label, which is
+// how a chat ended up under the "Active" header being counted as "Done".
+//
+// Precedence, highest first:
+//   1 blocked on the user (approval / prompt_user / stuck-ish card / Pause) -> 'stuck'
+//   2 a live run                                                            -> 'active'
+//   3 an unresolved failure                                                 -> 'error'
+//   4 still open work for the monitor (linger window, unread <24 h)         -> 'active'
+//   5 the terminal progress card                        -> 'pr_opened' / 'pr_merged' / 'done'
 function _homeChatFilterKey(chatId) {
+    // 1) BLOCKED ON YOU. Nothing can advance until the user acts, so this
+    //    outranks everything -- including an actively "running" flag, which for
+    //    an approval-blocked or user-paused chat is a lie (isChatBusy() counts a
+    //    pending approval as busy, and a Pause keeps the loop in its abort
+    //    window). Mirrors _jobsChatState()'s attention/paused precedence.
     if ((typeof chatHasPendingApproval === 'function' && chatHasPendingApproval(chatId)) ||
         (typeof chatHasPendingPrompt === 'function' && chatHasPendingPrompt(chatId))) return 'stuck';
     var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(chatId) : null;
     var st = prog && prog.state;
     if (st === 'stuck' || st === 'needs_input' || st === 'needs_permission') return 'stuck';
-    // A live run wins over a stale non-terminal card (and over no card at all).
+    // A user-paused run is unfinished work waiting on the user to resume it
+    // (getActiveChatsList() step 7 admits it for exactly that reason). Before
+    // this arm it fell all the way through to 'done', which is why a paused chat
+    // sat under "Active" while the pills counted it as "Done".
+    if (typeof _isChatUserPaused === 'function' && _isChatUserPaused(chatId)) return 'stuck';
+    // 2) A LIVE RUN wins over a stale non-terminal card (and over no card).
     var busy = (typeof isChatBusy === 'function') && isChatBusy(chatId);
     if (busy && !isTerminalProgressState(st)) return 'active';
+    // 3) UNRESOLVED FAILURE. _isChatErrored() already lets a terminal-SUCCESS
+    //    card outrank a stale mid-run API error (see its own guard), so testing
+    //    it here -- before the linger/unread arms -- cannot mislabel a
+    //    successful chat; it only makes sure a failed one reads red instead of
+    //    being swallowed by 'active'.
+    if (_isChatErrored(chatId)) return 'error';
+    if (st === 'error') return 'error';
+    // 4) STILL OPEN WORK for the run monitor. These three arms are what the old
+    //    _jobsExpandBuckets() re-filter used to decide section membership with,
+    //    while this classifier ignored them entirely -- the root of the
+    //    disagreement. They now produce the key, so membership and label are one
+    //    decision. 'active' (not 'done') is correct for all three: the chat is
+    //    work the user has not closed out yet.
+    if (busy) return 'active';                                  // busy behind a stale terminal card
+    if (_isChatLingering(chatId)) return 'active';               // finished < ACTIVE_CHAT_LINGER_MS ago
+    if (_isChatUnseen(chatId)) return 'active';                  // finished, unread, < UNSEEN_CHAT_MAX_AGE_MS
+    // 5) FINISHED: the progress card has the last word.
     if (st === 'pr_opened') return 'pr_opened';
     if (st === 'pr_merged') return 'pr_merged';
-    if (st === 'error') return 'error';
     if (isTerminalProgressState(st)) return 'done'; // done / finished / finished_with_caveat
-    if (_isChatErrored(chatId)) return 'error';
     // Run over without a terminal card (stale running/waiting, stopped, none).
     return 'done';
+}
+// Section membership, derived from THE classifier and nothing else. This is the
+// only predicate any surface may use to answer "is this chat in the Active
+// section?" -- renderJobsDropdown()'s Active rows and (via the per-render key
+// map) _jobsExpandBuckets() both go through it. Throwing chats degrade to
+// 'done' -> not Active, matching _homeChatsFilterBarHtml()'s existing fallback.
+function _isChatInActiveSection(chatId) {
+    var k; try { k = _homeChatFilterKey(chatId); } catch (e) { k = 'done'; }
+    return !!HOME_ACTIVE_SECTION_KEYS[k];
 }
 // Apply the current filter to _jobsExpandBuckets() output. Returns fresh
 // bucket arrays (never mutates the input) with a recomputed total.
 function _homeChatsApplyFilter(buckets) {
     if (_homeChatsFilter === 'all') return buckets;
-    function match(c) { try { return _homeChatFilterKey(c.id) === _homeChatsFilter; } catch (e) { return true; } }
+    // Reads buckets.keys -- the SAME map _jobsExpandBuckets() bucketed with and
+    // _homeChatsFilterBarHtml() counted, so the selected pill can never hide a
+    // row it just counted (the "clicking a pill empties a visibly full list"
+    // bug). _homeChatFilterKey() is only re-called for a chat the map somehow
+    // misses, which cannot happen for these three arrays.
+    var keys = buckets.keys || {};
+    function match(c) {
+        var k = keys[c.id];
+        if (k === undefined) { try { k = _homeChatFilterKey(c.id); } catch (e) { k = 'done'; } }
+        return k === _homeChatsFilter;
+    }
     var out = {
         active: buckets.active.filter(match),
         today: buckets.today.filter(match),
-        pinned: buckets.pinned.filter(match)
+        pinned: buckets.pinned.filter(match),
+        keys: keys
     };
     out.total = out.active.length + out.today.length + out.pinned.length;
     return out;
@@ -3420,9 +3680,14 @@ function _homeChatsApplyFilter(buckets) {
 // visible so the user can see why the list is empty and switch back to All.
 function _homeChatsFilterBarHtml(buckets) {
     var all = buckets.active.concat(buckets.today, buckets.pinned);
+    var keys = buckets.keys || {};
     var counts = {};
     all.forEach(function(c) {
-        var k; try { k = _homeChatFilterKey(c.id); } catch (e) { k = 'done'; }
+        // buckets.keys is the map _jobsExpandBuckets() bucketed with. Reading it
+        // (instead of re-deriving) is what makes the counts and the section
+        // headers structurally identical rather than merely similar.
+        var k = keys[c.id];
+        if (k === undefined) { try { k = _homeChatFilterKey(c.id); } catch (e) { k = 'done'; } }
         counts[k] = (counts[k] || 0) + 1;
     });
     counts.all = all.length;
@@ -3453,6 +3718,85 @@ var _homeActiveChatsTimer = null;
 // held inside the panel" and DEFER repaints until release; the poll (or the
 // clicked action's own re-render, which clears the hold) repaints right after.
 var _homeChatsPointerHeld = false;
+// ---- Fix 7: a repaint must not destroy the user's selection or focus --------
+// container.innerHTML = html throws away every node, so an in-progress TEXT
+// SELECTION and keyboard focus inside the panel die with it -- up to once per
+// second while a chat streams. Scroll offsets were already preserved; these two
+// were not (getSelection/activeElement appeared nowhere in the repo).
+// Strategy = the (b) DEFER approach, mirroring _homeChatsPointerHeld, plus an
+// (a)-style focus restore for the cases we do NOT defer:
+//   * defer only for things a repaint would silently ruin and that the user is
+//     mid-gesture on: a NON-COLLAPSED selection inside the panel, or focus in an
+//     editable field inside it;
+//   * a focused BUTTON deliberately does NOT defer -- Chrome focuses a button on
+//     click, so treating that as "in use" would freeze the run monitor after
+//     every card click. Button focus is RESTORED after the repaint instead;
+//   * deferral is capped by HOME_CHATS_DEFER_MAX_MS so it can never starve
+//     updates: past the ceiling the monitor repaints regardless.
+// It does NOT touch container.style.display, which stays assigned above every
+// early return (Fix 3) -- the section can still never vanish.
+var HOME_CHATS_DEFER_MAX_MS = 8000;
+var _homeChatsDeferSince = 0;
+function _homeChatsUserBusyIn(container) {
+    if (!container) return false;
+    try {
+        var ae = document.activeElement;
+        if (ae && ae !== document.body && container.contains(ae)) {
+            var tag = (ae.tagName || '').toLowerCase();
+            if (tag === 'input' || tag === 'textarea' || tag === 'select' || ae.isContentEditable) return true;
+        }
+        var sel = (typeof window !== 'undefined' && typeof window.getSelection === 'function') ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed && sel.rangeCount) {
+            var node = sel.getRangeAt(0).commonAncestorContainer;
+            if (node && node.nodeType !== 1) node = node.parentNode;
+            if (node && container.contains(node)) return true;
+        }
+    } catch (e) {}
+    return false;
+}
+// Snapshot just enough to find the focused control again after the replace: the
+// owning card's stable data-chat-id plus the element's own class + title (the
+// card buttons are distinguished by title: Pin chat / Open chat / Remove from
+// list). No index is used -- indices shift, which is why the panel repainted.
+function _homeChatsFocusKey(container) {
+    try {
+        var ae = document.activeElement;
+        if (!ae || ae === document.body || !container.contains(ae)) return null;
+        var card = (typeof ae.closest === 'function') ? ae.closest('.jobs-expand-card') : null;
+        return {
+            chatId: card ? card.getAttribute('data-chat-id') : null,
+            cls: (ae.getAttribute('class') || '').trim(),
+            title: ae.getAttribute('title') || ''
+        };
+    } catch (e) { return null; }
+}
+function _homeChatsRestoreFocus(container, k) {
+    if (!k || (!k.cls && !k.title)) return;
+    try {
+        var scope = container;
+        if (k.chatId) {
+            scope = null;
+            var cards = container.querySelectorAll('.jobs-expand-card');
+            for (var ci = 0; ci < cards.length; ci++) {
+                if (cards[ci].getAttribute('data-chat-id') === k.chatId) { scope = cards[ci]; break; }
+            }
+            if (!scope) return; // the card left the list -- nothing to focus
+        }
+        // Attribute matching in JS, not a CSS selector: chat ids and titles are
+        // arbitrary strings and would need escaping in a selector.
+        var cands = scope.querySelectorAll('button, a[href], [tabindex]');
+        var el = null, loose = null;
+        for (var i = 0; i < cands.length; i++) {
+            var cCls = (cands[i].getAttribute('class') || '').trim();
+            var cTitle = cands[i].getAttribute('title') || '';
+            if (cCls === k.cls && cTitle === k.title) { el = cands[i]; break; }
+            if (!loose && k.title && cTitle === k.title) loose = cands[i];
+            if (!loose && !k.title && k.cls && cCls === k.cls) loose = cands[i];
+        }
+        el = el || loose;
+        if (el && typeof el.focus === 'function' && el !== document.activeElement) el.focus();
+    } catch (e) {}
+}
 document.addEventListener('pointerdown', function(e) {
     var el = document.getElementById('home-active-chats');
     _homeChatsPointerHeld = !!(el && e.target && el.contains(e.target));
@@ -3520,16 +3864,36 @@ function renderHomeActiveChats() {
             '</div>' +
         '</div>';
     }
+    // VISIBILITY FIRST -- applied BEFORE both early returns below and never gated
+    // on either of them. ui/030-home-view.js re-creates this container with an
+    // inline style="display:none", so while this assignment sat AFTER the diff /
+    // pointer guards, a single skipped repaint left the whole section invisible
+    // even though it had chats to show. Only the innerHTML replace may be
+    // deferred; whether the section is on screen at all must not be.
+    container.style.display = rawTotal ? '' : 'none';
     // Diff (last HTML stored on the container node, like the modal) -- skip the
     // repaint + flicker when nothing changed.
-    if (container._homeLastHtml === html) return;
+    // Nothing pending -> no deferral debt (so a selection made during a quiet
+    // spell still gets the full HOME_CHATS_DEFER_MAX_MS grace when a change
+    // finally arrives).
+    if (container._homeLastHtml === html) { _homeChatsDeferSince = 0; return; }
     // Pointer pressed inside the panel: skip this repaint WITHOUT updating
     // _homeLastHtml, so the press target stays alive and the click actually
     // fires; the deferred content lands on the next poll tick / action render.
     if (_homeChatsPointerHeld) return;
+    // Fix 7: the user is selecting text / typing inside the panel -- defer the
+    // innerHTML replace (same shape as the pointer guard: _homeLastHtml is NOT
+    // updated, so the next tick retries). Capped so it can never starve: past
+    // HOME_CHATS_DEFER_MAX_MS the run monitor repaints anyway.
+    if (_homeChatsUserBusyIn(container)) {
+        if (!_homeChatsDeferSince) _homeChatsDeferSince = Date.now();
+        if ((Date.now() - _homeChatsDeferSince) < HOME_CHATS_DEFER_MAX_MS) return;
+    }
+    _homeChatsDeferSince = 0;
+    // Keyboard focus survives the replace (fix 7): snapshot before, restore after.
+    var _focusKey = _homeChatsFocusKey(container);
     container._homeLastHtml = html;
     container.innerHTML = html;
-    container.style.display = rawTotal ? '' : 'none';
     // Restore scroll positions after the repaint (body first — it's the outer
     // scroller; columns/cards scroll independently inside it).
     var newBodyEl = container.querySelector('.home-active-chats-body');
@@ -3544,6 +3908,9 @@ function renderHomeActiveChats() {
             if (bodyEl) bodyEl.scrollTop = prevCardScroll[cid];
         }
     });
+    // Focus last: after the scroll restores, so focusing a control cannot fight
+    // the scrollTop we just wrote back.
+    _homeChatsRestoreFocus(container, _focusKey);
 }
 function renderJobsExpandModal() {
     var overlay = document.getElementById('jobs-expand-overlay');
@@ -3893,7 +4260,9 @@ function openChatFromJobsDropdown(chatId) {
     if (typeof selectChat === 'function' && typeof chats !== 'undefined' && chats[chatId]) {
         if (chats[chatId].isBackground) chats[chatId]._revealed = true;
         // Opening a chat you previously removed from the list brings it back.
-        if (chats[chatId]._jobsHidden) delete chats[chatId]._jobsHidden;
+        // Explicit `false`, not delete -- ONE representation of "not hidden" across
+        // page and service worker (see markChatRecentlyFinished).
+        if (chats[chatId]._jobsHidden) chats[chatId]._jobsHidden = false;
         // Persist the reveal flag immediately — don't rely on selectChat to save it.
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         selectChat(chatId);
@@ -3916,7 +4285,8 @@ function toggleJobsPin(chatId) {
     _homeChatsPointerHeld = false; // our own repaint must not be deferred
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!c) return;
-    if (!c.pinned && c._jobsHidden) delete c._jobsHidden;
+    // Explicit `false`, not delete -- see markChatRecentlyFinished.
+    if (!c.pinned && c._jobsHidden) c._jobsHidden = false;
     if (typeof togglePinChat === 'function') {
         togglePinChat(chatId);
     } else {
@@ -3961,7 +4331,15 @@ function dismissChatNotifications(chatId) {
     }
     _clearChatApprovalRows(c);
     c.lastViewedAt = Date.now();
-    if (c._lastApiError) delete c._lastApiError;
+    // Cleared to an explicit `null`, NOT deleted -- same convention as
+    // markChatRecentlyFinished()'s `c._jobsHidden = false` above. The page-field
+    // merge in app/045-agent-port-bridge-page.js:518-520 only carries a page
+    // value forward when the incoming SW snapshot's field is `undefined`, so a
+    // DELETED field is indistinguishable from "the page never had an opinion"
+    // and the user's dismissal is invisible to the merge. Every reader tests
+    // truthiness (_isChatErrored: `if (!c._lastApiError) return false;`), so a
+    // defined null behaves identically locally while staying expressible.
+    c._lastApiError = null;
     if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
     if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
@@ -3980,7 +4358,7 @@ function dismissChatFromJobs(chatId) {
     }
     _clearChatApprovalRows(c);
     c.lastViewedAt = Date.now();
-    if (c._lastApiError) delete c._lastApiError;
+    c._lastApiError = null; // defined-null clear -- see dismissChatNotifications
     if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
     if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }

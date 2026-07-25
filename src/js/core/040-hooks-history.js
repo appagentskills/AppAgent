@@ -33,6 +33,8 @@ function getHistoryTitle(view, chatId, skillId) {
         return 'Documentation - ' + baseTitle;
     } else if (view === 'history') {
         return 'Chat History - ' + baseTitle;
+    } else if (view === 'documents') {
+        return 'Documents - ' + baseTitle;
     }
     return baseTitle;
 }
@@ -43,7 +45,18 @@ function pushHistoryState(view, chatId, skillId) {
     var url = window.location.pathname + window.location.search; // Keep current URL
     var title = getHistoryTitle(view, chatId, skillId);
     document.title = title;
-    if (isInitialLoad) {
+    // NAV-H4: never stack two identical entries. Re-opening the view we are already on
+    // (double tap on a nav button, a view-open that runs twice, an in-app back landing
+    // on its own parent) pushed a duplicate, so Back appeared to do nothing and the
+    // user needed N presses to leave one view. Identical {view,chatId,skillId} as the
+    // current entry => replaceState. history.state is read defensively: it is a plain
+    // getter, but a serialization-restricted host would throw and wedge navigation.
+    var currentState = null;
+    try { currentState = history.state; } catch (e) { currentState = null; }
+    var isSameEntry = !!currentState && currentState.view === state.view &&
+        (currentState.chatId || null) === state.chatId &&
+        (currentState.skillId || null) === state.skillId;
+    if (isInitialLoad || isSameEntry) {
         // Use replaceState for initial load to set up base state without creating extra history entry
         // Note: isInitialLoad is set to false at the end of init(), not here, to ensure
         // all pushHistoryState calls during initialization use replaceState
@@ -62,15 +75,73 @@ function replaceHistoryState(view, chatId, skillId) {
 }
 
 function handlePopState(event) {
-    var state = event.state;
-    if (!state) return;
+    // NAV-H1: the browser legitimately fires popstate with a NULL state — a plain hash
+    // change, or an entry pushed by something that isn't pushHistoryState(). There is
+    // nothing to restore in that case, so leave the current view exactly as it is
+    // instead of dereferencing state.view (which would throw). `event` is guarded too:
+    // a hand-invoked handlePopState() with no argument used to throw on event.state.
+    // Both returns happen BEFORE isHandlingPopState is set, so neither can wedge it.
+    var state = event && event.state;
+    if (!state || typeof state !== 'object') return;
     
     isHandlingPopState = true;
     
     try {
         var targetView = state.view || 'chat';
         var targetChatId = state.chatId;
+
+        // Save the LEAVING context's pending composer state (text + images)
+        // BEFORE the view switch — mirrors selectChat (ui/170-chat-management.js)
+        // and openHomeView. Without this, browser Back/Forward silently dropped
+        // the draft, and the next normal exit persisted the empty composer over
+        // the stored one. typeof-guarded: the helpers live in the app tier
+        // (app/050-image-attachments.js), which loads after this core file.
+        if (typeof getCurrentPendingContext === 'function' && typeof savePendingTextForContext === 'function') {
+            try {
+                var leavingContext = getCurrentPendingContext();
+                savePendingImagesForContext(leavingContext);
+                savePendingTextForContext(leavingContext);
+            } catch (e) {}
+        }
+
         
+        // NAV-H3: widget chat mode paints its chrome on the SHARED .main-header
+        // (widget-mode class + dataset + #widget-back-btn, ui/070-dashboard-ui.js:999-1024)
+        // and pushes NO history entry of its own, so browser Back out of it left that
+        // chrome orphaned over whatever view we land on. No popstate state.view ever
+        // means "widget mode", so tear it down for every branch below. The helper
+        // deliberately does NOT touch #header-chat-title (see its comment): the chat
+        // branch below rebuilds that via updateChatTitleHeader, and a blanket
+        // .textContent write here would flatten its badge + progress pill. Idempotent and
+        // typeof-guarded: the helper lives in the ui tier, which loads after this core file.
+        if (typeof exitWidgetModeChrome === 'function') {
+            try { exitWidgetModeChrome(); } catch (e) {}
+        }
+
+        // NAV-H6: the entry points at a chat that no longer exists (deleteChat,
+        // ui/170-chat-management.js:1047, never prunes history entries). This used to
+        // fall through to the default branch at the bottom, which force-showed the chat
+        // view with whatever currentChatId happened to be — under the deleted chat's
+        // stale title. Redirect to Home, which always exists.
+        if (targetView === 'chat' && targetChatId && (typeof chats === 'undefined' || !chats[targetChatId])) {
+            // In-memory retarget only — never destructive, so it is unconditional.
+            targetView = 'home';
+            targetChatId = null;
+            // Re-seeding the ENTRY (so a Forward/Back bounce can't land on the dead chat
+            // again) is destructive if `chats` simply has not hydrated yet: this listener
+            // is registered at parse time (:356 below) while loadChatsFromStorage resolves
+            // async (core/120-init.js:355), so an early Back would rewrite a perfectly
+            // VALID chat entry into 'home' and lose it for good. Only rewrite once
+            // hydration has definitively succeeded — _chatsHydrated (ui/070-dashboard-ui.js:1549,
+            // set :1867) is the same gate the save path and ui/160-notifications.js:115 use.
+            // Otherwise leave the entry intact and let the next visit re-evaluate it
+            // against the then-populated `chats`.
+            var chatsReady = (typeof _chatsHydrated !== 'undefined') && _chatsHydrated === true;
+            if (chatsReady && typeof replaceHistoryState === 'function') {
+                try { replaceHistoryState('home', null, null); } catch (e) {}
+            }
+        }
+
         // Navigate to the appropriate view
         if (targetView === 'chat' && targetChatId && chats[targetChatId]) {
             // Close any open view first
@@ -134,6 +205,11 @@ function handlePopState(event) {
             if (typeof rerenderCurrentNotification === 'function') {
                 rerenderCurrentNotification();
             }
+            // Restore the target chat's pending draft (images + text) — mirrors
+            // selectChat's restore; popstate bypassed it, so the composer kept
+            // the previous context's text.
+            if (typeof restorePendingImagesForContext === 'function') { try { restorePendingImagesForContext(targetChatId); } catch (e) {} }
+            if (typeof restorePendingTextForContext === 'function') { try { restorePendingTextForContext(targetChatId); } catch (e) {} }
         } else if (targetView === 'dashboard') {
             currentView = 'dashboard';
             appStorage.setItem('currentView', 'dashboard');
@@ -180,7 +256,11 @@ function handlePopState(event) {
             if (homePanel) { homePanel.style.display = 'flex'; renderHome(); }
             updateAllButtonStates();
             renderChatList();
-            restorePendingImagesForContext('home');
+            if (typeof restorePendingImagesForContext === 'function') { try { restorePendingImagesForContext('home'); } catch (e) {} }
+            // Restore the saved home draft: renderHome() just recreated
+            // #home-message-input empty (mirrors openHomeView's restore; the
+            // input exists synchronously after renderHome, so no timeout).
+            if (typeof restorePendingTextForContext === 'function') { try { restorePendingTextForContext('home'); } catch (e) {} }
             document.title = getHistoryTitle('home', null, null);
         } else if (targetView === 'settings-page') {
             currentView = 'settings-page';
@@ -209,6 +289,23 @@ function handlePopState(event) {
             updateAllButtonStates();
             renderChatList();
             document.title = getHistoryTitle('history', null, null);
+        } else if (targetView === 'documents') {
+            // NAV-H2: openDocumentsView pushes 'documents' (tools/110-smart-documents.js:895)
+            // but there was no restore branch, so Back/Forward onto a Documents entry fell
+            // through to the default below and force-switched to the chat view. Mirrors the
+            // docs/history branches above; renderDocumentsPage lives in the tools tier, so
+            // it gets the same typeof guard this file uses for cross-tier calls.
+            currentView = 'documents';
+            appStorage.setItem('currentView', 'documents');
+            hideAllPanels();
+            var documentsPanel = document.getElementById('documents-panel');
+            if (documentsPanel) {
+                documentsPanel.style.display = 'flex';
+                if (typeof renderDocumentsPage === 'function') renderDocumentsPage();
+            }
+            updateAllButtonStates();
+            renderChatList();
+            document.title = getHistoryTitle('documents', null, null);
         } else {
             // Default: go to home or current chat
             hideAllPanels();
@@ -224,6 +321,11 @@ function handlePopState(event) {
             updateAllButtonStates();
             renderChatList();
             renderMessages();
+            // #744: every named branch above sets document.title; the default
+            // (return-to-chat) branch must too, or the tab keeps the previous
+            // view's title. getHistoryTitle falls back to the base title when
+            // currentChatId is null/unknown.
+            document.title = getHistoryTitle('chat', currentChatId, null);
         }
         // SWM2-F3: leaving the chat view for any NON-chat view must clear this
         // panel's focus entry so the SW sub-agent GC isn't pinned on a chat the user
@@ -233,6 +335,26 @@ function handlePopState(event) {
         // covers dashboard / skill-editor / skills / home / settings / docs / history.
         if (currentView !== 'chat' && typeof pushFocusChatToOffscreen === 'function') {
             pushFocusChatToOffscreen(null);
+        }
+    } catch (err) {
+        // NAV-H1b: one view's re-render must not be able to wedge navigation. The finally
+        // below already guarantees isHandlingPopState is cleared, but an escaping throw
+        // still left the app on a half-switched view (hideAllPanels ran, no panel shown).
+        // Log — console.warn('[tag] …', err) is the bundle convention, e.g.
+        // core/120-init.js:295 — and fall back to the chat view, the same recovery the
+        // default branch above performs. Nested try so a failing fallback can't rethrow.
+        console.warn('[history] popstate restore failed for view "' + (state && state.view) + '" — falling back to the chat view', err);
+        try {
+            hideAllPanels();
+            currentView = 'chat';
+            showChatView();
+            appStorage.setItem('currentView', 'chat');
+            updateAllButtonStates();
+            renderChatList();
+            renderMessages();
+            document.title = getHistoryTitle('chat', currentChatId, null);
+        } catch (e2) {
+            console.warn('[history] popstate fallback re-render also failed', e2);
         }
     } finally {
         isHandlingPopState = false;

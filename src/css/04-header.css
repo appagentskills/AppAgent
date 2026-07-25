@@ -52,6 +52,17 @@
 .header-rename-btn .ui-icon { width: 14px; height: 14px; }
 .main-header:hover .header-rename-btn { opacity: 1; }
 .header-chat-title:empty + .header-rename-btn { display: none; }
+/* Header pin button — same chrome as the rename button next to it. Outline
+   icon is hover-revealed like rename; the pinned (filled) state stays visible
+   at full opacity so a pinned chat is recognizable at a glance. */
+.header-pin-btn { background: transparent; border: none; cursor: pointer; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--text-muted); transition: all var(--transition-fast); opacity: 0; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.header-pin-btn:hover { background: var(--secondary-light); color: var(--text-primary); }
+.header-pin-btn .ui-icon { width: 14px; height: 14px; }
+.main-header:hover .header-pin-btn { opacity: 1; }
+.header-pin-btn.pinned { opacity: 1; color: var(--primary); }
+/* Hide alongside the rename button when there is no title (general-sibling
+   combinator — the pin button sits after the rename button). */
+.header-chat-title:empty ~ .header-pin-btn { display: none; }
 /* Model name status pill — matches credits-display sizing */
 .model-name { font-size: var(--text-body-sm); color: var(--text-secondary); font-weight: var(--font-medium); display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; padding: var(--space-2) var(--space-5); border-radius: var(--radius-xl); border: 1px solid var(--border); background: var(--bg-code); transition: all var(--transition-fast); white-space: nowrap; }
 .model-name:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-dark); }

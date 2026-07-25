@@ -68,6 +68,35 @@ function applyTheme() {
         effectiveTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
     document.documentElement.setAttribute('data-theme', effectiveTheme);
+    broadcastWidgetTheme(effectiveTheme);
+}
+
+// Push the active theme into every live widget iframe. Widgets render inside
+// widget-sandbox.html — a separate document that gets none of our CSS — so the
+// design tokens injected by injectWidgetTokens (ui/070-dashboard-ui.js) switch on
+// <html data-appagent-theme>. This message flips that attribute IN PLACE: no
+// re-render, so widget state (counters, fetched data, scroll) survives a theme
+// change. Mirrors the iframe enumeration in _isWidgetSource
+// (ui/070-dashboard-ui.js): chat/inline widgets sit in the light DOM, dashboard
+// tiles inside .widget-shadow-host shadow roots. applyTheme also runs at startup
+// (core/120-init.js) when there are zero widgets, so every step is guarded and an
+// empty document is a silent no-op.
+function broadcastWidgetTheme(theme) {
+    var msg = { type: 'themeChange', theme: theme === 'dark' ? 'dark' : 'light' };
+    function postAll(frames) {
+        for (var i = 0; i < frames.length; i++) {
+            try {
+                if (frames[i].contentWindow) frames[i].contentWindow.postMessage(msg, '*');
+            } catch (e) { /* cross-origin or torn-down iframe */ }
+        }
+    }
+    try {
+        postAll(document.querySelectorAll('iframe.widget-iframe'));
+        var hosts = document.querySelectorAll('.widget-shadow-host');
+        for (var h = 0; h < hosts.length; h++) {
+            if (hosts[h].shadowRoot) postAll(hosts[h].shadowRoot.querySelectorAll('iframe.widget-iframe'));
+        }
+    } catch (e) { /* never let a theme switch break on widget plumbing */ }
 }
 
 // Change theme setting

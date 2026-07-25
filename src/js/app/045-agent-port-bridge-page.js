@@ -502,9 +502,22 @@ function _mergePageChatMeta(prevChat, inChat) {
         var pv = prevChat[f] || 0;
         if (pv && pv > (inChat[f] || 0)) inChat[f] = pv;
     });
-    if (inChat._jobsHidden === undefined && prevChat._jobsHidden !== undefined) {
-        inChat._jobsHidden = prevChat._jobsHidden;
-    }
+    // ACTIVE-CLASSIFY-F4: `pinned` and `_lastApiError` are PAGE-TIER-ONLY chat
+    // fields — grepping either name under src/js/worker/ returns ZERO hits, and
+    // every writer is page-side (pin toggle: tools/120-actions.js `c.pinned =
+    // !c.pinned`; error stamp: app/036-agent-event-handlers-page.js
+    // `chat._lastApiError = ...`, cleared in app/020-api-messages.js). The SW's
+    // snapshot therefore carries at best the value last PERSISTED to IDB, so the
+    // wholesale `chats[id] = snapshot` replaces below reverted them: an errored
+    // chat stopped painting red (_isChatErrored reads chats[id]._lastApiError)
+    // and a just-pinned chat could lose its pin. Same undefined-wins rule as
+    // _jobsHidden, so a DELIBERATE page-side unpin (pinned = false) or
+    // error-clear (_lastApiError = null) is a DEFINED value that wins and is
+    // never resurrected — only a snapshot that says nothing at all about the
+    // field inherits the page's copy.
+    ['_jobsHidden', 'pinned', '_lastApiError'].forEach(function(f) {
+        if (inChat[f] === undefined && prevChat[f] !== undefined) inChat[f] = prevChat[f];
+    });
 }
 
 function _handleAgentBusMessage(msg) {

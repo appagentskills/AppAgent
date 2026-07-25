@@ -247,8 +247,9 @@ Platform.getTabForInstance = function(instanceUrl, targetUrl) {
 };
 
 // Refresh the instance cache after the initial sessionToken / instanceUrl load,
-// so the first tool call after SW boot sees a populated registry. Subsequent
-// refreshes happen on-demand via list_instances({refresh:true}).
+// so the first tool call after SW boot sees a populated registry. list_instances
+// now ALWAYS re-probes (matching the header pill), and servicenow_api /
+// iframe_tool instance resolution still reads this registry between probes.
 Platform.ready.then(function() {
     Platform.refreshInstances().catch(function() {});
 });

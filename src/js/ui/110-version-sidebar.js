@@ -53,12 +53,12 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
         hideSpinner();
 
         if (res.ok || res.status === 204) {
-            // Mark all entries for this file as invalidated
-            versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId && v.action !== 'REVERT') {
-                    versionHistory[idx].invalidated = true;
-                }
-            });
+            // Mark all entries for this file as invalidated — across the
+            // active chat AND its sub-agent chats (the deleted record's
+            // entries may be owned by a sub chat whose artifact rolled up
+            // into this sidebar, see getVersionHistorySources in
+            // 090-version-history.js).
+            setRecordEntriesInvalidated(table, sysId, true);
 
             // Add delete entry
             addVersionHistoryEntry({

@@ -508,6 +508,21 @@ function handleSearchSnippetClick(chatId, matchIndex) {
     navigateToSearchMatch(chatId, matches[matchIndex]);
 }
 
+// ATTRIBUTE-safe wrapper around escapeHtml. escapeHtml covers & < > " ' but
+// NOT newlines, and a raw \n inside an attribute VALUE survives into the
+// markup string. Later markdown passes then split that string on '\n'
+// (ui/250-message-render.js formatContent) and inject line-level tags whose own
+// double quotes ('<table class="md-table">', '<blockquote class="md-blockquote">',
+// '<p class="md-paragraph">') INSIDE the half-open attribute, which terminates it
+// early and prematurely closes the owning element. User text stays escaped, so
+// this is markup mangling rather than XSS -- but it visibly breaks the element.
+// Encoding the newline as a numeric entity keeps the tooltip's line break while
+// removing the literal character the line splitter keys on.
+function escapeAttr(t) {
+    if (t == null) return '';
+    return escapeHtml(t).replace(/\r\n|\r|\n/g, '&#10;').replace(/\t/g, '&#9;');
+}
+
 function escapeHtml(t) {
     // Explicit per-char replace — covers BOTH text-content and attribute
     // contexts. The previous textContent/innerHTML trick correctly escaped

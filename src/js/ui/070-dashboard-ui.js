@@ -1,15 +1,23 @@
-// Toggle dashboard headers visibility
+// Toggle dashboard headers visibility — ONE global state shared by the
+// dashboard-page toolbar button, its More-dropdown entry, and the home
+// section's compact headers button.
 function toggleDashboardHeaders() {
     showDashboardHeaders = !showDashboardHeaders;
     appStorage.setItem('showDashboardHeaders', showDashboardHeaders);
+    syncDashboardHeadersUI();
+}
+
+// Live-patch the MAIN dashboard grid (#dashboard-grid) and its headers-toggle
+// control to the current showDashboardHeaders state. The home-page grid is
+// deliberately excluded: home widget cards never render a header at all
+// (buildWidgetHtml skips it for dashboard === 'home') and have no toggle.
+// Every element is optional (the dashboard panel may not be in the DOM), so
+// each lookup is guarded.
+function syncDashboardHeadersUI() {
     var grid = document.getElementById('dashboard-grid');
+    if (grid) grid.classList.toggle('show-headers', showDashboardHeaders);
     var btn = document.getElementById('dashboard-toggle-headers-btn');
-    if (grid) {
-        grid.classList.toggle('show-headers', showDashboardHeaders);
-    }
-    if (btn) {
-        btn.classList.toggle('active', showDashboardHeaders);
-    }
+    if (btn) btn.classList.toggle('active', showDashboardHeaders);
 }
 
 // Dashboard responsive More menu
@@ -85,8 +93,16 @@ function expandDashboardWidget(widgetId) {
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
         '<span class="widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>' +
         '<div class="widget-modal-controls">' +
-        '<button class="widget-modal-btn" onclick="closeExpandedWidget();regenerateDashboardWidget(\'' + widgetId + '\')" title="Regenerate">' + UI_ICONS.refresh + '</button>' +
-        '<button class="widget-modal-btn" onclick="closeExpandedWidget();editDashboardWidget(\'' + widgetId + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
+        '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+        (widget.history && widget.history.length > 0 ? '<button class="widget-modal-btn" onclick="closeExpandedWidget();showWidgetHistory(\'' + widgetId + '\')" title="History (' + widget.history.length + ')">' + UI_ICONS.history + '</button>' : '') +
+        '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
+        '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
+        // Dashboard twin of the chat toolbar's manual code editor
+        // (tools/080-widget-tools.js:429). Distinct from the "Edit" button above:
+        // that one hands the widget to the agent in a fresh chat, this one opens
+        // the raw HTML editor. Same title/icon pair the chat fullscreen uses, so
+        // the two surfaces stay learnable.
+        '<button class="widget-modal-btn widget-code-btn" data-widget-id="' + widgetId + '" onclick="editDashboardWidgetCode(\'' + widgetId + '\', event)" title="Edit code">' + UI_ICONS.code + '</button>' +
         '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
         '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="Close">' + UI_ICONS.close + '</button>' +
         '</div>';
@@ -107,7 +123,7 @@ function expandDashboardWidget(widgetId) {
         iframe.style.cssText = 'width:100%;height:100%;border:none;background:var(--bg-white);';
         iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
         content.appendChild(iframe);
-        writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title));
+        writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id));
     }
 }
 
@@ -117,10 +133,40 @@ function closeExpandedWidget() {
     if (overlay) overlay.remove();
 }
 
+// ── Dashboard → manual code editor ───────────────────────────────────────────
+// Dashboard-pinned widgets had NO route to the code editor: editWidgetCode
+// (tools/080-widget-tools.js:535) was reachable from exactly ONE call site,
+// the CHAT fullscreen toolbar (tools/080-widget-tools.js:429), and the
+// dashboard modal built by expandDashboardWidget above never goes through
+// openWidgetFullscreen. PR #734 also deleted the old editDashboardWidget
+// bridge that used to walk the user back to the source chat, so a pinned
+// widget's code was simply unreachable. This is the dashboard twin.
+//
+// The editor overlay is surface-agnostic (it appends its own
+// #widget-edit-overlay to document.body) and the shared save is dashboard-safe
+// at the ROOT: getWidgetById falls back to dashboardWidgets
+// (tools/080-widget-tools.js:199) so a dashboard-only widget resolves, and
+// saveDashboardWidget MERGES content onto the existing record instead of
+// replacing it (ui/020-dashboard.js) so grid placement survives. This is
+// therefore a pure route — close, then hand off. No dashboard-side save fork.
+function editDashboardWidgetCode(widgetId, event) {
+    if (event) { event.stopPropagation(); event.preventDefault(); }
+    if (!dashboardWidgets[widgetId]) { showSnackbar('Widget not found', 'error'); return; }
+    if (typeof editWidgetCode !== 'function') { showSnackbar('Code editor unavailable', 'error'); return; }
+    // Close the dashboard fullscreen FIRST — load-bearing, not cosmetic: it is a
+    // .widget-fullscreen-overlay at --z-fullscreen (10003) while the editor is a
+    // .widget-modal-overlay at --z-widget-modal (10002) (css/00-tokens.css:174-175),
+    // so leaving it up buries the editor behind this backdrop and desyncs the
+    // global Escape order (core/120-init.js:209-211 checks #widget-fullscreen-overlay
+    // first). Same reason the chat-side button calls closeWidgetFullscreen() first.
+    closeExpandedWidget();
+    editWidgetCode(widgetId);
+}
+
 // Grid occupancy and collision detection functions
-function initGridOccupancy() {
+function initGridOccupancy(dashboard) {
     gridState.occupancy = {};
-    Object.values(dashboardWidgets).forEach(function(widget) {
+    dashboardWidgetsFor(dashboard).forEach(function(widget) {
         if (widget.gridX !== undefined && widget.gridY !== undefined) {
             markOccupied(widget.id, widget.gridX, widget.gridY, widget.width || 4, widget.height || 4);
         }
@@ -178,15 +224,15 @@ function findNextAvailablePosition(w, h) {
     return { gridX: 0, gridY: 0 }; // Fallback
 }
 
-function migrateWidgetPositions() {
-    var widgets = Object.values(dashboardWidgets)
+function migrateWidgetPositions(dashboard) {
+    var widgets = dashboardWidgetsFor(dashboard)
         .filter(function(w) { return w.gridX === undefined || w.gridY === undefined; })
         .sort(function(a, b) { return (a.order || 0) - (b.order || 0); });
 
     if (widgets.length === 0) return;
 
-    // Initialize occupancy for already migrated widgets
-    initGridOccupancy();
+    // Initialize occupancy for already migrated widgets (same dashboard only)
+    initGridOccupancy(dashboard);
 
     widgets.forEach(function(widget) {
         var w = widget.width || 4;
@@ -235,6 +281,31 @@ function handleWidgetDragOver(event) {
     event.dataTransfer.dropEffect = 'move';
 }
 
+// Both dashboards render into a .dashboard-grid, but the two surfaces do NOT
+// share a padding: the main page grid uses var(--space-8) = 16px
+// (css/19-dashboard.css:15) while .home-dashboard-grid overrides it to
+// var(--space-4) = 8px (css/19-dashboard.css:95, and the home grid carries BOTH
+// classes - ui/030-home-view.js:598). The snap maths below used to hard-code the
+// main grid's 16px, which on the Home surface biased every drop ~8px up/left and
+// under-computed cellWidth by ~1.33px per column (a 16px error spread over 12
+// columns) - enough to land a drop near the right/bottom edge one cell off.
+// Read the real padding off the element instead. The 16px fallbacks only apply
+// when there is no element or no getComputedStyle (non-DOM contexts).
+function gridPaddingOf(grid) {
+    var pad = { left: 16, right: 16, top: 16 };
+    if (!grid || typeof window === 'undefined' || !window.getComputedStyle) return pad;
+    var cs = null;
+    try { cs = window.getComputedStyle(grid); } catch (e) { return pad; }
+    if (!cs) return pad;
+    var l = parseFloat(cs.paddingLeft);
+    var r = parseFloat(cs.paddingRight);
+    var t = parseFloat(cs.paddingTop);
+    if (!isNaN(l)) pad.left = l;
+    if (!isNaN(r)) pad.right = r;
+    if (!isNaN(t)) pad.top = t;
+    return pad;
+}
+
 function handleWidgetDrop(event) {
     event.preventDefault();
 
@@ -243,8 +314,9 @@ function handleWidgetDrop(event) {
     var widget = dashboardWidgets[gridState.draggedWidgetId];
     if (!widget) return;
 
-    // Calculate drop position accounting for grab offset
-    var grid = document.getElementById('dashboard-grid');
+    // Calculate drop position accounting for grab offset — resolve the grid
+    // the widget lives in ('main' page grid or the home grid).
+    var grid = dashboardGridEl(widgetDashboardOf(widget));
     if (!grid) return;
 
     var gridRect = grid.getBoundingClientRect();
@@ -257,13 +329,15 @@ function handleWidgetDrop(event) {
     var widgetLeft = event.clientX - offsetX - gridRect.left;
     var widgetTop = event.clientY - offsetY - gridRect.top + scrollTop;
 
-    // Calculate grid cell dimensions
-    var cellWidth = (gridRect.width - 32 - (11 * gridState.gap)) / 12;
+    // Calculate grid cell dimensions from THIS grid's real padding (main 16px /
+    // home 8px) instead of the old hard-coded 32 / 16 literals - see gridPaddingOf.
+    var pad = gridPaddingOf(grid);
+    var cellWidth = (gridRect.width - pad.left - pad.right - (11 * gridState.gap)) / 12;
     var cellHeight = gridState.rowHeight + gridState.gap;
 
     // Snap to grid
-    var gridX = Math.round((widgetLeft - 16) / (cellWidth + gridState.gap));
-    var gridY = Math.round((widgetTop - 16) / cellHeight);
+    var gridX = Math.round((widgetLeft - pad.left) / (cellWidth + gridState.gap));
+    var gridY = Math.round((widgetTop - pad.top) / cellHeight);
 
     // Clamp to bounds
     var w = widget.width || 4;
@@ -302,7 +376,11 @@ function handleWidgetDragEnd(event) {
     currentDragWidgetId = null;
 }
 
-function buildWidgetHtml(widget) {
+// dashboard: 'main' (default) or 'home'. Home cards NEVER render the widget
+// header — the home section has no headers toggle; the floating hover control
+// below supplies expand + drag there.
+function buildWidgetHtml(widget, dashboard) {
+    var isHome = dashboard === 'home';
     // Grid-based positioning
     var width = Math.max(3, widget.width || 4);
     var height = Math.max(2, widget.height || 4);
@@ -330,22 +408,29 @@ function buildWidgetHtml(widget) {
     html += 'ondrop="handleWidgetDrop(event)" ';
     html += 'ondragend="handleWidgetDragEnd(event)" ';
     html += 'style="grid-column: ' + gridColStyle + '; grid-row: ' + gridRowStyle + '; z-index: ' + zIndex + ';">';
+    if (!isHome) {
     html += '<div class="dashboard-widget-header">';
     html += '<span class="dashboard-widget-icon drag-handle">' + UI_ICONS.widget + '</span>';
     html += '<span class="dashboard-widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>';
     html += errorBadge;
     html += '<div class="dashboard-widget-controls">';
-    html += '<button class="dashboard-widget-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event)" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>';
-    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();regenerateDashboardWidget(\'' + widget.id + '\')" title="Regenerate">' + UI_ICONS.refresh + '</button>';
-    if (widget.history && widget.history.length > 0) {
-        html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();showWidgetHistory(\'' + widget.id + '\')" title="History (' + widget.history.length + ')">' + UI_ICONS.history + '</button>';
+    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" title="Expand">' + UI_ICONS.maximize + '</button>';
+    html += '</div>';
+    html += '</div>';
     }
-    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>';
-    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>';
-    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();editDashboardWidget(\'' + widget.id + '\')" title="Edit">' + UI_ICONS.edit + '</button>';
-    html += '<button class="dashboard-widget-btn danger" onclick="event.stopPropagation();confirmDeleteDashboardWidget(\'' + widget.id + '\')" title="Delete">' + UI_ICONS.trash + '</button>';
-    html += '</div>';
-    html += '</div>';
+    // #732/#730: with headers hidden (showDashboardHeaders=false is the default,
+    // core/130-indexeddb.js:106) the header — which carries the Expand button and
+    // the only usable grab surface (the content iframe swallows mouse events) — is
+    // display:none, leaving the card inert: no expand, no drag. This small floating
+    // hover-only control restores both: click runs the SAME expandDashboardWidget
+    // action as the header button, and it is draggable through the SAME
+    // handleWidgetDragStart the card root uses (stopPropagation so the root's
+    // bubbled ondragstart doesn't run it twice). Hidden under .show-headers — the
+    // header supplies both affordances there (css/19-dashboard.css).
+    html += '<button class="dashboard-widget-hover-btn" draggable="true" ';
+    html += 'ondragstart="event.stopPropagation();handleWidgetDragStart(event, \'' + widget.id + '\')" ';
+    html += 'onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" ';
+    html += 'title="Expand · drag to move">' + UI_ICONS.maximize + '</button>';
     html += '<div class="dashboard-widget-content" id="dashboard-widget-content-' + widget.id + '">' + loadingOverlay + '</div>';
     html += '<div class="dashboard-widget-resize-handle" onmousedown="startWidgetResize(event, \'' + widget.id + '\')"></div>';
     html += '</div>';
@@ -391,12 +476,16 @@ function handleWidgetResizeMove(event) {
     var widgetEl = document.querySelector('.dashboard-widget[data-widget-id="' + widgetDragState.widgetId + '"]');
     if (!widgetEl) return;
 
-    // Get the dashboard grid for calculating units
-    var grid = document.getElementById('dashboard-grid');
+    // Get the grid this widget is rendered in for calculating units
+    var grid = widgetEl.closest('.dashboard-grid') || document.getElementById('dashboard-grid');
     if (!grid) return;
 
     var gridRect = grid.getBoundingClientRect();
-    var cellWidth = (gridRect.width - 32 - (11 * gridState.gap)) / 12;
+    // Padding-aware cell width, same as handleWidgetDrop: the home grid's 8px
+    // padding (css/19-dashboard.css:95) is half the main grid's 16px, so the old
+    // hard-coded 32 under-computed cellWidth by ~1.33px per column on Home.
+    var pad = gridPaddingOf(grid);
+    var cellWidth = (gridRect.width - pad.left - pad.right - (11 * gridState.gap)) / 12;
     var cellHeight = gridState.rowHeight;
 
     // Calculate new size based on mouse position
@@ -455,12 +544,18 @@ function handleWidgetResizeEnd(event) {
 }
 
 // Inject executeTool bridge into widget HTML before </head> tag
-function injectWidgetBridge(html, widgetTitle) {
+// `widgetId` (optional) is exposed to the widget as window._widgetId and is
+// also what the start_chat tool uses to identify the CALLING widget — see the
+// widgetToolCall handler below, which resolves it authoritatively from the DOM
+// rather than trusting the shim.
+function injectWidgetBridge(html, widgetTitle, widgetId) {
     // escapeJsString escapes \ first, then quotes/</>/& as JS hex sequences —
     // a title containing \ or </script> can no longer corrupt the script block.
     var safeTitle = escapeJsString(widgetTitle || 'Widget');
+    var safeId = escapeJsString(widgetId || '');
     var bridgeScript = '<script>' +
         'window._widgetTitle="' + safeTitle + '";' +
+        'window._widgetId="' + safeId + '";' +
         // executeTool bridge - allows widgets to call agent tools via postMessage
         'window._toolCallbacks={};' +
         'window._toolCallId=0;' +
@@ -579,27 +674,117 @@ function injectWidgetBridge(html, widgetTitle) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Design tokens for widgets
+// ---------------------------------------------------------------------------
+// Widgets render inside widget-sandbox.html via document.write, so they start
+// from a BLANK document with none of the app's stylesheets. These three blocks
+// mirror the REAL values from src/css/00-tokens.css (light) and
+// src/css/01-dark-theme.css (dark) so a widget can use var(--primary),
+// var(--space-8), var(--font-sans)... exactly like the app does. Keep them in
+// sync if a token value changes in those files.
+//
+// Deliberately NOT emitted: color-scheme. Setting it would flip UA defaults
+// (form controls, scrollbars, default canvas background) inside every widget
+// and make the many existing widgets that hardcode light colors unreadable in
+// dark mode. Widgets opt in by painting with the tokens instead.
+var WIDGET_TOKENS_STATIC =
+    '--space-2:4px;--space-4:8px;--space-6:12px;--space-8:16px;--space-10:24px;' +
+    '--text-caption:11px;--text-body-sm:12px;--text-body:13px;--text-body-lg:14px;--text-xl:16px;--text-2xl:18px;' +
+    '--radius-sm:4px;--radius-md:6px;--radius-lg:8px;--radius-xl:12px;' +
+    '--shadow-sm:0 1px 3px rgba(0,0,0,0.08);--shadow-md:0 2px 8px rgba(0,0,0,0.1);' +
+    "--font-sans:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;" +
+    "--font-mono:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace;";
+
+var WIDGET_TOKENS_LIGHT =
+    '--primary:#293E6B;--primary-hover:#1e2f52;--primary-light:#e8f0fa;--accent:#0891b2;' +
+    '--success:#059669;--warning:#d97706;--danger:#dc2626;--info:#3b82f6;' +
+    '--border:#e5e7eb;--border-light:#f0f0f0;' +
+    '--text-primary:#1f2937;--text-secondary:#6b7280;--text-muted:#9ca3af;--text-heading:#111827;--text-link:#2563eb;' +
+    '--bg-main:#fff;--bg-light:#f9fafb;--bg-hover:#f3f4f6;--bg-code:#f5f5f5;--bg-secondary:#f3f4f6;';
+
+// Only the tokens that actually differ under :root[data-theme="dark"] in
+// 01-dark-theme.css. --shadow-sm/--shadow-md sit in the static block for their
+// light values but DO have dark overrides, so they repeat here.
+var WIDGET_TOKENS_DARK =
+    '--primary:#6b8bc4;--primary-hover:#85a1d4;--primary-light:#1e2a42;--accent:#22d3ee;' +
+    '--success:#34d399;--warning:#fbbf24;--danger:#f87171;--info:#60a5fa;' +
+    '--border:#2e3138;--border-light:#252830;' +
+    '--text-primary:#e5e7eb;--text-secondary:#9ca3af;--text-muted:#6b7280;--text-heading:#f3f4f6;--text-link:#60a5fa;' +
+    '--bg-main:#111317;--bg-light:#181a1f;--bg-hover:#1f2228;--bg-code:#1a1d24;--bg-secondary:#1a1d24;' +
+    '--shadow-sm:0 1px 3px rgba(0,0,0,0.3);--shadow-md:0 2px 8px rgba(0,0,0,0.4);';
+
+// Prepend the token <style> so every widget inherits the app's design language.
+// BOTH selectors are wrapped in :where(), which zeroes their specificity to
+// (0,0,0). That is what actually lets a widget override a token: a bare
+// :root[data-appagent-theme="dark"]{} is (0,2,0) and would beat the widget's own
+// :root{} (0,1,0) no matter the document order, so in dark mode NOTHING could be
+// overridden. At (0,0,0) every widget rule wins on specificity (:root{}, body{},
+// .cls{}, inline style=""), while dark still beats light because it comes later
+// inside this same sheet. The block is still injected FIRST so that even a
+// widget rule with equally-zero specificity (:where(:root){}, *{}) wins on
+// document order.
+// The dark half keys off <html data-appagent-theme="dark">, which the sandbox
+// sets from the loadWidget payload and flips again on every themeChange
+// broadcast (see widget-sandbox.html + broadcastWidgetTheme in ui/240-layout.js).
+// Idempotent: the &snap=1 capture path re-writes an ALREADY-injected serialized
+// DOM back through writeWidgetHtml, and a second block would just be dead weight
+// baked into every screenshot. The guard matches the <style> TAG, not the bare
+// marker string, so a widget that merely MENTIONS data-appagent-tokens in its own
+// copy (the widget-best-practices table does, verbatim) still gets tokens.
+function injectWidgetTokens(html) {
+    if (!html || typeof html !== 'string') return html;
+    if (/<style[^>]*data-appagent-tokens/i.test(html)) return html;
+    var style = '<style data-appagent-tokens="1">' +
+        ':where(:root){' + WIDGET_TOKENS_STATIC + WIDGET_TOKENS_LIGHT + '}' +
+        ':where(:root[data-appagent-theme="dark"]){' + WIDGET_TOKENS_DARK + '}' +
+        '</style>';
+    // Function replacement (not a string) so $-sequences in the CSS can never be
+    // read as replacement patterns. The \s in the head pattern is load-bearing:
+    // /<head[^>]*>/ ALSO matches <header ...>, which would drop the block into the
+    // body of any head-less fragment that happens to open with a <header>.
+    var result = html.replace(/<head(\s[^>]*)?>/i, function(m) { return m + style; });
+    if (result === html) {
+        // No <head> (widgets are often bare fragments): prepend and let the
+        // parser hoist the <style> into the head it synthesizes.
+        result = style + html;
+    }
+    return result;
+}
+
 // Write widget HTML to iframe via the manifest-sandboxed widget page
 // CSP blocks inline scripts in the extension page, so we route through widget-sandbox.html
 function writeWidgetHtml(iframe, html) {
+    // Inject once, before the handshake, so the same string is posted no matter
+    // how many ready messages arrive.
+    var _html = injectWidgetTokens(html);
     function onMsg(e) {
         if (e.source !== iframe.contentWindow) return;
         if (e.data && e.data.type === 'widgetSandboxReady') {
             window.removeEventListener('message', onMsg);
-            iframe.contentWindow.postMessage({ type: 'loadWidget', html: html }, '*');
+            // Resolve the theme at POST time (not at call time) so a flip during
+            // the handshake can't ship a stale value.
+            iframe.contentWindow.postMessage({
+                type: 'loadWidget',
+                html: _html,
+                theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'
+            }, '*');
         }
     }
     window.addEventListener('message', onMsg);
     iframe.src = 'widget-sandbox.html';
 }
 
-// Validate that a message source is a known widget iframe's contentWindow
-function _isWidgetSource(source) {
-    if (!source) return false;
-    // Check light DOM iframes
+// Resolve a message source to the known widget IFRAME element it came from,
+// or null when the source is not a widget. This is the authoritative identity
+// check for widget→page postMessage traffic: the widget shim can claim any
+// title/id it likes, but it cannot forge event.source.
+function _resolveWidgetSource(source) {
+    if (!source) return null;
+    // Check light DOM iframes (inline chat widgets)
     var iframes = document.querySelectorAll('iframe.widget-iframe');
     for (var i = 0; i < iframes.length; i++) {
-        try { if (iframes[i].contentWindow === source) return true; } catch(e) {}
+        try { if (iframes[i].contentWindow === source) return iframes[i]; } catch(e) {}
     }
     // Check shadow DOM iframes (dashboard widgets use shadow hosts)
     var hosts = document.querySelectorAll('.widget-shadow-host');
@@ -607,11 +792,42 @@ function _isWidgetSource(source) {
         if (hosts[i].shadowRoot) {
             var shadowIframes = hosts[i].shadowRoot.querySelectorAll('iframe.widget-iframe');
             for (var j = 0; j < shadowIframes.length; j++) {
-                try { if (shadowIframes[j].contentWindow === source) return true; } catch(e) {}
+                try { if (shadowIframes[j].contentWindow === source) return shadowIframes[j]; } catch(e) {}
             }
         }
     }
-    return false;
+    return null;
+}
+
+// Validate that a message source is a known widget iframe's contentWindow.
+// Kept as a thin wrapper — it has other callers (the widgetDownload handler
+// below and the widgetToolCall handler).
+function _isWidgetSource(source) {
+    return !!_resolveWidgetSource(source);
+}
+
+// The widget id that owns a resolved widget iframe, or null.
+// Inverse of getWidgetIframe (ui/300-iframe-management.js:12-25):
+//   • inline chat widget  → .widget-inline[data-widget-id]
+//   • dashboard widget    → the iframe lives inside a shadow root, so .closest()
+//     cannot escape it; hop out via getRootNode().host (.widget-shadow-host,
+//     appended into #dashboard-widget-content-<id>) and continue from there up
+//     to .dashboard-widget[data-widget-id].
+function _widgetIdForIframe(iframe) {
+    if (!iframe) return null;
+    try {
+        var el = iframe.closest ? iframe.closest('[data-widget-id]') : null;
+        if (!el) {
+            var root = iframe.getRootNode ? iframe.getRootNode() : null;
+            var host = (root && root.host) ? root.host : null;
+            if (host && host.closest) el = host.closest('[data-widget-id]');
+        }
+        if (el) {
+            var id = el.getAttribute('data-widget-id');
+            if (id) return id;
+        }
+    } catch (e) {}
+    return null;
 }
 
 // Listen for download requests from widgets (sandbox can't trigger downloads directly)
@@ -630,16 +846,27 @@ window.addEventListener('message', function(event) {
 window.addEventListener('message', async function(event) {
     if (event.data && event.data.type === 'widgetToolCall') {
         // Security: only accept tool calls from known widget iframes
-        if (!_isWidgetSource(event.source)) return;
+        var _srcIframe = _resolveWidgetSource(event.source);
+        if (!_srcIframe) return;
         var id = event.data.id;
         var name = event.data.name;
         var args = event.data.args || {};
         var widgetName = event.data.widgetName || 'Widget';
+        // The shim only forwards widgetName (the widget TITLE, which is not
+        // unique). Derive the real widget id from the DOM instead, so tools like
+        // start_chat can default to the CALLING widget without trusting the
+        // widget's own claim. null when the iframe has no data-widget-id
+        // ancestor (e.g. a preview/fullscreen container) — never fabricated.
+        var _srcWidgetId = _widgetIdForIframe(_srcIframe);
 
         try {
             // executeTool checks permissions via requestProgrammaticToolApproval
             // For programmatic calls, approval uses notifications (not renderMessages) to preserve widget iframe
-            var result = await executeTool(name, args, null, { chatId: currentChatId, widgetName: widgetName });
+            // fromWidget: user-driven widget calls are not LLM-turn tool calls —
+            // the sub-agent dispatch gates (tools/020-tool-execution.js,
+            // worker/120-tool-routing.js) exempt them from the display-only
+            // tool-call counter.
+            var result = await executeTool(name, args, null, { chatId: currentChatId, widgetName: widgetName, widgetId: _srcWidgetId, fromWidget: true });
 
             // Persist screenshot to chat.screenshots map so screenshot_by_id can find it after reload
             // (NOT chat.messages — inserting there breaks tool_use/tool_result ordering for the API)
@@ -698,11 +925,11 @@ function renderWidgetContent(widget) {
     iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
 
     shadow.appendChild(iframe);
-    writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title));
+    writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id));
 }
 
-// Add a chat widget to the dashboard
-async function addWidgetToDashboard(widgetId, event) {
+// Add a chat widget to a dashboard ('main' = dashboard page, 'home' = home page)
+async function addWidgetToDashboard(widgetId, event, dashboard) {
     if (event) event.stopPropagation();
 
     // Get widget from chat widgets - try multiple sources
@@ -741,8 +968,10 @@ async function addWidgetToDashboard(widgetId, event) {
         }
     }
     
-    // Find available grid position for new widget
-    initGridOccupancy();
+    dashboard = dashboard === 'home' ? 'home' : 'main';
+
+    // Find available grid position for new widget (occupancy of the TARGET dashboard only)
+    initGridOccupancy(dashboard);
     var pos = findNextAvailablePosition(4, 4);
 
     // Create dashboard widget from chat widget
@@ -760,36 +989,97 @@ async function addWidgetToDashboard(widgetId, event) {
         chatId: chatId,
         msgIndex: msgIndex,
         error: null,
-        isLoading: false
+        isLoading: false,
+        dashboard: dashboard
     };
 
     dashboardWidgets[widgetId] = dashWidget;
     await saveDashboardWidget(dashWidget);
-    
-    // Update button state
-    var btn = document.querySelector('.widget-dashboard-btn[onclick*="' + widgetId + '"]');
-    if (btn) {
-        btn.classList.add('on-dashboard');
-        btn.setAttribute('onclick', "removeWidgetFromDashboard('" + widgetId + "', event)");
-        btn.setAttribute('title', 'Remove from Dashboard');
-    }
-    
-    // Re-render dashboard if it's currently visible to show the new widget
-    var dashboardPanel = document.getElementById('dashboard-panel');
-    if (dashboardPanel && dashboardPanel.style.display === 'flex') {
-        renderDashboard();
-    }
-    
+
+    // Update pin button states + re-render whichever dashboard is visible
+    updateWidgetPinButtons(widgetId);
+    refreshVisibleDashboards();
+
     // Update sidebar to reflect dashboard state
     renderVersionSidebar();
-    
-    showSnackbar('Widget added to dashboard', 'success');
+
+    showSnackbar(dashboard === 'home' ? 'Widget pinned to Home' : 'Widget pinned to Dashboard', 'success');
+    return dashWidget;
+}
+
+// Patch the pin buttons for a widget in place (inline chat / fullscreen spots).
+// Sidebar spots re-render wholesale via renderVersionSidebar/renderWidgetSidebar.
+function updateWidgetPinButtons(widgetId) {
+    var pinned = !!dashboardWidgets[widgetId];
+    document.querySelectorAll('.widget-dashboard-btn[data-widget-id="' + widgetId + '"]').forEach(function(btn) {
+        btn.classList.toggle('on-dashboard', pinned);
+        btn.innerHTML = pinned ? UI_ICONS.pinFilled : UI_ICONS.pin;
+        btn.title = pinned ? 'Pinned — click to change' : 'Pin to dashboard…';
+    });
+}
+
+// Small popover letting the user choose the pin target (Home / Dashboard / Unpin).
+function showWidgetPinMenu(widgetId, event) {
+    if (event) { event.stopPropagation(); event.preventDefault(); }
+    closeWidgetPinMenu();
+    var current = dashboardWidgets[widgetId] ? widgetDashboardOf(dashboardWidgets[widgetId]) : null;
+    var menu = document.createElement('div');
+    menu.className = 'widget-pin-menu';
+    menu.id = 'widget-pin-menu';
+    var html = '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'home\')"' + (current === 'home' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>Pin to Home</span></button>';
+    html += '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'main\')"' + (current === 'main' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>Pin to Dashboard</span></button>';
+    if (current) {
+        html += '<button class="danger" onclick="pinWidgetTo(\'' + widgetId + '\', \'none\')">' + UI_ICONS.close + '<span>Unpin</span></button>';
+    }
+    menu.innerHTML = html;
+    document.body.appendChild(menu);
+    var x = event ? event.clientX : window.innerWidth / 2;
+    var y = event ? event.clientY : window.innerHeight / 2;
+    menu.style.left = Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    menu.style.top = Math.max(8, Math.min(y + 6, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+    setTimeout(function() {
+        document.addEventListener('click', closeWidgetPinMenu, { once: true });
+    }, 0);
+}
+
+function closeWidgetPinMenu() {
+    var m = document.getElementById('widget-pin-menu');
+    if (m) m.remove();
+}
+
+// Pin/move/unpin a widget. target: 'main' | 'home' | 'none'.
+async function pinWidgetTo(widgetId, target) {
+    closeWidgetPinMenu();
+    if (target === 'none') {
+        await removeWidgetFromDashboard(widgetId);
+        return;
+    }
+    target = target === 'home' ? 'home' : 'main';
+    var existing = dashboardWidgets[widgetId];
+    if (existing) {
+        if (widgetDashboardOf(existing) !== target) {
+            existing.dashboard = target;
+            // Re-place in the target grid to avoid overlapping its widgets
+            initGridOccupancy(target);
+            var pos = findNextAvailablePosition(existing.width || 4, existing.height || 4);
+            existing.gridX = pos.gridX;
+            existing.gridY = pos.gridY;
+            await saveDashboardWidget(existing);
+            refreshVisibleDashboards();
+            showSnackbar(target === 'home' ? 'Widget moved to Home' : 'Widget moved to Dashboard', 'success');
+        }
+        updateWidgetPinButtons(widgetId);
+        renderVersionSidebar();
+        return existing;
+    }
+    return addWidgetToDashboard(widgetId, null, target);
 }
 
 // Remove a widget from the dashboard
 async function removeWidgetFromDashboard(widgetId, event) {
     if (event) event.stopPropagation();
     
+    var removedFrom = dashboardWidgets[widgetId] ? widgetDashboardOf(dashboardWidgets[widgetId]) : 'main';
     if (dashboardWidgets[widgetId]) {
         await deleteDashboardWidget(widgetId);
     }
@@ -802,31 +1092,52 @@ async function removeWidgetFromDashboard(widgetId, event) {
         if (iframe && iframe.__widgetCleanup) iframe.__widgetCleanup();
         dashboardWidgetEl.remove();
         
-        // Show empty state if no widgets left
-        var container = document.getElementById('dashboard-grid');
-        if (container && Object.keys(dashboardWidgets).length === 0) {
-            container.innerHTML = '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
+        // Show empty state if no widgets left on the dashboard it was removed from
+        var container = dashboardGridEl(removedFrom);
+        if (container && dashboardWidgetsFor(removedFrom).length === 0) {
+            container.innerHTML = removedFrom === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
         }
     }
+    // Hide the home section entirely when its last widget is unpinned
+    if (removedFrom === 'home' && typeof renderHomeDashboard === 'function') renderHomeDashboard();
     
-    // Update button state in chat view
-    var btn = document.querySelector('.widget-dashboard-btn[onclick*="' + widgetId + '"]');
-    if (btn) {
-        btn.classList.remove('on-dashboard');
-        btn.setAttribute('onclick', "addWidgetToDashboard('" + widgetId + "', event)");
-        btn.setAttribute('title', 'Add to Dashboard');
-    }
+    // Update pin button state in chat view
+    updateWidgetPinButtons(widgetId);
     // Update sidebar
     renderVersionSidebar();
 }
 
-// Toggle widget on/off dashboard from sidebar
-async function toggleWidgetOnDashboard(widgetId) {
-    if (dashboardWidgets && dashboardWidgets[widgetId]) {
-        await removeWidgetFromDashboard(widgetId);
-    } else {
-        await addWidgetToDashboard(widgetId);
+// Render the home-page dashboard section (hidden when no 'home' widgets are pinned)
+function renderHomeDashboard() {
+    var section = document.getElementById('home-dashboard-section');
+    if (!section) return;
+    var widgets = dashboardWidgetsFor('home');
+    if (widgets.length === 0) {
+        section.style.display = 'none';
+        return;
     }
+    section.style.display = '';
+    var expanded = appStorage.getItem('homeDashboardExpanded') === 'true';
+    section.classList.toggle('expanded', expanded);
+    updateHomeDashboardExpandBtn(expanded);
+    renderDashboard('home');
+}
+
+function toggleHomeDashboardExpanded() {
+    var section = document.getElementById('home-dashboard-section');
+    if (!section) return;
+    var expanded = !section.classList.contains('expanded');
+    section.classList.toggle('expanded', expanded);
+    appStorage.setItem('homeDashboardExpanded', expanded);
+    updateHomeDashboardExpandBtn(expanded);
+}
+
+function updateHomeDashboardExpandBtn(expanded) {
+    var btn = document.getElementById('home-dashboard-expand-btn');
+    if (!btn) return;
+    btn.innerHTML = UI_ICONS.chevronDown || '';
+    btn.classList.toggle('expanded', expanded);
+    btn.title = expanded ? 'Collapse' : 'Expand';
 }
 
 // Show widget in the browser/iframe panel
@@ -851,36 +1162,6 @@ function openAddWidgetModal() {
     if (input) {
         input.placeholder = 'Describe the widget you want to create...';
         input.focus();
-    }
-}
-
-function editDashboardWidget(widgetId) {
-    var widget = dashboardWidgets[widgetId];
-    if (!widget) return;
-
-    // If widget has a source chat, open that chat
-    if (widget.chatId && chats[widget.chatId]) {
-        // Close dashboard view properly (updates currentView)
-        closeDashboardView();
-        
-        // Load the source chat
-        selectChat(widget.chatId);
-        
-        // Scroll to the widget display inside the chat
-        setTimeout(function() {
-            // First try to scroll to the widget element itself
-            var widgetEl = document.getElementById('widget-' + widgetId);
-            if (widgetEl) {
-                widgetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            } else if (widget.msgIndex !== undefined) {
-                // Fallback to message element if widget not found
-                var msgEl = document.querySelector('[data-msg-index="' + widget.msgIndex + '"]');
-                if (msgEl) msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-        }, 100);
-    } else {
-        console.warn('Widget has no valid source chat. chatId:', widget.chatId, 'available chats:', Object.keys(chats));
-        showSnackbar('Source chat not found - widget may have been created in a deleted chat', 'warning');
     }
 }
 
@@ -928,14 +1209,21 @@ function openWidgetInChatMode(widget, isNew) {
     if (input) input.focus();
 }
 
-function closeWidgetChatMode() {
-    var widget = dashboardWidgets[currentEditingWidget];
-    
-    // If it's a new widget with no content, remove it
-    if (widget && !widget.html && (!widget.conversation || widget.conversation.length === 0)) {
-        delete dashboardWidgets[currentEditingWidget];
-    }
-    
+// NAV-H3: idempotent teardown of ONLY the widget-chat-mode chrome that
+// openWidgetInChatMode paints on the SHARED .main-header (widget-mode class +
+// dataset, #widget-back-btn's inline display) plus the two editing pointers that
+// route the composer to sendWidgetMessage (app/040-send-message.js:150). Exists so
+// browser Back, which never runs closeWidgetChatMode, can clean that chrome up too
+// (handlePopState in core/040-hooks-history.js calls it for every branch).
+// DELIBERATELY EXCLUDES the #header-chat-title restore: popstate calls this on EVERY
+// entry, and a .textContent write there would flatten the rich header that
+// updateChatTitleHeader builds (sub-agent badge + clickable progress pill,
+// ui/170-chat-management.js:986-990) and would write the literal 'New Chat' where that
+// function writes '' (:913) — which breaks the .header-chat-title:empty rules that hide
+// the rename/pin buttons (css/04-header.css:54,65). The title restore therefore stays in
+// closeWidgetChatMode, the only caller that KNOWS the title holds a widget name.
+// Safe to call when widget mode was never entered: every step is null-guarded.
+function exitWidgetModeChrome() {
     currentEditingWidget = null;
     activeWidgetStreamingId = null;
     
@@ -950,14 +1238,36 @@ function closeWidgetChatMode() {
     // Hide back button
     var backBtn = document.getElementById('widget-back-btn');
     if (backBtn) backBtn.style.display = 'none';
+}
+
+function closeWidgetChatMode() {
+    var widget = dashboardWidgets[currentEditingWidget];
     
-    // Restore chat title
-    var headerTitle = document.getElementById('header-chat-title');
-    if (headerTitle && chats[currentChatId]) {
-        headerTitle.textContent = chats[currentChatId].title || 'New Chat';
+    // If it's a new widget with no content, remove it
+    if (widget && !widget.html && (!widget.conversation || widget.conversation.length === 0)) {
+        delete dashboardWidgets[currentEditingWidget];
     }
     
-    // Show dashboard
+    // Clears currentEditingWidget/activeWidgetStreamingId and the .main-header chrome —
+    // unchanged statements in unchanged order, now shared with browser Back.
+    exitWidgetModeChrome();
+    
+    // Restore chat title. Stays HERE rather than in the shared helper above: this is
+    // the only caller that knows #header-chat-title currently holds a widget name.
+    var headerTitle = document.getElementById('header-chat-title');
+    if (headerTitle && chats[currentChatId]) {
+        // '' (never a literal placeholder) when the chat has no title, matching
+        // updateChatTitleHeader (ui/170-chat-management.js:913) — a non-empty
+        // 'New Chat' here defeated the .header-chat-title:empty rules that hide
+        // the rename/pin buttons (css/04-header.css:54,65).
+        headerTitle.textContent = chats[currentChatId].title || '';
+    }
+    
+    // Show dashboard. Widget mode pushed no history entry of its own, so the current
+    // entry is still the 'dashboard' one we came from — openDashboardView's
+    // pushHistoryState('dashboard', null) therefore hits the isSameEntry dedupe in
+    // pushHistoryState (core/040-hooks-history.js) and replaces instead of stacking a
+    // forward-duplicate. No one-shot flag needed.
     openDashboardView();
 }
 
@@ -1008,7 +1318,7 @@ function closeWidgetEditorPanel() {
     var dashboardPanel = document.getElementById('dashboard-panel');
     if (dashboardPanel) { 
         dashboardPanel.style.display = 'flex'; 
-        renderDashboard(); 
+        refreshVisibleDashboards(); 
     }
 }
 
@@ -1036,7 +1346,7 @@ async function revertWidgetToHistory(widgetId, historyIndex) {
     widget.error = null;
     
     await saveDashboardWidget(widget, true); // Skip history tracking since we're managing it manually
-    renderDashboard();
+    refreshVisibleDashboards();
     showSnackbar('Widget reverted to previous version', 'success');
 }
 
@@ -1074,110 +1384,6 @@ function showWidgetHistory(widgetId) {
 function closeWidgetHistory() {
     var modal = document.getElementById('widget-history-modal-overlay');
     if (modal) modal.remove();
-}
-
-// Regenerate widget - creates a new chat with full history and runs the last prompt
-async function regenerateDashboardWidget(widgetId) {
-    var widget = dashboardWidgets[widgetId];
-    if (!widget) {
-        showSnackbar('Widget not found', 'error');
-        return;
-    }
-    
-    // Find the source chat and the prompt to regenerate
-    var prompt = widget.prompt;
-    var historyMessages = [];
-    var lastUserMsgIndex = -1;
-    var sourceChatTitle = null;
-    
-    // Try to get history from source chat
-    if (widget.chatId && chats[widget.chatId]) {
-        var sourceChat = chats[widget.chatId];
-        sourceChatTitle = sourceChat.title;
-        // Find the last user message before the widget was created
-        var msgIndex = widget.msgIndex || sourceChat.messages.length;
-        for (var i = msgIndex - 1; i >= 0; i--) {
-            if (sourceChat.messages[i] && sourceChat.messages[i].role === 'user') {
-                if (!prompt) prompt = sourceChat.messages[i].content;
-                lastUserMsgIndex = i;
-                break;
-            }
-        }
-        
-        // Copy all messages BEFORE the last user message as history
-        if (lastUserMsgIndex > 0) {
-            for (var i = 0; i < lastUserMsgIndex; i++) {
-                var msg = sourceChat.messages[i];
-                // Skip internal messages like approval, pending_tool, etc.
-                if (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool' || msg.role === 'system') {
-                    // Clone the message to avoid modifying original
-                    var clonedMsg = JSON.parse(JSON.stringify(msg));
-                    // Remove streaming/transient properties
-                    delete clonedMsg.isStreaming;
-                    historyMessages.push(clonedMsg);
-                }
-            }
-        }
-    }
-    
-    // Also check widget conversation for user messages if no prompt found
-    if (!prompt && widget.conversation && widget.conversation.length > 0) {
-        for (var i = widget.conversation.length - 1; i >= 0; i--) {
-            if (widget.conversation[i].role === 'user') {
-                prompt = widget.conversation[i].content;
-                break;
-            }
-        }
-    }
-    
-    if (!prompt) {
-        showSnackbar('No prompt found to regenerate', 'error');
-        return;
-    }
-    
-    // Store the prompt for future regenerations
-    widget.prompt = prompt;
-    
-    // Close dashboard and show chat
-    closeDashboardView();
-    
-    // Create a new chat for regeneration
-    newChat();
-    
-    // Copy the source chat title to the new chat
-    var chat = chats[currentChatId];
-    if (sourceChatTitle && sourceChatTitle !== 'New Chat') {
-        chat.title = sourceChatTitle;
-        chat.isTemporary = false;
-        renderChatList();
-        updateChatTitleHeader();
-    }
-
-    // Copy cached tool results from source chat so cached_content_* tools work
-    if (widget.chatId && chats[widget.chatId] && chats[widget.chatId].cachedToolResults) {
-        chat.cachedToolResults = Object.assign({}, chats[widget.chatId].cachedToolResults);
-    }
-
-    // Store which widget we're regenerating so we can update it when done.
-    // B-B2: register against the new chat so concurrent regens don't collide.
-    setPendingWidgetRegeneration(currentChatId, widgetId);
-    
-    // Add history messages first, then the prompt
-    
-    // Add all history messages
-    for (var i = 0; i < historyMessages.length; i++) {
-        chat.messages.push(historyMessages[i]);
-    }
-    
-    // Add the prompt as the last user message
-    chat.messages.push({ role: 'user', content: prompt });
-    renderMessages();
-    
-    // Run the agent - it will create a new widget via html_widget tool
-    // The widget will be linked to this new chat
-    runAgent();
-    
-    showSnackbar('Regenerating widget with full history...', 'info');
 }
 
 // Run a prompt for a widget in the background (for batch regeneration)
@@ -1333,13 +1539,13 @@ async function refreshAllDashboardWidgets() {
 
         // Show loading on this widget
         widget.isLoading = true;
-        renderDashboard();
+        refreshVisibleDashboards();
 
         widget.conversation = [];
         await runWidgetPrompt(widget, prompt);
 
         widget.isLoading = false;
-        renderDashboard();
+        refreshVisibleDashboards();
         regeneratedCount++;
     }
 
@@ -1382,33 +1588,14 @@ async function confirmDeleteDashboardWidget(widgetId) {
         widgetEl.remove();
     }
 
-    // Show empty state if no widgets left
-    var container = document.getElementById('dashboard-grid');
-    if (container && Object.keys(dashboardWidgets).length === 0) {
-        container.innerHTML = '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
+    // Show empty state if no widgets left on this widget's dashboard
+    var container = dashboardGridEl(widgetDashboardOf(widget));
+    if (container && dashboardWidgetsFor(widgetDashboardOf(widget)).length === 0) {
+        container.innerHTML = widgetDashboardOf(widget) === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
     }
+    if (widgetDashboardOf(widget) === 'home' && typeof renderHomeDashboard === 'function') renderHomeDashboard();
     
     showSnackbar('Widget deleted', 'success');
-}
-
-function downloadDashboardWidget(widgetId) {
-    var widget = dashboardWidgets[widgetId];
-    if (!widget) return;
-    
-    var exportData = {
-        type: 'appagent-dashboard-widget',
-        version: 1,
-        widget: widget
-    };
-    
-    var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'widget-' + (widget.title || widget.id).replace(/[^a-z0-9]/gi, '-').toLowerCase() + '.json';
-    a.click();
-    URL.revokeObjectURL(url);
-    showSnackbar('Widget downloaded', 'success');
 }
 
 function openDashboardInNewTab() {
@@ -1484,7 +1671,7 @@ async function importDashboard() {
                 return;
             }
             
-            renderDashboard();
+            refreshVisibleDashboards();
             var msg = 'Imported ' + imported + ' widget(s)';
             if (updated > 0) msg += ', updated ' + updated;
             showSnackbar(msg, 'success');

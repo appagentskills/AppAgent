@@ -319,7 +319,27 @@ function closeSkillEditor() {
     if (editorPanel) editorPanel.style.display = 'none';
     if (listPanel) listPanel.style.display = 'flex';
     renderSkillsList();
-    pushHistoryState('skills', null, null);
+    // NAV-H5: this is a BACK button — do NOT push (that made browser Back
+    // RE-OPEN the editor the user had just closed).
+    // NAV-H5b: replacing was not right either. openSkillEditor PUSHES a
+    // 'skill-editor' entry (core/120-init.js:887 pushHistoryState('skill-editor',
+    // null, skill.id)) on TOP of the skills-list entry, so rewriting the top
+    // entry to {view:'skills'} left TWO ADJACENT IDENTICAL skills entries and the
+    // user's first Back press only re-rendered the list they were already looking
+    // at — a visual no-op. Popping the pushed editor entry instead removes the
+    // duplicate AND makes Back move immediately; handlePopState's 'skills' arm
+    // (core/040-hooks-history.js:237-250) re-shows the list, which is idempotent
+    // with the panel work above.
+    // Guard: only pop when we are actually standing on a PUSHED editor entry
+    // (history.length > 1). A boot-restored editor view (core/120-init.js:552)
+    // can be the only entry in the session — going back from there would leave
+    // the app — so that case keeps the old replace.
+    var _hs = null;
+    try { _hs = history.state; } catch (e) {}
+    var _canPop = !!(_hs && _hs.view === 'skill-editor') &&
+        (typeof history.length !== 'number' || history.length > 1);
+    if (_canPop) { try { history.back(); return; } catch (e) {} }
+    replaceHistoryState('skills', null, null);
 }
 
 async function saveCurrentSkill() {

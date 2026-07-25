@@ -63,9 +63,21 @@ function closeHomeView() {
 // Home bike trail animation - simple bike game
 var homeTrailAnimation = null;
 var homeTrailCleanup = null;
+var homeTrailInitTimer = null; // pending deferred-init timer from renderHome()
 function initHomeTrailAnimation() {
+    // Idempotent init: renderHome() defers this call by 100ms, so two renders
+    // <100ms apart used to double-init — the second overwrote homeTrailCleanup
+    // (leaking the first loop's window listeners) and both loops clobbered the
+    // shared rAF id, leaving one loop uncancellable. Stop any existing
+    // animation before starting a new one.
+    stopHomeTrailAnimation();
+    // Stale-guard: the user may have left home during the 100ms defer window
+    // (selectChat / popstate / view toggles). Don't start a loop against a
+    // hidden 0x0 canvas — offsetParent is null while any ancestor
+    // (home-panel) is display:none.
+    if (typeof currentView !== 'undefined' && currentView !== 'home') return;
     var canvas = document.getElementById('home-trail-canvas');
-    if (!canvas) return;
+    if (!canvas || !canvas.offsetParent) return;
     
     var ctx = canvas.getContext('2d');
     var pathPoints = [];
@@ -452,6 +464,12 @@ function initHomeTrailAnimation() {
 }
 
 function stopHomeTrailAnimation() {
+    // Also cancel a pending deferred init (renderHome's 100ms timer) so
+    // leaving home within that window can't start a loop on a hidden canvas.
+    if (homeTrailInitTimer) {
+        clearTimeout(homeTrailInitTimer);
+        homeTrailInitTimer = null;
+    }
     if (homeTrailAnimation) {
         cancelAnimationFrame(homeTrailAnimation);
         homeTrailAnimation = null;
@@ -515,9 +533,14 @@ function renderHome() {
     // Show home-content (hidden by default in HTML)
     contentEl.style.display = '';
 
-    // Initialize trail animation
+    // Initialize trail animation. Track the timer id so a re-render or a
+    // home exit within the 100ms defer window cancels the previous pending
+    // init (stopHomeTrailAnimation clears it).
     stopHomeTrailAnimation();
-    setTimeout(initHomeTrailAnimation, 100);
+    homeTrailInitTimer = setTimeout(function() {
+        homeTrailInitTimer = null;
+        initHomeTrailAnimation();
+    }, 100);
 
     // Get last 4 user prompts from all chats
     var recentPrompts = getRecentUserPrompts(4);
@@ -562,6 +585,17 @@ function renderHome() {
                 return actionsHtml ? '<div class="home-actions-row" id="home-actions-row">' + actionsHtml + '</div>' : '';
             })() +
         '</div>' +
+        // Home dashboard: pinned widgets (dashboard === 'home') rendered with the
+        // SAME grid renderer as the dashboard page (renderDashboard('home')).
+        // Hidden entirely when nothing is pinned to 'home'; collapsed by default
+        // with an expand/collapse toggle (toggleHomeDashboardExpanded).
+        '<div class="home-dashboard-section" id="home-dashboard-section" style="display:none;">' +
+            '<div class="home-dashboard-bar">' +
+                '<span class="home-section-label">Pinned widgets</span>' +
+                '<button class="home-dashboard-expand-btn" id="home-dashboard-expand-btn" onclick="toggleHomeDashboardExpanded()" title="Expand" aria-label="Expand pinned widgets"></button>' +
+            '</div>' +
+            '<div class="dashboard-grid home-dashboard-grid" id="home-dashboard-grid" ondragover="handleWidgetDragOver(event)" ondrop="handleWidgetDrop(event)"></div>' +
+        '</div>' +
         // Embedded live "Active chats" panel -- populated by renderHomeActiveChats()
         // (tools tier) just under the Actions row. Hidden until there are
         // active / pinned / completed-today chats.
@@ -583,6 +617,10 @@ function renderHome() {
     // renderHomeActiveChats lives in the tools tier (loads after this ui tier)
     // and no-ops cheaply when its container is absent / all buckets are empty.
     if (typeof renderHomeActiveChats === 'function') { try { renderHomeActiveChats(); } catch (e) {} }
+
+    // Home dashboard section (above Active chats) — shows/hides itself based on
+    // whether any widgets are pinned to the 'home' dashboard.
+    if (typeof renderHomeDashboard === 'function') { try { renderHomeDashboard(); } catch (e) {} }
 
     // Calculate stats
     var chatCount = Object.keys(chats).length;

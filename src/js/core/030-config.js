@@ -172,6 +172,20 @@ var DEFAULT_API_PROVIDERS = [
         // the global 64k default was chosen to fit under exactly this cap
     },
     {
+        // Opus 5 (July 2026) — the current default (see currentProvider below
+        // and DEFAULT_TIER_ALIASES.medium). Same Anthropic-OAuth shape as the
+        // Opus-4-8 entry below, which is deliberately KEPT so anyone who
+        // prefers it can still select it.
+        name: 'Opus 5',
+        model: 'claude-opus-5',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        apiKey: 'oauth',
+        // xhigh is supported on Opus 5 and is the documented recommended
+        // starting point for coding/agentic work
+        effort: 'xhigh',
+        isClaudeOAuth: true
+    },
+    {
         name: 'Opus-4-8',
         model: 'claude-opus-4-8',
         endpoint: 'https://api.anthropic.com/v1/messages',
@@ -225,7 +239,7 @@ function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
 
-var currentProvider = 'Opus-4-8'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
+var currentProvider = 'Opus 5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
 
 // Old default-provider names → their renamed successors (the Opus 4.8
 // alignment). Used by loadProviderFromStorage (ui/070-dashboard-ui.js) as a
@@ -273,7 +287,7 @@ var TIER_ALIASES_SETTING_KEY = 'subagentTierAliases';
 // DEFAULT_API_PROVIDERS entries above when models are renamed.
 var DEFAULT_TIER_ALIASES = {
     small: 'Sonnet 5',
-    medium: 'Opus-4-8',
+    medium: 'Opus 5',
     large: 'Fable 5'
 };
 var subAgentTierAliases = null; // null = not yet hydrated from IDB

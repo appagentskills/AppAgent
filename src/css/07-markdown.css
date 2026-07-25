@@ -13,6 +13,24 @@
 .sh-number { color: var(--sh-number); }
 .sh-comment { color: var(--sh-comment); font-style: italic; }
 code.inline-code { background: var(--bg-hover); color: var(--text-heading); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.9em; border: 1px solid var(--border); white-space: nowrap; }
+/* Clickable widget_/doc_ ID chips emitted by decorateIdMentions()
+   (ui/250-message-render.js) inside formatContent output — so they appear in BOTH
+   .message-content (chat bubbles, assistant + user) and .markdown-body surfaces.
+   Styled off the same tokens as code.inline-code above, which is what makes dark
+   mode automatic: 01-dark-theme.css only re-points the variables at
+   :root[data-theme="dark"] (--bg-hover #1f2228, --border #2e3138,
+   --text-heading #f3f4f6, --primary #6b8bc4, --primary-lighter #161e30,
+   --accent #22d3ee, --accent-lighter #0a1f24), so no dark-specific rule is needed.
+   The 0.25em side margin restores a readable word gap: formatContent's inter-tag
+   whitespace cleanup collapses the real space between a chip and an adjacent
+   inline element, and an em-relative value keeps it correct at any font size. */
+.id-mention { display: inline; margin: 0 0.25em; padding: var(--space-1) var(--space-3); background: var(--bg-hover); color: var(--text-heading); border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.85em; cursor: pointer; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast); }
+.id-mention:hover { text-decoration: underline; }
+/* Per-type accent so a widget chip and a document chip are distinguishable. */
+.id-mention-widget { border-left: 2px solid var(--accent); }
+.id-mention-widget:hover { background: var(--accent-lighter); border-color: var(--accent); color: var(--accent-hover); }
+.id-mention-doc { border-left: 2px solid var(--primary); }
+.id-mention-doc:hover { background: var(--primary-lighter); border-color: var(--primary); color: var(--primary); }
 .message-content { line-height: var(--leading-loose); }
 .message-content h2 { font-size: 1.25em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }
 .message-content h3 { font-size: 1.1em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }

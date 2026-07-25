@@ -124,6 +124,15 @@ function addVersionHistoryEntryForChat(chatId, entry) {
         renderVersionSidebar();
         updateVersionSidebarVisibility();
         renderMessages();
+    } else {
+        // A record mutated by one of the VIEWED chat's sub-agents rolls up
+        // into this sidebar (getVersionHistorySources) — refresh it live.
+        try {
+            if (typeof getSubAgentChatsForChat === 'function' &&
+                getSubAgentChatsForChat(currentChatId).some(function(sc) { return sc.chatId === chatId; })) {
+                renderVersionSidebar();
+            }
+        } catch (e) { /* registry not ready */ }
     }
     saveChatsToStorage();
 }
@@ -154,12 +163,17 @@ function getChangesForUserMessage(userMsgIndex) {
 
 // Get the first version (before chat started) for a record
 function getFirstVersionForRecord(table, sysId) {
-    var entries = versionHistory.filter(function(v) {
-        return v.chatId === currentChatId && 
-               v.table === table && 
-               v.sysId === sysId &&
-               v.action !== 'REVERT' &&
-               !v.invalidated;
+    var entries = [];
+    getVersionHistorySources().forEach(function(src) {
+        src.entries.forEach(function(v) {
+            if (v.chatId === src.chatId &&
+                v.table === table &&
+                v.sysId === sysId &&
+                v.action !== 'REVERT' &&
+                !v.invalidated) {
+                entries.push(v);
+            }
+        });
     });
     if (entries.length > 0) {
         // Sort by timestamp and return the beforeVersion of the first change
@@ -169,23 +183,82 @@ function getFirstVersionForRecord(table, sysId) {
     return null;
 }
 
-// Get all unique files changed in this chat
+// ---- Sub-agent version-history rollup ----
+// Sources of version-history entries for the CURRENT sidebar: the active
+// chat's own mirror (global `versionHistory`) plus each of its sub-agent
+// chats' persisted histories — mirrors the PR rollup in renderVersionSidebar
+// (120-ui-utils.js, via getSubAgentChatsForChat). Returns
+// [{chatId, entries, worker}]; worker is null for the active chat itself.
+// getSubAgentChatsForChat is defined in 120-ui-utils.js (loads after this
+// file in the ui tier) — guarded by typeof at call time.
+function getVersionHistorySources() {
+    var sources = [{ chatId: currentChatId, entries: versionHistory || [], worker: null }];
+    if (typeof getSubAgentChatsForChat === 'function') {
+        try {
+            getSubAgentChatsForChat(currentChatId).forEach(function(sc) {
+                if (sc && sc.chat && Array.isArray(sc.chat.versionHistory) && sc.chat.versionHistory.length) {
+                    sources.push({ chatId: sc.chatId, entries: sc.chat.versionHistory, worker: sc.name });
+                }
+            });
+        } catch (e) { /* sub-agent registry not ready */ }
+    }
+    return sources;
+}
+
+// Invalidate (or un-invalidate) every non-REVERT entry for a record across
+// the active chat AND its sub-agent chats — revert/redo must act on the
+// OWNING chat's entries now that the sidebar rolls up sub-agent artifacts.
+function setRecordEntriesInvalidated(table, sysId, invalidated) {
+    getVersionHistorySources().forEach(function(src) {
+        src.entries.forEach(function(v) {
+            if (v.table === table && v.sysId === sysId && v.action !== 'REVERT') {
+                v.invalidated = invalidated;
+            }
+        });
+    });
+}
+
+// Remove REVERT entries for a record across the active chat and its
+// sub-agent chats (redo path). filter() returns a new array, so the owning
+// chat's array is reassigned and the active-chat mirror kept in sync.
+function removeRevertEntriesForRecord(table, sysId) {
+    getVersionHistorySources().forEach(function(src) {
+        var filtered = src.entries.filter(function(v) {
+            return !(v.table === table && v.sysId === sysId && v.action === 'REVERT');
+        });
+        if (filtered.length !== src.entries.length) {
+            if (chats[src.chatId]) chats[src.chatId].versionHistory = filtered;
+            if (src.chatId === currentChatId) versionHistory = filtered;
+        }
+    });
+}
+
+// Get all unique files changed in this chat (and its sub-agent chats —
+// rolled up with a `worker` attribution, parent's own entries win).
 function getAllChangedFiles() {
     var files = {};
-    versionHistory.forEach(function(v) {
-        if (v.chatId === currentChatId && v.action !== 'REVERT' && v.action !== 'USER_DELETE' && !v.invalidated) {
-            var key = v.table + '_' + v.sysId;
-            if (!files[key]) {
-                files[key] = {
-                    table: v.table,
-                    sysId: v.sysId,
-                    displayName: v.displayName,
-                    firstBeforeVersion: v.beforeVersion,
-                    changes: []
-                };
+    getVersionHistorySources().forEach(function(src) {
+        src.entries.forEach(function(v) {
+            if (v.chatId === src.chatId && v.action !== 'REVERT' && v.action !== 'USER_DELETE' && !v.invalidated) {
+                var key = v.table + '_' + v.sysId;
+                if (!files[key]) {
+                    files[key] = {
+                        table: v.table,
+                        sysId: v.sysId,
+                        displayName: v.displayName,
+                        firstBeforeVersion: v.beforeVersion,
+                        worker: src.worker,
+                        changes: []
+                    };
+                } else if (!src.worker) {
+                    // The active chat also touched this record — its entry
+                    // wins the attribution (no worker chip), same rule as the
+                    // PR rollup.
+                    files[key].worker = null;
+                }
+                files[key].changes.push(v);
             }
-            files[key].changes.push(v);
-        }
+        });
     });
     return Object.values(files);
 }
@@ -193,12 +266,17 @@ function getAllChangedFiles() {
 // Get reverted files that can be redone
 function getRevertedFiles() {
     var reverted = {};
-    versionHistory.forEach(function(v) {
-        if (v.chatId === currentChatId && v.action === 'REVERT' && v.afterVersion && v.table !== 'batch') {
+    var sources = getVersionHistorySources();
+    sources.forEach(function(src) {
+        src.entries.forEach(function(v) {
+        if (v.chatId === src.chatId && v.action === 'REVERT' && v.afterVersion && v.table !== 'batch') {
             var key = v.table + '_' + v.sysId;
-            // Only show if the original changes are invalidated
-            var hasInvalidated = versionHistory.some(function(h) {
-                return h.chatId === currentChatId && h.table === v.table && h.sysId === v.sysId && h.invalidated;
+            // Only show if the original changes are invalidated (the entries
+            // may live in a sub-agent chat's history — check all sources)
+            var hasInvalidated = sources.some(function(s2) {
+                return s2.entries.some(function(h) {
+                    return h.table === v.table && h.sysId === v.sysId && h.invalidated;
+                });
             });
             if (hasInvalidated) {
                 reverted[key] = {
@@ -210,19 +288,25 @@ function getRevertedFiles() {
                 };
             }
         }
+        });
     });
     return Object.values(reverted);
 }
 
 // Get the latest after version for a record (to redo changes)
 function getLatestAfterVersion(table, sysId) {
-    var entries = versionHistory.filter(function(v) {
-        return v.chatId === currentChatId && 
-               v.table === table && 
-               v.sysId === sysId &&
-               v.action !== 'REVERT' &&
-               v.action !== 'USER_DELETE' &&
-               v.afterVersion;
+    var entries = [];
+    getVersionHistorySources().forEach(function(src) {
+        src.entries.forEach(function(v) {
+            if (v.chatId === src.chatId &&
+                v.table === table &&
+                v.sysId === sysId &&
+                v.action !== 'REVERT' &&
+                v.action !== 'USER_DELETE' &&
+                v.afterVersion) {
+                entries.push(v);
+            }
+        });
     });
     if (entries.length > 0) {
         entries.sort(function(a, b) { return b.timestamp - a.timestamp; });
@@ -928,11 +1012,12 @@ function loadVersionHistory() {
     updateVersionSidebarVisibility();
 }
 
-// Get all versions for a specific file in this chat
+// Get all versions for a specific file in this chat (incl. sub-agent chats)
 function getVersionsForFile(table, sysId) {
     var versions = [];
-    versionHistory.forEach(function(v) {
-        if (v.chatId === currentChatId && v.table === table && v.sysId === sysId &&
+    getVersionHistorySources().forEach(function(src) {
+    src.entries.forEach(function(v) {
+        if (v.chatId === src.chatId && v.table === table && v.sysId === sysId &&
             v.action !== 'REVERT' && v.action !== 'USER_DELETE' && !v.invalidated) {
             if (v.beforeVersion) {
                 var exists = versions.some(function(ver) { return ver.versionId === v.beforeVersion; });
@@ -958,6 +1043,7 @@ function getVersionsForFile(table, sysId) {
                 });
             }
         }
+    });
     });
     // Sort by timestamp
     versions.sort(function(a, b) { return a.timestamp - b.timestamp; });

@@ -114,6 +114,14 @@
 
 /* Dark theme: workspace owning-chat chip — lift lightness so per-chat hues
    stay readable on dark backgrounds (chip itself is defined in 04-header.css) */
+/* CONTRAST-722x728 (see 21b-prompt-user.css): --text-secondary is #9ca3af in
+   dark theme, which reads as a 7.42:1 hairline on #111317 — correct but loud.
+   --text-muted (#6b7280) keeps the boundary well above the 3:1 non-text target
+   (3.90:1 on --bg-white, 3.71:1 on the --bg-primary popup, 3.52:1 on the card's
+   own --bg-secondary fill) while sitting quietly in a dark panel. */
+:root[data-theme="dark"] .prompt-user-desc,
+:root[data-theme="dark"] .prompt-value-chip { border-color: var(--text-muted); }
+
 :root[data-theme="dark"] .ws-file-chat {
     color: hsl(var(--chat-hue), 75%, 70%);
     background: hsla(var(--chat-hue), 70%, 60%, 0.18);
@@ -122,9 +130,17 @@
     background: hsla(var(--chat-hue), 70%, 60%, 0.32);
 }
 
-/* Dark theme: native form elements */
+/* Dark theme: native form elements.
+   [type="range"] is excluded alongside checkbox/radio because range inputs in
+   this app are fully CUSTOM-PAINTED: the reasoning-effort slider
+   (.model-menu-effort-slider, 04-header.css) keeps the native input
+   transparent and topmost (z-index 4) so it owns pointer events, while the
+   rail/fill/level circles/disc paint underneath it. An opaque background-color
+   here outranks `.model-menu-effort-slider { background: transparent }`
+   (specificity 0,4,1 vs 0,1,0) and so blanketed the whole 26px track with
+   --bg-secondary — the bar rendered as an empty grey slab in dark mode. */
 :root[data-theme="dark"] select,
-:root[data-theme="dark"] input:not([type="checkbox"]):not([type="radio"]) {
+:root[data-theme="dark"] input:not([type="checkbox"]):not([type="radio"]):not([type="range"]) {
     background-color: var(--bg-secondary);
     color: var(--text-primary);
     border-color: var(--border);

@@ -214,6 +214,53 @@ async function init() {
         if (modal && modal.classList.contains('show')) { closeModal(); return; }
     });
 
+    // NAV-H7: global Alt+ArrowLeft = app Back (browser history). Registered right next
+    // to the global Escape handler above so both app-level shortcuts live together and
+    // share the same "is an overlay open?" checks. preventDefault is required: in a tab
+    // Alt+Left is ALSO the browser's own Back, and without it the entry would be popped
+    // twice; in side-panel mode the browser shortcut doesn't fire at all, so this is the
+    // only Back key. history.back() replays through handlePopState (core/040-hooks-history.js).
+    document.addEventListener('keydown', function(e) {
+        if (e.key !== 'ArrowLeft' || !e.altKey) return;
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return; // don't shadow other combos
+        // Never steal the keystroke from a text field — Alt+Left is a word-wise caret
+        // move on some platforms. Same e.target tag guard the workspace-files overlay
+        // arrow-nav uses (ui/115-workspace-files-sidebar.js:308-309), plus contenteditable
+        // and a focused <iframe> (widget previews / the controlled panel), whose own
+        // document must keep the key.
+        var t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' ||
+            t.tagName === 'IFRAME' || t.isContentEditable)) return;
+        // Never navigate out from under an open overlay/modal (Escape closes them; Back
+        // must not slide out underneath them). ONE class-first selector rather than an id
+        // list — an id list silently misses every modal added later, and it already missed
+        // six. Every selector below is 'present ⇒ open': each overlay is .remove()d on
+        // close, and the one permanently-mounted overlay (#modal-overlay, html/body.html:388)
+        // is gated on .show, exactly as the Escape handler above gates it.
+        //   .modal-overlay.show     — #modal-overlay (showModal/showPromptModal + the
+        //     screenshot viewer, ui/290-screenshot-ui.js:41,53) AND every dynamic twin that
+        //     reuses the class: #tool-inspector-modal (ui/040-tools-settings.js:27-28),
+        //     #llm-endpoint-modal (:1580-1581), #api-provider-modal (:1743-1744),
+        //     #github-setup-modal (tools/130-github-setup.js:54-55),
+        //     #widget-history-modal-overlay (ui/070-dashboard-ui.js:1193-1194).
+        //   .sdoc-preview-overlay   — #sdoc-preview-modal (tools/110-smart-documents.js:795-796)
+        //   .widget-fullscreen-overlay (tools/080-widget-tools.js:388, ui/070-dashboard-ui.js:85)
+        //   .widget-modal-overlay   — #widget-edit-overlay + #widget-modal-overlay
+        //     (tools/080-widget-tools.js:515-516, 598-599)
+        //   .wsf-overlay            — ui/115-workspace-files-sidebar.js:293; owns ArrowLeft itself
+        //   #diff-viewer-overlay    — ui/100-diff-viewer.js:58-59 (removed in closeDiffViewer:355)
+        //   #jobs-expand-overlay    — tools/120-actions.js:3323-3324
+        // The four widget ids are kept explicitly so the guard still holds if one of those
+        // overlays is ever created without its class.
+        if (document.querySelector(
+            '.modal-overlay.show, .sdoc-preview-overlay, .widget-fullscreen-overlay, ' +
+            '.widget-modal-overlay, .wsf-overlay, #diff-viewer-overlay, #jobs-expand-overlay, ' +
+            '#widget-fullscreen-overlay, #widget-edit-overlay, #widget-modal-overlay, ' +
+            '#widget-history-modal-overlay')) return;
+        e.preventDefault();
+        history.back();
+    });
+
     // Restore impersonation state
     impersonateOriginalUserSysId = appStorage.getItem('impersonateOriginalUserSysId') || null;
 
@@ -717,6 +764,18 @@ function closeSkillsView() {
     if (activeStreamingChatId && currentChatId === activeStreamingChatId) {
         renderMessages();
     }
+    // #744: align history with the view switch — leaving history.state on
+    // {view:'skills'} made the first Back press a visual no-op (it popped back
+    // onto the entry beneath, usually the chat we are already showing). Same
+    // pop-the-pushed-entry pattern as closeSkillEditor (ui/010-skills-ui.js:337-342);
+    // a boot-restored skills view (no pushed entry / short history) keeps the
+    // replace so Back never exits the app.
+    var _hs = null;
+    try { _hs = history.state; } catch (e) {}
+    if (_hs && _hs.view === 'skills' && (typeof history.length !== 'number' || history.length > 1)) {
+        try { history.back(); return; } catch (e) {}
+    }
+    replaceHistoryState('chat', currentChatId, null);
 }
 
 function updateSkillsButtonState() {

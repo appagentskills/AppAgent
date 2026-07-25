@@ -117,16 +117,53 @@ function findAdjacentForAttachmentGroup(messages, index, direction) {
     return null;
 }
 
-// R1: incremental render fast-path state. sigs[i] is the normalized HTML that
-// the last completed render produced for chat.messages[i]. Normalized = the
-// per-render rc-N copy nonces minted by storeRawCopy() are stripped, otherwise
-// identical content would never compare equal across renders (gcRawCopyStore
-// sweeps the discarded nonces afterwards — it keeps whatever the DOM still
-// references, so untouched nodes keep working copy buttons).
+// R1: incremental render fast-path state. FIX2: sigs[i] is a CHEAP SIGNATURE
+// (length + 32-bit string hash + widget flag) of the normalized HTML the last
+// completed render produced for chat.messages[i] — NOT the HTML itself.
+// Retaining the full per-message HTML kept a persistent multi-MB duplicate of
+// the whole chat (inline base64 screenshot data-URLs included) alive between
+// renders. Normalized = the per-render rc-N copy nonces minted by
+// storeRawCopy() are stripped before hashing, otherwise identical content
+// would never compare equal across renders (gcRawCopyStore sweeps the
+// discarded nonces afterwards — it keeps whatever the DOM still references,
+// so untouched nodes keep working copy buttons). The trailing ':w' flag
+// records whether the RAW part contained widget markup, replacing the old
+// substring search over the retained HTML (see _sigHasWidget below).
 var _lastRenderState = { chatId: null, count: 0, sigs: [] };
 
 function _renderSig(part) {
-    return part.replace(/ data-copy-id="rc-[0-9]+"/g, '');
+    var s = part.replace(/ data-copy-id="rc-[0-9]+"/g, '');
+    // 31x string hash (ES5-safe, no Math.imul needed). A collision would only
+    // skip one tail repaint until the next content change — acceptable odds
+    // for a 32-bit hash guarded by an exact length prefix.
+    var h = 0;
+    for (var i = 0; i < s.length; i++) {
+        h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    }
+    var w = (part.indexOf('widgets-container') !== -1 || part.indexOf('widget-inline') !== -1) ? ':w' : '';
+    return s.length + ':' + h + w;
+}
+
+function _sigHasWidget(sig) {
+    return typeof sig === 'string' && sig.slice(-2) === ':w';
+}
+
+// FIX4c: safety net for widgets parked on document.body by the moveBefore
+// preservation dance below. The park → rebuild → reclaim sequence is
+// synchronous, so at the END of any render every legitimately parked widget
+// has been either moved back or explicitly removed — anything still sitting
+// under body (a render that threw mid-way, a container wiped by another code
+// path) is an orphan whose iframe would otherwise run its bridge + resize
+// machinery forever, invisible. Clean it up.
+function _sweepOrphanedParkedWidgets() {
+    var parked = document.querySelectorAll('body > .widget-inline[data-widget-id]');
+    for (var i = 0; i < parked.length; i++) {
+        var iframes = parked[i].querySelectorAll('.widget-iframe');
+        for (var fi = 0; fi < iframes.length; fi++) {
+            if (iframes[fi].__widgetCleanup) { try { iframes[fi].__widgetCleanup(); } catch (e) {} }
+        }
+        parked[i].remove();
+    }
 }
 
 // Shared by the full render and the R1 fast path: right-edge fade shadow for
@@ -182,10 +219,14 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
     var tailChanged = newSigs[tailIdx] !== prev.sigs[tailIdx];
 
     // Widget markup in the touched range → full render so the existing
-    // moveBefore iframe-preservation logic owns it.
-    var touchedHtml = tailChanged ? (prev.sigs[tailIdx] + mappedParts[tailIdx]) : '';
-    for (var ai = oldCount; ai < newCount; ai++) touchedHtml += mappedParts[ai];
-    if (touchedHtml.indexOf('widgets-container') !== -1 || touchedHtml.indexOf('widget-inline') !== -1) return false;
+    // moveBefore iframe-preservation logic owns it. FIX2: sigs no longer
+    // retain the HTML, so the check reads the ':w' widget flag each sig
+    // carries (computed from the raw part at sig time) — same semantics as
+    // the old substring search over old-tail + new-tail + appended HTML.
+    if (tailChanged && (_sigHasWidget(prev.sigs[tailIdx]) || _sigHasWidget(newSigs[tailIdx]))) return false;
+    for (var ai = oldCount; ai < newCount; ai++) {
+        if (_sigHasWidget(newSigs[ai])) return false;
+    }
 
     // The old tail node must be an id-addressable DIRECT child of root. This
     // anchors both the patch and the append, and doubles as a DOM integrity
@@ -255,6 +296,11 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
         restoreChatScrollTop(container, savedScrollTop);
     }
 
+    // FIX6/FIX4c: the tail swap above can discard expanded tool panels —
+    // disconnect their orphaned sticky observers; also clear any parked
+    // widget orphans left behind by an earlier interrupted full render.
+    if (typeof sweepStickyObservers === 'function') sweepStickyObservers();
+    _sweepOrphanedParkedWidgets();
     if (typeof gcRawCopyStore === 'function') gcRawCopyStore();
     return true;
 }
@@ -285,7 +331,19 @@ function renderMessages() {
     // while a background action streams would hide that chat's final assistant
     // message (because branches like `!(isRunning && block.isLastBlock)` falsely
     // assumed the visible chat was still streaming).
-    var isRunning = window.isRunning && activeStreamingChatId === currentChatId;
+    // SILENT-HOOK-OPEN-FIX: additionally treat a SILENT after-response hook run
+    // (auto title/tldr/links — _isChatInSilentHook, tools/120-actions.js) as NOT
+    // streaming for render purposes. The hook run re-sets runningChatIds /
+    // activeStreamingChatId, but its stream is invisible (suppressed by the
+    // silent-hook gates), so nothing ever lands in #streaming-text. Without this,
+    // opening/switching to the chat WHILE its hooks run did a full rebuild with
+    // isRunning=true and the `!(isRunning && block.isLastBlock)` / `!isRunning`
+    // branches below suppressed the final answer's content — the user saw their
+    // last output missing until the hook run finished. From the user's point of
+    // view the chat is DONE the moment the visible answer landed, so render it
+    // as done. Hook rows themselves stay hidden via the isHookMessage checks.
+    var isRunning = window.isRunning && activeStreamingChatId === currentChatId &&
+        !(typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(currentChatId));
 
     var container = document.getElementById('messages');
     var chat = chats[currentChatId];
@@ -1256,6 +1314,16 @@ function renderMessages() {
     // R1: record what this full render produced so the next render can diff.
     _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
 
+    // FIX6: the innerHTML rebuild above discarded every previous expanded
+    // tool panel WITHOUT disconnecting its IntersectionObserver — disconnect
+    // the orphans now (fresh ones for the new DOM were registered by the
+    // setupStickyObserver calls above).
+    if (typeof sweepStickyObservers === 'function') sweepStickyObservers();
+
+    // FIX4c: any widget still parked on document.body after the reclaim loop
+    // above is an orphan (this render's parks were all reclaimed or removed).
+    _sweepOrphanedParkedWidgets();
+
     // The rebuild above minted fresh rc-N rawCopyStore entries for every
     // tool panel / code fence and orphaned the previous render's keys —
     // sweep the orphans now (see gcRawCopyStore in 200-ui-interactions.js
@@ -1691,7 +1759,15 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
     msgEl.querySelectorAll('details.tool-call.expanded').forEach(function(details) {
         setupStickyObserver(details);
     });
-    
+
+    // FIX6/FIX1: the msgEl.innerHTML swap above runs on EVERY streaming tick —
+    // it discards the row's previous expanded panels (orphaning their sticky
+    // observers) and re-mints rc-N copy entries for every tool-args panel
+    // (storeRawCopy above). Disconnect the orphaned observers and sweep the
+    // orphaned copy entries on a throttle.
+    if (typeof sweepStickyObservers === 'function') sweepStickyObservers();
+    if (typeof gcRawCopyStoreThrottled === 'function') gcRawCopyStoreThrottled();
+
     scrollToBottomIfAllowed();
 }
 
@@ -1832,6 +1908,25 @@ function formatContent(content) {
         })(_protectedSpans[_pi], _pi);
     }
 
+    // Clickable widget_/doc_ ID chips. MUST run here — after the markdown-link and
+    // bare-URL passes and BEFORE the emoji/header/line passes. At this point the
+    // text is already HTML-escaped and fenced code, <!--display:--> and
+    // <!--document:--> blocks are still %%CODEBLOCK/%%DISPLAY/%%DOCUMENT
+    // placeholders, so IDs inside a code fence or inside already-rendered
+    // widget/document markup are immune by construction.
+    html = decorateIdMentions(html);
+
+    // Emoji shortcodes: convert :name: (e.g. :rocket:, :bug:) to real emoji.
+    // Runs AFTER inline <code>, markdown links and bare-URL autolinking (and
+    // while fenced code is still a %%CODEBLOCK%% placeholder), so a ':' that
+    // belongs to code or a URL is never rewritten. Helper + curated map live
+    // in core/055-emoji-shortcodes.js (replaceEmojiShortcodes /
+    // SECTION_ICON_SHORTCODES) — CORE tier, so it is defined before every
+    // renderer in the page bundle and shipped to the SW via
+    // WORKER_SHARED_FILES. Called UNCONDITIONALLY: the old typeof guard could
+    // silently skip the pass, hiding a wiring bug instead of surfacing it.
+    html = replaceEmojiShortcodes(html);
+
     // Headers (process in order from most # to fewest)
     html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
     html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
@@ -1901,8 +1996,15 @@ function formatContent(content) {
             out.push('');
             continue;
         } else if (trimmedLn === '') {
-            // Skip empty lines entirely - they cause spacing issues
-            continue;
+            // Preserve the blank line as a PARAGRAPH SEPARATOR. The paragraph
+            // pass below flushes its buffer on an empty line, so blank-line-
+            // separated text becomes separate block-level .md-paragraph spans
+            // (visible spacing via 07-markdown.css) instead of being <br>-
+            // joined into one flowing paragraph and then collapsed by the
+            // (<br>){2,} cleanup. Blank lines inside lists/blockquotes are
+            // handled by the branches above; stray blanks around block
+            // elements are swallowed by the cleanup regexes further down.
+            out.push('');
         } else {
             if (inTable) { out.push('</table>'); inTable = false; }
             if (inList) { out.push('</ul>'); inList = false; }
@@ -1940,7 +2042,7 @@ function formatContent(content) {
         var trimmed = line.trim();
         
         // Check if this is a block element (including table parts, list items, blockquotes)
-        if (trimmed.match(/^<(h[234]|pre|table|tbody|tr|td|th|ul|ol|li|div|blockquote|\/)/) || trimmed.match(/^%%(DOCUMENT|DISPLAY)\d+%%$/)) {
+        if (trimmed.match(/^<(h[234]|pre|table|tbody|tr|td|th|ul|ol|li|div|blockquote|\/)/) || trimmed.match(/^%%(DOCUMENT|DISPLAY|CODEBLOCK)\d+%%$/)) {
             flushParagraph();
             result.push(trimmed);
         } else if (trimmed === '') {
@@ -1993,6 +2095,93 @@ function formatContent(content) {
         html = applySearchHighlight(html, window.currentSearchHighlight);
     }
     
+    return html;
+}
+
+// Decorate bare widget_/doc_ IDs written in chat text — by the agent OR by the
+// user (user bubbles run through this same formatContent pipeline, see the
+// user-text-md branch above) — as clickable chips with a hover tooltip.
+// ID formats are anchored on the real generators:
+//   widget_<Date.now()>_<Math.random().toString(36).substr(2,9)>  tools/080-widget-tools.js:68
+//   doc_<Date.now()>_<Math.random().toString(36).substr(2,7)>     tools/110-smart-documents.js:105
+// The \d{10,} epoch requirement is what keeps prose like "doc_id" / "widget_id"
+// (and a bare "doc_1234") from being decorated. Because the matched substring can
+// only contain [a-z0-9_], it is safe verbatim inside the single-quoted onclick
+// argument and inside the title attribute — no quote can ever appear in it.
+function decorateIdMentions(html) {
+    // Fast path first: formatContent re-runs on EVERY streaming repaint (rAF tick,
+    // core/050-streaming.js:268), so the common case must cost two indexOf scans.
+    if (html.indexOf('widget_') === -1 && html.indexOf('doc_') === -1) return html;
+
+    // Stash-then-restore, same trick as the bare-URL autolinker in formatContent.
+    // Two passes, in this order:
+    //  1. <a>/<code> spans — never rewrite an ID that is already a link or that the
+    //     author deliberately showed as inline code.
+    //  2. ANY-SCHEME URL-ish runs. The autolinker above only handles http/https, so
+    //     without this an ID inside a chrome-extension:// , file:// or ftp:// URL
+    //     would get a chip spliced into the middle of the URL. The [^\s<\u0000]
+    //     class keeps the run from swallowing markup or a marker minted by pass 1.
+    // Every chip this function EMITS is stashed the same way (see the two passes
+    // below): the doc pass scans the widget pass's output, so a widget whose title
+    // contains a doc_ id would otherwise get a <span> spliced inside that chip's
+    // own title="…" attribute. Markers are inert text, so a stashed chip is
+    // invisible to every later pass and comes back verbatim in the restore loop.
+    var idSpans = [];
+    function stash(m) {
+        idSpans.push(m);
+        return '\u0000M' + (idSpans.length - 1) + '\u0000';
+    }
+    html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>|<code\b[^>]*>[\s\S]*?<\/code>/g, stash);
+    html = html.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<\u0000]+/gi, stash);
+
+    html = html.replace(/\bwidget_\d{10,}_[a-z0-9]{1,9}\b/g, function(id) {
+        // Resolve a friendly name when we can. getWidgetById lives in the TOOLS tier
+        // (loaded after this ui file) and walks the `chats` map, so it is both
+        // typeof-guarded and try/catch-wrapped: a rendering pass must never throw
+        // because a widget store is missing (e.g. headless/SW contexts). NOTE the
+        // lookup is deterministic but NOT allocation-free and NOT side-effect-free:
+        // it builds Object.values(chatWidgets).flat() and repopulates the
+        // chatWidgets cache (080-widget-tools.js:187,199-202) on every repaint that
+        // paints a chip. Cheap in practice (0-2 chips per message), never memoised.
+        var name = '';
+        try {
+            if (typeof getWidgetById === 'function') {
+                var w = getWidgetById(id);
+                if (w && w.title) name = String(w.title);
+            }
+        } catch (e) {}
+        var tip = name ? ('Open widget: ' + name) : ('Click to open widget ' + id);
+        // stash(), NOT a direct return: the doc pass below scans this pass's output,
+        // and a widget title can legitimately contain a doc_ id ("Summary of
+        // doc_1784927648803_a1b2c3d") — returning the chip inline let that pass
+        // splice a <span> into this chip's own title attribute.
+        return stash('<span class="id-mention id-mention-widget" onclick="openWidgetMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+    });
+
+    html = html.replace(/\bdoc_\d{10,}_[a-z0-9]{1,9}\b/g, function(id) {
+        // smartDocuments (tools/110-smart-documents.js:7) is hydrated lazily, so an
+        // unresolved doc just gets the generic tooltip — openDocumentMention loads
+        // it from IndexedDB on click.
+        var name = '';
+        try {
+            if (typeof smartDocuments !== 'undefined' && smartDocuments && smartDocuments[id] && smartDocuments[id].title) {
+                name = String(smartDocuments[id].title);
+            }
+        } catch (e) {}
+        var tip = name ? ('Open document: ' + name) : ('Click to open document ' + id);
+        // Stashed for symmetry — a doc titled with a widget_ id is only safe today
+        // because the widget pass happens to run first. Stashing makes both passes
+        // order-independent instead of relying on that accident.
+        return stash('<span class="id-mention id-mention-doc" onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+    });
+
+    // Function replacements (not strings) so $-patterns in the restored markup are
+    // never interpreted by String.replace — same rationale as the restores above.
+    for (var _mi = 0; _mi < idSpans.length; _mi++) {
+        (function(span, idx) {
+            html = html.replace('\u0000M' + idx + '\u0000', function() { return span; });
+        })(idSpans[_mi], _mi);
+    }
     return html;
 }
 

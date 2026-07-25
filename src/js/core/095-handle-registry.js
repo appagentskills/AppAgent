@@ -370,8 +370,8 @@ function _awaitAll(chatId, handleIds, timeoutMs) {
 }
 
 // Out-of-band error settlement. Used by the sub-agent registry when a sub
-// reports status:'error' (explicit report, auto_report crash fallback, or
-// budget_exhausted) so that snapshot.status === 'error' lines up with the
+// reports status:'error' (explicit report or auto_report crash fallback) so
+// that snapshot.status === 'error' lines up with the
 // report payload — instead of the previous behavior where the outer handle
 // stayed `done` while result.status was 'error', which was easy to miss.
 //

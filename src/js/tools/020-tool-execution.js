@@ -716,6 +716,20 @@ function trackRecordMutation(evt) {
     AgentEvents.emit('recordMutated', evt);
 }
 
+// The tool schema makes `instance` REQUIRED, so a resolved target URL very
+// often IS the active instance. Tracking gates must only skip GENUINE
+// cross-instance mutations — compare the resolved target against the active
+// instance URL (normalized: scheme, case, trailing slash).
+function _isActiveInstanceUrl(resolvedUrl) {
+    if (!resolvedUrl) return true;
+    var active = (typeof Platform.resolveInstanceUrl === 'function' ? Platform.resolveInstanceUrl(null) : null) || Platform.instanceUrl || '';
+    if (!active) return false;
+    var norm = function(u) {
+        return String(u).toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    };
+    return norm(resolvedUrl) === norm(active);
+}
+
 async function executeDiffEdit(args, messageIndex, options) {
     if (!(/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(args.table))) {
         return { success: false, error: 'Invalid table name: must be alphanumeric/underscores only' };
@@ -740,11 +754,15 @@ async function executeDiffEdit(args, messageIndex, options) {
             }
         }
         var _diffApiToken = _diffToken || Platform.getSessionToken() || '';
+        // Cross-instance only when the resolved target is NOT the active
+        // instance — an `instance` arg naming the active instance must still
+        // be version-tracked (the tool schema makes `instance` required).
+        var _diffCrossInstance = !!_diffInstanceUrl && !_isActiveInstanceUrl(_diffInstanceUrl);
 
         // Capture version before the change (skip for cross-instance)
         var versionBefore = null;
         var beforeVersion = null;
-        if (!_diffInstanceUrl) {
+        if (!_diffCrossInstance) {
             versionBefore = await getRecordVersion(args.table, args.sys_id);
             beforeVersion = versionBefore ? versionBefore.sys_id : null;
         }
@@ -796,7 +814,7 @@ async function executeDiffEdit(args, messageIndex, options) {
 
         // PUT the updated content using record's scope
         var putUrl = '/api/now/table/' + args.table + '/' + args.sys_id;
-        var recordScope = _diffInstanceUrl ? null : await getRecordScope(args.table, args.sys_id);
+        var recordScope = _diffCrossInstance ? null : await getRecordScope(args.table, args.sys_id);
         if (recordScope) {
             putUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
         }
@@ -823,7 +841,7 @@ async function executeDiffEdit(args, messageIndex, options) {
         }
 
         // Capture version after the change and track it (skip for cross-instance)
-        if (!_diffInstanceUrl) {
+        if (!_diffCrossInstance) {
             await new Promise(function(r) { setTimeout(r, 200); });
             var versionAfter = await getRecordVersion(args.table, args.sys_id);
             var afterVersion = versionAfter ? versionAfter.sys_id : null;
@@ -1013,8 +1031,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return { success: false, error: approval.error, _denied: true };
     }
 
-    // -------- Sub-agent enforcement (roster + budget) --------
-    // Two gates for sub-agent chats:
+    // -------- Sub-agent dispatch gate (roster + call counter) --------
+    // Two concerns for sub-agent chats:
     //   1. tool_roster: the deterministic per-sub roster set at spawn — the
     //      parent's full tool list, optionally narrowed by tool `profiles`
     //      (core/078-tool-profiles.js), minus the nested-delegation tools
@@ -1023,24 +1041,24 @@ async function _executeToolInner(name, args, messageIndex, options) {
     //      already filtered by getEnabledTools, but the dispatch arm is the
     //      defense-in-depth boundary — if a denied tool slips through
     //      (skill tool, cache lag, js_eval bridge), this rejects it.
-    //   2. tool-call budget (SOFT cap): increment tool_calls_used; from 90%
-    //      usage (and on every call past max_tool_calls) the registry stages a
-    //      warning that the agent loop appends to the next tool result, so the
-    //      model wraps up + report_to_parent on its own. The sub is never
-    //      hard-stopped. Read-only finalization tools (agent_status /
-    //      report_to_parent / sleep_self) and the handle helpers are exempt
-    //      so bookkeeping never accelerates exhaustion.
+    //   2. tool-call COUNTER (display only): increment tool_calls_used so the
+    //      Workers card / agent_status can show how much work a sub has done.
+    //      There is NO cap and NO enforcement — nothing here can refuse or
+    //      stop a sub. Read-only finalization tools (agent_status /
+    //      report_to_parent / sleep_self), the handle helpers and nested
+    //      (sandbox/widget) dispatches stay uncounted so the number reflects
+    //      top-level productive model turns.
     if (typeof SubAgents !== 'undefined' && SubAgents.onToolCallInSubAgent) {
-        var _budgetChatId = (options && options.chatId)
+        var _subChatId = (options && options.chatId)
             || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
             || (typeof currentChatId !== 'undefined' ? currentChatId : null);
         // Roster gate. Sub-only tools (report_to_parent / sleep_self / agent_message)
         // are always allowed regardless of roster — the registry injects them as
         // SUB_ONLY_TOOLS at spawn, but a defensive check here means "a sub can
         // always finalize" even if the persisted record is somehow malformed.
-        if (_budgetChatId && typeof chats !== 'undefined' && chats[_budgetChatId]
-            && chats[_budgetChatId].isSubAgent && SubAgents.getById) {
-            var _subRec = SubAgents.getById(chats[_budgetChatId].subAgentId);
+        if (_subChatId && typeof chats !== 'undefined' && chats[_subChatId]
+            && chats[_subChatId].isSubAgent && SubAgents.getById) {
+            var _subRec = SubAgents.getById(chats[_subChatId].subAgentId);
             if (_subRec && Array.isArray(_subRec.tool_roster)) {
                 var _alwaysAllowed = (name === 'report_to_parent'
                     || name === 'sleep_self'
@@ -1064,27 +1082,35 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 }
             }
         }
-        // Status / lifecycle / handle-management tools don't burn budget — a
+        // Status / lifecycle / handle-management tools are not counted — a
         // sub-agent pushing a `partial` update to the parent via agent_message,
-        // or polling its own handles, shouldn't accelerate its own tool-budget
-        // exhaustion. The cap exists to bound *productive work*, not bookkeeping.
-        var _exemptBudget = (name === 'agent_status'
+        // or polling its own handles, is bookkeeping, not productive work, and
+        // the displayed number should reflect the latter.
+        // NESTED-CALL EXEMPTION: the counter counts TOP-LEVEL tool calls made
+        // by the model's turn — ONE js_eval that fans out into N nested
+        // executeTool calls is ONE unit of model work (the outer js_eval /
+        // skill-tool call already counted when the model dispatched it).
+        // fromSandbox marks every nested dispatch path: the page sandbox
+        // bridge (this file), the offscreen 'sw-exec-tool' relay
+        // (platform/extension/background.js), skill-tool JS
+        // (core/140-skills-engine.js) and the eval runner
+        // (core/085-eval-runner.js). fromWidget marks the html_widget
+        // postMessage bridge (ui/070-dashboard-ui.js) — user-driven widget
+        // clicks are not model turns at all. The roster gate above still
+        // applies to nested calls (defense-in-depth is unchanged).
+        var _nestedCall = !!(options && (options.fromSandbox || options.fromWidget));
+        var _exemptFromCount = _nestedCall
+            || (name === 'agent_status'
             || name === 'report_to_parent'
             || name === 'sleep_self'
             || name === 'agent_message'
             || name === 'await_handle'
             || name === 'await_any'
             || name === 'await_all');
-        if (!_exemptBudget) {
-            // Soft cap: onToolCallInSubAgent counts usage and stages a budget
-            // warning (>=90% / past cap) that the agent loop appends to the
-            // next tool result via appendBudgetNotice. SAFETY BACKSTOP: past
-            // 2x max_tool_calls the registry force-stops the runaway sub and
-            // returns false — short-circuit so the stopped sub does no work.
-            var _ok = SubAgents.onToolCallInSubAgent(_budgetChatId);
-            if (!_ok) {
-                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped. Do NOT retry work tools — every further call will be refused. Call report_to_parent NOW with your findings so far (it is budget-exempt and will be delivered).', _budget_exhausted: true };
-            }
+        if (!_exemptFromCount) {
+            // Bookkeeping only — onToolCallInSubAgent bumps the display counter
+            // and returns nothing. Never gate dispatch on its result.
+            SubAgents.onToolCallInSubAgent(_subChatId);
         }
     }
 
@@ -1524,9 +1550,21 @@ async function _executeToolInner(name, args, messageIndex, options) {
             return { success: false, error: e.message };
         }
     } else if (name === 'list_instances') {
-        // List all connected ServiceNow instances
-        if (args.refresh && Platform.refreshInstances) {
-            await Platform.refreshInstances();
+        // List all connected ServiceNow instances.
+        // ALWAYS re-probe via Platform.refreshInstances() — the same live
+        // snGetInstancesDetailed probe (background.js) the header instance
+        // pill's picker fires on every open/focus (_refreshInstancePicker in
+        // platform-bridge.js sends 'list-sn-instances-detailed'). Previously
+        // this branch trusted the cached Platform.instances registry unless
+        // args.refresh was passed — but in the SW that registry is only
+        // seeded once at service-worker boot (worker/010-platform-stub.js
+        // Platform.ready.then), so the tool reported stale/wrong data
+        // (missing instances, dead tabs, flipped connected flags) while the
+        // pill was correct. args.refresh is kept for backward compatibility
+        // but a fresh probe is now always implied. On probe failure, fall
+        // back to the last-known registry rather than erroring out.
+        if (Platform.refreshInstances) {
+            try { await Platform.refreshInstances(); } catch (e) { /* keep last-known Platform.instances */ }
         }
         return {
             success: true,
@@ -1605,6 +1643,24 @@ async function _executeToolInner(name, args, messageIndex, options) {
             var _attachRespText = await res.text();
             var data;
             try { data = JSON.parse(_attachRespText); } catch(e) { data = { error: { message: 'Non-JSON response (HTTP ' + res.status + ')' } }; }
+            // Track the upload in the chat's version history / Artifacts list
+            // (skip only GENUINE cross-instance uploads).
+            if (res.ok && !(_attachInstanceUrl && !_isActiveInstanceUrl(_attachInstanceUrl))) {
+                var _attachSysId = data && data.result && data.result.sys_id;
+                if (_attachSysId) {
+                    trackRecordMutation({
+                        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                        table: 'sys_attachment',
+                        sysId: _attachSysId,
+                        displayName: args.attachment_file_name,
+                        action: 'POST',
+                        statusMessage: args.status_message || null,
+                        messageIndex: messageIndex,
+                        beforeVersion: null,
+                        afterVersion: null
+                    });
+                }
+            }
             return { success: res.ok, status: res.status, data: data };
         } catch (e) {
             return { success: false, error: e.message };
@@ -1632,6 +1688,22 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 if (!_atToken) {
                     return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Ensure a tab is open for that instance.' };
                 }
+            }
+
+            // For DELETE tracking: grab the file name (display name) before the
+            // attachment disappears. Best-effort — never blocks the delete.
+            var _atCrossInstance = !!_atInstanceUrl && !_isActiveInstanceUrl(_atInstanceUrl);
+            var _atDeleteName = null;
+            if (args.method === 'DELETE' && !_atCrossInstance) {
+                try {
+                    var _atMetaRes = await fetch('/api/now/attachment/' + args.sys_id, {
+                        headers: { 'Accept': 'application/json', 'X-UserToken': _atToken || Platform.getSessionToken() || '' }
+                    });
+                    if (_atMetaRes.ok) {
+                        var _atMeta = await _atMetaRes.json();
+                        _atDeleteName = _atMeta && _atMeta.result && _atMeta.result.file_name;
+                    }
+                } catch (e) { /* best-effort display name only */ }
             }
 
             var atUrl = '/api/now/attachment';
@@ -1674,6 +1746,21 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 var _atRespText = await atRes.text();
                 try { atData = JSON.parse(_atRespText); } catch (e) { atData = { error: { message: 'Non-JSON response (HTTP ' + atRes.status + ')' } }; }
             }
+            // Track attachment deletion in the chat's version history /
+            // Artifacts list (skip only GENUINE cross-instance deletes).
+            if (atRes.ok && args.method === 'DELETE' && !_atCrossInstance) {
+                trackRecordMutation({
+                    chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                    table: 'sys_attachment',
+                    sysId: args.sys_id,
+                    displayName: _atDeleteName || ('Attachment ' + args.sys_id),
+                    action: 'DELETE',
+                    statusMessage: args.status_message || null,
+                    messageIndex: messageIndex,
+                    beforeVersion: null,
+                    afterVersion: null
+                });
+            }
             var _atResult = { success: atRes.ok, status: atRes.status, data: atData };
             if (_atInstanceUrl) _atResult.instance = args.instance;
             return _atResult;
@@ -1695,11 +1782,24 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
         }
 
+        // Cross-instance only when the resolved target is NOT the active
+        // instance — an `instance` arg naming the active instance must still
+        // be version-tracked (the tool schema makes `instance` required).
+        var _apiCrossInstance = !!_targetInstanceUrl && !_isActiveInstanceUrl(_targetInstanceUrl);
+
         var url = '/api/now/table/' + args.table;
         if (args.sys_id) url += '/' + args.sys_id;
         var params = [];
         if (args.query) params.push('sysparm_query=' + encodeURIComponent(args.query));
-        if (args.fields) params.push('sysparm_fields=' + encodeURIComponent(args.fields));
+        // A POST whose `fields` projection excludes sys_id would return a
+        // result without sys_id, making the created record untrackable —
+        // force sys_id into the projection for record-creating requests.
+        var _fieldsArg = args.fields;
+        if (_fieldsArg && args.method === 'POST' &&
+            _fieldsArg.split(',').map(function(f) { return f.trim(); }).indexOf('sys_id') === -1) {
+            _fieldsArg += ',sys_id';
+        }
+        if (_fieldsArg) params.push('sysparm_fields=' + encodeURIComponent(_fieldsArg));
         if (args.limit) params.push('sysparm_limit=' + args.limit);
         // Exclude reference links by default (returns just the value instead of {link, value} object)
         params.push('sysparm_exclude_reference_link=true');
@@ -1726,7 +1826,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
         try {
             var beforeVersion = null;
             var isModifyingRequest = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(args.method);
-            if (isModifyingRequest && args.sys_id && !_targetInstanceUrl) {
+            if (isModifyingRequest && args.sys_id && !_apiCrossInstance) {
                 var versionBefore = await getRecordVersion(args.table, args.sys_id);
                 beforeVersion = versionBefore ? versionBefore.sys_id : null;
             }
@@ -1748,8 +1848,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 try { data = JSON.parse(_apiRespText); } catch(e) { data = { error: { message: 'Non-JSON response (HTTP ' + res.status + ')' } }; }
             }
 
-            // Version history tracking (skip for cross-instance requests)
-            if (res.ok && isModifyingRequest && !_targetInstanceUrl) {
+            // Version history tracking (skip for GENUINE cross-instance requests)
+            if (res.ok && isModifyingRequest && !_apiCrossInstance) {
                 var recordSysId = args.sys_id || (data.result && data.result.sys_id);
                 if (recordSysId) {
                     await new Promise(function(r) { setTimeout(r, 200); });
@@ -1932,7 +2032,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // page bundle only) is always defined here.
         return await executeGitHubSetup(args);
     } else if (name === 'html_widget') {
-        return executeHtmlWidget(args, messageIndex, options);
+        return await executeHtmlWidget(args, messageIndex, options);
+    } else if (name === 'pin_widget') {
+        // Page-only (headless: false) — dashboardWidgets + dashboard renderers are page globals.
+        return await executePinWidget(args);
     } else if (name === 'take_screenshot') {
         return await executeTakeScreenshot(args);
     } else if (name === 'screenshot_by_id') {
@@ -2072,6 +2175,12 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return await executeWorkspaceTool(args, options);
     } else if (name === 'eval_runner') {
         return await executeEvalRunner(args, options);
+    } else if (name === 'start_chat') {
+        // Page-only (headless: false) — the SW routes this to a connected panel
+        // before the dispatcher runs, so executeStartChat (tools/150-start-chat.js,
+        // page bundle only) is always defined here. `options` carries widgetId /
+        // fromWidget / chatId from the widget bridge (ui/070-dashboard-ui.js).
+        return await executeStartChat(args, options);
     } else if (isSkillTool(name)) {
         // Pass messageIndex so nested tool calls from inside the skill
         // sandbox stamp real per-message indexes on version-history entries

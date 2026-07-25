@@ -132,6 +132,9 @@ const WORKER_JS_TIERS = ['worker'];
 const WORKER_SHARED_FILES = [
     // core (declarations + utilities)
     'js/core/030-config.js',
+    // 055-emoji-shortcodes: SECTION_ICON_SHORTCODES map + replaceEmojiShortcodes,
+    // called unconditionally by formatContent — DOM-free, safe in the SW.
+    'js/core/055-emoji-shortcodes.js',
     'js/core/060-ui-constants.js',
     'js/core/070-permissions.js',
     // 078-tool-profiles declares TOOL_PROFILES + getToolNamesForProfiles,

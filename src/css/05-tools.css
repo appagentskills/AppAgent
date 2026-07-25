@@ -250,9 +250,6 @@
 .widgets-container .widget-header .widget-title { font-size: var(--text-caption); }
 .widgets-container .widget-header .widget-icon { width: 14px; height: 14px; }
 .widgets-container .widget-header .widget-icon svg { width: 12px; height: 12px; }
-.widgets-container .widget-edit-btn,
-.widgets-container .widget-expand-btn,
-.widgets-container .widget-fullscreen-btn { display: none; }
 .widgets-container .widget-ctrl-btn { width: 22px; height: 22px; }
 .widgets-container .widget-ctrl-btn svg { width: 11px; height: 11px; }
 .widgets-container .widget-content { flex: 1; min-height: 0; overflow: hidden; pointer-events: none; position: relative; }

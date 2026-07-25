@@ -1900,7 +1900,7 @@ async function deleteApiProviderAndRefresh(providerName) {
     // Check if this provider is currently selected
     if (currentProvider === providerName) {
         // Switch to first available provider
-        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus-4-8';
+        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus 5';
         saveProviderToStorage();
     }
     
@@ -2263,6 +2263,15 @@ function hideAllPanels() {
         var el = document.getElementById(id);
         if (el) el.style.display = 'none';
     });
+    // Most home exits funnel through here (selectChat, popstate, the view
+    // toggles) WITHOUT calling closeHomeView(), which used to leave the home
+    // trail-animation rAF loop + its window resize/mouse listeners running
+    // against the hidden canvas. Stop it whenever home is hidden; re-entering
+    // home restarts it via renderHome()'s deferred init. typeof-guarded for
+    // bundles/load paths where ui/030-home-view.js isn't present.
+    if (typeof stopHomeTrailAnimation === 'function') {
+        try { stopHomeTrailAnimation(); } catch (e) {}
+    }
     // Hide browser controls (URL input) when leaving views
     var browserControls = document.getElementById('browser-controls');
     if (browserControls) browserControls.style.display = 'none';

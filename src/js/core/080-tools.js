@@ -362,7 +362,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'html_widget',
-            description: 'Display an interactive HTML widget inline in the chat. The widget runs inside an isolated iframe with its own document context - all scripts, CSS, and DOM are fully isolated. You can include ANY interactive content: click handlers, dynamic rendering, forms, animations, API calls, etc. For ServiceNow API requests from within the widget, use headers: { "X-UserToken": window.sessionToken } (NOT Authorization Bearer). Widgets can also call agent tools via: await executeTool(name, args) - e.g. await executeTool("servicenow_api", {method:"GET", table:"incident", limit:5}). To embed a previously taken screenshot inside a widget, use: executeTool("screenshot_by_id", {id: screenshotId}).then(function(r){ img.src = r.base64; }) — the screenshot_id is returned by take_screenshot. The response includes a widgetId that can be used with iframe_tool for debugging (get_visible_text, get_dom, click, fill actions) or take_screenshot for visual analysis. DO NOT use this tool unless the user asked for a visualization/dashboard/interactive UI, or the data is too large or structured for a plain-text answer. For short answers, reply in plain text instead.',
+            description: 'Display an interactive HTML widget inline in the chat. The widget runs inside an isolated iframe with its own document context - all scripts, CSS, and DOM are fully isolated. You can include ANY interactive content: click handlers, dynamic rendering, forms, animations, API calls, etc. There is NO session token exposed inside the sandbox (no window.sessionToken, no X-UserToken shim), so ServiceNow requests MUST go through the agent tool. Widgets call agent tools via: await executeTool(name, args) - e.g. await executeTool("servicenow_api", {method:"GET", table:"incident", limit:5}). To embed a previously taken screenshot inside a widget, use: executeTool("screenshot_by_id", {id: screenshotId}).then(function(r){ img.src = r.base64; }) — the screenshot_id is returned by take_screenshot. Widget buttons can also hand a question off to a fresh chat with await executeTool("start_chat", {message: "...", mode: "send"|"draft", include_widget: true}) — an "Ask the agent" button; include_widget references THIS widget automatically, mode "draft" only prefills the composer, and background:true keeps the widget on screen. The app design tokens are auto-injected into every widget (colors, spacing, radii, fonts) and follow the user light/dark theme live - use var(--bg-main), var(--text-primary), var(--primary), var(--space-8), var(--radius-md); see the widget-best-practices skill for the full token table. The response includes a widgetId that can be used with iframe_tool for debugging (get_visible_text, get_dom, click, fill actions) or take_screenshot for visual analysis. DO NOT use this tool unless the user asked for a visualization/dashboard/interactive UI, or the data is too large or structured for a plain-text answer. For short answers, reply in plain text instead.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -370,10 +370,27 @@ var TOOLS = [
                     html: { type: 'string', description: 'Complete HTML document including styles and scripts. Use <style> for CSS and <script> for JS. Scripts run in isolated iframe with access to executeTool(name, args) for calling agent tools. For ServiceNow API calls, use: await executeTool("servicenow_api", {method:"GET", table:"incident", ...})' },
                     height: { type: 'string', description: 'Initial height of the widget (e.g., "400px", "auto"). Default: "400px"' },
                     width: { type: 'string', description: 'Width of the widget (e.g., "400px", "500px"). Default: "400px"' },
+                    pin: { type: 'string', enum: ['main', 'home'], description: 'Optionally pin the widget to a dashboard at creation: "home" (home page, above Active chats) or "main" (dashboard page). Omit to leave the widget unpinned (inline in chat only).' },
                     confirm: { type: 'boolean', description: 'Set to true when creating widgets that will modify instance data and you think the user should review. Omit or set false for display-only widgets.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
                 required: ['title', 'html']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'pin_widget',
+            description: 'Pin, move, or unpin an EXISTING html_widget on a dashboard. dashboard="main" pins to the dashboard page, "home" pins to the home page dashboard (above Active chats), "none" unpins. Use the widget id returned by html_widget.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    widget_id: { type: 'string', description: 'The widget id (returned by html_widget as id/widgetId)' },
+                    dashboard: { type: 'string', enum: ['main', 'home', 'none'], description: "Target dashboard: 'main' (dashboard page), 'home' (home page), or 'none' to unpin" },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['widget_id', 'dashboard']
             }
         }
     },
@@ -524,7 +541,7 @@ var TOOLS = [
                 type: 'object',
                 properties: {
                     title: { type: 'string', description: 'Form title shown in the header' },
-                    description: { type: 'string', description: 'Optional description text below the title' },
+                    description: { type: 'string', description: 'Optional description text below the title. Rendered as MARKDOWN (paragraphs, bold, lists, inline/fenced code, links) — write it in markdown.' },
                     fields: {
                         type: 'array',
                         description: 'Array of form fields',
@@ -656,7 +673,7 @@ var TOOLS = [
                     scope: { type: 'string', enum: ['shared', 'chat'], description: 'Create visibility: \'shared\' (default, global) or \'chat\' (private to the creating chat). Fixed at creation.' },
                     version: { type: 'number', description: 'Version number (for read_version)' },
                     edits: { type: 'array', description: 'For edit action: search-and-replace operations. Each find must be unique in the document.', items: { type: 'object', properties: { find: { type: 'string', description: 'Unique text to find' }, replace: { type: 'string', description: 'Replacement text' } }, required: ['find', 'replace'] } },
-                    prompts: { type: 'array', description: 'Non-blocking prompts below document. Array of {title?, description?, fields: [{name, type, label, options?, placeholder?, value?}]}', items: { type: 'object' } },
+                    prompts: { type: 'array', description: 'Non-blocking prompts below document. Array of {title?, description?, fields: [{name, type, label, options?, placeholder?, value?}]}. The description is rendered as MARKDOWN (bold, lists, inline/fenced code, links) — write it in markdown.', items: { type: 'object' } },
                     confirm: { type: 'boolean', description: 'Set to true for operations that create, modify, or delete documents that you think the user should review. Omit or set false for read-only operations.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 },
@@ -672,7 +689,7 @@ var TOOLS = [
             parameters: {
                 type: 'object',
                 properties: {
-                    refresh: { type: 'boolean', description: 'If true, re-probes all open tabs for fresh token/user data. Default: false (uses cached data).' },
+                    refresh: { type: 'boolean', description: 'Deprecated — the tool now ALWAYS re-probes open tabs for fresh token/user data (same live probe as the header instance pill), so this flag is a no-op kept for backward compatibility.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
                 }
             }
@@ -752,8 +769,7 @@ var TOOLS = [
                     context_seed: { type: 'object', description: 'Small JSON blob copied into the sub\'s first message (record ids, queries, etc.).' },
                     output_schema: { type: 'object', description: 'Optional JSON-Schema-ish object describing the EXACT shape the sub must return in report_to_parent\'s `data` field. Injected into the sub\'s first message with a directive to conform (same keys/types, no extras). Use when you spawn + parse the result programmatically (e.g. inside one js_eval) and want a predictable structure to destructure. The root should be an object (report_to_parent\'s `data` is itself an object) — wrap arrays in a named property, e.g. {items:[...]}, rather than using a root-level array.' },
                     auto_report: { type: 'boolean', description: 'If true (default), a fallback report is synthesized from the last assistant message if the sub finishes without calling report_to_parent.' },
-                    wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash, budget force-stop): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Keeping the DEFAULT true is the RECOMMENDED pattern for fan-outs — end your turn and react to each report as it wakes you. Pass false ONLY for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
-                    max_tool_calls: { type: 'number', description: 'Soft tool-call budget for the sub. Default: 300. From 90% usage onward (and on every call past the budget) an escalating warning is appended to its tool results telling it to wrap up and report_to_parent. Safety backstop: a sub that ignores every warning is force-stopped at 2x the budget.' },
+                    wake_parent: { type: 'boolean', description: 'If true (DEFAULT), the parent chat is woken when this sub reports (report_to_parent, auto-report, crash): an idle parent gets a notice row and a run STARTS so the agent can act on the report immediately; a running parent gets the notice injected mid-run at a safe point. Skipped automatically while you are blocked in await_handle on the spawn handle (the settle already delivers — no double notification). Keeping the DEFAULT true is the RECOMMENDED pattern for fan-outs — end your turn and react to each report as it wakes you. Pass false ONLY for fire-and-forget spawns you will collect manually via await_handle / agent_status.' },
                     profiles: { type: 'array', items: { type: 'string', enum: ['servicenow', 'browser', 'research', 'code', 'extension-dev', 'skill-manager', 'eval-runner', 'audit-runner', 'orchestrator'] }, description: 'Tool profiles for the sub — the sub\'s tool list is narrowed to the base tools plus ONLY these profiles, cutting its context size. Mix freely, e.g. ["servicenow","browser"]. Omit = full legacy toolset. Choices: servicenow (ServiceNow record CRUD, server scripts, code edits); browser (drive/inspect the ServiceNow UI in the iframe, screenshots); research (web_fetch — all HTTP methods — plus docs/web search; NO workspace access); code (GitHub repo work: clone/read/edit/diff/push via workspace, plus web_fetch for the GitHub REST API); extension-dev (the code tools plus runtime_inspect and screenshots); skill-manager (create/update/manage AI skills); eval-runner (ServiceNow eval grader + the ServiceNow tools the eval tasks need); audit-runner (instance audits: audit tool + ServiceNow read access); orchestrator (spawning/managing its own subs, async handles, prompts, rendering — pair with allow_nested). NOTE: some profile tools are SKILL-provided (web_search, search_docs, run_audit) — the sub only gets them when the corresponding skill is active in the spawning chat. The core toolset (js_eval, cached-result readers, get_file, get_skill, progress card), the sub-agent reporting tools, and `document` (scratchpad docs) are ALWAYS included — never list them.' },
                     tier: { type: 'string', enum: ['small', 'medium', 'large', 'same'], description: 'Pick the sub\'s model size tier. There are three size tiers — small | medium | large (plus `same`) — which the user maps to concrete models in Settings → Sub-Agent Model Tiers; the agent never sees or chooses model/provider names. small = cheap fan-outs (searches, summaries, discovery/scoping); medium = code-review passes and synthesis/triage/moderate implementation; large = heavy implementation or subtle reasoning. same = the sub DYNAMICALLY follows the spawner\'s current model (resolved per LLM call, so it tracks later model switches), bypassing the tier→model mapping — use when the sub must always run on exactly the model you are on, e.g. a self-evaluation. Set this explicitly on EVERY spawn.' },
                     status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
@@ -784,7 +800,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'agent_status',
-            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, last_assistant_message ({text, at} — the sub\'s most recent assistant CHAT message, i.e. what it last said in its own chat even before any report; clipped to ~600 chars in the list view, ~2000 when agent_id is given, with an \'… [truncated]\' marker when clipped; null before the sub\'s first text turn), tool_calls_used, inbox size, pool position, and action_state — the sub\'s live update_action_state progress card ({state, label, tasks[], output}), i.e. how to check a running sub\'s progress and its current todo list without reading its chat. Each sub also carries `usage` (per-sub LLM cost rollup: {calls, input_tokens, output_tokens, cost, by_tier}), saturation gauges `context_tokens`/`context_pct`/`tool_budget_pct`/`saturated` (measured against a FIXED assumed 200k-token window, model-independent — threshold is 100k = 50% of context, and tool budget saturates at 50% too; check these before re-tasking a sub), `revisions_requested` + `escalation_suggestion` (after 2 revision_requested verdicts: the next tier up, or an independent fresh-context reviewer sub when already at the top — suggestion only, never auto-applied), and `pending_approvals`/`awaiting_approval` ({tool, since} while a tool call is parked on a permission modal in the sub\'s chat). Each sub also carries lifecycle diagnostics: last_error {message, at, transient, retried}, crash_cause, retries_used (transient network/timeout crashes are auto-retried once before the sub is declared errored), resurrectable (true when an errored/stopped sub can be revived via wake_sub_agent with its full prior context intact), and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
+            description: 'Read-only snapshot of sub-agents. By default lists every sub spawned by the current chat (running, sleeping, stopped, errored) with last_report, last_assistant_message ({text, at} — the sub\'s most recent assistant CHAT message, i.e. what it last said in its own chat even before any report; clipped to ~600 chars in the list view, ~2000 when agent_id is given, with an \'… [truncated]\' marker when clipped; null before the sub\'s first text turn), tool_calls_used (a display-only lifetime counter — there is no tool-call limit), inbox size, pool position, and action_state — the sub\'s live update_action_state progress card ({state, label, tasks[], output}), i.e. how to check a running sub\'s progress and its current todo list without reading its chat. Each sub also carries `usage` (per-sub LLM cost rollup: {calls, input_tokens, output_tokens, cost, by_tier}), saturation gauges `context_tokens`/`context_pct`/`saturated` (measured against a FIXED assumed 200k-token window, model-independent — threshold is 100k = 50% of the window; check these before re-tasking a sub), `revisions_requested` + `escalation_suggestion` (after 2 revision_requested verdicts: the next tier up, or an independent fresh-context reviewer sub when already at the top — suggestion only, never auto-applied), and `pending_approvals`/`awaiting_approval` ({tool, since} while a tool call is parked on a permission modal in the sub\'s chat). Each sub also carries lifecycle diagnostics: last_error {message, at, transient, retried}, crash_cause, retries_used (transient network/timeout crashes are auto-retried once before the sub is declared errored), resurrectable (true when an errored/stopped sub can be revived via wake_sub_agent with its full prior context intact), and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}. Pass agent_id for a single sub, or parent_chat_id:"*" to see every sub in every chat. Cheap, synchronous — use freely.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -949,6 +965,26 @@ var TOOLS = [
                 required: ['names']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'start_chat',
+            description: 'Open a NEW chat pre-loaded with a message. The main use case is a BUTTON INSIDE AN html_widget: the button calls await executeTool("start_chat", {message, mode, include_widget}) so the user can hand a question off to the agent straight from the widget — either answered immediately (mode:"send") or dropped into the composer for them to edit and submit (mode:"draft"). Returns {success, chat_id, mode, sent, widget_id, message}. IMPORTANT: in foreground modes (mode:"send" without background, and mode:"draft") the view switches to the new chat, which tears down the calling widget\'s iframe — so a widget cannot rely on receiving the return value there; pass background:true if the widget must stay alive to show feedback. Do NOT use this to talk to yourself mid-answer: it starts a SEPARATE conversation.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    message: { type: 'string', description: 'REQUIRED. The chat message text to pre-load.' },
+                    mode: { type: 'string', enum: ['send', 'draft'], description: '"send" (default) auto-submits the message so the agent answers immediately. "draft" only prefills and focuses the composer — nothing is sent, the user presses enter themselves.' },
+                    background: { type: 'boolean', description: 'send mode only. true = run the new chat in the background: the user\'s view does NOT switch, the chat shows in the jobs badge while it runs and rings the finished-chat bell when done. IGNORED in draft mode (a draft has to be visible to be edited). Default false.' },
+                    include_widget: { type: 'boolean', description: 'Prepend a widget-context reference to the message so the new chat knows which widget the question is about ("Context: widget <id> ("<title>") — read it with iframe_tool get_visible_text or take_screenshot."). Uses widget_id, or the CALLING widget when invoked from inside one. Omitted (with a note in the return payload) if no widget id can be resolved. Default false.' },
+                    widget_id: { type: 'string', description: 'Explicit widget id to reference. Omit when calling from inside a widget — the calling widget is used automatically.' },
+                    title: { type: 'string', description: 'Optional title for the new chat. Omit to let the usual first-message/auto-title logic name it.' },
+                    status_message: { type: 'string', description: 'Human-friendly status message describing what this tool call is doing (shown in UI header)' }
+                },
+                required: ['message']
+            }
+        }
     }
 ];
 
@@ -1014,6 +1050,8 @@ var HEADLESS_TOOLS = {
     iframe_tool: false,
     take_screenshot: false,
     html_widget: false,
+    // pin_widget mutates dashboardWidgets + re-renders the dashboard/home grids — page only.
+    pin_widget: false,
     display: false,
     prompt_user: false,
     // github_setup opens a modal in the side panel DOM (impl in
@@ -1022,7 +1060,11 @@ var HEADLESS_TOOLS = {
     // runtime_inspect reads page globals + drives the panel UI (impl in
     // tools/140-runtime-inspect.js, page bundle only) — must be routed to a
     // connected panel executor, never run headless in the SW.
-    runtime_inspect: false
+    runtime_inspect: false,
+    // start_chat drives newChat/sendMessage/#message-input + the chat lists
+    // (impl in tools/150-start-chat.js, page bundle only — not in
+    // WORKER_SHARED_FILES). Route it to the panel.
+    start_chat: false
 };
 // ─── short catalog descriptions ─────────────────────────────────────────────
 // One-liners for the deferred-tool catalog ({{TOOL_CATALOG}} in the system
@@ -1047,6 +1089,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     get_skill: 'Read an AI skill body or one of its files before starting related work.',
     manage_skill: 'Create, update, edit, activate, or delete AI skills and their files (live runtime copy).',
     html_widget: 'Render a custom interactive HTML widget inline in chat when no display template fits.',
+    pin_widget: 'Pin, move, or unpin an existing widget on the main or home dashboard.',
     take_screenshot: 'Capture a PNG screenshot of the browser panel, a widget, or an element for visual analysis.',
     screenshot_by_id: 'Retrieve a previously taken screenshot by its ID.',
     get_file: 'Retrieve any stored file by ID — view it (attach) or hand the user a download.',
@@ -1068,6 +1111,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     wake_sub_agent: 'Wake a parked sub-agent with follow-up instructions; returns a fresh handle.',
     stop_sub_agent: 'Terminate a sub-agent and cancel its pending work.',
     sleep_self: 'Sub-agent only: park yourself until the parent wakes you.',
+    start_chat: 'Open a new chat pre-loaded with a message (auto-send or draft) — for hand-off buttons inside widgets.',
     agent_message: 'Send a message between agents (parent↔sub) without settling the spawn handle.',
     eval_runner: 'Sandboxed grader for the ServiceNow eval skill lifecycle (init, setup, verify, teardown).',
     github_setup: 'Open the GitHub setup popup to connect an account or clone a repo.',

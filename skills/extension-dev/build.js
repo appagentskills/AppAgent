@@ -129,6 +129,8 @@ async function extension_build(args) {
     // KEEP IN SYNC with build/build.js WORKER_SHARED_FILES.
     var WORKER_SHARED_FILES = [
         'src/js/core/030-config.js',
+        // emoji shortcode map + replaceEmojiShortcodes (formatContent calls it unconditionally)
+        'src/js/core/055-emoji-shortcodes.js',
         'src/js/core/060-ui-constants.js',
         'src/js/core/070-permissions.js',
         // 078-tool-profiles — TOOL_PROFILES table + profile helpers used by

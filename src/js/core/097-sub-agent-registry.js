@@ -69,11 +69,6 @@ var SUBAGENT_POOL_SIZE          = 2;
 // regardless of how many distinct groups are active.
 var SUBAGENT_POOL_SIZE_RELAXED  = 4;
 var SUBAGENT_POOL_GLOBAL_MAX    = 6;
-var SUBAGENT_DEFAULT_MAX_TOOLS  = 300;
-// Soft-cap warning threshold: once a sub has used this fraction of its
-// tool budget, every subsequent tool result carries a budget warning so
-// the model wraps up and reports instead of being hard-killed mid-task.
-var SUBAGENT_BUDGET_WARN_RATIO  = 0.9;
 // Worker-saturation policy (system prompt "WORKER SATURATION" rule): context
 // occupancy is measured against the SAME assumed window for EVERY sub,
 // REGARDLESS of the actual model behind its tier. Deliberate: the agent
@@ -82,17 +77,11 @@ var SUBAGENT_BUDGET_WARN_RATIO  = 0.9;
 // user-editable global setting (default 200k) resolved via
 // getAssumedContextTokens in core/030-config.js — 030 loads before this
 // file in BOTH bundles, and _subAssumedContextTokens() reads it at call
-// time with a hard 200k fallback. The tool budget uses the same 50% ratio.
+// time with a hard 200k fallback.
 function _subAssumedContextTokens() {
     return (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
 }
 var SUBAGENT_SATURATION_RATIO       = 0.5;
-// Absolute force-stop ceiling, as a multiple of max_tool_calls. The band
-// between the cap and the ceiling is soft (escalating warnings only), but
-// a runaway sub that ignores every warning must not hold a pool slot and
-// burn tokens forever — past cap*MULT the old hard termination path runs
-// (cascade-stop, error-settle the spawn handle, pause, release the slot).
-var SUBAGENT_BUDGET_HARD_MULT   = 2;
 var SUBAGENT_DEFAULT_SUMMARY_KB = 4;
 var SUBAGENT_MAX_ARTIFACTS      = 32;
 // Soft cap on the inbox queue (sleeping sub). Older messages are dropped
@@ -114,13 +103,33 @@ var SUBAGENT_TOMBSTONE_TTL_MS   = 60 * 60 * 1000; // 1h
 // + background chat row forever. Reclaim sleeping subs idle longer than this.
 // Re-waking resets last_activity_at, so an actively-managed sub is never hit.
 var SUBAGENT_SLEEP_TTL_MS       = 60 * 60 * 1000; // 1h idle
+// ACTIVE-CLASSIFY-F6b: age-out for records STUCK at state:'running'. The sweep
+// below only reclaimed stopped/errored (tombstone TTL) and sleeping (sleep TTL)
+// records — 'running' had NO expiry at all, so a record whose loop died without
+// ever emitting a terminal event (SW killed mid-run, an exception on a path that
+// never reaches _markErrored) stayed 'running' forever. That pins the OWNING
+// chat into "Active Chats" indefinitely: chatHasRunningSubAgents (tools/120-
+// actions.js, `_sr.state !== 'running'` → continue) → isChatBusy → the jobs
+// dropdown's Active-vs-Done classification.
+// TTL CHOICE (2h): a genuinely live sub refreshes last_activity_at on a ~1s-
+// throttled heartbeat at EVERY tool call (onToolCallInSubAgent, called from
+// tools/020-tool-execution.js and worker/120-tool-routing.js) and again on every
+// report / wake / inbox message, so the longest legitimate gap for a live sub is
+// one LLM turn plus one tool execution — minutes, not hours. 2h is therefore ~an
+// order of magnitude above the real ceiling (deliberately conservative: a false
+// age-out settles a parent's handle with an error, which is worse than a slow
+// self-heal) while still being 2x the sleep/tombstone TTLs so a wedged record
+// self-heals inside one browsing session instead of never. Fix 6a is the FAST
+// path for the common case (page trusting stale IDB records); this is the
+// backstop for a record genuinely stuck in the authoritative context.
+var SUBAGENT_RUNNING_TTL_MS      = 2 * 60 * 60 * 1000; // 2h with no activity
 
 // Default-denied nested-delegation tools. Sub-agents cannot spawn /
 // stop / wake other subs unless the caller passes `allow_nested:true`
 // at spawn time. Spec §8.4 "fork-bomb prevention" + Phase 5 ACL hardening.
 var SUBAGENT_NESTED_DELEGATION_TOOLS = ['spawn_sub_agent', 'stop_sub_agent', 'wake_sub_agent'];
-// Maximum allowed nesting depth. Hard ceiling on tree depth, independent of
-// per-sub `max_tool_calls` budgets. Default 5 levels (root → 5 descendants).
+// Maximum allowed nesting depth. Hard ceiling on tree depth. Default 5
+// levels (root → 5 descendants).
 var SUBAGENT_MAX_DEPTH = 5;
 
 // ───── Standard worker-report template (Orchestrator §3) ─────────
@@ -441,7 +450,30 @@ async function loadAllSubAgents() {
         // listens on _notifyListeners).
         _subAgentsLoaded = true;
         _notifyListeners();
-    } catch (e) { /* non-fatal — _subAgentsLoaded stays false, hello sends null */ }
+    } catch (e) {
+        // ACTIVE-CLASSIFY-F6a: DEGRADED-BUT-SETTLED. This catch used to leave
+        // _subAgentsLoaded === false for the ENTIRE SW session, and both
+        // consumers are gated on it: the hello envelope
+        // (src/js/worker/130-port-bridge.js, `SubAgents.isLoaded()` → sends
+        // null) and the snapshot broadcast (src/js/worker/105-subagent-
+        // broadcast.js, `if (!SubAgents.isLoaded()) return;`). With both gates
+        // shut the page never got ANY snapshot, so it kept trusting its own
+        // IDB-hydrated mirror — including records still marked state:'running'
+        // from a previous session — and chatHasRunningSubAgents → isChatBusy
+        // pinned the parent chat into "Active Chats" forever. Mark hydration
+        // settled so the gates open: the SW then ships whatever it does have
+        // (the drain loop may well have completed and thrown later, in the
+        // boot-decision await or handle rehydration), and the page replaces
+        // stale local state with the authoritative view instead of guessing.
+        // TRADE-OFF (accepted): if the throw happened BEFORE the drain, the
+        // snapshot is empty and the page mirror is cleared. That is the point —
+        // an empty authoritative snapshot beats phantom 'running' records. The
+        // records themselves are still safe in IDB and recoverable per-id via
+        // _rehydrateSubAgentRecordById (see below) / resurrectSubAgent.
+        console.error('[sub-agents] loadAllSubAgents failed — hydration marked SETTLED (degraded); serving/broadcasting the partial registry so the isLoaded() gates open', e);
+        _subAgentsLoaded = true;
+        try { _notifyListeners(); } catch (_) { /* listeners handle their own errors */ }
+    }
     // Kick off the idle/tombstone sweeper now that the registry is loaded.
     _startIdleSweep();
 }
@@ -527,8 +559,12 @@ function _orphanErrorSubAtBoot(rec) {
 // `_subAgents` stays empty for the whole SW session while the records are
 // still safely persisted in IDB — so wake_sub_agent returned "unknown
 // agent_id" for a sub the Workers strip (page mirror, correctly hydrated
-// from ITS OWN IDB read and shielded from the empty snapshot by the
-// isLoaded() broadcast gate) still visibly renders as ERRORED/resurrectable.
+// from ITS OWN IDB read) still visibly renders as ERRORED/resurrectable.
+// NOTE (ACTIVE-CLASSIFY-F6a): loadAll's catch no longer leaves isLoaded()
+// false, so the page mirror is NO LONGER shielded from a degraded (possibly
+// empty) snapshot — deliberately, because phantom 'running' records pinned the
+// parent chat into "Active Chats" forever. This per-id rehydration is the
+// recovery path for records the degraded snapshot dropped.
 // Returns a Promise<record|null>:
 //   • null — not persisted (genuinely unknown), past the tombstone TTL
 //     (honor the GC contract: expired tombstones are NOT resurrectable),
@@ -851,6 +887,49 @@ function _idleSweepTick() {
         // the sub_agents IDB record + background chat row races the SW's persistence
         // and breaks the sub_report "open transcript" link. _isAbandonedSleep was
         // already gated; _isTombstone was not.
+        // ACTIVE-CLASSIFY-F6b: stale 'running' age-out (see
+        // SUBAGENT_RUNNING_TTL_MS). Runs BEFORE the reclaim arms below: this one
+        // does not DELETE anything (so it needs none of the focus guards — the
+        // record + chat row survive and only become collectable via the normal
+        // tombstone TTL, 1h after the settle stamped here), it only transitions
+        // the record to terminal. Reuses _markErrored — the full error helper —
+        // rather than _orphanErrorSubAtBoot, because a stuck 'running' record
+        // also holds a POOL SLOT and an UNSETTLED spawn handle: _markErrored
+        // cascade-stops descendants, sets state/settled_at/crash_cause/
+        // last_error/last_report, persists, finalizes the parent card, resolves
+        // the spawn handle (so a parent blocked in await_handle unblocks with an
+        // error instead of hanging forever) and releases the pool slot.
+        // _orphanErrorSubAtBoot does none of the last three.
+        // The reason string deliberately avoids the words matched by
+        // _isTransientSubError (/timeout|timed out|.../) — a "transient" verdict
+        // would send _markErrored down its auto-retry arm and re-queue the dead
+        // sub instead of settling it.
+        // Queued-but-not-yet-started subs are skipped: they are legitimately
+        // waiting for a pool slot, their start refreshes last_activity_at, and
+        // erroring one would leave a stale id in _subPool.queue for a later
+        // _drainPool to start.
+        if (_authoritativeCtx && r.state === 'running'
+            && r.last_activity_at && (now - r.last_activity_at) > SUBAGENT_RUNNING_TTL_MS
+            && _subPool.queue.indexOf(aid) === -1) {
+            var _staleMins = Math.round(SUBAGENT_RUNNING_TTL_MS / 60000);
+            console.warn('[sub-agents] stale running record reclaimed by the idle sweep', aid, 'idle for', Math.round((now - r.last_activity_at) / 60000), 'min');
+            // Overwrite (not ||) any older last_report so the UI shows THIS
+            // reason — _markErrored keeps a pre-existing report verbatim, and a
+            // record that was woken after reporting would otherwise re-surface a
+            // stale success.
+            r.last_report = {
+                status: 'error',
+                summary: 'stale run reclaimed by the idle sweep: no sub-agent activity for over ' + _staleMins + ' min (the service worker most likely died mid-run)',
+                from: r.agent_id,
+                from_name: r.name,
+                at: now,
+                _stale_running: true
+            };
+            try {
+                _markErrored(aid, 'stale run reclaimed by the idle sweep: no sub-agent activity for over ' + _staleMins + ' min');
+            } catch (e) { console.warn('subAgent GC: stale-running age-out failed', aid, e); }
+            continue;
+        }
         var _isTombstone = _authoritativeCtx
             && (r.state === 'stopped' || r.state === 'errored')
             && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS;
@@ -1322,11 +1401,13 @@ function spawnSubAgent(args, ctx) {
         // markReportCollected). Persisted, so an undelivered report can be
         // identified — and replayed/queried — after an MV3 SW restart.
         report_collected: false,
-        max_tool_calls: (typeof args.max_tool_calls === 'number' && args.max_tool_calls > 0)
-            ? Math.floor(args.max_tool_calls) : SUBAGENT_DEFAULT_MAX_TOOLS,
         summary_cap_bytes: SUBAGENT_DEFAULT_SUMMARY_KB * 1024,
         created_at: now,
         last_activity_at: now,
+        // DISPLAY-ONLY tool-call counter — there is no cap and no enforcement.
+        // Surfaced by agent_status, the persisted sub_report card metrics and
+        // the Workers sidebar. BACK-COMPAT: a legacy `max_tool_calls` spawn
+        // argument is accepted and silently ignored (never stored).
         tool_calls_used: 0,
         // Orchestrator §5: per-sub LLM usage rollup. Updated on EVERY LLM call
         // by the agent loop's metrics-capture block (030-agent-loop.js →
@@ -1434,7 +1515,6 @@ function spawnSubAgent(args, ctx) {
             subAgentId: agent_id,
             subAgentName: record.name,
             subChatId: chat_id,
-            maxToolCalls: record.max_tool_calls || 0,
             subDepth: record.depth || 1,
             spawnArgs: {
                 instructions: _cardInstr,
@@ -1470,8 +1550,8 @@ function spawnSubAgent(args, ctx) {
 }
 
 // ---------- Spawn-handle settlement ----------
-// The spawn handle resolves when the sub reports done/error, is stopped,
-// or exhausts its tool budget. We use a per-handle deferred (in-memory
+// The spawn handle resolves when the sub reports done/error or is stopped.
+// We use a per-handle deferred (in-memory
 // only — handles themselves are in-memory per spec §8.3) so the resolution
 // is push-driven.
 
@@ -1954,7 +2034,7 @@ function drainPendingWakes() {
 
 // ---------- Wake-the-parent on report (P2) ----------
 // SYMPTOM this fixes: when a sub reported (explicit report_to_parent,
-// auto-report, crash, budget force-stop, bare sleep_self), the report row
+// auto-report, crash, bare sleep_self), the report row
 // landed in the parent TRANSCRIPT but the parent AGENT only learned about
 // it on the user's next message — an idle parent never started a run, so
 // fire-and-forget delegation silently stalled.
@@ -2586,6 +2666,70 @@ function recordSubActionState(subChatId, snap) {
     return true;
 }
 
+// AUTOLINK-PR (sub→parent PR-link propagation): queue every PR URL a sub
+// produced onto the nearest non-sub ancestor chat's answer LINKS card, so a
+// PR opened by a sub-agent surfaces on the parent even when the sub never
+// called report_to_parent (auto_report / stop / crash synthesized reports)
+// or its report text lacked the full URL ("opened PR #712"). Two sources,
+// unioned:
+//   1. extractPrUrls(text) over the report-derived text (summary + data);
+//   2. a deterministic O(messages) scan of the SUB's OWN transcript:
+//      - workspace `push` tool results with r.success && r.pr_url and NOT
+//        r.auto_deleted (mirrors getPushedPRsForChat, ui/120-ui-utils.js —
+//        that helper lives in the ui tier which the SW bundle does not
+//        ship, so the scan is inlined here);
+//      - update_action_state calls with state:'pr_opened' (extractPrUrls
+//        over output + label, same as mergeChatAutoLinks in
+//        tools/020-tool-execution.js).
+// queueChatAutoLinks already dedupes, caps the queue at 12 and walks nested
+// subs to the nearest non-sub ancestor. Wrapped in try/catch: link
+// extraction must NEVER break handle settlement or report delivery.
+function _queuePrLinksToParent(rec, text) {
+    try {
+        if (!rec || typeof queueChatAutoLinks !== 'function' || typeof extractPrUrls !== 'function') return;
+        if (typeof chats === 'undefined' || !chats[rec.parent_chat_id]) return;
+        var urls = extractPrUrls(String(text || ''));
+        var seen = {};
+        for (var s = 0; s < urls.length; s++) seen[urls[s]] = true;
+        var sub = chats[rec.chat_id];
+        var msgs = (sub && sub.messages) || [];
+        var pushIds = {}; // tool_call_id -> true for workspace push calls
+        for (var i = 0; i < msgs.length; i++) {
+            var m = msgs[i];
+            if (!m) continue;
+            if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+                for (var j = 0; j < m.tool_calls.length; j++) {
+                    var tc = m.tool_calls[j];
+                    if (!tc || !tc.function) continue;
+                    if (tc.function.name === 'workspace') {
+                        try {
+                            var a = JSON.parse(tc.function.arguments || '{}');
+                            if (a && a.action === 'push') pushIds[tc.id] = true;
+                        } catch (e) { /* malformed args — skip */ }
+                    } else if (tc.function.name === 'update_action_state') {
+                        var ua = null;
+                        try { ua = JSON.parse(tc.function.arguments || '{}'); } catch (e) { ua = null; }
+                        if (ua && ua.state === 'pr_opened') {
+                            var uu = extractPrUrls(String(ua.output || '') + ' ' + String(ua.label || ''));
+                            for (var k = 0; k < uu.length; k++) {
+                                if (!seen[uu[k]]) { seen[uu[k]] = true; urls.push(uu[k]); }
+                            }
+                        }
+                    }
+                }
+            } else if (m.role === 'tool' && m.tool_call_id && pushIds[m.tool_call_id] && m.content) {
+                var r = null;
+                try { r = (typeof m.content === 'string') ? JSON.parse(m.content) : m.content; } catch (e) { r = null; }
+                if (r && r.success && r.pr_url && !r.auto_deleted && !seen[r.pr_url]) {
+                    seen[r.pr_url] = true;
+                    urls.push(r.pr_url);
+                }
+            }
+        }
+        if (urls.length) queueChatAutoLinks(chats[rec.parent_chat_id], urls);
+    } catch (e) { /* non-fatal — settlement must never fail on link extraction */ }
+}
+
 function reportToParent(args, ctx) {
     args = args || {};
     var subChatId = (ctx && ctx.chatId)
@@ -2621,22 +2765,11 @@ function reportToParent(args, ctx) {
         // again") and the parent never learns the work actually succeeded.
         // Self-revive instead: mirror _wakeSubAgentImpl's resurrect
         // bookkeeping, re-arm the spawn deferred, and accept the report.
-        // 'stopped' stays refused ONLY when explicit (stop_sub_agent / user
-        // cancellation — _stoppedByUser is set): that is a deliberate kill,
-        // not a stale crash record.
-        // BUDGET-STOP WRAP-UP: the hard-ceiling backstop (onToolCallInSubAgent)
-        // sets state='stopped' + crash_cause='budget_exhausted' WITHOUT
-        // _stoppedByUser, while the sub's live loop usually survives long
-        // enough to attempt one wrap-up report (report_to_parent is
-        // budget-exempt in the dispatch gate). Refusing it here stranded the
-        // sub's actual findings — the parent only ever saw the force-stop
-        // error. Treat a budget backstop stop like a stale crash record and
-        // self-revive; the report below settles the re-armed handle and parks
-        // the sub (state 'sleeping'), so this is a bounded one-shot revival,
-        // not a revive loop (FIX #6 still refuses a second settle).
-        var _budgetBackstopStop = (rec.state === 'stopped' && !rec._stoppedByUser
-            && rec.crash_cause === 'budget_exhausted');
-        if (rec.state === 'errored' || _budgetBackstopStop) {
+        // 'stopped' is ALWAYS refused, whoever set it: an explicit
+        // stop_sub_agent / user cancellation (_stoppedByUser) and an internal
+        // parent cascade-stop (_cascadeStopDescendants) are both deliberate
+        // kills, not stale crash records.
+        if (rec.state === 'errored') {
             rec.settled_at = null;
             delete rec._retry_used;
             delete rec._throttle_retries;
@@ -2704,16 +2837,11 @@ function reportToParent(args, ctx) {
 
     // AUTOLINK-PR: a report that carries a pull-request URL surfaces it on
     // the parent's answer LINKS card even when the parent model never calls
-    // set_links. queueChatAutoLinks (tools/020-tool-execution.js) walks to
-    // the nearest non-sub ancestor; executeAfterResponseHooks merges the
-    // queue into that chat's final answer at the end of its run.
-    if (typeof queueChatAutoLinks === 'function' && typeof extractPrUrls === 'function'
-        && chats[rec.parent_chat_id]) {
-        try {
-            var _alUrls = extractPrUrls(summary + ' ' + (data ? JSON.stringify(data) : ''));
-            if (_alUrls.length) queueChatAutoLinks(chats[rec.parent_chat_id], _alUrls);
-        } catch (_alErr) { /* non-fatal — the report itself must never fail on this */ }
-    }
+    // set_links. The helper also scans the sub's own transcript so a pushed
+    // PR propagates even when the report text lacks the full URL.
+    // executeAfterResponseHooks merges the queue into the parent chat's
+    // final answer at the end of its run.
+    _queuePrLinksToParent(rec, summary + ' ' + (data ? JSON.stringify(data) : ''));
 
     // Push a styled callout row into the parent chat so the human reading
     // the parent transcript can see the report inline.
@@ -2733,7 +2861,6 @@ function reportToParent(args, ctx) {
             // Workers panel can reconstruct an accurate card (tool counts,
             // depth) after the registry GCs this sub's live record (~1h).
             _rcard.toolCallsUsed = rec.tool_calls_used || 0;
-            _rcard.maxToolCalls = rec.max_tool_calls || 0;
             _rcard.subDepth = rec.depth || 1;
         } else {
             chats[rec.parent_chat_id].messages.push({
@@ -2743,7 +2870,6 @@ function reportToParent(args, ctx) {
                 subChatId: rec.chat_id,
                 report: report,
                 toolCallsUsed: rec.tool_calls_used || 0,
-                maxToolCalls: rec.max_tool_calls || 0,
                 subDepth: rec.depth || 1,
                 createdAt: report.at
             });
@@ -2848,6 +2974,10 @@ function sleepSelf(args, ctx) {
             from: rec.agent_id,
             _synthesized: true
         });
+        // AUTOLINK-PR: a sub that parked without reporting may still have
+        // pushed a PR — propagate it from its transcript to the parent
+        // BEFORE the wake below persists the parent chat.
+        _queuePrLinksToParent(rec, rec.last_report.summary || '');
         _wakeParentOnReport(rec, rec.last_report, { hadAwaiters: _ssHadAwaiters });
     }
     // Stale-card fix: parking settles this turn — stop a still-running card.
@@ -2994,21 +3124,10 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         delete rec._stoppedByUser;
         delete rec._retry_used;
         delete rec._throttle_retries;
-        // PR383-R1: a sub force-stopped for budget exhaustion carries
-        // tool_calls_used past the hard ceiling (SUBAGENT_BUDGET_HARD_MULT ×
-        // max_tool_calls). Without a rebase, its FIRST tool call after
-        // revival re-trips the ceiling in onToolCallInSubAgent — force-stop,
-        // error-settle the fresh handle, another 'force-stopped …
-        // Resurrectable' notice: a wake→stop→notify churn loop. Rebase usage
-        // to exactly max_tool_calls: every subsequent call is past the soft
-        // cap (the ⛔ BUDGET EXCEEDED wrap-up warning fires immediately), but
-        // the 2× ceiling leaves ~max_tool_calls calls of real headroom to
-        // wrap up. Checked BEFORE the history move below so the pre-resurrect
-        // crash_cause is still readable.
-        if (rec.crash_cause === 'budget_exhausted'
-            || (rec.tool_calls_used || 0) >= rec.max_tool_calls * SUBAGENT_BUDGET_HARD_MULT) {
-            rec.tool_calls_used = rec.max_tool_calls;
-        }
+        // tool_calls_used is a display-only lifetime counter — it deliberately
+        // survives a resurrection so the Workers card keeps showing the total
+        // work this sub has done. Nothing is capped, so there is nothing to
+        // rebase here.
         // PR383-R3: archive, then clear, the previous run's terminal
         // diagnostics so a NEW crash after resurrection records its own
         // cause/error instead of inheriting the old ones.
@@ -3243,8 +3362,8 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // caller decides whether to escalate or cross-check).
     // WORKER SATURATION: when this wake delivered new work (an instruction
     // and/or a drained inbox re-tasks the sub), warn — non-blocking — if the
-    // sub is past 50% of the assumed 200k context window or its tool budget,
-    // so the caller spawns a FRESH successor instead of piling on.
+    // sub is past 50% of the assumed 200k context window, so the caller
+    // spawns a FRESH successor instead of piling on.
     var _satWarn = (args.instruction || pendingMsgs.length) ? _saturationWarning(rec) : null;
     return { success: true, ok: true, state: 'running', handle: newHandleId, resurrected_from: _resurrectedFrom || undefined, escalation_suggestion: _escalationSuggestion(rec) || undefined, saturation_warning: _satWarn || undefined };
 }
@@ -3348,7 +3467,6 @@ function agentMessage(args, ctx, _regMissRetried) {
                     progress: [_entry],
                     report: { status: 'running', summary: '', from: rec.agent_id, from_name: rec.name, at: Date.now() },
                     toolCallsUsed: rec.tool_calls_used || 0,
-                    maxToolCalls: rec.max_tool_calls || 0,
                     subDepth: rec.depth || 1,
                     createdAt: Date.now()
                 });
@@ -3627,9 +3745,9 @@ function agentMessage(args, ctx, _regMissRetried) {
 // ---------- stop_sub_agent ----------
 
 // Cascade-terminate every descendant of `rec` (deepest first, via
-// _descendants ordering). Shared by stop_sub_agent, the budget-exhaustion
-// path, and _markErrored so that a parent sub going terminal for ANY reason
-// (explicit stop, budget exhausted, crash) never orphans its grandchildren.
+// _descendants ordering). Shared by stop_sub_agent and _markErrored so that
+// a parent sub going terminal for ANY reason (explicit stop, crash) never
+// orphans its grandchildren.
 // Orphaned descendants would otherwise keep burning pool slots, report into a
 // now-dead chat, and leave their spawn handles hanging. Runs as an internal
 // cascade (ACL bypassed; ctx is unused by the internal path).
@@ -3730,6 +3848,10 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     }
     // Resolve the spawn handle with `cancelled`.
     _resolveSpawnHandle(rec.agent_id, { status: 'cancelled', summary: reason, from: rec.agent_id });
+
+    // AUTOLINK-PR: a PR pushed before the stop is still real — queue it on
+    // the parent BEFORE the card finalize below persists chats.
+    _queuePrLinksToParent(rec, (rec.last_report && rec.last_report.summary) || '');
 
     // Finalize the live parent card so its spinner stops and it reads cancelled.
     _finalizeSubAgentCard(rec, { status: 'cancelled', summary: reason, from: rec.agent_id, from_name: rec.name, at: Date.now() });
@@ -3893,7 +4015,7 @@ function _markErrored(agentId, errMsg) {
         return;
     }
     // A crashing parent sub must cascade-stop its descendants, mirroring
-    // stop_sub_agent and the budget path. Without this, grandchildren of a
+    // stop_sub_agent. Without this, grandchildren of a
     // crashed sub keep running, hold pool slots, and report into a dead chat.
     _cascadeStopDescendants(rec, 'parent sub-agent errored: ' + rec.name);
     rec.state = 'errored';
@@ -3904,7 +4026,7 @@ function _markErrored(agentId, errMsg) {
     // spawn-handle settle, parent notice) — raw payload goes to the console.
     errMsg = _shortSubErrorHeadline(errMsg);
     // PR383-R3: unconditional — the old `crash_cause || 'run_error'` guard let
-    // a stale pre-resurrect cause (e.g. 'budget_exhausted') survive a NEW
+    // a stale pre-resurrect cause (e.g. 'run_error') survive a NEW
     // crash and corrupt diagnostics. Each terminal event owns these fields.
     rec.crash_cause = 'run_error';
     rec.last_error = { message: String(errMsg || 'sub-agent errored'), at: rec.settled_at, transient: _meTransient, retried: !!rec._retry_used };
@@ -3913,6 +4035,10 @@ function _markErrored(agentId, errMsg) {
         error: { message: rec.last_error.message, transient: _meTransient, retried: rec.last_error.retried, retryable: true, hint: 'resurrectable via wake_sub_agent (full prior context preserved)' }
     };
     _subAgentsPersist(rec);
+    // AUTOLINK-PR: a PR pushed before the crash is still real — queue it on
+    // the parent BEFORE _finalizeSubAgentCard so _repaintParent's
+    // saveChatsToStorage persists the autoLinkQueue.
+    _queuePrLinksToParent(rec, (rec.last_report && rec.last_report.summary) || '');
     _finalizeSubAgentCard(rec, rec.last_report);
     var _meHadAwaiters = _spawnHandleHasAwaiters(rec); // P2: pre-settle sample
     _resolveSpawnHandle(agentId, { status: 'error', error: errMsg, summary: errMsg, from: rec.agent_id, error_info: { message: rec.last_error.message, transient: _meTransient, retried: rec.last_error.retried, retryable: true } });
@@ -3934,15 +4060,11 @@ function _markErrored(agentId, errMsg) {
 // (_subAssumedContextTokens — user-editable setting, model-independent).
 function _saturationInfo(rec) {
     var contextTokens = (rec && rec.last_input_tokens) || 0;
-    var used = (rec && rec.tool_calls_used) || 0;
-    var cap = (rec && rec.max_tool_calls) || 0;
     var assumedCtx = _subAssumedContextTokens();
     return {
         context_tokens: contextTokens,
         context_pct: Math.round(100 * contextTokens / assumedCtx),
-        tool_budget_pct: cap ? Math.round(100 * used / cap) : 0,
         saturated: contextTokens >= assumedCtx * SUBAGENT_SATURATION_RATIO
-            || !!(cap && used >= cap * SUBAGENT_SATURATION_RATIO)
     };
 }
 
@@ -3953,8 +4075,8 @@ function _saturationWarning(rec) {
     var s = _saturationInfo(rec);
     if (!s.saturated) return null;
     return 'Recipient sub is at ~' + s.context_pct + '% of the assumed 200k context window ('
-        + Math.round(s.context_tokens / 1000) + 'k tokens) and ' + s.tool_budget_pct
-        + '% of its tool budget — per the WORKER SATURATION rule, spawn a FRESH sub seeded with a handover instead of piling on.';
+        + Math.round(s.context_tokens / 1000) + 'k tokens) — per the WORKER SATURATION rule,'
+        + ' spawn a FRESH sub seeded with a handover instead of piling on.';
 }
 
 // ---------- agent_status ----------
@@ -3975,8 +4097,8 @@ function agentStatus(args, ctx) {
             created_at: rec.created_at,
             last_activity_at: rec.last_activity_at,
             settled_at: rec.settled_at || null,
+            // Display-only lifetime counter — no cap exists.
             tool_calls_used: rec.tool_calls_used || 0,
-            max_tool_calls: rec.max_tool_calls,
             // P1d: whether the parent has collected the latest report via
             // await/poll — false after a restart means "undelivered report,
             // re-await the spawn handle (rehydrated) or read last_report here".
@@ -4010,11 +4132,10 @@ function agentStatus(args, ctx) {
             usage: _sanitizeUsageForAgent(rec.usage),
             // WORKER SATURATION instrumentation: context occupancy proxy (last
             // LLM call's input tokens) against the FIXED assumed 200k window,
-            // tool-budget %, and the combined 50% `saturated` flag. Same math
-            // as the wake/message saturation_warning (_saturationInfo).
+            // plus the 50% `saturated` flag. Same math as the wake/message
+            // saturation_warning (_saturationInfo).
             context_tokens: sat.context_tokens,
             context_pct: sat.context_pct,
-            tool_budget_pct: sat.tool_budget_pct,
             saturated: sat.saturated,
             // Orchestrator §5: parent revision verdicts + the resulting
             // suggestion (null below SUBAGENT_ESCALATE_AFTER_REVISIONS).
@@ -4198,38 +4319,18 @@ function _lastAssistantSnap(rec, full) {
     return { text: t, at: rec.last_assistant_at || null };
 }
 
-// Called by 030-agent-loop.js whenever a tool call is dispatched inside a
-// sub-agent chat. Increments the budget counter. The budget is a SOFT cap:
-// once usage crosses SUBAGENT_BUDGET_WARN_RATIO (and on every call past
-// the cap) a warning notice is staged on the record; the agent loop
-// appends it to the next tool result via consumeBudgetNotice() so the
-// model sees it inline and can wrap up + report_to_parent on its own.
-// SAFETY BACKSTOP: past cap * SUBAGENT_BUDGET_HARD_MULT the sub is
-// force-stopped (cascade-stop descendants, error-settle the parent's
-// spawn handle, pause the chat, release the pool slot) and this returns
-// false so the caller short-circuits — otherwise a model loop that
-// ignores every warning would hold a pool slot and burn tokens forever.
-// Returns true in every other case.
+// Called by the two dispatch gates (tools/020-tool-execution.js for headless
+// tools, worker/120-tool-routing.js for UI tools) whenever a tool call is
+// dispatched inside a sub-agent chat. PURELY BOOKKEEPING: it bumps a
+// DISPLAY-ONLY lifetime counter (tool_calls_used), refreshes last_activity_at
+// and clears the per-crash retry latch. There is no cap, no warning notice and
+// no termination path — sub-agents are bounded by CONTEXT saturation
+// (_saturationInfo / the WORKER SATURATION rule), not by a tool-call ceiling.
+// Returns nothing; callers must NOT gate dispatch on the result.
 function onToolCallInSubAgent(chatId) {
-    if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return true;
+    if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return;
     var rec = _subAgents[chats[chatId].subAgentId];
-    if (!rec) return true;
-    // BUDGET-LOOP FIX (straggler latch): after the hard-ceiling force-stop
-    // below runs ONCE, in-flight work can still dispatch more tool calls —
-    // e.g. a js_eval sandbox looping over nested executeTool calls keeps
-    // going after the stop (observed: 31 → 109 tool_calls_used in ~6s, ~78
-    // duplicate 'force-stopped — hard tool-budget ceiling exceeded' parent
-    // notices, one per straggler call, each re-running the WHOLE termination
-    // path and inflating the counter past any wake-rebase). A budget-stopped
-    // sub does no further work: refuse stragglers SILENTLY — no increment,
-    // no notice, no handle settle, no cascade. Scoped to the budget backstop
-    // (crash_cause 'budget_exhausted') so explicit user/parent stops keep
-    // their pre-existing wind-down behavior, and a proper wake_sub_agent
-    // resurrection (state → 'running', counter rebased, crash_cause
-    // archived) is unaffected.
-    if ((rec.state === 'stopped' || rec.state === 'errored') && rec.crash_cause === 'budget_exhausted') {
-        return false;
-    }
+    if (!rec) return;
     rec.tool_calls_used = (rec.tool_calls_used || 0) + 1;
     var now = Date.now();
     rec.last_activity_at = now;
@@ -4241,70 +4342,15 @@ function onToolCallInSubAgent(chatId) {
     // let a later no_report / auto-report-disabled finish reuse the OLD
     // (already recovered) error in error_info and the parent notice.
     if (rec._retry_used || rec._throttle_retries) { delete rec._retry_used; delete rec._throttle_retries; rec.last_error = null; }
-    var used = rec.tool_calls_used;
-    var cap = rec.max_tool_calls;
-    var ceiling = cap * SUBAGENT_BUDGET_HARD_MULT;
-    if (used > ceiling) {
-        var msg = 'Sub-agent ' + rec.name + ' ran to ' + used + ' tool calls — past the hard ceiling ('
-            + ceiling + ' = ' + SUBAGENT_BUDGET_HARD_MULT + '\u00d7 max_tool_calls of ' + cap
-            + ') — ignoring every budget warning. Force-stopped.';
-        // Same termination path as the pre-soft-cap hard stop: cascade-stop
-        // descendants so grandchildren are never orphaned, finalize the live
-        // card, error-settle the spawn handle so the parent's await_handle
-        // returns, pause the chat, and release the pool slot.
-        _cascadeStopDescendants(rec, 'parent sub-agent exceeded hard tool-budget ceiling: ' + rec.name);
-        rec.state = 'stopped';
-        rec.settled_at = now;
-        rec.last_report = rec.last_report || { status: 'error', summary: msg, from: rec.agent_id, from_name: rec.name, at: rec.settled_at };
-        // RES-6: structured diagnostics + proactive parent notice (the parent
-        // did not initiate this stop — the registry's backstop did).
-        rec.crash_cause = 'budget_exhausted';
-        rec.last_error = { message: msg, at: now, transient: false, retried: false };
-        _subAgentsPersist(rec);
-        _finalizeSubAgentCard(rec, rec.last_report);
-        var _btHadAwaiters = _spawnHandleHasAwaiters(rec); // P2: pre-settle sample
-        _resolveSpawnHandle(rec.agent_id, { status: 'error', error: 'budget_exhausted', summary: msg, from: rec.agent_id, error_info: { message: msg, transient: false, retried: false, retryable: true } });
-        _notifySubLifecycle(rec, 'force-stopped — hard tool-budget ceiling exceeded (' + used + ' calls). Resurrectable via wake_sub_agent if you want it to wrap up.');
-        if (typeof pausedChats !== 'undefined') pausedChats[rec.chat_id] = true;
-        _releasePoolSlot(rec.agent_id);
-        // P2: error report — wake an idle parent (notice already delivered above).
-        _wakeParentOnReport(rec, rec.last_report, { hadAwaiters: _btHadAwaiters, noticeDelivered: true });
-        _notifyListeners();
-        return false;
-    }
-    if (used > cap) {
-        rec._budget_notice = '\u26d4 [BUDGET EXCEEDED] You have used ' + used
-            + ' tool calls (budget: ' + cap + '). STOP exploratory work NOW. '
-            + 'Finish the absolute minimum remaining steps (batch them in a single js_eval if possible) '
-            + 'and call report_to_parent immediately with what you have, flagging anything left undone. '
-            + 'You will be force-stopped at ' + ceiling + ' calls.';
-    } else if (used >= Math.ceil(cap * SUBAGENT_BUDGET_WARN_RATIO)) {
-        rec._budget_notice = '\u26a0\ufe0f [BUDGET WARNING] You have used ' + used + ' of ' + cap
-            + ' tool calls (' + Math.round(used * 100 / cap) + '%). Wrap up soon: batch remaining work '
-            + 'into js_eval calls and call report_to_parent before the budget runs out.';
-    }
     _subAgentsPersist(rec);
-    // Throttled UI heartbeat so the live used/cap counter in the sub-agent
-    // panel ticks during a run (state transitions notify unconditionally
-    // elsewhere; without this the counter only refreshed on transitions).
+    // Throttled UI heartbeat (<=1 Hz) so the live tool-call counter in the
+    // sub-agent panel ticks during a run (state transitions notify
+    // unconditionally elsewhere; without this the counter only refreshed on
+    // transitions).
     if (!rec._lastHeartbeatNotifyAt || now - rec._lastHeartbeatNotifyAt > 1000) {
         rec._lastHeartbeatNotifyAt = now;
         _notifyListeners();
     }
-    return true;
-}
-
-// Returns and clears any staged budget notice for the sub-agent owning
-// `chatId`. Called by the agent loop right after a tool result is
-// processed, so the notice rides along inside the tool-result content the
-// model reads next turn. Returns null for non-sub chats / no notice.
-function consumeBudgetNotice(chatId) {
-    if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return null;
-    var rec = _subAgents[chats[chatId].subAgentId];
-    if (!rec || !rec._budget_notice) return null;
-    var n = rec._budget_notice;
-    rec._budget_notice = null;
-    return n;
 }
 
 // Called by 030-agent-loop.js when runAgent finishes naturally (the model
@@ -4596,6 +4642,12 @@ function onSubAgentRunFinished(chatId, finishCtx) {
         // P2: error report — wake an idle parent (notice already delivered above).
         _wakeParentOnReport(rec, rec.last_report, { hadAwaiters: _nrHadAwaiters, noticeDelivered: true });
     }
+    // AUTOLINK-PR: a PR pushed by the sub is real even when the run ended
+    // without report_to_parent — the auto_report synthesis above (done AND
+    // errored: a PR pushed before a crash still exists) and the no_report
+    // branch both land here. Queue BEFORE _finalizeSubAgentCard so
+    // _repaintParent's saveChatsToStorage persists the autoLinkQueue.
+    _queuePrLinksToParent(rec, (rec.last_report && rec.last_report.summary) || '');
     // Finalize the live parent card if it's still showing a non-terminal status
     // (auto-report, crash, and no-report terminal paths don't push their own
     // row) so its spinner stops and the terminal status/summary is shown.
@@ -4631,7 +4683,6 @@ var SubAgents = {
     // chat message (called by the loop after each finalized assistant
     // message in a sub-agent chat; see recordSubAssistantMessage).
     recordAssistantMessage: recordSubAssistantMessage,
-    consumeBudgetNotice: consumeBudgetNotice,
     onSubAgentRunFinished: onSubAgentRunFinished,
     // RES-6: unsolicited-event hooks — called by the SW port bridge when the
     // user sends a message into a sub's chat (worker/130-port-bridge.js) and

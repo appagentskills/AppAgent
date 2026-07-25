@@ -123,20 +123,6 @@ function appendNoticeToContent(content, notice, key) {
     return content + '\n\n' + notice;
 }
 
-// Sub-agent soft tool-budget: if the SubAgents registry staged a budget
-// notice for this chat (>=90% used, or past the cap), append it to the
-// tool-result content so the model sees the warning inline on its very
-// next read. No-op for normal chats. Content is always a string here
-// (processToolResultForCache stringifies).
-function appendBudgetNotice(chatId, content) {
-    try {
-        if (typeof SubAgents === 'undefined' || !SubAgents.consumeBudgetNotice) return content;
-        var notice = SubAgents.consumeBudgetNotice(chatId);
-        if (!notice) return content;
-        return appendNoticeToContent(content, notice, '_tool_budget_notice');
-    } catch (_) { return content; }
-}
-
 // Latest context occupancy for a chat: the newest non-aggregate assistant
 // message's reported input_tokens — the same scan the sub-agent nudge below
 // and updateContextIndicator (ui/240-layout.js) use. Returns 0 when no
@@ -164,8 +150,8 @@ function getChatContextTokens(chat) {
 // matching wins — no double warnings). No one-shot/re-arm logic — fires on every tool
 // result while over threshold, goes quiet if occupancy drops. Wording is
 // deliberately PERCENTAGE-ONLY (never absolute token counts — the model
-// must not reason about real window sizes). Composes with appendBudgetNotice
-// at all three tool-result write sites.
+// must not reason about real window sizes). Applied at all three
+// tool-result write sites via appendNoticeToContent.
 function appendContextNotice(chat, content) {
     try {
         var limit = (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
@@ -492,7 +478,7 @@ async function executePendingApprovedTools(chat) {
                 var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
-                processed.content = appendContextNotice(chat, appendBudgetNotice(chat.id, processed.content));
+                processed.content = appendContextNotice(chat, processed.content);
                 // recordToolResult overwrites the seeded placeholder in-place. Main's
                 // push-to-end was correct because end-of-array == slot-after-assistant
                 // (no placeholders). With approval messages + atomic placeholders
@@ -723,7 +709,7 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            processed.content = appendContextNotice(chat, appendBudgetNotice(streamingChatId, processed.content));
+            processed.content = appendContextNotice(chat, processed.content);
             recordToolResult(chat, tc.id, toolName, processed.content);
             // Defer screenshot messages so they don't interleave between tool results
             if (screenshotMsg) deferredScreenshots.push(screenshotMsg);
@@ -1312,7 +1298,7 @@ async function runAgent(overrideChatId) {
             delete result._screenshotMessage;
             delete result._screenshotMessages;
             var processed = processToolResultForCache(streamingChatId, tc.id, toolName, result);
-            processed.content = appendContextNotice(chat, appendBudgetNotice(streamingChatId, processed.content));
+            processed.content = appendContextNotice(chat, processed.content);
             var resultMsg = recordToolResult(chat, tc.id, toolName, processed.content);
             var toolResultIdx = chat.messages.indexOf(resultMsg);
             // Correct widget msgIndex if approval messages shifted it

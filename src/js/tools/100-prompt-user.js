@@ -120,8 +120,7 @@ function openBackgroundPromptPopup(chatId, promptId) {
     if (!msg || msg.status !== 'pending') return;
 
     var fieldsHtml = (msg.fields || []).map(function(f) { return renderPromptField(f, promptId); }).join('');
-    var descHtml = msg.description ?
-        '<div class="bg-popup-desc">' + escapeHtml(msg.description) + '</div>' : '';
+    var descHtml = promptDescriptionHtml(msg.description);
 
     var host = document.createElement('div');
     host.id = 'bg-popup-host';
@@ -382,6 +381,21 @@ function injectPromptToolResult(chat, promptId, result) {
     } // end _doInject
 }
 
+// Render a prompt description as a readable markdown card. Reuses the chat
+// markdown pipeline (formatContent in ui/250-message-render.js: escapes HTML
+// internally, preserves blank-line paragraphs, lists, inline/fenced code,
+// links) inside a .markdown-body container so 07-markdown.css block rules
+// apply. Fallback keeps escaping + newlines if formatContent is unavailable.
+// Used by BOTH the inline chat form (renderPromptUserMessage) and the
+// background prompt popup (openBackgroundPromptPopup).
+function promptDescriptionHtml(description) {
+    if (!description) return '';
+    var inner = (typeof formatContent === 'function')
+        ? formatContent(String(description))
+        : escapeHtml(String(description)).replace(/\n/g, '<br>');
+    return '<div class="prompt-user-desc markdown-body">' + inner + '</div>';
+}
+
 // Render a prompt_user message inline (called from renderMessages)
 function renderPromptUserMessage(msg, index) {
     var promptId = msg.promptId;
@@ -396,16 +410,19 @@ function renderPromptUserMessage(msg, index) {
     // Header
     var headerColor = isPending ? '' : (isSubmitted ? '' : '');
     html += '<summary class="tool-approval-header">';
-    html += escapeHtml(msg.title || 'Input needed');
+    // Title: INLINE markdown only (code spans + bold) — block markdown would
+    // break the one-line <summary> row. Escaped first, same regexes as
+    // formatContent's inline passes.
+    html += escapeHtml(msg.title || 'Input needed')
+        .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     if (isSubmitted) html += ' <span class="tool-approval-status allowed">Submitted</span>';
     if (isCancelled) html += ' <span class="tool-approval-status denied">Cancelled</span>';
     html += '</summary>';
 
     // Body
     html += '<div class="tool-approval-body">';
-    if (msg.description) {
-        html += '<div style="margin-bottom:var(--space-6);color:var(--text-secondary);font-size:var(--text-body-sm)">' + escapeHtml(msg.description) + '</div>';
-    }
+    html += promptDescriptionHtml(msg.description);
 
     if (isPending) {
         // RES-5: capture drafts on every input/change (events bubble to the
@@ -417,12 +434,16 @@ function renderPromptUserMessage(msg, index) {
         });
         html += '</form>';
     } else if (isSubmitted && msg.values) {
-        // Show submitted values as read-only
+        // Show submitted values as read-only: one block per field — the label
+        // on its own muted line, the answer below it. Newlines the user typed
+        // (textareas) survive via .prompt-value-text's white-space: pre-wrap;
+        // arrays render as one chip per entry; empty answers show an em dash.
         html += '<div class="prompt-submitted-values">';
         (msg.fields || []).forEach(function(field) {
-            var val = msg.values[field.name];
-            var displayVal = Array.isArray(val) ? val.join(', ') : (val === true ? 'Yes' : val === false ? 'No' : String(val || ''));
-            html += '<div class="prompt-value-row"><span class="prompt-value-label">' + escapeHtml(field.label || field.name) + ':</span> <span class="prompt-value-text">' + escapeHtml(displayVal) + '</span></div>';
+            html += '<div class="prompt-value-row">';
+            html += '<div class="prompt-value-label">' + escapeHtml(field.label || field.name) + '</div>';
+            html += promptSubmittedValueHtml(field, msg.values[field.name]);
+            html += '</div>';
         });
         html += '</div>';
     }
@@ -438,6 +459,42 @@ function renderPromptUserMessage(msg, index) {
 
     html += '</details></div>';
     return html;
+}
+
+// Map a raw submitted value back to its option LABEL — select/multi-select
+// store option values, but the label is what the user actually clicked.
+// Falls back to the raw value when no option matches (free-text, stale opts).
+function promptOptionLabel(field, val) {
+    var options = (field && field.options) || [];
+    for (var i = 0; i < options.length; i++) {
+        var opt = options[i];
+        var ov = typeof opt === 'object' ? opt.value : opt;
+        if (String(ov) === String(val)) {
+            return String(typeof opt === 'object' ? (opt.label || opt.value) : opt);
+        }
+    }
+    return String(val);
+}
+
+// Render ONE submitted answer as a display block (submitted/read-only state).
+// All user content goes through escapeHtml — do not weaken this (XSS).
+// Empty (null/undefined/''/[]) → muted em dash; arrays → chips; booleans →
+// Yes/No; numbers/strings → pre-wrap text (newlines preserved by CSS).
+function promptSubmittedValueHtml(field, val) {
+    if (val == null || val === '' || (Array.isArray(val) && !val.length)) {
+        return '<div class="prompt-value-text prompt-value-empty">&mdash;</div>';
+    }
+    if (Array.isArray(val)) {
+        var chips = val.map(function(v) {
+            return '<span class="prompt-value-chip">' + escapeHtml(promptOptionLabel(field, v)) + '</span>';
+        }).join('');
+        return '<div class="prompt-value-chips">' + chips + '</div>';
+    }
+    if (typeof val === 'boolean') {
+        return '<div class="prompt-value-text">' + (val ? 'Yes' : 'No') + '</div>';
+    }
+    var text = (field && field.type === 'select') ? promptOptionLabel(field, val) : String(val);
+    return '<div class="prompt-value-text">' + escapeHtml(text) + '</div>';
 }
 
 function renderPromptField(field, promptId) {

@@ -32,13 +32,25 @@
 .dashboard-widget-icon svg { width: 16px; height: 16px; }
 .dashboard-widget-title { flex: 1; font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .widget-error-badge { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--danger); background: var(--danger-light); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); }
-.dashboard-widget-controls { display: flex; gap: var(--space-2); flex-shrink: 0; opacity: 0; transition: opacity var(--transition-normal); }
-.dashboard-widget-header:hover .dashboard-widget-controls { opacity: 1; }
+/* Expand is the ONLY in-card action (everything else lives in the expanded modal),
+   so the header controls stay persistently visible while the header shows.
+   The header itself is display:none unless .show-headers is set (line 28/29);
+   with headers HIDDEN (the default) the floating .dashboard-widget-hover-btn
+   below carries the Expand action + drag grip instead, hover-revealed. */
+.dashboard-widget-controls { display: flex; gap: var(--space-2); flex-shrink: 0; opacity: 1; }
 .dashboard-widget-btn { width: 26px; height: 26px; border: none; background: var(--bg-white); border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
 .dashboard-widget-btn:hover { background: var(--primary-lighter); color: var(--primary); }
-.dashboard-widget-btn.danger:hover { background: var(--danger-light); color: var(--danger); }
 .dashboard-widget-btn svg { width: 14px; height: 14px; }
 .dashboard-widget-content { flex: 1; overflow: hidden; background: var(--bg-white); min-height: 100px; position: relative; }
+/* Floating hover-only card control (headers hidden — the default): restores the
+   Expand click and a drag grip, since the header owns both and the content
+   iframe eats mouse events. Hidden under .show-headers (header supplies them).
+   z-index 11 clears the .widget-loading-overlay (z-index 10 above). */
+.dashboard-widget-hover-btn { position: absolute; top: var(--space-3); right: var(--space-3); z-index: 11; width: 26px; height: 26px; border: 1px solid var(--secondary-border); background: var(--bg-white); border-radius: var(--radius-sm); cursor: grab; display: flex; align-items: center; justify-content: center; color: var(--text-muted); box-shadow: var(--shadow-sm); opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast); }
+.dashboard-widget:hover .dashboard-widget-hover-btn { opacity: 1; }
+.dashboard-widget-hover-btn:hover { background: var(--primary-lighter); color: var(--primary); }
+.dashboard-widget-hover-btn svg { width: 14px; height: 14px; }
+.show-headers .dashboard-widget-hover-btn { display: none; }
 .dashboard-widget-content .widget-shadow-host { width: 100%; height: 100%; }
 .dashboard-widget-content iframe { width: 100%; height: 100%; border: none; }
 
@@ -76,6 +88,42 @@
 .screenshot-preview-actions .modal-close-icon svg { width: 13px; height: 13px; }
 .screenshot-preview-image-wrap { flex: 1; overflow: auto; }
 .screenshot-preview-image-wrap img { display: block; max-width: none; }
+
+/* Home dashboard (pinned widgets above Active chats on the home page).
+   Sized IDENTICALLY to .home-active-chats (23-actions.css) so the two panels
+   align: width 100%, max-width 1200px, margin var(--space-8) auto 0. */
+.home-dashboard-section { width: 100%; max-width: 1200px; margin: var(--space-8) auto 0; }
+.home-dashboard-bar { display: flex; align-items: center; gap: var(--space-4); padding: 0 var(--space-4); }
+.home-dashboard-bar .home-section-label { flex: 1; text-align: left; }
+.home-dashboard-expand-btn { width: 24px; height: 24px; border: none; background: none; border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
+.home-dashboard-expand-btn:hover { background: var(--secondary-light); color: var(--text-primary); }
+.home-dashboard-expand-btn svg { width: 16px; height: 16px; transition: transform var(--transition-fast); }
+.home-dashboard-expand-btn.expanded svg { transform: rotate(180deg); }
+/* Collapsed by default: exactly ONE default-size widget row, no scroll strip;
+   .expanded reveals the whole grid.
+   264px = 4 rows x 50px grid-auto-rows (:15) + 3 x 16px gap (--space-8)
+         + 8px top + 8px bottom padding (--space-4) - i.e. the full height of a
+   default 4-row widget (ui/070-dashboard-ui.js buildWidgetHtml: `widget.height
+   || 4`). The previous 224px cap clipped the last 40px, which put the widget's
+   bottom-right .dashboard-widget-resize-handle (:54, `bottom: 0`) outside the
+   `overflow: hidden` box and made resizing impossible until the section was
+   expanded. Taller widgets are still clipped when collapsed - that is the point
+   of the collapsed state. */
+.home-dashboard-grid { flex: none; max-height: 264px; overflow: hidden; padding: var(--space-4); padding-bottom: var(--space-4); }
+.home-dashboard-section.expanded .home-dashboard-grid { max-height: none; overflow: visible; }
+
+/* Widget pin-target popover (Pin to Home / Pin to Dashboard / Unpin) */
+.widget-pin-menu { position: fixed; z-index: 2147483000; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 170px; padding: var(--space-2); }
+.widget-pin-menu button { width: 100%; display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: none; border: none; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--text-primary); cursor: pointer; text-align: left; }
+.widget-pin-menu button:hover { background: var(--secondary-light); }
+.widget-pin-menu button.active { color: var(--primary); font-weight: var(--font-semibold); }
+.widget-pin-menu button.danger:hover { background: var(--danger-light); color: var(--danger); }
+.widget-pin-menu button svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+/* Match .home-active-chats' small-screen sizing (23-actions.css @media 560px) */
+@media (max-width: 560px) {
+    .home-dashboard-section { max-width: 100%; padding: 0 8px; }
+}
 
 /* Skip link accessibility */
 .skip-link:focus { position: fixed !important; left: 50% !important; top: 10px !important; transform: translateX(-50%); width: auto !important; height: auto !important; overflow: visible !important; padding: var(--space-5) var(--space-9); background: var(--primary); color: var(--text-inverse); text-decoration: none; border-radius: var(--radius-sm); font-weight: var(--font-semibold); z-index: var(--z-overlay); box-shadow: var(--shadow-md); }

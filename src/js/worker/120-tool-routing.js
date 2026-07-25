@@ -548,33 +548,36 @@ executeTool = async function(name, args, messageIndex, options) {
         return await _executeToolLocal(name, args, messageIndex, options);
     }
 
-    // -------- Sub-agent tool-call budget (UI tools) --------
-    // Headless tools count toward max_tool_calls inside _executeToolLocal's gate
+    // -------- Sub-agent tool-call counter (UI tools) --------
+    // DISPLAY ONLY — there is no cap and nothing here can refuse a call.
+    // Headless tools are counted inside _executeToolLocal's gate
     // (tools/020-tool-execution.js). Non-headless UI tools never reach
     // _executeToolLocal in the SW — they route straight to the panel below — so
-    // without this the authoritative budget would silently ignore every
+    // without this the authoritative counter would silently ignore every
     // iframe_tool / take_screenshot / html_widget / display / prompt_user /
-    // get_skill / manage_skill call a sub makes, and the cap would never fire.
-    // The SW is the authoritative SubAgents context, so count here. (The page
-    // also runs _executeToolLocal's gate when it executes the routed tool, but
-    // that mutates its read-only mirror, which the next SW snapshot clobbers —
-    // harmless, never the authoritative count.) All UI tools are productive work;
-    // none are in the lifecycle/handle exempt set (those are all headless).
+    // get_skill / manage_skill call a sub makes, and the Workers card would
+    // under-report. The SW is the authoritative SubAgents context, so count
+    // here. (The page also runs _executeToolLocal's gate when it executes the
+    // routed tool, but that mutates its read-only mirror, which the next SW
+    // snapshot clobbers — harmless, never the authoritative count.) All UI
+    // tools are productive work; none are in the lifecycle/handle exempt set
+    // (those are all headless).
     if (typeof SubAgents !== 'undefined' && SubAgents.onToolCallInSubAgent) {
-        var _budgetChatId = (options && options.chatId)
+        var _subChatId = (options && options.chatId)
             || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
             || (typeof currentChatId !== 'undefined' ? currentChatId : null);
-        if (_budgetChatId && typeof chats !== 'undefined' && chats[_budgetChatId]
-            && chats[_budgetChatId].isSubAgent) {
-            // Soft cap: onToolCallInSubAgent counts usage and stages a budget
-            // warning (>=90% / past cap) that the agent loop appends to the
-            // next tool result via appendBudgetNotice. SAFETY BACKSTOP: past
-            // 2x max_tool_calls the registry force-stops the runaway sub and
-            // returns false — short-circuit so the stopped sub does no work.
-            var _budgetOk = SubAgents.onToolCallInSubAgent(_budgetChatId);
-            if (!_budgetOk) {
-                return { success: false, error: 'Sub-agent exceeded the hard tool-call ceiling (2x max_tool_calls) after ignoring every budget warning. The sub has been force-stopped. Do NOT retry work tools — every further call will be refused. Call report_to_parent NOW with your findings so far (it is budget-exempt and will be delivered).', _budget_exhausted: true };
-            }
+        // NESTED-CALL EXEMPTION (mirrors _executeToolLocal's gate in
+        // tools/020-tool-execution.js): a UI tool dispatched from INSIDE a
+        // js_eval sandbox / skill-tool run arrives here via the offscreen
+        // 'sw-exec-tool' relay with fromSandbox:true — it is part of ONE
+        // already-counted top-level call, so it must not be counted twice.
+        // fromWidget covers the html_widget postMessage bridge.
+        var _nestedCall = !!(options && (options.fromSandbox || options.fromWidget));
+        if (!_nestedCall && _subChatId && typeof chats !== 'undefined' && chats[_subChatId]
+            && chats[_subChatId].isSubAgent) {
+            // Bookkeeping only — onToolCallInSubAgent bumps the display counter
+            // and returns nothing. Never gate dispatch on its result.
+            SubAgents.onToolCallInSubAgent(_subChatId);
         }
     }
 
@@ -694,18 +697,51 @@ executeTool = async function(name, args, messageIndex, options) {
             delete result._display_persist;
         }
         if (result._widget_persist) {
-            if (!chats[chatId].widgets) chats[chatId].widgets = [];
-            // Upsert by id. html_widget creation sends a brand-new widget (id absent
-            // -> append). edit_html now re-sends the SAME id with updated html/
-            // contentVersion; pushing unconditionally would DUPLICATE the widget and
-            // leave the stale copy first, so getWidgetById / the ?widget= deep-link
-            // temp tab (take_screenshot) would still read the OLD html. Update in
-            // place so the SW's authoritative chat — and its store.clear()+rewrite
-            // save — carries the post-edit html.
             var _wp = result._widget_persist;
-            var _wpIdx = chats[chatId].widgets.findIndex(function(w) { return w && w.id === _wp.id; });
-            if (_wpIdx !== -1) chats[chatId].widgets[_wpIdx] = _wp;
-            else chats[chatId].widgets.push(_wp);
+            // CROSS-CHAT: mirror onto the widget's OWNING chat (_wp.chatId, stamped at
+            // creation in tools/080-widget-tools.js), NOT the chat that ISSUED the tool
+            // call. An agent running in chat A that edits a widget living in chat B (a
+            // sub-agent editing its parent chat's widget, or edit_html against a
+            // Home-pinned widget) used to upsert the post-edit widget into chat A, so
+            // chat B's authoritative SW copy kept the PRE-edit html — and the SW, being
+            // the authoritative writer, re-persisted/re-broadcast that stale copy and
+            // clobbered the page-side save (observed: widgets[].html reverting
+            // 13795 -> 11252 bytes on a chat that wasn't even running). Same owning-chat
+            // rule the page-side writers already use (tools/010-iframe-tool.js edit_html,
+            // tools/080-widget-tools.js saveWidgetCodeEdit "B-B3").
+            var _wpChat = chats[_wp.chatId || chatId];
+            // No SW record for the owning chat means the SW never saw that chat, so
+            // there is no stale snapshot of it to clobber — skip the mirror, but
+            // loudly (same call as the 'record-mutation' handler in
+            // worker/130-port-bridge.js). Falling back to the ISSUING chat here would
+            // inject a foreign widget — carrying chat B's msgIndex — into chat A.
+            // NOTE: skipping the mirror is NOT proof the widget is durable. The
+            // page-side saveChatsToStorage() commits it only when the owning chat is
+            // not _payloadsEvicted — both realms' put-loops skip such a chat
+            // (ui/070-dashboard-ui.js:2011, worker/115-storage.js:178) and the page
+            // loader flags every chat outside the newest 8. That is what the MEMFIX
+            // ensureChatPayloads guard in tools/010-iframe-tool.js edit_html is for;
+            // without it the durable write is silently dropped for this exact case.
+            // A DASHBOARD-ONLY widget (source chat deleted) also lands here by
+            // design: its durable copy lives in the page-side dashboard store
+            // (saveDashboardWidget in edit_html), which the SW chat rewrite never
+            // touches — so the skip is correct, not a loss.
+            if (!_wpChat) {
+                console.warn('[tool-routing] widget mirror skipped: no SW record for owning chat '
+                    + (_wp.chatId || chatId) + ' (widget ' + _wp.id + ')');
+            } else {
+                if (!_wpChat.widgets) _wpChat.widgets = [];
+                // Upsert by id. html_widget creation sends a brand-new widget (id absent
+                // -> append). edit_html now re-sends the SAME id with updated html/
+                // contentVersion; pushing unconditionally would DUPLICATE the widget and
+                // leave the stale copy first, so getWidgetById / the ?widget= deep-link
+                // temp tab (take_screenshot) would still read the OLD html. Update in
+                // place so the SW's authoritative chat — and its diff-save rewrite —
+                // carries the post-edit html.
+                var _wpIdx = _wpChat.widgets.findIndex(function(w) { return w && w.id === _wp.id; });
+                if (_wpIdx !== -1) _wpChat.widgets[_wpIdx] = _wp;
+                else _wpChat.widgets.push(_wp);
+            }
             delete result._widget_persist;
         }
         // iframe_tool navigate sets chat.targetTabId page-side. Without this

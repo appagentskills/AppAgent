@@ -22,6 +22,19 @@
 //       - scrollTop DECREASED and the position is above the bottom → the user
 //         scrolled up (wheel, scrollbar drag, middle-click autoscroll,
 //         selection drag, PageUp — all of them) → release.
+//       - scrollTop INCREASED and landed NEAR the bottom (isNearBottom's
+//         threshold, the same one chat-open uses to derive the flag in
+//         120-init.js) → re-stick. RESTICK-RACE: requiring the EXACT bottom
+//         (≤2px) here made re-engaging follow nearly impossible mid-stream —
+//         every rAF paint grows scrollHeight between the user's last downward
+//         wheel tick and the coalesced scroll event, so the event is
+//         classified 10-100px above the freshly-grown bottom and the ≤2px
+//         gate never passes: the user chases a moving bottom and auto-scroll
+//         appears permanently broken until the next send re-sticks. Only
+//         UPWARD movement can release, and only user gestures produce
+//         top > last (pins/restores seed _agLastScrollTop to their landing
+//         position, clamps only ever move top DOWN), so a downward gesture
+//         near the bottom is unambiguous "resume following" intent.
 //     Programmatic pins are always instant scrollTop writes to the exact
 //     bottom, and programmatic RESTORES seed _agLastScrollTop (see
 //     restoreChatScrollTop), so neither can be misread as a user scroll.
@@ -83,10 +96,25 @@ function handleChatScroll(el) {
         // max) — keep the current state: a following user stays following, a
         // released user is NOT yanked back by a shrink they never asked for.
         if (top >= last) stickToBottom = true;
+    } else if (top > last) {
+        // RESTICK-RACE (see header): a deliberate DOWNWARD scroll that lands
+        // near the bottom re-engages follow even when streaming growth moved
+        // the exact bottom out from under the gesture. Programmatic writes
+        // can't take this arm: pinToBottom / restoreChatScrollTop seed
+        // _agLastScrollTop to their landing position (echo has top === last)
+        // and clamps only ever DECREASE top. Threshold mirrors the chat-open
+        // derivation (stickToBottom = isNearBottom(...) in 120-init.js);
+        // typeof-guarded like other cross-file calls, with the same 150px
+        // fallback isNearBottom uses (core/040-hooks-history.js).
+        var _nearBottom = (typeof isNearBottom === 'function') ? isNearBottom(el) : (distFromBottom < 150);
+        if (_nearBottom) stickToBottom = true;
+        // Downward scrolls that stop farther above the bottom keep the
+        // current state.
     } else if (top < last - 1) {
         stickToBottom = false;  // user moved up, away from the bottom → release
     }
-    // Downward scrolls that stop above the bottom keep the current state.
+    // Sub-pixel jitter (top within 1px of last, above the bottom) keeps the
+    // current state.
 }
 
 // Pin an element to its bottom with an instant write (no smooth glide — rapid
@@ -246,6 +274,15 @@ function updateStreamingText(msg, index, streamingChatId) {
             prevMsgDiv = msgDiv;
         }
     }
+    // FIX1: each streaming repaint above re-ran formatContent(), minting fresh
+    // rc-N rawCopyStore entries (200-ui-interactions.js storeRawCopy) for
+    // every code fence while the innerHTML swap orphaned the previous tick's
+    // entries — nothing swept them until the NEXT full renderMessages, so
+    // long code-heavy streams accumulated entries quadratically. Sweep on a
+    // throttle during streaming (ui-tier helper; typeof-guarded like other
+    // cross-file calls). Copy buttons keep working: the finalize path does a
+    // full render that mints fresh keys for the final DOM.
+    if (typeof gcRawCopyStoreThrottled === 'function') gcRawCopyStoreThrottled();
     scrollToBottomIfAllowed();
 }
 

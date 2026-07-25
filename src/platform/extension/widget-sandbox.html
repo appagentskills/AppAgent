@@ -11,6 +11,12 @@ window.addEventListener('message', function(e) {
         document.open();
         document.write(e.data.html);
         document.close();
+        // Design-token theme hook. The parent injects a token <style> whose dark
+        // half is scoped to :root[data-appagent-theme="dark"] (injectWidgetTokens
+        // in ui/070-dashboard-ui.js), so we mark the document with the theme the
+        // parent resolved. MUST run after document.close(): document.write built a
+        // brand new documentElement, so anything set before this point is gone.
+        try { document.documentElement.setAttribute('data-appagent-theme', e.data.theme || 'light'); } catch (err) {}
         // Notify parent ONLY AFTER the newly written content has been laid out and
         // painted, so a screenshot taken on this signal reflects the FINAL rendered
         // widget (not a pre-layout / pre-font-swap frame). The deep-link capture
@@ -38,6 +44,15 @@ window.addEventListener('message', function(e) {
         } else {
             _afterLayout();
         }
+    }
+    // Live theme flips, broadcast by applyTheme/broadcastWidgetTheme
+    // (ui/240-layout.js) to every widget iframe. Only the attribute changes: the
+    // widget is NOT re-written, so its scripts, state and scroll position survive
+    // and the token block's dark overrides simply start/stop matching. Works
+    // standalone (documentElement always exists, even before any loadWidget) and
+    // never touches the ready handshake.
+    if (e.data && e.data.type === 'themeChange') {
+        try { document.documentElement.setAttribute('data-appagent-theme', e.data.theme === 'dark' ? 'dark' : 'light'); } catch (err) {}
     }
 });
 

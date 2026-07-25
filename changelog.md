@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.1.19
+
+### Features
+- Opus 5 is now the default model (Opus-4-8 stays selectable).
+- Widgets can be pinned to Home as well as the Dashboard, follow the app's light/dark theme, and gather all their actions in one expanded view.
+- Buttons inside a widget can hand work back to the agent with the new `start_chat` tool.
+- Widget and document IDs in chat are clickable chips, and smart documents gained an "Edit with agent" button.
+- Active Chats keeps completed and unread chats listed until you dismiss them.
+- Emoji shortcodes render as real emoji, and prompt panels render markdown descriptions.
+
+### Fixes
+- Active Chats no longer lists every chat in history.
+- Records edited by the agent, and pull requests opened by sub-agents, are back on the sidebar Artifacts list and the parent's links card.
+- The last output is no longer missing when you open a chat while its after-response hooks are still running.
+- Back/forward navigation, chat auto-scroll and New Chat drafts are reliable again, and the reasoning-effort bar is visible in dark mode.
+- Fixed five chat-page memory leaks and a stale `list_instances` report.
+
+---
+
 ## v1.1.18
 
 ### Fixes

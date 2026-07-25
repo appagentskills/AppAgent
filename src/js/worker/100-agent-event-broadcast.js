@@ -148,3 +148,52 @@ function _maybeMarkOffscreenIdle() {
         try { self.markOffscreenMaybeIdle(); } catch (e) {}
     }
 }
+
+// ACTIVE-CLASSIFY-F5: SW-side finish stamp.
+// `lastResponseAt` used to be written in exactly ONE place —
+// markChatRecentlyFinished (src/js/tools/120-actions.js, PAGE bundle, called
+// from app/036-agent-event-handlers-page.js runFinished/runCrashed and from
+// app/045-agent-port-bridge-page.js _cleanupStaleForegroundRun). Grepping
+// `lastResponseAt` under src/js/worker/ returned ZERO hits, so a run that
+// finished while the panel was CLOSED stamped nothing at all: on reopen,
+// getActiveChatsList()'s persisted-finish fallback (tools/120-actions.js, `if
+// (c && !c.isBackground && !c.isSubAgent && c.lastResponseAt) t =
+// c.lastResponseAt`) found no stamp, so the chat never surfaced as
+// recently-finished / unseen. Stamp it here — in the SW's own terminal-event
+// path — so it survives regardless of whether any page is listening.
+//
+// ORDERING: these listeners run inside _origEmit (see the emit monkey-patch at
+// the top of this file), i.e. BEFORE broadcastAgentEvent() snapshots
+// chats[chatId]. runFinished/runCrashed are both in EVENTS_WITH_CHAT_INLINE, so
+// a connected panel receives the stamp inlined in the very same envelope.
+//
+// NO BACKWARDS MOVE / NO FIGHT WITH THE PAGE: the write is monotonic
+// (Math.max), and the page-side merge _mergePageChatMeta
+// (app/045-agent-port-bridge-page.js) is max-wins on lastResponseAt, so neither
+// tier can regress the other. The page's markChatRecentlyFinished still runs
+// afterwards (from the re-emitted event) and re-stamps a >= value — a redundant
+// but harmless second write of the same finish, and saveChatsToStorage()
+// single-flights (worker/115-storage.js _workerSavePending), so a
+// runFinished+runCrashed pair for one run costs one IDB transaction.
+//
+// Skips background (Action) + sub-agent chats for exactly the reason
+// markChatRecentlyFinished does: Action chats live under "Active Actions" and
+// sub-agents under the Workers strip; lingering them would clutter the badge.
+AgentEvents.on('runFinished', _swStampChatFinished);
+AgentEvents.on('runCrashed', _swStampChatFinished);
+function _swStampChatFinished(e) {
+    var chatId = e && e.chatId;
+    if (!chatId) return;
+    var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+    if (!c || c.isBackground || c.isSubAgent) return;
+    c.lastResponseAt = Math.max(c.lastResponseAt || 0, Date.now());
+    // Persist so the stamp survives an MV3 SW eviction — the whole point is a
+    // finish nobody was listening to. Fire-and-forget: the save is coalesced
+    // and already logs its own failures.
+    if (typeof saveChatsToStorage === 'function') {
+        try {
+            var _p = saveChatsToStorage();
+            if (_p && typeof _p.catch === 'function') _p.catch(function() {});
+        } catch (err) { console.warn('[sw] finish-stamp persist failed', chatId, err); }
+    }
+}

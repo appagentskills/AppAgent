@@ -28,6 +28,21 @@ function renameCurrentChat() {
     openRenameModal(currentChatId);
 }
 
+// Pin/unpin the current chat from the header pin button. togglePinChat
+// (170-chat-management.js) flips chat.pinned, persists, and re-renders the
+// sidebar chat list + version sidebar; the header refresh below repaints the
+// pin button itself (filled vs outline), and renderHistoryPage keeps an open
+// History view's pin badges in sync (same follow-up the History card's own
+// pin button performs).
+function togglePinCurrentChat() {
+    if (!currentChatId || !chats[currentChatId]) return;
+    togglePinChat(currentChatId);
+    if (typeof renderHistoryPage === 'function') {
+        try { renderHistoryPage(); } catch (e) {}
+    }
+    updateChatTitleHeader();
+}
+
 // Rename chat modal
 function openRenameModal(chatId) {
     var chat = chats[chatId];

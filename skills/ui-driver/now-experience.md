@@ -78,11 +78,11 @@ Returns **only the FIRST match's** properties plus `match_count`:
 
 ## 3. Hydration — it is **TWO-PHASE**; poll a readiness anchor, never a fixed sleep for the initial mount
 
-Workspaces hydrate in **two waves**, and this is the **#1 cause of false "field missing" failures** (and of burning a tool-call budget on retry loops):
+Workspaces hydrate in **two waves**, and this is the **#1 cause of false "field missing" failures** (and of burning wall-clock time and tokens on retry loops):
 1. **Text wave (~20 s):** `get_visible_text` already shows all the labels/values — *tempting but premature*.
 2. **Interactive wave (~45–60 s on a COLD load):** the actual web components (`button.now-tab`, `input.now-input-native`, `button.now-select-trigger`) mount. **Until this wave, every form/tab selector returns `match_count:0`** even though the text is on screen.
 
-A recently-visited (warm/cached) record re-hydrates in **~7 s**. So **poll a readiness anchor with a few coarse retries** — do **not** sleep a fixed amount, and do **not** spin a 20–30× tight loop (that is what exhausted a sub-agent at 200 calls). *(This applies to INITIAL hydration; a short fixed settle after an in-page click is fine, but never use one to wait out the cold first mount — poll a field/tab anchor.)*
+A recently-visited (warm/cached) record re-hydrates in **~7 s**. So **poll a readiness anchor with a few coarse retries** — do **not** sleep a fixed amount, and do **not** spin a 20–30× tight loop (observed: 200+ pointless calls burning minutes and tokens on a single field). *(This applies to INITIAL hydration; a short fixed settle after an in-page click is fine, but never use one to wait out the cold first mount — poll a field/tab anchor.)*
 
 > ⚠️ **Resize the viewport BEFORE navigating.** Verified live: at the default (small) iframe size a **cold** workspace load served the text wave but **never mounted the interactive wave** (>110s, `button.now-tab` stayed 0, and the List→record round-trip didn't unstick it); after `iframe_tool resize preset:"fullhd"` and a fresh `navigate`, the same record hydrated in **7s**. Make `resize` (desktop/fullhd) the first step of any workspace session.
 
@@ -97,7 +97,7 @@ async function waitWorkspace(){
   return -1; // never hydrated — try a List→record round-trip to force the mount (see the round-trip note just below — it uses §5's #list-btn + open-record strip)
 }
 ```
-- **Budget discipline:** every `executeTool` inside a sub-agent's `js_eval` counts against its tool-call cap. Batch many `ift()` calls into ONE `js_eval`; poll coarsely; never loop-poll per field.
+- **Call discipline:** there is no tool-call cap, but every round-trip costs wall-clock time and context tokens — and context saturation is what actually ends a sub-agent's run. Batch many `ift()` calls into ONE `js_eval`; poll coarsely; never loop-poll per field.
 - If `waitWorkspace()` returns `-1`, click the left-rail **`#list-btn`** then re-open the record (or its open-record tab) — a List→record round-trip usually forces the form to finish mounting (⚠️ except viewport-induced stalls — it did NOT unstick a small-viewport cold load; resize first, see the note above).
 
 ---
@@ -268,7 +268,7 @@ async function setSwitch(label, want){ const s=`input.now-toggle[role="switch"][
 
 ## 9. Gotchas (all verified on SOW; release-checked across two instances)
 - 🧭 **The form is on the Details tab** — Overview is read-only summary cards; field anchors read 0 until you `click button.now-tab[aria-label="Details"]` (§0). #1 source of "fill does nothing".
-- 🐢 **Hydration is two-phase** — text ~20s, interactive components ~45–60s cold (~7s warm). Poll `button.now-tab[aria-label="Details"]`, coarse retries, never a fixed sleep or a 30× tight loop (budget). A List→record round-trip usually forces a stuck mount (but not viewport-induced stalls — see next bullet).
+- 🐢 **Hydration is two-phase** — text ~20s, interactive components ~45–60s cold (~7s warm). Poll `button.now-tab[aria-label="Details"]`, coarse retries, never a fixed sleep or a 30× tight loop (wasted time + context). A List→record round-trip usually forces a stuck mount (but not viewport-induced stalls — see next bullet).
 - 🖥️ **Small viewports can stall the interactive wave indefinitely** — `resize` to desktop/fullhd **before** navigating (verified: >110s stall at default size vs 7s after fullhd resize; the List→record round-trip did NOT unstick it).
 - 👻 **Deleted record = silent blank tab** (“Component is not configured”, no error) — masquerades as hydration failure; `GET` the record via API first. Stale chrome tabs keep dead sys_ids across sessions.
 - 📑 **Details may be sectioned with collapsed sections** — expand `span.sn-section-header.collapsable` before trusting field counts/anchors (selects 1→7 after expanding on a 2026 build).

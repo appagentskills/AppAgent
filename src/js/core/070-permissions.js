@@ -61,6 +61,7 @@ var GLOBAL_READ_KEYS = [
 var GLOBAL_WRITE_KEYS = [
     'js_eval',
     'html_widget',
+    'pin_widget',
     'web_fetch',
     'set_chat_title',
     'set_tldr',
@@ -90,7 +91,8 @@ var GLOBAL_WRITE_KEYS = [
     'update_action_state',
     'show_action_button',
     'github_setup',
-    'runtime_inspect'
+    'runtime_inspect',
+    'start_chat'
 ];
 
 var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);

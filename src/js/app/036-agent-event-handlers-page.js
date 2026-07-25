@@ -629,7 +629,7 @@ AgentEvents.on('runFinished', function(e) {
             // Sub-agent natural-park suppression — see the matching block in
             // the 'paused' handler above for the full rationale. runFinished
             // with isPaused=true fires when a sub's loop exits via the
-            // pausedChats gate (report_to_parent / sleep_self / stop / budget),
+            // pausedChats gate (report_to_parent / sleep_self / stop),
             // and if the user is viewing that sub's chat we used to flash
             // "Agent paused. Click Resume to continue." Same wrong message,
             // same fix — the sub parked itself, not the user. We also hide

@@ -25,9 +25,33 @@ Use `html_widget` when showing:
 ### Environment
 - Widgets run in an **isolated iframe** - no access to parent window or page globals
 - **`executeTool()`** is available for calling agent tools (including ServiceNow API)
-- CSS is fully isolated - use `<style>` tags freely
+- CSS is fully isolated - use `<style>` tags freely (the app's design tokens ARE pre-injected, see below)
 - **No external dependencies** - no CDN links, external fonts, or libraries
 - Use vanilla HTML/CSS/JS only
+
+### Design tokens (auto-injected)
+
+Every widget gets a `<style data-appagent-tokens="1">` block prepended, so `var(--token)` works with no setup. Light/dark switches **live** - an attribute flip on `<html>`, no re-render, widget state survives. Both injected selectors are wrapped in `:where()` (zero specificity), so **any** rule of your own overrides a token - `:root{}`, `body{}`, `.cls{}` or an inline `style=`. The block is added at render time and is **not** part of the stored widget HTML (so don't `edit_html` against it).
+
+`color-scheme` is deliberately NOT set, so set your own: `body { background: var(--bg-main); color: var(--text-primary); }`.
+
+These tokens are **always defined**, so a `var(--x, fallback)` fallback will never be used - pick an explicit value, or a different custom-property name, if you need your own default.
+
+| Token | Light | Dark |
+|---|---|---|
+| `--primary` `--primary-hover` `--primary-light` | `#293E6B` `#1e2f52` `#e8f0fa` | `#6b8bc4` `#85a1d4` `#1e2a42` |
+| `--accent` | `#0891b2` | `#22d3ee` |
+| `--success` `--warning` `--danger` `--info` | `#059669` `#d97706` `#dc2626` `#3b82f6` | `#34d399` `#fbbf24` `#f87171` `#60a5fa` |
+| `--border` `--border-light` | `#e5e7eb` `#f0f0f0` | `#2e3138` `#252830` |
+| `--text-primary` `--text-secondary` `--text-muted` | `#1f2937` `#6b7280` `#9ca3af` | `#e5e7eb` `#9ca3af` `#6b7280` |
+| `--text-heading` `--text-link` | `#111827` `#2563eb` | `#f3f4f6` `#60a5fa` |
+| `--bg-main` `--bg-light` `--bg-hover` | `#fff` `#f9fafb` `#f3f4f6` | `#111317` `#181a1f` `#1f2228` |
+| `--bg-code` `--bg-secondary` | `#f5f5f5` `#f3f4f6` | `#1a1d24` `#1a1d24` |
+| `--shadow-sm` `--shadow-md` | `0 1px 3px rgba(0,0,0,0.08)` `0 2px 8px rgba(0,0,0,0.1)` | `0 1px 3px rgba(0,0,0,0.3)` `0 2px 8px rgba(0,0,0,0.4)` |
+| `--space-2` `-4` `-6` `-8` `-10` | `4px` `8px` `12px` `16px` `24px` | same |
+| `--text-caption` `--text-body-sm` `--text-body` `--text-body-lg` `--text-xl` `--text-2xl` | `11px` `12px` `13px` `14px` `16px` `18px` | same |
+| `--radius-sm` `-md` `-lg` `-xl` | `4px` `6px` `8px` `12px` | same |
+| `--font-sans` `--font-mono` | system-ui stack / SFMono-Regular stack | same |
 
 ### Sizing
 - Use **static width and height** that best suits the content
@@ -59,6 +83,24 @@ const response = await executeTool('servicenow_api', {
 | `fields` | Limit fields returned | `fields: 'sys_id,number'` |
 | `sys_id` | Get specific record | `sys_id: 'abc123'` |
 | `url_params` | Additional params | `url_params: { sysparm_display_value: 'true' }` |
+
+## Ask-the-agent buttons
+
+A widget button can hand a question off to a NEW chat with the `start_chat` tool:
+
+```html
+<button id="ask">Ask the agent</button>
+<script>
+document.getElementById('ask').onclick = async function () {
+    // send = answered immediately; background:true keeps THIS widget on screen
+    await executeTool('start_chat', { message: 'Why is this SLA breaching?', mode: 'send', background: true, include_widget: true });
+    // draft = prefill + focus the composer, user presses enter:
+    // await executeTool('start_chat', { message: 'About this chart: ', mode: 'draft', include_widget: true });
+};
+</script>
+```
+
+`include_widget: true` prepends `Context: widget <id> ("<title>") — read it with iframe_tool get_visible_text or take_screenshot.` using the CALLING widget's id (also readable as `window._widgetId`). In foreground modes (`send` without `background`, and `draft`) the view switches to the new chat and this widget's iframe is destroyed — don't await feedback there; use `background: true` if the button must show a result.
 
 ## Common Gotchas
 

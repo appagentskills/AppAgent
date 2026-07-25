@@ -1997,6 +1997,14 @@
     display: block;
     overflow-x: hidden;
 }
+/* Roomier vertical rhythm between the cards on the New Chat page only (the
+   shared expand-modal spacing is left alone). The cards sit in a MULTICOL
+   container (.jobs-expand-section-cards, column-count), where column-gap only
+   spaces the COLUMNS — so the card's margin-bottom is the only card-to-card
+   vertical gap. */
+.home-active-chats-body .jobs-expand-section-cards > .jobs-expand-card {
+    margin-bottom: var(--space-9);
+}
 /* State filter pills (top-right of the panel head) — replace the old
    columns/sections layout toggle. Uppercase caption-sized chips; the active
    pill takes the state palette used elsewhere (.action-btn.state-*, dots). */
@@ -2167,11 +2175,8 @@
     overflow-y: auto;
     flex: 1;
 }
-.bg-popup-desc {
-    color: var(--text-secondary);
-    font-size: var(--text-body-sm);
-    margin-bottom: var(--space-4);
-}
+/* .bg-popup-desc removed — the popup description now uses the shared
+   .prompt-user-desc markdown card (21b-prompt-user.css). */
 .bg-popup-body form {
     display: flex;
     flex-direction: column;

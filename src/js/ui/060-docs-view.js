@@ -147,34 +147,40 @@ function updateDashboardButtonState() {
     if (btn) btn.classList.toggle('active', isOpen);
 }
 
-var dashboardRenderGeneration = 0; // Track render generation to cancel stale callbacks
+var dashboardRenderGeneration = { main: 0, home: 0 }; // Per-dashboard render generation to cancel stale callbacks
 
-function renderDashboard() {
-    var container = document.getElementById('dashboard-grid');
+// dashboard: 'main' (dashboard page, default) or 'home' (home page grid)
+function renderDashboard(dashboard) {
+    dashboard = dashboard === 'home' ? 'home' : 'main';
+    var container = dashboardGridEl(dashboard);
     if (!container) return;
 
     // Increment generation to invalidate any pending render callbacks
-    dashboardRenderGeneration++;
-    var currentGeneration = dashboardRenderGeneration;
+    dashboardRenderGeneration[dashboard]++;
+    var currentGeneration = dashboardRenderGeneration[dashboard];
 
-    var widgetList = Object.values(dashboardWidgets);
+    var widgetList = dashboardWidgetsFor(dashboard);
     if (widgetList.length === 0) {
-        container.innerHTML = '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
+        // Home grid has no empty-state hint — the whole section is hidden by renderHomeDashboard.
+        container.innerHTML = dashboard === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
         return;
     }
 
     // Migrate widgets from order-based to grid-based positioning if needed
-    migrateWidgetPositions();
+    migrateWidgetPositions(dashboard);
 
     var html = '';
     widgetList.forEach(function(widget) {
-        html += buildWidgetHtml(widget);
+        html += buildWidgetHtml(widget, dashboard);
     });
 
     container.innerHTML = html;
 
-    // Apply show-headers class if enabled
-    if (showDashboardHeaders) {
+    // Apply show-headers class if enabled — MAIN dashboard only. Home cards
+    // never render a header (buildWidgetHtml skips it) and have no toggle, so
+    // the home grid must never get .show-headers (it would also hide the
+    // floating hover expand/drag control).
+    if (dashboard !== 'home' && showDashboardHeaders) {
         container.classList.add('show-headers');
     } else {
         container.classList.remove('show-headers');
@@ -183,7 +189,7 @@ function renderDashboard() {
     // Render widget content synchronously using requestAnimationFrame for proper timing
     requestAnimationFrame(function() {
         // Check if this render is still current
-        if (currentGeneration !== dashboardRenderGeneration) return;
+        if (currentGeneration !== dashboardRenderGeneration[dashboard]) return;
 
         widgetList.forEach(function(widget) {
             if (!widget.isLoading) {

@@ -36,9 +36,14 @@ var currentDiffFile = null;
 async function openDiffViewer(table, sysId, displayName) {
     var versions = getVersionsForFile(table, sysId);
 
-    var isNew = versionHistory.some(function(v) {
-        return v.chatId === currentChatId && v.table === table && v.sysId === sysId &&
-               v.action === 'POST' && !v.invalidated;
+    // Source-aware: the record may have been created by one of this chat's
+    // sub-agents (rolled up into the sidebar) — check the active chat AND its
+    // sub-agent chats (getVersionHistorySources, 090-version-history.js).
+    var isNew = getVersionHistorySources().some(function(src) {
+        return src.entries.some(function(v) {
+            return v.chatId === src.chatId && v.table === table && v.sysId === sysId &&
+                   v.action === 'POST' && !v.invalidated;
+        });
     });
     var firstBeforeVersion = getFirstVersionForRecord(table, sysId);
     var latestAfterVersion = getLatestAfterVersion(table, sysId);
@@ -406,12 +411,9 @@ async function revertFromDiffViewer() {
             });
 
             if (res.ok || res.status === 204) {
-                // Mark all changes as invalidated
-                versionHistory.forEach(function(v, idx) {
-                    if (v.table === currentDiffFile.table && v.sysId === currentDiffFile.sysId && v.chatId === currentChatId) {
-                        versionHistory[idx].invalidated = true;
-                    }
-                });
+                // Mark all changes as invalidated — across the active chat
+                // AND its sub-agent chats (the record may be sub-owned).
+                setRecordEntriesInvalidated(currentDiffFile.table, currentDiffFile.sysId, true);
                 addVersionHistoryEntry({
                     id: 'vh_' + Date.now(),
                     chatId: currentChatId,
@@ -441,12 +443,9 @@ async function revertFromDiffViewer() {
             if (xml) {
                 var result = await uploadXml(xml, currentDiffFile.table, currentDiffFile.sysId);
                 if (result.success) {
-                    // Mark all changes as invalidated
-                    versionHistory.forEach(function(v, idx) {
-                        if (v.table === currentDiffFile.table && v.sysId === currentDiffFile.sysId && v.chatId === currentChatId) {
-                            versionHistory[idx].invalidated = true;
-                        }
-                    });
+                    // Mark all changes as invalidated — across the active chat
+                    // AND its sub-agent chats (the record may be sub-owned).
+                    setRecordEntriesInvalidated(currentDiffFile.table, currentDiffFile.sysId, true);
                     addVersionHistoryEntry({
                         id: 'vh_' + Date.now(),
                         chatId: currentChatId,

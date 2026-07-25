@@ -53,7 +53,7 @@ var agentRunsStoreName = 'agent_runs';
 //     spawn_args, spawn_handle_id, tool_roster,
 //     created_at, last_activity_at, tool_calls_used,
 //     last_report?, inbox: [...], pending_handles: [...],
-//     auto_report, max_tool_calls, summary_cap_bytes }
+//     auto_report, summary_cap_bytes }
 var subAgentsStoreName = 'sub_agents';
 // pending_wakes: durable sub-agent parent wakes (WAKE-DUR). Written by
 // _wakeParentOnReport / the end-of-run drain when a wake's delivery is
@@ -1411,6 +1411,93 @@ async function deleteLlmEndpoint(endpointId) {
 // providers (API keys!) with defaults. Set ONLY in the load onsuccess below.
 var _apiProvidersHydrated = false;
 
+// Durable one-shot marker for the 'Opus-4-8' → 'Opus 5' DEFAULT repoint in
+// loadApiProviders below (July 2026). Stored in appStorage (page realm only)
+// so the repoint can never fire twice and can never fight a user who later
+// re-selects Opus-4-8 — that provider is still shipped and still selectable.
+var OPUS5_DEFAULT_REPOINT_KEY = 'appagent_opus5_default_repointed';
+// v2 marker (#739 rescue). The v1 marker above is burned UNCONDITIONALLY at the
+// top of the repoint, BEFORE the stored value is inspected — so every install
+// that reached the block burned it, including the cohort the repoint failed to
+// move: installs whose localStorage still held a LEGACY name ('Opus-4-8 OAuth',
+// 'opus-4.8', 'haiku-4.5', 'opus-4.6', 'Proxy') because the SW had already
+// migrated the IDB entry, which makes the rename loop's appStorage rewrite
+// early-return. #739 added PROVIDER_RENAMES resolution to rescue exactly that
+// cohort, but the already-burned v1 marker skipped the whole block, so the fix
+// never ran for the users it was written for. v2 gates ONE more pass, and once
+// v1 is burned it is deliberately NARROWER: it moves a selection only when the
+// stored value is a legacy ALIAS. A literal 'Opus-4-8' at that point can only be
+// a deliberate post-repoint re-selection (the picker offers names present in
+// apiProviders, and none of the five aliases are), so it is left alone.
+var OPUS5_DEFAULT_REPOINT_KEY_V2 = 'appagent_opus5_default_repointed_v2';
+
+// One-shot 'Opus-4-8' → 'Opus 5' DEFAULT repoint (July 2026): the config default
+// moved to the new 'Opus 5' entry. This is NOT a rename — BOTH providers exist
+// and nothing in apiProviders is deleted or rewritten here. It only repoints a
+// SELECTION still sitting on the old default name, so an existing install
+// actually follows the new default instead of staying pinned to Opus-4-8 forever.
+// Called from loadApiProviders AFTER the fresh-seed / merge branches, so it runs
+// on BOTH: on a true fresh install 'appagent_provider' is null, nothing is
+// rewritten and the markers simply burn; on an IDB-emptied-but-localStorage-intact
+// install the legitimate repoint still happens (before the hoist this lived
+// inside the else and boot 2 of a degraded boot could silently rewrite a
+// deliberate Opus-4-8 selection).
+// The in-memory currentProvider is only touched inside the same guarded branch —
+// it must NOT be repointed on its own, because in the SW realm currentProvider is
+// the panel's live selection adopted at worker/130-port-bridge.js (run-agent) and
+// hijacking it would override a deliberate Opus-4-8 run.
+function applyOpus5DefaultRepoint() {
+    // appStorage is real only in the page bundle (020-bootstrap is not in
+    // WORKER_SHARED_FILES); the SW shim's getItem returns null and setItem is a
+    // no-op (worker/000-runtime-globals.js:41-45) — so in the SW nothing is read,
+    // nothing is burned and nothing is rewritten. Inert by construction.
+    if (typeof appStorage === 'undefined') return;
+    // 'Opus 5' must actually EXIST in apiProviders, otherwise
+    // loadProviderFromStorage (ui/070-dashboard-ui.js) silently drops the stored
+    // selection. Guaranteed on the fresh path (apiProviders =
+    // DEFAULT_API_PROVIDERS.slice(), core/030-config.js) and after the
+    // default-merge on the existing-install path.
+    if (!apiProviders.some(function(p) { return p.name === 'Opus 5'; })) return;
+    var v1Done = !!appStorage.getItem(OPUS5_DEFAULT_REPOINT_KEY);
+    var v2Done = !!appStorage.getItem(OPUS5_DEFAULT_REPOINT_KEY_V2);
+    if (v1Done && v2Done) return;               // both one-shots already spent
+    try { appStorage.setItem(OPUS5_DEFAULT_REPOINT_KEY, '1'); } catch (e) {}
+    try { appStorage.setItem(OPUS5_DEFAULT_REPOINT_KEY_V2, '1'); } catch (e) {}
+    var storedName = appStorage.getItem('appagent_provider');
+    // #739 guard: a CUSTOMIZED legacy-named provider survives the deletion
+    // migration below (its `untouched` check), so the stored selection can still
+    // point at a REAL provider under its literal legacy name. That selection is
+    // deliberate and working — resolving it through PROVIDER_RENAMES and
+    // repointing would clobber it. Only a stored name with NO matching provider
+    // is a dangling selection eligible for the rescue below. Scoped to renamed
+    // legacy names so the documented literal-'Opus-4-8' default repoint (v1,
+    // lines below) is untouched.
+    if (typeof PROVIDER_RENAMES !== 'undefined' && PROVIDER_RENAMES[storedName]
+        && apiProviders.some(function(p) { return p && p.name === storedName; })) {
+        return;
+    }
+    // Resolve a LEGACY stored name first. The rename loop in loadApiProviders
+    // rewrites this key only when it runs in the PAGE, and it early-returns when
+    // the SW already migrated the IDB entry away (worker/190-entry.js calls
+    // loadApiProviders too) — so localStorage can still hold 'Opus-4-8 OAuth' /
+    // 'opus-4.8' / 'haiku-4.5' / 'opus-4.6' / 'Proxy'. Same recovery as
+    // loadProviderFromStorage; typeof-guarded because PROVIDER_RENAMES lives in
+    // core/030-config.js.
+    var resolvedName = (typeof PROVIDER_RENAMES !== 'undefined'
+        && PROVIDER_RENAMES[storedName]) || storedName;
+    if (resolvedName !== 'Opus-4-8') return;
+    // v1 already burned => this is the #739 rescue pass, which must only move the
+    // scenario-(c) cohort (stored value is a legacy alias). A literal 'Opus-4-8'
+    // here means the user re-selected it AFTER a correct repoint — never drag
+    // them forward again.
+    if (v1Done && storedName === 'Opus-4-8') return;
+    try { appStorage.setItem('appagent_provider', 'Opus 5'); } catch (e) {}
+    // Keep the in-memory copy consistent: the rename / removal migrations may
+    // already have set currentProvider to 'Opus-4-8', and loadProviderFromStorage
+    // runs later (core/120-init.js).
+    if (currentProvider === 'Opus-4-8') currentProvider = 'Opus 5';
+}
+
 // API Providers Management
 async function loadApiProviders() {
     // Endpoints must be hydrated first: the endpoint migration below and
@@ -1648,6 +1735,9 @@ async function loadApiProviders() {
                     if (epEndpointsChanged) saveAllLlmEndpoints();
                     if (epProvidersChanged) saveAllApiProviders();
                 }
+                // Hoisted OUT of the else above so it runs on BOTH branches (see
+                // the function's header for why the fresh-install branch is safe).
+                applyOpus5DefaultRepoint();
                 resolve();
             };
             request.onerror = function() {
