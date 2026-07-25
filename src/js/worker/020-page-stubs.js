@@ -123,6 +123,8 @@ if (typeof refreshClaudeOAuthUsage !== 'function') var refreshClaudeOAuthUsage =
 if (typeof executeIframeTool !== 'function') var executeIframeTool = async function() { return { success: false, error: 'iframe_tool unavailable in SW context' }; };
 if (typeof executeDisplay !== 'function') var executeDisplay = function() { return { success: false, error: 'display unavailable in SW context' }; };
 if (typeof executeHtmlWidget !== 'function') var executeHtmlWidget = function() { return { success: false, error: 'html_widget unavailable in SW context' }; };
+if (typeof executePinWidget !== 'function') var executePinWidget = async function() { return { success: false, error: 'pin_widget unavailable in SW context' }; };
+if (typeof executeStartChat !== 'function') var executeStartChat = async function() { return { success: false, error: 'start_chat unavailable in SW context' }; };
 if (typeof executePromptUser !== 'function') var executePromptUser = async function() { return { success: false, error: 'prompt_user unavailable in SW context' }; };
 if (typeof executeTakeScreenshot !== 'function') var executeTakeScreenshot = async function() { return { success: false, error: 'take_screenshot unavailable in SW context' }; };
 if (typeof executeUpdateActionState !== 'function') var executeUpdateActionState = async function() { return { success: false, error: 'update_action_state unavailable in SW context' }; };
