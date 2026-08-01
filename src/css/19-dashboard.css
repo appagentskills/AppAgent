@@ -26,31 +26,28 @@
 .dashboard-widget.widget-error { border-color: var(--danger-light); }
 .dashboard-widget.widget-loading .dashboard-widget-content { pointer-events: none; }
 .dashboard-widget-header { display: none; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-6); background: var(--primary-lighter); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; cursor: grab; }
-.show-headers .dashboard-widget-header { display: flex; }
 .dashboard-widget-icon { width: 20px; height: 20px; color: var(--primary); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .dashboard-widget-icon.drag-handle { cursor: grab; }
 .dashboard-widget-icon svg { width: 16px; height: 16px; }
 .dashboard-widget-title { flex: 1; font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .widget-error-badge { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--danger); background: var(--danger-light); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); }
-/* Expand is the ONLY in-card action (everything else lives in the expanded modal),
-   so the header controls stay persistently visible while the header shows.
-   The header itself is display:none unless .show-headers is set (line 28/29);
-   with headers HIDDEN (the default) the floating .dashboard-widget-hover-btn
-   below carries the Expand action + drag grip instead, hover-revealed. */
+/* Headers are RETIRED (#749 home, #752 main toggle; the orphaned
+   showDashboardHeaders setting is purged in loadDashboardWidgets) — the
+   .dashboard-widget-header markup is still built for main-dashboard cards but
+   stays display:none permanently. The floating .dashboard-widget-hover-btn
+   below carries the Expand action + drag grip on every card, hover-revealed. */
 .dashboard-widget-controls { display: flex; gap: var(--space-2); flex-shrink: 0; opacity: 1; }
 .dashboard-widget-btn { width: 26px; height: 26px; border: none; background: var(--bg-white); border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
 .dashboard-widget-btn:hover { background: var(--primary-lighter); color: var(--primary); }
 .dashboard-widget-btn svg { width: 14px; height: 14px; }
 .dashboard-widget-content { flex: 1; overflow: hidden; background: var(--bg-white); min-height: 100px; position: relative; }
-/* Floating hover-only card control (headers hidden — the default): restores the
-   Expand click and a drag grip, since the header owns both and the content
-   iframe eats mouse events. Hidden under .show-headers (header supplies them).
+/* Floating hover-only card control (headers are never shown): carries the
+   Expand click and a drag grip, since the content iframe eats mouse events.
    z-index 11 clears the .widget-loading-overlay (z-index 10 above). */
 .dashboard-widget-hover-btn { position: absolute; top: var(--space-3); right: var(--space-3); z-index: 11; width: 26px; height: 26px; border: 1px solid var(--secondary-border); background: var(--bg-white); border-radius: var(--radius-sm); cursor: grab; display: flex; align-items: center; justify-content: center; color: var(--text-muted); box-shadow: var(--shadow-sm); opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast); }
 .dashboard-widget:hover .dashboard-widget-hover-btn { opacity: 1; }
 .dashboard-widget-hover-btn:hover { background: var(--primary-lighter); color: var(--primary); }
 .dashboard-widget-hover-btn svg { width: 14px; height: 14px; }
-.show-headers .dashboard-widget-hover-btn { display: none; }
 .dashboard-widget-content .widget-shadow-host { width: 100%; height: 100%; }
 .dashboard-widget-content iframe { width: 100%; height: 100%; border: none; }
 

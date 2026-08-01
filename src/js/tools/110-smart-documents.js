@@ -88,11 +88,22 @@ async function executeSmartDocument(args, messageIndex, options) {
     var action = args.action;
     if (!action) return { success: false, error: 'action is required' };
 
+    // Re-hydrate from IndexedDB before acting. The page mutates documents too
+    // (inline edits via sdocSaveEdit, prompt answers, manual create/delete) and
+    // those writes never reach this context's in-memory cache: documentChanged
+    // only flows worker -> page (app/036-agent-event-handlers-page.js:864), so
+    // the SW-side smartDocuments entry stays stale — reads served an old
+    // version and update/edit would build on (and clobber) the stale base.
+    if (args.doc_id) {
+        var fresh = await loadDocumentById(args.doc_id);
+        if (!fresh) delete smartDocuments[args.doc_id]; // deleted page-side
+    }
+
     if (action === 'create') return await sdocToolCreate(args, options);
     if (action === 'update') return await sdocToolUpdate(args, options);
     if (action === 'edit') return await sdocToolEdit(args, options);
     if (action === 'read') return sdocToolRead(args, options);
-    if (action === 'list') return sdocToolList(options);
+    if (action === 'list') return await sdocToolList(options);
     if (action === 'list_versions') return sdocToolListVersions(args, options);
     if (action === 'read_version') return sdocToolReadVersion(args, options);
     if (action === 'delete') return await sdocToolDelete(args, options);
@@ -185,8 +196,11 @@ function sdocToolRead(args, options) {
     };
 }
 
-function sdocToolList(options) {
-    var list = Object.values(smartDocuments).filter(function(doc) {
+async function sdocToolList(options) {
+    // Fresh IDB read: page-side creates/deletes never reach this context's
+    // cache (see the re-hydrate note in executeSmartDocument).
+    var docs = await loadAllDocuments();
+    var list = docs.filter(function(doc) {
         return _sdocAccessible(doc, options);
     }).map(function(doc) {
         return { doc_id: doc.id, title: doc.title, scope: doc.scope || 'shared', current_version: doc.currentVersion, updated_at: doc.updatedAt, created_at: doc.createdAt };
@@ -675,9 +689,12 @@ function sdocStartChat(docId) {
     var doc = smartDocuments[docId];
     if (!doc) return;
 
-    // Close preview modal if open
+    // Close preview modal if open (incl. its document-level Escape listener)
     var modal = document.getElementById('sdoc-preview-modal');
-    if (modal) modal.remove();
+    if (modal) {
+        if (modal._escHandler) document.removeEventListener('keydown', modal._escHandler);
+        modal.remove();
+    }
 
     // Switch to chat view if needed
     if (currentView !== 'chat') {
@@ -714,9 +731,13 @@ function editDocumentWithAgent(docId, event) {
     if (!docId) return;
 
     // The click can come from inside the preview modal (sdocOpenPreview) — remove
-    // it so the chat composer is actually visible. No-op for an inline doc.
+    // it so the chat composer is actually visible (incl. removing the preview's
+    // document-level Escape listener). No-op for an inline doc.
     var modal = document.getElementById('sdoc-preview-modal');
-    if (modal) modal.remove();
+    if (modal) {
+        if (modal._escHandler) document.removeEventListener('keydown', modal._escHandler);
+        modal.remove();
+    }
 
     // The doc can also be open from the Documents panel, so switch to the chat
     // view first — same pattern as sdocStartChat above.
@@ -789,12 +810,15 @@ function sdocOpenPreview(docId) {
     if (!doc) return;
 
     var existing = document.getElementById('sdoc-preview-modal');
-    if (existing) existing.remove();
+    if (existing) {
+        if (existing._escHandler) document.removeEventListener('keydown', existing._escHandler);
+        existing.remove();
+    }
 
     var modal = document.createElement('div');
     modal.id = 'sdoc-preview-modal';
     modal.className = 'sdoc-preview-overlay';
-    modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
+    modal.onclick = function(e) { if (e.target === modal) closePreview(); };
 
     // Reuse full sdocRender for all features (edit, versions, diff, prompts)
     var html = '<div class="sdoc-preview-container">' + sdocRender(doc) + '</div>';
@@ -807,16 +831,29 @@ function sdocOpenPreview(docId) {
         closeBtn.className = 'sdoc-action-btn';
         closeBtn.title = 'Close';
         closeBtn.innerHTML = UI_ICONS.close;
-        closeBtn.onclick = function(e) { e.stopPropagation(); modal.remove(); };
+        closeBtn.onclick = function(e) { e.stopPropagation(); closePreview(); };
         headerActions.appendChild(closeBtn);
     }
 
     document.body.appendChild(modal);
 
-    // Escape key to close
-    modal.tabIndex = -1;
-    modal.addEventListener('keydown', function(e) { if (e.key === 'Escape') modal.remove(); });
-    modal.focus();
+    // Escape to close — document-level, so it works no matter where focus is
+    // (the old element-level keydown died once focus left the modal). Removed
+    // again on every close path; when the generic #modal-overlay is up on top
+    // (e.g. the delete-document confirm), the key is left for the global
+    // handler so only the topmost layer closes per press.
+    function onEsc(e) {
+        if (e.key !== 'Escape') return;
+        var m = document.getElementById('modal-overlay');
+        if (m && m.classList.contains('show')) return;
+        closePreview();
+    }
+    function closePreview() {
+        document.removeEventListener('keydown', onEsc);
+        modal.remove();
+    }
+    modal._escHandler = onEsc;
+    document.addEventListener('keydown', onEsc);
 }
 
 // Open a document from a clickable ID chip in chat text (.id-mention-doc, emitted

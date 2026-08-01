@@ -50,6 +50,14 @@ function progressStateMeta(state) {
         case 'pr_opened': return { icon: UI_ICONS.rocket, label: 'PR opened', cls: 'state-pr_opened' };
         case 'pr_merged': return { icon: UI_ICONS.gitMerge || UI_ICONS.git, label: 'PR merged', cls: 'state-pr_merged' };
         case 'finished_with_caveat': return { icon: UI_ICONS.alert, label: 'Finished with caveat', cls: 'state-finished_with_caveat' };
+        // User-stopped run (stopAction sets state='stopped', icon='stop', label
+        // 'Stopped'). Without this arm the default returned an ANIMATED SPINNER
+        // plus the raw lowercase state for a run that is over — and disagreed
+        // with getStateBadgeIcon('stopped') below, which returns UI_ICONS.stop.
+        case 'stopped': return { icon: UI_ICONS.stop, label: 'Stopped', cls: 'state-stopped' };
+        // Not started / dismissed back to idle. getStateBadgeIcon returns ''
+        // (deliberately no badge) for idle — mirror that instead of a spinner.
+        case 'idle': return { icon: '', label: 'Idle', cls: 'state-idle' };
         // Live waiting states — the chat is blocked on the USER (pending
         // prompt_user form / tool call parked on the approval modal).
         case 'needs_input': return { icon: UI_ICONS.question || UI_ICONS.bell, label: 'Waiting for input', cls: 'state-needs_input' };
@@ -2277,12 +2285,25 @@ function markChatRecentlyFinished(chatId) {
 }
 
 // Newest-activity stamp for a chat: the latest of its last response, its last
-// recorded activity, and its creation time. Drives the Active Chats ORDER --
-// creation time alone buried a chat that had just done something under newer but
-// idle ones, which is wrong for a run monitor (most recently active wins).
+// recorded activity, and its creation time. No longer drives the Active Chats
+// ORDER (see _chatCreatedTs below) -- kept for the _progressStateMemo
+// invalidation key, where "something happened" is exactly the right signal.
 function _chatActivityTs(c) {
     if (!c) return 0;
     return Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0, c.createdAt || 0);
+}
+
+// Creation stamp for a chat: drives the Active Chats ORDER (home panel, jobs
+// dropdown, expand modal). Creation time is IMMUTABLE, so rows keep a stable
+// position instead of re-shuffling every time a chat streams a response
+// (activity-order made the list jump around under the pointer). Chats created
+// before createdAt was stamped fall back to the timestamp embedded in the id
+// ('chat_<Date.now()>_<rand>'), then 0 (sorts to the bottom).
+function _chatCreatedTs(c) {
+    if (!c) return 0;
+    if (c.createdAt) return c.createdAt;
+    var m = /^chat_(\d+)_/.exec(c.id || '');
+    return m ? parseInt(m[1], 10) : 0;
 }
 
 // #743 PERF: memo for getActiveChatsList() pass 9. getChatProgressStateFor is a
@@ -2430,11 +2451,12 @@ function getActiveChatsList() {
             if (!_liveIds[cid]) delete _progressStateMemo[cid];
         });
     }
-    // Order by LAST ACTIVITY, MOST RECENT FIRST (see _chatActivityTs), so the
-    // chat that most recently did something sits at the top of the Active list.
+    // Order by CREATION TIME, NEWEST FIRST (see _chatCreatedTs), so the list is
+    // STABLE: a chat keeps its position while it runs/updates instead of the
+    // rows re-ordering on every response (the old last-activity order).
     // _jobsExpandBuckets() re-sorts pinned-first on top of this; Array#sort is
-    // stable (ES2019), so this activity order survives inside each pinned group.
-    out.sort(function(a, b) { return _chatActivityTs(b) - _chatActivityTs(a); });
+    // stable (ES2019), so this creation order survives inside each pinned group.
+    out.sort(function(a, b) { return _chatCreatedTs(b) - _chatCreatedTs(a); });
     return out;
 }
 
@@ -2796,12 +2818,20 @@ function renderJobsDropdown(dropdown) {
             '<span class="jobs-row-chevron">' + (UI_ICONS.chevronDown || '') + '</span>' +
         '</div>';
     } catch (e) { console.warn('jobs: chat row render failed', e); return ''; } }).join('');
+    // Preserve the selected tab (Active/History) across re-render ticks — same
+    // spirit as the accordion restore below: read it from the live DOM before
+    // innerHTML wipes it. Defaults to Active on first render.
+    var _selJobsTab = 'active';
+    try {
+        var _selBtn = dropdown.querySelector('.jobs-tab.active');
+        if (_selBtn && _selBtn.getAttribute('data-tab') === 'done') _selJobsTab = 'done';
+    } catch (e) {}
     var html = '';
     // Active actions are treated like chats: they live in the same Active tab/list
     // (carrying their own action icon) rather than a separate "Active Actions"
     // section. Render them above the running chats and count them toward Active.
     // Tabbed chat panel: Active (running now) / Recent (24h) / Done (finished).
-    html += _renderJobsChatTabs(rowsHtml + chatRowsHtml, runningChats.length + list.length);
+    html += _renderJobsChatTabs(rowsHtml + chatRowsHtml, runningChats.length + list.length, _selJobsTab);
     // The badge is always-on, so it can be opened with nothing to show (no
     // actions, no chats yet) — render a friendly empty state, not a blank box.
     if (!html) html = '<div class="jobs-dropdown-empty">No active or recent chats</div>';
@@ -3227,7 +3257,7 @@ function _jobsTodayRowHtml(c, timeW) {
 }
 // Build the header + Active/Recent/Done tabs + panels + footer. Returns '' when
 // there are no chats to show at all (keeps the dropdown clean for action-only runs).
-function _renderJobsChatTabs(activeRowsHtml, activeCount) {
+function _renderJobsChatTabs(activeRowsHtml, activeCount, selectedTab) {
     var doneChats = getDoneChatsList();
     // #743: same Active-section dedupe as _jobsExpandBuckets' activeIds filter —
     // a chat still in the Active section (lingering / unread / paused / stuck /
@@ -3261,13 +3291,16 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount) {
     var h = '';
     // Title row removed (no dropdown repeats its pill's name); the functional
     // Expand control moved into the tabs row as a compact icon button.
+    // Selected tab survives background re-render ticks: renderJobsDropdown
+    // reads it from the live DOM and passes it through (defaults to Active).
+    var selTab = selectedTab === 'done' ? 'done' : 'active';
     h += '<div class="jobs-tabs" role="tablist">' +
-            '<button class="jobs-tab active" data-tab="active" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
-            '<button class="jobs-tab" data-tab="done" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
+            '<button class="jobs-tab' + (selTab === 'active' ? ' active' : '') + '" data-tab="active" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
+            '<button class="jobs-tab' + (selTab === 'done' ? ' active' : '') + '" data-tab="done" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
             '<button type="button" class="jobs-expand-btn" onclick="expandJobsDropdown()" title="Expand to full screen" aria-label="Expand to full screen"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>' +
         '</div>';
-    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active">' + activePanel + pinnedHtml + todayHtml + '</div>';
-    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done" style="display:none">' +
+    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active"' + (selTab === 'active' ? '' : ' style="display:none"') + '>' + activePanel + pinnedHtml + todayHtml + '</div>';
+    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done"' + (selTab === 'done' ? '' : ' style="display:none"') + '>' +
             _renderJobsHistoryPanel(doneChats) + '</div>';
     return h;
 }
@@ -3808,6 +3841,74 @@ document.addEventListener('pointerup', function() {
     setTimeout(function() { _homeChatsPointerHeld = false; }, 0);
 }, true);
 document.addEventListener('pointercancel', function() { _homeChatsPointerHeld = false; }, true);
+// ---------------------------------------------------------------------------
+// Per-card scroll preservation (home panel + expand modal share these).
+//
+// The card body (.jobs-expand-card-body) is NOT the only scroller inside a
+// card: the progress output rendered into it is .action-result-output
+// (css/23-actions.css:664-672 — max-height:240px; overflow-y:auto) and
+// .action-result-args (max-height:160px) — both scroll on their own. Only the
+// card body was snapshotted/restored across the 1s repaint, so any scrolling
+// the user did inside a NESTED scroller was thrown away every tick, which reads
+// as "the card jumps back to the top each time I scroll".
+//
+// So: snapshot every KNOWN scroller inside each card, keyed by chat id + the
+// element's ordinal among that card's matched scrollers (stable across a
+// repaint of the same content, and simply a no-op miss if the content really
+// changed shape). Both axes are preserved — .action-result-args is
+// `white-space: pre; overflow: auto`, so it scrolls horizontally too.
+//
+// A FIXED selector list (not an overflow heuristic over every descendant) so
+// the ordinals stay stable: a heuristic also matches clipped overflow:hidden
+// nodes, shifts every ordinal when a scroller appears/disappears earlier in
+// document order, and costs O(all nodes) layout reads twice a second.
+var JOBS_CARD_SCROLLER_SEL = '.jobs-expand-card-body, .action-result-output, .action-result-args';
+function _jobsCardScrollables(cardEl) {
+    return cardEl.querySelectorAll(JOBS_CARD_SCROLLER_SEL);
+}
+function _jobsSnapshotCardScroll(root) {
+    var map = {};
+    if (!root) return map;
+    root.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
+        var cid = cardEl.getAttribute('data-chat-id');
+        if (!cid) return;
+        var scrollables = _jobsCardScrollables(cardEl);
+        var entries = [];
+        for (var i = 0; i < scrollables.length; i++) {
+            var el = scrollables[i];
+            if (el.scrollTop || el.scrollLeft) entries.push([i, el.scrollTop, el.scrollLeft]);
+        }
+        if (entries.length) map[cid] = entries;
+    });
+    return map;
+}
+function _jobsRestoreCardScroll(root, map) {
+    if (!root || !map) return;
+    root.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
+        var cid = cardEl.getAttribute('data-chat-id');
+        var entries = cid ? map[cid] : null;
+        if (!entries || !entries.length) return;
+        var scrollables = _jobsCardScrollables(cardEl);
+        entries.forEach(function(pair) {
+            var el = scrollables[pair[0]];
+            if (!el) return;
+            if (pair[1]) el.scrollTop = pair[1];
+            if (pair[2]) el.scrollLeft = pair[2];
+        });
+    });
+}
+// The user is actively wheel/trackpad scrolling inside the panel: rebuilding the
+// DOM under the cursor mid-gesture kills the in-flight scroll even when we
+// restore scrollTop afterwards (the gesture is latched to the destroyed node).
+// Defer the repaint for a short window after the last scroll, capped by the
+// same HOME_CHATS_DEFER_MAX_MS starvation guard as the other defer paths.
+var HOME_CHATS_SCROLL_QUIET_MS = 700;
+var _homeChatsLastScrollAt = 0;
+document.addEventListener('scroll', function(e) {
+    var panel = document.getElementById('home-active-chats');
+    var t = e.target;
+    if (panel && t && t.nodeType === 1 && panel.contains(t)) _homeChatsLastScrollAt = Date.now();
+}, true);
 function renderHomeActiveChats() {
     var container = document.getElementById('home-active-chats');
     var homeContent = document.getElementById('home-content');
@@ -3833,12 +3934,7 @@ function renderHomeActiveChats() {
     var prevBodyEl = container.querySelector('.home-active-chats-body');
     var prevBodyTop = prevBodyEl ? prevBodyEl.scrollTop : 0;
     var prevBodyLeft = prevBodyEl ? prevBodyEl.scrollLeft : 0;
-    var prevCardScroll = {};
-    container.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
-        var cid = cardEl.getAttribute('data-chat-id');
-        var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
-        if (cid && bodyEl && bodyEl.scrollTop) prevCardScroll[cid] = bodyEl.scrollTop;
-    });
+    var prevCardScroll = _jobsSnapshotCardScroll(container);
     var buckets = _jobsExpandBuckets();
     var rawTotal = buckets.total;
     // Filter pills reflect the UNFILTERED buckets (so per-group counts stay
@@ -3885,7 +3981,8 @@ function renderHomeActiveChats() {
     // innerHTML replace (same shape as the pointer guard: _homeLastHtml is NOT
     // updated, so the next tick retries). Capped so it can never starve: past
     // HOME_CHATS_DEFER_MAX_MS the run monitor repaints anyway.
-    if (_homeChatsUserBusyIn(container)) {
+    if (_homeChatsUserBusyIn(container) ||
+        (Date.now() - _homeChatsLastScrollAt) < HOME_CHATS_SCROLL_QUIET_MS) {
         if (!_homeChatsDeferSince) _homeChatsDeferSince = Date.now();
         if ((Date.now() - _homeChatsDeferSince) < HOME_CHATS_DEFER_MAX_MS) return;
     }
@@ -3901,13 +3998,7 @@ function renderHomeActiveChats() {
         newBodyEl.scrollTop = prevBodyTop;
         newBodyEl.scrollLeft = prevBodyLeft;
     }
-    container.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
-        var cid = cardEl.getAttribute('data-chat-id');
-        if (cid && prevCardScroll[cid] != null) {
-            var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
-            if (bodyEl) bodyEl.scrollTop = prevCardScroll[cid];
-        }
-    });
+    _jobsRestoreCardScroll(container, prevCardScroll);
     // Focus last: after the scroll restores, so focusing a control cannot fight
     // the scrollTop we just wrote back.
     _homeChatsRestoreFocus(container, _focusKey);
@@ -3920,12 +4011,8 @@ function renderJobsExpandModal() {
     // Card bodies scroll too (progress content, max-height capped). Snapshot
     // their scrollTop keyed by chat id so a live repaint doesn't yank the user
     // back to the top of the card they were reading.
-    var prevCardScroll = {};
-    overlay.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
-        var cid = cardEl.getAttribute('data-chat-id');
-        var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
-        if (cid && bodyEl && bodyEl.scrollTop) prevCardScroll[cid] = bodyEl.scrollTop;
-    });
+    // (nested scrollers included — see _jobsSnapshotCardScroll)
+    var prevCardScroll = _jobsSnapshotCardScroll(overlay);
     // Buckets (Active / Completed Today / Pinned) shared with the embedded home
     // panel via _jobsExpandBuckets() so both surfaces render identical cards.
     var buckets = _jobsExpandBuckets();
@@ -3952,13 +4039,7 @@ function renderJobsExpandModal() {
     overlay.innerHTML = html;
     var newBody = overlay.querySelector('.jobs-expand-body');
     if (newBody) newBody.scrollTop = prevScroll;
-    overlay.querySelectorAll('.jobs-expand-card').forEach(function(cardEl) {
-        var cid = cardEl.getAttribute('data-chat-id');
-        if (cid && prevCardScroll[cid] != null) {
-            var bodyEl = cardEl.querySelector('.jobs-expand-card-body');
-            if (bodyEl) bodyEl.scrollTop = prevCardScroll[cid];
-        }
-    });
+    _jobsRestoreCardScroll(overlay, prevCardScroll);
 }
 // One active chat as a card: status indicator + title + open button, with the
 // chat's progress content (label / status / tasks / output) as the card body.

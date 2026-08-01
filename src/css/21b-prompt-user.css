@@ -14,26 +14,18 @@
 .prompt-user .tool-approval-prompt.denied { background: var(--bg-white); }
 .prompt-user .tool-approval-actions { background: var(--bg-white); }
 
-/* Description card — markdown-rendered (formatContent output inside a
+/* Description — markdown-rendered (formatContent output inside a
    .markdown-body container, so 07-markdown.css paragraph/list/blockquote and
-   the global code.inline-code / .code-block rules apply). Subtle grey surface
-   (--bg-light, theme-aware) so the card stands out on the now-white panel
-   body. Shared by the inline chat form AND the
-   background prompt popup (see promptDescriptionHtml in tools/100-prompt-user.js). */
-/* CONTRAST-722x728: #722 styled these on a TINTED panel body; #728 then made the
-   body --bg-white, so both surfaces collapsed into their background:
-     light  desc  #f9fafb on #fff        1.05:1   border #f0f0f0 on #fff  1.14:1
-     light  desc  #f9fafb on #f4f7fc     1.03:1   (background prompt popup)
-     dark   desc  #181a1f on #111317     1.04:1
-   The FILL can never do this job: the same card renders on --bg-white (inline
-   panel) and on --bg-primary (background popup), and no single tint contrasts
-   with both. So the delineation is carried by the BORDER, which is
-   surface-independent: --text-secondary reaches 4.83:1 on #fff, 4.50:1 on
-   #f4f7fc and 4.39:1 on the card's own fill (dark theme softened to
-   --text-muted in 01-dark-theme.css: 3.90:1 / 3.71:1 / 3.52:1). The fill only
-   moves --bg-light -> --bg-secondary (1.05:1 -> 1.10:1 light), so #728's
-   "no heavy tint" goal is preserved. */
-.prompt-user-desc { margin-bottom: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--bg-secondary); border: 1px solid var(--text-secondary); border-radius: var(--radius-md); color: var(--text-primary); font-size: var(--text-body); line-height: var(--leading-relaxed); overflow-wrap: break-word; }
+   the global code.inline-code / .code-block rules apply). Shared by the inline
+   chat form AND the background prompt popup (see promptDescriptionHtml in
+   tools/100-prompt-user.js).
+   NO CARD by design (user request; supersedes the CONTRAST-722x728 fill+border
+   card): the description reads as plain text directly on the panel surface
+   (--bg-white inline panel body / modal body in the popup) — no background,
+   no border, no extra padding. Breathing room comes from the container's own
+   padding (.tool-approval-body in 10-approval.css, .bg-popup-body in
+   23-actions.css); margin-bottom separates it from the first form field. */
+.prompt-user-desc { margin-bottom: var(--space-6); background: transparent; border: none; color: var(--text-primary); font-size: var(--text-body); line-height: var(--leading-relaxed); overflow-wrap: break-word; }
 .prompt-user-desc .md-paragraph { line-height: var(--leading-relaxed); }
 .prompt-user-desc:last-child { margin-bottom: 0; }
 
@@ -98,5 +90,6 @@ select.prompt-field-input[multiple] { min-height: 80px; }
 .prompt-value-chips { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 /* CONTRAST-722x728: the chip fill was --bg-white, i.e. EXACTLY the #728 panel
    body (1.00:1), and its --border-light edge only 1.14:1 light / 1.28:1 dark —
-   the chip was invisible. Same fix as .prompt-user-desc above. */
+   the chip was invisible. Fixed with a --bg-secondary fill + --text-secondary
+   border (dark theme softens the border to --text-muted in 01-dark-theme.css). */
 .prompt-value-chip { display: inline-block; padding: var(--space-1) var(--space-4); background: var(--bg-secondary); border: 1px solid var(--text-secondary); border-radius: var(--radius-pill); font-size: var(--text-body-sm); color: var(--text-primary); line-height: 1.4; max-width: 100%; overflow-wrap: break-word; }

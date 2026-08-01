@@ -161,7 +161,7 @@
        Tokens preserve the historical stacking order. Local stacking
        contexts (< 1000) intentionally stay as raw numbers.
        Ladder (bottom → top): overlay-base < drawer < jobs-dropdown
-         < overlay < modal < widget-modal < fullscreen < action-panel
+         < overlay < widget-modal < fullscreen < action-panel < modal
          < snackbar < dropdown < tooltip < banner < max
        Note: --z-dropdown was historically tied with --z-snackbar (10010);
        the dropdown now sits one step above to resolve the tie, and
@@ -170,7 +170,7 @@
     --z-drawer: 1001;         /* slide-in version sidebar */
     --z-jobs-dropdown: 9000;  /* jobs dropdown (below full-screen overlays) */
     --z-overlay: 10000;       /* full-screen overlays & backdrops: spinner, diff viewer, ws dropdown, doc preview, icon picker, bg-popup, skip link */
-    --z-modal: 10001;         /* generic modal overlay */
+    --z-modal: 10006;         /* generic modal + jobs expand — above widget-modal/fullscreen/action-panel so confirm dialogs spawned from those overlays stay visible */
     --z-widget-modal: 10002;  /* widget modal, action result popover */
     --z-fullscreen: 10003;    /* widget fullscreen overlay */
     --z-action-panel: 10005;  /* action "more" panel */

@@ -843,6 +843,26 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
 
+    // Remove a saved instance (header instance picker's \u2715 button). Deletes the
+    // per-origin heartbeat token so snGetInstancesDetailed stops folding the
+    // origin back into the instance list \u2014 without this the removed row would
+    // reappear on the next detailed probe. The picker clears its own
+    // snInstancesCache entry page-side (platform-bridge.js).
+    if (message.type === 'remove-sn-instance') {
+        var _rmUrl = String(message.instanceUrl || '').replace(/\/+$/, '');
+        chrome.storage.local.get('instanceTokens', function(d) {
+            var map = (d && d.instanceTokens) || {};
+            var removed = false;
+            Object.keys(map).forEach(function(k) {
+                if (String(k).replace(/\/+$/, '') === _rmUrl) { delete map[k]; removed = true; }
+            });
+            chrome.storage.local.set({ instanceTokens: map }, function() {
+                sendResponse({ success: true, removed: removed });
+            });
+        });
+        return true;
+    }
+
     // Get token from a specific ServiceNow tab
     if (message.type === 'get-instance-token') {
         chrome.scripting.executeScript({

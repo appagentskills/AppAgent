@@ -1,5 +1,38 @@
 // Notification System
+//
+// TOAST QUEUE — there is exactly ONE #snackbar element and src/css/13-notifications.css
+// styles it as a single fixed-position bar (no stacking rules, and
+// `#snackbar.show ~ .approval-card.show` assumes one toast), so toasts are shown one
+// at a time. Error/warning toasts are deliberately PINNED (no auto-dismiss — the user
+// must click the X). Previously ANY later toast overwrote #snackbar.innerHTML and
+// silently destroyed a pinned error nobody had read yet (a live "AI endpoint saturated"
+// warning was lost exactly this way). Now a toast that arrives while a pinned toast is
+// on screen is QUEUED and rendered once the pinned one is dismissed.
 var snackbarTimeout = null;
+var snackbarQueue = [];        // pending toasts: { message, type, duration, pinned }
+var currentSnackbar = null;    // the toast currently on screen (null = none)
+var snackbarDrainTimer = null; // set while waiting out the slide-out before the next toast
+var SNACKBAR_QUEUE_MAX = 20;
+var SNACKBAR_STALE_MS = 15000; // auto-dismissing toasts expire while queued (pinned ones never do)
+
+// Errors and warnings never auto-dismiss (legacy boolean true === error).
+function isPinnedSnackbar(type) {
+    return type === 'error' || type === true || type === 'warning';
+}
+
+// A pinned toast that never makes it onto the screen must still leave a trace:
+// silently dropping an unread error is the exact bug class this queue exists to
+// fix, so mirror it to the console (which already holds the surrounding stack and
+// is where the dropped error's context lives). Auto-dismissing status toasts are
+// noise and are dropped quietly.
+function _warnDroppedSnackbar(entry, why) {
+    if (!entry || !entry.pinned) return;
+    try {
+        console.warn('[snackbar] ' + (why || 'dropped') + ' \u2014 unseen ' +
+            (entry.type === true ? 'error' : entry.type) + ' toast never shown: ' + entry.message);
+    } catch (e) {}
+}
+
 function showSnackbar(message, type, duration) {
     var snackbar = document.getElementById('snackbar');
     if (!snackbar) return;
@@ -8,33 +41,124 @@ function showSnackbar(message, type, duration) {
     // (#approval-card, see getApprovalCardEl below) — toasts here can no
     // longer displace a pending approval, so no requeue logic is needed.
 
+    var entry = { message: message, type: type, duration: duration, pinned: isPinnedSnackbar(type), at: Date.now() };
+
+    // A pinned toast is on screen (or one is about to be rendered from the
+    // queue): do NOT clobber it — queue this one instead.
+    var pinnedShowing = !!(currentSnackbar && currentSnackbar.pinned && snackbar.classList.contains('show'));
+    if (pinnedShowing || snackbarDrainTimer) {
+        // Collapse exact duplicates so a repeating error can't flood the queue.
+        if (currentSnackbar && currentSnackbar.message === entry.message && currentSnackbar.type === entry.type) return;
+        for (var i = 0; i < snackbarQueue.length; i++) {
+            if (snackbarQueue[i].message === entry.message && snackbarQueue[i].type === entry.type) return;
+        }
+        if (snackbarQueue.length >= SNACKBAR_QUEUE_MAX) {
+            // Full: sacrifice the oldest auto-dismissing entry, never a pinned one.
+            var dropIdx = -1;
+            for (var j = 0; j < snackbarQueue.length; j++) { if (!snackbarQueue[j].pinned) { dropIdx = j; break; } }
+            if (dropIdx === -1) {
+                // 20 unread pinned errors are already queued. Evicting one of THOSE to
+                // make room would throw away the OLDEST failure, which in a cascade is
+                // the root cause and the most diagnostic — and the screen can show
+                // nothing new until the user has clicked X twenty times anyway, so
+                // promoting the newcomer buys no visibility. The newcomer still loses
+                // the race, but it is no longer lost SILENTLY: it goes to the console.
+                _warnDroppedSnackbar(entry, 'queue full (' + SNACKBAR_QUEUE_MAX + ' pinned toasts unread)');
+                return;
+            }
+            snackbarQueue.splice(dropIdx, 1);
+        }
+        snackbarQueue.push(entry);
+        return;
+    }
+
+    // Nothing pinned on screen — render now. An auto-dismissing toast is still
+    // replaceable, which keeps chatty status toasts snappy (unchanged behaviour).
+    renderSnackbar(entry);
+}
+
+function renderSnackbar(entry) {
+    var snackbar = document.getElementById('snackbar');
+    if (!snackbar) return;
+    currentSnackbar = entry;
+
     // Handle both string type ('error'/'success'/'warning') and legacy boolean isError
-    var isError = type === 'error' || type === true;
-    var isWarning = type === 'warning';
+    var isError = entry.type === 'error' || entry.type === true;
+    var isWarning = entry.type === 'warning';
     var typeClass = isError ? ' error' : (isWarning ? ' warning' : ' success');
 
     // Build snackbar content with close button for errors and warnings
-    var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="hideSnackbar()">' + UI_ICONS.close + '</button>' : '';
-    snackbar.innerHTML = '<span class="snackbar-message">' + escapeHtml(message) + '</span>' + closeBtn;
+    var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="dismissSnackbar()">' + UI_ICONS.close + '</button>' : '';
+    snackbar.innerHTML = '<span class="snackbar-message">' + escapeHtml(entry.message) + '</span>' + closeBtn;
     snackbar.className = 'snackbar show' + typeClass;
 
-    if (snackbarTimeout) clearTimeout(snackbarTimeout);
+    if (snackbarTimeout) { clearTimeout(snackbarTimeout); snackbarTimeout = null; }
 
     // Don't auto-close errors or warnings - user must dismiss manually
-    if (!isError && !isWarning) {
+    if (!entry.pinned) {
         snackbarTimeout = setTimeout(function() {
+            snackbarTimeout = null;
             snackbar.classList.remove('show');
-        }, duration || 3000);
+            currentSnackbar = null;
+            drainSnackbarQueue();
+        }, entry.duration || 3000);
     }
 }
 
+// Render the next queued toast after a short beat so the outgoing toast gets to
+// slide out (the .snackbar transition in 13-notifications.css is 0.3s).
+function drainSnackbarQueue() {
+    if (snackbarDrainTimer || !snackbarQueue.length) return;
+    snackbarDrainTimer = setTimeout(function() {
+        snackbarDrainTimer = null;
+        var next = null;
+        while (snackbarQueue.length) {
+            var cand = snackbarQueue.shift();
+            // Drop stale status toasts — a "Saving…" queued behind a pinned error
+            // is noise once the user finally dismisses it. Pinned toasts never expire.
+            if (!cand.pinned && (Date.now() - cand.at) > SNACKBAR_STALE_MS) continue;
+            next = cand;
+            break;
+        }
+        if (next) renderSnackbar(next);
+    }, 320);
+}
+
+// CLEAR the toast surface. Every caller means "the toast on screen belongs to a
+// context the user just left": newChat (170:670), selectChat (170:772),
+// openChatFromHistory (050:380), retryLastCall / retryChat / continueAgent
+// (020-api-messages.js:270/329/353) and the transport-countdown expiry
+// (036-agent-event-handlers-page.js:477). So this must leave the bar EMPTY — which
+// means killing the drain already in flight (it used to survive the hide and repaint
+// a toast ~320ms later, on top of the freshly cleared context, and it also made the
+// drainSnackbarQueue() call below a silent no-op via its own timer guard) and
+// discarding what is queued behind it rather than promoting it into the new context.
+// Unread pinned entries are logged, never dropped in silence.
+// The X button does NOT come here — see dismissSnackbar().
 function hideSnackbar() {
     var snackbar = document.getElementById('snackbar');
     if (snackbar) snackbar.classList.remove('show');
-    if (snackbarTimeout) clearTimeout(snackbarTimeout);
+    if (snackbarTimeout) { clearTimeout(snackbarTimeout); snackbarTimeout = null; }
+    if (snackbarDrainTimer) { clearTimeout(snackbarDrainTimer); snackbarDrainTimer = null; }
+    for (var i = 0; i < snackbarQueue.length; i++) _warnDroppedSnackbar(snackbarQueue[i], 'toast area cleared');
+    snackbarQueue = [];
+    currentSnackbar = null;
     // Note: hideSnackbar only affects toasts — the approval card lives in its
     // own #approval-card element and is only hidden by its own dismiss/approve
     // paths (dismissApprovalNotification / approveFromNotification / etc).
+}
+
+// The X on a pinned error/warning. Unlike hideSnackbar this is the user saying "I
+// have read this one", so the toasts queued BEHIND it get their turn: this is the
+// only release valve for a queue held up by a pinned toast. A drain already in
+// flight is deliberately left alone — drainSnackbarQueue's guard makes the call a
+// no-op and the pending timer renders the same next entry (re-entrant safe).
+function dismissSnackbar() {
+    var snackbar = document.getElementById('snackbar');
+    if (snackbar) snackbar.classList.remove('show');
+    if (snackbarTimeout) { clearTimeout(snackbarTimeout); snackbarTimeout = null; }
+    currentSnackbar = null;
+    drainSnackbarQueue();
 }
 
 // Notification queue for tool approvals
@@ -538,6 +662,121 @@ function normalizeModalVariant(variant) {
     if (variant === 'warning' || variant === 'orange') return 'warning';
     return 'normal';
 }
+// ALLOW-list of elements a modal message may keep. Everything else is UNWRAPPED
+// (element dropped, its text kept) or, for the opaque set below, dropped whole.
+//
+// An allow-list, not a deny-list: a deny-list only stops the tags someone thought
+// of, and the previous one already missed <img src=https://evil> (MV3's default CSP
+// leaves img-src open, so a record-controlled chat name became a remote beacon),
+// <a href>, srcset, ping, <audio>/<video> and <input> UI-spoofing.
+// Kept deliberately tight: a grep of all 34 showModal/showConfirmModal call sites
+// found exactly three that pass markup, and they only use <br> and <strong>
+// (ui/170-chat-management.js:1069-1071, ui/040-tools-settings.js:1104-1106,
+// ui/270-iframe-panel.js:173/175). The rest are inline text formatters kept as
+// headroom so a future caller degrades gracefully rather than losing its text.
+var MODAL_ALLOWED_TAGS = { BR:1, STRONG:1, B:1, EM:1, I:1, CODE:1, SPAN:1, P:1, UL:1, OL:1, LI:1 };
+
+// Not-allowed elements whose CHILDREN must go too. Everything else is unwrapped so
+// no legitimate text is lost, but these hold raw source (script/CSS) or content that
+// is never meant to render, and unwrapping them would paint that source as text.
+// .toUpperCase() matters: SVG/MathML-namespaced elements report a lowercase tagName.
+var MODAL_OPAQUE_TAGS = { SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1, IFRAME:1, FRAME:1,
+    FRAMESET:1, OBJECT:1, EMBED:1, HEAD:1, TITLE:1, XMP:1, PLAINTEXT:1 };
+
+// ALLOW-list of attributes. Intentionally EMPTY: none of the three markup callers
+// carries an attribute, and an empty list is what kills the whole attribute class at
+// once — on*="…" / data-_ev-*="…" (the CSP polyfill's bound form), href/src/srcset/
+// ping, and `style` (CSS exfil via background:url(), plus a position:fixed;inset:0
+// overlay that click-jacks the modal's Confirm button). Add a name here ONLY if a
+// caller truly needs it; the copy loop below still runs the on*/URL-scheme guards.
+var MODAL_ALLOWED_ATTRS = {};
+var MODAL_URL_ATTRS = { href:1, src:1, action:1, formaction:1, 'xlink:href':1, background:1, poster:1, srcset:1, ping:1, data:1, codebase:1 };
+var MODAL_MAX_DEPTH = 24; // nesting cap — a modal message is one paragraph, not a document
+
+// True when a URL-ish attribute value carries a script-capable scheme.
+// The value is tested with ALL whitespace/control characters removed first: the URL
+// parser strips ASCII tab/LF/CR from anywhere in a URL (and leading C0/space) before
+// it reads the scheme, so href="java&#9;script:alert(1)" — which DOMParser decodes to
+// "java\tscript:alert(1)" — is live in the browser even though a ^-anchored regex on
+// the raw value does not match it.
+function isUnsafeModalUrl(value) {
+    var u = String(value == null ? '' : value).replace(/[\u0000-\u0020\u007f]+/g, '');
+    return /^(javascript|data|vbscript):/i.test(u);
+}
+
+// Defence-in-depth sanitizer for the showModal message sink.
+//
+// The message is intentionally NOT blanket-escaped: three callers pass small
+// TRUSTED markup (ui/170-chat-management.js:1069-1071 uses <br>/<strong>,
+// ui/040-tools-settings.js:1104-1106 uses <strong>, ui/270-iframe-panel.js:173/175
+// uses <br>), and they already escapeHtml() their untrusted interpolations. Callers
+// MUST keep doing that. This pass is the safety net for the ~10 that forget: it
+// parses the markup INERT via DOMParser (no script execution, no sub-resource loads)
+// and REBUILDS it from an allow-list before the nodes touch the live document.
+//
+// Rebuild, not strip: every kept element is re-created with document.createElement
+// and its children re-parented, so an attribute can only exist if it was explicitly
+// copied. Nothing survives by being un-enumerated.
+//
+// Returning NODES rather than a string matters and MUST stay that way: assigning
+// innerHTML would run the MV3 inline-handler polyfill (platform/extension/
+// csp-polyfill.js:37/53/71/79, which patches innerHTML/outerHTML/insertAdjacentHTML/
+// setAttribute), and it rewrites on*="…" into data-_ev-*="…" then re-binds it with
+// addEventListener — the exact reason <img src=x onerror=…> executed here despite
+// MV3's script-src 'self'. There is no innerHTML/outerHTML/insertAdjacentHTML in
+// this function, and the only setAttribute call is gated on MODAL_ALLOWED_ATTRS
+// (empty) plus an explicit on*/data-_ev-* reject, so no handler can ever be bound.
+function sanitizeModalMessage(message) {
+    var frag = document.createDocumentFragment();
+    if (message == null) return frag;
+    var doc = null;
+    try { doc = new DOMParser().parseFromString(String(message), 'text/html'); } catch (e) { doc = null; }
+    if (!doc || !doc.body) { frag.appendChild(document.createTextNode(String(message))); return frag; }
+
+    // Iterative (not recursive — hostile input can nest arbitrarily deep) depth-first
+    // copy. Stack items are [sourceNode, destinationParent, depth]; children are
+    // pushed in reverse so they pop back in document order.
+    var stack = [];
+    var roots = doc.body.childNodes;
+    for (var r = roots.length - 1; r >= 0; r--) stack.push([roots[r], frag, 0]);
+
+    while (stack.length) {
+        var item = stack.pop();
+        var node = item[0], dest = item[1], depth = item[2];
+
+        if (node.nodeType === 3) { dest.appendChild(document.createTextNode(node.nodeValue)); continue; } // text
+        if (node.nodeType !== 1) continue; // comments, CDATA, PIs, doctypes: dropped
+
+        var tag = String(node.tagName).toUpperCase();
+        if (MODAL_OPAQUE_TAGS[tag]) continue; // drop the element AND its subtree
+
+        var target = dest;
+        if (MODAL_ALLOWED_TAGS[tag] && depth < MODAL_MAX_DEPTH) {
+            // Fresh element, HTML namespace, zero attributes carried over. `tag` came
+            // from the allow-list, so createElement can never be fed hostile input.
+            target = document.createElement(tag.toLowerCase());
+            var attrs = node.attributes;
+            for (var j = 0; j < attrs.length; j++) {
+                var lower = String(attrs[j].name).toLowerCase();
+                if (!MODAL_ALLOWED_ATTRS[lower]) continue;
+                // Belt and braces if the allow-list is ever widened: an event handler
+                // in either spelling must never reach the patched setAttribute, and a
+                // URL attribute must survive the scheme check first.
+                if (lower.indexOf('on') === 0 || lower.indexOf('data-_ev-') === 0) continue;
+                if (MODAL_URL_ATTRS[lower] && isUnsafeModalUrl(attrs[j].value)) continue;
+                target.setAttribute(lower, attrs[j].value);
+            }
+            dest.appendChild(target);
+        }
+        // else: UNWRAP — the element itself is discarded but its children are copied
+        // into `dest`, so an unexpected <div>/<h1>/<a> loses its markup, never its text.
+
+        var kids = node.childNodes;
+        for (var k = kids.length - 1; k >= 0; k--) stack.push([kids[k], target, depth + 1]);
+    }
+    return frag;
+}
+
 function showModal(title, message, buttons, variant) {
     return new Promise(function(resolve) {
         modalResolve = resolve;
@@ -549,7 +788,9 @@ function showModal(title, message, buttons, variant) {
         var v = normalizeModalVariant(variant);
         if (v !== 'normal') overlay.classList.add('modal-variant-' + v);
         header.textContent = title;
-        body.innerHTML = message;
+        // Sanitized nodes, never innerHTML — see sanitizeModalMessage above.
+        body.textContent = '';
+        body.appendChild(sanitizeModalMessage(message));
         actions.innerHTML = buttons.map(function(btn) {
             return '<button class="modal-btn ' + (btn.class || 'secondary') + '" onclick="resolveModal(\'' + escapeJsString(btn.value) + '\')">' + escapeHtml(btn.label) + '</button>';
         }).join('');

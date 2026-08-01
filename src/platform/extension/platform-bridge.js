@@ -562,6 +562,49 @@
     // instead of rendering duplicates with the same host.
     function _normUrl(u) { return String(u || '').replace(/\/+$/, ''); }
 
+    // Per-instance "disabled for agent" flags. Persisted in chrome.storage.local
+    // under `disabledInstances` (map of normalized URL -> true) so the tool layer
+    // (list_instances + the disabled-instance guard in tools/020-tool-execution.js)
+    // can read the same source of truth from either the page bundle or the
+    // service worker. Semantics: the AGENT must never use a disabled instance;
+    // the USER can still open/switch to it manually from the picker.
+    var _disabledInstances = {};
+    var _DISABLED_INSTANCES_KEY = 'disabledInstances';
+    try {
+        chrome.storage.local.get(_DISABLED_INSTANCES_KEY, function(d) {
+            _disabledInstances = (d && d[_DISABLED_INSTANCES_KEY]) || {};
+            // Hydration races the first render: clear the signature so the next
+            // refresh/render can't be short-circuited into keeping a row that
+            // was drawn before the flags loaded (isInstanceDisabled fails open
+            // until this callback runs).
+            _instancePickerLastSig = '';
+        });
+    } catch (e) {}
+    function isInstanceDisabled(url) { return !!_disabledInstances[_normUrl(url)]; }
+    function setInstanceDisabled(url, disabled) {
+        var u = _normUrl(url);
+        if (disabled) _disabledInstances[u] = true; else delete _disabledInstances[u];
+        try { var _o = {}; _o[_DISABLED_INSTANCES_KEY] = _disabledInstances; chrome.storage.local.set(_o); } catch (e) {}
+    }
+    // Expose for other page modules (this file is an IIFE).
+    window.isInstanceDisabled = isInstanceDisabled;
+    window.setInstanceDisabled = setInstanceDisabled;
+
+    // Tombstones for just-removed instances: a detailed probe already in
+    // flight when the user clicked remove would otherwise re-persist the URL
+    // (its response was built BEFORE the background deleted the
+    // instanceTokens entry) and the row would pop right back. Honoured by
+    // _cacheInstances / _seedRenderList / _withRetainedInstances for 10s \u2014
+    // by then the deletion has landed and the next probe stays clean.
+    var _recentlyRemoved = {};
+    var _REMOVED_TOMBSTONE_MS = 10000;
+    function _isRecentlyRemoved(u) {
+        var t = _recentlyRemoved[u];
+        if (!t) return false;
+        if (Date.now() - t > _REMOVED_TOMBSTONE_MS) { delete _recentlyRemoved[u]; return false; }
+        return true;
+    }
+
     function _cacheInstances(list) {
         if (!list) return;
         var now = Date.now();
@@ -575,12 +618,14 @@
         (_instancesCache || []).forEach(function(c) {
             if (!c || !c.url) return;
             var u = _normUrl(c.url);
+            if (_isRecentlyRemoved(u)) return;
             merged[u] = { url: u, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || now };
         });
         // 2) Upsert everything currently live with a fresh lastSeen + latest details.
         (list || []).forEach(function(i) {
             if (!i || !i.url) return;
             var u = _normUrl(i.url);
+            if (_isRecentlyRemoved(u)) return;
             merged[u] = { url: u, tabs: i.tabs || [], userName: i.userName || '', roles: i.roles || [], connected: !!i.token, lastSeen: now };
         });
         // 3) Drop anything not seen within the retention window.
@@ -594,7 +639,7 @@
     // (which still carry tokens for roles/test) plus any cached-but-no-longer-live
     // instances rendered as disconnected "signed out" rows. Connected first.
     function _withRetainedInstances(liveList) {
-        liveList = liveList || [];
+        liveList = (liveList || []).filter(function(i) { return i && !_isRecentlyRemoved(_normUrl(i.url)); });
         var liveUrls = {};
         liveList.forEach(function(i) { if (i && i.url) liveUrls[_normUrl(i.url)] = true; });
         var retained = (_instancesCache || []).filter(function(c) {
@@ -611,7 +656,7 @@
     function _seedRenderList(seed) {
         var cutoff = Date.now() - _INSTANCE_RETENTION_MS;
         seed = (seed || []).filter(function(i) {
-            return i && (!i.lastSeen || i.lastSeen >= cutoff);
+            return i && (!i.lastSeen || i.lastSeen >= cutoff) && !_isRecentlyRemoved(_normUrl(i.url));
         });
         return _orderInstances(seed.map(function(i) {
             if (!i) return i;
@@ -665,6 +710,53 @@
     // nothing meaningful changed (avoids collapsing an open per-row roles panel
     // or flickering when a refresh returns identical data).
     var _instancePickerLastSig = '';
+    // The instance list the CURRENTLY mounted dropdown DOM was built from. The
+    // remove \u2715 confirms through an ASYNC dialog (showConfirmModal), so by the
+    // time the user clicks Confirm the per-row forEach closure's `instances`
+    // array can be a render behind (a window-focus _refreshInstancePicker may
+    // have swapped the DOM meanwhile). _removeInstanceEntry re-renders from this
+    // instead of the stale closure list.
+    var _lastRenderedInstances = [];
+
+    // ── Remove-confirm in-flight guard ──────────────────────────────────────
+    // The picker paints ABOVE the shared confirm dialog (--z-dropdown 10011 vs
+    // --z-modal 10006, css/00-tokens.css:173,178). The tokens are deliberately NOT
+    // reordered: --z-modal also backs .jobs-expand-overlay (css/23-actions.css:1747)
+    // and the whole ladder is load-bearing elsewhere (documented order in
+    // css/00-tokens.css:163-168, "stay below --z-modal/--z-snackbar" in
+    // css/25-ws-files.css:16, Escape precedence in js/core/120-init.js:216-220) —
+    // lifting the modal over 10011 would also lift it over --z-snackbar (10010) and
+    // force --z-tooltip to move again. So the picker is neutralised locally instead.
+    // While a remove confirm is awaiting an answer this flag:
+    //   (a) refuses to open a SECOND dialog — there is a single global
+    //       modalResolve (ui/220-notification-system.js:656,782), so a second
+    //       showConfirmModal overwrites the first resolver and the first promise
+    //       would dangle forever (rapid double-click on ✕, or ✕ on another row);
+    //   (b) marks the dropdown .confirm-pending (css/04-header.css:235) +
+    //       `inert`, which makes it click-through and un-tabbable, so no row can
+    //       run switchToInstance while an aria-modal dialog is open — and clicks
+    //       landing in the overlap region reach the dialog underneath.
+    var _removeConfirmPending = false;
+
+    // Read the flag through this: it is only trusted while the shared dialog is
+    // actually on screen. If some OTHER modal steals modalResolve our promise
+    // never settles, and a bare boolean would leave the picker inert forever —
+    // reading it in that state heals the flag instead.
+    function _isRemoveConfirmPending() {
+        if (!_removeConfirmPending) return false;
+        var ov = document.getElementById('modal-overlay');
+        if (ov && ov.classList.contains('show')) return true;
+        _removeConfirmPending = false;   // stale — no dialog is up
+        return false;
+    }
+
+    function _setRemoveConfirmPending(pending) {
+        _removeConfirmPending = !!pending;
+        if (!_instanceDropdown) return;   // closed meanwhile — re-applied on the next render
+        if (_removeConfirmPending) _instanceDropdown.classList.add('confirm-pending');
+        else _instanceDropdown.classList.remove('confirm-pending');
+        _instanceDropdown.inert = _removeConfirmPending;
+    }
 
     function showInstancePicker() {
         if (_instanceDropdown) { hideInstancePicker(); return; }
@@ -763,7 +855,8 @@
                     i.userName || '',
                     (i.roles || []).slice().sort().join(','),
                     (i.token || i.connected) ? 'c' : 'd',
-                    perm.tier || 'manual'
+                    perm.tier || 'manual',
+                    _disabledInstances[_normUrl(i.url)] ? 'x' : ''
                 ].join('|');
             }).join('\n');
         } catch (e) { return String(Date.now()); }
@@ -781,9 +874,49 @@
     }
 
     function _onClickOutsideDropdown(e) {
+        // A click inside the shared confirm dialog (#modal-overlay, html/body.html:384)
+        // is NOT an outside click. The remove \u2715 opens showConfirmModal ON TOP of the
+        // still-open picker, and this listener runs in the CAPTURE phase \u2014 without this
+        // guard the Confirm/Cancel click would tear the dropdown down before the modal
+        // promise resolved, and the post-confirm re-render would then pop a picker the
+        // user never reopened back onto the screen.
+        if (e.target && e.target.closest && e.target.closest('#modal-overlay')) return;
         if (_instanceDropdown && !_instanceDropdown.contains(e.target) && !e.target.closest('#ext-sn-status') && !e.target.closest('#home-ext-sn-status')) {
             hideInstancePicker();
         }
+    }
+
+    // Durably forget ONE instance from the picker. Callers MUST have confirmed
+    // first (showConfirmModal) \u2014 this is only the commit step, and its body is
+    // unchanged from the two-step inline confirm it replaced: tombstone, purge the
+    // picker cache (memory + chrome.storage.local.snInstancesCache), clear the
+    // stale disabled flag, drop the background's per-origin heartbeat token, then
+    // re-render + refresh the header pill.
+    function _removeInstanceEntry(rawUrl) {
+        var u = _normUrl(rawUrl);
+        // 0) Tombstone the URL so an in-flight probe response can't re-persist it.
+        _recentlyRemoved[u] = Date.now();
+        // 1) Drop from the picker cache (memory + storage) so re-opens don't seed it back.
+        _instancesCache = (_instancesCache || []).filter(function(c) { return c && _normUrl(c.url) !== u; });
+        try { var _o = {}; _o[_INSTANCES_CACHE_KEY] = _instancesCache; chrome.storage.local.set(_o); } catch (err) {}
+        // 2) Clear any stale disabled flag for the removed URL.
+        setInstanceDisabled(u, false);
+        // 3) Drop the background's per-origin heartbeat token so
+        //    snGetInstancesDetailed stops folding the instance back in.
+        try { chrome.runtime.sendMessage({ type: 'remove-sn-instance', instanceUrl: u }, function() { void chrome.runtime.lastError; }); } catch (err) {}
+        // 4) Re-render immediately without the removed row \u2014 from the list the
+        //    mounted DOM was built from, never a stale forEach closure. The sig reset
+        //    happens unconditionally so that if the picker WAS closed while the dialog
+        //    was up (header pill re-click, Escape reaching the menus), the next open
+        //    re-renders instead of short-circuiting on the pre-removal signature.
+        var newList = (_lastRenderedInstances || []).filter(function(i) { return i && _normUrl(i.url) !== u; });
+        _instancePickerLastSig = '';
+        if (_instanceDropdown) {
+            renderInstanceDropdown(newList);   // also refreshes _lastRenderedInstances
+        } else {
+            _lastRenderedInstances = newList;
+        }
+        updateSnStatus();
     }
 
     function renderInstanceDropdown(instances, isLoading) {
@@ -791,6 +924,7 @@
         // (it spans the whole open session, not a single render).
         _teardownDropdownDom();
         _instancePickerLastSig = _instancesSignature(instances);
+        _lastRenderedInstances = instances || [];
         var anchor = document.getElementById('ext-sn-status');
         if (anchor && anchor.offsetParent === null) anchor = document.getElementById('home-ext-sn-status');
         if (!anchor) {
@@ -803,7 +937,12 @@
         var dd = document.createElement('div');
         // Chrome (bg/border/radius/shadow) comes from the shared .header-menu
         // class (04-header.css) so all header pill dropdowns match.
-        dd.className = 'ext-instance-dropdown header-menu';
+        // Carry the in-flight remove-confirm state onto the fresh DOM: a
+        // window-focus refresh can re-render WHILE the dialog is up, and the new
+        // dropdown must stay neutralised (and drop it again once it is stale).
+        var _pending = _isRemoveConfirmPending();
+        dd.className = 'ext-instance-dropdown header-menu' + (_pending ? ' confirm-pending' : '');
+        dd.inert = _pending;
         // Shared banded section title (round-5 unification): same band + icon
         // pattern as every other header pill dropdown.
         var _instTitleIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.globe) ? UI_ICONS.globe : '';
@@ -830,8 +969,10 @@
                 var shortName = host.split('.')[0];
                 var instPerms = instancePermissions[host] || { tier: 'manual', tools: {} };
                 var currentTier = instPerms.tier || 'manual';
+                var hasTab = !!(inst.tabs && inst.tabs.length);
+                var agentDisabled = isInstanceDisabled(inst.url);
                 var row = document.createElement('div');
-                row.className = 'ext-instance-row' + (isActive ? ' active' : '') + (signedOut ? ' retained' : '');
+                row.className = 'ext-instance-row' + (isActive ? ' active' : '') + (signedOut ? ' retained' : '') + (agentDisabled ? ' agent-disabled' : '');
                 var openIcon = typeof UI_ICONS !== 'undefined' ? UI_ICONS.externalLink : '&#x2197;';
                 var userName = inst.userName || '';
                 var roles = signedOut ? [] : (inst.roles || []);  // signed-out rows show no privilege badge
@@ -851,13 +992,37 @@
                     : (!badgeHtml && userName)
                         ? ' <span class="ext-instance-user" title="Click to view all roles">· ' + escapeHtml(userName) + '</span>'
                         : '';
+                // Per-row agent control: rows WITH a live tab get a Disable/Enable
+                // toggle (agent must never use a disabled instance); rows with NO
+                // live tab get a remove \u2715 (confirmed through the extension's
+                // shared confirm dialog). The remove button is hidden for the ACTIVE
+                // instance so the current session can never be yanked out from under
+                // the user.
+                var closeIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.close) ? UI_ICONS.close : '&#x2715;';
+                var disabledPill = agentDisabled
+                    ? '<span class="ext-instance-disabled-pill" title="The agent will not use this instance">disabled</span>'
+                    : '';
+                var controlHtml = '';
+                if (hasTab || isActive) {
+                    // Live-tab rows AND the active instance (even tab-less \u2014 the
+                    // agent still resolves it as the default target via its cached
+                    // heartbeat token) get the Disable toggle; Remove stays
+                    // suppressed for the active instance.
+                    controlHtml = '<button class="ext-instance-disable' + (agentDisabled ? ' on' : '') + '" title="' +
+                        (agentDisabled ? 'Agent is blocked from ' + escapeHtml(host) + ' \u2014 click to re-enable' : 'Prevent the agent from using ' + escapeHtml(host)) + '">' +
+                        (agentDisabled ? 'Enable' : 'Disable') + '</button>';
+                } else {
+                    controlHtml = '<button class="ext-instance-remove" title="Remove ' + escapeHtml(host) + ' from this list">' + closeIcon + '</button>';
+                }
                 row.innerHTML = '<span class="ext-instance-dot' + (isConnected ? ' ok' : '') + '"></span>' +
                     '<span class="ext-instance-name" title="' + escapeHtml(host) + '">' + escapeHtml(shortName) + userSuffix + '</span>' +
                     badgeHtml +
+                    disabledPill +
                     '<a class="ext-instance-open" href="' + escapeHtml(inst.url) + '" target="_blank" title="Open ' + escapeHtml(host) + '">' + openIcon + '</a>' +
                     '<span class="ext-instance-tier" title="' + (currentTier === 'auto' ? 'Auto: Agent decides for write operations' : 'Manual: You control each permission') + '">' +
                         (currentTier === 'auto' ? (typeof UI_ICONS !== 'undefined' ? UI_ICONS.sparkle : '&#x2728;') + ' Auto' : (typeof UI_ICONS !== 'undefined' ? UI_ICONS.lock : '&#x1F512;') + ' Manual') +
                     '</span>' +
+                    controlHtml +
                     '<button class="ext-instance-test" style="display:none;">Test</button>';
 
                 // Wrap row + collapsible roles panel together so the panel sits directly below.
@@ -872,6 +1037,7 @@
                 row.addEventListener('click', function(e) {
                     if (e.target.classList.contains('ext-instance-test')) return;
                     if (e.target.closest('.ext-instance-open')) return;
+                    if (e.target.closest('.ext-instance-remove') || e.target.closest('.ext-instance-disable')) return;
                     if (e.target.closest('.ext-instance-role-badge') || e.target.closest('.ext-instance-user')) {
                         // Toggle roles panel
                         e.stopPropagation();
@@ -913,6 +1079,88 @@
                     e.stopPropagation();
                     testInstanceConnection(inst, row);
                 });
+
+                // Disable/Enable toggle (rows WITH a live tab): flip the persisted
+                // per-instance "agent may not use this" flag and re-render in place
+                // (same pattern as the tier toggle above).
+                var disableBtn = row.querySelector('.ext-instance-disable');
+                if (disableBtn) {
+                    disableBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        setInstanceDisabled(inst.url, !isInstanceDisabled(inst.url));
+                        _instancePickerLastSig = ''; // sig short-circuit must not skip the fresh render
+                        renderInstanceDropdown(instances);
+                        updateSnStatus();
+                    });
+                }
+
+                // Remove button (rows with NO live tab): ONE click opens the
+                // extension's shared confirm dialog \u2014 showConfirmModal
+                // (ui/230-modals.js:59), the same helper every other destructive
+                // action uses (e.g. mergeSidebarPR ui/120-ui-utils.js:458, discard
+                // changes ui/115-workspace-files-sidebar.js:682). Confirm commits
+                // via _removeInstanceEntry; Cancel / Escape / backdrop do nothing.
+                // The picker deliberately stays OPEN behind the dialog (the modal
+                // overlay is excluded in _onClickOutsideDropdown) so the row visibly
+                // disappears as the dialog closes \u2014 same "surface stays, act +
+                // re-render on confirm" shape as mergeSidebarPR.
+                var removeBtn = row.querySelector('.ext-instance-remove');
+                if (removeBtn) {
+                    removeBtn.addEventListener('click', function(e) {
+                        // Synchronous, BEFORE any await/then: the row click handler
+                        // must never see this and switch instances.
+                        e.stopPropagation();
+                        // Re-entrancy: never a second dialog while one is pending.
+                        // Both conditions matter — the flag covers OUR dialog (and
+                        // self-heals if it went stale), the overlay probe also covers
+                        // an unrelated modal that already owns the shared
+                        // modalResolve, which we must not overwrite either.
+                        if (_isRemoveConfirmPending()) return;
+                        var _ov = document.getElementById('modal-overlay');
+                        if (_ov && _ov.classList.contains('show')) return;
+                        // Captured now \u2014 `inst`/`row` may be detached by a re-render
+                        // while the dialog is up, so only this plain string is used after.
+                        var url = inst.url;
+                        var title = 'Remove ' + host + '?';
+                        var msg = 'AppAgent forgets its cached session for <strong>' + escapeHtml(host) +
+                            '</strong> and drops it from this list. Nothing changes on the instance itself \u2014 ' +
+                            'it reappears here as soon as a ServiceNow tab for it is opened again.';
+                        // Resolved LAZILY at click time. platform-bridge.js is an IIFE
+                        // concatenated AFTER the page bundle (build/build.js:485,
+                        // skills/extension-dev/build.js:176), so the top-level
+                        // `async function showConfirmModal` is already a hoisted window
+                        // global before any click can happen; the guard only covers a
+                        // stripped/partial build where the page tier is absent.
+                        if (typeof window.showConfirmModal === 'function') {
+                            // Set BEFORE the call so the dropdown is already inert when
+                            // showModal mounts the overlay; cleared in BOTH settle paths
+                            // (confirm AND cancel/Escape/backdrop/reject) so the picker
+                            // is usable again the moment the dialog closes.
+                            _setRemoveConfirmPending(true);
+                            Promise.resolve(window.showConfirmModal(title, msg, 'danger')).then(function(ok) {
+                                _setRemoveConfirmPending(false);
+                                if (ok) _removeInstanceEntry(url);
+                            })['catch'](function() { _setRemoveConfirmPending(false); });
+                            return;
+                        }
+                        // Fallback (dialog helper genuinely unavailable, e.g. a stripped
+                        // build without the page tier): the requirement is that removal is
+                        // ALWAYS confirmed through a dialog. Native window.confirm still IS
+                        // a dialog, so it stays the fallback — but when even that is
+                        // missing the button is a deliberate no-op: never a silent,
+                        // unconfirmed removal. Synchronous + browser-modal, so it needs no
+                        // in-flight guard of its own.
+                        if (typeof window.confirm === 'function') {
+                            if (window.confirm(title)) _removeInstanceEntry(url);
+                            return;
+                        }
+                        try {
+                            console.warn('[AppAgent] Instance remove skipped for ' + url +
+                                ' \u2014 no confirm dialog available (showConfirmModal and window.confirm both missing);' +
+                                ' refusing to remove without confirmation.');
+                        } catch (err) {}
+                    });
+                }
 
                 dd.appendChild(item);
 

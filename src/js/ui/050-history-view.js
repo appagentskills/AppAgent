@@ -475,6 +475,15 @@ function filterHistoryChats(query) {
 }
 
 function clearHistorySearch() {
+    // Cancel the in-flight debounce FIRST. handleHistorySearch schedules a 250ms
+    // timer that closes over the OLD input value and re-assigns it to
+    // historySearchQuery + re-renders; without this cancel the cleared state was
+    // silently overwritten by the stale query a quarter second later (input
+    // empty, stats line still "N results for <old query>").
+    if (historySearchDebounceTimer) {
+        clearTimeout(historySearchDebounceTimer);
+        historySearchDebounceTimer = null;
+    }
     historySearchQuery = '';
     var input = document.getElementById('history-search-input');
     if (input) {

@@ -1137,6 +1137,39 @@ async function _executeToolInner(name, args, messageIndex, options) {
         }
     }
 
+    // -------- Disabled-instance guard --------
+    // A per-instance "disabled" flag (chrome.storage.local.disabledInstances,
+    // toggled from the header instance picker \u2014 setInstanceDisabled in
+    // platform-bridge.js) means the AGENT must never target that instance.
+    // Two paths are covered: (1) any tool call that EXPLICITLY targets an
+    // instance via args.instance; (2) instance-affecting tools (ServiceNow
+    // data tools + the browser-driving iframe_tool) that act on the ACTIVE
+    // instance when args.instance is absent \u2014 without this second arm the
+    // agent could still drive a disabled instance through its live tab.
+    // Instance-agnostic tools (js_eval, widgets, documents, sub-agent tools,
+    // screenshots, \u2026) are deliberately NOT listed and never blocked. The
+    // user can still switch to / browse a disabled instance manually.
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local
+        && typeof Platform !== 'undefined' && typeof Platform.resolveInstanceUrl === 'function') {
+        var _digUrl = null;
+        if (args && args.instance) {
+            _digUrl = Platform.resolveInstanceUrl(args.instance);
+        } else if (name === 'servicenow_api' || name === 'servicenow_run_script'
+                || name === 'servicenow_diff_edit' || name === 'eval_runner'
+                || name === 'iframe_tool') {
+            _digUrl = Platform.resolveInstanceUrl(null); // active instance
+        }
+        if (_digUrl) {
+            var _digMap = await new Promise(function(r) {
+                try { chrome.storage.local.get('disabledInstances', function(d) { r((d && d.disabledInstances) || {}); }); }
+                catch (e) { r({}); }
+            });
+            if (_digMap[String(_digUrl).replace(/\/+$/, '')]) {
+                return { success: false, error: 'Instance "' + ((args && args.instance) || _digUrl) + '" is disabled for agent use (toggle in the header instance picker). Target another instance or ask the user to re-enable it.' };
+            }
+        }
+    }
+
     // -------- Handle helper tools (sub-agent spawn handles) --------
     if (name === 'await_handle'
         || name === 'await_any' || name === 'await_all') {
@@ -1566,9 +1599,23 @@ async function _executeToolInner(name, args, messageIndex, options) {
         if (Platform.refreshInstances) {
             try { await Platform.refreshInstances(); } catch (e) { /* keep last-known Platform.instances */ }
         }
+        // Per-instance "disabled for agent" flags (toggled from the header
+        // instance picker \u2014 setInstanceDisabled in platform-bridge.js, stored
+        // under chrome.storage.local.disabledInstances). Disabled instances are
+        // EXCLUDED from the targetable list and surfaced separately so the
+        // agent knows they exist but must not use them.
+        var _liDisabledMap = {};
+        try {
+            _liDisabledMap = await new Promise(function(r) {
+                chrome.storage.local.get('disabledInstances', function(d) { r((d && d.disabledInstances) || {}); });
+            });
+        } catch (e) { _liDisabledMap = {}; }
+        var _liNorm = function(u) { return String(u || '').replace(/\/+$/, ''); };
+        var _liDisabled = Platform.instances.filter(function(inst) { return _liDisabledMap[_liNorm(inst.url)]; })
+            .map(function(inst) { return { shortName: inst.shortName, url: inst.url, disabled: true }; });
         return {
             success: true,
-            instances: Platform.instances.map(function(inst) {
+            instances: Platform.instances.filter(function(inst) { return !_liDisabledMap[_liNorm(inst.url)]; }).map(function(inst) {
                 return {
                     shortName: inst.shortName,
                     url: inst.url,
@@ -1579,6 +1626,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     tabCount: (inst.tabs || []).length
                 };
             }),
+            disabledInstances: _liDisabled, // present but NOT targetable by the agent
             activeInstance: Platform.instanceUrl ? Platform.instanceUrl.replace(/^https?:\/\//, '').split('.')[0] : ''
         };
     } else if (name === 'servicenow_api' && !(/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(args.table))) {
@@ -5289,6 +5337,19 @@ async function wsPush(wk, args, chatId, chatTitle) {
     var _prInfoTitle = (typeof args.pr_title === 'string' && args.pr_title !== '') ? args.pr_title
         : ((prReused && existingPr && existingPr.title) ? existingPr.title : '');
     var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name, title: _prInfoTitle, chatId: chatId || null };
+    // Durable parent attribution: when the pusher is a SUB-AGENT chat, its
+    // chat row and registry record are reaped ~1h after it settles
+    // (SUBAGENT_TOMBSTONE_TTL_MS, src/js/core/097-sub-agent-registry.js) —
+    // orphaning the chatId stamp above. Also stamp the ROOT parent chat id
+    // so the sidebar's meta.prs fallback (renderVersionSidebar,
+    // src/js/ui/120-ui-utils.js) keeps attributing the PR card to the parent
+    // chat after the sub is GC'd. root_chat_id resolves the ROOT of the
+    // spawn tree even for nested subs — _wsRootChatId (this file, ~L2370)
+    // reads the registry record's root_chat_id with a capped parent walk for
+    // legacy records, and resolves to chatId itself for a non-sub pusher
+    // (in which case we skip the stamp: chatId already attributes it).
+    var _pushRootChatId = _wsRootChatId(chatId);
+    if (chatId && _pushRootChatId && _pushRootChatId !== chatId) prInfo.root_chat_id = _pushRootChatId;
     // Per-file ownership attribution for the push RESULT (same fields + helpers
     // as wsStatus: last_modified_by_chat_id/_title/_at/_ago, pushed_pr, message).
     // Captured HERE — after the commit set is final and the target PR is known,
@@ -5417,6 +5478,12 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // Append push without a pr_title: keep the previously tracked title
             // instead of wiping it (mirrors getPushedPRsForChat's message scan).
             if (!prInfo.title && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].title) prInfo.title = meta.prs[_trackedIdx].title;
+            // Likewise keep a previously stamped root_chat_id when THIS push
+            // couldn't resolve one (e.g. the parent itself appends to a PR its
+            // sub opened, or the sub's registry record is already GC'd). The
+            // stamp only ever names the ROOT chat that spawned the original
+            // pusher — it never widens visibility to unrelated chats.
+            if (!prInfo.root_chat_id && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].root_chat_id) prInfo.root_chat_id = meta.prs[_trackedIdx].root_chat_id;
             // Cumulative snapshot set on append pushes: keep prior per-file
             // snapshots for paths NOT in this commit (a scoped args.files push
             // would otherwise drop earlier files from the PR's diff record);

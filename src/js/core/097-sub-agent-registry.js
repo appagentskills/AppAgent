@@ -1101,6 +1101,17 @@ function _resolveSpawnProvider(args, toolLabel, callerChatId) {
             return { ok: false, error: toolLabel + ': unknown tier "' + tier + '"' + origin + '. Valid tiers: small, medium, large, same.' };
         }
         var mapped = resolveTierAlias(key);
+        // Tier mapped to the special "Same" option (Settings → Sub-Agent
+        // Model Tiers, TIER_ALIAS_SAME in core/030-config.js): behave
+        // EXACTLY like an explicit tier:'same' spawn — pin no provider,
+        // stamp same_as so the sub dynamically follows the spawner's current
+        // model at each LLM call (see the 'same' branch above; this reuses
+        // that path's shape verbatim). record.tier becomes 'same' so
+        // wake/resurrect re-stamping (_applyChatModelStamp) and the Workers
+        // UI display behave identically to an explicit same-tier sub.
+        if (typeof TIER_ALIAS_SAME !== 'undefined' && mapped === TIER_ALIAS_SAME) {
+            return { ok: true, provider: null, tier: 'same', same_as: callerChatId || null };
+        }
         var res = checkProvider(mapped, ' (tier "' + key + '" maps to it — fix the tier aliases in Settings)');
         if (res.ok) res.tier = key;
         return res;

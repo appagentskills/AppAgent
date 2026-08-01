@@ -10,6 +10,45 @@ function isHookToolName(n) {
     return n === 'set_chat_title' || n === 'set_tldr' || n === 'set_links' || n === 'set_caveat';
 }
 
+// Did this tool call FAIL? Tool results are persisted as strings by
+// recordToolResult; a failed call serialises as {"success": false, "error": …}
+// (app/030-agent-loop.js:495, 660-705). Used by both tool-call summary badges
+// so an errored call stops rendering the green success check.
+function toolResultIsError(result) {
+    if (!result) return false;
+    var s = typeof result === 'string' ? result : JSON.stringify(result);
+    if (!s) return false;
+    // Plain-text verdict, shared by the raw payload and by a JSON-ENCODED string
+    // payload. Two cases count:
+    //  1. an explicit leading "Error…" (ordinary prose that merely mentions an
+    //     error stays green);
+    //  2. an interrupted/abandoned marker — these are recorded as REAL
+    //     (non-_placeholder) tool rows for calls that never ran, so a green ✓
+    //     would claim success for work that never happened. Emitted by
+    //     app/030-agent-loop.js: "[Tool call interrupted by user - no result
+    //     available]" (:305, :329, :684, :1260), "[Tool call abandoned — user
+    //     sent a new message]" (:697, :1281), "[Tool call interrupted by user —
+    //     user sent a new message]" (:1213) and "[Tool call abandoned — paused
+    //     by user]" (:1282). Note the mix of hyphen and em-dash, so the test
+    //     deliberately stops before the dash.
+    function isErrorText(t) {
+        return /^\s*\[Tool call (interrupted|abandoned)\b/i.test(t) || /^\s*error\b/i.test(t);
+    }
+    if (isErrorText(s)) return true;
+    var parsed = null;
+    try { parsed = JSON.parse(s); } catch (e) { parsed = null; }
+    // A JSON-encoded STRING ("\"Error: boom\"") parses to a string, not an
+    // object — test the DECODED text, otherwise the leading quote defeats the
+    // ^error anchor and the failure renders green.
+    if (typeof parsed === 'string') return isErrorText(parsed);
+    if (parsed && typeof parsed === 'object') {
+        // Arrays fall through these checks and correctly return false.
+        if (parsed.success === false || parsed.ok === false || parsed.isError === true) return true;
+        return !!parsed.error;
+    }
+    return false;
+}
+
 // TL;DR card rendered at the end of an answer (set by the autoTldr hook via
 // the set_tldr tool — see executeSetTldr in tools/020-tool-execution.js).
 function renderTldrCard(msg) {
@@ -736,7 +775,12 @@ function renderMessages() {
                 
                 // On FIRST assistant message, render the collapsible area with thinking + all tools
                 // Also show when streaming (even if timeline is empty) so user sees immediate feedback
-                if (isFirstAssistant && block && (block.timeline.length > 0 || block.isStreaming)) {
+                // A metrics-only timeline (hook-only turn with its calls hidden,
+                // or a plain text answer with API stats on) must not render a
+                // pointless "0 tool calls" expander around just the API-stats row —
+                // that row renders bare via the metrics fallback below (~:902).
+                var hasVisibleTimeline = block && block.timeline.some(function(t) { return t.type !== 'metrics'; });
+                if (isFirstAssistant && block && (hasVisibleTimeline || block.isStreaming)) {
                     // Use stored state to preserve expanded state during streaming updates
                     // Fall back to DOM check for backwards compatibility, then default to collapsed
                     // B2: read with the same chatId-scoped key the toggle handler writes.
@@ -778,7 +822,7 @@ function renderMessages() {
                     // reset the status line to a bare "Thinking…" and the user
                     // stared at a silent spinner for the whole retry window.
                     var liveTransport = (!agentDone && typeof _transportStatusText === 'function') ? _transportStatusText(currentChatId) : null;
-                    var statusText = agentDone ? (block.toolCalls.length + ' tool call' + (block.toolCalls.length > 1 ? 's' : '')) : (liveTransport || block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
+                    var statusText = agentDone ? (block.toolCalls.length === 1 ? '1 tool call' : block.toolCalls.length + ' tool calls') : (liveTransport || block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
                     var spinnerClass = agentDone ? '' : ' streaming';
 
                     html += '<details class="compact-tools-area' + spinnerClass + '"' + (isExpanded ? ' open' : '') + ' ontoggle="toggleCompactAreaState(' + index + ', this)">';
@@ -833,7 +877,12 @@ function renderMessages() {
                             }
                             html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
                             if (item.hasResult) {
-                                html += '<span class="tool-result-badge">' + UI_ICONS.check + '</span>';
+                                // The badge used to be an unconditional green check, so a
+                                // failed call read as SUCCESS and the error was only
+                                // visible after expanding the panel.
+                                html += toolResultIsError(item.result)
+                                    ? '<span class="tool-result-badge error" style="color: var(--danger);" title="Tool call failed">' + UI_ICONS.alert + '</span>'
+                                    : '<span class="tool-result-badge" title="Tool call succeeded">' + UI_ICONS.check + '</span>';
                             }
                             html += '</summary>';
                             var argsCopyId = storeRawCopy(tc.function.arguments);
@@ -988,6 +1037,24 @@ function renderMessages() {
                         if (am.role === 'user') break;
                     }
                     
+                    // Result lookup for the summary badge — mirrors the compact
+                    // path (:486-502): first role:'tool' row carrying this call's id,
+                    // skipping the pre-execution placeholder row. statusClass below
+                    // encodes APPROVAL only, so without this the standard-mode summary
+                    // carried no success/failure signal at all.
+                    var tcResult = null;
+                    var tcHasResult = false;
+                    for (var ri = index + 1; ri < chat.messages.length; ri++) {
+                        var rm = chat.messages[ri];
+                        if (rm.role === 'tool' && rm.tool_call_id === tc.id) {
+                            if (rm._placeholder) break;
+                            tcResult = typeof rm.content === 'string' ? rm.content : JSON.stringify(rm.content);
+                            tcHasResult = true;
+                            break;
+                        }
+                        if (rm.role === 'user') break;
+                    }
+
                     var statusClass = approval ? (approval.msg.status === 'allowed' || approval.msg.status === 'always_allowed' || approval.msg.status === 'session_allowed' ? ' approved' : (approval.msg.status === 'denied' ? ' denied' : (approval.msg.status === 'pending' ? ' pending' : ''))) : '';
                     var needsApproval = approval && approval.msg.status === 'pending';
                     if (needsApproval) tcOpen = true;
@@ -1000,6 +1067,11 @@ function renderMessages() {
                     html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
                     if (tcStatusMessage) {
                         html += '<span class="tool-status-message">' + escapeHtml(tcStatusMessage) + '</span>';
+                    }
+                    if (tcHasResult) {
+                        html += toolResultIsError(tcResult)
+                            ? '<span class="tool-result-badge error" style="color: var(--danger);" title="Tool call failed">' + UI_ICONS.alert + '</span>'
+                            : '<span class="tool-result-badge" title="Tool call succeeded">' + UI_ICONS.check + '</span>';
                     }
                     if (approval) {
                         var statusLabel = approval.msg.status === 'pending' ? 'Pending' : (approval.msg.status === 'allowed' ? 'Allowed' : (approval.msg.status === 'always_allowed' ? 'Always' : (approval.msg.status === 'session_allowed' ? 'Session' : 'Denied')));

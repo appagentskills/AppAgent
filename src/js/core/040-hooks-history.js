@@ -217,8 +217,6 @@ function handlePopState(event) {
             hideAllPanels();
             var dashboardPanel = document.getElementById('dashboard-panel');
             if (dashboardPanel) { dashboardPanel.style.display = 'flex'; renderDashboard(); }
-            var headersBtn = document.getElementById('dashboard-toggle-headers-btn');
-            if (headersBtn) headersBtn.classList.toggle('active', showDashboardHeaders);
             updateAllButtonStates();
             renderChatList();
             document.title = getHistoryTitle('dashboard', null, null);

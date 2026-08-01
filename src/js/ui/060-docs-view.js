@@ -115,9 +115,6 @@ function openDashboardView() {
     hideAllPanels();
     var dashboardPanel = document.getElementById('dashboard-panel');
     if (dashboardPanel) { dashboardPanel.style.display = 'flex'; renderDashboard(); }
-    // Update headers toggle button state based on loaded preference
-    var headersBtn = document.getElementById('dashboard-toggle-headers-btn');
-    if (headersBtn) headersBtn.classList.toggle('active', showDashboardHeaders);
     updateAllButtonStates();
     renderChatList(); // Update sidebar to deselect chat
     // Push browser history state
@@ -175,16 +172,6 @@ function renderDashboard(dashboard) {
     });
 
     container.innerHTML = html;
-
-    // Apply show-headers class if enabled — MAIN dashboard only. Home cards
-    // never render a header (buildWidgetHtml skips it) and have no toggle, so
-    // the home grid must never get .show-headers (it would also hide the
-    // floating hover expand/drag control).
-    if (dashboard !== 'home' && showDashboardHeaders) {
-        container.classList.add('show-headers');
-    } else {
-        container.classList.remove('show-headers');
-    }
 
     // Render widget content synchronously using requestAnimationFrame for proper timing
     requestAnimationFrame(function() {

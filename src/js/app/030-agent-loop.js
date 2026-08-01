@@ -547,8 +547,19 @@ async function runAgent(overrideChatId) {
     // the catch/finally below: runningChatIds is cleared and runCrashed
     // carries the real message, so pool/resume/wake callers still settle
     // their records exactly as they do for any other loop crash.
-    if (!chat) {
-        throw new Error('runAgent: chat ' + streamingChatId + ' is not loaded in this context — refusing to start');
+    // TOMBSTONE (last line of defence): a `_deleted` entry is the tombstone the
+    // 'update-chat' explicit-delete lane parks in `chats`
+    // (worker/130-port-bridge.js) when the user deletes a chat. It is TRUTHY, so
+    // the !chat guard alone lets a run start on a deleted chat — and that run's
+    // assistant message would give the tombstone messages.length > 0, re-admitting
+    // it to `desired` (worker/115-storage.js:116), dropping it out of the
+    // unbudgeted explicit-delete lane and RE-PUTTING the row (resurrection).
+    // Every caller (checkpoint resume, after-response hook, send-message) funnels
+    // through here, so refuse it here too.
+    if (!chat || chat._deleted) {
+        throw new Error('runAgent: chat ' + streamingChatId + ' is '
+            + (chat ? 'deleted (tombstone)' : 'not loaded in this context')
+            + ' — refusing to start');
     }
     isBackgroundRun = !!(chat && chat.isBackground);
     // Clear any stale API error left from a PREVIOUS run of THIS chat so the

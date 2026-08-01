@@ -1,8 +1,9 @@
 // Tool Inspector Modal — view a tool's JSON schema and implementation source.
 // Used from Settings page Tool Permissions section and from search.
 function showToolInspector(toolName, skillId) {
-    var existing = document.getElementById('tool-inspector-modal');
-    if (existing) existing.remove();
+    // Route through the close fn so a re-open also removes the previous
+    // modal's document-level Escape listener.
+    if (document.getElementById('tool-inspector-modal')) closeToolInspectorModal();
 
     var schema, source, displayName, description;
 
@@ -54,11 +55,24 @@ function showToolInspector(toolName, skillId) {
         '</div>';
 
     document.body.appendChild(overlay);
+
+    // Escape to close. The global Escape handler in core/120-init.js only
+    // knows the permanent #modal-overlay — this dynamic twin wires its own
+    // document-level key and removes it again on close.
+    overlay._escHandler = function(e) {
+        if (e.key !== 'Escape') return;
+        var m = document.getElementById('modal-overlay');
+        if (m && m.classList.contains('show')) return; // confirm on top — global handler closes it
+        closeToolInspectorModal();
+    };
+    document.addEventListener('keydown', overlay._escHandler);
 }
 
 function closeToolInspectorModal() {
     var modal = document.getElementById('tool-inspector-modal');
-    if (modal) modal.remove();
+    if (!modal) return;
+    if (modal._escHandler) document.removeEventListener('keydown', modal._escHandler);
+    modal.remove();
 }
 
 function copyInspectorContent(type) {
@@ -174,7 +188,7 @@ function renderSettingsPage() {
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.api + ' Sub-Agent Model Tiers</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Map the abstract <code>small</code> / <code>medium</code> / <code>large</code> tiers to providers above. The agent uses these when spawning sub-agents with <code>tier</code> (e.g. small for cheap search fan-outs, large for heavy implementation work).</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Map the abstract <code>small</code> / <code>medium</code> / <code>large</code> tiers to providers above, or pick <code>Same</code> to make a tier dynamically follow the spawning agent&#39;s current model. The agent uses these when spawning sub-agents with <code>tier</code> (e.g. small for cheap search fan-outs, large for heavy implementation work).</div>' +
             '<div id="tier-aliases-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
@@ -250,21 +264,21 @@ function renderSettingsPage() {
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Context Window (tokens)</div><div class="settings-page-row-hint">Default: 200000</div></div>' +
                 '<div class="settings-input-group">' +
-                    '<input type="number" id="settings-page-context-window" class="settings-number-input" min="1000" step="1000" value="' + getAssumedContextTokens() + '" onchange="updateAssumedContextTokens(this.value)" />' +
+                    '<input type="number" id="settings-page-context-window" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.contextWindow.min + '" max="' + SETTINGS_NUMBER_LIMITS.contextWindow.max + '" step="1000" value="' + getAssumedContextTokens() + '" onchange="updateAssumedContextTokensFromSettings(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Max Tokens</div><div class="settings-page-row-hint">Max output tokens per request, for all providers. Default: 64000</div></div>' +
                 '<div class="settings-input-group">' +
-                    '<input type="number" id="settings-page-max-tokens" class="settings-number-input" min="1" step="1000" value="' + getGlobalMaxTokens() + '" onchange="updateGlobalMaxTokens(this.value)" />' +
+                    '<input type="number" id="settings-page-max-tokens" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.maxTokens.min + '" max="' + SETTINGS_NUMBER_LIMITS.maxTokens.max + '" step="1000" value="' + getGlobalMaxTokens() + '" onchange="updateGlobalMaxTokens(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). Default: 32000</div></div>' +
                 '<div class="settings-input-group">' +
-                    '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="1" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
+                    '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.min + '" max="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.max + '" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
                 '</div>' +
             '</div>' +
@@ -312,18 +326,78 @@ function renderSettingsPage() {
 // Settings page onchange handlers for the global token-budget fields.
 // Persist via saveGlobalMaxTokens / saveGlobalThinkingBudget
 // (core/030-config.js — same IDB settings store as Context Window) and
-// write the normalized value back into the input (bad input snaps to the
-// default, mirroring updateAssumedContextTokens in ui/070-dashboard-ui.js).
+// write the normalized value back into the input.
+//
+// VALIDATION CONTRACT (all the numeric settings-page fields): the raw value
+// is parsed + clamped HERE, before it ever reaches save*(), so the number
+// painted into the input, the in-memory global and the IDB settings row are
+// always the SAME value. Previously a negative like -5 sailed through
+// `parseInt(v) || DEFAULT` in core/030-config.js (it is truthy), so the store
+// kept -5 while the guarded getter made the input display the default -- a
+// lying UI plus bad persisted data. And there was no upper bound at all, so
+// 99999999 persisted verbatim and was sent as max_tokens on EVERY request.
+// Non-numeric/empty falls back to the default; a NEGATIVE value also falls back
+// to the default (see _clampSettingNumber); any other out-of-range value clamps
+// to the bound. Mirrors updateCacheTokenLimitFromK (ui/070-dashboard-ui.js), the
+// one numeric field that already clamped.
+var SETTINGS_NUMBER_LIMITS = {
+    // Assumed context window. Floor is the input's existing min; ceiling 10M
+    // tokens sits above the largest advertised model window (Llama 4 Scout
+    // 10M, Gemini 2M), so no legitimate value is blocked while typo-scale
+    // numbers are.
+    contextWindow:  { min: 1000, max: 10000000 },
+    // Max OUTPUT tokens per request. Ceiling 200k is comfortably above the
+    // highest per-request output cap of any supported model (~128k).
+    maxTokens:      { min: 1,    max: 200000 },
+    // Reasoning budget -- same ceiling as maxTokens (a reasoning budget above
+    // the output cap is meaningless).
+    thinkingBudget: { min: 1,    max: 200000 }
+};
+
+// parseInt + finite check + clamp. Non-numeric / empty -> fallback default.
+//
+// NEGATIVES ARE NOT CLAMPED, THEY FALL BACK. Clamping -5 to bounds.min looks
+// tidy but is the worst possible outcome for these particular settings: it
+// persists maxTokens = 1, and since the clamp now also writes the value back to
+// the input and to IDB, the UI and the store agree on a number that makes every
+// subsequent request send `max_tokens: 1` (an empty completion). A negative is
+// not a mistyped magnitude the user meant to cap -- it is nonsense input, and
+// nonsense input already has a defined behaviour here: the default.
+// 0 is NOT negative and keeps clamping to bounds.min (unchanged behaviour).
+// The Object.is check catches -0: parseInt('-0.5', 10) is -0, which is not < 0,
+// so a small negative fraction would otherwise still clamp to bounds.min.
+function _clampSettingNumber(value, bounds, fallback) {
+    var n = parseInt(value, 10);
+    if (!isFinite(n)) return fallback;
+    if (n < 0 || Object.is(n, -0)) return fallback;
+    return Math.max(bounds.min, Math.min(bounds.max, n));
+}
+
 async function updateGlobalMaxTokens(value) {
-    var normalized = await saveGlobalMaxTokens(value);
+    var clamped = _clampSettingNumber(value, SETTINGS_NUMBER_LIMITS.maxTokens, DEFAULT_MAX_TOKENS);
+    var normalized = await saveGlobalMaxTokens(clamped);
     var input = document.getElementById('settings-page-max-tokens');
     if (input) input.value = normalized;
 }
 
 async function updateGlobalThinkingBudget(value) {
-    var normalized = await saveGlobalThinkingBudget(value);
+    var clamped = _clampSettingNumber(value, SETTINGS_NUMBER_LIMITS.thinkingBudget, DEFAULT_THINKING_BUDGET);
+    var normalized = await saveGlobalThinkingBudget(clamped);
     var input = document.getElementById('settings-page-thinking-budget');
     if (input) input.value = normalized;
+}
+
+// Settings-page wrapper for the Context Window field. Clamps FIRST, then
+// delegates to updateAssumedContextTokens (ui/070-dashboard-ui.js) which
+// persists via saveAssumedContextTokens, repaints the input and refreshes the
+// context indicator. Because the value handed over is already valid, the
+// input, the `assumedContextTokens` global and the IDB row cannot diverge.
+async function updateAssumedContextTokensFromSettings(value) {
+    var clamped = _clampSettingNumber(value, SETTINGS_NUMBER_LIMITS.contextWindow, ASSUMED_CONTEXT_TOKENS_DEFAULT);
+    if (typeof updateAssumedContextTokens === 'function') {
+        return await updateAssumedContextTokens(clamped);
+    }
+    return clamped;
 }
 
 // Sub-agent tier alias settings (Orchestrator §1). Renders one row per
@@ -344,8 +418,12 @@ function renderTierAliasSettings() {
         var html = '';
         SUBAGENT_TIER_NAMES.forEach(function(tier) {
             var current = map[tier];
-            var options = '';
-            var found = false;
+            // "Same" pseudo-option (TIER_ALIAS_SAME, core/030-config.js):
+            // the tier follows the spawning agent's current model dynamically
+            // — identical behavior to an explicit tier:'same' spawn.
+            var isSame = (typeof TIER_ALIAS_SAME !== 'undefined' && current === TIER_ALIAS_SAME);
+            var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>Same</option>';
+            var found = isSame;
             (apiProviders || []).forEach(function(p) {
                 if (p.name === current) found = true;
                 options += '<option value="' + escapeHtml(p.name) + '"' + (p.name === current ? ' selected' : '') + '>' + escapeHtml(p.name) + '</option>';
@@ -1063,12 +1141,26 @@ async function _recloneWorkspaceFromDropdown(repo, branch) {
 // Toggle a workspace pin from the UI — shared logic lives in setWorkspacePin
 // (020-tool-execution.js), same code path as the `pin` workspace action.
 async function _toggleWorkspacePinFromUi(wk) {
+    // The toggle itself. A failure here USED to be swallowed by a bare
+    // `catch (e) {}`, so a pin/unpin that never happened looked identical to
+    // one that did. Surface it (same showSnackbar pattern as the re-clone
+    // handler above). setWorkspacePin semantics are unchanged.
     try {
         var meta = await getWorkspaceMeta(wk);
-        if (!meta) return;
+        if (!meta) {
+            if (typeof showSnackbar === 'function') showSnackbar('Pin failed: no local workspace metadata for ' + wk, 'error');
+            return;
+        }
         await setWorkspacePin(wk, !!meta.pinned); // toggle
-        // Refresh cached metas + re-render every open dropdown section (a pin
-        // elsewhere may have been cleared by the single-pin invariant).
+    } catch (e) {
+        if (typeof showSnackbar === 'function') showSnackbar('Pin update failed: ' + (e && e.message ? e.message : String(e)), 'error');
+        return;
+    }
+    // Refresh cached metas + re-render every open dropdown section (a pin
+    // elsewhere may have been cleared by the single-pin invariant). Kept in a
+    // SEPARATE try so a re-render hiccup is never mis-reported as a pin
+    // failure -- the pin already succeeded -- but is not silent either.
+    try {
         var all = await getAllWorkspaceMetas();
         all.forEach(function(m) { if (_wsHeaderCaches[m.repo]) _wsHeaderCaches[m.repo].meta = m; });
         if (_wsDropdown) {
@@ -1078,7 +1170,9 @@ async function _toggleWorkspacePinFromUi(wk) {
             });
         }
         renderGitHubReposList();
-    } catch (e) {}
+    } catch (e2) {
+        console.warn('[workspace-pin] pin saved but UI refresh failed', e2);
+    }
 }
 
 // Total number of change rows shown for a workspace section (local dirty +
@@ -2045,6 +2139,19 @@ function updateSystemPromptTokenCount() {
     }
 }
 
+// Canonical ServiceNow permission keys for the "ServiceNow API" group,
+// derived from INSTANCE_PERMISSION_KEYS (core/070-permissions.js =
+// INSTANCE_READ_KEYS.concat(INSTANCE_WRITE_KEYS)) so a key added there --
+// e.g. 'sn:run_script', server-side script execution -- automatically gets a
+// row in the UI. Both permission renderers (renderSettingsToolPermissions
+// here and renderToolPermissions in ui/140-dropdowns.js) used to hardcode a
+// 4-key list, which is exactly how sn:run_script ended up with a radio group
+// that had no container to render into. Read keys come first, matching the
+// canonical list order.
+function _snPermissionKeys() {
+    return INSTANCE_PERMISSION_KEYS.filter(function(k) { return k.indexOf('sn:') === 0; });
+}
+
 function renderSettingsToolPermissions() {
     var container = document.getElementById('settings-tool-permissions');
     if (!container) return;
@@ -2076,8 +2183,8 @@ function renderSettingsToolPermissions() {
 
     if (host) {
         html += '<div class="tool-permission-group">';
-        html += '<div class="tool-permission-group-title">ServiceNow API ' + _toolSourceBtn('servicenow_api') + ' ' + _toolSourceBtn('servicenow_diff_edit') + '</div>';
-        ['sn:read', 'sn:create', 'sn:update', 'sn:delete'].forEach(function(key) {
+        html += '<div class="tool-permission-group-title">ServiceNow API ' + _toolSourceBtn('servicenow_api') + ' ' + _toolSourceBtn('servicenow_diff_edit') + ' ' + _toolSourceBtn('servicenow_run_script') + '</div>';
+        _snPermissionKeys().forEach(function(key) {
             var displayName = TOOL_DISPLAY_NAMES[key] || key;
             var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
             html += '<div class="tool-permission-item tool-permission-subitem' + (isAutoTier ? ' tier-auto' : '') + '">' +

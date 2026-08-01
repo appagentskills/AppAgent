@@ -1017,6 +1017,67 @@ function updateChatTitleHeader(includeToolCallId) {
     }
 }
 
+// EXPLICIT-DELETE (SW propagation). The service worker keeps its OWN
+// authoritative `chats` map (worker/115-storage.js) and re-puts every chat it
+// holds at its next save (one fires at every tool boundary), so a page-only
+// delete was silently undone: the row came back and survived reload.
+// The SW's inbound port switch (worker/130-port-bridge.js) has no 'delete-chat'
+// type, so the deletion is expressed with the EXISTING 'update-chat' type
+// carrying an empty-message TOMBSTONE ({ messages: [], _deleted: true }):
+//   • the SW's save desired-set filter keeps only chats with messages.length > 0,
+//     so the SW can never re-put this row again, and
+//   • the SW's delete-pass treats a `_deleted` tombstone as an EXPLICIT delete,
+//     exempt from the wipe-guard cap/budget — so if a save that was already in
+//     flight re-put the row, the next SW save removes it again, and
+//   • the SW's 'update-chat' handler accepts a `_deleted` payload EVEN WHILE A
+//     RUN IS REGISTERED for that chat (it is a delete command, not a stale
+//     snapshot) and fires its own targeted deleteChatFromDB — without that
+//     exemption the tombstone for a RUNNING chat was dropped by the
+//     authoritative-writer guard and the chat resurrected.
+// Posted straight on the agent bus port (_agentBusPort, app/045-agent-port-bridge-page.js)
+// because pushChatUpdateToOffscreen() reads chats[chatId], which is already gone.
+// FOLLOW-UP: a dedicated 'delete-chat' inbound type would be the explicit
+// protocol; the tombstone is the equivalent expressed with today's message set
+// (and now gets the same unconditional treatment on the SW side).
+// Returns TRUE only when the tombstone was actually handed to a live port.
+// A dropped tombstone means the SW re-puts the row at its next save, i.e. a
+// guaranteed resurrection — so callers MUST surface a false return (deleteChat
+// does, next to the same snackbar the IDB-delete failure path uses).
+function _notifyWorkerChatDeleted(chatId) {
+    if (!chatId) return false;
+    var _payload = {
+        type: 'update-chat',
+        chatId: chatId,
+        chat: { id: chatId, messages: [], _deleted: true, deletedAt: Date.now() }
+    };
+    // Dead / never-opened bus (SW evicted, reconnect window): recover before
+    // giving up. _openAgentBus (app/045-agent-port-bridge-page.js) assigns
+    // _agentBusPort SYNCHRONOUSLY unless chrome.runtime.connect throws, and
+    // it is idempotent (no-ops on a live port), so one call is enough to make
+    // the post attempt below meaningful.
+    if (typeof _agentBusPort === 'undefined' || !_agentBusPort) {
+        try { if (typeof _openAgentBus === 'function') _openAgentBus(); } catch (eO) {}
+        if (typeof _agentBusPort === 'undefined' || !_agentBusPort) return false;
+    }
+    try {
+        _agentBusPort.postMessage(_payload);
+        return true;
+    } catch (e) {
+        // The port died between the check and the post. onDisconnect nulls
+        // _agentBusPort synchronously, so reopen once and re-post; if the
+        // handle is still the stale one, the retry throws again and we report
+        // the failure instead of swallowing it.
+        try {
+            if (typeof _openAgentBus === 'function') _openAgentBus();
+            if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+                _agentBusPort.postMessage(_payload);
+                return true;
+            }
+        } catch (e2) {}
+        return false;
+    }
+}
+
 async function deleteChat(chatId, e) {
     e.stopPropagation();
     var chat = chats[chatId];
@@ -1044,6 +1105,22 @@ async function deleteChat(chatId, e) {
         { label: 'Delete', value: 'delete', class: 'danger' }
     ], 'danger');
     if (result !== 'delete') return;
+    // EXPLICIT-DELETE: stop the run first. This is no longer what makes the
+    // tombstone land (the SW now accepts a `_deleted` payload even mid-run —
+    // worker/130-port-bridge.js 'update-chat'), and it deliberately is NOT
+    // awaited: a mid-stream abort can take seconds to settle, and blocking the
+    // delete on it would leave the user's action pending and lose it entirely
+    // if the panel closed meanwhile. It is still required so the aborted run
+    // stops burning tokens/tools on a chat that no longer exists.
+    try {
+        if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]
+            && typeof pushInterruptToOffscreen === 'function') {
+            pushInterruptToOffscreen(chatId, false);
+        }
+    } catch (eInt) {}
+    // Keep the record for the targeted IDB delete at the end — it needs this
+    // chat's payload ids, and the map entry is about to go.
+    var _deletedRecord = chats[chatId];
     delete chats[chatId];
     // SWM-TOKENLEAK: prune the per-chat pause/interrupt latest-wins token maps so a
     // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
@@ -1070,6 +1147,11 @@ async function deleteChat(chatId, e) {
             _deadFids.forEach(function(fid) { fileIndex.delete(fid); });
         }
     } catch (eFi) {}
+    // EXPLICIT-DELETE: tell the service worker BEFORE the save, so its own
+    // authoritative copy stops being a source of re-puts (see
+    // _notifyWorkerChatDeleted above).
+    var _swNotified = false;
+    try { _swNotified = _notifyWorkerChatDeleted(chatId); } catch (eSw) { _swNotified = false; }
     saveChatsToStorage();
     if (currentChatId === chatId) {
         var ids = Object.keys(chats);
@@ -1077,6 +1159,56 @@ async function deleteChat(chatId, e) {
     } else renderChatList();
     renderHistoryPage();
     showSnackbar('Chat deleted', 'success');
+    // EXPLICIT-DELETE: a tombstone that never reached the SW is a guaranteed
+    // resurrection (its authoritative copy re-puts the row at the next tool
+    // boundary), so it gets the SAME visible treatment as a failed IDB delete
+    // below instead of being discarded silently. The 3s retry may still
+    // recover it — that outcome is reported too.
+    if (!_swNotified) {
+        showSnackbar('Chat deleted, but the background worker could not be reached — it may come back after a reload', 'error');
+    }
+    // EXPLICIT-DELETE: durable, targeted removal of the row (and this chat's
+    // now-unreferenced payload blobs) from IndexedDB. saveChatsToStorage above
+    // is a BULK diff-save whose delete-pass is capped at 5 per save and
+    // budgeted at WIPE_GUARD_MAX_DELETES_PER_BOOT per realm boot
+    // (ui/070-dashboard-ui.js) — once that budget was spent the pass was dead
+    // for the rest of the realm's life and every deleted chat resurrected on
+    // reload. deleteChatFromDB is neither capped nor budgeted.
+    // Awaited AFTER the UI updates so a congested IDB can't stall the delete
+    // feedback.
+    if (typeof deleteChatFromDB === 'function') {
+        var _delOk = await deleteChatFromDB(chatId, _deletedRecord);
+        if (!_delOk) showSnackbar('Chat removed from the list, but the stored copy could not be deleted', 'error');
+    }
+    // One bounded re-run: covers an SW save that was already in flight when we
+    // deleted (it re-puts the row before our tombstone is applied), a run whose
+    // abort hadn't settled yet, and a bus that was down at delete time. Both
+    // the tombstone post and the targeted delete are idempotent.
+    setTimeout(function() {
+        var _reNotified = false;
+        try { _reNotified = _notifyWorkerChatDeleted(chatId); } catch (eR1) {}
+        // Only speak up when the first attempt had already failed and the user
+        // saw the error above — silence otherwise (the happy path is routine).
+        if (!_swNotified) {
+            showSnackbar(_reNotified
+                ? 'Background worker reached — the chat deletion is durable'
+                : 'The background worker is still unreachable — the deleted chat may come back after a reload',
+                _reNotified ? 'success' : 'error');
+        }
+        // deleteChatFromDB is async: a plain try/catch around the call can only
+        // catch a SYNCHRONOUS throw, so a rejected promise escaped as an
+        // unhandled rejection and its false return was discarded. Handle both.
+        if (typeof deleteChatFromDB !== 'function') return;
+        try {
+            Promise.resolve(deleteChatFromDB(chatId, _deletedRecord)).then(function(ok) {
+                if (!ok) console.warn('[chat-delete] retry: targeted IDB delete of chat ' + chatId + ' did not complete');
+            }, function(eR2) {
+                console.error('[chat-delete] retry: targeted IDB delete failed for chat ' + chatId, eR2);
+            });
+        } catch (eR3) {
+            console.error('[chat-delete] retry: targeted IDB delete threw for chat ' + chatId, eR3);
+        }
+    }, 3000);
 }
 
 function togglePinChat(chatId) {

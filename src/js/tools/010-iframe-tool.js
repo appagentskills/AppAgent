@@ -992,6 +992,13 @@ async function _executeIframeToolImpl(args) {
                 // Refresh inline widget if visible
                 var inlineContainer = document.getElementById('widget-content-' + widgetId);
                 if (inlineContainer) {
+                    // Release the old iframe's onWidgetResize 'message' listener
+                    // before nuking it — every other teardown path calls
+                    // __widgetCleanup (tools/080-widget-tools.js deactivate/modal,
+                    // ui/250-message-render.js); innerHTML='' alone leaked one
+                    // inert listener per agent inline edit.
+                    var _oldIframe = inlineContainer.querySelector('iframe');
+                    if (_oldIframe && _oldIframe.__widgetCleanup) { try { _oldIframe.__widgetCleanup(); } catch (e) {} }
                     inlineContainer.innerHTML = '';
                     renderWidgetInContainer(widget, inlineContainer);
                 }

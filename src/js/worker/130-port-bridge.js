@@ -93,6 +93,10 @@ function _panelId(port) {
 function _serializeChatsSnapshot() {
     var out = {};
     Object.keys(chats).forEach(function(cid) {
+        // TOMBSTONE: never ship a `_deleted` entry to the panel — the page
+        // merges snapshot chats into its list (app/045-agent-port-bridge-page.js)
+        // and would re-add the just-deleted chat as an empty ghost row.
+        if (chats[cid] && chats[cid]._deleted) return;
         if (runningChatIds[cid] || (parkedToolCallsByChatId[cid] && parkedToolCallsByChatId[cid].length)) {
             out[cid] = chats[cid];
         }
@@ -652,6 +656,43 @@ function _handlePanelMessage(port, msg) {
             // chats[chatId] while a run is in flight for it, otherwise we
             // clobber the SW's in-flight tool_result placeholders / partial
             // assistant message and the next save persists an orphan shape.
+            // EXPLICIT-DELETE (tombstone lane) — checked BEFORE the guard
+            // below. A `_deleted` payload is not a stale panel snapshot, it is
+            // the user's delete command: deleteChat (ui/170-chat-management.js)
+            // posts { messages: [], _deleted: true } over this same
+            // 'update-chat' type. Dropping it because the chat is still
+            // registered as running is exactly how a deleted RUNNING chat
+            // resurrected — the page aborts the run and posts the tombstone in
+            // the same tick, this guard dropped it, and the next tool-boundary
+            // save re-put the row. A tombstone must never be silently dropped,
+            // so it is accepted unconditionally. That cannot clobber in-flight
+            // state: the loop captured its OWN reference to the record at run
+            // entry (`chat = chats[streamingChatId]`, app/030-agent-loop.js:538)
+            // and never re-reads the map, so an aborting run keeps writing to
+            // its detached object — which is never persisted again, because
+            // only entries still IN this map are saved. The tombstone itself
+            // can never be re-put (the save's desired filter keeps only
+            // messages.length > 0, worker/115-storage.js:116) and its key goes
+            // to the unbudgeted explicit-delete lane of the delete-pass.
+            // Belt-and-braces: also remove the row NOW (targeted, unbudgeted,
+            // worker/115-storage.js) so the delete is durable even if this SW
+            // is evicted before its next save. The tombstone carries no
+            // payload ids, so that call deletes the chat ROW only and never
+            // touches chat_payloads blobs (the page-side delete owns those; it
+            // has the full pre-delete record AND a hydration gate).
+            if (msg.chatId && msg.chat && msg.chat._deleted === true) {
+                chats[msg.chatId] = msg.chat;
+                if (typeof deleteChatFromDB === 'function') {
+                    try {
+                        Promise.resolve(deleteChatFromDB(msg.chatId, msg.chat)).then(function(ok) {
+                            if (!ok) console.warn('[port-bridge] tombstone: targeted delete of chat ' + msg.chatId + ' did not complete — the next save\'s explicit-delete lane retries it');
+                        }, function(eD) {
+                            console.error('[port-bridge] tombstone: targeted delete threw for chat ' + msg.chatId, eD);
+                        });
+                    } catch (eD2) { console.error('[port-bridge] tombstone: targeted delete threw for chat ' + msg.chatId, eD2); }
+                }
+                return;
+            }
             if (msg.chatId && msg.chat && !runningChatIds[msg.chatId]
                 && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[msg.chatId])) {
                 chats[msg.chatId] = msg.chat;
@@ -685,6 +726,37 @@ function _handlePanelMessage(port, msg) {
                     rmChat.versionHistory.push(rmEntry);
                     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                 } catch (e) { console.error('[port-bridge] record-mutation append failed', msg.chatId, e); }
+            });
+            return;
+
+        case 'widget-persist':
+            // Manual "edit widget code" save (saveWidgetCodeEdit in
+            // tools/080-widget-tools.js). The page already wrote its own chats
+            // mirror + IDB, but the SW is the authoritative writer: it keeps its
+            // own copy of every adopted chat and its saveChatsToStorage re-puts
+            // them all after every tool result (worker/115-storage.js), which
+            // used to silently revert the manual edit. Upsert by widget id — the
+            // SAME merge the agent path's result._widget_persist gets in
+            // worker/120-tool-routing.js — then persist. Boot-gated like
+            // 'record-mutation'; a missing chat after boot means the SW never
+            // adopted it, so there is no stale SW snapshot to clobber the page's
+            // own IDB save (skip loudly, mirroring the tool-routing warn).
+            (self._swBootReady || Promise.resolve()).then(function() {
+                try {
+                    var wpW = msg.widget;
+                    var wpChat = msg.chatId ? chats[msg.chatId] : null;
+                    if (!wpW || !wpW.id) return;
+                    if (!wpChat) {
+                        console.warn('[port-bridge] widget-persist skipped: no SW record for chat '
+                            + msg.chatId + ' (widget ' + wpW.id + ')');
+                        return;
+                    }
+                    if (!Array.isArray(wpChat.widgets)) wpChat.widgets = [];
+                    var wpIdx = wpChat.widgets.findIndex(function(w) { return w && w.id === wpW.id; });
+                    if (wpIdx !== -1) wpChat.widgets[wpIdx] = wpW;
+                    else wpChat.widgets.push(wpW);
+                    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                } catch (e) { console.error('[port-bridge] widget-persist upsert failed', msg.chatId, e); }
             });
             return;
 
@@ -964,6 +1036,22 @@ function _extractUnseenTrailingUserInput(inChat, swChat, pendInj) {
 async function _handlePanelSendMessage(msg) {
     var chatId = msg.chatId;
     if (!chatId) return;
+    // TOMBSTONE: `chats[chatId]` may be the {messages: [], _deleted: true}
+    // tombstone parked by the 'update-chat' explicit-delete lane above. It is
+    // TRUTHY, so the `if (!chats[chatId])` below leaves it in place and the
+    // idle branch pushes the user message straight onto it — giving it
+    // messages.length > 0, which re-admits it to `desired`
+    // (worker/115-storage.js:116), drops it out of the unbudgeted
+    // explicit-delete lane (:155) and RE-PUTS the deleted row at the
+    // `await saveChatsToStorage()` below. That save runs BEFORE the runAgent
+    // at the tail, so the tombstone guard in app/030-agent-loop.js does not
+    // cover this path — it has to be stopped here. A send addressed to a chat
+    // the user just deleted (stale panel mirror, or a queued send racing the
+    // delete in the same tick) is not a chat the user wants resurrected.
+    if (chats[chatId] && chats[chatId]._deleted) {
+        console.warn('[port-bridge] send-message dropped: chat ' + chatId + ' is deleted (tombstone)');
+        return;
+    }
     if (!chats[chatId]) chats[chatId] = msg.chat || { id: chatId, messages: [] };
 
     // MEMFIX: rehydrate a payload-evicted chat BEFORE the idle branch pushes
@@ -1107,7 +1195,18 @@ function resumeRunningCheckpoints(checkpoints) {
                 // settled record + handle. Reap the stale checkpoint so the
                 // alarm-driven path (background.js → this function) can't
                 // revive it later either.
-                var _chatRow = (typeof chats !== 'undefined') ? chats[cp.chatId] : null;
+                // TOMBSTONE: a `_deleted` entry is the user's delete command
+                // parked in the map (see the 'update-chat' explicit-delete
+                // lane above), NOT a live chat row. Left truthy it defeats
+                // BOTH missing-chat reapers below (:1206 sub / :1233
+                // CKPT-POISON), so a crashed run — whose checkpoint stays
+                // {status:'running'} because 110-agent-checkpoint.js has no
+                // runCrashed handler while app/030-agent-loop.js:1605 clears
+                // runningChatIds — would reach runAgent() and start an
+                // empty-transcript run on a deleted chat, re-putting the row.
+                // Treat it as missing.
+                var _chatRowRaw = (typeof chats !== 'undefined') ? chats[cp.chatId] : null;
+                var _chatRow = (_chatRowRaw && _chatRowRaw._deleted === true) ? null : _chatRowRaw;
                 var _looksSub = ((cp.chatId || '').indexOf('chat_sub_') === 0)
                     || !!(_chatRow && _chatRow.isSubAgent);
                 if (_looksSub) {

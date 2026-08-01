@@ -3,11 +3,13 @@
 
 async function loadDashboardWidgets() {
     try {
-        // Load header visibility state from localStorage
-        var savedHeaderState = appStorage.getItem('showDashboardHeaders');
-        if (savedHeaderState !== null) {
-            showDashboardHeaders = savedHeaderState === 'true';
-        }
+        // Headers feature retired: #749 removed home headers, #752 removed the
+        // main-dashboard toggle (toggleDashboardHeaders) — leaving this key
+        // orphaned with NO writer. A persisted 'true' from a pre-#752 build kept
+        // headers forever ON and hid the floating hover expand/drag control
+        // (.show-headers hid .dashboard-widget-hover-btn), with no UI left to
+        // turn it off. One-time purge; dashboards are always headerless now.
+        appStorage.removeItem('showDashboardHeaders');
         
         var database = await openDatabase();
         var transaction = database.transaction([dashboardWidgetsStoreName], 'readonly');

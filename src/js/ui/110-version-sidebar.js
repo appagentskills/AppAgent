@@ -31,7 +31,11 @@ async function downloadSingleFile(table, sysId, displayName) {
 
 // Delete a new record from the sidebar (simpler version without userMsgIdx)
 async function deleteNewRecordFromSidebar(table, sysId, displayName) {
-    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
+    // displayName is RECORD-CONTROLLED (getRecordDisplayValue in core/150-record-helpers.js
+    // returns name || number || short_description straight off the ServiceNow Table API),
+    // and showModal renders the confirm message as HTML. Escape it here — the same
+    // pattern already used by ui/070-dashboard-ui.js:1492 and ui/170-chat-management.js.
+    if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
 
     try {
         showSpinner('Deleting ' + displayName + '...');
@@ -95,7 +99,9 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
     var entry = versionHistory[historyIndex];
     if (!entry) return;
     
-    var confirmMsg = 'Revert ' + entry.displayName + ' to ' + (revertType === 'before' ? 'before' : 'after') + ' this change?';
+    // entry.displayName originates from the ServiceNow record (see comment in
+    // deleteNewRecordFromSidebar above) and lands in an HTML sink — escape it.
+    var confirmMsg = 'Revert ' + escapeHtml(entry.displayName) + ' to ' + (revertType === 'before' ? 'before' : 'after') + ' this change?';
     if (!await showConfirmModal('Revert Change', confirmMsg)) return;
     
     try {

@@ -685,7 +685,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'list_instances',
-            description: 'List all connected ServiceNow instances with their connection status, user info, and short names. Use this to discover which instances are available before targeting them with servicenow_api or iframe_tool.',
+            description: 'List all connected ServiceNow instances with their connection status, user info, and short names. Use this to discover which instances are available before targeting them with servicenow_api or iframe_tool. Instances the user has DISABLED for agent use (via the header instance picker) are EXCLUDED from the targetable list and returned separately in a `disabledInstances` field \u2014 never target those: any tool call against a disabled instance (explicit `instance` arg or the active instance) is refused with an error until the user re-enables it.',
             parameters: {
                 type: 'object',
                 properties: {

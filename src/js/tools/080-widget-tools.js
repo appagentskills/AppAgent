@@ -697,6 +697,23 @@ async function saveWidgetCodeEdit(widgetId) {
         }
         await saveChatsToStorage();
         _savedToChat = true;
+        // SW-MIRROR: the write above landed in the PAGE realm only. Once the SW
+        // has adopted this chat (worker/130-port-bridge.js `if (!chats[chatId])`)
+        // it keeps its OWN copy and re-puts EVERY held chat from SW memory after
+        // every tool result (worker/115-storage.js) — without a mirror this
+        // manual edit is silently reverted by the next tool result in ANY chat.
+        // The agent edit path mirrors via result._widget_persist on the tool
+        // result (tools/010-iframe-tool.js edit_html -> worker/120-tool-routing.js);
+        // a manual save has no tool result flowing to the SW, so post the same
+        // upsert over the agent bus instead ('widget-persist' handler in
+        // worker/130-port-bridge.js). This file is page-only (not in
+        // WORKER_SHARED_FILES), but _agentBusPort can be null before the bridge
+        // connects — same guard as trackRecordMutation (tools/020-tool-execution.js).
+        try {
+            if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+                _agentBusPort.postMessage({ type: 'widget-persist', chatId: owningChatId, widget: widget });
+            }
+        } catch (e) { /* stale port — the page IDB save above holds the edit until the next SW save */ }
     } else {
         // No live chat holds this widget: the pre-fix code fell through silently and
         // still told the user "Widget saved" for an edit that was never persisted.

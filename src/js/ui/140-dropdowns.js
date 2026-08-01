@@ -177,10 +177,13 @@ function renderToolPermissions() {
     html += '</div>';
 
     if (host) {
-        // ServiceNow CRUD
+        // ServiceNow CRUD + server-side script execution. Keys come from the
+        // canonical list (_snPermissionKeys -> INSTANCE_PERMISSION_KEYS in
+        // core/070-permissions.js, see ui/040-tools-settings.js) rather than a
+        // hardcoded array, which is what silently dropped 'sn:run_script'.
         html += '<div class="tool-permission-group">';
         html += '<div class="tool-permission-group-title">ServiceNow API</div>';
-        ['sn:read', 'sn:create', 'sn:update', 'sn:delete'].forEach(function(key) {
+        _snPermissionKeys().forEach(function(key) {
             html += _renderInstancePermItem(key, isAutoTier);
         });
         html += '</div>';

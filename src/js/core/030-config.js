@@ -291,6 +291,17 @@ var DEFAULT_TIER_ALIASES = {
     large: 'Fable 5'
 };
 var subAgentTierAliases = null; // null = not yet hydrated from IDB
+// Special alias value: a tier mapped to TIER_ALIAS_SAME resolves to NO
+// concrete provider — spawns through that tier behave exactly like an
+// explicit tier:'same' spawn (dynamic follow of the spawning agent's
+// current model, re-resolved at EACH LLM call via chats[chatId].same_as /
+// resolveChatProviderName). Stored in the same subagentTierAliases map as
+// concrete provider names; the sentinel is namespaced so it can never
+// collide with a real apiProviders name shown in the pickers. Consumers:
+// checkTier in _resolveSpawnProvider (core/097-sub-agent-registry.js) and
+// the two tier-picker UIs (ui/040-tools-settings.js renderTierAliasSettings,
+// ui/160-notifications.js _tierMenuRowsHtml).
+var TIER_ALIAS_SAME = '__same__';
 
 // Merged view: stored overrides win, defaults fill the gaps.
 function getTierAliasMap() {
@@ -302,7 +313,8 @@ function getTierAliasMap() {
     return out;
 }
 
-// tier → provider name, or null when the tier is unknown.
+// tier → provider name (or the TIER_ALIAS_SAME sentinel when the tier is
+// mapped to the "Same" option), or null when the tier is unknown.
 function resolveTierAlias(tier) {
     if (!tier) return null;
     var key = String(tier).toLowerCase();

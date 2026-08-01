@@ -534,7 +534,16 @@ function executeAfterResponseHooks(chatId) {
     // still delivers the hook run.
     var _hookDeliver = function() {
         var hchat = chats[chatId];
-        if (!hchat || !Array.isArray(hchat.messages)) return;
+        // TOMBSTONE: this re-read happens AFTER the ensureChatPayloads await
+        // below, so the user can have deleted the chat in the gap — the
+        // 'update-chat' explicit-delete lane (worker/130-port-bridge.js)
+        // installs a {messages: [], _deleted: true} tombstone in this very
+        // map. Pushing the hook message onto it would give it
+        // messages.length === 1, which re-admits it to `desired`
+        // (worker/115-storage.js:116), drops it out of the explicit-delete
+        // lane (:153) and RE-PUTS the deleted row — and the runAgent() below
+        // would start a fresh LLM run on a deleted chat. Bail out.
+        if (!hchat || hchat._deleted || !Array.isArray(hchat.messages)) return;
         hchat.messages.push({
             role: 'user',
             content: instruction,

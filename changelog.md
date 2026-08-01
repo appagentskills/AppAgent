@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.20
+
+### Features
+- Sub-agent tier pickers gained a "Same" option: sub-agents follow the parent's current model instead of a fixed one.
+- Instance picker: stale instances can be removed with ✕, and live ones can be disabled for the agent with a toggle.
+
+### Fixes
+- Widgets now follow theme changes live, without a page reload.
+- Sidebar PR cards no longer vanish after sub-agent cleanup, and reverting a dashboard widget no longer stacks duplicate history entries.
+- Fixed "executeTool is not defined" when widgets are rendered from a deep link.
+
+---
+
 ## v1.1.19
 
 ### Features

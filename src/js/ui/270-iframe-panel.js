@@ -216,6 +216,23 @@ function openWidgetInIframePanel(widgetId) {
 function openBrowserWithUrl(source, openedByAI) {
     if (source && typeof source === 'object' && source.preventDefault) source.preventDefault();
 
+    // Read the typed URL BEFORE any branching. The full-tab arm below returns
+    // early, and it used to do so before this lookup ever ran — so whatever the
+    // user typed into the visible bar was discarded and the tab always landed on
+    // the instance root. `source === 'home'` is passed by the home header's copy
+    // of the bar (html/body.html:266), which owns a DIFFERENT input id
+    // (#home-browser-url-input); the param was accepted but never used, so the
+    // home bar read the chat header's input instead. Null-guarded like
+    // openUIPageInBrowser — neither input exists on every host page.
+    var urlInput = document.getElementById(source === 'home' ? 'home-browser-url-input' : 'browser-url-input')
+        || document.getElementById('browser-url-input');
+    var url = (urlInput && urlInput.value ? urlInput.value.trim() : '') || '/';
+    // A bare path typed without the leading slash ('incident_list.do') would
+    // resolve against the extension page, not the instance — normalise it.
+    if (url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0 && url.charAt(0) !== '/') {
+        url = '/' + url;
+    }
+
     // Full-tab mode: open side panel + navigate current tab to SN instance
     if (!document.body.classList.contains('sidepanel-mode')) {
         var snUrl = Platform.instanceUrl;
@@ -223,25 +240,27 @@ function openBrowserWithUrl(source, openedByAI) {
             showSnackbar('No ServiceNow instance connected. Open a ServiceNow page first.', 'error');
             return;
         }
+        // Honour the typed path: resolveUrl prefixes the instance for a
+        // leading-slash path and passes an absolute URL through untouched.
+        // '/' (the default) resolves to the instance root — the old behaviour.
+        var navUrl = Platform.resolveUrl(url);
         // Save chat state before leaving
         appStorage.setItem('lastChatId', currentChatId);
         saveChatsToStorage().then(function() {
             // Open side panel (user gesture from click — this works)
             if (typeof chrome !== 'undefined' && chrome.sidePanel) {
                 chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT }).then(function() {
-                    window.location.href = snUrl;
+                    window.location.href = navUrl;
                 }).catch(function() {
-                    window.location.href = snUrl;
+                    window.location.href = navUrl;
                 });
             } else {
-                window.location.href = snUrl;
+                window.location.href = navUrl;
             }
         });
         return;
     }
 
-    var urlInput = document.getElementById('browser-url-input');
-    var url = urlInput.value.trim() || '/';
     openIframePanel();
     navigateIframe(url);
 }

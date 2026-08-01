@@ -238,16 +238,12 @@
                 <span class="dashboard-title">Dashboard</span>
                 <div class="dashboard-actions" id="dashboard-actions">
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
-                    <button class="skills-action-btn dashboard-action-collapsible" id="dashboard-toggle-headers-btn" onclick="toggleDashboardHeaders()" title="Toggle Headers"><span class="action-icon" id="headers-toggle-icon"></span>Headers</button>
-                    <button class="skills-action-btn dashboard-action-collapsible" id="dashboard-refresh-all-btn" onclick="refreshAllDashboardWidgets()" title="Regenerate All Widgets"><span class="action-icon"></span>Regenerate All</button>
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="importDashboard()" title="Import"><span class="action-icon"></span>Import</button>
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="exportDashboard()" title="Export"><span class="action-icon"></span>Export</button>
                     <div class="dashboard-more-btn">
                         <button class="skills-action-btn" onclick="toggleDashboardMoreMenu(event)"><span class="action-icon"></span>More</button>
                         <div class="dashboard-more-dropdown" id="dashboard-more-dropdown">
                             <button onclick="openDashboardInNewTab(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-standalone-icon"></span>Open Standalone</button>
-                            <button onclick="toggleDashboardHeaders(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-headers-icon"></span>Headers</button>
-                            <button onclick="refreshAllDashboardWidgets(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-refresh-icon"></span>Regenerate All</button>
                             <button onclick="importDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-import-icon"></span>Import</button>
                             <button onclick="exportDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-export-icon"></span>Export</button>
                         </div>

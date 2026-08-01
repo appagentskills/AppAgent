@@ -1,25 +1,3 @@
-// Toggle dashboard headers visibility — ONE global state shared by the
-// dashboard-page toolbar button, its More-dropdown entry, and the home
-// section's compact headers button.
-function toggleDashboardHeaders() {
-    showDashboardHeaders = !showDashboardHeaders;
-    appStorage.setItem('showDashboardHeaders', showDashboardHeaders);
-    syncDashboardHeadersUI();
-}
-
-// Live-patch the MAIN dashboard grid (#dashboard-grid) and its headers-toggle
-// control to the current showDashboardHeaders state. The home-page grid is
-// deliberately excluded: home widget cards never render a header at all
-// (buildWidgetHtml skips it for dashboard === 'home') and have no toggle.
-// Every element is optional (the dashboard panel may not be in the DOM), so
-// each lookup is guarded.
-function syncDashboardHeadersUI() {
-    var grid = document.getElementById('dashboard-grid');
-    if (grid) grid.classList.toggle('show-headers', showDashboardHeaders);
-    var btn = document.getElementById('dashboard-toggle-headers-btn');
-    if (btn) btn.classList.toggle('active', showDashboardHeaders);
-}
-
 // Dashboard responsive More menu
 function toggleDashboardMoreMenu(e) {
     e.stopPropagation();
@@ -418,15 +396,15 @@ function buildWidgetHtml(widget, dashboard) {
     html += '</div>';
     html += '</div>';
     }
-    // #732/#730: with headers hidden (showDashboardHeaders=false is the default,
-    // core/130-indexeddb.js:106) the header — which carries the Expand button and
-    // the only usable grab surface (the content iframe swallows mouse events) — is
-    // display:none, leaving the card inert: no expand, no drag. This small floating
-    // hover-only control restores both: click runs the SAME expandDashboardWidget
-    // action as the header button, and it is draggable through the SAME
+    // #732/#730: the header — which carries the Expand button and the only usable
+    // grab surface (the content iframe swallows mouse events) — is display:none
+    // permanently (headers retired: #749/#752 removed the toggles; the orphaned
+    // showDashboardHeaders setting is purged in loadDashboardWidgets), which
+    // would leave the card inert: no expand, no drag. This small floating
+    // hover-only control provides both: click runs the SAME expandDashboardWidget
+    // action as the (hidden) header button, and it is draggable through the SAME
     // handleWidgetDragStart the card root uses (stopPropagation so the root's
-    // bubbled ondragstart doesn't run it twice). Hidden under .show-headers — the
-    // header supplies both affordances there (css/19-dashboard.css).
+    // bubbled ondragstart doesn't run it twice).
     html += '<button class="dashboard-widget-hover-btn" draggable="true" ';
     html += 'ondragstart="event.stopPropagation();handleWidgetDragStart(event, \'' + widget.id + '\')" ';
     html += 'onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" ';
@@ -1054,7 +1032,14 @@ async function pinWidgetTo(widgetId, target) {
         await removeWidgetFromDashboard(widgetId);
         return;
     }
-    target = target === 'home' ? 'home' : 'main';
+    if (target !== 'home' && target !== 'main') {
+        // Reject unknown targets instead of silently coercing them to 'main'.
+        // Known callers pass literals only: the pin menu (:1007-1010) and
+        // executePinWidget (tools/080-widget-tools.js:165, pre-validated).
+        console.warn('pinWidgetTo: unknown target "' + target + '"');
+        if (typeof showSnackbar === 'function') showSnackbar('Unknown pin target: ' + String(target), 'error');
+        return null;
+    }
     var existing = dashboardWidgets[widgetId];
     if (existing) {
         if (widgetDashboardOf(existing) !== target) {
@@ -1332,13 +1317,28 @@ async function revertWidgetToHistory(widgetId, historyIndex) {
     
     var historyEntry = widget.history[historyIndex];
     
-    // Save current as new history entry before reverting
-    if (widget.html) {
-        widget.history.push({
-            html: widget.html,
-            timestamp: Date.now(),
-            prompt: widget.lastPrompt || 'Before revert'
+    // Save current html as a safety snapshot before reverting — but only when
+    // it would actually preserve something: skip when reverting to identical
+    // content (no-op revert), and skip when the current html already exists
+    // anywhere in history (bouncing A<->B must not stack duplicate entries).
+    // saveDashboardWidget is called with skipHistory=true below, so its own
+    // dedup guard and cap never run here — we enforce both ourselves.
+    if (widget.html && widget.html !== historyEntry.html) {
+        var alreadyPreserved = widget.history.some(function(entry) {
+            return entry && entry.html === widget.html;
         });
+        if (!alreadyPreserved) {
+            widget.history.push({
+                html: widget.html,
+                timestamp: Date.now(),
+                prompt: 'Auto-saved before revert'
+            });
+            // Keep only last 10 versions — mirrors the cap in saveDashboardWidget
+            // (src/js/ui/020-dashboard.js); no shared constant exists, keep in sync.
+            if (widget.history.length > 10) {
+                widget.history = widget.history.slice(-10);
+            }
+        }
     }
     
     // Restore the old HTML
@@ -1483,84 +1483,6 @@ async function runWidgetPrompt(widget, prompt) {
     // Restore original context
     currentChatId = originalChatId;
     currentEditingWidget = originalEditingWidget;
-}
-
-async function refreshAllDashboardWidgets() {
-    var widgetList = Object.values(dashboardWidgets);
-    if (widgetList.length === 0) {
-        showSnackbar('No widgets to refresh', 'error');
-        return;
-    }
-    
-    if (dashboardRefreshing) {
-        showSnackbar('Already refreshing...', 'warning');
-        return;
-    }
-    
-    dashboardRefreshing = true;
-    var refreshBtn = document.getElementById('dashboard-refresh-all-btn');
-    if (refreshBtn) {
-        refreshBtn.disabled = true;
-        refreshBtn.innerHTML = '<span class="action-icon">' + UI_ICONS.spinner + '</span>Regenerating...';
-    }
-    
-    var skippedWidgets = [];
-    var regeneratedCount = 0;
-
-    for (var i = 0; i < widgetList.length; i++) {
-        var widget = widgetList[i];
-        var prompt = widget.prompt;
-
-        // Try to get prompt from source chat if not directly available
-        if (!prompt && widget.chatId && chats[widget.chatId]) {
-            var sourceChat = chats[widget.chatId];
-            var msgIndex = widget.msgIndex || sourceChat.messages.length;
-            for (var j = msgIndex - 1; j >= 0; j--) {
-                if (sourceChat.messages[j] && sourceChat.messages[j].role === 'user') {
-                    prompt = sourceChat.messages[j].content;
-                    widget.prompt = prompt; // Store for future use
-                    break;
-                }
-            }
-        }
-
-        // Check if we can regenerate this widget
-        if (!prompt) {
-            var reason = 'no prompt found';
-            if (widget.chatId && !chats[widget.chatId]) {
-                reason = 'source chat was deleted';
-            }
-            skippedWidgets.push({ title: widget.title, reason: reason });
-            showSnackbar('Skipping "' + widget.title + '": ' + reason, 'warning');
-            continue;
-        }
-
-        showSnackbar('Regenerating ' + (regeneratedCount + 1) + '/' + widgetList.length + ': ' + widget.title, 'success');
-
-        // Show loading on this widget
-        widget.isLoading = true;
-        refreshVisibleDashboards();
-
-        widget.conversation = [];
-        await runWidgetPrompt(widget, prompt);
-
-        widget.isLoading = false;
-        refreshVisibleDashboards();
-        regeneratedCount++;
-    }
-
-    dashboardRefreshing = false;
-    if (refreshBtn) {
-        refreshBtn.disabled = false;
-        refreshBtn.innerHTML = '<span class="action-icon">' + UI_ICONS.refresh + '</span>Regenerate All';
-    }
-
-    // Show final status
-    if (skippedWidgets.length > 0) {
-        showSnackbar(regeneratedCount + ' widgets regenerated, ' + skippedWidgets.length + ' skipped', 'warning');
-    } else {
-        showSnackbar('All ' + regeneratedCount + ' widgets regenerated', 'success');
-    }
 }
 
 async function confirmDeleteDashboardWidget(widgetId) {
@@ -2175,6 +2097,12 @@ async function saveChatsToStorage() {
                 // remaining instead of dropping it wholesale, so a partial
                 // budget is spent, not wasted (F2-2). When the budget is fully
                 // spent the slice is empty, so deletes still halt.
+                // EXPLICIT-DELETE: this cap/budget applies ONLY to this bulk
+                // "absent from memory" diff. An explicit user delete no longer
+                // depends on this pass at all — deleteChat (ui/170-chat-management.js)
+                // calls deleteChatFromDB below, a targeted single-id delete that is
+                // neither capped nor budgeted (the SW mirror gets the same exemption
+                // via `_deleted` tombstones in worker/115-storage.js).
                 if (_delKeys.length && _wipeGuardDeletedSinceLoad + _delKeys.length > WIPE_GUARD_MAX_DELETES_PER_BOOT) {
                     console.warn('[storage] delete-pass TRIMMED (wipe-guard-3): '
                         + _wipeGuardDeletedSinceLoad + ' of a ' + WIPE_GUARD_MAX_DELETES_PER_BOOT
@@ -2261,6 +2189,121 @@ async function saveChatsToStorage() {
             _w.forEach(function(r) { try { r(); } catch (e) {} });
         }
     }
+}
+
+// EXPLICIT-DELETE (chat-delete durability): targeted, single-id removal of ONE
+// chat row (plus the payload blob rows only that chat referenced).
+// Deliberately does NOT go through the diff-save above. That delete-pass is a
+// BULK reconciliation of "rows on disk that are absent from the in-memory
+// map", so it is rate-limited (5 per save) and budgeted
+// (WIPE_GUARD_MAX_DELETES_PER_BOOT per realm boot) to contain a partially-
+// hydrated map turning into a mass wipe. An explicit user delete is a
+// different operation — one known id, requested by the user — and must never
+// be capped, budgeted or deferred: once the per-boot budget was spent the
+// diff-save's delete-pass went dead for the rest of the realm's life and every
+// deleted chat resurrected on reload (the exact failure the guard was added to
+// prevent). The bulk guard is left untouched.
+// `chatSnapshot` is the record as it was BEFORE the caller dropped it from
+// `chats` (deleteChat captures it) — used only to find this chat's payload ids.
+// Resolves true when the delete transaction completed, false on failure.
+async function deleteChatFromDB(chatId, chatSnapshot) {
+    if (!chatId) return false;
+    // chat_payloads rows are keyed by file_id/screenshot_id (core/130-indexeddb.js),
+    // never by chat id, and those ids survive payload eviction — so even a
+    // stripped record still lists them. Reap only the ids no OTHER surviving
+    // in-memory chat references (same reference rule as sweepOrphanChatPayloads,
+    // without its 24h age gate: this delete is explicit, not a speculative sweep).
+    var _mine = _chatPayloadIdsFor(chatSnapshot);
+    var payloadIds = Object.keys(_mine);
+    // HYDRATION GATE — the same precondition sweepOrphanChatPayloads enforces
+    // (core/130-indexeddb.js:1011). The "minus every blob a SURVIVING chat
+    // still references" subtraction below is only sound when `chats` holds
+    // EVERY chat. On a partially-hydrated map (boot still loading) or a
+    // degraded one (IDB read failed — _chatsHydrated stays false), a
+    // survivor's reference is invisible, so its blob looks unreferenced and
+    // gets deleted out from under a live chat. When the map is not
+    // known-complete, DEFER blob cleanup instead of deleting blind: the boot
+    // orphan sweep reaps genuinely unreferenced rows later (gated on the same
+    // flag, plus its 24h age floor). The chat ROW delete below still runs —
+    // deferring blob cleanup must never block the delete the user asked for.
+    if (payloadIds.length && !(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) {
+        console.warn('[storage] explicit delete: chats map not fully hydrated — deferring '
+            + payloadIds.length + ' payload blob row(s) of chat ' + chatId
+            + ' to the boot orphan sweep; deleting the chat row only');
+        payloadIds = [];
+    }
+    if (payloadIds.length) {
+        var _stillReferenced = {};
+        Object.keys(chats).forEach(function(cid) {
+            if (cid === chatId) return;
+            var _other = _chatPayloadIdsFor(chats[cid]);
+            Object.keys(_other).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
+        });
+        payloadIds = payloadIds.filter(function(pid) { return !_stillReferenced[pid]; });
+    }
+    var _txAbortErr = null;
+    try {
+        var _committed = await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
+            var store = transaction.objectStore(chatStoreName);
+            var payloadStore = transaction.objectStore(chatPayloadsStoreName);
+            return new Promise(function(_resolve) {
+                // Same settle-guard discipline as saveChatsToStorage: settle
+                // EXACTLY once, and never wedge if the transaction aborts.
+                // ABORT = FAILURE (PR #761 follow-up): an abort ROLLS BACK every
+                // delete in this transaction, so settling it as success made the
+                // function log "removed from IDB" and return true while the row
+                // was still on disk. Settle false instead — still resolve, never
+                // reject, so the never-throw contract holds. Success settles on
+                // COMMIT (transaction.oncomplete), not on the last request's
+                // onsuccess: a request error (nothing here calls preventDefault)
+                // aborts the tx AFTER that request settles, so the old
+                // per-request counter resolved success before the abort event
+                // could fire.
+                var _settled = false;
+                function settle(ok) { if (_settled) return; _settled = true; _resolve(ok); }
+                transaction.oncomplete = function() { settle(true); };
+                transaction.onabort = function() { _txAbortErr = transaction.error || null; settle(false); };
+                store.delete(chatId);
+                payloadIds.forEach(function(pid) {
+                    payloadStore.delete(pid);
+                    // Drop the known-durable cache entry so a future put of the
+                    // same id isn't skipped (mirrors sweepOrphanChatPayloads).
+                    try { if (typeof _persistedPayloadIds !== 'undefined' && _persistedPayloadIds) delete _persistedPayloadIds[pid]; } catch (e) {}
+                });
+            });
+        });
+        if (!_committed) {
+            console.warn('[storage] explicit delete ABORTED for chat ' + chatId
+                + ' — transaction rolled back, nothing was removed', _txAbortErr || '');
+            return false;
+        }
+        console.log('[storage] explicit delete: chat ' + chatId + ' removed from IDB'
+            + (payloadIds.length ? ' (+' + payloadIds.length + ' payload rows)' : ''));
+        // Keep the degraded-mode chrome.storage.local index in step with the
+        // store, exactly as a committed save does.
+        try { mirrorChatIndexToLocal(); } catch (e) {}
+        return true;
+    } catch (e) {
+        console.error('[storage] explicit delete FAILED for chat ' + chatId, e);
+        return false;
+    }
+}
+
+// Payload ids (file_id / screenshot_id) a chat record references. Ids survive
+// payload eviction, so a stripped record still reports them.
+function _chatPayloadIdsFor(chat) {
+    var ids = {};
+    if (!chat) return ids;
+    if (Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (!m) continue;
+            if (m.file_id) ids[m.file_id] = true;
+            if (m.screenshot_id) ids[m.screenshot_id] = true;
+        }
+    }
+    if (chat.screenshots) Object.keys(chat.screenshots).forEach(function(k) { ids[k] = true; });
+    return ids;
 }
 
 async function loadProviderFromStorage() {

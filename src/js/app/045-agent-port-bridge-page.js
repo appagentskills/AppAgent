@@ -555,6 +555,30 @@ function _handleAgentBusMessage(msg) {
                     _mergedVH.sort(function(a, b) { return (a && a.timestamp || 0) - (b && b.timestamp || 0); });
                     _inChat.versionHistory = _mergedVH;
                 }
+                // WIDGET-MERGE: a manual widget code save (saveWidgetCodeEdit in
+                // tools/080-widget-tools.js) bumps contentVersion page-side and
+                // mirrors to the SW over the bus ('widget-persist'), but a snapshot
+                // generated BEFORE the SW processed that mirror can land here right
+                // after the save — the wholesale replace below would revert the
+                // page's fresh edit until the next snapshot. Keep the page copy
+                // only when its contentVersion is STRICTLY greater (agent edit_html
+                // bumps the page's live object first and mirrors synchronously via
+                // the tool result, so a same-version tie means same content — the
+                // snapshot may win it). Membership is untouched: page-only widgets
+                // are NOT grafted in and snapshot-only widgets are kept (the SW
+                // snapshot stays authoritative for the widget LIST).
+                if (_prevChat && Array.isArray(_prevChat.widgets) && _prevChat.widgets.length
+                    && Array.isArray(_inChat.widgets) && _inChat.widgets.length) {
+                    var _inWIdx = {};
+                    _inChat.widgets.forEach(function(w, i) { if (w && w.id) _inWIdx[w.id] = i; });
+                    _prevChat.widgets.forEach(function(pw) {
+                        if (!pw || !pw.id || !(pw.id in _inWIdx)) return;
+                        var _iw = _inChat.widgets[_inWIdx[pw.id]];
+                        if ((pw.contentVersion || 0) > ((_iw && _iw.contentVersion) || 0)) {
+                            _inChat.widgets[_inWIdx[pw.id]] = pw;
+                        }
+                    });
+                }
                 // RES-5: keep pending prompt_user / approval rows the SW
                 // snapshot can't know about (see _mergePagePendingRows).
                 _mergePagePendingRows(_prevChat, _inChat, msg.detail.chatId); // PR383-F3: chatId for approval re-key

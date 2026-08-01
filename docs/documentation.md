@@ -125,7 +125,7 @@ Configure AppAgent preferences. [Open Settings →](app:openSettingsPageView)
 - **Agent Model** — Choose which LLM to use
 - **API Providers** — Add or edit providers (Anthropic, OpenRouter, custom). Supports API-key and OAuth (Claude Code sign-in) providers
 - **LLM Endpoints** — Named `URL + API key` pairs; point the extension at any OpenAI-compatible LLM API
-- **Sub-Agent Model Tiers** — Map the small / medium / large tiers to concrete models
+- **Sub-Agent Model Tiers** — Map the small / medium / large tiers to concrete models, or pick **Same** to make a tier dynamically follow the spawning agent's current model (same behavior as spawning with `tier: "same"`)
 - **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. `xhigh` is accepted on Opus 4.7/4.8 and Fable/Mythos 5 on Anthropic directly (other models top out at `high`/`max`); OpenRouter maps unsupported values to the nearest supported level
 - **Max Tokens & Thinking Budget** — Global caps on response length (64k default) and extended-thinking budget (32k default)
 - **Context Window** — Set the assumed context-window size that drives the context indicator and saturation warnings

@@ -202,16 +202,116 @@ async function init() {
         }
     });
 
-    // Global Escape handler — closes the topmost overlay/modal
+    // Global Escape handler — closes the topmost open dismissable surface.
+    //
+    // CLASS-FIRST, not an id list. The previous version only knew the permanent
+    // #modal-overlay, so every dynamically-created twin that reuses the SAME
+    // class with a different id (#github-setup-modal, #llm-endpoint-modal,
+    // #api-provider-modal, …) was unclosable by Escape, as were the jobs
+    // dropdown, the gear settings panel and the action popovers. That is the
+    // same lesson the Alt+ArrowLeft guard below already learned: an id list
+    // silently misses every surface added later.
+    //
+    // Precedence = innermost / most-recently-opened first, following the
+    // z-index ladder in css/00-tokens.css:
+    //   --z-modal (10006)        .modal-overlay.show — permanent + dynamic twins
+    //   --z-widget-modal          widget overlays, .action-result-popover
+    //   --z-overlay (10000)       #diff-viewer-overlay (css/16-diff.css:2)
+    //   --z-jobs-dropdown (9000)  .header-menu pills (jobs, gear, model, ws, usage)
+    //
+    // Surfaces that register their OWN document-level Escape handler are
+    // deliberately NOT handled here (double-close / leaked listeners):
+    //   #tool-inspector-modal  ui/040-tools-settings.js:62-68 — skipped explicitly below
+    //   #jobs-expand-overlay   tools/120-actions.js:3468-3470 — capture phase +
+    //                          stopPropagation, so the key never reaches us
+    //   .sdoc-preview-overlay  tools/110-smart-documents.js:846
+    //   .wsf-overlay           ui/115-workspace-files-sidebar.js:305
+    //   usage tooltip          ui/170-chat-management.js:366-370
+    //
+    // Nothing open ⇒ every branch falls through ⇒ harmless no-op. Nothing here
+    // calls preventDefault/stopPropagation, so Escape keeps whatever meaning it
+    // has in a focused input/textarea/iframe and the other handlers above still
+    // see the key — the handler never swallows it.
     document.addEventListener('keydown', function(e) {
         if (e.key !== 'Escape') return;
-        // Order: highest z-index first
+        // 1. The generic modal (--z-modal 10006) stacks ABOVE the widget
+        // overlays — confirm dialogs spawn from the widget fullscreen / editor
+        // (e.g. Delete Widget) — so it closes first.
+        var modal = document.getElementById('modal-overlay');
+        if (modal && modal.classList.contains('show')) { closeModal(); return; }
+        // 2. Widget overlays, each with a dedicated close fn. Checked BEFORE the
+        // generic .modal-overlay.show sweep so #widget-history-modal-overlay
+        // (ui/070-dashboard-ui.js:1376-1381 — it also carries that class) is
+        // closed by closeWidgetHistory() rather than by the generic path.
         if (document.getElementById('widget-fullscreen-overlay')) { closeWidgetFullscreen(); return; }
         if (document.getElementById('widget-edit-overlay')) { closeWidgetCodeEdit(); return; }
         if (document.getElementById('widget-modal-overlay')) { closeWidgetModal(); return; }
         if (document.getElementById('widget-history-modal-overlay')) { closeWidgetHistory(); return; }
-        var modal = document.getElementById('modal-overlay');
-        if (modal && modal.classList.contains('show')) { closeModal(); return; }
+        // 3. Every OTHER .modal-overlay.show — the dynamic twins built by
+        // showGitHubSetupModal (tools/130-github-setup.js:53-56),
+        // showLlmEndpointModal (ui/040-tools-settings.js:1593-1596),
+        // showApiProviderModal (:1756-1759) and anything added later. They are
+        // appended to <body> in open order, so the LAST match is the most
+        // recently opened one. Every twin assigns
+        //     overlay.onclick = function(e) { if (e.target === overlay) closeXxx(); }
+        // so replaying that backdrop click runs the modal's OWN close fn — no
+        // id→function table to keep in sync. .remove() is the belt-and-braces
+        // fallback for a future twin that ships without an onclick.
+        var overlays = document.querySelectorAll('.modal-overlay.show');
+        for (var i = overlays.length - 1; i >= 0; i--) {
+            var ov = overlays[i];
+            if (ov.id === 'modal-overlay') continue;         // handled in 1.
+            // #tool-inspector-modal wires its own Escape listener at open time and
+            // removes it in closeToolInspectorModal(); closing it from here would
+            // both double-close and leak that listener.
+            if (ov.id === 'tool-inspector-modal') return;
+            if (typeof ov.onclick === 'function') {
+                try {
+                    ov.onclick({ target: ov, currentTarget: ov,
+                        preventDefault: function() {}, stopPropagation: function() {} });
+                } catch (err) {}
+            }
+            if (ov.isConnected) ov.remove();
+            return;
+        }
+        // 4. Action popovers — running/result/permission popovers anchored to the
+        // jobs pills (tools/120-actions.js openRunningPopover:1609 /
+        // openResultPopover:1665). They only ever registered a click-outside
+        // handler (_resultPopoverOutside), never a key handler. Closed BEFORE the
+        // jobs dropdown because a popover is opened FROM a dropdown row and
+        // deliberately leaves that dropdown open (tools/120-actions.js:1667).
+        if (document.querySelector('.action-result-popover')) { closeResultPopover(); return; }
+        // 5. Diff viewer (#diff-viewer-overlay, ui/100-diff-viewer.js:58-59) —
+        // a full-screen backdrop at --z-overlay (10000, css/16-diff.css:2) that
+        // shipped with NO key handler of its own, so Escape never closed it. It
+        // does not carry .modal-overlay, so step 3's class-first sweep misses it
+        // and it needs its own branch. Sits BELOW --z-modal (10006, steps 1+3)
+        // and --z-widget-modal (10002, steps 2+4) and ABOVE the dropdowns/header
+        // pills, so this is its z-order slot in the ladder.
+        if (document.getElementById('diff-viewer-overlay')) { closeDiffViewer(); return; }
+        // 6. sn-dropdown menus (skills import/export/download) sit below every
+        // overlay — close them only when nothing above claimed the key.
+        if (document.querySelector('.sn-dropdown.open')) { closeDropdowns(); return; }
+        // 7. Header pill menus — gear settings panel, jobs dropdown, model menu,
+        // workspace dropdown, usage + instance pickers. They all share the
+        // .header-menu chrome class (css/04-header.css:86) and are mutually
+        // exclusive, so one class-first visibility probe plus the shared registry
+        // closes whichever is open: closeAllHeaderMenus (ui/240-layout.js:115)
+        // fans out to closeSettingsPanel / closeJobsDropdown / _closeModelMenu /
+        // hideWorkspaceDropdown / hideUsageTooltipNow / hideInstancePicker, each
+        // behind a typeof guard. Visibility is probed with getComputedStyle().display
+        // rather than offsetParent (null for these position:fixed panels even when
+        // they ARE visible) or getClientRects() (layout-dependent); every one of these
+        // menus is toggled by display — inline style (.jobs-dropdown, model menu) or a
+        // stylesheet class (.settings-panel.visible, css/09-settings.css:8-9) — and
+        // getComputedStyle resolves both. At most six elements carry .header-menu.
+        var menus = document.querySelectorAll('.header-menu');
+        for (var j = menus.length - 1; j >= 0; j--) {
+            if (window.getComputedStyle(menus[j]).display !== 'none') {
+                if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus();
+                return;
+            }
+        }
     });
 
     // NAV-H7: global Alt+ArrowLeft = app Back (browser history). Registered right next
@@ -243,7 +343,7 @@ async function init() {
         //     #llm-endpoint-modal (:1580-1581), #api-provider-modal (:1743-1744),
         //     #github-setup-modal (tools/130-github-setup.js:54-55),
         //     #widget-history-modal-overlay (ui/070-dashboard-ui.js:1193-1194).
-        //   .sdoc-preview-overlay   — #sdoc-preview-modal (tools/110-smart-documents.js:795-796)
+        //   .sdoc-preview-overlay   — #sdoc-preview-modal (tools/110-smart-documents.js:811-812)
         //   .widget-fullscreen-overlay (tools/080-widget-tools.js:388, ui/070-dashboard-ui.js:85)
         //   .widget-modal-overlay   — #widget-edit-overlay + #widget-modal-overlay
         //     (tools/080-widget-tools.js:515-516, 598-599)
@@ -295,19 +395,14 @@ async function init() {
         else if (text.indexOf('Save') !== -1) el.innerHTML = UI_ICONS.save;
         else if (text.indexOf('Download') !== -1) el.innerHTML = UI_ICONS.download;
         else if (text.indexOf('Refresh') !== -1 || text.indexOf('Regenerate') !== -1) el.innerHTML = UI_ICONS.refresh;
-        else if (text.indexOf('Headers') !== -1) el.innerHTML = UI_ICONS.menu;
         else if (text.indexOf('Standalone') !== -1) el.innerHTML = UI_ICONS.externalLink;
         else if (text.indexOf('More') !== -1) el.innerHTML = UI_ICONS.moreHorizontal;
     });
     // Initialize dropdown menu icons
     var moreStandaloneIcon = document.getElementById('more-standalone-icon');
-    var moreHeadersIcon = document.getElementById('more-headers-icon');
-    var moreRefreshIcon = document.getElementById('more-refresh-icon');
     var moreImportIcon = document.getElementById('more-import-icon');
     var moreExportIcon = document.getElementById('more-export-icon');
     if (moreStandaloneIcon) moreStandaloneIcon.innerHTML = UI_ICONS.externalLink;
-    if (moreHeadersIcon) moreHeadersIcon.innerHTML = UI_ICONS.menu;
-    if (moreRefreshIcon) moreRefreshIcon.innerHTML = UI_ICONS.refresh;
     if (moreImportIcon) moreImportIcon.innerHTML = UI_ICONS.upload;
     if (moreExportIcon) moreExportIcon.innerHTML = UI_ICONS.download;
 
@@ -660,6 +755,7 @@ async function init() {
             // captured frame preserves interactive state (counters, loaded data) without
             // re-executing and resetting it. Falls back to a fresh render if no snapshot.
             var _dlHtml = dlWidget.html;
+            var _dlIsStaticSnap = false;
             if (urlParams.get('snap') === '1') {
                 try {
                     var _dlSnap = await new Promise(function(res){
@@ -669,6 +765,7 @@ async function init() {
                     if (_dlSnap && _dlSnap.widgetId === deepLinkWidgetId && _dlSnap.html) {
                         // Neutralize ALL <script> tags (set a non-executable type) so the
                         // snapshot is purely visual and no script re-runs to reset state.
+                        _dlIsStaticSnap = true;
                         _dlHtml = String(_dlSnap.html).replace(/<script\b/gi, '<script type="application/x-neutered" data-neutered="1" ');
                         // Size the iframe + body to the snapshot's content height so the
                         // temp tab lays out at widget size (060 also crops the raster).
@@ -678,6 +775,33 @@ async function init() {
                         }
                     }
                 } catch (e) { /* fall back to fresh render of dlWidget.html */ }
+            }
+            // BRIDGE FIX: every fresh (non-neutered) render EXECUTES the widget's live
+            // scripts, and widgets call `await executeTool(name, args)` per the
+            // html_widget contract — so the executeTool bridge MUST be prepended here
+            // exactly like the other three render paths do (renderWidgetInContainer
+            // tools/080-widget-tools.js:305, expandDashboardWidget ui/070-dashboard-
+            // ui.js:104, renderWidgetContent ui/070-dashboard-ui.js:906). This
+            // deep-link path used to write dlWidget.html RAW, so any tool-calling
+            // widget threw 'executeTool is not defined' whenever it rendered here:
+            // take_screenshot's fresh-render fallback (060:271, when the live-DOM
+            // snapshot times out or mismatches), screenshotWidget's temp-tab fallback
+            // (080:519), open-in-new-tab (080:479) and openWidgetInIframePanel
+            // (270:212). The static &snap=1 path is deliberately left untouched —
+            // its scripts are neutered above, nothing executes there.
+            if (!_dlIsStaticSnap) {
+                _dlHtml = injectWidgetBridge(_dlHtml, dlWidget.title, deepLinkWidgetId);
+                // Make the bridge FUNCTIONAL, not just defined: the global
+                // widgetToolCall/widgetDownload listeners (ui/070-dashboard-ui.js:812,
+                // 824) only trust messages whose source resolves via
+                // _resolveWidgetSource (iframe.widget-iframe elements), and
+                // _widgetIdForIframe derives the calling widget id from the closest
+                // [data-widget-id] (closest() starts at the element itself). Mark the
+                // deep-link iframe accordingly so widget tool calls dispatch through
+                // the page executeTool with the correct widget identity instead of
+                // being silently dropped (pending-forever promises).
+                wf.className = 'widget-iframe';
+                wf.setAttribute('data-widget-id', deepLinkWidgetId);
             }
             window.addEventListener('message', _dlOnWidgetMsg);
             writeWidgetHtml(wf, _dlHtml);

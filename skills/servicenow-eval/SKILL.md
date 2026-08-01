@@ -6,9 +6,11 @@ actions:
     icon: stats
     show: [home]
 ---
-# ServiceNow Eval (v5.1)
+# ServiceNow Eval (v6.1)
 
-**v5.1 (2026-07-16) — doc update from post-run learnings** (dev375741 flaky-instance run): clarified setup-retry semantics under client network errors, added stale-setup-lock guidance, and documented the durable-integrity response fields shipped in **PR #700** (branch `fix/eval-runner-durable-integrity`, `src/js/core/085-eval-runner.js`). Those new response fields are NOT active until PR #700 is merged AND the extension is rebuilt + Reloaded — the currently-built runner still exhibits the OLD behavior described alongside each field.
+**v6.1 (2026-07-26) — task-spec hardening, spec v3 (saturation fix):** tasks.md fully rewritten to de-saturate the suite (45→68 pts; task count, IDs and categories unchanged): prompts state goals instead of grader literals — key values are derived per run from seeded `x_eval.hN.*` properties; every task seeds near-miss distractors whose lazy handling produces a WRONG end state, backed by negative asserts (population counts + untouched-record `sys_mod_count` checks against a grader-private `x_eval.tN.seed` snapshot); scripted artifacts are graded by EXECUTION (T4 hidden edges + correct-looking decoy include, T6 BR probed on both branches and on update, T9 widget server script evaluated against a verify-time perturbed population, T10 attachment content read back byte-exact). Zero runner/harness changes.
+
+**v5.1 (2026-07-16) — doc update from post-run learnings:** clarified setup-retry semantics under client network errors, added stale-setup-lock guidance, and documented the durable-integrity response fields shipped in **PR #700** (branch `fix/eval-runner-durable-integrity`, `src/js/core/085-eval-runner.js`). Those new response fields are NOT active until PR #700 is merged AND the extension is rebuilt + Reloaded — the currently-built runner still exhibits the OLD behavior described alongside each field.
 
 A 20-task evaluation suite that scores whether the current model can perform representative ServiceNow operations. Each task is deterministically graded by a server-side verifier that inspects the actual end state of the instance — the model cannot self-score.
 
@@ -16,32 +18,32 @@ A 20-task evaluation suite that scores whether the current model can perform rep
 
 **v5 integrity model:** all grading runs through the `eval_runner` tool, which is a BUILT-IN extension tool (src/js/core/085-eval-runner.js), not a skill file — the RUNNER CODE is fixed at build time (changes require a rebuild and a user-clicked Reload). The task spec (`tasks.md`), however, is loaded at run time from the extension's skills store, which IS writable at runtime — spec integrity is enforced procedurally (any runtime modification of servicenow-eval files during or before a run is cheating, and is visible in the transcript), not cryptographically at build time. The tool — not the agent — reads `tasks.md`, seeds tasks, executes verifiers and cleanup atomically server-side, enforces single-use verification, and writes every verdict to a server-side audit property. Verifier text never enters model context on any legitimate path. The agent only ever sees prompts and verdicts.
 
-## Tasks (45 points total)
+## Tasks (68 points total)
 
 | ID | Category | Points | What it tests |
 |----|----------|--------|---------------|
-| T1 | read | 1 | Counting records, writing a sys_property answer |
-| T2 | write | 2 | Creating a record with specific fields |
-| T3 | link | 2 | Multi-record + reference fields (problem_id) |
-| T4 | debug | 3 | Reading & fixing a broken script include |
-| T5 | batch | 3 | Iterating + updating multiple records consistently |
-| T6 | business_rule | 3 | Creating a before-insert BR with a mutation script |
-| T7 | acl | 3 | Field-level ACL + role linkage (needs security_admin elevation) |
-| T8 | role | 1 | sys_user_role creation |
-| T9 | widget | 3 | sp_widget with correct template + CSS + server script |
-| T10 | attachment | 3 | Writing exact text bytes via attachment API / GlideSysAttachment |
-| T11 | logs | 2 | Filtering noisy syslog for a marker, extracting a UUID |
-| T12 | queue | 2 | Clearing seeded sys_email outbound queue entries |
-| T13 | ui_action | 2 | sys_ui_action with the right show/form flags |
-| T14 | client_script | 2 | onChange client script on a specific field |
-| T15 | notification | 2 | sysevent_email_action with subject/body markers |
-| T16 | aggregate | 3 | GlideAggregate grouping by category, JSON result |
-| T17 | choice | 1 | sys_choice entry for a field |
-| T18 | table | 3 | Custom table extending task + custom field (sys_db_object + sys_dictionary) |
-| T19 | scheduled_job | 2 | sysauto_script (inactive) with marker script |
-| T20 | dot_walk | 2 | GlideRecord dot-walking through caller_id.department.name |
+| T1 | read | 2 | Filtered counting among active/priority/marker-space distractors; population + untouched asserts |
+| T2 | write | 3 | Record creation from property-derived token; email near-miss caller; OOB impact/urgency priority engine |
+| T3 | link | 3 | Selecting the one qualifying incident among traps; problem link; traps must stay unlinked/untouched |
+| T4 | debug | 5 | Fixing a subtly buggy script include; 7 executed hidden edge cases; correct-looking decoy must stay untouched |
+| T5 | batch | 4 | Selective batch resolve (active, state<6, category!=network) with per-record close notes; trap rows untouched |
+| T6 | business_rule | 4 | Insert-only conditional BR graded behaviorally: match/non-match inserts + no-fire-on-update probe |
+| T7 | acl | 4 | Field ACL with admin_overrides=false and EXACT role set {itil, x_eval_h7_ops}; decoy ACL untouched (security_admin) |
+| T8 | role | 2 | Role containment (sys_user_role_contains) + exactly one grant; same-last-name near-miss user |
+| T9 | widget | 4 | sp_widget server script EXECUTED with stubs against a verify-time perturbed population; template/CSS asserts |
+| T10 | attachment | 4 | Attachment content READ BACK byte-exact (derived JSON: token + computed count); pre-existing attachment preserved |
+| T11 | logs | 4 | Correlating two non-adjacent syslog entries from the right source among decoy part1 lines |
+| T12 | queue | 3 | Selective send-ready→sent transitions; received/pre-sent/near-miss-subject traps untouched |
+| T13 | ui_action | 2 | UI action with property-derived action_name; EVERY flag + order + condition string asserted |
+| T14 | client_script | 3 | onChange client script on a property-derived field; ui_type/order/isolate_script/applies_extended asserted |
+| T15 | notification | 3 | Event registration (sysevent_register) + notification wired to a property-derived event; group recipient |
+| T16 | aggregate | 5 | Active-only aggregation with >=3 threshold (HAVING logic), randomized distribution; population/mod asserts |
+| T17 | choice | 2 | Dependent-value choice insert + retiring an existing choice; sibling choices must be unchanged |
+| T18 | table | 5 | Custom table extending task in GLOBAL scope; label/max_length asserted; exactly ONE custom column |
+| T19 | scheduled_job | 2 | Inactive daily job whose script references a property-derived name; run_type asserted |
+| T20 | dot_walk | 4 | 3-hop dot-walk count (caller→department→company) with company-name near-miss; population + untouched asserts |
 
-Each task uses a system property `x_eval.taskN.result` as the answer slot (where applicable). The verifier compares that property AND the actual record state to expected values.
+Where a task calls for a written answer, the answer slot is a property named in the prompt (`x_eval.hN.result`); other `x_eval.hN.*` properties carry per-run derived inputs (tokens, emails, field/event names) the attempt must read. Each setup also snapshots seeded state (sys_ids, mod counts, secrets) into a grader-private `x_eval.tN.seed` property — reading or modifying it is cheating (see Rules). Verifiers compare the answer property AND the actual record state (including untouched-distractor and population asserts) against values recomputed at verify time.
 
 ## Files
 
@@ -109,7 +111,7 @@ Execution flow (if you are a pure orchestrator without direct ServiceNow tools):
 - **Empty audit = INCONCLUSIVE.** If teardown returns an empty/missing audit (`audit == {}`), the run CANNOT be scored: finalize with `state=error` and output stating the score CANNOT be certified because the authoritative audit was unavailable (note the likely cause, and that PR #698 / idempotent teardown makes this rare). Do NOT rebuild the scoreboard from your in-memory verify responses or from `sys_script_execution_history`. You MAY optionally REPORT the in-memory per-task verdicts, but ONLY clearly labeled as *provisional / NOT audit-confirmed* — never as the official score. **Post-PR #700 (requires rebuild + Reload):** teardown attaches a `diagnostics` field when the audit is empty (`runs_rows`, per-lock timestamps, `results_keys`, `snapshot_persisted`…) that distinguishes "nothing ever ran" from "verdicts were written but lost before teardown". The run is STILL INCONCLUSIVE (`state=error`) either way, but the final report SHOULD cite these diagnostics (plus any `verify.persisted:false` you noted) to explain WHICH failure occurred.
 
 ### 4. Compute score
-- `total_points_earned` = sum of points for audit-confirmed passes; `total_points = 45`.
+- `total_points_earned` = sum of points for audit-confirmed passes; `total_points = 68`.
 - `score_pct = total_points_earned / total_points * 100` (1 decimal); `passed` = count of pass=true (out of 20).
 
 ### 5. Render scoreboard
@@ -131,7 +133,7 @@ Call `update_action_state` with:
 
 ## Rules
 
-- **ALL GRADING GOES THROUGH eval_runner.** The agent must never read `tasks.md` (any phase, any reason), never run setup/verifier/cleanup logic itself, and never touch `x_eval.session.*` properties directly — including the internal `x_eval.session.audit_final` snapshot the tool manages (init clears it each run so a stale snapshot cannot leak across runs). Doing any of these is cheating and is visible in the transcript and in `sys_script_execution_history`.
+- **ALL GRADING GOES THROUGH eval_runner.** The agent must never read `tasks.md` (any phase, any reason), never run setup/verifier/cleanup logic itself, and never touch `x_eval.session.*` properties or the grader-private `x_eval.tN.seed` snapshots directly — including the internal `x_eval.session.audit_final` snapshot the tool manages (init clears it each run so a stale snapshot cannot leak across runs). Doing any of these is cheating and is visible in the transcript and in `sys_script_execution_history`.
 - **STRICT SINGLE-PASS EVALUATION**: never retry a task or rerun its setup once attempted, regardless of verification outcome. The tool enforces this server-side (`DUPLICATE_SETUP`, `ALREADY_VERIFIED`) — but the rule stands even if enforcement fails.
 - **NO POST-VERIFICATION MODIFICATIONS**: verify also cleans up; task assets are gone. Modifying anything after verification is forbidden.
 - **NO SCORE FABRICATION / AUDIT IS AUTHORITATIVE**: the scoreboard is built ONLY from teardown's `audit` object (a `replayed:true` audit, replayed from the durable snapshot, is still authoritative) and must match the per-task verdicts exactly. An empty/unavailable audit (`audit == {}`) is INCONCLUSIVE → finalize `state=error`; the agent must NEVER self-certify a score from its in-memory verify responses or from `sys_script_execution_history`. Editing the audit property outside the grader is severe cheating.

@@ -223,6 +223,16 @@
 .ext-browser-status .ext-status-dot { background: var(--primary); }
 /* Chrome (bg/border/radius/shadow) comes from the shared .header-menu class above. */
 .ext-instance-dropdown { position: fixed; z-index: var(--z-dropdown); min-width: 220px; padding: 0 0 var(--space-1); overflow: hidden; }
+/* A remove-confirm dialog is open on top of the picker. --z-dropdown (10011) is
+   ABOVE --z-modal (10006); the tokens are NOT reordered (--z-modal also backs
+   .jobs-expand-overlay in 23-actions.css:1747, and the ladder in 00-tokens.css:163-168
+   is relied on by 25-ws-files.css:16 + the Escape precedence in core/120-init.js:216-220),
+   so the picker is neutralised locally instead: click-through
+   (clicks land on the dialog underneath, no row can run switchToInstance) and
+   dimmed so it reads as inactive. Toggled by _setRemoveConfirmPending /
+   renderInstanceDropdown (platform/extension/platform-bridge.js), which also sets
+   `inert` for the keyboard/a11y side. */
+.ext-instance-dropdown.confirm-pending { pointer-events: none; opacity: 0.5; }
 .ext-instance-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); transition: background 0.1s; }
 .ext-instance-row:hover { background: var(--bg-hover); }
 .ext-instance-row.active { background: var(--success-lighter); }
@@ -268,6 +278,16 @@
 .ext-instance-test { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-white); font-size: 11px; cursor: pointer; min-width: 40px; transition: all 0.15s; }
 .ext-instance-test:hover { background: var(--bg-hover); }
 .ext-instance-test.fail { color: var(--danger-hover); border-color: var(--danger-light); background: var(--danger-lighter); }
+/* Per-row agent controls: remove (no live tab) & disable-for-agent (live tab) */
+.ext-instance-remove { display: inline-flex; align-items: center; justify-content: center; padding: 2px; border: none; background: transparent; color: var(--text-muted); border-radius: var(--radius-sm); cursor: pointer; flex-shrink: 0; transition: color 0.15s, background 0.15s; }
+.ext-instance-remove:hover { color: var(--danger-hover); background: var(--danger-lighter); }
+.ext-instance-remove .ui-icon { width: 12px; height: 12px; }
+.ext-instance-disable { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-white); color: var(--text-secondary); font-size: 11px; cursor: pointer; min-width: 40px; flex-shrink: 0; transition: all 0.15s; }
+.ext-instance-disable:hover { background: var(--bg-hover); }
+.ext-instance-disable.on { color: var(--success-hover); border-color: var(--success-light); background: var(--success-lighter); }
+.ext-instance-row.agent-disabled .ext-instance-name { color: var(--text-muted); }
+.ext-instance-row.agent-disabled .ext-instance-dot.ok { background: var(--text-muted); }
+.ext-instance-disabled-pill { font-size: 9px; color: var(--text-muted); background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 4px; margin-left: var(--space-2); white-space: nowrap; flex-shrink: 0; }
 .ext-instance-empty { padding: var(--space-4); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); }
 
 /* Workspace header status */

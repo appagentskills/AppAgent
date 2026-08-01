@@ -331,6 +331,63 @@ function getSubAgentChatsForChat(chatId) {
     return out;
 }
 
+// ---- Orphaned sub-agent PR backfill (sidebar meta.prs fallback) ----
+// A meta.prs entry pushed by a sub-agent chat is stamped with the SUB's
+// chatId (and, for new pushes, a durable root_chat_id — see wsPush in
+// tools/020-tool-execution.js). Sub-agent chats are reaped ~1h after they
+// settle (SUBAGENT_TOMBSTONE_TTL_MS, core/097-sub-agent-registry.js), so a
+// LEGACY entry (no root_chat_id) loses every sidebar path once the sub's
+// chat row is gone: the sub's own message scan (chat deleted), the parent's
+// sub-agent aggregation (getSubAgentChatsForChat skips vanished rows), and
+// the strict meta.prs owner gate below. Backfill: attribute such an entry to
+// the CURRENT chat only when the current chat's own transcript provably
+// references the PR URL — in a retained sub-agent report (sub_report
+// message) or an answer links card. Strictly scoped to explicit URL
+// presence in THIS chat's messages, so it cannot reintroduce the cross-chat
+// leak fixed in PR #564 (unattributed PRs rendered in every chat).
+// ACCEPTED TRADEOFF: a chat that merely DISCUSSES the PR URL in one of its
+// own sub-agent reports (e.g. a regression sweep reviewing that PR) could
+// claim the orphaned card. That requires the URL to appear verbatim in THIS
+// chat's retained sub reports/links — a strong signal of involvement — and
+// is partly mitigated by the merged/closed skip above (stale history never
+// resurfaces). Preferred over the alternative failure mode: the pushing
+// chat losing its own PR card entirely.
+// Cheap: only invoked when the strict owner gate already failed, and only
+// for chat_sub_* owners whose chat row no longer exists.
+// Returns null (no claim) or { name } — the GC'd worker's display name
+// recovered from the matching sub_report message (null when the match came
+// from a links card, which carries no worker attribution).
+function _orphanedSubPrBelongsHere(pr, ownerChatId) {
+    if (!pr || !pr.url || !ownerChatId) return null;
+    if (String(ownerChatId).indexOf('chat_sub_') !== 0) return null; // only sub-agent pushers
+    if (typeof chats === 'undefined' || !chats) return null;
+    if (chats[ownerChatId]) return null; // sub chat still alive — the strict gates decide
+    var cur = chats[currentChatId];
+    if (!cur || !Array.isArray(cur.messages)) return null;
+    // PR-number prefix guard: ".../pull/76" must NOT match a report that
+    // mentions ".../pull/764". Escape the URL for regex use and require a
+    // non-digit (or end of string) immediately after it. The links scan
+    // below keeps exact === matching and needs no boundary.
+    var _urlRe;
+    try { _urlRe = new RegExp(pr.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![0-9])'); } catch (e) { return null; }
+    for (var i = 0; i < cur.messages.length; i++) {
+        var m = cur.messages[i];
+        if (!m) continue;
+        // Sub-agent report copy retained on the parent transcript — the PR URL
+        // typically lives in report.data.pr_url or the report summary.
+        if (m.role === 'sub_report' && m.report) {
+            try { if (_urlRe.test(JSON.stringify(m.report))) return { name: m.subAgentName || null }; } catch (e) { /* unserializable — skip */ }
+        }
+        // Answer links card ([{title, url}] — see queueChatAutoLinks/set_links).
+        if (Array.isArray(m.links)) {
+            for (var j = 0; j < m.links.length; j++) {
+                if (m.links[j] && m.links[j].url === pr.url) return { name: null };
+            }
+        }
+    }
+    return null;
+}
+
 // ---- Sidebar PR durable fallback (workspace meta.prs) ----
 // The message scan above misses a PR when its push tool-result never made it
 // into the chat (e.g. the push created the PR on GitHub but the local
@@ -542,9 +599,42 @@ async function mergeSidebarPR(event, btn) {
     }
 }
 
+// Capture both possible scroll containers. The flex layout currently makes
+// .version-sidebar-content the scroll owner, but #version-history-list also has
+// overflow-y:auto and can own scrolling if the layout changes.
+function _captureVersionSidebarScroll(container) {
+    var content = container.querySelector('.version-sidebar-content');
+    function capture(el) {
+        if (!el) return null;
+        var maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        return {
+            top: el.scrollTop,
+            // Preserve an intentional follow-to-bottom position when new sidebar
+            // content grows; don't treat a non-scrollable empty rail as bottom.
+            atBottom: maxScrollTop > 0 && el.scrollTop >= maxScrollTop - 2
+        };
+    }
+    return { list: capture(container), content: capture(content) };
+}
+
+function _restoreVersionSidebarScroll(container, state) {
+    if (!container || !state) return;
+    var content = container.querySelector('.version-sidebar-content');
+    function restore(el, saved) {
+        if (!el || !saved) return;
+        var maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = saved.atBottom && maxScrollTop > 0
+            ? maxScrollTop
+            : Math.min(Math.max(0, saved.top), maxScrollTop);
+    }
+    restore(container, state.list);
+    restore(content, state.content);
+}
+
 function renderVersionSidebar() {
     var container = document.getElementById('version-history-list');
     if (!container) return;
+    var savedSidebarScroll = _captureVersionSidebarScroll(container);
     
     var changedFiles = getAllChangedFiles();
     var revertedFiles = getRevertedFiles();
@@ -613,7 +703,17 @@ function renderVersionSidebar() {
             if (_o && _o.chatId) _ownerChatId = _o.chatId;
         }
         if (!_ownerChatId) return; // unattributed — no per-chat sidebar shows it
-        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]) return;
+        // Accept, in order: the owning chat itself; a live sub-agent of this
+        // chat (worker chip); a durable root_chat_id stamp naming this chat
+        // (survives sub-agent GC — see wsPush); else the conservative
+        // orphaned-sub backfill (PR URL present in THIS chat's transcript —
+        // which also recovers the GC'd worker's name for the chip).
+        var _orphanHit = null;
+        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]
+            && pr.root_chat_id !== currentChatId) {
+            _orphanHit = _orphanedSubPrBelongsHere(pr, _ownerChatId);
+            if (!_orphanHit) return;
+        }
         _prSeenUrls[pr.url] = true;
         pushedPRs.push({
             url: pr.url,
@@ -621,7 +721,7 @@ function renderVersionSidebar() {
             title: pr.title || pr.branch || ('PR #' + pr.number),
             branch: pr.branch || '',
             base: '',
-            worker: _ownerChatId !== currentChatId ? _subChatNames[_ownerChatId] : null
+            worker: _ownerChatId !== currentChatId ? (_subChatNames[_ownerChatId] || (_orphanHit && _orphanHit.name) || null) : null
         });
     });
     if (pushedPRs.length > 0) {
@@ -901,6 +1001,17 @@ function renderVersionSidebar() {
     html += '</div>'; // end version-sidebar-content
     
     container.innerHTML = html;
+
+    // Brand-new chat: no PRs, progress, changes, widgets, screenshots or
+    // documents yet — only the hidden placeholder hosts are present. Show a
+    // friendly empty state instead of a blank rail.
+    var _vsc = container.querySelector('.version-sidebar-content');
+    if (_vsc && !_vsc.querySelector(':scope > :not(#sub-self-parent-host):not(#sub-self-card-host):not(#sidebar-workers)')) {
+        var _vsEmpty = document.createElement('div');
+        _vsEmpty.className = 'version-sidebar-empty';
+        _vsEmpty.textContent = 'Changes, pull requests and artifacts from this chat will appear here.';
+        _vsc.appendChild(_vsEmpty);
+    }
     
     // The Workers placeholder was just recreated empty by the innerHTML
     // rebuild above — repopulate it from the live sub-agent registry.
@@ -912,6 +1023,11 @@ function renderVersionSidebar() {
     if (typeof updateSubAgentSelfCard === 'function') {
         try { updateSubAgentSelfCard(); } catch (e) {}
     }
+
+    // Reapply the user's position after the rebuilt content and live worker
+    // cards are back in the DOM. Restore both candidates so this remains safe
+    // if the flex layout changes which node owns overflow scrolling.
+    _restoreVersionSidebarScroll(container, savedSidebarScroll);
 }
 
 // Redo changes that were previously reverted

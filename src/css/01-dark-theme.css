@@ -117,9 +117,8 @@
 /* CONTRAST-722x728 (see 21b-prompt-user.css): --text-secondary is #9ca3af in
    dark theme, which reads as a 7.42:1 hairline on #111317 — correct but loud.
    --text-muted (#6b7280) keeps the boundary well above the 3:1 non-text target
-   (3.90:1 on --bg-white, 3.71:1 on the --bg-primary popup, 3.52:1 on the card's
-   own --bg-secondary fill) while sitting quietly in a dark panel. */
-:root[data-theme="dark"] .prompt-user-desc,
+   while sitting quietly in a dark panel. (.prompt-user-desc is borderless now —
+   plain text by design — so only the submitted-value chip needs this.) */
 :root[data-theme="dark"] .prompt-value-chip { border-color: var(--text-muted); }
 
 :root[data-theme="dark"] .ws-file-chat {

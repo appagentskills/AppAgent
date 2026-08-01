@@ -103,7 +103,6 @@ var dashboardWidgets = {}; // { widgetId: { id, title, prompt, html, conversatio
 var currentEditingWidget = null;
 var dashboardRefreshing = false;
 var activeWidgetStreamingId = null; // Track which widget has active streaming
-var showDashboardHeaders = false; // Toggle for showing widget headers
 var pendingWidgetRegeneration = null; // LEGACY single-slot — kept for any external readers; do NOT use in new code.
 // B-B2: per-chat map of regeneration intents. Key is the chatId the regen agent
 // loop is running in; value is the dashboard widget id whose HTML should be

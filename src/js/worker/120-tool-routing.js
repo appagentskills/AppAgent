@@ -680,7 +680,21 @@ executeTool = async function(name, args, messageIndex, options) {
     // recordToolResult) clobbers the page's saved chat with a version
     // missing these fields, and the user sees "Display not found" /
     // missing widgets on reload.
-    if (result && chatId && chats[chatId]) {
+    // TOMBSTONE: `chats[chatId]` may be a DELETE tombstone ({messages: [],
+    // _deleted: true}) installed by the 'update-chat' explicit-delete lane
+    // (worker/130-port-bridge.js) while this UI tool was still blocked — the
+    // classic case is prompt_user / show_action_button, which set
+    // result._message_persist on BOTH submit and cancel
+    // (tools/100-prompt-user.js, tools/120-actions.js) and can resolve long
+    // AFTER the user deleted the chat. The `_message_persist` mirror below
+    // would then push a message onto the tombstone, giving it
+    // messages.length === 1 — which puts it into `desired`
+    // (worker/115-storage.js:116), drops it out of the unbudgeted
+    // explicit-delete lane (:153) and RE-PUTS the row: the deleted chat
+    // resurrects on reload. A tombstone must never gain a message, so skip
+    // the whole mirror block for it (the other arms — displays, widgets,
+    // targetTabId — are equally pointless on a deleted chat).
+    if (result && chatId && chats[chatId] && !chats[chatId]._deleted) {
         if (result._display_persist) {
             var dp = result._display_persist;
             if (!chats[chatId].displays) chats[chatId].displays = {};

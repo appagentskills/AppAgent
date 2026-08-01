@@ -137,9 +137,23 @@ async function saveChatsToStorage() {
                 // BOUNDED batch per save (first 5), so a legit backlog drains
                 // over successive saves while a partial-map incident is still
                 // capped at 5 rows per transaction instead of a mass-delete.
+                // EXPLICIT-DELETE: partition first. A key whose in-memory
+                // entry is a `_deleted` TOMBSTONE — an empty-message record the
+                // page posts as an 'update-chat' when the user deletes a chat
+                // (deleteChat in ui/170-chat-management.js) — is an EXPLICIT
+                // single-chat delete the user asked for, NOT the bulk "absent
+                // from memory" reconciliation the wipe-guard exists to contain.
+                // Those keys are deleted unconditionally: no per-save cap, no
+                // per-boot budget. Without the exemption a tombstoned row that
+                // an already-in-flight save had re-put stayed on disk forever
+                // once the boot budget was spent, and resurrected on reload.
                 var _delKeys = [];
+                var _explicitDelKeys = [];
                 existingKeys.forEach(function(key) {
-                    if (!Object.prototype.hasOwnProperty.call(desired, key)) _delKeys.push(key);
+                    if (Object.prototype.hasOwnProperty.call(desired, key)) return;
+                    var _mem = chats[key];
+                    if (_mem && _mem._deleted === true) _explicitDelKeys.push(key);
+                    else _delKeys.push(key);
                 });
                 if (_delKeys.length > 5) {
                     console.warn('[worker-storage] delete-pass CAPPED (wipe-guard-2): '
@@ -162,6 +176,10 @@ async function saveChatsToStorage() {
                     _delKeys = _delKeys.slice(0, Math.max(0, WIPE_GUARD_MAX_DELETES_PER_BOOT - _wipeGuardDeletedSinceLoad));
                 }
                 _wipeGuardDeletedSinceLoad += _delKeys.length;
+                // EXPLICIT-DELETE: append the exempt keys AFTER budget
+                // accounting, so a user delete neither consumes nor is blocked
+                // by the bulk-diff budget.
+                if (_explicitDelKeys.length) _delKeys = _explicitDelKeys.concat(_delKeys);
                 _delKeys.forEach(function(key) {
                     pending++;
                     var delRequest = store.delete(key);
@@ -228,6 +246,98 @@ async function saveChatsToStorage() {
             _w.forEach(function(r) { try { r(); } catch (e) {} });
         }
     }
+}
+
+// EXPLICIT-DELETE (chat-delete durability, mirrors ui/070-dashboard-ui.js):
+// targeted single-id removal of ONE chat row plus the payload blob rows only
+// that chat referenced. Bypasses the bulk diff-save delete-pass above and its
+// wipe-guard cap/budget on purpose — that guard contains a partially-hydrated
+// map turning into a mass wipe, which an explicit one-id delete is not.
+// CALL SITE: the `_deleted` tombstone branch of the 'update-chat' handler in
+// worker/130-port-bridge.js calls this the moment the page reports a user
+// delete, so the row leaves IDB immediately instead of waiting for the next
+// save's explicit-delete lane (which remains the retry: this SW can be evicted
+// before it saves again). That tombstone carries NO messages, hence no payload
+// ids — and independent of what a caller passes, this twin deletes the chat
+// ROW only. That is ENFORCED below (PR #761 follow-up), not just a call-site
+// convention: the SW's `chats` map is run-adopted-only (never a complete
+// view — at best complete at the instant of its boot getAll, after which
+// page-realm chats created or mutated later are missing or stale here; THIS
+// realm's _chatsHydrated only certifies that boot read succeeded, it is not
+// the page twin's map-completeness gate), so this realm can never prove a
+// blob unreferenced. The page-side twin (ui/070-dashboard-ui.js), which has
+// the full pre-delete record and a hydration-gated complete map, owns
+// chat_payloads cleanup; the boot orphan sweep (sweepOrphanChatPayloads,
+// core/130-indexeddb.js) is the backstop.
+async function deleteChatFromDB(chatId, chatSnapshot) {
+    if (!chatId) return false;
+    // HARD GATE (see header): never compute "unreferenced" blobs in this
+    // realm. The cross-chat subtraction that lived here was dead-safe only
+    // because the tombstone call site passes no payload ids — with a full
+    // snapshot it would have deleted blobs still referenced by chats absent
+    // from this realm's map. Surface (but do not act on) anything a future
+    // caller does pass.
+    try {
+        var _ignored = Object.keys(_chatPayloadIdsFor(chatSnapshot || (typeof chats !== 'undefined' ? chats[chatId] : null))).length;
+        if (_ignored) {
+            console.warn('[worker-storage] explicit delete: NOT reaping ' + _ignored
+                + ' payload id(s) of chat ' + chatId
+                + ' — this realm cannot prove them unreferenced; blob cleanup is page-owned');
+        }
+    } catch (eGate) {}
+    var _txAbortErr = null;
+    try {
+        var _committed = await withStore([chatStoreName], 'readwrite', function(transaction) {
+            var store = transaction.objectStore(chatStoreName);
+            return new Promise(function(_resolve) {
+                // Same settle discipline as the page twin — and ABORT = FAILURE
+                // (PR #761 follow-up): an abort ROLLS BACK the delete, so
+                // settling it as success made this function log "removed from
+                // IDB" and return true while the row was still on disk. Settle
+                // false instead — still resolve, never reject, so the
+                // never-throw contract holds. Success settles on COMMIT
+                // (transaction.oncomplete), not on delRequest.onsuccess: a
+                // request error (nothing here calls preventDefault) aborts the
+                // tx AFTER the request settles, so a per-request resolve raced
+                // the abort event and reported success. The tx scope is
+                // [chatStoreName] only — this twin never touches chat_payloads
+                // (see header), so it takes no readwrite lock on that store.
+                var _settled = false;
+                function settle(ok) { if (_settled) return; _settled = true; _resolve(ok); }
+                transaction.oncomplete = function() { settle(true); };
+                transaction.onabort = function() { _txAbortErr = transaction.error || null; settle(false); };
+                store.delete(chatId);
+            });
+        });
+        if (!_committed) {
+            console.warn('[worker-storage] explicit delete ABORTED for chat ' + chatId
+                + ' — transaction rolled back, the chat row is still on disk; the explicit-delete lane of the next save retries it', _txAbortErr || '');
+            return false;
+        }
+        console.log('[worker-storage] explicit delete: chat ' + chatId
+            + ' removed from IDB (chat row only — blob cleanup is page-owned)');
+        return true;
+    } catch (e) {
+        console.error('[worker-storage] explicit delete FAILED for chat ' + chatId, e);
+        return false;
+    }
+}
+
+// Payload ids (file_id / screenshot_id) a chat record references. Ids survive
+// payload eviction, so a stripped record still reports them.
+function _chatPayloadIdsFor(chat) {
+    var ids = {};
+    if (!chat) return ids;
+    if (Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (!m) continue;
+            if (m.file_id) ids[m.file_id] = true;
+            if (m.screenshot_id) ids[m.screenshot_id] = true;
+        }
+    }
+    if (chat.screenshots) Object.keys(chat.screenshots).forEach(function(k) { ids[k] = true; });
+    return ids;
 }
 
 // PERSIST-BUSY (root-cause fix, 2026-07): consulted by background.js's

@@ -106,7 +106,13 @@ var EVENTS_WITH_CHAT_INLINE = {
 function broadcastAgentEvent(type, detail) {
     if (_agentSubscribers.size === 0) return;
     var payload = detail || {};
-    if (EVENTS_WITH_CHAT_INLINE[type] && payload.chatId && chats[payload.chatId]) {
+    // TOMBSTONE: never inline a `_deleted` entry (the delete tombstone parked in
+    // `chats` by the 'update-chat' explicit-delete lane, worker/130-port-bridge.js).
+    // runFinished/runCrashed fire on the aborting run of a just-deleted chat, and
+    // the page's event-agnostic assign path re-adds it to the chat list as an empty
+    // ghost row.
+    if (EVENTS_WITH_CHAT_INLINE[type] && payload.chatId && chats[payload.chatId]
+        && !chats[payload.chatId]._deleted) {
         // postMessage uses structured clone, which deep-copies the chat.
         // For very large histories this is the dominant cost; the
         // chats-snapshot-on-hello path also pays it on connect. If

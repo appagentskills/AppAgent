@@ -2,6 +2,10 @@
 .chat-content-wrapper { display: flex; flex: 1; overflow: hidden; min-height: 0; min-width: 0; position: relative; }
 .chat-content-wrapper .messages { flex: 1; overflow-y: auto; min-width: 0; }
 
+/* Empty state for a brand-new chat — appended by renderVersionSidebar
+   (ui/120-ui-utils.js) when no sections rendered at all. */
+.version-sidebar-empty { padding: var(--space-8) var(--space-6); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); line-height: 1.5; }
+
 /* Version History Sidebar - Inline with messages */
 .version-sidebar { width: 320px; background: var(--bg-white); border-left: 1px solid var(--secondary-border); display: none; flex-direction: column; flex-shrink: 0; position: relative; }
 .version-sidebar.visible { display: flex; }

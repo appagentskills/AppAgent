@@ -683,8 +683,12 @@ function _tierMenuRowsHtml() {
     var html = '';
     ['large', 'medium', 'small'].forEach(function(tier) {
         var current = map[tier];
-        var options = '';
-        var found = false;
+        // "Same" pseudo-option (TIER_ALIAS_SAME, core/030-config.js): the tier
+        // follows the spawning agent's current model dynamically — identical
+        // behavior to an explicit tier:'same' spawn. Mirrors the Settings page.
+        var isSame = (typeof TIER_ALIAS_SAME !== 'undefined' && current === TIER_ALIAS_SAME);
+        var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>Same</option>';
+        var found = isSame;
         (apiProviders || []).forEach(function(p) {
             if (p.name === current) found = true;
             options += '<option value="' + escapeHtml(p.name) + '"' + (p.name === current ? ' selected' : '') + '>' + escapeHtml(p.name) + '</option>';
@@ -707,7 +711,9 @@ function _tierMenuRowsHtml() {
 // settings page uses. Menu stays open so several tiers can be set at once.
 function setTierAliasFromMenu(tier, providerName) {
     if (typeof setTierAlias === 'function') setTierAlias(tier, providerName);
-    showSnackbar('Sub-agent ' + tier + ' tier: ' + providerName, 'info');
+    var _tierLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && providerName === TIER_ALIAS_SAME)
+        ? 'Same (follows current model)' : providerName;
+    showSnackbar('Sub-agent ' + tier + ' tier: ' + _tierLabel, 'info');
 }
 
 // Pill click now opens a dropdown (reasoning effort + model picker + sub-agent
