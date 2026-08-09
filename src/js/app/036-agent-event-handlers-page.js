@@ -1021,6 +1021,89 @@ AgentEvents.on('silentHookState', function(e) {
 // chat-inlined broadcast — but THIS event may arrive first, so append-if-
 // missing (deduped by entryId in addVersionHistoryEntryForChat) covers both
 // orderings without double entries.
+// AB (approval broadcast): the SW settled a permission approval — the FIRST
+// verdict won (worker/120-tool-routing.js _swSettleApprovalRow). The envelope
+// inlined the chat, so the event-agnostic assign in app/045 already merged
+// the flipped row into this panel's mirror. Here: flip the row if the merge
+// raced, settle any LOCAL resolver quietly (its redundant
+// exec-approval-prompt-result is dropped by the SW's deleted pending entry —
+// first-verdict-wins), drop queued/showing cards for this approval, and
+// refresh every approval surface. NEVER routes through handleApproval (its
+// no-resolver branch would re-kick runAgent).
+AgentEvents.on('approvalSettled', function(e) {
+    if (!e || !e.chatId || !e.toolCallId) return;
+    var chatId = e.chatId, toolCallId = e.toolCallId;
+    // 1. Local row flip (belt-and-braces — snapshot merge usually did it).
+    var rowIndex = -1;
+    var chat = chats[chatId];
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'approval' && m.toolCallId === toolCallId) {
+                rowIndex = i;
+                if (m.status === 'pending') m.status = e.status || (e.allowed ? 'allowed' : 'denied');
+                break;
+            }
+        }
+    }
+    // 2. Settle + drop the local resolver (matched by toolCallId; the panel
+    // the user answered on already deleted its entry in handleApproval).
+    if (typeof pendingToolApprovals === 'object' && pendingToolApprovals) {
+        for (var k in pendingToolApprovals) {
+            var ent = pendingToolApprovals[k];
+            if (ent && ent.chatId === chatId && ent.toolCallId === toolCallId) {
+                delete pendingToolApprovals[k];
+                try { ent.resolve(!!e.allowed); } catch (e2) {}
+            }
+        }
+    }
+    // 3. Remove this approval from the card queue / the shown card. Cards
+    // are matched primarily by toolCallId (stamped at queue time by ui/220
+    // showApprovalNotification) so entries queued BEFORE a snapshot merge
+    // shifted row indexes still purge; entries without a toolCallId (older/
+    // foreign) fall back to the approvalIndex === rowIndex comparison. With
+    // rowIndex unknown (-1) those fallback entries are deliberately left
+    // alone — a stale card click is already a safe no-op (handleApproval's
+    // PR384-FIX-4 guard).
+    var settledCardMatch = function(n) {
+        if (!n || n.chatId !== chatId) return false;
+        if (n.toolCallId) return n.toolCallId === toolCallId;
+        return rowIndex !== -1 && n.approvalIndex === rowIndex;
+    };
+    if (typeof approvalNotificationQueue !== 'undefined') {
+        approvalNotificationQueue = approvalNotificationQueue.filter(function(n) {
+            return !settledCardMatch(n);
+        });
+        if (typeof updateNotificationQueueBadge === 'function') { try { updateNotificationQueueBadge(); } catch (e3) {} }
+    }
+    if (Array.isArray(currentApprovalNotification) && currentApprovalNotification.length > 0
+        && currentApprovalNotification[0].chatId === chatId) {
+        var remaining = currentApprovalNotification.filter(function(n) {
+            return !settledCardMatch(n);
+        });
+        if (remaining.length === 0) {
+            currentApprovalNotification = null;
+            isShowingApprovalNotification = false;
+            var _cardEl = (typeof getApprovalCardEl === 'function') ? getApprovalCardEl() : document.getElementById('approval-card');
+            if (_cardEl) _cardEl.classList.remove('show');
+            if (typeof showNextApprovalNotification === 'function') setTimeout(showNextApprovalNotification, 300);
+        } else if (remaining.length !== currentApprovalNotification.length) {
+            currentApprovalNotification = remaining;
+            if (typeof rerenderCurrentNotification === 'function') { try { rerenderCurrentNotification(); } catch (e4) {} }
+        }
+    }
+    // 4. Background Action button + badges + title flash + repaint.
+    if (chat && chat.isBackground && chat.actionId && typeof clearActionNeedsPermission === 'function') {
+        try { clearActionNeedsPermission(chat.actionId); } catch (e5) {}
+    }
+    if (typeof renderChatList === 'function') { try { renderChatList(); } catch (e6) {} }
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e7) {} }
+    if (typeof syncApprovalTitleFlash === 'function') { try { syncApprovalTitleFlash(); } catch (e8) {} }
+    if (currentChatId === chatId && currentView === 'chat' && typeof renderMessages === 'function') {
+        try { renderMessages(); } catch (e9) {}
+    }
+});
+
 AgentEvents.on('recordMutated', function(e) {
     if (typeof addVersionHistoryEntryForChat !== 'function') return;
     addVersionHistoryEntryForChat(e.chatId, {

@@ -133,7 +133,14 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
         if (!chat) {
             _retryApprovalWhenChatLoads(chatId, function() {
                 showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, chatId, options).then(resolve);
-            }, function() { resolve(false); });
+            }, function() {
+                // AB: mark the give-up on the caller-shared options object so
+                // _handleApprovalPromptFromOffscreen (app/045) can suppress a
+                // non-primary panel's auto-deny — with the prompt broadcast to
+                // every panel, only the PRIMARY may deny for everyone.
+                options._gaveUp = true;
+                resolve(false);
+            });
             return;
         }
 
@@ -158,11 +165,19 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             // resolver to this (live) caller so the verdict reaches it.
             var reuseKey = chatId + ':' + existingRow.index;
             pendingToolApprovals[reuseKey] = { resolve: resolve, approvalIndex: existingRow.index, chatId: chatId, toolCallId: toolCallId };
+            // AB: with the SW seeding the approval row BEFORE the prompt
+            // envelope (per-port FIFO), EVERY panel takes THIS reuse branch —
+            // the push branch below never runs, so its Action-button lock and
+            // waiting-badge refresh must fire here too (mirrors :191/:229).
+            if (chat.isBackground && chat.actionId && typeof setActionNeedsPermission === 'function') {
+                setActionNeedsPermission(chat.actionId, { approvalIndex: existingRow.index });
+            }
+            if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
             var reuseTitle = (toolCallId && toolCallId.startsWith('prog_'))
                 ? (options.widgetName || chat.title || 'Background task')
                 : (chat.title || 'A chat');
             var reuseStatusMessage = (args && args.status_message) ? args.status_message : null;
-            showApprovalNotification(reuseTitle, displayName, chatId, reuseStatusMessage, existingRow.index, args);
+            showApprovalNotification(reuseTitle, displayName, chatId, reuseStatusMessage, existingRow.index, args, options);
             renderChatList();
             return;
         }
@@ -202,19 +217,19 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             // generic label — "Widget" was misleading for non-widget callers.
             var notificationTitle = options.widgetName || chat.title || 'Background task';
             var statusMessage = (args && args.status_message) ? args.status_message : null;
-            showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args);
+            showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
         } else if (currentChatId === chatId && currentView === 'chat') {
             // For agent tool calls on current chat, show notification popup instead of inline
             var chatTitle = chat.title || 'A chat';
             var statusMessage = (args && args.status_message) ? args.status_message : null;
-            showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args);
+            showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
             renderMessages(); // Still render to update chat but notification handles approval
             scrollToBottomIfAllowed();
         } else {
             // Show notification when user is on a different chat or different view
             var chatTitle = chat.title || 'A chat';
             var statusMessage = (args && args.status_message) ? args.status_message : null;
-            showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args);
+            showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
         }
         // Always update chat list to show attention indicator
         renderChatList();

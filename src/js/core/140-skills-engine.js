@@ -163,6 +163,16 @@ function jsObjectLiteralToJson(s) {
     return out;
 }
 
+// Does this .js asset even CLAIM to be a tool file? The builder
+// (build/build.js) embeds EVERY .js in a skill folder as a type:'js' asset,
+// so helper / reference / paste-into-js_eval modules land in the same list as
+// real tool files. Same two shapes parseSkillToolFile accepts.
+function _hasToolDefinition(content) {
+    if (!content) return false;
+    return /(?:var|const|let)\s+TOOL_DEFINITION\s*=/.test(content)
+        || /\/\/\s*TOOL_DEFINITION\s*\n/.test(content);
+}
+
 function parseSkillToolFile(content) {
     // Try multiple formats:
     // 1. var TOOL_DEFINITION = {...};
@@ -227,18 +237,34 @@ async function loadSkillTools(skillId) {
 
     skillTools[skillId] = {};
     var errors = [];
+    var skipped = [];
 
     for (var i = 0; i < jsAssets.length; i++) {
-        var parsed = parseSkillToolFile(jsAssets[i].content);
+        var content = jsAssets[i].content;
+        // SKIP, don't ERROR, when a .js asset carries no TOOL_DEFINITION at
+        // all. activateSkill() unloads the ENTIRE skill on any error (see the
+        // errors.length branch there), so a single non-tool .js dropped in the
+        // folder used to nuke that skill's working tools on every off→on
+        // toggle. A file that isn't a tool file simply isn't one.
+        if (!_hasToolDefinition(content)) {
+            var skipMsg = jsAssets[i].filename + ': no TOOL_DEFINITION — not a tool file, skipped';
+            console.warn('Skill "' + skillId + '" — ' + skipMsg);
+            skipped.push(skipMsg);
+            continue;
+        }
+        var parsed = parseSkillToolFile(content);
         if (parsed) {
             skillTools[skillId][parsed.name] = parsed;
         } else {
+            // It DID declare a TOOL_DEFINITION but it is malformed (bad
+            // literal, missing function name, function not found). That is a
+            // genuine authoring error and still fails activation loudly.
             var errMsg = jsAssets[i].filename + ': Failed to parse tool definition';
             console.warn(errMsg);
             errors.push(errMsg);
         }
     }
-    return { loaded: Object.keys(skillTools[skillId]).length, errors: errors };
+    return { loaded: Object.keys(skillTools[skillId]).length, errors: errors, skipped: skipped };
 }
 
 function unloadSkillTools(skillId) {
@@ -486,6 +512,18 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
 function isSkillTool(toolName) {
     for (var skillId in skillTools) {
         if (skillTools[skillId][toolName]) return true;
+    }
+    return false;
+}
+
+// Same as isSkillTool, but honours the devOnly gate that getActiveSkillTools()
+// applies — a tool belonging to a devOnly skill is invisible (and must stay
+// uncallable) outside extension dev mode. Any code path that treats "is a
+// skill tool" as "is allowed to run" must use THIS, not isSkillTool.
+function isVisibleSkillTool(toolName) {
+    for (var skillId in skillTools) {
+        if (!skillTools[skillId][toolName]) continue;
+        return !isSkillDevHidden(skillId);
     }
     return false;
 }

@@ -96,6 +96,11 @@ async function getLatestRecordXml(table, sysId) {
 
 function addVersionHistoryEntry(entry) {
     versionHistory.push(entry);
+    // MEMFIX: cap (drop oldest) — splice in place so the chat.versionHistory
+    // alias (see addVersionHistoryEntryForChat below) sees the same array.
+    if (typeof VERSION_HISTORY_CAP !== 'undefined' && versionHistory.length > VERSION_HISTORY_CAP) {
+        versionHistory.splice(0, versionHistory.length - VERSION_HISTORY_CAP);
+    }
     saveVersionHistory();
     renderVersionSidebar();
     updateVersionSidebarVisibility();
@@ -119,6 +124,10 @@ function addVersionHistoryEntryForChat(chatId, entry) {
     // chat-inlined broadcast before this event handler ran.
     var already = entry && entry.id && chat.versionHistory.some(function(v) { return v && v.id === entry.id; });
     if (!already) chat.versionHistory.push(entry);
+    // MEMFIX: same cap as the executing tier (trackRecordMutation).
+    if (typeof VERSION_HISTORY_CAP !== 'undefined' && chat.versionHistory.length > VERSION_HISTORY_CAP) {
+        chat.versionHistory.splice(0, chat.versionHistory.length - VERSION_HISTORY_CAP);
+    }
     if (chatId === currentChatId) {
         versionHistory = chat.versionHistory;
         renderVersionSidebar();

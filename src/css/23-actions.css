@@ -2176,7 +2176,7 @@
     flex: 1;
 }
 /* .bg-popup-desc removed — the popup description now uses the shared
-   .prompt-user-desc markdown card (21b-prompt-user.css). */
+   .prompt-user-desc markdown block (21b-prompt-user.css). */
 .bg-popup-body form {
     display: flex;
     flex-direction: column;

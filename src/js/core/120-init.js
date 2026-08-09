@@ -527,6 +527,10 @@ async function init() {
     await loadSkillsFromStorage();
     await loadActiveSkills();
     await importEmbeddedSkills();
+    // The SW boots before this import and loaded its own skillTools from the
+    // pre-import activeSkills setting — push a refresh so brand-new embedded
+    // skills' tools are recognised there too (isSkillTool / roster gate).
+    if (typeof pushSkillToolsRefreshToOffscreen === 'function') pushSkillToolsRefreshToOffscreen();
     // Re-evaluate the reload-button gate now that skill tools are loaded. The gate
     // call at the top of init() runs before skills load, so isSkillTool('extension_build')
     // is false there and the button stays hidden. (Regression from the gating PR.)

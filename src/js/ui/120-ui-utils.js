@@ -709,10 +709,15 @@ function renderVersionSidebar() {
         // orphaned-sub backfill (PR URL present in THIS chat's transcript —
         // which also recovers the GC'd worker's name for the chip).
         var _orphanHit = null;
-        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]
-            && pr.root_chat_id !== currentChatId) {
+        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]) {
+            // Sweep 753-773 (764-worker-chip-asymmetry): run the transcript scan
+            // even when the durable root_chat_id stamp already vouches for the
+            // entry — for stamped rows it is purely worker-NAME recovery, so a
+            // GC'd sub renders the same chip on stamped and legacy entries
+            // alike. Gate semantics unchanged: stamped rows always render;
+            // unstamped rows still need a transcript hit.
             _orphanHit = _orphanedSubPrBelongsHere(pr, _ownerChatId);
-            if (!_orphanHit) return;
+            if (!_orphanHit && pr.root_chat_id !== currentChatId) return;
         }
         _prSeenUrls[pr.url] = true;
         pushedPRs.push({

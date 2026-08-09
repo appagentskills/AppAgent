@@ -422,15 +422,40 @@ function processUserMessageForCache(chatId, content) {
     };
 }
 
+// MEMFIX-CTR: a cache entry's fullContent may be evicted from memory
+// (stripChatPayloadsInPlace) — rehydrate the chat before serving a read.
+// No-op when the entry is hydrated or unknown. Used by the three
+// executeCachedContent* tools below, which run in BOTH realms (this file
+// is in WORKER_SHARED_FILES): the SW serves the agent loop's tool calls,
+// the page serves widget-tier executeTool calls.
+async function ensureCachedContent(chatId, contentId) {
+    try {
+        var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        if (!chat || !chat.cachedToolResults) return;
+        var entry = chat.cachedToolResults[contentId];
+        if (!entry || !entry._fcEvicted) return;
+        if (typeof ensureChatPayloads === 'function') await ensureChatPayloads(chatId);
+    } catch (e) { console.warn('[cached-results] rehydration failed for', contentId, e); }
+}
+
+// Shared post-hydration guard: entry exists but its fullContent is gone
+// and could not be brought back (blob lost/corrupt — rehydration already
+// ran). Distinct message from plain not-found so the agent knows re-running
+// the original tool call is the only recovery.
+function cachedContentUnavailable(contentId) {
+    return { success: false, error: 'Cached content ' + contentId + ' is no longer available (evicted from memory and not recoverable from storage). Re-run the original tool call to regenerate it.' };
+}
+
 // Execute cached_content_outline tool
 // detail_level: 1 = minimal detail, higher = more detail
-function executeCachedContentOutline(chatId, args) {
+async function executeCachedContentOutline(chatId, args) {
     var contentId = args.content_id;
     var detailLevel = args.detail_level || 3;
     var path = args.path || null;
     var arrayOffset = args.array_offset || 0;
     var arrayLimit = args.array_limit || null;
 
+    await ensureCachedContent(chatId, contentId);
     var chat = chats[chatId];
     if (!chat || !chat.cachedToolResults || !chat.cachedToolResults[contentId]) {
         return { success: false, error: 'Cached content not found: ' + contentId };
@@ -438,6 +463,7 @@ function executeCachedContentOutline(chatId, args) {
 
     var cached = chat.cachedToolResults[contentId];
     var targetData = cached.fullContent;
+    if (targetData === undefined) return cachedContentUnavailable(contentId);
 
     // Navigate to path if specified
     if (path) {
@@ -620,7 +646,8 @@ function executeCachedContentOutline(chatId, args) {
 }
 
 // Execute cached_content_search tool
-function executeCachedContentSearch(chatId, args) {
+async function executeCachedContentSearch(chatId, args) {
+    await ensureCachedContent(chatId, args.content_id);
     var contentId = args.content_id;
     var query = args.query;
     var searchPath = args.path;
@@ -635,6 +662,7 @@ function executeCachedContentSearch(chatId, args) {
 
     var cached = chat.cachedToolResults[contentId];
     var searchTarget = cached.fullContent;
+    if (searchTarget === undefined) return cachedContentUnavailable(contentId);
 
     // Navigate to path if specified
     if (searchPath) {
@@ -762,7 +790,8 @@ function executeCachedContentSearch(chatId, args) {
 }
 
 // Execute cached_content_read tool
-function executeCachedContentRead(chatId, args) {
+async function executeCachedContentRead(chatId, args) {
+    await ensureCachedContent(chatId, args.content_id);
     var contentId = args.content_id;
     var path = args.path;
     var startLine = args.start_line;
@@ -775,6 +804,7 @@ function executeCachedContentRead(chatId, args) {
 
     var cached = chat.cachedToolResults[contentId];
     var targetData = cached.fullContent;
+    if (targetData === undefined) return cachedContentUnavailable(contentId);
 
     // Navigate to path if specified
     if (path) {

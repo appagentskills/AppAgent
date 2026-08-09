@@ -581,6 +581,22 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                         if (ssChat) {
                             if (!ssChat.screenshots) ssChat.screenshots = {};
                             ssChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
+                            // Sweep 753-773 (771-1): cap the per-chat screenshots map
+                            // (~20, LRU by timestamp) — mirrors the page-side sandbox
+                            // bridge (tools/020-tool-execution.js) and the skills-engine
+                            // cap (core/140-skills-engine.js). Without it, SW-routed
+                            // nested captures (background/sub-agent js_eval) grew
+                            // chats[chatId].screenshots unbounded.
+                            try {
+                                var _ssKeys = Object.keys(ssChat.screenshots);
+                                var _SS_CAP = 20;
+                                if (_ssKeys.length > _SS_CAP) {
+                                    _ssKeys.sort(function(a, b) { return (ssChat.screenshots[a].timestamp || 0) - (ssChat.screenshots[b].timestamp || 0); });
+                                    for (var _ei = 0; _ei < _ssKeys.length - _SS_CAP; _ei++) {
+                                        delete ssChat.screenshots[_ssKeys[_ei]];
+                                    }
+                                }
+                            } catch (eCap) {}
                             if (typeof registerFile === 'function') registerFile(ssMsg.screenshot_id, { type: 'screenshots_map', chatId: p.chatId });
                             if (typeof saveChatsToStorage === 'function') { try { await saveChatsToStorage(); } catch (e) {} }
                         }

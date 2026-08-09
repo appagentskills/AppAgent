@@ -142,6 +142,16 @@ function _registerPanel(port) {
                 ? SubAgents.listAll() : null
         });
         replayParkedToolCalls(port);
+        // AB: re-deliver still-pending approval prompts to this late-connecting
+        // panel (card-only copy — primary:false keeps OS-notify and give-up
+        // duties on the original executor). Parked approvals were replayed
+        // above (this port became their primary); this covers LIVE entries
+        // already dispatched to panels that connected before this one.
+        Object.keys(_pendingUIToolCalls).forEach(function(id) {
+            var e2 = _pendingUIToolCalls[id];
+            if (!e2 || !e2.isApproval || !e2.envelope || e2.port === port) return;
+            try { port.postMessage(Object.assign({}, e2.envelope, { primary: false, osNotify: false })); } catch (e3) {}
+        });
     } catch (e) {
         console.error('[port-bridge] hello/replay failed', e);
     }
@@ -176,7 +186,49 @@ function _unregisterPanel(port) {
             // run. For those, honour the documented "clean rejection if re-park
             // is not possible" contract so `await approvalPromise` settles
             // instead of hanging.
-            if (entry.name) {
+            if (entry.isApproval) {
+                // AB: approval prompts are broadcast to EVERY panel — losing
+                // the PRIMARY port must not abort the prompt while other panels
+                // still show a live card. Rebind the entry to a surviving
+                // subscriber and re-post the envelope primary:true so exactly
+                // one panel keeps the give-up-deny duty (panel-side dedup makes
+                // the re-post idempotent; osNotify:false — the original OS
+                // notification already fired, never duplicate it). With NO
+                // survivors, re-park as '__approval_prompt__' (the SWM3F-3
+                // shape) so the next panel connect replays it — the old
+                // clean-reject aborted a tool the user never even saw.
+                var _survivor = null;
+                try { _survivor = pickExecutorPort(); } catch (eS) {}
+                if (_survivor && entry.envelope) {
+                    entry.port = _survivor;
+                    try {
+                        _survivor.postMessage(Object.assign({}, entry.envelope, { primary: true, osNotify: false }));
+                        return; // rebound — keep the pending entry alive
+                    } catch (eP) { /* survivor died too — fall through to park */ }
+                }
+                var _apIn = entry.envelope || {};
+                try {
+                    parkUIToolCall(entry.chatId, id, '__approval_prompt__', {
+                        displayName: _apIn.displayName,
+                        args: _apIn.args,
+                        permissionKey: _apIn.permissionKey,
+                        toolCallId: _apIn.toolCallId || entry.toolCallId,
+                        toolName: _apIn.toolName,
+                        widgetName: _apIn.widgetName || null
+                    }, entry.resolve, entry.reject);
+                } catch (eK) {
+                    // Fallback: never leave the loop hanging.
+                    try { entry.reject(new Error('panel disconnected before returning tool result')); } catch (e2) {}
+                }
+            } else if (entry._remoteResult) {
+                // Sweep 753-773 (F772-1 void-post race): another panel's submission
+                // was already FORWARDED to this now-dead executor (the
+                // prompt-user-remote-result post succeeded silently before the
+                // disconnect fired). The result is known — settle the loop's
+                // promise directly instead of re-parking, which would re-ask the
+                // user and discard the first submission's values.
+                try { entry.resolve(entry._remoteResult); } catch (e2) {}
+            } else if (entry.name) {
                 try {
                     // B1: pass alreadyDispatched=true — this tool was already sent to
                     // the now-disconnected panel and may have executed, so replay must
@@ -591,14 +643,18 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'pull-chat':
-            if (msg.chatId && chats[msg.chatId]) {
+            // Sweep 753-773 (F1-pullchat-tombstone): never reply with a soft-
+            // deleted chat — the page assigns the snapshot WHOLESALE (app/045
+            // 'chat-snapshot') with no _deleted guard, resurrecting a ghost row.
+            // Mirrors _serializeChatsSnapshot and broadcastAgentEvent filters.
+            if (msg.chatId && chats[msg.chatId] && !chats[msg.chatId]._deleted) {
                 // MEMFIX: the SW's copy may be payload-evicted (worker loader
                 // strips all chats). The page assigns this snapshot WHOLESALE
                 // (app/045), which would clobber a hydrated page copy with an
                 // evicted one — rehydrate before replying. ensureChatPayloads
                 // never rejects and is a fast no-op for hydrated chats.
                 var _pcSend = function() {
-                    if (!chats[msg.chatId]) return;
+                    if (!chats[msg.chatId] || chats[msg.chatId]._deleted) return;
                     try {
                         port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: chats[msg.chatId] });
                     } catch (e) {}
@@ -716,6 +772,14 @@ function _handlePanelMessage(port, msg) {
             // SW never saw it — the page's own IDB save already carries the
             // entry in that case).
             (self._swBootReady || Promise.resolve()).then(function() {
+                // Sweep 753-773 (771-2): the K=0 post-commit sweep leaves cold
+                // chats _payloadsEvicted as steady state, and BOTH realms' put-
+                // loops skip evicted chats (worker/115-storage.js) — so this
+                // append was held only in SW memory and silently lost on the
+                // next SW restart. Rehydrate first (same pattern as 'pull-chat'
+                // above); ensureChatPayloads never rejects and is a fast no-op
+                // for hydrated chats.
+                var _rmAppend = function() {
                 try {
                     var rmEntry = msg.entry;
                     var rmChat = msg.chatId ? chats[msg.chatId] : null;
@@ -724,8 +788,23 @@ function _handlePanelMessage(port, msg) {
                     var rmDup = rmChat.versionHistory.some(function(v) { return v && v.id === rmEntry.id; });
                     if (rmDup) return;
                     rmChat.versionHistory.push(rmEntry);
+                    // MEMFIX: same cap as the other append sites (VERSION_HISTORY_CAP
+                    // in core/030-config.js, shared into this bundle) — this is the
+                    // SW-authoritative append for widget-tier mutations, so without
+                    // it those chats' histories grew unbounded and snapshot
+                    // broadcasts overwrote the page's capped mirror.
+                    if (typeof VERSION_HISTORY_CAP !== 'undefined' && rmChat.versionHistory.length > VERSION_HISTORY_CAP) {
+                        rmChat.versionHistory.splice(0, rmChat.versionHistory.length - VERSION_HISTORY_CAP);
+                    }
                     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                 } catch (e) { console.error('[port-bridge] record-mutation append failed', msg.chatId, e); }
+                };
+                var _rmChat0 = msg.chatId ? chats[msg.chatId] : null;
+                if (_rmChat0 && _rmChat0._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                    ensureChatPayloads(msg.chatId).then(_rmAppend);
+                } else {
+                    _rmAppend();
+                }
             });
             return;
 
@@ -765,8 +844,36 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'exec-approval-prompt-result':
+            // AB-2: first-verdict-wins — the pending entry exists only until
+            // the first result deletes it (resolvePendingUIToolCall), so a
+            // late verdict from another panel resolves nothing AND skips the
+            // settle broadcast below (clean no-op, like exec-tool dups).
+            var _abEntry = _pendingUIToolCalls[msg.approvalRequestId];
             resolvePendingUIToolCall(msg.approvalRequestId,
                 { allowed: !!msg.allowed }, msg.error || null);
+            if (_abEntry && _abEntry.isApproval && typeof _swSettleApprovalRow === 'function') {
+                _swSettleApprovalRow(
+                    msg.chatId || _abEntry.chatId,
+                    msg.toolCallId || _abEntry.toolCallId,
+                    msg.status || null,
+                    !!msg.allowed);
+            }
+            return;
+
+        case 'prompt-user-pending':
+            // MP-1: the executing panel just pushed a pending prompt_user row
+            // into its page mirror. Seed it into the SW's authoritative copy
+            // NOW (not after resolve) so every panel's snapshot renders the
+            // live form. Implementation lives in worker/120-tool-routing.js.
+            if (typeof _swSeedPromptRow === 'function') _swSeedPromptRow(msg.chatId, msg.row);
+            return;
+
+        case 'prompt-user-result':
+            // MP-2: a panel WITHOUT the armed resolver collected submit/cancel
+            // values. Reconcile the row (first-submit-wins) and route the
+            // result to the executing panel's resolver — or settle the
+            // pending/parked call directly when that panel is gone.
+            if (typeof _swSettleRemotePrompt === 'function') _swSettleRemotePrompt(msg, port);
             return;
 
         case 'hooks-settings':
@@ -786,6 +893,20 @@ function _handlePanelMessage(port, msg) {
             // (WORKER_SHARED_FILES); pushed by
             // pushDeferredToolsSettingToOffscreen (045-agent-port-bridge-page.js).
             deferredToolsEnabled = !!msg.enabled;
+            return;
+
+        case 'skills-refresh':
+            // Panel finished importEmbeddedSkills() (or activated/deactivated a
+            // skill). Re-run loadActiveSkills so the SW's `skillTools` registry
+            // picks up skills that did not exist in IDB when the SW booted.
+            // Without this, a freshly shipped embedded skill's tools stay
+            // invisible to isSkillTool() / getActiveSkillTools() in the SW until
+            // the next service-worker restart.
+            if (typeof loadActiveSkills === 'function') {
+                Promise.resolve(loadActiveSkills()).catch(function(e) {
+                    console.warn('[sw-runtime] skills-refresh failed', e);
+                });
+            }
             return;
 
         case 'permissions-update':
@@ -839,6 +960,32 @@ function _handlePanelMessage(port, msg) {
                     inflightToolCalls: msg.inflightToolCalls || [],
                     completedToolResults: msg.completedToolResults || []
                 }, port);
+            }
+            // Belt-and-braces skill-tool re-hydration: the explicit
+            // 'skills-refresh' push from core/120-init.js is skipped when the
+            // agent bus port isn't open yet at import time, so also refresh
+            // whenever a panel (re)connects — but ONLY when the SW's registry
+            // is actually empty.
+            //   WHY THE GATE: loadActiveSkills() (core/140-skills-engine.js)
+            //   reassigns the global `activeSkills` and then does an IDB
+            //   getSkillAssets read + TOOL_DEFINITION regex parse for EVERY
+            //   active skill (~20+). Running that on every panel open/close
+            //   and every SW wake is pure waste, and swapping `activeSkills`
+            //   out mid-flight can race an agent run that is reading it.
+            //   When `skillTools` already has entries the SW is hydrated (the
+            //   boot path in worker/190-entry.js did it), so there is nothing
+            //   to re-read. A genuine activate/deactivate still arrives via
+            //   the explicit 'skills-refresh' message handled above, and a
+            //   fresh install (empty registry) still self-heals here.
+            var _swSkillsHydrated = false;
+            try {
+                _swSkillsHydrated = (typeof skillTools !== 'undefined' && skillTools
+                    && Object.keys(skillTools).length > 0);
+            } catch (e) { _swSkillsHydrated = false; }
+            if (!_swSkillsHydrated && typeof loadActiveSkills === 'function') {
+                Promise.resolve(loadActiveSkills()).catch(function(e) {
+                    console.warn('[sw-runtime] panel-hello skills refresh failed', e);
+                });
             }
             return;
 

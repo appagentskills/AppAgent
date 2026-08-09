@@ -375,14 +375,7 @@ function replayParkedToolCalls(port) {
                     // exec-approval-prompt message the port-exists path uses,
                     // populated from the parked entry.input.
                     var _ap = entry.input || {};
-                    _pendingUIToolCalls[entry.toolCallId] = {
-                        resolve: entry.resolve,
-                        reject: entry.reject,
-                        startedAt: Date.now(),
-                        port: port,
-                        chatId: chatId
-                    };
-                    port.postMessage({
+                    var _apEnv = {
                         type: 'exec-approval-prompt',
                         chatId: chatId,
                         toolCallId: _ap.toolCallId,
@@ -392,7 +385,39 @@ function replayParkedToolCalls(port) {
                         permissionKey: _ap.permissionKey,
                         toolName: _ap.toolName,
                         widgetName: _ap.widgetName || null
-                    });
+                    };
+                    _pendingUIToolCalls[entry.toolCallId] = {
+                        resolve: entry.resolve,
+                        reject: entry.reject,
+                        startedAt: Date.now(),
+                        port: port,
+                        chatId: chatId,
+                        // AB: approval marker + envelope for rebind / re-park /
+                        // late-panel re-delivery (worker/130-port-bridge.js).
+                        isApproval: true,
+                        toolCallId: _ap.toolCallId,
+                        envelope: _apEnv
+                    };
+                    // AB-1: (re-)seed the authoritative row — idempotent by
+                    // toolCallId: already-seeded rows are kept, and a park
+                    // created BEFORE any panel existed gains its row now.
+                    if (typeof _swSeedApprovalRow === 'function') {
+                        _swSeedApprovalRow(chatId, {
+                            role: 'approval',
+                            toolName: _ap.displayName,
+                            actualToolName: _ap.toolName || _ap.displayName,
+                            args: _ap.args,
+                            permissionKey: _ap.permissionKey,
+                            toolCallId: _ap.toolCallId,
+                            status: 'pending'
+                        });
+                    }
+                    // AB-3: replayed approvals fan out too — the replay port
+                    // becomes the new PRIMARY; other panels get card-only copies.
+                    // NOTE: _broadcastApprovalPrompt swallows per-port post errors,
+                    // so the surrounding catch's re-park arm is dead for approvals —
+                    // a dead primary is cleaned up by the onDisconnect rebind/re-park.
+                    _broadcastApprovalPrompt(_apEnv, port);
                     AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: entry.toolCallId, reason: 'replayed-approval' });
                 } else if (entry.alreadyDispatched) {
                     // B1: this tool was already dispatched to (and may have run on)
@@ -516,6 +541,226 @@ function resolvePendingUIToolCall(toolCallId, result, error) {
     if (_panelAdoptedTools[toolCallId]) {
         _adoptedResults[toolCallId] = { result: result, error: error };
         if (typeof scheduleAdoptedEviction === 'function') scheduleAdoptedEviction(toolCallId); // SWM3-L1: bound a buffer created after the tombstone downgrade
+    }
+}
+
+// =============================================================
+// MP (multi-panel prompt_user) helpers. See tools/100-prompt-user.js
+// MP-1/MP-2 and app/045-agent-port-bridge-page.js MP-4.
+// =============================================================
+
+// MP-1: seed the pending prompt_user row into the SW's authoritative chat
+// copy at DISPATCH time, splicing it before the tool placeholder — the same
+// slot the resolve-time _message_persist mirror uses. Idempotent by promptId
+// (panel reloads re-invoke executePromptUser with the same toolCallId, and
+// the adopted-row path never re-posts anyway). Broadcasts 'messagesAppended'
+// (chat-inlined — see worker/100-agent-event-broadcast.js) so every panel
+// viewing the chat renders the live form immediately.
+function _swSeedPromptRow(chatId, row) {
+    var chat = chatId && chats[chatId];
+    if (!chat || chat._deleted || !row || !row.promptId) return;
+    if (!Array.isArray(chat.messages)) chat.messages = [];
+    for (var i = 0; i < chat.messages.length; i++) {
+        var m = chat.messages[i];
+        if (m && m.role === 'prompt_user' && m.promptId === row.promptId) return;
+    }
+    var idx = -1;
+    if (row.toolCallId) {
+        for (var j = chat.messages.length - 1; j >= 0; j--) {
+            if (chat.messages[j].role === 'tool' && chat.messages[j].tool_call_id === row.toolCallId) { idx = j; break; }
+        }
+    }
+    if (idx >= 0) chat.messages.splice(idx, 0, row);
+    else chat.messages.push(row);
+    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-pending' });
+}
+
+// MP-2: a panel WITHOUT the armed resolver submitted/cancelled the form.
+// First-submit-wins on the authoritative row, then route the result:
+//   • executor panel still connected → forward so ITS resolver settles and
+//     executePromptUser returns through the normal _message_persist path;
+//   • executor gone but entry pending (dead port not yet unregistered, or
+//     the submitting panel itself) → settle the SW promise directly;
+//   • executor closed and the call RE-PARKED (_unregisterPanel) → consume
+//     the parked entry with the submitted values instead of hanging.
+function _swSettleRemotePrompt(msg, fromPort) {
+    if (!msg || !msg.promptId) return;
+    var chatId = msg.chatId;
+    var result = msg.result || { success: false, cancelled: true, message: 'Prompt settled remotely' };
+    var chat = chatId && chats[chatId];
+    var row = null;
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'prompt_user' && m.promptId === msg.promptId) { row = m; break; }
+        }
+    }
+    if (row && row.status !== 'pending') return; // first-submit-wins: a second panel's race loses
+    if (row) {
+        row.status = result.success ? 'submitted' : 'cancelled';
+        if (result.values) row.values = result.values;
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    }
+    var toolCallId = msg.toolCallId || (row && row.toolCallId) || null;
+    var forwarded = false;
+    if (toolCallId) {
+        var pending = _pendingUIToolCalls[toolCallId];
+        if (pending && pending.port && pending.port !== fromPort) {
+            try {
+                // Sweep 753-773 (F772-1): stash the result on the entry BEFORE the
+                // forward — if the executor port is dead-but-not-yet-disconnected
+                // the post is a silent void; _unregisterPanel then settles the
+                // entry from _remoteResult instead of re-parking it (a re-park
+                // replays the prompt and discards this first submission).
+                pending._remoteResult = result;
+                pending.port.postMessage({ type: 'prompt-user-remote-result', chatId: chatId, promptId: msg.promptId, result: result });
+                forwarded = true;
+            } catch (e) { /* dead port — fall through to direct settle */ }
+        }
+        if (!forwarded && pending) {
+            resolvePendingUIToolCall(toolCallId, result);
+        } else if (!forwarded) {
+            var arr = parkedToolCallsByChatId[chatId];
+            if (arr) {
+                for (var pi = 0; pi < arr.length; pi++) {
+                    if (arr[pi].toolCallId === toolCallId) {
+                        var entry = arr[pi];
+                        arr.splice(pi, 1);
+                        try { if (entry._ttlTimer) { clearTimeout(entry._ttlTimer); entry._ttlTimer = null; } } catch (eT) {}
+                        try { entry.resolve(result); } catch (e2) {}
+                        AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: toolCallId, reason: 'remote-prompt-result' });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Broadcast the resolved row so every panel reconciles (submitted →
+    // read-only values; cancelled → dismissed). The MP-4 merge rule lets a
+    // non-pending snapshot copy win over a page's pending one.
+    AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-result' });
+}
+
+// =============================================================
+// AB (approval broadcast) helpers — clone of the MP prompt_user pattern
+// above, for permission approvals. Consumed by the dispatch below, by
+// worker/130-port-bridge.js (result / register / unregister lanes) and by
+// ui/160-notifications.js + app/036-agent-event-handlers-page.js page-side.
+// =============================================================
+
+// AB-1: seed the pending approval row into the SW's authoritative chat copy
+// at DISPATCH time (mirror of _swSeedPromptRow). Approval rows are appended
+// at the end — the same slot the page-side showToolApprovalPrompt uses.
+// Idempotent by toolCallId, so parked replays / rebind re-posts never
+// duplicate it. Persisting here means the row survives SW restarts and
+// late-connecting panels receive the pending approval in their hello /
+// chat-inlined broadcast snapshots (the page merge keeps a non-pending
+// snapshot copy over a pending page one, see _mergePagePendingRows).
+function _swSeedApprovalRow(chatId, row) {
+    var chat = chatId && chats[chatId];
+    if (!chat || chat._deleted || !row || !row.toolCallId) return;
+    if (!Array.isArray(chat.messages)) chat.messages = [];
+    for (var i = 0; i < chat.messages.length; i++) {
+        var m = chat.messages[i];
+        if (m && m.role === 'approval' && m.toolCallId === row.toolCallId) return;
+    }
+    chat.messages.push(row);
+    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'approval-pending' });
+}
+
+// AB-2: the FIRST verdict arrived (see 'exec-approval-prompt-result' in
+// worker/130-port-bridge.js — the pending entry existed, so this verdict
+// won). Flip the authoritative row and broadcast 'approvalSettled'
+// (chat-inlined, see EVENTS_WITH_CHAT_INLINE) so EVERY panel dismisses its
+// card, drops its local resolver and repaints the row terminal. Late
+// verdicts never reach here — their pending entry is already gone.
+function _swSettleApprovalRow(chatId, toolCallId, status, allowed) {
+    if (!chatId || !toolCallId) return;
+    var chat = chats[chatId];
+    var row = null;
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'approval' && m.toolCallId === toolCallId) { row = m; break; }
+        }
+    }
+    if (row && row.status === 'pending') {
+        row.status = status || (allowed ? 'allowed' : 'denied');
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    }
+    AgentEvents.emit('approvalSettled', {
+        chatId: chatId,
+        toolCallId: toolCallId,
+        status: (row && row.status !== 'pending' && row.status) || status || (allowed ? 'allowed' : 'denied'),
+        allowed: !!allowed
+    });
+}
+
+// AB-3: broadcast an exec-approval-prompt envelope to EVERY connected panel.
+// Approvals are pure UI — unlike exec-tool, multi-dispatch has no side
+// effects: each panel shows its own card, the first verdict wins in the SW
+// (resolvePendingUIToolCall's delete-on-first-resolve) and late verdicts
+// drop. Exactly ONE port is PRIMARY (envelope.primary === true): it keeps
+// today's single-panel duties — firing the OS notification (when ITS
+// document is hidden) and the missing-chat give-up denial — so the fan-out
+// can neither duplicate OS notifications (N hidden panels) nor race-deny
+// for everyone (see _gaveUp in app/045-agent-port-bridge-page.js).
+function _broadcastApprovalPrompt(envelope, primaryPort) {
+    var n = 0;
+    _agentSubscribers.forEach(function(p) {
+        try {
+            p.postMessage(Object.assign({}, envelope, {
+                primary: p === primaryPort,
+                osNotify: p === primaryPort
+            }));
+            n++;
+        } catch (e) { /* dead port — the unregister scan will reap it */ }
+    });
+    return n;
+}
+
+// MP-3 (abandon cleanup): the agent loop abandoned in-flight tool calls
+// (user sent a new message / paused). Settle + remove the SW pending entry
+// and any parked twin so neither leaks, and for prompt_user flip the
+// authoritative row to its abandoned state + disarm the executing panel's
+// page resolver via the same remote-result lane. The loop has ALREADY
+// recorded the '[Tool call abandoned …]' placeholder — the orphan promise
+// resolution below is discarded by the loop's _interrupted branch.
+function abandonPendingUIToolCall(chatId, toolCallId, reason) {
+    var result = { success: false, cancelled: true, abandoned: true, message: 'Tool call abandoned — ' + (reason || 'interrupted') };
+    // Locate the seeded row FIRST — the page-side resolver map is keyed by
+    // promptId, so the forward below must carry the real promptId.
+    var row = null;
+    var chat = chatId && chats[chatId];
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'prompt_user' && m.toolCallId === toolCallId && m.status === 'pending') { row = m; break; }
+        }
+    }
+    var pending = _pendingUIToolCalls[toolCallId];
+    if (pending) {
+        if (pending._backstopTimer) { clearTimeout(pending._backstopTimer); pending._backstopTimer = null; }
+        delete _pendingUIToolCalls[toolCallId];
+        if (pending.name === 'prompt_user' && pending.port && row) {
+            // Disarm the executing panel's pendingPromptResolvers entry and
+            // dismiss its live form (page: _handleRemotePromptResult).
+            try { pending.port.postMessage({ type: 'prompt-user-remote-result', chatId: chatId, promptId: row.promptId, result: result }); } catch (e) {}
+        }
+        try { pending.resolve(result); } catch (e2) {}
+    }
+    // Parked twin (no panel was connected, or the executor closed): resolve +
+    // drop it so the 24h TTL closure isn't the only thing bounding it.
+    cancelParkedToolCall(chatId, toolCallId, reason || 'abandoned');
+    // Flip the authoritative row (seeded by MP-1) so every panel's form
+    // dismisses and shows 'Abandoned' instead of a live Submit button.
+    if (row) {
+        row.status = 'cancelled';
+        row.abandoned = true;
+        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-abandoned' });
     }
 }
 
@@ -786,17 +1031,36 @@ executeTool = async function(name, args, messageIndex, options) {
         // before the tool_result slot (or placeholder) for this toolCallId.
         if (result._message_persist && chats[chatId].messages) {
             var msgs = chats[chatId].messages;
-            var insertIdx = -1;
-            for (var mi = msgs.length - 1; mi >= 0; mi--) {
-                if (msgs[mi].role === 'tool' && msgs[mi].tool_call_id === toolCallId) {
-                    insertIdx = mi;
-                    break;
+            var mp = result._message_persist;
+            // MP-3: prompt_user rows are now ALSO seeded at dispatch time
+            // (_swSeedPromptRow), so the resolve-time mirror must update the
+            // existing row IN PLACE instead of splicing a duplicate. Never
+            // downgrade an already-resolved row back to pending (a stale
+            // pending object can arrive when a remote settle raced the
+            // executor's own resolve).
+            var existingIdx = -1;
+            if (mp.role === 'prompt_user' && mp.promptId) {
+                for (var xi = 0; xi < msgs.length; xi++) {
+                    if (msgs[xi] && msgs[xi].role === 'prompt_user' && msgs[xi].promptId === mp.promptId) { existingIdx = xi; break; }
                 }
             }
-            if (insertIdx >= 0) {
-                msgs.splice(insertIdx, 0, result._message_persist);
+            if (existingIdx >= 0) {
+                if (!(mp.status === 'pending' && msgs[existingIdx].status !== 'pending')) {
+                    msgs[existingIdx] = mp;
+                }
             } else {
-                msgs.push(result._message_persist);
+                var insertIdx = -1;
+                for (var mi = msgs.length - 1; mi >= 0; mi--) {
+                    if (msgs[mi].role === 'tool' && msgs[mi].tool_call_id === toolCallId) {
+                        insertIdx = mi;
+                        break;
+                    }
+                }
+                if (insertIdx >= 0) {
+                    msgs.splice(insertIdx, 0, result._message_persist);
+                } else {
+                    msgs.push(result._message_persist);
+                }
             }
             delete result._message_persist;
         }
@@ -913,14 +1177,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             // `name` is intentionally left UNSET so _unregisterPanel takes its
             // clean-reject branch — an approval cannot be faithfully replayed as an
             // exec-tool.
-            _pendingUIToolCalls[approvalRequestId] = {
-                resolve: function(v) { resolve(v); },
-                reject: function(e) { reject(e); },
-                startedAt: Date.now(),
-                port: port,
-                chatId: targetChatId
-            };
-            port.postMessage({
+            var _abEnvelope = {
                 type: 'exec-approval-prompt',
                 chatId: targetChatId,
                 toolCallId: toolCallId,
@@ -933,7 +1190,37 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 // labels the notification correctly (mirrors the page-side path
                 // where options flow into showToolApprovalPrompt directly).
                 widgetName: options.widgetName || null
+            };
+            _pendingUIToolCalls[approvalRequestId] = {
+                resolve: function(v) { resolve(v); },
+                reject: function(e) { reject(e); },
+                startedAt: Date.now(),
+                port: port,
+                chatId: targetChatId,
+                // AB: approval marker + stashed envelope so 130-port-bridge can
+                // rebind/re-park on primary disconnect and re-deliver to
+                // late-connecting panels. `name` stays UNSET (see comment above).
+                isApproval: true,
+                toolCallId: toolCallId,
+                envelope: _abEnvelope
+            };
+            // AB-1: seed the authoritative pending row BEFORE any port post —
+            // per-port FIFO delivery means every panel merges the row (via the
+            // chat-inlined messagesAppended) before its exec-approval-prompt
+            // arrives, so showToolApprovalPrompt takes its REUSE path instead
+            // of pushing a duplicate page-local row.
+            _swSeedApprovalRow(targetChatId, {
+                role: 'approval',
+                toolName: displayName,
+                actualToolName: toolName || displayName,
+                args: args,
+                permissionKey: permissionKey,
+                toolCallId: toolCallId,
+                status: 'pending'
             });
+            // AB-3: fan out to ALL panels (approvals are pure UI, first verdict
+            // wins); `port` stays PRIMARY for OS-notify + give-up-deny duties.
+            _broadcastApprovalPrompt(_abEnvelope, port);
         });
 
         // If this call runs inside a background handle (options._handleId —

@@ -61,8 +61,11 @@ function showToolInspector(toolName, skillId) {
     // document-level key and removes it again on close.
     overlay._escHandler = function(e) {
         if (e.key !== 'Escape') return;
-        var m = document.getElementById('modal-overlay');
-        if (m && m.classList.contains('show')) return; // confirm on top — global handler closes it
+        // Sweep 753-773 (F2-escape-inspector-doubleclose): defer to ANY visible
+        // overlay (permanent #modal-overlay or a dynamic twin), not just the
+        // permanent confirm — otherwise one Escape closes both the twin (via
+        // the global ladder) and this inspector on the same keypress.
+        if (document.querySelector('.modal-overlay.show:not(#tool-inspector-modal)')) return; // something on top — its own/global handler closes it
         closeToolInspectorModal();
     };
     document.addEventListener('keydown', overlay._escHandler);

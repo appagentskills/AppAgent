@@ -217,6 +217,13 @@ async function saveChatsToStorage() {
         // Committed: clear any armed backoff and surface slow-but-successful
         // saves so future congestion is diagnosable (which realm, how big).
         _workerSaveBackoffUntil = 0;
+        // MEMFIX runtime sweep: the commit above made every non-evicted
+        // chat's record + payload blobs durable, so re-strip cold chats
+        // now (K=0, mirroring this realm's boot strip) — without this,
+        // run-adopted hydrated chats stayed hydrated for the SW's whole
+        // lifetime. Running chats / cleanup-window chats are skipped
+        // inside the sweep (core/130-indexeddb.js).
+        try { if (typeof sweepColdChatPayloads === 'function') sweepColdChatPayloads(0); } catch (eSweep) {}
         var _saveDur = Date.now() - _saveT0;
         if (_saveDur > 2000) {
             console.warn('[worker-storage] slow save: ' + _saveDur + 'ms ('

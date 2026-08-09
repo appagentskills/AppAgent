@@ -100,7 +100,13 @@ var EVENTS_WITH_CHAT_INLINE = {
     // event-agnostic and merge-guarded (pending rows / versionHistory /
     // meta), so inlining here needs no page-side changes.
     'runFinished': true,
-    'runCrashed': true
+    'runCrashed': true,
+    // approvalSettled (AB, worker/120-tool-routing.js _swSettleApprovalRow)
+    // inlines the chat so every panel's event-agnostic assign (app/045)
+    // merges the FLIPPED approval row before the page handler (app/036)
+    // dismisses cards — the dup-merge rule keeps a non-pending snapshot row
+    // over the page's pending copy, so the row can never resurrect.
+    'approvalSettled': true
 };
 
 function broadcastAgentEvent(type, detail) {

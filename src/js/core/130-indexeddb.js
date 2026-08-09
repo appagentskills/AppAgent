@@ -843,6 +843,23 @@ function stripChatPayloadsInPlace(chat) {
             }
         }
     }
+    // MEMFIX-CTR: cached tool results — every >16KB tool result's
+    // fullContent rides on the chat object forever (dominant heap cost on
+    // cache-heavy histories). Entries are keyed by contentId, so they
+    // evict/rehydrate exactly like base64 payloads: blob row in
+    // chat_payloads (JSON-stringified), `_fcEvicted` flag on the entry,
+    // restored by ensureChatPayloads.
+    if (chat.cachedToolResults) {
+        var ctrIds = Object.keys(chat.cachedToolResults);
+        for (var k = 0; k < ctrIds.length; k++) {
+            var ctr = chat.cachedToolResults[ctrIds[k]];
+            if (ctr && ctr.fullContent !== undefined) {
+                delete ctr.fullContent;
+                ctr._fcEvicted = true;
+                stripped = true;
+            }
+        }
+    }
     if (stripped) chat._payloadsEvicted = true;
     return stripped;
 }
@@ -852,6 +869,52 @@ function stripChatPayloadsInPlace(chat) {
 function chatPayloadRecencyTs(chat) {
     if (!chat) return 0;
     return Math.max(chat.updatedAt || 0, chat.createdAt || 0, chat.lastViewedAt || 0);
+}
+
+// MEMFIX: how many of the most-recent chats the PAGE keeps fully hydrated
+// (boot pass in ui/070-dashboard-ui.js loadChatsFromStorage + the runtime
+// sweep below). The SW keeps 0 — no UI. Declared here (shared file) so
+// both the loader and the sweep call sites agree on one K.
+var CHAT_KEEP_HYDRATED = 8;
+// Page-only: handle for the periodic cold-chat sweep tick (registered by
+// the loader in ui/070-dashboard-ui.js; guards against double-registration
+// when a recovery pass re-runs the loader). Unused in the SW bundle.
+var _coldSweepTimer = null;
+
+// MEMFIX runtime sweep: the boot-time eviction above runs ONCE per realm,
+// so the maps regrow for the realm's whole lifetime — the page adopts full
+// hydrated chat snapshots on every SW event (app/045-agent-port-bridge-page.js)
+// and the SW hydrates chats at run entry. Re-run the boot eviction against
+// cold chats at runtime: NEVER the page's current chat, NEVER a running
+// chat (incl. running sub-agent chats) or one inside the finish→hook-rerun
+// cleanup window, and keep the newest `keepHydrated` by recency (page
+// passes its boot K; the SW passes 0, mirroring its boot strip).
+//
+// Call sites run POST-COMMIT in both realms' saveChatsToStorage (plus a
+// periodic page tick): a just-committed save has made every non-evicted
+// chat's record + payload blobs durable, so the strip only drops bytes
+// ensureChatPayloads can bring back. Chats already `_payloadsEvicted` are
+// skipped — their put-skip guard keeps protecting whatever state they hold.
+function sweepColdChatPayloads(keepHydrated) {
+    if (typeof chats === 'undefined' || !chats) return 0;
+    if (typeof _chatsHydrated !== 'undefined' && !_chatsHydrated) return 0;
+    var swept = 0;
+    try {
+        var ids = Object.keys(chats);
+        ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
+        for (var i = 0; i < ids.length; i++) {
+            if (i < (keepHydrated || 0)) continue;
+            var c = chats[ids[i]];
+            if (!c || c._payloadsEvicted) continue;
+            if (typeof currentChatId !== 'undefined' && ids[i] === currentChatId) continue;
+            if (typeof isChatRunning === 'function' && isChatRunning(ids[i])) continue;
+            if (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[ids[i]]) continue;
+            // Temporary chats never persist — stripping would lose payloads.
+            if (c.isTemporary) continue;
+            if (stripChatPayloadsInPlace(c)) swept++;
+        }
+    } catch (e) { console.warn('[indexeddb] cold-chat payload sweep failed', e); }
+    return swept;
 }
 
 // =============================================================
@@ -926,11 +989,39 @@ function extractChatPayloadsForPut(chat) {
             }
         }
     }
+    // MEMFIX-CTR: cached tool result fullContent becomes a blob row too
+    // (JSON-stringified — round-trips losslessly because
+    // processToolResultForCache already JSON.stringify'd the value once).
+    // The record keeps the entry metadata + `_fcEvicted` flag only. An
+    // unserializable value keeps its fullContent inline in the record —
+    // no blob means no way to rehydrate (same rule as id-less base64).
+    var newCtr = null;
+    if (chat.cachedToolResults) {
+        var ctrIds = Object.keys(chat.cachedToolResults);
+        for (var k = 0; k < ctrIds.length; k++) {
+            var ce = chat.cachedToolResults[ctrIds[k]];
+            if (ce && ce.fullContent !== undefined) {
+                var fcStr = null;
+                try { fcStr = JSON.stringify(ce.fullContent); } catch (eFc) {}
+                if (typeof fcStr !== 'string') continue;
+                if (!newCtr) newCtr = Object.assign({}, chat.cachedToolResults);
+                var ceClone = Object.assign({}, ce);
+                delete ceClone.fullContent;
+                ceClone._fcEvicted = true;
+                newCtr[ctrIds[k]] = ceClone;
+                payloads.push({ id: ctrIds[k], base64: fcStr, at: now });
+                evicted = true;
+            } else if (ce && ce._fcEvicted) {
+                evicted = true;
+            }
+        }
+    }
     var record = chat;
-    if (newMsgs || newSs || (evicted && !chat._payloadsEvicted)) {
+    if (newMsgs || newSs || newCtr || (evicted && !chat._payloadsEvicted)) {
         record = Object.assign({}, chat);
         if (newMsgs) record.messages = newMsgs;
         if (newSs) record.screenshots = newSs;
+        if (newCtr) record.cachedToolResults = newCtr;
         if (evicted) record._payloadsEvicted = true;
     }
     return { record: record, payloads: payloads };
@@ -1025,6 +1116,11 @@ function sweepOrphanChatPayloads() {
         if (c.screenshots) {
             Object.keys(c.screenshots).forEach(function(k) { referenced[k] = true; });
         }
+        // MEMFIX-CTR: cached-tool-result blobs are keyed by contentId —
+        // count them or the sweep reaps every evicted fullContent after 24h.
+        if (c.cachedToolResults) {
+            Object.keys(c.cachedToolResults).forEach(function(k) { referenced[k] = true; });
+        }
     });
     var cutoff = Date.now() - DB_PAYLOAD_GC_MIN_AGE_MS;
     return withStore([chatPayloadsStoreName], 'readwrite', function(transaction) {
@@ -1091,6 +1187,11 @@ async function ensureChatPayloads(chatId) {
             if (chat.screenshots) {
                 Object.keys(chat.screenshots).forEach(function(wk) {
                     if (chat.screenshots[wk] && chat.screenshots[wk]._b64Evicted) wantIds[wk] = true;
+                });
+            }
+            if (chat.cachedToolResults) {
+                Object.keys(chat.cachedToolResults).forEach(function(wc) {
+                    if (chat.cachedToolResults[wc] && chat.cachedToolResults[wc]._fcEvicted) wantIds[wc] = true;
                 });
             }
             var record = null;
@@ -1206,6 +1307,41 @@ async function ensureChatPayloads(chatId) {
                         continue;
                     }
                     delete cs._b64Evicted;
+                }
+            }
+            // MEMFIX-CTR: restore evicted cached-tool-result fullContent. Blob
+            // rows carry it JSON-stringified (parse back); the legacy fallback
+            // is the record's own inline copy (chats never re-saved since this
+            // fix shipped — fullContent still rides in the record, already an
+            // object). Same errored/never-fetched retry discipline as above.
+            if (chat.cachedToolResults) {
+                var cIds = Object.keys(chat.cachedToolResults);
+                for (var ci = 0; ci < cIds.length; ci++) {
+                    var ce = chat.cachedToolResults[cIds[ci]];
+                    if (!ce || !ce._fcEvicted) continue;
+                    var rc = (record && record.cachedToolResults) ? record.cachedToolResults[cIds[ci]] : null;
+                    if (typeof blobById[cIds[ci]] === 'string') {
+                        try {
+                            ce.fullContent = JSON.parse(blobById[cIds[ci]]);
+                        } catch (ePc) {
+                            // Corrupt blob: unrecoverable — clear the flag below so
+                            // the chat can persist again (readers report the id as
+                            // no longer available). Retrying can never succeed.
+                            console.warn('[indexeddb] cached-content blob unparsable for', cIds[ci]);
+                        }
+                    } else if (rc && rc.fullContent !== undefined) {
+                        ce.fullContent = rc.fullContent;
+                    } else if (failedIds[cIds[ci]]) {
+                        // Errored ≠ absent — keep it retryable.
+                        keptAny = true;
+                        continue;
+                    } else if (!wantIds[cIds[ci]]) {
+                        // NEVER-FETCHED (live chat replaced mid-await): keep the
+                        // flag so the next hydration fetches it.
+                        keptAny = true;
+                        continue;
+                    }
+                    delete ce._fcEvicted;
                 }
             }
             // Hydrated (or nothing durable to hydrate from) — clear the flag so

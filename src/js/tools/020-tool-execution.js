@@ -686,6 +686,11 @@ function trackRecordMutation(evt) {
             var trmChat = chats[evt.chatId];
             if (!Array.isArray(trmChat.versionHistory)) trmChat.versionHistory = [];
             trmChat.versionHistory.push(entry);
+            // MEMFIX: cap per-chat version history (drop oldest) — unbounded
+            // appends grew the chat record forever on long-lived chats.
+            if (typeof VERSION_HISTORY_CAP !== 'undefined' && trmChat.versionHistory.length > VERSION_HISTORY_CAP) {
+                trmChat.versionHistory.splice(0, trmChat.versionHistory.length - VERSION_HISTORY_CAP);
+            }
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         }
     } catch (e) { /* tracking must never break the tool result */ }
@@ -1068,6 +1073,27 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     // existed don't contain it, and a sub must always be
                     // able to fetch a cataloged tool's schema.
                     || name === 'get_tool_schema');
+                // SKILL-PROVIDED TOOLS ARE NEVER ROSTER-DENIED.
+                // Skill tools (run_audit, web_search, search_docs, …) are not
+                // in the static TOOLS array and are not members of any entry in
+                // core/078-tool-profiles.js, so a profile-narrowed spawn roster
+                // never contains them — yet a sub that reads the skill doc is
+                // told to call them. Denying the call is the bug: the roster is
+                // a REGISTRY-tool budget, not a skill gate. `isSkillTool`
+                // (core/140-skills-engine.js) only returns true for a tool that
+                // is actually registered under an active skill, so unknown /
+                // nonexistent tool names still fall through to the deny branch
+                // below with the same clear error.
+                // NOTE: prefer isVisibleSkillTool over isSkillTool — it applies
+                // the same devOnly gate as getActiveSkillTools(), so a tool from
+                // a devOnly skill stays uncallable outside extension dev mode
+                // instead of slipping through this roster bypass.
+                var _skillToolCheck = (typeof isVisibleSkillTool === 'function')
+                    ? isVisibleSkillTool
+                    : (typeof isSkillTool === 'function' ? isSkillTool : null);
+                if (!_alwaysAllowed && _skillToolCheck) {
+                    try { _alwaysAllowed = _skillToolCheck(name); } catch (_e) { /* skill subsystem unavailable */ }
+                }
                 if (!_alwaysAllowed && _subRec.tool_roster.indexOf(name) === -1) {
                     var _nestedTools = (typeof SUBAGENT_NESTED_DELEGATION_TOOLS !== 'undefined') ? SUBAGENT_NESTED_DELEGATION_TOOLS : ['spawn_sub_agent', 'stop_sub_agent', 'wake_sub_agent'];
                     var _rosterErr;
@@ -1450,6 +1476,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
                                         if (jsChat) {
                                             if (!jsChat.screenshots) jsChat.screenshots = {};
                                             jsChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
+                                            // MEMFIX: cap the per-chat screenshots map (~20, LRU by
+                                            // timestamp) — mirrors the skills-sandbox cap in
+                                            // core/140-skills-engine.js; an unbounded map grows the
+                                            // chat by ~1-2MB per sandbox screenshot forever.
+                                            try {
+                                                var _ssKeys = Object.keys(jsChat.screenshots);
+                                                var _SS_CAP = 20;
+                                                if (_ssKeys.length > _SS_CAP) {
+                                                    _ssKeys.sort(function(a, b) { return (jsChat.screenshots[a].timestamp || 0) - (jsChat.screenshots[b].timestamp || 0); });
+                                                    for (var _ei = 0; _ei < _ssKeys.length - _SS_CAP; _ei++) {
+                                                        delete jsChat.screenshots[_ssKeys[_ei]];
+                                                    }
+                                                }
+                                            } catch (eCap) {}
                                             // Register in the file index so screenshot_by_id/getFile resolve it
                                             // immediately, and AWAIT the persistence write BEFORE the id is
                                             // posted back to the running js_eval code (avoids a phantom id).
@@ -2092,6 +2132,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return await executeGetFile(args);
     } else if (name === 'read_attached_file') {
         return executeReadAttachedFile(args, options);
+    } else if (name === 'get_cookie') {
+        // Impl: executeGetCookie at the bottom of this file. Headless
+        // (HEADLESS_TOOLS.get_cookie = true) so it executes in the SW — the only
+        // context where chrome.cookies exists (the js_eval sandbox has none).
+        return await executeGetCookie(args);
     } else if (name === 'web_fetch') {
         try {
             var _wfSaveFile = args.save_file;
@@ -2355,6 +2400,13 @@ function _wsFormatAgo(ms) {
 // service-worker restart, so "not running" alone is not proof of dormancy.
 var WS_RECENT_MS = 15 * 60 * 1000;
 
+// Recovery hint appended to HARD cross-chat blocks only (the dormant-takeover
+// warning path proceeds and needs no recovery): instead of forcing over
+// another agent's in-progress work, the blocked agent can fork its own branch
+// and keep working there — wsBranch leaves hard-locked foreign dirty files
+// behind in the source workspace.
+var WS_BRANCH_HINT = ' To continue without touching their edits, fork your own branch: workspace {"action":"branch","branch":"<new-branch>"} \u2014 your dirty files move with you; files hard-locked by other chats stay behind.';
+
 function _wsRecentlyModified(when) {
     return !!(when && (Date.now() - when) < WS_RECENT_MS);
 }
@@ -2420,7 +2472,7 @@ function _wsCheckCrossChatConflict(file, chatId) {
             last_modified_ago: ago,
             last_modified_iso: when ? new Date(when).toISOString() : null,
             other_chat_running: false,
-            message: '\u26A0 This file has uncommitted changes with NO recorded owner, edited ' + (ago || 'just now') + ' \u2014 likely still in progress by an unknown agent. Pass {"force": true} to take over.'
+            message: '\u26A0 This file has uncommitted changes with NO recorded owner, edited ' + (ago || 'just now') + ' \u2014 likely still in progress by an unknown agent. Pass {"force": true} to take over.' + WS_BRANCH_HINT
         };
     }
     if (chatId && _wsSameChatLineage(lastChat, chatId)) return null;
@@ -2435,9 +2487,9 @@ function _wsCheckCrossChatConflict(file, chatId) {
     if (stillRunning) {
         headline = '\u26A0 ANOTHER AGENT IS ACTIVELY RUNNING in chat "' + otherTitle + '" (' + lastChat + ')';
         if (ago) headline += ' \u2014 last edited ' + ago;
-        headline += '. Coordinate with the other chat, or pass {"force": true} to override and clobber their work.';
+        headline += '. Coordinate with the other chat, or pass {"force": true} to override and clobber their work.' + WS_BRANCH_HINT;
     } else if (recent) {
-        headline = '\u26A0 This file was recently edited ' + (ago || 'just now') + ' by another chat "' + otherTitle + '" (' + lastChat + ') \u2014 likely still in progress; pass {"force": true} to take over.';
+        headline = '\u26A0 This file was recently edited ' + (ago || 'just now') + ' by another chat "' + otherTitle + '" (' + lastChat + ') \u2014 likely still in progress; pass {"force": true} to take over.' + WS_BRANCH_HINT;
     } else {
         headline = '\u26A0 This file has uncommitted changes from another (dormant) chat "' + otherTitle + '" (' + lastChat + ')';
         if (ago) headline += ' \u2014 last edited ' + ago;
@@ -3352,7 +3404,9 @@ async function setWorkspacePin(wk, unpin) {
 // overlay content travels to the fork (that is the point: work already
 // started on the source branch moves to the fork). With moveDirty (default)
 // the SOURCE's dirty files are then reverted clean (discard semantics) so
-// the edits live in exactly one place; moveDirty=false keeps both.
+// the edits live in exactly one place; moveDirty=false keeps both. Dirty
+// files HARD-locked by another chat do not travel: the fork gets their
+// pristine base, the source keeps the foreign edits (see left_behind).
 // The REMOTE branch does not exist yet — wsPush creates the ref lazily on
 // the first push, cutting it from the fork's base branch (meta.base_branch).
 // The fork is pinned automatically (it is the workspace the user is about
@@ -3373,31 +3427,27 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     // dirty rows keep their inline overlay content, which must travel.
     var allRows = await getAllWorkspaceFilesAllRepos();
 
-    // Cross-chat guard: forking sweeps EVERY dirty file into the fork and (with
-    // moveDirty, the default) force-discards them from the source — which would
-    // bypass the per-file mutation lock. Fail the WHOLE branch action when any
-    // dirty file hard-conflicts with another owner (unless force).
+    // Cross-chat guard: forking sweeps dirty files into the fork and (with
+    // moveDirty, the default) force-discards them from the source — which
+    // would bypass the per-file mutation lock. Dirty files that HARD-conflict
+    // with another owner (owner chat running, or stamp recent/unowned-recent)
+    // are LEFT BEHIND instead of failing the fork: the fork receives their
+    // pristine base version and their source rows are not touched, so the
+    // owning chat keeps its in-progress work. Soft (dormant+stale) foreign
+    // dirty files keep travelling as before. force=true sweeps everything.
+    var leftBehind = [];
+    // Null prototype: repo paths like "constructor"/"toString" must not hit
+    // inherited Object keys and be mistaken for left-behind entries.
+    var leftBehindSet = Object.create(null);
     if (!force) {
-        var blockedDirty = [];
         for (var gi = 0; gi < allRows.length; gi++) {
             var gr = allRows[gi];
             if (!gr || gr.repo !== wk || !gr.dirty) continue;
             var gDec = await _wsConflictDecision(wk, gr.path, gr, chatId, false);
             if (gDec.block) {
-                blockedDirty.push({
-                    path: gr.path,
-                    owner_chat_id: gDec.block.last_modified_by_chat_id,
-                    owner_chat_title: gDec.block.last_modified_by_chat_title,
-                    last_modified_ago: gDec.block.last_modified_ago
-                });
+                leftBehind.push(gr.path);
+                leftBehindSet[gr.path] = true;
             }
-        }
-        if (blockedDirty.length > 0) {
-            return {
-                success: false,
-                error: 'branch blocked — ' + blockedDirty.length + ' dirty file(s) have uncommitted changes owned by another chat that is running or recently active: ' + blockedDirty.map(function(b) { return b.path; }).join(', ') + '. Coordinate with the owning chat(s), or pass {"force": true} to fork anyway.',
-                blocking_files: blockedDirty
-            };
         }
     }
 
@@ -3418,10 +3468,33 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
         copy.last_modified_by_chat_id = src.last_modified_by_chat_id || null;
         copy.last_modified_by_chat_title = src.last_modified_by_chat_title || null;
         copy.last_modified_at = src.last_modified_at || null;
+        if (leftBehindSet[src.path]) {
+            // Hard-conflicting foreign dirty row: the fork gets the PRISTINE
+            // base version with no dirty overlay and no ownership stamp — the
+            // owning chat's uncommitted edits stay only in the source. A
+            // never-committed new file (no sha) has no base version: no fork
+            // row. Any other row has a base blob on GitHub — when the base
+            // content is not held locally (deleted-without-hydration stub, or
+            // a write whose pre-write hydration failed: sha set,
+            // original_content null, stub unset), copy a CLEAN STUB so the
+            // fork re-hydrates the pristine base by sha on demand.
+            if (!src.sha) continue;
+            if (src.original_content === null) {
+                copy.content = null;
+                copy.stub = true;
+            } else {
+                copy.content = src.original_content;
+            }
+            copy.dirty = false;
+            copy.deleted = false;
+            copy.last_modified_by_chat_id = null;
+            copy.last_modified_by_chat_title = null;
+            copy.last_modified_at = null;
+        }
         await setWorkspaceFile(copy);
         registerFile(copy.file_id, { type: 'workspace', workspace: targetWk, path: copy.path });
         copied++;
-        if (src.dirty) dirtyCopied.push(src.path);
+        if (src.dirty && !leftBehindSet[src.path]) dirtyCopied.push(src.path);
     }
 
     await setWorkspaceMeta({
@@ -3442,15 +3515,29 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     var movedOut = false;
     if (moveDirty !== false && dirtyCopied.length > 0) {
         try {
-            var disc = await wsDiscard(wk, null, chatId, chatTitle, true);
-            movedOut = !!(disc && disc.success);
+            if (leftBehind.length === 0) {
+                var disc = await wsDiscard(wk, null, chatId, chatTitle, true);
+                movedOut = !!(disc && disc.success);
+            } else {
+                // Foreign-owned dirty rows stayed behind: discard ONLY the
+                // travelled paths so the owning chat's source edits survive.
+                var allDiscarded = true;
+                for (var di = 0; di < dirtyCopied.length; di++) {
+                    var discOne = await wsDiscard(wk, dirtyCopied[di], chatId, chatTitle, true);
+                    if (!discOne || !discOne.success) allDiscarded = false;
+                }
+                // Only claim moved AFTER the loop completes — a discard that
+                // throws mid-loop must not leave movedOut=true with paths
+                // still undiscarded (the catch below swallows the error).
+                movedOut = allDiscarded;
+            }
         } catch (e) {}
     }
 
     var pinRes = null;
     try { pinRes = await setWorkspacePin(targetWk, false); } catch (e) {}
 
-    return {
+    var res = {
         success: true,
         workspace: targetWk,
         forked_from: wk,
@@ -3462,6 +3549,11 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
         pinned: !!(pinRes && pinRes.success),
         message: 'Forked "' + wk + '" → "' + targetWk + '" (' + copied + ' files, ' + dirtyCopied.length + ' dirty ' + (movedOut ? 'moved' : 'copied') + '). The remote branch does not exist yet — the first push creates it from base "' + meta.branch + '".'
     };
+    if (leftBehind.length > 0) {
+        res.left_behind = leftBehind;
+        res.message += ' ' + leftBehind.length + ' dirty file(s) hard-locked by other chats were left behind: the fork got their pristine base version (or no row for never-committed new files) and their uncommitted edits stay in the source workspace: ' + leftBehind.join(', ') + '.';
+    }
+    return res;
 }
 
 // Move dirty edits from workspace `wk` onto workspace `targetWk`.
@@ -5757,3 +5849,116 @@ async function wsDeploy(wk, srcPath, destSubdir) {
 }
 
 // =============================================
+
+// =============================================================
+// get_cookie — read browser cookies for a URL.
+//
+// WHY THIS TOOL EXISTS
+//   js_eval runs inside chrome-extension://<id>/sandbox.html, which is
+//   listed in the manifest "sandbox" section. That context has a null
+//   origin and NO chrome.* APIs: `document.cookie` throws SecurityError
+//   and `chrome.cookies` is undefined. So authenticated fetches against
+//   cookie-gated sites (e.g. a site that requires a session cookie value
+//   echoed back in a request header) cannot read the cookie themselves.
+//
+//   This tool is HEADLESS (core/080-tools.js HEADLESS_TOOLS.get_cookie =
+//   true), so the SW tool router (worker/120-tool-routing.js) runs it in
+//   the service worker — the background context, where chrome.cookies IS
+//   available (manifest permissions: "cookies" + host_permissions
+//   <all_urls>). The sandbox reaches it over the EXISTING generic bridge:
+//   sandbox.html postMessage 'sandboxToolCall' -> offscreen-helper.js
+//   'sw-exec-tool' -> background.js executeTool -> this function.
+//
+// SECURITY
+//   Cookie values ARE session credentials. The tool is ALLOWED by default:
+//   it runs silently and the user is NOT prompted, the same treatment as
+//   workspace:push. GLOBAL_WRITE_KEYS membership (core/070-permissions.js)
+//   alone would give it the generic write default 'auto', so get_cookie is
+//   EXPLICITLY special-cased to 'allow' in every default-resolution site:
+//     • worker/025-permissions-helpers.js  getToolPermission
+//     • ui/140-dropdowns.js                getToolPermission + the global
+//                                          radio-render fallback
+//     • ui/070-dashboard-ui.js             initDefaultToolPermissions,
+//                                          _getGlobalDefault,
+//                                          resetAllPermissionsToDefaults
+//   loadToolPermissions() also runs a one-time
+//   permMigrations.getCookieAllow migration that flips a previously
+//   persisted 'auto'/'ask' to 'allow'. Staying in GLOBAL_WRITE_KEYS keeps
+//   the tool visible in Settings > Tool permissions, where the user can
+//   restrict it to 'Ask' or 'Off'. Values are NEVER written to console.
+//
+// USAGE (from js_eval or a widget)
+//   var r = await executeTool('get_cookie', { url: 'https://example.com', name: 'session_id' });
+//   r.cookies.session_id  // -> the value, or undefined when not set
+// =============================================================
+
+async function executeGetCookie(args) {
+    args = args || {};
+    var url = args.url;
+    if (!url || typeof url !== 'string') {
+        return { success: false, error: 'get_cookie requires a "url" string (e.g. "https://example.com").' };
+    }
+    try { new URL(url); } catch (e) {
+        return { success: false, error: 'get_cookie: invalid url ' + JSON.stringify(url) + ' — pass a full absolute URL including the scheme.' };
+    }
+    if (typeof chrome === 'undefined' || !chrome.cookies || !chrome.cookies.getAll) {
+        return { success: false, error: 'get_cookie: chrome.cookies is unavailable in this context. It only exists in the extension background/service-worker context — call the tool via executeTool("get_cookie", …) rather than touching chrome.cookies directly.' };
+    }
+
+    // Requested names: `name` (single) and/or `names` (array), de-duped.
+    var wanted = [];
+    var seen = Object.create(null);
+    function want(n) {
+        if (typeof n !== 'string') return;
+        n = n.trim();
+        if (!n || seen[n]) return;
+        seen[n] = true;
+        wanted.push(n);
+    }
+    if (Array.isArray(args.names)) { for (var i = 0; i < args.names.length; i++) want(args.names[i]); }
+    want(args.name);
+
+    var list;
+    try {
+        list = await new Promise(function(resolve, reject) {
+            chrome.cookies.getAll({ url: url }, function(cookies) {
+                var lastErr = (chrome.runtime && chrome.runtime.lastError) || null;
+                if (lastErr) reject(new Error(lastErr.message || String(lastErr)));
+                else resolve(cookies || []);
+            });
+        });
+    } catch (err) {
+        return { success: false, error: 'get_cookie: chrome.cookies.getAll failed — ' + (err && err.message ? err.message : String(err)) };
+    }
+
+    // Never log values. Build a plain { name: value } map.
+    var cookies = {};
+    for (var j = 0; j < list.length; j++) {
+        var c = list[j];
+        if (!c || typeof c.name !== 'string') continue;
+        if (wanted.length && !seen[c.name]) continue;
+        cookies[c.name] = c.value;
+    }
+
+    var missing = [];
+    for (var k = 0; k < wanted.length; k++) {
+        if (!Object.prototype.hasOwnProperty.call(cookies, wanted[k])) missing.push(wanted[k]);
+    }
+
+    var out = {
+        success: true,
+        url: url,
+        cookies: cookies,
+        names: Object.keys(cookies),
+        count: Object.keys(cookies).length
+    };
+    if (wanted.length) {
+        out.requested = wanted;
+        out.missing = missing;
+        if (missing.length) {
+            out.note = 'Not set for this URL (or HttpOnly-scoped to a different domain/path): ' + missing.join(', ') +
+                '. Make sure you are logged in to the site in this browser profile and that the URL scheme/host match the cookie domain.';
+        }
+    }
+    return out;
+}

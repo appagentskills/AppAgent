@@ -1907,7 +1907,7 @@ async function _loadChatsFromStorageImpl() {
         // call sites (switchToChat, history view) also hydrate on demand,
         // this just front-loads the common case.
         try {
-            var KEEP_HYDRATED = 8;
+            var KEEP_HYDRATED = CHAT_KEEP_HYDRATED;
             if (typeof stripChatPayloadsInPlace === 'function') {
                 var _ids = Object.keys(chats);
                 _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
@@ -1946,6 +1946,19 @@ async function _loadChatsFromStorageImpl() {
                 }
             }
         } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
+        // MEMFIX runtime sweep, periodic leg: the page regrows outside saves
+        // too — every SW event assigns full hydrated chat snapshots into
+        // `chats` (app/045-agent-port-bridge-page.js) and the SW owns their
+        // persistence, so a backgrounded page may not save (= not sweep) for
+        // hours. A 60s tick re-strips cold chats; registered once (guarded)
+        // even if this loader re-runs on a recovery pass.
+        try {
+            if (!_coldSweepTimer && typeof sweepColdChatPayloads === 'function') {
+                _coldSweepTimer = setInterval(function() {
+                    try { sweepColdChatPayloads(CHAT_KEEP_HYDRATED); } catch (e) {}
+                }, 60000);
+            }
+        } catch (e) {}
         // WIPE-GUARD follow-up: the file index is a derived cache; its failure
         // must not block hydration or leave _chatsHydrated false (which would
         // block saves all session even though `chats` hydrated fine).
@@ -2154,6 +2167,13 @@ async function saveChatsToStorage() {
         // Committed: clear any armed backoff and surface slow-but-successful
         // saves so future congestion is diagnosable (which realm, how big).
         _saveChatsBackoffUntil = 0;
+        // MEMFIX runtime sweep: the commit above made every non-evicted
+        // chat's record + payload blobs durable, so re-strip cold chats now
+        // (same K as the boot pass; current/running chats are skipped inside
+        // the sweep — core/130-indexeddb.js). Without this, chats hydrated
+        // since boot (snapshot adoption, viewed-then-left chats) stayed
+        // hydrated for the page's whole lifetime.
+        try { if (typeof sweepColdChatPayloads === 'function') sweepColdChatPayloads(CHAT_KEEP_HYDRATED); } catch (eSweep) {}
         var _saveDur = Date.now() - _saveT0;
         if (_saveDur > 2000) {
             console.warn('[storage] slow save: ' + _saveDur + 'ms ('
@@ -2380,6 +2400,28 @@ async function loadToolPermissions() {
         setSetting('permMigrations', permMigrations);
     }
 
+    // One-time migration: pre-release builds of get_cookie seeded its default
+    // as 'auto' (the generic GLOBAL_WRITE_KEYS default) and then as 'ask'; the
+    // baked-in default is now 'allow' — cookie reads run silently, like
+    // workspace:push. initDefaultToolPermissions PERSISTS whichever default was
+    // current the first time it ran, and a stored value always shadows the
+    // baked-in default, so those installs would never pick up 'allow'. Flip a
+    // stored 'auto' OR 'ask' → 'allow' exactly once, guarded by a persisted
+    // permMigrations flag, so a user who afterwards deliberately picks
+    // 'ask'/'auto'/'off' is never re-migrated.
+    // 'ask' is migrated too (not just 'auto') on purpose: get_cookie has never
+    // shipped in a release with an 'ask' default — it only existed on the
+    // unmerged feature branch — so a stored 'ask' can only be a seeded
+    // pre-release default, not a considered user choice.
+    if (!permMigrations.getCookieAllow) {
+        if (toolPermissions['get_cookie'] === 'auto' || toolPermissions['get_cookie'] === 'ask') {
+            toolPermissions['get_cookie'] = 'allow';
+            saveToolPermissions();
+        }
+        permMigrations.getCookieAllow = true;
+        setSetting('permMigrations', permMigrations);
+    }
+
     // Mirror to SW now that IDB load is complete. initDefaultToolPermissions
     // ends in saveToolPermissions which pushes ONLY toolPermissions — so
     // without an explicit instancePermissions push, the SW never learns about
@@ -2411,7 +2453,9 @@ function initDefaultToolPermissions() {
                 toolPermissions[key] = 'disabled';
             } else if (key === 'web_fetch') {
                 toolPermissions[key] = 'ask';
-            } else if (key === 'workspace:push') {
+            } else if (key === 'workspace:push' || key === 'get_cookie') {
+                // get_cookie runs silently by default; the user can lower it
+                // to 'ask'/'Off' in Settings > Tool permissions.
                 toolPermissions[key] = 'allow';
             } else {
                 toolPermissions[key] = 'auto';
@@ -2425,7 +2469,7 @@ function _getGlobalDefault(key) {
     if (GLOBAL_READ_KEYS.indexOf(key) !== -1) return 'allow';
     if (key === 'manage_skill:activate') return 'disabled';
     if (key === 'web_fetch') return 'ask';
-    if (key === 'workspace:push') return 'allow';
+    if (key === 'workspace:push' || key === 'get_cookie') return 'allow';
     return 'auto';
 }
 
@@ -2464,7 +2508,7 @@ function resetAllPermissionsToDefaults() {
             toolPermissions[key] = 'disabled';
         } else if (key === 'web_fetch') {
             toolPermissions[key] = 'ask';
-        } else if (key === 'workspace:push') {
+        } else if (key === 'workspace:push' || key === 'get_cookie') {
             toolPermissions[key] = 'allow';
         } else {
             toolPermissions[key] = 'auto';

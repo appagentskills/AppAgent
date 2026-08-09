@@ -144,6 +144,15 @@ function getToolPermission(toolName, methodOrAction) {
     if (toolPermissions[permKey]) return toolPermissions[permKey];
     // workspace:push defaults to 'allow' — PR pushes never prompt unless overridden
     if (permKey === 'workspace:push') return 'allow';
+    // get_cookie defaults to 'allow' — cookie reads run silently and are never
+    // prompted, exactly like workspace:push above. It stays in
+    // GLOBAL_WRITE_KEYS so it still appears in Settings > Tool permissions and
+    // can be lowered to 'ask'/'Off', but the generic write default 'auto' is
+    // overridden here so a fresh profile, or a profile whose stored value was
+    // cleared, resolves to 'allow'. The values returned ARE session
+    // credentials. Keep this in sync with ui/140-dropdowns.js
+    // getToolPermission and ui/070-dashboard-ui.js _getGlobalDefault.
+    if (permKey === 'get_cookie') return 'allow';
     return isReadPermissionKey(permKey) ? 'allow' : 'auto';
 }
 

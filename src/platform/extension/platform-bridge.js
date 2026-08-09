@@ -746,7 +746,13 @@
         if (!_removeConfirmPending) return false;
         var ov = document.getElementById('modal-overlay');
         if (ov && ov.classList.contains('show')) return true;
-        _removeConfirmPending = false;   // stale — no dialog is up
+        // Sweep 753-773 (F2-stale-pending-inert-dropdown): heal through the
+        // setter so a mounted dropdown also sheds .confirm-pending + inert —
+        // the bare boolean left the picker click-through until it was closed
+        // and reopened (the \u2715 that allegedly self-heals it was itself
+        // unclickable, and the focus-refresh signature short-circuit skips a
+        // re-render because the signature ignores pending state).
+        _setRemoveConfirmPending(false); // stale — no dialog is up
         return false;
     }
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.21
+
+### Features
+- New `get_cookie` tool lets `js_eval` make authenticated fetches against cookie-gated sites.
+- Branching a workspace on a conflict now shows a recovery hint, and the new branch leaves files locked by other chats behind.
+
+### Fixes
+- Fixed tab out-of-memory crashes: large tool results now unload from memory and reload on demand.
+- With multiple panels open, tool-approval popups and `prompt_user` forms now show up in all of them.
+- Skill-provided tools no longer get blocked for sub-agents, and new skill tools work without an extension restart.
+
+---
+
 ## v1.1.20
 
 ### Features

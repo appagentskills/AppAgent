@@ -57,12 +57,24 @@ var GLOBAL_READ_KEYS = [
     'list_instances'
 ];
 
-// Modifying: default 'auto' (except web_fetch → 'ask', workspace:push → 'allow')
+// Modifying: default 'auto'
+// (except web_fetch → 'ask', get_cookie → 'allow', workspace:push → 'allow')
 var GLOBAL_WRITE_KEYS = [
     'js_eval',
     'html_widget',
     'pin_widget',
     'web_fetch',
+    // get_cookie is ALLOWED by default (runs silently, no prompt) — same
+    // treatment as workspace:push below. Membership here is only so it shows up
+    // in Settings > Tool permissions and can be lowered to 'ask'/'Off'; the
+    // generic write default 'auto' is overridden by an explicit 'allow' special
+    // case in every place the default is computed:
+    // worker/025-permissions-helpers.js getToolPermission, ui/140-dropdowns.js
+    // getToolPermission + renderToolPermissions, and ui/070-dashboard-ui.js
+    // initDefaultToolPermissions / _getGlobalDefault /
+    // resetAllPermissionsToDefaults. Note the values it returns ARE session
+    // credentials.
+    'get_cookie',
     'set_chat_title',
     'set_tldr',
     'set_links',

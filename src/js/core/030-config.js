@@ -501,6 +501,12 @@ var interruptResolversByChatId = (typeof interruptResolversByChatId !== 'undefin
 var currentStreamingMsgIndex = -1;
 var activeStreamingChatId = null; // Track which chat has active streaming (the one the UI is focused on)
 function isChatRunning(chatId) { return !!runningChatIds[chatId]; }
+
+// MEMFIX: cap on per-chat versionHistory entries (oldest dropped beyond
+// this) — enforced at every append site (trackRecordMutation in
+// tools/020-tool-execution.js, addVersionHistoryEntry* in
+// ui/090-version-history.js). Both bundles include this file.
+var VERSION_HISTORY_CAP = 200;
 // LEFT nav rail (chat-list sidebar) collapsed state — toggled by toggleSidebar()
 // (ui/240-layout.js), persisted as appStorage key 'sidebarCollapsed'. NOT the
 // RIGHT chat/version sidebar — that is versionSidebarManuallyHidden in

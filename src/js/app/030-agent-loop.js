@@ -706,6 +706,13 @@ async function runAgent(overrideChatId) {
                 for (var rj = pci; rj < pendingToolCalls.length; rj++) {
                     var rjtc = pendingToolCalls[rj].tc;
                     recordToolResult(chat, rjtc.id, rjtc.function ? rjtc.function.name : 'unknown', '[Tool call abandoned — user sent a new message]');
+                    // MP-3: also settle + remove the SW's _pendingUIToolCalls /
+                    // parked entry and disarm the executing panel's prompt
+                    // resolver — without this both leak and an abandoned
+                    // prompt_user form stays live on every panel. Worker-tier
+                    // helper (worker/120-tool-routing.js); typeof-guarded so
+                    // the page bundle's dormant copy of this loop no-ops.
+                    if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rjtc.id, 'user sent a new message');
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
@@ -1294,6 +1301,10 @@ async function runAgent(overrideChatId) {
                 for (var ri2 = i; ri2 < assistantMsg.tool_calls.length; ri2++) {
                     var rtc2 = assistantMsg.tool_calls[ri2];
                     recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _placeholder);
+                    // MP-3: settle + clean the SW pending/parked entry and the
+                    // executor panel's prompt resolver for every abandoned call
+                    // (see worker/120-tool-routing.js abandonPendingUIToolCall).
+                    if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rtc2.id, _wasUserMessage ? 'user sent a new message' : 'paused by user');
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();

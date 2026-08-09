@@ -447,7 +447,20 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
             if (rm.role === 'prompt_user' ? (rn.promptId === rm.promptId)
                                           : (rn.toolCallId === rm.toolCallId && rn.toolCallId)) { dup = true; break; }
         }
-        if (dup) continue;
+        if (dup) {
+            // MP-4 (multi-panel): the SW snapshot now CONTAINS prompt_user rows
+            // (seeded at dispatch — see _swSeedPromptRow). When both copies are
+            // still pending, keep the PAGE's own object: object identity matters
+            // (executePromptUser holds it for result._message_persist and
+            // submitPromptUser mutates it) and it carries promptCaptureDraft's
+            // draft values. When the snapshot copy is RESOLVED (remote panel
+            // submitted/cancelled first, or abandon cleanup), the snapshot wins
+            // so the local form dismisses/reconciles to read-only.
+            if (rm.role === 'prompt_user' && rn && rn.status === 'pending') {
+                inChat.messages[rj] = rm;
+            }
+            continue;
+        }
         var _pos = Math.min(ri, inChat.messages.length);
         inChat.messages.splice(_pos, 0, rm);
         // PR383-F3: approvals are resolved strictly by index — handleApproval
@@ -834,6 +847,14 @@ function _handleAgentBusMessage(msg) {
             // Offscreen needs an approval for an 'ask' permission.
             _handleApprovalPromptFromOffscreen(msg);
             return;
+
+        case 'prompt-user-remote-result':
+            // MP-2: another panel submitted/cancelled a prompt_user form whose
+            // blocked await lives HERE (this panel is the executor), or the SW
+            // abandoned the call. Settle the local resolver so executePromptUser
+            // returns through its normal path.
+            _handleRemotePromptResult(msg);
+            return;
     }
 }
 
@@ -911,6 +932,22 @@ async function _handleApprovalPromptFromOffscreen(msg) {
         // (showToolApprovalPrompt). It's bound to the chat's UI and pushes
         // an `approval` message that the user clicks. Returns true/false.
         var approved = false;
+        // AB (approval broadcast): the SW fans this prompt out to EVERY panel
+        // (worker/120-tool-routing.js _broadcastApprovalPrompt); exactly one
+        // copy is `primary`. opts is shared with showToolApprovalPrompt so its
+        // missing-chat give-up can mark _gaveUp: a NON-primary panel whose
+        // mirror lacks the chat bows out SILENTLY — posting allowed:false
+        // would race-deny an approval other panels still show. The primary
+        // keeps the give-up denial as the ultimate backstop (status quo).
+        // osNotify:false suppresses duplicate OS notifications on fan-out /
+        // re-delivery copies (ui/220-notification-system.js).
+        var opts = {
+            // Forward widgetName (set by the SW envelope when the call
+            // originated from a widget) so the notification is labeled
+            // with the widget's title instead of the chat title.
+            widgetName: msg.widgetName || undefined,
+            osNotify: msg.osNotify !== false
+        };
         if (typeof showToolApprovalPrompt === 'function') {
             approved = await showToolApprovalPrompt(
                 msg.displayName,
@@ -919,17 +956,27 @@ async function _handleApprovalPromptFromOffscreen(msg) {
                 msg.toolCallId,
                 msg.toolName,
                 msg.chatId,
-                // Forward widgetName (set by the SW envelope when the call
-                // originated from a widget) so the notification is labeled
-                // with the widget's title instead of the chat title.
-                { widgetName: msg.widgetName || undefined }
+                opts
             );
         }
+        if (opts._gaveUp && msg.primary === false) return;
+        // Thread the row's terminal status (allowed / session_allowed /
+        // always_allowed / denied) + ids so the SW can flip its authoritative
+        // row and broadcast 'approvalSettled' to the other panels (AB-2).
+        var _rowStatus = null;
+        try {
+            var _abRow = (typeof findExistingApprovalRow === 'function')
+                ? findExistingApprovalRow(chats[msg.chatId], msg.toolCallId) : null;
+            if (_abRow && _abRow.msg && _abRow.msg.status && _abRow.msg.status !== 'pending') _rowStatus = _abRow.msg.status;
+        } catch (eR) {}
         if (_agentBusPort) {
             _agentBusPort.postMessage({
                 type: 'exec-approval-prompt-result',
                 approvalRequestId: msg.approvalRequestId,
-                allowed: !!approved
+                allowed: !!approved,
+                chatId: msg.chatId,
+                toolCallId: msg.toolCallId,
+                status: _rowStatus
             });
         }
     } catch (e) {
@@ -942,6 +989,74 @@ async function _handleApprovalPromptFromOffscreen(msg) {
             });
         }
     }
+}
+
+// MP-1: mirror a freshly-pushed pending prompt_user row to the SW so its
+// authoritative chat copy (and every snapshot broadcast to other panels)
+// carries the row from dispatch time. Best-effort — on a dead port the row
+// still reaches the SW after resolve via result._message_persist (status quo).
+function postPromptRowToSW(chatId, row) {
+    if (!_agentBusPort || !chatId || !row) return false;
+    try {
+        _agentBusPort.postMessage({ type: 'prompt-user-pending', chatId: chatId, row: row });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// MP-2: submit/cancel collected on a panel that does NOT hold the armed
+// resolver (pendingPromptResolvers). Route the result through the SW — it
+// forwards to the executing panel's resolver, or settles the pending/parked
+// tool call directly when that panel is gone. Returns true only when the
+// message was actually posted AND a live run can consume it; false falls
+// back to the dead-run recovery path (injectPromptToolResult).
+function _promptResultViaSW(chatId, promptId, result) {
+    if (!_agentBusPort || !chatId || !runningChatIds[chatId]) return false;
+    var chat = chats[chatId];
+    var toolCallId = null;
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'prompt_user' && m.promptId === promptId) { toolCallId = m.toolCallId || null; break; }
+        }
+    }
+    try {
+        _agentBusPort.postMessage({ type: 'prompt-user-result', chatId: chatId, promptId: promptId, toolCallId: toolCallId, result: result });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// MP-2 receiver (executor side): the SW forwarded a submit/cancel/abandon
+// for a prompt whose resolver is armed on THIS panel. Mutate the local row
+// first (executePromptUser's captured promptMsg reference — preserved by the
+// MP-4 merge rule — must carry the final state into result._message_persist),
+// then resolve. Idempotent: a row already resolved locally no-ops.
+function _handleRemotePromptResult(msg) {
+    if (!msg || !msg.promptId) return;
+    var chat = chats[msg.chatId];
+    var row = null;
+    if (chat && Array.isArray(chat.messages)) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (m && m.role === 'prompt_user' && m.promptId === msg.promptId) { row = m; break; }
+        }
+    }
+    var result = msg.result || { success: false, cancelled: true, message: 'Prompt settled remotely' };
+    if (row && row.status === 'pending') {
+        row.status = result.success ? 'submitted' : 'cancelled';
+        if (result.values) row.values = result.values;
+        if (result.abandoned) row.abandoned = true;
+    }
+    var resolver = (typeof pendingPromptResolvers !== 'undefined') ? pendingPromptResolvers[msg.promptId] : null;
+    if (resolver) {
+        delete pendingPromptResolvers[msg.promptId];
+        try { resolver(result); } catch (_) {}
+    }
+    if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(msg.chatId); } catch (e) {} }
+    if (typeof currentChatId !== 'undefined' && currentChatId === msg.chatId && typeof renderMessages === 'function') renderMessages();
 }
 
 // =============================================================
@@ -1088,6 +1203,22 @@ function pushHooksSettingsToOffscreen(hooks) {
 // in Settings — same reasoning as pushHooksSettingsToOffscreen: without
 // this the SW keeps the boot-time value until the next SW restart, so the
 // slim tools array / {{TOOL_CATALOG}} wouldn't apply to background runs.
+// Tell the SW to re-hydrate its skill-tool registry (`skillTools`).
+// WHY: the SW boots first and calls loadActiveSkills() (worker/190-entry.js
+// -> core/140-skills-engine.js:635) from the PERSISTED activeSkills setting.
+// A build that ships a BRAND-NEW embedded skill only gets that skill written
+// to IDB later, by the page's importEmbeddedSkills() (core/130-indexeddb.js).
+// The SW never re-reads, so for the whole life of that service worker the new
+// skill's tools are missing from `skillTools` -> isSkillTool() is false and
+// getActiveSkillTools() omits them. Pushing this after the page import closes
+// the window without waiting for an SW restart.
+function pushSkillToolsRefreshToOffscreen() {
+    if (!_agentBusPort) return;
+    try {
+        _agentBusPort.postMessage({ type: 'skills-refresh' });
+    } catch (e) {}
+}
+
 function pushDeferredToolsSettingToOffscreen(enabled) {
     if (!_agentBusPort) return;
     try {

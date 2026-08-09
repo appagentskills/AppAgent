@@ -57,6 +57,7 @@ var TOOL_DISPLAY_NAMES = {
     'screenshot_by_id': 'Get Screenshot',
     'get_file': 'Get File',
     'read_attached_file': 'Read Attached File',
+    'get_cookie': 'Read Cookies',
     'workspace': 'Workspace',
     'workspace:clone': 'Clone Repo',
     'workspace:ls': 'List Files',
@@ -387,5 +388,6 @@ function getToolIcon(toolName) {
     if (toolName === 'read_attached_file') return UI_ICONS.file;
     if (toolName === 'document') return UI_ICONS.file;
     if (toolName === 'list_instances') return UI_ICONS.api;
+    if (toolName === 'get_cookie') return UI_ICONS.lock;
     return UI_ICONS.tool;
 }

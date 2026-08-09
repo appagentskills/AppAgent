@@ -204,7 +204,7 @@ function getToolContextLabels(args) {
 }
 
 // Show notification for tool approval with action button to go to the chat
-function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, approvalIndex, args) {
+function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, approvalIndex, args, opts) {
     // Check if this approval is already in the queue or currently showing
     var alreadyQueued = approvalNotificationQueue.some(function(n) {
         return n.chatId === chatId && n.approvalIndex === approvalIndex;
@@ -217,15 +217,37 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
         return;
     }
 
-    var newNotification = { chatTitle: chatTitle, toolName: toolName, chatId: chatId, statusMessage: statusMessage, approvalIndex: approvalIndex, args: args };
+    // PR776-FIX: stamp the approval row's toolCallId on the notification at
+    // queue time. A snapshot merge can SHIFT row indexes after a card is
+    // queued, so the approvalSettled purge (app/036-agent-event-handlers-
+    // page.js) matches primarily by toolCallId and only falls back to
+    // approvalIndex for entries without one. Derived here — the single
+    // creation site of queue entries — because not every caller (ui/160,
+    // ui/225) has the approval row handy.
+    var toolCallId = null;
+    try {
+        var apChat = (typeof chats === 'object' && chats) ? chats[chatId] : null;
+        var apRow = (apChat && Array.isArray(apChat.messages)) ? apChat.messages[approvalIndex] : null;
+        if (apRow && apRow.role === 'approval' && apRow.toolCallId) toolCallId = apRow.toolCallId;
+    } catch (eTci) { toolCallId = null; }
+    var newNotification = { chatTitle: chatTitle, toolName: toolName, chatId: chatId, statusMessage: statusMessage, approvalIndex: approvalIndex, toolCallId: toolCallId, args: args };
 
     // Send browser notification when the page is hidden so user knows a tool needs approval
     if (document.hidden) {
-        Platform.sendNotification({
-            title: 'Tool needs approval',
-            message: (statusMessage || toolName) + ' — ' + chatTitle,
-            chatId: chatId
-        });
+        // AB (OS-notification dedup): the SW broadcasts approval prompts to
+        // EVERY panel — only the PRIMARY copy may fire the OS notification
+        // (opts.osNotify === false on fan-out / re-delivery / rebind copies),
+        // otherwise N hidden panels fire N duplicates. Callers that pass no
+        // opts (chat-open resurface, watchdog, page-local approvals) keep
+        // today's behavior. The tab-title flash below stays per-panel: each
+        // hidden tab flashing its own title is signal, not noise.
+        if (!(opts && opts.osNotify === false)) {
+            Platform.sendNotification({
+                title: 'Tool needs approval',
+                message: (statusMessage || toolName) + ' — ' + chatTitle,
+                chatId: chatId
+            });
+        }
         // Flash the tab title until the approval is handled or the tab
         // becomes visible (ui/225-approval-attention.js).
         if (typeof startApprovalTitleFlash === 'function') { try { startApprovalTitleFlash(); } catch (e) {} }

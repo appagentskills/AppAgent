@@ -66,6 +66,16 @@ async function executePromptUser(args, options) {
         };
         chat.messages.push(promptMsg);
         saveChatsToStorage();
+        // MP-1 (multi-panel): mirror the pending row to the SW's authoritative
+        // copy AT DISPATCH, not only after resolve (_message_persist below).
+        // Without this, SW chat snapshots sent to OTHER panels (or to a panel
+        // opening this chat later) lack the row entirely — with 2+ panels the
+        // executor can be a panel NOT viewing the chat (pickExecutorPort is
+        // first-wins), so the viewing panel rendered only the raw tool_use
+        // block + spinner and no form anywhere. The SW seeds the row before
+        // the tool placeholder and broadcasts, so every panel viewing the chat
+        // renders the live form (worker/120-tool-routing.js _swSeedPromptRow).
+        if (typeof postPromptRowToSW === 'function') postPromptRowToSW(chatId, promptMsg);
     }
 
     // If this is a background Action chat, flip the action button to 'needs_input'
@@ -282,8 +292,15 @@ function submitPromptUser(promptId) {
     if (pendingPromptResolvers[promptId]) {
         pendingPromptResolvers[promptId]({ success: true, values: values });
         delete pendingPromptResolvers[promptId];
+    } else if (typeof _promptResultViaSW === 'function' && _promptResultViaSW(chatId, promptId, { success: true, values: values })) {
+        // MP-2 (multi-panel): no LOCAL resolver, but the run is still live —
+        // the blocked await lives in executePromptUser on ANOTHER panel (the
+        // executor). Route the values through the SW, which forwards them to
+        // the panel holding the armed resolver (or settles the call directly
+        // if that panel is gone). First-submit-wins is enforced SW-side.
     } else {
-        // After page reload: no resolver exists — inject a proper tool_result and re-run agent
+        // After page reload with no live run: no resolver exists anywhere —
+        // inject a proper tool_result and re-run agent
         injectPromptToolResult(chat, promptId, { success: true, values: values });
     }
 
@@ -320,6 +337,8 @@ function cancelPromptUser(promptId) {
     if (pendingPromptResolvers[promptId]) {
         pendingPromptResolvers[promptId]({ success: false, cancelled: true, message: 'User cancelled the form' });
         delete pendingPromptResolvers[promptId];
+    } else if (typeof _promptResultViaSW === 'function' && _promptResultViaSW(chatId, promptId, { success: false, cancelled: true, message: 'User cancelled the form' })) {
+        // MP-2: cancel from a non-executing panel — same SW route as submit.
     } else {
         // After page reload
         injectPromptToolResult(chat, promptId, { success: false, cancelled: true, message: 'User cancelled the form' });
@@ -417,7 +436,7 @@ function renderPromptUserMessage(msg, index) {
         .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     if (isSubmitted) html += ' <span class="tool-approval-status allowed">Submitted</span>';
-    if (isCancelled) html += ' <span class="tool-approval-status denied">Cancelled</span>';
+    if (isCancelled) html += ' <span class="tool-approval-status denied">' + (msg.abandoned ? 'Abandoned' : 'Cancelled') + '</span>';
     html += '</summary>';
 
     // Body
