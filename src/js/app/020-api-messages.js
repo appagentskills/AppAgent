@@ -62,11 +62,22 @@ function buildAPIMessages(chatMessages, chatId) {
         // Handle screenshot messages - convert to multimodal user message with image
         if (m.role === 'screenshot') {
             var screenshotLabel = m.name || m.description || 'screenshot';
+            // Providers only accept inline data: URLs (converted to base64
+            // source for Anthropic) or real https URLs in image blocks —
+            // anything else (undefined/'' from an evicted-but-not-rehydrated
+            // screenshot row, chrome-extension://, blob:, http://) is a hard
+            // 400 (Anthropic: "Only HTTPS URLs are supported"). If the
+            // payload is missing (hydration failed / backing file GC'd),
+            // degrade to a text placeholder instead of crashing the run.
+            var _ssSrc = (typeof m.base64 === 'string') ? m.base64 : '';
+            if (_ssSrc.indexOf('data:') !== 0 && _ssSrc.indexOf('https://') !== 0) {
+                return { role: 'user', content: '[image no longer available: ' + screenshotLabel + ']' };
+            }
             return {
                 role: 'user',
                 content: [
                     { type: 'text', text: '[Screenshot captured: ' + screenshotLabel + (m.width && m.height ? ' (' + m.width + 'x' + m.height + ')' : '') + ']\nAnalyze this image to help the user. Describe what you see and identify any issues, UI elements, or relevant details.' },
-                    { type: 'image_url', image_url: { url: m.base64 } }
+                    { type: 'image_url', image_url: { url: _ssSrc } }
                 ]
             };
         }
@@ -74,6 +85,11 @@ function buildAPIMessages(chatMessages, chatId) {
         if (m.role === 'pdf') {
             var pdfLabel = m.name || m.description || 'document.pdf';
             var pdfFilename = pdfLabel.endsWith('.pdf') ? pdfLabel : pdfLabel + '.pdf';
+            // Same eviction guard as the screenshot arm above: an evicted pdf
+            // row without base64 would send file_data: undefined (provider 400).
+            if (typeof m.base64 !== 'string' || !m.base64) {
+                return { role: 'user', content: '[PDF no longer available: ' + pdfLabel + ']' };
+            }
             return {
                 role: 'user',
                 content: [

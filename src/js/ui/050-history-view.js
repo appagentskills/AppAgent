@@ -1,4 +1,16 @@
 // History View Management
+
+// HIST-RECENCY: single source of truth for a chat's "last touched" stamp, used
+// by the history page (sort + card date) and the sidebar chat list (sort).
+// `updatedAt` was a DEAD FIELD (read here, written nowhere) until it was wired
+// to the two lastResponseAt writers (worker/100-agent-event-broadcast.js
+// _swStampChatFinished, tools/120-actions.js markChatRecentlyFinished);
+// lastActivityAt covers mid-run activity on unfocused chats (markChatActivity).
+function chatActivityTs(c) {
+    // Recency = real activity stamps with createdAt floor. EXCLUDES lastViewedAt (P696-1: viewing ≠ activity).
+    return Math.max(c.updatedAt || 0, c.lastResponseAt || 0, c.lastActivityAt || 0, c.createdAt || 0);
+}
+
 function toggleHistoryView() {
     if (currentView === 'history') return;
     openHistoryView();
@@ -92,11 +104,12 @@ function renderHistoryPage() {
         return;
     }
     
-    // Sort: pinned first, then by date (newest first) - same as sidebar
+    // Sort: pinned first, then by last activity (newest first) - same as sidebar.
+    // chatActivityTs (not createdAt) so a chat continued today surfaces today.
     var sortedChats = chatIds.map(function(id) { return chats[id]; }).sort(function(a, b) {
         if (a.pinned && !b.pinned) return -1;
         if (!a.pinned && b.pinned) return 1;
-        return b.createdAt - a.createdAt;
+        return chatActivityTs(b) - chatActivityTs(a);
     });
     
     // When searching, use sidebar's exact search result display (renderChatItem)
@@ -176,7 +189,7 @@ function renderHistoryChatCard(chatId) {
     var title = chat.title || 'Untitled Chat';
     var preview = getHistoryChatPreview(chat);
     var messageCount = chat.messages ? chat.messages.length : 0;
-    var dateStr = formatHistoryDate(chat.updatedAt || chat.createdAt);
+    var dateStr = formatHistoryDate(chatActivityTs(chat));
     var isActive = chatId === currentChatId;
     var stats = getChatStats(chatId);
     var contextLength = getContextLength(chat);

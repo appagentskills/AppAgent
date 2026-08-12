@@ -180,6 +180,12 @@ function appendContextNotice(chat, content) {
 
 function recordToolResult(chat, toolCallId, name, content) {
     if (!chat || !chat.messages || !toolCallId) return null;
+    // SAVE-DROP RESCUE (runaway-spawn incident): a result recorded while the
+    // chat is payload-evicted would be silently dropped by saveChatsToStorage's
+    // evicted-put guard (worker/115-storage.js) — flag the chat so the guard
+    // hydrates + re-saves it out-of-band instead of losing the write (which
+    // left the tool_use permanently "pending" and re-executed on every replay).
+    if (chat._payloadsEvicted) chat._dirtyWhileEvicted = true;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         var m = chat.messages[i];
         if (m.role !== 'tool') continue;
@@ -192,6 +198,34 @@ function recordToolResult(chat, toolCallId, name, content) {
     var newMsg = { role: 'tool', tool_call_id: toolCallId, name: name || 'unknown', content: content };
     chat.messages.push(newMsg);
     return newMsg;
+}
+
+// SPAWN-REPLAY GUARD (runaway-spawn incident): tools that CREATE new agents /
+// chats / cross-agent deliveries are NOT idempotent — re-executing them on a
+// restart-driven replay multiplies side effects instead of recovering a lost
+// result. Incident: a spawn_sub_agent tool_use whose tool_result never became
+// durable (evicted-put guard, worker/115-storage.js) was re-executed with
+// identical args by the pending-tool replay below on every heartbeat/
+// checkpoint/pending-wake restart — ~92 same-name sub-agents in ~46 min,
+// reload-proof because every driver lives in IndexedDB. Mirrors the parked-
+// UI-tool no-replay rule (worker/130-port-bridge.js resumeRunningCheckpoints):
+// on replay these get a synthesized "interrupted — NOT re-executed" result
+// and the model decides on the next turn whether to re-issue the call.
+var NON_REPLAYABLE_TOOLS = {
+    spawn_sub_agent: true,   // creates a new sub-agent + chat per call
+    wake_sub_agent: true,    // re-dispatches a sub-agent run per call
+    agent_message: true,     // delivers (and may wake the recipient) per call
+    start_chat: true         // creates a new chat (and may run it) per call
+};
+
+function synthesizeNonReplayableResult(toolName) {
+    return JSON.stringify({
+        success: false,
+        error: '[' + toolName + ' was interrupted by an extension restart and was NOT re-executed'
+            + ' (non-idempotent: re-running it would duplicate its side effects, e.g. spawn a'
+            + ' second agent). If the action is still needed, check current state first'
+            + ' (e.g. agent_status for existing sub-agents) and only then issue a NEW call.]'
+    });
 }
 
 // Atomic-placeholder seed: BEFORE we start executing this assistant turn's
@@ -461,6 +495,18 @@ async function executePendingApprovedTools(chat) {
             // Execute this pending tool
             var toolName = msg.actualToolName || msg.toolName;
             var args = msg.args;
+
+            // SPAWN-REPLAY GUARD: same rule as the pending-tool replay — an
+            // approved-but-unexecuted spawn-class call found on a restarted
+            // run must not be re-executed (its approval may predate a crash
+            // that already ran it once without persisting the result).
+            if (NON_REPLAYABLE_TOOLS[toolName]) {
+                console.warn('[agent-loop] approved-replay skipped non-replayable tool ' + toolName + ' (' + msg.toolCallId + ') — synthesized interrupted result');
+                recordToolResult(chat, msg.toolCallId, toolName, synthesizeNonReplayableResult(toolName));
+                saveChatsToStorage();
+                AgentEvents.emit('toolCallResult', { chatId: chat && chat.id, toolCallId: msg.toolCallId, name: toolName, result: { success: false, _synthesized: true }, force: true });
+                continue;
+            }
             
             // Find the assistant message index
             var assistantMsgIndex = -1;
@@ -560,6 +606,21 @@ async function runAgent(overrideChatId) {
         throw new Error('runAgent: chat ' + streamingChatId + ' is '
             + (chat ? 'deleted (tombstone)' : 'not loaded in this context')
             + ' — refusing to start');
+    }
+    // SAVE-DROP RESCUE (runaway-spawn incident): hydrate an evicted chat at
+    // the ONE entry point every run lane funnels through (send / checkpoint
+    // resume / pending-wake drain / sub wake). A run on a _payloadsEvicted
+    // chat records tool results + assistant rows ONLY in memory — the
+    // evicted-put guard in saveChatsToStorage (worker/115-storage.js) skips
+    // the row, so on the next SW boot the transcript reverts and the pending-
+    // tool replay re-executes the same calls. Per-lane hydration gates exist
+    // (resume scan, send lane, wake drain) but any missed or future lane
+    // re-opens the hole — close it at the funnel. No-op when not evicted;
+    // never throws (a hydration failure falls back to today's behavior).
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(streamingChatId); } catch (eHyd) {
+            console.warn('[agent-loop] entry hydration failed for ' + streamingChatId, eHyd);
+        }
     }
     isBackgroundRun = !!(chat && chat.isBackground);
     // Clear any stale API error left from a PREVIOUS run of THIS chat so the
@@ -662,6 +723,16 @@ async function runAgent(overrideChatId) {
             if (isChatPaused(streamingChatId)) break;
             var tc = pendingToolCalls[pci].tc;
             var toolName = tc.function.name;
+            // SPAWN-REPLAY GUARD: never re-execute spawn-class tools on a
+            // restart replay — synthesize a result instead (see
+            // NON_REPLAYABLE_TOOLS above).
+            if (NON_REPLAYABLE_TOOLS[toolName]) {
+                console.warn('[agent-loop] pending-replay skipped non-replayable tool ' + toolName + ' (' + tc.id + ') — synthesized interrupted result');
+                recordToolResult(chat, tc.id, toolName, synthesizeNonReplayableResult(toolName));
+                saveChatsToStorage();
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: { success: false, _synthesized: true } });
+                continue;
+            }
             var args;
             try {
                 args = JSON.parse(tc.function.arguments || '{}');

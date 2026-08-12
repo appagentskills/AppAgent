@@ -2358,8 +2358,15 @@ function convertContentPart(part) {
                 var imgData = url.substring(commaIdx + 1);
                 result = { type: 'image', source: { type: 'base64', media_type: header.split(':')[1].split(';')[0], data: imgData } };
             } catch(e) { result = { type: 'text', text: '[Invalid image]' }; }
-        } else {
+        } else if (url.indexOf('https://') === 0) {
             result = { type: 'image', source: { type: 'url', url: url } };
+        } else {
+            // Anthropic rejects any non-https url source with a hard 400
+            // ("Only HTTPS URLs are supported") — chrome-extension://,
+            // http://, blob:, or ''/undefined from an image row whose base64
+            // payload was evicted and never rehydrated. A text placeholder
+            // keeps the request alive instead of crashing the whole run.
+            result = { type: 'text', text: '[image no longer available]' };
         }
     } else if (part.type === 'file') {
         var fi = part.file || {};
@@ -2380,7 +2387,13 @@ function convertContentPart(part) {
             data = fd;
             mediaType = (fn && fn.toLowerCase().endsWith('.pdf')) ? 'application/pdf' : 'application/octet-stream';
         }
-        result = { type: 'document', source: { type: 'base64', media_type: mediaType, data: data } };
+        if (!data) {
+            // Same eviction guard as the image arm: an empty document payload
+            // (evicted pdf row that was never rehydrated) is a provider 400.
+            result = { type: 'text', text: '[document no longer available' + (fn ? ': ' + fn : '') + ']' };
+        } else {
+            result = { type: 'document', source: { type: 'base64', media_type: mediaType, data: data } };
+        }
     } else {
         result = { type: 'text', text: JSON.stringify(part) };
     }

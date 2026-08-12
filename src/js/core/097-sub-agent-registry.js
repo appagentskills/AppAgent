@@ -131,6 +131,9 @@ var SUBAGENT_NESTED_DELEGATION_TOOLS = ['spawn_sub_agent', 'stop_sub_agent', 'wa
 // Maximum allowed nesting depth. Hard ceiling on tree depth. Default 5
 // levels (root → 5 descendants).
 var SUBAGENT_MAX_DEPTH = 5;
+// SPAWN FUSE (runaway-spawn incident): max ACTIVE same-name subs per parent
+// chat — the last-resort cap that stops a replay loop at 3 instead of 92.
+var SUBAGENT_SAME_NAME_FUSE = 3;
 
 // ───── Standard worker-report template (Orchestrator §3) ─────────
 // Default shape for report_to_parent's `data` when the parent did not pass
@@ -368,8 +371,8 @@ async function loadAllSubAgents() {
                     // PR383-R2: _pending_approvals is persisted verbatim, but
                     // its only decrements are the live approval callbacks in
                     // worker/120-tool-routing.js. A SW kill mid-approval
-                    // strands the counter >= 1 forever, permanently muting
-                    // onSubApprovalEvent's `=== 1` park-notice gate. No
+                    // strands the counter >= 1 forever, leaving agent_status /
+                    // the sub-card badge claiming a phantom approval. No
                     // approval modal survives a reboot — zero it at load.
                     rec._pending_approvals = 0;
                     rec.awaiting_approval = null;
@@ -825,6 +828,28 @@ function _drainPool() {
                 // mis-attributing crash errors.
                 (function(capturedAid, capturedChatId) {
                     Promise.resolve()
+                        // MEMFIX-FU (M2): pool starts (spawn / wake / resurrect /
+                        // inbox auto-wake) bypass the port-bridge run-agent
+                        // hydration gate (worker/130-port-bridge.js). On a
+                        // payload-evicted chat (the SW loader strips ALL chats —
+                        // worker/115-storage.js) the resumed transcript's
+                        // screenshot/pdf rows have no base64, so buildAPIMessages
+                        // would emit image blocks with an empty payload →
+                        // provider 400 (Anthropic: "Only HTTPS URLs are
+                        // supported") and the loop's saves would be skipped by
+                        // the evicted-put guard. Hydrate FIRST, then run.
+                        // ensureChatPayloads never rejects by contract
+                        // (core/130-indexeddb.js) — the catch arm is purely
+                        // defensive and still starts the run.
+                        .then(function() {
+                            var _dpChat = (typeof chats !== 'undefined') ? chats[capturedChatId] : null;
+                            if (_dpChat && _dpChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                                return ensureChatPayloads(capturedChatId).catch(function(e) {
+                                    console.warn('[sub-agents] pool-start hydration failed for', capturedChatId, e);
+                                });
+                            }
+                            return null;
+                        })
                         .then(function() { return runAgent(capturedChatId); })
                         .catch(function(err) {
                             _markErrored(capturedAid, 'agent loop crashed: ' + (err && err.message || err));
@@ -1314,6 +1339,32 @@ function spawnSubAgent(args, ctx) {
         return { success: false, error: 'spawn_sub_agent: nesting depth ' + depth + ' exceeds SUBAGENT_MAX_DEPTH (' + SUBAGENT_MAX_DEPTH + '). Refusing to spawn — if you genuinely need deeper trees, raise the constant.' };
     }
 
+    // SPAWN FUSE (runaway-spawn incident, fix 5): refuse to create ANOTHER sub
+    // when the same parent chat already has SUBAGENT_SAME_NAME_FUSE or more
+    // ACTIVE (running / sleeping / queued — non-terminal) subs with the SAME
+    // name. A restart/replay loop re-issuing an identical spawn (identical
+    // args ⇒ identical name) hits this wall at the cap instead of 92.
+    // Unnamed spawns get a unique default name below and are not fused. Loud
+    // error — the parent agent must check agent_status and reuse/wake/stop
+    // the existing subs instead of spawning more.
+    if (args.name) {
+        var _fuseCount = 0;
+        for (var _fid in _subAgents) {
+            var _fr = _subAgents[_fid];
+            if (_fr && _fr.parent_chat_id === parentChatId && _fr.name === args.name
+                && (_fr.state === 'running' || _fr.state === 'sleeping' || _fr.state === 'queued')) {
+                _fuseCount++;
+            }
+        }
+        if (_fuseCount >= SUBAGENT_SAME_NAME_FUSE) {
+            return { success: false, error: 'spawn_sub_agent: SPAWN FUSE — ' + _fuseCount
+                + ' ACTIVE sub-agents named "' + args.name + '" already exist for this chat (cap '
+                + SUBAGENT_SAME_NAME_FUSE + '). This usually means a restart/replay loop is re-issuing the same'
+                + ' spawn. Check agent_status: reuse or wake an existing sub, stop stale ones, or pick a'
+                + ' distinct name if you truly need another.' };
+        }
+    }
+
     // ── Per-spawn model selection (Orchestrator §1) ──
     // Provider/tier resolution — fail fast with a clear error BEFORE any
     // handle/record allocation. resolved.provider === null means "inherit
@@ -1766,6 +1817,35 @@ function persistPendingWake(parentChatId, noticeText, subAgentId) {
     });
 }
 
+// RUNAWAY-SPAWN fix (attempts carry-forward): when the delivery cap fired we
+// used to clearPendingWake — but each NEW sub settle re-created the record via
+// persistPendingWake with attempts: 0 (→L rec default), so a self-refueling
+// loop (every failed run spawns a sub whose settle persists a fresh wake)
+// reset its own cap forever. Keep an EXHAUSTED marker instead: the record
+// survives with its spent attempts, so re-persisted notices inherit the burnt
+// budget (persistPendingWake reuses an existing record) and the drain keeps
+// delivering ROWS (cap path) without ever starting runs. Recovery paths:
+// a real answered cycle ('delivered AND consumed') still clears the record
+// outright, and a bare marker expires after PENDING_WAKE_EXHAUST_TTL_MS so
+// one bad episode doesn't permanently disable auto-wakes for the chat.
+var PENDING_WAKE_EXHAUST_TTL_MS = 24 * 60 * 60 * 1000;
+function _markPendingWakeExhausted(parentChatId, attempts) {
+    if (!parentChatId) return Promise.resolve();
+    return _pendingWakesStore('readwrite').then(function(store) {
+        return new Promise(function(resolve) {
+            var putReq = store.put({
+                parentChatId: parentChatId,
+                notices: [],
+                attempts: Math.max(attempts || 0, PENDING_WAKE_MAX_ATTEMPTS),
+                exhaustedAt: Date.now(),
+                lastEventAt: Date.now()
+            });
+            putReq.onsuccess = function() { resolve(); };
+            putReq.onerror = function() { resolve(); };
+        });
+    }).catch(function() { /* best-effort */ });
+}
+
 function clearPendingWake(parentChatId) {
     if (!parentChatId) return Promise.resolve();
     return _pendingWakesStore('readwrite').then(function(store) {
@@ -1862,7 +1942,13 @@ function _drainOnePendingWake(rec) {
     var pcid = rec && rec.parentChatId;
     if (!pcid) return Promise.resolve();
     var pchat = (typeof chats !== 'undefined') ? chats[pcid] : null;
-    if (!pchat) return clearPendingWake(pcid); // chat deleted — nothing to deliver to
+    // Chat deleted — nothing to deliver to. A `_deleted` TOMBSTONE entry (the
+    // explicit-delete lane parks one in `chats`, worker/130-port-bridge.js) is
+    // TRUTHY but equally dead — pushing rows into it would give the tombstone
+    // messages.length > 0 and resurrect the deleted chat through the storage
+    // delete-pass (worker/115-storage.js), and runAgent refuses tombstones
+    // anyway, so the record would retry forever. Clear both cases.
+    if (!pchat || pchat._deleted === true) return clearPendingWake(pcid);
     // A live run consumes the in-memory queue itself, or — after an SW death
     // wiped it — finishes and lets the next tick deliver. Never inject here.
     if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return Promise.resolve();
@@ -1899,7 +1985,17 @@ function _drainOnePendingWake(rec) {
                 if (msgs[j] && msgs[j].role === 'user') { anchor = j; break; }
             }
         }
-        if (anchor < 0) return clearPendingWake(pcid); // nothing actionable
+        if (anchor < 0) {
+            // EXHAUSTED marker (bare, notices already delivered): keep it — it
+            // preserves the spent attempts budget across re-persists (see
+            // _markPendingWakeExhausted) until the TTL forgives it. Everything
+            // else with no anchor is truly stale.
+            if (rec.exhaustedAt) {
+                if ((Date.now() - rec.exhaustedAt) > PENDING_WAKE_EXHAUST_TTL_MS) return clearPendingWake(pcid);
+                return Promise.resolve();
+            }
+            return clearPendingWake(pcid); // nothing actionable
+        }
         for (var k = anchor + 1; k < msgs.length; k++) {
             if (msgs[k] && msgs[k].role === 'assistant') {
                 return clearPendingWake(pcid); // delivered AND consumed
@@ -1958,7 +2054,7 @@ function _drainOnePendingWake(rec) {
             }
         }).then(function() {
             // Chat deleted during the async hydrate — nothing to deliver to.
-            if (typeof chats === 'undefined' || !chats[pcid]) return clearPendingWake(pcid);
+            if (typeof chats === 'undefined' || !chats[pcid] || chats[pcid]._deleted === true) return clearPendingWake(pcid);
             // PR626-FU (L1): a run may have started during the async hydrate
             // above — keep the record and retry on the next tick instead of
             // injecting a bare user row mid-stream. Same nested-sub guard as
@@ -1966,7 +2062,7 @@ function _drainOnePendingWake(rec) {
             // runningChatIds yet while queued).
             if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return;
             if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return;
-            return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return clearPendingWake(pcid); });
+            return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return _markPendingWakeExhausted(pcid, attempts); });
         });
     }
     // Bump BEFORE attempting so a crash mid-delivery still counts toward the cap.
@@ -1989,7 +2085,7 @@ function _drainOnePendingWake(rec) {
         // Chat deleted during the async attempt-bump/hydrate — abort: the
         // post-push tail would otherwise runAgent() a dead chat id / read the
         // stale pchat reference. Clear the record; nothing to deliver to.
-        if (typeof chats === 'undefined' || !chats[pcid]) { clearPendingWake(pcid); return true; }
+        if (typeof chats === 'undefined' || !chats[pcid] || chats[pcid]._deleted === true) { clearPendingWake(pcid); return true; }
         if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return true;
         if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return true;
         return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return false; });
@@ -2587,10 +2683,12 @@ function onUserMessageToSubChat(subChatId) {
 
 // RES-6: approval lifecycle for a sub's tool call (driven by the SW approval
 // stub in worker/120-tool-routing.js). phase: 'requested' | 'approved' |
-// 'denied' | 'aborted'. The park notice fires once per episode (0→1 pending
-// approvals — no spam when several asks stack); denials always notify (the
-// sub was told to STOP an operation); plain approvals just unblock the sub —
-// its own progress stream shows life — so they only stamp the interaction.
+// 'denied' | 'aborted'. A park ('requested') deliberately does NOT notify
+// the parent — the user already sees the approval modal, and the parent can
+// poll it passively via agent_status (pending_approvals / awaiting_approval)
+// and the sub-card badge. Denials always notify (the sub was told to STOP an
+// operation); plain approvals just unblock the sub — its own progress stream
+// shows life — so they only stamp the interaction.
 function onSubApprovalEvent(subChatId, phase, info) {
     try {
         if (typeof chats === 'undefined' || !chats[subChatId] || !chats[subChatId].isSubAgent) return false;
@@ -2608,9 +2706,6 @@ function onSubApprovalEvent(subChatId, phase, info) {
                 tool: tool,
                 since: (rec.awaiting_approval && rec.awaiting_approval.since) || Date.now()
             };
-            if (rec._pending_approvals === 1) {
-                _notifySubLifecycle(rec, 'parked waiting for USER APPROVAL of "' + tool + '" — it cannot proceed until the user responds');
-            }
         } else {
             rec._pending_approvals = Math.max(0, (rec._pending_approvals || 0) - 1);
             if (rec._pending_approvals === 0) rec.awaiting_approval = null;
@@ -3229,8 +3324,8 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
 
     // PR383-R2: a SW killed mid-approval strands the persisted
     // _pending_approvals counter >= 1 (its only decrements are the live
-    // approved/denied/aborted callbacks in worker/120-tool-routing.js), which
-    // permanently suppresses onSubApprovalEvent's `=== 1` park-notice gate.
+    // approved/denied/aborted callbacks in worker/120-tool-routing.js),
+    // leaving agent_status / the sub-card badge claiming a phantom approval.
     // A wake (normal or resurrect — this point is common to both) starts a
     // fresh run, so no approval episode can carry across it: reset.
     rec._pending_approvals = 0;
@@ -4374,14 +4469,15 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     var rec = _subAgents[chats[chatId].subAgentId];
     if (!rec) return;
     // PR383-R2: run completion ends every approval episode for this run —
-    // reset the gate counter so a stranded value (SW killed mid-approval,
-    // decrement callbacks never fired) can't mute future park notices.
+    // reset the counter so a stranded value (SW killed mid-approval,
+    // decrement callbacks never fired) can't leave agent_status / the
+    // sub-card badge claiming a phantom approval forever.
     // PR384-FIX-6: but a sub can park via report_to_parent while a handle-
     // wrapped tool call is STILL awaiting approval — that approval belongs to the HANDLE,
-    // not the loop. Zeroing the counter here re-opens onSubApprovalEvent's
-    // `=== 1` park-notice gate, so the next 'requested' event re-emits a park
-    // notice while the old approval is still pending. Only reset when no handle
-    // for this chat is genuinely awaiting approval.
+    // not the loop. Zeroing the counter here would clear awaiting_approval
+    // while the modal is genuinely still up, making agent_status lie to the
+    // parent. Only reset when no handle for this chat is genuinely awaiting
+    // approval.
     var _approvalParked = false;
     if (typeof Handles !== 'undefined' && typeof Handles.list === 'function') {
         try {

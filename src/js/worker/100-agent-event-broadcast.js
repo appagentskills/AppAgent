@@ -199,6 +199,11 @@ function _swStampChatFinished(e) {
     var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
     if (!c || c.isBackground || c.isSubAgent) return;
     c.lastResponseAt = Math.max(c.lastResponseAt || 0, Date.now());
+    // HIST-RECENCY: `updatedAt` was read by the history UI but never written
+    // anywhere — stamp it beside every lastResponseAt write. Monotonic for the
+    // same dual-writer reason as above (page-side markChatRecentlyFinished
+    // stamps it too).
+    c.updatedAt = Math.max(c.updatedAt || 0, Date.now());
     // Persist so the stamp survives an MV3 SW eviction — the whole point is a
     // finish nobody was listening to. Fire-and-forget: the save is coalesced
     // and already logs its own failures.

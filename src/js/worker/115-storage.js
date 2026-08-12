@@ -54,6 +54,29 @@ var WIPE_GUARD_MAX_DELETES_PER_BOOT = 25;
 // without this gate a broken boot silently wipes the store on first save).
 var _chatsHydrated = false;
 
+// SAVE-DROP RESCUE (runaway-spawn incident): single-flight per chat. When the
+// evicted-put guard below skips a chat that was MUTATED while evicted
+// (chat._dirtyWhileEvicted — stamped by recordToolResult in
+// app/030-agent-loop.js), hydrate its payloads back (clears _payloadsEvicted)
+// and re-run a save so the mutation becomes durable instead of silently
+// dropped — a dropped tool_result left the tool_use permanently "pending" and
+// the pending-tool replay re-executed it on every restart. Never rejects.
+var _evictedRescueInFlight = {};
+function _rescueDirtyEvictedChat(id) {
+    if (_evictedRescueInFlight[id]) return;
+    if (typeof ensureChatPayloads !== 'function') return;
+    _evictedRescueInFlight[id] = true;
+    console.warn('[worker-storage] evicted chat ' + id + ' has unsaved mutations — hydrating to persist them');
+    Promise.resolve().then(function() { return ensureChatPayloads(id); })
+        .then(function() {
+            var c = (typeof chats !== 'undefined') ? chats[id] : null;
+            if (c) delete c._dirtyWhileEvicted;
+            return saveChatsToStorage();
+        })
+        .catch(function(e) { console.warn('[worker-storage] evicted-chat rescue failed for ' + id, e); })
+        .then(function() { delete _evictedRescueInFlight[id]; });
+}
+
 async function saveChatsToStorage() {
     // Park this caller on a waiter resolved only after a save capturing the
     // CURRENT state commits — never resolved by an in-flight save that started
@@ -193,7 +216,15 @@ async function saveChatsToStorage() {
                     // amplification (an evicted chat's record hasn't changed).
                     // It stays in `desired` so the delete-pass above cannot
                     // remove its record either.
-                    if (desired[id]._payloadsEvicted) return;
+                    if (desired[id]._payloadsEvicted) {
+                        // SAVE-DROP RESCUE: the skip below is correct for THIS
+                        // transaction (putting a stripped record would clobber
+                        // inline payloads), but if the chat was mutated while
+                        // evicted the write would be silently lost — queue an
+                        // out-of-band hydrate→save so it lands durably.
+                        if (desired[id]._dirtyWhileEvicted) _rescueDirtyEvictedChat(id);
+                        return;
+                    }
                     // PAYLOAD-STORE: strip payloads into blob rows; the record
                     // put carries flags instead of base64. All requests are
                     // issued synchronously here, so `pending` cannot zero-cross

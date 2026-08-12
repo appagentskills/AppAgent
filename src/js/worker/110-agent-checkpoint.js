@@ -49,6 +49,18 @@
 //            fresh waiters list and resolve on the next drain pass.
 var _ckptChannels = {};
 
+// RESUME-BUDGET (runaway-spawn incident): persisted count of how many times a
+// checkpoint has been auto-resumed WITHOUT the run making progress. Seeded
+// from the row + incremented by resumeRunningCheckpoints
+// (worker/130-port-bridge.js), carried onto every subsequent write by
+// writeAgentCheckpoint (snapshots are rebuilt from scratch, so without the
+// merge the resumed run's own runStarted would wipe the counter), reset on
+// real progress (assistantMessage = a completed LLM call) and dropped when
+// the run finishes cleanly (record deleted). A run that never progresses is
+// resumed at most CKPT_MAX_RESUMES times, then marked 'errored'.
+var _ckptResumeCounts = {};
+var CKPT_MAX_RESUMES = 5;
+
 function _ckptEnqueue(chatId, op) {
     var ch = _ckptChannels[chatId] || (_ckptChannels[chatId] = { op: null, draining: false, waiters: [] });
     ch.op = op; // latest wins — a queued-but-unwritten older op is superseded
@@ -124,6 +136,9 @@ function writeAgentCheckpoint(chatId, snapshot) {
         chatId: chatId,
         lastEventAt: Date.now()
     });
+    // RESUME-BUDGET: carry the resume counter across rebuilt snapshots so a
+    // resumed run's own checkpoint writes don't reset its budget.
+    if (!record.resume_count && _ckptResumeCounts[chatId]) record.resume_count = _ckptResumeCounts[chatId];
     return _ckptEnqueue(chatId, { type: 'put', record: record });
 }
 
@@ -271,6 +286,12 @@ AgentEvents.on('toolCallCancelled', function(e) {
 });
 
 AgentEvents.on('assistantMessage', function(e) {
+    // RESUME-BUDGET: a completed LLM call is real progress — reset the
+    // auto-resume counter so a long-lived run that gets legitimately resumed
+    // many times (SW idle-kills, browser restarts) never exhausts the budget;
+    // only a run that NEVER completes a call (deterministic early crash)
+    // burns through it.
+    delete _ckptResumeCounts[e.chatId];
     writeAgentCheckpoint(e.chatId, _buildCheckpointSnapshotFor(e.chatId) || { chatId: e.chatId, status: 'running' });
 });
 
@@ -280,11 +301,32 @@ AgentEvents.on('runFinished', function(e) {
         // scanner only ever looks at 'running'/'parked' records, so a
         // 'finished' record is dead weight (with a full messagesSnapshot
         // inside). Delete instead of writing status:'finished'.
+        delete _ckptResumeCounts[e.chatId];
         deleteAgentCheckpoint(e.chatId);
         return;
     }
     var snap = _buildCheckpointSnapshotFor(e.chatId) || { chatId: e.chatId };
     snap.status = e.hasError ? 'errored' : 'paused';
+    writeAgentCheckpoint(e.chatId, snap);
+});
+
+// RUNAWAY-SPAWN incident (fix 3): a crashed run previously left its checkpoint
+// {status:'running'} FOREVER — this file had handlers for runStarted /
+// toolCallResult / toolCallCancelled / assistantMessage / runFinished /
+// toolParked but NOT runCrashed (the gap is acknowledged in
+// worker/130-port-bridge.js's tombstone comment). The 30s agent-heartbeat
+// resume scan (background.js → resumeRunningCheckpoints) then re-entered the
+// crashed run on every tick, re-executing whatever crashed it — one of the
+// three drivers of the ~92-spawn loop. Mark the checkpoint 'errored': the
+// resume scan only picks up 'running'/'parked', so a crashed run stays down
+// until a NEW runStarted (user send, sub-agent transient retry, wake)
+// legitimately re-arms it — those paths all emit runStarted, which re-writes
+// {status:'running'} through the same coalescing channel, so ordering is safe.
+AgentEvents.on('runCrashed', function(e) {
+    if (!e || !e.chatId) return;
+    var snap = _buildCheckpointSnapshotFor(e.chatId) || { chatId: e.chatId };
+    snap.status = 'errored';
+    if (e.error && e.error.message) snap.lastError = String(e.error.message).slice(0, 500);
     writeAgentCheckpoint(e.chatId, snap);
 });
 

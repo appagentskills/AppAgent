@@ -164,10 +164,11 @@ function renderChatList() {
     var sorted = Object.values(chats)
         .filter(function(c) { return c.messages && c.messages.length > 0 && chatMatchesSearch(c, chatSearchQuery) && (!(c.isBackground && !c._revealed) || (c.actionId && !c.isSubAgent)) && !c.isSubAgent; })
         .sort(function(a, b) {
-            // Pinned chats first, then by date
+            // Pinned chats first, then by last activity (chatActivityTs,
+            // ui/050-history-view.js) so a chat continued today resurfaces.
             if (a.pinned && !b.pinned) return -1;
             if (!a.pinned && b.pinned) return 1;
-            return b.createdAt - a.createdAt;
+            return chatActivityTs(b) - chatActivityTs(a);
         });
 
     // Separate pinned and unpinned for divider

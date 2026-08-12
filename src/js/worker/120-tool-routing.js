@@ -1230,9 +1230,11 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {
             Handles.markAwaitingApproval(options._handleChatId, options._handleId, true);
         }
-        // RES-6: a SUB-AGENT parked on a permission prompt is invisible to its
-        // parent — surface the park (once per episode) and the user's verdict
-        // through the registry so the parent gets a lifecycle notice.
+        // RES-6: surface a sub's approval lifecycle to the registry —
+        // 'requested' stamps pending_approvals / awaiting_approval for
+        // agent_status + the sub-card badge (deliberately NO parent notice:
+        // the user already sees the modal), and the verdict unwinds it
+        // (denials push a lifecycle notice to the parent).
         var _subApprovalChat = !!(targetChatId && chats[targetChatId] && chats[targetChatId].isSubAgent
             && typeof SubAgents !== 'undefined' && SubAgents.onSubApprovalEvent);
         if (_subApprovalChat) {

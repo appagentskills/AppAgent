@@ -1278,6 +1278,15 @@ async function _handlePanelSendMessage(msg) {
         try { await saveChatsToStorage(); } catch (e) {}
     }
 
+    // MEMFIX-FU (M2): same hydration gate as the run-agent lane above (:463) —
+    // this send-message lane also starts the loop, and the chat row may be
+    // payload-evicted (the SW loader strips ALL chats — worker/115-storage.js):
+    // buildAPIMessages would emit empty image payloads (provider 400) and the
+    // loop's saves would be skipped by the evicted-put guard.
+    // ensureChatPayloads never rejects by contract; try/catch is defensive.
+    if (chats[chatId] && chats[chatId]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
     // Deliberately not awaited (fire-and-forget run start), but the rejection
     // must be handled — an unhandled async crash here surfaced as a raw
     // uncaught TypeError in the SW console.
@@ -1416,6 +1425,35 @@ function resumeRunningCheckpoints(checkpoints) {
                     return;
                 }
                 if (!runningChatIds[cp.chatId]) {
+                    // RESUME-BUDGET (runaway-spawn incident, fix 2a): cap
+                    // unattended auto-resumes of the SAME checkpoint. Counted
+                    // ONLY here — when we actually attempt a resume of an idle
+                    // chat (an already-running chat skips this block, so a
+                    // healthy long run ticking past every 30s never burns
+                    // budget). The counter is persisted on the agent_runs row
+                    // (carried across snapshot rewrites by writeAgentCheckpoint,
+                    // worker/110-agent-checkpoint.js) so it survives SW death
+                    // AND extension reloads; assistantMessage (real progress)
+                    // resets it. On exhaustion the checkpoint is marked
+                    // 'errored' — the scan only picks 'running'/'parked', so
+                    // the zombie stays down; a user send still starts fresh.
+                    var _resumeN = (cp.resume_count || 0) + 1;
+                    if (_resumeN > CKPT_MAX_RESUMES) {
+                        console.error('[port-bridge] checkpoint for ' + cp.chatId
+                            + ' exhausted its resume budget (' + (_resumeN - 1) + '/' + CKPT_MAX_RESUMES
+                            + ' resumes without progress) — marking errored, not resuming');
+                        delete _ckptResumeCounts[cp.chatId];
+                        try {
+                            writeAgentCheckpoint(cp.chatId, {
+                                chatId: cp.chatId, status: 'errored', turn: cp.turn,
+                                callNumber: cp.callNumber, resume_count: _resumeN - 1,
+                                lastError: 'resume budget exhausted (' + CKPT_MAX_RESUMES + ' auto-resumes without progress)',
+                                parkedToolCalls: []
+                            });
+                        } catch (eBudget) {}
+                        return;
+                    }
+                    _ckptResumeCounts[cp.chatId] = _resumeN;
                     if (_looksSub && _subRec) {
                         // ZR1-R1: the boot decision in 097 already claimed this
                         // sub's pool slot; a runAgent failure here (sync throw OR
@@ -1427,7 +1465,20 @@ function resumeRunningCheckpoints(checkpoints) {
                         // then reap the checkpoint ONLY if the record went
                         // terminal (see the conditional reap in the catch — a
                         // transient crash keeps the sub alive via the retry latch).
+                        // MEMFIX-FU (M2): checkpoint resume starts the loop on a
+                        // chat the SW loader just re-read in evicted form —
+                        // hydrate first or the resumed transcript's image rows
+                        // 400 the first LLM call ("Only HTTPS URLs are supported").
                         Promise.resolve()
+                            .then(function() {
+                                var _cpChat = (typeof chats !== 'undefined') ? chats[cp.chatId] : null;
+                                if (_cpChat && _cpChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                                    return ensureChatPayloads(cp.chatId).catch(function(e) {
+                                        console.warn('[port-bridge] resume hydration failed for', cp.chatId, e);
+                                    });
+                                }
+                                return null;
+                            })
                             .then(function() { return runAgent(cp.chatId); })
                             .catch(function(err) {
                                 console.error('[port-bridge] resume runAgent failed for sub chat', cp.chatId, err);
@@ -1462,7 +1513,18 @@ function resumeRunningCheckpoints(checkpoints) {
                         // the sync catch never fired. With the loop's entry guard
                         // this now logs one descriptive line instead of spamming
                         // a raw TypeError on every heartbeat tick.
+                        // MEMFIX-FU (M2): same resume-hydration gate as the sub
+                        // branch above — evicted image rows 400 the first call.
                         Promise.resolve()
+                            .then(function() {
+                                var _cpChat2 = (typeof chats !== 'undefined') ? chats[cp.chatId] : null;
+                                if (_cpChat2 && _cpChat2._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                                    return ensureChatPayloads(cp.chatId).catch(function(e) {
+                                        console.warn('[port-bridge] resume hydration failed for', cp.chatId, e);
+                                    });
+                                }
+                                return null;
+                            })
                             .then(function() { return runAgent(cp.chatId); })
                             .catch(function(e) { console.error('[port-bridge] resume runAgent failed', cp.chatId, e); });
                     }

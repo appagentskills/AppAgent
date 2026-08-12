@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.22
+
+### Fixes
+- Sub-agents can no longer spawn in a runaway loop, re-creating the same worker dozens of times.
+- History now surfaces continued chats by their real latest activity instead of a stale timestamp.
+- Parents no longer get a notification every time a sub-agent's tool call waits on the approval popup.
+- Fixed a 400 crash when resuming or waking chats that contain images.
+
+---
+
 ## v1.1.21
 
 ### Features

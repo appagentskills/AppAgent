@@ -2257,6 +2257,11 @@ function markChatRecentlyFinished(chatId) {
         // the finish time backwards -- that would shorten the linger window and
         // the unread age cap.
         c.lastResponseAt = Math.max(c.lastResponseAt || 0, Date.now());
+        // HIST-RECENCY: `updatedAt` was read by the history UI but never
+        // written anywhere — stamp it beside every lastResponseAt write (the
+        // SW twin is worker/100-agent-event-broadcast.js _swStampChatFinished).
+        // Monotonic for the same dual-writer reason as lastResponseAt.
+        c.updatedAt = Math.max(c.updatedAt || 0, Date.now());
         // A re-run un-hides a chat the user previously removed from the jobs list.
         // Cleared to an explicit `false`, NOT deleted (phase-2 follow-up 1): the
         // page-field merge in app/045-agent-port-bridge-page.js only preserves a

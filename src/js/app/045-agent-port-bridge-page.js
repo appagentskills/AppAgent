@@ -511,7 +511,13 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
 // page-side leaves it undefined on prev, so a re-run's un-hide sticks).
 function _mergePageChatMeta(prevChat, inChat) {
     if (!prevChat || !inChat) return;
-    ['lastResponseAt', 'lastActivityAt', 'lastViewedAt'].forEach(function(f) {
+    // HIST-RECENCY hardening (PR #780 follow-up): `updatedAt` is dual-written
+    // (SW _swStampChatFinished + page markChatRecentlyFinished) just like
+    // lastResponseAt, so a stale SW snapshot must not revert the page's newer
+    // stamp — _jobsChatTs (tools/120-actions.js) reads it FIRST-TRUTHY
+    // (`updatedAt || lastResponseAt`), so unlike the history UI's Math.max it
+    // has no lastResponseAt immunity.
+    ['lastResponseAt', 'lastActivityAt', 'lastViewedAt', 'updatedAt'].forEach(function(f) {
         var pv = prevChat[f] || 0;
         if (pv && pv > (inChat[f] || 0)) inChat[f] = pv;
     });
