@@ -172,11 +172,13 @@ function closeBackgroundPromptPopup(e) {
 function submitBackgroundPromptPopup(chatId, promptId) {
     var form = document.getElementById('prompt-form-' + promptId);
     if (!form) return;
-    // Reuse the existing collection logic by temporarily swapping currentChatId
-    var prev = currentChatId;
-    currentChatId = chatId; // so status updates target the right chat
-    var ok = submitPromptUser(promptId);
-    currentChatId = prev;
+    // FLUX-QW1: pass the target chat EXPLICITLY instead of swapping the
+    // currentChatId global around the call. The old swap had no try/finally
+    // (a throw stranded the panel on the background chat) and
+    // submitPromptUser's renderMessages() fired MID-SWAP, repainting the
+    // visible pane with the BACKGROUND chat's transcript (the restore never
+    // re-rendered, so the wrong transcript stayed up).
+    var ok = submitPromptUser(promptId, chatId);
     if (ok === false) return; // validation failed — keep popup open and needs_input state intact
     // Clear needs-input flag on the action button
     var chat = chats[chatId];
@@ -187,10 +189,8 @@ function submitBackgroundPromptPopup(chatId, promptId) {
 }
 
 function cancelBackgroundPromptPopup(chatId, promptId) {
-    var prev = currentChatId;
-    currentChatId = chatId;
-    cancelPromptUser(promptId);
-    currentChatId = prev;
+    // FLUX-QW1: explicit chatId, no global swap — see submitBackgroundPromptPopup.
+    cancelPromptUser(promptId, chatId);
     var chat = chats[chatId];
     if (chat && chat.actionId && typeof clearActionNeedsInput === 'function') {
         clearActionNeedsInput(chat.actionId);
@@ -198,8 +198,10 @@ function cancelBackgroundPromptPopup(chatId, promptId) {
     closeBackgroundPromptPopup();
 }
 
-// Called when PM submits the form
-function submitPromptUser(promptId) {
+// Called when PM submits the form. `chatId` is optional: the inline
+// transcript form omits it (the prompt belongs to the chat on screen); the
+// background prompt popup passes the owning chat explicitly (FLUX-QW1).
+function submitPromptUser(promptId, chatId) {
     var form = document.getElementById('prompt-form-' + promptId);
     // Return false (not undefined) so submitBackgroundPromptPopup's
     // `ok === false` guard holds: returning undefined would clear the
@@ -264,7 +266,7 @@ function submitPromptUser(promptId) {
     if (oldNotice) oldNotice.remove();
 
     // Update message status
-    var chatId = currentChatId;
+    chatId = chatId || currentChatId;
     var chat = chats[chatId];
     if (chat) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -306,15 +308,21 @@ function submitPromptUser(promptId) {
 
     // Clear the live needs_input badge on jobs rows / header pill.
     if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
-    renderMessages();
-    scrollToBottomIfAllowed();
+    // FLUX-QW1: repaint only when the prompt belongs to the chat on screen —
+    // renderMessages() always draws currentChatId, so rendering here on a
+    // background chat's popup submit repainted the visible pane pointlessly
+    // (and, under the old swap, with the WRONG chat's transcript).
+    if (chatId === currentChatId) {
+        renderMessages();
+        scrollToBottomIfAllowed();
+    }
     return true;
 }
 
-// Called when PM cancels the form
-function cancelPromptUser(promptId) {
+// Called when PM cancels the form. `chatId` optional — see submitPromptUser.
+function cancelPromptUser(promptId, chatId) {
     // Update message status
-    var chatId = currentChatId;
+    chatId = chatId || currentChatId;
     var chat = chats[chatId];
     if (chat) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -346,8 +354,11 @@ function cancelPromptUser(promptId) {
 
     // Clear the live needs_input badge on jobs rows / header pill.
     if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
-    renderMessages();
-    scrollToBottomIfAllowed();
+    // FLUX-QW1: same current-chat guard as submitPromptUser above.
+    if (chatId === currentChatId) {
+        renderMessages();
+        scrollToBottomIfAllowed();
+    }
 }
 
 // After page reload: write a proper tool_result matching the orphaned tool_use.

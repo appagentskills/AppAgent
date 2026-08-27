@@ -393,27 +393,18 @@ function _openAgentBus() {
             && typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
         pushFocusChatToOffscreen(_focusNow);
     }
-    // Re-mirror in-memory session permissions: the SW loses these on
-    // restart (in-memory only, not in IDB), so without this push the user
-    // would get prompted again after a SW eviction even though they
-    // already chose "Allow for session" earlier.
-    //
-    // tool/instancePermissions: only push if THIS PAGE has already hydrated
-    // them from IDB (non-empty). _openAgentBus runs at file-load time, well
-    // BEFORE loadToolPermissions() in core/120-init.js completes — pushing
-    // the empty defaults on cold load would CLOBBER the SW's own IDB-loaded
-    // state and strand Auto-tier instances back on 'ask' for every tool.
-    // loadToolPermissions re-pushes both sources once IDB read completes,
-    // covering the belt-and-suspenders case.
-    if (typeof pushPermissionsToOffscreen === 'function') {
-        var _hasTool = toolPermissions && typeof toolPermissions === 'object' && Object.keys(toolPermissions).length > 0;
-        var _hasInst = instancePermissions && typeof instancePermissions === 'object' && Object.keys(instancePermissions).length > 0;
-        pushPermissionsToOffscreen({
-            sessionPermissions: typeof sessionPermissions === 'object' ? sessionPermissions : null,
-            toolPermissions: _hasTool ? toolPermissions : null,
-            instancePermissions: _hasInst ? instancePermissions : null
-        });
-    }
+    // F6 (flux single-writer): panels NEVER push permission state at hello.
+    // The SW is the permissions authority — it hydrates tool/instance maps
+    // from IDB at its own boot (loadToolPermissionsInWorker, worker/190-entry)
+    // and ships its in-memory session map DOWN in the 'hello' envelope. The
+    // old boot-time mirror push here was the QW9 wipe bug: a fresh panel's
+    // `{}` sessionPermissions passed the typeof guard, the SW applied it as
+    // a change, and the rebroadcast revoked "Allow for session" grants in
+    // EVERY panel. The only thing sent on (re)connect now is a queued EDIT
+    // that failed while the port was down (pushPermissionsToOffscreen's
+    // queue) — an explicit user action, never a boot-state mirror.
+    _flushPendingPermPatch();
+    _flushPendingChatMetaPatches();
 }
 
 // RES-5: preserve page-only PENDING interactive rows across SW chat-snapshot
@@ -422,7 +413,7 @@ function _openAgentBus() {
 // authoritative copy AFTER they resolve (result._message_persist for
 // prompt_user; the decision write-back for approvals). Any snapshot that
 // arrives while one is still pending — e.g. a sub-agent progress repaint
-// (recordSubActionState → _repaintParent → messagesAppended force:true, which
+// (recordSubActionState → _repaintParent → messagesAppended, which
 // inlines the SW's parent-chat copy) — lacks the row, so the wholesale
 // `chats[chatId] = snapshot` assignment dropped it and the handler's
 // renderMessages() wiped the live form out from under the user. Splice each
@@ -499,10 +490,9 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
 // JOBS-UNREAD: page-owned jobs-list metadata must survive SW chat-snapshot
 // replaces. The unread/bold + linger predicates (tools/120-actions.js) read
 // lastResponseAt / lastActivityAt / lastViewedAt, and the dropdown's 'remove
-// from list' uses _jobsHidden — ALL of them are stamped PAGE-side only
-// (markChatActivity / markChatRecentlyFinished / selectChat / showChatView),
-// so the SW's snapshot never carries fresh values (at best stale ones loaded
-// from IDB at SW boot). The wholesale `chats[chatId] = snapshot` assignment
+// from list' uses _jobsHidden — since FLUX-4C those are stamped through the
+// SW-canonical chat-meta lane (dispatchChatMeta below), so the SW snapshot is
+// authoritative for them and this merge no longer touches them. The wholesale `chats[chatId] = snapshot` assignment
 // dropped the stamps: a jobs row went bold on markChatActivity, then the next
 // inlined snapshot (e.g. the silent title/tldr hook's runStarted ~1s after
 // the run finished) wiped lastResponseAt/lastActivityAt and the repaint
@@ -511,38 +501,143 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
 // page-side leaves it undefined on prev, so a re-run's un-hide sticks).
 function _mergePageChatMeta(prevChat, inChat) {
     if (!prevChat || !inChat) return;
-    // HIST-RECENCY hardening (PR #780 follow-up): `updatedAt` is dual-written
-    // (SW _swStampChatFinished + page markChatRecentlyFinished) just like
-    // lastResponseAt, so a stale SW snapshot must not revert the page's newer
-    // stamp — _jobsChatTs (tools/120-actions.js) reads it FIRST-TRUTHY
-    // (`updatedAt || lastResponseAt`), so unlike the history UI's Math.max it
-    // has no lastResponseAt immunity.
-    ['lastResponseAt', 'lastActivityAt', 'lastViewedAt', 'updatedAt'].forEach(function(f) {
-        var pv = prevChat[f] || 0;
-        if (pv && pv > (inChat[f] || 0)) inChat[f] = pv;
-    });
-    // ACTIVE-CLASSIFY-F4: `pinned` and `_lastApiError` are PAGE-TIER-ONLY chat
-    // fields — grepping either name under src/js/worker/ returns ZERO hits, and
-    // every writer is page-side (pin toggle: tools/120-actions.js `c.pinned =
-    // !c.pinned`; error stamp: app/036-agent-event-handlers-page.js
-    // `chat._lastApiError = ...`, cleared in app/020-api-messages.js). The SW's
-    // snapshot therefore carries at best the value last PERSISTED to IDB, so the
-    // wholesale `chats[id] = snapshot` replaces below reverted them: an errored
-    // chat stopped painting red (_isChatErrored reads chats[id]._lastApiError)
-    // and a just-pinned chat could lose its pin. Same undefined-wins rule as
-    // _jobsHidden, so a DELIBERATE page-side unpin (pinned = false) or
-    // error-clear (_lastApiError = null) is a DEFINED value that wins and is
-    // never resurrected — only a snapshot that says nothing at all about the
-    // field inherits the page's copy.
-    ['_jobsHidden', 'pinned', '_lastApiError'].forEach(function(f) {
-        if (inChat[f] === undefined && prevChat[f] !== undefined) inChat[f] = prevChat[f];
-    });
+    // FLUX-4C (narrow pull-forward): the seven chat-meta fields
+    // (lastResponseAt/lastActivityAt/lastViewedAt/updatedAt + _jobsHidden/
+    // pinned/_lastApiError) are SW-CANONICAL now — every page writer
+    // dispatches 'chat-meta-update' (dispatchChatMeta below); the SW applies,
+    // persists and rebroadcasts 'chat-meta-changed'. An incoming SW snapshot
+    // is therefore at least as fresh as any legitimately-written page value,
+    // so the old max-wins timestamp arm and undefined-wins flag arm are GONE
+    // (the flag arm was the F3 laundering rule: a stale DEFINED flag from
+    // another panel round-tripped through run-agent adopt → snapshot → this
+    // merge → the page's blind put, defeating the SW put-side protection).
+    // Only the page-only displays state below still needs preserving until
+    // Phase 4a/4b event-payload completeness lands.
+    // FLUX-QW7: keep the page's newer checklist-toggle state when an SW
+    // snapshot replaces the chat. The page stamps entry._toggledAt on every
+    // toggle (tools/090-display-templates.js); the SW only creates display
+    // entries, so a mid-run snapshot would otherwise revert just-clicked
+    // boxes. Union per displayId, newest _toggledAt wins.
+    // FLUX-T1 (title lane): keep the page's OPTIMISTIC rename when a chat
+    // snapshot generated BEFORE the SW applied the dispatch lands here —
+    // pair max-wins, mirroring the lane echo that will confirm it (belt and
+    // braces: without this the title flickers old→new). Strict >: an equal
+    // stamp is the same lane generation and the SW snapshot wins.
+    if (typeof prevChat.titleUpdatedAt === 'number' && isFinite(prevChat.titleUpdatedAt)
+        && typeof prevChat.title === 'string' && prevChat.title
+        && prevChat.titleUpdatedAt > (inChat.titleUpdatedAt || 0)) {
+        inChat.title = prevChat.title;
+        inChat.titleUpdatedAt = prevChat.titleUpdatedAt;
+        if (prevChat.titleProvisional === true) inChat.titleProvisional = true;
+        else delete inChat.titleProvisional;
+    }
+    if (prevChat.displays) {
+        // FLUX-6: same per-id union the put paths use (_unionChatDisplaysForPut,
+        // core/130-indexeddb.js) — one implementation, no drift: keep the
+        // snapshot's entry unless the page's _toggledAt is strictly newer, add
+        // page-only ids. Returns null when the snapshot already has it all.
+        var _du = _unionChatDisplaysForPut(inChat.displays, prevChat.displays);
+        if (_du) inChat.displays = _du;
+    }
+}
+
+// MEMFIX-EVDELTA: heavy-payload graft. SW broadcasts now strip screenshot
+// base64 / cachedToolResults fullContent from inlined snapshots and delta
+// meta (worker/100-agent-event-broadcast.js _slimChatSnapshot). When the
+// page's previous copy still holds the hydrated entry, keep it — otherwise
+// the entry stays flagged (_b64Evicted/_fcEvicted) and ensureChatPayloads
+// (core/130-indexeddb.js) lazy-loads it on demand, exactly like a chat
+// loaded from a payload-stripped record.
+function _graftHeavyMap(prevMap, inMap, field, flag) {
+    if (!prevMap || !inMap) return;
+    for (var id in inMap) {
+        var ie = inMap[id];
+        if (ie && ie[flag] && ie[field] === undefined) {
+            var pe = prevMap[id];
+            if (pe && pe[field] !== undefined) inMap[id] = pe;
+        }
+    }
+}
+function _mergePageHeavyPayloads(prevChat, inChat) {
+    if (!prevChat || !inChat) return;
+    _graftHeavyMap(prevChat.screenshots, inChat.screenshots, 'base64', '_b64Evicted');
+    _graftHeavyMap(prevChat.cachedToolResults, inChat.cachedToolResults, 'fullContent', '_fcEvicted');
+}
+
+// MEMFIX-EVDELTA: rebuild a full chat snapshot locally from a chatDelta
+// envelope (worker/100-agent-event-broadcast.js _buildChatDelta): slim meta
+// over the page's previous copy, previous messages up to fromIndex, the
+// appended tail, then the known-mutable row updates (matched by role+key,
+// index as a hint). Returns null when the page mirror can't absorb the delta
+// (chat unseen, fewer messages than fromIndex, or an update row that can't
+// be located) — the caller then falls back to a 'pull-chat' full resync.
+function _locateDeltaRow(msgs, up) {
+    var m = up.message;
+    var keyField = m.role === 'prompt_user' ? 'promptId'
+                 : m.role === 'sub_report' ? 'subAgentId'
+                 : (m.role === 'approval' || m.role === 'tool') ? 'toolCallId' : null;
+    var cand = (up.index >= 0 && up.index < msgs.length) ? msgs[up.index] : null;
+    if (cand && cand.role === m.role && (!keyField || !m[keyField] || cand[keyField] === m[keyField])) return up.index;
+    if (keyField && m[keyField]) {
+        for (var i = msgs.length - 1; i >= 0; i--) {
+            var c = msgs[i];
+            if (c && c.role === m.role && c[keyField] === m[keyField]) return i;
+        }
+    }
+    return -1;
+}
+function _synthesizeChatFromDelta(chatId, delta) {
+    var prev = chats[chatId];
+    if (!prev || prev._deleted || !Array.isArray(prev.messages)) return null;
+    if (!delta || typeof delta.fromIndex !== 'number' || delta.fromIndex < 0) return null;
+    if (prev.messages.length < delta.fromIndex) return null;
+    var msgs = prev.messages.slice(0, delta.fromIndex);
+    var tail = Array.isArray(delta.tail) ? delta.tail : [];
+    for (var i = 0; i < tail.length; i++) msgs.push(tail[i]);
+    if (Array.isArray(delta.updates)) {
+        for (var u = 0; u < delta.updates.length; u++) {
+            var up = delta.updates[u];
+            if (!up || !up.message || typeof up.index !== 'number') continue;
+            var idx = _locateDeltaRow(msgs, up);
+            if (idx < 0) return null;
+            msgs[idx] = up.message;
+        }
+    }
+    var inChat = Object.assign({}, prev, delta.meta || {});
+    inChat.messages = msgs;
+    return inChat;
+}
+
+// MEMFIX-EVDELTA: full-resync fallback when a delta can't be applied. Uses
+// the existing 'pull-chat' lane (worker/130-port-bridge.js), whose reply is
+// the 'chat-snapshot' case below. Debounced per chat — several deltas can
+// arrive before the snapshot lands.
+var _pendingChatPulls = {};
+function _requestChatPull(chatId) {
+    if (!chatId || !_agentBusPort) return;
+    var now = Date.now();
+    if (_pendingChatPulls[chatId] && (now - _pendingChatPulls[chatId]) < 2000) return;
+    _pendingChatPulls[chatId] = now;
+    try { _agentBusPort.postMessage({ type: 'pull-chat', chatId: chatId }); } catch (e) {}
 }
 
 function _handleAgentBusMessage(msg) {
     if (!msg || !msg.type) return;
     switch (msg.type) {
         case 'agent-event':
+            // MEMFIX-EVDELTA: delta envelopes carry chatDelta instead of the
+            // full chat. Rebuild a synthetic snapshot from the local mirror
+            // and let it flow through the SAME merge path below (versionHistory
+            // / widget / pending-row / meta guards all apply unchanged). A
+            // failed rebuild (first sight of a background chat, gap, or row
+            // divergence) requests a full snapshot instead — handlers still
+            // re-emit off the stale mirror this tick and heal when the
+            // 'chat-snapshot' reply lands.
+            if (msg.detail && msg.detail.chatId && msg.detail.chatDelta && !msg.detail.chat) {
+                var _synthChat = _synthesizeChatFromDelta(msg.detail.chatId, msg.detail.chatDelta);
+                if (_synthChat) msg.detail.chat = _synthChat;
+                else _requestChatPull(msg.detail.chatId);
+            }
             // Mutating events inline the chat snapshot so the page mirror
             // stays in sync without async pull-chat round-trips. Assign
             // BEFORE re-emitting so the handlers (which read chats[chatId])
@@ -603,6 +698,9 @@ function _handleAgentBusMessage(msg) {
                 _mergePagePendingRows(_prevChat, _inChat, msg.detail.chatId); // PR383-F3: chatId for approval re-key
                 // JOBS-UNREAD: carry page-owned unread/seen stamps across the replace.
                 _mergePageChatMeta(_prevChat, _inChat);
+                // MEMFIX-EVDELTA: keep hydrated heavy payloads the slim
+                // snapshot / delta meta stripped.
+                _mergePageHeavyPayloads(_prevChat, _inChat);
                 chats[msg.detail.chatId] = _inChat;
                 // Re-point the active-chat versionHistory mirror: it referenced
                 // the replaced chat object's array, so sidebar/inline renders
@@ -692,6 +790,20 @@ function _handleAgentBusMessage(msg) {
             // BEFORE arming the grace reconcile below, so the timer knows
             // whether it may need its one-shot extension.
             _swResumeScanSettledSeen = !!msg.resumeScanSettled;
+            // F6: the hello envelope carries the SW's authoritative in-memory
+            // session permission map. Overwrite — not merge — the page
+            // replica: a fresh SW legitimately resets session grants (RFC
+            // §4.5 phase-3 semantics), and a live SW seeds panels that
+            // connect after "Allow for session" was granted elsewhere.
+            if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
+                sessionPermissions = msg.sessionPermissions;
+                // FLUX-4/1: the hello map is applied SW authority — arm the
+                // per-key diff baseline for the session slot too.
+                if (typeof _permBaselineCapture === 'function') _permBaselineCapture('sessionPermissions', sessionPermissions);
+                if (typeof renderToolPermissions === 'function') {
+                    try { renderToolPermissions(); } catch (e) { /* settings view may not be mounted */ }
+                }
+            }
             // Offscreen sent us the running-chats snapshot + the list of
             // running chat ids. Merge into local state so the panel UI
             // reflects ongoing background runs immediately on connect.
@@ -706,6 +818,10 @@ function _handleAgentBusMessage(msg) {
                     // JOBS-UNREAD: same page-owned stamp preservation as the
                     // agent-event inline-snapshot path.
                     _mergePageChatMeta(chats[cid], msg.chatsSnapshot[cid]);
+                    // MEMFIX-EVDELTA: the SW keeps 0 chats hydrated, so hello
+                    // snapshots can arrive payload-evicted — don't let them
+                    // clobber a hydrated page copy.
+                    _mergePageHeavyPayloads(chats[cid], msg.chatsSnapshot[cid]);
                     chats[cid] = msg.chatsSnapshot[cid];
                     if (typeof currentChatId !== 'undefined' && cid === currentChatId) _helloRerenderCurrent = true;
                 });
@@ -803,6 +919,102 @@ function _handleAgentBusMessage(msg) {
             }
             return;
 
+        case 'permissions-changed':
+            // QW9 (flux single-writer, step 1): the SW applied a permissions
+            // delta (pushed by SOME panel via pushPermissionsToOffscreen) and
+            // rebroadcast the changed slots to all panels. Overwrite this
+            // panel's replicas so cross-panel edits converge without a
+            // reload. Do NOT push back or persist here — the SW already
+            // persisted the durable slots (F6 single writer), and re-pushing
+            // would ping-pong. Boot-state mirror pushes no longer exist: the
+            // hello lane only flows DOWNWARD (SW → panel), so a received map
+            // is always the applied authority, never a cold panel's echo.
+            if (msg.toolPermissions && typeof msg.toolPermissions === 'object') {
+                toolPermissions = msg.toolPermissions;
+                _permBaselineCapture('toolPermissions', toolPermissions);
+            }
+            if (msg.instancePermissions && typeof msg.instancePermissions === 'object') {
+                instancePermissions = msg.instancePermissions;
+                _permBaselineCapture('instancePermissions', instancePermissions);
+            }
+            if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
+                sessionPermissions = msg.sessionPermissions;
+                _permBaselineCapture('sessionPermissions', sessionPermissions);
+            }
+            // Refresh the settings permissions list if it's on screen.
+            if (typeof renderToolPermissions === 'function') {
+                try { renderToolPermissions(); } catch (e) { /* non-fatal — settings view may not be mounted */ }
+            }
+            return;
+
+        case 'chat-meta-changed':
+            // FLUX-4C: the SW applied a chat-meta dispatch (possibly OURS —
+            // echo included, like 'permissions-changed') and rebroadcast the
+            // applied fields. Idempotent apply: timestamps max-wins, flags
+            // overwrite. Never re-dispatch or persist here (the SW already
+            // persisted) — no loop.
+            // Review fix B (repaint storm): repaint ONLY when the apply really
+            // changed something. The echo to the dispatching panel is a no-op
+            // there (dispatchChatMeta already applied the value optimistically),
+            // and repainting on it unconditionally defeated both of
+            // markChatActivity's deliberate no-render paths — the focused-chat
+            // lastViewedAt stamp (tools/120-actions.js:2200-2204, zero repaints)
+            // and the already-unread early return (tools/120-actions.js:2210) —
+            // turning every streamed event into a full renderChatList +
+            // renderJobsBadge + jobs-dropdown repaint, plus a double paint on
+            // the panel that also painted itself. Panels that DID change (every
+            // other panel) still repaint: echo-to-all is unchanged.
+            if (msg.chatId && msg.fields && _applyChatMetaChangedFromSW(msg.chatId, msg.fields)) {
+                _repaintChatMetaSurfaces();
+            }
+            return;
+
+        case 'chat-meta-snapshot':
+            // FLUX-H4 (reconnect anti-entropy): the SW pushed its authoritative
+            // chat-meta map (7 lane fields per held chat) after its boot
+            // hydration settled. Apply through the SAME idempotent path as
+            // 'chat-meta-changed' above (max-wins ts, overwrite flags — flag
+            // null = "store holds no opinion", reverting phantom optimistic
+            // values the SW died holding), repaint ONCE if anything changed,
+            // and never re-dispatch or persist — no echo loop. A queued
+            // dispatch flushed on this same reconnect lands at the SW BEFORE
+            // its boot gate resolves, so the snapshot already reflects it; a
+            // late flush is self-healed by its own 'chat-meta-changed' echo.
+            if (msg.chatMeta && typeof msg.chatMeta === 'object') {
+                var _cmsChanged = false;
+                Object.keys(msg.chatMeta).forEach(function(_cmsCid) {
+                    try { if (_applyChatMetaChangedFromSW(_cmsCid, msg.chatMeta[_cmsCid])) _cmsChanged = true; } catch (e) {}
+                });
+                // FLUX-T1 (title retransmit): title has NO null=no-opinion
+                // encoding in the snapshot (it is a VALUE — see
+                // _serializeChatMetaSnapshot), so a phantom local pair the
+                // dead SW never persisted cannot be reverted by it. Repair
+                // the other way: when OUR replica holds a STRICTLY newer
+                // pair than the snapshot's opinion (or the snapshot has
+                // none), re-dispatch it once. This is a retransmit of a
+                // lost LOCAL write, not an echo of an SW value (the apply
+                // half never dispatches), so it terminates after one round
+                // trip: the SW applies+persists, its echo matches our
+                // replica, and no further snapshot fires.
+                if (typeof chats !== 'undefined' && typeof dispatchChatMeta === 'function') {
+                    Object.keys(chats).forEach(function(_cmsCid) {
+                        try {
+                            var _cmsLocal = chats[_cmsCid];
+                            if (!_cmsLocal || _cmsLocal._deleted) return;
+                            if (typeof _cmsLocal.titleUpdatedAt !== 'number' || !isFinite(_cmsLocal.titleUpdatedAt)
+                                || typeof _cmsLocal.title !== 'string' || !_cmsLocal.title) return;
+                            var _cmsIn = msg.chatMeta[_cmsCid];
+                            if (_cmsIn && (_cmsIn.titleUpdatedAt || 0) >= _cmsLocal.titleUpdatedAt) return;
+                            var _cmsPatch = { title: _cmsLocal.title, titleUpdatedAt: _cmsLocal.titleUpdatedAt };
+                            if (_cmsLocal.titleProvisional === true) _cmsPatch.titleProvisional = true;
+                            dispatchChatMeta(_cmsCid, _cmsPatch);
+                        } catch (e) {}
+                    });
+                }
+                if (_cmsChanged) _repaintChatMetaSurfaces();
+            }
+            return;
+
         case 'resume-scan-done':
             // REG-AUDIT-2: the SW's checkpoint resume scan is decided. Just
             // record it — do NOT run the reconcile early; the grace timer
@@ -828,6 +1040,11 @@ function _handleAgentBusMessage(msg) {
                 // JOBS-UNREAD: same page-owned stamp preservation as the
                 // agent-event inline-snapshot path.
                 _mergePageChatMeta(chats[msg.chatId], msg.chat);
+                // MEMFIX-EVDELTA: same heavy-payload graft as the agent-event
+                // path (pull-chat replies rehydrate SW-side, so this is
+                // usually a no-op — belt and braces).
+                _mergePageHeavyPayloads(chats[msg.chatId], msg.chat);
+                delete _pendingChatPulls[msg.chatId];
                 chats[msg.chatId] = msg.chat;
                 if (msg.chatId === currentChatId && typeof renderMessages === 'function') {
                     renderMessages();
@@ -1129,19 +1346,6 @@ async function runAgent(overrideChatId) {
     return _pendingEntry.promise;
 }
 
-// Push a chat update to offscreen (used by panel-side mutations
-// outside an agent run, e.g. title rename, manual message edit).
-function pushChatUpdateToOffscreen(chatId) {
-    if (!_agentBusPort || !chatId || !chats[chatId]) return;
-    try {
-        _agentBusPort.postMessage({
-            type: 'update-chat',
-            chatId: chatId,
-            chat: chats[chatId]
-        });
-    } catch (e) {}
-}
-
 // Toggle pause from the page side (the existing togglePause UI calls
 // into this and pushes the new state to offscreen).
 // SWM14-F5: per-chat latest-wins tokens for pause toggles. A rapid Pause→Resume
@@ -1235,29 +1439,226 @@ function pushDeferredToolsSettingToOffscreen(enabled) {
     } catch (e) {}
 }
 
-// Push permission state changes to the SW. The page-side `getToolPermission`
-// reads three sources: `toolPermissions` (IDB-persisted, "always allow"),
-// `instancePermissions` (IDB-persisted per-host), and `sessionPermissions`
-// (in-memory only, "allow until close"). With the agent loop relocated to
-// the SW, the SW has its OWN copies of these globals — `toolPermissions` /
-// `instancePermissions` are hydrated from IDB at SW boot, but session-only
-// changes and any post-boot mutation must be mirrored or the SW's
-// `getToolPermission` will return 'ask' and the approval prompt fires on
-// every tool call even after the user picked "Allow for session" or
-// "Always allow". The mirror is best-effort; if the port is down the next
-// reconnect's hello flow plus the SW's IDB load will catch up the
-// persisted ones (session-only choices ARE lost across SW restart, same
-// as a page reload).
+// Dispatch a permission EDIT to the SW (RFC F6 perms/set action). The SW is
+// the single owner: it applies the slots to its globals, persists the
+// durable ones (tool/instance) to IDB — the page never writes permission
+// maps to IDB anymore — and rebroadcasts 'permissions-changed' so every
+// panel's replicas converge. sessionPermissions stays in-memory in the SW
+// and dies with it (same as a page reload wiping the page copy).
+// Because a dropped dispatch would now lose the edit entirely (no page-side
+// persist to fall back on), a patch posted while the port is down is queued
+// (latest value per slot — the slots hold live map references, so the flush
+// ships current state) and flushed on the next reconnect.
+var _pendingPermPatch = null;
+// FLUX-4/1 (per-key permissions merge): baseline = the last map this panel
+// RECEIVED from the SW per slot ('permissions-changed' echo, hello session
+// map). pushPermissionsToOffscreen diffs the live replica against it and
+// dispatches only the changed keys plus explicitly-deleted keys, so two
+// panels editing DIFFERENT keys concurrently both survive — the old
+// whole-map replace made the later push clobber the earlier edit (RFC F6
+// follow-up). A slot with no baseline yet (no echo received since load)
+// falls back to the legacy full-map push, which the SW still accepts
+// (initial sync); the SW's full-map rebroadcast is what arms the baseline.
+var _permBaseline = { toolPermissions: null, instancePermissions: null, sessionPermissions: null };
+function _permBaselineCapture(slot, map) {
+    try { _permBaseline[slot] = JSON.parse(JSON.stringify(map || {})); } catch (e) { _permBaseline[slot] = null; }
+}
+// Structural per-key diff (values compared via JSON — instancePermissions
+// nests one level per host, so key granularity there is the host).
+// Returns { set: {k: v}, del: [k] } or null when nothing changed.
+function _permDiff(base, cur) {
+    var set = {}, del = [], any = false;
+    Object.keys(cur || {}).forEach(function(k) {
+        try {
+            if (JSON.stringify(cur[k]) !== JSON.stringify(base[k])) { set[k] = cur[k]; any = true; }
+        } catch (e) { set[k] = cur[k]; any = true; }
+    });
+    Object.keys(base || {}).forEach(function(k) {
+        if (!(k in (cur || {}))) { del.push(k); any = true; }
+    });
+    return any ? { set: set, del: del } : null;
+}
+// Queue only the DURABLE slots: replaying a stale SESSION map on reconnect
+// would resurrect grants a fresh SW legitimately reset (RFC §4.5 — session
+// grants die with the SW). A session grant lost to a port flap re-prompts.
+function _queuePermPatch(patch) {
+    var q = null;
+    if (patch.toolPermissions) { q = q || {}; q.toolPermissions = patch.toolPermissions; }
+    if (patch.instancePermissions) { q = q || {}; q.instancePermissions = patch.instancePermissions; }
+    if (q) _pendingPermPatch = Object.assign(_pendingPermPatch || {}, q);
+}
 function pushPermissionsToOffscreen(patch) {
-    if (!_agentBusPort || !patch) return;
+    if (!patch) return;
+    if (!_agentBusPort) {
+        _queuePermPatch(patch);
+        return;
+    }
     try {
-        _agentBusPort.postMessage({
-            type: 'permissions-update',
-            toolPermissions: patch.toolPermissions || null,
-            instancePermissions: patch.instancePermissions || null,
-            sessionPermissions: patch.sessionPermissions || null
+        // FLUX-4/1: per slot — send a per-key DELTA when this panel holds a
+        // baseline for the slot, else the legacy full map (initial sync /
+        // first push after load). Deltas carry explicit deletions too (a
+        // pure per-key merge never deletes). The SW applies per-key and
+        // rebroadcasts the FULL merged maps ('permissions-changed'), which
+        // re-arms the baseline — so a lost echo just means the next push
+        // resends the same idempotent delta.
+        var _pm = { type: 'permissions-update', toolPermissions: null, instancePermissions: null, sessionPermissions: null };
+        var _pmAny = false;
+        ['toolPermissions', 'instancePermissions', 'sessionPermissions'].forEach(function(slot) {
+            if (!patch[slot] || typeof patch[slot] !== 'object') return;
+            if (_permBaseline[slot]) {
+                var d = _permDiff(_permBaseline[slot], patch[slot]);
+                if (d) { _pm[slot + 'Delta'] = d; _pmAny = true; }
+                // no diff → replica already equals the last applied map; skip
+            } else {
+                _pm[slot] = patch[slot];
+                _pmAny = true;
+            }
         });
-    } catch (e) {}
+        if (!_pmAny) return;
+        _agentBusPort.postMessage(_pm);
+    } catch (e) {
+        _queuePermPatch(patch);
+    }
+}
+
+// Flush an edit queued while the agent bus was down. Called from
+// _openAgentBus after the port (re)connects; ordering vs the SW's hello is
+// harmless — the queue only ever holds explicit user edits, and the SW
+// applies + rebroadcasts whatever lands last.
+function _flushPendingPermPatch() {
+    if (!_pendingPermPatch || !_agentBusPort) return;
+    var p = _pendingPermPatch;
+    _pendingPermPatch = null;
+    pushPermissionsToOffscreen(p);
+}
+
+// ── FLUX-4C (narrow pull-forward): chat-meta single-writer lane ─────────
+// The seven chat-meta fields (CHAT_META_TS_FIELDS + CHAT_META_FLAG_FIELDS,
+// declared in ui/070-dashboard-ui.js) are SW-canonical. Page writers call
+// dispatchChatMeta(chatId, fields) instead of assigning chats[id].<field> +
+// saveChatsToStorage(): the value is applied to THIS panel's replica
+// immediately (optimistic — reads right after the call see it), then
+// dispatched; the SW applies (timestamps max-wins = any-panel-latest
+// semantics, flags last-dispatch-wins), persists, and rebroadcasts
+// 'chat-meta-changed' to every panel (echo INCLUDED — the apply is
+// idempotent, and the echo self-heals the race where an in-flight snapshot
+// reverted the optimistic value). A dispatch posted while the port is down
+// is queued per-chat (latest value per field) and flushed on reconnect —
+// same durability window as the permissions lane (#786), accepted as
+// strictly better than the old blind-put corruption.
+// Returns TRUE only when a field actually changed on `target` (review fix B):
+// the 'chat-meta-changed' handler repaints only on a real mutation, so a
+// no-op echo (typically this panel's OWN dispatch, already applied
+// optimistically below) costs zero renders. The write conditions are
+// unchanged — the added `target[f] !== fields[f]` test only skips an
+// assignment that would have written the identical value. Object-valued flags
+// (_lastApiError) survive the port's structured clone as a NEW identity, so an
+// error SET always reads as changed (conservative: repaint rather than miss a
+// red row), while an error CLEAR (defined null) compares equal and is gated.
+function _applyChatMetaFields(target, fields) {
+    if (!target || !fields) return false;
+    var changed = false;
+    // FLUX-T1 (title lane): the title VALUE rides its paired stamp. >= (not
+    // strict >) + adopt-on-differ: the SW rebroadcast/snapshot is the
+    // arbiter — on a tied stamp (two panels renamed in the same ms) the
+    // losing panel must still converge to the SW's canonical pick, and an
+    // equal-value echo is a no-op so the winner repaints nothing. The same
+    // rule serves the optimistic local apply (dispatchChatMeta stamps
+    // strictly above the replica's current stamp). titleProvisional rides
+    // the winning pair: true → set, absent → cleared. Runs BEFORE the TS
+    // loop so the compare reads the pre-merge stamp.
+    if (typeof fields.titleUpdatedAt === 'number' && isFinite(fields.titleUpdatedAt)
+        && typeof fields.title === 'string' && fields.title
+        && fields.titleUpdatedAt >= (target.titleUpdatedAt || 0)) {
+        if (target.title !== fields.title) { target.title = fields.title; changed = true; }
+        var _tpIn = fields.titleProvisional === true;
+        if (_tpIn !== (target.titleProvisional === true)) {
+            if (_tpIn) target.titleProvisional = true; else delete target.titleProvisional;
+            changed = true;
+        }
+        if ((target.titleUpdatedAt || 0) !== fields.titleUpdatedAt) { target.titleUpdatedAt = fields.titleUpdatedAt; }
+    }
+    CHAT_META_TS_FIELDS.forEach(function(f) {
+        // isFinite: same guard as the SW's _swApplyChatMetaFields — an
+        // Infinity must not apply optimistically when the SW will reject it.
+        if (typeof fields[f] === 'number' && isFinite(fields[f]) && fields[f] > (target[f] || 0)) { target[f] = fields[f]; changed = true; }
+    });
+    CHAT_META_FLAG_FIELDS.forEach(function(f) {
+        if (fields[f] !== undefined && target[f] !== fields[f]) { target[f] = fields[f]; changed = true; }
+    });
+    return changed;
+}
+// FLUX-H4: shared apply half of the 'chat-meta-changed' handler — also used
+// by the 'chat-meta-snapshot' reconnect anti-entropy push so both go through
+// ONE idempotent apply. Returns true only when a field really changed.
+function _applyChatMetaChangedFromSW(chatId, fields) {
+    if (!chatId || !fields || typeof chats === 'undefined' || !chats[chatId]) return false;
+    // FLUX-P1: sync the derived pausedChats cache on every SW-authoritative
+    // apply (echo, cross-panel change, reconnect snapshot — where a null
+    // flag means "no opinion recorded" and reads as unpaused).
+    if (fields.pausedByUser !== undefined && typeof pausedChats !== 'undefined') pausedChats[chatId] = fields.pausedByUser === true;
+    return _applyChatMetaFields(chats[chatId], fields);
+}
+// FLUX-H4: shared repaint half (chat list + jobs badge + open jobs dropdown)
+// — the exact surfaces the seven lane fields feed.
+function _repaintChatMetaSurfaces() {
+    if (typeof renderChatList === 'function') { try { renderChatList(); } catch (e) {} }
+    // FLUX-T1: the title pair repaints the open-chat header too (cheap,
+    // idempotent — reads chats[currentChatId].title and sets text).
+    if (typeof updateChatTitleHeader === 'function') { try { updateChatTitleHeader(); } catch (e) {} }
+    if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+    if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
+        try { var _jdCM = _getOpenJobsDropdown(); if (_jdCM) renderJobsDropdown(_jdCM); } catch (e) {}
+    }
+}
+var _pendingChatMetaPatches = {};
+function _queueChatMetaPatch(chatId, fields) {
+    var q = _pendingChatMetaPatches[chatId] || (_pendingChatMetaPatches[chatId] = {});
+    // FLUX-T1: the title pair replaces atomically — a later pair must not
+    // inherit a stale title or titleProvisional rider from an earlier
+    // queued patch (per-field merge would fuse two generations).
+    if (fields.titleUpdatedAt !== undefined) { delete q.title; delete q.titleProvisional; }
+    Object.keys(fields).forEach(function(f) { q[f] = fields[f]; });
+}
+function dispatchChatMeta(chatId, fields) {
+    if (!chatId || !fields) return;
+    // FLUX-T1: a title write ALWAYS travels as a pair — auto-stamp a
+    // monotonic titleUpdatedAt, strictly above the replica's current stamp:
+    // two same-ms renames from one panel must not tie at the SW arbiter
+    // (the second would lose and revert on echo).
+    if (typeof fields.title === 'string' && fields.title && fields.titleUpdatedAt === undefined) {
+        var _tCur = (typeof chats !== 'undefined' && chats[chatId] && chats[chatId].titleUpdatedAt) || 0;
+        fields = Object.assign({}, fields, { titleUpdatedAt: Math.max(Date.now(), _tCur + 1) });
+    }
+    var clean = null;
+    CHAT_META_TS_FIELDS.concat(CHAT_META_FLAG_FIELDS, ['title', 'titleProvisional']).forEach(function(f) {
+        if (fields[f] !== undefined) { (clean = clean || {})[f] = fields[f]; }
+    });
+    if (!clean) return;
+    if (typeof chats !== 'undefined' && chats[chatId]) _applyChatMetaFields(chats[chatId], clean);
+    // FLUX-P1: pausedChats is a DERIVED cache of the lane's pausedByUser flag
+    // — synced on the optimistic apply too (so the page loop gate and the
+    // pause-button label see a toggle the same tick), and unconditionally on
+    // chats[chatId]: the pre-lane helper updated the cache even for a record
+    // this panel doesn't hold.
+    if (clean.pausedByUser !== undefined && typeof pausedChats !== 'undefined') pausedChats[chatId] = clean.pausedByUser === true;
+    if (!_agentBusPort) { _queueChatMetaPatch(chatId, clean); return; }
+    try {
+        _agentBusPort.postMessage({ type: 'chat-meta-update', chatId: chatId, fields: clean });
+    } catch (e) {
+        _queueChatMetaPatch(chatId, clean);
+    }
+}
+// Flush edits queued while the bus was down. Called from _openAgentBus after
+// reconnect, beside _flushPendingPermPatch — port message order guarantees
+// these land BEFORE any run-agent this panel posts afterwards, so the adopt
+// overlay in worker/130-port-bridge.js never sees a pre-flush stale snapshot
+// win over a queued edit.
+function _flushPendingChatMetaPatches() {
+    if (!_agentBusPort) return;
+    var q = _pendingChatMetaPatches;
+    _pendingChatMetaPatches = {};
+    Object.keys(q).forEach(function(cid) { dispatchChatMeta(cid, q[cid]); });
 }
 
 // SAGF-1: tell the SW which chat the user is now viewing so the sub-agent GC

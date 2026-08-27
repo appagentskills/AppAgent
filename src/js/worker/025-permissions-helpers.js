@@ -93,15 +93,15 @@ function getEnabledTools(chatId, opts) {
             }
         } else {
             // Tool Profiles (core/078-tool-profiles.js): non-sub chats load
-            // only core + orchestrator REGISTRY tools; skill-provided tools
-            // keep legacy always-on behavior. Keep in sync with the page
-            // twin in src/js/ui/140-dropdowns.js.
+            // only core + orchestrator + code + servicenow REGISTRY tools;
+            // skill-provided tools keep legacy always-on behavior. Keep in
+            // sync with the page twin in src/js/ui/140-dropdowns.js.
             var _regSet = Object.create(null);
             baseTools.forEach(function(t) { _regSet[t.function.name] = true; });
             var _mainSet = null;
             if (typeof getToolNamesForProfiles === 'function') {
                 _mainSet = Object.create(null);
-                getToolNamesForProfiles(['orchestrator']).forEach(function(n) { _mainSet[n] = true; });
+                getToolNamesForProfiles(['orchestrator', 'code', 'servicenow']).forEach(function(n) { _mainSet[n] = true; });
             }
             allTools = allTools.filter(function(t) {
                 var n = t.function && t.function.name;

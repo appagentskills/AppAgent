@@ -876,7 +876,8 @@ function openSkillsView() {
     updateAllButtonStates();
     renderChatList(); // Update sidebar to deselect chat
     // Push browser history state
-    pushHistoryState('skills', null);
+    // ui/025-history-nav.js callee — typeof-guarded cross-tier call.
+    if (typeof pushHistoryState === 'function') pushHistoryState('skills', null);
 }
 
 function closeSkillsView() {
@@ -1024,7 +1025,8 @@ async function openSkillEditor(skillId) {
     
     // Push browser history state for skill editor
     if (skill) {
-        pushHistoryState('skill-editor', null, skill.id);
+        // ui/025-history-nav.js callee — typeof-guarded cross-tier call.
+        if (typeof pushHistoryState === 'function') pushHistoryState('skill-editor', null, skill.id);
     }
 }
 

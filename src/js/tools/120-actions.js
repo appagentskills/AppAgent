@@ -137,9 +137,11 @@ async function loadAllActionStates() {
                         // Continue button (in chat view) and the Resume affordance on the
                         // action button so the user explicitly resumes.
                         if (a._isPaused && a.chatId) {
-                            // Mirror the explicit-pause flag into pausedChats so any
-                            // BroadcastChannel-driven resume bails until the user clicks Resume.
-                            pausedChats[a.chatId] = true;
+                            // Mirror the explicit-pause flag through the FLUX-P1 lane
+                            // facade so any BroadcastChannel-driven resume bails until
+                            // the user clicks Resume (no-op when the boot fold already
+                            // rehydrated pausedByUser into the derived cache).
+                            setChatPausedPersistent(a.chatId, true);
                         }
                     }
                     activeActions[a.actionId] = a;
@@ -232,7 +234,9 @@ if (_actionsBC) {
             case 'pauseChat':
                 // PM paused/stopped from another tab — halt any local agent loop on this chat
                 if (msg.chatId) {
-                    pausedChats[msg.chatId] = true;
+                    // FLUX-P1: user pause from another tab — through the lane facade
+                    // (idempotent with the SW's 'chat-meta-changed' echo).
+                    setChatPausedPersistent(msg.chatId, true);
                     // B-A2 (cross-tab): unblock any approval the local loop is parked on,
                     // otherwise the cross-tab pause is silently a no-op for this chat.
                     if (typeof rejectPendingApprovalsForChat === 'function') {
@@ -243,7 +247,7 @@ if (_actionsBC) {
                 break;
             case 'resumeChat':
                 if (msg.chatId) {
-                    pausedChats[msg.chatId] = false;
+                    setChatPausedPersistent(msg.chatId, false); // FLUX-P1 lane facade
                     _syncChatPagePauseUIForChat(msg.chatId);
                 }
                 break;
@@ -615,7 +619,10 @@ async function startAction(skillId, actionName, extraContext) {
 async function pauseAction(actionId) {
     var a = activeActions[actionId];
     if (!a) return;
-    pausedChats[a.chatId] = true;
+    // FLUX-P1: user pause of an action chat — through the lane facade. Persists
+    // pausedByUser, so a PM-paused action now stays paused across an SW restart
+    // (the old live-map-only write silently unpaused on the next boot fold).
+    setChatPausedPersistent(a.chatId, true);
     // B9: the agent loop now runs in the service worker, which reads its OWN
     // pausedChats copy — setting only the page copy never halts it. Mirror the
     // pause + interrupt into the SW (as togglePause does) so Pause actually stops
@@ -641,7 +648,7 @@ async function pauseAction(actionId) {
 async function resumeAction(actionId) {
     var a = activeActions[actionId];
     if (!a) return;
-    pausedChats[a.chatId] = false;
+    setChatPausedPersistent(a.chatId, false); // FLUX-P1 lane facade
     a._isPaused = false;
     a.reloadInterrupted = false;
     a.updatedAt = Date.now();
@@ -677,8 +684,11 @@ async function stopAction(actionId) {
     // Cancel any in-flight auto-dismiss timer — the user explicitly stopped this
     // action and expects the button to remain visible until they dismiss it.
     if (a._dismissTimer) { clearTimeout(a._dismissTimer); a._dismissTimer = null; }
-    // Soft-stop: signal the loop to pause on next check (locally + in any other tab)
-    pausedChats[a.chatId] = true;
+    // Soft-stop: signal the loop to pause on next check (locally + in any other
+    // tab) — FLUX-P1 lane facade. Net state matches the pre-lane behavior: the
+    // B9 SW toggle push below already persisted pausedByUser for Stop; now both
+    // realms converge through the one lane writer instead of two direct pokes.
+    setChatPausedPersistent(a.chatId, true);
     // B9: mirror the stop into the service-worker loop (which reads the SW's own
     // pausedChats). Without this the PM sees "Stopped" while the SW keeps streaming
     // and executing tools (ServiceNow writes, sub-agent spawns) to completion — the
@@ -2198,13 +2208,16 @@ function markChatActivity(chatId) {
     if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId)) return;
     var now = Date.now();
     if (_isChatViewFocused(chatId)) {
-        c.lastViewedAt = now; // watching — seen as it happens
+        // watching — seen as it happens (FLUX-4C: rides the chat-meta lane;
+        // the SW persists + panels converge, any-panel-latest-wins)
+        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { lastViewedAt: now });
         return;
     }
     var wasUnread = _chatHasUnseenActivity(chatId);
-    c.lastActivityAt = now;
-    if (wasUnread) return; // already bold — no repaint/save churn per event
-    try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (e) {}
+    // FLUX-4C: computed BEFORE the dispatch — the optimistic replica apply
+    // inside dispatchChatMeta would otherwise flip the unread predicate.
+    if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { lastActivityAt: now });
+    if (wasUnread) return; // already bold — no repaint churn per event
     try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
     try {
         var _jdAct = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
@@ -2256,23 +2269,28 @@ function markChatRecentlyFinished(chatId) {
         // the two ever land out of order the later, smaller value must not move
         // the finish time backwards -- that would shorten the linger window and
         // the unread age cap.
-        c.lastResponseAt = Math.max(c.lastResponseAt || 0, Date.now());
+        // FLUX-4C: the four stamps below ride the chat-meta lane in ONE
+        // dispatch — the SW applies max-wins for the timestamps (monotonic
+        // vs its own _swStampChatFinished twin), persists, and converges
+        // every panel.
+        var _mcrfFields = { lastResponseAt: Date.now() };
         // HIST-RECENCY: `updatedAt` was read by the history UI but never
         // written anywhere — stamp it beside every lastResponseAt write (the
         // SW twin is worker/100-agent-event-broadcast.js _swStampChatFinished).
         // Monotonic for the same dual-writer reason as lastResponseAt.
-        c.updatedAt = Math.max(c.updatedAt || 0, Date.now());
+        _mcrfFields.updatedAt = Date.now();
         // A re-run un-hides a chat the user previously removed from the jobs list.
-        // Cleared to an explicit `false`, NOT deleted (phase-2 follow-up 1): the
-        // page-field merge in app/045-agent-port-bridge-page.js only preserves a
-        // page value when the incoming snapshot's field is `undefined`, so a
-        // deleted flag let the stale `true` win straight back on the next SW
-        // snapshot. A defined `false` survives the merge, and every reader tests
-        // truthiness (`if (c._jobsHidden && !c.pinned)`), so behaviour is
-        // unchanged locally while an SW-side un-hide is now expressible.
-        c._jobsHidden = false;
-        if (_isChatViewFocused(chatId)) c.lastViewedAt = Date.now();
-        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+        // Cleared to an explicit `false`, NOT deleted (phase-2 follow-up 1,
+        // re-based on FLUX-4C): dispatchChatMeta drops `undefined` fields from
+        // the dispatch entirely, so a delete would be a lane no-op and the
+        // stored `true` would win straight back on the next hydration. A
+        // defined `false` rides the lane (flags are last-dispatch-wins in the
+        // SW), and every reader tests truthiness (`if (c._jobsHidden &&
+        // !c.pinned)`), so behaviour is unchanged locally while the un-hide
+        // is durable SW-side.
+        _mcrfFields._jobsHidden = false;
+        if (_isChatViewFocused(chatId)) _mcrfFields.lastViewedAt = Date.now();
+        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, _mcrfFields);
     }
     _recentlyFinishedChats[chatId] = Date.now();
     setTimeout(function() {
@@ -2731,6 +2749,10 @@ function renderJobsDropdown(dropdown) {
         var iconSvg = (typeof UI_ICONS[a.originalIcon] === 'string' && UI_ICONS[a.originalIcon]) ||
             (typeof UI_ICONS[a.icon] === 'string' && UI_ICONS[a.icon]) || UI_ICONS.play;
         var showViewChat = (a.state !== 'running');
+        // Design A: a RUNNING action swaps its static icon for the animated
+        // spinner (UI_ICONS.spinner carries class "spin"; the existing
+        // .state-running .jobs-row-icon svg.spin rule animates it).
+        if (a.state === 'running' && typeof UI_ICONS.spinner === 'string') iconSvg = UI_ICONS.spinner;
         // state is enum-validated on write, but persisted copies reload from
         // IndexedDB — escape as defense-in-depth for the class attribute.
         return '<div class="jobs-dropdown-row state-' + escapeHtml(a.state || '') + '" ' +
@@ -2781,7 +2803,7 @@ function renderJobsDropdown(dropdown) {
         var _cState = _jobsChatState(c.id);
         var _cPaused = (_cState === 'paused');
         if (_cState === 'unseen') _cState = 'done';
-        var _cIcon = '<span class="jobs-row-dot state-' + _cState + '"></span>';
+        var _cIcon = _jobsStateIndicatorHtml(_cState);
         // Show the chat's current progress task under its title (latest
         // update_action_state: the running task label, falling back to the
         // progress label / status_message). Generic 'Running…' only when the
@@ -2799,15 +2821,13 @@ function renderJobsDropdown(dropdown) {
         // focused chat is always seen) — flag it so the user knows to catch up.
         var _cUnseen = !_cRunning && !_cErr && !_cPaused && c.lastResponseAt &&
             c.lastResponseAt > (c.lastViewedAt || 0) && !_isChatViewFocused(c.id);
-        // Unread (bold) is BROADER than the bell: ANY activity — including on a
-        // still-running or errored chat — the user hasn't viewed yet counts.
-        var _cUnread = _cUnseen || _chatHasUnseenActivity(c.id);
+        // Design A: the unread / current / read channels come from the shared
+        // _jobsRowSignals helper (it reuses _chatHasUnseenActivity, which the
+        // narrower _cUnseen already implies, so the old `_cUnseen || ...` OR was
+        // redundant). The current chat is never unread (viewing it = read).
         var _cLabel = _cApproval ? 'Awaiting approval' : (_cState === 'attention' && !_cApproval) ? 'Awaiting input' : (_cPaused ? 'Paused' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished'))));
-        if (_cUnseen) _cIcon = '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>';
-        var _cCur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-        // Unseen finished response → bold the title like an unread email (the
-        // .jobs-unread CSS rule), until the user opens the chat.
-        return '<div class="jobs-dropdown-row state-' + _cState + _cCur + (_cUnread ? ' jobs-unread' : '') + '" ' +
+        var _cSig = _jobsRowSignals(c.id, _cState);
+        return '<div class="jobs-dropdown-row state-' + _cState + _cSig.cls + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
             '<span class="jobs-row-icon">' + _cIcon + '</span>' +
@@ -2820,6 +2840,7 @@ function renderJobsDropdown(dropdown) {
             (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
             (_cErr ? '<button class="jobs-row-btn" title="Retry" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
             _jobsRowButtons(c, _cUnseen || _cErr) +
+            _cSig.trail +
             '<span class="jobs-row-chevron">' + (UI_ICONS.chevronDown || '') + '</span>' +
         '</div>';
     } catch (e) { console.warn('jobs: chat row render failed', e); return ''; } }).join('');
@@ -3190,22 +3211,58 @@ function _jobsProgressBadgeHtml(chatId) {
         '<span class="jobs-row-state-badge-label">' + escapeHtml(meta.label) + '</span>' +
     '</span>';
 }
+// ---- Design A (Gmail classic): one visual channel per signal ----
+// Shared by ALL chat-row surfaces (Active dropdown rows, Pinned / Recent /
+// Done / Completed-Today rows, and the expand-modal + home-panel cards):
+//   unread  -> .jobs-unread: BOLD title + trailing blue dot (bold is used for
+//              nothing else). Reuses _chatHasUnseenActivity — no new tracking.
+//   current -> .is-current: a lifted white tab — the row/card renders as an
+//              elevated rounded card (CSS-only, see 23-actions.css); no
+//              trailing label. The chat open in the main view is NEVER
+//              unread/bold (viewing it = reading it).
+//   read    -> .jobs-read: seen, finished rows dim like read emails.
+// Run-state lives ONLY in the leading slot (_jobsStateIndicatorHtml below).
+function _jobsRowSignals(chatId, st) {
+    var isCur = (typeof currentChatId !== 'undefined' && chatId === currentChatId);
+    var unread = !isCur && _chatHasUnseenActivity(chatId);
+    var read = !isCur && !unread && (st === 'done' || st === 'unseen');
+    return {
+        cls: (isCur ? ' is-current' : '') + (unread ? ' jobs-unread' : '') + (read ? ' jobs-read' : ''),
+        // The current chat renders NO trailing signal — the lifted-card
+        // styling on .is-current IS the marker — but the explicit isCur branch
+        // stays: it guarantees the unread dot can never appear on the current
+        // row.
+        trail: isCur
+            ? ''
+            : (unread ? '<span class="jobs-unread-dot" aria-hidden="true"></span>' : '')
+    };
+}
+// Leading run-state indicator: animated spinner while running, muted gray check
+// once finished (read or not — the trailing blue dot carries unread), colored
+// status dot for the attention / paused / error states. 'unseen' is a finished
+// chat, so it maps to the check.
+function _jobsStateIndicatorHtml(st) {
+    if (st === 'running') return '<span class="jobs-row-spinner">' + (UI_ICONS.spinner || '') + '</span>';
+    if (st === 'done' || st === 'unseen') return '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
+    return '<span class="jobs-row-dot state-' + escapeHtml(st) + '"></span>';
+}
 // A pinned chat row (Pinned section): pin indicator + title + time; row click
 // expands the inline progress accordion (the bubble button opens the chat).
 function _jobsPinnedRowHtml(c, timeW) {
     var st = _jobsChatState(c.id);
     var timeStr = _jobsHistTimeStr(c);
-    var indicator = (st === 'unseen')
-        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
-        : '<span class="jobs-row-pin-dot">' + UI_ICONS.pinFilled + '</span>';
-    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" ' +
+    // Design A: the pin glyph is the row's identity mark; unread is signaled by
+    // the shared bold-title + trailing-blue-dot channel (no bell).
+    var indicator = '<span class="jobs-row-pin-dot">' + UI_ICONS.pinFilled + '</span>';
+    var sig = _jobsRowSignals(c.id, st);
+    return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' + _jobsProgressBadgeHtml(c.id) + '</div>' +
         _jobsPinBtnHtml(c) +
         (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error') +
+        sig.trail +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
@@ -3215,13 +3272,11 @@ function _jobsPinnedRowHtml(c, timeW) {
 function _jobsChatRowHtml(c, mode, timeW) {
     var st = _jobsChatState(c.id);
     var timeStr = _jobsHistTimeStr(c);
-    var indicator = (st === 'unseen')
-        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
-        : '<span class="jobs-row-dot state-' + st + '"></span>';
-    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-    // No per-state row tint on Recent/Done rows — the status dot already conveys
-    // state; only the current chat gets a highlight (.is-current).
-    return '<div class="jobs-dropdown-row jobs-chat-row' + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" ' +
+    // Design A: the leading slot carries RUN state only (spinner / muted check /
+    // colored dot); read-state is the bold + blue-dot channel from _jobsRowSignals.
+    var indicator = _jobsStateIndicatorHtml(st);
+    var sig = _jobsRowSignals(c.id, st);
+    return '<div class="jobs-dropdown-row jobs-chat-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main">' +
@@ -3231,6 +3286,7 @@ function _jobsChatRowHtml(c, mode, timeW) {
         _jobsPinBtnHtml(c) +
         (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error', true) +
+        sig.trail +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
@@ -3238,16 +3294,12 @@ function _jobsChatRowHtml(c, mode, timeW) {
 function _jobsTodayRowHtml(c, timeW) {
     var timeStr = _jobsTodayTimeStr(c);
     var st = _jobsChatState(c.id);
-    // Unread = a finished response the user hasn't opened yet. Show a bell + bold
-    // title (like an unread email) until they view the chat; otherwise a green check.
-    var _unread = (st === 'unseen') || _chatHasUnseenActivity(c.id);
-    var _todayIndicator = _unread
-        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
-        : '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
-    // Highlight the row for the chat the user is currently viewing (.is-current),
-    // matching the Active / Pinned / Recent / History rows.
-    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
-    return '<div class="jobs-dropdown-row jobs-today-row' + cur + (_unread ? ' jobs-unread' : '') + '" ' +
+    // Design A: completed rows show the muted check (or a status dot for edge
+    // states) via _jobsStateIndicatorHtml; unread = bold title + trailing blue
+    // dot, current = tinted selected row + accent bar — both from _jobsRowSignals.
+    var _todayIndicator = _jobsStateIndicatorHtml(st);
+    var sig = _jobsRowSignals(c.id, st);
+    return '<div class="jobs-dropdown-row jobs-today-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         _todayIndicator +
         '<div class="jobs-row-main">' +
@@ -3257,6 +3309,7 @@ function _jobsTodayRowHtml(c, timeW) {
         _jobsPinBtnHtml(c) +
         (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsTodayRowButtons(c) +
+        sig.trail +
         _jobsTimeSpan(timeStr, timeW) +
     '</div>';
 }
@@ -4050,10 +4103,9 @@ function renderJobsExpandModal() {
 // chat's progress content (label / status / tasks / output) as the card body.
 function _jobsExpandCardHtml(c) {
     var st = (typeof _jobsChatState === 'function') ? _jobsChatState(c.id) : 'done';
-    var indicator = (st === 'unseen')
-        ? '<span class="jobs-row-bell">' + (UI_ICONS.bell || '') + '</span>'
-        : '<span class="jobs-row-dot state-' + st + '"></span>';
-    var cur = (typeof currentChatId !== 'undefined' && c.id === currentChatId) ? ' is-current' : '';
+    // Design A: same three channels as the dropdown rows (see _jobsRowSignals).
+    var indicator = _jobsStateIndicatorHtml(st);
+    var sig = _jobsRowSignals(c.id, st);
     var idJs = escapeJsString(c.id);
     // Progress only in the scrollable body — sub-agent rows live in a drawer
     // docked INSIDE the card but BELOW the body scroll, so they stay visible
@@ -4068,10 +4120,11 @@ function _jobsExpandCardHtml(c) {
     var pinBtn = (typeof _jobsPinBtnHtml === 'function') ? _jobsPinBtnHtml(c) : '';
     var dismissBtn = pinned ? '' :
         '<button class="jobs-row-btn danger jobs-card-dismiss" title="Remove from list" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
-    return '<div class="jobs-expand-card state-' + escapeHtml(st) + cur + ((st === 'unseen' || _chatHasUnseenActivity(c.id)) ? ' jobs-unread' : '') + '" data-chat-id="' + escapeHtml(c.id) + '">' +
+    return '<div class="jobs-expand-card state-' + escapeHtml(st) + sig.cls + '" data-chat-id="' + escapeHtml(c.id) + '">' +
         '<div class="jobs-expand-card-head">' +
             indicator +
             '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            sig.trail +
             _jobsProgressBadgeHtml(c.id) +
             pinBtn +
             (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
@@ -4348,8 +4401,10 @@ function openChatFromJobsDropdown(chatId) {
         // Opening a chat you previously removed from the list brings it back.
         // Explicit `false`, not delete -- ONE representation of "not hidden" across
         // page and service worker (see markChatRecentlyFinished).
-        if (chats[chatId]._jobsHidden) chats[chatId]._jobsHidden = false;
-        // Persist the reveal flag immediately — don't rely on selectChat to save it.
+        if (chats[chatId]._jobsHidden && typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { _jobsHidden: false });
+        // Persist the reveal flag immediately — don't rely on selectChat to
+        // save it. (_revealed is page-put persisted; _jobsHidden rode the
+        // chat-meta lane above — FLUX-4C.)
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         selectChat(chatId);
     }
@@ -4371,13 +4426,13 @@ function toggleJobsPin(chatId) {
     _homeChatsPointerHeld = false; // our own repaint must not be deferred
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!c) return;
-    // Explicit `false`, not delete -- see markChatRecentlyFinished.
-    if (!c.pinned && c._jobsHidden) c._jobsHidden = false;
+    // Explicit `false`, not delete -- see markChatRecentlyFinished. FLUX-4C:
+    // rides the chat-meta lane (SW persists + panels converge).
+    if (!c.pinned && c._jobsHidden && typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { _jobsHidden: false });
     if (typeof togglePinChat === 'function') {
         togglePinChat(chatId);
-    } else {
-        c.pinned = !c.pinned;
-        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+    } else if (typeof dispatchChatMeta === 'function') {
+        dispatchChatMeta(chatId, { pinned: !c.pinned });
     }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     _rerenderOpenJobsDropdown();
@@ -4416,18 +4471,13 @@ function dismissChatNotifications(chatId) {
         try { rejectPendingApprovalsForChat(chatId); } catch (e) {}
     }
     _clearChatApprovalRows(c);
-    c.lastViewedAt = Date.now();
-    // Cleared to an explicit `null`, NOT deleted -- same convention as
-    // markChatRecentlyFinished()'s `c._jobsHidden = false` above. The page-field
-    // merge in app/045-agent-port-bridge-page.js:518-520 only carries a page
-    // value forward when the incoming SW snapshot's field is `undefined`, so a
-    // DELETED field is indistinguishable from "the page never had an opinion"
-    // and the user's dismissal is invisible to the merge. Every reader tests
-    // truthiness (_isChatErrored: `if (!c._lastApiError) return false;`), so a
-    // defined null behaves identically locally while staying expressible.
-    c._lastApiError = null;
+    // FLUX-4C: both fields ride the chat-meta lane in one dispatch — the SW
+    // persists + panels converge. The error is cleared to an explicit `null`,
+    // NOT deleted — one expressible representation of "dismissed" (readers
+    // test truthiness: _isChatErrored `if (!c._lastApiError) return false;`),
+    // and a defined value is what last-dispatch-wins propagates.
+    if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { lastViewedAt: Date.now(), _lastApiError: null });
     if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
-    if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     _rerenderOpenJobsDropdown();
 }
@@ -4438,15 +4488,14 @@ function dismissChatFromJobs(chatId) {
     _homeChatsPointerHeld = false; // our own repaint must not be deferred
     var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!c || c.pinned) return;
-    c._jobsHidden = true;
     if (typeof rejectPendingApprovalsForChat === 'function') {
         try { rejectPendingApprovalsForChat(chatId); } catch (e) {}
     }
     _clearChatApprovalRows(c);
-    c.lastViewedAt = Date.now();
-    c._lastApiError = null; // defined-null clear -- see dismissChatNotifications
+    // FLUX-4C: all three fields in one chat-meta dispatch (SW persists +
+    // panels converge); defined-null error clear per dismissChatNotifications.
+    if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { _jobsHidden: true, lastViewedAt: Date.now(), _lastApiError: null });
     if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
-    if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     _rerenderOpenJobsDropdown();
     _refreshJobsExpandModal();

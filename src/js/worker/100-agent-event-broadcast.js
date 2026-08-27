@@ -55,11 +55,18 @@ var _agentSubscribers = new Set();
 // chat before re-emitting so the existing handlers Just Work.
 //
 // State-only events (paused, etc.) do not include the chat — the
-// page's chats mirror has nothing to sync for them. The streamDelta
-// event ALSO inlines the chat: although the
-// delta itself carries the current assistant message, the page handler
-// (updateStreamingMessage) needs to write to chats[chatId].messages
-// [msgIndex] and that array must exist with the right length first.
+// page's chats mirror has nothing to sync for them.
+//
+// MEMFIX-DELTA (Fix B): streamDelta is deliberately NOT in this map.
+// Inlining the chat structured-cloned the ENTIRE hydrated chat (base64
+// screenshots, cachedToolResults included) per subscriber on EVERY stream
+// chunk — the dominant streaming memory churn on large histories. The
+// delta already carries msgIndex + the streaming message; the page's
+// streamDelta handler (app/036-agent-event-handlers-page.js) patches
+// chats[chatId].messages[msgIndex] from it. assistantMessageStarted (full
+// slim snapshot) and assistantMessage / toolCallResult (chatDelta — see
+// MEMFIX-EVDELTA below) still bracket every streamed message with
+// authoritative state.
 var EVENTS_WITH_CHAT_INLINE = {
     // runStarted must carry the chat snapshot so the page mirror gains
     // chats[chatId] the instant a BACKGROUND chat starts running. Without it,
@@ -68,7 +75,6 @@ var EVENTS_WITH_CHAT_INLINE = {
     // badge/dropdown "Active Chats" group until some later chat-inlining event.
     'runStarted': true,
     'assistantMessageStarted': true,
-    'streamDelta': true,
     'assistantMessage': true,
     'toolCallResult': true,
     'toolCallCancelled': true,
@@ -109,6 +115,118 @@ var EVENTS_WITH_CHAT_INLINE = {
     'approvalSettled': true
 };
 
+// MEMFIX-EVDELTA: subset of EVENTS_WITH_CHAT_INLINE whose chat mutations are
+// structurally predictable — they APPEND rows to chat.messages and/or mutate a
+// small known set of row kinds in place: the streamed assistant row (located
+// by identity via detail.message), prompt_user / approval rows (seeded
+// SW-side, flipped by worker/120-tool-routing.js), and sub_report cards
+// (mutated in place by core/097 _repaintParent). For these, inlining the FULL
+// hydrated chat structured-cloned base64 screenshots + cachedToolResults per
+// subscriber per event — multi-MB per tool call on large chats (the dominant
+// churn after MEMFIX-DELTA fixed streamDelta). Send a chatDelta instead:
+// slim meta (no messages, heavy maps stripped) + the appended tail past a
+// per-chat watermark + the known-mutable rows below it. The page bridge
+// (app/045 _synthesizeChatFromDelta) rebuilds a full snapshot locally and
+// feeds it through the SAME merge path full snapshots use; on any gap or
+// divergence it falls back to a 'pull-chat' full resync.
+var EVENTS_WITH_CHAT_DELTA = {
+    'assistantMessage': true,
+    'messagesAppended': true,
+    'toolCallResult': true
+};
+
+// MEMFIX-EVDELTA: per-chat watermark of the messages array as of the last
+// inlined broadcast: { len, lastRef }. lastRef (identity of the last row the
+// panels saw) detects truncation or wholesale array replacement (undo/redo,
+// 'update-chat' adopt in worker/130-port-bridge.js) — any mismatch falls back
+// to a full slim snapshot, which re-arms the watermark.
+var _chatDeltaSync = {};
+
+// MEMFIX-EVDELTA: clone `map` with `field` removed from every entry that has
+// it, stamping `flag` (mirrors stripChatPayloadsInPlace / extractChatPayloads-
+// ForPut in core/130-indexeddb.js so the page's ensureChatPayloads lazy-load
+// path recognizes the entries). Entries are cloned per-entry; the SW's live
+// objects are NEVER mutated. Returns null when nothing needed stripping.
+function _slimHeavyMap(map, field, flag) {
+    if (!map) return null;
+    var out = null;
+    for (var id in map) {
+        var e = map[id];
+        if (e && e[field] !== undefined) {
+            if (!out) out = Object.assign({}, map);
+            var c = Object.assign({}, e);
+            delete c[field];
+            c[flag] = true;
+            out[id] = c;
+        }
+    }
+    return out;
+}
+
+// MEMFIX-EVDELTA: full-snapshot sends strip the two heavy per-chat maps
+// (screenshot base64, cached-tool-result fullContent) from a CLONE. Message
+// rows are untouched — a just-captured screenshot row still carries its
+// inline base64 to the page (ui/250-message-render.js reads msg.base64 first
+// and only falls back to chat.screenshots). The page merge grafts its own
+// hydrated entries back (app/045 _mergePageHeavyPayloads) and lazy-loads
+// never-seen ones via ensureChatPayloads (blob rows are queued durable by the
+// saveChatsToStorage call that precedes every emit).
+function _slimChatSnapshot(chat) {
+    var ssSlim = _slimHeavyMap(chat.screenshots, 'base64', '_b64Evicted');
+    var ctrSlim = _slimHeavyMap(chat.cachedToolResults, 'fullContent', '_fcEvicted');
+    if (!ssSlim && !ctrSlim) return chat;
+    var snap = Object.assign({}, chat);
+    if (ssSlim) snap.screenshots = ssSlim;
+    if (ctrSlim) snap.cachedToolResults = ctrSlim;
+    // Same flag semantics as extractChatPayloadsForPut: adopted snapshots
+    // carrying _payloadsEvicted are an established state (the page's runtime
+    // sweep + ensureChatPayloads handle them).
+    snap._payloadsEvicted = true;
+    return snap;
+}
+
+// MEMFIX-EVDELTA: build the delta payload, or return null to force the full
+// slim-snapshot fallback (no watermark yet, or the messages array shrank /
+// was replaced since the last broadcast).
+function _buildChatDelta(chat, detail) {
+    var sync = _chatDeltaSync[chat.id];
+    if (!sync) return null;
+    var msgs = Array.isArray(chat.messages) ? chat.messages : [];
+    if (sync.len > msgs.length) return null;
+    if (sync.len > 0 && msgs[sync.len - 1] !== sync.lastRef) return null;
+    var fromIndex = sync.len;
+    var tail = msgs.slice(fromIndex);
+    var updates = [];
+    for (var i = 0; i < fromIndex; i++) {
+        var m = msgs[i];
+        if (!m) continue;
+        // Known in-place mutators below the watermark: prompt/approval rows
+        // (status flips in worker/120-tool-routing.js) and sub_report cards
+        // (core/097 _repaintParent mutates the row object). Bounded count per
+        // chat, small rows — cheap to re-send every delta.
+        if (m.role === 'prompt_user' || m.role === 'approval' || m.role === 'sub_report') {
+            updates.push({ index: i, message: m });
+        }
+    }
+    // assistantMessage mutates the ALREADY-APPENDED streamed row in place
+    // (appended at assistantMessageStarted, which broadcast a full snapshot
+    // and advanced the watermark past it). detail.message IS that row —
+    // locate it by identity (lastIndexOf scans from the tail; the row is at
+    // or near the end).
+    if (detail && detail.message) {
+        var di = msgs.lastIndexOf(detail.message);
+        if (di >= 0 && di < fromIndex) updates.push({ index: di, message: detail.message });
+    }
+    var meta = Object.assign({}, chat);
+    delete meta.messages;
+    var ssSlim = _slimHeavyMap(meta.screenshots, 'base64', '_b64Evicted');
+    var ctrSlim = _slimHeavyMap(meta.cachedToolResults, 'fullContent', '_fcEvicted');
+    if (ssSlim) meta.screenshots = ssSlim;
+    if (ctrSlim) meta.cachedToolResults = ctrSlim;
+    if (ssSlim || ctrSlim) meta._payloadsEvicted = true;
+    return { fromIndex: fromIndex, tail: tail, updates: updates, meta: meta };
+}
+
 function broadcastAgentEvent(type, detail) {
     if (_agentSubscribers.size === 0) return;
     var payload = detail || {};
@@ -119,13 +237,28 @@ function broadcastAgentEvent(type, detail) {
     // ghost row.
     if (EVENTS_WITH_CHAT_INLINE[type] && payload.chatId && chats[payload.chatId]
         && !chats[payload.chatId]._deleted) {
-        // postMessage uses structured clone, which deep-copies the chat.
-        // For very large histories this is the dominant cost; the
-        // chats-snapshot-on-hello path also pays it on connect. If
-        // streaming throughput becomes a problem, switch to msg-delta
-        // events (assistantMessageStarted gives msgIndex; the page can
-        // then build messages locally without the full snapshot).
-        payload = Object.assign({}, detail, { chat: chats[payload.chatId] });
+        var _chat = chats[payload.chatId];
+        // MEMFIX-EVDELTA: append/known-update events ship a delta instead of
+        // the full chat; everything else ships a slim snapshot (heavy maps
+        // stripped — see _slimChatSnapshot). postMessage still structured-
+        // clones the payload per subscriber, but it is now KBs, not MBs.
+        var _delta = EVENTS_WITH_CHAT_DELTA[type] ? _buildChatDelta(_chat, detail) : null;
+        if (_delta) {
+            payload = Object.assign({}, detail, { chatDelta: _delta });
+        } else {
+            payload = Object.assign({}, detail, { chat: _slimChatSnapshot(_chat) });
+        }
+        // Advance the watermark: after this envelope every connected panel
+        // has (delta-merged or wholesale) the current messages array.
+        var _wmMsgs = Array.isArray(_chat.messages) ? _chat.messages : [];
+        _chatDeltaSync[_chat.id] = {
+            len: _wmMsgs.length,
+            lastRef: _wmMsgs.length ? _wmMsgs[_wmMsgs.length - 1] : null
+        };
+    } else if (payload.chatId && chats[payload.chatId] && chats[payload.chatId]._deleted) {
+        // Tombstoned chat — drop its watermark so the map can't grow stale
+        // entries across delete/recreate cycles.
+        delete _chatDeltaSync[payload.chatId];
     }
     var envelope = { type: 'agent-event', eventType: type, detail: payload };
     var dead = [];

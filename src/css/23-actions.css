@@ -1309,18 +1309,47 @@
 }
 .jobs-dropdown-row:last-child { border-bottom: none; }
 .jobs-dropdown-row:hover { background: var(--bg-hover); }
-.jobs-dropdown-row.state-running { background: var(--primary-lighter); }
+/* Design A: no row tint for running — the leading spinner is the sole running
+   signal. Row backgrounds are reserved for read
+   (.jobs-read) and the attention/error tints below. */
 .jobs-dropdown-row.state-needs_input,
 .jobs-dropdown-row.state-needs_permission { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
 .jobs-dropdown-row.state-attention { background: var(--warning-lighter, rgba(245, 158, 11, 0.08)); }
 .jobs-dropdown-row.state-error { background: var(--danger-lighter, rgba(239, 68, 68, 0.06)); }
-/* The chat you're currently viewing gets a green left accent band only (no
-   background tint) so it stands out from the rest of the neutral chat rows —
-   matches .jobs-expand-card.is-current. */
+/* Current chat (open in the main view): a flat FULL-BLEED row (no
+   margins/insets, square corners) whose ONLY marker is the 3px inset
+   --primary left bar (same single-bar mechanism as .acc-open below — the two
+   never duplicate). No elevation shadows, no stacking tricks.
+   No trailing label, NEVER bold (bold belongs exclusively to unread rows;
+   title weight is nudged to medium below). Placed AFTER the state tints above
+   so the elevated surface deliberately WINS over the attention/error row
+   tints at equal specificity — the leading colored state dot still carries
+   those states on the row. --bg-elevated is white in light theme and a step
+   LIGHTER than the row surfaces in dark theme (00-tokens / 01-dark-theme). */
 .jobs-dropdown-row.is-current {
-    box-shadow: inset 3px 0 0 var(--success, #10b981);
+    background: var(--bg-elevated, var(--bg-white));
+    box-shadow: inset 3px 0 0 var(--primary);
 }
-.jobs-dropdown-row.is-current .jobs-row-title { font-weight: var(--font-bold, 700); }
+/* Hover must not wipe the elevated bg with the generic --bg-hover repaint
+   (equal specificity would leave it to file order — make it explicit). */
+.jobs-dropdown-row.is-current:hover {
+    background: var(--bg-elevated, var(--bg-white));
+    box-shadow: inset 3px 0 0 var(--primary);
+}
+/* Current row with its accordion open: row + accordion fuse into ONE
+   full-bleed card on the elevated surface. The blue left bar is NOT
+   duplicated: the row and the accordion each draw the same single 3px inset
+   bar, which reads as one continuous bar down the whole card (exactly how
+   .acc-open already worked). This 3-class rule outranks both .acc-open and
+   .is-current:hover (needed so the elevated bg survives in dark mode). */
+.jobs-dropdown-row.is-current.acc-open {
+    background: var(--bg-elevated, var(--bg-white));
+    box-shadow: inset 3px 0 0 var(--primary);
+}
+.jobs-dropdown-row.is-current.acc-open + .jobs-row-accordion {
+    background: var(--bg-elevated, var(--bg-white));
+    box-shadow: inset 3px 0 0 var(--primary);
+}
 
 .jobs-row-icon {
     width: 28px; height: 28px;
@@ -1578,22 +1607,49 @@
 .jobs-subhead {
     border-top: 1px solid var(--secondary-border);
 }
-.jobs-today-row .jobs-row-check {
+/* Muted gray check = finished (Design A): shared by Completed Today, the
+   Recent/Done rows and the expand/home cards. Green retired — color stays
+   with the live states (spinner / amber / red). */
+.jobs-row-check {
     width: 20px; height: 20px;
     display: inline-flex; align-items: center; justify-content: center;
-    color: var(--success, #10b981);
+    color: var(--text-muted);
     flex-shrink: 0;
 }
-.jobs-today-row .jobs-row-check svg { width: 16px; height: 16px; }
+.jobs-row-check svg { width: 16px; height: 16px; }
+/* Animated spinner in the leading slot of RUNNING rows/cards — replaces the
+   static green dot (@keyframes spin is global, see 05-tools.css). */
+.jobs-row-spinner {
+    width: 20px; height: 20px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--primary);
+    flex-shrink: 0;
+}
+.jobs-row-spinner svg { width: 15px; height: 15px; animation: spin 1s linear infinite; }
+.jobs-row-icon .jobs-row-spinner,
+.jobs-row-icon .jobs-row-check { margin: 0; }
 
-/* Unread finished chat (a response the user hasn't opened yet): bold the title
-   like an unread email, until they view the chat (which clears the 'unseen'
-   state). Applies in the Recent / Done / Pinned / Completed Today rows. */
+/* Unread chat (activity the user hasn't viewed yet): BOLD title + small
+   trailing blue dot (.jobs-unread-dot, rendered by _jobsRowSignals) on the
+   NORMAL card background — like an unread email. Viewing the chat clears it;
+   the current chat never renders unread. Bold is used for nothing else. */
 .jobs-dropdown-row.jobs-unread .jobs-row-title {
     font-weight: var(--font-bold, 700);
     color: var(--text-primary);
 }
 .jobs-dropdown-row.jobs-unread .jobs-row-time { color: var(--text-secondary); }
+/* Read (seen) rows — slightly dimmed background + secondary title color, so
+   unread rows pop (Gmail classic). */
+.jobs-dropdown-row.jobs-read { background: var(--bg-hover); }
+.jobs-dropdown-row.jobs-read:hover { background: var(--secondary-light, var(--bg-hover)); }
+.jobs-dropdown-row.jobs-read .jobs-row-title { color: var(--text-secondary); }
+/* The unread channel's blue dot (trailing side of rows / card heads). */
+.jobs-unread-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--info, #2f6fed);
+}
 
 /* ---- Pinned section + per-row pin / dismiss controls ---- */
 /* The Pinned subhead uses the SAME shared band as every other menu section
@@ -1653,6 +1709,15 @@
     color: var(--primary);
     transform: rotate(180deg);
 }
+
+/* Selected row/card title: medium weight (never bold — bold belongs to
+   unread) on normal token colors; placed after the .acc-open semibold rule so
+   an expanded selected row stays at medium. */
+.jobs-dropdown-row.is-current .jobs-row-title,
+.jobs-expand-card.is-current .jobs-expand-card-title {
+    font-weight: var(--font-medium, 500);
+}
+
 /* ---- Shared progress-body typography ----
    One rule set for BOTH hosts of _jobsAccordionBodyHtml: the dropdown
    accordion (.jobs-row-accordion) and the expand-modal / home cards
@@ -1870,13 +1935,25 @@
     background: transparent;
     pointer-events: none;
 }
-.jobs-expand-card.state-running::before { background: var(--success, #10b981); }
+/* Design A: running is carried by the head spinner (no green edge), and
+   'unseen' by the bold-title + blue-dot channel (no amber edge) — the left
+   edge carries the current-chat primary accent plus the blocked/error
+   emphasis. Order is deliberate: the is-current bar comes FIRST so a current
+   card that is ALSO blocked/errored lets the state color win the edge (equal
+   specificity, later rules win) — the elevated surface still says
+   "current". */
+.jobs-expand-card.is-current::before { background: var(--primary); }
 .jobs-expand-card.state-attention::before,
-.jobs-expand-card.state-paused::before,
-.jobs-expand-card.state-unseen::before { background: var(--warning, #f59e0b); }
+.jobs-expand-card.state-paused::before { background: var(--warning, #f59e0b); }
 .jobs-expand-card.state-error::before { background: var(--danger, #ef4444); }
-.jobs-expand-card.is-current { box-shadow: inset 3px 0 0 var(--success, #10b981); }
-.jobs-expand-card.is-current .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
+/* Current chat's card: flat like its siblings — the elevated surface (a
+   distinction only in dark mode; white === siblings in light mode) + the
+   primary ::before edge above are the only markers. Never bold (bold belongs
+   to unread; the medium title-weight rule lives with the row rules). */
+.jobs-expand-card.is-current {
+    --jobs-card-bg: var(--bg-elevated, var(--bg-white));
+    background: var(--bg-elevated, var(--bg-white));
+}
 .jobs-expand-card-head {
     display: flex; align-items: center; gap: var(--space-2);
     margin-bottom: var(--space-2);
@@ -1904,19 +1981,17 @@
     color: var(--text-primary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* Unread (unopened finished) chat: bold like an unread email, plus a small
-   primary dot after the title (hidden when the title truncates — the bold
-   weight still carries the signal). */
+/* Unread chat card: bold title; the blue dot is a REAL element in the card
+   head (.jobs-unread-dot, from _jobsRowSignals) so it can't be clipped away
+   when the title truncates. */
 .jobs-expand-card.jobs-unread .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
-.jobs-expand-card.jobs-unread .jobs-expand-card-title::after {
-    content: '';
-    display: inline-block;
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--primary);
-    margin-left: 6px;
-    vertical-align: middle;
-}
+/* Read (seen) cards dim like read emails. */
+.jobs-expand-card.jobs-read { background: var(--bg-hover); }
+.jobs-expand-card.jobs-read .jobs-expand-card-title { color: var(--text-secondary); }
+/* Trailing signals in the card head never shrink. */
+.jobs-expand-card-head .jobs-unread-dot,
+.jobs-expand-card-head .jobs-row-spinner,
+.jobs-expand-card-head .jobs-row-check { flex-shrink: 0; }
 /* Progress body: adaptive height (viewport-relative, clamped) instead of a
    hardcoded cap; thin scrollbar + scroll-shadow hints (Lea Verou technique:
    the shadows only appear when there IS hidden content on that edge).
@@ -1929,9 +2004,12 @@
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: var(--secondary-border) transparent;
+    /* The opaque fade layers must match the CARD surface — --bg-white for
+       ordinary cards, --bg-elevated for the current chat's card (carried by
+       the --jobs-card-bg custom prop set on .is-current below). */
     background:
-        linear-gradient(var(--bg-white) 30%, transparent),
-        linear-gradient(transparent, var(--bg-white) 70%) 0 100%,
+        linear-gradient(var(--jobs-card-bg, var(--bg-white)) 30%, transparent),
+        linear-gradient(transparent, var(--jobs-card-bg, var(--bg-white)) 70%) 0 100%,
         radial-gradient(farthest-side at 50% 0, var(--jobs-scroll-fade), transparent),
         radial-gradient(farthest-side at 50% 100%, var(--jobs-scroll-fade), transparent) 0 100%;
     background-repeat: no-repeat;

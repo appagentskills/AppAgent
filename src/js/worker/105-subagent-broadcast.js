@@ -106,6 +106,27 @@
     // reason also routes the crash through the RES-6 transient auto-retry /
     // structured-error / parent-notification machinery.
     if (typeof AgentEvents !== 'undefined' && AgentEvents.on) {
+        // ACTIVITY: live thinking-vs-tool indicator for sub-agent cards/chips.
+        // The SW hosts every sub-agent loop, so its AgentEvents stream is
+        // authoritative. noteSubActivity (core/097) no-ops on unchanged
+        // phase+tool, so the per-token streamDelta flood is two map lookups;
+        // real changes fire _notifyListeners → the rAF-coalesced snapshot
+        // broadcast above carries rec.activity to the page mirror for free.
+        var _noteActivity = function(chatId, phase, tool, toolLabel) {
+            try {
+                if (chatId && typeof chats !== 'undefined' && chats[chatId]
+                    && chats[chatId].isSubAgent && typeof SubAgents.noteSubActivity === 'function') {
+                    SubAgents.noteSubActivity(chatId, phase, tool, toolLabel);
+                }
+            } catch (_) { /* display-only — never break the run */ }
+        };
+        AgentEvents.on('toolCallStarted', function(e) { _noteActivity(e && e.chatId, 'tool', e && e.name, e && e.displayName); });
+        AgentEvents.on('toolCallResult', function(e) { _noteActivity(e && e.chatId, 'thinking'); });
+        AgentEvents.on('toolCallCancelled', function(e) { _noteActivity(e && e.chatId, 'thinking'); });
+        AgentEvents.on('assistantMessageStarted', function(e) { _noteActivity(e && e.chatId, 'thinking'); });
+        AgentEvents.on('streamDelta', function(e) { _noteActivity(e && e.chatId, 'thinking'); });
+        AgentEvents.on('runFinished', function(e) { _noteActivity(e && e.chatId, null); });
+        AgentEvents.on('runCrashed', function(e) { _noteActivity(e && e.chatId, null); });
         AgentEvents.on('runCrashed', function(e) {
             try {
                 if (e && e.chatId && typeof chats !== 'undefined' && chats[e.chatId]

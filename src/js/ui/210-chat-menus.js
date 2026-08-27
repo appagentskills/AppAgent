@@ -81,17 +81,25 @@ function confirmRenameChat(chatId) {
     
     var chat = chats[chatId];
     if (chat) {
-        chat.title = newTitle;
-        // A user-chosen name is authoritative — clear the provisional flag so
-        // the auto-title hook doesn't overwrite the manual rename later.
-        delete chat.titleProvisional;
-        // MEMFIX: a payload-evicted chat is skipped by the diff-save put-loop,
-        // so a rename of a non-recent chat would silently never persist —
-        // rehydrate first, then save. ensureChatPayloads never rejects.
-        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-            ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
+        // FLUX-T1 (title lane): route the rename through the SW-owned
+        // chat-meta lane. dispatchChatMeta stamps a monotonic pair, applies
+        // it optimistically here (clearing titleProvisional — a user-chosen
+        // name is authoritative, the auto-title hook stops re-firing), then
+        // the SW applies (rehydrate-first for evicted chats), persists and
+        // rebroadcasts to every panel. The old direct write + page save
+        // never told the SW, whose stale full-map re-put clobbered the
+        // rename on the next tool result.
+        if (typeof dispatchChatMeta === 'function') {
+            dispatchChatMeta(chatId, { title: newTitle });
         } else {
-            saveChatsToStorage();
+            // Legacy fallback (no lane in this realm): direct write + save.
+            chat.title = newTitle;
+            delete chat.titleProvisional;
+            if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
+            } else {
+                saveChatsToStorage();
+            }
         }
         renderChatList();
         if (chatId === currentChatId) updateChatTitleHeader();

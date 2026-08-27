@@ -164,6 +164,10 @@ function scrollToMessage(messageIndex) {
     
     clearToolHighlights();
     
+    // MEMWIN: the target may be outside the rendered message window — expand
+    // the window first so the msg-<idx> node exists (no-op when in window).
+    if (typeof ensureMessageInWindow === 'function') ensureMessageInWindow(messageIndex);
+    
     var msgEl = document.getElementById('msg-' + messageIndex);
     if (msgEl) {
         // Expand any tool call details in this message and scroll to first one

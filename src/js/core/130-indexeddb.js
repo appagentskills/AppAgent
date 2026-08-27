@@ -817,9 +817,20 @@ function probeDbAfterResume() {
 // Strip inline base64 payloads from a chat, in place. Returns true if
 // anything was stripped. Marks each stripped message/screenshot with
 // `_b64Evicted` and the chat with `_payloadsEvicted`.
-function stripChatPayloadsInPlace(chat) {
+// MEMFIX-BODY (Fix A): heavy message TEXT fields (tool-result content,
+// assistant thinking, tool_calls arguments) longer than this stay evicted
+// on cold chats. User/assistant text below the floor is kept so sidebar/
+// history search and previews keep working without hydration. The durable
+// copy is the chats-store RECORD itself (the _payloadsEvicted put-skip
+// guard protects it while the in-memory copy is stripped), so eviction
+// needs no new persistence: ensureChatPayloads already fetches the record
+// and restores the fields from it.
+var CHAT_BODY_EVICT_MIN_CHARS = 512;
+
+function stripChatPayloadsInPlace(chat, evictBodies) {
     if (!chat) return false;
     var stripped = false;
+    var newBodyMsgs = null; // COPY-ON-EVICT (PR #805 review, Issue 1): lazily-cloned messages array
     if (Array.isArray(chat.messages)) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
@@ -830,7 +841,74 @@ function stripChatPayloadsInPlace(chat) {
                 msg._b64Evicted = true;
                 stripped = true;
             }
+            // MEMFIX-BODY (Fix A): opt-in (page realm only) — evict heavy
+            // text bodies. `_bodyEvicted` rides the same lifecycle as
+            // `_b64Evicted`: set here under chat._payloadsEvicted (so the
+            // put-skip guard keeps the stored record's full copy), cleared
+            // by ensureChatPayloads after restoring from the record.
+            // COPY-ON-EVICT (PR #805 review, Issue 1): a pending save's
+            // extractChatPayloadsForPut record SHARES the messages array and
+            // its rows with the live chat (it only clones rows it strips
+            // b64/CTR from), and the record's store.put fires LATER in the
+            // save transaction (get-then-put). An in-place body strip in that
+            // async window would be persisted — permanent loss, since bodies
+            // have no blob row (unlike base64/CTR, whose blob puts are queued
+            // with the record). NEVER mutate the shared rows: swap a stripped
+            // CLONE into a CLONED array; any queued record keeps the original
+            // body-intact rows.
+            // MEMFIX-RD: rows already _bodyEvicted may still carry un-evicted
+            // heavy fields (reasoning_details from a build that never evicted
+            // them) — re-enter evicted rows too; the per-field checks below
+            // are idempotent no-ops on fields that are already stripped.
+            if (evictBodies && msg) {
+                var bodyClone = null;
+                if (msg.role === 'tool' && typeof msg.content === 'string'
+                    && msg.content.length > CHAT_BODY_EVICT_MIN_CHARS) {
+                    bodyClone = bodyClone || Object.assign({}, msg);
+                    delete bodyClone.content;
+                }
+                if (typeof msg.thinking === 'string' && msg.thinking.length > CHAT_BODY_EVICT_MIN_CHARS) {
+                    bodyClone = bodyClone || Object.assign({}, msg);
+                    delete bodyClone.thinking;
+                }
+                if (Array.isArray(msg.tool_calls)) {
+                    for (var bt = 0; bt < msg.tool_calls.length; bt++) {
+                        var btc = msg.tool_calls[bt];
+                        if (btc && btc.function && typeof btc.function.arguments === 'string'
+                            && btc.function.arguments.length > CHAT_BODY_EVICT_MIN_CHARS) {
+                            // Keep the array + names (history stats read
+                            // tool_calls.length / function.name) — only the
+                            // argument payload is dropped. Clone the path
+                            // down to `function` so the original row keeps
+                            // its arguments for any in-flight put.
+                            bodyClone = bodyClone || Object.assign({}, msg);
+                            if (bodyClone.tool_calls === msg.tool_calls) bodyClone.tool_calls = msg.tool_calls.slice();
+                            bodyClone.tool_calls[bt] = Object.assign({}, btc, {
+                                function: Object.assign({}, btc.function, { arguments: '' })
+                            });
+                        }
+                    }
+                }
+                // MEMFIX-RD: reasoning_details duplicate the FULL thinking
+                // text plus a ~0.6KB signature per block and were never
+                // evicted — measured ~100KB residual on one cold 96-message
+                // chat. Only API tool-use continuity reads them (the SW's own
+                // hydrated copy; the page hydrates on open/run via
+                // ensureChatPayloads, which restores them from the record
+                // row), so cold page copies never need them in memory.
+                if (Array.isArray(msg.reasoning_details) && msg.reasoning_details.length) {
+                    bodyClone = bodyClone || Object.assign({}, msg);
+                    delete bodyClone.reasoning_details;
+                }
+                if (bodyClone) {
+                    bodyClone._bodyEvicted = true;
+                    if (!newBodyMsgs) newBodyMsgs = chat.messages.slice();
+                    newBodyMsgs[i] = bodyClone;
+                    stripped = true;
+                }
+            }
         }
+        if (newBodyMsgs) chat.messages = newBodyMsgs;
     }
     if (chat.screenshots) {
         var ssIds = Object.keys(chat.screenshots);
@@ -895,7 +973,34 @@ var _coldSweepTimer = null;
 // chat's record + payload blobs durable, so the strip only drops bytes
 // ensureChatPayloads can bring back. Chats already `_payloadsEvicted` are
 // skipped — their put-skip guard keeps protecting whatever state they hold.
-function sweepColdChatPayloads(keepHydrated) {
+// MEMFIX-RD pre-scan: does this chat hold anything the BODIES leg could
+// still evict? Lets the sweep re-examine chats already flagged
+// _payloadsEvicted (a full-body SW snapshot adopted by the page carries the
+// flag riding along; rows evicted by older builds still hold
+// reasoning_details) without paying the copy-on-evict clone for the
+// nothing-left-to-strip majority every tick. Mirrors the field predicates
+// in stripChatPayloadsInPlace's bodies leg exactly.
+function chatHasEvictableBodies(chat) {
+    if (!chat || !Array.isArray(chat.messages)) return false;
+    for (var i = 0; i < chat.messages.length; i++) {
+        var m = chat.messages[i];
+        if (!m) continue;
+        if (m.role === 'tool' && typeof m.content === 'string'
+            && m.content.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
+        if (typeof m.thinking === 'string' && m.thinking.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
+        if (Array.isArray(m.reasoning_details) && m.reasoning_details.length) return true;
+        if (Array.isArray(m.tool_calls)) {
+            for (var t = 0; t < m.tool_calls.length; t++) {
+                var tc = m.tool_calls[t];
+                if (tc && tc.function && typeof tc.function.arguments === 'string'
+                    && tc.function.arguments.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function sweepColdChatPayloads(keepHydrated, evictBodies) {
     if (typeof chats === 'undefined' || !chats) return 0;
     if (typeof _chatsHydrated !== 'undefined' && !_chatsHydrated) return 0;
     var swept = 0;
@@ -905,13 +1010,46 @@ function sweepColdChatPayloads(keepHydrated) {
         for (var i = 0; i < ids.length; i++) {
             if (i < (keepHydrated || 0)) continue;
             var c = chats[ids[i]];
-            if (!c || c._payloadsEvicted) continue;
+            if (!c) continue;
+            // MEMFIX-RD guard relax: `_payloadsEvicted` used to settle a chat
+            // for good, which made the runtime sweep a permanent no-op for
+            // it — but the flag RIDES on full-body chat snapshots the page
+            // adopts wholesale from the SW (port-bridge hello / agent-event
+            // assigns), and pre-RD builds left reasoning_details behind on
+            // rows they evicted, so a flagged chat can still hold heavy
+            // bodies the sweep must reclaim. Let the BODIES leg re-examine
+            // flagged chats when the cheap pre-scan finds something
+            // evictable; the b64/CTR legs stay settled by the flag exactly
+            // as before.
+            if (c._payloadsEvicted && (!evictBodies || !chatHasEvictableBodies(c))) continue;
             if (typeof currentChatId !== 'undefined' && ids[i] === currentChatId) continue;
             if (typeof isChatRunning === 'function' && isChatRunning(ids[i])) continue;
             if (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[ids[i]]) continue;
             // Temporary chats never persist — stripping would lose payloads.
             if (c.isTemporary) continue;
-            if (stripChatPayloadsInPlace(c)) swept++;
+            // MEMFIX-BODY dirty guard: a chat mutated while evicted is waiting
+            // for the _rescueDirtyEvictedChat save — never strip MORE from it.
+            if (c._dirtyWhileEvicted) continue;
+            if (evictBodies) {
+                // COPY-ON-EVICT, chat level (PR #805 review, Issue 1): a
+                // pending save may hold THIS very object as its put record —
+                // extractChatPayloadsForPut returns the chat itself when no
+                // row needed cloning (pure-text chat) — and the record put
+                // fires later in the save tx (get-then-put). Strip a shallow
+                // copy (sliced messages array; the strip's own row-level
+                // copy-on-evict never mutates shared rows) and swap it into
+                // the map: the save's captured reference keeps the original
+                // body-intact object. Cold/non-running only, so no live
+                // stream or view holds the old reference.
+                var cCopy = Object.assign({}, c);
+                if (Array.isArray(c.messages)) cCopy.messages = c.messages.slice();
+                if (stripChatPayloadsInPlace(cCopy, true)) {
+                    chats[ids[i]] = cCopy;
+                    swept++;
+                }
+            } else {
+                if (stripChatPayloadsInPlace(c)) swept++;
+            }
         }
     } catch (e) { console.warn('[indexeddb] cold-chat payload sweep failed', e); }
     return swept;
@@ -1154,6 +1292,465 @@ function sweepOrphanChatPayloads() {
     });
 }
 
+// ─── Deletion authority for chat rows (RFC addendum §2.3, Invariant D) ───
+// A row leaves the `chats` store ONLY when a caller presents a DELETE
+// SIGNAL naming that id and a reason, AND the deleting transaction verifies
+// a precondition on the record AS IT EXISTS ON DISK, inside that same
+// transaction. No pass may infer deletion from absence in an in-memory map:
+// neither realm's `chats` map is authoritative over the store, so "I never
+// knew about this chat" is indistinguishable from "this chat was deleted" —
+// that conflation destroyed real user chats (observed live: store count
+// 904 → 900). Saves are upsert-only; absence means nothing.
+//
+// This lives in core/130-indexeddb.js on purpose: the file is in
+// WORKER_SHARED_FILES (build/build.js), so the service-worker bundle and
+// the page bundle run ONE implementation of the primitive. The only realm
+// difference is blob reaping — see _dbIsWorkerRealm below.
+//
+// Reasons are a CLOSED SET (RFC addendum §2.2). Adding one means adding a
+// precondition here; there is no "no reason" path.
+var CHAT_EMPTY_ROW_GC_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+// In-memory audit trail of every delete decision (granted AND refused) this
+// realm made. Read it from the console / runtime_inspect when a row goes
+// missing: it names who deleted what, why, and on what evidence. Not
+// persisted (RFC addendum PR5 would persist it and consult it at put time
+// to close the stale-put resurrection window — deferred).
+var CHAT_DELETE_LEDGER_MAX = 200;
+var _chatDeleteLedger = [];
+function _recordChatDelete(entry) {
+    try {
+        _chatDeleteLedger.push(entry);
+        if (_chatDeleteLedger.length > CHAT_DELETE_LEDGER_MAX) {
+            _chatDeleteLedger.splice(0, _chatDeleteLedger.length - CHAT_DELETE_LEDGER_MAX);
+        }
+    } catch (e) {}
+}
+// Operator entry point: dumpChatDeleteLedger() in the page console or the SW
+// console prints THIS realm's delete decisions (newest last). Both realms keep
+// their own copy — check both when a row goes missing. Bare top-level
+// declaration on purpose: this file has zero self./window. exports and is
+// concatenated into both bundles (WORKER_SHARED_FILES, build/build.js:172).
+function dumpChatDeleteLedger(limit) {
+    var n = (limit > 0) ? limit : _chatDeleteLedger.length;
+    var rows = _chatDeleteLedger.slice(-n);
+    try { console.table(rows); } catch (e) { console.log(rows); }
+    return rows;
+}
+// FLUX-4/5 (delete-authority proof): does THIS realm's ledger hold a GRANTED
+// user-delete decision for this id? Granted = the entry has no `refused` key
+// (see the outcome ledgering at the tail of deleteChatRow — grants record
+// {absent, payloadRows, ...}, every failure/refusal records `refused`).
+// Deliberately restricted to reason 'user-delete': an 'empty-row' GC grant
+// must NOT permanently block re-puts of an id the user later revives by
+// typing into a still-open empty chat, and 'subagent-gc' rows keep their
+// pre-existing resurrection semantics. User-deleted chat ids are never
+// reused (timestamp + random suffix), so a granted entry is a safe terminal
+// verdict for the save put-loop (worker/115-storage.js) and the arm-3
+// corroboration below.
+function _chatDeleteLedgerGranted(chatId) {
+    try {
+        for (var i = _chatDeleteLedger.length - 1; i >= 0; i--) {
+            var e = _chatDeleteLedger[i];
+            if (e && e.id === chatId && e.reason === 'user-delete' && e.refused === undefined) return true;
+        }
+    } catch (e2) {}
+    return false;
+}
+// Evidence digest for the ledger — never keep the caller's pre-delete
+// RECORD (a whole transcript) alive in a 200-entry ring buffer.
+function _chatDeleteEvidenceDigest(evidence) {
+    var d = {};
+    if (!evidence) return d;
+    ['userInitiated', 'via', 'agentId', 'source', 'hadRecord'].forEach(function(k) {
+        if (evidence[k] !== undefined) d[k] = evidence[k];
+    });
+    return d;
+}
+function _chatRowIsRunning(chatId) {
+    try {
+        if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]) return true;
+    } catch (e) {}
+    return false;
+}
+
+// reason → precondition(stored, evidence, chatId). Returns null when the
+// delete is AUTHORISED, or a short string explaining the REFUSAL (logged +
+// ledgered). `stored` is always the record read from disk inside the
+// deleting transaction — never an in-memory copy.
+var CHAT_ROW_DELETE_PRECONDITIONS = {
+    // The user asked for this chat to go. Strongest proof is a persisted
+    // `_deleted` tombstone; today tombstones are parked IN MEMORY only
+    // (worker/130-port-bridge.js 'update-chat') and the save filters keep
+    // them off disk, so there are none on disk yet. Accepted signals, in
+    // descending strength:
+    //   1. stored._deleted === true         — on-disk tombstone
+    //   2. chats[chatId]._deleted === true  — tombstone parked in this realm
+    //   3. evidence.userInitiated === true  — a UI delete handler called us
+    //      in the same tick (deleteChat, ui/170-chat-management.js, also
+    //      hands over the pre-delete record for blob reaping)
+    // (3) is memory-derived, but it is a SIGNAL, not an inference: no bulk
+    // reconciliation pass can produce it, and it names exactly one id.
+    // FLUX-4/5a: (3) no longer authorizes BARE — the arm demands
+    // corroboration (pre-delete record/hadRecord, an armed _pendingDeletes
+    // retry entry, or a prior granted ledger entry for the id) before
+    // honoring the assertion. RFC 4a (_rev) / PR5 (persisted cross-realm
+    // ledger) remain the upgrade path to a true on-disk proof.
+    'user-delete': function(stored, evidence, chatId) {
+        if (stored._deleted === true) return null;
+        var mem = null;
+        try { mem = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null; } catch (e) {}
+        if (mem && mem._deleted === true) return null;
+        if (evidence.userInitiated === true) {
+            // FLUX-4/5a (delete-authority proof): worker/115-storage.js's
+            // deleteChatFromDB asserts userInitiated:true unconditionally,
+            // which made this arm "delete any row, no questions asked" for
+            // any SW-side caller holding just an id. Corroborate the
+            // assertion with evidence this realm can actually check:
+            //   • the caller hands over the pre-delete record, or attests it
+            //     held one: the page path (deleteChatFromDB in
+            //     ui/070-dashboard-ui.js ← deleteChat, ui/170) passes
+            //     `record`; the SW tombstone path passes hadRecord:true
+            //     derived from the parked tombstone — both prove a concrete
+            //     per-id signal, not a bare assertion;
+            //   • the SW retry lane is armed for this id (_pendingDeletes,
+            //     worker/115-storage.js — set by the 'update-chat' tombstone
+            //     branch BEFORE the first delete attempt);
+            //   • this realm already ledgered a granted user-delete for the
+            //     id (a retry after a partial failure).
+            if (evidence.record || evidence.hadRecord === true) return null;
+            try {
+                if (typeof _pendingDeletes !== 'undefined' && _pendingDeletes && _pendingDeletes[chatId]) return null;
+            } catch (ePd) {}
+            if (_chatDeleteLedgerGranted(chatId)) return null;
+            return 'userInitiated asserted without corroboration (no pre-delete record/hadRecord in evidence, no armed retry-lane entry, no granted ledger entry for this id)';
+        }
+        return 'no user-delete signal (record on disk is not tombstoned, no tombstone parked in this realm, and the caller did not declare userInitiated)';
+    },
+    // NO CALLER YET — lands in PR 2 of the RFC addendum staged plan (§4).
+    // Sub-agent garbage collection (core/097-sub-agent-registry.js). The
+    // authority is the sub_agents record being reclaimed — passed as
+    // evidence.agentId — not absence from any chats map. The on-disk record
+    // must actually be a background sub-agent chat, and must not be running.
+    'subagent-gc': function(stored, evidence, chatId) {
+        if (!evidence.agentId) return 'no agentId in evidence — the sub_agents record IS the authority for this reason';
+        if (stored.isBackground !== true) return 'stored record is not a background sub-agent chat (isBackground !== true on disk)';
+        if (_chatRowIsRunning(chatId)) return 'chat is currently running';
+        return null;
+    },
+    // Caller: gcEmptyChatRows() below (SW boot, worker/190-entry.js — PR 3).
+    // Empty-row GC. Modelled on
+    // sweepOrphanChatPayloads: authority = a complete read of the store plus
+    // a 24h age floor, so a row another realm just created cannot be reaped
+    // out from under it.
+    'empty-row': function(stored, evidence, chatId) {
+        if (stored.messages && stored.messages.length > 0) {
+            return 'stored record has ' + stored.messages.length + ' message(s) on disk';
+        }
+        if (_chatRowIsRunning(chatId)) return 'chat is currently running';
+        // Recency must consider EVERY chat-meta timestamp this codebase
+        // maintains (worker/115-storage.js:122 lists all four): a row the user
+        // just VIEWED, or one whose activity stamp moved without an updatedAt
+        // write, would otherwise read as arbitrarily old and be reaped.
+        // chatPayloadRecencyTs (:869) is the purpose-built helper the payload
+        // sweep already uses (updatedAt / createdAt / lastViewedAt); add the two
+        // it does not cover.
+        var _ts = (typeof chatPayloadRecencyTs === 'function')
+            ? chatPayloadRecencyTs(stored)
+            : (stored.updatedAt || stored.createdAt || 0);
+        var age = Date.now() - Math.max(_ts, stored.lastResponseAt || 0, stored.lastActivityAt || 0);
+        if (!(age > CHAT_EMPTY_ROW_GC_MIN_AGE_MS)) {
+            return 'empty row is only ' + Math.round(age / 1000) + 's old (24h floor)';
+        }
+        return null;
+    },
+    // NO CALLER YET — the wipe still uses store.clear(); present so the set of
+    // legitimate deletion signals is complete and reviewable in one place.
+    // "Delete all data" (ui/130-data-management.js). The user asked to erase
+    // everything; there is nothing to verify. Present for completeness of
+    // the closed set — the wipe still uses store.clear().
+    'wipe-all': function() { return null; }
+};
+
+// THE one EXPLICIT delete primitive. Since PR 3 removed the absence-diff
+// delete-pass from both realms (saves are upsert-only), this primitive is the
+// ONLY way a row leaves the chats store — except the user-initiated wipe-all
+// store.clear() in ui/130-data-management.js.
+// Never throws, never rejects: resolves true when
+// the row is gone (including "was already gone" — idempotent), false on
+// refusal, abort or failure.
+//   1. open [chats] (page realm: + [chat_payloads] when there are blobs)
+//   2. get(chatId) INSIDE that transaction; absent → true
+//   3. run the reason's precondition against the on-disk record; refusal →
+//      log '[chat-delete] REFUSED …' and return false
+//   4. store.delete(chatId) (+ this chat's now-unreferenced blob rows, page
+//      realm only, under the hydration gate + survivor-ref subtraction)
+//   5. settle on transaction.oncomplete — ABORT = FAILURE (an abort rolls
+//      the delete back, so settling it as success reports a row deleted
+//      that is still on disk)
+//   6. record the decision in _chatDeleteLedger and log it
+function deleteChatRow(chatId, reason, evidence) {
+    evidence = evidence || {};
+    // Every other failure path logs AND ledgers; this used to be the one
+    // silent false, i.e. a mystery failure in exactly the debugging scenario
+    // the ledger exists for. `evidence` was defaulted on the line above, so the
+    // digest call is safe.
+    if (!chatId) {
+        console.error('[chat-delete] REFUSED delete: no chatId (reason=' + reason + ')');
+        _recordChatDelete({ id: chatId || null, reason: reason, evidence: _chatDeleteEvidenceDigest(evidence), at: Date.now(), refused: 'no chatId' });
+        return Promise.resolve(false);
+    }
+    var pre = Object.prototype.hasOwnProperty.call(CHAT_ROW_DELETE_PRECONDITIONS, reason)
+        ? CHAT_ROW_DELETE_PRECONDITIONS[reason] : null;
+    if (typeof pre !== 'function') {
+        console.error('[chat-delete] REFUSED delete ' + chatId + ' reason=' + reason
+            + ' because unknown delete reason (closed set: '
+            + Object.keys(CHAT_ROW_DELETE_PRECONDITIONS).join(', ') + ')');
+        _recordChatDelete({ id: chatId, reason: reason, evidence: _chatDeleteEvidenceDigest(evidence), at: Date.now(), refused: 'unknown reason' });
+        return Promise.resolve(false);
+    }
+    // BLOB REAPING IS PAGE-OWNED. The SW's chats map is run-adopted-only —
+    // never a complete view of the store — so that realm can never prove a
+    // blob unreferenced; it deletes the chat ROW only and leaves
+    // chat_payloads to the page twin and to sweepOrphanChatPayloads.
+    var reapBlobs = !_dbIsWorkerRealm;
+    var payloadIds = [];
+    // NEVER-THROW CONTRACT (header above): this block runs BEFORE withStore, so
+    // it is outside the transaction's own error handling — a throw here would
+    // reject the returned promise, and the page consumer
+    // (ui/170-chat-management.js:1195 `await deleteChatFromDB(...)`) has no
+    // try/catch, so it would become an unhandled rejection inside deleteChat.
+    // The blob-id computation calls a helper owned by ANOTHER file
+    // (_chatPayloadIdsFor, ui/070-dashboard-ui.js:2373) and the contract must
+    // not depend on that helper staying defensive.
+    try { if (reapBlobs && evidence.record) {
+        // chat_payloads rows are keyed by file_id/screenshot_id, never by
+        // chat id, and those ids survive payload eviction — so even a
+        // stripped record still lists them. Reap only the ids no OTHER
+        // surviving in-memory chat references (same reference rule as
+        // sweepOrphanChatPayloads, without its 24h age gate: an explicit
+        // delete is not a speculative sweep).
+        var _mine = (typeof _chatPayloadIdsFor === 'function') ? _chatPayloadIdsFor(evidence.record) : {};
+        payloadIds = Object.keys(_mine);
+        // HYDRATION GATE — the same precondition sweepOrphanChatPayloads
+        // enforces. The "minus every blob a SURVIVING chat still references"
+        // subtraction below is only sound when `chats` holds EVERY chat. On a
+        // partially-hydrated or degraded map a survivor's reference is
+        // invisible, so its blob looks unreferenced and gets deleted out from
+        // under a live chat. Defer instead: the boot orphan sweep reaps
+        // genuinely unreferenced rows later. The chat ROW delete still runs —
+        // deferring blob cleanup must never block the delete the user asked for.
+        if (payloadIds.length && !(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) {
+            console.warn('[chat-delete] chats map not fully hydrated — deferring '
+                + payloadIds.length + ' payload blob row(s) of chat ' + chatId
+                + ' to the boot orphan sweep; deleting the chat row only');
+            payloadIds = [];
+        }
+        if (payloadIds.length) {
+            var _stillReferenced = {};
+            try {
+                Object.keys(chats).forEach(function(cid) {
+                    if (cid === chatId) return;
+                    var _other = _chatPayloadIdsFor(chats[cid]);
+                    Object.keys(_other).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
+                });
+            } catch (eRef) {
+                // Unreadable map → cannot prove anything unreferenced → reap nothing.
+                _stillReferenced = _mine;
+            }
+            payloadIds = payloadIds.filter(function(pid) { return !_stillReferenced[pid]; });
+        }
+    }
+    } catch (eBlob) {
+        // Never break the never-throw contract for a blob-cleanup detail: fall
+        // back to a row-only delete and let sweepOrphanChatPayloads reap the
+        // blobs.
+        console.warn('[chat-delete] payload-id computation failed for chat ' + chatId
+            + ' — deleting the chat row only', eBlob);
+        payloadIds = [];
+    }
+    var storeNames = payloadIds.length ? [chatStoreName, chatPayloadsStoreName] : [chatStoreName];
+    return withStore(storeNames, 'readwrite', function(transaction) {
+        var store = transaction.objectStore(chatStoreName);
+        var payloadStore = payloadIds.length ? transaction.objectStore(chatPayloadsStoreName) : null;
+        return new Promise(function(_resolve) {
+            // Settle EXACTLY once, and never wedge: success settles on COMMIT
+            // (transaction.oncomplete), failure on abort. A refusal does no
+            // writes, so its transaction also completes — carrying the refusal.
+            var _settled = false;
+            var outcome = { ok: false, absent: false, refused: null, aborted: false, error: null, reaped: 0, payloadErrors: 0, getFailed: null };
+            function settle() { if (_settled) return; _settled = true; _resolve(outcome); }
+            transaction.oncomplete = settle;
+            transaction.onabort = function() {
+                outcome.ok = false;
+                outcome.aborted = true;
+                outcome.error = transaction.error || null;
+                settle();
+            };
+            var getReq;
+            try {
+                getReq = store.get(chatId);
+            } catch (eGet) {
+                outcome.refused = 'store.get threw: ' + ((eGet && eGet.message) || eGet);
+                settle();
+                return;
+            }
+            getReq.onerror = function() {
+                // Nothing calls preventDefault here, so this aborts the tx and
+                // onabort settles — record why so the abort log can name it.
+                outcome.getFailed = 'store.get failed';
+            };
+            getReq.onsuccess = function() {
+                var stored = getReq.result;
+                // ABSENT ROW = idempotent success — but NOT a reason to skip blob
+                // reaping. The base page twin issued store.delete(chatId) AND the
+                // payloadStore deletes unconditionally, with no prior get, and the
+                // absent path is the COMMON one: deleteChat
+                // (ui/170-chat-management.js:1169) tombstones the SW, which deletes
+                // the row at worker/130-port-bridge.js:841 BEFORE the page awaits
+                // its own delete at :1195, and the 3s retry at :1218 always finds
+                // the row already gone. Returning early here would leak that chat's
+                // blob rows to the 24h boot sweep on every single user delete.
+                if (stored) {
+                    var why;
+                    try { why = pre(stored, evidence, chatId); }
+                    catch (ePre) { why = 'precondition threw: ' + ((ePre && ePre.message) || ePre); }
+                    if (why) { outcome.refused = why; return; }
+                    store.delete(chatId);
+                } else {
+                    outcome.absent = true;
+                }
+                if (payloadStore) {
+                    payloadIds.forEach(function(pid) {
+                        try {
+                            payloadStore.delete(pid);
+                            // Drop the known-durable cache entry so a future put
+                            // of the same id isn't skipped.
+                            if (typeof _persistedPayloadIds !== 'undefined' && _persistedPayloadIds) delete _persistedPayloadIds[pid];
+                            outcome.reaped++;
+                        } catch (eDel) {
+                            // NEVER silent: a leaked blob row must be diagnosable.
+                            // (The chat-row delete above is deliberately unwrapped —
+                            // a throw there aborts the tx and reports failure.)
+                            outcome.payloadErrors++;
+                            console.warn('[chat-delete] payload row ' + pid + ' of chat ' + chatId
+                                + ' could not be deleted — it will be reaped by the boot orphan sweep', eDel);
+                        }
+                    });
+                }
+                outcome.ok = true;
+            };
+        });
+    }).then(function(outcome) {
+        var digest = _chatDeleteEvidenceDigest(evidence);
+        if (outcome.aborted) {
+            var _abortWhy = 'transaction aborted' + (outcome.getFailed ? ' (' + outcome.getFailed + ')' : '');
+            console.warn('[chat-delete] delete ABORTED for chat ' + chatId + ' reason=' + reason
+                + ' — ' + _abortWhy + ', rolled back: the row is still on disk'
+                + (evidence.retryHint ? '; ' + evidence.retryHint : ''), outcome.error || '');
+            _recordChatDelete({ id: chatId, reason: reason, evidence: digest, at: Date.now(), refused: _abortWhy });
+            return false;
+        }
+        if (outcome.refused) {
+            console.warn('[chat-delete] REFUSED delete ' + chatId + ' reason=' + reason + ' because ' + outcome.refused);
+            _recordChatDelete({ id: chatId, reason: reason, evidence: digest, at: Date.now(), refused: outcome.refused });
+            return false;
+        }
+        if (!outcome.ok) {
+            // Belt and braces: the transaction committed but no arm claimed
+            // success. NEVER report a delete we cannot account for — a future
+            // early return inside onsuccess would otherwise resolve true with the
+            // row still on disk.
+            console.warn('[chat-delete] delete for chat ' + chatId + ' reason=' + reason
+                + ' committed without recording an outcome — reporting failure');
+            _recordChatDelete({ id: chatId, reason: reason, evidence: digest, at: Date.now(), refused: 'no outcome recorded' });
+            return false;
+        }
+        // Counts come from deletes ACTUALLY issued, never from the pre-computed
+        // payloadIds — the ledger is the forensic record of what left the store.
+        _recordChatDelete({ id: chatId, reason: reason, evidence: digest, at: Date.now(), absent: outcome.absent, payloadRows: outcome.reaped, payloadErrors: outcome.payloadErrors });
+        console.log('[chat-delete] ' + (outcome.absent ? 'chat row already absent (idempotent):' : 'deleted chat row')
+            + ' ' + chatId + ' reason=' + reason
+            + (outcome.reaped ? ' (+' + outcome.reaped + ' payload row(s))' : '')
+            + (outcome.payloadErrors ? ' [' + outcome.payloadErrors + ' payload row(s) FAILED]' : ''));
+        return true;
+    }).catch(function(e) {
+        console.error('[chat-delete] delete FAILED for chat ' + chatId + ' reason=' + reason, e);
+        _recordChatDelete({ id: chatId, reason: reason, evidence: _chatDeleteEvidenceDigest(evidence), at: Date.now(), refused: 'threw: ' + ((e && e.message) || e) });
+        return false;
+    });
+}
+// Boot-time empty-row GC (RFC addendum §2.5.2, PR 3): reap 0-message chat
+// rows via the explicit 'empty-row' signal. Before PR 3 these rows were
+// reaped implicitly by the save's absence-diff (the SW hydrates only
+// messages.length > 0 rows, so empty rows were "absent from memory" at the
+// first save); the diff is gone, so this boot pass is now the ONLY reaper of
+// empty rows. Authority = the on-disk record itself: the candidate scan below
+// is a cheap PRE-FILTER only — the 'empty-row' precondition re-verifies
+// emptiness, the 24h age floor and not-running against the record AS RE-READ
+// inside each delete transaction. Runs once per SW boot (worker/190-entry.js,
+// beside sweepOrphanChatPayloads), capped per boot so a pathological store
+// cannot turn boot into a mass-delete. Expect a one-off count drop at the
+// first boot after PR 3 ships (RFC addendum §5) — the [chat-delete] log lines
+// name every reaped id.
+var CHAT_EMPTY_ROW_GC_MAX_PER_BOOT = 200;
+function gcEmptyChatRows() {
+    if (typeof deleteChatRow !== 'function') return Promise.resolve(0);
+    // Phase 1 (readonly): cursor the chats store and collect candidate ids.
+    // The age/running checks here only cut REFUSED-log noise for fresh rows;
+    // the delete tx re-checks everything authoritatively.
+    return withStore([chatStoreName], 'readonly', function(transaction) {
+        return new Promise(function(resolve) {
+            var candidates = [];
+            var cursorReq;
+            try { cursorReq = transaction.objectStore(chatStoreName).openCursor(); }
+            catch (e) { resolve(candidates); return; }
+            cursorReq.onsuccess = function(ev) {
+                var cur = ev.target.result;
+                if (!cur) { resolve(candidates); return; }
+                var rec = cur.value;
+                if (rec && !(rec.messages && rec.messages.length > 0)
+                    && !_chatRowIsRunning(cur.primaryKey)) {
+                    var _ts = (typeof chatPayloadRecencyTs === 'function')
+                        ? chatPayloadRecencyTs(rec)
+                        : (rec.updatedAt || rec.createdAt || 0);
+                    var _age = Date.now() - Math.max(_ts, rec.lastResponseAt || 0, rec.lastActivityAt || 0);
+                    if (_age > CHAT_EMPTY_ROW_GC_MIN_AGE_MS) candidates.push(cur.primaryKey);
+                }
+                if (candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT) { resolve(candidates); return; }
+                cur.continue();
+            };
+            cursorReq.onerror = function() { resolve(candidates); };
+        });
+    }).then(function(candidates) {
+        if (!candidates.length) return 0;
+        // Phase 2: one explicit, precondition-checked deleteChatRow per
+        // candidate, serially — each delete is its own transaction, and a
+        // refusal (row gained messages since phase 1, aged back under the
+        // floor via a fresher timestamp, or started running) is logged by the
+        // primitive and simply skipped here.
+        var reaped = 0;
+        var i = 0;
+        function next() {
+            if (i >= candidates.length) return Promise.resolve(reaped);
+            var id = candidates[i++];
+            return Promise.resolve(deleteChatRow(id, 'empty-row', { source: 'gc-empty-rows-boot' }))
+                .then(function(ok) { if (ok) reaped++; }, function() {})
+                .then(next);
+        }
+        return next().then(function() {
+            console.log('[chat-delete] empty-row GC: reaped ' + reaped + ' of ' + candidates.length
+                + ' empty candidate row(s)'
+                + (candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT ? ' (per-boot cap hit — the rest drain next boot)' : ''));
+            return reaped;
+        });
+    }).catch(function(e) {
+        console.warn('[chat-delete] empty-row GC failed', e);
+        return 0;
+    });
+}
+// ─── End deletion authority ──────────────────────────────────────────────
+
+
 // Per-chatId single-flight guard: concurrent callers share one hydration.
 var _chatHydrationPromises = {};
 
@@ -1247,6 +1844,40 @@ async function ensureChatPayloads(chatId) {
             // errored): the chat must then stay _payloadsEvicted so the save
             // guard keeps skipping it and the next hydration retries.
             var keptAny = false;
+            // MEMFIX-BODY (Fix A): restore evicted message text bodies from
+            // the chats-store record fetched above. Bodies are never blob
+            // rows — the durable copy is the record itself (kept intact by
+            // the _payloadsEvicted put-skip guard). Index matching is safe:
+            // bodies are only evicted from cold, non-running chats (sweep
+            // guards), whose arrays only ever grow by appends afterwards.
+            if (Array.isArray(chat.messages)) {
+                for (var bri = 0; bri < chat.messages.length; bri++) {
+                    var brm = chat.messages[bri];
+                    if (!brm || !brm._bodyEvicted) continue;
+                    var brr = (record && Array.isArray(record.messages)) ? record.messages[bri] : null;
+                    // Defense-in-depth (PR #805 review, Issue 1): if the
+                    // stored row is ITSELF body-evicted (a stripped record
+                    // ever persisted through some future guard hole), do NOT
+                    // "restore" nothing and clear the flag — keep it
+                    // retryable so the loss stays visible/recoverable.
+                    if (brr && brr.role === brm.role && !brr._bodyEvicted) {
+                        if (brr.content !== undefined) brm.content = brr.content;
+                        if (brr.thinking !== undefined) brm.thinking = brr.thinking;
+                        if (brr.tool_calls !== undefined) brm.tool_calls = brr.tool_calls;
+                        // MEMFIX-RD: reasoning_details are evicted with the
+                        // other heavy bodies (page realm) — restore them from
+                        // the record row so API tool-use continuity survives
+                        // an open/run after cold eviction.
+                        if (brr.reasoning_details !== undefined) brm.reasoning_details = brr.reasoning_details;
+                        delete brm._bodyEvicted;
+                    } else {
+                        // No matching record row (record missing or index
+                        // drifted) — keep the flag retryable, same errored≠
+                        // absent discipline as the base64 loops below.
+                        keptAny = true;
+                    }
+                }
+            }
             if (Array.isArray(chat.messages)) {
                 for (var mi = 0; mi < chat.messages.length; mi++) {
                     var m = chat.messages[mi];
@@ -2656,4 +3287,176 @@ async function pickDeployDir() {
         await setDeployDirHandle(handle);
         return handle;
     } catch (e) { return null; }
+}
+
+// ═══ FLUX-6 (dual-realm persister): chat-row field ownership ═══════════
+// SHARED into both bundles (WORKER_SHARED_FILES, build/build.js) — ONE
+// implementation consumed by BOTH realms' put paths, so the merge rules
+// cannot drift the way per-realm twins can.
+//
+// Both realms run full-row upsert persisters over the same IDB rows (page:
+// ui/070-dashboard-ui.js; SW: worker/115-storage.js). Any field NOT merged
+// at put time is last-writer-wins between realms: a realm whose in-memory
+// copy is stale silently reverts the other realm's persisted work. The lane
+// fields (CHAT_META_* twins + title pair + pausedByUser) are already merged
+// by _preservePageChatFields (SW) / _preserveSwOwnedChatMeta (page). This
+// table + _mergeChatRowForPut extend that protection to the remaining
+// multi-writer fields and to FUTURE fields (omission safety).
+//
+// OWNERSHIP TABLE (documentation — enforced by the helpers below + the
+// realm-specific lane preservers; update this when adding a chat-row field):
+//   id                : immutable key — never merged.
+//   messages          : SW authors nearly all rows (loop, send handler,
+//                       injections); page authors pending prompt_user /
+//                       approval rows + removes transient parked_tool rows;
+//                       the loop realm POPS the trailing in-flight assistant
+//                       row on user abort / throttle retry / stream error
+//                       (app/030-agent-loop.js:1082/1126/1164 — both realms).
+//                       Put rule: append-tail preservation (below); the
+//                       preserved tail drops parked_tool AND isStreaming
+//                       rows so deliberate trailing removals stick.
+//   displays          : SW eager-creates entries; page stamps _toggledAt on
+//                       checklist toggles. Put rule: per-id union, newest
+//                       _toggledAt wins (was SW-only FLUX-QW7; now both).
+//   title/titleProvisional/titleUpdatedAt + CHAT_META_TS_FIELDS +
+//   CHAT_META_FLAG_FIELDS: SW-canonical lane (FLUX-4C/T1/P1) — merged by
+//                       the realm lane preservers BEFORE this helper runs.
+//   versionHistory    : both realms append; page legitimately FILTERS
+//                       (undo/redo invalidation, ui/090:823/913) and CAPS
+//                       (VERSION_HISTORY_CAP splices, tools/020:704,
+//                       ui/090:102/129) — an id-union at put time would
+//                       resurrect deliberately-removed entries, so it stays
+//                       defined-vs-defined last-writer-wins (DOCUMENTED
+//                       REMAINDER; in-memory protection: app/045 merge).
+//   widgets           : SW creates, page edits (contentVersion bumps,
+//                       mirrored via 'widget-persist') — copies converge
+//                       over the bus; defined-vs-defined stays LWW
+//                       (DOCUMENTED REMAINDER; in-memory: app/045 merge).
+//   progressStateOverride, isTemporary, provider, same_as: DELETE-AS-CLEAR
+//                       fields — cleared by `delete chat.<f>` + save
+//                       (override clear: tools/120-actions.js:312; temp-chat
+//                       promotion: app/040:257/330, app/030:1240, tools/080:90;
+//                       model-stamp flip: core/097 _applyChatModelStamp), so
+//                       the record LACKING them IS the authored clear.
+//                       Excluded from the fill-gap — carrying them forward
+//                       resurrected the stale value on the very save meant to
+//                       clear it (immortal pr_merged badge; re-flagged
+//                       temporary chats; provider+same_as coexisting).
+//                       Trade-off: they lose cross-realm omission safety and
+//                       converge via their event mirrors instead
+//                       (app/036:924-926 override adopt; bus chat pushes).
+//   everything else / FUTURE fields: fill-gap carry-forward — a field the
+//                       put record LACKS but the stored row has is carried
+//                       forward, so a field persisted by one realm is never
+//                       silently DROPPED by the other realm's full-row put.
+//                       Defined-vs-defined stays record-wins. '_'-prefixed
+//                       runtime transients (_deleted, _payloadsEvicted,
+//                       _dirtyWhileEvicted…) are never carried.
+
+// Fields the put-time merge must NOT touch generically: the identity key,
+// the fields merged structurally below, and the lane fields owned by the
+// realm-specific preservers. Reads the CHAT_META_* twins of WHICHEVER
+// bundle this runs in, at call time (both bundles declare them).
+function _chatRowPutHandledFields() {
+    var h = { id: 1, messages: 1, displays: 1, title: 1, titleProvisional: 1 };
+    // DELETE-AS-CLEAR fields (see ownership table): absence on the put record
+    // IS the authored clear — the fill-gap would resurrect the deleted value
+    // on the very save meant to clear it. Not lane fields; listed here solely
+    // to exempt them from the fill-gap carry-forward.
+    h.progressStateOverride = 1; h.isTemporary = 1; h.provider = 1; h.same_as = 1;
+    try {
+        CHAT_META_TS_FIELDS.forEach(function(f) { h[f] = 1; });
+        CHAT_META_FLAG_FIELDS.forEach(function(f) { h[f] = 1; });
+    } catch (e) { /* lists missing = lane fields fall back to fill-gap only */ }
+    return h;
+}
+
+// Row identity for the messages prefix compare — STABLE keys only, never
+// content for keyed rows (streaming legitimately grows the last row's
+// content in place; tool rows flip status pending→done on the same row).
+function _sameChatMsgIdentity(a, b) {
+    if (!a || !b || a.role !== b.role) return false;
+    var ka = a.id || a.toolCallId || a.promptId || null;
+    var kb = b.id || b.toolCallId || b.promptId || null;
+    if (ka || kb) return ka === kb;
+    if (a.timestamp || b.timestamp) return a.timestamp === b.timestamp;
+    if (typeof a.content === 'string' && typeof b.content === 'string') return a.content === b.content;
+    return false;
+}
+
+// Append-tail preservation: the ONLY divergence this merges is "the stored
+// row has EXTRA TRAILING rows and every record row identity-matches its
+// stored counterpart" — i.e. the put realm's copy is a stale PREFIX of what
+// the other realm appended (SW tool results vs a page save, page-persisted
+// pending prompt rows vs an SW re-put). The record keeps its own (possibly
+// in-place-mutated) prefix rows and gains the stored-only tail. ANY other
+// divergence — edit, mid-array delete, reorder, equal/shorter stored — is an
+// authored rewrite and the record wins wholesale (today's behavior).
+// Transient page-flicker rows (role 'parked_tool', removed in-memory by
+// app/036-agent-event-handlers-page.js) are dropped from the preserved tail
+// so a once-persisted parked row cannot ride the disk row forever.
+// Likewise stored tail rows still flagged isStreaming: an in-flight assistant
+// row (created isStreaming:true, app/030:977) only reaches disk MID-stream
+// (any same-realm save puts ALL chats), and the loop realm either completes
+// it (isStreaming=false at app/030:1061/:1184 — the live row then sits in the
+// put record's own prefix, never the tail) or deliberately POPS it on user
+// abort / throttle retry / stream error (app/030:1082/1126/1164). A stored
+// tail row still carrying isStreaming=true is therefore a dropped partial —
+// preserving it resurrected aborted/errored partials forever, because the
+// chat idles after the pop and no later authored save contradicted the
+// stored row.
+// Returns the merged array, or null when the record should win unchanged.
+function _mergeChatMessagesForPut(rec, stored) {
+    if (!Array.isArray(rec) || !Array.isArray(stored)) return null;
+    if (stored.length <= rec.length) return null;
+    for (var i = 0; i < rec.length; i++) {
+        if (!_sameChatMsgIdentity(rec[i], stored[i])) return null;
+    }
+    var tail = [];
+    for (var j = rec.length; j < stored.length; j++) {
+        var sm = stored[j];
+        if (!sm || sm.role === 'parked_tool' || sm.isStreaming === true) continue;
+        tail.push(sm);
+    }
+    if (!tail.length) return null;
+    return rec.concat(tail);
+}
+
+// Per-display union (FLUX-QW7 semantics, now shared): keep the base entry
+// unless the other side's _toggledAt is STRICTLY newer; add other-only ids.
+// Never mutates either map — returns a fresh merged map, or null when the
+// base needs no change.
+function _unionChatDisplaysForPut(base, other) {
+    if (!other) return null;
+    var merged = null;
+    Object.keys(other).forEach(function(id) {
+        var oe = other[id];
+        var be = base && base[id];
+        if (be && (((oe && oe._toggledAt) || 0) <= ((be && be._toggledAt) || 0))) return;
+        if (!merged) merged = Object.assign({}, base || {});
+        merged[id] = oe;
+    });
+    return merged;
+}
+
+// Put-time non-lane merge, called by BOTH realms' persisters AFTER their
+// lane preserver, with the same `stored` row that preserver read. NEVER
+// mutates `rec` in place (it may be the live in-memory chat object) —
+// claims a shallow copy on first change, mirroring the preservers.
+function _mergeChatRowForPut(rec, stored) {
+    if (!rec || !stored) return rec;
+    var out = rec;
+    function claim() { if (out === rec) out = Object.assign({}, rec); return out; }
+    var mm = _mergeChatMessagesForPut(rec.messages, stored.messages);
+    if (mm) claim().messages = mm;
+    var md = _unionChatDisplaysForPut(rec.displays, stored.displays);
+    if (md) claim().displays = md;
+    // Omission safety for future fields: carry forward stored fields the
+    // record lacks entirely (fill-gap only — a DEFINED record value wins).
+    var handled = _chatRowPutHandledFields();
+    Object.keys(stored).forEach(function(k) {
+        if (handled[k] || k.charAt(0) === '_') return;
+        if (out[k] === undefined) claim()[k] = stored[k];
+    });
+    return out;
 }

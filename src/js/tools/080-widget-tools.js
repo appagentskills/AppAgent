@@ -321,10 +321,14 @@ function renderWidgetInContainer(widget, container, options) {
     // (panel in a background tab / minimized) and resumes — with one catch-up
     // report — on visibilitychange; _rh itself also no-ops while hidden so
     // MutationObserver-driven calls cost nothing off-screen.
+    // MEMFIX-IO: additionally pauses while the iframe itself is scrolled out
+    // of the top-level viewport (IntersectionObserver on documentElement —
+    // see the injected observer below), so N chats x M widgets no longer keep
+    // permanent 2s timers alive for off-screen iframes.
     var heightScript = '<script>(function(){' +
-        'var _iv=null;' +
-        'function _rh(){if(document.hidden)return;var h=document.body?document.body.scrollHeight:0;if(h>0)window.parent.postMessage({type:"widgetResize",height:h},"*");}' +
-        'function _start(){if(!_iv)_iv=setInterval(_rh,2000);}' +
+        'var _iv=null;var _vis=true;' +
+        'function _rh(){if(document.hidden||!_vis)return;var h=document.body?document.body.scrollHeight:0;if(h>0)window.parent.postMessage({type:"widgetResize",height:h},"*");}' +
+        'function _start(){if(!_iv&&_vis&&!document.hidden)_iv=setInterval(_rh,2000);}' +
         'function _stop(){if(_iv){clearInterval(_iv);_iv=null;}}' +
         'window.addEventListener("load",_rh);' +
         'if(document.body){try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});' +
@@ -336,6 +340,17 @@ function renderWidgetInContainer(widget, container, options) {
         'if(document.body){document.body.style.margin="0";document.body.style.overflow="auto";' +
         'try{new MutationObserver(_rh).observe(document.body,{childList:true,subtree:true});}catch(e){}_rh();}});' +
         'document.addEventListener("visibilitychange",function(){if(document.hidden){_stop();}else{_start();_rh();}});' +
+        // MEMFIX-IO: pause the 2s reporter while the iframe is scrolled out of
+        // view. Inside an iframe, an IntersectionObserver with root:null tracks
+        // the iframe's own intersection with the TOP-LEVEL viewport (the
+        // spec's cross-origin ad-visibility case), so no parent<->iframe
+        // protocol is needed. display:none (collapsed widget group / node
+        // parked on body during a rebuild) also reports non-intersecting.
+        // 200px rootMargin resumes the reporter just before the widget scrolls
+        // back in, and the resume _rh() catch-up re-syncs any height change
+        // that happened while paused. try/catch guarded: if IO is unavailable
+        // _vis stays true and behavior is exactly the old always-on interval.
+        'try{new IntersectionObserver(function(es){var en=es[es.length-1];_vis=!!(en&&en.isIntersecting);if(_vis){_start();_rh();}else{_stop();}},{rootMargin:"200px"}).observe(document.documentElement);}catch(e){}' +
         'if(!document.hidden)_start();' +
     '})();<\/script>';
     widgetHtml = _appendWidgetScript(widgetHtml, heightScript);

@@ -119,6 +119,9 @@ function scrollToFirstToolCall(msgIdx) {
     
     clearToolHighlights();
     
+    // MEMWIN: expand the message window first so msg-<idx> exists in the DOM.
+    if (typeof ensureMessageInWindow === 'function') ensureMessageInWindow(msgIdx);
+    
     // Try the given index first
     var msgEl = document.getElementById('msg-' + msgIdx);
     if (msgEl) {
@@ -687,9 +690,15 @@ function renderVersionSidebar() {
     // workspace's whole PR history.
     if (_sidebarMetaPRs === null) _refreshSidebarMetaPRs();
     (_sidebarMetaPRs || []).forEach(function(pr) {
+        // Seed the in-memory state cache from the durable meta stamp (written
+        // by sync and the web_fetch REST merge hook) BEFORE the dedup return,
+        // so a known-merged PR renders its Merged chip immediately on a fresh
+        // session (message-scan entries included) instead of flashing a stale
+        // merge button until the background GitHub GET resolves. Never
+        // overwrites a live in-memory state (e.g. 'merging' mid-flight).
+        if (pr.state === 'merged' && !_sidebarPRState[pr.url]) _sidebarPRState[pr.url] = 'merged';
         if (_prSeenUrls[pr.url]) return;
         var st = _sidebarPRState[pr.url];
-        if (st === 'merged' || st === 'closed') return;
         // Scope the durable meta.prs fallback to the current chat OR one of its
         // sub-agent chats (the parent sidebar aggregates its workers' PRs).
         // Resolve the owner: explicit chatId stamp (see wsPush -> prInfo), else
@@ -719,6 +728,20 @@ function renderVersionSidebar() {
             _orphanHit = _orphanedSubPrBelongsHere(pr, _ownerChatId);
             if (!_orphanHit && pr.root_chat_id !== currentChatId) return;
         }
+        // Merged/closed skip — moved AFTER ownership resolution and narrowed
+        // to WEAK claims (rows accepted solely via the orphan transcript
+        // match, with no vouching stamp). It used to run before ownership and
+        // hid merged PRs from their OWNING chat too, while the message-scan
+        // path kept showing that chat's merged PRs with a Merged chip — that
+        // asymmetry made a REST-opened (meta-only) PR vanish on merge while a
+        // workspace-pushed one stayed visible. STRONG rows — owned by this
+        // chat, by a live sub of it, or by a durable root_chat_id stamp
+        // naming this chat — now render with the state chip, exactly like
+        // message-scan entries. Weak rows keep the skip so stale history
+        // never resurfaces in merely-discussing chats (the accepted tradeoff
+        // documented on _orphanedSubPrBelongsHere).
+        var _strongPrOwner = _ownerChatId === currentChatId || !!_subChatNames[_ownerChatId] || pr.root_chat_id === currentChatId;
+        if ((st === 'merged' || st === 'closed') && !_strongPrOwner) return;
         _prSeenUrls[pr.url] = true;
         pushedPRs.push({
             url: pr.url,
@@ -973,7 +996,8 @@ function renderVersionSidebar() {
         chat.messages.forEach(function(msg) {
             var txt = '';
             if (msg.content) txt = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-            var dre = /<!--document:(doc_\w+)-->/g;
+            // Accept legacy (doc_<epoch>_<rand>) AND human-readable slug doc ids.
+            var dre = /<!--document:([A-Za-z0-9_-]+)-->/g;
             var dm;
             while ((dm = dre.exec(txt)) !== null) chatDocIds[dm[1]] = true;
             if (msg.tool_calls) msg.tool_calls.forEach(function(tc) {

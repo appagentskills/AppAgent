@@ -87,6 +87,21 @@ function renderLinksCard(msg) {
     return '<div class="links-card"><div class="links-card-label">LINKS</div><ul class="links-card-list">' + items + '</ul></div>';
 }
 
+// MEMFIX-ESC (Fix D): attribute-escape for base64 data URLs. escapeHtml
+// regex-replaced (scan + full copy) multi-MB screenshot data URLs on EVERY
+// renderMessages pass, even though the base64 alphabet contains nothing
+// HTML-escapable. Three allocation-free indexOf scans verify that; anything
+// unexpected falls back to escapeHtml unchanged. Deliberately NOT a retained
+// per-message HTML memo — R1/FIX2 below removed exactly that kind of cache
+// because it kept a persistent multi-MB duplicate of the chat alive.
+function escapeDataUrlAttr(s) {
+    if (typeof s === 'string' && s.lastIndexOf('data:', 0) === 0
+        && s.indexOf('"') === -1 && s.indexOf('<') === -1 && s.indexOf('&') === -1) {
+        return s;
+    }
+    return escapeHtml(s);
+}
+
 // Render just the inner content of a single attachment (no group wrapper)
 function renderAttachmentContent(msg, index) {
     if (msg.role === 'screenshot') {
@@ -103,7 +118,7 @@ function renderAttachmentContent(msg, index) {
         h += '<div class="screenshot-container">';
         h += '<div class="screenshot-header" title="' + escapeHtml(screenshotName) + '"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + escapeHtml(screenshotName) + '</div>';
         if (base64) {
-            h += '<img class="screenshot-thumbnail" src="' + escapeHtml(base64) + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
+            h += '<img class="screenshot-thumbnail" src="' + escapeDataUrlAttr(base64) + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
         } else {
             h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">Screenshot unavailable</div>';
         }
@@ -169,6 +184,91 @@ function findAdjacentForAttachmentGroup(messages, index, direction) {
 // records whether the RAW part contained widget markup, replacing the old
 // substring search over the retained HTML (see _sigHasWidget below).
 var _lastRenderState = { chatId: null, count: 0, sigs: [] };
+
+// MEMWIN: message-list windowing. Long-running chats accumulated an unbounded
+// DOM (40k+ elements measured for a 17-message view) because renderMessages
+// mapped EVERY message on every rebuild. Render only the most recent window
+// (~MESSAGE_WINDOW_SIZE messages, snapped back to a turn boundary so
+// compact-mode blocks and attachment groups are never cut in half) and reveal
+// older turns on demand via the "Show earlier messages" notice. Out-of-window
+// indices map to '' (no DOM node at all) while keeping mappedParts
+// index-aligned with chat.messages, so msg-<idx> ids and the R1 incremental
+// fast path keep working unchanged. The window start only ADVANCES while the
+// user is stuck to the bottom (with MESSAGE_WINDOW_SLACK hysteresis so it
+// does not force a full rebuild on every append), meaning a reader scrolled
+// up never has content yanked out from above them. Widget iframes of pruned
+// messages are torn down by the park/reclaim else-branch in the full render
+// (no placeholder -> __widgetCleanup + remove) and re-mounted from the widget
+// store by initializeWidgetsInView when re-shown.
+var MESSAGE_WINDOW_SIZE = 50;   // target visible tail size (messages)
+var MESSAGE_WINDOW_BATCH = 50;  // messages revealed per "Show earlier" click
+var MESSAGE_WINDOW_SLACK = 25;  // hysteresis before the window start advances
+var _msgWindowStart = {};       // chatId -> first rendered message index
+
+// Snap a window start DOWN to the nearest visible turn boundary (a non-hook
+// user message) so a compact-mode response block is never cut in half.
+function _snapWindowStart(messages, idx) {
+    if (idx <= 0) return 0;
+    if (idx > messages.length - 1) idx = messages.length - 1;
+    while (idx > 0 && !(messages[idx].role === 'user' && !messages[idx].isHookMessage)) idx--;
+    return idx;
+}
+
+function _getWindowStart(chat) {
+    var msgs = chat.messages;
+    var cur = _msgWindowStart[currentChatId];
+    if (cur === undefined || cur >= msgs.length) {
+        // First render of this chat, or messages shrank below the stored
+        // start (delete/branch): (re)anchor the window to the tail.
+        cur = _snapWindowStart(msgs, Math.max(0, msgs.length - MESSAGE_WINDOW_SIZE));
+        _msgWindowStart[currentChatId] = cur;
+    } else if (stickToBottom && msgs.length - cur > MESSAGE_WINDOW_SIZE + MESSAGE_WINDOW_SLACK) {
+        // Streaming/appends grew the window past the slack while the user is
+        // pinned to the bottom — advance the start (prunes the oldest turns).
+        // Gated on stickToBottom so a user reading older messages never has
+        // them pruned out from under their scroll position.
+        cur = _snapWindowStart(msgs, Math.max(0, msgs.length - MESSAGE_WINDOW_SIZE));
+        _msgWindowStart[currentChatId] = cur;
+    }
+    return cur;
+}
+
+// Expand the window so msg-<msgIndex> exists in the DOM, re-rendering when
+// needed. Called by out-of-render-path DOM lookups (version-sidebar jump,
+// search jump, sidebar tool-call jump) before getElementById('msg-' + i).
+function ensureMessageInWindow(msgIndex) {
+    var chat = chats[currentChatId];
+    if (!chat || typeof msgIndex !== 'number' || msgIndex < 0) return;
+    var cur = _msgWindowStart[currentChatId];
+    if (cur === undefined || msgIndex >= cur) return;
+    _msgWindowStart[currentChatId] = _snapWindowStart(chat.messages, msgIndex);
+    renderMessages();
+}
+
+// onclick handler for the "Show earlier messages" notice rendered above the
+// windowed list. Reveals ~MESSAGE_WINDOW_BATCH more messages (snapped to a
+// turn boundary) and keeps the previously-first message visually anchored.
+function showEarlierMessages() {
+    var chat = chats[currentChatId];
+    if (!chat) return;
+    var cur = _msgWindowStart[currentChatId] || 0;
+    if (cur <= 0) return;
+    var container = document.getElementById('messages');
+    var anchorEl = document.getElementById('msg-' + cur);
+    var anchorTop = anchorEl ? anchorEl.getBoundingClientRect().top : 0;
+    _msgWindowStart[currentChatId] = _snapWindowStart(chat.messages, Math.max(0, cur - MESSAGE_WINDOW_BATCH));
+    renderMessages();
+    // Re-anchor: the render restores the absolute scrollTop, but the newly
+    // revealed content above shifted the old first message down — compensate
+    // so the user stays put and can scroll UP into the revealed turns.
+    var el = document.getElementById('msg-' + cur);
+    if (anchorEl && el && container) {
+        container.scrollTop += el.getBoundingClientRect().top - anchorTop;
+        // Seed the scroll tracker (see handleChatScroll, 050-streaming.js) so
+        // this programmatic jump is never misread as a user scroll.
+        container._agLastScrollTop = container.scrollTop;
+    }
+}
 
 function _renderSig(part) {
     var s = part.replace(/ data-copy-id="rc-[0-9]+"/g, '');
@@ -415,6 +515,11 @@ function renderMessages() {
         }
     }
     
+    // MEMWIN: first rendered message index for this chat. All block/index
+    // math below stays ABSOLUTE (mappedParts index === message index);
+    // windowing only short-circuits the per-message HTML to ''.
+    var winStart = _getWindowStart(chat);
+
     // Find user message indices to know where to insert inline changes
     var userMsgIndices = [];
     chat.messages.forEach(function(msg, idx) {
@@ -605,6 +710,10 @@ function renderMessages() {
     var processedAttachments = {};
 
     var mappedParts = chat.messages.map(function(msg, index) {
+        // MEMWIN: out-of-window messages produce NO markup (not even a hidden
+        // placeholder div). winStart sits on a turn boundary, so attachment
+        // groups and compact-mode blocks never straddle the cut.
+        if (index < winStart) return '';
         var html = '';
 
         // Check for attachment grouping (screenshot, pdf, file should wrap together)
@@ -1192,7 +1301,23 @@ function renderMessages() {
         }
         return '';
     });
-    var mappedHtml = mappedParts.join('');
+    // MEMWIN: "Show earlier messages" notice above the windowed tail. Kept out
+    // of mappedParts so msg-index alignment is preserved; the R1 fast path
+    // never touches it (it only swaps/appends msg-* tail nodes), and the count
+    // it shows can only change when winStart moves — which always forces a
+    // full rebuild (non-tail signature change).
+    var windowNoticeHtml = '';
+    if (winStart > 0) {
+        var hiddenTurns = 0;
+        for (var hti = 0; hti < winStart; hti++) {
+            if (chat.messages[hti].role === 'user' && !chat.messages[hti].isHookMessage) hiddenTurns++;
+        }
+        windowNoticeHtml = '<div class="messages-window-notice" id="messages-window-notice">' +
+            '<button class="show-earlier-btn" onclick="showEarlierMessages()">' + UI_ICONS.chevronDown + ' Show earlier messages' +
+            (hiddenTurns > 0 ? ' (' + hiddenTurns + ' turn' + (hiddenTurns === 1 ? '' : 's') + ' hidden)' : '') +
+            '</button></div>';
+    }
+    var mappedHtml = windowNoticeHtml + mappedParts.join('');
 
     // R1: compute per-message signatures and try the incremental fast path
     // before falling through to the full innerHTML rebuild below.
@@ -1917,7 +2042,9 @@ function highlightJS(code) {
 function formatContent(content) {
     // Extract document placeholders BEFORE escaping
     var documentBlocks = [];
-    var html = content.replace(/<!--document:(doc_\w+)-->/g, function(match, docId) {
+    // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids
+    // ([a-z0-9_]) — the class below covers both; hyphen kept for safety.
+    var html = content.replace(/<!--document:([A-Za-z0-9_-]+)-->/g, function(match, docId) {
         var rendered = typeof renderDocumentPlaceholder === 'function' ? renderDocumentPlaceholder(docId) : '<div class="sdoc-error">Document: ' + docId + '</div>';
         documentBlocks.push(rendered);
         return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
@@ -2170,20 +2297,59 @@ function formatContent(content) {
     return html;
 }
 
-// Decorate bare widget_/doc_ IDs written in chat text — by the agent OR by the
+// Decorate bare widget_/doc IDs written in chat text — by the agent OR by the
 // user (user bubbles run through this same formatContent pipeline, see the
 // user-text-md branch above) — as clickable chips with a hover tooltip.
 // ID formats are anchored on the real generators:
 //   widget_<Date.now()>_<Math.random().toString(36).substr(2,9)>  tools/080-widget-tools.js:68
-//   doc_<Date.now()>_<Math.random().toString(36).substr(2,7)>     tools/110-smart-documents.js:105
-// The \d{10,} epoch requirement is what keeps prose like "doc_id" / "widget_id"
-// (and a bare "doc_1234") from being decorated. Because the matched substring can
-// only contain [a-z0-9_], it is safe verbatim inside the single-quoted onclick
-// argument and inside the title attribute — no quote can ever appear in it.
+//   document ids: human-readable title slugs ([a-z0-9_], e.g. 'q3_report',
+//   'q3_report_2' on collision)                tools/110-smart-documents.js (_sdocNewId)
+//   LEGACY document ids: doc_<Date.now()>_<Math.random().toString(36).substr(2,7)>
+// Legacy widget/doc ids are matched by pattern (the \d{10,} epoch requirement
+// is what keeps prose like "doc_id" / "widget_id" and a bare "doc_1234" from
+// being decorated). Slug doc ids carry no marker, so they are decorated ONLY
+// on an exact word-token match against the KNOWN document ids in the
+// smartDocuments registry (memoised alternation regex below) — never by
+// shape, so arbitrary prose words are safe. All id alphabets are [a-z0-9_],
+// safe verbatim inside the single-quoted onclick argument and the title
+// attribute — no quote can ever appear in them.
+
+// Memoised \b(id1|id2|…)\b matcher over the KNOWN slug document ids.
+// Rebuilt only when the id set changes (formatContent re-runs on every
+// streaming repaint, so this must be cheap in steady state). Legacy-format
+// ids are excluded — the legacy pattern pass already covers them. Ids are
+// filtered to [a-z0-9_] so no regex escaping is needed.
+var _docIdChipRegex = null;
+var _docIdChipKey = '';
+function _knownDocIdRegex() {
+    try {
+        if (typeof smartDocuments === 'undefined' || !smartDocuments) return null;
+        var ids = [];
+        for (var k in smartDocuments) {
+            if (/^[a-z0-9_]+$/.test(k) && !/^doc_\d{10,}_[a-z0-9]{1,9}$/.test(k)) ids.push(k);
+        }
+        if (!ids.length) return null;
+        ids.sort();
+        var key = ids.join('|');
+        if (key !== _docIdChipKey || !_docIdChipRegex) {
+            _docIdChipKey = key;
+            _docIdChipRegex = new RegExp('\\b(?:' + key + ')\\b', 'g');
+        }
+        return _docIdChipRegex;
+    } catch (e) { return null; }
+}
+
 function decorateIdMentions(html) {
     // Fast path first: formatContent re-runs on EVERY streaming repaint (rAF tick,
-    // core/050-streaming.js:268), so the common case must cost two indexOf scans.
-    if (html.indexOf('widget_') === -1 && html.indexOf('doc_') === -1) return html;
+    // core/050-streaming.js:268), so the common case must stay cheap: two indexOf
+    // scans, plus ONE memoised-regex test for slug doc ids (they carry no 'doc_'
+    // marker an indexOf could find).
+    if (html.indexOf('widget_') === -1 && html.indexOf('doc_') === -1) {
+        var _kre = _knownDocIdRegex();
+        if (!_kre) return html;
+        _kre.lastIndex = 0;
+        if (!_kre.test(html)) return html;
+    }
 
     // Stash-then-restore, same trick as the bare-URL autolinker in formatContent.
     // Two passes, in this order:
@@ -2246,6 +2412,26 @@ function decorateIdMentions(html) {
         // order-independent instead of relying on that accident.
         return stash('<span class="id-mention id-mention-doc" onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
     });
+
+    // Slug document ids (human-readable, no prefix): decorate ONLY exact word
+    // tokens matching a KNOWN document id (see _knownDocIdRegex above). Runs
+    // after the legacy passes, whose chips are stashed and therefore invisible
+    // here. Case-sensitive: ids are lowercase, so prose like "Roadmap" never
+    // matches a doc id 'roadmap'.
+    var _slugRe = _knownDocIdRegex();
+    if (_slugRe) {
+        _slugRe.lastIndex = 0;
+        html = html.replace(_slugRe, function(id) {
+            var name = '';
+            try {
+                if (typeof smartDocuments !== 'undefined' && smartDocuments && smartDocuments[id] && smartDocuments[id].title) {
+                    name = String(smartDocuments[id].title);
+                }
+            } catch (e) {}
+            var tip = name ? ('Open document: ' + name) : ('Click to open document ' + id);
+            return stash('<span class="id-mention id-mention-doc" onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+        });
+    }
 
     // Function replacements (not strings) so $-patterns in the restored markup are
     // never interpreted by String.replace — same rationale as the restores above.

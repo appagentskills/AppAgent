@@ -544,8 +544,17 @@ async function summarizeAndStartNewChat() {
     
     // Run the agent to generate the summary
     stickToBottom = true;
+    // FLUX-QW6: clear pause via the shared helpers — legacy global + per-chat
+    // map + persisted flag (setChatPausedPersistent) + SW mirror
+    // (pushPauseToggleToOffscreen) — and repaint through the SSOT
+    // syncPauseButtonUI (app/020-api-messages.js). The old hand-written label
+    // left pausedChats[currentChatId] set on a paused chat, so the summary
+    // run was silently dropped by runAgent's pause gate while the button
+    // claimed "Pause".
     paused = false;
-    document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
+    setChatPausedPersistent(currentChatId, false);
+    pushPauseToggleToOffscreen(currentChatId, false);
+    syncPauseButtonUI(currentChatId);
     await runAgent();
     
     // After agent completes, check if we need to create a new chat with the summary
@@ -620,8 +629,14 @@ function completeSummaryAndCreateNewChat() {
     
     // Auto-start agent to get AI response
     stickToBottom = true;
+    // FLUX-QW6: same recipe as summarizeAndStartNewChat — currentChatId is the
+    // freshly created chat here so the clears are no-ops in practice, but one
+    // uniform recipe means every pause writer mutates pausedChats + the legacy
+    // global together and repaints via the SSOT syncPauseButtonUI.
     paused = false;
-    document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
+    setChatPausedPersistent(currentChatId, false);
+    pushPauseToggleToOffscreen(currentChatId, false);
+    syncPauseButtonUI(currentChatId);
     runAgent();
 }
 
@@ -745,7 +760,7 @@ function selectChat(chatId, options) {
     // Mark the chat as seen — the Active Chats dropdown surfaces chats whose
     // last response the user hasn't viewed yet (lastResponseAt > lastViewedAt).
     if (chats[chatId]) {
-        chats[chatId].lastViewedAt = Date.now();
+        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { lastViewedAt: Date.now() }); // FLUX-4C lane
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
         // Viewing the chat consumes its "finished while you were elsewhere"
         // header badge entry (ui/165-finished-chat-badge.js).
@@ -827,6 +842,28 @@ function selectChat(chatId, options) {
                 try { renderMessages(); } catch (e) {}
             }
         });
+    }
+    // MEMFIX churn guard (PR #805 review, Issue 3): merely VIEWING an idle
+    // chat never routes through the activity stamps (app/036 stamps only on
+    // unread activity), so an old chat's recency stayed old and the sweep
+    // below evicted it the moment the user switched away — A↔B switching
+    // between two old chats hydrated→evicted→hydrated on every switch.
+    // Stamp lastViewedAt through the FLUX-4C chat-meta lane (write-site
+    // ratchet: no direct chats[id].lastViewedAt poke). dispatchChatMeta's
+    // optimistic apply is SYNCHRONOUS and monotonic-max (_applyChatMetaFields,
+    // app/045), so the sweep below still reads the fresh stamp via
+    // chatPayloadRecencyTs, and the SW-canonical value follows (max-wins —
+    // neither side can regress the other).
+    if (chats[chatId] && !chats[chatId].isTemporary && typeof dispatchChatMeta === 'function') {
+        try { dispatchChatMeta(chatId, { lastViewedAt: Date.now() }); } catch (e) {}
+    }
+    // MEMFIX (Fix C): switching chats is the natural moment a previously-
+    // viewed (rehydrated) chat goes cold — run the SAME sweep the 60s tick
+    // runs (payloads + text bodies, keep newest K by recency) immediately
+    // instead of waiting for the next tick/boot. The sweep never touches
+    // the chat we just switched TO (currentChatId guard) nor running chats.
+    if (typeof sweepColdChatPayloads === 'function') {
+        try { sweepColdChatPayloads(CHAT_KEEP_HYDRATED, true); } catch (e) {}
     }
     updateInputPosition();
     updateChatTitleHeader();
@@ -1035,7 +1072,7 @@ function updateChatTitleHeader(includeToolCallId) {
 //     exemption the tombstone for a RUNNING chat was dropped by the
 //     authoritative-writer guard and the chat resurrected.
 // Posted straight on the agent bus port (_agentBusPort, app/045-agent-port-bridge-page.js)
-// because pushChatUpdateToOffscreen() reads chats[chatId], which is already gone.
+// with an inline tombstone payload — chats[chatId] is already gone at this point.
 // FOLLOW-UP: a dedicated 'delete-chat' inbound type would be the explicit
 // protocol; the tombstone is the equivalent expressed with today's message set
 // (and now gets the same unconditional treatment on the SW side).
@@ -1169,11 +1206,9 @@ async function deleteChat(chatId, e) {
     }
     // EXPLICIT-DELETE: durable, targeted removal of the row (and this chat's
     // now-unreferenced payload blobs) from IndexedDB. saveChatsToStorage above
-    // is a BULK diff-save whose delete-pass is capped at 5 per save and
-    // budgeted at WIPE_GUARD_MAX_DELETES_PER_BOOT per realm boot
-    // (ui/070-dashboard-ui.js) — once that budget was spent the pass was dead
-    // for the rest of the realm's life and every deleted chat resurrected on
-    // reload. deleteChatFromDB is neither capped nor budgeted.
+    // is UPSERT-ONLY since PR 3 (RFC addendum — the absence-diff delete-pass
+    // is gone from both realms): saves never delete, so this targeted
+    // deleteChatRow('user-delete') call IS the page-side deletion.
     // Awaited AFTER the UI updates so a congested IDB can't stall the delete
     // feedback.
     if (typeof deleteChatFromDB === 'function') {
@@ -1214,15 +1249,11 @@ async function deleteChat(chatId, e) {
 function togglePinChat(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
-    chat.pinned = !chat.pinned;
-    // MEMFIX: a payload-evicted chat is skipped by the diff-save put-loop, so
-    // a pin toggle on a non-recent chat would silently never persist —
-    // rehydrate first, then save. ensureChatPayloads never rejects.
-    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-        ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
-    } else {
-        saveChatsToStorage();
-    }
+    // FLUX-4C: pinned rides the chat-meta lane — the SW is the single
+    // persister. This also retires the old MEMFIX rehydrate-then-save dance
+    // for payload-evicted chats: the SW read-merge-puts the stored record
+    // directly, so no page-side payload rehydration is needed for a pin.
+    if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { pinned: !chat.pinned });
     renderChatList();
     renderVersionSidebar();
     // #720: pinning the CURRENTLY OPEN chat from the sidebar dropdown / History /

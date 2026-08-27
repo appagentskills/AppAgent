@@ -251,15 +251,21 @@ async function loadHooksSettings() {
 // page records into `sessionPermissions`) are mirrored separately via the
 // 'permissions-update' port message; this loader only covers the persisted
 // IDB state.
+// F6 boot-race guard: set (per slot) by the 'permissions-update' handler in
+// worker/130-port-bridge.js when a panel edit is applied. If that dispatch
+// lands while the boot-time IDB reads below are still in flight, the earlier
+// read must NOT clobber the fresher edit when it finally resolves — the edit
+// was already applied AND persisted by the handler (single writer).
+var _swPermsDirty = {};
 async function loadToolPermissionsInWorker() {
     if (typeof getSetting !== 'function') return;
     try {
         var saved = await getSetting('toolPermissions', null);
-        if (saved && typeof saved === 'object') toolPermissions = saved;
+        if (saved && typeof saved === 'object' && !_swPermsDirty.toolPermissions) toolPermissions = saved;
     } catch (e) {}
     try {
         var savedI = await getSetting('instancePermissions', null);
-        if (savedI && typeof savedI === 'object') instancePermissions = savedI;
+        if (savedI && typeof savedI === 'object' && !_swPermsDirty.instancePermissions) instancePermissions = savedI;
     } catch (e) {}
 }
 
@@ -283,8 +289,17 @@ function executeAfterResponseHooks(chatId) {
         // snippet as the final title.
         chat._titleHookTries = (chat._titleHookTries || 0) + 1;
         if (chat._titleHookTries > 2) {
-            delete chat.titleProvisional;
-            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            // FLUX-T1 (title lane): finalizing the provisional snippet is a
+            // title-state decision — route it through the lane so the clear
+            // persists AND rebroadcasts (panels drop their provisional flag
+            // too; the old bare delete+save left every panel provisional).
+            // Same title, fresh stamp, no rider ⇒ pair wins and clears.
+            if (typeof _swHandleChatMetaUpdate === 'function' && typeof chat.title === 'string' && chat.title) {
+                _swHandleChatMetaUpdate(chatId, { title: chat.title, titleUpdatedAt: Math.max(Date.now(), (chat.titleUpdatedAt || 0) + 1) });
+            } else {
+                delete chat.titleProvisional;
+                if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            }
         } else {
             needsTitle = true;
         }
@@ -395,11 +410,13 @@ function executeAfterResponseHooks(chatId) {
         }
     }
 
-    // Chat-progress hook (OPTIONAL, piggyback-only): ask the model to finalize
-    // the progress card by calling the EXISTING update_action_state tool with a
-    // terminal display state (finished / pr_opened / finished_with_caveat /
-    // error). Modeled on the caveat hook above: it NEVER triggers its own LLM
-    // run — the task is only appended when title/tldr/links already need one.
+    // Chat-progress hook (OPTIONAL): ask the model to finalize the progress
+    // card by calling the EXISTING update_action_state tool with a terminal
+    // display state (finished / pr_opened / finished_with_caveat / error).
+    // Unlike the caveat hook above it CAN fire standalone: a non-terminal
+    // progress card is user-visible dangling state worth one hook run even
+    // when title/tldr/links need nothing. When other hooks fire too, the
+    // finalize request shares their single combined run as before.
     // Skipped on background chats (their action buttons already carry terminal
     // state) and when the latest card already shows a terminal display state.
     // NOTE: getChatProgressStateFor (tools/120-actions.js) is NOT in the SW
@@ -454,9 +471,17 @@ function executeAfterResponseHooks(chatId) {
         }
     }
 
-    // Caveat / progress are piggyback-only: they must NEVER force a run on
-    // their own, so they are deliberately excluded from this early-return guard.
-    if (!needsTitle && !needsTldr && !needsLinks) return;
+    // Progress may fire STANDALONE: compute the will-push decision up front so
+    // the early-return guard, the caveat piggyback gate and the actual push
+    // below all agree. Mirrors the push-time conditions minus tasks.length.
+    var progressWillPush = progressEligible && (chat._progressHookTries || 0) < 2;
+
+    // Caveat is piggyback-only: it must NEVER force a run on its own, so it is
+    // deliberately excluded from this early-return guard. Progress CAN force a
+    // run standalone (progressWillPush) — but it is still delivered inside the
+    // same single combined hook message as any other pending hook tasks, never
+    // as a second follow-up run.
+    if (!needsTitle && !needsTldr && !needsLinks && !progressWillPush) return;
 
     // Build ONE combined instruction so title + TL;DR + links share a single
     // extra LLM run when more than one is needed.
@@ -470,19 +495,22 @@ function executeAfterResponseHooks(chatId) {
     // pushed. This guarantees a caveat-only turn never burns an extra LLM run.
     var caveatPushed = false;
     var caveatTaskNum = 0;
-    if (caveatEligible && tasks.length > 0 && (chat._caveatHookTries || 0) < 2) {
+    // tasks.length > 0 covers title/tldr/links; progressWillPush lets the
+    // caveat ride along on a standalone progress-finalize run too (the run is
+    // already happening — the caveat still never forces one itself).
+    if (caveatEligible && (tasks.length > 0 || progressWillPush) && (chat._caveatHookTries || 0) < 2) {
         tasks.push('OPTIONALLY call the set_caveat tool — set_caveat({caveat: "..."}) with a short warning (1-2 sentences) — ONLY IF your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; do NOT flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, do NOT call set_caveat');
         caveatTarget._caveatAsked = true;
         chat._caveatHookTries = (chat._caveatHookTries || 0) + 1;
         caveatPushed = true;
         caveatTaskNum = tasks.length;
     }
-    // Piggyback the OPTIONAL chat-progress task — same pattern as the caveat:
-    // only when another hook is already firing, flags/tries bumped only when
-    // the task is really pushed.
+    // Append the OPTIONAL chat-progress task — may fire standalone (unlike the
+    // caveat) via progressWillPush; flags/tries bumped only when the task is
+    // really pushed.
     var progressPushed = false;
     var progressTaskNum = 0;
-    if (progressEligible && tasks.length > 0 && (chat._progressHookTries || 0) < 2) {
+    if (progressWillPush) {
         tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary; SKIP this call entirely if no substantive work was done (pure conversational answer)');
         progressTarget._progressAsked = true;
         chat._progressHookTries = (chat._progressHookTries || 0) + 1;

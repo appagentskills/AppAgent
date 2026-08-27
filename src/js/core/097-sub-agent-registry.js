@@ -347,15 +347,60 @@ async function loadAllSubAgents() {
                             _subAgentsDeleteFromDB(rec.agent_id);
                             // Also reclaim the sub's background chat row, mirroring the
                             // idle sweep's cleanup (best-effort, guarded).
+                            // RFC addendum §2.5.3 — AUTHORITY: the sub_agents record being
+                            // reclaimed on the line above; its `agent_id` is the evidence
+                            // (passed as evidence.agentId — here `rec.agent_id`; the idle
+                            // sweep passes `aid`, which is the SAME value because
+                            // _subAgents is keyed by agent_id, so the two sites are
+                            // equivalent). Absence of rec.chat_id from THIS realm's
+                            // `chats` map is NOT authority for anything: the SW map is
+                            // adopt-only, so a sub's row this realm never adopted was
+                            // never in it — those are exactly the rows the save-time
+                            // absence-diff used to reap by inference. So the EXPLICIT
+                            // delete is issued for rec.chat_id unconditionally, and the
+                            // in-memory entry is dropped separately (only when present, so
+                            // the map can't keep a stale entry). No saveChatsToStorage()
+                            // dependency: the primitive re-reads the row inside its own
+                            // transaction and checks isBackground/not-running on disk.
                             try {
-                                if (typeof chats !== 'undefined' && rec.chat_id && chats[rec.chat_id]) {
-                                    delete chats[rec.chat_id];
-                                    // Persist the deletion via a full save — saveChatsToStorage
-                                    // does a clear+rewrite of the chats store, so the removed
-                                    // row actually leaves IDB. (deleteChatFromDB never existed.)
-                                    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                                if (rec.chat_id) {
+                                    // P1: capture the in-memory record BEFORE dropping it — the
+                                    // primitive reaps this chat's now-unreferenced chat_payloads
+                                    // blob rows from evidence.record (core/130-indexeddb.js:1303).
+                                    // Dropping it first (as this did) left every screenshot/file the
+                                    // sub produced in chat_payloads until the orphan payload sweep's
+                                    // 24h floor. Only a realm that reaps blobs acts on it (reapBlobs
+                                    // = !_dbIsWorkerRealm, core/130:1301) and this GC is gated to the
+                                    // authoritative context above (:312), so today it is defensive +
+                                    // ledger legibility (hadRecord) and becomes effective the moment
+                                    // a document-bearing realm runs this path.
+                                    var _gcRec = (typeof chats !== 'undefined' && chats[rec.chat_id]) ? chats[rec.chat_id] : null;
+                                    if (_gcRec) delete chats[rec.chat_id];
+                                    if (typeof deleteChatRow === 'function') {
+                                        // No IIFE needed here (unlike _idleSweepTick): `rec` is a
+                                        // per-iteration forEach parameter, not a for..in-rebound
+                                        // var. Keep it that way if this loop is ever refactored.
+                                        // Async, must never reject into the forEach: settle both arms.
+                                        Promise.resolve(deleteChatRow(rec.chat_id, 'subagent-gc', { agentId: rec.agent_id, record: _gcRec, hadRecord: !!_gcRec })).then(function(ok) {
+                                            if (!ok) {
+                                                // P2: the sub_agents record — the AUTHORITY for this
+                                                // reason (core/130:1239) — was reclaimed on line :347,
+                                                // so nothing would ever retry this row. Remember it.
+                                                console.warn('[sub-agents] boot GC: chat row ' + rec.chat_id + ' was NOT deleted (precondition refusal or aborted transaction) — the sub_agents record is already reclaimed, so remembering the row for the idle sweep to retry');
+                                                _rememberOrphanGcChatRow(rec.chat_id, rec.agent_id);
+                                            }
+                                        }, function(eDel) {
+                                            console.error('[sub-agents] boot GC: deleteChatRow threw for chat ' + rec.chat_id, eDel);
+                                        });
+                                    } else {
+                                        console.error('[sub-agents] boot GC: deleteChatRow (core/130-indexeddb.js) unavailable — chat ' + rec.chat_id + ' NOT deleted');
+                                    }
                                 }
-                            } catch (e) { /* non-fatal */ }
+                            // Was a silent `/* non-fatal */` catch. Now that the body
+                            // issues the authoritative delete, swallowing a synchronous
+                            // throw here would hide a leaked chat row — log it (still
+                            // non-fatal: the sub_agents record is already reclaimed).
+                            } catch (e) { console.warn('[sub-agents] boot GC: failed to delete chat row', rec.chat_id, e); }
                             return;
                         }
                         // else: focus unknown (boot race) or user is viewing this
@@ -887,10 +932,63 @@ function _releasePoolSlot(agentId) {
 // + background chat row). Previously this only ran at boot, so a long-lived
 // tab leaked records indefinitely.
 
+// ---------- P2: orphan chat-row retry list ----------
+// A 'subagent-gc' chat-row delete can be REFUSED on disk (the row is not
+// isBackground, or the chat is running — core/130-indexeddb.js:1240-1241) or its
+// transaction can abort. Both GC sites reclaim the sub_agents record in the same
+// tick, and that record IS the authority for this reason (core/130:1239), so
+// without this list the chat row survives with nobody left to ever retry it —
+// and once RFC PR 3 removes the save-time absence-diff delete pass, permanently.
+// Remember chatId -> the agent_id that authorised the delete, and re-issue it on
+// the next sweep tick. Attempts are capped so a row that will never pass its
+// precondition (e.g. a hand-edited non-background row) cannot retry forever.
+var GC_ORPHAN_RETRY_MAX_ATTEMPTS = 5;
+var _gcOrphanChatRows = Object.create(null); // chatId -> { agentId, attempts }
+
+function _rememberOrphanGcChatRow(chatId, agentId) {
+    // agentId is mandatory: the 'subagent-gc' precondition refuses without it.
+    if (!chatId || !agentId) return;
+    var _e = _gcOrphanChatRows[chatId];
+    if (_e) { _e.agentId = agentId; return; }
+    _gcOrphanChatRows[chatId] = { agentId: agentId, attempts: 0 };
+}
+
+function _retryOrphanGcChatRows() {
+    if (typeof deleteChatRow !== 'function') return;
+    for (var _cid in _gcOrphanChatRows) {
+        var _ent = _gcOrphanChatRows[_cid];
+        if (!_ent) { delete _gcOrphanChatRows[_cid]; continue; }
+        _ent.attempts++;
+        if (_ent.attempts > GC_ORPHAN_RETRY_MAX_ATTEMPTS) {
+            console.warn('[sub-agents] GC: giving up on orphan chat row ' + _cid + ' after '
+                + GC_ORPHAN_RETRY_MAX_ATTEMPTS + ' retries — its precondition keeps refusing; inspect'
+                + ' the decisions with dumpChatDeleteLedger() (core/130-indexeddb.js)');
+            delete _gcOrphanChatRows[_cid];
+            continue;
+        }
+        // No `record`: the in-memory chat entry was dropped when the original GC
+        // ran, so blob reaping is left to the orphan payload sweep. `source` is
+        // whitelisted by _chatDeleteEvidenceDigest (core/130:1195) so the retry is
+        // distinguishable in the ledger.
+        (function(_rcid, _raid, _n) {
+            Promise.resolve(deleteChatRow(_rcid, 'subagent-gc', { agentId: _raid, source: 'gc-orphan-retry' })).then(function(ok) {
+                if (ok) { delete _gcOrphanChatRows[_rcid]; return; }
+                console.warn('[sub-agents] GC: orphan retry ' + _n + '/' + GC_ORPHAN_RETRY_MAX_ATTEMPTS
+                    + ' for chat row ' + _rcid + ' still refused — will retry on the next sweep tick');
+            }, function(eDel) {
+                console.error('[sub-agents] GC: orphan retry deleteChatRow threw for chat ' + _rcid, eDel);
+            });
+        })(_cid, _ent.agentId, _ent.attempts);
+    }
+}
+
 var _idleSweepInterval = null;
 
 function _idleSweepTick() {
     var now = Date.now();
+    // P2: re-attempt chat rows a previous GC could not delete (the authorising
+    // sub_agents record is already gone, so this list is the only retry owner).
+    try { _retryOrphanGcChatRows(); } catch (e) { /* never break the sweep */ }
     for (var aid in _subAgents) {
         var r = _subAgents[aid];
         if (!r) continue;
@@ -994,16 +1092,47 @@ function _idleSweepTick() {
             // IDB. On long-lived tabs / restored profiles these accumulated
             // indefinitely (hidden because isBackground=true) and slowed every
             // chat-list enumeration.
+            // RFC addendum §2.5.3 — AUTHORITY: the sub_agents record `r` being
+            // reclaimed just below; its agent_id is the evidence (passed as
+            // evidence.agentId — here the loop key `aid`, which IS r.agent_id
+            // because _subAgents is keyed by agent_id, so this matches the boot
+            // GC's rec.agent_id). NOT absence from any chats map. This used to
+            // `delete chats[id]` and let saveChatsToStorage()'s absence-diff
+            // delete-pass infer the removal
+            // (budget-capped, so backlogs drained over successive saves). Now the
+            // delete is EXPLICIT and issued in this tick for r.chat_id even when
+            // this realm's map never held the row — the SW map is adopt-only, and
+            // those unadopted rows are precisely the ones the absence-diff reaped.
+            // The in-memory entry is dropped separately, only when present.
             try {
-                if (typeof chats !== 'undefined' && r.chat_id && chats[r.chat_id]) {
-                    delete chats[r.chat_id];
-                    // Persist the deletion via a full save — saveChatsToStorage
-                    // diff-saves: rows absent from the in-memory map are removed by
-                    // its delete-pass (capped at 5 deletions per save — wipe-guard-2
-                    // in worker/115-storage.js / ui/070-dashboard-ui.js — so larger
-                    // GC backlogs drain over successive saves). (deleteChatFromDB
-                    // never existed.)
-                    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                if (r.chat_id) {
+                    // P1: capture the record BEFORE dropping it (see the boot GC) —
+                    // evidence.record is what lets the primitive reap this chat's
+                    // chat_payloads blob rows (core/130-indexeddb.js:1303).
+                    var _gcRecord = (typeof chats !== 'undefined' && chats[r.chat_id]) ? chats[r.chat_id] : null;
+                    if (_gcRecord) delete chats[r.chat_id];
+                    if (typeof deleteChatRow === 'function') {
+                        // Capture chat/agent id + record: `var r` / `aid` are rebound by
+                        // the enclosing for..in on every iteration, so an async closure
+                        // reading them later would log the WRONG record.
+                        (function(_gcChatId, _gcAgentId, _gcRec) {
+                            // Async, must never reject out of the sweep: settle both arms.
+                            Promise.resolve(deleteChatRow(_gcChatId, 'subagent-gc', { agentId: _gcAgentId, record: _gcRec, hadRecord: !!_gcRec })).then(function(ok) {
+                                if (!ok) {
+                                    // P2: `delete _subAgents[aid]` + _subAgentsDeleteFromDB(aid)
+                                    // below run in THIS tick regardless of the outcome, and that
+                                    // record is the authority for this reason (core/130:1239) —
+                                    // so remember the row instead of leaking it forever.
+                                    console.warn('[sub-agents] GC: chat row ' + _gcChatId + ' was NOT deleted (precondition refusal or aborted transaction) — the sub_agents record is reclaimed in this same tick, so remembering the row for the next sweep to retry');
+                                    _rememberOrphanGcChatRow(_gcChatId, _gcAgentId);
+                                }
+                            }, function(eDel) {
+                                console.error('[sub-agents] GC: deleteChatRow threw for chat ' + _gcChatId, eDel);
+                            });
+                        })(r.chat_id, aid, _gcRecord);
+                    } else {
+                        console.error('[sub-agents] GC: deleteChatRow (core/130-indexeddb.js) unavailable — chat ' + r.chat_id + ' NOT deleted');
+                    }
                 }
             } catch (e) { console.warn('subAgent GC: failed to delete chat row', r.chat_id, e); }
             // A reclaimed ABANDONED-SLEEP parent may still own live descendants:
@@ -1080,12 +1209,44 @@ function applySubAgentSnapshot(records) {
 
 // ---------- ID helpers ----------
 
-function _newAgentId() {
-    return 'sub_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e9).toString(36);
+// True when `id` is already used by a known sub-agent. loadAllSubAgents()
+// drains the ENTIRE sub_agents IDB store into _subAgents at boot in the
+// authoritative (SW) context where spawns run, so the in-memory map IS the
+// full known-id set. The chats-map probe is belt-and-braces for the
+// pathological case where a registry record was GC'd but its chat row
+// lingers — the derived chat id would collide even though the agent id
+// looks free.
+function _agentIdTaken(id) {
+    if (_subAgents[id]) return true;
+    if (typeof chats !== 'undefined' && chats && chats['chat_sub_' + id]) return true;
+    return false;
 }
 
-function _newSubChatId() {
-    return 'chat_sub_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e9).toString(36);
+// Human-readable agent id: slug of the spawn `name` (fallback 'worker'),
+// e.g. name:"ID discovery" → 'id_discovery', made unique against every
+// known agent id by appending _2, _3, … (slugifyIdBase lives in
+// core/095-handle-registry.js, loaded before this file in both bundles).
+// RESERVED words: 'parent' is the special agent_message recipient literal
+// (to:'parent', see agentMessage below); 'all' is reserved defensively for
+// future broadcast semantics. Neither may ever be emitted as an agent id.
+// Legacy ids ('sub_<ts36>_<rand36>') persist in IDB and old transcripts;
+// every lookup is exact-key based (_subAgents[id] / getAll), so old and new
+// formats coexist with no migration.
+function _newAgentId(nameHint) {
+    var base = slugifyIdBase(nameHint, 'worker');
+    if (base === 'parent' || base === 'all') base = base + '_agent';
+    var id = base;
+    var n = 2;
+    while (_agentIdTaken(id)) { id = base + '_' + n; n++; }
+    return id;
+}
+
+// Sub chat ids KEEP the functional 'chat_sub_' prefix (prefix-checked by
+// ui/120-ui-utils.js:365 and worker/130-port-bridge.js:1830) and derive
+// 1:1 from the agent id — agent-id uniqueness covers chat-id uniqueness
+// (plus the explicit chats-map probe in _agentIdTaken).
+function _newSubChatId(agentId) {
+    return 'chat_sub_' + agentId;
 }
 
 // ---------- Tool roster computation ----------
@@ -1313,8 +1474,8 @@ function spawnSubAgent(args, ctx) {
         return { success: false, error: 'spawn_sub_agent: `instructions` is required (string).' };
     }
 
-    var agent_id = _newAgentId();
-    var chat_id  = _newSubChatId();
+    var agent_id = _newAgentId(args.name);
+    var chat_id  = _newSubChatId(agent_id);
 
     // Determine if the *spawner* is itself a sub-agent — used for
     // breadcrumbing and to enforce the no-nested-spawn default.
@@ -1429,7 +1590,9 @@ function spawnSubAgent(args, ctx) {
         parent_agent_id: parentAgentId,
         depth: depth,
         root_chat_id: rootChatId,
-        name: args.name || ('sub_' + agent_id.slice(-6)),
+        // Unnamed spawns fall back to the agent id itself — it is a readable
+        // slug now ('worker', 'worker_2', …), not an opaque suffix.
+        name: args.name || agent_id,
         state: 'running',
         spawn_args: args,
         spawn_handle_id: spawn_handle_id,
@@ -2405,8 +2568,11 @@ function _resolveSpawnHandle(agentId, payload) {
 // chat, pushed at spawn time (status:'running', spinner) and updated in place
 // as the sub makes progress (agent_message -> parent), then finalized on
 // report_to_parent / auto-report / stop. _findSubAgentCard locates that row;
-// _repaintParent persists + repaints the parent (if in view) and notifies
-// background subscribers / other tabs.
+// _repaintParent persists + notifies via ONE path: the 'messagesAppended'
+// emit. Page-side, the handler in app/036-agent-event-handlers-page.js
+// renders iff the parent chat is on screen; SW-side, the broadcast bridge
+// (worker/100-agent-event-broadcast.js) inlines the parent-chat snapshot and
+// relays to every panel, whose own handler applies the same gate.
 function _findSubAgentCard(parentChatId, agentId) {
     var pc = (typeof chats !== 'undefined') ? chats[parentChatId] : null;
     if (!pc || !pc.messages || !agentId) return null;
@@ -2418,13 +2584,17 @@ function _findSubAgentCard(parentChatId, agentId) {
 }
 function _repaintParent(parentChatId) {
     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
-    try {
-        if (typeof currentChatId !== 'undefined' && currentChatId === parentChatId
-            && typeof renderMessages === 'function') renderMessages();
-    } catch (_) { /* ignore */ }
+    // Single render path (flux QW5): no direct renderMessages() here. The
+    // emit below reaches app/036's 'messagesAppended' handler synchronously
+    // when this runs page-side (the old direct call rendered a second time
+    // right after it), and via the port broadcast when this runs SW-side
+    // (where renderMessages doesn't exist anyway). No force flag: panels
+    // viewing OTHER chats used to full-rebuild their own transcript for
+    // every sub-card progress tick; the inlined snapshot merge in app/045
+    // keeps their replica fresh without a repaint.
     try {
         if (typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
-            AgentEvents.emit('messagesAppended', { chatId: parentChatId, force: true });
+            AgentEvents.emit('messagesAppended', { chatId: parentChatId, reason: 'sub-agent-card' });
         }
     } catch (_) { /* ignore */ }
 }
@@ -4459,6 +4629,34 @@ function onToolCallInSubAgent(chatId) {
     }
 }
 
+// ---------- Live activity (thinking vs tool) ----------
+// EPHEMERAL display state: which phase a RUNNING sub is in right now —
+// 'thinking' (LLM streaming/reasoning) or 'tool' (a tool call executing).
+// Driven SW-side from AgentEvents in worker/105-subagent-broadcast.js and
+// mirrored to the page for free by the subagent-snapshot broadcast.
+// DELIBERATELY NOT persisted here (no _subAgentsPersist): streamDelta fires
+// many times per second and per-change IDB writes would be pure write
+// amplification for a value that is meaningless across an SW restart.
+// (Other persist sites may incidentally write a snapshot of rec.activity —
+// harmless: renderers gate on state==='running' and a resumed run re-stamps
+// it on its first event.) No-ops when phase+tool are unchanged, so the
+// streamDelta flood costs two map lookups and never notifies.
+function noteSubActivity(chatId, phase, toolName, toolLabel) {
+    if (typeof chats === 'undefined' || !chats[chatId] || !chats[chatId].isSubAgent) return;
+    var rec = _subAgents[chats[chatId].subAgentId];
+    if (!rec) return;
+    if (!phase) { // clear (runFinished / runCrashed)
+        if (!rec.activity) return;
+        rec.activity = null;
+        _notifyListeners();
+        return;
+    }
+    var prev = rec.activity;
+    if (prev && prev.phase === phase && (prev.tool || null) === (toolName || null)) return;
+    rec.activity = { phase: phase, tool: toolName || null, tool_label: toolLabel || null, at: Date.now() };
+    _notifyListeners();
+}
+
 // Called by 030-agent-loop.js when runAgent finishes naturally (the model
 // produced a final assistant message with no further tool calls). If the
 // sub never called report_to_parent + auto_report is on, synthesize a
@@ -4879,6 +5077,9 @@ var SubAgents = {
     // vanished from the chats store). Thin alias — _markErrored already does
     // everything atomically.
     markOrphaned: function(agentId, msg) { _markErrored(agentId, msg || 'sub-agent orphaned: chat transcript missing at resume'); },
+    // Live-activity setter (SW-authoritative; wired in worker/105-subagent-
+    // broadcast.js). In-memory + broadcast only — see noteSubActivity.
+    noteSubActivity: noteSubActivity,
     listAll: function() {
         var out = []; for (var aid in _subAgents) out.push(_subAgents[aid]); return out;
     },

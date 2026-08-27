@@ -110,10 +110,26 @@ async function executeSmartDocument(args, messageIndex, options) {
     return { success: false, error: 'Unknown action: ' + action };
 }
 
+// Human-readable doc id: slug of the title (fallback 'document'), unique
+// against the in-memory cache AND IndexedDB — the cache can be stale across
+// contexts (page vs SW mutate independently; documentChanged only flows
+// worker→page), so every candidate is probed in IDB too. loadDocumentById
+// doubles as a cache hydrator when the probe finds an existing doc.
+// Collisions get _2, _3, … appended. Legacy ids ('doc_<epoch>_<rand>')
+// persist in IDB / old transcripts; all lookups are exact-key based, so old
+// and new formats coexist with no migration.
+async function _sdocNewId(title) {
+    var base = typeof slugifyIdBase === 'function' ? slugifyIdBase(title, 'document') : ('doc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7));
+    var id = base;
+    var n = 2;
+    while (smartDocuments[id] || await loadDocumentById(id)) { id = base + '_' + n; n++; }
+    return id;
+}
+
 async function sdocToolCreate(args, options) {
     var title = args.title || 'Untitled Document';
     var content = args.content || '';
-    var docId = 'doc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7);
+    var docId = await _sdocNewId(title);
     var now = Date.now();
 
     var scope = (args.scope === 'chat') ? 'chat' : 'shared';
@@ -1013,8 +1029,9 @@ async function sdocDeleteFromPage(docId) {
 // ─── Create from Page ───
 
 async function sdocCreateFromPage() {
-    // Create a blank document
-    var docId = 'doc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7);
+    // Create a blank document — readable slug id ('untitled_document',
+    // 'untitled_document_2', … on collision).
+    var docId = await _sdocNewId('Untitled Document');
     var now = Date.now();
     var fileId = newFileId();
     var doc = {

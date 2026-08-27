@@ -2420,8 +2420,7 @@ function showChatView() {
     // user returns to the chat view and can actually see the messages.
     if (currentView === 'chat' && typeof currentChatId !== 'undefined' && currentChatId &&
         typeof chats !== 'undefined' && chats[currentChatId]) {
-        chats[currentChatId].lastViewedAt = Date.now();
-        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(currentChatId, { lastViewedAt: Date.now() }); // FLUX-4C lane
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     }
 }

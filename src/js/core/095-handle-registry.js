@@ -43,12 +43,39 @@ var _lastGcAt = 0;
 
 function _nowMs() { return Date.now(); }
 
-function _newHandleId() {
+// ---------- Shared slug helper (human-readable ids) ----------
+// Lowercase; any run of non-[a-z0-9] chars collapses to a single '_';
+// leading/trailing '_' trimmed; capped at ~40 chars; empty result falls
+// back to `fallback`. Output alphabet is strictly [a-z0-9_] so slugs
+// survive every \w-based regex in the codebase (placeholder parsing,
+// chip decoration, \b word bounds).
+// Consumers: _newHandleId below, the sub-agent registry
+// (core/097-sub-agent-registry.js _newAgentId) and smart documents
+// (tools/110-smart-documents.js _sdocNewId). This file loads before both
+// in the page bundle (core tier, 095 < 097 < tools) AND the worker bundle
+// (build/build.js WORKER_SHARED_FILES order).
+function slugifyIdBase(text, fallback) {
+    var s = String(text == null ? '' : text).toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 40)
+        .replace(/_+$/, ''); // the cap can cut mid-run and leave a trailing '_'
+    return s || fallback || 'item';
+}
+
+function _newHandleId(label) {
     _handleCounter = (_handleCounter + 1) | 0;
-    // h_<base36 ts>_<counter>_<rand>
-    var ts = _nowMs().toString(36);
-    var rnd = Math.floor(Math.random() * 1e9).toString(36);
-    return 'h_' + ts + '_' + _handleCounter + '_' + rnd;
+    // <slug>_h<counter>_<rand> — readable slug of the display/tool name the
+    // handle is created for (e.g. spawn_sub_agent_id_discovery_h3_k7f2),
+    // plus an in-session counter. The SHORT random suffix is NOT decorative:
+    // handles themselves are in-memory, but SPAWN handle ids are persisted
+    // (sub_agents records carry spawn_handle_id) and re-registered under
+    // their ORIGINAL id at boot via _restoreHandle — after an MV3 SW restart
+    // _handleCounter resets, so counter-only ids could collide with a
+    // restored id from the previous session.
+    var base = slugifyIdBase(label, 'handle');
+    var rnd = Math.floor(Math.random() * 1679616).toString(36); // ≤4 chars
+    return base + '_h' + _handleCounter + '_' + rnd;
 }
 
 function _resolvedChatId(chatId) {
@@ -160,7 +187,7 @@ function _startHandle(chatId, name, args, displayName, runFn) {
     _gcSweep();
     chatId = _resolvedChatId(chatId);
     if (!_handles[chatId]) _handles[chatId] = Object.create(null);
-    var handleId = _newHandleId();
+    var handleId = _newHandleId(displayName || name);
     var entry = {
         handleId: handleId,
         chatId: chatId,

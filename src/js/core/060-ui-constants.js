@@ -362,7 +362,11 @@ var UI_ICONS = {
     rocket: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>',
     bug: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2"/><path d="M5 7l3 2"/><path d="M19 13h-3"/><path d="M8 13H5"/><path d="M19 19l-3-2"/><path d="M5 19l3-2"/><path d="M12 6V4"/><path d="M9 4h6"/></svg>',
     gitBranch: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>',
-    gitMerge: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><circle cx="17" cy="12" r="2.5"/><path d="M7 7.5v9"/><path d="M7 8c0 2.7 2.5 4 7.5 4"/></svg>'
+    gitMerge: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><circle cx="17" cy="12" r="2.5"/><path d="M7 7.5v9"/><path d="M7 8c0 2.7 2.5 4 7.5 4"/></svg>',
+    // ACTIVITY: "model is thinking" indicator (lucide brain) — shown while an
+    // agent is streaming/reasoning with no tool executing (see _subActivityInfo
+    // in ui/175-sub-agent-ui.js and showSpinner in ui/240-layout.js).
+    thinking: '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></svg>'
 };
 
 // Get tool-specific icon based on tool name
@@ -389,5 +393,13 @@ function getToolIcon(toolName) {
     if (toolName === 'document') return UI_ICONS.file;
     if (toolName === 'list_instances') return UI_ICONS.api;
     if (toolName === 'get_cookie') return UI_ICONS.lock;
+    if (toolName === 'workspace') return UI_ICONS.gitBranch;
+    if (toolName === 'web_fetch') return UI_ICONS.globe;
+    if (toolName === 'spawn_sub_agent' || toolName === 'wake_sub_agent'
+        || toolName === 'stop_sub_agent' || toolName === 'agent_status') return UI_ICONS.bot;
+    if (toolName === 'report_to_parent') return UI_ICONS.backToParent;
+    if (toolName === 'agent_message') return UI_ICONS.chat;
+    if (toolName === 'await_handle' || toolName === 'await_any' || toolName === 'await_all') return UI_ICONS.hourglass;
+    if (toolName === 'get_file') return UI_ICONS.file;
     return UI_ICONS.tool;
 }

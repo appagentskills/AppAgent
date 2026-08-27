@@ -320,7 +320,7 @@ function updateInputPosition() {
     }
 }
 
-function showSpinner(text, chatId) {
+function showSpinner(text, chatId, opts) {
     // In compact mode, skip the spinner - the collapsible area shows status
     if (compactToolCalls) return;
     // Skip spinner while the TARGET chat's silent after-response hook runs.
@@ -336,8 +336,19 @@ function showSpinner(text, chatId) {
     // overwrite the foreground chat's spinner text every loop iteration.
     if (chatId && chatId !== currentChatId) return;
     var container = document.getElementById('messages');
+    // ACTIVITY: opts (from app/036-agent-event-handlers-page.js) picks the
+    // leading glyph — {phase:'tool', tool:'<raw name>'} shows that tool's icon
+    // (getToolIcon), {phase:'thinking'} shows the pulsing thinking icon. Every
+    // other caller (downloads, reverts, … pass no opts) keeps the generic
+    // spinner circle exactly as before.
+    var glyph = '<div class="spinner"></div>';
+    if (opts && opts.phase === 'tool' && opts.tool && typeof getToolIcon === 'function') {
+        glyph = '<span class="spinner-activity spinner-activity-tool" aria-hidden="true">' + getToolIcon(opts.tool) + '</span>';
+    } else if (opts && opts.phase === 'thinking' && typeof UI_ICONS !== 'undefined' && UI_ICONS.thinking) {
+        glyph = '<span class="spinner-activity spinner-activity-thinking" aria-hidden="true">' + UI_ICONS.thinking + '</span>';
+    }
     var spinnerHtml = '<div class="spinner-container" id="loading-spinner">' +
-        '<div class="spinner"></div>' +
+        glyph +
         '<span class="spinner-text">' + escapeHtml(text || 'Thinking...') + '</span>' +
         '</div>';
     hideSpinner();

@@ -309,6 +309,10 @@ function navigateToSearchMatch(chatId, match) {
         selectChat(chatId);
     }
     
+    // MEMWIN: expand the message window so the match's msg-<idx> node will be
+    // in the DOM after the highlight render below.
+    if (typeof ensureMessageInWindow === 'function' && match) ensureMessageInWindow(match.msgIndex);
+    
     // First enable highlighting
     window.currentSearchHighlight = chatSearchQuery;
     renderMessages();

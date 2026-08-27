@@ -88,8 +88,16 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     // record's spawn handle under its persisted id (see
     // _rehydrateSpawnHandle in src/js/core/097-sub-agent-registry.js).
     var loadSubs = (typeof SubAgents !== 'undefined' && SubAgents.loadAll) ? SubAgents.loadAll() : Promise.resolve();
+    // FLUX-4/3 (late-hydration resync): keep a handle on the REAL chats
+    // loader promise. safe() races it against the 20s deadline — when the
+    // deadline wins, _swBootReady resolves with _chatsHydrated still false
+    // and any panel connected in that window received an adopts-only
+    // chat-meta snapshot (worker/130-port-bridge.js _registerPanel). The
+    // one-shot .then armed after the gate below fires when the getAll
+    // finally lands and pushes a fresh snapshot to connected panels.
+    var _chatsLoadP = loadChatsFromStorage();
     Promise.all([
-        safe(loadChatsFromStorage(), 'chats'),
+        safe(_chatsLoadP, 'chats'),
         safe(loadApiProviders(), 'apiProviders'),
         safe(loadSkillDefs, 'skills'),
         safe(loadActive, 'activeSkills'),
@@ -104,6 +112,20 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // Signal that `chats` and providers are populated. Any concurrent
         // resume from background.js was waiting on this.
         if (_swBootReadyResolve) { _swBootReadyResolve(); _swBootReadyResolve = null; }
+        // FLUX-4/3: boot gate resolved while the chats getAll is still in
+        // flight (deadline path) — arm a ONE-SHOT resync for when it lands.
+        // loadChatsFromStorage never rejects (own try/catch) and leaves
+        // _chatsHydrated false on failure, so the guard inside the .then
+        // makes a failed / never-landing load a no-op (no storm, no retry).
+        if (typeof _chatsHydrated !== 'undefined' && !_chatsHydrated) {
+            console.warn('[sw-runtime] boot gate resolved before chats hydration — arming late-hydration resync');
+            Promise.resolve(_chatsLoadP).then(function() {
+                if (typeof _chatsHydrated !== 'undefined' && _chatsHydrated
+                    && typeof self._swLateHydrationResync === 'function') {
+                    self._swLateHydrationResync();
+                }
+            }).catch(function() {});
+        }
         // Boot sweep: reap finished/stale agent_runs checkpoints so the
         // store self-heals from pre-delete-on-finish bloat (each record
         // carries a full messagesSnapshot). Fire-and-forget, non-fatal;
@@ -136,6 +158,24 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
             }
         } catch (eSweep2) {
             console.warn('[sw-runtime] chat_payloads sweep failed', eSweep2);
+        }
+        // EMPTY-ROW GC (RFC addendum §2.5.2, PR 3): reap 0-message chat rows
+        // older than 24h via the explicit 'empty-row' delete signal
+        // (deleteChatRow, core/130-indexeddb.js). Before PR 3 the save's
+        // absence-diff reaped them implicitly at the first save; saves are
+        // upsert-only now, so this boot pass is the only reaper. Expect a
+        // one-off count drop at the first boot after PR 3 (RFC addendum §5).
+        // Fire-and-forget, non-fatal; capped at 200/boot inside.
+        try {
+            if (typeof gcEmptyChatRows === 'function') {
+                gcEmptyChatRows().then(function(n) {
+                    if (n > 0) console.log('[sw-runtime] empty-row GC reaped ' + n + ' empty chat row(s)');
+                }).catch(function(e) {
+                    console.warn('[sw-runtime] empty-row GC failed', e);
+                });
+            }
+        } catch (eSweep3) {
+            console.warn('[sw-runtime] empty-row GC failed', eSweep3);
         }
         return listRunningAgentCheckpoints();
     }).then(function(checkpoints) {

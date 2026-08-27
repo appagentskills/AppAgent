@@ -286,6 +286,59 @@ function _subReportLiveStatus(msg) {
     return 'running';
 }
 
+// ---------- Live activity (thinking vs tool) ----------
+// Resolve the live-activity descriptor for a RUNNING record. rec.activity is
+// stamped SW-side (core/097 noteSubActivity, wired in worker/105-subagent-
+// broadcast.js) and arrives here via the subagent-snapshot mirror. Returns
+// { phase, tool, icon, label } or null — callers MUST keep their existing
+// spinner / bot-icon fallback for null so old snapshots, non-running states
+// and cleared activity render exactly as before.
+function _subActivityInfo(rec) {
+    if (!rec || rec.state !== 'running' || !rec.activity || !rec.activity.phase) return null;
+    var act = rec.activity;
+    if (act.phase === 'tool' && act.tool) {
+        var icon = (typeof getToolIcon === 'function') ? getToolIcon(act.tool) : '';
+        if (!icon) return null;
+        var label = act.tool_label
+            || ((typeof TOOL_DISPLAY_NAMES !== 'undefined' && TOOL_DISPLAY_NAMES[act.tool]) || String(act.tool));
+        return { phase: 'tool', tool: act.tool, icon: icon, label: label };
+    }
+    if (act.phase === 'thinking' && typeof UI_ICONS !== 'undefined' && UI_ICONS.thinking) {
+        return { phase: 'thinking', tool: null, icon: UI_ICONS.thinking, label: 'thinking' };
+    }
+    return null;
+}
+
+// Change-key fragment for repaint gating (_subReportKey). '' when there is no
+// renderable activity, so legacy keys stay byte-identical to today's.
+function _subActivityKey(rec) {
+    var act = _subActivityInfo(rec);
+    return act ? (act.phase + ':' + (act.tool || '')) : '';
+}
+
+// In-place patch of a worker card's activity icon + state-line label (strip
+// cards AND the self card), keyed on data-activity-key so unchanged phases
+// are a no-op and CSS animations never restart. Null rec → untouched.
+function _patchWorkerCardActivity(card, rec) {
+    if (!card || !rec) return;
+    var iconEl = card.querySelector('.worker-card-icon');
+    if (!iconEl) return;
+    var act = _subActivityInfo(rec);
+    var key = act ? (act.phase + ':' + act.label) : '';
+    if (iconEl.getAttribute('data-activity-key') !== key) {
+        iconEl.setAttribute('data-activity-key', key);
+        iconEl.innerHTML = act ? act.icon : ((typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '');
+        iconEl.classList.toggle('worker-activity-thinking', !!act && act.phase === 'thinking');
+        iconEl.classList.toggle('worker-activity-tool', !!act && act.phase === 'tool');
+        var stEl = card.querySelector('[data-worker-state]');
+        if (stEl) {
+            var txt = act ? act.label : (rec.state || '');
+            if (stEl.textContent !== txt) stEl.textContent = txt;
+            stEl.title = act ? act.label : '';
+        }
+    }
+}
+
 // ---------- Threaded dialogue view (Orchestrator §4) ----------
 // Compact chronological parent⇄worker exchange, reconstructed ONLY from
 // fields the sub_report card actually persists (097-sub-agent-registry.js):
@@ -417,9 +470,18 @@ function renderSubReport(msg, index) {
              : (status === 'cancelled') ? '⊘'
              : (status === 'waiting') ? '\u275a\u275a'
              : '…';
-    // Running shows an animated spinner in the icon slot; everything else a glyph.
+    // Running: live activity glyph (tool icon while a tool executes, pulsing
+    // thinking icon while the model streams) when the registry record carries
+    // one; the generic spinner otherwise (old snapshots / GC'd records render
+    // exactly as before). Everything else keeps its status glyph.
+    var _rsAct = null;
+    if (isRunning && msg.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById) {
+        _rsAct = _subActivityInfo(SubAgents.getById(msg.subAgentId));
+    }
     var iconHtml = isRunning
-        ? '<span class="sub-report-spinner" aria-hidden="true"></span>'
+        ? (_rsAct
+            ? '<span class="sub-report-activity sub-activity-' + _rsAct.phase + '" title="' + escapeHtml(_rsAct.label) + '">' + _rsAct.icon + '</span>'
+            : '<span class="sub-report-spinner" aria-hidden="true"></span>')
         : '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>';
     // ── Review-state badge (Orchestrator §3) ──
     // Live-record read only: a GC'd/expired record simply shows no badge
@@ -1217,6 +1279,10 @@ function updateSidebarWorkerMetrics() {
             if (prsEl.textContent !== prsTxt) prsEl.textContent = prsTxt;
             prsEl.hidden = !work.prs;
         }
+        // ACTIVITY: live thinking/tool icon + state-line label, patched in
+        // place (a full strip repaint would restart the pulse animations on
+        // every phase flip — same rationale as the metric patches above).
+        _patchWorkerCardActivity(card, _resolveSubRec(card.getAttribute('data-worker-toggle')));
         // Live-refresh an expanded card's progress panel when the sub's
         // action_state advances — keyed on `at` so we rebuild only on a real
         // progress change, not on every heartbeat tick.
@@ -1599,6 +1665,7 @@ function _updateSelfCardMetrics() {
         ctxWrap.classList.toggle('worker-ctx-danger', ctx.pct >= 90);
         ctxWrap.classList.toggle('worker-ctx-warning', ctx.pct >= 70 && ctx.pct < 90);
     }
+    _patchWorkerCardActivity(card, rec);
     if (rec) {
         var toolsEl = card.querySelector('[data-worker-tools]');
         if (toolsEl) toolsEl.textContent = String(rec.tool_calls_used || 0) + ' tool calls';
@@ -1687,6 +1754,12 @@ function _workerCardHtml(r, opts) {
     var ctx = _subContextInfo(r.chat_id);
     var tokTip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
     var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
+    // ACTIVITY: live thinking/tool glyph replaces the static bot icon while
+    // running; the tool's display name replaces the state word in the sub
+    // line. Null (no activity / not running) keeps today's rendering.
+    var act = _subActivityInfo(r);
+    var cardIcon = (act && act.icon) ? act.icon : botIcon;
+    var stateText = act ? act.label : stateLabel;
     // Inline onclick removed (escapeHtml does not escape single quotes). The
     // document-level delegated listener handles data-worker-toggle / -reveal.
     var wkExpanded = !!_workerExpanded[r.agent_id];
@@ -1721,8 +1794,8 @@ function _workerCardHtml(r, opts) {
     return '<div class="worker-card-wrap' + (selfCard ? ' worker-card-wrap-self' : '') + '" data-depth="' + renderDepth + '"' + (selfCard ? ' style="margin-top:var(--space-3,6px)"' : '') + '>' +
         '<' + wkTag + ' class="worker-card worker-' + stateClass + (wkExpandedNow ? ' worker-card-expanded' : '') + (selfCard ? ' worker-card-self' : '') + '" ' +
         wkToggleAttrs +
-        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + ' \u2014 ' + escapeHtml(String(used)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
-        '<span class="worker-card-icon" aria-hidden="true">' + botIcon + '</span>' +
+        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(String(used)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
+        '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : '') + '" aria-hidden="true">' + cardIcon + '</span>' +
         '<span class="worker-card-main">' +
             '<span class="worker-card-row">' +
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
@@ -1732,7 +1805,7 @@ function _workerCardHtml(r, opts) {
                 (awaitingAp ? '' : ' hidden') + '>approval</span>' +
             '</span>' +
             '<span class="worker-card-row worker-card-sub">' +
-                '<span class="worker-state">' + escapeHtml(stateLabel) + '</span>' +
+                '<span class="worker-state" data-worker-state' + (act ? ' title="' + escapeHtml(act.label) + '"' : '') + '>' + escapeHtml(stateText) + '</span>' +
                 '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + ' tool calls</span>' +
                 '<span class="worker-files" data-worker-files title="workspace files edited by this sub"' + (work.files ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.files, 'file', 'files')) + '</span>' +
                 '<span class="worker-prs" data-worker-prs title="PRs opened by this sub"' + (work.prs ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.prs, 'PR', 'PRs')) + '</span>' +
@@ -1964,7 +2037,9 @@ function renderWorkersStrip() {
             if ((st === 'running' || st === 'partial')
                 && m.subAgentId && typeof SubAgents !== 'undefined' && SubAgents.getById) {
                 var r = SubAgents.getById(m.subAgentId);
-                if (r) live = r.state;
+                // ACTIVITY: phase/tool changes must repaint the running card's
+                // icon slot ('' suffix on legacy records keeps old keys stable).
+                if (r) live = r.state + ':' + _subActivityKey(r);
             }
             parts.push((m.subAgentId || '') + ':' + st + ':' + prog + ':' + phn + ':' + ((m.phasesDropped | 0)) + ':' + live);
         }

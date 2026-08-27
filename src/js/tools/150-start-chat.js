@@ -71,8 +71,7 @@ function _startChatReportAsyncFailure(chatId, what, err) {
     try { console.warn('start_chat: ' + what + '() failed for chat ' + chatId + ': ' + msg, err); } catch (e) {}
     try {
         if (chatId && typeof chats !== 'undefined' && chats && chats[chatId]) {
-            chats[chatId]._lastApiError = { message: 'start_chat ' + what + ': ' + msg, chatId: chatId, timestamp: Date.now() };
-            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { _lastApiError: { message: 'start_chat ' + what + ': ' + msg, chatId: chatId, timestamp: Date.now() } }); // FLUX-4C lane
         }
     } catch (e) {}
     try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}

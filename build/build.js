@@ -400,6 +400,338 @@ function scanSwBundleGaps(raw) {
     return { gaps: gaps, guardedGaps: guardedGaps };
 }
 
+// ─── Decl-parity check: SW runtime globals ↔ page bundle ─────────────
+// worker/000-runtime-globals.js re-declares the page bundle's chat/run
+// globals so the shared agent code (WORKER_SHARED_FILES) sees the same
+// free variables in both realms. Its header says "keep names in sync" —
+// this check ENFORCES it: every top-level `var` name in that file must
+// be declared at the top level of BOTH bundles. If a page-side
+// declaration is renamed or removed while worker/000 still lists it
+// (or vice versa), shared code throws ReferenceError at runtime in the
+// realm that lost the declaration — this fails the build instead,
+// BEFORE dist/ is touched.
+//
+// Names in DECL_PARITY_SW_ONLY are intentionally SW-only. Allowlist
+// bar: zero page-tier references at all, or every page-tier reference
+// typeof-guarded. Verify with a grep before adding a name here.
+const DECL_PARITY_SW_ONLY = new Set([
+    // SW pause map (worker/130-port-bridge.js toggle-pause). Page refs:
+    // only typeof-guarded reads in core/097-sub-agent-registry.js
+    // (:2287, :3661 at the time of writing).
+    'pausedChatIds',
+    // Layer-C parked UI tool calls (worker/120-tool-routing.js). Zero
+    // page-tier references — worker tier only.
+    'parkedToolCallsByChatId',
+]);
+
+// Top-level `var` names of a JS source: strip block comments + full-line
+// line comments, then match `var` at column 0. In this codebase a
+// column-0 `var` IS a top-level declaration (function bodies are
+// indented), so this is a reliable file-scope decl extractor for both
+// the manifest file and the concatenated bundles.
+function topLevelVarNames(src) {
+    const stripped = src
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^[ \t]*\/\/.*$/gm, '');
+    const names = [];
+    const re = /^var\s+([A-Za-z_$][\w$]*)/gm;
+    let m;
+    while ((m = re.exec(stripped)) !== null) names.push(m[1]);
+    return names;
+}
+
+// ─── Write-site ratchet shared logic (RFC Flux Phase 1) ──────────────
+// KEEP IN SYNC (byte-identical) between build/build.js and
+// skills/extension-dev/build.js — the in-browser replica enforces the
+// same guard on Reload builds. Byte-identity of this whole region
+// (through the End marker below, incl. the chat-meta and guard-region
+// helpers) is ENFORCED by compareGuardRegions — drift fails the build.
+//
+// Guards the unidirectional-data-flow (Flux) migration against
+// backsliding: per-file counts of the canonical-state
+// write/render/persist token patterns are checked in at
+// build/write-site-ratchet.json, and the build FAILS when any per-file
+// count INCREASES. Decreases are the ratchet direction — tighten the
+// baseline when they land (node build/build.js --update-ratchet).
+// Counting is token-based on comment-stripped source (block comments +
+// full-line // comments, same rules as topLevelVarNames in
+// build/build.js) — a tripwire against accidental new write sites, not
+// a sandbox against adversarial code (globalThis.chats[...] would
+// evade it; review catches that).
+var WRITE_SITE_RATCHET_PATTERNS = [
+    // chats[<key>] = ... — direct canonical chats-map entry assignment.
+    // The lookbehind excludes lookalikes (pausedChats[...], obj.chats[...]);
+    // (?![=>]) excludes == / === comparisons.
+    { id: 'chatsAssign', label: 'chats[...] = assignment', re: '(?<![\\w$.])chats\\s*\\[[^\\]\\n]*\\]\\s*=(?![=>])' },
+    // saveChatsToStorage( — chat persistence site. Calls AND definitions
+    // count: a second definition of the persister is also a new write path.
+    { id: 'saveChatsToStorage', label: 'saveChatsToStorage( site', re: '(?<![\\w$.])saveChatsToStorage\\s*\\(' },
+    // renderMessages( — message render site.
+    { id: 'renderMessages', label: 'renderMessages( site', re: '(?<![\\w$.])renderMessages\\s*\\(' },
+    // currentChatId = ... — selected-chat global assignment. Declarations
+    // count too; property writes (msg.currentChatId = ...) are a different
+    // variable and don't.
+    { id: 'currentChatIdAssign', label: 'currentChatId = assignment', re: '(?<![\\w$.])currentChatId\\s*=(?![=>])' },
+    // IDB object-store row deletes, all three call shapes: <ident ending in
+    // store/Store>.delete( | objectStore(...).delete( | zero-arg .delete()
+    // (an IDB cursor delete — Map/Set .delete always passes a key). RFC
+    // addendum §4.1: a regex cannot see WHICH store a delete targets, so
+    // EVERY object-store delete site is baselined per file — any new delete
+    // call (in particular any chats-store delete outside deleteChatRow,
+    // core/130-indexeddb.js) rises above the baseline and fails the build
+    // until reviewed. The user-initiated wipe-all path uses store.clear(),
+    // not delete, so it never counts here.
+    { id: 'idbStoreDelete', label: 'IDB object-store .delete( site', re: '[\\w$]*[Ss]tore\\s*\\.\\s*delete\\s*\\(|objectStore\\s*\\([^()\\n]*\\)\\s*\\.\\s*delete\\s*\\(|\\.\\s*delete\\s*\\(\\s*\\)' },
+    // chats[<x>].<field> = / chat.<field> = — direct chat-FIELD pokes.
+    // chatsAssign above only sees whole-entry assignment; field-level
+    // writes on the canonical row (or a `chat` alias of it) evade it.
+    // Chained paths (chat.meta.x =) count too. Compound assignments
+    // (+=, ||=) and optional chaining (chat?.x =) have zero sites at
+    // the time of writing and are NOT matched — extend the regex if
+    // one ever appears.
+    { id: 'chatFieldPoke', label: 'chat-field poke (chats[...].f = / chat.f =)', re: '(?<![\\w$.])chats\\s*\\[[^\\]\\n]*\\](?:\\s*\\.\\s*[\\w$]+)+\\s*=(?![=>])|(?<![\\w$.])chat(?:\\s*\\.\\s*[\\w$]+)+\\s*=(?![=>])' },
+    // delete chats[<x>] — canonical chats-map entry eviction. Every
+    // baselined site is paired with a sanctioned IDB row removal
+    // (deleteChatRow / the SW boot-eviction path); a NEW bare delete is
+    // a Flux bypass until reviewed.
+    { id: 'deleteChatsEntry', label: 'delete chats[...] site', re: '(?<![\\w$.])delete\\s+chats\\s*\\[' },
+    // chrome.storage.local.set( — storage side-bus write site. A KEY
+    // registry was evaluated and skipped: at the time of writing 8 sites
+    // pass a computed object or variable (background.js:71/838,
+    // platform-bridge.js:587/635/907/1481, ui/070-dashboard-ui.js:1697),
+    // so static key extraction cannot be trusted. Ratcheting the SITES
+    // still surfaces any new side-bus channel for review.
+    { id: 'storageLocalSet', label: 'chrome.storage.local.set( site', re: 'chrome\\s*\\.\\s*storage\\s*\\.\\s*local\\s*\\.\\s*set\\s*\\(' }
+];
+
+function stripCommentsForRatchet(src) {
+    return src
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
+// { 'src/js/...': source } → { patternId: { file: count } }. Only
+// non-zero counts are recorded; files iterate sorted so regenerated
+// baselines are byte-stable.
+function computeWriteSiteRatchetCounts(fileMap) {
+    var counts = {};
+    Object.keys(fileMap).sort().forEach(function(file) {
+        var src = stripCommentsForRatchet(fileMap[file]);
+        WRITE_SITE_RATCHET_PATTERNS.forEach(function(p) {
+            var re = new RegExp(p.re, 'g');
+            var n = 0;
+            while (re.exec(src) !== null) n++;
+            if (n > 0) {
+                if (!counts[p.id]) counts[p.id] = {};
+                counts[p.id][file] = n;
+            }
+        });
+    });
+    return counts;
+}
+
+// baseline/current per-pattern file→count maps → { violations (count
+// rose — fail the build), tightenable (count fell — update baseline) }.
+function compareWriteSiteRatchet(baselinePatterns, currentCounts) {
+    var violations = [];
+    var tightenable = [];
+    WRITE_SITE_RATCHET_PATTERNS.forEach(function(p) {
+        var base = baselinePatterns[p.id] || {};
+        var cur = currentCounts[p.id] || {};
+        var seen = {};
+        Object.keys(base).concat(Object.keys(cur)).forEach(function(f) { seen[f] = true; });
+        Object.keys(seen).sort().forEach(function(f) {
+            var b = base[f] || 0;
+            var c = cur[f] || 0;
+            if (c > b) violations.push({ pattern: p.id, label: p.label, file: f, baseline: b, current: c });
+            else if (c < b) tightenable.push({ pattern: p.id, label: p.label, file: f, baseline: b, current: c });
+        });
+    });
+    return { violations: violations, tightenable: tightenable };
+}
+
+// ─── Chat-meta lane vocabulary guard (shared, Flux guard rails) ──────
+// Hosted inside this synced region so the guard-region check below also
+// protects it against divergence between the two build implementations.
+
+// The chat-meta lane lists are declared ONCE, in core/030-config.js —
+// bundled into BOTH outputs (page core tier + WORKER_SHARED_FILES). The
+// old per-realm twin copies (worker/115-storage.js + ui/070-dashboard-
+// ui.js) could silently drift; a re-declaration anywhere re-opens that
+// bug class (a later `var` in the same bundle SHADOWS the shared one),
+// so the check fails on: a missing shared decl, ANY duplicate decl in
+// src, or a built bundle whose first parsed decl differs from the
+// shared file (= not bundled / shadowed).
+var CHAT_META_SHARED_FILE = 'src/js/core/030-config.js';
+var CHAT_META_SHARED_LISTS = ['CHAT_META_TS_FIELDS', 'CHAT_META_FLAG_FIELDS'];
+
+// First `var <name> = ['a', 'b']` declaration in src → ['a','b'];
+// null when missing/unparseable — callers FAIL loudly on null.
+function parseDeclaredStringList(src, name) {
+    var m = new RegExp('^[ \\t]*var\\s+' + name + '\\s*=\\s*\\[([^\\]]*)\\]', 'm').exec(src);
+    if (!m) return null;
+    var items = [];
+    var re = /'([^'\n]*)'|"([^"\n]*)"/g;
+    var s;
+    while ((s = re.exec(m[1])) !== null) items.push(s[1] !== undefined ? s[1] : s[2]);
+    return items;
+}
+
+// (srcByFile: { 'src/js/...': source }, bundles: { 'app.js': src,
+// 'sw-bundle.js': src }) → array of failure strings ([] = in sync).
+function checkChatMetaSharedLists(srcByFile, bundles) {
+    var failures = [];
+    CHAT_META_SHARED_LISTS.forEach(function(name) {
+        var shared = parseDeclaredStringList(srcByFile[CHAT_META_SHARED_FILE] || '', name);
+        if (!shared) {
+            failures.push(name + ': `var ' + name + ' = [...]` not found in ' + CHAT_META_SHARED_FILE + ' — if the declaration moved, update CHAT_META_SHARED_FILE in the shared guard region (build/build.js AND skills/extension-dev/build.js).');
+        }
+        Object.keys(srcByFile).sort().forEach(function(f) {
+            if (f === CHAT_META_SHARED_FILE) return;
+            if (parseDeclaredStringList(srcByFile[f] || '', name) !== null) {
+                failures.push(name + ': duplicate `var ' + name + ' = [...]` declaration in ' + f + ' — the lane vocabulary is single-source (' + CHAT_META_SHARED_FILE + '); a second copy shadows it and re-opens the realm-drift bug class. Reference the shared declaration instead.');
+            }
+        });
+        if (!shared) return;
+        Object.keys(bundles).sort().forEach(function(b) {
+            var got = parseDeclaredStringList(bundles[b] || '', name);
+            if (!got) {
+                failures.push(name + ': no declaration in the built ' + b + ' bundle — ' + CHAT_META_SHARED_FILE + ' must stay in the page core tier AND in WORKER_SHARED_FILES so both realms load the shared lane vocabulary.');
+            } else if (JSON.stringify(got) !== JSON.stringify(shared)) {
+                failures.push(name + ': the built ' + b + ' bundle parses [' + got.join(', ') + '] but ' + CHAT_META_SHARED_FILE + ' declares [' + shared.join(', ') + '] — an earlier declaration in the bundle shadows the shared one.');
+            }
+        });
+    });
+    return failures;
+}
+
+// ─── Guard-region sync helpers ────────────────────────────────────────
+// This whole marked region exists twice (build/build.js and
+// skills/extension-dev/build.js); a comment was previously the only
+// sync mechanism. Each build now extracts the region from BOTH files
+// and fails on any byte difference. The marker strings are assembled
+// from halves so these literals can never match the marker lines.
+var GUARD_REGION_START = '─── Write-site ratchet ' + 'shared logic';
+var GUARD_REGION_END = '─── End write-site ratchet ' + 'shared logic';
+
+// Full lines from the start marker's line through the end marker's
+// line, or null when either marker is missing.
+function extractGuardRegion(src) {
+    var i0 = src.indexOf(GUARD_REGION_START);
+    var i1 = i0 < 0 ? -1 : src.indexOf(GUARD_REGION_END, i0);
+    if (i0 < 0 || i1 < 0) return null;
+    var from = src.lastIndexOf('\n', i0) + 1;
+    var to = src.indexOf('\n', i1);
+    return src.slice(from, to === -1 ? src.length : to);
+}
+
+// 32-bit FNV-1a hex — a small fingerprint for the failure message.
+function fnv1aHex(str) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 0x01000193);
+    return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+// (buildSrc, skillSrc) → array of failure strings ([] = byte-identical).
+function compareGuardRegions(buildSrc, skillSrc) {
+    var a = extractGuardRegion(buildSrc);
+    var b = extractGuardRegion(skillSrc);
+    var failures = [];
+    if (!a) failures.push('guard-region markers not found in build/build.js — restore the "' + GUARD_REGION_START + '" / "' + GUARD_REGION_END + '" comment lines.');
+    if (!b) failures.push('guard-region markers not found in skills/extension-dev/build.js — restore the "' + GUARD_REGION_START + '" / "' + GUARD_REGION_END + '" comment lines.');
+    if (failures.length > 0 || a === b) return failures;
+    var la = a.split('\n');
+    var lb = b.split('\n');
+    for (var i = 0; i < Math.max(la.length, lb.length); i++) {
+        if (la[i] !== lb[i]) {
+            failures.push('region fnv1a ' + fnv1aHex(a) + ' (build/build.js, ' + la.length + ' lines) vs ' + fnv1aHex(b) + ' (skills/extension-dev/build.js, ' + lb.length + ' lines); first drift at region line ' + (i + 1) + ':' +
+                '\n        build/build.js:                ' + (la[i] === undefined ? '<line missing>' : JSON.stringify(la[i]).slice(0, 140)) +
+                '\n        skills/extension-dev/build.js: ' + (lb[i] === undefined ? '<line missing>' : JSON.stringify(lb[i]).slice(0, 140)) +
+                '\n        The two copies MUST stay byte-identical — copy the edited region verbatim onto the other file.');
+            break;
+        }
+    }
+    return failures;
+}
+// ─── End write-site ratchet shared logic ─────────────────────────────
+
+// Scan scope: every .js under src/js/ plus the flat extension platform
+// files (background.js has a guarded saveChatsToStorage() call — new
+// ad-hoc writers there must trip the ratchet too). dist/ and skills/
+// are out of scope (generated output / not part of the app bundles).
+function listRatchetScanFiles() {
+    const out = [];
+    (function walk(dir) {
+        for (const entry of fs.readdirSync(dir)) {
+            const full = path.join(dir, entry);
+            if (fs.statSync(full).isDirectory()) walk(full);
+            else if (entry.endsWith('.js')) out.push(path.relative(ROOT, full).split(path.sep).join('/'));
+        }
+    })(path.join(SRC, 'js'));
+    for (const entry of fs.readdirSync(path.join(SRC, 'platform/extension'))) {
+        const full = path.join(SRC, 'platform/extension', entry);
+        if (entry.endsWith('.js') && !fs.statSync(full).isDirectory()) out.push(path.relative(ROOT, full).split(path.sep).join('/'));
+    }
+    return out.sort();
+}
+
+// Enforce the ratchet (or regenerate the baseline with --update-ratchet).
+// Called from buildExtension() BEFORE the dist/ wipe — like the other
+// validations, a failed build must never destroy a working output.
+function runWriteSiteRatchet() {
+    const baselinePath = path.join(ROOT, 'build', 'write-site-ratchet.json');
+    const fileMap = {};
+    for (const rel of listRatchetScanFiles()) fileMap[rel] = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
+    const current = computeWriteSiteRatchetCounts(fileMap);
+    if (process.argv.includes('--update-ratchet')) {
+        // Print old→new per-file deltas before regenerating, so the console
+        // shows exactly what the baseline bump/tighten covers (PR #788 review
+        // follow-up). Reuses the shared comparator: violations = counts that
+        // rose, tightenable = counts that fell.
+        if (fs.existsSync(baselinePath)) {
+            try {
+                const prev = JSON.parse(fs.readFileSync(baselinePath, 'utf-8'));
+                const delta = compareWriteSiteRatchet(prev.patterns || {}, current);
+                const changes = delta.violations.concat(delta.tightenable);
+                if (changes.length === 0) {
+                    console.log('  Write-site ratchet: no per-file count changes vs the old baseline');
+                } else {
+                    console.log('  Write-site ratchet: baseline deltas (old → new):');
+                    for (const d of changes) console.log(`    - ${d.file}: ${d.label} ${d.baseline} → ${d.current}`);
+                }
+            } catch (e) {
+                console.warn('  Write-site ratchet: could not diff old baseline (' + e.message + ')');
+            }
+        }
+        const ordered = {};
+        for (const p of WRITE_SITE_RATCHET_PATTERNS) if (current[p.id]) ordered[p.id] = current[p.id];
+        const doc = {
+            '//': 'Write-site ratchet baseline (RFC Flux Phase 1 guard rails). Per-file counts of canonical-state write/render/persist token sites. The build FAILS when any per-file count INCREASES vs this file — route new writes through the sanctioned paths instead, or bump this baseline in the same PR (node build/build.js --update-ratchet) so the increase is review-visible. Decreases only warn: tighten with the same command. Enforced by build/build.js and skills/extension-dev/build.js (in-browser replica).',
+            patterns: ordered
+        };
+        fs.writeFileSync(baselinePath, JSON.stringify(doc, null, 2) + '\n', 'utf-8');
+        console.log('  Write-site ratchet: baseline regenerated at build/write-site-ratchet.json');
+        return;
+    }
+    if (!fs.existsSync(baselinePath)) {
+        throw new Error('Write-site ratchet baseline missing (build/write-site-ratchet.json); restore it or regenerate with: node build/build.js --update-ratchet');
+    }
+    const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf-8'));
+    const { violations, tightenable } = compareWriteSiteRatchet(baseline.patterns || {}, current);
+    if (violations.length > 0) {
+        console.error('\n  Write-site ratchet failures — per-file count rose above the checked-in baseline:');
+        violations.forEach(v => console.error(`    - ${v.file}: ${v.label} — baseline ${v.baseline}, found ${v.current}`));
+        console.error('  New canonical-state write sites regress the Flux migration (RFC Phase 1). Route the mutation/render/persist through the existing sanctioned path instead.');
+        console.error('  If the new site is genuinely intentional, bump build/write-site-ratchet.json in the same PR (node build/build.js --update-ratchet) so reviewers see the increase.\n');
+        throw new Error('Write-site ratchet failed for ' + violations.length + ' file/pattern pair(s); aborting build (dist/ untouched).');
+    }
+    console.log(`  Write-site ratchet: OK (${WRITE_SITE_RATCHET_PATTERNS.length} patterns across ${Object.keys(fileMap).length} files)`);
+    if (tightenable.length > 0) {
+        console.log(`  Write-site ratchet: ${tightenable.length} count(s) fell below baseline — tighten it: node build/build.js --update-ratchet`);
+        tightenable.forEach(t => console.log(`    - ${t.file}: ${t.label} ${t.baseline} → ${t.current}`));
+    }
+}
+
 // ─── MV3 CSP HTML Transformation ───
 // Chrome MV3 forbids inline scripts and inline event handlers (onclick="...")
 // This transform extracts them at build time into external JS files
@@ -622,7 +954,68 @@ ${processedBody}
             console.warn(`  SW-bundle: ${guardedGaps.length} typeof-guarded identifier(s) undefined in worker context (guarded calls silently no-op in the SW):`);
             guardedGaps.forEach(g => console.warn('    - ' + g.name + '  (near: ' + g.ctx + ')'));
         }
+
+        // Decl-parity: every SW runtime global declared in worker/000-
+        // runtime-globals.js must exist as a top-level `var` in BOTH
+        // bundles (see DECL_PARITY_SW_ONLY above for the intentional
+        // SW-only exceptions). Runs before the dist/ wipe for the same
+        // reason as the gap scan — a failed build must never destroy a
+        // working output.
+        const declParityManifest = topLevelVarNames(readSrcFile('js/worker/000-runtime-globals.js'));
+        const pageTopVars = new Set(topLevelVarNames(appJS));
+        const workerTopVars = new Set(topLevelVarNames(workerJS));
+        const parityFailures = [];
+        for (const name of declParityManifest) {
+            if (!workerTopVars.has(name)) {
+                parityFailures.push(name + '  (no top-level `var` in sw-bundle.js — manifest extraction broke?)');
+            }
+            if (DECL_PARITY_SW_ONLY.has(name)) continue;
+            if (!pageTopVars.has(name)) {
+                parityFailures.push(name + '  (no top-level `var` in app.js — page declaration renamed/removed?)');
+            }
+        }
+        if (parityFailures.length > 0) {
+            console.error('\n  Decl-parity failures — worker/000-runtime-globals.js names missing a top-level declaration:');
+            parityFailures.forEach(f => console.error('    - ' + f));
+            console.error('  Restore the missing declaration (page side: core/030-config.js and friends), or, if the name is genuinely SW-only (all page references typeof-guarded — grep first), add it to DECL_PARITY_SW_ONLY in build/build.js.\n');
+            throw new Error('Decl-parity check failed for ' + parityFailures.length + ' name(s); aborting build (dist/ untouched).');
+        }
+        console.log(`  Decl-parity: ${declParityManifest.length} SW runtime globals declared in both bundles (${DECL_PARITY_SW_ONLY.size} SW-only allowlisted)`);
     }
+
+    // 6b. Write-site ratchet (RFC Flux Phase 1) — enforced before the
+    // dist/ wipe for the same reason as the gap/parity checks above.
+    runWriteSiteRatchet();
+
+    // 6c. CHAT_META lane vocabulary — the chat-meta field lists are
+    // declared ONCE (core/030-config.js, shared into both bundles). The
+    // check fails on a missing/duplicate declaration in src and on a
+    // built bundle that lacks (or shadows) the shared declaration. Same
+    // fail-loud bar as the twin-list parity check it replaces; enforced
+    // before the dist/ wipe for the same reason.
+    const chatMetaSrcByFile = {};
+    for (const rel of listRatchetScanFiles()) chatMetaSrcByFile[rel] = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
+    const chatMetaFailures = checkChatMetaSharedLists(chatMetaSrcByFile, { 'app.js': appJS, 'sw-bundle.js': workerJS });
+    if (chatMetaFailures.length > 0) {
+        console.error('\n  CHAT_META lane vocabulary failures:');
+        chatMetaFailures.forEach(f => console.error('    - ' + f));
+        throw new Error('CHAT_META lane vocabulary check failed (' + chatMetaFailures.length + ' failure(s)); aborting build (dist/ untouched).');
+    }
+    console.log(`  CHAT_META lane vocabulary: ${CHAT_META_SHARED_LISTS.join(' + ')} single-sourced in ${CHAT_META_SHARED_FILE}, present in both bundles`);
+
+    // 6d. Guard-region sync — the shared guard region above is duplicated
+    // into skills/extension-dev/build.js (the in-browser Reload replica).
+    // Byte-identity used to be comment-enforced only; now drift fails the
+    // build in both implementations.
+    const guardRegionBuildSrc = fs.readFileSync(path.join(ROOT, 'build', 'build.js'), 'utf-8');
+    const guardRegionSkillSrc = fs.readFileSync(path.join(ROOT, 'skills', 'extension-dev', 'build.js'), 'utf-8');
+    const guardRegionFailures = compareGuardRegions(guardRegionBuildSrc, guardRegionSkillSrc);
+    if (guardRegionFailures.length > 0) {
+        console.error('\n  Guard-region sync failures:');
+        guardRegionFailures.forEach(f => console.error('    - ' + f));
+        throw new Error('Shared guard region drifted between build/build.js and skills/extension-dev/build.js; aborting build (dist/ untouched).');
+    }
+    console.log('  Guard-region sync: build/build.js ↔ skills/extension-dev/build.js byte-identical (fnv1a ' + fnv1aHex(extractGuardRegion(guardRegionBuildSrc)) + ')');
 
     // 7. Write output files
     // Wipe outDir first so files removed from src/ don't linger as cruft in

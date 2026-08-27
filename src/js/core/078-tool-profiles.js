@@ -5,7 +5,8 @@
 // agent loads only the tools tagged with its profiles, cutting the
 // tool-schema tokens sent to the LLM:
 //   • Non-sub chats (main agent, background Action chats): core +
-//     orchestrator REGISTRY tools. Skill-provided tools keep their
+//     orchestrator + code + servicenow REGISTRY tools. Skill-provided
+//     tools keep their
 //     legacy always-on behavior for non-sub chats (gated only by
 //     skill activation) so skill actions (run_audit, web_search,
 //     extension_build, …) keep working.

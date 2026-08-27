@@ -464,24 +464,57 @@ var chats = {};
 var paused = false; // LEGACY: kept for backwards compat with bits that still read it. Do NOT consult in isChatPaused — it would cross-pollute pause across concurrent chats.
 var pausedChats = {}; // Per-chat pause flags (for background Action chats the user paused via button)
 function isChatPaused(chatId) { return chatId ? pausedChats[chatId] === true : false; }
-// Set/clear a chat's pause flag in BOTH the live map and the persisted chat
-// record (chat.pausedByUser) so a user-pause survives a panel reload —
-// loadChatsFromStorage rehydrates pausedChats from the persisted field.
-// Shared into the worker bundle too: each realm updates its own chats copy
-// (both realms do full-record puts to the chats store, so whichever saves
-// last must carry the flag). Lifecycle pauses (sub-agent park, action
-// dismiss) intentionally do NOT use this helper — they set only the live map.
+// ── Chat-meta lane vocabulary (FLUX-4C/T1/P1) — SINGLE SOURCE OF TRUTH ──
+// The SW-canonical chat-meta fields: every page writer dispatches them over
+// the 'chat-meta-update' lane (dispatchChatMeta, app/045) and the SW arbiter
+// persists + rebroadcasts them. Consumed by BOTH realms' put-lane preservers
+// (_preserveSwOwnedChatMeta, ui/070-dashboard-ui.js; _preservePageChatFields,
+// worker/115-storage.js), the shared fold/eviction paths (core/130-indexeddb.js)
+// and the lane plumbing (app/045, worker/130). Declared ONCE here — this file
+// loads first in the page core tier AND heads WORKER_SHARED_FILES, so both
+// bundles see one declaration (flux audit: layering — the old per-realm twin
+// copies in ui/070 + worker/115 drifted-by-construction; the build's
+// CHAT_META check now FAILS on any re-declaration outside this file).
+//   • TS fields: monotonic timestamps — newest-wins merges.
+//   • Flag fields: last-dispatch-wins values arbitrated by the SW.
+var CHAT_META_TS_FIELDS = ['lastResponseAt', 'lastActivityAt', 'lastViewedAt', 'updatedAt', 'titleUpdatedAt'];
+var CHAT_META_FLAG_FIELDS = ['_jobsHidden', 'pinned', '_lastApiError', 'pausedByUser'];
+// FLUX-P1 (pause-state single-writer lane): USER-pause facade. pausedByUser
+// is a CHAT_META_FLAG_FIELDS entry (last-dispatch-wins, SW-arbitrated,
+// persisted + rebroadcast by the chat-meta lane) — this helper is the ONLY
+// sanctioned entry for user-pause writes and routes to the realm's lane entry:
+//   • page → dispatchChatMeta (app/045): optimistic apply sets
+//     chats[id].pausedByUser AND the derived pausedChats cache synchronously,
+//     so the loop gate / pause-button reads see the toggle immediately;
+//   • SW → _swHandleChatMetaUpdate (worker/130): the 'chat-meta-update'
+//     ingress applies, syncs the derived pausedChats/pausedChatIds caches,
+//     rehydrate-first persists, and rebroadcasts 'chat-meta-changed'.
+// Unpause dispatches an EXPLICIT false (never a field delete): the reconnect
+// snapshot encodes undefined flags as null=no-opinion and _swOverlayChatMeta
+// only defends flags the SW has an opinion on — a deleted false would let a
+// stale panel snapshot resurrect pausedByUser:true on the next adopt.
+// The no-op guard keeps high-frequency callers (the run-agent / send-message
+// stale-pause clears fire on EVERY send) off the lane when the record and
+// this realm's derived caches already agree.
+// Lifecycle halts (sub-agent park, action dismiss transients) intentionally
+// do NOT use this helper — they are per-realm run-control signals on the
+// live pausedChats map only, never persisted (amber paused rows and
+// survives-reload pause are user-pause semantics only).
 function setChatPausedPersistent(chatId, isPaused) {
     if (!chatId) return;
-    pausedChats[chatId] = isPaused === true;
+    var v = isPaused === true;
     try {
         var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
-        if (!c) return;
-        var changed = (isPaused === true) ? (c.pausedByUser !== true) : (c.pausedByUser === true);
-        if (isPaused === true) c.pausedByUser = true;
-        else if (c.pausedByUser) delete c.pausedByUser;
-        if (changed && typeof saveChatsToStorage === 'function') saveChatsToStorage();
-    } catch (e) { /* persistence is best-effort */ }
+        if ((pausedChats[chatId] === true) === v
+            && (typeof pausedChatIds === 'undefined' || (pausedChatIds[chatId] === true) === v)
+            && (!c || (c.pausedByUser === true) === v)) return;
+        if (typeof dispatchChatMeta === 'function') { dispatchChatMeta(chatId, { pausedByUser: v }); return; }
+        if (typeof _swHandleChatMetaUpdate === 'function') { _swHandleChatMetaUpdate(chatId, { pausedByUser: v }); return; }
+        // Defensive dead arm: no lane in this realm (never expected — the page
+        // bundle has dispatchChatMeta, the SW bundle has _swHandleChatMetaUpdate).
+        // Keep the loop gate correct rather than silently dropping the pause.
+        pausedChats[chatId] = v;
+    } catch (e) { /* lane dispatch is best-effort */ }
 }
 var isRunning = false;
 // PR390-FU-3: the five per-chat run-state maps below are ALSO declared in

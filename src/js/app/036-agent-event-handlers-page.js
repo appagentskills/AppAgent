@@ -76,9 +76,8 @@ function _consumeFocusedChatUnread() {
         if (!c) return;
         var last = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
         if (!last || last <= (c.lastViewedAt || 0)) return; // nothing unread
-        c.lastViewedAt = Date.now();
+        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(currentChatId, { lastViewedAt: Date.now() }); // FLUX-4C lane
         if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(currentChatId); } catch (e) {} }
-        if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
         if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') {
             var _jd = _getOpenJobsDropdown();
@@ -118,6 +117,17 @@ AgentEvents.on('runStarted', function(e) {
     _stampChatActivity(chatId);
     _agentEventsHiddenDuringRun[chatId] = !!document.hidden ||
         (typeof document.hasFocus === 'function' && !document.hasFocus());
+    // FLUX-4C review fix B (paint ordering): a chat starting a run clears its own
+    // persisted per-chat error. This used to be dispatched at the TAIL of the
+    // handler (both branches, identical payload) — i.e. AFTER the three repaints
+    // below — so the acting panel painted a still-red row and only the
+    // unconditional 'chat-meta-changed' echo repaint un-redded it. Now that the
+    // echo repaints only on a REAL mutation (and the optimistic apply inside
+    // dispatchChatMeta makes the sender's own echo a no-op), the clear has to
+    // happen BEFORE the paints. Other panels still converge via the echo.
+    if (typeof chats !== 'undefined' && chats[chatId] && typeof dispatchChatMeta === 'function') {
+        dispatchChatMeta(chatId, { _lastApiError: null });
+    }
     if (typeof renderChatList === 'function') renderChatList();
     if (typeof renderJobsBadge === 'function') renderJobsBadge();
     if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdStart = _getOpenJobsDropdown(); if (_jdStart) renderJobsDropdown(_jdStart); }
@@ -140,21 +150,18 @@ AgentEvents.on('runStarted', function(e) {
             if (messagesEl) messagesEl.classList.add('is-streaming');
         }
         activeStreamingChatId = chatId;
-        var _rsFocused = (typeof chats !== 'undefined') ? chats[chatId] : null;
-        if (_rsFocused) _rsFocused._lastApiError = null; // focused chat starting fresh
     } else {
         // R-1 (B11): an UNFOCUSED chat starting a run must NOT mutate the GLOBAL
         // lastApiError (it belongs to the focused chat — the toolbar Retry reads it).
         // A sub-agent/background chat starting previously nulled the global and left
-        // the focused chat's Retry button visible-but-dead. Clear only THIS chat's
-        // own persisted error as it starts fresh.
-        var _rsChat = (typeof chats !== 'undefined') ? chats[chatId] : null;
-        if (_rsChat) _rsChat._lastApiError = null;
+        // the focused chat's Retry button visible-but-dead. Only THIS chat's own
+        // persisted error is cleared, by the branch-independent chat-meta dispatch
+        // above — the global is deliberately left alone here.
     }
 });
 
 AgentEvents.on('turnStarted', function(e) {
-    showSpinner('Waiting for response...', e.chatId);
+    showSpinner('Waiting for response...', e.chatId, { phase: 'thinking' });
 });
 
 AgentEvents.on('assistantMessageStarted', function(e) {
@@ -169,6 +176,26 @@ AgentEvents.on('streamDelta', function(e) {
     try {
         // Real stream progress — clear the inline transport-backoff status.
         if (e && e.chatId) _clearTransportInlineStatus(e.chatId);
+        // MEMFIX-DELTA (Fix B): streamDelta no longer inlines the full chat
+        // snapshot (worker/100-agent-event-broadcast.js) — keep the page
+        // mirror's streaming slot fresh from the delta itself so the rAF
+        // re-read in updateStreamingMessage (REG-F1) sees current content.
+        // Only an actively-streaming assistant slot may be patched (REG-F2
+        // discipline): a drifted index (page-only pending rows) is skipped
+        // and heals at the next chat-inlining event. Same-context emits
+        // pass the live object — the reference check makes them a no-op.
+        var _sdChat = (typeof chats !== 'undefined' && chats) ? chats[e.chatId] : null;
+        if (_sdChat && Array.isArray(_sdChat.messages) && e.message && typeof e.msgIndex === 'number' && e.msgIndex >= 0) {
+            var _sdPrev = _sdChat.messages[e.msgIndex];
+            if (_sdPrev && _sdPrev.role === 'assistant' && _sdPrev.isStreaming === true) {
+                if (_sdPrev !== e.message) _sdChat.messages[e.msgIndex] = e.message;
+            } else if (!_sdPrev && e.msgIndex === _sdChat.messages.length && e.message.isStreaming === true) {
+                // Panel missed assistantMessageStarted (connected mid-stream
+                // with a hello snapshot taken just before the message row) —
+                // appending at the exact tail keeps indexes aligned.
+                _sdChat.messages.push(e.message);
+            }
+        }
         updateStreamingMessage(e.msgIndex, e.message, e.chatId);
     } catch (err) {
         var label;
@@ -253,7 +280,7 @@ AgentEvents.on('toolCallStarted', function(e) {
     // fresh assistantMessage event in this panel's lifetime (SW restart /
     // pending-tool resume in 030-agent-loop.js).
     _flushFinalizedStreamingText(e.chatId);
-    showSpinner('Executing ' + e.displayName + '...', e.chatId);
+    showSpinner('Executing ' + e.displayName + '...', e.chatId, { phase: 'tool', tool: e.name });
 });
 
 AgentEvents.on('toolCallResult', function(e) {
@@ -304,11 +331,12 @@ AgentEvents.on('userInjected', function(e) {
 
 AgentEvents.on('messagesAppended', function(e) {
     _stampChatActivity(e.chatId);
-    // Honor e.force like the toolCallResult handler above — _repaintParent
-    // (097-sub-agent-registry.js) emits force:true so the page repaints even
-    // when the event originated for another chat id; renderMessages always
-    // renders the CURRENT chat, so a forced call is safe regardless of which
-    // chat the event names.
+    // e.force is honored for parity with the toolCallResult handler above,
+    // but no in-tree emitter sets it for this event anymore: _repaintParent
+    // (097-sub-agent-registry.js) used to emit force:true, making every panel
+    // full-rebuild its transcript for sub-card ticks in OTHER chats (flux QW5
+    // removed that — the app/045 snapshot merge keeps replicas fresh without
+    // a repaint). Kept as an explicit escape hatch for manual dispatch.
     if (e.force || e.chatId === currentChatId) renderMessages();
 });
 
@@ -514,11 +542,11 @@ AgentEvents.on('error', function(e) {
             // openChatFromHistory) restores Retry if the user switches away from this
             // focused-but-errored chat and back. Without this a focused-origin error
             // has no persistent home and the re-derive reads undefined.
-            if (chat) chat._lastApiError = lastApiError;
+            if (chat && typeof dispatchChatMeta === 'function') dispatchChatMeta(e.chatId, { _lastApiError: lastApiError }); // FLUX-4C lane
             showSnackbar('API Error: ' + msg, 'error');
             showRetryButton();
-        } else if (chat) {
-            chat._lastApiError = { message: msg, chatId: e.chatId, timestamp: Date.now() };
+        } else if (chat && typeof dispatchChatMeta === 'function') {
+            dispatchChatMeta(e.chatId, { _lastApiError: { message: msg, chatId: e.chatId, timestamp: Date.now() } }); // FLUX-4C lane
         }
     }
     // An error while the user is away is activity too — bold the jobs row.
@@ -587,9 +615,11 @@ AgentEvents.on('runFinished', function(e) {
                 // pausedChats flag — clear that stale flag, or finishActionIfDone's
                 // isChatPaused guard refuses and the button spins forever anyway.
                 if (typeof pausedChats !== 'undefined' && pausedChats[chatId] === true) {
-                    // Also clears the persisted pausedByUser flag (survives-reload pause).
-                    if (typeof setChatPausedPersistent === 'function') setChatPausedPersistent(chatId, false);
-                    else pausedChats[chatId] = false;
+                    // Also clears the persisted pausedByUser flag (survives-reload
+                    // pause) — via the FLUX-P1 lane facade (core/030-config.js).
+                    // The old direct-write else-arm is gone: the facade is core-
+                    // tier, always defined before this app-tier handler runs.
+                    setChatPausedPersistent(chatId, false);
                 }
                 if (typeof finishActionIfDone === 'function') finishActionIfDone(chatId);
             } catch (err) { console.error('PR383-F4 deferred action finalize failed', err); }
@@ -744,7 +774,7 @@ AgentEvents.on('notifyFinish', function(e) {
     // Sub-agent chats are invisible to the user — they finish constantly as
     // part of the parent's work. Pushing a browser notification for every
     // sub natural-finish would spam the user with "Agent finished" toasts
-    // bearing meaningless "sub_xxxxxx" names. The parent's runFinished is
+    // bearing internal worker names. The parent's runFinished is
     // the right surface for the actual PM-visible work.
     var nc = chats[chatId];
     if (nc && nc.isSubAgent) return;
@@ -933,13 +963,13 @@ AgentEvents.on('actionStateChanged', function(e) {
 // until some later unrelated render (the "title not visible right away" bug).
 AgentEvents.on('chatTitleChanged', function(e) {
     if (!e || !e.chatId) return;
-    if (chats[e.chatId]) {
-        chats[e.chatId].title = e.title;
-        // Mirror the SW-side flag clear (executeSetChatTitle). Without this the
-        // page's stale titleProvisional=true gets re-inlined to the SW on the
-        // next send and the auto-title hook needlessly re-fires.
-        delete chats[e.chatId].titleProvisional;
-    }
+    // FLUX-T1 (title lane): the VALUE now travels the chat-meta lane — the
+    // canonical 'chat-meta-changed' echo (posted by the SW on the same port
+    // BEFORE this broadcast event, FIFO per sender) already applied title +
+    // titleProvisional pair-aware; in a page-only realm dispatchChatMeta
+    // applied it optimistically before this event fired. A blind e.title
+    // write here could clobber a strictly newer local rename in the
+    // in-flight window, so this handler is REPAINT-ONLY now.
     if (typeof renderChatList === 'function') {
         try { renderChatList(); } catch (err) {}
     }

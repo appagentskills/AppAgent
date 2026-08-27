@@ -37,15 +37,10 @@ var WORKER_SAVE_TIMEOUT_BACKOFF_MS = 15000;
 // so an awaited save resolved BEFORE a capturing save committed — a lost user
 // message on SW eviction / a stale edit_html→screenshot read. Restored here.
 var _workerSaveWaiters = [];
-// WIPE-GUARD-3: cumulative per-boot delete budget. The per-save cap below
-// (wipe-guard-2) rate-limits rather than blocks — under a persistently
-// partial in-memory map, 5 real chats would still be deleted at EVERY save
-// (saves fire at every tool boundary), draining the store over a long
-// incident. Budget total deletes per realm boot; once exhausted, stop
-// deleting entirely until a fresh load rebuilds the map. Keep in sync with
-// the page mirror in ui/070-dashboard-ui.js.
-var _wipeGuardDeletedSinceLoad = 0;
-var WIPE_GUARD_MAX_DELETES_PER_BOOT = 25;
+// PR 4 (RFC addendum §5): the wipe-guard-2/3 per-boot delete caps and the
+// SW-side known-chat-id set are RETIRED — dead since PR 3 made saves
+// upsert-only (no delete-pass consumed them any more). The hydration
+// save-gate below is a DIFFERENT guard and stays.
 
 // WIPE-GUARD: mirrors the page-side flag in ui/070-dashboard-ui.js. Saves are
 // forbidden until this worker context has successfully hydrated `chats` from
@@ -75,6 +70,72 @@ function _rescueDirtyEvictedChat(id) {
         })
         .catch(function(e) { console.warn('[worker-storage] evicted-chat rescue failed for ' + id, e); })
         .then(function() { delete _evictedRescueInFlight[id]; });
+}
+
+// FLUX-4C (chat-meta lane, put-time backstop): these seven fields are
+// SW-CANONICAL. Panels no longer write them — every page writer dispatches
+// 'chat-meta-update' (dispatchChatMeta, app/045-agent-port-bridge-page.js) and
+// the SW's lane handler (worker/130-port-bridge.js 'chat-meta-update') is the
+// single applier + persister: it applies to chats[id] (timestamps max-wins,
+// flags last-dispatch-wins) and saves, or — for a chat this SW does not hold —
+// read-merge-writes the stored record directly (_swChatMetaRMW) and buffers the
+// fields in _swChatMetaPendingByChatId until an adopt/update-chat/send-message
+// overlay (_swOverlayChatMeta) folds them into the in-memory record.
+// This function is the put-time backstop for the one thing the lane cannot see:
+// a record on disk that is NEWER or MORE DEFINED than the copy being put — the
+// SW's in-memory record may predate a lane RMW that landed on disk while the
+// chat was not held, or predate another SW generation's writes.
+//   • Timestamps: keep the NEWEST of the two (monotonic; updatedAt is
+//     legitimately stamped by the SW at run finish too, so a fresher in-memory
+//     stamp still wins).
+//   • Flags: the stored value is used ONLY to fill a record-side gap
+//     (undefined) — a DEFINED value on the record being put is a lane-applied
+//     decision, including deliberate defined-null / explicit-false clears, and
+//     must beat disk. That is why every path where a page snapshot replaces
+//     chats[id] has to run _swOverlayChatMeta first: without it a stale defined
+//     flag laundered in from a panel replica would win here (F3).
+// Returns the record to put; NEVER mutates `record` in place — it may BE the
+// live chats[id] object (extractChatPayloadsForPut returns the live object
+// when nothing needed stripping).
+// CHAT_META_TS_FIELDS / CHAT_META_FLAG_FIELDS are declared ONCE in
+// core/030-config.js (WORKER_SHARED_FILES loads it ahead of this 1xx worker
+// file; flux audit: layering — the per-realm twin copies were collapsed, and
+// the build fails on any re-declaration).
+function _preservePageChatFields(record, stored) {
+    if (!record || !stored) return record;
+    var out = record;
+    function claim() { if (out === record) out = Object.assign({}, record); return out; }
+    // FLUX-T1 (title lane): `title` is a VALUE riding its paired
+    // `titleUpdatedAt` stamp (in CHAT_META_TS_FIELDS, so the TS loop below
+    // advances the stamp itself). The stored pair wins only when STRICTLY
+    // newer — an equal stamp is the same lane generation and the in-memory
+    // record is the lane-applied arbiter decision. `titleProvisional` rides
+    // the winning pair: true → set, absent → cleared. Runs BEFORE the TS
+    // loop so the compare reads the record's pre-merge stamp.
+    if (typeof stored.titleUpdatedAt === 'number' && isFinite(stored.titleUpdatedAt)
+        && typeof stored.title === 'string' && stored.title
+        && stored.titleUpdatedAt > (out.titleUpdatedAt || 0)) {
+        claim().title = stored.title;
+        if (stored.titleProvisional === true) claim().titleProvisional = true;
+        else if (out.titleProvisional !== undefined) delete claim().titleProvisional;
+    }
+    CHAT_META_TS_FIELDS.forEach(function(f) {
+        // FLUX-6 (#799 review, defensive): pair atomicity — never advance
+        // titleUpdatedAt from a stored row carrying a bare stamp without its
+        // title value (a bare stamp would make every later legit rename with
+        // an older stamp lose the compare forever).
+        if (f === 'titleUpdatedAt' && !(typeof stored.title === 'string' && stored.title)) return;
+        var sv = stored[f] || 0;
+        if (sv && sv > (out[f] || 0)) claim()[f] = sv;
+    });
+    CHAT_META_FLAG_FIELDS.forEach(function(f) {
+        if (out[f] === undefined && stored[f] !== undefined) claim()[f] = stored[f];
+    });
+    // FLUX-QW7 → FLUX-6: the displays per-id union moved into the SHARED
+    // non-lane put merge (_mergeChatRowForPut, core/130-indexeddb.js), which
+    // the put site below chains after this lane preserver — one
+    // implementation for both realms instead of an SW-only inline block.
+    return out;
 }
 
 async function saveChatsToStorage() {
@@ -113,9 +174,18 @@ async function saveChatsToStorage() {
         // so a record never commits without its payloads being durable.
         await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
-        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
-        // vanished from memory, upsert the rest.
-        var keysRequest = store.getAllKeys();
+        // UPSERT-ONLY (RFC addendum Invariant D, PR 3): the save NEVER deletes.
+        // The absence-diff delete-pass that used to live here — "stored key ∉
+        // in-memory `chats` ⇒ delete the row" — was the root cause of the
+        // chat-deletion data-loss class: neither realm's map is authoritative
+        // over the store, so "I never knew about this chat" was
+        // indistinguishable from "this chat was deleted" (observed live: store
+        // count 904 → 900). Rows now leave the store ONLY through deleteChatRow
+        // (core/130-indexeddb.js) presenting an explicit reason + on-disk
+        // precondition: user deletes via the _pendingDeletes retry lane below,
+        // sub-agent GC via core/097-sub-agent-registry.js, 0-message rows via
+        // gcEmptyChatRows at SW boot (worker/190-entry.js), wipe-all via
+        // ui/130-data-management.js. Absence from memory means NOTHING.
         return new Promise(function(_resolve) {
             // WS-1 (B16/B17): settle-guard so the commit promise resolves EXACTLY
             // once and can't wedge. A put-error can ABORT the whole txn; without the
@@ -128,87 +198,29 @@ async function saveChatsToStorage() {
             var _settled = false;
             function resolve() { if (_settled) return; _settled = true; _resolve(); }
             transaction.onabort = function() { resolve(); };
-            keysRequest.onsuccess = function() {
-                var existingKeys = keysRequest.result || [];
-                // PAYLOAD-STORE: refresh the known-durable blob id cache once per
-                // realm (key-only read) so unchanged payloads aren't re-put.
-                primeChatPayloadIdCache(transaction, function() {
+            // PAYLOAD-STORE: refresh the known-durable blob id cache once per
+            // realm (key-only read) so unchanged payloads aren't re-put. Its
+            // getAllKeys request is issued SYNCHRONOUSLY here, so the fresh
+            // transaction has a pending request and cannot auto-commit before
+            // the put loop below queues its own.
+            primeChatPayloadIdCache(transaction, function() {
                 var desired = {};
                 Object.keys(chats).forEach(function(id) {
                     var c = chats[id];
                     if (c && c.messages && c.messages.length > 0) desired[id] = c;
                 });
                 var pending = 0;
-                // B16 semantics preserved: every request (delete or put, success or
-                // error) settles through here so a final errored request still
+                // B16 semantics preserved: every request (success or error)
+                // settles through here so a final errored request still
                 // resolves — else the await hangs and wedges every future save.
                 function settleOne() {
                     pending--;
                     if (pending === 0) resolve();
                 }
-                // WIPE-GUARD-2: cap the delete-pass. A partially-hydrated map
-                // (observed live: SW holding 3 chats while the store held 535
-                // — run-adopted chats only) turned every save into a ~532-
-                // record MASS-DELETE transaction: the 30s scope-holder AND an
-                // active data-destruction mechanism, survivable only because
-                // most of those transactions timed out or died uncommitted.
-                // Legit flows CAN exceed a handful (sub-agent GC batches in
-                // core/097-sub-agent-registry.js routinely backlog >5 chat
-                // rows), so the cap must NOT skip the pass entirely — that
-                // permanently disabled deletion: deleted chats resurrected on
-                // reload and the store grew unbounded. Instead delete a
-                // BOUNDED batch per save (first 5), so a legit backlog drains
-                // over successive saves while a partial-map incident is still
-                // capped at 5 rows per transaction instead of a mass-delete.
-                // EXPLICIT-DELETE: partition first. A key whose in-memory
-                // entry is a `_deleted` TOMBSTONE — an empty-message record the
-                // page posts as an 'update-chat' when the user deletes a chat
-                // (deleteChat in ui/170-chat-management.js) — is an EXPLICIT
-                // single-chat delete the user asked for, NOT the bulk "absent
-                // from memory" reconciliation the wipe-guard exists to contain.
-                // Those keys are deleted unconditionally: no per-save cap, no
-                // per-boot budget. Without the exemption a tombstoned row that
-                // an already-in-flight save had re-put stayed on disk forever
-                // once the boot budget was spent, and resurrected on reload.
-                var _delKeys = [];
-                var _explicitDelKeys = [];
-                existingKeys.forEach(function(key) {
-                    if (Object.prototype.hasOwnProperty.call(desired, key)) return;
-                    var _mem = chats[key];
-                    if (_mem && _mem._deleted === true) _explicitDelKeys.push(key);
-                    else _delKeys.push(key);
-                });
-                if (_delKeys.length > 5) {
-                    console.warn('[worker-storage] delete-pass CAPPED (wipe-guard-2): '
-                        + _delKeys.length + ' of ' + existingKeys.length
-                        + ' stored chats are absent from memory (' + Object.keys(desired).length
-                        + ' held) — deleting only 5 this save; a legit backlog drains over the'
-                        + ' next saves, a partial in-memory map stays bounded');
-                    _delKeys = _delKeys.slice(0, 5);
-                }
-                // WIPE-GUARD-3: enforce the per-boot cumulative budget (see
-                // declaration above) — trim the batch to the budget still
-                // remaining instead of dropping it wholesale, so a partial
-                // budget is spent, not wasted (F2-2). When the budget is fully
-                // spent the slice is empty, so deletes still halt.
-                if (_delKeys.length && _wipeGuardDeletedSinceLoad + _delKeys.length > WIPE_GUARD_MAX_DELETES_PER_BOOT) {
-                    console.warn('[worker-storage] delete-pass TRIMMED (wipe-guard-3): '
-                        + _wipeGuardDeletedSinceLoad + ' of a ' + WIPE_GUARD_MAX_DELETES_PER_BOOT
-                        + ' per-boot delete budget already used since load — trimming this save to the'
-                        + ' remaining budget (a reload/full rehydration rebuilds the map)');
-                    _delKeys = _delKeys.slice(0, Math.max(0, WIPE_GUARD_MAX_DELETES_PER_BOOT - _wipeGuardDeletedSinceLoad));
-                }
-                _wipeGuardDeletedSinceLoad += _delKeys.length;
-                // EXPLICIT-DELETE: append the exempt keys AFTER budget
-                // accounting, so a user delete neither consumes nor is blocked
-                // by the bulk-diff budget.
-                if (_explicitDelKeys.length) _delKeys = _explicitDelKeys.concat(_delKeys);
-                _delKeys.forEach(function(key) {
-                    pending++;
-                    var delRequest = store.delete(key);
-                    delRequest.onsuccess = settleOne;
-                    delRequest.onerror = settleOne;
-                });
+                // PR 3: the absence-diff delete-pass that lived here is GONE
+                // (PR 4 retired its caps and known-id sets). Explicit user
+                // deletes are handled the moment the tombstone arrives, by
+                // scheduleChatRowDelete below — not at save time.
                 Object.keys(desired).forEach(function(id) {
                     // MEMFIX: NEVER put a payload-evicted chat. Post-PAYLOAD-STORE
                     // this protects legacy records whose payloads are still inline
@@ -226,23 +238,75 @@ async function saveChatsToStorage() {
                         return;
                     }
                     // PAYLOAD-STORE: strip payloads into blob rows; the record
-                    // put carries flags instead of base64. All requests are
-                    // issued synchronously here, so `pending` cannot zero-cross
-                    // before the loop finishes.
+                    // put carries flags instead of base64. The blob puts and
+                    // the record GET are issued synchronously in this loop;
+                    // the record put is issued from the get's handler, which
+                    // bumps `pending` BEFORE settling the get's own slot — so
+                    // `pending` cannot zero-cross before the loop finishes.
                     var extracted = extractChatPayloadsForPut(desired[id]);
                     var _nBlobs = queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
                     pending += _nBlobs;
                     _putBlobs += _nBlobs;
+                    // FLUX-QW3: read-merge-write — preserve the page-owned
+                    // whitelist from the stored record instead of a blind
+                    // full-record put (_preservePageChatFields above). A
+                    // failed get falls back to putting the un-merged record
+                    // (preventDefault contains the request error so it can't
+                    // abort the whole tx).
                     pending++;
                     _putRecords++;
-                    var putRequest = store.put(extracted.record);
-                    putRequest.onsuccess = settleOne;
-                    putRequest.onerror = settleOne;
+                    (function(_rec, _getReq) {
+                        function _issuePut(stored) {
+                            // FLUX-4/5b (stale-put resurrection window): this
+                            // put is issued ASYNC from the get's callback — the
+                            // chat that was live when `desired` was captured
+                            // may have been DELETED while the get was in
+                            // flight (page deleteChatRow committed → this
+                            // get returned undefined → the old unconditional
+                            // put re-created the deleted row from the SW's
+                            // hydrated copy; a tombstone re-delete self-healed
+                            // ONLY if this SW survived). Consult the delete
+                            // authority NOW and DROP the put when the id is
+                            // deleted: a tombstone (parked in chats[] by the
+                            // 'update-chat' branch, or on-disk), an armed
+                            // _pendingDeletes retry entry, or a granted
+                            // user-delete ledger entry
+                            // (_chatDeleteLedgerGranted, core/130-indexeddb.js
+                            // — covers the post-verified-gone window after the
+                            // parked tombstone is dropped).
+                            var _delNow = false;
+                            try {
+                                var _liveNow = chats[id];
+                                _delNow = (_liveNow && _liveNow._deleted === true)
+                                    || (stored && stored._deleted === true)
+                                    || !!_pendingDeletes[id]
+                                    || (typeof _chatDeleteLedgerGranted === 'function' && _chatDeleteLedgerGranted(id));
+                            } catch (eDel) {}
+                            if (_delNow) {
+                                console.warn('[worker-storage] dropping put of chat ' + id + ' — deleted while the save was in flight');
+                                settleOne(); // settle the get's slot; no put issued
+                                return;
+                            }
+                            pending++;
+                            // FLUX-6: chain the SHARED non-lane merge (messages
+                            // append-tail preservation, displays union, future-
+                            // field fill-gap — core/130-indexeddb.js) after the
+                            // lane preserver, against the SAME stored row.
+                            var putRequest = store.put(_mergeChatRowForPut(_preservePageChatFields(_rec, stored), stored));
+                            putRequest.onsuccess = settleOne;
+                            putRequest.onerror = settleOne;
+                            settleOne(); // settle the get's slot
+                        }
+                        if (!_getReq) { _issuePut(null); return; }
+                        _getReq.onsuccess = function() { _issuePut(_getReq.result); };
+                        _getReq.onerror = function(ev) {
+                            if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+                            _issuePut(null);
+                        };
+                    })(extracted.record, (function() { try { return store.get(id); } catch (eGet) { return null; } })());
                 });
                 if (pending === 0) resolve();
-                }); // end primeChatPayloadIdCache
-            };
-            keysRequest.onerror = function() { resolve(); };
+            }); // end primeChatPayloadIdCache
         });
         }); // end withStore fn
         // Committed: clear any armed backoff and surface slow-but-successful
@@ -287,34 +351,36 @@ async function saveChatsToStorage() {
 }
 
 // EXPLICIT-DELETE (chat-delete durability, mirrors ui/070-dashboard-ui.js):
-// targeted single-id removal of ONE chat row plus the payload blob rows only
-// that chat referenced. Bypasses the bulk diff-save delete-pass above and its
-// wipe-guard cap/budget on purpose — that guard contains a partially-hydrated
-// map turning into a mass wipe, which an explicit one-id delete is not.
+// targeted single-id removal of ONE chat row. Thin wrapper over the SHARED
+// delete primitive deleteChatRow (core/130-indexeddb.js — RFC addendum §2.3),
+// which owns the transaction, the ON-DISK precondition check, the
+// abort=failure settle discipline and the delete ledger.
 // CALL SITE: the `_deleted` tombstone branch of the 'update-chat' handler in
-// worker/130-port-bridge.js calls this the moment the page reports a user
-// delete, so the row leaves IDB immediately instead of waiting for the next
-// save's explicit-delete lane (which remains the retry: this SW can be evicted
-// before it saves again). That tombstone carries NO messages, hence no payload
-// ids — and independent of what a caller passes, this twin deletes the chat
-// ROW only. That is ENFORCED below (PR #761 follow-up), not just a call-site
-// convention: the SW's `chats` map is run-adopted-only (never a complete
-// view — at best complete at the instant of its boot getAll, after which
-// page-realm chats created or mutated later are missing or stale here; THIS
-// realm's _chatsHydrated only certifies that boot read succeeded, it is not
-// the page twin's map-completeness gate), so this realm can never prove a
-// blob unreferenced. The page-side twin (ui/070-dashboard-ui.js), which has
-// the full pre-delete record and a hydration-gated complete map, owns
-// chat_payloads cleanup; the boot orphan sweep (sweepOrphanChatPayloads,
-// core/130-indexeddb.js) is the backstop.
+// worker/130-port-bridge.js arms scheduleChatRowDelete (below) the moment the
+// page reports a user delete, so the row leaves IDB immediately — and a
+// transient failure is retried by the bounded _pendingDeletes lane. That tombstone is also parked in
+// this realm's `chats` map, which is what the 'user-delete' precondition
+// verifies (alongside the userInitiated signal passed below).
+// BLOB CLEANUP IS PAGE-OWNED and enforced by the primitive via
+// _dbIsWorkerRealm: this realm's `chats` map is run-adopted-only (never a
+// complete view of the store), so it can never prove a blob unreferenced.
+// The page-side twin owns chat_payloads cleanup; sweepOrphanChatPayloads
+// (core/130-indexeddb.js) is the backstop.
+// CALLER CONTRACT: this wrapper asserts userInitiated:true unconditionally,
+// which is the operative 'user-delete' signal (core/130-indexeddb.js:1230 —
+// the on-disk/parked tombstone arms above it cannot fire in this realm on the
+// page-delete path). So this function is effectively "delete any chat row, no
+// questions asked" INSIDE the SW (FLUX-4/5a: no longer — the arm now demands
+// corroboration: hadRecord / an armed _pendingDeletes entry / a granted
+// ledger entry, so a bare id does not suffice). It has exactly ONE legitimate caller: the
+// _pendingDeletes retry lane below (_attemptPendingChatDelete), armed by the
+// `_deleted` tombstone branch of 'update-chat' in worker/130-port-bridge.js,
+// which HAS the user's tombstone. Any NEW caller must NOT reuse this function
+// — add a reason + precondition to CHAT_ROW_DELETE_PRECONDITIONS
+// (core/130-indexeddb.js) instead.
 async function deleteChatFromDB(chatId, chatSnapshot) {
     if (!chatId) return false;
-    // HARD GATE (see header): never compute "unreferenced" blobs in this
-    // realm. The cross-chat subtraction that lived here was dead-safe only
-    // because the tombstone call site passes no payload ids — with a full
-    // snapshot it would have deleted blobs still referenced by chats absent
-    // from this realm's map. Surface (but do not act on) anything a future
-    // caller does pass.
+    // Surface (but never act on) payload ids a caller passes — see above.
     try {
         var _ignored = Object.keys(_chatPayloadIdsFor(chatSnapshot || (typeof chats !== 'undefined' ? chats[chatId] : null))).length;
         if (_ignored) {
@@ -323,41 +389,97 @@ async function deleteChatFromDB(chatId, chatSnapshot) {
                 + ' — this realm cannot prove them unreferenced; blob cleanup is page-owned');
         }
     } catch (eGate) {}
-    var _txAbortErr = null;
-    try {
-        var _committed = await withStore([chatStoreName], 'readwrite', function(transaction) {
-            var store = transaction.objectStore(chatStoreName);
-            return new Promise(function(_resolve) {
-                // Same settle discipline as the page twin — and ABORT = FAILURE
-                // (PR #761 follow-up): an abort ROLLS BACK the delete, so
-                // settling it as success made this function log "removed from
-                // IDB" and return true while the row was still on disk. Settle
-                // false instead — still resolve, never reject, so the
-                // never-throw contract holds. Success settles on COMMIT
-                // (transaction.oncomplete), not on delRequest.onsuccess: a
-                // request error (nothing here calls preventDefault) aborts the
-                // tx AFTER the request settles, so a per-request resolve raced
-                // the abort event and reported success. The tx scope is
-                // [chatStoreName] only — this twin never touches chat_payloads
-                // (see header), so it takes no readwrite lock on that store.
-                var _settled = false;
-                function settle(ok) { if (_settled) return; _settled = true; _resolve(ok); }
-                transaction.oncomplete = function() { settle(true); };
-                transaction.onabort = function() { _txAbortErr = transaction.error || null; settle(false); };
-                store.delete(chatId);
-            });
-        });
-        if (!_committed) {
-            console.warn('[worker-storage] explicit delete ABORTED for chat ' + chatId
-                + ' — transaction rolled back, the chat row is still on disk; the explicit-delete lane of the next save retries it', _txAbortErr || '');
+    if (typeof deleteChatRow !== 'function') {
+        console.error('[worker-storage] explicit delete: deleteChatRow (core/130-indexeddb.js) unavailable — chat '
+            + chatId + ' NOT deleted');
+        return false;
+    }
+    // NOTE: no `record` in the evidence — the primitive would only use it for
+    // blob reaping, which this realm must never do.
+    return await deleteChatRow(chatId, 'user-delete', {
+        userInitiated: true,
+        via: 'sw-tombstone',
+        hadRecord: !!chatSnapshot,
+        // Operator hint: an aborted delete is retried by the bounded
+        // _pendingDeletes lane below (PR 3 removed the save-time retry).
+        retryHint: 'the _pendingDeletes retry lane (worker/115-storage.js) retries it'
+    });
+}
+
+// EXPLICIT-DELETE RETRY (RFC addendum §2.4, PR 3): _pendingDeletes drives a
+// bounded retry of the targeted tombstone delete. Before PR 3, a tombstone
+// whose targeted delete failed was retried by the explicit-delete arm of
+// EVERY subsequent save's delete-pass; saves are upsert-only now, so this
+// ledger is what makes a user delete durable against a transient IDB failure
+// (congestion, force-closed connection, aborted tx).
+//   • The tombstone stays PARKED in `chats` until the row is VERIFIED gone:
+//     every SW read of chats[id] keeps seeing "deleted", and the chat-meta
+//     lane's memory guard (worker/130-port-bridge.js `_cmChat._deleted`)
+//     keeps refusing RMW writes for it (RFC addendum §4.1).
+//   • On verified-gone (deleteChatRow resolved true — includes the idempotent
+//     already-absent case): drop the ledger entry AND the parked tombstone.
+//   • On final failure: log LOUDLY and keep the tombstone parked — reads in
+//     this SW generation still see "deleted", but the row is still on disk
+//     and resurfaces after an SW restart unless the page-side bounded re-run
+//     (ui/170-chat-management.js) lands it. PR 5's persisted ledger is the
+//     permanent fix.
+//   • Lost on MV3 eviction like the tombstone itself — same recovery story.
+var _pendingDeletes = Object.create(null); // chatId -> { reason, tries, at }
+var PENDING_CHAT_DELETE_MAX_TRIES = 3;
+var PENDING_CHAT_DELETE_BACKOFF_MS = 2000; // doubles per retry: 2s, 4s
+
+function scheduleChatRowDelete(chatId, chatSnapshot) {
+    if (!chatId) return Promise.resolve(false);
+    if (_pendingDeletes[chatId]) {
+        // A retry chain is already driving this id — let it finish (the
+        // duplicate tombstone changes nothing: same id, same reason).
+        return Promise.resolve(false);
+    }
+    _pendingDeletes[chatId] = { reason: 'user-delete', tries: 0, at: Date.now() };
+    return _attemptPendingChatDelete(chatId, chatSnapshot);
+}
+
+function _attemptPendingChatDelete(chatId, chatSnapshot) {
+    var entry = _pendingDeletes[chatId];
+    if (!entry) return Promise.resolve(false);
+    entry.tries++;
+    entry.at = Date.now();
+    function _finish(ok) {
+        if (ok) {
+            delete _pendingDeletes[chatId];
+            // Row verified gone → drop the parked tombstone (§2.4). Guarded:
+            // only a TOMBSTONE may be dropped — never a live record that
+            // re-adopted this id while the delete was in flight.
+            try {
+                if (typeof chats !== 'undefined' && chats && chats[chatId] && chats[chatId]._deleted === true) {
+                    delete chats[chatId];
+                }
+            } catch (eDrop) {}
+            return true;
+        }
+        if (entry.tries >= PENDING_CHAT_DELETE_MAX_TRIES) {
+            delete _pendingDeletes[chatId];
+            console.error('[chat-delete] tombstone delete of chat ' + chatId + ' FAILED after '
+                + entry.tries + ' attempts — the row is STILL ON DISK. The tombstone stays parked in'
+                + ' memory (this SW generation keeps treating the chat as deleted), but the row will'
+                + ' resurface after an SW restart unless the page-side retry'
+                + ' (ui/170-chat-management.js) lands it. Inspect dumpChatDeleteLedger().');
             return false;
         }
-        console.log('[worker-storage] explicit delete: chat ' + chatId
-            + ' removed from IDB (chat row only — blob cleanup is page-owned)');
-        return true;
-    } catch (e) {
-        console.error('[worker-storage] explicit delete FAILED for chat ' + chatId, e);
+        var _delay = PENDING_CHAT_DELETE_BACKOFF_MS * Math.pow(2, entry.tries - 1);
+        console.warn('[chat-delete] tombstone delete of chat ' + chatId + ' did not complete (attempt '
+            + entry.tries + '/' + PENDING_CHAT_DELETE_MAX_TRIES + ') — retrying in ' + _delay + 'ms');
+        setTimeout(function() { _attemptPendingChatDelete(chatId, chatSnapshot); }, _delay);
         return false;
+    }
+    try {
+        return Promise.resolve(deleteChatFromDB(chatId, chatSnapshot)).then(_finish, function(e) {
+            console.error('[chat-delete] tombstone delete threw for chat ' + chatId, e);
+            return _finish(false);
+        });
+    } catch (eSync) {
+        console.error('[chat-delete] tombstone delete threw for chat ' + chatId, eSync);
+        return Promise.resolve(_finish(false));
     }
 }
 
@@ -416,14 +538,17 @@ async function loadChatsFromStorage() {
         return new Promise(function(resolve, reject) {
             request.onsuccess = function() {
                 var results = request.result || [];
-                chats = {};
-                // WIPE-GUARD-3 (mirrors ui/070-dashboard-ui.js): a full
-                // rehydration rebuilds the chats map from IDB, so the per-boot
-                // delete budget starts fresh here — without this reset the budget
-                // was never replenished and all chat-row deletes silently halted
-                // after WIPE_GUARD_MAX_DELETES_PER_BOOT cumulative deletes in one
-                // realm lifetime (F2-1).
-                _wipeGuardDeletedSinceLoad = 0;
+                // FLUX-H2 (boot-adopt preservation): do NOT wholesale-replace
+                // `chats`. This loader runs once per SW life (worker/190-entry.js)
+                // and `chats` starts {}, so any entry present here is a panel
+                // snapshot adopted while this getAll was in flight (the pre-gate
+                // run-agent adopt, the ungated update-chat put, or a parked
+                // tombstone — worker/130-port-bridge.js). The old `chats = {}`
+                // replace dropped those adopts, losing the freshly-typed user
+                // turn the snapshot carried. Disk rows fill in around them below;
+                // on id collision the adopted record wins and disk-only meta is
+                // pulled forward via _swOverlayChatMeta (same prev=SW-copy
+                // semantics as a post-boot adopt overlay).
                 _legacyPayloadMigrationQueue = [];
                 // STORE-ACCT: one line per boot sizing the store — record count,
                 // read duration, and how much inline base64 is still riding in
@@ -437,7 +562,7 @@ async function loadChatsFromStorage() {
                         // chat at load (K=0 — the SW has no UI; run entry points
                         // rehydrate via ensureChatPayloads in core/130-indexeddb.js
                         // before a chat is run/persisted). Evicted chats stay in
-                        // `chats` (delete-pass safety) and are skipped by the
+                        // `chats` (they are live chats; saves are upsert-only) and are skipped by the
                         // put-loop in saveChatsToStorage above (put safety).
                         // LEGACY-MIGRATE: strip returning true means the RECORD
                         // itself still held inline base64 — a legacy-inline row
@@ -480,9 +605,50 @@ async function loadChatsFromStorage() {
                                 chat._payloadsEvicted = true;
                             } catch (e) {}
                         }
-                        chats[chat.id] = chat;
+                        var _rowId = chat.id;
+                        var _adoptedPreBoot = chats[_rowId];
+                        if (_adoptedPreBoot) {
+                            // FLUX-H2: keep the fresher adopted record and replay
+                            // the post-boot adopt ordering — overlay the DISK
+                            // copy as `prev` (timestamps max-wins, disk DEFINED
+                            // flags win; boot-window dispatches are re-asserted
+                            // by the pending fold below, keeping last-dispatch-
+                            // wins intact). A parked tombstone is kept untouched:
+                            // the delete lane owns it and its meta must never be
+                            // resurrected from the doomed disk row.
+                            if (!_adoptedPreBoot._deleted && typeof _swOverlayChatMeta === 'function') {
+                                try { _swOverlayChatMeta(chat, _adoptedPreBoot); } catch (eOv) { /* best-effort — adopt stays */ }
+                            }
+                            chat = _adoptedPreBoot;
+                        }
+                        chats[_rowId] = chat;
                     }
                 });
+                // FLUX-H3 (boot-window lane fold): fold chat-meta dispatches
+                // buffered in _swChatMetaPendingByChatId into the hydrated
+                // records, with the lane's own merge (_swApplyChatMetaFields:
+                // ts max-wins, flags last-wins). getAll is a SNAPSHOT — a
+                // 'chat-meta-update' landing mid-window RMWed the STORED row
+                // (durable) and buffered its fields, but the rows read above
+                // can predate that RMW; without this fold the stale disk value
+                // wins in memory, a later adopt's `chats[id] || pending` prefers
+                // the stale held record and deletes the pending entry unfolded,
+                // and the next save writes the stale flag back over the RMWed
+                // row (_preservePageChatFields lets a DEFINED record flag beat
+                // disk). Entries are NOT deleted here: adopt sites still
+                // consume them for never-held chats, and the serialized RMW
+                // chain reads the map at execution time — re-folding is
+                // idempotent (same values, max-wins/last-wins).
+                try {
+                    if (typeof _swChatMetaPendingByChatId === 'object' && _swChatMetaPendingByChatId
+                        && typeof _swApplyChatMetaFields === 'function') {
+                        Object.keys(_swChatMetaPendingByChatId).forEach(function(_pmCid) {
+                            if (chats[_pmCid] && !chats[_pmCid]._deleted) {
+                                _swApplyChatMetaFields(chats[_pmCid], _swChatMetaPendingByChatId[_pmCid]);
+                            }
+                        });
+                    }
+                } catch (eFold) { /* fold is best-effort — the RMW already persisted the fields */ }
                 // Rehydrate per-chat pause flags from the persisted record field
                 // (chat.pausedByUser — see setChatPausedPersistent in
                 // core/030-config.js) so a user-paused chat stays paused across an
@@ -492,7 +658,14 @@ async function loadChatsFromStorage() {
                 try {
                     if (typeof pausedChats !== 'undefined') {
                         Object.keys(chats).forEach(function(_pcid) {
-                            if (chats[_pcid] && chats[_pcid].pausedByUser === true) pausedChats[_pcid] = true;
+                            if (chats[_pcid] && chats[_pcid].pausedByUser === true) {
+                                pausedChats[_pcid] = true;
+                                // FLUX-P1: pausedChatIds is a derived cache of the
+                                // lane's pausedByUser flag — fold it here too so the
+                                // worker/020-page-stubs.js isChatPaused fallback
+                                // agrees after an SW restart.
+                                if (typeof pausedChatIds !== 'undefined') pausedChatIds[_pcid] = true;
+                            }
                         });
                     }
                 } catch (e) { /* rehydration is best-effort */ }

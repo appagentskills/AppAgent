@@ -216,11 +216,23 @@ function executeSetChatTitle(args, options) {
         return { success: false, error: 'No active chat' };
     }
 
-    chat.title = title;
-    // A model-set title is authoritative — clear the provisional flag set by
-    // updateChatTitle so the auto-title hook stops re-firing for this chat.
-    delete chat.titleProvisional;
-    saveChatsToStorage();
+    // FLUX-T1 (title lane): a model-set title routes through the lane in
+    // BOTH realms — page: dispatchChatMeta (optimistic apply + SW persist);
+    // SW: _swHandleChatMetaUpdate (worker/130 — the same handler the port
+    // case uses: lane merge, rehydrate-first persist, canonical
+    // 'chat-meta-changed' rebroadcast). No titleProvisional rider ⇒ the
+    // winning pair CLEARS it (a model title is authoritative — the
+    // auto-title hook stops re-firing). Direct write only as the legacy
+    // fallback for a realm with neither entry.
+    if (typeof dispatchChatMeta === 'function') {
+        dispatchChatMeta(targetChatId, { title: title });
+    } else if (typeof _swHandleChatMetaUpdate === 'function') {
+        _swHandleChatMetaUpdate(targetChatId, { title: title, titleUpdatedAt: Math.max(Date.now(), (chat.titleUpdatedAt || 0) + 1) });
+    } else {
+        chat.title = title;
+        delete chat.titleProvisional;
+        saveChatsToStorage();
+    }
     // set_chat_title is a HEADLESS tool — it normally runs in the SW where the
     // page-only UI fns (renderChatList/updateChatTitleHeader) don't exist and
     // the page's `chats` mirror is stale. Emit a sync event (mirrors
@@ -2256,6 +2268,18 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 // --------------------------------------------------------------
                 _wfResult.body = _wfBody;
             }
+            // --- GitHub REST PR registration ------------------------------
+            // A PR opened (POST .../pulls -> 201) or merged (PUT
+            // .../pulls/:n/merge -> 200) through the configured REST base
+            // registers in workspace meta.prs like a `workspace push` PR, so
+            // the sidebar PR section sees it (impl + rationale in
+            // _wfMaybeTrackGitHubPr below). _wfAuth is var-hoisted from the
+            // auth-injection try above (undefined when that try threw — the
+            // helper no-ops on null). save_file bodies are data URLs, not
+            // JSON — skipped by passing null.
+            try {
+                await _wfMaybeTrackGitHubPr(args, _wfOpts.method, _wfRes.status, _wfSaveFile ? null : _wfBody, _wfAuth || null, options);
+            } catch (_wfPrErr) { /* PR tracking is best-effort — never fail the fetch */ }
             return _wfResult;
         } catch (e) {
             return { success: false, error: e.message };
@@ -2368,6 +2392,118 @@ async function getGitHubApiAuthForUrl(url) {
 // work tokenless (token presence only affects the Authorization header).
 async function isConfiguredGitHubApiUrl(url) {
     return !!(await getGitHubApiAuthForUrl(url));
+}
+
+// =============================================
+// GitHub REST PR tracking (web_fetch)
+// =============================================
+// A PR opened (or merged) DIRECTLY via the GitHub REST API through web_fetch
+// must land in workspace meta.prs exactly like a `workspace push` PR does —
+// otherwise the sidebar PR section (renderVersionSidebar + meta.prs fallback,
+// src/js/ui/120-ui-utils.js) never learns it exists. Bug: PR #784, opened by
+// a sub-agent chat via raw POST /repos/:o/:r/pulls, showed nowhere while its
+// workspace-pushed sibling #783 did. Mirrors wsPush's prInfo shape and stamps
+// ({url, number, branch, title, chatId, root_chat_id?} — see wsPush ~L5560)
+// so a sub-agent-opened PR surfaces on the ROOT chat's sidebar even after the
+// sub chat is GC'd. Also stamps state:'merged' (+merged_at) on a successful
+// PUT .../pulls/:n/merge — the same shape the sync-side stamping writes.
+// Scoped to the CONFIGURED instance's REST base only (auth.apiBase from
+// getGitHubApiAuthForUrl; web/content-host matches carry no REST endpoints)
+// and to repos that exist as local workspaces: meta.prs lives per-workspace,
+// so a PR on a never-cloned repo has nowhere to register. Among same-repo
+// workspaces prefer the pinned one, else the most recently used — the same
+// resolution the sidebar fallback reads (_refreshSidebarMetaPRs).
+// Best-effort by contract: the caller swallows every error; a tracking
+// failure must never fail the web_fetch itself.
+async function _wfMaybeTrackGitHubPr(args, method, status, bodyText, auth, options) {
+    if (!auth || !auth.apiBase || typeof bodyText !== 'string' || !bodyText) return;
+    // Re-verify the URL targets the REST base itself: `auth` is also non-null
+    // for approval-only web-host matches (github.com etc.), which never carry
+    // REST endpoints. Compare origin, then strip the base path (GHE /api/v3).
+    var reqPath;
+    try {
+        var u = new URL(args.url);
+        var b = new URL(auth.apiBase);
+        if (u.protocol !== b.protocol || u.hostname.toLowerCase() !== b.hostname.toLowerCase()) return;
+        reqPath = u.pathname;
+        var basePath = b.pathname.replace(/\/$/, '');
+        if (basePath) {
+            if (reqPath.toLowerCase().indexOf(basePath.toLowerCase() + '/') !== 0) return;
+            reqPath = reqPath.slice(basePath.length);
+        }
+    } catch (e) { return; }
+    var mCreate = (method === 'POST' && status === 201) ? reqPath.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/?$/i) : null;
+    var mMerge = (method === 'PUT' && status === 200) ? reqPath.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/merge\/?$/i) : null;
+    if (!mCreate && !mMerge) return;
+    var body;
+    try { body = JSON.parse(bodyText); } catch (e) { return; }
+    if (!body || typeof body !== 'object') return;
+    var repo = decodeURIComponent((mCreate || mMerge)[1]);
+    // Pick the workspace meta the sidebar reads for this repo: pinned wins,
+    // else most recently used among clones of the same owner/repo.
+    var metas = await getAllWorkspaceMetas();
+    var chosen = null;
+    (metas || []).forEach(function(m) {
+        if (!m || !m.repo) return;
+        var mRepo = m.github_repo || parseWsKey(m.repo).repo;
+        if (!mRepo || String(mRepo).toLowerCase() !== repo.toLowerCase()) return;
+        if (chosen && chosen.pinned && !m.pinned) return;
+        if (!chosen || (m.pinned && !chosen.pinned)
+            || (m.last_used_at || m.cloned_at || 0) > (chosen.last_used_at || chosen.cloned_at || 0)) chosen = m;
+    });
+    if (!chosen) return;
+    if (!chosen.prs) chosen.prs = [];
+    if (mCreate) {
+        if (!body.html_url || !body.number) return; // not a PR payload
+        var who = _wsResolveChat(options);
+        var prInfo = {
+            url: body.html_url,
+            number: body.number,
+            branch: (body.head && body.head.ref) || '',
+            title: body.title || '',
+            chatId: who.chatId || null
+        };
+        // Durable parent attribution for sub-agent pushers — same rationale
+        // as wsPush: the sub's chat row is reaped after it settles, so the
+        // sidebar needs the ROOT chat id to keep attributing the PR card.
+        var rootChatId = _wsRootChatId(who.chatId);
+        if (who.chatId && rootChatId && rootChatId !== who.chatId) prInfo.root_chat_id = rootChatId;
+        var idx = -1;
+        for (var i = 0; i < chosen.prs.length; i++) {
+            var p = chosen.prs[i];
+            if (p && (p.number === prInfo.number || (prInfo.branch && p.branch === prInfo.branch))) { idx = i; break; }
+        }
+        if (idx >= 0) {
+            // Same PR/branch already tracked (e.g. wsPush created it): keep
+            // prior title/root stamp/snapshots when this payload lacks them.
+            if (!prInfo.title && chosen.prs[idx].title) prInfo.title = chosen.prs[idx].title;
+            if (!prInfo.root_chat_id && chosen.prs[idx].root_chat_id) prInfo.root_chat_id = chosen.prs[idx].root_chat_id;
+            if (chosen.prs[idx].files) prInfo.files = chosen.prs[idx].files;
+            chosen.prs[idx] = prInfo;
+        } else {
+            chosen.prs.push(prInfo);
+        }
+        await setWorkspaceMeta(chosen);
+        try { AgentEvents.emit('workspaceMutated', { action: 'pr_tracked', repo: chosen.repo, pr_url: prInfo.url }); } catch (e) { /* bus refresh is best-effort */ }
+    } else if (body.merged === true) {
+        // Successful REST merge — stamp the tracked entry like the sync-side
+        // stamping does (state + merged_at + originating chat's card flip).
+        var prNum = parseInt(mMerge[2], 10);
+        var stamped = false;
+        for (var j = 0; j < chosen.prs.length; j++) {
+            var tp = chosen.prs[j];
+            if (tp && tp.number === prNum && tp.state !== 'merged') {
+                tp.state = 'merged';
+                if (!tp.merged_at) tp.merged_at = new Date().toISOString();
+                stamped = true;
+                if (tp.chatId) { try { wsNotifyPrMerged(tp.chatId, tp); } catch (e) { /* card flip is best-effort */ } }
+            }
+        }
+        if (stamped) {
+            await setWorkspaceMeta(chosen);
+            try { AgentEvents.emit('workspaceMutated', { action: 'pr_merged', repo: chosen.repo, pr_number: prNum }); } catch (e) { /* bus refresh is best-effort */ }
+        }
+    }
 }
 
 // =============================================
@@ -2590,16 +2726,49 @@ async function executeWorkspaceTool(args, options) {
                 var _lFiles = await getAllWorkspaceFiles(_lm.repo);
                 var _lIgnored = await wsGetIgnoreFilter(_lm.repo);
                 var _lDirty = _lFiles.filter(function(f) { return f.dirty && !_lIgnored(f.path); });
-                workspaces.push({
+                // LEAN PR summary: the stored meta.prs entries carry heavy push
+                // metadata (per-file arrays with old_sha/new_sha, chat ownership)
+                // needed by push PR-reuse / merge-lifecycle sync / the sidebar —
+                // those consumers read meta.prs directly. The list action only
+                // needs to TELL the agent which PRs exist, so return a trimmed
+                // view: {number, title, state, url, branch, merged_at?}. All
+                // open/unmerged PRs are kept; merged PRs are capped to the 3
+                // most recent (merged_prs_omitted reports how many were cut).
+                var _lPrsFull = _lm.prs || [];
+                var _lOpenPrs = [];
+                var _lMergedPrs = [];
+                for (var _lp = 0; _lp < _lPrsFull.length; _lp++) {
+                    var _lpr = _lPrsFull[_lp];
+                    if (!_lpr) continue;
+                    var _lean = { number: _lpr.number, title: _lpr.title, state: _lpr.state, url: _lpr.url, branch: _lpr.branch };
+                    if (_lpr.merged_at) _lean.merged_at = _lpr.merged_at;
+                    if (_lpr.state === 'merged' || _lpr.merged_at) { _lean._idx = _lp; _lMergedPrs.push(_lean); }
+                    else _lOpenPrs.push(_lean);
+                }
+                var _lMergedOmitted = 0;
+                if (_lMergedPrs.length > 3) {
+                    _lMergedPrs.sort(function(a, b) {
+                        var ta = a.merged_at ? new Date(a.merged_at).getTime() : 0;
+                        var tb = b.merged_at ? new Date(b.merged_at).getTime() : 0;
+                        if (tb !== ta) return tb - ta;
+                        return b._idx - a._idx; // fallback: later array entries are more recent
+                    });
+                    _lMergedOmitted = _lMergedPrs.length - 3;
+                    _lMergedPrs = _lMergedPrs.slice(0, 3);
+                }
+                for (var _lc = 0; _lc < _lMergedPrs.length; _lc++) delete _lMergedPrs[_lc]._idx;
+                var _lEntry = {
                     workspace: _lm.repo,
                     repo: _lm.github_repo || parseWsKey(_lm.repo).repo,
                     branch: _lm.branch,
                     files: _lFiles.length,
                     dirty: _lDirty.length,
-                    prs: _lm.prs || [],
+                    prs: _lOpenPrs.concat(_lMergedPrs),
                     pinned: !!_lm.pinned,
                     forked_from: _lm.forked_from || null
-                });
+                };
+                if (_lMergedOmitted) _lEntry.merged_prs_omitted = _lMergedOmitted;
+                workspaces.push(_lEntry);
             }
             return { success: true, workspaces: workspaces, total: workspaces.length };
         }

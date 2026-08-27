@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.1.23
+
+### Features
+- Active Chats list redesigned: the current chat stands out as a lifted white card with an accent bar, and unread, read, and running chats each have their own distinct visual cue.
+- Live activity indicator: while an agent works you now see a pulsing "thinking" icon or the icon of the exact tool it is running, instead of a generic spinner.
+- Sub-agents, documents, and other handles now get human-readable IDs derived from their names instead of random character strings.
+- The main agent can now handle quick code and ServiceNow tasks itself instead of delegating everything to sub-agents.
+- Pull requests opened via the raw GitHub API now appear in the sidebar alongside workspace-pushed ones, including your own merged PRs.
+
+### Fixes
+- Fixed silent data loss where a background or page save could delete chats it didn't know about — chats no longer vanish from storage.
+- Fixed out-of-memory crashes on the extension page: long chats render only the visible messages, idle chats release their memory, and streaming no longer copies the entire chat on every event.
+- The "Agent finished" notification no longer fires while sub-agents are still working.
+- Progress cards now finalize on their own instead of hanging until an unrelated follow-up request.
+- Workspace listings are much leaner, removing kilobytes of stale metadata from agent context.
+- Major internal storage overhaul: chat state syncing between the page and background worker is now single-writer with build-time guards, making titles, pause state, and permissions far more reliable.
+
+---
+
 ## v1.1.22
 
 ### Fixes

@@ -271,13 +271,11 @@ async function sendMessage() {
     if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
     // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
     if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
-    // Sync the button label off the (now-cleared) per-chat state instead of
-    // hard-coding it — keeps a single source of truth for the label.
-    if (typeof syncPauseButtonUI === 'function') {
-        syncPauseButtonUI(currentChatId);
-    } else {
-        document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
-    }
+    // FLUX-QW6: sync the button label off the (now-cleared) per-chat state —
+    // syncPauseButtonUI (app/020-api-messages.js) is the SINGLE writer of the
+    // pause button's label. Never hand-write the markup here: the old typeof
+    // fallback duplicated the label HTML and could drift from the SSOT.
+    syncPauseButtonUI(currentChatId);
 
     await runAgent();
 }
@@ -334,8 +332,18 @@ async function sendWidgetMessage(message) {
     renderMessages();
     renderChatList();
     
+    // FLUX-QW6: clear pause through the same helpers sendMessage uses — the
+    // legacy global AND the per-chat map + persisted flag
+    // (setChatPausedPersistent) AND the SW mirror (pushPauseToggleToOffscreen,
+    // which also supersedes any armed pause-retry chain, SWM14-T1) — then let
+    // the SSOT syncPauseButtonUI paint the label. The old code hand-wrote the
+    // label and left pausedChats[chatId] set, so on a previously-paused chat
+    // the widget request was silently dropped by runAgent's pause gate while
+    // the button claimed the chat was running.
     paused = false;
-    document.getElementById('pause-btn').innerHTML = '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
+    if (currentChatId) setChatPausedPersistent(currentChatId, false);
+    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+    syncPauseButtonUI(currentChatId);
     
     // Run main agent
     await runAgent();

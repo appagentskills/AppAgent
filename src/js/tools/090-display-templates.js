@@ -14,10 +14,12 @@ function executeDisplay(args, messageIndex, options) {
     var generator = DISPLAY_GENERATORS[template];
     if (!generator) return { success: false, error: 'Unknown template: ' + template + '. Available: ' + Object.keys(DISPLAY_GENERATORS).join(', ') };
 
-    var html = generator(args);
+    // FLUX-QW7: allocate the id BEFORE generating so stateful templates
+    // (checklist) can embed it and address their persisted state later.
+    var displayId = 'dsp_' + (++_displayIdCounter) + '_' + Date.now();
+    var html = generator(args, displayId);
     if (!html) return { success: false, error: 'Template generator returned empty HTML' };
 
-    var displayId = 'dsp_' + (++_displayIdCounter) + '_' + Date.now();
     _displayStore[displayId] = { template: template, args: args, html: html };
 
     // Persist on chat for re-render
@@ -117,7 +119,7 @@ function renderDisplayPlaceholder(displayId) {
         var stored = chat.displays[displayId];
         var generator = DISPLAY_GENERATORS[stored.template];
         if (generator) {
-            var html = generator(stored.args);
+            var html = generator(stored.args, displayId);
             _displayStore[displayId] = { template: stored.template, args: stored.args, html: html };
             return html;
         }
@@ -279,13 +281,16 @@ function displayFilterCards(input) {
 }
 
 // ─── Checklist Template ───
-function generateChecklist(args) {
+function generateChecklist(args, displayId) {
     var items = args.items || [];
     if (!items.length) return null;
 
-    var listId = 'dcl_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+    // FLUX-QW7: stable DOM id derived from the displayId so toggle handlers
+    // can find the owning display entry; random fallback only for direct
+    // callers that pass no id (none in-tree today).
+    var listId = displayId ? ('dcl_' + displayId) : ('dcl_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
 
-    var html = '<div class="display-template display-checklist" id="' + listId + '">';
+    var html = '<div class="display-template display-checklist" id="' + listId + '"' + (displayId ? ' data-display-id="' + escDisplay(displayId) + '"' : '') + '>';
     html += '<div class="display-check-summary" id="' + listId + '-summary">';
     html += '<div class="display-check-progress"><div class="display-check-progress-fill" id="' + listId + '-bar"></div></div>';
     html += '<span class="display-check-summary-text" id="' + listId + '-text"></span></div>';
@@ -307,6 +312,33 @@ function generateChecklist(args) {
 function displayToggleCheck(listId, el) {
     el.classList.toggle('checked');
     displayUpdateCheckSummary(listId);
+    // FLUX-QW7: persist the toggle onto the owning display entry
+    // (chat.displays[displayId].args.items[i].checked) through the standard
+    // save path. Before this, the checked state lived ONLY in the DOM class,
+    // so any re-render (renderMessages regenerates from args) reset every
+    // box the user had clicked.
+    var wrap = document.getElementById(listId);
+    var displayId = wrap && wrap.getAttribute('data-display-id');
+    if (!displayId) return; // legacy markup rendered before QW7 — DOM-only as before
+    var chat = (typeof chats !== 'undefined' && chats) ? chats[currentChatId] : null;
+    var entry = chat && chat.displays && chat.displays[displayId];
+    if (!entry || !entry.args || !entry.args.items) return;
+    var idx = [].indexOf.call(wrap.querySelectorAll('.display-check-item'), el);
+    if (idx < 0 || idx >= entry.args.items.length) return;
+    var item = entry.args.items[idx];
+    if (typeof item !== 'object' || item === null) {
+        item = { label: String(item == null ? '' : item) };
+        entry.args.items[idx] = item;
+    }
+    item.checked = el.classList.contains('checked');
+    // Newest-wins stamp read by the two replica merge helpers
+    // (_preservePageChatFields, _mergePageChatMeta) so an in-flight SW save /
+    // snapshot can't revert a just-clicked box.
+    entry._toggledAt = Date.now();
+    // Refresh the in-memory HTML cache — renderDisplayPlaceholder serves
+    // _displayStore[displayId].html first, which now embeds stale classes.
+    if (_displayStore[displayId]) _displayStore[displayId].html = generateChecklist(entry.args, displayId);
+    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
 }
 
 function displayUpdateCheckSummary(listId) {

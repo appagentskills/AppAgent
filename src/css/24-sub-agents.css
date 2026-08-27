@@ -114,6 +114,26 @@
 @keyframes sub-report-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .sub-report-spinner { animation-duration: 2.4s; } }
 
+/* ACTIVITY: live thinking/tool glyph replacing the running spinner (sub_report
+   icon slot) and the worker card's bot icon. Sized to the slots they replace;
+   'thinking' gets a gentle opacity pulse. */
+.sub-report-activity {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    color: var(--accent, #6c63ff);
+}
+.sub-report-activity .ui-icon { width: 16px; height: 16px; }
+.sub-activity-thinking,
+.worker-activity-thinking { animation: activity-thinking-pulse 1.6s ease-in-out infinite; }
+@keyframes activity-thinking-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+    .sub-activity-thinking, .worker-activity-thinking { animation: none; }
+}
+
 /* Sub progress card — the sub's update_action_state mirrored onto the
    parent's sub_report card (state pill + label + tasks checklist).
    Stamped as msg.actionState / phase.actionState by recordSubActionState
@@ -556,6 +576,14 @@
     text-overflow: ellipsis;
 }
 .worker-card-sub { gap: 8px; }
+/* ACTIVITY: the state line doubles as the live tool-name label — truncate so
+   long tool display names never grow the card. */
+.worker-card .worker-state {
+    max-width: 110px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 .worker-tools {
     font-size: var(--text-xs, 10px);
     color: var(--text-muted, #6b7280);

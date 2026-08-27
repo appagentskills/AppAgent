@@ -66,6 +66,10 @@
 
     /* Backgrounds */
     --bg-white: #fff;
+    /* Raised/elevated surface (lifted cards, e.g. the current-chat tab in the
+       Active Chats list): white in light theme, a step LIGHTER than the list
+       surfaces in dark theme (overridden in 01-dark-theme.css). */
+    --bg-elevated: #fff;
     --bg-light: #f9fafb;
     --bg-dark: #1e1e1e;
     --bg-hover: #f3f4f6;

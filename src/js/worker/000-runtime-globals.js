@@ -13,10 +13,24 @@
 //
 // IMPORTANT: keep names in sync with the page bundle declarations.
 // If a name drifts, the agent loop will throw ReferenceError on the
-// first read. The page bundle declarations are in:
-//   src/js/core/020-bootstrap.js   (chats, currentChatId, etc.)
-//   src/js/app/030-agent-loop.js   (per-chat state maps)
-//   src/js/app/040-send-message.js (pendingInjection*)
+// first read. The page bundle declares these names in:
+//   src/js/core/010-platform.js      (Platform)
+//   src/js/core/020-bootstrap.js     (STORAGE_PREFIX, isInIframe,
+//                                     appStorage — page-only file,
+//                                     hence the shims below)
+//   src/js/core/030-config.js        (chats, currentChatId,
+//                                     currentProvider, lastApiError,
+//                                     lastRequestMetrics, isRunning,
+//                                     activeStreamingChatId,
+//                                     pendingInjection*, and the
+//                                     per-chat run-state maps)
+//   src/js/core/040-hooks-history.js (_silentHookRunningByChat)
+// pausedChatIds and parkedToolCallsByChatId are intentionally SW-only
+// (no page declaration; page reads are typeof-guarded).
+// Sync is ENFORCED at build time: the decl-parity check in
+// build/build.js (topLevelVarNames / DECL_PARITY_SW_ONLY) fails the
+// build when any name declared here is missing a top-level `var` in
+// either bundle.
 // =============================================================
 
 // Marker: this is the SW runtime context, not the page bundle and

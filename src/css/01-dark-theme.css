@@ -64,6 +64,9 @@
 
     /* Backgrounds */
     --bg-white: #111317;
+    /* Raised surface: LIGHTER than --bg-hover/--bg-light so lifted cards read
+       as elevated in dark mode (shadows alone don't carry elevation on dark). */
+    --bg-elevated: #2a2f3a;
     --bg-light: #181a1f;
     --bg-dark: #0d0e12;
     --bg-hover: #1f2228;

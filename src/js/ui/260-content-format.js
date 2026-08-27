@@ -92,9 +92,19 @@ function updateChatTitle(chat) {
         var first = (typeof userMsgs[0].content === 'string') ? userMsgs[0].content : '';
         first = first.replace(/\s+/g, ' ').trim();
         if (!first) return;
-        chat.title = first.substring(0, 80) + (first.length > 80 ? '...' : '');
-        chat.titleProvisional = true;
-        saveChatsToStorage();
+        // FLUX-T1 (title lane): the provisional snippet rides the lane too
+        // (titleProvisional: true tells the auto-title hook it still needs
+        // upgrading) — otherwise the SW would keep a stale 'New Chat' and
+        // re-put it over this snippet on the next tool result.
+        var _provTitle = first.substring(0, 80) + (first.length > 80 ? '...' : '');
+        if (typeof dispatchChatMeta === 'function') {
+            dispatchChatMeta(chat.id, { title: _provTitle, titleProvisional: true });
+        } else {
+            // Legacy fallback (no lane in this realm): direct write + save.
+            chat.title = _provTitle;
+            chat.titleProvisional = true;
+            saveChatsToStorage();
+        }
         renderChatList();
         updateChatTitleHeader();
     }

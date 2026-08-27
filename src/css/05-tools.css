@@ -83,6 +83,12 @@
 .ui-icon.spin { animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner-text { font-size: var(--text-body-lg); color: var(--text-secondary); }
+/* ACTIVITY: main-chat spinner glyph variants (240-layout.js showSpinner opts):
+   tool icon while a tool executes, pulsing thinking icon while streaming.
+   `pulse` keyframes are defined below in this file. */
+.spinner-activity { display: inline-flex; align-items: center; color: var(--text-link); }
+.spinner-activity .ui-icon { width: 20px; height: 20px; }
+.spinner-activity-thinking { animation: pulse 1.5s infinite; }
 
 /* Overlay Spinner */
 .overlay-spinner { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); display: flex; align-items: center; justify-content: center; z-index: var(--z-overlay); }

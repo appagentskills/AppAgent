@@ -288,7 +288,7 @@ function retryLastCall() {
     // B13: also clear the errored chat's persisted per-chat copy (set by R-2) so the
     // jobs badge / dropdown row don't stay red after a focused Retry. runStarted also
     // clears it, but do it now to avoid a transient stale-error flash.
-    if (targetChatId && chats[targetChatId]) chats[targetChatId]._lastApiError = null;
+    if (targetChatId && chats[targetChatId] && typeof dispatchChatMeta === 'function') dispatchChatMeta(targetChatId, { _lastApiError: null }); // FLUX-4C lane
     // Defensive paused-state reset — matches continueAgent. A 429 itself
     // doesn't set pausedChats, but if a stale pause flag survives from
     // earlier in the session, runAgent's `while (!isChatPaused)` gate
@@ -344,7 +344,7 @@ function retryChat(chatId) {
         // RETRY-F2-SNACK: also hide the non-auto-dismiss error snackbar (selectChat/newChat do this too).
         if (typeof hideSnackbar === 'function') hideSnackbar();
     }
-    chats[chatId]._lastApiError = null; // consumed — clear so badge/dropdown row don't stay red
+    if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { _lastApiError: null }); // consumed — clear so badge/dropdown row don't stay red (FLUX-4C lane)
     // RETRY1-F1: re-render the jobs badge + open dropdown synchronously, mirroring
     // selectChat (170:547-552) and newChat (170:420-425). Without this, if
     // runStarted never fires (SW guard sees a stale isRunning, or the SW is

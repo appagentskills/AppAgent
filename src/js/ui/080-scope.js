@@ -3,20 +3,20 @@
 // record scope is now passed per-call via the `scope` parameter on
 // servicenow_api / servicenow_run_script, so no global scope state exists.)
 
+// F6 (flux single-writer): these are DISPATCHERS, not writers. The page
+// mutates its replica for instant UI feedback, then posts the map to the SW
+// ('permissions-update'), which applies it, persists to IDB `settings` (the
+// page never writes permission maps to IDB anymore), and rebroadcasts
+// 'permissions-changed' so every panel converges. If the bus port is down
+// the patch is queued and flushed on reconnect (see
+// pushPermissionsToOffscreen in app/045-agent-port-bridge-page.js).
 function saveToolPermissions() {
-    setSetting('toolPermissions', toolPermissions);
-    // Mirror to the SW: the agent loop in offscreen has its own
-    // `toolPermissions` global hydrated from IDB at boot; without this push,
-    // post-boot mutations ("Always allow" from an approval prompt, reset to
-    // defaults, settings-panel edits) would only take effect on the next SW
-    // restart, so the prompt would keep firing.
     if (typeof pushPermissionsToOffscreen === 'function') {
         pushPermissionsToOffscreen({ toolPermissions: toolPermissions });
     }
 }
 
 function saveInstancePermissions() {
-    setSetting('instancePermissions', instancePermissions);
     if (typeof pushPermissionsToOffscreen === 'function') {
         pushPermissionsToOffscreen({ instancePermissions: instancePermissions });
     }

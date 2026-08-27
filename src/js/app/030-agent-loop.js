@@ -1614,6 +1614,11 @@ async function runAgent(overrideChatId) {
     // no hook fired the chat is genuinely idle and a future run-agent proceeds.
     delete _runCleanupGuard[streamingChatId];
 
+    // PREM-NOTIFY: set when the drain below schedules an immediate follow-up
+    // run for a parked sub report — the chat is about to CONTINUE, so the
+    // notifyFinish emit at the bottom must be skipped (the follow-up run's own
+    // finish will notify instead).
+    var _followUpScheduled = false;
     // REG391-2: end-of-run wake-on-report race. A sub can call report_to_parent
     // in the window between this loop's last flushPendingInjection (line 1085)
     // and the cleanup above. _wakeParentOnReport sees the parent loop still
@@ -1636,6 +1641,7 @@ async function runAgent(overrideChatId) {
                 && !isChatPaused(streamingChatId)
                 && !runningChatIds[streamingChatId]
                 && typeof runAgent === 'function') {
+                _followUpScheduled = true;
                 Promise.resolve()
                     .then(function() { return runAgent(streamingChatId); })
                     .catch(function(err) { console.warn('[agent-loop] follow-up run for parked report failed', streamingChatId, err); });
@@ -1668,12 +1674,45 @@ async function runAgent(overrideChatId) {
     // the wasHidden-during-run flag tracked in 035. Kept distinct from
     // runFinished so it fires AFTER hooks + fetchCredits, matching the
     // original ordering.
-    AgentEvents.emit('notifyFinish', {
-        chatId: streamingChatId,
-        isPaused: isChatPaused(streamingChatId),
-        wasSilentHook: wasSilentHook,
-        hasError: !!_runApiError
-    });
+    //
+    // PREM-NOTIFY: notifyFinish must fire on TASK end, not run-segment end.
+    // Two premature cases are suppressed here:
+    //   (a) _followUpScheduled — the REG391-2 drain above just scheduled an
+    //       immediate follow-up run for a parked sub report; the chat is
+    //       about to continue, so "Agent finished" now would be a lie.
+    //   (b) in-flight sub-agents — an orchestrating parent that ends its
+    //       turn while subs it spawned are still running (state 'running' in
+    //       the registry) will be re-woken by _wakeParentOnReport when they
+    //       report; each intermediate turn end used to fire an OS
+    //       notification + unseen bell. Same predicate as the terminal-state
+    //       guard in tools/120-actions.js (update_action_state). Only subs
+    //       with wake_parent !== false count: a detached fire-and-forget sub
+    //       never wakes the parent, so it must not suppress the notification
+    //       (nothing later would ever fire it). Fail-OPEN: if the registry is
+    //       unreadable, notify rather than stay silent.
+    // In both cases the FINAL run — after the last waking sub settles and no
+    // follow-up is parked — emits notifyFinish as before. runFinished (above)
+    // is deliberately untouched: spinner/render cleanup must always happen.
+    var _suppressNotifyFinish = _followUpScheduled;
+    if (!_suppressNotifyFinish) {
+        try {
+            if (typeof SubAgents !== 'undefined' && typeof SubAgents.listAll === 'function') {
+                _suppressNotifyFinish = SubAgents.listAll().some(function(r) {
+                    return r && r.parent_chat_id === streamingChatId
+                        && r.state === 'running'
+                        && r.wake_parent !== false;
+                });
+            }
+        } catch (e) { _suppressNotifyFinish = false; }
+    }
+    if (!_suppressNotifyFinish) {
+        AgentEvents.emit('notifyFinish', {
+            chatId: streamingChatId,
+            isPaused: isChatPaused(streamingChatId),
+            wasSilentHook: wasSilentHook,
+            hasError: !!_runApiError
+        });
+    }
     } catch (_loopErr) {
         // PR390-FU-1: stash for the finally's runCrashed emit, then rethrow
         // UNCHANGED — callers (e.g. _drainPool's .catch → _markErrored) still

@@ -247,7 +247,29 @@ async function importAllData() {
             for (var j = 0; j < importData.settings.length; j++) {
                 settingsStore.put(importData.settings[j]);
             }
-            
+
+            // F6: permission maps are SW-owned at runtime — the generic put
+            // above restores the IDB rows, but a live SW (which outlives the
+            // location.reload() below, often for hours under keep-awake)
+            // only re-reads IDB at its own boot, so without an explicit
+            // dispatch it would keep ENFORCING the pre-import maps —
+            // security-relevant when the import TIGHTENS permissions. Route
+            // the imported maps through the normal perms/set lane: the SW
+            // applies them to its globals, re-persists (same content, no-op)
+            // and rebroadcasts so any other open panel converges before this
+            // panel reloads.
+            if (typeof pushPermissionsToOffscreen === 'function') {
+                var _impPerms = {};
+                for (var p2 = 0; p2 < importData.settings.length; p2++) {
+                    var _iRow = importData.settings[p2] || {};
+                    if (_iRow.key === 'toolPermissions' && _iRow.value && typeof _iRow.value === 'object') _impPerms.toolPermissions = _iRow.value;
+                    if (_iRow.key === 'instancePermissions' && _iRow.value && typeof _iRow.value === 'object') _impPerms.instancePermissions = _iRow.value;
+                }
+                if (_impPerms.toolPermissions || _impPerms.instancePermissions) {
+                    pushPermissionsToOffscreen(_impPerms);
+                }
+            }
+
             // Import dashboard widgets (if present)
             if (importData.dashboardWidgets && importData.dashboardWidgets.length > 0 && database.objectStoreNames.contains(dashboardWidgetsStoreName)) {
                 var dashboardTransaction = database.transaction([dashboardWidgetsStoreName], 'readwrite');

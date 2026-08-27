@@ -1392,7 +1392,6 @@ async function runWidgetPrompt(widget, prompt) {
     if (!widget || !prompt) return;
 
     // Store original context to restore after
-    var originalChatId = currentChatId;
     var originalEditingWidget = currentEditingWidget;
 
     // Get history from source chat if available
@@ -1449,9 +1448,11 @@ async function runWidgetPrompt(widget, prompt) {
     // Add the prompt as user message
     chats[newChatId].messages.push({ role: 'user', content: prompt });
 
-    // Switch to the new chat context for agent execution.
+    // FLUX-QW2: do NOT swap the currentChatId global — the old swap was held
+    // across `await runAgent()`, so a user who switched chats during the run
+    // was clobbered back to the stale id afterwards and the next send went to
+    // the wrong chat. runAgent(overrideChatId) takes the target explicitly.
     // B-B2: register against the new chat so concurrent regens don't collide.
-    currentChatId = newChatId;
     setPendingWidgetRegeneration(newChatId, widget.id);
 
     // Set widget as loading
@@ -1463,9 +1464,9 @@ async function runWidgetPrompt(widget, prompt) {
     saveChatsToStorage();
     renderChatList();
 
-    // Run agent and wait for completion
+    // Run agent and wait for completion (explicit chat — no global swap).
     paused = false;
-    await runAgent();
+    await runAgent(newChatId);
 
     // Update widget to link to new chat
     widget.chatId = newChatId;
@@ -1480,8 +1481,7 @@ async function runWidgetPrompt(widget, prompt) {
     saveChatsToStorage();
     renderChatList();
 
-    // Restore original context
-    currentChatId = originalChatId;
+    // Restore original context (currentChatId was never swapped — FLUX-QW2).
     currentEditingWidget = originalEditingWidget;
 }
 
@@ -1633,6 +1633,11 @@ function getSkillsSummaryForPrompt() {
 // and a save would erase every stored chat. Set ONLY in the load onsuccess
 // handler below.
 var _chatsHydrated = false;
+
+// PR 4 (RFC addendum §5): the page-side known-chat-id set and the
+// wipe-guard-2/3 per-boot delete caps are RETIRED — dead since PR 3 made
+// saves upsert-only (no delete-pass consumed them any more). The
+// _chatsHydrated save-gate above is a DIFFERENT guard and stays.
 
 // Post-retry storage failure: chat history genuinely could not be read in
 // this realm (dead connection that survived the withStore retry, blocked
@@ -1869,12 +1874,6 @@ async function _loadChatsFromStorageImpl() {
         // those forward into `loaded` before the atomic swap.
         Object.keys(chats).forEach(function(id){ var c=chats[id]; if(!loaded[id] && c && (c.isTemporary || (_storageDegraded && c.messages && c.messages.length) || id===currentChatId)) loaded[id]=c; });
         chats = loaded;
-        // WIPE-GUARD-3 (mirrors worker/115-storage.js): a full rehydration
-        // rebuilds the chats map from IDB, so the per-boot delete budget starts
-        // fresh here — without this reset the budget was never replenished and all
-        // chat-row deletes silently halted after WIPE_GUARD_MAX_DELETES_PER_BOOT
-        // cumulative deletes in one realm lifetime (F2-1).
-        _wipeGuardDeletedSinceLoad = 0;
         console.log('[storage] loaded ' + Object.keys(loaded).length + ' chats in '
             + (Date.now() - _loadT0) + 'ms — '
             + (_acctB64
@@ -1912,7 +1911,11 @@ async function _loadChatsFromStorageImpl() {
                 var _ids = Object.keys(chats);
                 _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
                 for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
-                    stripChatPayloadsInPlace(chats[_ids[_si]]);
+                    // MEMFIX-BODY (Fix A): evictBodies=true — the page also
+                    // drops heavy message text (tool results, thinking,
+                    // tool_calls args) of non-recent chats at boot; restored
+                    // with the payloads by ensureChatPayloads on open.
+                    stripChatPayloadsInPlace(chats[_ids[_si]], true);
                     // WRITE-AMP root fix (mirrors worker/115-storage.js): strip
                     // only flags chats it stripped base64 from, so pure-TEXT
                     // chats stayed in the put set and the page re-wrote every
@@ -1955,7 +1958,7 @@ async function _loadChatsFromStorageImpl() {
         try {
             if (!_coldSweepTimer && typeof sweepColdChatPayloads === 'function') {
                 _coldSweepTimer = setInterval(function() {
-                    try { sweepColdChatPayloads(CHAT_KEEP_HYDRATED); } catch (e) {}
+                    try { sweepColdChatPayloads(CHAT_KEEP_HYDRATED, true); } catch (e) {}
                 }, 60000);
             }
         } catch (e) {}
@@ -1979,14 +1982,6 @@ async function _loadChatsFromStorageImpl() {
 
 var saveChatsPending = false;
 var saveChatsPendingAgain = false;
-// WIPE-GUARD-3 (mirrors worker/115-storage.js): cumulative per-boot delete
-// budget. The per-save cap (wipe-guard-2) rate-limits rather than blocks —
-// under a persistently partial in-memory map, 5 real chats would still be
-// deleted at EVERY save, draining the store over a long incident. Budget
-// total deletes per realm boot; once exhausted, stop deleting entirely
-// until a fresh load rebuilds the map.
-var _wipeGuardDeletedSinceLoad = 0;
-var WIPE_GUARD_MAX_DELETES_PER_BOOT = 25;
 var _saveChatsWaiters = [];
 // CONGESTION-BACKOFF (mirrors worker/115-storage.js): after a save blows the
 // 30s write deadline, withStore leaves the transaction queued and rejects.
@@ -1996,6 +1991,46 @@ var _saveChatsWaiters = [];
 // scope. Hold off after a timeout so the backlog commits.
 var _saveChatsBackoffUntil = 0;
 var SAVE_CHATS_TIMEOUT_BACKOFF_MS = 15000;
+
+// ── FLUX-4C (narrow pull-forward): SW-owned chat-meta fields ────────────
+// These seven fields are canonical in the SERVICE WORKER — every page writer
+// dispatches them over the 'chat-meta-update' lane (dispatchChatMeta,
+// app/045-agent-port-bridge-page.js) and the SW persists them. The page put
+// below must therefore never write a page value for them: for each field the
+// STORED record's state passes through unchanged (defined or absent). The
+// ONE exception is a chat with no stored row yet (first save): the page is
+// the creator and its values are the only truth, so they're kept.
+// CHAT_META_TS_FIELDS / CHAT_META_FLAG_FIELDS — the lane vocabulary this
+// preserver iterates — are declared ONCE in core/030-config.js (shared into
+// both bundles; flux audit: layering — the twin per-realm copies were
+// collapsed, and the build fails on any re-declaration).
+function _preserveSwOwnedChatMeta(record, stored) {
+    if (!record || !stored) return record;
+    var out = record;
+    function claim() { if (out === record) out = Object.assign({}, record); return out; }
+    // FLUX-T1 (title lane): `title` + its `titleProvisional` rider are
+    // SW-canonical too (the pair's stamp, titleUpdatedAt, is already in the
+    // TS list) — the stored state passes through the page put unchanged,
+    // same rule as the other lane fields. First save (no stored row) keeps
+    // the page creator values via the null-guard above.
+    // FLUX-6 (#799 review, defensive): pair atomicity — a stored row carrying
+    // a bare titleUpdatedAt stamp WITHOUT a title value must not propagate
+    // through this put (it would delete the record's title and freeze the
+    // stamp compare against every later legit rename). Keep the record's own
+    // pair fields in that corrupt case; all other lane fields still pass
+    // through from the stored row unchanged.
+    var _storedBareStamp = (stored.titleUpdatedAt !== undefined)
+        && !(typeof stored.title === 'string' && stored.title);
+    CHAT_META_TS_FIELDS.concat(CHAT_META_FLAG_FIELDS, ['title', 'titleProvisional']).forEach(function(f) {
+        if (_storedBareStamp && (f === 'titleUpdatedAt' || f === 'title' || f === 'titleProvisional')) return;
+        if (stored[f] === undefined) {
+            if (out[f] !== undefined) delete claim()[f];
+        } else if (out[f] !== stored[f]) {
+            claim()[f] = stored[f];
+        }
+    });
+    return out;
+}
 
 async function saveChatsToStorage() {
     // Prevent concurrent saves which can cause data loss. Callers that AWAIT
@@ -2036,11 +2071,18 @@ async function saveChatsToStorage() {
         await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
         var store = transaction.objectStore(chatStoreName);
 
-        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
-        // vanished from memory, upsert the rest. Even a buggy save can no
-        // longer mass-erase the store in one transaction.
-        var keysRequest = store.getAllKeys();
-        
+        // UPSERT-ONLY (RFC addendum Invariant D, PR 3 — mirrors
+        // worker/115-storage.js): the save NEVER deletes. The absence-diff
+        // delete-pass that used to live here — "stored key ∉ in-memory
+        // `chats` ⇒ delete the row" — was the root cause of the chat-deletion
+        // data-loss class: the page map is NOT a superset of the store (it
+        // only learns foreign chats through SW pushes), so rows imported or
+        // created by another panel were silently destroyed (observed live:
+        // 904 → 903 → 902 across two page saves). Rows now leave the store
+        // ONLY through deleteChatRow (core/130-indexeddb.js) presenting an
+        // explicit reason + on-disk precondition — for this realm that is
+        // deleteChatFromDB below ('user-delete', called by deleteChat in
+        // ui/170-chat-management.js). Absence from memory means NOTHING.
         return new Promise(function(_resolve) {
             // WS1F-1: settle-guard so the commit promise resolves EXACTLY once and
             // can't wedge if the transaction aborts. A put-error can abort the whole
@@ -2058,11 +2100,12 @@ async function saveChatsToStorage() {
             transaction.onabort = function() {
                 if (!_settled) { updateStorageIndicator(); resolve(); }
             };
-            keysRequest.onsuccess = function() {
-                var existingKeys = keysRequest.result || [];
-                // PAYLOAD-STORE: refresh the known-durable blob id cache once per
-                // realm (key-only read) so unchanged payloads aren't re-put.
-                primeChatPayloadIdCache(transaction, function() {
+            // PAYLOAD-STORE: refresh the known-durable blob id cache once per
+            // realm (key-only read) so unchanged payloads aren't re-put. Its
+            // getAllKeys request is issued SYNCHRONOUSLY here, so the fresh
+            // transaction has a pending request and cannot auto-commit before
+            // the put loop below queues its own.
+            primeChatPayloadIdCache(transaction, function() {
                 // Persistable snapshot — same filter as before (drop 0-message chats)
                 var desired = {};
                 Object.keys(chats).forEach(function(id) {
@@ -2083,53 +2126,11 @@ async function saveChatsToStorage() {
                         resolve();
                     }
                 }
-                // WIPE-GUARD-2 (mirrors worker/115-storage.js): cap the
-                // delete-pass. A partially-hydrated map turns the diff-save
-                // into a mass-delete of every chat this realm doesn't hold in
-                // memory. But legit flows CAN exceed a handful (sub-agent GC
-                // batches in core/097-sub-agent-registry.js backlog >5 rows),
-                // so do NOT skip entirely — that permanently disabled
-                // deletion (rows resurrected on reload, unbounded growth).
-                // Delete a BOUNDED batch per save (first 5): legit backlogs
-                // drain over successive saves, a partial-map incident stays
-                // capped at 5 rows per transaction.
-                var _delKeys = [];
-                existingKeys.forEach(function(key) {
-                    if (!Object.prototype.hasOwnProperty.call(desired, key)) _delKeys.push(key);
-                });
-                if (_delKeys.length > 5) {
-                    console.warn('[storage] delete-pass CAPPED (wipe-guard-2): '
-                        + _delKeys.length + ' of ' + existingKeys.length
-                        + ' stored chats are absent from memory (' + Object.keys(desired).length
-                        + ' held) — deleting only 5 this save; a legit backlog drains over the'
-                        + ' next saves, a partial in-memory map stays bounded');
-                    _delKeys = _delKeys.slice(0, 5);
-                }
-                // WIPE-GUARD-3: enforce the per-boot cumulative budget (see
-                // declaration above) — trim the batch to the budget still
-                // remaining instead of dropping it wholesale, so a partial
-                // budget is spent, not wasted (F2-2). When the budget is fully
-                // spent the slice is empty, so deletes still halt.
-                // EXPLICIT-DELETE: this cap/budget applies ONLY to this bulk
-                // "absent from memory" diff. An explicit user delete no longer
-                // depends on this pass at all — deleteChat (ui/170-chat-management.js)
-                // calls deleteChatFromDB below, a targeted single-id delete that is
-                // neither capped nor budgeted (the SW mirror gets the same exemption
-                // via `_deleted` tombstones in worker/115-storage.js).
-                if (_delKeys.length && _wipeGuardDeletedSinceLoad + _delKeys.length > WIPE_GUARD_MAX_DELETES_PER_BOOT) {
-                    console.warn('[storage] delete-pass TRIMMED (wipe-guard-3): '
-                        + _wipeGuardDeletedSinceLoad + ' of a ' + WIPE_GUARD_MAX_DELETES_PER_BOOT
-                        + ' per-boot delete budget already used since load — trimming this save to the'
-                        + ' remaining budget (a reload/full rehydration rebuilds the map)');
-                    _delKeys = _delKeys.slice(0, Math.max(0, WIPE_GUARD_MAX_DELETES_PER_BOOT - _wipeGuardDeletedSinceLoad));
-                }
-                _wipeGuardDeletedSinceLoad += _delKeys.length;
-                _delKeys.forEach(function(key) {
-                    pending++;
-                    var delRequest = store.delete(key);
-                    delRequest.onsuccess = settleOne;
-                    delRequest.onerror = settleOne;
-                });
+                // PR 3: the absence-diff delete-pass that lived here is GONE
+                // (PR 4 retired its caps and known-id sets) — see the
+                // UPSERT-ONLY header above. Explicit user deletes take the
+                // targeted deleteChatFromDB lane below; they never depended
+                // on this save.
                 Object.keys(desired).forEach(function(id) {
                     // MEMFIX: NEVER put a payload-evicted chat. Post-PAYLOAD-STORE
                     // this protects legacy records whose payloads are still inline
@@ -2139,29 +2140,62 @@ async function saveChatsToStorage() {
                     // remove its record either.
                     if (desired[id]._payloadsEvicted) return;
                     // PAYLOAD-STORE: strip payloads into blob rows; the record
-                    // put carries flags instead of base64. All requests are
-                    // issued synchronously here, so `pending` cannot zero-cross
-                    // before the loop finishes.
+                    // put carries flags instead of base64. `pending` is
+                    // INCREMENTED synchronously for every record in this loop
+                    // (the FLUX-4C put itself is issued async, after its get),
+                    // so `pending` cannot zero-cross before the loop finishes.
                     var extracted = extractChatPayloadsForPut(desired[id]);
                     var _nBlobs = queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
                     pending += _nBlobs;
                     _putBlobs += _nBlobs;
                     pending++;
                     _putRecords++;
-                    var putRequest = store.put(extracted.record);
-                    putRequest.onsuccess = settleOne;
-                    putRequest.onerror = settleOne;
+                    // FLUX-4C (F2 close): get-then-put inside the same txn so
+                    // the stored record's SW-owned chat-meta fields pass
+                    // through this put untouched — a panel's stale replica can
+                    // NEVER clobber the lane's persisted state (the old blind
+                    // put was panel↔panel last-writer-wins on pin / error /
+                    // hidden / timestamps). Mirrors the SW's own put-side
+                    // merge (worker/115-storage.js). A get error degrades to
+                    // the blind put for this one save.
+                    (function(_putRec, _putId) {
+                        // Both callbacks settle even when put() throws
+                        // SYNCHRONOUSLY (DataCloneError): unlike the old
+                        // sync loop-body put (whose throw surfaced to the
+                        // caller), a throw inside an IDB event handler only
+                        // aborts the txn — without the catch this record's
+                        // settleOne never fires and the save lock hangs.
+                        var _metaGet = store.get(_putId);
+                        _metaGet.onsuccess = function() {
+                            try {
+                                // FLUX-6: tombstone put-drop (mirrors the SW's
+                                // deleted-while-in-flight guard, PR #800) — never
+                                // re-put a row another panel's delete tombstoned
+                                // while this save's get was in flight.
+                                if (_metaGet.result && _metaGet.result._deleted === true) { settleOne(); return; }
+                                // FLUX-6: chain the SHARED non-lane merge (messages
+                                // append-tail preservation, displays union, future-
+                                // field fill-gap — core/130-indexeddb.js) after the
+                                // lane preserver, against the SAME stored row.
+                                var putRequest = store.put(_mergeChatRowForPut(_preserveSwOwnedChatMeta(_putRec, _metaGet.result), _metaGet.result));
+                                putRequest.onsuccess = settleOne;
+                                putRequest.onerror = settleOne;
+                            } catch (e) { console.warn('[storage] chat put failed (post-get)', _putId, e); settleOne(); }
+                        };
+                        _metaGet.onerror = function() {
+                            try {
+                                var putRequest = store.put(_putRec);
+                                putRequest.onsuccess = settleOne;
+                                putRequest.onerror = settleOne;
+                            } catch (e) { console.warn('[storage] chat put failed (get-error fallback)', _putId, e); settleOne(); }
+                        };
+                    })(extracted.record, id);
                 });
                 if (pending === 0) {
                     updateStorageIndicator();
                     resolve();
                 }
-                }); // end primeChatPayloadIdCache
-            };
-            keysRequest.onerror = function() {
-                console.error('Failed to read chat store keys:', keysRequest.error);
-                resolve();
-            };
+            }); // end primeChatPayloadIdCache
         });
         }); // end withStore fn
         // Committed: clear any armed backoff and surface slow-but-successful
@@ -2213,100 +2247,43 @@ async function saveChatsToStorage() {
 
 // EXPLICIT-DELETE (chat-delete durability): targeted, single-id removal of ONE
 // chat row (plus the payload blob rows only that chat referenced).
-// Deliberately does NOT go through the diff-save above. That delete-pass is a
-// BULK reconciliation of "rows on disk that are absent from the in-memory
-// map", so it is rate-limited (5 per save) and budgeted
-// (WIPE_GUARD_MAX_DELETES_PER_BOOT per realm boot) to contain a partially-
-// hydrated map turning into a mass wipe. An explicit user delete is a
-// different operation — one known id, requested by the user — and must never
-// be capped, budgeted or deferred: once the per-boot budget was spent the
-// diff-save's delete-pass went dead for the rest of the realm's life and every
-// deleted chat resurrected on reload (the exact failure the guard was added to
-// prevent). The bulk guard is left untouched.
+// Thin wrapper over the SHARED delete primitive deleteChatRow
+// (core/130-indexeddb.js — RFC addendum §2.3 "the one delete primitive").
+// The primitive owns the transaction, the ON-DISK precondition check (a row
+// leaves the store only for a named reason whose precondition holds against
+// the record as it exists on disk, verified INSIDE the deleting
+// transaction), the abort=failure settle discipline, the page-realm blob
+// reaping (hydration gate + survivor-reference subtraction, moved there
+// verbatim) and the delete ledger. This wrapper supplies the SIGNAL
+// ('user-delete'), the pre-delete record, and the degraded-mode index mirror.
+// It deliberately does NOT go through the diff-save above: that pass is a
+// bulk reconciliation, rate-limited and budgeted; an explicit user delete is
+// one known id requested by the user and must never be capped or deferred.
 // `chatSnapshot` is the record as it was BEFORE the caller dropped it from
-// `chats` (deleteChat captures it) — used only to find this chat's payload ids.
-// Resolves true when the delete transaction completed, false on failure.
+// `chats` (deleteChat in ui/170-chat-management.js captures it) — used to
+// find this chat's payload ids, and as the caller's proof that it holds the
+// pre-delete record.
+// Resolves true when the delete transaction completed (or the row was
+// already gone — the primitive is idempotent), false on refusal/abort/failure.
 async function deleteChatFromDB(chatId, chatSnapshot) {
     if (!chatId) return false;
-    // chat_payloads rows are keyed by file_id/screenshot_id (core/130-indexeddb.js),
-    // never by chat id, and those ids survive payload eviction — so even a
-    // stripped record still lists them. Reap only the ids no OTHER surviving
-    // in-memory chat references (same reference rule as sweepOrphanChatPayloads,
-    // without its 24h age gate: this delete is explicit, not a speculative sweep).
-    var _mine = _chatPayloadIdsFor(chatSnapshot);
-    var payloadIds = Object.keys(_mine);
-    // HYDRATION GATE — the same precondition sweepOrphanChatPayloads enforces
-    // (core/130-indexeddb.js:1011). The "minus every blob a SURVIVING chat
-    // still references" subtraction below is only sound when `chats` holds
-    // EVERY chat. On a partially-hydrated map (boot still loading) or a
-    // degraded one (IDB read failed — _chatsHydrated stays false), a
-    // survivor's reference is invisible, so its blob looks unreferenced and
-    // gets deleted out from under a live chat. When the map is not
-    // known-complete, DEFER blob cleanup instead of deleting blind: the boot
-    // orphan sweep reaps genuinely unreferenced rows later (gated on the same
-    // flag, plus its 24h age floor). The chat ROW delete below still runs —
-    // deferring blob cleanup must never block the delete the user asked for.
-    if (payloadIds.length && !(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) {
-        console.warn('[storage] explicit delete: chats map not fully hydrated — deferring '
-            + payloadIds.length + ' payload blob row(s) of chat ' + chatId
-            + ' to the boot orphan sweep; deleting the chat row only');
-        payloadIds = [];
+    if (typeof deleteChatRow !== 'function') {
+        console.error('[storage] explicit delete: deleteChatRow (core/130-indexeddb.js) unavailable — chat '
+            + chatId + ' NOT deleted');
+        return false;
     }
-    if (payloadIds.length) {
-        var _stillReferenced = {};
-        Object.keys(chats).forEach(function(cid) {
-            if (cid === chatId) return;
-            var _other = _chatPayloadIdsFor(chats[cid]);
-            Object.keys(_other).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
-        });
-        payloadIds = payloadIds.filter(function(pid) { return !_stillReferenced[pid]; });
-    }
-    var _txAbortErr = null;
-    try {
-        var _committed = await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
-            var store = transaction.objectStore(chatStoreName);
-            var payloadStore = transaction.objectStore(chatPayloadsStoreName);
-            return new Promise(function(_resolve) {
-                // Same settle-guard discipline as saveChatsToStorage: settle
-                // EXACTLY once, and never wedge if the transaction aborts.
-                // ABORT = FAILURE (PR #761 follow-up): an abort ROLLS BACK every
-                // delete in this transaction, so settling it as success made the
-                // function log "removed from IDB" and return true while the row
-                // was still on disk. Settle false instead — still resolve, never
-                // reject, so the never-throw contract holds. Success settles on
-                // COMMIT (transaction.oncomplete), not on the last request's
-                // onsuccess: a request error (nothing here calls preventDefault)
-                // aborts the tx AFTER that request settles, so the old
-                // per-request counter resolved success before the abort event
-                // could fire.
-                var _settled = false;
-                function settle(ok) { if (_settled) return; _settled = true; _resolve(ok); }
-                transaction.oncomplete = function() { settle(true); };
-                transaction.onabort = function() { _txAbortErr = transaction.error || null; settle(false); };
-                store.delete(chatId);
-                payloadIds.forEach(function(pid) {
-                    payloadStore.delete(pid);
-                    // Drop the known-durable cache entry so a future put of the
-                    // same id isn't skipped (mirrors sweepOrphanChatPayloads).
-                    try { if (typeof _persistedPayloadIds !== 'undefined' && _persistedPayloadIds) delete _persistedPayloadIds[pid]; } catch (e) {}
-                });
-            });
-        });
-        if (!_committed) {
-            console.warn('[storage] explicit delete ABORTED for chat ' + chatId
-                + ' — transaction rolled back, nothing was removed', _txAbortErr || '');
-            return false;
-        }
-        console.log('[storage] explicit delete: chat ' + chatId + ' removed from IDB'
-            + (payloadIds.length ? ' (+' + payloadIds.length + ' payload rows)' : ''));
+    var ok = await deleteChatRow(chatId, 'user-delete', {
+        userInitiated: true,
+        via: 'page-delete',
+        hadRecord: !!chatSnapshot,
+        record: chatSnapshot || null
+    });
+    if (ok) {
         // Keep the degraded-mode chrome.storage.local index in step with the
         // store, exactly as a committed save does.
         try { mirrorChatIndexToLocal(); } catch (e) {}
-        return true;
-    } catch (e) {
-        console.error('[storage] explicit delete FAILED for chat ' + chatId, e);
-        return false;
     }
+    return ok;
 }
 
 // Payload ids (file_id / screenshot_id) a chat record references. Ids survive
@@ -2422,18 +2399,13 @@ async function loadToolPermissions() {
         setSetting('permMigrations', permMigrations);
     }
 
-    // Mirror to SW now that IDB load is complete. initDefaultToolPermissions
-    // ends in saveToolPermissions which pushes ONLY toolPermissions — so
-    // without an explicit instancePermissions push, the SW never learns about
-    // tier='auto' on the user's connected instance and prompts on every
-    // browser:* / sn:write call. Push both sources together as the
-    // authoritative post-IDB-load mirror.
-    if (typeof pushPermissionsToOffscreen === 'function') {
-        pushPermissionsToOffscreen({
-            toolPermissions: toolPermissions,
-            instancePermissions: instancePermissions
-        });
-    }
+    // F6: no post-load mirror push to the SW. The SW hydrates tool/instance
+    // maps from the SAME IDB at its own boot (loadToolPermissionsInWorker),
+    // and under single-writer the page never writes them, so both realms read
+    // an identical source — a full-map push here was pure staleness risk
+    // (panel A booting could clobber an edit panel B dispatched moments
+    // earlier). Genuine boot-time MUTATIONS (seeded defaults, migrations
+    // above) still dispatch through saveToolPermissions.
     // The header tier pill (updateSnStatus) typically renders BEFORE this
     // async IDB load completes, so it shows the default 'Manual' even when
     // the stored tier is 'auto' — and nothing re-renders it until the next
@@ -2442,9 +2414,10 @@ async function loadToolPermissions() {
 }
 
 function initDefaultToolPermissions() {
+    var changed = false;
     // Global read tools → allow
     GLOBAL_READ_KEYS.forEach(function(key) {
-        if (!toolPermissions[key]) toolPermissions[key] = 'allow';
+        if (!toolPermissions[key]) { toolPermissions[key] = 'allow'; changed = true; }
     });
     // Global write tools → auto (with exceptions)
     GLOBAL_WRITE_KEYS.forEach(function(key) {
@@ -2460,9 +2433,14 @@ function initDefaultToolPermissions() {
             } else {
                 toolPermissions[key] = 'auto';
             }
+            changed = true;
         }
     });
-    saveToolPermissions();
+    // F6: dispatch only when a default was actually seeded. The old
+    // unconditional save re-shipped the full (unchanged) map to the SW on
+    // every panel boot — harmless when single-panel, but a stale-clobber
+    // lane when another panel had just edited a permission.
+    if (changed) saveToolPermissions();
 }
 
 function _getGlobalDefault(key) {
@@ -2530,8 +2508,16 @@ function resetAllPermissionsToDefaults() {
         saveInstancePermissions();
     }
 
-    // Clear session permissions
+    // Clear session permissions — and dispatch the clear to the SW (F6):
+    // the SW owns the authoritative session map, so a page-local wipe alone
+    // would be resurrected by the next hello/rebroadcast, and other panels
+    // would keep their grants. This is the ONLY place an empty session map
+    // is legitimately pushed — it is an explicit user action, unlike the
+    // removed boot-time hello mirror (the QW9 wipe bug).
     sessionPermissions = {};
+    if (typeof pushPermissionsToOffscreen === 'function') {
+        pushPermissionsToOffscreen({ sessionPermissions: sessionPermissions });
+    }
 
     // Re-render
     renderToolPermissions();
