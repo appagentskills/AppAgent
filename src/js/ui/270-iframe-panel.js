@@ -158,7 +158,16 @@ async function _rebuildBeforeReload() {
         if (!handle) return true;
 
         if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
-        var res = await executeTool('extension_build', {});
+        // fromSandbox: bypass the skill-tool large-response truncation in
+        // executeSkillTool (core/140-skills-engine.js) — results over
+        // LARGE_RESPONSE_LINE_LIMIT (50) pretty-printed lines are otherwise
+        // replaced by a preview envelope that DROPS stats/error/deploy, so the
+        // `ok` predicate below would fail on a perfectly good build (and the
+        // failure modal would show the generic 'no files were built/deployed'
+        // message). Agent-side sandbox calls already get the untruncated
+        // result via this same flag; this is programmatic consumption, not
+        // model output, so truncation would only destroy information.
+        var res = await executeTool('extension_build', {}, null, { fromSandbox: true });
         var ok = !!(res && res.success && res.stats && res.stats.jsFiles > 0 && res.stats.filesDeployed > 0);
         if (ok) {
             // Surface WHICH workspace was built — with pinning + forks the

@@ -1,6 +1,12 @@
 /* Modal Dialog */
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-modal); display: none; align-items: center; justify-content: center; }
 .modal-overlay.show { display: flex; }
+/* The STATIC generic confirm/prompt overlay (#modal-overlay, body.html) sits
+   early in the DOM, so at equal z-index any dynamically appended
+   .modal-overlay (e.g. #api-provider-modal) paints over it. Confirms are by
+   nature the topmost blocking interaction — bump it one above --z-modal so
+   e.g. the Delete confirm opened FROM the edit-model modal stays visible. */
+#modal-overlay { z-index: calc(var(--z-modal) + 1); }
 
 /* Widget History Modal */
 .widget-history-modal { background: var(--bg-white); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); max-width: 500px; width: 90%; max-height: 70vh; display: flex; flex-direction: column; }
@@ -31,6 +37,18 @@
 .modal-overlay.modal-variant-warning .modal-header { color: var(--warning-dark); }
 .modal-overlay.modal-variant-danger .modal-dialog { border-top: 4px solid var(--danger); }
 .modal-overlay.modal-variant-danger .modal-header { color: var(--danger); }
+
+/* ChatGPT device authorization: deliberately larger than generic confirms so the
+   one-time code stays readable from another device and under browser zoom. */
+.modal-overlay.chatgpt-device-modal .modal-dialog { max-width: 620px; }
+.chatgpt-device-intro { margin-top: 0; }
+.chatgpt-device-url { display: block; margin: var(--space-5) 0; overflow-wrap: anywhere; }
+.chatgpt-device-code-row { display: flex; align-items: center; gap: var(--space-5); margin: var(--space-7) 0 var(--space-3); }
+.chatgpt-device-code { flex: 1; padding: var(--space-7); border: 2px solid var(--primary); border-radius: var(--radius-lg); background: var(--secondary-light); color: var(--text-primary); font-family: var(--font-mono); font-size: clamp(2rem, 7vw, 3.5rem); font-weight: var(--font-bold); letter-spacing: .12em; line-height: 1.1; text-align: center; user-select: all; }
+.chatgpt-device-feedback { min-height: 1.4em; color: var(--success); font-weight: var(--font-medium); }
+.chatgpt-device-feedback.error, .chatgpt-device-expiry.expired { color: var(--danger); }
+.chatgpt-device-expiry { font-variant-numeric: tabular-nums; font-weight: var(--font-medium); }
+@media (max-width: 560px) { .chatgpt-device-code-row { align-items: stretch; flex-direction: column; } .chatgpt-device-code { font-size: clamp(1.7rem, 10vw, 2.6rem); } }
 
 /* Skill Asset Modal - Larger size */
 .modal-overlay.skill-asset-modal .modal-dialog { max-width: 800px; max-height: 85vh; display: flex; flex-direction: column; }

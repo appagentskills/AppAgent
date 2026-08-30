@@ -164,22 +164,9 @@ async function exportAllData() {
             return idx === 0 ? line : '  ' + line;
         }).join('\n'));
 
-        // Get and write LLM endpoints
-        var llmEndpointsData = [];
-        if (database.objectStoreNames.contains(llmEndpointsStoreName)) {
-            var llmEndpointsTransaction = database.transaction([llmEndpointsStoreName], 'readonly');
-            var llmEndpointsStore = llmEndpointsTransaction.objectStore(llmEndpointsStoreName);
-            llmEndpointsData = await new Promise(function(resolve) {
-                var request = llmEndpointsStore.getAll();
-                request.onsuccess = function() { resolve(request.result || []); };
-                request.onerror = function() { resolve([]); };
-            });
-        }
-
-        await writable.write(',\n  "llmEndpoints": ');
-        await writable.write(JSON.stringify(llmEndpointsData, null, 2).split('\n').map(function(line, idx) {
-            return idx === 0 ? line : '  ' + line;
-        }).join('\n'));
+        // New exports intentionally contain only inline provider records. A
+        // physically retained legacy llmEndpoints store is migration input, not
+        // part of the current runtime/export architecture.
         await writable.write('\n}');
 
         await writable.close();
@@ -216,7 +203,11 @@ async function importAllData() {
                 delete importedChat.titleProvisional;
                 delete importedChat._titleHookTries;
                 importedChat.createdAt = Date.now();
-                chats[newId] = importedChat;
+                // FLUX-ADOPT (#836): import/restore is user-authoritative —
+                // route through the sanctioned adopt path with force (newId is
+                // freshly generated, so the guard is moot, but the ratchet
+                // keeps all wholesale adopts on the one site).
+                adoptChatRow(importedChat, { chatId: newId, force: true });
                 await saveChatsToStorage();
                 renderChatList();
                 showSnackbar('Chat imported successfully', 'success');
@@ -238,7 +229,11 @@ async function importAllData() {
             var chatTransaction = database.transaction([chatStoreName], 'readwrite');
             var chatStore = chatTransaction.objectStore(chatStoreName);
             for (var i = 0; i < importData.chats.length; i++) {
-                chatStore.put(importData.chats[i]);
+                // TRANSIENT-FLAG STRIP (core/130-indexeddb.js): backup files
+                // exported before the strip existed can carry legacy
+                // '_'-prefixed session flags — shed them at this put too so
+                // an import cannot re-seed retired transient schema.
+                chatStore.put(stripTransientChatFieldsForPut(importData.chats[i]));
             }
             
             // Import settings
@@ -279,22 +274,31 @@ async function importAllData() {
                 }
             }
             
-            // Import API providers (if present)
+            // Import API providers (if present). Old backups may also contain
+            // llmEndpoints; inline their matched connection fields before writing
+            // provider rows. The helper preserves all custom fields, credentials,
+            // and unmatched endpointId providers. New exports never emit the store.
             if (importData.apiProviders && importData.apiProviders.length > 0 && database.objectStoreNames.contains(apiProvidersStoreName)) {
+                var importedProviders = importData.apiProviders;
+                if (Array.isArray(importData.llmEndpoints)) {
+                    // Canonical endpoint list for endpointId preservation: after the
+                    // reload below, the BACKUP's own settings 'llmEndpoints' row (put
+                    // above) is what loadLlmEndpoints hydrates — judging id survival
+                    // against THIS device's live in-memory list keeps/drops endpointId
+                    // wrongly. Prefer the imported settings row; fall back to the live
+                    // global only when the backup carries none.
+                    var _canonicalEndpoints = (typeof llmEndpoints !== 'undefined' && Array.isArray(llmEndpoints)) ? llmEndpoints : [];
+                    for (var e3 = 0; e3 < importData.settings.length; e3++) {
+                        var _eRow = importData.settings[e3] || {};
+                        if (_eRow.key === 'llmEndpoints' && Array.isArray(_eRow.value)) { _canonicalEndpoints = _eRow.value; break; }
+                    }
+                    importedProviders = inlineLegacyEndpointProviders(importedProviders, importData.llmEndpoints,
+                        _canonicalEndpoints).providers;
+                }
                 var apiProvidersTransaction = database.transaction([apiProvidersStoreName], 'readwrite');
                 var apiProvidersStore = apiProvidersTransaction.objectStore(apiProvidersStoreName);
-                for (var m = 0; m < importData.apiProviders.length; m++) {
-                    apiProvidersStore.put(importData.apiProviders[m]);
-                }
-            }
-            
-            // Import LLM endpoints (if present) — providers reference these by
-            // endpointId, so they round-trip together with apiProviders.
-            if (importData.llmEndpoints && importData.llmEndpoints.length > 0 && database.objectStoreNames.contains(llmEndpointsStoreName)) {
-                var llmEndpointsTransaction = database.transaction([llmEndpointsStoreName], 'readwrite');
-                var llmEndpointsStore = llmEndpointsTransaction.objectStore(llmEndpointsStoreName);
-                for (var n = 0; n < importData.llmEndpoints.length; n++) {
-                    llmEndpointsStore.put(importData.llmEndpoints[n]);
+                for (var m = 0; m < importedProviders.length; m++) {
+                    apiProvidersStore.put(importedProviders[m]);
                 }
             }
             

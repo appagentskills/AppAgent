@@ -2341,6 +2341,1507 @@ chrome.runtime.onConnect.addListener(function(port) {
     });
 });
 
+// ============================================================
+// ChatGPT subscription (OAuth) provider — device-code auth + Responses adapter
+// ============================================================
+//
+// Auth is the OAuth 2.0 DEVICE-CODE flow that the public Codex client_id
+// supports. No redirect/localhost listener, no declarativeNetRequest, no
+// chrome.identity — so no new manifest permission is required (we already hold
+// <all_urls> host access).
+//
+// Field names verified against openai/codex codex-rs/login/src/device_code_auth.rs
+// (usercode -> {device_auth_id, user_code, interval}; token poll -> {authorization_code,
+// code_challenge, code_verifier}; PENDING is signalled by HTTP 403/404) and
+// codex-rs/login/src/server.rs (form-encoded /oauth/token exchange with
+// grant_type/code/redirect_uri/client_id/code_verifier -> {id_token, access_token,
+// refresh_token}). Refresh shape verified against codex-rs/login/src/auth/manager.rs
+// (JSON {client_id, grant_type:'refresh_token', refresh_token} -> all-optional
+// {id_token, access_token, refresh_token}).
+
+var OPENAI_OAUTH = {
+    clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+    issuer: 'https://auth.openai.com',
+    deviceUserCodeUrl: 'https://auth.openai.com/api/accounts/deviceauth/usercode',
+    deviceTokenUrl: 'https://auth.openai.com/api/accounts/deviceauth/token',
+    tokenUrl: 'https://auth.openai.com/oauth/token',
+    redirectUri: 'https://auth.openai.com/deviceauth/callback',
+    verifyUrl: 'https://auth.openai.com/codex/device',
+    scopes: 'openid profile email offline_access',
+    responsesUrl: 'https://chatgpt.com/backend-api/codex/responses',
+    // Live Codex model catalog. Upstream requires ?client_version= (see
+    // fetchCodexModelCatalog, EvanZhouDev/openai-oauth packages/core/src/models.ts
+    // and codex-rs/model-provider/src/models_endpoint.rs MODELS_ENDPOINT).
+    modelsUrl: 'https://chatgpt.com/backend-api/codex/models',
+    // VERIFIED openai/codex codex-rs/login/src/auth/default_client.rs:40
+    // `pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";` — sent as the
+    // `originator` header by default_headers() (same file, :337) on every
+    // Codex request.
+    originator: 'codex_cli_rs',
+    // The Codex client version is NEVER hardcoded as the primary path: OpenAI
+    // gates model availability on it (every catalog entry carries
+    // `minimal_client_version` — codex-rs/codex-api/src/endpoint/models.rs) and
+    // answers 400 "The '<model>' model requires a newer version of Codex."
+    // when the advertised version is below a model's floor. A pinned constant
+    // is stale the moment Codex ships — that is exactly the bug this replaces
+    // (0.50.0 vs 0.151.0 on npm). resolveCodexClientVersion() reads the live
+    // npm dist-tag; the constant below is only the net when that fetch fails.
+    // Mirrors EvanZhouDev/openai-oauth packages/core/src/models.ts:3
+    // (DEFAULT_CODEX_CLIENT_VERSION) + :114 resolveCodexClientVersion.
+    codexVersionRegistryUrl: 'https://registry.npmjs.org/@openai/codex/latest',
+    fallbackClientVersion: '0.151.0'
+};
+
+// ---- Codex client version -------------------------------------------------
+// Memoised in memory (NO chrome.storage write site added on purpose — the
+// write-site ratchet stays put) with a 1h TTL, matching upstream's
+// CODEX_VERSION_CACHE_TTL_MS. A shared in-flight promise collapses concurrent
+// callers so a burst of turns costs one registry fetch.
+var OPENAI_CODEX_VERSION_TTL_MS = 60 * 60 * 1000;
+var _openaiCodexVersion = null;
+var _openaiCodexVersionAt = 0;
+var _openaiCodexVersionInFlight = null;
+// 'npm' when the live registry answered, 'fallback' when the constant was used.
+// Surfaced in the version-gate error message so the NEXT gate failure names
+// both the version AND where it came from.
+var _openaiCodexVersionSource = 'fallback';
+
+function _openaiValidVersion(v) {
+    return (typeof v === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+/.test(v.trim())) ? v.trim() : null;
+}
+
+async function resolveCodexClientVersion(force) {
+    if (!force && _openaiCodexVersion && (Date.now() - _openaiCodexVersionAt) < OPENAI_CODEX_VERSION_TTL_MS) {
+        return _openaiCodexVersion;
+    }
+    if (_openaiCodexVersionInFlight) return _openaiCodexVersionInFlight;
+    _openaiCodexVersionInFlight = (async function() {
+        var version = null;
+        try {
+            var res = await fetch(OPENAI_OAUTH.codexVersionRegistryUrl, { headers: { accept: 'application/json' } });
+            if (res.ok) {
+                var j = await res.json();
+                version = _openaiValidVersion(j && j.version);
+            }
+        } catch (e) { /* offline / blocked — fall through to the net below */ }
+        if (version) {
+            _openaiCodexVersionSource = 'npm';
+        } else {
+            version = OPENAI_OAUTH.fallbackClientVersion;
+            _openaiCodexVersionSource = 'fallback';
+            console.warn('[AppAgent] Could not resolve the latest @openai/codex version — advertising ' + version + ' to the Codex backend.');
+        }
+        _openaiCodexVersion = version;
+        _openaiCodexVersionAt = Date.now();
+        // Keep the spoofed User-Agent in lockstep with the advertised version.
+        _openaiEnsureCodexUserAgentRule(version);
+        return version;
+    })();
+    var p = _openaiCodexVersionInFlight;
+    try { return await p; }
+    finally { if (_openaiCodexVersionInFlight === p) _openaiCodexVersionInFlight = null; }
+}
+self.resolveCodexClientVersion = resolveCodexClientVersion;
+
+// `User-Agent` is a FORBIDDEN header for fetch() — a service worker cannot set
+// it. But the real Codex client advertises its version there:
+// codex-rs/login/src/auth/default_client.rs:335 default_headers() inserts
+// USER_AGENT = get_codex_user_agent(), whose format is (same file, :163)
+//   "{originator}/{version} ({os_type} {os_version}; {arch}) {terminal}".
+// declarativeNetRequest CAN set it, which is exactly how this extension
+// already spoofs claude-cli for api.anthropic.com (dynamic rule id 3000 at the
+// bottom of this file). Rule id 3001 does the same for the Codex backend.
+var OPENAI_CODEX_UA_RULE_ID = 3001;
+var _openaiCodexUaRuleVersion = null;
+function _openaiCodexUserAgent(version) {
+    return OPENAI_OAUTH.originator + '/' + version + ' (Mac OS 15.6.0; arm64) Apple_Terminal';
+}
+function _openaiEnsureCodexUserAgentRule(version) {
+    if (!version || _openaiCodexUaRuleVersion === version) return;
+    _openaiCodexUaRuleVersion = version;
+    try {
+        chrome.declarativeNetRequest.updateDynamicRules({
+            removeRuleIds: [OPENAI_CODEX_UA_RULE_ID],
+            addRules: [{
+                id: OPENAI_CODEX_UA_RULE_ID,
+                priority: 1,
+                action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: _openaiCodexUserAgent(version) }] },
+                condition: { urlFilter: 'chatgpt.com/backend-api/codex/*', resourceTypes: ['xmlhttprequest'] }
+            }]
+        }).catch(function() { _openaiCodexUaRuleVersion = null; });
+    } catch (e) { _openaiCodexUaRuleVersion = null; }
+}
+
+// Append ?client_version=<resolved> to a Codex backend URL. VERIFIED against
+// codex-rs/codex-api/src/endpoint/models.rs `append_client_version_query`
+// (and its `appends_client_version_query` test asserting
+// ".../models?client_version=0.99.0"), plus EvanZhouDev/openai-oauth
+// packages/core/src/models.ts:174 and runtime.ts:941.
+function _openaiWithClientVersion(url, version) {
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'client_version=' + encodeURIComponent(version);
+}
+
+// Refresh proactively this far before expiry (mirrors Codex/creatorweave's 5 min).
+var OPENAI_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+// Device auth is only valid for 15 minutes server-side.
+var OPENAI_DEVICE_AUTH_TTL_MS = 15 * 60 * 1000;
+
+// Guards, mirroring the Claude trio but shaped for device-code:
+//   - openaiDeviceLoginInFlight (memory): blocks overlapping poll loops in one
+//     service-worker lifecycle.
+//   - openaiPendingDeviceAuth (chrome.storage.local): the in-progress device
+//     auth. A status poll RESUMES this instead of starting a second login, and
+//     it self-expires, so a stale/abandoned code can never spam the endpoint.
+//   - openaiOAuthSuppressAutoLogin (chrome.storage.local): an explicit logout
+//     sticks — no resume until the user logs in again.
+// NOTE: unlike Claude (cookie -> token, fully silent) device-code CANNOT
+// auto-login: it requires the human to type a code. So there is no
+// cookie-exchange auto-login branch; the status handler resumes a pending
+// device auth instead.
+var openaiDeviceLoginInFlight = false;
+// deviceAuthId the live poll loop OWNS. A newer login claims it, which makes the
+// older loop exit at its next tick. This replaced the old `if (inFlight) return`
+// bail, which could leave a freshly minted code with no poll loop behind it.
+var openaiActiveDeviceAuthId = null;
+var openaiAuthGeneration = 0;
+var openaiDeviceAbortController = null;
+var openaiStartAbortController = null;
+var openaiRenewAbortController = null;
+var openaiRenewInFlight = null;
+// Serializes ALL OAuth-owned storage writes with logout. Queue order is the
+// proof: a pending/credential write that started first commits before logout's
+// removal; anything queued later must re-check generation/ownership inside its
+// operation and cannot resurrect the logged-out session.
+var openaiOAuthStorageQueue = Promise.resolve();
+function _openaiQueueOAuthStorage(operation) {
+    var result = openaiOAuthStorageQueue.catch(function() {}).then(operation);
+    openaiOAuthStorageQueue = result.catch(function() {});
+    return result;
+}
+// Concurrent startChatGPTOAuth() callers (e.g. the model-menu "Log in" row and
+// a status-poll resume firing in the same tick) would BOTH sail past the
+// pending-record checks below before either has written openaiPendingDeviceAuth,
+// minting two device codes and showing the caller a code that no poll loop owns.
+// One shared in-flight promise (same shape as openaiRenewInFlight) collapses
+// them onto a single login.
+var openaiStartLoginInFlight = null;
+// Per-model-slug memo of request fields the Codex backend rejected for that
+// model, learned from a 400 (see runChatGPTOAuthStream's degrade-and-retry).
+// Shape: { '<model>': { noReasoningContext: true, noParallelToolCalls: true } }.
+var _openaiModelQuirks = {};
+
+// Net for when the LIVE catalog fetch below fails. openai/codex deleted its
+// hardcoded presets (codex-rs/models-manager/src/model_presets.rs: "model
+// listings are now derived from the active catalog"), so a hardcoded list is
+// always a guess with a shelf life — these three are the GPT-5.6 slugs
+// advertised for ChatGPT accounts by EvanZhouDev/openai-oauth (README:
+// "Available Models: gpt-5.6-terra, gpt-5.6-sol, ...") and present in
+// codex-rs/model-provider/src/provider.rs.
+var OPENAI_FALLBACK_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+var OPENAI_MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
+var _openaiModelCatalog = null;
+var _openaiModelCatalogAt = 0;
+var _openaiModelCatalogAccountId = null;
+var _openaiModelCatalogInFlight = null;
+var _openaiModelCatalogEpoch = 0;
+function _openaiInvalidateModelCatalog() {
+    _openaiModelCatalogEpoch++;
+    _openaiModelCatalog = null;
+    _openaiModelCatalogAt = 0;
+    _openaiModelCatalogAccountId = null;
+    _openaiModelCatalogInFlight = null;
+}
+
+// Strip an OpenRouter-style vendor prefix. AppAgent model slugs are routinely
+// carried over from OpenRouter ('openai/gpt-5.6-sol'), but the Codex Responses
+// backend accepts only the BARE slug and answers a 400 otherwise:
+//   "The 'openai/gpt-5.6-sol' model is not supported when using Codex with a
+//    ChatGPT account."
+// Exactly ONE leading '<vendor>/' segment is removed, and only when it looks
+// like a vendor token, so an unusual slug is left intact.
+function _openaiNormalizeModelSlug(model) {
+    var s = String(model == null ? '' : model).trim();
+    if (!s) return '';
+    var m = s.match(/^[A-Za-z0-9_.-]+\/(.+)$/);
+    return m ? m[1].trim() : s;
+}
+self._openaiNormalizeModelSlug = _openaiNormalizeModelSlug;
+
+// The account's REAL model list, straight from the Codex catalog endpoint.
+// Memoised in-memory (no chrome.storage write site added on purpose) with a
+// short TTL and a shared in-flight promise so concurrent callers collapse.
+// Filtering mirrors isPublicCodexModel (openai-oauth packages/core/src/models.ts).
+async function fetchChatGPTModelCatalog(force) {
+    var data = await chrome.storage.local.get('openaiOAuth');
+    var oauth = data.openaiOAuth;
+    if (!oauth || !oauth.accessToken) throw new Error('Not logged in to ChatGPT.');
+    if (Date.now() > oauth.expiresAt - OPENAI_REFRESH_MARGIN_MS) oauth = await renewChatGPTToken(oauth);
+    var accountId = oauth.accountId || '';
+    if (!force && _openaiModelCatalog && _openaiModelCatalogAccountId === accountId && (Date.now() - _openaiModelCatalogAt) < OPENAI_MODEL_CATALOG_TTL_MS) return _openaiModelCatalog;
+    if (_openaiModelCatalogInFlight && _openaiModelCatalogInFlight.accountId === accountId) return _openaiModelCatalogInFlight.promise;
+    // Starting B while A is still in flight invalidates A's publication epoch;
+    // A may resolve for its caller but cannot overwrite/evict B's cache state.
+    if (_openaiModelCatalogInFlight && _openaiModelCatalogInFlight.accountId !== accountId) _openaiModelCatalogEpoch++;
+    var catalogGeneration = openaiAuthGeneration;
+    var catalogEpoch = _openaiModelCatalogEpoch;
+    var flight;
+    var catalogPromise = (async function() {
+        var clientVersion = await resolveCodexClientVersion();
+        var url = _openaiWithClientVersion(OPENAI_OAUTH.modelsUrl, clientVersion);
+        var res = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'accept': 'application/json',
+                'authorization': 'Bearer ' + oauth.accessToken,
+                'chatgpt-account-id': oauth.accountId || '',
+                'originator': OPENAI_OAUTH.originator,
+                'version': clientVersion
+            }
+        });
+        var parsed = await _openaiJson(res);
+        if (!res.ok) throw new Error('Codex model catalog request failed: ' + res.status + ' ' + conciseApiErrorBody(parsed.text));
+        var j = parsed.json || {};
+        // Codex answers {models:[{slug,...}]}; the OpenAI-compatible shape is
+        // {data:[{id}]}. Accept both so a backend swap does not break this.
+        var raw = Array.isArray(j.models) ? j.models : (Array.isArray(j.data) ? j.data : []);
+        var out = [];
+        var seen = {};
+        for (var i = 0; i < raw.length; i++) {
+            var m = raw[i] || {};
+            var slug = m.slug || m.id;
+            if (!slug || seen[slug]) continue;
+            if (m.supported_in_api === false) continue;
+            if (m.visibility !== undefined && m.visibility !== 'list') continue;
+            seen[slug] = true;
+            out.push({ slug: slug, useResponsesLite: m.use_responses_lite === true });
+        }
+        if (!out.length) throw new Error('Codex returned an empty models list.');
+        if (catalogGeneration !== openaiAuthGeneration || catalogEpoch !== _openaiModelCatalogEpoch) throw new DOMException('OAuth session changed', 'AbortError');
+        _openaiModelCatalog = out;
+        _openaiModelCatalogAt = Date.now();
+        _openaiModelCatalogAccountId = accountId;
+        return out;
+    })();
+    flight = { accountId: accountId, promise: catalogPromise };
+    _openaiModelCatalogInFlight = flight;
+    try { return await catalogPromise; }
+    finally { if (_openaiModelCatalogInFlight === flight) _openaiModelCatalogInFlight = null; }
+}
+self.fetchChatGPTModelCatalog = fetchChatGPTModelCatalog;
+
+// Slug list for user-facing messages — live catalog, hardcoded net on failure.
+async function _openaiAvailableModelSlugs() {
+    try {
+        var cat = await fetchChatGPTModelCatalog();
+        return cat.map(function(m) { return m.slug; });
+    } catch (e) {
+        return OPENAI_FALLBACK_MODELS.slice();
+    }
+}
+
+function _openaiDecodeJwt(token) {
+    try {
+        var parts = String(token || '').split('.');
+        if (parts.length < 2 || !parts[1]) return null;
+        var norm = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        while (norm.length % 4) norm += '=';
+        return JSON.parse(atob(norm));
+    } catch (e) { return null; }
+}
+
+// accountId lives in the id_token's namespaced auth claim
+// ("https://api.openai.com/auth".chatgpt_account_id) — see codex token_data.rs.
+// The access_token carries the same claim, so it is the fallback when the
+// refresh response omits id_token.
+function _openaiAccountId(idToken, accessToken) {
+    var toks = [idToken, accessToken];
+    for (var i = 0; i < toks.length; i++) {
+        var claims = _openaiDecodeJwt(toks[i]);
+        var auth = claims && claims['https://api.openai.com/auth'];
+        if (auth && auth.chatgpt_account_id) return auth.chatgpt_account_id;
+    }
+    return null;
+}
+
+// JWT exp (seconds) is authoritative for access-token lifetime; the token
+// endpoint's expires_in is the fallback.
+function _openaiExpiresAt(tokenData) {
+    var claims = _openaiDecodeJwt(tokenData && tokenData.access_token);
+    if (claims && claims.exp) return claims.exp * 1000;
+    return Date.now() + ((tokenData && tokenData.expires_in) || 3600) * 1000;
+}
+
+function _openaiAbortError(message) {
+    try { return new DOMException(message || 'OAuth operation cancelled', 'AbortError'); }
+    catch (e) { var err = new Error(message || 'OAuth operation cancelled'); err.name = 'AbortError'; return err; }
+}
+function _openaiAssertGeneration(generation, signal) {
+    if (generation !== openaiAuthGeneration || (signal && signal.aborted)) throw _openaiAbortError();
+}
+function _openaiAwaitWithSignal(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(_openaiAbortError());
+    return new Promise(function(resolve, reject) {
+        function aborted() { cleanup(); reject(_openaiAbortError()); }
+        function cleanup() { signal.removeEventListener('abort', aborted); }
+        signal.addEventListener('abort', aborted, { once: true });
+        promise.then(function(value) { cleanup(); resolve(value); }, function(error) { cleanup(); reject(error); });
+    });
+}
+function _openaiAbortableDelay(ms, signal) {
+    return new Promise(function(resolve, reject) {
+        if (signal && signal.aborted) { reject(_openaiAbortError()); return; }
+        var timer = setTimeout(done, ms);
+        function done() { cleanup(); resolve(); }
+        function aborted() { clearTimeout(timer); cleanup(); reject(_openaiAbortError()); }
+        function cleanup() { if (signal) signal.removeEventListener('abort', aborted); }
+        if (signal) signal.addEventListener('abort', aborted, { once: true });
+    });
+}
+// Mirrors saveOAuthCreds (Claude) — same storage/broadcast contract, different key.
+async function saveChatGPTOAuthCreds(tokenData, existing, generation, signal) {
+    if (generation === undefined) generation = openaiAuthGeneration;
+    _openaiAssertGeneration(generation, signal);
+    existing = existing || {};
+    var accessToken = tokenData.access_token || existing.accessToken;
+    var idToken = tokenData.id_token || existing.idToken;
+    var creds = {
+        accessToken: accessToken,
+        refreshToken: tokenData.refresh_token || existing.refreshToken,
+        idToken: idToken,
+        accountId: _openaiAccountId(idToken, accessToken) || existing.accountId || null,
+        expiresAt: _openaiExpiresAt({ access_token: accessToken, expires_in: tokenData.expires_in })
+    };
+    await _openaiQueueOAuthStorage(async function() {
+        _openaiAssertGeneration(generation, signal);
+        await chrome.storage.local.set({ openaiOAuth: creds });
+        _openaiAssertGeneration(generation, signal);
+    });
+    if ((existing.accountId || null) !== creds.accountId) _openaiInvalidateModelCatalog();
+    chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: creds }).catch(function() {});
+    return creds;
+}
+
+async function _openaiJson(res) {
+    var text = await res.text();
+    var json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) {}
+    return { text: text, json: json };
+}
+
+// Step 1 of the device flow: ask for a user code.
+async function requestChatGPTDeviceCode(signal) {
+    var res = await fetch(OPENAI_OAUTH.deviceUserCodeUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ client_id: OPENAI_OAUTH.clientId }),
+        signal: signal
+    });
+    var parsed = await _openaiJson(res);
+    if (!res.ok) {
+        if (res.status === 404) throw new Error('Device-code login is not enabled for this OpenAI client (HTTP 404).');
+        throw new Error('Device code request failed: ' + res.status + ' ' + conciseApiErrorBody(parsed.text));
+    }
+    var j = parsed.json || {};
+    // `usercode` is an accepted alias for `user_code` (serde alias in codex).
+    var userCode = j.user_code || j.usercode;
+    if (!j.device_auth_id || !userCode) throw new Error('Device code response missing device_auth_id/user_code');
+    var intervalSec = parseInt(j.interval, 10);
+    if (isNaN(intervalSec) || intervalSec < 1) intervalSec = 5;
+    return {
+        deviceAuthId: j.device_auth_id,
+        userCode: userCode,
+        intervalMs: intervalSec * 1000,
+        verificationUrl: OPENAI_OAUTH.verifyUrl,
+        expiresAt: Date.now() + OPENAI_DEVICE_AUTH_TTL_MS
+    };
+}
+
+// Step 2: one poll of the device-auth token endpoint.
+// Returns {pending:true} | {authorizationCode, codeVerifier}. Throws on hard failure.
+async function pollChatGPTDeviceAuthOnce(deviceAuthId, userCode, signal) {
+    var res = await fetch(OPENAI_OAUTH.deviceTokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+            client_id: OPENAI_OAUTH.clientId,
+            device_auth_id: deviceAuthId,
+            user_code: userCode
+        }),
+        signal: signal
+    });
+    var parsed = await _openaiJson(res);
+    if (!res.ok) {
+        // Codex treats 403/404 as "not approved yet"; the OAuth-standard JSON
+        // codes are also honored (slow_down asks us to back off).
+        var code = (parsed.json && (parsed.json.error || parsed.json.error_code)) || '';
+        if (res.status === 403 || res.status === 404 || code === 'authorization_pending' || code === 'slow_down') {
+            return { pending: true, slowDown: code === 'slow_down' };
+        }
+        throw new Error('Device auth failed: ' + res.status + ' ' + conciseApiErrorBody(parsed.text));
+    }
+    var j = parsed.json || {};
+    if (!j.authorization_code || !j.code_verifier) {
+        throw new Error('Device auth response missing authorization_code/code_verifier');
+    }
+    return { authorizationCode: j.authorization_code, codeVerifier: j.code_verifier };
+}
+
+// Step 3: exchange the device-issued authorization_code for tokens. The PKCE
+// verifier is generated SERVER-side for this flow and handed back by step 2.
+async function exchangeChatGPTDeviceCode(authorizationCode, codeVerifier, generation, signal) {
+    _openaiAssertGeneration(generation, signal);
+    var body = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: authorizationCode,
+        redirect_uri: OPENAI_OAUTH.redirectUri,
+        client_id: OPENAI_OAUTH.clientId,
+        code_verifier: codeVerifier
+    });
+    var res = await fetch(OPENAI_OAUTH.tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        body: body.toString(),
+        signal: signal
+    });
+    var parsed = await _openaiJson(res);
+    if (!res.ok || !parsed.json || !parsed.json.access_token) {
+        throw new Error('Token exchange failed: ' + res.status + ' ' + conciseApiErrorBody(parsed.text));
+    }
+    _openaiAssertGeneration(generation, signal);
+    return saveChatGPTOAuthCreds(parsed.json, null, generation, signal);
+}
+
+function _openaiSetPending(pending, generation, signal) {
+    if (generation === undefined) generation = openaiAuthGeneration;
+    return _openaiQueueOAuthStorage(async function() {
+        _openaiAssertGeneration(generation, signal);
+        if (!pending || !pending.deviceAuthId) throw new Error('Pending device auth is missing its owner id');
+        await chrome.storage.local.set({ openaiPendingDeviceAuth: pending });
+        _openaiAssertGeneration(generation, signal);
+    });
+}
+function _openaiClearPending(generation, signal, deviceAuthId) {
+    if (generation === undefined) generation = openaiAuthGeneration;
+    return _openaiQueueOAuthStorage(async function() {
+        _openaiAssertGeneration(generation, signal);
+        if (deviceAuthId) {
+            var latest = (await chrome.storage.local.get('openaiPendingDeviceAuth')).openaiPendingDeviceAuth;
+            _openaiAssertGeneration(generation, signal);
+            if (latest && latest.deviceAuthId !== deviceAuthId) return false;
+        }
+        await chrome.storage.local.remove('openaiPendingDeviceAuth');
+        _openaiAssertGeneration(generation, signal);
+        return true;
+    });
+}
+
+// Drive the poll loop to completion. Fire-and-forget: the UI learns the result
+// from the 'openai-oauth-updated' broadcast / the next status poll. Awaited
+// fetches keep the MV3 worker alive between polls; if it is evicted anyway the
+// persisted pending record lets the next status poll resume the same code.
+async function pollChatGPTDeviceAuthUntilDone(pending) {
+    // Already polling THIS code: never stack a second loop on it.
+    if (openaiDeviceLoginInFlight && openaiActiveDeviceAuthId === pending.deviceAuthId) return;
+    // A DIFFERENT (newer) code: claim ownership. The older loop notices it lost
+    // ownership on its next tick and returns without polling or mutating shared
+    // state, so we never poll two codes at once AND never leave a newly minted
+    // code unpolled.
+    openaiActiveDeviceAuthId = pending.deviceAuthId;
+    openaiDeviceLoginInFlight = true;
+    if (openaiDeviceAbortController) openaiDeviceAbortController.abort();
+    var deviceController = new AbortController();
+    openaiDeviceAbortController = deviceController;
+    var loginGeneration = openaiAuthGeneration;
+    var intervalMs = pending.intervalMs || 5000;
+    try {
+        while (Date.now() < pending.expiresAt) {
+            await _openaiAbortableDelay(intervalMs, deviceController.signal);
+            _openaiAssertGeneration(loginGeneration, deviceController.signal);
+            if (openaiActiveDeviceAuthId !== pending.deviceAuthId) return;
+            var step;
+            try {
+                step = await pollChatGPTDeviceAuthOnce(pending.deviceAuthId, pending.userCode, deviceController.signal);
+                _openaiAssertGeneration(loginGeneration, deviceController.signal);
+            } catch (e) {
+                if (e && e.name === 'AbortError') return;
+                await _openaiClearPending(loginGeneration, deviceController.signal, pending.deviceAuthId);
+                chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: null, error: e.message }).catch(function() {});
+                return;
+            }
+            if (step.pending) {
+                if (step.slowDown) intervalMs = Math.min(intervalMs + 5000, 30000);
+                continue;
+            }
+            try {
+                _openaiAssertGeneration(loginGeneration, deviceController.signal);
+                await exchangeChatGPTDeviceCode(step.authorizationCode, step.codeVerifier, loginGeneration, deviceController.signal);
+                _openaiAssertGeneration(loginGeneration, deviceController.signal);
+                await _openaiClearPending(loginGeneration, deviceController.signal, pending.deviceAuthId);
+            } catch (e) {
+                if (e && e.name === 'AbortError') return;
+                await _openaiClearPending(loginGeneration, deviceController.signal, pending.deviceAuthId);
+                chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: null, error: e.message }).catch(function() {});
+            }
+            return;
+        }
+        // Expired without approval. Only clear if the stored record is still
+        // OURS — a newer login may have replaced it while we were sleeping.
+        var latest = (await chrome.storage.local.get('openaiPendingDeviceAuth')).openaiPendingDeviceAuth;
+        if (!latest || latest.deviceAuthId === pending.deviceAuthId) await _openaiClearPending(loginGeneration, deviceController.signal, pending.deviceAuthId);
+        chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: null, error: 'Device code expired — start the login again.' }).catch(function() {});
+    } catch (e) {
+        if (!e || e.name !== 'AbortError') throw e;
+    } finally {
+        // Only the loop that still OWNS the login releases the shared flag — a
+        // superseded loop must not advertise "no login in flight" while the newer
+        // loop is still polling.
+        if (openaiActiveDeviceAuthId === pending.deviceAuthId) {
+            openaiDeviceLoginInFlight = false;
+            openaiActiveDeviceAuthId = null;
+            if (openaiDeviceAbortController === deviceController) openaiDeviceAbortController = null;
+        }
+    }
+}
+
+// Kick off a login. Returns immediately with the code the user must type, then
+// polls in the background. Opens (or focuses) the approval page on EVERY attempt
+// — reused-code attempts included — and reports whether that succeeded via
+// `tabOpened`; the code still has to be entered by hand.
+function startChatGPTOAuth() {
+    if (openaiStartLoginInFlight) return openaiStartLoginInFlight;
+    openaiStartLoginInFlight = (async function() {
+        try { return await _startChatGPTOAuth(); }
+        finally { openaiStartLoginInFlight = null; }
+    })();
+    return openaiStartLoginInFlight;
+}
+
+// Open — or FOCUS, when it is already open — the device-approval page. EVERY
+// path that hands the caller a user code MUST call this: a code with no page to
+// type it on is a dead end. That was the reported bug — only the fresh-mint path
+// opened a tab, so the 2nd..Nth login click within the 15-minute TTL took the
+// code-reuse branch and showed "enter code X on the page that just opened" with
+// no page. Returns true when a tab was opened/focused; false is surfaced to the
+// UI (as the verification URL in copyable text) instead of being swallowed.
+async function _openaiOpenVerifyTab() {
+    var url = OPENAI_OAUTH.verifyUrl;
+    try {
+        var existing = await chrome.tabs.query({ url: url + '*' });
+        if (existing && existing.length) {
+            await chrome.tabs.update(existing[0].id, { active: true });
+            try { await chrome.windows.update(existing[0].windowId, { focused: true }); } catch (e) {}
+            return true;
+        }
+    } catch (e) { /* tabs.query/update unavailable — fall through to create */ }
+    try {
+        var tab = await chrome.tabs.create({ url: url, active: true });
+        return !!tab;
+    } catch (e) {
+        console.warn('[openai-oauth] could not open the device-approval page:', e && e.message);
+        return false;
+    }
+}
+
+async function _startChatGPTOAuth() {
+    var startGeneration = openaiAuthGeneration;
+    var startController = new AbortController();
+    openaiStartAbortController = startController;
+    var signal = startController.signal;
+    try {
+    _openaiAssertGeneration(startGeneration, signal);
+    var stored = await chrome.storage.local.get('openaiPendingDeviceAuth');
+    _openaiAssertGeneration(startGeneration, signal);
+    var pending = stored.openaiPendingDeviceAuth;
+    // Never resurrect an expired/consumed record: handing back a code the server
+    // no longer honours is worse than minting a fresh one.
+    if (pending && !(pending.expiresAt > Date.now())) {
+        _openaiAssertGeneration(startGeneration, signal);
+        await _openaiClearPending(startGeneration, signal, pending.deviceAuthId);
+        _openaiAssertGeneration(startGeneration, signal);
+        pending = null;
+    }
+    if (pending) {
+        // A live code exists: reuse it rather than burning a second one (the
+        // running loop owns the pending record and would clear a newer one when
+        // the old one expires) — but ALWAYS re-open/focus the approval page so
+        // the reused code stays reachable.
+        _openaiAssertGeneration(startGeneration, signal);
+        var reFocused = await _openaiOpenVerifyTab();
+        _openaiAssertGeneration(startGeneration, signal);
+        pollChatGPTDeviceAuthUntilDone(pending);
+        return {
+            pending: true,
+            userCode: pending.userCode,
+            verificationUrl: pending.verificationUrl || OPENAI_OAUTH.verifyUrl,
+            expiresAt: pending.expiresAt,
+            reused: true,
+            tabOpened: reFocused
+        };
+    }
+    var dc = await requestChatGPTDeviceCode(signal);
+    _openaiAssertGeneration(startGeneration, signal);
+    await _openaiSetPending(dc, startGeneration, signal);
+    _openaiAssertGeneration(startGeneration, signal);
+    var tabOpened = await _openaiOpenVerifyTab();
+    _openaiAssertGeneration(startGeneration, signal);
+    pollChatGPTDeviceAuthUntilDone(dc);
+    return { pending: true, userCode: dc.userCode, verificationUrl: dc.verificationUrl, expiresAt: dc.expiresAt, reused: false, tabOpened: tabOpened };
+    } finally {
+        if (openaiStartAbortController === startController) openaiStartAbortController = null;
+    }
+}
+
+async function refreshChatGPTToken(refreshToken, signal) {
+    var res = await fetch(OPENAI_OAUTH.tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+            client_id: OPENAI_OAUTH.clientId,
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken,
+            scope: OPENAI_OAUTH.scopes
+        }),
+        signal: signal
+    });
+    var parsed = await _openaiJson(res);
+    if (!res.ok) throw new Error('Token refresh failed: ' + res.status + ' ' + conciseApiErrorBody(parsed.text));
+    if (!parsed.json || !parsed.json.access_token) throw new Error('Token refresh returned no access_token');
+    return parsed.json;
+}
+
+// Unlike the Claude Desktop client, OpenAI DOES issue refresh tokens for this
+// client_id, so renewal is fully silent — there is no cookie fallback and no
+// re-prompt unless the refresh token itself is dead. Concurrent callers share
+// one in-flight refresh so N parked streams can't rotate the token N times
+// (refresh tokens are single-use).
+function renewChatGPTToken(oauth, callerSignal) {
+    if (openaiRenewInFlight) return _openaiAwaitWithSignal(openaiRenewInFlight, callerSignal);
+    var renewGeneration = openaiAuthGeneration;
+    var renewController = new AbortController();
+    openaiRenewAbortController = renewController;
+    openaiRenewInFlight = (async function() {
+        try {
+            _openaiAssertGeneration(renewGeneration, renewController.signal);
+            if (!oauth || !oauth.refreshToken) {
+                throw new Error('Not logged in to ChatGPT (no refresh token). Use "Log in" in the model menu.');
+            }
+            var tokenData = await refreshChatGPTToken(oauth.refreshToken, renewController.signal);
+            _openaiAssertGeneration(renewGeneration, renewController.signal);
+            return saveChatGPTOAuthCreds(tokenData, oauth, renewGeneration, renewController.signal);
+        } finally {
+            if (openaiRenewAbortController === renewController) openaiRenewAbortController = null;
+            openaiRenewInFlight = null;
+        }
+    })();
+    return _openaiAwaitWithSignal(openaiRenewInFlight, callerSignal);
+}
+
+// --- ChatGPT OAuth message handlers ---
+chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+    if (message.type === 'openai-oauth-login') {
+        // Manual login re-enables resume in the same ordered OAuth lane. If
+        // logout wins first, the generation check prevents this remove from
+        // landing after logout's suppression write.
+        var manualLoginGeneration = openaiAuthGeneration;
+        _openaiQueueOAuthStorage(async function() {
+            _openaiAssertGeneration(manualLoginGeneration);
+            await chrome.storage.local.remove(['openaiOAuthSuppressAutoLogin']);
+            _openaiAssertGeneration(manualLoginGeneration);
+        }).then(function() { return startChatGPTOAuth(); }).then(function(info) {
+            sendResponse({
+                success: true, pending: true,
+                userCode: info.userCode,
+                verificationUrl: info.verificationUrl || OPENAI_OAUTH.verifyUrl,
+                reused: !!info.reused,
+                tabOpened: info.tabOpened !== false
+            });
+        }).catch(function(err) {
+            sendResponse({ error: err.message });
+        });
+        return true;
+    }
+    // "Open the page again" in the device-code modal. One place owns the
+    // open-or-focus logic so the UI never has to duplicate it.
+    if (message.type === 'openai-oauth-open-verify') {
+        _openaiOpenVerifyTab().then(function(opened) {
+            sendResponse({ success: true, tabOpened: opened, verificationUrl: OPENAI_OAUTH.verifyUrl });
+        });
+        return true;
+    }
+    if (message.type === 'openai-oauth-refresh') {
+        chrome.storage.local.get('openaiOAuth', function(data) {
+            renewChatGPTToken(data.openaiOAuth).then(function(creds) {
+                sendResponse({ success: true, openaiOAuth: creds });
+            }).catch(function(err) { sendResponse({ error: err.message }); });
+        });
+        return true;
+    }
+    if (message.type === 'openai-oauth-status') {
+        chrome.storage.local.get(['openaiOAuth', 'openaiPendingDeviceAuth', 'openaiOAuthSuppressAutoLogin'], async function(data) {
+            if (!data.openaiOAuth) {
+                // No token yet. Device-code cannot log in silently, so instead of
+                // starting a login we RESUME an approved-but-unpolled device auth
+                // (e.g. the service worker was evicted mid-flow). Guards mirror
+                // Claude's: in-flight (memory), the persisted pending record
+                // (self-expiring, replaces the failed-cookie guard), and the
+                // explicit-logout suppression flag.
+                var pending = data.openaiPendingDeviceAuth;
+                // No !openaiDeviceLoginInFlight guard any more: the poll loop now
+                // dedupes by deviceAuthId, which is strictly stronger — the old
+                // global boolean also skipped resuming a NEWER stored code.
+                if (pending && pending.expiresAt > Date.now() && !data.openaiOAuthSuppressAutoLogin) {
+                    pollChatGPTDeviceAuthUntilDone(pending);
+                    sendResponse({ loggedIn: false, pending: true, userCode: pending.userCode, verificationUrl: pending.verificationUrl });
+                    return;
+                }
+                if (pending && pending.expiresAt <= Date.now()) {
+                    _openaiClearPending(openaiAuthGeneration, null, pending.deviceAuthId).catch(function() {});
+                }
+                sendResponse({ loggedIn: false });
+                return;
+            }
+            var oauth = data.openaiOAuth;
+            if (Date.now() > oauth.expiresAt - OPENAI_REFRESH_MARGIN_MS) {
+                try {
+                    oauth = await renewChatGPTToken(oauth);
+                } catch (e) {
+                    sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt, error: e.message });
+                    return;
+                }
+            }
+            sendResponse({
+                loggedIn: true,
+                expired: Date.now() > oauth.expiresAt,
+                expiresAt: oauth.expiresAt,
+                accountId: oauth.accountId || null
+            });
+        });
+        return true;
+    }
+    if (message.type === 'openai-oauth-logout') {
+        openaiAuthGeneration++;
+        openaiActiveDeviceAuthId = null;
+        openaiDeviceLoginInFlight = false;
+        openaiStartLoginInFlight = null;
+        if (openaiDeviceAbortController) openaiDeviceAbortController.abort();
+        if (openaiStartAbortController) openaiStartAbortController.abort();
+        if (openaiRenewAbortController) openaiRenewAbortController.abort();
+        openaiDeviceAbortController = null;
+        openaiStartAbortController = null;
+        openaiRenewAbortController = null;
+        openaiRenewInFlight = null;
+        _openaiInvalidateModelCatalog();
+        _openaiQueueOAuthStorage(function() {
+            return Promise.all([
+                chrome.storage.local.remove(['openaiOAuth', 'openaiPendingDeviceAuth']),
+                chrome.storage.local.set({ openaiOAuthSuppressAutoLogin: true })
+            ]);
+        }).then(function() {
+            chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: null }).catch(function() {});
+            sendResponse({ success: true });
+        }).catch(function(err) { sendResponse({ error: err && err.message }); });
+        return true;
+    }
+    // Live model catalog for the model menu's ChatGPT Subscription model section. Falls
+    // back to OPENAI_FALLBACK_MODELS (live:false) so the picker is never empty.
+    if (message.type === 'openai-oauth-models') {
+        fetchChatGPTModelCatalog(message.force === true).then(function(cat) {
+            sendResponse({ success: true, live: true, models: cat.map(function(m) { return m.slug; }) });
+        }).catch(function(e) {
+            sendResponse({ success: false, live: false, error: e && e.message, models: OPENAI_FALLBACK_MODELS.slice() });
+        });
+        return true;
+    }
+
+    if (message.type === 'openai-oauth-usage') {
+        chrome.storage.local.get('openaiRateLimits', function(data) {
+            if (data.openaiRateLimits) sendResponse({ data: data.openaiRateLimits });
+            else sendResponse({ error: 'No usage data yet' });
+        });
+        return true;
+    }
+});
+
+// --- OpenAI chat-completions -> Responses API request transform ---
+//
+// Body rules confirmed from EvanZhouDev/openai-oauth packages/core/src/runtime.ts
+// (normalizeCodexResponsesBodyInternal / addEncryptedReasoningContent /
+// applyModelDefaults): store=false, stream forced true, include must contain
+// reasoning.encrypted_content, max_output_tokens deleted. reasoning.context=
+// 'all_turns' AND parallel_tool_calls=false are BOTH responses-lite-only
+// (`if (modelInfo.useResponsesLite) reasoning.context = "all_turns"`, then
+// `if (!modelInfo.useResponsesLite) return` guards the block that ends
+// `normalized.parallel_tool_calls = false`) — see the scoping note at the
+// reasoning block below. previous_response_id / item_reference are NEVER sent —
+// the upstream Codex endpoint is stateless and hard-rejects them, so every
+// request carries the full history.
+function _openaiTextOf(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return content == null ? '' : String(content);
+    var out = '';
+    for (var i = 0; i < content.length; i++) {
+        var p = content[i];
+        if (typeof p === 'string') out += p;
+        else if (p && (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text')) out += (p.text || '');
+    }
+    return out;
+}
+
+function _openaiContentParts(content, textType) {
+    if (typeof content === 'string' || !Array.isArray(content)) {
+        return [{ type: textType, text: _openaiTextOf(content) }];
+    }
+    var parts = [];
+    for (var i = 0; i < content.length; i++) {
+        var p = content[i];
+        if (typeof p === 'string') { parts.push({ type: textType, text: p }); continue; }
+        if (!p) continue;
+        if (p.type === 'image_url') {
+            var url = p.image_url && (p.image_url.url || p.image_url);
+            if (url) parts.push({ type: 'input_image', image_url: url });
+            continue;
+        }
+        if (p.type === 'input_image') { parts.push(p); continue; }
+        var t = p.text != null ? p.text : '';
+        if (t) parts.push({ type: textType, text: t });
+    }
+    if (!parts.length) parts.push({ type: textType, text: '' });
+    return parts;
+}
+
+function transformToResponses(body) {
+    var messages = (body && body.messages) || [];
+    var input = [];
+    var instructions = '';
+    for (var i = 0; i < messages.length; i++) {
+        var m = messages[i] || {};
+        if (m.role === 'system' || m.role === 'developer') {
+            var sysText = _openaiTextOf(m.content);
+            if (!instructions) {
+                // First system message becomes the Responses `instructions`.
+                instructions = sysText;
+            } else if (sysText) {
+                // Any further system prompt is rewritten into a developer
+                // input_text item (the Codex responses-lite shape) — the
+                // endpoint only accepts one instructions string.
+                input.push({ type: 'message', role: 'developer', content: [{ type: 'input_text', text: sysText }] });
+            }
+            continue;
+        }
+        if (m.role === 'tool') {
+            input.push({
+                type: 'function_call_output',
+                call_id: m.tool_call_id || m.id || '',
+                output: _openaiTextOf(m.content)
+            });
+            continue;
+        }
+        if (m.role === 'assistant') {
+            var aText = _openaiTextOf(m.content);
+            if (aText) {
+                input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: aText }] });
+            }
+            var calls = m.tool_calls || [];
+            for (var c = 0; c < calls.length; c++) {
+                var tc = calls[c] || {};
+                var fn = tc.function || {};
+                input.push({
+                    type: 'function_call',
+                    name: fn.name || '',
+                    arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {}),
+                    call_id: tc.id || ''
+                });
+            }
+            continue;
+        }
+        // user (and anything unrecognized) -> user message
+        input.push({ type: 'message', role: 'user', content: _openaiContentParts(m.content, 'input_text') });
+    }
+
+    var tools = [];
+    var srcTools = (body && body.tools) || [];
+    for (var t = 0; t < srcTools.length; t++) {
+        var st = srcTools[t] || {};
+        var f = st.function || st;
+        if (!f.name) continue;
+        tools.push({
+            type: 'function',
+            name: f.name,
+            description: f.description || '',
+            parameters: f.parameters || { type: 'object', properties: {} },
+            strict: false
+        });
+    }
+
+    var reasoning = {};
+    var effort = null;
+    if (body && body.reasoning && typeof body.reasoning === 'object') effort = body.reasoning.effort;
+    else if (body && body.reasoning_effort) effort = body.reasoning_effort;
+    // AppAgent providers can carry Anthropic-flavoured efforts (e.g. 'xhigh')
+    // that the Responses API rejects — clamp to the values OpenAI accepts.
+    if (effort) {
+        var OK_EFFORTS = { minimal: 1, low: 1, medium: 1, high: 1 };
+        reasoning.effort = OK_EFFORTS[String(effort).toLowerCase()] ? String(effort).toLowerCase() : 'high';
+    }
+    reasoning.summary = 'auto';
+    // SCOPING (reviewer item): upstream applies reasoning.context='all_turns' and
+    // parallel_tool_calls=false ONLY on the responses-lite path — selected from
+    // the live Codex model catalog (`use_responses_lite`, packages/core/src/
+    // models.ts), which also sends a responses-lite request header and folds
+    // `tools` into a developer message. AppAgent sends the PLAIN Responses shape
+    // (real `tools` array + `instructions` string, no lite header) and does not
+    // fetch that catalog, so it takes the NON-lite defaults: no reasoning.context
+    // unless the caller asked for one, and the caller's own parallel_tool_calls
+    // (010-llm-streaming.js:107 requests true — the agent loop really does emit
+    // independent tool calls in a single turn). Anything the backend rejects for
+    // a given model is dropped and memoised in _openaiModelQuirks by the
+    // degrade-and-retry in runChatGPTOAuthStream, so at worst we pay one 400.
+    // NORMALISED here, once: `out.model` and the _openaiModelQuirks memo key
+    // are both this value, and runChatGPTOAuthStream keys the degrade-and-retry
+    // memo off responsesBody.model — so key parity is structural, not a
+    // convention two call sites have to remember.
+    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-5.6-sol';
+    var quirks = _openaiModelQuirks[modelSlug] || {};
+    var askedCtx = (body && body.reasoning && typeof body.reasoning === 'object') ? body.reasoning.context : null;
+    if (askedCtx && !quirks.noReasoningContext) reasoning.context = askedCtx;
+
+    var out = {
+        model: modelSlug,
+        instructions: instructions,
+        input: input,
+        stream: true,
+        store: false,
+        include: ['reasoning.encrypted_content'],
+        parallel_tool_calls: !(body && body.parallel_tool_calls === false) && !quirks.noParallelToolCalls,
+        reasoning: reasoning
+    };
+    if (tools.length) {
+        out.tools = tools;
+        // chat-completions puts the forced tool name under .function.name;
+        // Responses expects it flat as {type:'function', name}.
+        var tc = body.tool_choice;
+        if (tc) {
+            if (typeof tc === 'string') out.tool_choice = tc;
+            else if (tc.function && tc.function.name) out.tool_choice = { type: 'function', name: tc.function.name };
+            else if (tc.name) out.tool_choice = { type: 'function', name: tc.name };
+        }
+    }
+    // Stable per-conversation cache key. Codex CLI sends prompt_cache_key =
+    // session_id on every Responses request (codex-rs/core/src/client.rs
+    // prompt_cache_key()) and the backend routes its prompt cache off it
+    // (openai/codex#5556) — without it every turn is a cache miss.
+    // _codexSessionKey is stamped by 010-llm-streaming.js for the ChatGPT
+    // OAuth path only; the internal field itself is never forwarded (this
+    // function builds `out` fresh). quirks.noPromptCacheKey is a
+    // degrade-and-retry escape hatch, see runChatGPTOAuthStream's 400 ladder.
+    if (body && body._codexSessionKey && !quirks.noPromptCacheKey) {
+        out.prompt_cache_key = String(body._codexSessionKey);
+    }
+    // Heartbeat-only output cap (sendCacheHeartbeat in 010-llm-streaming.js):
+    // chat-completions `max_tokens` is deliberately NOT mapped for real
+    // requests, but the keep-warm ping must be as cheap as possible. 16 is
+    // the minimum the Responses API accepts for max_output_tokens.
+    if (body && body._maxOutputTokens) {
+        out.max_output_tokens = Math.max(16, body._maxOutputTokens | 0);
+    }
+    return out;
+}
+
+// --- ChatGPT OAuth streaming proxy ---
+// Same envelope contract as runClaudeOAuthStream: {type:'sse'|'error'|'done'|'status'}.
+// SSE payloads are OpenAI chat.completion.chunk objects so the existing
+// chat-completions parser in 010-llm-streaming.js needs no changes.
+function mergeCodexRateLimitSnapshot(previous, incoming, capturedAt) {
+    var rl = incoming || {};
+    var merged = Object.assign({}, previous || {});
+    ['primary', 'secondary'].forEach(function(prefix) {
+        var stem = 'x-codex-' + prefix + '-';
+        var bucketChanged = Object.keys(rl).some(function(k) { return k.indexOf(stem) === 0; });
+        if (!bucketChanged) return;
+        var resetAtKey = stem + 'reset-at';
+        var resetAfterKey = stem + 'reset-after-seconds';
+        var capturedKey = 'appagent-codex-' + prefix + '-captured-at';
+        if (Object.prototype.hasOwnProperty.call(rl, resetAfterKey)) {
+            // Bucket-specific capture metadata prevents a partial primary snapshot
+            // from rebasing a retained secondary duration. A new relative reset
+            // supersedes any retained absolute timestamp for the same bucket.
+            rl[capturedKey] = String(capturedAt);
+            delete merged[resetAtKey];
+        } else {
+            delete merged[capturedKey];
+            delete merged[resetAfterKey];
+        }
+        if (Object.prototype.hasOwnProperty.call(rl, resetAtKey)) {
+            // Absolute time wins; do not retain a conflicting relative reset.
+            delete merged[resetAfterKey];
+            delete merged[capturedKey];
+        } else if (!Object.prototype.hasOwnProperty.call(rl, resetAfterKey)) {
+            delete merged[resetAtKey];
+        }
+    });
+    // Legacy snapshots used one global capture timestamp. Never replace it during
+    // a partial merge: retained legacy durations keep their original base, while
+    // new relative values use bucket-specific capture metadata.
+    Object.keys(rl).forEach(function(k) { merged[k] = rl[k]; });
+    return merged;
+}
+self.mergeCodexRateLimitSnapshot = mergeCodexRateLimitSnapshot;
+
+async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
+    var aborted = false;
+    var completionSent = false;
+    var activeReader = null;
+    function complete(includeDoneMarker) {
+        if (completionSent) return;
+        completionSent = true;
+        if (includeDoneMarker) sink({ type: 'sse', data: 'data: [DONE]\n\n' });
+        sink({ type: 'done' });
+    }
+    // MV3 service workers are evicted after ~30s of inactivity; an awaited
+    // reader.read() does NOT count as activity. Mirrors runClaudeOAuthStream's
+    // keep-alive (background.js: streamKeepAlive) so long Codex streams survive.
+    var cgKeepAlive = null;
+    function onAbort() {
+        aborted = true;
+        // fetch abort does not reliably settle an already-awaited reader.read().
+        // Cancel the active reader so the read promise settles immediately.
+        if (activeReader) {
+            try { Promise.resolve(activeReader.cancel()).catch(function() {}); } catch (e) {}
+        }
+    }
+    if (abortSignal) {
+        if (abortSignal.aborted) onAbort();
+        else abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    var chunkId = 'chatcmpl-' + Date.now().toString(36);
+    var created = Math.floor(Date.now() / 1000);
+    // Echoed back in every chat.completion.chunk — normalise so the UI shows
+    // the slug we actually sent upstream.
+    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-5.6-sol';
+    function emit(payload) {
+        sink({ type: 'sse', data: 'data: ' + JSON.stringify(payload) + '\n\n' });
+    }
+    function emitDelta(delta, finishReason) {
+        emit({
+            id: chunkId,
+            object: 'chat.completion.chunk',
+            created: created,
+            model: model,
+            choices: [{ index: 0, delta: delta, finish_reason: finishReason === undefined ? null : finishReason }]
+        });
+    }
+
+    try {
+        var data = await chrome.storage.local.get('openaiOAuth');
+        var oauth = data.openaiOAuth;
+        if (!oauth || !oauth.accessToken) {
+            sink({ type: 'error', error: 'Not logged in to ChatGPT. Use "Log in" in the model menu.' });
+            sink({ type: 'done' });
+            return;
+        }
+        if (Date.now() > oauth.expiresAt - OPENAI_REFRESH_MARGIN_MS) {
+            try {
+                oauth = await renewChatGPTToken(oauth, abortSignal);
+            } catch (e) {
+                if ((e && e.name === 'AbortError') || aborted) throw e;
+                sink({ type: 'error', error: 'Token refresh failed: ' + e.message + '. Log in to ChatGPT again from the model menu.' });
+                sink({ type: 'done' });
+                return;
+            }
+        }
+        if (!oauth.accountId) {
+            sink({ type: 'error', error: 'ChatGPT account id missing from the OAuth token — log out and log in again.' });
+            sink({ type: 'done' });
+            return;
+        }
+
+        var responsesBody = transformToResponses(requestBody);
+        // Stable per-chat session identity (openai/codex#5556): the backend
+        // derives its prompt-cache routing from these headers, so the old
+        // crypto.randomUUID()-per-request re-keyed the cache on EVERY turn and
+        // burned subscription usage on full-price uncached tokens.
+        // 010-llm-streaming.js stamps _codexSessionKey (deterministic per-chat
+        // UUID); random remains only as a fallback for callers that didn't
+        // stamp one. Codex CLI keeps one session_id/thread_id for the whole
+        // conversation and sets x-client-request-id = thread_id too
+        // (codex-api/src/endpoint/responses.rs), so all three stay stable.
+        var sessionId = (requestBody && requestBody._codexSessionKey)
+            || ((crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()));
+        var threadId = sessionId;
+        // Resolved ONCE per stream so every retry advertises the same version,
+        // and so the version-gate branch below can name it.
+        var clientVersion = await _openaiAwaitWithSignal(resolveCodexClientVersion(), abortSignal);
+        if (aborted || (abortSignal && abortSignal.aborted)) throw _openaiAbortError();
+        var responsesUrl = _openaiWithClientVersion(OPENAI_OAUTH.responsesUrl, clientVersion);
+
+        var res;
+        var maxRetries = 3;
+        var errBodyText = null;
+        var triedReauth = false;
+        for (var attempt = 0; attempt <= maxRetries; attempt++) {
+            if (aborted) { complete(true); return; }
+            res = await fetch(responsesUrl, {
+                method: 'POST',
+                headers: {
+                    // accept: codex-rs/codex-api/src/endpoint/responses.rs:176
+                    //   inserts ACCEPT = "text/event-stream".
+                    'accept': 'text/event-stream',
+                    'content-type': 'application/json',
+                    'authorization': 'Bearer ' + oauth.accessToken,
+                    'chatgpt-account-id': oauth.accountId,
+                    // originator: codex-rs/login/src/auth/default_client.rs:337.
+                    'originator': OPENAI_OAUTH.originator,
+                    // `version`: legacy Codex client-version header, kept because
+                    // it costs nothing. The AUTHORITATIVE advertisement is the
+                    // ?client_version= query param (see responsesUrl) plus the
+                    // DNR-spoofed User-Agent, since fetch() forbids setting
+                    // User-Agent from a service worker.
+                    'version': clientVersion,
+                    // session-id / thread-id are the REAL header names:
+                    // codex-rs/codex-api/src/requests/headers.rs
+                    //   build_session_headers -> "session-id", "thread-id";
+                    // codex-api/src/endpoint/responses.rs:121 also sets
+                    //   "x-client-request-id" = thread id (stable per thread,
+                    //   NOT per-request — verified against upstream).
+                    // All three carry the stable per-chat sessionId so the
+                    // backend's prompt cache stays keyed to this conversation.
+                    // The old underscored `session_id` is kept alongside them
+                    // (harmless, and it is what pre-rename backends accepted).
+                    'session-id': sessionId,
+                    'thread-id': threadId,
+                    'x-client-request-id': threadId,
+                    'session_id': sessionId
+                },
+                body: JSON.stringify(responsesBody),
+                signal: abortSignal
+            });
+
+            // Hard 401: token rejected server-side before our clock-based
+            // proactive refresh fired. Silently renew ONCE and retry.
+            if (res.status === 401 && !triedReauth) {
+                triedReauth = true;
+                try { oauth = await renewChatGPTToken(oauth, abortSignal); continue; }
+                catch (e) {
+                    if ((e && e.name === 'AbortError') || aborted) throw e;
+                    sink({ type: 'error', error: 'ChatGPT session expired and refresh failed: ' + e.message });
+                    sink({ type: 'done' });
+                    return;
+                }
+            }
+
+            errBodyText = null;
+            if (res.status === 400) {
+                // TOLERANT 400 recovery. OpenAI's wording for a rejected Responses
+                // field is not stable ("Unknown parameter", "Unsupported value",
+                // "Invalid schema for …", plain `detail` strings), so instead of
+                // pattern-matching the message we DEGRADE the body one optimistic
+                // field at a time and retry. A retry is always strictly more
+                // conservative than the request that just failed, so a false
+                // positive costs one round trip and nothing else; a genuine 400
+                // (e.g. a bad tool schema) exhausts the ladder and is reported
+                // verbatim below. Each rung fires at most once, so the loop
+                // always makes progress. The verdict is memoised per model slug
+                // in _openaiModelQuirks, so later turns never re-send the field.
+                try { errBodyText = await res.text(); } catch (e) { errBodyText = ''; }
+                // A client-version gate is NOT a body-shape problem: degrading
+                // reasoning.context / parallel_tool_calls cannot fix it, would
+                // burn three round trips, and would poison _openaiModelQuirks
+                // with bogus verdicts for this model. Break straight out so the
+                // !res.ok handler reports it verbatim (and legibly).
+                if (/newer version|upgrade to the latest|out of date|outdated/i.test(errBodyText || '')) break;
+                var quirk = _openaiModelQuirks[responsesBody.model] || (_openaiModelQuirks[responsesBody.model] = {});
+                var degraded = null;
+                if (responsesBody.reasoning && responsesBody.reasoning.context !== undefined) {
+                    delete responsesBody.reasoning.context;
+                    quirk.noReasoningContext = true;
+                    degraded = 'reasoning.context';
+                } else if (responsesBody.parallel_tool_calls) {
+                    responsesBody.parallel_tool_calls = false;
+                    quirk.noParallelToolCalls = true;
+                    degraded = 'parallel_tool_calls';
+                } else if (responsesBody.prompt_cache_key) {
+                    // Standard Responses field (Codex CLI always sends it),
+                    // but keep an escape hatch in case a backend variant
+                    // rejects it — losing cache hits beats hard-failing.
+                    delete responsesBody.prompt_cache_key;
+                    quirk.noPromptCacheKey = true;
+                    degraded = 'prompt_cache_key';
+                }
+                if (degraded && attempt < maxRetries) {
+                    console.warn('[AppAgent] ChatGPT 400 — retrying without ' + degraded + ' for model ' + responsesBody.model + ': ' + conciseApiErrorBody(errBodyText || ''));
+                    errBodyText = null;
+                    continue;
+                }
+                break;
+            }
+            if (res.status !== 429 && res.status !== 500 && res.status !== 502 && res.status !== 503) break;
+            try { errBodyText = await res.text(); } catch (e) { errBodyText = ''; }
+            // A plan/quota exhaustion is not transient. Retrying it only burns the
+            // complete transport budget and then invites the agent loop to replay
+            // that whole budget again. Surface a machine-readable terminal error on
+            // the FIRST response so every layer can preserve the no-retry decision.
+            if (res.status === 429 && /usage[ _-]?(?:limit|quota)|quota(?:[ _-]?(?:exceeded|exhausted))?|insufficient[ _-]?quota|plan(?:[ _-]?(?:limit|exhausted))|billing[ _-]?hard[ _-]?limit/i.test(errBodyText || '')) {
+                sink({ type: 'error', error: 'ChatGPT usage limit reached: ' + (conciseApiErrorBody(errBodyText) || 'plan or quota exhausted'), code: 'usage_exhausted', retryable: false });
+                sink({ type: 'done' });
+                return;
+            }
+            if (attempt === maxRetries) break;
+            var retryDelayMs = 4000 * Math.pow(2, attempt);
+            var retryAfterSec = parseInt(res.headers.get('retry-after'), 10);
+            if (!isNaN(retryAfterSec) && retryAfterSec > 0) retryDelayMs = Math.min(retryAfterSec * 1000, 30000);
+            retryDelayMs = Math.round(retryDelayMs * (0.7 + Math.random() * 0.6));
+            var label = res.status === 429
+                ? (/usage[ _-]?limit|quota|plan/i.test(errBodyText || '') ? 'ChatGPT usage limit reached' : 'Rate-limited')
+                : 'ChatGPT endpoint error ' + res.status;
+            var transportRetryNumber = attempt + 1;
+            sink({ type: 'status', status: 'rate_limited', reason: res.status, waitMs: retryDelayMs, message: label + ' — transport retry ' + transportRetryNumber + ' of ' + maxRetries + ' (request attempt ' + (transportRetryNumber + 1) + ' of ' + (maxRetries + 1) + ') in ' + Math.round(retryDelayMs / 1000) + 's…' });
+            console.error('[AppAgent] ChatGPT ' + res.status + ' ' + label + ', transport retry ' + transportRetryNumber + '/' + maxRetries + ' (request attempt ' + (transportRetryNumber + 1) + '/' + (maxRetries + 1) + ')');
+            await _openaiAbortableDelay(retryDelayMs, abortSignal);
+        }
+
+        if (!res.ok) {
+            var errText = (errBodyText !== null) ? errBodyText : await res.text();
+            var concise = conciseApiErrorBody(errText) || '';
+            // CLIENT-VERSION GATE. OpenAI answers
+            //   400 "The 'gpt-5.6-sol' model requires a newer version of Codex.
+            //        Please upgrade to the latest app or CLI and try again."
+            // when the version we advertise is below the model's
+            // `minimal_client_version`. The raw message is opaque because it
+            // never says WHICH version we sent — so name it, and say where it
+            // came from, making the next occurrence self-diagnosing.
+            if (res.status === 400 && /newer version|upgrade to the latest|out of date|outdated/i.test(concise)) {
+                sink({ type: 'error', error: 'ChatGPT/Codex rejected the request as an out-of-date client. We advertised client_version=' + clientVersion
+                    + ' (' + (_openaiCodexVersionSource === 'npm' ? 'resolved live from the npm registry' : 'HARDCODED fallback — the npm registry lookup failed, so this is probably stale') + ')'
+                    + ', originator=' + OPENAI_OAUTH.originator + ', User-Agent="' + _openaiCodexUserAgent(clientVersion) + '"'
+                    + ' for model "' + responsesBody.model + '". If ' + clientVersion + ' really is the latest @openai/codex release, this model needs a client version we cannot yet advertise — open the ChatGPT Subscription model section and edit Model ID or choose another model. Upstream said: ' + concise });
+                sink({ type: 'done' });
+                return;
+            }
+            // A model-not-supported 400 is the ONE 400 the user can fix
+            // themselves, so name the model and list what the account can
+            // actually use instead of echoing the raw API error.
+            if (res.status === 400 && /model/i.test(concise) && /not\s+supported|not\s+available|not\s+found|does\s+not\s+exist|unknown\s+model|invalid\s+model/i.test(concise)) {
+                var avail = await _openaiAvailableModelSlugs();
+                sink({ type: 'error', error: 'ChatGPT/Codex rejected the model "' + responsesBody.model + '": it is not available on this ChatGPT account. Available ChatGPT Subscription models: ' + avail.join(', ') + '. Open the ChatGPT Subscription model section and edit Model ID or choose another model. Upstream said: ' + concise });
+                sink({ type: 'done' });
+                return;
+            }
+            var transportWasRetried = (res.status === 429 || res.status === 500 || res.status === 502 || res.status === 503) && attempt === maxRetries;
+            // Only stamp a hard no-retry decision when we KNOW retrying is futile:
+            // the transport exhausted its own budget on a retried status, or the
+            // status is clearly non-transient (4xx client errors). Transient
+            // statuses OUTSIDE the transport retry set (529/524/408…) were never
+            // retried here, so leave `retryable` undefined and let the outer
+            // agent-loop throttle heuristic (030-agent-loop.js) decide.
+            var _nonTransient = (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404);
+            var _terminalErr = {
+                type: 'error',
+                error: transportWasRetried
+                    ? 'ChatGPT transport retries exhausted after ' + (maxRetries + 1) + ' request attempts (HTTP ' + res.status + '): ' + concise
+                    : 'API error ' + res.status + ': ' + concise,
+                code: transportWasRetried ? 'transport_exhausted' : 'api_error'
+            };
+            if (transportWasRetried || _nonTransient) _terminalErr.retryable = false;
+            sink(_terminalErr);
+            sink({ type: 'done' });
+            return;
+        }
+
+        // Codex surfaces plan usage in x-codex-* response headers — persist them
+        // for the credits pill (mirrors the anthropic-ratelimit-* scrape).
+        try {
+            var rl = {};
+            res.headers.forEach(function(v, k) {
+                if (k.indexOf('x-codex-') === 0 || k.indexOf('x-ratelimit-') === 0) rl[k] = v;
+            });
+            if (Object.keys(rl).length) {
+                var prev = (await chrome.storage.local.get('openaiRateLimits')).openaiRateLimits || {};
+                await chrome.storage.local.set({ openaiRateLimits: mergeCodexRateLimitSnapshot(prev, rl, Date.now()) });
+            }
+        } catch (e) {}
+
+        var reader = res.body.getReader();
+        activeReader = reader;
+        var decoder = new TextDecoder();
+        cgKeepAlive = setInterval(function() {
+            chrome.runtime.getPlatformInfo(function() {});
+        }, 5000);
+        var buffer = '';
+        var roleSent = false;
+        var toolIndexes = {};   // responses item_id -> chat tool_call index
+        var toolArgsSeen = {};  // responses item_id -> saw an arguments delta
+        var nextToolIndex = 0;
+        var sawToolCall = false;
+        var finished = false;
+
+        while (true) {
+            // Cancel the body on abort — without this the fetch stream is left
+            // open and the connection leaks until the SW dies (mirrors
+            // runClaudeOAuthStream).
+            if (aborted) {
+                try { await reader.cancel(); } catch (e) {}
+                break;
+            }
+            var step = await reader.read();
+            if (step.done) break;
+            buffer += decoder.decode(step.value, { stream: true });
+            var lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (var li = 0; li < lines.length; li++) {
+                var line = lines[li].trim();
+                if (!line || line.indexOf('data:') !== 0) continue;
+                var raw = line.slice(5).trim();
+                if (!raw || raw === '[DONE]') continue;
+                var ev;
+                try { ev = JSON.parse(raw); } catch (e) { continue; }
+                var et = ev.type || '';
+
+                if (!roleSent && et.indexOf('response.') === 0) {
+                    roleSent = true;
+                    emitDelta({ role: 'assistant' });
+                }
+
+                if (et === 'response.output_text.delta') {
+                    if (ev.delta) emitDelta({ content: ev.delta });
+                } else if (et === 'response.reasoning_summary_text.delta' || et === 'response.reasoning_text.delta') {
+                    if (ev.delta) emitDelta({ reasoning: ev.delta });
+                } else if (et === 'response.output_item.added') {
+                    var item = ev.item || {};
+                    if (item.type === 'function_call') {
+                        sawToolCall = true;
+                        var key = item.id || item.call_id;
+                        toolIndexes[key] = nextToolIndex;
+                        emitDelta({
+                            tool_calls: [{
+                                index: nextToolIndex,
+                                id: item.call_id || item.id,
+                                type: 'function',
+                                function: { name: item.name || '', arguments: '' }
+                            }]
+                        });
+                        nextToolIndex++;
+                    }
+                } else if (et === 'response.function_call_arguments.delta') {
+                    var dKey = ev.item_id;
+                    var dIdx = toolIndexes[dKey];
+                    if (dIdx !== undefined && ev.delta) {
+                        toolArgsSeen[dKey] = true;
+                        emitDelta({ tool_calls: [{ index: dIdx, function: { arguments: ev.delta } }] });
+                    }
+                } else if (et === 'response.function_call_arguments.done' || et === 'response.output_item.done') {
+                    // Some models (e.g. the codex-spark family) return tool-call
+                    // arguments in ONE shot with no incremental deltas — synthesize
+                    // the full-arguments chunk from the terminal event.
+                    // (chat-stream.ts:167-190 in EvanZhouDev/openai-oauth.)
+                    var doneItem = ev.item || {};
+                    var dnKey = ev.item_id || doneItem.id || doneItem.call_id;
+                    var dnIdx = toolIndexes[dnKey];
+                    if (dnIdx === undefined || toolArgsSeen[dnKey]) continue;
+                    var full = ev.arguments;
+                    if (full === undefined) full = doneItem.arguments;
+                    if (full === undefined) continue;
+                    if (typeof full !== 'string') full = JSON.stringify(full);
+                    toolArgsSeen[dnKey] = true;
+                    emitDelta({ tool_calls: [{ index: dnIdx, function: { arguments: full } }] });
+                } else if (et === 'response.completed') {
+                    if (finished) continue;
+                    // Only a successful terminal response owns usage. Emit it before
+                    // finish_reason so the page parser has the final, non-partial
+                    // metrics before the assistant message is committed.
+                    var usage = (ev.response && ev.response.usage) || {};
+                    var inputTokens = Number(usage.input_tokens);
+                    var outputTokens = Number(usage.output_tokens);
+                    var totalTokens = Number(usage.total_tokens);
+                    var inputDetails = usage.input_tokens_details || {};
+                    var outputDetails = usage.output_tokens_details || {};
+                    var cachedTokens = Number(inputDetails.cached_tokens);
+                    var reasoningTokens = Number(outputDetails.reasoning_tokens);
+                    if (!Number.isFinite(inputTokens) || inputTokens < 0) inputTokens = 0;
+                    if (!Number.isFinite(outputTokens) || outputTokens < 0) outputTokens = 0;
+                    if (!Number.isFinite(totalTokens) || totalTokens < 0) totalTokens = inputTokens + outputTokens;
+                    if (!Number.isFinite(cachedTokens) || cachedTokens < 0) cachedTokens = 0;
+                    if (!Number.isFinite(reasoningTokens) || reasoningTokens < 0) reasoningTokens = 0;
+                    emit({
+                        id: chunkId,
+                        object: 'chat.completion.chunk',
+                        created: created,
+                        model: model,
+                        choices: [],
+                        usage: {
+                            prompt_tokens: inputTokens,
+                            completion_tokens: outputTokens,
+                            total_tokens: totalTokens,
+                            prompt_tokens_details: { cached_tokens: cachedTokens },
+                            completion_tokens_details: { reasoning_tokens: reasoningTokens }
+                        }
+                    });
+                    finished = true;
+                    emitDelta({}, sawToolCall ? 'tool_calls' : 'stop');
+                } else if (et === 'response.incomplete') {
+                    if (finished) continue;
+                    var incomplete = (ev.response && ev.response.incomplete_details) || ev.incomplete_details || {};
+                    var incompleteReason = incomplete.reason || incomplete.message || 'unknown reason';
+                    emit({ error: { message: 'ChatGPT response incomplete: ' + incompleteReason, type: 'incomplete_response', recoverable: true } });
+                    finished = true;
+                } else if (et === 'response.failed' || et === 'error') {
+                    if (finished) continue;
+                    var errObj = (ev.response && ev.response.error) || ev.error || {};
+                    emit({ error: { message: errObj.message || 'ChatGPT stream error', type: 'api_error' } });
+                    finished = true;
+                }
+            }
+        }
+
+        // EOF is never success. Partial text/tool fragments stay uncommitted and
+        // cannot trigger tool execution unless response.completed was observed.
+        if (!finished && !aborted) {
+            emit({ error: { message: 'ChatGPT stream ended before response.completed', type: 'incomplete_stream', recoverable: true } });
+            finished = true;
+        }
+        complete(true);
+    } catch (e) {
+        if ((e && e.name === 'AbortError') || aborted) {
+            try { complete(true); } catch (e2) {}
+        } else {
+            try { sink({ type: 'error', error: e.message, code: e && e.code, retryable: e && e.retryable }); } catch (e2) {}
+            try { complete(false); } catch (e2) {}
+        }
+    } finally {
+        // Every exit path — clean finish, error, abort, and the pre-stream
+        // early returns (not-logged-in / refresh-failed / !res.ok) where
+        // cgKeepAlive is still null.
+        if (cgKeepAlive) { clearInterval(cgKeepAlive); cgKeepAlive = null; }
+        activeReader = null;
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+    }
+}
+self.runChatGPTOAuthStream = runChatGPTOAuthStream;
+
+// Thin port wrapper — mirrors the 'claude-oauth-stream' port for page-context
+// callers. The SW-internal path calls self.runChatGPTOAuthStream directly.
+chrome.runtime.onConnect.addListener(function(port) {
+    if (port.name !== 'chatgpt-oauth-stream') return;
+    var abortController = new AbortController();
+    port.onDisconnect.addListener(function() {
+        try { abortController.abort(); } catch (e) {}
+    });
+    port.onMessage.addListener(function(msg) {
+        if (msg.type !== 'start-stream') return;
+        var requestBody;
+        try { requestBody = JSON.parse(msg.body); }
+        catch (e) {
+            try { port.postMessage({ type: 'error', error: 'Bad request body: ' + e.message }); } catch (e2) {}
+            try { port.postMessage({ type: 'done' }); } catch (e2) {}
+            return;
+        }
+        runChatGPTOAuthStream(requestBody, function(env) {
+            try { port.postMessage(env); } catch (e) {}
+        }, abortController.signal);
+    });
+});
+
 // Transform OpenAI-format request body to Anthropic Messages API format
 
 function convertContentPart(part) {
@@ -2979,12 +4480,19 @@ function _cacheHeartbeatTick() {
     for (var chatId in reg) {
         try {
             var entry = reg[chatId];
-            if (!entry || !entry.at) continue;
-            var idle = now - entry.at;
-            if (idle < CACHE_HEARTBEAT_AFTER_MS) continue;
-            // Safety stop: a run idle for 2h+ is dead — drop the entry so we
-            // never heartbeat a stale conversation forever.
-            if (idle > CACHE_HEARTBEAT_MAX_AGE_MS) { delete reg[chatId]; continue; }
+            // lastRealRequestAt anchors the 2h lifetime (immutable between
+            // real requests); legacy entries stamped by older code only carry
+            // `at`, which doubles as the anchor for them. lastHeartbeatAt only
+            // paces the 4-minute cadence — it must NOT extend the lifetime
+            // (the old code reset entry.at on every heartbeat, so the 2h hard
+            // stop below could never fire).
+            var born = entry && (entry.lastRealRequestAt || entry.at);
+            if (!entry || !born) continue;
+            // Lifetime hard stop: a run older than 2h is dead — drop the entry
+            // so we never heartbeat a stale conversation forever.
+            if (now - born > CACHE_HEARTBEAT_MAX_AGE_MS) { delete reg[chatId]; continue; }
+            var lastActivity = (entry.lastHeartbeatAt && entry.lastHeartbeatAt > born) ? entry.lastHeartbeatAt : born;
+            if (now - lastActivity < CACHE_HEARTBEAT_AFTER_MS) continue;
             // Only chats actually waiting on sub-agent work get heartbeats.
             if (!_chatWaitingOnSubAgents(chatId)) continue;
             // Skip if a REAL stream is currently in flight for this chat —

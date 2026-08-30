@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.24
+
+### Features
+- ChatGPT subscription accounts can now sign in with OAuth, use Codex models, see their usage limits, and choose subscription endpoints alongside API providers.
+- Model setup has been polished with provider icons, automatic display names, effort controls, foldable model lists, and clearer delete and sign-out actions.
+
+### Fixes
+- Sub-agent transcripts no longer render empty or disappear during state syncing and cleanup; sleeping agents retire safely into history instead.
+- Sub-agent usage totals and per-model cost breakdowns now roll up correctly.
+- Reload no longer shows a false "Extension rebuild failed" message after a successful build.
+
+---
+
 ## v1.1.23
 
 ### Features

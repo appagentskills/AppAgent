@@ -56,7 +56,9 @@
             window.NOW.user_name = changes.userName.newValue || '';
         }
         // Auto-update usage display when rate limit headers arrive from API responses
-        if (changes.claudeRateLimits && typeof fetchCredits === 'function') {
+        // (claudeRateLimits: anthropic-ratelimit-* scrape; openaiRateLimits: x-codex-*
+        // scrape after each Codex response — makes the pill appear without a manual refresh)
+        if ((changes.claudeRateLimits || changes.openaiRateLimits) && typeof fetchCredits === 'function') {
             fetchCredits();
         }
         // Refresh multi-instance registry when SN connection changes

@@ -84,7 +84,9 @@ async function init() {
     // Setup credits display click handler and initialize with cached value
     var creditsDisplay = document.getElementById('credits-display');
     var homeCreditsDisplay = document.getElementById('home-credits-display');
-    var cachedCreditsVal = appStorage.getItem('cachedCredits');
+    // Provider-scoped restore (core/020-bootstrap.js helper) — never paint
+    // another provider's cached usage.
+    var cachedCreditsVal = getBootCachedCredits();
     if (creditsDisplay) {
         creditsDisplay.onclick = function() { refreshClaudeOAuthUsage(true); fetchCredits(); };
         // cachedCredits already embeds its unit ('$12.34' or '57% for 2h') — no '$' prefix
@@ -249,7 +251,6 @@ async function init() {
         if (document.getElementById('widget-history-modal-overlay')) { closeWidgetHistory(); return; }
         // 3. Every OTHER .modal-overlay.show — the dynamic twins built by
         // showGitHubSetupModal (tools/130-github-setup.js:53-56),
-        // showLlmEndpointModal (ui/040-tools-settings.js:1593-1596),
         // showApiProviderModal (:1756-1759) and anything added later. They are
         // appended to <body> in open order, so the LAST match is the most
         // recently opened one. Every twin assigns
@@ -824,6 +825,8 @@ async function init() {
 
     // Initialize Claude OAuth button
     initClaudeOAuth();
+    // Initialize ChatGPT (OpenAI) OAuth button
+    initChatGPTOAuth();
 
     // Fetch credits last (external API call shouldn't block UI initialization)
     fetchCredits();

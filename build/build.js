@@ -422,6 +422,11 @@ const DECL_PARITY_SW_ONLY = new Set([
     // Layer-C parked UI tool calls (worker/120-tool-routing.js). Zero
     // page-tier references — worker tier only.
     'parkedToolCallsByChatId',
+    // Provider-change abort markers, set only by worker/130-port-bridge.js
+    // 'provider-change'. Page refs: only typeof-guarded reads/deletes in
+    // app/030-agent-loop.js.
+    'providerChangedChats',
+    'providerChangeBackoffResolversByChatId',
 ]);
 
 // Top-level `var` names of a JS source: strip block comments + full-line

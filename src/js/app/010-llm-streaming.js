@@ -177,6 +177,21 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // Store request body in metrics for debugging
     reqMetrics.requestBody = requestBody;
 
+    // Stable per-chat Codex session identity: the chatgpt.com/backend-api/codex
+    // Responses endpoint keys its prompt cache off the session/thread headers
+    // and prompt_cache_key (openai/codex#5556) — a fresh UUID per request
+    // re-keys the cache every turn and guarantees a 0% hit rate. Stamp a
+    // deterministic per-chat key on the body; it survives the port JSON
+    // round-trip to runChatGPTOAuthStream (background.js), which uses it for
+    // the session-id/thread-id/x-client-request-id headers, and
+    // transformToResponses maps it to `prompt_cache_key`. Never sent raw:
+    // transformToResponses builds the upstream body fresh, and this branch is
+    // unreachable for the plain-fetch (OpenRouter/OpenAI-key) and Claude OAuth
+    // paths, so no other provider ever sees the field.
+    if (provider.isChatGPTOAuth) {
+        requestBody._codexSessionKey = getCodexSessionKey(chatId);
+    }
+
     // Prompt-cache heartbeat: stamp the finalized request body per chat so the
     // SW alarm (background.js) can re-send an identical-prefix 1-token request
     // when the chat sits waiting on sub-agents past the cache-TTL window.
@@ -191,7 +206,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     //     named 'claude-oauth-stream' from inside the SW would fire
     //     onConnect in every OTHER extension context, never our own.
     //   • Page context: connect to the SW port (legacy path).
-    if (provider.isClaudeOAuth && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.connect) {
+    if ((provider.isClaudeOAuth || provider.isChatGPTOAuth) && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.connect) {
         reader = await (function() {
             return new Promise(function(resolve) {
                 var chunks = [];
@@ -199,7 +214,10 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 var streamDone = false;
                 function onEnvelope(env) {
                     if (env.type === 'error') {
-                        var encoded = new TextEncoder().encode('data: ' + JSON.stringify({ error: { message: env.error, type: 'api_error' } }) + '\n\n');
+                        // Preserve transport classification through the synthetic SSE
+                        // bridge. The parser below rehydrates these fields onto Error,
+                        // allowing the outer loop to honor retryable:false.
+                        var encoded = new TextEncoder().encode('data: ' + JSON.stringify({ error: { message: env.error, type: 'api_error', code: env.code, retryable: env.retryable } }) + '\n\n');
                         if (resolveRead) {
                             var r = resolveRead; resolveRead = null;
                             r({ value: encoded, done: false });
@@ -246,16 +264,20 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                     }
                 };
 
-                if (typeof Platform !== 'undefined' && Platform.isWorker && typeof self.runClaudeOAuthStream === 'function') {
+                // Both OAuth providers speak the SAME envelope contract; only the
+                // SW entry point and the port name differ.
+                var _oauthStreamFn = provider.isChatGPTOAuth ? 'runChatGPTOAuthStream' : 'runClaudeOAuthStream';
+                var _oauthPortName = provider.isChatGPTOAuth ? 'chatgpt-oauth-stream' : 'claude-oauth-stream';
+                if (typeof Platform !== 'undefined' && Platform.isWorker && typeof self[_oauthStreamFn] === 'function') {
                     // SW-internal: call the streamer directly.
                     var signal = (abortController && abortController.signal) || null;
-                    self.runClaudeOAuthStream(requestBody, onEnvelope, signal);
+                    self[_oauthStreamFn](requestBody, onEnvelope, signal);
                     resolve(fakeReader);
                     return;
                 }
 
                 // Page-side fallback path: port-based.
-                var port = chrome.runtime.connect({ name: 'claude-oauth-stream' });
+                var port = chrome.runtime.connect({ name: _oauthPortName });
                 if (abortController && abortController.signal) {
                     abortController.signal.addEventListener('abort', function() {
                         try { port.disconnect(); } catch (e) {}
@@ -281,13 +303,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             });
         })();
     } else {
-        // Standard fetch path — resolve endpoint URL + API key through the
-        // named LLM-endpoint registry (falls back to legacy inline fields).
-        var conn = resolveProviderConnection(provider);
+        // Standard fetch path uses the provider's inline endpoint and API key.
         var fetchOpts = {
             method: 'POST',
             headers: {
-                'Authorization': 'Bearer ' + conn.apiKey,
+                'Authorization': 'Bearer ' + provider.apiKey,
                 'Content-Type': 'application/json',
                 // Worker-safe: getReferer() returns a stable string in offscreen
                 // (window.location.href there is offscreen.html, not useful).
@@ -298,7 +318,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             body: JSON.stringify(requestBody)
         };
         if (abortController && abortController.signal) fetchOpts.signal = abortController.signal;
-        var res = await fetch(conn.endpoint, fetchOpts);
+        var res = await fetch(provider.endpoint, fetchOpts);
 
         if (!res.ok) {
             setLLMConnectionStatus('disconnected');
@@ -306,7 +326,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             var requestBodyStr = JSON.stringify(requestBody);
             console.error('API Error Response:', errorText);
             console.error('Request size:', Math.round(requestBodyStr.length / 1024) + 'KB, messages:', requestBody.messages.length);
-            console.error('Provider config:', JSON.stringify({ model: provider.model, provider: provider.provider, endpoint: conn.endpoint }));
+            console.error('Provider config:', JSON.stringify({ model: provider.model, provider: provider.provider, endpoint: provider.endpoint }));
             console.error('Request provider setting:', JSON.stringify(requestBody.provider));
             var lastMsgs = requestBody.messages.slice(-5).map(function(m) {
                 return { role: m.role, hasToolCalls: !!m.tool_calls, hasContent: !!(m.content && (typeof m.content === 'string' ? m.content.length : m.content.length) > 0), hasReasoning: !!m.reasoning_details };
@@ -344,7 +364,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // header pill (the SW may hold a token; this may be a non-OAuth provider).
     // For OAuth providers re-verify real login/expiry instead of blindly going
     // green, otherwise the chat page shows 'connected' even when logged out.
-    if (provider && provider.isClaudeOAuth && typeof updateClaudeOAuthStatus === 'function') {
+    if (provider && provider.isChatGPTOAuth && typeof updateChatGPTOAuthStatus === 'function') {
+        updateChatGPTOAuthStatus();
+    } else if (provider && provider.isClaudeOAuth && typeof updateClaudeOAuthStatus === 'function') {
         updateClaudeOAuthStatus();
     } else {
         setLLMConnectionStatus('connected');
@@ -408,6 +430,12 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 if (data.error) {
                     var errMsg = data.error.message || (typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
                     var apiErr = new Error(errMsg);
+                    // Structured transport classification must survive envelope →
+                    // synthetic SSE → Error. Assign by presence so false is retained.
+                    if (data.error && typeof data.error === 'object') {
+                        if (data.error.code !== undefined) apiErr.code = data.error.code;
+                        if (data.error.retryable !== undefined) apiErr.retryable = data.error.retryable;
+                    }
                     // Flag so the parse-error swallow below can't eat a genuine
                     // in-stream API error whose text happens to contain 'JSON'
                     // or 'Unexpected token'.
@@ -417,22 +445,25 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
                 // Capture usage data from OpenRouter
                 if (data.usage) {
-                    if (data.usage.prompt_tokens) reqMetrics.input_tokens = data.usage.prompt_tokens;
-                    if (data.usage.completion_tokens) reqMetrics.output_tokens = data.usage.completion_tokens;
-                    if (data.usage.total_tokens) reqMetrics.total_tokens = data.usage.total_tokens;
+                    // Terminal usage is authoritative, including legitimate zeroes.
+                    // Assignment-by-presence prevents stale values surviving when a
+                    // provider reports 0 for a detail on the latest assistant turn.
+                    if (Number.isFinite(data.usage.prompt_tokens)) reqMetrics.input_tokens = data.usage.prompt_tokens;
+                    if (Number.isFinite(data.usage.completion_tokens)) reqMetrics.output_tokens = data.usage.completion_tokens;
+                    if (Number.isFinite(data.usage.total_tokens)) reqMetrics.total_tokens = data.usage.total_tokens;
                     // Capture cache info from OpenRouter (Anthropic models via OpenRouter)
                     if (data.usage.cache_creation_input_tokens) reqMetrics.cache_creation_tokens = data.usage.cache_creation_input_tokens;
                     if (data.usage.cache_read_input_tokens) reqMetrics.cache_read_tokens = data.usage.cache_read_input_tokens;
                     // Also check prompt_tokens_details for cache info
                     if (data.usage.prompt_tokens_details) {
-                        if (data.usage.prompt_tokens_details.cached_tokens) reqMetrics.cache_read_tokens = data.usage.prompt_tokens_details.cached_tokens;
-                        if (data.usage.prompt_tokens_details.cache_write_tokens) reqMetrics.cache_write_tokens = data.usage.prompt_tokens_details.cache_write_tokens;
+                        if (Number.isFinite(data.usage.prompt_tokens_details.cached_tokens)) reqMetrics.cache_read_tokens = data.usage.prompt_tokens_details.cached_tokens;
+                        if (Number.isFinite(data.usage.prompt_tokens_details.cache_write_tokens)) reqMetrics.cache_write_tokens = data.usage.prompt_tokens_details.cache_write_tokens;
                     }
                     // Capture cost
                     if (data.usage.cost !== undefined) reqMetrics.cost = data.usage.cost;
                     // Capture reasoning tokens from completion_tokens_details
                     if (data.usage.completion_tokens_details) {
-                        if (data.usage.completion_tokens_details.reasoning_tokens) reqMetrics.reasoning_tokens = data.usage.completion_tokens_details.reasoning_tokens;
+                        if (Number.isFinite(data.usage.completion_tokens_details.reasoning_tokens)) reqMetrics.reasoning_tokens = data.usage.completion_tokens_details.reasoning_tokens;
                     }
                 }
                 // Check for cache_discount at top level of response (OpenRouter cache savings)
@@ -655,12 +686,52 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 // JSON string at stamp time so later in-place mutations of message objects
 // elsewhere can never drift the heartbeat body away from what was sent.
 
+// ─── Codex per-chat session key ─────────────────────────────────────────
+// Deterministic chatId → UUID mapping for the ChatGPT OAuth (Codex) path.
+// Codex CLI keeps ONE session_id/thread_id UUID for the lifetime of a
+// conversation and sends session_id as prompt_cache_key
+// (codex-rs/core/src/client.rs prompt_cache_key(),
+// codex-api/src/requests/headers.rs build_session_headers) — the backend
+// routes its prompt cache off these, so they must be STABLE per chat. Chat
+// ids ("chat_1788..._x") are not UUIDs, so hash the id into UUID shape
+// (FNV-1a ×4 with distinct seeds). Deterministic ⇒ the same chat always maps
+// to the same UUID across service-worker restarts and page reloads, with no
+// storage to persist or migrate. The memo map is just a hot-path shortcut.
+function getCodexSessionKey(chatId) {
+    var key = String(chatId || 'no-chat');
+    var reg = (typeof self !== 'undefined') ? (self._codexSessionKeys = self._codexSessionKeys || {}) : {};
+    if (reg[key]) return reg[key];
+    function fnv32(str, seed) {
+        var h = (0x811c9dc5 ^ seed) >>> 0;
+        for (var i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return ('00000000' + h.toString(16)).slice(-8);
+    }
+    var hex = fnv32(key, 0) + fnv32(key, 0x9e3779b9) + fnv32(key, 0x85ebca6b) + fnv32(key, 0xc2b2ae35);
+    // Shape into a syntactically valid v4/variant-1 UUID so upstream header
+    // validators that expect UUID format accept it.
+    var uuid = hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-4' + hex.slice(13, 16) + '-'
+        + ((parseInt(hex.charAt(16), 16) & 0x3 | 0x8).toString(16)) + hex.slice(17, 20) + '-' + hex.slice(20, 32);
+    reg[key] = uuid;
+    return uuid;
+}
+if (typeof self !== 'undefined') { self.getCodexSessionKey = getCodexSessionKey; }
+
 function _stampCacheHeartbeat(chatId, requestBody, providerName) {
     if (!chatId) return;
     try {
         var reg = self._cacheHeartbeat = self._cacheHeartbeat || {};
+        // Two timestamps: lastRealRequestAt anchors the 2h lifetime cutoff in
+        // _cacheHeartbeatTick (background.js) and is IMMUTABLE between real
+        // requests — heartbeats must never extend the lifetime, or the hard
+        // stop can never fire. lastHeartbeatAt drives the 4-minute cadence.
+        // `at` is kept as a legacy alias (old tick code read it) and is no
+        // longer mutated by sendCacheHeartbeat.
         reg[chatId] = {
             at: Date.now(),
+            lastRealRequestAt: Date.now(),
             bodyJson: JSON.stringify(requestBody),
             provider: providerName,
             chatId: chatId
@@ -672,10 +743,13 @@ function sendCacheHeartbeat(chatId) {
     var reg = (typeof self !== 'undefined') ? self._cacheHeartbeat : null;
     var entry = reg && reg[chatId];
     if (!entry || !entry.bodyJson) return false;
-    // Re-stamp NOW, before dispatch: prevents double-fire from overlapping
-    // alarm ticks, and doubles as retry-storm suppression on hard failure
-    // (next attempt is another 4 minutes out either way).
-    entry.at = Date.now();
+    // Stamp the heartbeat time NOW, before dispatch: prevents double-fire
+    // from overlapping alarm ticks, and doubles as retry-storm suppression on
+    // hard failure (next attempt is another 4 minutes out either way).
+    // Deliberately NOT entry.at / entry.lastRealRequestAt — those anchor the
+    // 2h lifetime cutoff in _cacheHeartbeatTick and only real requests
+    // (_stampCacheHeartbeat) may reset them.
+    entry.lastHeartbeatAt = Date.now();
     try {
         var body = JSON.parse(entry.bodyJson);
         body.max_tokens = 1;
@@ -692,6 +766,27 @@ function sendCacheHeartbeat(chatId) {
         var provider = getProviderById(entry.provider);
         if (!provider) return false;
 
+        if (provider.isChatGPTOAuth) {
+            // The Codex backend DOES keep an implicit prompt cache (~5-10 min
+            // TTL) routed by the stable session headers + prompt_cache_key
+            // (openai/codex#5556). Re-send the identical prefix through
+            // runChatGPTOAuthStream — the stamped body still carries
+            // _codexSessionKey, so the heartbeat reuses the SAME
+            // session-id/thread-id headers and prompt_cache_key as the real
+            // request — with a minimal continuation. _maxOutputTokens maps to
+            // Responses `max_output_tokens` in transformToResponses (16 is the
+            // API minimum; the chat-completions `max_tokens` set above is
+            // ignored by that transform). Same discard contract as the Claude
+            // branch below: a short stream ends by itself, no abort needed.
+            // Only reachable in the SW (the alarm lives there).
+            if (typeof self !== 'undefined' && typeof self.runChatGPTOAuthStream === 'function') {
+                body.stream = true;
+                body._maxOutputTokens = 16;
+                self.runChatGPTOAuthStream(body, function discard() {}, null);
+                return true;
+            }
+            return false;
+        }
         if (provider.isClaudeOAuth) {
             // transformToAnthropic hardcodes stream:true, so send streaming
             // and discard every envelope — a 1-token stream ends immediately,
@@ -707,11 +802,10 @@ function sendCacheHeartbeat(chatId) {
 
         // Non-OAuth providers: plain fetch with the same headers as the real
         // path (callOpenRouterStreaming's fetch branch). Fire-and-forget.
-        var conn = resolveProviderConnection(provider);
-        fetch(conn.endpoint, {
+        fetch(provider.endpoint, {
             method: 'POST',
             headers: {
-                'Authorization': 'Bearer ' + conn.apiKey,
+                'Authorization': 'Bearer ' + provider.apiKey,
                 'Content-Type': 'application/json',
                 'HTTP-Referer': (typeof Platform !== 'undefined' && Platform.getReferer)
                     ? Platform.getReferer()

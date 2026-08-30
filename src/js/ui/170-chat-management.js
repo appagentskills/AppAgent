@@ -21,12 +21,47 @@ function updateModelDisplayWithProvider(actualModel) {
     }
 }
 
+var _creditsRequestGeneration = 0;
+function invalidateCreditsRequests() {
+    _creditsRequestGeneration++;
+}
+function _creditsRequestStillCurrent(generation, providerName) {
+    return generation === _creditsRequestGeneration && currentProvider === providerName;
+}
+function _creditsCacheKey(providerName) {
+    return 'cachedCredits:' + encodeURIComponent(providerName || '');
+}
+function _writeCreditsCache(providerName, value) {
+    appStorage.setItem(_creditsCacheKey(providerName), value);
+    // Keep the legacy key for the home stat/bootstrap readers, but pair it with
+    // its provider so fetchCredits never renders one provider's usage for another.
+    appStorage.setItem('cachedCredits', value);
+    appStorage.setItem('cachedCreditsProvider', providerName);
+}
+
 async function fetchCredits() {
+    var generation = ++_creditsRequestGeneration;
+    var providerName = currentProvider;
+    var provider = getProviderByName(providerName);
     var creditsEl = document.getElementById('credits-display');
     var homeCreditsEl = document.getElementById('home-credits-display');
 
-    // Show cached usage immediately to prevent layout shift
-    var cachedUsage = appStorage.getItem('cachedCredits');
+    if (!provider || !provider.endpoint) {
+        [creditsEl, homeCreditsEl].forEach(function(el) { if (el) el.style.display = 'none'; });
+        var emptyHomeCredits = document.getElementById('home-credits-value');
+        if (emptyHomeCredits) emptyHomeCredits.textContent = '—';
+        return;
+    }
+
+    // Cache entries are provider-scoped. A legacy unscoped value is accepted only
+    // when its companion provider marker matches; old snapshots without a marker
+    // intentionally show loading rather than another provider's balance.
+    var cachedUsage = appStorage.getItem(_creditsCacheKey(providerName));
+    if (!cachedUsage && appStorage.getItem('cachedCreditsProvider') === providerName) {
+        cachedUsage = appStorage.getItem('cachedCredits');
+    }
+    var homeCreditsValueEl = document.getElementById('home-credits-value');
+    if (homeCreditsValueEl) homeCreditsValueEl.textContent = cachedUsage || '—';
     if (cachedUsage) {
         if (creditsEl) {
             creditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedUsage;
@@ -52,12 +87,59 @@ async function fetchCredits() {
         }
     }
 
-    // Derive credits URL from current provider's endpoint (extract base up to /v1/).
-    // Resolved through the named LLM-endpoint registry (legacy inline fallback).
-    var provider = getProviderByName(currentProvider);
-    if (!provider) return;
-    var conn = resolveProviderConnection(provider);
-    if (!conn.endpoint) return;
+    // ChatGPT OAuth: no standalone credits endpoint, but every Codex inference
+    // response carries x-codex-* usage headers which the SW scrapes into
+    // chrome.storage.local.openaiRateLimits (read back via the
+    // 'openai-oauth-usage' message). Render the pill from that cache — mirrors
+    // the Claude OAuth path below. Hidden only while no usage is cached yet.
+    if (provider.isChatGPTOAuth) {
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+            try {
+                var orl = await new Promise(function(resolve, reject) {
+                    chrome.runtime.sendMessage({ type: 'openai-oauth-usage' }, function(response) {
+                        if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+                        if (response && response.error) { reject(new Error(response.error)); return; }
+                        resolve(response && response.data);
+                    });
+                });
+                if (!_creditsRequestStillCurrent(generation, providerName)) return;
+                if (!orl) throw new Error('No usage data');
+                var cu = codexUsageModelFromRl(orl);
+                if (!cu) throw new Error('No usable x-codex-* usage headers');
+                var cgText = Math.round(cu.pill.percent) + '%' + (cu.pill.resetStr ? ' for ' + cu.pill.resetStr : '');
+                var cgTitle = cu.pill.percent.toFixed(1) + '% used' + (cu.pill.resetStr ? ' \u00b7 resets in ' + cu.pill.resetStr : '') + (cu.weeklyTip ? ' \u00b7 ' + cu.weeklyTip : '') + ' | Click to refresh';
+                var cgClass = 'credits-display';
+                if (cu.pill.percent > 80) cgClass += ' error';
+                _writeCreditsCache(providerName, cgText);
+                // Push the fresh value into the home Credits stat card (null-guarded
+                // no-op when home isn't rendered) — same as the Claude path below.
+                if (typeof updateHomeCredits === 'function') { try { updateHomeCredits(); } catch (e) {} }
+                var cgHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cgText;
+                if (creditsEl) { creditsEl.innerHTML = cgHtml; creditsEl.className = cgClass; creditsEl.title = cgTitle; creditsEl.style.display = ''; }
+                if (homeCreditsEl) { homeCreditsEl.innerHTML = cgHtml; homeCreditsEl.className = cgClass; homeCreditsEl.title = cgTitle; homeCreditsEl.style.display = ''; }
+                // Rich click dropdown — reuse the Claude tooltip renderer by feeding
+                // it the normalized appagent-usage-limits shape claudeUsageModelFromRl
+                // parses (session bucket = primary 5h window, weekly = secondary).
+                if (cu.limits.length) {
+                    var cgRlLike = { 'appagent-usage-limits': JSON.stringify(cu.limits), 'appagent-extra-usage-enabled': 'false' };
+                    attachUsageTooltip(creditsEl, cgRlLike);
+                    attachUsageTooltip(homeCreditsEl, cgRlLike);
+                }
+                return;
+            } catch (e) {
+                if (!_creditsRequestStillCurrent(generation, providerName)) return;
+                console.log('ChatGPT OAuth usage error:', e.message);
+            }
+        } else {
+            console.log('ChatGPT OAuth usage: chrome.runtime unavailable');
+        }
+        if (!_creditsRequestStillCurrent(generation, providerName)) return;
+        // No cached usage yet (first run before any Codex response) or an error:
+        // hide both pills rather than flashing Error.
+        var _cgEls = [creditsEl, homeCreditsEl];
+        _cgEls.forEach(function(el) { if (el) el.style.display = 'none'; });
+        return;
+    }
 
     // Claude OAuth: read rate limit headers cached from last API response (no extra network call)
     if (provider.isClaudeOAuth && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
@@ -69,6 +151,7 @@ async function fetchCredits() {
                     resolve(response && response.data);
                 });
             });
+            if (!_creditsRequestStillCurrent(generation, providerName)) return;
             if (!rl) throw new Error('No usage data');
             // Parse: anthropic-ratelimit-unified-5h-utilization, anthropic-ratelimit-unified-5h-reset, etc.
             var util5h = parseFloat(rl['anthropic-ratelimit-unified-5h-utilization']);
@@ -112,7 +195,7 @@ async function fetchCredits() {
                 if (eu.pct > 80) cssClass += ' error';
             }
             if (displayText) {
-                appStorage.setItem('cachedCredits', displayText);
+                _writeCreditsCache(providerName, displayText);
                 // Refresh the home Credits stat card now that the cache changed —
                 // renderHome() only calls updateHomeCredits() synchronously with the
                 // stale cache, so a cold cache showed '—' until a full re-render.
@@ -127,19 +210,20 @@ async function fetchCredits() {
                 attachUsageTooltip(homeCreditsEl, rl);
             }
         } catch(e) {
+            if (!_creditsRequestStillCurrent(generation, providerName)) return;
             console.log('Claude OAuth usage error:', e.message);
             // Keep cached value visible, don't flash error
         }
         return;
     }
 
-    var v1Idx = conn.endpoint.indexOf('/v1/');
+    var v1Idx = provider.endpoint.indexOf('/v1/');
     if (v1Idx === -1) return;
-    var creditsUrl = conn.endpoint.substring(0, v1Idx) + '/v1/credits';
+    var creditsUrl = provider.endpoint.substring(0, v1Idx) + '/v1/credits';
 
     try {
         var headers = {};
-        if (conn.apiKey) headers['Authorization'] = 'Bearer ' + conn.apiKey;
+        if (provider.apiKey) headers['Authorization'] = 'Bearer ' + provider.apiKey;
         var res = await fetch(creditsUrl, { method: 'GET', headers: headers, cache: 'no-store' });
 
         if (!res.ok) {
@@ -147,6 +231,7 @@ async function fetchCredits() {
         }
 
         var data = await res.json();
+        if (!_creditsRequestStillCurrent(generation, providerName)) return;
         var displayText = '';
         var creditTitle = 'Click to refresh';
         var cssClass = 'credits-display';
@@ -179,13 +264,17 @@ async function fetchCredits() {
             // which claudeUsageModelFromRl also understands.
             if (Array.isArray(data.limits) && data.limits.length) {
                 var rlLike = { 'appagent-usage-limits': JSON.stringify(data.limits) };
-                setTimeout(function() { attachUsageTooltip(creditsEl, rlLike); attachUsageTooltip(homeCreditsEl, rlLike); }, 0);
+                setTimeout(function() {
+                    if (!_creditsRequestStillCurrent(generation, providerName)) return;
+                    attachUsageTooltip(creditsEl, rlLike);
+                    attachUsageTooltip(homeCreditsEl, rlLike);
+                }, 0);
             }
         }
 
         if (!displayText) return;
 
-        appStorage.setItem('cachedCredits', displayText);
+        _writeCreditsCache(providerName, displayText);
         // Same as the OAuth path above: push the fresh value into the home
         // Credits stat card (null-guarded no-op when home isn't rendered).
         if (typeof updateHomeCredits === 'function') { try { updateHomeCredits(); } catch (e) {} }
@@ -204,6 +293,7 @@ async function fetchCredits() {
             homeCreditsEl.style.display = '';
         }
     } catch (e) {
+        if (!_creditsRequestStillCurrent(generation, providerName)) return;
         console.error('Failed to fetch credits:', e);
         if (creditsEl) {
             creditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>Error';
@@ -264,6 +354,61 @@ function claudeUsageModelFromRl(rl) {
     var u7 = parseFloat(rl['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u7)) model.weekly.push({ label: 'All models', percent: u7 <= 1 ? u7 * 100 : u7, resetsAt: toMs(rl['anthropic-ratelimit-unified-7d-reset']) });
     return model;
+}
+
+// Parse the cached x-codex-* headers (scraped off Codex inference responses by
+// the SW into openaiRateLimits) into a pill model + normalized limits for the
+// rich dropdown. Codex reports two buckets: primary (~5h session window) and
+// secondary (weekly). used-percent is already 0-100; reset-at is unix epoch
+// SECONDS; reset-after-seconds is relative to a bucket-specific capture time
+// (new snapshots), falling back to appagent-codex-captured-at for compatibility
+// with old snapshots. Every header is optional — parse defensively. Returns
+// { pill: {percent, resetStr}, weeklyTip, limits } or
+// null when no usable bucket exists.
+function codexUsageModelFromRl(rl) {
+    if (!rl) return null;
+    var legacyCapturedAt = parseFloat(rl['appagent-codex-captured-at']);
+    function bucket(prefix) {
+        var pct = parseFloat(rl['x-codex-' + prefix + '-used-percent']);
+        if (isNaN(pct)) return null;
+        var resetMs = null;
+        var resetAt = parseFloat(rl['x-codex-' + prefix + '-reset-at']);
+        if (!isNaN(resetAt) && resetAt > 0) {
+            resetMs = resetAt > 9999999999 ? resetAt : resetAt * 1000; // epoch secs -> ms
+        } else {
+            var after = parseFloat(rl['x-codex-' + prefix + '-reset-after-seconds']);
+            var bucketCapturedAt = parseFloat(rl['appagent-codex-' + prefix + '-captured-at']);
+            var capturedAt = !isNaN(bucketCapturedAt) ? bucketCapturedAt : legacyCapturedAt;
+            if (!isNaN(after) && !isNaN(capturedAt)) resetMs = capturedAt + after * 1000;
+        }
+        if (resetMs != null && resetMs <= Date.now()) resetMs = null; // already past
+        var winMin = parseFloat(rl['x-codex-' + prefix + '-window-minutes']);
+        return { percent: pct, resetMs: resetMs, windowMinutes: isNaN(winMin) ? null : winMin };
+    }
+    var primary = bucket('primary');
+    var secondary = bucket('secondary');
+    var main = primary || secondary; // pill shows primary, falls back to secondary
+    if (!main) return null;
+    var resetStr = '';
+    if (main.resetMs) {
+        // Ceil to match fmtUsageResetIn in the dropdown (same as the Claude pill)
+        var diffMin = Math.ceil((main.resetMs - Date.now()) / 60000);
+        var h = Math.floor(diffMin / 60);
+        var m = diffMin % 60;
+        resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
+    }
+    function weeklyLabel(b) {
+        if (b.windowMinutes == null || Math.round(b.windowMinutes) === 10080) return 'Weekly limit';
+        return Math.round(b.windowMinutes / 1440) + '-day limit';
+    }
+    var limits = [];
+    if (primary) limits.push({ group: 'session', percent: primary.percent, resets_at: primary.resetMs ? Math.round(primary.resetMs / 1000) : null });
+    var weeklyTip = '';
+    if (secondary) {
+        limits.push({ kind: 'weekly_all', label: weeklyLabel(secondary), percent: secondary.percent, resets_at: secondary.resetMs ? Math.round(secondary.resetMs / 1000) : null });
+        if (primary) weeklyTip = weeklyLabel(secondary).toLowerCase() + ': ' + secondary.percent.toFixed(1) + '%';
+    }
+    return { pill: { percent: main.percent, resetStr: resetStr }, weeklyTip: weeklyTip, limits: limits };
 }
 
 function fmtUsageResetIn(ms) { // "4 hr 34 min"
@@ -842,6 +987,28 @@ function selectChat(chatId, options) {
                 try { renderMessages(); } catch (e) {}
             }
         });
+    }
+    // STUB-HEAL (safety net): the in-memory entry can be an EMPTY stub that
+    // shadows a full transcript sitting in IDB all session — e.g. a sub-agent
+    // chat adopted as the spawn-time empty seed via a hello/chat-snapshot
+    // envelope and never updated because the panel wasn't watching the run.
+    // Heal through the SANCTIONED lane only (RFC Flux Phase 1 — no new
+    // chats[...]= / renderMessages( write sites here): request a 'pull-chat';
+    // the SW replies from its map or — post-restart / post-reclaim — from the
+    // IDB row (worker/130-port-bridge.js STUB-HEAL fallback), and the reply
+    // lands on the baselined 'chat-snapshot' adopt+render path (app/045,
+    // which re-renders when the healed chat is the currently-viewed one —
+    // currentChatId was already set above). Only fires for a 0-message,
+    // not-running entry (normal opens pay ZERO extra work), and only ONCE
+    // per entry (_stubHealAttempted) so a genuinely-empty / never-persisted
+    // chat (fresh New Chat) can't loop — the SW simply never replies for it.
+    var _selHealChat = chats[chatId];
+    if (_selHealChat && !_selHealChat._deleted && !runningChatIds[chatId]
+        && Array.isArray(_selHealChat.messages) && _selHealChat.messages.length === 0
+        && !_selHealChat._stubHealAttempted
+        && typeof _requestChatPull === 'function') {
+        _selHealChat._stubHealAttempted = true;
+        _requestChatPull(chatId);
     }
     // MEMFIX churn guard (PR #805 review, Issue 3): merely VIEWING an idle
     // chat never routes through the activity stamps (app/036 stamps only on

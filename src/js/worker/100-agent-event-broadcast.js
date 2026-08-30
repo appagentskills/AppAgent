@@ -238,6 +238,19 @@ function broadcastAgentEvent(type, detail) {
     if (EVENTS_WITH_CHAT_INLINE[type] && payload.chatId && chats[payload.chatId]
         && !chats[payload.chatId]._deleted) {
         var _chat = chats[payload.chatId];
+        // FLUX-REV (#836): per-chat monotonic revision counter, stamped at THE
+        // broadcast choke point — every canonical chat mutation that reaches a
+        // panel flows through this chat-inlining branch, so one bump per
+        // envelope keeps page-known rev and SW rev in lockstep. It rides the
+        // delta meta (_buildChatDelta clones the whole row minus messages) and
+        // the slim snapshot (_slimChatSnapshot) built below, and persists with
+        // the row via the normal save loops (no leading underscore, so the
+        // stripTransientChatFieldsForPut allowlist strip keeps it — see
+        // core/130-indexeddb.js). Pages use it for the adopt staleness guard
+        // (adoptChatRow) and delta gap detection (rev > known+1 ⇒
+        // _requestChatPull), both in app/045-agent-port-bridge-page.js.
+        // Cost: one integer field — the delta hot path is untouched.
+        _chat.rev = (typeof _chat.rev === 'number' && isFinite(_chat.rev) ? _chat.rev : 0) + 1;
         // MEMFIX-EVDELTA: append/known-update events ship a delta instead of
         // the full chat; everything else ships a slim snapshot (heavy maps
         // stripped — see _slimChatSnapshot). postMessage still structured-

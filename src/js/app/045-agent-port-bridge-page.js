@@ -501,6 +501,13 @@ function _mergePagePendingRows(prevChat, inChat, chatId) {
 // page-side leaves it undefined on prev, so a re-run's un-hide sticks).
 function _mergePageChatMeta(prevChat, inChat) {
     if (!prevChat || !inChat) return;
+    // STUB-HEAL: `_revealed` is a PAGE-ONLY flag (revealSubAgentChat,
+    // ui/175-sub-agent-ui.js) — the SW copy / disk row of a sub chat may
+    // lack it (an empty revealed stub is never persisted: save loops skip
+    // 0-message chats). Keep it across wholesale snapshot adopts so a
+    // revealed background chat doesn't vanish from the sidebar when a
+    // hello / chat-snapshot / pull-chat-heal envelope replaces the entry.
+    if (prevChat._revealed && inChat._revealed === undefined) inChat._revealed = true;
     // FLUX-4C (narrow pull-forward): the seven chat-meta fields
     // (lastResponseAt/lastActivityAt/lastViewedAt/updatedAt + _jobsHidden/
     // pinned/_lastApiError) are SW-CANONICAL now — every page writer
@@ -562,6 +569,52 @@ function _mergePageHeavyPayloads(prevChat, inChat) {
     if (!prevChat || !inChat) return;
     _graftHeavyMap(prevChat.screenshots, inChat.screenshots, 'base64', '_b64Evicted');
     _graftHeavyMap(prevChat.cachedToolResults, inChat.cachedToolResults, 'fullContent', '_fcEvicted');
+}
+
+// FLUX-ADOPT (#836): staleness compare for wholesale chat-row adopts.
+// Returns true when `row` must NOT replace `prev`: rev compare when BOTH
+// carry the per-chat monotonic revision (stamped SW-side at the broadcast
+// choke point, worker/100-agent-event-broadcast.js), else the pre-rev
+// fallback heuristic — never adopt a row with FEWER messages over one with
+// more. Equal rev / equal count adopts (SW snapshot wins ties, matching the
+// pre-guard wholesale-assign semantics).
+function _chatRowStaler(row, prev) {
+    var rRev = (row && typeof row.rev === 'number' && isFinite(row.rev)) ? row.rev : null;
+    var pRev = (prev && typeof prev.rev === 'number' && isFinite(prev.rev)) ? prev.rev : null;
+    if (rRev !== null && pRev !== null) return rRev < pRev;
+    var rN = (row && Array.isArray(row.messages)) ? row.messages.length : 0;
+    var pN = (prev && Array.isArray(prev.messages)) ? prev.messages.length : 0;
+    return rN < pN;
+}
+
+// FLUX-ADOPT (#836): the ONE sanctioned wholesale page-map chat adopt path.
+// Every `chats[id] = <full row>` replace of a possibly-existing entry goes
+// through here — the agent-event inline-snapshot lane, the hello
+// chatsSnapshot loop, the 'chat-snapshot' (pull-chat reply) lane, the boot
+// carry-forward (ui/070-dashboard-ui.js, via opts.map) and the import paths
+// (ui/130-data-management.js / ui/210-chat-menus.js, force:true). The guard
+// refuses to replace a FRESHER existing copy (see _chatRowStaler); an
+// accepted adopt runs the standard page-preservation merges (RES-5 pending
+// rows, JOBS-UNREAD/_-flag meta, MEMFIX-EVDELTA heavy payloads) BEFORE the
+// assign so the merges can never fire for a refused row. opts:
+//   chatId — key when row.id is absent/differs
+//   force  — bypass the staleness guard (import/restore paths)
+//   map    — adopt into an alternate map (boot's `loaded`) instead of chats
+// Returns true when the row was adopted. O(1) — no IDB reads, hot-path safe.
+function adoptChatRow(row, opts) {
+    opts = opts || {};
+    var id = opts.chatId || (row && row.id);
+    if (!row || !id) return false;
+    var map = opts.map || chats;
+    var prev = map[id];
+    if (prev && prev !== row) {
+        if (!opts.force && _chatRowStaler(row, prev)) return false;
+        _mergePagePendingRows(prev, row, id); // PR383-F3: chatId for approval re-key
+        _mergePageChatMeta(prev, row);
+        _mergePageHeavyPayloads(prev, row);
+    }
+    if (opts.map) { opts.map[id] = row; } else { chats[id] = row; }
+    return true;
 }
 
 // MEMFIX-EVDELTA: rebuild a full chat snapshot locally from a chatDelta
@@ -634,6 +687,20 @@ function _handleAgentBusMessage(msg) {
             // re-emit off the stale mirror this tick and heal when the
             // 'chat-snapshot' reply lands.
             if (msg.detail && msg.detail.chatId && msg.detail.chatDelta && !msg.detail.chat) {
+                // FLUX-REV (#836): gap detection. Every chat-inlining broadcast
+                // bumps chat.rev exactly once (worker/100 broadcastAgentEvent),
+                // so a delta whose rev is > known+1 means this panel MISSED an
+                // envelope (update-only mutations can slip past the fromIndex/
+                // lastRef structural checks below). Schedule the debounced
+                // targeted full resync; still apply the delta best-effort so
+                // the UI stays live until the snapshot lands. Rows without rev
+                // (pre-#836 SW / old disk rows) skip this and behave as today.
+                var _gapMeta = msg.detail.chatDelta.meta;
+                var _gapPrev = chats[msg.detail.chatId];
+                if (_gapMeta && typeof _gapMeta.rev === 'number' && _gapPrev
+                    && typeof _gapPrev.rev === 'number' && _gapMeta.rev > _gapPrev.rev + 1) {
+                    _requestChatPull(msg.detail.chatId);
+                }
                 var _synthChat = _synthesizeChatFromDelta(msg.detail.chatId, msg.detail.chatDelta);
                 if (_synthChat) msg.detail.chat = _synthChat;
                 else _requestChatPull(msg.detail.chatId);
@@ -693,21 +760,20 @@ function _handleAgentBusMessage(msg) {
                         }
                     });
                 }
-                // RES-5: keep pending prompt_user / approval rows the SW
-                // snapshot can't know about (see _mergePagePendingRows).
-                _mergePagePendingRows(_prevChat, _inChat, msg.detail.chatId); // PR383-F3: chatId for approval re-key
-                // JOBS-UNREAD: carry page-owned unread/seen stamps across the replace.
-                _mergePageChatMeta(_prevChat, _inChat);
-                // MEMFIX-EVDELTA: keep hydrated heavy payloads the slim
-                // snapshot / delta meta stripped.
-                _mergePageHeavyPayloads(_prevChat, _inChat);
-                chats[msg.detail.chatId] = _inChat;
-                // Re-point the active-chat versionHistory mirror: it referenced
-                // the replaced chat object's array, so sidebar/inline renders
-                // would otherwise read (and write flags into) a dangling copy.
-                if (msg.detail.chatId === currentChatId && typeof versionHistory !== 'undefined') {
-                    if (!Array.isArray(_inChat.versionHistory)) _inChat.versionHistory = [];
-                    versionHistory = _inChat.versionHistory;
+                // FLUX-ADOPT (#836): guarded adopt — runs the RES-5 pending-row,
+                // JOBS-UNREAD meta and MEMFIX-EVDELTA heavy-payload merges, then
+                // assigns. A refusal (incoming row staler than the page copy —
+                // e.g. an empty SW stub after restart) keeps the mirror intact;
+                // the re-emitted handlers read chats[chatId] and therefore see
+                // the page's fresher copy, same as the delta-rebuild fallback.
+                if (adoptChatRow(_inChat, { chatId: msg.detail.chatId })) {
+                    // Re-point the active-chat versionHistory mirror: it referenced
+                    // the replaced chat object's array, so sidebar/inline renders
+                    // would otherwise read (and write flags into) a dangling copy.
+                    if (msg.detail.chatId === currentChatId && typeof versionHistory !== 'undefined') {
+                        if (!Array.isArray(_inChat.versionHistory)) _inChat.versionHistory = [];
+                        versionHistory = _inChat.versionHistory;
+                    }
                 }
             }
             // Track running state locally so the chat list pill / pause button
@@ -810,19 +876,12 @@ function _handleAgentBusMessage(msg) {
             if (msg.chatsSnapshot) {
                 var _helloRerenderCurrent = false;
                 Object.keys(msg.chatsSnapshot).forEach(function(cid) {
-                    // PR383-F6: same pending prompt_user/approval row preservation
-                    // as the agent-event inline-snapshot and chat-snapshot paths
-                    // (RES-5 / _mergePagePendingRows) — the wholesale replace here
-                    // wiped page-only pending rows on every reconnect hello.
-                    _mergePagePendingRows(chats[cid], msg.chatsSnapshot[cid], cid);
-                    // JOBS-UNREAD: same page-owned stamp preservation as the
-                    // agent-event inline-snapshot path.
-                    _mergePageChatMeta(chats[cid], msg.chatsSnapshot[cid]);
-                    // MEMFIX-EVDELTA: the SW keeps 0 chats hydrated, so hello
-                    // snapshots can arrive payload-evicted — don't let them
-                    // clobber a hydrated page copy.
-                    _mergePageHeavyPayloads(chats[cid], msg.chatsSnapshot[cid]);
-                    chats[cid] = msg.chatsSnapshot[cid];
+                    // FLUX-ADOPT (#836): guarded adopt — keeps the PR383-F6
+                    // pending-row, JOBS-UNREAD meta and MEMFIX-EVDELTA heavy-
+                    // payload preservation, and additionally REFUSES a staler
+                    // SW copy (a fresh SW's sparse map after restart must not
+                    // clobber the fuller page copy on reconnect hello).
+                    if (!adoptChatRow(msg.chatsSnapshot[cid], { chatId: cid })) return;
                     if (typeof currentChatId !== 'undefined' && cid === currentChatId) _helloRerenderCurrent = true;
                 });
                 // PR383-F6: mirror the chat-snapshot path's re-render so a
@@ -1034,19 +1093,14 @@ function _handleAgentBusMessage(msg) {
 
         case 'chat-snapshot':
             if (msg.chatId && msg.chat) {
-                // RES-5: same pending-row preservation as the agent-event
-                // inline-snapshot path above.
-                _mergePagePendingRows(chats[msg.chatId], msg.chat, msg.chatId); // PR383-F3: chatId for approval re-key
-                // JOBS-UNREAD: same page-owned stamp preservation as the
-                // agent-event inline-snapshot path.
-                _mergePageChatMeta(chats[msg.chatId], msg.chat);
-                // MEMFIX-EVDELTA: same heavy-payload graft as the agent-event
-                // path (pull-chat replies rehydrate SW-side, so this is
-                // usually a no-op — belt and braces).
-                _mergePageHeavyPayloads(chats[msg.chatId], msg.chat);
                 delete _pendingChatPulls[msg.chatId];
-                chats[msg.chatId] = msg.chat;
-                if (msg.chatId === currentChatId && typeof renderMessages === 'function') {
+                // FLUX-ADOPT (#836): guarded adopt — same preservation merges
+                // as before (RES-5 pending rows, JOBS-UNREAD meta, heavy
+                // payloads), plus the staleness guard: a pull reply OLDER than
+                // the page copy (SW restarted onto a stale disk row — the #835
+                // class) is refused instead of regressing the mirror.
+                if (adoptChatRow(msg.chat, { chatId: msg.chatId })
+                    && msg.chatId === currentChatId && typeof renderMessages === 'function') {
                     renderMessages();
                 }
             }
@@ -1344,6 +1398,31 @@ async function runAgent(overrideChatId) {
     };
     attempt();
     return _pendingEntry.promise;
+}
+
+// Notify the authoritative worker that the foreground provider changed.
+// The worker updates its global selection and aborts only the named foreground
+// run/backoff; pinned sub-agents keep resolving their chat.provider unchanged.
+// Latest-wins generation counter: rapid provider switches during a port-down
+// window used to stack independent immortal 50ms retry chains, each posting a
+// STALE provider-change once the port returned. Each call captures its own
+// generation; a superseded chain no-ops. Retries are also capped (~100 × 50ms
+// = 5s) so a permanently dead port cannot leak a timer chain forever.
+var _providerChangeGen = 0;
+function pushProviderChangeToOffscreen(providerId, chatId) {
+    if (!providerId || !chatId) return;
+    _providerChangeGen++;
+    var _gen = _providerChangeGen;
+    var _tries = 0;
+    var attemptProviderChange = function() {
+        if (_gen !== _providerChangeGen) return; // superseded by a newer provider change
+        if (_tries++ >= 100) return; // ~5s of retries — give up silently
+        if (!_agentBusPort) { setTimeout(attemptProviderChange, 50); return; }
+        try {
+            _agentBusPort.postMessage({ type: 'provider-change', providerId: providerId, chatId: chatId });
+        } catch (e) { setTimeout(attemptProviderChange, 50); }
+    };
+    attemptProviderChange();
 }
 
 // Toggle pause from the page side (the existing togglePause UI calls

@@ -178,7 +178,7 @@ function renderSettingsPage() {
                 '<span>' + UI_ICONS.api + ' LLM Endpoints</span>' +
                 '<button class="skills-action-btn" onclick="showLlmEndpointModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' Add Endpoint</button>' +
             '</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Named endpoint URL + API key pairs. Each model below picks one — update a key here once and every model using it follows. The same URL can appear under different names with different keys.</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Named endpoint URL + API key pairs. Each endpoint-backed model below picks one — update a key here once and every model using it follows. The same URL can appear under different names with different keys.</div>' +
             '<div id="llm-endpoints-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
@@ -1614,29 +1614,17 @@ async function showWorkspaceDropdown() {
     }, 0);
 }
 
-// API Providers UI Functions
-function isProviderCustomized(provider) {
-    var defaultProvider = DEFAULT_API_PROVIDERS.find(function(d) { return d.name === provider.name; });
-    if (!defaultProvider) return false; // It's a new custom provider, not customized
-    return JSON.stringify(defaultProvider) !== JSON.stringify(provider);
-}
-
-function getEndpointDomain(endpoint) {
-    try {
-        var url = new URL(endpoint);
-        return url.hostname.replace('www.', '');
-    } catch (e) {
-        return '';
-    }
-}
-
-// LLM Endpoints UI Functions
+// LLM Endpoints UI (Settings → LLM Endpoints) — restored after PR #824
+// removed the section and inlined endpoints into providers. Endpoints are
+// { id, name, url, apiKey }; endpoint-backed models reference one by
+// endpointId and carry an inline snapshot of its url/apiKey for the request
+// path.
 function renderLlmEndpointsList() {
     var container = document.getElementById('llm-endpoints-list');
     if (!container) return;
 
     if (llmEndpoints.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">No endpoints configured. Add one to use API-key models (Claude OAuth models don\'t need one).</div>';
+        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">No endpoints configured. Add one to use endpoint-backed models (subscription models don\'t need one).</div>';
         return;
     }
 
@@ -1645,10 +1633,11 @@ function renderLlmEndpointsList() {
         var domain = getEndpointDomain(ep.url);
         var domainTag = domain ? '<span class="provider-tag">' + escapeHtml(domain) + '</span>' : '';
         var keyTag = (ep.apiKey || '') ? '<span class="provider-tag">key set</span>' : '<span class="provider-tag">no key</span>';
-        var useCount = apiProviders.filter(function(p) { return !p.isClaudeOAuth && p.endpointId === ep.id; }).length;
+        var useCount = apiProviders.filter(function(p) { return findEndpointForProvider(p) === ep; }).length;
         var usageTag = '<span class="provider-tag">' + useCount + ' model' + (useCount === 1 ? '' : 's') + '</span>';
 
         html += '<div class="api-provider-row">' +
+            '<span class="api-provider-endpoint-icon">' + getEndpointIcon(ep.url) + '</span>' +
             '<span class="api-provider-name">' + escapeHtml(ep.name) + '</span>' +
             '<div class="api-provider-tags">' + domainTag + keyTag + usageTag + '</div>' +
             '<div class="api-provider-actions">' +
@@ -1666,7 +1655,6 @@ function editLlmEndpoint(endpointId) {
 }
 
 function showLlmEndpointModal(editingEndpoint) {
-    // Remove any existing modal first
     var existingModal = document.getElementById('llm-endpoint-modal');
     if (existingModal) existingModal.remove();
 
@@ -1676,7 +1664,16 @@ function showLlmEndpointModal(editingEndpoint) {
     var overlay = document.createElement('div');
     overlay.id = 'llm-endpoint-modal';
     overlay.className = 'modal-overlay show';
-    overlay.onclick = function(e) { if (e.target === overlay) closeLlmEndpointModal(); };
+    // Same backdrop-press dismissal contract as the model modal above: only a
+    // click whose mousedown STARTED on the backdrop closes; the Escape replay
+    // (core/120-init.js) passes a synthetic non-isTrusted event and still closes.
+    var backdropPressed = false;
+    overlay.addEventListener('mousedown', function(e) { backdropPressed = (e.target === overlay); });
+    overlay.onclick = function(e) {
+        if (e.target !== overlay) return;
+        if (e.isTrusted && !backdropPressed) return;
+        closeLlmEndpointModal();
+    };
 
     overlay.innerHTML =
         '<div class="modal-dialog" style="max-width:480px;">' +
@@ -1715,54 +1712,265 @@ async function saveLlmEndpointFromModal(editingId) {
     var apiKey = document.getElementById('llm-endpoint-apikey').value.trim();
 
     if (!name || !url) {
-        showSnackbar('Please fill in all required fields (Name, Endpoint URL)', 'error');
+        showSnackbar('Please fill in Name and Endpoint URL', 'error');
         return;
     }
     var nameClash = llmEndpoints.some(function(ep) { return ep.name === name && ep.id !== editingId; });
     if (nameClash) {
-        showSnackbar('An endpoint named "' + name + '" already exists', 'error');
+        showSnackbar('An endpoint with that name already exists', 'error');
         return;
     }
 
+    // Stage detached clones. Nothing visible or global changes until the strict
+    // cross-store transaction commits.
+    var nextEndpoints = llmEndpoints.map(function(ep) { return Object.assign({}, ep); });
     var endpoint;
     if (editingId) {
-        var existing = getLlmEndpointById(editingId);
-        if (!existing) {
-            showSnackbar('Endpoint not found', 'error');
-            return;
-        }
-        // Keep the id stable so provider endpointId references survive renames
-        endpoint = Object.assign({}, existing, { name: name, url: url, apiKey: apiKey });
+        var existingIndex = nextEndpoints.findIndex(function(ep) { return ep.id === editingId; });
+        if (existingIndex < 0) return;
+        endpoint = Object.assign({}, nextEndpoints[existingIndex], { name: name, url: url, apiKey: apiKey });
+        nextEndpoints[existingIndex] = endpoint;
     } else {
         var baseId = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'endpoint';
         var newId = baseId;
         var suffix = 2;
-        while (getLlmEndpointById(newId)) { newId = baseId + '-' + suffix; suffix++; }
+        while (nextEndpoints.some(function(ep) { return ep.id === newId; })) { newId = baseId + '-' + suffix; suffix++; }
         endpoint = { id: newId, name: name, url: url, apiKey: apiKey };
+        nextEndpoints.push(endpoint);
     }
 
-    await saveLlmEndpoint(endpoint);
+    // Re-sync detached provider clones so endpoints + affected rows commit atomically.
+    var touched = 0;
+    var affectedProviders = [];
+    var nextProviders = apiProviders.map(function(p) {
+        if (p.endpointId !== endpoint.id) return p;
+        touched++;
+        var copy = Object.assign({}, p, { endpoint: endpoint.url, apiKey: endpoint.apiKey || '' });
+        affectedProviders.push(copy);
+        return copy;
+    });
+
+    try {
+        await persistLlmEndpointState(nextEndpoints, affectedProviders);
+    } catch (e) {
+        console.error('Failed to save LLM endpoint:', e);
+        showSnackbar('Could not save endpoint: ' + (e && e.message), 'error');
+        return;
+    }
+    llmEndpoints = nextEndpoints;
+    apiProviders = nextProviders;
     closeLlmEndpointModal();
     renderLlmEndpointsList();
     renderApiProvidersList();
-    showSnackbar(editingId ? 'Endpoint updated' : 'Endpoint added', 'success');
+    showSnackbar(editingId ? 'Endpoint updated' + (touched ? ' (' + touched + ' model' + (touched === 1 ? '' : 's') + ' re-synced)' : '') : 'Endpoint added', 'success');
 }
 
 async function confirmDeleteLlmEndpoint(endpointId) {
     var ep = getLlmEndpointById(endpointId);
     if (!ep) return;
-
-    var inUse = apiProviders.filter(function(p) { return !p.isClaudeOAuth && p.endpointId === endpointId; }).length;
-    if (inUse > 0) {
-        showSnackbar('In use by ' + inUse + ' model' + (inUse === 1 ? '' : 's') + ' — reassign them first', 'error');
-        return;
-    }
-
-    if (await showConfirmModal('Delete Endpoint', 'Delete endpoint "' + ep.name + '"? This cannot be undone.', 'danger')) {
-        await deleteLlmEndpoint(endpointId);
+    var useCount = apiProviders.filter(function(p) { return findEndpointForProvider(p) === ep; }).length;
+    var msg = 'Delete endpoint "' + ep.name + '"?' + (useCount ? ' ' + useCount + ' model' + (useCount === 1 ? '' : 's') + ' reference it and will keep the current URL/key until re-saved.' : '') + ' This cannot be undone.';
+    if (await showConfirmModal('Delete Endpoint', msg, 'danger')) {
+        var nextEndpoints = llmEndpoints.filter(function(e) { return e.id !== endpointId; }).map(function(e) { return Object.assign({}, e); });
+        try {
+            await persistLlmEndpointState(nextEndpoints, []);
+        } catch (e) {
+            console.error('Failed to delete LLM endpoint:', e);
+            showSnackbar('Could not delete endpoint: ' + (e && e.message), 'error');
+            return;
+        }
+        llmEndpoints = nextEndpoints;
         renderLlmEndpointsList();
         showSnackbar('Endpoint deleted', 'success');
     }
+}
+
+// API Providers UI Functions
+function isProviderCustomized(provider) {
+    var defaultProvider = DEFAULT_API_PROVIDERS.find(function(d) { return d.name === provider.name; });
+    if (!defaultProvider) return false; // It's a new custom provider, not customized
+    return JSON.stringify(defaultProvider) !== JSON.stringify(provider);
+}
+
+function getEndpointDomain(endpoint) {
+    try {
+        var url = new URL(endpoint);
+        return url.hostname.replace('www.', '');
+    } catch (e) {
+        return '';
+    }
+}
+
+// Canonical form of an endpoint URL for cross-record matching: lowercased,
+// trailing slashes stripped, then common API path suffixes
+// (/chat/completions, /completions, /responses, /messages) and a trailing
+// /v1 removed — so 'https://openrouter.ai/api/v1/chat/completions' and
+// 'https://OpenRouter.ai/api/v1/' compare equal.
+function _normalizeEndpointUrl(url) {
+    var u = (url || '').trim().toLowerCase();
+    u = u.replace(/\/+$/, '');
+    u = u.replace(/\/(chat\/completions|completions|responses|messages)$/, '');
+    u = u.replace(/\/v1$/, '');
+    return u.replace(/\/+$/, '');
+}
+
+// The LLM-endpoint record backing a model. Prefers the explicit endpointId
+// reference; models saved before endpointId existed (PR #824 era — only an
+// inline endpoint URL) fall back to a normalized-URL match, so legacy models
+// still count toward / fold under their endpoint. Subscription models never
+// match (their endpoint field is the OAuth backend URL, not a configured
+// endpoint).
+function findEndpointForProvider(provider) {
+    if (!provider || provider.isChatGPTOAuth || provider.isClaudeOAuth) return null;
+    if (provider.endpointId) {
+        var byId = getLlmEndpointById(provider.endpointId);
+        if (byId) return byId;
+    }
+    var norm = _normalizeEndpointUrl(provider.endpoint || '');
+    if (!norm) return null;
+    return llmEndpoints.find(function(ep) { return _normalizeEndpointUrl(ep.url) === norm; }) || null;
+}
+
+// Brand icon for an endpoint URL: OpenRouter mark for openrouter.ai, a
+// monitor for local/LAN hosts, a globe for everything else.
+function getEndpointIcon(url) {
+    var host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) {}
+    if (host.indexOf('openrouter') !== -1) return UI_ICONS.brandOpenRouter;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || /^192\.168\./.test(host) || /^10\./.test(host) || /\.local$/.test(host)) return UI_ICONS.brandLocalhost;
+    return UI_ICONS.brandEndpoint;
+}
+
+// Auto display name from a model id: strip the vendor prefix before '/',
+// split on - _ : and whitespace (dots only outside version numbers like 3.5),
+// then title-case each word. Known acronyms keep their casing; tokens
+// containing a digit ('4o', '3.5', 'v2') pass through verbatim.
+var _MODEL_NAME_CASINGS = { gpt: 'GPT', chatgpt: 'ChatGPT', ai: 'AI', oss: 'OSS', glm: 'GLM', deepseek: 'DeepSeek', xai: 'xAI', llm: 'LLM' };
+function autoNameFromModelId(modelId) {
+    var id = (modelId || '').trim();
+    if (!id) return '';
+    var slash = id.lastIndexOf('/');
+    if (slash !== -1) id = id.slice(slash + 1);
+    var out = [];
+    id.split(/[-_:@\s]+/).filter(Boolean).forEach(function(w) {
+        var parts = /^\d+(\.\d+)*[a-z]*$/i.test(w) ? [w] : w.split('.').filter(Boolean);
+        parts.forEach(function(t) {
+            var lower = t.toLowerCase();
+            if (_MODEL_NAME_CASINGS[lower]) out.push(_MODEL_NAME_CASINGS[lower]);
+            else if (/\d/.test(t)) out.push(t);
+            else out.push(t.charAt(0).toUpperCase() + t.slice(1));
+        });
+    });
+    return out.join(' ');
+}
+
+// Display Name mirrors the Model ID while untouched; a manual edit sets the
+// dirty flag and stops the mirroring (clearing the field re-arms it).
+var _modelNameDirty = false;
+function onModelIdInput(value) {
+    if (_modelNameDirty) return;
+    var nameField = document.getElementById('provider-name');
+    if (nameField) nameField.value = autoNameFromModelId(value);
+}
+function onModelNameInput(value) {
+    _modelNameDirty = value.trim() !== '';
+}
+
+// Endpoint radio group in the model modal — mirrors selectModelAuthKind and
+// writes the chosen id to the hidden #provider-endpoint-select input that
+// saveApiProviderFromModal reads.
+function selectModelEndpoint(endpointId) {
+    var group = document.getElementById('provider-endpoint-group');
+    if (group) {
+        group.querySelectorAll('.radio-option').forEach(function(opt) {
+            var on = opt.getAttribute('data-value') === endpointId;
+            opt.classList.toggle('selected', on);
+            opt.setAttribute('aria-checked', on ? 'true' : 'false');
+        });
+    }
+    var hidden = document.getElementById('provider-endpoint-select');
+    if (hidden) hidden.value = endpointId;
+}
+
+// Reasoning-effort slider in the model modal: the pill-menu control
+// (_EFFORT_LEVELS, ui/160-notifications.js) plus a TRAILING 'Default' stop at
+// the high end — same semantics as the old select's empty option
+// (provider.effort unset; saved value stays ''). Default sits at the top end
+// because the server-side default effort is high (_providerDefaultEffort,
+// ui/160-notifications.js), so displaying it below Low misread as minimal.
+var _MODAL_EFFORT_LEVELS = [
+    { v: 'low', label: 'Low' },
+    { v: 'medium', label: 'Medium' },
+    { v: 'high', label: 'High' },
+    { v: 'xhigh', label: 'X-High' },
+    { v: 'max', label: 'Max' },
+    { v: '', label: 'Default' }
+];
+var _MODAL_EFFORT_DEFAULT_IDX = _MODAL_EFFORT_LEVELS.length - 1;
+function _modalEffortLabelHtml(idx) {
+    var e = _MODAL_EFFORT_LEVELS[idx] || _MODAL_EFFORT_LEVELS[_MODAL_EFFORT_DEFAULT_IDX];
+    return '<span class="model-menu-effort-name">' + e.label + '</span>' +
+        (e.v === '' ? '<span class="model-row-badge">server decides</span>' : '');
+}
+function onModalEffortSliderInput(v) {
+    var idx = parseInt(v, 10);
+    if (isNaN(idx) || idx < 0 || idx > 5) idx = _MODAL_EFFORT_DEFAULT_IDX;
+    var hidden = document.getElementById('provider-effort');
+    if (hidden) hidden.value = _MODAL_EFFORT_LEVELS[idx].v;
+    var label = document.getElementById('modal-effort-label');
+    if (label) label.innerHTML = _modalEffortLabelHtml(idx);
+    var track = document.getElementById('modal-effort-track');
+    if (track) track.style.setProperty('--pos', String(idx / 5));
+    document.querySelectorAll('#modal-effort-track .effort-dot').forEach(function(d, i) {
+        d.classList.toggle('active', i <= idx);
+        d.classList.toggle('current', i === idx);
+    });
+    var disc = document.getElementById('modal-effort-disc');
+    if (disc && disc._lastIdx !== idx) {
+        disc._lastIdx = idx;
+        disc.classList.remove('is-morph');
+        void disc.offsetWidth; // reflow so the keyframe animation restarts
+        disc.classList.add('is-morph');
+    }
+}
+
+// Collapsed state of the Settings model-list sections — in-memory only
+// (resets on reload; default expanded), keyed by section key.
+var _modelSectionCollapsed = {};
+function _modelSectionFor(provider) {
+    if (provider.isChatGPTOAuth) return { key: 'chatgpt', label: 'ChatGPT Subscription', icon: UI_ICONS.brandOpenAI };
+    if (provider.isClaudeOAuth) return { key: 'claude', label: 'Claude Subscription', icon: UI_ICONS.brandClaude };
+    var ep = findEndpointForProvider(provider);
+    if (ep) return { key: 'ep:' + ep.id, label: ep.name, icon: getEndpointIcon(ep.url) };
+    var domain = getEndpointDomain(provider.endpoint) || 'Other';
+    return { key: 'url:' + domain, label: domain, icon: getEndpointIcon(provider.endpoint || '') };
+}
+function toggleModelSection(key) {
+    _modelSectionCollapsed[key] = !_modelSectionCollapsed[key];
+    renderApiProvidersList();
+}
+
+// Shared section grouping for model lists — used by BOTH the Settings model
+// list (renderApiProvidersList) and the header model-pill menu
+// (toggleModelMenu, ui/160-notifications.js): subscriptions first, then one
+// section per configured endpoint (llmEndpoints order), then inline-url
+// fallback groups (models whose endpoint can't be resolved) last.
+function groupProvidersIntoSections(providers) {
+    var sections = [];
+    var byKey = {};
+    (providers || []).forEach(function(provider) {
+        var meta = _modelSectionFor(provider);
+        var sec = byKey[meta.key];
+        if (!sec) { sec = { meta: meta, rows: [] }; byKey[meta.key] = sec; sections.push(sec); }
+        sec.rows.push(provider);
+    });
+    var order = ['chatgpt', 'claude'].concat(llmEndpoints.map(function(ep) { return 'ep:' + ep.id; }));
+    sections.forEach(function(sec, i) {
+        var idx = order.indexOf(sec.meta.key);
+        sec._rank = idx < 0 ? order.length + i : idx;
+    });
+    sections.sort(function(a, b) { return a._rank - b._rank; });
+    return sections;
 }
 
 function renderApiProvidersList() {
@@ -1774,21 +1982,25 @@ function renderApiProvidersList() {
         return;
     }
     
+    // Foldable sections — shared grouping with the model-pill menu
+    // (groupProvidersIntoSections above).
+    var sections = groupProvidersIntoSections(apiProviders);
+
     var html = '';
-    apiProviders.forEach(function(provider) {
+    sections.forEach(function(sec) {
+        var collapsed = !!_modelSectionCollapsed[sec.meta.key];
+        var rowsHtml = '';
+        sec.rows.forEach(function(provider) {
         var isCustomized = isProviderCustomized(provider);
         var isNew = !DEFAULT_API_PROVIDERS.find(function(d) { return d.name === provider.name; });
         var isActive = provider.name === currentProvider;
         var statusBadge = isNew ? '<span class="provider-badge new">custom</span>' : (isCustomized ? '<span class="provider-badge">modified</span>' : '');
         var activeTag = isActive ? '<span class="provider-tag active">Active</span>' : '';
-        // Endpoint NAME tag (falls back to the resolved URL's domain for
-        // legacy inline entries and OAuth providers).
-        var conn = resolveProviderConnection(provider);
-        var endpointLabel = conn.endpointName || getEndpointDomain(conn.endpoint);
+        var endpointLabel = getEndpointDomain(provider.endpoint);
         var domainTag = endpointLabel ? '<span class="provider-tag">' + escapeHtml(endpointLabel) + '</span>' : '';
         var providerTag = provider.provider ? '<span class="provider-tag">' + escapeHtml(provider.provider) + '</span>' : '';
         
-        html += '<div class="api-provider-row' + (isActive ? ' active' : '') + '">' +
+        rowsHtml += '<div class="api-provider-row' + (isActive ? ' active' : '') + '">' +
             '<span class="api-provider-name">' + escapeHtml(provider.name) + '</span>' +
             statusBadge +
             '<div class="api-provider-tags">' + activeTag + domainTag + providerTag + '</div>' +
@@ -1797,6 +2009,18 @@ function renderApiProvidersList() {
                 '<button class="api-provider-btn" onclick="editApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
                 '<button class="api-provider-btn danger" onclick="confirmDeleteApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
             '</div>' +
+        '</div>';
+        });
+        html += '<div class="model-section' + (collapsed ? ' collapsed' : '') + '">' +
+            '<div class="model-section-header" role="button" tabindex="0" aria-expanded="' + !collapsed + '"' +
+                ' onclick="toggleModelSection(\'' + escapeJsString(sec.meta.key) + '\')"' +
+                ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleModelSection(\'' + escapeJsString(sec.meta.key) + '\');}">' +
+                '<span class="model-section-chevron">' + UI_ICONS.chevronDown + '</span>' +
+                '<span class="model-section-icon">' + sec.meta.icon + '</span>' +
+                '<span class="model-section-title">' + escapeHtml(sec.meta.label) + '</span>' +
+                '<span class="model-section-count">' + sec.rows.length + '</span>' +
+            '</div>' +
+            '<div class="model-section-body">' + rowsHtml + '</div>' +
         '</div>';
     });
     container.innerHTML = html;
@@ -1814,82 +2038,205 @@ function showAddApiProviderModal(editingProvider) {
     
     var isEditing = !!editingProvider;
     var originalName = isEditing ? editingProvider.name : '';
-    var provider = editingProvider || { 
-        name: '', 
-        model: '', 
-        endpointId: 'openrouter',
-        // No maxTokens / thinkingBudget — token budgets are GLOBAL settings
-        // (Settings → Context Window & Token Budgets), never per-provider.
+    var provider = editingProvider || {
+        name: '',
+        model: '',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
         provider: ''
     };
-
-    // Endpoint dropdown: preselect the provider's endpoint, else the seeded
-    // 'openrouter' entry, else the first configured endpoint.
-    var selectedEndpointId = (provider.endpointId && getLlmEndpointById(provider.endpointId)) ? provider.endpointId
-        : (getLlmEndpointById('openrouter') ? 'openrouter' : (llmEndpoints.length > 0 ? llmEndpoints[0].id : ''));
-    var endpointOptions = llmEndpoints.map(function(ep) {
-        var epDomain = getEndpointDomain(ep.url);
-        var epLabel = ep.name + (epDomain ? ' (' + epDomain + ')' : '');
-        return '<option value="' + escapeHtml(ep.id) + '"' + (ep.id === selectedEndpointId ? ' selected' : '') + '>' + escapeHtml(epLabel) + '</option>';
-    }).join('');
-    var endpointFieldInner = llmEndpoints.length > 0
-        ? '<select id="provider-endpoint-select" class="form-input">' + endpointOptions + '</select>'
-        : '<div class="settings-page-row-hint">No LLM endpoints configured — add one in the LLM Endpoints section of Settings first (Claude OAuth models don\'t need one).</div>';
+    // Which auth backs this model: 'chatgpt' / 'claude' subscription, or a
+    // custom 'endpoint'. Editing preselects the saved kind; new models start
+    // on the first radio (ChatGPT Subscription).
     
+    var authKind = provider.isChatGPTOAuth ? 'chatgpt'
+        : (provider.isClaudeOAuth ? 'claude'
+        : (isEditing ? 'endpoint' : 'chatgpt'));
+
+    // Endpoint picker: one radio per endpoint configured in Settings → LLM
+    // Endpoints, each with its brand icon. A hidden input keeps the
+    // 'provider-endpoint-select' contract with saveApiProviderFromModal.
+    // Preselect the model's endpoint, else the seeded 'openrouter', else the
+    // first configured endpoint.
+    var _providerEp = findEndpointForProvider(provider);
+    var selectedEndpointId = _providerEp ? _providerEp.id
+        : (getLlmEndpointById('openrouter') ? 'openrouter' : (llmEndpoints.length > 0 ? llmEndpoints[0].id : ''));
+    var endpointFieldInner = llmEndpoints.length > 0
+        ? '<div class="radio-group radio-group-vertical" id="provider-endpoint-group" role="radiogroup" aria-label="Endpoint">' +
+            llmEndpoints.map(function(ep) {
+                var on = ep.id === selectedEndpointId;
+                var epDomain = getEndpointDomain(ep.url);
+                return '<div class="radio-option endpoint-radio' + (on ? ' selected' : '') + '" data-value="' + escapeHtml(ep.id) + '" role="radio" aria-checked="' + on + '" tabindex="0"' +
+                    ' onclick="selectModelEndpoint(\'' + escapeJsString(ep.id) + '\')"' +
+                    ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();selectModelEndpoint(\'' + escapeJsString(ep.id) + '\');}">' +
+                    '<span class="radio-option-icon">' + getEndpointIcon(ep.url) + '</span>' +
+                    '<span class="endpoint-radio-name">' + escapeHtml(ep.name) + '</span>' +
+                    (epDomain ? '<span class="endpoint-radio-domain">' + escapeHtml(epDomain) + '</span>' : '') +
+                '</div>';
+            }).join('') +
+          '</div>' +
+          '<input type="hidden" id="provider-endpoint-select" value="' + escapeHtml(selectedEndpointId) + '">'
+        : '<div class="settings-page-row-hint">No LLM endpoints configured — add one in the LLM Endpoints section of Settings first (subscription models don\'t need one).</div>';
+
+    // Reasoning-effort slider (same control as the model pill menu, plus a
+    // trailing 'Default' stop at the high end = the old select's empty option).
+    var effortIdx = _MODAL_EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(provider.effort || '');
+    if (effortIdx < 0) effortIdx = _MODAL_EFFORT_DEFAULT_IDX;
+    var effortDots = '';
+    for (var di = 0; di < 6; di++) {
+        effortDots += '<span class="effort-dot' + (di <= effortIdx ? ' active' : '') + (di === effortIdx ? ' current' : '') + '" data-level="' + (di + 1) + '"></span>';
+    }
+
+    // Display-name autofill is armed only while the name matches what the
+    // Model ID would generate (or is empty) — an existing custom name stays.
+    _modelNameDirty = !!(provider.name && provider.name !== autoNameFromModelId(provider.model));
+
     var overlay = document.createElement('div');
     overlay.id = 'api-provider-modal';
-    overlay.className = 'modal-overlay show';
-    overlay.onclick = function(e) { if (e.target === overlay) closeApiProviderModal(); };
+    // .model-modal (09-settings.css) fixes the dialog to one LARGE constant
+    // size — switching API-Access radios shows/hides fields, and the modal
+    // must not resize with them. The body scrolls between the fixed
+    // header/footer instead.
+    overlay.className = 'modal-overlay show model-modal';
+    // Dismiss only when the mouse press STARTED on the backdrop — selecting
+    // text inside the dialog and releasing over the backdrop must NOT close
+    // the modal. The Escape handler (core/120-init.js:267-271) replays a
+    // SYNTHETIC {target: overlay} click object with no isTrusted flag and no
+    // preceding mousedown, so it bypasses the press check and still closes.
+    var backdropPressed = false;
+    overlay.addEventListener('mousedown', function(e) { backdropPressed = (e.target === overlay); });
+    overlay.onclick = function(e) {
+        if (e.target !== overlay) return;
+        if (e.isTrusted && !backdropPressed) return;
+        closeApiProviderModal();
+    };
     
     overlay.innerHTML = 
-        '<div class="modal-dialog" style="max-width:480px;">' +
-            '<div class="modal-header">' + (isEditing ? 'Edit' : 'Add') + ' API Provider</div>' +
+        '<div class="modal-dialog">' +
+            '<div class="modal-header">' + (isEditing ? 'Edit' : 'Add') + ' Model</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Display Name <span class="required">*</span></label>' +
-                    '<input type="text" id="provider-name" class="form-input" value="' + escapeHtml(provider.name) + '" placeholder="e.g. Claude 4 Sonnet">' +
+                    '<label class="form-label">API Access</label>' +
+                    '<div class="radio-group" id="provider-auth-kind" role="radiogroup" aria-label="API access">' +
+                        [['chatgpt', 'ChatGPT Subscription', UI_ICONS.brandOpenAI], ['claude', 'Claude Subscription', UI_ICONS.brandClaude], ['endpoint', 'Endpoint', UI_ICONS.brandEndpoint]].map(function(opt) {
+                            var on = authKind === opt[0];
+                            return '<div class="radio-option' + (on ? ' selected' : '') + '" data-value="' + opt[0] + '" role="radio" aria-checked="' + on + '" tabindex="0"' +
+                                ' onclick="selectModelAuthKind(\'' + opt[0] + '\')"' +
+                                ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();selectModelAuthKind(\'' + opt[0] + '\');}">' +
+                                '<span class="radio-option-icon">' + opt[2] + '</span>' + opt[1] + '</div>';
+                        }).join('') +
+                    '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">Model ID <span class="required">*</span></label>' +
-                    '<input type="text" id="provider-model" class="form-input" value="' + escapeHtml(provider.model) + '" placeholder="e.g. anthropic/claude-sonnet-4">' +
+                    '<input type="text" id="provider-model" class="form-input" list="provider-model-datalist" value="' + escapeHtml(provider.model) + '" placeholder="e.g. anthropic/claude-sonnet-4" oninput="onModelIdInput(this.value)">' +
+                    '<datalist id="provider-model-datalist"></datalist>' +
+                    '<div class="settings-page-row-hint" id="provider-model-catalog-hint" style="display:none"></div>' +
                 '</div>' +
-                '<div class="form-field" id="provider-provider-field"' + (provider.isClaudeOAuth ? ' style="display:none"' : '') + '>' +
-                    '<label class="form-label">Provider (Optional)</label>' +
-                    '<input type="text" id="provider-provider" class="form-input" value="' + escapeHtml(provider.provider || '') + '" placeholder="e.g. anthropic or novita/bf16">' +
+                '<div class="form-field">' +
+                    '<label class="form-label">Display Name <span class="required">*</span></label>' +
+                    '<input type="text" id="provider-name" class="form-input" value="' + escapeHtml(provider.name) + '" placeholder="Auto-filled from Model ID" oninput="onModelNameInput(this.value)">' +
                 '</div>' +
-                '<label class="settings-checkbox" style="margin-bottom:var(--space-4);">' +
-                    '<input type="checkbox" id="provider-oauth"' + (provider.isClaudeOAuth ? ' checked' : '') + ' onchange="toggleOAuthProvider(this.checked)">' +
-                    '<span>Use Claude OAuth (no API key needed)</span>' +
-                '</label>' +
-                '<div class="form-field" id="provider-endpoint-select-field"' + (provider.isClaudeOAuth ? ' style="display:none"' : '') + '>' +
-                    '<label class="form-label">Endpoint <span class="required">*</span></label>' +
-                    endpointFieldInner +
+                '<div id="provider-custom-fields" style="' + (authKind === 'endpoint' ? 'display:flex;flex-direction:column;gap:var(--space-8)' : 'display:none') + '">' +
+                    '<div class="form-field">' +
+                        '<label class="form-label">Endpoint <span class="required">*</span></label>' +
+                        endpointFieldInner +
+                    '</div>' +
+                    '<div class="form-field" id="provider-provider-field">' +
+                        '<label class="form-label">Provider (Optional)</label>' +
+                        '<input type="text" id="provider-provider" class="form-input" value="' + escapeHtml(provider.provider || '') + '" placeholder="e.g. anthropic or novita/bf16">' +
+                    '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">Reasoning Effort</label>' +
-                    '<select id="provider-effort" class="form-input">' +
-                        ['', 'low', 'medium', 'high', 'xhigh', 'max'].map(function(v) {
-                            var label = v === '' ? '(default — let server decide)' : v;
-                            var selected = (provider.effort || '') === v ? ' selected' : '';
-                            return '<option value="' + v + '"' + selected + '>' + label + '</option>';
-                        }).join('') +
-                    '</select>' +
+                    '<div class="model-menu-effort modal-effort">' +
+                        '<div class="model-menu-effort-track" id="modal-effort-track" style="--pos: ' + (effortIdx / 5) + '">' + effortDots +
+                            '<span class="effort-track-fill"></span>' +
+                            '<input type="range" class="model-menu-effort-slider" id="modal-effort-slider" min="0" max="5" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onModalEffortSliderInput(this.value)">' +
+                            '<span class="effort-disc" id="modal-effort-disc"></span>' +
+                        '</div>' +
+                        '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx) + '</div>' +
+                    '</div>' +
+                    '<input type="hidden" id="provider-effort" value="' + escapeHtml(provider.effort || '') + '">' +
                 '</div>' +
             '</div>' +
             '<div class="modal-actions">' +
+                (isEditing ? '<button class="modal-btn danger" style="margin-right:auto" onclick="deleteApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">Delete</button>' : '') +
                 '<button class="modal-btn secondary" onclick="closeApiProviderModal()">Cancel</button>' +
                 '<button class="modal-btn primary" onclick="saveApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
             '</div>' +
         '</div>';
     
     document.body.appendChild(overlay);
+    // Offer the live ChatGPT/Codex catalog when the ChatGPT Subscription radio
+    // is preselected (async, race-guarded — see refreshCodexModelOptions).
+    refreshCodexModelOptions();
 }
 
-function toggleOAuthProvider(checked) {
-    ['provider-endpoint-select-field', 'provider-provider-field'].forEach(function(id) {
-        var el = document.getElementById(id);
-        if (el) el.style.display = checked ? 'none' : '';
-    });
+// Live ChatGPT/Codex model catalog for the Add/Edit-Model modal. When the
+// ChatGPT Subscription radio is selected, ask the SW for the live catalog
+// ('openai-oauth-models' in background.js — fetchChatGPTModelCatalog, falling
+// back to OPENAI_FALLBACK_MODELS with live:false when signed out or the fetch
+// fails) and offer the slugs as datalist suggestions under the Model ID input.
+// Best-effort and non-blocking: free-form typing always works. The generation
+// token plus element/auth-kind re-checks in the callback guard the
+// modal-closed and auth-kind-changed races.
+var _codexCatalogGeneration = 0;
+function refreshCodexModelOptions() {
+    var generation = ++_codexCatalogGeneration;
+    var dl = document.getElementById('provider-model-datalist');
+    var hint = document.getElementById('provider-model-catalog-hint');
+    if (!dl) return;
+    if (_selectedModelAuthKind() !== 'chatgpt') {
+        dl.innerHTML = '';
+        if (hint) hint.style.display = 'none';
+        return;
+    }
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return;
+    try {
+        chrome.runtime.sendMessage({ type: 'openai-oauth-models' }, function(response) {
+            if (chrome.runtime.lastError) return; // SW unreachable — keep free-form input
+            if (generation !== _codexCatalogGeneration) return; // superseded by a newer refresh
+            var dlNow = document.getElementById('provider-model-datalist');
+            if (!dlNow) return; // modal closed while the fetch was in flight
+            if (_selectedModelAuthKind() !== 'chatgpt') return; // auth kind changed mid-flight
+            var models = (response && Array.isArray(response.models)) ? response.models : [];
+            dlNow.innerHTML = models.map(function(slug) {
+                return '<option value="' + escapeHtml(String(slug)) + '"></option>';
+            }).join('');
+            var hintNow = document.getElementById('provider-model-catalog-hint');
+            if (!hintNow) return;
+            if (!models.length) { hintNow.style.display = 'none'; return; }
+            hintNow.textContent = (response.success && response.live)
+                ? (models.length + ' model' + (models.length === 1 ? '' : 's') + ' available on your ChatGPT subscription')
+                : 'Live catalog unavailable — showing known Codex models';
+            hintNow.style.display = '';
+        });
+    } catch (e) { /* catalog is best-effort — never block the modal */ }
+}
+
+// Radio group in the add/edit-model modal: 'chatgpt' | 'claude' | 'endpoint'.
+// Selecting 'endpoint' reveals the endpoint / API-key / provider fields.
+function selectModelAuthKind(kind) {
+    var group = document.getElementById('provider-auth-kind');
+    if (group) {
+        group.querySelectorAll('.radio-option').forEach(function(opt) {
+            var on = opt.getAttribute('data-value') === kind;
+            opt.classList.toggle('selected', on);
+            opt.setAttribute('aria-checked', on ? 'true' : 'false');
+        });
+    }
+    var custom = document.getElementById('provider-custom-fields');
+    if (custom) custom.style.cssText = kind === 'endpoint' ? 'display:flex;flex-direction:column;gap:var(--space-8)' : 'display:none';
+    // Populate (chatgpt) or clear (claude/endpoint) the Model ID suggestions.
+    refreshCodexModelOptions();
+}
+
+function _selectedModelAuthKind() {
+    var sel = document.querySelector('#provider-auth-kind .radio-option.selected');
+    // Defensive fallback: 'endpoint' fails loudly (endpoint validation) rather
+    // than silently minting a subscription provider.
+    return sel ? sel.getAttribute('data-value') : 'endpoint';
 }
 
 function closeApiProviderModal() {
@@ -1901,10 +2248,14 @@ async function saveApiProviderFromModal(originalName) {
     var name = document.getElementById('provider-name').value.trim();
     var model = document.getElementById('provider-model').value.trim();
     var providerField = document.getElementById('provider-provider').value.trim();
-    var oauthCheckbox = document.getElementById('provider-oauth');
-    var isOAuth = oauthCheckbox && oauthCheckbox.checked;
+    // The selected radio is the single source of truth for how this model
+    // authenticates — for NEW and EDITED models alike. (PR #824 regression:
+    // isOAuth was derived as `!existingProvider || …`, which forced every NEW
+    // model onto the subscription path and ignored the typed endpoint.)
+    var authKind = _selectedModelAuthKind();
+    var isOAuth = authKind === 'chatgpt' || authKind === 'claude';
     var endpointSelect = document.getElementById('provider-endpoint-select');
-    var endpointId = endpointSelect ? endpointSelect.value : '';
+    var selectedEp = !isOAuth ? getLlmEndpointById(endpointSelect ? endpointSelect.value : '') : null;
     var effortField = document.getElementById('provider-effort');
     var effort = effortField ? effortField.value : '';
 
@@ -1912,30 +2263,12 @@ async function saveApiProviderFromModal(originalName) {
         showSnackbar('Please fill in all required fields (Name, Model ID)', 'error');
         return;
     }
-    if (!isOAuth && !endpointId) {
-        showSnackbar('Please select an Endpoint — add one in the LLM Endpoints section of Settings first', 'error');
+    if (!isOAuth && !selectedEp) {
+        showSnackbar('Please select an Endpoint — add one in Settings → LLM Endpoints first', 'error');
         return;
     }
     
-    // If renaming, handle in-place update to preserve list order
-    var originalIndex = -1;
-    if (originalName && originalName !== name) {
-        originalIndex = apiProviders.findIndex(function(p) { return p.name === originalName; });
-        // Delete old entry from IndexedDB (but don't remove from array yet)
-        try {
-            var database = await openDatabase();
-            var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
-            var store = transaction.objectStore(apiProvidersStoreName);
-            store.delete(originalName);
-        } catch (e) {
-            console.error('Failed to delete old provider entry:', e);
-        }
-        // Update currentProvider if it was the renamed one
-        if (currentProvider === originalName) {
-            currentProvider = name;
-            saveProviderToStorage();
-        }
-    }
+    var renamingCurrent = !!(originalName && originalName !== name && currentProvider === originalName);
     
     // No maxTokens / thinkingBudget on the saved provider — token budgets
     // are GLOBAL settings (core/030-config.js), pure-global design.
@@ -1944,35 +2277,38 @@ async function saveApiProviderFromModal(originalName) {
         model: model
     };
     if (isOAuth) {
-        // Claude OAuth providers keep their inline endpoint/apiKey and do
-        // NOT reference a named LLM endpoint.
-        provider.endpoint = 'https://api.anthropic.com/v1/messages';
         provider.apiKey = 'oauth';
-        provider.isClaudeOAuth = true;
+        if (authKind === 'chatgpt') {
+            provider.endpoint = 'https://chatgpt.com/backend-api/codex/responses';
+            provider.isChatGPTOAuth = true;
+        } else {
+            provider.endpoint = 'https://api.anthropic.com/v1/messages';
+            provider.isClaudeOAuth = true;
+        }
     } else {
-        provider.endpointId = endpointId;
+        // Reference the configured endpoint AND snapshot its url/key inline —
+        // the request path (app/010-llm-streaming.js, background.js) reads
+        // provider.endpoint / provider.apiKey directly.
+        provider.endpointId = selectedEp.id;
+        provider.endpoint = selectedEp.url;
+        provider.apiKey = selectedEp.apiKey || '';
     }
     if (providerField && !isOAuth) provider.provider = providerField;
     if (effort) provider.effort = effort;
 
-    // If renaming, update in-place to preserve list order
-    if (originalIndex >= 0) {
-        apiProviders[originalIndex] = provider;
-        // Save to IndexedDB
-        try {
-            var database = await openDatabase();
-            var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
-            var store = transaction.objectStore(apiProvidersStoreName);
-            store.put(provider);
-        } catch (e) {
-            console.error('Failed to save renamed provider:', e);
-        }
-    } else {
-        await saveApiProvider(provider);
+    try {
+        await saveApiProvider(provider, originalName || null);
+    } catch (e) {
+        console.error('Failed to save API provider:', e);
+        showSnackbar('Could not save provider: ' + (e && e.message), 'error');
+        return; // keep modal open with the user's input intact
+    }
+    if (renamingCurrent) {
+        currentProvider = name;
+        saveProviderToStorage();
     }
     closeApiProviderModal();
     renderApiProvidersList();
-    renderLlmEndpointsList();
     populateProviderDropdown();
     showSnackbar(originalName ? 'Provider updated' : 'Provider added', 'success');
 }
@@ -1984,26 +2320,45 @@ function editApiProvider(providerName) {
     }
 }
 
+// Delete button in the EDIT-model modal footer. Same confirm + delete flow as
+// the settings list's trash button; the modal only closes once the user
+// confirms (cancelling the confirm keeps the edit modal open, untouched).
+async function deleteApiProviderFromModal(providerName) {
+    var provider = apiProviders.find(function(p) { return p.name === providerName; });
+    if (!provider) return;
+    if (await showConfirmModal('Delete Model', 'Delete model "' + provider.name + '"? This cannot be undone.', 'danger')) {
+        closeApiProviderModal();
+        await deleteApiProviderAndRefresh(providerName);
+    }
+}
+
 async function confirmDeleteApiProvider(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
     
     if (await showConfirmModal('Delete Provider', 'Delete provider "' + provider.name + '"? This cannot be undone.', 'danger')) {
-        deleteApiProviderAndRefresh(providerName);
+        await deleteApiProviderAndRefresh(providerName);
     }
 }
 
 async function deleteApiProviderAndRefresh(providerName) {
-    // Check if this provider is currently selected
-    if (currentProvider === providerName) {
-        // Switch to first available provider
-        currentProvider = apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus 5';
+    var wasCurrent = currentProvider === providerName;
+    var replacement = wasCurrent
+        ? (apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus 5')
+        : currentProvider;
+    try {
+        await deleteApiProvider(providerName);
+    } catch (e) {
+        console.error('Failed to delete API provider:', e);
+        showSnackbar('Could not delete provider: ' + ((e && e.message) || 'storage transaction failed'), 'error');
+        return;
+    }
+    // Only publish selection/UI changes after deleteApiProvider confirms commit.
+    if (wasCurrent) {
+        currentProvider = replacement;
         saveProviderToStorage();
     }
-    
-    await deleteApiProvider(providerName);
     renderApiProvidersList();
-    renderLlmEndpointsList();
     populateProviderDropdown();
     updateModelDisplay();
     showSnackbar('Provider deleted', 'success');

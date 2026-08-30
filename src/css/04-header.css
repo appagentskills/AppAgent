@@ -74,8 +74,9 @@
 .model-status-dot.connected { background: var(--success); }
 .model-status-dot.disconnected { background: var(--danger); }
 .model-status-dot.unknown { background: var(--text-muted); }
-.model-login-icon { display: inline-flex; align-items: center; }
-.model-login-icon .ui-icon { width: 13px; height: 13px; }
+.model-login-btn { border: 0; border-left: 1px solid currentColor; background: transparent; color: inherit; font: inherit; font-size: var(--text-caption); font-weight: var(--font-semibold); padding: 1px 0 1px var(--space-3); cursor: pointer; }
+.model-login-btn:hover, .model-login-btn:focus-visible { text-decoration: underline; outline: none; }
+.model-login-btn.pending { cursor: progress; opacity: .8; }
 .header-controls { display: flex; align-items: center; gap: var(--space-6); align-self: center; }
 /* OAuth button styles removed — model-name pill handles connection status */
 /* ---- Shared header pill dropdown chrome (.header-menu) ----
@@ -106,7 +107,9 @@
 .menu-title-btn .ui-icon { width: 14px; height: 14px; }
 
 /* Model pill dropdown menu (reasoning effort + model picker) */
-.model-menu { z-index: var(--z-overlay-base); min-width: 286px; max-width: 360px; max-height: 72vh; overflow-y: auto; padding: 0; }
+/* FIXED width: the menu must not grow/shrink as sections with long model
+   names expand/collapse — long names ellipsize (.model-row-name) instead. */
+.model-menu { z-index: var(--z-overlay-base); width: 360px; max-width: calc(100vw - 16px); max-height: 72vh; overflow-y: auto; padding: 0; }
 /* Typography comes from the shared .menu-section-title class above. */
 .model-menu-section-title { position: sticky; top: 0; z-index: 1; }
 /* ---- Reasoning-effort slider: stepped circles + morphing disc ----
@@ -169,6 +172,9 @@
 .model-menu-row.selected .model-row-icon { color: var(--success); }
 .model-row-main { flex: 1; min-width: 0; }
 .model-row-title { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The name is a real element (not an anonymous flex item) so text-overflow
+   can actually ellipsize it; badges keep their full width next to it. */
+.model-row-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-menu-row.selected .model-row-title { color: var(--success-hover); font-weight: var(--font-semibold); }
 .model-row-sub { font-size: var(--text-caption); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
 .model-row-badge { font-size: 9px; line-height: 1; text-transform: uppercase; letter-spacing: 0.04em; font-weight: var(--font-semibold); padding: 2px 5px; border-radius: var(--radius-sm); background: var(--secondary-light); color: var(--text-secondary); border: 1px solid var(--border); flex-shrink: 0; }
@@ -179,6 +185,16 @@
 .model-row-edit .ui-icon { width: 13px; height: 13px; }
 .model-row-check { width: 16px; height: 16px; flex-shrink: 0; color: var(--success); display: inline-flex; align-items: center; justify-content: center; }
 .model-row-check svg { width: 16px; height: 16px; }
+/* Folded model sections inside the model pill menu — shared markup with the
+   Settings list's .model-section (base styles in 09-settings.css), re-skinned
+   flat/borderless to match the menu rows. */
+.model-menu .model-section { margin: 0; border: none; border-radius: 0; border-bottom: 1px solid var(--secondary-border); }
+.model-menu .model-section-header { background: transparent; padding: var(--space-3) var(--space-4); }
+.model-menu .model-section-header:hover { background: var(--bg-hover); }
+.model-menu .model-section-count { background: transparent; border-color: var(--secondary-border); }
+.model-menu .model-section-body { padding: 0; }
+.model-menu .model-section-body .model-menu-row { padding-left: var(--space-8); }
+.model-menu .model-section-body .model-menu-row:last-child { border-bottom: none; }
 /* OAuth login/logout row reuses .custom-dropdown-option — keep it full-width + divided to match the rows above */
 .model-menu .custom-dropdown-option { padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); color: var(--text-primary); border-bottom: 1px solid var(--secondary-border); transition: background var(--transition-fast); }
 .model-menu .custom-dropdown-option:last-child { border-bottom: none; }

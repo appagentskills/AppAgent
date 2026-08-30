@@ -627,7 +627,9 @@ function renderHome() {
     var widgetCount = Object.keys(dashboardWidgets).length;
     var skillCount = Object.keys(skills).length;
     var toolCount = TOOLS.length;
-    var cachedCredits = appStorage.getItem('cachedCredits');
+    // Provider-scoped read (core/020-bootstrap.js) — never show another
+    // provider's cached usage in the Credits stat card.
+    var cachedCredits = getBootCachedCredits();
     var systemPromptTokens = getSystemPromptTokenCount();
     var systemPromptTokensFormatted = systemPromptTokens >= 1000 ? (systemPromptTokens / 1000).toFixed(1) + 'k' : systemPromptTokens.toString();
     
@@ -674,7 +676,7 @@ function renderHome() {
 function updateHomeCredits() {
     var el = document.getElementById('home-credits-value');
     if (!el) return;
-    var cachedCredits = appStorage.getItem('cachedCredits');
+    var cachedCredits = getBootCachedCredits();
     if (cachedCredits) {
         // cachedCredits already embeds its unit ('$12.34' or '57% for 2h')
         el.textContent = cachedCredits;

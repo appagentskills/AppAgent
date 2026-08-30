@@ -169,8 +169,12 @@ function importSingleChat() {
             delete importedChat._titleHookTries;
             importedChat.createdAt = Date.now();
             
-            // Add to chats without affecting existing ones
-            chats[newId] = importedChat;
+            // Add to chats without affecting existing ones.
+            // FLUX-ADOPT (#836): import is user-authoritative — route through
+            // the sanctioned adopt path with force (newId is freshly generated,
+            // so the guard is moot, but the ratchet keeps all wholesale adopts
+            // on the one site).
+            adoptChatRow(importedChat, { chatId: newId, force: true });
             await saveChatsToStorage();
             renderChatList();
             

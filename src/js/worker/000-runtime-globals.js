@@ -86,6 +86,11 @@ var _silentHookRunningByChat = {};
 // --- Per-chat agent-run state (mirrors page bundle 030-agent-loop.js) ---
 var runningChatIds = {};
 var currentStreamAbortControllers = {};
+// Active foreground provider transitions are control-plane aborts, distinct
+// from user sends/pause/stop. The marker selects accurate tool placeholders;
+// the resolver interrupts an outer throttle backoff immediately.
+var providerChangedChats = {};
+var providerChangeBackoffResolversByChatId = {};
 var pendingInjectionsByChatId = {};
 var interruptResolversByChatId = {};
 var userInterruptedChats = {};

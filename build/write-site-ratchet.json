@@ -2,7 +2,7 @@
   "//": "Write-site ratchet baseline (RFC Flux Phase 1 guard rails). Per-file counts of canonical-state write/render/persist token sites. The build FAILS when any per-file count INCREASES vs this file — route new writes through the sanctioned paths instead, or bump this baseline in the same PR (node build/build.js --update-ratchet) so the increase is review-visible. Decreases only warn: tighten with the same command. Enforced by build/build.js and skills/extension-dev/build.js (in-browser replica).",
   "patterns": {
     "chatsAssign": {
-      "src/js/app/045-agent-port-bridge-page.js": 3,
+      "src/js/app/045-agent-port-bridge-page.js": 1,
       "src/js/app/050-image-attachments.js": 1,
       "src/js/core/097-sub-agent-registry.js": 1,
       "src/js/core/120-init.js": 2,
@@ -10,9 +10,7 @@
       "src/js/tools/140-runtime-inspect.js": 1,
       "src/js/tools/150-start-chat.js": 1,
       "src/js/ui/070-dashboard-ui.js": 1,
-      "src/js/ui/130-data-management.js": 1,
       "src/js/ui/170-chat-management.js": 2,
-      "src/js/ui/210-chat-menus.js": 1,
       "src/js/worker/115-storage.js": 1,
       "src/js/worker/130-port-bridge.js": 4
     },
@@ -126,7 +124,7 @@
       "src/js/ui/070-dashboard-ui.js": 1,
       "src/js/ui/270-iframe-panel.js": 1,
       "src/js/worker/010-platform-stub.js": 2,
-      "src/platform/extension/background.js": 13,
+      "src/platform/extension/background.js": 17,
       "src/platform/extension/platform-bridge.js": 6
     }
   }

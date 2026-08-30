@@ -102,7 +102,7 @@ var SUBAGENT_TOMBSTONE_TTL_MS   = 60 * 60 * 1000; // 1h
 // records — so without an idle window the happy-path 'done' sub leaks its record
 // + background chat row forever. Reclaim sleeping subs idle longer than this.
 // Re-waking resets last_activity_at, so an actively-managed sub is never hit.
-var SUBAGENT_SLEEP_TTL_MS       = 60 * 60 * 1000; // 1h idle
+var SUBAGENT_SLEEP_TTL_MS       = 24 * 60 * 60 * 1000; // 24h idle (was 1h — a settled sub's registry record is cheap; transcripts are retired, never destroyed: see _retireOrDeleteSubChatRow)
 // ACTIVE-CLASSIFY-F6b: age-out for records STUCK at state:'running'. The sweep
 // below only reclaimed stopped/errored (tombstone TTL) and sleeping (sleep TTL)
 // records — 'running' had NO expiry at all, so a record whose loop died without
@@ -300,8 +300,15 @@ async function loadAllSubAgents() {
                 var now = Date.now();
                 list.forEach(function(rec) {
                     // GC tombstoned records past TTL.
+                    // LEGACY-LEAK FIX: records from old builds have
+                    // settled_at:null (only last_report was stamped), which made
+                    // them immortal — this arm REQUIRED settled_at. Fall back to
+                    // last_activity_at/created_at so terminal records always age
+                    // out (registry record only; transcripts are retired, not
+                    // deleted — see _retireOrDeleteSubChatRow).
+                    var _tombTs = rec.settled_at || rec.last_activity_at || rec.created_at;
                     if ((rec.state === 'stopped' || rec.state === 'errored')
-                        && rec.settled_at && (now - rec.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS) {
+                        && _tombTs && (now - _tombTs) > SUBAGENT_TOMBSTONE_TTL_MS) {
                         // Only the authoritative (SW/headless) context may reclaim
                         // tombstones from IDB. The page bundle ALSO runs
                         // loadAllSubAgents() at boot; letting it delete the sub_agents
@@ -362,45 +369,13 @@ async function loadAllSubAgents() {
                             // the map can't keep a stale entry). No saveChatsToStorage()
                             // dependency: the primitive re-reads the row inside its own
                             // transaction and checks isBackground/not-running on disk.
-                            try {
-                                if (rec.chat_id) {
-                                    // P1: capture the in-memory record BEFORE dropping it — the
-                                    // primitive reaps this chat's now-unreferenced chat_payloads
-                                    // blob rows from evidence.record (core/130-indexeddb.js:1303).
-                                    // Dropping it first (as this did) left every screenshot/file the
-                                    // sub produced in chat_payloads until the orphan payload sweep's
-                                    // 24h floor. Only a realm that reaps blobs acts on it (reapBlobs
-                                    // = !_dbIsWorkerRealm, core/130:1301) and this GC is gated to the
-                                    // authoritative context above (:312), so today it is defensive +
-                                    // ledger legibility (hadRecord) and becomes effective the moment
-                                    // a document-bearing realm runs this path.
-                                    var _gcRec = (typeof chats !== 'undefined' && chats[rec.chat_id]) ? chats[rec.chat_id] : null;
-                                    if (_gcRec) delete chats[rec.chat_id];
-                                    if (typeof deleteChatRow === 'function') {
-                                        // No IIFE needed here (unlike _idleSweepTick): `rec` is a
-                                        // per-iteration forEach parameter, not a for..in-rebound
-                                        // var. Keep it that way if this loop is ever refactored.
-                                        // Async, must never reject into the forEach: settle both arms.
-                                        Promise.resolve(deleteChatRow(rec.chat_id, 'subagent-gc', { agentId: rec.agent_id, record: _gcRec, hadRecord: !!_gcRec })).then(function(ok) {
-                                            if (!ok) {
-                                                // P2: the sub_agents record — the AUTHORITY for this
-                                                // reason (core/130:1239) — was reclaimed on line :347,
-                                                // so nothing would ever retry this row. Remember it.
-                                                console.warn('[sub-agents] boot GC: chat row ' + rec.chat_id + ' was NOT deleted (precondition refusal or aborted transaction) — the sub_agents record is already reclaimed, so remembering the row for the idle sweep to retry');
-                                                _rememberOrphanGcChatRow(rec.chat_id, rec.agent_id);
-                                            }
-                                        }, function(eDel) {
-                                            console.error('[sub-agents] boot GC: deleteChatRow threw for chat ' + rec.chat_id, eDel);
-                                        });
-                                    } else {
-                                        console.error('[sub-agents] boot GC: deleteChatRow (core/130-indexeddb.js) unavailable — chat ' + rec.chat_id + ' NOT deleted');
-                                    }
-                                }
-                            // Was a silent `/* non-fatal */` catch. Now that the body
-                            // issues the authoritative delete, swallowing a synchronous
-                            // throw here would hide a leaked chat row — log it (still
-                            // non-fatal: the sub_agents record is already reclaimed).
-                            } catch (e) { console.warn('[sub-agents] boot GC: failed to delete chat row', rec.chat_id, e); }
+                            // TRANSCRIPT-PRESERVE (GC policy): garbage collection
+                            // must never destroy user-visible history. Rows that
+                            // still hold messages are RETIRED into plain history
+                            // chats; only genuinely empty rows are deleted. Shared
+                            // helper — same rule as the idle sweep and the orphan
+                            // retry lane; 'failed' outcomes are remembered there.
+                            if (rec.chat_id) _retireOrDeleteSubChatRow(rec.chat_id, rec.agent_id, 'boot GC');
                             return;
                         }
                         // else: focus unknown (boot race) or user is viewing this
@@ -767,7 +742,10 @@ function _poolSlotsFree() {
 // config: Claude-OAuth providers (isClaudeOAuth / apiKey 'oauth' — see
 // DEFAULT_API_PROVIDERS in core/030-config.js) all share the SAME Anthropic
 // account-level concurrency cap, so they pool into one conservative group.
-// Everything else groups by its resolveProviderConnection endpoint URL.
+// ChatGPT-OAuth providers (isChatGPTOAuth) also carry apiKey 'oauth' but hit a
+// DIFFERENT account (chatgpt.com/backend-api/codex), so they get their OWN
+// conservative group instead of contending with the Anthropic one.
+// Everything else groups by its inline provider endpoint URL.
 // Unknown provider → conservative OAuth-sized group (safe default).
 function _poolGroupFor(rec) {
     try {
@@ -788,10 +766,10 @@ function _poolGroupFor(rec) {
                 : (typeof currentProvider !== 'undefined' ? currentProvider : null));
         var prov = (provName && typeof getProviderById === 'function') ? getProviderById(provName) : null;
         if (!prov) return { key: 'unknown', limit: SUBAGENT_POOL_SIZE };
-        var conn = (typeof resolveProviderConnection === 'function') ? resolveProviderConnection(prov) : null;
-        var isOAuth = !!(prov.isClaudeOAuth || prov.apiKey === 'oauth' || (conn && conn.apiKey === 'oauth'));
+        if (prov.isChatGPTOAuth) return { key: 'openai-oauth', limit: SUBAGENT_POOL_SIZE };
+        var isOAuth = !!(prov.isClaudeOAuth || prov.apiKey === 'oauth');
         if (isOAuth) return { key: 'anthropic-oauth', limit: SUBAGENT_POOL_SIZE };
-        var endpoint = (conn && conn.endpoint) || prov.endpoint || prov.name || 'unknown-endpoint';
+        var endpoint = prov.endpoint || prov.name || 'unknown-endpoint';
         return { key: 'ep:' + endpoint, limit: pinned ? SUBAGENT_POOL_SIZE_RELAXED : SUBAGENT_POOL_SIZE };
     } catch (_) {
         return { key: 'unknown', limit: SUBAGENT_POOL_SIZE };
@@ -953,6 +931,102 @@ function _rememberOrphanGcChatRow(chatId, agentId) {
     _gcOrphanChatRows[chatId] = { agentId: agentId, attempts: 0 };
 }
 
+// ---------- TRANSCRIPT-PRESERVE: retire-or-delete for sub chat rows ----------
+// GC policy: garbage collection must NEVER destroy user-visible history (the
+// abandoned-sleep arm used to delete full transcripts after 1h idle — observed
+// data loss). When a reclaimed sub's chat row still holds messages, the row is
+// RETIRED instead of deleted: isBackground is cleared plus a persisted
+// `retiredSubAgent` marker — deliberately NOT `_`-prefixed, so the persist
+// allowlist strip (PR #838) keeps it on disk — which surfaces the transcript
+// as a plain history chat (ui/050-history-view.js + ui/070-dashboard-ui.js
+// filter only on `isBackground && !_revealed`; home-view recents and search
+// still skip it via isSubAgent, so it does not spam primary surfaces). Only a
+// genuinely EMPTY row (0 messages) is handed to deleteChatRow('subagent-gc'),
+// whose precondition now also refuses rows with messages
+// (core/130-indexeddb.js — belt and braces, mirrors 'empty-row').
+// Resolves 'retired' | 'deleted' | 'absent' | 'failed'. Unless isRetry, a
+// 'failed' outcome is remembered in the orphan retry list above (the
+// authorising sub_agents record is reclaimed by the caller in the same tick,
+// so that list is the only retry owner). Callers run only in the
+// authoritative (SW) realm — both GC arms are gated on Platform.isWorker.
+function _retireOrDeleteSubChatRow(chatId, agentId, source, isRetry) {
+    if (!chatId || !agentId) return Promise.resolve('failed');
+    if (typeof openDatabase !== 'function') return Promise.resolve('failed');
+    var _chatsStore = (typeof chatStoreName !== 'undefined') ? chatStoreName : 'chats';
+    return openDatabase().then(function(database) {
+        return new Promise(function(resolve) {
+            var tx = database.transaction([_chatsStore], 'readwrite');
+            var outcome = 'failed';
+            var settled = false;
+            function settle(v) { if (!settled) { settled = true; resolve(v); } }
+            // Settle on COMMIT (a put that never commits must not report
+            // 'retired') — abort = failure, mirrors deleteChatRow's contract.
+            tx.oncomplete = function() { settle(outcome); };
+            tx.onabort = function() { settle('failed'); };
+            var store = tx.objectStore(_chatsStore);
+            var getReq = store.get(chatId);
+            getReq.onerror = function() { /* aborts the tx → onabort settles */ };
+            getReq.onsuccess = function() {
+                var row = getReq.result;
+                if (!row) { outcome = 'absent'; return; }
+                if (row.messages && row.messages.length > 0) {
+                    // RETIRE: same row, same store — now a plain history chat.
+                    // Read-modify-write INSIDE one transaction, so a concurrent
+                    // save cannot interleave between the get and the put.
+                    row.isBackground = false;
+                    row.retiredSubAgent = true;
+                    row.retiredAt = Date.now();
+                    store.put(row);
+                    outcome = 'retired';
+                    return;
+                }
+                outcome = 'empty';
+            };
+        });
+    }).then(function(res) {
+        if (res === 'empty') {
+            // Genuinely empty row → the explicit, ledgered delete primitive
+            // (precondition re-reads the row inside its own transaction, so a
+            // message that landed between our read and this call refuses there).
+            if (typeof deleteChatRow !== 'function') {
+                console.error('[sub-agents] GC (' + source + '): deleteChatRow (core/130-indexeddb.js) unavailable — empty chat row ' + chatId + ' NOT deleted');
+                return 'failed';
+            }
+            return Promise.resolve(deleteChatRow(chatId, 'subagent-gc', { agentId: agentId, source: source }))
+                .then(function(ok) { return ok ? 'deleted' : 'failed'; });
+        }
+        return res;
+    }).then(function(res) {
+        // Keep THIS realm's in-memory map consistent: flip the flags in place
+        // on retire (so a later upsert save cannot resurrect isBackground:true
+        // from a stale map copy), drop the entry when the row left the store.
+        try {
+            if (typeof chats !== 'undefined' && chats[chatId]) {
+                if (res === 'retired') {
+                    var _mem = chats[chatId];
+                    _mem.isBackground = false;
+                    _mem.retiredSubAgent = true;
+                    _mem.retiredAt = Date.now();
+                } else if (res === 'deleted' || res === 'absent') {
+                    delete chats[chatId];
+                }
+            }
+        } catch (eMem) { /* map sync is best-effort */ }
+        if (res === 'retired') {
+            console.log('[sub-agents] GC (' + source + '): retired sub chat ' + chatId + ' to plain history — transcript preserved, registry record reclaimed');
+        } else if (res === 'failed' && !isRetry) {
+            console.warn('[sub-agents] GC (' + source + '): chat row ' + chatId + ' neither retired nor deleted — remembering it for the sweep retry lane');
+            _rememberOrphanGcChatRow(chatId, agentId);
+        }
+        return res;
+    }).catch(function(e) {
+        // NEVER-THROW: both GC arms call this fire-and-forget from loops.
+        console.warn('[sub-agents] GC (' + source + '): retire-or-delete threw for chat ' + chatId, e);
+        if (!isRetry) _rememberOrphanGcChatRow(chatId, agentId);
+        return 'failed';
+    });
+}
+
 function _retryOrphanGcChatRows() {
     if (typeof deleteChatRow !== 'function') return;
     for (var _cid in _gcOrphanChatRows) {
@@ -971,7 +1045,12 @@ function _retryOrphanGcChatRows() {
         // whitelisted by _chatDeleteEvidenceDigest (core/130:1195) so the retry is
         // distinguishable in the ledger.
         (function(_rcid, _raid, _n) {
-            Promise.resolve(deleteChatRow(_rcid, 'subagent-gc', { agentId: _raid, source: 'gc-orphan-retry' })).then(function(ok) {
+            // isRetry:true — THIS lane owns the attempt counter; the helper must
+            // not re-remember a 'failed' row (that would defeat the attempt cap).
+            // A row that grew messages since the original GC gets RETIRED here
+            // instead of being refused forever.
+            _retireOrDeleteSubChatRow(_rcid, _raid, 'gc-orphan-retry', true).then(function(res) {
+                var ok = (res !== 'failed');
                 if (ok) { delete _gcOrphanChatRows[_rcid]; return; }
                 console.warn('[sub-agents] GC: orphan retry ' + _n + '/' + GC_ORPHAN_RETRY_MAX_ATTEMPTS
                     + ' for chat row ' + _rcid + ' still refused — will retry on the next sweep tick');
@@ -1053,9 +1132,13 @@ function _idleSweepTick() {
             } catch (e) { console.warn('subAgent GC: stale-running age-out failed', aid, e); }
             continue;
         }
+        // LEGACY-LEAK FIX: settled_at fallback — see the boot GC twin in
+        // loadAllSubAgents (records from old builds have settled_at:null and
+        // were immortal here).
+        var _tombSettledTs = r.settled_at || r.last_activity_at || r.created_at;
         var _isTombstone = _authoritativeCtx
             && (r.state === 'stopped' || r.state === 'errored')
-            && r.settled_at && (now - r.settled_at) > SUBAGENT_TOMBSTONE_TTL_MS;
+            && _tombSettledTs && (now - _tombSettledTs) > SUBAGENT_TOMBSTONE_TTL_MS;
         var _isAbandonedSleep = _authoritativeCtx
             && r.state === 'sleeping'
             && r.last_activity_at && (now - r.last_activity_at) > SUBAGENT_SLEEP_TTL_MS
@@ -1104,37 +1187,12 @@ function _idleSweepTick() {
             // this realm's map never held the row — the SW map is adopt-only, and
             // those unadopted rows are precisely the ones the absence-diff reaped.
             // The in-memory entry is dropped separately, only when present.
-            try {
-                if (r.chat_id) {
-                    // P1: capture the record BEFORE dropping it (see the boot GC) —
-                    // evidence.record is what lets the primitive reap this chat's
-                    // chat_payloads blob rows (core/130-indexeddb.js:1303).
-                    var _gcRecord = (typeof chats !== 'undefined' && chats[r.chat_id]) ? chats[r.chat_id] : null;
-                    if (_gcRecord) delete chats[r.chat_id];
-                    if (typeof deleteChatRow === 'function') {
-                        // Capture chat/agent id + record: `var r` / `aid` are rebound by
-                        // the enclosing for..in on every iteration, so an async closure
-                        // reading them later would log the WRONG record.
-                        (function(_gcChatId, _gcAgentId, _gcRec) {
-                            // Async, must never reject out of the sweep: settle both arms.
-                            Promise.resolve(deleteChatRow(_gcChatId, 'subagent-gc', { agentId: _gcAgentId, record: _gcRec, hadRecord: !!_gcRec })).then(function(ok) {
-                                if (!ok) {
-                                    // P2: `delete _subAgents[aid]` + _subAgentsDeleteFromDB(aid)
-                                    // below run in THIS tick regardless of the outcome, and that
-                                    // record is the authority for this reason (core/130:1239) —
-                                    // so remember the row instead of leaking it forever.
-                                    console.warn('[sub-agents] GC: chat row ' + _gcChatId + ' was NOT deleted (precondition refusal or aborted transaction) — the sub_agents record is reclaimed in this same tick, so remembering the row for the next sweep to retry');
-                                    _rememberOrphanGcChatRow(_gcChatId, _gcAgentId);
-                                }
-                            }, function(eDel) {
-                                console.error('[sub-agents] GC: deleteChatRow threw for chat ' + _gcChatId, eDel);
-                            });
-                        })(r.chat_id, aid, _gcRecord);
-                    } else {
-                        console.error('[sub-agents] GC: deleteChatRow (core/130-indexeddb.js) unavailable — chat ' + r.chat_id + ' NOT deleted');
-                    }
-                }
-            } catch (e) { console.warn('subAgent GC: failed to delete chat row', r.chat_id, e); }
+            // TRANSCRIPT-PRESERVE (GC policy): retire rows with messages into
+            // plain history chats; delete only genuinely empty rows. The helper
+            // captures its own copies of the loop-rebound `r`/`aid` values (plain
+            // function arguments), so no IIFE is needed here anymore, and it
+            // remembers 'failed' outcomes in the orphan retry lane itself.
+            if (r.chat_id) _retireOrDeleteSubChatRow(r.chat_id, aid, 'idle sweep');
             // A reclaimed ABANDONED-SLEEP parent may still own live descendants:
             // 'sleeping' is non-terminal, so no cascade ran when it parked. If we
             // delete its record + chat row now without cascading, a still-running
@@ -1336,27 +1394,38 @@ function _providerToTier(prov) {
     for (var t in aliasMap) { if (aliasMap[t] === prov) return t; }
     return null;
 }
-function _sanitizeUsageForAgent(usage) {
+// `rec` (optional) supplies the authoritative tier fallback: by_provider is
+// keyed on the raw MODEL id from the stream (reqMetrics.actualModel, e.g.
+// 'claude-fable-5'), which can NEVER equal a tier-alias VALUE (provider
+// display names like 'Fable 5') — so the reverse map alone always fell
+// through to 'default'. Resolution order per slot: alias reverse-map →
+// per-slot tier stamped by recordSubLLMUsage → rec.tier / rec.provider →
+// 'default' (legacy records only).
+// COST HONESTY: only endpoints that actually REPORT a cost (usage.cost —
+// OpenRouter) mark cost_reported; otherwise cost is null (unknown), never a
+// misleading 0 — there is deliberately no client-side dollar pricing table.
+function _sanitizeUsageForAgent(usage, rec) {
     if (!usage) return null;
     var aliasMap = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
     var provToTier = {};
     for (var t in aliasMap) provToTier[aliasMap[t]] = t;
+    var recTier = rec ? (rec.tier || _providerToTier(rec.provider)) : null;
     var byTier = {};
     var bp = usage.by_provider || {};
     for (var k in bp) {
-        var tier = provToTier[k] || 'default';
+        var tier = provToTier[k] || bp[k].tier || recTier || 'default';
         var slot = byTier[tier];
-        if (!slot) slot = byTier[tier] = { calls: 0, input_tokens: 0, output_tokens: 0, cost: 0 };
+        if (!slot) slot = byTier[tier] = { calls: 0, input_tokens: 0, output_tokens: 0, cost: null };
         slot.calls += bp[k].calls || 0;
         slot.input_tokens += bp[k].input_tokens || 0;
         slot.output_tokens += bp[k].output_tokens || 0;
-        slot.cost += bp[k].cost || 0;
+        if (bp[k].cost_reported) slot.cost = (slot.cost || 0) + (bp[k].cost || 0);
     }
     return {
         calls: usage.calls || 0,
         input_tokens: usage.input_tokens || 0,
         output_tokens: usage.output_tokens || 0,
-        cost: usage.cost || 0,
+        cost: usage.cost_reported ? (usage.cost || 0) : null,
         by_tier: byTier
     };
 }
@@ -4404,8 +4473,10 @@ function agentStatus(args, ctx) {
             tier: rec.tier || _providerToTier(rec.provider) || null,
             // Orchestrator §5: per-sub LLM usage rollup ({calls, input_tokens,
             // output_tokens, cost, by_tier}) — internal by_provider (keyed by
-            // model) is folded to by_tier for the agent. null on legacy records.
-            usage: _sanitizeUsageForAgent(rec.usage),
+            // model) is folded to by_tier for the agent; rec supplies the
+            // authoritative tier fallback. cost is null when no endpoint ever
+            // reported one (only OpenRouter does). null on legacy records.
+            usage: _sanitizeUsageForAgent(rec.usage, rec),
             // WORKER SATURATION instrumentation: context occupancy proxy (last
             // LLM call's input tokens) against the FIXED assumed 200k window,
             // plus the 50% `saturated` flag. Same math as the wake/message
@@ -4445,9 +4516,60 @@ function agentStatus(args, ctx) {
             user_interactions: rec.user_interactions || null
         };
     }
+    // Compact list entry (DEFAULT list shape — pass verbose:true for the full
+    // snap). Keeps only the orchestration essentials; diagnostic fields are
+    // included ONLY when meaningful (non-null / non-zero), so a healthy sub
+    // costs a handful of lines instead of ~30 mostly-null fields.
+    function snapCompact(rec) {
+        var sat = _saturationInfo(rec);
+        var tier = rec.tier || _providerToTier(rec.provider) || null;
+        var e = {
+            agent_id: rec.agent_id,
+            chat_id: rec.chat_id,
+            parent_chat_id: rec.parent_chat_id,
+            name: rec.name,
+            state: rec.state,
+            tier: tier,
+            created_at: rec.created_at,
+            last_activity_at: rec.last_activity_at,
+            tool_calls_used: rec.tool_calls_used || 0,
+            context_pct: sat.context_pct,
+            saturated: sat.saturated,
+            review_state: rec.review_state || null,
+            report_collected: !!rec.report_collected,
+            last_report: null
+        };
+        if (rec.parent_agent_id) e.parent_agent_id = rec.parent_agent_id;
+        if (rec.last_report) {
+            var s = String(rec.last_report.summary || '');
+            if (s.length > 200) s = s.slice(0, 200) + '\u2026 [truncated — agent_status({agent_id}) or verbose:true for full]';
+            e.last_report = { status: rec.last_report.status, summary: s, at: rec.last_report.at };
+        }
+        // Live progress card: label + state only (no tasks array / output).
+        if (rec.action_state) e.action_state = { state: rec.action_state.state, label: rec.action_state.label };
+        // Compact usage: totals + the sub's tier (full by_tier breakdown in
+        // verbose / single-agent mode). cost null = unknown (never reported).
+        var su = _sanitizeUsageForAgent(rec.usage, rec);
+        e.usage = su ? { calls: su.calls, input_tokens: su.input_tokens, output_tokens: su.output_tokens, cost: su.cost, tier: tier } : null;
+        // Only-when-meaningful diagnostics / flow state.
+        if (rec._pending_approvals) e.pending_approvals = rec._pending_approvals;
+        if (rec.awaiting_approval) e.awaiting_approval = rec.awaiting_approval;
+        if ((rec.pending_handles || []).length) e.pending_handles = rec.pending_handles.length;
+        if ((rec.inbox || []).length) e.inbox_size = rec.inbox.length;
+        if (rec.last_error) e.last_error = rec.last_error;
+        if (rec.crash_cause) e.crash_cause = rec.crash_cause;
+        if (rec.revisions_requested) e.revisions_requested = rec.revisions_requested;
+        var esc = _escalationSuggestion(rec);
+        if (esc) e.escalation_suggestion = esc;
+        if ((rec.state === 'errored' || rec.state === 'stopped')
+            && typeof chats !== 'undefined' && chats[rec.chat_id]) e.resurrectable = true;
+        return e;
+    }
     if (args.agent_id) {
         var rec = _subAgents[args.agent_id];
         if (!rec) return { success: false, error: 'unknown agent_id: ' + args.agent_id };
+        // Single-agent lookups stay FULL by default — the caller asked about
+        // this one sub specifically, so detail is the point.
         return { success: true, agent: snap(rec, true) };
     }
     // List — optionally filter by parent_chat_id so the parent sees its own subs.
@@ -4477,7 +4599,7 @@ function agentStatus(args, ctx) {
             var rRoot = r.root_chat_id || r.parent_chat_id;
             if (rRoot !== parentChatId && r.parent_chat_id !== parentChatId) continue;
         }
-        out.push(snap(r));
+        out.push(args.verbose ? snap(r) : snapCompact(r));
     }
     // Sort: running first, then sleeping, then terminal; newest within group.
     var rank = { running: 0, sleeping: 1, stopped: 2, errored: 3 };
@@ -4488,6 +4610,7 @@ function agentStatus(args, ctx) {
         return b.last_activity_at - a.last_activity_at;
     });
     var resp = { success: true, agents: out, pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot() } };
+    if (!args.verbose && out.length) resp.note = 'compact list — pass verbose:true (or agent_id for one sub) for the full per-agent detail';
     // Optional tree assembly (Phase 5). When `include_tree:true`, attach a
     // parent_agent_id-keyed map of children agent_ids so callers can render
     // a hierarchy without re-walking the flat list. Top-level roots are
@@ -4526,7 +4649,14 @@ function recordSubLLMUsage(chatId, m) {
         u.calls++;
         u.input_tokens += m.input_tokens || 0;
         u.output_tokens += m.output_tokens || 0;
-        u.cost += m.cost || 0;
+        // Cost honesty: only OpenRouter streams report usage.cost — every
+        // other endpoint leaves reqMetrics.cost undefined. Track WHETHER a
+        // cost was ever endpoint-reported so _sanitizeUsageForAgent can
+        // return null (unknown) instead of a misleading 0.
+        if (typeof m.cost === 'number') {
+            u.cost += m.cost;
+            u.cost_reported = true;
+        }
         // Live context proxy: the MOST RECENT call's input tokens ≈ the sub's
         // current context occupancy (every request re-sends the whole
         // transcript). Overwritten on each call; read by _saturationInfo
@@ -4539,7 +4669,16 @@ function recordSubLLMUsage(chatId, m) {
         bp.calls++;
         bp.input_tokens += m.input_tokens || 0;
         bp.output_tokens += m.output_tokens || 0;
-        bp.cost += m.cost || 0;
+        if (typeof m.cost === 'number') {
+            bp.cost += m.cost;
+            bp.cost_reported = true;
+        }
+        // Tier attribution: pkey is a raw MODEL id, which never matches the
+        // tier alias map's provider display names — stamp the authoritative
+        // tier from the sub record at record time so the agent-facing
+        // by_tier fold (_sanitizeUsageForAgent) doesn't fall to 'default'.
+        // Survives the all-tiers→'__same__' alias config (rec.tier='same').
+        bp.tier = rec.tier || _providerToTier(rec.provider) || _providerToTier(m.providerName) || bp.tier || null;
         _subAgentsPersist(rec);
         return true;
     } catch (e) {

@@ -208,7 +208,13 @@ function _swChatMetaRMW(chatId) {
                 // run-agent adopt overlay.
                 if (!stored || stored._deleted) { resolve(); return; }
                 _swApplyChatMetaFields(stored, fields);
-                var p = st.put(stored);
+                // TRANSIENT-FLAG STRIP (core/130-indexeddb.js): the base here
+                // is the stored row, so no NEW in-memory transient can leak —
+                // but rows written before the strip existed may still carry
+                // legacy '_'-prefixed working flags; shed them on this RMW so
+                // the schema converges. Allowlisted fields (incl. the lane's
+                // own _jobsHidden/_lastApiError) pass through untouched.
+                var p = st.put(stripTransientChatFieldsForPut(stored));
                 p.onsuccess = function() { resolve(); };
                 p.onerror = function() { resolve(); };
             };
@@ -755,6 +761,27 @@ function _handlePanelMessage(port, msg) {
             }
             return;
 
+        case 'provider-change':
+            // Foreground-only control transition. Update the worker selection first,
+            // then abort the named active run/backoff/tool without setting
+            // userInterruptedChats. Pinned sub-agents still resolve chat.provider.
+            if (msg.providerId) currentProvider = msg.providerId;
+            var pcid = msg.chatId;
+            if (pcid && runningChatIds[pcid]) {
+                providerChangedChats[pcid] = msg.providerId || true;
+                if (providerChangeBackoffResolversByChatId[pcid]) {
+                    try { providerChangeBackoffResolversByChatId[pcid](); } catch (e) {}
+                    delete providerChangeBackoffResolversByChatId[pcid];
+                }
+                if (interruptResolversByChatId[pcid]) {
+                    try { interruptResolversByChatId[pcid](); } catch (e) {}
+                }
+                if (currentStreamAbortControllers[pcid]) {
+                    try { currentStreamAbortControllers[pcid].abort(); } catch (e) {}
+                }
+            }
+            return;
+
         case 'send-message':
             // SWM14-T7: gate the send-message dispatch on the SW boot (and the same
             // Platform.ready + providers chain run-agent uses @:218). Without the boot
@@ -900,7 +927,11 @@ function _handlePanelMessage(port, msg) {
             // deleted chat — the page assigns the snapshot WHOLESALE (app/045
             // 'chat-snapshot') with no _deleted guard, resurrecting a ghost row.
             // Mirrors _serializeChatsSnapshot and broadcastAgentEvent filters.
-            if (msg.chatId && chats[msg.chatId] && !chats[msg.chatId]._deleted) {
+            if (!msg.chatId) return;
+            // Tombstone: never resurrect a soft-deleted chat, and never "heal"
+            // it from a doomed disk row either — the delete lane owns it.
+            if (chats[msg.chatId] && chats[msg.chatId]._deleted) return;
+            if (chats[msg.chatId] && chats[msg.chatId].messages && chats[msg.chatId].messages.length > 0) {
                 // MEMFIX: the SW's copy may be payload-evicted (worker loader
                 // strips all chats). The page assigns this snapshot WHOLESALE
                 // (app/045), which would clobber a hydrated page copy with an
@@ -917,6 +948,44 @@ function _handlePanelMessage(port, msg) {
                 } else {
                     _pcSend();
                 }
+                return;
+            }
+            // STUB-HEAL (root cause A): the SW map lacks the chat entirely
+            // (MV3 restart before/without a boot row for it, or a sub-agent
+            // transcript reclaimed from memory) or only holds an EMPTY stub
+            // (e.g. the spawn-time chats[chat_id] seed in core/097, or an
+            // empty panel snapshot adopted via FLUX-H2). Previously this lane
+            // went silent (map miss) or replied with the empty stub — the
+            // panel could NEVER hydrate a transcript that is sitting whole in
+            // IDB. Fall back to the disk row and reply with it when it is a
+            // real transcript. Rare miss/empty path only — a populated SW
+            // copy takes the fast path above with zero extra reads.
+            if (typeof loadChatRowFromDB === 'function') {
+                loadChatRowFromDB(msg.chatId).then(function(row) {
+                    var live = chats[msg.chatId];
+                    if (live && live._deleted) return; // deleted while reading
+                    // The SW copy gained messages while the read was in
+                    // flight (a run started / a snapshot was adopted) — the
+                    // LIVE copy is now the authority, not the disk row.
+                    if (live && live.messages && live.messages.length > 0) {
+                        try {
+                            port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: live });
+                        } catch (e) {}
+                        return;
+                    }
+                    if (!row || row._deleted || !(row.messages && row.messages.length > 0)) return;
+                    // v16 rows keep heavy payloads in the chat_payloads store
+                    // — flag the reply so the page save put-loop skips this
+                    // copy (identical to disk) and selectChat's
+                    // ensureChatPayloads gate rehydrates images lazily.
+                    row._payloadsEvicted = true;
+                    // Reply WITHOUT adopting the row into the SW map: the
+                    // sub-agent GC / boot loader own SW residency; this lane
+                    // only exists to feed the asking panel.
+                    try {
+                        port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: row });
+                    } catch (e) {}
+                });
             }
             return;
 

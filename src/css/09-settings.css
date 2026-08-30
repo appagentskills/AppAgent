@@ -115,3 +115,53 @@
 .data-btn.delete-btn { color: var(--text-secondary); }
 .data-btn.delete-btn:hover { background: var(--danger-lighter); color: var(--danger); }
 .header-controls { display: flex; align-items: center; gap: var(--space-6); position: relative; align-self: center; }
+
+/* Icons inside radio options (API-access + endpoint pickers in the model modal) */
+.radio-option .radio-option-icon { display: inline-flex; vertical-align: -3px; margin-right: var(--space-2); }
+.radio-option .radio-option-icon svg { width: 16px; height: 16px; }
+.radio-group-vertical { flex-direction: column; gap: var(--space-2); }
+.radio-group-vertical .radio-option { display: flex; align-items: center; gap: var(--space-3); text-align: left; }
+.radio-group-vertical .radio-option .radio-option-icon { margin-right: 0; vertical-align: baseline; }
+.endpoint-radio-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.endpoint-radio-domain { font-size: var(--text-caption); color: var(--text-muted); }
+
+/* Endpoint icon on Settings → LLM Endpoints rows */
+.api-provider-endpoint-icon { display: inline-flex; margin-right: var(--space-2); color: var(--text-secondary); flex-shrink: 0; }
+.api-provider-endpoint-icon svg { width: 16px; height: 16px; }
+
+/* 6-stop reasoning-effort slider in the add/edit-model modal: same control as
+   the model pill menu (base styles in 04-header.css) plus a trailing "Default"
+   stop at the high end (level 6), so the dots are respaced at 20% intervals.
+   Levels 1-5 = Low..Max, level 6 = Default (server decides). */
+.modal-effort { border-bottom: none; padding: 0; }
+.modal-effort .effort-dot[data-level="1"] { width: 6px; height: 6px; left: 7px; }
+.modal-effort .effort-dot[data-level="2"] { width: 7px; height: 7px; left: calc(7px + (100% - 14px) * 0.2); }
+.modal-effort .effort-dot[data-level="3"] { width: 8px; height: 8px; left: calc(7px + (100% - 14px) * 0.4); }
+.modal-effort .effort-dot[data-level="4"] { width: 10px; height: 10px; left: calc(7px + (100% - 14px) * 0.6); }
+.modal-effort .effort-dot[data-level="5"] { width: 12px; height: 12px; left: calc(7px + (100% - 14px) * 0.8); }
+.modal-effort .effort-dot[data-level="6"] { width: 14px; height: 14px; left: calc(100% - 7px); }
+
+/* Foldable model sections (Settings → API Providers, grouped by subscription/endpoint) */
+.model-section { margin-bottom: var(--space-3); border: 1px solid var(--border-light); border-radius: var(--radius-md); overflow: hidden; }
+.model-section-header { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); cursor: pointer; background: var(--bg-light); user-select: none; }
+.model-section-header:hover { background: var(--bg-code); }
+.model-section-chevron { display: inline-flex; transition: transform var(--transition-fast); }
+.model-section-chevron svg { width: 14px; height: 14px; }
+.model-section.collapsed .model-section-chevron { transform: rotate(-90deg); }
+.model-section-icon { display: inline-flex; color: var(--text-secondary); }
+.model-section-icon svg { width: 16px; height: 16px; }
+.model-section-title { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-section-count { font-size: var(--text-caption); color: var(--text-muted); background: var(--bg-white); border: 1px solid var(--border-light); border-radius: var(--radius-full); padding: 0 var(--space-3); }
+.model-section-body { padding: var(--space-2) var(--space-4); }
+.model-section.collapsed .model-section-body { display: none; }
+
+/* ---- Fixed-size Add/Edit Model modal (#api-provider-modal) ----
+   The API-Access radios reveal different field sets (subscription hides the
+   endpoint/provider block), so the dialog must NOT resize with its content:
+   one LARGE constant size, the body scrolls between the fixed header and the
+   always-visible footer. The LLM Endpoint modal does not carry .model-modal
+   and keeps the default auto height. */
+.modal-overlay.model-modal .modal-dialog { width: min(480px, calc(100vw - 32px)); max-width: none; height: min(720px, 85vh); display: flex; flex-direction: column; }
+.modal-overlay.model-modal .modal-header { flex-shrink: 0; }
+.modal-overlay.model-modal .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.modal-overlay.model-modal .modal-actions { flex-shrink: 0; }

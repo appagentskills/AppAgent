@@ -6,8 +6,6 @@ var dbName = STORAGE_PREFIX + 'AppAgentDB';
 // lightweight refs (path, sha, flags) + dirty overlay content only.
 // v13 also runs an eager row migration inside the versionchange
 // transaction (see onupgradeneeded).
-// Bumped to 14 for the `llmEndpoints` store: named endpoint objects
-// { id, name, url, apiKey } that providers reference by endpointId.
 // Bumped to 15 for the `pending_wakes` store: durable sub-agent parent
 // wakes (WAKE-DUR — see core/097-sub-agent-registry.js). Volatile
 // pendingInjectionsByChatId entries died with the MV3 service worker,
@@ -29,7 +27,6 @@ var settingsStoreName = 'settings';
 var skillsStoreName = 'skills';
 var dashboardWidgetsStoreName = 'dashboardWidgets';
 var apiProvidersStoreName = 'apiProviders';
-var llmEndpointsStoreName = 'llmEndpoints';
 var documentsStoreName = 'documents';
 var actionStateStoreName = 'action_state';
 // agent_runs: per-chat run state for the offscreen runtime. Written
@@ -330,9 +327,6 @@ function openDatabase() {
             }
             if (!database.objectStoreNames.contains(apiProvidersStoreName)) {
                 database.createObjectStore(apiProvidersStoreName, { keyPath: 'name' });
-            }
-            if (!database.objectStoreNames.contains(llmEndpointsStoreName)) {
-                database.createObjectStore(llmEndpointsStoreName, { keyPath: 'id' });
             }
             if (!database.objectStoreNames.contains(workspaceMetaStoreName)) {
                 database.createObjectStore(workspaceMetaStoreName, { keyPath: 'repo' });
@@ -1077,6 +1071,65 @@ function sweepColdChatPayloads(keepHydrated, evictBodies) {
 // on transaction COMMIT (see queueChatPayloadPuts).
 var _persistedPayloadIds = {};
 
+// ═══ TRANSIENT-FLAG STRIP (put-time) ═════════════════════════════════
+// CONVENTION (inverted from "strip a known list"): a '_'-prefixed
+// TOP-LEVEL chat-row field is a runtime TRANSIENT by default — session
+// working state a realm stamps on the live object (heal guards like
+// _stubHealAttempted, hook retry counters like _titleHookTries /
+// _tldrHookTries / _linksHookTries / _caveatHookTries /
+// _progressHookTries, context gauges _ctxTokens / _ctxSubAgentNudgedAt,
+// the eviction rescue mark _dirtyWhileEvicted). Every chat-row put
+// strips ALL '_'-prefixed top-level keys EXCEPT this explicit
+// allowlist, so a new working flag can never silently become durable
+// schema. Add a field here ONLY when its absence after reload breaks
+// behavior — and document why. NESTED flags are untouched (this strips
+// the chat-row TOP LEVEL only): message/screenshot _b64Evicted,
+// cachedToolResults _fcEvicted and displays-entry _toggledAt stay in
+// the record by design.
+var PERSISTED_CHAT_UNDERSCORE_FIELDS = {
+    // Rides the persisted record so a loaded row is indistinguishable
+    // from an evicted chat and hydrates via ensureChatPayloads (see the
+    // PAYLOAD-STORE header above; extractChatPayloadsForPut sets it).
+    _payloadsEvicted: 1,
+    // Chat-meta lane flags (CHAT_META_FLAG_FIELDS, core/030-config.js):
+    // SW-arbitrated, deliberately persisted + rebroadcast. _lastApiError
+    // keeps an unfocused errored chat recoverable across reloads
+    // (ui/050-history-view.js retry banner, jobs-dropdown error rows);
+    // _jobsHidden keeps a user-dismissed row out of the jobs dropdown.
+    _jobsHidden: 1,
+    _lastApiError: 1,
+    // Page-put persisted reveal flag (tools/120-actions.js): a background
+    // chat the user opened must stay visible in history/search after a
+    // reload — the isBackground && !_revealed filters (ui/050, ui/180,
+    // ui/070) would re-hide it if this were stripped.
+    _revealed: 1,
+    // Delete tombstone. Tombstones are parked in memory and the save
+    // loops' messages.length>0 filter keeps them out of puts today, but
+    // the delete authority also honours an ON-DISK stored._deleted
+    // (worker/115-storage.js put-drop, core/130 deleteChatRow
+    // preconditions) — stripping it from any future put would resurrect
+    // a deleted row as a live record.
+    _deleted: 1
+};
+
+// Return `rec` with every NON-allowlisted '_'-prefixed top-level key
+// removed. NEVER mutates `rec` in place (it may BE the live in-memory
+// chat object) — claims a shallow copy on the first strip, mirroring
+// the put-path preservers/mergers.
+function stripTransientChatFieldsForPut(rec) {
+    if (!rec) return rec;
+    var out = rec;
+    var ks = Object.keys(rec);
+    for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        if (k.charAt(0) !== '_') continue;
+        if (Object.prototype.hasOwnProperty.call(PERSISTED_CHAT_UNDERSCORE_FIELDS, k)) continue;
+        if (out === rec) out = Object.assign({}, rec);
+        delete out[k];
+    }
+    return out;
+}
+
 // Build the chats-store record for a chat: a clone with every payload that
 // carries a file_id/screenshot_id stripped and flagged, plus the blob rows
 // those payloads become. The live in-memory chat is NEVER mutated (clones
@@ -1162,6 +1215,12 @@ function extractChatPayloadsForPut(chat) {
         if (newCtr) record.cachedToolResults = newCtr;
         if (evicted) record._payloadsEvicted = true;
     }
+    // TRANSIENT-FLAG STRIP: this is the choke point BOTH realms' save
+    // loops feed their record put from (worker/115-storage.js,
+    // ui/070-dashboard-ui.js — including the page's get-error blind-put
+    // fallback), so stripping here covers every extract-based put. The
+    // helper clones on first strip, never mutating the live chat.
+    record = stripTransientChatFieldsForPut(record);
     return { record: record, payloads: payloads };
 }
 
@@ -1433,6 +1492,14 @@ var CHAT_ROW_DELETE_PRECONDITIONS = {
     // must actually be a background sub-agent chat, and must not be running.
     'subagent-gc': function(stored, evidence, chatId) {
         if (!evidence.agentId) return 'no agentId in evidence — the sub_agents record IS the authority for this reason';
+        // TRANSCRIPT-PRESERVE (belt and braces, mirrors 'empty-row' below):
+        // sub-agent GC RETIRES rows with messages into plain history chats
+        // (_retireOrDeleteSubChatRow, core/097-sub-agent-registry.js) — this
+        // reason must never destroy a transcript, even when invoked by a stale
+        // or future caller that skipped the retire step.
+        if (stored.messages && stored.messages.length > 0) {
+            return 'stored record has ' + stored.messages.length + ' message(s) on disk — subagent-gc never deletes transcripts (retire to history instead)';
+        }
         if (stored.isBackground !== true) return 'stored record is not a background sub-agent chat (isBackground !== true on disk)';
         if (_chatRowIsRunning(chatId)) return 'chat is currently running';
         return null;
@@ -1751,6 +1818,32 @@ function gcEmptyChatRows() {
 // ─── End deletion authority ──────────────────────────────────────────────
 
 
+// STUB-HEAL (sub-chat empty-stub hydration): read ONE chat row straight from
+// the chats store. Shared by BOTH bundles (this file is in WORKER_SHARED_FILES):
+//  - SW: the 'pull-chat' lane (worker/130-port-bridge.js) falls back to disk
+//    when its in-memory map lacks the chat or only holds an empty stub
+//    (post-restart, or a sub-agent transcript reclaimed from memory).
+//    The page-side heal (selectChat, ui/170-chat-management.js) stays on the
+//    sanctioned lane — it posts 'pull-chat' and adopts via the baselined
+//    'chat-snapshot' path (app/045) instead of calling this directly.
+// NEVER rejects — resolves null on miss or error (callers treat null as
+// "nothing better on disk" and keep their current state). Only invoked on
+// rare miss/empty paths, so it adds zero cost to normal operation.
+async function loadChatRowFromDB(chatId) {
+    if (!chatId) return null;
+    try {
+        return await withStore([chatStoreName], 'readonly', function(transaction) {
+            return new Promise(function(resolve, reject) {
+                var req = transaction.objectStore(chatStoreName).get(chatId);
+                req.onsuccess = function() { resolve(req.result || null); };
+                req.onerror = function() { reject(req.error || new Error('chat row get failed')); };
+            });
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
 // Per-chatId single-flight guard: concurrent callers share one hydration.
 var _chatHydrationPromises = {};
 
@@ -2025,6 +2118,106 @@ async function setSetting(key, value) {
     }
 }
 
+// --- LLM endpoints persistence (Settings → LLM Endpoints) ---
+// Restored after PR #824 removed the endpoints UI. Stored as a single
+// 'llmEndpoints' key in the settings store (no schema/version bump needed —
+// the legacy v14 'llmEndpoints' object store is no longer created on fresh
+// installs). First load imports the user's old endpoint records from that
+// legacy store when present, else seeds DEFAULT_LLM_ENDPOINTS.
+async function loadLlmEndpoints() {
+    var stored = await getSetting('llmEndpoints', null);
+    if (Array.isArray(stored)) {
+        llmEndpoints = stored;
+        return;
+    }
+    var legacy = [];
+    try {
+        legacy = await withStore(['llmEndpoints'], 'readonly', function(transaction) {
+            var req = transaction.objectStore('llmEndpoints').getAll();
+            return new Promise(function(resolve) {
+                req.onsuccess = function() { resolve(req.result || []); };
+                req.onerror = function() { resolve([]); };
+            });
+        });
+    } catch (e) {
+        legacy = []; // store absent on fresh installs — expected
+    }
+    llmEndpoints = (legacy && legacy.length)
+        ? legacy.map(function(ep) { return { id: ep.id, name: ep.name || ep.id, url: ep.url || '', apiKey: ep.apiKey || '' }; })
+        : DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
+    await saveLlmEndpoints();
+}
+
+async function saveLlmEndpoints() {
+    await setSetting('llmEndpoints', llmEndpoints);
+}
+
+// Strict endpoint CRUD path. Unlike lenient setSetting(), this rejects on every
+// request/transaction failure and resolves only after the single transaction
+// commits. Callers stage clones and publish globals only after this succeeds.
+async function persistLlmEndpointState(nextEndpoints, affectedProviders, deadlineMs) {
+    if (!_apiProvidersHydrated) throw new Error('Providers not hydrated — refusing endpoint update');
+    var endpointsSnapshot = (nextEndpoints || []).map(function(ep) { return Object.assign({}, ep); });
+    var providerSnapshots = (affectedProviders || []).map(function(p) { return Object.assign({}, p); });
+    var database = await openDatabase();
+    var timeoutMs = deadlineMs > 0 ? deadlineMs : DB_TX_DEADLINE_WRITE_MS;
+    return new Promise(function(resolve, reject) {
+        var transaction;
+        try {
+            transaction = database.transaction([settingsStoreName, apiProvidersStoreName], 'readwrite');
+        } catch (e) {
+            reject(e);
+            return;
+        }
+        var settled = false;
+        var timer = setTimeout(function() {
+            if (settled) return;
+            var error = new Error('Endpoint transaction timed out after ' + timeoutMs + 'ms');
+            error.name = 'TimeoutError';
+            // Settle with the SPECIFIC error before aborting: an abort handler
+            // firing synchronously must not preempt it with the generic message.
+            fail(error);
+            try { transaction.abort(); } catch (e) {}
+        }, timeoutMs);
+        function fail(error) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error || transaction.error || new Error('Endpoint transaction failed'));
+        }
+        function watch(request, label) {
+            request.onerror = function() {
+                var error = request.error || new Error(label + ' request failed');
+                // fail() first so the rejection carries the request's own error
+                // even when the abort event fires synchronously (the generic
+                // onabort handler is a settled no-op by then).
+                fail(error);
+                try { transaction.abort(); } catch (e) {}
+            };
+        }
+        try {
+            watch(transaction.objectStore(settingsStoreName).put({ key: 'llmEndpoints', value: endpointsSnapshot }), 'Endpoint settings');
+            var providerStore = transaction.objectStore(apiProvidersStoreName);
+            providerSnapshots.forEach(function(provider) {
+                if (!provider || !provider.name) throw new Error('Cannot save affected provider without a name');
+                watch(providerStore.put(provider), 'Affected provider');
+            });
+        } catch (e) {
+            fail(e);
+            try { transaction.abort(); } catch (abortError) {}
+            return;
+        }
+        transaction.oncomplete = function() {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+        };
+        transaction.onerror = function() { fail(transaction.error); };
+        transaction.onabort = function() { fail(transaction.error || new Error('Endpoint transaction aborted')); };
+    });
+}
+
 // Helper function to get provider by name
 function getProviderByName(providerName) {
     return apiProviders.find(function(p) { return p.name === providerName; }) || null;
@@ -2036,139 +2229,6 @@ var getProviderById = getProviderByName;
 // Get all providers
 function getAllProviders() {
     return apiProviders;
-}
-
-// WIPE-GUARD: mirrors the chats-store flag. saveAllLlmEndpoints is forbidden
-// until a load has SUCCEEDED — an unhydrated save would overwrite the user's
-// stored endpoints (API keys!) with the empty/default in-memory array. Set
-// ONLY in the loadLlmEndpoints onsuccess below.
-var _llmEndpointsHydrated = false;
-
-// LLM Endpoints Management (mirrors the provider functions below).
-// Safe to call twice (page + SW realm): once hydrated, a re-call just
-// refreshes from the store and never re-seeds over in-memory entries.
-async function loadLlmEndpoints() {
-    try {
-        var database = await openDatabase();
-        var transaction = database.transaction([llmEndpointsStoreName], 'readonly');
-        var store = transaction.objectStore(llmEndpointsStoreName);
-        var request = store.getAll();
-        return new Promise(function(resolve) {
-            request.onsuccess = function() {
-                var loaded = request.result || [];
-                // Hydration succeeded — unblock saves BEFORE the seeding/merge
-                // branches below, which legitimately save.
-                _llmEndpointsHydrated = true;
-                if (loaded.length === 0) {
-                    if (llmEndpoints.length === 0) {
-                        // First load — seed with COPIES of the defaults (the
-                        // migration below may donate a key into an entry; the
-                        // pristine DEFAULT_LLM_ENDPOINTS must stay untouched).
-                        llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
-                        saveAllLlmEndpoints();
-                    }
-                    // else: in-memory entries exist but the store is empty
-                    // (save still in flight) — keep them, never re-seed.
-                } else {
-                    llmEndpoints = loaded;
-                    // Merge any new default endpoints not yet in IndexedDB
-                    var added = false;
-                    DEFAULT_LLM_ENDPOINTS.forEach(function(def) {
-                        var exists = llmEndpoints.some(function(ep) { return ep.id === def.id; });
-                        if (!exists) {
-                            llmEndpoints.push(Object.assign({}, def));
-                            added = true;
-                        }
-                    });
-                    if (added) saveAllLlmEndpoints();
-                }
-                resolve();
-            };
-            request.onerror = function() {
-                console.error('Failed to load LLM endpoints:', request.error);
-                // Never clobber hydrated in-memory state on a failed RE-load.
-                if (!_llmEndpointsHydrated && llmEndpoints.length === 0) {
-                    llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
-                }
-                resolve();
-            };
-        });
-    } catch (e) {
-        console.error('IndexedDB error loading LLM endpoints:', e);
-        if (!_llmEndpointsHydrated && llmEndpoints.length === 0) {
-            llmEndpoints = DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
-        }
-        return Promise.resolve();
-    }
-}
-
-async function saveAllLlmEndpoints() {
-    // WIPE-GUARD: never persist before a successful hydration (see flag above).
-    if (!_llmEndpointsHydrated) {
-        console.error('saveAllLlmEndpoints blocked: endpoints not hydrated — refusing to overwrite stored endpoints');
-        return;
-    }
-    try {
-        var database = await openDatabase();
-        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
-        var store = transaction.objectStore(llmEndpointsStoreName);
-        // WIPE-GUARD: diff save — no store.clear(). Delete only ids that
-        // vanished from memory, upsert the rest.
-        var keysRequest = store.getAllKeys();
-        keysRequest.onerror = function() {
-            console.error('saveAllLlmEndpoints: getAllKeys failed — save skipped', keysRequest.error);
-        };
-        transaction.onabort = function() {
-            console.error('saveAllLlmEndpoints: transaction aborted — save lost', transaction.error);
-        };
-        keysRequest.onsuccess = function() {
-            var existingKeys = keysRequest.result || [];
-            var desiredIds = {};
-            llmEndpoints.forEach(function(ep) { if (ep && ep.id) desiredIds[ep.id] = true; });
-            existingKeys.forEach(function(key) {
-                if (!Object.prototype.hasOwnProperty.call(desiredIds, key)) {
-                    try { store.delete(key); } catch (e) { console.error('saveAllLlmEndpoints: delete failed', key, e); }
-                }
-            });
-            llmEndpoints.forEach(function(ep) {
-                if (!ep || !ep.id) { console.warn('saveAllLlmEndpoints: skipping endpoint without an id', ep); return; }
-                try { store.put(ep); } catch (e) { console.error('saveAllLlmEndpoints: put failed', ep.id, e); }
-            });
-        };
-    } catch (e) {
-        console.error('Failed to save all LLM endpoints:', e);
-    }
-}
-
-async function saveLlmEndpoint(endpoint) {
-    try {
-        var database = await openDatabase();
-        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
-        var store = transaction.objectStore(llmEndpointsStoreName);
-        store.put(endpoint);
-        // Update in-memory array
-        var existingIndex = llmEndpoints.findIndex(function(ep) { return ep.id === endpoint.id; });
-        if (existingIndex >= 0) {
-            llmEndpoints[existingIndex] = endpoint;
-        } else {
-            llmEndpoints.push(endpoint);
-        }
-    } catch (e) {
-        console.error('Failed to save LLM endpoint:', e);
-    }
-}
-
-async function deleteLlmEndpoint(endpointId) {
-    try {
-        var database = await openDatabase();
-        var transaction = database.transaction([llmEndpointsStoreName], 'readwrite');
-        var store = transaction.objectStore(llmEndpointsStoreName);
-        store.delete(endpointId);
-        // Remove from in-memory array
-        llmEndpoints = llmEndpoints.filter(function(ep) { return ep.id !== endpointId; });
-    } catch (e) {
-        console.error('Failed to delete LLM endpoint:', e);
-    }
 }
 
 // WIPE-GUARD: mirrors the chats-store flag. saveAllApiProviders is forbidden
@@ -2265,18 +2325,89 @@ function applyOpus5DefaultRepoint() {
 }
 
 // API Providers Management
+// v16 compatibility bridge: old builds stored connection fields behind
+// apiProviders[].endpointId in an llmEndpoints store. The DB version did not
+// change when that runtime architecture was removed, so no onupgradeneeded hook
+// can repair an already-v16 database. Hydration therefore reads the legacy store
+// when it physically exists, inlines only matched connection fields, and saves
+// the complete provider objects back. The store itself is intentionally retained
+// until a future DB-version upgrade can delete it; no runtime lookup uses it.
+function inlineLegacyEndpointProviders(providers, endpoints, canonicalEndpoints) {
+    var byId = {};
+    (endpoints || []).forEach(function(ep) {
+        if (!ep || typeof ep !== 'object') return;
+        [ep.id, ep.endpointId, ep.name].forEach(function(key) {
+            if (key !== undefined && key !== null && key !== '') byId[String(key)] = ep;
+        });
+    });
+    // Ids present in the RESTORED endpoint list (llmEndpoints — loadLlmEndpoints
+    // imports legacy rows with their ids intact). When the matched endpoint
+    // survives there, the provider keeps a canonical endpointId so a later
+    // endpoint edit re-syncs it (saveLlmEndpointFromModal matches strictly on
+    // p.endpointId === endpoint.id); deleting the reference orphaned the row.
+    var canonicalIds = {};
+    (canonicalEndpoints || []).forEach(function(ep) {
+        if (ep && typeof ep === 'object' && ep.id !== undefined && ep.id !== null && ep.id !== '') {
+            canonicalIds[String(ep.id)] = true;
+        }
+    });
+    var changed = false;
+    var result = (providers || []).map(function(provider) {
+        if (!provider || !provider.endpointId) return provider;
+        var endpoint = byId[String(provider.endpointId)];
+        if (!endpoint) return provider; // unmatched rows remain byte-for-byte intact
+        var inlined = Object.assign({}, provider);
+        if (Object.prototype.hasOwnProperty.call(endpoint, 'endpoint')) inlined.endpoint = endpoint.endpoint;
+        if (Object.prototype.hasOwnProperty.call(endpoint, 'url')) {
+            inlined.url = endpoint.url;
+            if (!Object.prototype.hasOwnProperty.call(endpoint, 'endpoint')) inlined.endpoint = endpoint.url;
+        }
+        if (Object.prototype.hasOwnProperty.call(endpoint, 'apiKey')) inlined.apiKey = endpoint.apiKey;
+        if (endpoint.id !== undefined && endpoint.id !== null && endpoint.id !== '' && canonicalIds[String(endpoint.id)]) {
+            inlined.endpointId = endpoint.id;
+        } else {
+            delete inlined.endpointId;
+        }
+        changed = true;
+        return inlined;
+    });
+    return { providers: result, changed: changed };
+}
+
+async function readLegacyEndpointProviders(database) {
+    if (!database.objectStoreNames.contains('llmEndpoints')) return [];
+    return new Promise(function(resolve, reject) {
+        var tx = database.transaction(['llmEndpoints'], 'readonly');
+        var req = tx.objectStore('llmEndpoints').getAll();
+        req.onsuccess = function() { resolve(req.result || []); };
+        req.onerror = function() { reject(req.error || tx.error || new Error('Failed to read legacy endpoint store')); };
+        tx.onabort = function() { reject(tx.error || new Error('Legacy endpoint read aborted')); };
+    });
+}
+
 async function loadApiProviders() {
-    // Endpoints must be hydrated first: the endpoint migration below and
-    // resolveProviderConnection() both read the llmEndpoints array.
-    await loadLlmEndpoints();
+    // Hydrate the named LLM endpoints first — the settings UI and the
+    // add-model endpoint picker read the llmEndpoints global.
+    try { await loadLlmEndpoints(); } catch (e) { console.error('loadLlmEndpoints failed:', e); }
     try {
         var database = await openDatabase();
+        var legacyEndpoints = [];
+        try { legacyEndpoints = await readLegacyEndpointProviders(database); }
+        catch (legacyError) {
+            // A damaged/blocked obsolete store must never prevent hydration of the
+            // authoritative provider rows (or replace them with defaults).
+            console.warn('Could not read legacy endpoint store; providers remain untouched:', legacyError);
+        }
         var transaction = database.transaction([apiProvidersStoreName], 'readonly');
         var store = transaction.objectStore(apiProvidersStoreName);
         var request = store.getAll();
-        return new Promise(function(resolve) {
-            request.onsuccess = function() {
+        return new Promise(function(resolve, reject) {
+            request.onsuccess = async function() {
+                try {
                 var loaded = request.result || [];
+                var legacyInline = inlineLegacyEndpointProviders(loaded, legacyEndpoints,
+                    (typeof llmEndpoints !== 'undefined' && Array.isArray(llmEndpoints)) ? llmEndpoints : []);
+                loaded = legacyInline.providers;
                 // Hydration succeeded — unblock saves BEFORE the default-seeding /
                 // merge / migration branches below, which legitimately save.
                 _apiProvidersHydrated = true;
@@ -2284,9 +2415,13 @@ async function loadApiProviders() {
                     // First load - initialize with defaults
                     apiProviders = DEFAULT_API_PROVIDERS.slice();
                     // Save defaults to IndexedDB
-                    saveAllApiProviders();
+                    await saveAllApiProviders();
                 } else {
                     apiProviders = loaded;
+                    // Persist the v16 compatibility repair before any later default
+                    // migration. saveAllApiProviders snapshots every provider/custom
+                    // field, including unmatched endpointId rows and credentials.
+                    if (legacyInline.changed) await saveAllApiProviders();
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
                     // sonnet-5, gpt-5.2 → gpt-5.6-sol (chain-collapsed through the
@@ -2321,7 +2456,7 @@ async function loadApiProviders() {
                         { to: 'sonnet-5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
                         { to: 'gpt-5.6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
-                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpointId: 'openrouter', effort: 'low' } },
+                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
@@ -2329,7 +2464,13 @@ async function loadApiProviders() {
                         // retune below, 'xhigh' after — match both vintages.
                         { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
-                        { to: 'Sonnet 5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } }
+                        { to: 'Sonnet 5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
+                        // ChatGPT-subscription seeds shipped with ASSUMED slugs
+                        // (gpt-5.1-codex / gpt-5.1) that the Codex backend does
+                        // not serve to ChatGPT accounts — retarget onto the
+                        // GPT-5.6 slugs the live catalog actually advertises.
+                        { to: 'GPT-5.6 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-5.6 Terra (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } }
                     ].forEach(function(mig) {
                         var idx = -1;
                         for (var i = 0; i < apiProviders.length; i++) {
@@ -2394,7 +2535,7 @@ async function loadApiProviders() {
                             migratedDefaults = true;
                         }
                     });
-                    if (migratedDefaults) saveAllApiProviders();
+                    if (migratedDefaults) await saveAllApiProviders();
                     // Merge any new default providers not yet in IndexedDB
                     var added = false;
                     DEFAULT_API_PROVIDERS.forEach(function(def) {
@@ -2404,7 +2545,7 @@ async function loadApiProviders() {
                             added = true;
                         }
                     });
-                    if (added) saveAllApiProviders();
+                    if (added) await saveAllApiProviders();
                     // Migrate: switch OAuth providers from thinkingBudget to effort
                     var migrated = false;
                     apiProviders.forEach(function(p) {
@@ -2414,97 +2555,16 @@ async function loadApiProviders() {
                             migrated = true;
                         }
                     });
-                    if (migrated) saveAllApiProviders();
-                    // ---------------------------------------------------------
-                    // One-shot endpoint migration (idempotent — it may run in
-                    // BOTH the page and the SW realm; the second run finds
-                    // endpointId already set and only strips leftovers).
-                    // Providers historically carried inline endpoint/apiKey
-                    // fields; endpoints are now first-class NAMED objects in
-                    // the llmEndpoints store and providers reference them by
-                    // endpointId. Each legacy provider's url+key is folded
-                    // into a matching llmEndpoints entry — donating its key
-                    // to a keyless endpoint with the same url (this collapses
-                    // the common single-OpenRouter-key case into the seeded
-                    // 'OpenRouter' entry) — or a new named endpoint is created
-                    // from the url's hostname. Claude-OAuth providers are
-                    // exempt: they keep inline endpoint/apiKey ('oauth') and
-                    // never get an endpointId. No key is ever dropped.
-                    // ---------------------------------------------------------
-                    var epProvidersChanged = false;
-                    var epEndpointsChanged = false;
-                    var epDefaultUrl = 'https://openrouter.ai/api/v1/chat/completions';
-                    apiProviders.forEach(function(p) {
-                        if (!p || p.isClaudeOAuth) return;
-                        if (p.endpointId && getLlmEndpointById(p.endpointId)) {
-                            // Already migrated — strip any leftover inline
-                            // fields (e.g. the default-rename path above
-                            // copies a legacy apiKey onto the new default
-                            // shape). Donate a leftover key to the referenced
-                            // endpoint if it is still keyless, so no key is
-                            // ever lost.
-                            if (Object.prototype.hasOwnProperty.call(p, 'apiKey')) {
-                                var refEp = getLlmEndpointById(p.endpointId);
-                                if (p.apiKey && p.apiKey !== 'oauth' && !(refEp.apiKey || '')) {
-                                    refEp.apiKey = p.apiKey;
-                                    epEndpointsChanged = true;
-                                }
-                                delete p.apiKey;
-                                epProvidersChanged = true;
-                            }
-                            if (Object.prototype.hasOwnProperty.call(p, 'endpoint')) {
-                                delete p.endpoint;
-                                epProvidersChanged = true;
-                            }
-                            return;
-                        }
-                        var epUrl = p.endpoint || epDefaultUrl;
-                        var epKey = p.apiKey || '';
-                        // Reuse an endpoint with the same url whose key matches
-                        // (or which has no key yet — the provider donates its
-                        // key into it).
-                        var ep = null;
-                        for (var ei = 0; ei < llmEndpoints.length; ei++) {
-                            var cand = llmEndpoints[ei];
-                            if (cand.url === epUrl && ((cand.apiKey || '') === epKey || (cand.apiKey || '') === '')) {
-                                ep = cand;
-                                break;
-                            }
-                        }
-                        if (ep) {
-                            if (!(ep.apiKey || '') && epKey) {
-                                ep.apiKey = epKey;
-                                epEndpointsChanged = true;
-                            }
-                        } else {
-                            // No match — create a named endpoint from the
-                            // url's hostname (unique id slug + unique name).
-                            var epHost = '';
-                            try { epHost = new URL(epUrl).hostname.replace(/^www\./, ''); } catch (eHost) { epHost = ''; }
-                            var epBaseId = (epHost || 'endpoint').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'endpoint';
-                            var epId = epBaseId;
-                            var epIdSuffix = 2;
-                            while (getLlmEndpointById(epId)) { epId = epBaseId + '-' + epIdSuffix; epIdSuffix++; }
-                            var epBaseName = epHost || 'Endpoint';
-                            var epName = epBaseName;
-                            var epNameSuffix = 2;
-                            while (llmEndpoints.some(function(x) { return x.name === epName; })) { epName = epBaseName + ' (' + epNameSuffix + ')'; epNameSuffix++; }
-                            ep = { id: epId, name: epName, url: epUrl, apiKey: epKey };
-                            llmEndpoints.push(ep);
-                            epEndpointsChanged = true;
-                        }
-                        p.endpointId = ep.id;
-                        delete p.endpoint;
-                        delete p.apiKey;
-                        epProvidersChanged = true;
-                    });
-                    if (epEndpointsChanged) saveAllLlmEndpoints();
-                    if (epProvidersChanged) saveAllApiProviders();
+                    if (migrated) await saveAllApiProviders();
                 }
                 // Hoisted OUT of the else above so it runs on BOTH branches (see
                 // the function's header for why the fresh-install branch is safe).
                 applyOpus5DefaultRepoint();
                 resolve();
+                } catch (e) {
+                    console.error('Failed to persist API provider migrations:', e);
+                    reject(e);
+                }
             };
             request.onerror = function() {
                 console.error('Failed to load API providers:', request.error);
@@ -2536,70 +2596,125 @@ async function loadApiProviders() {
 async function saveAllApiProviders() {
     // WIPE-GUARD: never persist before a successful hydration (see flag above).
     if (!_apiProvidersHydrated) {
-        console.error('saveAllApiProviders blocked: providers not hydrated — refusing to overwrite stored providers');
-        return;
+        var hydrationError = new Error('Providers not hydrated — refusing to overwrite stored providers');
+        console.error('saveAllApiProviders blocked:', hydrationError.message);
+        throw hydrationError;
     }
-    try {
-        var database = await openDatabase();
-        var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
-        var store = transaction.objectStore(apiProvidersStoreName);
-        // WIPE-GUARD: diff save — no store.clear(). Delete only names that
-        // vanished from memory, upsert the rest.
-        var keysRequest = store.getAllKeys();
-        keysRequest.onerror = function() {
-            console.error('saveAllApiProviders: getAllKeys failed — save skipped', keysRequest.error);
-        };
-        transaction.onabort = function() {
-            console.error('saveAllApiProviders: transaction aborted — save lost', transaction.error);
-        };
+    var database = await openDatabase();
+    var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
+    var store = transaction.objectStore(apiProvidersStoreName);
+    // Snapshot the intended commit so later in-memory mutations cannot change an
+    // in-flight transaction's meaning.
+    var providersToSave = apiProviders.map(function(p) { return p && Object.assign({}, p); });
+    var keysRequest = store.getAllKeys();
+    await new Promise(function(resolve, reject) {
+        var settled = false;
+        function fail(error) {
+            if (settled) return;
+            settled = true;
+            var reason = error || transaction.error || keysRequest.error || new Error('API provider bulk transaction failed');
+            console.error('Failed to save all API providers:', reason);
+            reject(reason);
+        }
         keysRequest.onsuccess = function() {
-            var existingKeys = keysRequest.result || [];
-            var desiredNames = {};
-            apiProviders.forEach(function(p) { if (p && p.name) desiredNames[p.name] = true; });
-            existingKeys.forEach(function(key) {
-                if (!Object.prototype.hasOwnProperty.call(desiredNames, key)) {
-                    try { store.delete(key); } catch (e) { console.error('saveAllApiProviders: delete failed', key, e); }
-                }
-            });
-            apiProviders.forEach(function(p) {
-                if (!p || !p.name) { console.warn('saveAllApiProviders: skipping provider without a name', p); return; }
-                try { store.put(p); } catch (e) { console.error('saveAllApiProviders: put failed', p.name, e); }
-            });
+            try {
+                var existingKeys = keysRequest.result || [];
+                var desiredNames = {};
+                providersToSave.forEach(function(p) { if (p && p.name) desiredNames[p.name] = true; });
+                existingKeys.forEach(function(key) {
+                    if (!Object.prototype.hasOwnProperty.call(desiredNames, key)) store.delete(key);
+                });
+                providersToSave.forEach(function(p) {
+                    if (!p || !p.name) throw new Error('Cannot save API provider without a name');
+                    store.put(p);
+                });
+            } catch (e) {
+                try { transaction.abort(); } catch (abortError) {}
+                fail(e);
+            }
         };
-    } catch (e) {
-        console.error('Failed to save all API providers:', e);
-    }
+        keysRequest.onerror = function() { fail(keysRequest.error); };
+        transaction.oncomplete = function() {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        transaction.onerror = function() { fail(transaction.error); };
+        transaction.onabort = function() { fail(transaction.error || new Error('API provider bulk transaction aborted')); };
+    });
 }
 
-async function saveApiProvider(provider) {
+async function saveApiProvider(provider, originalName) {
+    var database = await openDatabase();
+    var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
+    var store = transaction.objectStore(apiProvidersStoreName);
+    var request;
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
-        var store = transaction.objectStore(apiProvidersStoreName);
-        store.put(provider);
-        // Update in-memory array
-        var existingIndex = apiProviders.findIndex(function(p) { return p.name === provider.name; });
-        if (existingIndex >= 0) {
-            apiProviders[existingIndex] = provider;
-        } else {
-            apiProviders.push(provider);
-        }
+        request = store.put(provider);
+        if (originalName && originalName !== provider.name) store.delete(originalName);
     } catch (e) {
+        try { transaction.abort(); } catch (abortError) {}
         console.error('Failed to save API provider:', e);
+        throw e;
     }
+    await new Promise(function(resolve, reject) {
+        var settled = false;
+        function fail(error) {
+            if (settled) return;
+            settled = true;
+            var reason = error || transaction.error || request.error || new Error('API provider transaction failed');
+            console.error('Failed to save API provider:', reason);
+            reject(reason);
+        }
+        transaction.oncomplete = function() {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        transaction.onerror = function() { fail(transaction.error); };
+        transaction.onabort = function() { fail(transaction.error || new Error('API provider transaction aborted')); };
+        request.onerror = function() { fail(request.error); };
+    });
+    // Publish to memory only after IndexedDB confirms the atomic put/delete.
+    var lookupName = originalName || provider.name;
+    var existingIndex = apiProviders.findIndex(function(p) { return p.name === lookupName; });
+    if (existingIndex >= 0) apiProviders[existingIndex] = provider;
+    else apiProviders.push(provider);
+    return provider;
 }
 
 async function deleteApiProvider(providerName) {
+    var database = await openDatabase();
+    var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
+    var store = transaction.objectStore(apiProvidersStoreName);
+    var request;
     try {
-        var database = await openDatabase();
-        var transaction = database.transaction([apiProvidersStoreName], 'readwrite');
-        var store = transaction.objectStore(apiProvidersStoreName);
-        store.delete(providerName);
-        // Remove from in-memory array
-        apiProviders = apiProviders.filter(function(p) { return p.name !== providerName; });
+        request = store.delete(providerName);
     } catch (e) {
+        try { transaction.abort(); } catch (abortError) {}
         console.error('Failed to delete API provider:', e);
+        throw e;
     }
+    await new Promise(function(resolve, reject) {
+        var settled = false;
+        function fail(error) {
+            if (settled) return;
+            settled = true;
+            var reason = error || transaction.error || request.error || new Error('API provider delete transaction failed');
+            console.error('Failed to delete API provider:', reason);
+            reject(reason);
+        }
+        transaction.oncomplete = function() {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        transaction.onerror = function() { fail(transaction.error); };
+        transaction.onabort = function() { fail(transaction.error || new Error('API provider delete transaction aborted')); };
+        request.onerror = function() { fail(request.error); };
+    });
+    // Publish to memory only after IndexedDB confirms the delete commit.
+    apiProviders = apiProviders.filter(function(p) { return p.name !== providerName; });
 }
 
 function generateSkillId(title) {
@@ -3351,7 +3466,10 @@ async function pickDeployDir() {
 //                       silently DROPPED by the other realm's full-row put.
 //                       Defined-vs-defined stays record-wins. '_'-prefixed
 //                       runtime transients (_deleted, _payloadsEvicted,
-//                       _dirtyWhileEvicted…) are never carried.
+//                       _dirtyWhileEvicted…) are never carried — and the
+//                       put record itself sheds every '_'-prefixed key
+//                       outside PERSISTED_CHAT_UNDERSCORE_FIELDS (the
+//                       TRANSIENT-FLAG STRIP above extractChatPayloadsForPut).
 
 // Fields the put-time merge must NOT touch generically: the identity key,
 // the fields merged structurally below, and the lane fields owned by the

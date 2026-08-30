@@ -1872,7 +1872,22 @@ async function _loadChatsFromStorageImpl() {
         // chats kept alive under _storageDegraded, or the chat currently
         // being viewed) when this load is a fast-fail recovery pass. Carry
         // those forward into `loaded` before the atomic swap.
-        Object.keys(chats).forEach(function(id){ var c=chats[id]; if(!loaded[id] && c && (c.isTemporary || (_storageDegraded && c.messages && c.messages.length) || id===currentChatId)) loaded[id]=c; });
+        Object.keys(chats).forEach(function(id){
+            var c = chats[id];
+            if (!c) return;
+            if (!loaded[id]) {
+                if (c.isTemporary || (_storageDegraded && c.messages && c.messages.length) || id === currentChatId) loaded[id] = c;
+                return;
+            }
+            // FLUX-ADOPT (#836): guarded boot carry-forward. When a chat we
+            // already hold in memory was ALSO loaded from disk, adopt the
+            // in-memory copy into `loaded` through the sanctioned guard
+            // (adoptChatRow, app/045-agent-port-bridge-page.js): a staler
+            // in-memory copy is refused (disk row wins, as before), while a
+            // FRESHER in-memory copy (higher rev / more messages) survives a
+            // recovery re-load instead of being regressed by an older disk row.
+            adoptChatRow(c, { chatId: id, map: loaded });
+        });
         chats = loaded;
         console.log('[storage] loaded ' + Object.keys(loaded).length + ' chats in '
             + (Date.now() - _loadT0) + 'ms — '

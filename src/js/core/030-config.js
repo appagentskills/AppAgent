@@ -1,43 +1,3 @@
-// Default named LLM endpoints (used on first load, then stored in IndexedDB).
-// Endpoints are first-class objects { id, name, url, apiKey }: the same URL
-// can appear under several names with different API keys. Providers (models)
-// reference an endpoint by `endpointId` instead of carrying inline
-// endpoint/apiKey fields. Claude-OAuth providers are the exception — they
-// keep their inline endpoint/apiKey ('oauth') and never use endpointId.
-var DEFAULT_LLM_ENDPOINTS = [
-    { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' }
-];
-
-// LLM endpoints (loaded from IndexedDB, initialized with defaults on first load)
-var llmEndpoints = [];
-
-// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES) so the
-// SW/offscreen streaming path resolves endpoints the same way the page does.
-function getLlmEndpointById(id) {
-    if (!id) return null;
-    return llmEndpoints.find(function(ep) { return ep.id === id; }) || null;
-}
-
-// THE single resolution point for a provider's connection details.
-// Returns { endpoint, apiKey, endpointName }. If provider.endpointId
-// resolves to a named endpoint, its url/apiKey/name win; otherwise fall
-// back to the provider's legacy inline endpoint/apiKey fields (OAuth
-// providers and not-yet-migrated entries), with an empty endpointName.
-// Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
-function resolveProviderConnection(provider) {
-    if (provider && provider.endpointId) {
-        var ep = getLlmEndpointById(provider.endpointId);
-        if (ep) {
-            return { endpoint: ep.url, apiKey: ep.apiKey || '', endpointName: ep.name || '' };
-        }
-    }
-    return {
-        endpoint: (provider && provider.endpoint) || '',
-        apiKey: (provider && provider.apiKey) || '',
-        endpointName: ''
-    };
-}
-
 // ── Global token-budget settings ────────────────────────────────────────
 // ONE GLOBAL user-editable value each for max output tokens and reasoning
 // budget — set on the Settings page next to Context Window
@@ -141,7 +101,8 @@ var DEFAULT_API_PROVIDERS = [
     {
         name: 'GLM 5.2',
         model: 'z-ai/glm-5.2',
-        endpointId: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
         // Routing is pinned to first-party Z.AI (provider below), whose
         // endpoint allows 131,072 completion tokens — the global 64k default
         // is safely under it
@@ -155,19 +116,22 @@ var DEFAULT_API_PROVIDERS = [
         // at xhigh for the same cost — 'high' is the sane default here.
         name: 'sonnet-5',
         model: 'anthropic/claude-sonnet-5',
-        endpointId: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
         effort: 'high'
     },
     {
         name: 'gpt-5.6-sol',
         model: 'openai/gpt-5.6-sol',
-        endpointId: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
         effort: 'low'
     },
     {
         name: 'Gemini 3.5 Flash',
         model: 'google/gemini-3.5-flash',
-        endpointId: 'openrouter'
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: ''
         // OpenRouter caps Gemini 3.5 Flash completions at 65,536 tokens —
         // the global 64k default was chosen to fit under exactly this cap
     },
@@ -210,17 +174,68 @@ var DEFAULT_API_PROVIDERS = [
         apiKey: 'oauth',
         effort: 'high',
         isClaudeOAuth: true
+    },
+    // --- ChatGPT subscription (OAuth device-code) ---
+    // Routed through the SW adapter runChatGPTOAuthStream, which converts the
+    // chat-completions body below into a Codex Responses API request. The
+    // endpoint string is informational (the adapter hardcodes the upstream URL)
+    // and is kept inline with the provider like every other apiProviders record.
+    // Slugs are BARE (no 'openai/' vendor prefix) — the Codex backend rejects a
+    // prefixed slug with "The 'openai/...' model is not supported when using
+    // Codex with a ChatGPT account". background.js normalises defensively too.
+    // These entries seed the generic provider list. The model menu also lists
+    // the account's live catalog (GET codex/models?client_version=), which stays
+    // authoritative for availability.
+    {
+        name: 'GPT-5.6 Sol (ChatGPT)',
+        model: 'gpt-5.6-sol',
+        endpoint: 'https://chatgpt.com/backend-api/codex/responses',
+        apiKey: 'oauth',
+        effort: 'high',
+        isChatGPTOAuth: true
+    },
+    {
+        name: 'GPT-5.6 Terra (ChatGPT)',
+        model: 'gpt-5.6-terra',
+        endpoint: 'https://chatgpt.com/backend-api/codex/responses',
+        apiKey: 'oauth',
+        effort: 'medium',
+        isChatGPTOAuth: true
+    },
+    {
+        name: 'GPT-5.6 Luna (ChatGPT)',
+        model: 'gpt-5.6-luna',
+        endpoint: 'https://chatgpt.com/backend-api/codex/responses',
+        apiKey: 'oauth',
+        effort: 'medium',
+        isChatGPTOAuth: true
     }
 ];
 
 // API providers (loaded from IndexedDB, initialized with defaults on first load)
+// Named LLM endpoints (Settings → LLM Endpoints): { id, name, url, apiKey }.
+// Endpoint-backed models reference one via provider.endpointId; the endpoint's
+// url/apiKey are snapshotted inline onto the provider at save time so the
+// request path keeps reading provider.endpoint / provider.apiKey. Restored
+// after PR #824 removed the section (endpoints were inlined into providers).
+var DEFAULT_LLM_ENDPOINTS = [
+    { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' }
+];
+var llmEndpoints = [];
+
+function getLlmEndpointById(id) {
+    if (!id) return null;
+    return llmEndpoints.find(function(ep) { return ep.id === id; }) || null;
+}
+
 var apiProviders = [];
 
 // Default API provider template for adding new providers (based on haiku45)
 var DEFAULT_API_PROVIDER = {
     name: '',
     model: '',
-    endpointId: 'openrouter',
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    apiKey: '',
     // maxTokens / thinkingBudget intentionally absent — the GLOBAL settings
     // (getGlobalMaxTokens / getGlobalThinkingBudget above) apply.
     provider: ''
@@ -269,7 +284,11 @@ var PROVIDER_RENAMES = {
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
     // default names (same providers, friendlier labels)
     'Opus-4-8 OAuth': 'Opus-4-8',
-    'Sonnet 5 OAuth': 'Sonnet 5'
+    'Sonnet 5 OAuth': 'Sonnet 5',
+    // ChatGPT-OAuth seeds: the assumed gpt-5.1* slugs never existed on the
+    // Codex backend for ChatGPT accounts
+    'GPT-5.1 Codex': 'GPT-5.6 Sol (ChatGPT)',
+    'GPT-5.1': 'GPT-5.6 Terra (ChatGPT)'
 };
 
 // ─── Per-spawn model selection (Orchestrator §1) ────────────────────

@@ -857,6 +857,12 @@ async function runAgent(overrideChatId) {
         // resolver/abort fired by _handlePanelSendMessage are no-ops and only
         // the userInterruptedChats flag survives. Consume it and flush the
         // queued message NOW instead of streaming a whole extra turn first.
+        // A foreground provider switch aborts the current transport/backoff/tool
+        // without pretending the user sent a message. Consume its marker at the
+        // iteration boundary; provider resolution below then reads the new global.
+        if (typeof providerChangedChats !== 'undefined' && providerChangedChats[streamingChatId]) {
+            delete providerChangedChats[streamingChatId];
+        }
         if (userInterruptedChats[streamingChatId]) {
             userInterruptedChats[streamingChatId] = false;
             if (flushPendingInjection(chat)) {
@@ -1074,7 +1080,25 @@ async function runAgent(overrideChatId) {
 
             // User-initiated abort: drop the partial assistant message, flush their queued
             // message, and let the loop continue with their input.
-            var isUserAbort = (e && (e.name === 'AbortError' || e.isUserAbort)) || userInterruptedChats[streamingChatId];
+            var _isAbortError = !!(e && (e.name === 'AbortError' || e.isUserAbort));
+            var _providerChangeMarker = !!(typeof providerChangedChats !== 'undefined' && providerChangedChats[streamingChatId]);
+            // The provider-change continue path only applies when the error really
+            // IS an abort. A genuine non-abort error (network fault, API error…)
+            // racing a provider switch must NOT be swallowed by the marker — clear
+            // the stale marker and fall through to normal error handling.
+            var isProviderChangeAbort = _providerChangeMarker && _isAbortError;
+            if (_providerChangeMarker && !_isAbortError) {
+                delete providerChangedChats[streamingChatId];
+            }
+            var isUserAbort = _isAbortError || userInterruptedChats[streamingChatId];
+            if (isProviderChangeAbort) {
+                delete providerChangedChats[streamingChatId];
+                // Drop only the uncommitted assistant turn. The issued request body
+                // is immutable; the next iteration rebuilds against the new provider.
+                if (chat.messages[chat.messages.length - 1] === assistantMsg) chat.messages.pop();
+                AgentEvents.emit('streamAborted', { chatId: streamingChatId, reason: 'provider_change' });
+                continue;
+            }
             if (isUserAbort) {
                 userInterruptedChats[streamingChatId] = false;
                 // Drop the partial in-flight assistant message entirely — we never use it.
@@ -1120,7 +1144,10 @@ async function runAgent(overrideChatId) {
             var _throttleClass = (_throttleStatus === 429 || _throttleStatus === 502 || _throttleStatus === 503 || _throttleStatus === 529)
                 || /overloaded|rate.?limit|too many requests|temporarily unavailable|(?:^|\b(?:status|http|code|error|failed)\s*[:=]?\s*)(?:429|502|503|529)\b/i
                 .test(String((e && e.message) || e));
-            if (_throttleClass && throttleRetries < AGENT_THROTTLE_MAX_RETRIES) {
+            // A structured terminal decision from the transport always wins over
+            // message/status heuristics. This prevents the outer loop multiplying
+            // an already-exhausted bounded transport retry sequence.
+            if (_throttleClass && (!e || e.retryable !== false) && throttleRetries < AGENT_THROTTLE_MAX_RETRIES) {
                 throttleRetries++;
                 if (chat.messages[chat.messages.length - 1] === assistantMsg) {
                     chat.messages.pop();
@@ -1142,7 +1169,19 @@ async function runAgent(overrideChatId) {
                     waitMs: _waitMs,
                     chatId: streamingChatId
                 });
-                await new Promise(function(r) { setTimeout(r, _waitMs); });
+                await new Promise(function(resolve) {
+                    var _timer = setTimeout(function() {
+                        if (typeof providerChangeBackoffResolversByChatId !== 'undefined'
+                            && providerChangeBackoffResolversByChatId[streamingChatId] === _cancelBackoff) {
+                            delete providerChangeBackoffResolversByChatId[streamingChatId];
+                        }
+                        resolve();
+                    }, _waitMs);
+                    var _cancelBackoff = function() { clearTimeout(_timer); resolve(); };
+                    if (typeof providerChangeBackoffResolversByChatId !== 'undefined') {
+                        providerChangeBackoffResolversByChatId[streamingChatId] = _cancelBackoff;
+                    }
+                });
                 continue;
             }
 
@@ -1152,7 +1191,7 @@ async function runAgent(overrideChatId) {
             // that survives the postMessage to panels.
             var errEnv;
             if (e instanceof Error) {
-                errEnv = { name: e.name, message: e.message, stack: e.stack };
+                errEnv = { name: e.name, message: e.message, stack: e.stack, code: e.code, retryable: e.retryable };
             } else if (typeof e === 'string') {
                 errEnv = { message: e };
             } else if (e && typeof e === 'object') {
@@ -1366,20 +1405,21 @@ async function runAgent(overrideChatId) {
             //      to the agent on the next API call and confusing in the transcript.
             if (result && result._interrupted) {
                 var _wasUserMessage = !!userInterruptedChats[streamingChatId];
+                var _wasProviderChange = !!(typeof providerChangedChats !== 'undefined' && providerChangedChats[streamingChatId]);
                 var _placeholder = _wasUserMessage
                     ? '[Tool call abandoned — user sent a new message]'
-                    : '[Tool call abandoned — paused by user]';
+                    : (_wasProviderChange ? '[Tool call abandoned — provider changed]' : '[Tool call abandoned — paused by user]');
                 for (var ri2 = i; ri2 < assistantMsg.tool_calls.length; ri2++) {
                     var rtc2 = assistantMsg.tool_calls[ri2];
                     recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _placeholder);
                     // MP-3: settle + clean the SW pending/parked entry and the
                     // executor panel's prompt resolver for every abandoned call
                     // (see worker/120-tool-routing.js abandonPendingUIToolCall).
-                    if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rtc2.id, _wasUserMessage ? 'user sent a new message' : 'paused by user');
+                    if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rtc2.id, _wasUserMessage ? 'user sent a new message' : (_wasProviderChange ? 'provider changed' : 'paused by user'));
                 }
                 userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
-                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: _wasUserMessage ? 'user_message' : 'paused' });
+                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: _wasUserMessage ? 'user_message' : (_wasProviderChange ? 'provider_change' : 'paused') });
                 break;
             }
 
