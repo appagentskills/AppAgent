@@ -1934,14 +1934,17 @@ function _claudeStreamEnded() {
     var ws = _claudeStreams.waiters.splice(0);
     for (var i = 0; i < ws.length; i++) { try { ws[i](); } catch (e) {} }
 }
-// Resolves when ANY in-flight stream ends, or after timeoutMs — whichever
-// comes first. Never rejects.
-function _waitForFreeStreamSlot(timeoutMs) {
+// Resolves when ANY in-flight stream ends, after timeoutMs, or when the
+// optional abortSignal fires — whichever comes first. Never rejects.
+function _waitForFreeStreamSlot(timeoutMs, abortSignal) {
     return new Promise(function(resolve) {
         var done = false;
         function fire() {
             if (done) return;
             done = true;
+            // PR#874 follow-up (P3): a Pause/Stop during the concurrency park
+            // must not sit out the full 8-15s wait.
+            if (abortSignal) { try { abortSignal.removeEventListener('abort', fire); } catch (e) {} }
             // Remove ourselves so timed-out waiters don't accumulate in the
             // array when no stream ever completes (inert but unbounded).
             var i = _claudeStreams.waiters.indexOf(fire);
@@ -1950,6 +1953,24 @@ function _waitForFreeStreamSlot(timeoutMs) {
         }
         _claudeStreams.waiters.push(fire);
         setTimeout(fire, timeoutMs);
+        if (abortSignal) {
+            if (abortSignal.aborted) fire();
+            else abortSignal.addEventListener('abort', fire, { once: true });
+        }
+    });
+}
+// PR#874 follow-up (P3): abort-aware sleep for the 429/529 backoff. Resolves
+// (never rejects) on timeout OR abort — the loop-head `if (aborted)` guard in
+// runClaudeOAuthStream then ends the stream cleanly. Mirrors
+// _openaiAbortableDelay (ChatGPT sibling) minus the reject.
+function _claudeAbortableDelay(ms, signal) {
+    return new Promise(function(resolve) {
+        if (signal && signal.aborted) { resolve(); return; }
+        var timer = setTimeout(done, ms);
+        function done() { cleanup(); resolve(); }
+        function onAbort() { clearTimeout(timer); done(); }
+        function cleanup() { if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (e) {} } }
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
     });
 }
 
@@ -2009,10 +2030,16 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
             }
             res = await fetch('https://api.anthropic.com/v1/messages', {
                 method: 'POST',
+                // PR#874 follow-up (P3): without the signal, Pause/Stop could
+                // not cancel an in-flight request — the SW kept streaming until
+                // the next chunk arrived (minutes on a slow first token). An
+                // AbortError from fetch()/reader.read() is folded into a clean
+                // end-of-stream by the outer catch below.
+                signal: abortSignal || undefined,
                 headers: {
                     'accept': 'text/event-stream',
                     'anthropic-version': '2023-06-01',
-                    'anthropic-beta': 'oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05',
+                    'anthropic-beta': getAnthropicBetas(anthropicBody.model),
                     'anthropic-dangerous-direct-browser-access': 'true',
                     'authorization': 'Bearer ' + oauth.accessToken,
                     'content-type': 'application/json'
@@ -2070,7 +2097,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                     : 'AI endpoint saturated — no free stream slot, waiting' + parkSuffix;
                 sink({ type: 'status', status: 'rate_limited', reason: 'concurrents', waitMs: parkMs, message: parkMsg });
                 console.warn('[AppAgent] 429 concurrents, parking for a free stream slot (' + parks + '/' + maxParks + ', ≤' + Math.round(parkMs / 1000) + 's, ' + _claudeStreams.active + ' active)');
-                await _waitForFreeStreamSlot(parkMs);
+                await _waitForFreeStreamSlot(parkMs, abortSignal); // PR#874 follow-up (P3): abort-aware park
                 attempt--; // compensate the for-loop increment — parks are budgeted separately
                 continue;
             }
@@ -2126,7 +2153,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
             }
             sink({ type: 'status', status: 'rate_limited', reason: res.status, waitMs: retryDelayMs, message: backoffLabel + ' — retrying in ' + Math.round(retryDelayMs / 1000) + 's (attempt ' + (attempt + 1) + '/' + maxRetries + ')…' });
             console.error('[AppAgent] ' + res.status + ' ' + backoffLabel + ', retry ' + (attempt + 1) + '/' + maxRetries + ' in ' + Math.round(retryDelayMs / 1000) + 's');
-            await new Promise(function(r) { setTimeout(r, retryDelayMs); });
+            await _claudeAbortableDelay(retryDelayMs, abortSignal); // PR#874 follow-up (P3): abort-aware backoff
         }
 
         if (!res.ok) {
@@ -2222,6 +2249,20 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                             choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: '' }] }, finish_reason: null }]
                         }) + '\n\n' });
                     }
+                    else if (block.type === 'redacted_thinking') {
+                        // Safety-redacted reasoning: the whole block arrives on
+                        // content_block_start (opaque `data`, no deltas follow).
+                        // Forward it into the same reasoning_details store as
+                        // thinking blocks (page side merges by index and keeps
+                        // `type`/`data` — 010-llm-streaming.js) so
+                        // transformMessageToAnthropic can replay it verbatim on
+                        // the next tool-use continuation.
+                        var blockIdx = eventData.index || 0;
+                        sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                            id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, type: 'redacted_thinking', data: block.data || '' }] }, finish_reason: null }]
+                        }) + '\n\n' });
+                    }
                 }
                 else if (eventType === 'content_block_delta') {
                     var delta = eventData.delta || {};
@@ -2305,6 +2346,14 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
 
     } catch(e) {
         clearInterval(streamKeepAlive); streamKeepAlive = null;
+        // PR#874 follow-up (P3): an aborted fetch()/reader.read() is a clean
+        // end-of-stream, not an error — emit the same envelopes as the
+        // loop-head `aborted` guard (SSE [DONE] first, then done).
+        if (aborted || (e && e.name === 'AbortError')) {
+            try { sink({ type: 'sse', data: 'data: [DONE]\n\n' }); } catch(e2) {}
+            try { sink({ type: 'done' }); } catch(e2) {}
+            return;
+        }
         try { sink({ type: 'error', error: e.message }); } catch(e2) {}
         try { sink({ type: 'done' }); } catch(e2) {}
     } finally {
@@ -3902,6 +3951,39 @@ function convertContentPart(part) {
     return result;
 }
 
+// Claude Fable 5.1+ / Mythos 5.1+ (Sept 2026). These models bind thinking blocks
+// to the exact system/tools/prior-message prefix (a mismatch on replay is a 400
+// unless the request opts into block_binding.prefix_mismatch_behavior:'drop_block'
+// via the thinking-binding-controls beta), and only show readable progress
+// updates between tool calls when thinking.display:'updates' is requested
+// under the thinking-display-updates beta. Matches the dateless pinned ids
+// (claude-fable-5-1) and dated variants (claude-fable-5-1-2026MMDD); does NOT
+// match the 5.0 ids (claude-fable-5, claude-fable-5-20260501) which keep the
+// display:'summarized' shape — the (?!\d) lookahead is what keeps an 8-digit
+// date suffix on a 5.0 id from reading as a minor version (1–2 digit minors
+// only). Reused by getAnthropicBetas (header) and transformToAnthropic
+// (thinking object) — keep those two in lock-step.
+// Docs: https://platform.claude.com/docs/en/models/fable-5-1/whats-new-fable-5-1
+//       https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
+var FABLE_5_1_PLUS_RE = /claude-(?:fable|mythos)-5-[1-9]\d?(?!\d)/;
+function isFable51Plus(model) {
+    return FABLE_5_1_PLUS_RE.test(String(model || '').toLowerCase());
+}
+
+// Beta flags for the OAuth /v1/messages call. The base trio is unconditional
+// (OAuth access, interleaved thinking, cache scope); Fable 5.1+ additionally
+// needs the two thinking betas that back the block_binding / display:'updates'
+// fields transformToAnthropic emits for it — sending those fields WITHOUT the
+// betas is a 400, and sending the betas to older models is harmless but noisy,
+// so they are gated on the same regex.
+var ANTHROPIC_BASE_BETAS = ['oauth-2025-04-20', 'interleaved-thinking-2025-05-14', 'prompt-caching-scope-2026-01-05'];
+var ANTHROPIC_FABLE_5_1_BETAS = ['thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18'];
+function getAnthropicBetas(model) {
+    var betas = ANTHROPIC_BASE_BETAS.slice();
+    if (isFable51Plus(model)) betas = betas.concat(ANTHROPIC_FABLE_5_1_BETAS);
+    return betas.join(',');
+}
+
 function transformToAnthropic(body) {
     var systemBlocks = [];
     var transformedMessages = [];
@@ -4007,16 +4089,34 @@ function transformToAnthropic(body) {
         result.tool_choice = { type: 'auto' };
     }
 
+    // Fable 5.1+: thinking is always-on adaptive (type 'enabled'/'disabled' → 400),
+    // so the thinking object is sent UNCONDITIONALLY for it — even when the
+    // provider has no effort/budget configured (effort then stays at the model
+    // default; output_config is only emitted when body.reasoning asks for one).
+    //   display:'updates'  — readable progress-update thinking blocks between
+    //                        tool calls (beta thinking-display-updates-2026-08-18).
+    //   block_binding.prefix_mismatch_behavior:'drop_block' — replayed thinking
+    //                        blocks whose bound prefix no longer matches (edited
+    //                        system prompt, tool roster change, context compaction)
+    //                        are dropped server-side and reported in the response's
+    //                        input_transformations instead of failing the request
+    //                        with a 400 (beta thinking-binding-controls-2026-08-01).
+    // Both betas are added by getAnthropicBetas for the same FABLE_5_1_PLUS_RE match.
+    var fable51 = isFable51Plus(body.model);
+    if (fable51) {
+        result.thinking = { type: 'adaptive', display: 'updates', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
+    }
+
     if (body.reasoning) {
         if (body.reasoning.effort) {
             // Claude 4.6 adaptive thinking — model decides how much to think based on effort level
             // display: 'summarized' is required for Opus 4.7+ (default changed to 'omitted')
-            result.thinking = { type: 'adaptive', display: 'summarized' };
+            if (!fable51) result.thinking = { type: 'adaptive', display: 'summarized' };
             result.output_config = { effort: body.reasoning.effort };
         } else if (body.reasoning.max_tokens) {
             // Use adaptive thinking for all models (enabled is deprecated for newer models)
             // display: 'summarized' is required for Opus 4.7+ (default changed to 'omitted')
-            result.thinking = { type: 'adaptive', display: 'summarized' };
+            if (!fable51) result.thinking = { type: 'adaptive', display: 'summarized' };
             result.output_config = { effort: 'high' };
         }
     }
@@ -4056,6 +4156,15 @@ function transformMessageToAnthropic(msg) {
         var blocks = [];
         if (msg.reasoning_details && Array.isArray(msg.reasoning_details)) {
             msg.reasoning_details.forEach(function(rd) {
+                // redacted_thinking blocks (safety-redacted reasoning) carry an
+                // opaque `data` payload instead of thinking+signature; the API
+                // requires them to be replayed verbatim during tool-use
+                // continuations. Captured by the SSE handler in
+                // runClaudeOAuthStream as { type:'redacted_thinking', data }.
+                if (rd.type === 'redacted_thinking') {
+                    if (rd.data) blocks.push({ type: 'redacted_thinking', data: rd.data });
+                    return;
+                }
                 if (!rd.signature) return;
                 blocks.push({ type: 'thinking', thinking: rd.thinking || rd.text || rd.content || '', signature: rd.signature });
             });
@@ -4551,7 +4660,7 @@ chrome.declarativeNetRequest.updateDynamicRules({
     addRules: [{
         id: 3000,
         priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: 'claude-cli/2.1.37 (external, cli)' }] },
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: 'claude-cli/2.1.257 (external, cli)' }] },
         condition: { urlFilter: 'api.anthropic.com/*', resourceTypes: ['xmlhttprequest'] }
     }]
 }).catch(function() {});

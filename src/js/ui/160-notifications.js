@@ -647,19 +647,21 @@ function updateModelConnectionDot() {
         } else {
             el.title = name;
         }
-        // ChatGPT alone gets a compact action inside the same model pill.
+        // Claude + ChatGPT OAuth providers get a compact login action inside
+        // the same model pill when they are not connected.
         var loginButton = loginButtons[idx];
         if (loginButton) {
             // Login-only control (Connect / Waiting… / Retry). NEVER a logout
             // on the pill — logging out lives in the pill dropdown's
-            // subscription section (modelMenuChatGPTOAuthToggle).
-            var showButton = !!(provider && provider.isChatGPTOAuth) && llmConnectionStatus !== 'connected';
+            // subscription section (modelMenuOAuthToggle /
+            // modelMenuChatGPTOAuthToggle) and is only offered while connected.
+            var showButton = isOAuth && llmConnectionStatus !== 'connected';
             loginButton.style.display = showButton ? '' : 'none';
             if (showButton) {
                 loginButton.classList.toggle('pending', llmConnectionStatus === 'pending');
                 loginButton.disabled = llmConnectionStatus === 'pending';
                 loginButton.textContent = llmConnectionStatus === 'pending' ? 'Waiting…' : (llmConnectionStatus === 'error' ? 'Retry' : 'Connect');
-                loginButton.setAttribute('aria-label', loginButton.textContent + ' ChatGPT subscription');
+                loginButton.setAttribute('aria-label', loginButton.textContent + ' ' + (provider.isClaudeOAuth ? 'Claude' : 'ChatGPT') + ' subscription');
             }
         }
     });
@@ -979,14 +981,31 @@ function modelMenuOAuthToggle() {
             showSnackbar('Logged out from Claude', 'info');
         });
     } else {
-        showSnackbar('Logging in to Claude...', 'info');
-        chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
-            if (chrome.runtime.lastError) { showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
-            else if (response && response.error) { showSnackbar('Sign-in error: ' + response.error, 'error'); }
-            else { showSnackbar('Logged in to Claude Subscription', 'success'); }
-            updateClaudeOAuthStatus();
-        });
+        startClaudeOAuthLogin();
     }
+}
+
+// Login-only Claude OAuth flow — used by the model menu's "Log in" row, the
+// pill's Connect button (modelPillLoginClick) and the not-logged-in error
+// toast's Log in action (snackbarLoginClick, ui/220-notification-system.js).
+// The pill dot refreshes via updateClaudeOAuthStatus in the callback.
+function startClaudeOAuthLogin() {
+    showSnackbar('Logging in to Claude...', 'info');
+    chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
+        if (chrome.runtime.lastError) { showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
+        else if (response && response.error) { showSnackbar('Sign-in error: ' + response.error, 'error'); }
+        else { showSnackbar('Logged in to Claude Subscription', 'success'); }
+        updateClaudeOAuthStatus();
+    });
+}
+
+// Compact Connect button inside the model pill (#model-login-btn /
+// #home-model-login-btn, src/html/body.html) — dispatch to the login flow of
+// whichever OAuth provider is currently selected.
+function modelPillLoginClick() {
+    var provider = getProviderById(currentProvider);
+    if (provider && provider.isClaudeOAuth) startClaudeOAuthLogin();
+    else if (provider && provider.isChatGPTOAuth) startChatGPTOAuthLogin();
 }
 
 // Device-code login: the response comes back PENDING with the one-time code the
@@ -994,7 +1013,7 @@ function modelMenuOAuthToggle() {
 // the background handler on every attempt, reused code included). Completion
 // arrives later via 'openai-oauth-updated'.
 function modelMenuChatGPTOAuthToggle() {
-    _chatGPTDeviceReturnFocus = document.activeElement;
+    var returnFocus = document.activeElement;
     _closeModelMenu();
     if (llmConnectionStatus === 'connected') {
         chrome.runtime.sendMessage({ type: 'openai-oauth-logout' }, function() {
@@ -1003,15 +1022,28 @@ function modelMenuChatGPTOAuthToggle() {
             showSnackbar('Logged out from ChatGPT', 'info');
         });
     } else {
-        setLLMConnectionStatus('pending');
-        chrome.runtime.sendMessage({ type: 'openai-oauth-login' }, function(response) {
-            if (chrome.runtime.lastError) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
-            else if (response && response.error) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + response.error, 'error'); }
-            else if (response && response.userCode) { showChatGPTDeviceCodeModal(response); }
-            else { showSnackbar('Starting ChatGPT device login\u2026', 'info'); }
-            updateChatGPTOAuthStatus();
-        });
+        startChatGPTOAuthLogin(returnFocus);
     }
+}
+
+// Login-only ChatGPT OAuth flow — used by the model menu's "Log in" row, the
+// pill's Connect button (modelPillLoginClick) and the not-logged-in error
+// toast's Log in action (snackbarLoginClick, ui/220-notification-system.js).
+// The pill dot refreshes via updateChatGPTOAuthStatus / the
+// 'openai-oauth-updated' broadcast once the device code is approved.
+function startChatGPTOAuthLogin(returnFocusEl) {
+    _chatGPTDeviceReturnFocus = returnFocusEl || document.activeElement;
+    // Only flip the visible pill status when the ChatGPT provider is the one
+    // selected — the button can also be clicked from an error toast.
+    var p = getProviderById(currentProvider);
+    if (p && p.isChatGPTOAuth) setLLMConnectionStatus('pending');
+    chrome.runtime.sendMessage({ type: 'openai-oauth-login' }, function(response) {
+        if (chrome.runtime.lastError) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
+        else if (response && response.error) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + response.error, 'error'); }
+        else if (response && response.userCode) { showChatGPTDeviceCodeModal(response); }
+        else { showSnackbar('Starting ChatGPT device login\u2026', 'info'); }
+        updateChatGPTOAuthStatus();
+    });
 }
 
 var _chatGPTDeviceExpiryTimer = null;

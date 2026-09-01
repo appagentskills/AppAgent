@@ -526,18 +526,27 @@ function renderMessages() {
         if (msg.role === 'user') userMsgIndices.push(idx);
     });
     
+    // Block ownership — needed by BOTH render paths (hoisted out of the compact-only
+    // branch below for the F15 follow-up). One forward pass computes:
+    //   lastUserMsgIdx  — index of the last visible user message (the "last" response
+    //                     block is the one anchored on it); -1 if none.
+    //   blockOwnerIdx[i] — index of the nearest visible user message at or before
+    //                     message i (-1 if none). For an assistant message this is
+    //                     the user turn that owns its response block.
+    // Hidden hook user messages are skipped, matching the compact grouping below.
+    var lastUserMsgIdx = -1;
+    var blockOwnerIdx = new Array(chat.messages.length);
+    for (var oi = 0; oi < chat.messages.length; oi++) {
+        var _om = chat.messages[oi];
+        if (_om.role === 'user' && !(_om.isHookMessage && !hooksEnabled.showHookMessages)) {
+            lastUserMsgIdx = oi;
+        }
+        blockOwnerIdx[oi] = lastUserMsgIdx;
+    }
+
     // In compact mode, collect everything grouped by response block (between user messages)
     var responseBlocks = [];
-    var lastUserMsgIdx = -1;
     if (compactToolCalls) {
-        // Find the last user message index to determine the "last" response block
-        for (var i = chat.messages.length - 1; i >= 0; i--) {
-            if (chat.messages[i].role === 'user' && !(chat.messages[i].isHookMessage && !hooksEnabled.showHookMessages)) {
-                lastUserMsgIdx = i;
-                break;
-            }
-        }
-        
         // Group everything by response block
         var currentBlock = null;
         chat.messages.forEach(function(msg, msgIdx) {
@@ -1063,7 +1072,10 @@ function renderMessages() {
                 
                 // Show Copy Answer when agent is done
                 // Non-last blocks are always done (conversation moved past them)
-                var agentDone = block && (!block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming));
+                // Bug-sweep F14: aligned with the spinner gate at ~L916 — a dormant chat
+                // (no live loop per isChatRunning) is done regardless of persisted flags.
+                var _copyChatRunning = (typeof isChatRunning === 'function') && isChatRunning(currentChatId);
+                var agentDone = block && (!_copyChatRunning || !block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming));
                 if (isLastAssistant && agentDone && prevUserMsgIdx >= 0) {
                     html += renderInlineChanges(prevUserMsgIdx);
                     html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' Copy Answer</button></div>';
@@ -1090,7 +1102,17 @@ function renderMessages() {
                     '</summary>' +
                     '<div class="' + contentClass + '">' + thinkingContent + '</div></details>';
             }
-            if (msg.content && !msg.isStreaming && !isRunning) {
+            // Bug-sweep F15 (follow-up to #873): scope the streaming gate to the LAST
+            // block, like the compact path above (L~1052). The bare `!isRunning` hid EVERY
+            // completed assistant message's content while this chat ran, not just the
+            // block being streamed. `responseBlocks`/`blocksByUserIdx` are only populated
+            // in compact mode, so the block lookup #873 added here always missed; use the
+            // hoisted `blockOwnerIdx` / `lastUserMsgIdx` (computed before the map) instead.
+            // A message with no owning user turn (-1) has no block to anchor on and keeps
+            // the hide-while-running behaviour rather than leaking the streamed block.
+            var _stdBlockUserIdx = (typeof blockOwnerIdx[index] === 'number') ? blockOwnerIdx[index] : -1;
+            var _stdIsLastBlock = (_stdBlockUserIdx === lastUserMsgIdx || _stdBlockUserIdx === -1);
+            if (msg.content && !msg.isStreaming && !(isRunning && _stdIsLastBlock)) {
                 html += '<div class="message-content">' + formatContent(msg.content) + '</div>';
                 if (msg.caveat) html += renderCaveatCard(msg);
                 if (msg.tldr) html += renderTldrCard(msg);
@@ -2040,6 +2062,9 @@ function highlightJS(code) {
 }
 
 function formatContent(content) {
+    // Bug-sweep F13: callers (assistant / tldr / caveat render paths) don't all
+    // coerce — a non-string content (null, number, object) used to throw on .replace.
+    if (typeof content !== 'string') content = content == null ? '' : String(content);
     // Extract document placeholders BEFORE escaping
     var documentBlocks = [];
     // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids

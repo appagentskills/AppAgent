@@ -128,7 +128,14 @@ function processImageFile(file) {
                 });
 
                 renderPendingImages();
+            }).catch(function() {
+                // Bug-sweep F8: surface compression failures instead of dropping silently.
+                showSnackbar('Could not read image', 'error');
             });
+        };
+        // Bug-sweep F8: a corrupt / unsupported image never fires onload.
+        img.onerror = function() {
+            showSnackbar('Could not read image', 'error');
         };
         img.src = e.target.result;
     };
@@ -201,10 +208,13 @@ function handleDrop(e) {
     var files = e.dataTransfer && e.dataTransfer.files;
     if (!files || files.length === 0) return;
 
+    // Bug-sweep F7: route every dropped file through the same handler the file
+    // picker uses (handleImageFileSelect -> processImageFile). It already accepts
+    // images / PDFs / text files (csv, txt, json, xml, md) and snackbars anything
+    // else, so the old image|pdf pre-filter only served to silently swallow text
+    // files that the picker would have accepted.
     for (var i = 0; i < files.length; i++) {
-        if (files[i].type.startsWith('image/') || files[i].type === 'application/pdf') {
-            processImageFile(files[i]);
-        }
+        processImageFile(files[i]);
     }
 }
 
@@ -246,10 +256,12 @@ function renderPendingImages() {
         var imageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;
         var pdfCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'pdf'; }).length;
         var fileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
+        var docCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; }).length; // Bug-sweep F6
         var parts = [];
         if (imageCount > 0) parts.push(imageCount + ' image' + (imageCount > 1 ? 's' : ''));
         if (pdfCount > 0) parts.push(pdfCount + ' PDF' + (pdfCount > 1 ? 's' : ''));
         if (fileCount > 0) parts.push(fileCount + ' file' + (fileCount > 1 ? 's' : ''));
+        if (docCount > 0) parts.push(docCount + ' document' + (docCount > 1 ? 's' : ''));
         html += '<div class="pending-images-hint">' + parts.join(', ') + ' attached. Click to preview, or × to remove.</div>';
     }
 
@@ -284,7 +296,16 @@ function viewPendingImage(index) {
     var img = pendingImageAttachments[index];
     if (!img) return;
 
-    if (img.fileType === 'pdf') {
+    if (img.fileType === 'document') {
+        // Bug-sweep F6: Smart-Document chips (tools/110 sdocAttachToInput) carry only
+        // {name, sdocId} — no base64 — so the image fallthrough below opened an empty
+        // screenshot modal. Preview through the document's own modal instead.
+        if (img.sdocId && typeof sdocOpenPreview === 'function' && typeof smartDocuments !== 'undefined' && smartDocuments[img.sdocId]) {
+            sdocOpenPreview(img.sdocId);
+        } else {
+            showSnackbar('Document is no longer available', 'warning');
+        }
+    } else if (img.fileType === 'pdf') {
         openPdfModal(img.base64, img.name);
     } else if (img.fileType === 'file') {
         openFileModal(img.content, img.name, img.mimeType);

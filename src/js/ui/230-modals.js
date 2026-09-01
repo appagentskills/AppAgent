@@ -69,6 +69,8 @@ async function showConfirmModal(title, message, variant) {
 // Helper function for prompt dialogs - returns input value or null
 function showPromptModal(title, message, defaultValue) {
     return new Promise(function(resolve) {
+        // Bug-sweep F1: never orphan a pending resolver (see ui/220 settlePendingModalResolve).
+        if (typeof settlePendingModalResolve === 'function') settlePendingModalResolve();
         modalResolve = resolve;
         var overlay = document.getElementById('modal-overlay');
         var header = document.getElementById('modal-header');
@@ -93,9 +95,13 @@ function showPromptModal(title, message, defaultValue) {
 // so Escape is intentionally NOT duplicated here.
 document.addEventListener('keydown', function(e) {
     if (e.key !== 'Enter' || e.isComposing) return;
-    if (!modalResolve) return; // only generic prompt/confirm modals set modalResolve
     var overlay = document.getElementById('modal-overlay');
     if (!overlay || !overlay.classList.contains('show')) return;
+    // Only generic prompt/confirm modals set modalResolve. Bug-sweep F2: the rename
+    // modal (ui/210 openRenameModal) does not use a resolver — its Rename button
+    // calls confirmRenameChat directly — so also accept it when its input is live.
+    var renameInput = document.getElementById('rename-chat-input');
+    if (!modalResolve && !(renameInput && overlay.contains(renameInput))) return;
     // Multi-line inputs keep Enter for newlines
     if (e.target && e.target.tagName === 'TEXTAREA') return;
     // Let focused buttons/links activate natively (e.g. Tab to Cancel, then Enter)

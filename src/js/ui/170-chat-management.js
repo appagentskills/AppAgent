@@ -698,13 +698,24 @@ async function summarizeAndStartNewChat() {
     // claimed "Pause".
     paused = false;
     setChatPausedPersistent(currentChatId, false);
-    pushPauseToggleToOffscreen(currentChatId, false);
+    // PR-PAUSE (B2): propagate=true — user-initiated resume of this chat; any
+    // subs its Pause parked come back too (SW: SubAgents.resumeDescendantsOfChat).
+    pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
     syncPauseButtonUI(currentChatId);
-    await runAgent();
-    
-    // After agent completes, check if we need to create a new chat with the summary
-    if (pendingSummaryRequest && pendingSummaryRequest.chatId === currentChatId) {
-        completeSummaryAndCreateNewChat();
+    var summaryChatId = currentChatId;
+    var summaryRunOk = false;
+    try {
+        await runAgent();
+        summaryRunOk = true;
+    } finally {
+        // After agent completes, check if we need to create a new chat with the summary.
+        // Bug-sweep F5: if the user switched chats mid-run (or runAgent threw), the
+        // stale request must not linger — clear it so a later summary starts clean.
+        if (summaryRunOk && pendingSummaryRequest && pendingSummaryRequest.chatId === currentChatId) {
+            completeSummaryAndCreateNewChat();
+        } else if (pendingSummaryRequest && pendingSummaryRequest.chatId === summaryChatId) {
+            pendingSummaryRequest = null;
+        }
     }
 }
 
@@ -780,9 +791,13 @@ function completeSummaryAndCreateNewChat() {
     // global together and repaints via the SSOT syncPauseButtonUI.
     paused = false;
     setChatPausedPersistent(currentChatId, false);
-    pushPauseToggleToOffscreen(currentChatId, false);
+    // PR-PAUSE (B2): propagate=true for uniformity (fresh chat — no subs, no-op).
+    pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
     syncPauseButtonUI(currentChatId);
-    runAgent();
+    // Bug-sweep F5: fire-and-forget, but never an unhandled rejection.
+    Promise.resolve().then(function() { return runAgent(); }).catch(function(e) {
+        console.warn('[summary] runAgent for continued chat failed:', e && e.message ? e.message : e);
+    });
 }
 
 function newChat() {
@@ -904,8 +919,15 @@ function selectChat(chatId, options) {
 
     // Mark the chat as seen — the Active Chats dropdown surfaces chats whose
     // last response the user hasn't viewed yet (lastResponseAt > lastViewedAt).
+    // Bug-sweep F4: this is the ONE lastViewedAt stamp in selectChat (a second,
+    // duplicate dispatch further down was removed). It must stay HERE, before
+    // renderJobsBadge, because dispatchChatMeta's optimistic apply is synchronous
+    // and the badge reads the fresh stamp. Skips isTemporary (never-persisted
+    // fresh New Chat) entries — same exclusion the later MEMFIX churn guard had.
     if (chats[chatId]) {
-        if (typeof dispatchChatMeta === 'function') dispatchChatMeta(chatId, { lastViewedAt: Date.now() }); // FLUX-4C lane
+        if (!chats[chatId].isTemporary && typeof dispatchChatMeta === 'function') {
+            try { dispatchChatMeta(chatId, { lastViewedAt: Date.now() }); } catch (e) {} // FLUX-4C lane
+        }
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
         // Viewing the chat consumes its "finished while you were elsewhere"
         // header badge entry (ui/165-finished-chat-badge.js).
@@ -1015,15 +1037,13 @@ function selectChat(chatId, options) {
     // unread activity), so an old chat's recency stayed old and the sweep
     // below evicted it the moment the user switched away — A↔B switching
     // between two old chats hydrated→evicted→hydrated on every switch.
-    // Stamp lastViewedAt through the FLUX-4C chat-meta lane (write-site
-    // ratchet: no direct chats[id].lastViewedAt poke). dispatchChatMeta's
-    // optimistic apply is SYNCHRONOUS and monotonic-max (_applyChatMetaFields,
-    // app/045), so the sweep below still reads the fresh stamp via
-    // chatPayloadRecencyTs, and the SW-canonical value follows (max-wins —
-    // neither side can regress the other).
-    if (chats[chatId] && !chats[chatId].isTemporary && typeof dispatchChatMeta === 'function') {
-        try { dispatchChatMeta(chatId, { lastViewedAt: Date.now() }); } catch (e) {}
-    }
+    // lastViewedAt is stamped through the FLUX-4C chat-meta lane at the TOP of
+    // this function (write-site ratchet: no direct chats[id].lastViewedAt poke).
+    // dispatchChatMeta's optimistic apply is SYNCHRONOUS and monotonic-max
+    // (_applyChatMetaFields, app/045), so the sweep below still reads the fresh
+    // stamp via chatPayloadRecencyTs, and the SW-canonical value follows
+    // (max-wins — neither side can regress the other). Bug-sweep F4: the
+    // duplicate dispatch that used to sit here was removed.
     // MEMFIX (Fix C): switching chats is the natural moment a previously-
     // viewed (rehydrated) chat goes cold — run the SAME sweep the 60s tick
     // runs (payloads + text bodies, keep newest K by recency) immediately

@@ -271,6 +271,21 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 if (typeof Platform !== 'undefined' && Platform.isWorker && typeof self[_oauthStreamFn] === 'function') {
                     // SW-internal: call the streamer directly.
                     var signal = (abortController && abortController.signal) || null;
+                    // PR-PAUSE (R2): mirror the page-port abort listener below.
+                    // Without it the fakeReader keeps awaiting the next envelope
+                    // after Pause aborts, so the loop only stands down when the
+                    // provider happens to send another chunk (or never).
+                    if (signal) {
+                        signal.addEventListener('abort', function() {
+                            streamDone = true;
+                            if (resolveRead) {
+                                var r = resolveRead; resolveRead = null;
+                                var err = new Error('User aborted stream');
+                                err.name = 'AbortError';
+                                r({ value: undefined, done: true, _abortErr: err });
+                            }
+                        }, { once: true });
+                    }
                     self[_oauthStreamFn](requestBody, onEnvelope, signal);
                     resolve(fakeReader);
                     return;

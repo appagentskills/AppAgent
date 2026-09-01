@@ -175,6 +175,22 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high',
         isClaudeOAuth: true
     },
+    {
+        // Fable 5.1 (Sept 2026) — dateless pinned id, 1M context, 128k max
+        // output. Thinking is always-on adaptive (effort via output_config,
+        // same as Fable 5); the SW additionally opts this model into the
+        // thinking-display-updates + thinking-binding-controls betas and the
+        // block_binding drop_block opt-out — see FABLE_5_1_PLUS_RE in
+        // src/platform/extension/background.js. Existing installs pick this
+        // entry up via the name-keyed default merge in
+        // loadApiProviders (core/130-indexeddb.js).
+        name: 'Fable 5.1',
+        model: 'claude-fable-5-1',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        apiKey: 'oauth',
+        effort: 'high',
+        isClaudeOAuth: true
+    },
     // --- ChatGPT subscription (OAuth device-code) ---
     // Routed through the SW adapter runChatGPTOAuthStream, which converts the
     // chat-completions body below into a Codex Responses API request. The

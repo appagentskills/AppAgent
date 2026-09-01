@@ -197,8 +197,11 @@ function togglePause() {
         if (typeof interruptFn === 'function') {
             try { interruptFn(); } catch (e) {}
         }
+        // PR-PAUSE (B2): propagate=true — the USER paused this chat, so its
+        // live sub-agent subtree stands down too (SW: pauseDescendantsOfChat).
+        // Only this button path sets the flag; stop/dismiss halts do not.
         if (typeof pushPauseToggleToOffscreen === 'function') {
-            pushPauseToggleToOffscreen(chatId, true);
+            pushPauseToggleToOffscreen(chatId, true, undefined, undefined, true);
         }
         if (typeof pushInterruptToOffscreen === 'function') {
             pushInterruptToOffscreen(chatId, false);
@@ -214,10 +217,12 @@ function togglePause() {
         return;
     }
 
-    // Resuming: tell offscreen the pause flag is cleared, then kick off
-    // a fresh run via the shim if this chat isn't already known-running.
+    // Resuming: tell offscreen the pause flag is cleared (propagate=true → the
+    // SW re-queues the subs THIS chat's Pause parked, via
+    // resumeDescendantsOfChat), then kick off a fresh run via the shim if this
+    // chat isn't already known-running.
     if (typeof pushPauseToggleToOffscreen === 'function') {
-        pushPauseToggleToOffscreen(chatId, false);
+        pushPauseToggleToOffscreen(chatId, false, undefined, undefined, true);
     }
     // SWM-T5: bump the interrupt generation too, so a stale interrupt(false) retry
     // chain armed during a port-down window can't survive resume and abort the run.
@@ -248,7 +253,13 @@ function hidePauseButton() {
 
 function showRetryButton() {
     var retryBtn = document.getElementById('retry-btn');
-    if (retryBtn) retryBtn.classList.add('visible');
+    if (retryBtn) {
+        retryBtn.classList.add('visible');
+        // PR-PAUSE (R6): see showContinueButton — Retry re-issues the FAILED
+        // request; it is never shown alongside Continue.
+        retryBtn.title = 'Retry the failed request';
+    }
+    hideContinueButton();
 }
 
 function hideRetryButton() {
@@ -258,9 +269,17 @@ function hideRetryButton() {
 
 function showContinueButton() {
     var btn = document.getElementById('continue-btn');
-    if (btn) btn.classList.add('visible');
+    if (btn) {
+        btn.classList.add('visible');
+        // PR-PAUSE (R6): self-explanatory affordance — Continue resumes an
+        // interrupted run, Retry re-issues a FAILED request. They used to be
+        // shown together after an errored run and both just called runAgent.
+        btn.title = 'Resume the interrupted run';
+    }
     // Pause and Continue are mutually exclusive.
     hidePauseButton();
+    // PR-PAUSE (R6): so is Retry — an errored chat shows Retry only.
+    if (typeof hideRetryButton === 'function') hideRetryButton();
 }
 
 function hideContinueButton() {
@@ -488,7 +507,16 @@ function refreshContinueButtonForChat(chatId) {
         hideContinueButton();
         return;
     }
-    if (isChatInterrupted(chats[chatId])) {
+    // PR-PAUSE (R6): Retry and Continue are now mutually exclusive. When the
+    // chat has a recorded API error, Retry owns the affordance (it re-issues
+    // the failed request and clears the error); Continue is only offered for a
+    // clean interruption. Previously both could be visible at once and both
+    // simply called runAgent(chatId), which read as one of them being broken.
+    var _errForChat = (typeof lastApiError !== 'undefined' && lastApiError && lastApiError.chatId === chatId)
+        || !!(chats[chatId] && chats[chatId]._lastApiError);
+    if (_errForChat) {
+        hideContinueButton();
+    } else if (isChatInterrupted(chats[chatId])) {
         showContinueButton();
     } else {
         hideContinueButton();

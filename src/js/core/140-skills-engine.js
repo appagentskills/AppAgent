@@ -470,7 +470,9 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
         document.body.removeChild(sandbox);
 
         // Check if response is too large (skip when called from js_eval or another skill tool)
-        var resultStr = JSON.stringify(result, null, 2);
+        // Bug-sweep F10: JSON.stringify(undefined) returns undefined (not a string),
+        // so a tool that resolved with no value used to throw here on .split().
+        var resultStr = String(JSON.stringify(result === undefined ? null : result, null, 2) ?? '');
         var lines = resultStr.split('\n');
 
         if (lines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {

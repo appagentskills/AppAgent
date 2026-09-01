@@ -913,11 +913,46 @@ function _handlePanelMessage(port, msg) {
             // The stream catch sees an AbortError, drops the partial assistant msg,
             // and `continue`s — the while-gate then exits because the flag is set.
             if (msg.paused && msg.chatId) {
+                // PR-PAUSE (R3): the in-loop throttle backoff
+                // (app/030-agent-loop.js) parks on a timer that only the
+                // provider-change resolver could cancel — a pause during a
+                // 30s backoff sat out the whole sleep before standing down.
+                if (providerChangeBackoffResolversByChatId[msg.chatId]) {
+                    try { providerChangeBackoffResolversByChatId[msg.chatId](); } catch (e) {}
+                    delete providerChangeBackoffResolversByChatId[msg.chatId];
+                }
                 if (interruptResolversByChatId[msg.chatId]) {
                     try { interruptResolversByChatId[msg.chatId](); } catch (e) {}
                 }
                 if (currentStreamAbortControllers[msg.chatId]) {
                     try { currentStreamAbortControllers[msg.chatId].abort(); } catch (e) {}
+                }
+                // PR-PAUSE (R1): propagate to the live sub-agent subtree. The
+                // registry owns the walk (it holds _subAgents / the pool) and
+                // applies the same pause lane + abort trio per sub, skipping
+                // parked/sleeping/terminal subs.
+                // B2: ONLY when the sender asked for it (msg.propagate === true,
+                // set by every USER-initiated pause/resume: app/020 togglePause,
+                // tools/120 pauseAction/resumeAction, app/040 send-message
+                // unpause, ui/170 summary runs → pushPauseToggleToOffscreen). stopAction /
+                // dismissAction (tools/120-actions.js) reuse toggle-pause as a
+                // loop-halt signal and must NOT record the subs into
+                // _pausedByParentChat (Stop would leave them paused with
+                // pending handles forever; dismiss's deferred unpause would
+                // restart the dismissed action's subs headless). Pre-#874
+                // behaviour for those callers is preserved: subs untouched.
+                if (msg.propagate === true && typeof SubAgents !== 'undefined' && SubAgents.pauseDescendantsOfChat) {
+                    try { SubAgents.pauseDescendantsOfChat(msg.chatId); }
+                    catch (e) { console.warn('[port-bridge] pauseDescendantsOfChat threw', e); }
+                }
+            } else if (!msg.paused && msg.chatId) {
+                // PR-PAUSE (R4): resume propagates too — subs FIRST (their
+                // runs are re-entered through the sub-agent pool, keeping
+                // every stream event on the sub's own chatId), then the panel
+                // kicks runAgent for the parent.
+                if (msg.propagate === true && typeof SubAgents !== 'undefined' && SubAgents.resumeDescendantsOfChat) {
+                    try { SubAgents.resumeDescendantsOfChat(msg.chatId); }
+                    catch (e) { console.warn('[port-bridge] resumeDescendantsOfChat threw', e); }
                 }
             }
             return;

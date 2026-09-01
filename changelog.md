@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.25
+
+### Features
+- Claude Fable 5.1 is now supported, including adaptive-thinking updates, thinking-block binding, and redacted-thinking replay.
+- Claude and ChatGPT subscription providers now offer Connect controls in model pills and Log in actions on not-signed-in error messages.
+
+### Fixes
+- Pause and resume now propagate reliably to sub-agents and interrupt OAuth streaming, retry backoff, and stream-slot waits.
+- Claude OAuth requests now use the newer spoofed `claude-cli` 2.1.257 User-Agent for API compatibility.
+- Attachment previews, modal cleanup, message rendering, input restoration, and related promise handling are more reliable.
+
+---
+
 ## v1.1.24
 
 ### Features

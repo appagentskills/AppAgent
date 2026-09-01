@@ -774,7 +774,17 @@ async function runAgent(overrideChatId) {
             // valid; we just overwrite the placeholder content with an explanatory
             // note so the model knows on the next turn.
             if (result && result._interrupted) {
-                for (var rj = pci; rj < pendingToolCalls.length; rj++) {
+                // PR-PAUSE (R5): this branch used to ALWAYS claim "user sent a
+                // new message" and always replace the placeholder — even when
+                // the interrupt came from Pause. recordToolResult clears
+                // _placeholder, so the next runAgent's pending scan no longer
+                // saw the call as unprocessed: Resume silently dropped the
+                // tool. On a PAUSE interrupt leave every remaining call
+                // pending (placeholder rows intact, Anthropic shape still
+                // valid) so Resume replays them; only a genuine new user
+                // message abandons them.
+                var _prPaused = isChatPaused(streamingChatId) && !userInterruptedChats[streamingChatId];
+                for (var rj = pci; !_prPaused && rj < pendingToolCalls.length; rj++) {
                     var rjtc = pendingToolCalls[rj].tc;
                     recordToolResult(chat, rjtc.id, rjtc.function ? rjtc.function.name : 'unknown', '[Tool call abandoned — user sent a new message]');
                     // MP-3: also settle + remove the SW's _pendingUIToolCalls /
@@ -785,9 +795,9 @@ async function runAgent(overrideChatId) {
                     // the page bundle's dormant copy of this loop no-ops.
                     if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rjtc.id, 'user sent a new message');
                 }
-                userInterruptedChats[streamingChatId] = false;
+                if (!_prPaused) userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
-                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: 'user_message' });
+                AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: _prPaused ? 'paused' : 'user_message' });
                 break;
             }
 
@@ -1409,7 +1419,16 @@ async function runAgent(overrideChatId) {
                 var _placeholder = _wasUserMessage
                     ? '[Tool call abandoned — user sent a new message]'
                     : (_wasProviderChange ? '[Tool call abandoned — provider changed]' : '[Tool call abandoned — paused by user]');
-                for (var ri2 = i; ri2 < assistantMsg.tool_calls.length; ri2++) {
+                // PR-PAUSE (R5/P6): same rule as the pending-replay branch —
+                // a PAUSE interrupt leaves the remaining calls pending (their
+                // seeded _placeholder rows stay marked unprocessed) so Resume
+                // re-runs them. This is what makes a parent blocked in
+                // await_handle / await_all / await_any pausable WITHOUT losing
+                // the wait: the interrupt resolver (fired by toggle-pause)
+                // unblocks executeToolWithInterrupt, the loop hits its pause
+                // check, and the await tool is replayed on resume.
+                var _btPaused = !_wasUserMessage && !_wasProviderChange && isChatPaused(streamingChatId);
+                for (var ri2 = i; !_btPaused && ri2 < assistantMsg.tool_calls.length; ri2++) {
                     var rtc2 = assistantMsg.tool_calls[ri2];
                     recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _placeholder);
                     // MP-3: settle + clean the SW pending/parked entry and the
@@ -1417,7 +1436,7 @@ async function runAgent(overrideChatId) {
                     // (see worker/120-tool-routing.js abandonPendingUIToolCall).
                     if (typeof abandonPendingUIToolCall === 'function') abandonPendingUIToolCall(streamingChatId, rtc2.id, _wasUserMessage ? 'user sent a new message' : (_wasProviderChange ? 'provider changed' : 'paused by user'));
                 }
-                userInterruptedChats[streamingChatId] = false;
+                if (!_btPaused) userInterruptedChats[streamingChatId] = false;
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallCancelled', { chatId: streamingChatId, toolCallId: tc.id, reason: _wasUserMessage ? 'user_message' : (_wasProviderChange ? 'provider_change' : 'paused') });
                 break;
@@ -1486,6 +1505,11 @@ async function runAgent(overrideChatId) {
             if (_acHookTurn || _acHasText) break;
         }
     }
+    // PR-PAUSE (B3): sample the pause flag SYNCHRONOUSLY at the while-gate exit.
+    // A quick Resume can clear the flag before the finish hook below runs, so
+    // isChatPaused() there would no longer tell a pause-exit from a natural
+    // finish. Consumed by SubAgents.onSubAgentRunFinished via finishCtx.paused.
+    var _exitedPaused = isChatPaused(streamingChatId);
 
     // Show aggregate summary if there were multiple API calls
     if (aggregateMetrics.callCount > 1) {
@@ -1592,7 +1616,7 @@ async function runAgent(overrideChatId) {
         // synthesizes status:'done' over an errored run and the parent
         // unblocks with a false-positive success.
         var _finishReason = _runApiError ? 'errored' : 'completed';
-        try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: _runApiError || null }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
+        try { SubAgents.onSubAgentRunFinished(streamingChatId, { reason: _finishReason, error: _runApiError || null, paused: _exitedPaused }); } catch (e) { console.warn('onSubAgentRunFinished hook threw', e); }
     }
     // Reset THIS chat's silent hook flag before the UI handler runs the final
     // render so messages are properly displayed. Per-chat map, not a global

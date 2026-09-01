@@ -1436,7 +1436,17 @@ function pushProviderChangeToOffscreen(providerId, chatId) {
 var _pauseToggleGen = Object.create(null);
 var _pauseToggleDesired = Object.create(null);
 
-function pushPauseToggleToOffscreen(chatId, paused, _retries, _gen) {
+// `propagate` (5th arg, fresh calls only): ask the SW to pause/resume the
+// chat's sub-agent subtree too (SubAgents.pause/resumeDescendantsOfChat). Set
+// by every USER-initiated pause/resume: the Pause/Resume button (app/020
+// togglePause), pauseAction / resumeAction (tools/120-actions.js), sending a
+// message into a paused chat (app/040 sendMessage / sendWidgetMessage) and the
+// summary runs (ui/170). Loop-halt callers (stopAction / dismissAction,
+// tools/120-actions.js) leave it unset so their toggle never records subs into
+// the parent-paused map. Latched per chat so the
+// retry chain below re-sends the same value.
+var _pauseTogglePropagate = Object.create(null);
+function pushPauseToggleToOffscreen(chatId, paused, _retries, _gen, propagate) {
     if (!chatId) return;
     // SWM14-F5: allocate/refresh the generation on a fresh call; drop a superseded
     // stale chain; always act on the CURRENT latest desired value for this chat.
@@ -1444,6 +1454,7 @@ function pushPauseToggleToOffscreen(chatId, paused, _retries, _gen) {
         _gen = (_pauseToggleGen[chatId] || 0) + 1;
         _pauseToggleGen[chatId] = _gen;
         _pauseToggleDesired[chatId] = !!paused;
+        _pauseTogglePropagate[chatId] = (propagate === true);
     } else if (_gen !== _pauseToggleGen[chatId]) {
         return; // a newer Pause/Resume for this chat superseded this chain — drop it
     }
@@ -1465,7 +1476,8 @@ function pushPauseToggleToOffscreen(chatId, paused, _retries, _gen) {
         _agentBusPort.postMessage({
             type: 'toggle-pause',
             chatId: chatId,
-            paused: !!_desired
+            paused: !!_desired,
+            propagate: _pauseTogglePropagate[chatId] === true
         });
     } catch (e) {
         // SWM4F-1: same exhaustion fallback as the no-port guard above.

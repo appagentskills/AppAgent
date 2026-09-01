@@ -47,7 +47,7 @@
     },
     "renderMessages": {
       "src/js/app/036-agent-event-handlers-page.js": 15,
-      "src/js/app/040-send-message.js": 4,
+      "src/js/app/040-send-message.js": 5,
       "src/js/app/045-agent-port-bridge-page.js": 4,
       "src/js/app/050-image-attachments.js": 1,
       "src/js/core/120-init.js": 2,
@@ -80,13 +80,12 @@
     },
     "idbStoreDelete": {
       "src/js/core/097-sub-agent-registry.js": 3,
-      "src/js/core/130-indexeddb.js": 11,
+      "src/js/core/130-indexeddb.js": 10,
       "src/js/core/140-skills-engine.js": 2,
       "src/js/tools/020-tool-execution.js": 4,
       "src/js/tools/110-smart-documents.js": 1,
       "src/js/tools/120-actions.js": 1,
       "src/js/ui/020-dashboard.js": 1,
-      "src/js/ui/040-tools-settings.js": 1,
       "src/js/worker/110-agent-checkpoint.js": 2
     },
     "chatFieldPoke": {
@@ -113,7 +112,7 @@
       "src/js/worker/120-tool-routing.js": 4
     },
     "deleteChatsEntry": {
-      "src/js/core/097-sub-agent-registry.js": 2,
+      "src/js/core/097-sub-agent-registry.js": 1,
       "src/js/ui/170-chat-management.js": 1,
       "src/js/worker/115-storage.js": 1
     },
@@ -124,7 +123,7 @@
       "src/js/ui/070-dashboard-ui.js": 1,
       "src/js/ui/270-iframe-panel.js": 1,
       "src/js/worker/010-platform-stub.js": 2,
-      "src/platform/extension/background.js": 17,
+      "src/platform/extension/background.js": 15,
       "src/platform/extension/platform-bridge.js": 6
     }
   }

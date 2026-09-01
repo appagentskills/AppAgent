@@ -89,7 +89,15 @@ function renderSnackbar(entry) {
 
     // Build snackbar content with close button for errors and warnings
     var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="dismissSnackbar()">' + UI_ICONS.close + '</button>' : '';
-    snackbar.innerHTML = '<span class="snackbar-message">' + escapeHtml(entry.message) + '</span>' + closeBtn;
+    // OAuth "not logged in" errors carry a Log in action so the user can fix
+    // the failure from the toast itself (same flows as the pill's Connect
+    // button — startClaudeOAuthLogin / startChatGPTOAuthLogin in
+    // ui/160-notifications.js).
+    var loginProvider = isError ? _snackbarLoginProvider(entry.message) : null;
+    var loginBtn = loginProvider
+        ? '<button class="snackbar-action" onclick="snackbarLoginClick(\'' + loginProvider + '\')">Log in</button>'
+        : '';
+    snackbar.innerHTML = '<span class="snackbar-message">' + escapeHtml(entry.message) + '</span>' + loginBtn + closeBtn;
     snackbar.className = 'snackbar show' + typeClass;
 
     if (snackbarTimeout) { clearTimeout(snackbarTimeout); snackbarTimeout = null; }
@@ -103,6 +111,26 @@ function renderSnackbar(entry) {
             drainSnackbarQueue();
         }, entry.duration || 3000);
     }
+}
+
+// Detect the OAuth auth-failure error strings emitted by background.js
+// ('Not logged in to Claude. Click the login button.', 'Not logged in to
+// ChatGPT. Use "Log in" in the model menu.', and the token-refresh variant
+// 'Log in to ChatGPT again from the model menu.') so the error toast can
+// offer the fix inline. Returns 'claude' | 'chatgpt' | null.
+function _snackbarLoginProvider(message) {
+    var m = String(message || '');
+    if (/not logged in to claude/i.test(m)) return 'claude';
+    if (/not logged in to chatgpt|log in to chatgpt/i.test(m)) return 'chatgpt';
+    return null;
+}
+
+// Log in action on a not-logged-in error toast — dismiss the toast (the user
+// has acted on it) and start the matching OAuth login flow.
+function snackbarLoginClick(provider) {
+    dismissSnackbar();
+    if (provider === 'claude' && typeof startClaudeOAuthLogin === 'function') startClaudeOAuthLogin();
+    else if (provider === 'chatgpt' && typeof startChatGPTOAuthLogin === 'function') startChatGPTOAuthLogin();
 }
 
 // Render the next queued toast after a short beat so the outgoing toast gets to
@@ -799,8 +827,21 @@ function sanitizeModalMessage(message) {
     return frag;
 }
 
+// Bug-sweep F1: modalResolve is a single global slot. Opening a second generic
+// modal while one is still pending used to overwrite the first resolver, so the
+// first caller's `await showModal(...)` hung forever. Settle the previous one as
+// cancelled (null) before installing the new resolver. Shared by showModal and
+// showPromptModal (ui/230-modals.js).
+function settlePendingModalResolve() {
+    if (!modalResolve) return;
+    var prev = modalResolve;
+    modalResolve = null;
+    try { prev(null); } catch (e) {}
+}
+
 function showModal(title, message, buttons, variant) {
     return new Promise(function(resolve) {
+        settlePendingModalResolve();
         modalResolve = resolve;
         var overlay = document.getElementById('modal-overlay');
         var header = document.getElementById('modal-header');

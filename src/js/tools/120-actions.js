@@ -627,7 +627,10 @@ async function pauseAction(actionId) {
     // pausedChats copy — setting only the page copy never halts it. Mirror the
     // pause + interrupt into the SW (as togglePause does) so Pause actually stops
     // the background loop instead of letting it stream to completion.
-    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, true);
+    // PR-PAUSE (B2): propagate=true — the PM paused this action, so its live
+    // sub-agent subtree stands down too (SW: SubAgents.pauseDescendantsOfChat).
+    // stopAction / dismissAction below deliberately do NOT propagate.
+    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, true, undefined, undefined, true);
     if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(a.chatId, false);
     a._isPaused = true;
     a.updatedAt = Date.now();
@@ -665,7 +668,9 @@ async function resumeAction(actionId) {
     // runningChatIds is set, a still-running SW loop would never get un-paused —
     // its `while (!isChatPaused)` gate stays tripped. Push the cleared flag BEFORE
     // the runAgent re-kick so the loop resumes whether or not it re-enters here.
-    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, false);
+    // PR-PAUSE (B2): propagate=true — re-queue the subs pauseAction parked
+    // (SW: SubAgents.resumeDescendantsOfChat) before the parent re-kicks.
+    if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(a.chatId, false, undefined, undefined, true);
     // SWM-T5: bump the interrupt generation too, so a stale interrupt(false) retry
     // chain armed during a port-down window can't survive resume and abort the run.
     if (typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(a.chatId);

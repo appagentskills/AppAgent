@@ -5,6 +5,9 @@ function copyMessageText(msgIndex) {
     var msg = chat.messages[msgIndex];
     navigator.clipboard.writeText(msg.content).then(function() {
         showSnackbar('Message copied', 'success');
+    }).catch(function() {
+        // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
+        showSnackbar('Copy failed', 'error');
     });
 }
 
@@ -38,6 +41,9 @@ function copyAiMessage(userMsgIdx) {
     
     navigator.clipboard.writeText(content.join('\n\n')).then(function() {
         showSnackbar('Response copied', 'success');
+    }).catch(function() {
+        // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
+        showSnackbar('Copy failed', 'error');
     });
 }
 

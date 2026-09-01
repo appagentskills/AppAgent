@@ -89,10 +89,73 @@ async function sendMessage() {
         // offscreen. Retry on a short timer (mirrors runAgent's attempt() loop /
         // pushInterruptToOffscreen) and force-reopen the bus so the injection
         // reliably lands.
-        (function _sendMessageToOffscreen(_chatId, _text, _images, _retries) {
+        // Bug-sweep F9: the chain is BOUNDED — 20 quick retries, then ONE bus
+        // reopen followed by 20 more, then give up with an error snackbar. The
+        // old chain reset _retries to 0 after every reopen, so a bus that never
+        // came back kept the timer loop alive forever.
+        // F9 follow-up: the input + draft + attachments were already cleared above
+        // (L52-60) BEFORE this chain started, so on give-up the "try again" snackbar
+        // was not actionable — the user's text was gone. Capture what we cleared so
+        // the give-up path can put it back. `message` is the literal typed text
+        // (NOT `_newText`, which may be the synthetic attachment label);
+        // `_newImages` is the attachment snapshot; `_existing` is the page-side
+        // queue-mirror entry as it was before we merged this send into it.
+        var _f9TypedText = message;
+        var _f9PrevEntry = _existing || null;
+        var _f9MergedText = _mergedText;
+        (function _sendMessageToOffscreen(_chatId, _text, _images, _retries, _reopens) {
+            function _restoreUnsentInput() {
+                // Roll back the page-side "Queued" mirror ONLY if it is still exactly
+                // the entry we wrote (another concurrent send may have merged into it
+                // since — leave that alone, its own chain restores its own text).
+                try {
+                    var _cur = pendingInjectionsByChatId[_chatId];
+                    if (_cur && _cur.text === _f9MergedText) {
+                        if (_f9PrevEntry) pendingInjectionsByChatId[_chatId] = _f9PrevEntry;
+                        else delete pendingInjectionsByChatId[_chatId];
+                    }
+                } catch (e) {}
+                var _onThisChat = (getCurrentPendingContext() === _chatId);
+                // Text: back into the live input when the user is still on this chat,
+                // otherwise into the per-chat draft so the next chat switch restores it
+                // (restorePendingTextForContext). Prepend to anything typed since.
+                if (_f9TypedText) {
+                    if (_onThisChat) {
+                        var _inp = document.getElementById('message-input');
+                        if (_inp) {
+                            _inp.value = _inp.value ? (_f9TypedText + '\n\n' + _inp.value) : _f9TypedText;
+                            if (typeof autoResizeTextarea === 'function') autoResizeTextarea(_inp);
+                            chatPendingTexts[_chatId] = _inp.value;
+                        } else {
+                            chatPendingTexts[_chatId] = _f9TypedText;
+                        }
+                    } else {
+                        chatPendingTexts[_chatId] = chatPendingTexts[_chatId] ? (_f9TypedText + '\n\n' + chatPendingTexts[_chatId]) : _f9TypedText;
+                    }
+                    persistPendingTextsToStorage();
+                }
+                // Attachments: same split — live pending list vs. per-chat map
+                // (restorePendingImagesForContext reads chatPendingImages).
+                if (_images && _images.length > 0) {
+                    if (_onThisChat) {
+                        pendingImageAttachments = _images.concat(pendingImageAttachments || []);
+                        renderPendingImages();
+                    } else {
+                        chatPendingImages[_chatId] = _images.concat(chatPendingImages[_chatId] || []);
+                    }
+                }
+                if (_onThisChat && typeof renderMessages === 'function') { try { renderMessages(); } catch (e) {} }
+            }
+            function _retryOrGiveUp() {
+                if ((_retries || 0) < 20) { setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, (_retries || 0) + 1, _reopens); }, 50); }
+                else if ((_reopens || 0) < 1) { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0, (_reopens || 0) + 1); }, 250); }
+                else {
+                    _restoreUnsentInput();
+                    showSnackbar('Could not deliver message — agent connection unavailable. Your message was restored to the input; please try again.', 'error');
+                }
+            }
             if (typeof _agentBusPort === 'undefined' || !_agentBusPort) {
-                if ((_retries || 0) < 20) { setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, (_retries || 0) + 1); }, 50); }
-                else { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0); }, 250); }
+                _retryOrGiveUp();
                 return;
             }
             try {
@@ -109,13 +172,13 @@ async function sendMessage() {
                     images: _images
                 });
             } catch (e) {
-                if ((_retries || 0) < 20) { setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, (_retries || 0) + 1); }, 50); }
-                else { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e2) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0); }, 250); }
+                _retryOrGiveUp();
             }
-        })(currentChatId, _newText, _newImages, 0);
+        })(currentChatId, _newText, _newImages, 0, 0);
 
         // SWM-T4: supersede any pause(true)/interrupt(false) retry chain armed during a port-down window so it can't re-pause or abort this fresh send on reconnect.
-        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+        // PR-PAUSE (B2): propagate=true — a user message is a user-initiated resume; subs the parent's Pause parked (SubAgents.resumeDescendantsOfChat) come back too. No-op when nothing is parent-paused.
+        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
         if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
         // SILENT-HOOK-QUEUE-FIX: if THIS chat is mid silent after-response hook
         // (set_chat_title / set_tldr — mirrored from the SW into the per-chat
@@ -189,7 +252,8 @@ async function sendMessage() {
         // (setChatPausedPersistent also clears the persisted pausedByUser flag.)
         if (currentChatId && pausedChats) setChatPausedPersistent(currentChatId, false);
         // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
-        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+        // PR-PAUSE (B2): propagate=true — user-initiated resume, wake parent-paused subs too.
+        if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
         // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
         if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
         hideSpinner(currentChatId);
@@ -268,7 +332,8 @@ async function sendMessage() {
     // (setChatPausedPersistent also clears the persisted pausedByUser flag.)
     if (currentChatId && pausedChats) setChatPausedPersistent(currentChatId, false);
     // SWM14-T1: a bare flag clear doesn't bump _pauseToggleGen, so a pause(true) retry chain armed during a prior port-down window is still 'current' and re-posts true after this send lands, re-pausing/dropping the run. Supersede it.
-    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+    // PR-PAUSE (B2): propagate=true — user-initiated resume, wake parent-paused subs too.
+    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
     // SWM14-T3: symmetrically supersede any armed interrupt(false) retry chain so it can't abort the freshly-sent stream + delete the just-queued pendingInjection on reconnect.
     if (currentChatId && typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(currentChatId);
     // FLUX-QW6: sync the button label off the (now-cleared) per-chat state —
@@ -342,7 +407,8 @@ async function sendWidgetMessage(message) {
     // the button claimed the chat was running.
     paused = false;
     if (currentChatId) setChatPausedPersistent(currentChatId, false);
-    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false);
+    // PR-PAUSE (B2): propagate=true — user-initiated resume, wake parent-paused subs too.
+    if (currentChatId && typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
     syncPauseButtonUI(currentChatId);
     
     // Run main agent

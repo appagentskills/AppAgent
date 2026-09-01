@@ -515,6 +515,14 @@ async function loadAllSubAgents() {
 // by design) so the resume scan restarts the loop LEGITIMATELY:
 // _rehydrateSpawnHandle then re-arms the parent's spawn handle as PENDING
 // and the sub's eventual report settles it through the normal push paths.
+// PAUSED-BY-PARENT (B1): a sub the user paused THROUGH its parent's Pause
+// button (pauseDescendantsOfChat stamped rec.paused_by_parent_chat) has a
+// 'paused' checkpoint and a persisted pausedByUser flag — it is neither live
+// nor orphaned. Leave it paused: rebuild the in-memory _pausedByParentChat
+// entry (the map itself does not survive the restart), keep the record
+// 'running' so _rehydrateSpawnHandle re-arms the parent's handle as PENDING,
+// and claim NO pool slot — the parent's eventual Resume re-queues it through
+// resumeDescendantsOfChat exactly like a live-session resume.
 // Only when no live checkpoint exists (sub was still QUEUED — never started,
 // so runStarted never wrote one — or the checkpoint was already reaped) do we
 // fall back to the orphan-error.
@@ -542,6 +550,17 @@ function _resumeOrOrphanSubAtBoot(rec) {
         // either. A slot already claimed (e.g. a wake started the loop) means
         // the new owner manages it — stand down in both branches.
         if (rec.state !== 'running' || _subPool.running[rec.agent_id]) return;
+        if (rec.paused_by_parent_chat && rec.chat_id) {
+            if (!_pausedByParentChat[rec.chat_id]) {
+                _pausedByParentChat[rec.chat_id] = { parentChatId: rec.paused_by_parent_chat, resumePending: false };
+            }
+            // The sub's own pausedByUser flag was persisted by
+            // pauseDescendantsOfChat (chat-meta lane), so the boot resume scan
+            // (resumeRunningCheckpoints) sees a paused chat and leaves the loop
+            // alone. Deliberately NO lane write here: loadAll runs concurrently
+            // with loadChatsFromStorage and the chats map may not be hydrated.
+            return;
+        }
         var resumable = !!(cp && (cp.status === 'running' || cp.status === 'parked'));
         if (resumable) {
             // Orchestrator §5: stamp the connection-group key (not `true`) so
@@ -1876,6 +1895,170 @@ function _children(agentId) {
         if (_subAgents[aid].parent_agent_id === agentId) out.push(aid);
     }
     return out;
+}
+
+// PR-PAUSE (R1/R4): user-pause propagation across a chat's sub-agent subtree.
+// A user pausing a PARENT chat expects the whole live subtree to stand down —
+// nothing walked the registry on pause before, so subs kept streaming, kept
+// burning tokens and kept reporting into a paused parent. Keyed by the SUB's
+// chat_id so resume can find exactly the subs THIS parent paused (a sub that
+// was already parked/sleeping is never touched: its pausedChats flag is the
+// park signal and clearing it on resume would restart a sub the model
+// deliberately put to sleep).
+// Entry shape: { parentChatId, resumePending }. `resumePending` is set by
+// resumeDescendantsOfChat when the sub's OLD loop is still unwinding from the
+// pause abort (_subPool.running still holds it): the entry must stay visible to
+// onSubAgentRunFinished's guard so the paused-exit is not mistaken for a
+// natural finish; the guard then re-queues the sub and clears the entry.
+// PERSISTENCE: this map is in-memory, but the relation is ALSO stamped on the
+// sub's registry record as rec.paused_by_parent_chat (persisted with the record
+// in the sub_agents IDB store) so a SW restart while paused can rebuild the
+// entry in _resumeOrOrphanSubAtBoot instead of orphan-erroring the sub.
+var _pausedByParentChat = Object.create(null); // sub chat_id -> { parentChatId, resumePending }
+
+// Registry record for a sub chat id (linear scan — same as SubAgents.getByChatId).
+// Used instead of chats[subChatId].subAgentId so an evicted / not-yet-hydrated
+// chat row cannot strand the sub.
+function _subRecByChatId(subChatId) {
+    if (!subChatId) return null;
+    for (var aid in _subAgents) {
+        if (_subAgents[aid].chat_id === subChatId) return _subAgents[aid];
+    }
+    return null;
+}
+
+// Every sub-agent record whose chat descends from `parentChatId` (DFS).
+// Depth-1 subs are matched on rec.parent_chat_id; deeper levels via _children.
+function _descendantsOfChat(parentChatId) {
+    var out = [];
+    if (!parentChatId) return out;
+    var stack = [];
+    for (var aid in _subAgents) {
+        if (_subAgents[aid].parent_chat_id === parentChatId) stack.push(aid);
+    }
+    var seen = Object.create(null);
+    while (stack.length) {
+        var cur = stack.pop();
+        if (seen[cur]) continue;
+        seen[cur] = true;
+        out.push(cur);
+        var kids = _children(cur);
+        for (var i = 0; i < kids.length; i++) stack.push(kids[i]);
+    }
+    return out;
+}
+
+// Pause every RUNNING descendant of `parentChatId`. Returns the sub chat ids
+// actually paused. Unlike the lifecycle halts elsewhere in this file, this one
+// DOES route through setChatPausedPersistent (core/030-config.js): it is a USER
+// pause propagated down, so the subs must render as amber Paused rows on every
+// panel (the chat-meta lane rebroadcasts 'chat-meta-changed') and must survive
+// a reload exactly like the parent's own pause.
+function pauseDescendantsOfChat(parentChatId) {
+    var paused = [];
+    var aids = _descendantsOfChat(parentChatId);
+    for (var i = 0; i < aids.length; i++) {
+        var rec = _subAgents[aids[i]];
+        // Only live subs. sleeping/stopped/errored subs own their own
+        // pausedChats flag (park signal) — never co-opt it.
+        if (!rec || rec.state !== 'running' || !rec.chat_id) continue;
+        if (_pausedByParentChat[rec.chat_id]) continue;
+        // A sub the user paused DIRECTLY (its own Pause button) is not ours to
+        // resume either: recording it here would make the parent's Resume
+        // restart a sub the user explicitly halted. Leave it alone.
+        if (typeof isChatPaused === 'function' ? isChatPaused(rec.chat_id)
+            : (typeof pausedChats !== 'undefined' && pausedChats[rec.chat_id] === true)) continue;
+        _pausedByParentChat[rec.chat_id] = { parentChatId: parentChatId, resumePending: false };
+        rec.paused_by_parent_chat = parentChatId; // persisted below via _subAgentsPersist (B1: survives SW restart)
+        if (typeof setChatPausedPersistent === 'function') setChatPausedPersistent(rec.chat_id, true);
+        else if (typeof pausedChats !== 'undefined') pausedChats[rec.chat_id] = true;
+        // Same immediate-abort trio the SW toggle-pause handler applies to the
+        // parent (worker/130-port-bridge.js) — without these the sub only
+        // notices at its next loop boundary, i.e. after a whole streaming turn.
+        if (typeof providerChangeBackoffResolversByChatId !== 'undefined' && providerChangeBackoffResolversByChatId[rec.chat_id]) {
+            try { providerChangeBackoffResolversByChatId[rec.chat_id](); } catch (e) {}
+            delete providerChangeBackoffResolversByChatId[rec.chat_id];
+        }
+        if (typeof interruptResolversByChatId !== 'undefined' && interruptResolversByChatId[rec.chat_id]) {
+            try { interruptResolversByChatId[rec.chat_id](); } catch (e) {}
+        }
+        if (typeof currentStreamAbortControllers !== 'undefined' && currentStreamAbortControllers[rec.chat_id]) {
+            try { currentStreamAbortControllers[rec.chat_id].abort(); } catch (e) {}
+        }
+        rec.last_activity_at = Date.now();
+        _subAgentsPersist(rec);
+        paused.push(rec.chat_id);
+    }
+    if (paused.length) _notifyListeners();
+    return paused;
+}
+
+// Resume every sub this parent chat paused, and re-enter each sub's run
+// through the SAME pool entry a wake uses (_subPool.queue + _drainPool →
+// runAgent(sub.chat_id)), so the sub resumes with its own pending tool
+// results / replay list intact and every stream event stays keyed to the
+// sub's own chatId. Returns the resumed sub chat ids.
+// Only subs recorded in _pausedByParentChat for THIS parent are touched — a sub
+// the user paused directly is never in the map (see pauseDescendantsOfChat).
+function resumeDescendantsOfChat(parentChatId) {
+    var resumed = [];
+    if (!parentChatId) return resumed;
+    for (var subChatId in _pausedByParentChat) {
+        var entry = _pausedByParentChat[subChatId];
+        if (!entry || entry.parentChatId !== parentChatId) continue;
+        // Registry lookup by chat id (not chats[subChatId].subAgentId): the SW's
+        // chat row may be payload-evicted while the record is intact.
+        var rec = _subRecByChatId(subChatId);
+        var _clearPause = function() {
+            if (typeof setChatPausedPersistent === 'function') setChatPausedPersistent(subChatId, false);
+            else if (typeof pausedChats !== 'undefined') delete pausedChats[subChatId];
+        };
+        // Record gone (GC'd — the record itself survives an SW restart, see
+        // _resumeOrOrphanSubAtBoot): clear the pause flag so the chat is no
+        // longer stuck, but there is no pool entry to re-queue.
+        if (!rec) { _clearPause(); delete _pausedByParentChat[subChatId]; continue; }
+        // A sub that went terminal or PARKED itself while parent-paused (e.g.
+        // report_to_parent landed right as the parent paused: the spawn handle
+        // settled, so onSubAgentRunFinished's !_spawnDeferreds early-return
+        // left this entry behind) keeps its own state AND its own pausedChats
+        // flag — for a sleeping sub that flag is the park signal the boot
+        // resume scan relies on; clearing it would let a later SW restart
+        // re-arm the parked loop as a zombie. Only a still-'running' sub is
+        // un-paused (below) and re-entered.
+        if (rec.state !== 'running') {
+            delete _pausedByParentChat[subChatId];
+            delete rec.paused_by_parent_chat;
+            _subAgentsPersist(rec);
+            continue;
+        }
+        _clearPause();
+        // B3 (quick Pause→Resume race): the sub's OLD loop is still unwinding
+        // from the pause abort — it still owns the pool slot and will reach
+        // onSubAgentRunFinished shortly. Deleting the map entry now would let
+        // that finish look natural and auto_report a bogus 'done'. Keep the
+        // entry, flag it resumePending: the guard in onSubAgentRunFinished
+        // releases the slot, re-queues the sub and clears the entry there.
+        // (If the resume landed BEFORE the loop's pause gate, the old loop
+        // simply carries on — the guard clears the entry on its natural
+        // finish using finishCtx.paused === false.)
+        if (rec.state === 'running' && _subPool.running[rec.agent_id]) {
+            entry.resumePending = true;
+            rec.last_activity_at = Date.now();
+            _subAgentsPersist(rec);
+            resumed.push(rec.chat_id);
+            continue;
+        }
+        delete _pausedByParentChat[subChatId];
+        delete rec.paused_by_parent_chat;
+        rec.last_activity_at = Date.now();
+        _subAgentsPersist(rec);
+        if (_subPool.queue.indexOf(rec.agent_id) === -1) {
+            _subPool.queue.push(rec.agent_id);
+        }
+        resumed.push(rec.chat_id);
+    }
+    if (resumed.length) { _drainPool(); _notifyListeners(); }
+    return resumed;
 }
 
 // All descendants of `agentId` (DFS, deepest first — useful for cascade-stop
@@ -4901,6 +5084,51 @@ function onSubAgentRunFinished(chatId, finishCtx) {
         return;
     }
 
+    // PR-PAUSE (R1): the run ended because the USER paused the parent chat and
+    // pauseDescendantsOfChat propagated it here — that is not a natural finish.
+    // Without this guard the auto_report tail below would synthesize a bogus
+    // 'done' and settle the parent's spawn handle while the sub still has work
+    // left. Stand down quietly; resumeDescendantsOfChat re-queues the sub.
+    // finishCtx.paused (app/030-agent-loop.js, sampled right at the while-gate
+    // exit) tells a paused-exit apart from a natural finish that merely
+    // coincided with the parent's pause.
+    var _ppEntry = _pausedByParentChat[chatId];
+    if (_ppEntry) {
+        var _pausedExit = !!(finishCtx && finishCtx.paused);
+        if (_ppEntry.resumePending) {
+            // B3: the parent already resumed while this (old) loop was still
+            // unwinding. Clear the relation; if this really was the pause-exit,
+            // re-enter the sub through the pool now. Otherwise the resume
+            // landed before the pause gate, the old loop carried on and this
+            // is its natural finish — fall through to the normal tail.
+            delete _pausedByParentChat[chatId];
+            delete rec.paused_by_parent_chat;
+            if (_pausedExit) {
+                rec.last_activity_at = Date.now();
+                _subAgentsPersist(rec);
+                _releasePoolSlot(rec.agent_id);
+                if (rec.state === 'running' && _subPool.queue.indexOf(rec.agent_id) === -1) {
+                    _subPool.queue.push(rec.agent_id);
+                }
+                _drainPool();
+                _notifyListeners();
+                return;
+            }
+        } else if (_pausedExit || !finishCtx) {
+            rec.last_activity_at = Date.now();
+            _subAgentsPersist(rec);
+            _releasePoolSlot(rec.agent_id);
+            _notifyListeners();
+            return;
+        } else {
+            // Natural finish (completed/errored) that coincided with the
+            // parent's pause: the sub has no work left, so let it report
+            // normally instead of holding the parent's handle until resume.
+            delete _pausedByParentChat[chatId];
+            delete rec.paused_by_parent_chat;
+        }
+    }
+
     if (rec.state === 'sleeping') {
         _subAgentsPersist(rec);
         _releasePoolSlot(rec.agent_id);
@@ -5128,6 +5356,10 @@ var SubAgents = {
     // message in a sub-agent chat; see recordSubAssistantMessage).
     recordAssistantMessage: recordSubAssistantMessage,
     onSubAgentRunFinished: onSubAgentRunFinished,
+    // PR-PAUSE (R1/R4): parent-pause propagation, called by the SW
+    // toggle-pause handler (worker/130-port-bridge.js).
+    pauseDescendantsOfChat: pauseDescendantsOfChat,
+    resumeDescendantsOfChat: resumeDescendantsOfChat,
     // RES-6: unsolicited-event hooks — called by the SW port bridge when the
     // user sends a message into a sub's chat (worker/130-port-bridge.js) and
     // by the SW approval stub around a sub's permission prompts

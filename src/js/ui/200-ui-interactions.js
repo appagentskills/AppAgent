@@ -166,5 +166,8 @@ function copyCodeBlock(btn, event) {
     
     navigator.clipboard.writeText(text).then(function() {
         showSnackbar('Copied to clipboard', 'success');
+    }).catch(function() {
+        // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
+        showSnackbar('Copy failed', 'error');
     });
 }
