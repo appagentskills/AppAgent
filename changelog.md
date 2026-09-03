@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.27
+
+### Features
+- Thinking settings now reach every provider correctly: legacy Claude models get a real thinking budget, adaptive-only Claude models show their default thinking, a budget of 0 turns thinking off, and ChatGPT shows a hint when its effort is clamped.
+
+### Fixes
+- Reasoning is now preserved across turns for all models, including ChatGPT reasoning items, so the Claude Fable 5.1 thinking chain no longer breaks at turn boundaries and prompt caching keeps working.
+- The selected model is always the one that runs: the background worker no longer falls back to a stale provider, and the default large sub-agent tier is no longer silently pinned to Fable 5.
+- The workspace pill no longer flashes a "refreshing" spinner every time you switch back to the extension page.
+
+---
+
 ## v1.1.26
 
 ### Features

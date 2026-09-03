@@ -678,7 +678,7 @@ function _handlePanelMessage(port, msg) {
                         }
                     } catch (e) { console.error('[port-bridge] flap-recovery injection failed', msg.chatId, e); }
                 }
-                if (msg.currentProvider) currentProvider = msg.currentProvider;
+                _swAdoptProvider(msg.currentProvider);
                 // SWM1F-1: a run-agent means the user intends this chat to run
                 // now, so clear any stale SW-side pause flag. Post-SW-move the
                 // loop's `while (!isChatPaused)` gate reads the SW's pausedChats
@@ -765,7 +765,11 @@ function _handlePanelMessage(port, msg) {
             // Foreground-only control transition. Update the worker selection first,
             // then abort the named active run/backoff/tool without setting
             // userInterruptedChats. Pinned sub-agents still resolve chat.provider.
-            if (msg.providerId) currentProvider = msg.providerId;
+            // chatId is OPTIONAL: changeProvider (ui/160-notifications.js) now
+            // posts on EVERY switch — with no chatId this is a pure adopt (safe
+            // with no run active); the abort block below only fires for a
+            // named, currently-running chat.
+            _swAdoptProvider(msg.providerId);
             var pcid = msg.chatId;
             if (pcid && runningChatIds[pcid]) {
                 providerChangedChats[pcid] = msg.providerId || true;
@@ -802,6 +806,13 @@ function _handlePanelMessage(port, msg) {
             // queued message only flushes at the end of the run. The SWM14-T7 wipe risk only
             // applies to the IDLE branch (which writes chats + IDB); during the cold-boot
             // window runningChatIds is empty, so this fast path can never take that branch.
+            // STALE-PROVIDER: adopt the panel's current model FIRST (same as
+            // run-agent). The page's changeProvider only wrote localStorage,
+            // which the SW cannot read — a model switched while idle stayed
+            // stale here and the next send-message-started run used the old
+            // one. Synchronous so the running fast path below also benefits
+            // (the next LLM step of an un-pinned chat reads currentProvider).
+            _swAdoptProvider(msg.currentProvider);
             if (msg.chatId && runningChatIds[msg.chatId]) {
                 try { _handlePanelSendMessage(msg); }
                 catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
@@ -810,6 +821,11 @@ function _handlePanelMessage(port, msg) {
             (self._swBootReady || Promise.resolve())
                 .then(function() { return Platform.ready; })
                 .then(function() { return loadApiProviders(); })
+                // Same tier-alias refresh as the run-agent gate: this lane also
+                // starts runs, and spawn_sub_agent({tier}) inside them must see
+                // the user's latest small|medium|large mapping (not the
+                // DEFAULT_TIER_ALIASES fallback of an unhydrated SW).
+                .then(function() { return (typeof loadTierAliases === 'function') ? loadTierAliases() : null; })
                 .then(function() {
                     try { _handlePanelSendMessage(msg); }
                     catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
@@ -1501,6 +1517,11 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'panel-hello':
+            // Adopt the panel's current model BEFORE the in-flight adoption
+            // below opens _swResumeGate — resumeRunningCheckpoints waits on
+            // that gate, so a resumed un-pinned chat then runs on the user's
+            // selection instead of this SW's default/stale currentProvider.
+            _swAdoptProvider(msg.currentProvider);
             // Panel declares which tool executions it's still running AND
             // which it finished but whose result may not have been
             // persisted (in case the previous SW died right after the
@@ -1735,6 +1756,41 @@ function _extractUnseenTrailingUserInput(inChat, swChat, pendInj) {
 //     loop would push a duplicate.
 //   • Idle chat — push the user message + attachments now, save to IDB,
 //     and start a fresh run.
+// ─── SW currentProvider adoption ─────────────────────────────────────
+// THE single write path for the SW's global `currentProvider` from panel
+// messages (run-agent, send-message, provider-change, panel-hello). The SW
+// cannot read the page's localStorage 'appagent_provider', so the panel
+// carries the name on every lane that can start/steer a run. Also persists
+// the adopted name (IDB settings, SW_PROVIDER_SETTING_KEY) so a panel-less
+// checkpoint resume (_swHydrateProviderFallback) can recover the user's
+// last selection instead of running on the bundle default.
+var SW_PROVIDER_SETTING_KEY = 'swCurrentProvider';
+var _swProviderAdopted = false;
+function _swAdoptProvider(name) {
+    if (!name || typeof name !== 'string') return;
+    // Persist on the FIRST adoption of this SW lifetime even when the name
+    // equals the bundle default (030-config.js seeds 'Opus 5'): otherwise a
+    // user whose selection IS the default would never refresh the stored
+    // fallback and a panel-less resume could revive an older selection.
+    var _first = !_swProviderAdopted;
+    _swProviderAdopted = true;
+    if (!_first && name === currentProvider) return;
+    currentProvider = name;
+    if (typeof setSetting === 'function') {
+        try { Promise.resolve(setSetting(SW_PROVIDER_SETTING_KEY, name)).catch(function() {}); }
+        catch (e) { /* best-effort */ }
+    }
+}
+// Resume-gate fallback: only when NO panel has told this SW instance which
+// provider to use. Panel-carried values always win (they set _swProviderAdopted).
+async function _swHydrateProviderFallback() {
+    if (_swProviderAdopted || typeof getSetting !== 'function') return;
+    try {
+        var stored = await getSetting(SW_PROVIDER_SETTING_KEY, null);
+        if (stored && typeof stored === 'string' && !_swProviderAdopted) currentProvider = stored;
+    } catch (e) { /* keep the bundle default */ }
+}
+
 async function _handlePanelSendMessage(msg) {
     var chatId = msg.chatId;
     if (!chatId) return;
@@ -1887,6 +1943,13 @@ function resumeRunningCheckpoints(checkpoints) {
         .then(function() { return self._swResumeGate || Promise.resolve(); })
         .then(function() { return Platform.ready; })
         .then(function() { return loadApiProviders(); })
+        // Same tier-alias refresh as the run-agent / send-message gates, so
+        // spawns inside a resumed run resolve against the user's mapping.
+        .then(function() { return (typeof loadTierAliases === 'function') ? loadTierAliases() : null; })
+        // No panel told us the current model yet (alarm-driven resume with
+        // no panel open — the 1.5s fallback opened _swResumeGate): fall back
+        // to the last provider this SW adopted, persisted by _swAdoptProvider.
+        .then(function() { return _swHydrateProviderFallback(); })
         // MEMFIX: the SW loader evicts inline base64 payloads from every chat
         // (worker/115-storage.js). Rehydrate each checkpoint's chat BEFORE
         // runAgent so the resumed loop can inline vision blocks and its saves

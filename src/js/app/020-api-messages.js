@@ -42,15 +42,36 @@ function buildAPIMessages(chatMessages, chatId) {
             var msg = { role: 'assistant' };
             if (m.content) msg.content = m.content;
             if (m.tool_calls) msg.tool_calls = m.tool_calls;
-            // Only include reasoning_details when the NEXT message is a tool result (tool-use loop).
-            // The API requires thinking blocks to be sent back unchanged during tool-use continuations,
-            // but they're automatically stripped on normal user turns — sending old thinking wastes tokens.
-            if (m.reasoning_details && m.reasoning_details.length > 0) {
-                var myIdx = cloned.indexOf(m);
-                var nextMsg = myIdx >= 0 && myIdx < cloned.length - 1 ? cloned[myIdx + 1] : null;
-                if (nextMsg && nextMsg.role === 'tool') {
-                    msg.reasoning_details = m.reasoning_details;
-                }
+            // reasoning_details replay policy — ONE regime for every model /
+            // provider: every COMPLETED assistant turn replays its stored
+            // reasoning_details (thinking blocks, encrypted reasoning items) on
+            // every request. Per-provider transforms decide what to do with them:
+            //   • Anthropic (transformMessageToAnthropic, background.js): thinking
+            //     blocks with a signature → `thinking` blocks. Fable 5.1+ REQUIRES
+            //     every prior block (chained; dropping one mid-history invalidates
+            //     every block after it — with block_binding drop_block the API
+            //     then silently drops them and reports input_transformations).
+            //     Older Claude models: the API ignores previous-turn thinking
+            //     ("Keep sending the full history and let the API decide on each
+            //     request ... no error, not billed" — preserved-thinking docs),
+            //     so replaying is free and keeps the history model-portable.
+            //   • ChatGPT / Codex Responses (transformToResponses, background.js):
+            //     `reasoning.encrypted` items (format openai-responses-v1) →
+            //     `{type:'reasoning', id, summary, encrypted_content}` items
+            //     ("pass back all reasoning items, function call items, and
+            //     function call output items" — OpenAI reasoning guide).
+            //   • OpenRouter (raw chat-completions passthrough): documented
+            //     multi-turn shape ("To preserve reasoning context across multiple
+            //     turns ... message.reasoning_details (array): Pass the full
+            //     reasoning_details block").
+            // Only leading blocks may be trimmed, which is what context trimming
+            // of the OLDEST messages does. A thinking-ONLY row (aborted/interrupted
+            // stream that never produced text or a tool call) is NOT replayed —
+            // it was never a completed turn, and a thinking-only assistant
+            // message (especially as the LAST message) is not a valid request
+            // shape; the empty-message filter below then drops the row.
+            if (m.reasoning_details && m.reasoning_details.length > 0 && (msg.content || msg.tool_calls)) {
+                msg.reasoning_details = m.reasoning_details;
             }
             // Skip empty assistant messages (streaming placeholders) - they have no content,
             // no tool_calls, and no reasoning. Sending them causes hangs with image+tool combos.

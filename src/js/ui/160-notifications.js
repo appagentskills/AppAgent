@@ -500,17 +500,28 @@ function changeProvider(providerId) {
         var previousProviderObj = getProviderById(currentProvider);
         if (typeof invalidateCreditsRequests === 'function') invalidateCreditsRequests();
         currentProvider = providerId;
-        // Provider selection is also a run-state transition for the active
-        // foreground chat. Tell the worker before the next dispatch so it can
-        // abort the issued ChatGPT request/backoff without marking a user send.
+        // ALWAYS tell the authoritative worker about the new global selection.
+        // The SW keeps its own `currentProvider` copy (worker/000-runtime-
+        // globals.js) and cannot read localStorage; before this it only
+        // learned the provider from run-agent posts, so a switch made while
+        // idle (or between send-message-driven runs) left the SW resolving
+        // every un-pinned chat against the PREVIOUS model until the next
+        // run-agent. The SW 'provider-change' handler (worker/130-port-
+        // bridge.js) just sets currentProvider when no chatId is given.
+        //
+        // Abort semantics are unchanged and stay gated: only when the
+        // PREVIOUS provider was ChatGPT-OAuth and the foreground main chat is
+        // running do we also name that chat, so the worker aborts the issued
+        // ChatGPT request/backoff without marking a user send.
         var foregroundChatId = (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
             ? activeStreamingChatId : ((typeof currentChatId !== 'undefined') ? currentChatId : null);
         var foregroundChat = (foregroundChatId && typeof chats !== 'undefined') ? chats[foregroundChatId] : null;
-        if (previousProviderObj && previousProviderObj.isChatGPTOAuth
+        var abortChatId = (previousProviderObj && previousProviderObj.isChatGPTOAuth
             && foregroundChatId && (!foregroundChat || !foregroundChat.isSubAgent)
-            && typeof runningChatIds !== 'undefined' && runningChatIds[foregroundChatId]
-            && typeof pushProviderChangeToOffscreen === 'function') {
-            pushProviderChangeToOffscreen(providerId, foregroundChatId);
+            && typeof runningChatIds !== 'undefined' && runningChatIds[foregroundChatId])
+            ? foregroundChatId : null;
+        if (typeof pushProviderChangeToOffscreen === 'function') {
+            pushProviderChangeToOffscreen(providerId, abortChatId);
         }
         saveProviderToStorage();
         updateModelDisplay();
@@ -742,8 +753,12 @@ function _effortSliderLabelHtml(idx) {
     var e = _EFFORT_LEVELS[idx] || _EFFORT_LEVELS[2];
     var provider = getProviderById(currentProvider);
     var isDef = e.v === _providerDefaultEffort(provider);
+    // ChatGPT OAuth: transformToResponses (background.js) clamps xhigh/max to
+    // 'high' (the Responses API rejects them) — say so instead of silently lying.
+    var clampedOnChatGPT = !!(provider && provider.isChatGPTOAuth && (e.v === 'xhigh' || e.v === 'max'));
     return '<span class="model-menu-effort-name">' + e.label + '</span>' +
-        (isDef ? '<span class="model-row-badge">default</span>' : '');
+        (isDef ? '<span class="model-row-badge">default</span>' : '') +
+        (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
 }
 
 // Live refresh while dragging (does not persist): label text, level circles

@@ -190,7 +190,10 @@ function renderSettingsPage() {
             '<div id="custom-api-providers-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.api + ' Sub-Agent Model Tiers</div>' +
+            '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
+                '<span>' + UI_ICONS.api + ' Sub-Agent Model Tiers</span>' +
+                '<button class="skills-action-btn" onclick="resetTierAliases()" title="Clear your tier overrides and go back to the built-in defaults" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">Reset to defaults</button>' +
+            '</div>' +
             '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Map the abstract <code>small</code> / <code>medium</code> / <code>large</code> tiers to providers above, or pick <code>Same</code> to make a tier dynamically follow the spawning agent&#39;s current model. The agent uses these when spawning sub-agents with <code>tier</code> (e.g. small for cheap search fan-outs, large for heavy implementation work).</div>' +
             '<div id="tier-aliases-list"></div>' +
         '</div>' +
@@ -279,7 +282,7 @@ function renderSettingsPage() {
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). Default: 32000</div></div>' +
+                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). 0 = thinking off (not for Fable 5.1+; a model with an Effort set still thinks). Default: 32000</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.min + '" max="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.max + '" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
@@ -353,8 +356,10 @@ var SETTINGS_NUMBER_LIMITS = {
     // highest per-request output cap of any supported model (~128k).
     maxTokens:      { min: 1,    max: 200000 },
     // Reasoning budget -- same ceiling as maxTokens (a reasoning budget above
-    // the output cap is meaningless).
-    thinkingBudget: { min: 1,    max: 200000 }
+    // the output cap is meaningless). Floor is 0, NOT 1: 0 is the explicit
+    // "thinking off" value (getGlobalThinkingBudget in core/030-config.js
+    // returns it as-is; the request builder sends reasoning:{enabled:false}).
+    thinkingBudget: { min: 0,    max: 200000 }
 };
 
 // parseInt + finite check + clamp. Non-numeric / empty -> fallback default.
@@ -366,7 +371,8 @@ var SETTINGS_NUMBER_LIMITS = {
 // subsequent request send `max_tokens: 1` (an empty completion). A negative is
 // not a mistyped magnitude the user meant to cap -- it is nonsense input, and
 // nonsense input already has a defined behaviour here: the default.
-// 0 is NOT negative and keeps clamping to bounds.min (unchanged behaviour).
+// 0 is NOT negative and keeps clamping to bounds.min (unchanged behaviour) --
+// for thinkingBudget bounds.min is 0, so 0 passes through as "thinking off".
 // The Object.is check catches -0: parseInt('-0.5', 10) is -0, which is not < 0,
 // so a small negative fraction would otherwise still clamp to bounds.min.
 function _clampSettingNumber(value, bounds, fallback) {
@@ -436,9 +442,14 @@ function renderTierAliasSettings() {
             if (!found && current) {
                 options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + ' (missing)</option>' + options;
             }
+            // Show the built-in default explicitly so the user can tell an
+            // override apart from the fallback (DEFAULT_TIER_ALIASES,
+            // core/030-config.js; `large` defaults to Same).
+            var _def = (typeof DEFAULT_TIER_ALIASES !== 'undefined') ? DEFAULT_TIER_ALIASES[tier] : '';
+            var _defLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && _def === TIER_ALIAS_SAME) ? 'Same' : (_def || '');
             html += '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label" style="text-transform:capitalize;">' + tier + '</div>' +
-                '<div class="settings-page-row-hint">' + (TIER_ALIAS_HINTS[tier] || '') + '</div></div>' +
+                '<div class="settings-page-row-hint">' + (TIER_ALIAS_HINTS[tier] || '') + (_defLabel ? ' · default: ' + escapeHtml(_defLabel) : '') + '</div></div>' +
                 '<select onchange="setTierAlias(\'' + tier + '\', this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
                     options +
                 '</select>' +
@@ -457,6 +468,20 @@ function setTierAlias(tier, providerName) {
     var map = getTierAliasMap();
     map[tier] = providerName;
     saveTierAliases(map);
+}
+// "Reset to defaults" (section header button). Writes an EMPTY override map
+// through saveTierAliases (core/030-config.js) — getTierAliasMap then fills
+// every tier from DEFAULT_TIER_ALIASES, in the page AND in the SW (its gates
+// re-run loadTierAliases, which reads the same IDB key). Then repaints.
+async function resetTierAliases() {
+    try {
+        await saveTierAliases({});
+    } catch (e) {
+        if (typeof showSnackbar === 'function') showSnackbar('Could not reset sub-agent tiers: ' + (e && e.message), 'error');
+        return;
+    }
+    renderTierAliasSettings();
+    if (typeof showSnackbar === 'function') showSnackbar('Sub-agent tiers reset to defaults', 'info');
 }
 
 // GitHub settings UI
@@ -892,9 +917,10 @@ async function recloneGitHubRepo(repo, branch) {
 }
 
 async function deleteGitHubRepo(repo) {
-    // Remove the workspace from every in-memory surface immediately. Persistence
-    // is verified below; on failure the canonical IDB-backed renders restore it.
-    delete _wsHeaderCaches[repo];
+    // Remove the workspace from every in-memory surface immediately. Keep a
+    // short-lived tombstone until persistence confirms (or rolls back) deletion.
+    _wsPendingCacheDeletes[repo] = true;
+    _deleteWsTerminalCache(null, repo);
     if (_wsDropdown) {
         var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(repo) + '"]');
         if (section) section.remove();
@@ -919,6 +945,10 @@ async function deleteGitHubRepo(repo) {
         var remainingMeta = await getWorkspaceMeta(repo);
         var remainingFiles = await getAllWorkspaceFiles(repo);
         if (remainingMeta || remainingFiles.length > 0) throw new Error('Local workspace data could not be fully removed');
+        // Re-stamp the confirmed deletion so scans that began while persistence
+        // was pending retain the tombstone after the pending guard is released.
+        _deleteWsTerminalCache(null, repo);
+        delete _wsPendingCacheDeletes[repo];
         try { gcWorkspaceBlobs(); } catch (e) {}
         try { AgentEvents.emit('workspaceMutated', { action: 'delete_local_workspace', repo: repo }); } catch (e2) {}
         await updateWorkspaceHeaderStatus();
@@ -926,6 +956,7 @@ async function deleteGitHubRepo(repo) {
         return { success: true };
     } catch (e) {
         // Restore every surface from persistence when cleanup did not complete.
+        delete _wsPendingCacheDeletes[repo];
         await updateWorkspaceHeaderStatus();
         _reconcileDropdownSections();
         renderGitHubReposList();
@@ -938,6 +969,9 @@ async function deleteGitHubRepo(repo) {
 // ============================================
 var _wsDropdown = null;
 var _wsHeaderCaches = {}; // map of wk -> { wk, meta, dirtyCount, dirtyFiles, syncStatus, behindFiles, conflictFiles }
+var _wsHeaderTerminalRevision = 0;
+var _wsActiveLocalScans = []; // scan-scoped revision/tombstone guards; emptied when each local scan settles
+var _wsPendingCacheDeletes = {}; // explicit deletes remain tombstoned until persistence confirms or rolls back
 // True only in extension-dev mode (the extension_build skill tool is loaded AND a deploy
 // folder is connected) — the same gate the Reload button uses. Resolved (async) when the
 // dropdown opens and then read synchronously by _renderDropdownSection to decide whether
@@ -974,9 +1008,11 @@ async function getAllWorkspaceSummaries() {
 function _resetBaseCacheAfterAutoDelete(syncResult) {
     var bw = syncResult && syncResult.base_workspace;
     if (!bw || !syncResult.base_synced || !_wsHeaderCaches[bw]) return;
-    _wsHeaderCaches[bw].syncStatus = 'up-to-date';
-    _wsHeaderCaches[bw].behindFiles = [];
-    _wsHeaderCaches[bw].conflictFiles = [];
+    _commitWsTerminalCache(bw, function() {
+        _wsHeaderCaches[bw].syncStatus = 'up-to-date';
+        _wsHeaderCaches[bw].behindFiles = [];
+        _wsHeaderCaches[bw].conflictFiles = [];
+    });
 }
 
 // Render header badge text from caches
@@ -1025,12 +1061,65 @@ function _renderWsHeaderBadge() {
     });
 }
 
-// Quick local-only header update (no remote sync, fire-and-forget safe)
-async function updateWorkspaceHeaderStatus() {
+function _beginWsLocalScan() {
+    var scan = { revision: _wsHeaderTerminalRevision, changed: {} };
+    _wsActiveLocalScans.push(scan);
+    return scan;
+}
+
+function _endWsLocalScan(scan) {
+    var idx = _wsActiveLocalScans.indexOf(scan);
+    if (idx !== -1) _wsActiveLocalScans.splice(idx, 1);
+}
+
+function _commitWsTerminalCache(wk, mutation) {
+    mutation();
+    var revision = ++_wsHeaderTerminalRevision;
+    _wsActiveLocalScans.forEach(function(scan) { scan.changed[wk] = revision; });
+}
+
+function _deleteWsTerminalCache(session, wk) {
+    _commitWsTerminalCache(wk, function() { delete _wsHeaderCaches[wk]; });
+    if (session) session.deleted[wk] = true;
+}
+
+function _applyWsLocalSummaries(summaries, scan, session) {
+    var nextCaches = {};
+    summaries.forEach(function(s) {
+        if (_wsPendingCacheDeletes[s.wk] || (session && session.deleted[s.wk])) return;
+        if (scan.changed[s.wk] > scan.revision) {
+            // A terminal write won this race. Preserve its cache value, or preserve
+            // its deletion as a tombstone when no cache entry remains.
+            if (_wsHeaderCaches[s.wk]) nextCaches[s.wk] = _wsHeaderCaches[s.wk];
+            return;
+        }
+        nextCaches[s.wk] = s;
+    });
+    // A terminal write may create/update a key omitted by the scan's old meta list.
+    Object.keys(scan.changed).forEach(function(wk) {
+        if (!_wsPendingCacheDeletes[wk] && !(session && session.deleted[wk]) && _wsHeaderCaches[wk]) {
+            nextCaches[wk] = _wsHeaderCaches[wk];
+        }
+    });
+    _wsHeaderCaches = nextCaches;
+}
+
+async function _refreshWsLocalCaches(session) {
+    var scan = _beginWsLocalScan();
     try {
         var summaries = await getAllWorkspaceSummaries();
-        _wsHeaderCaches = {};
-        summaries.forEach(function(s) { _wsHeaderCaches[s.wk] = s; });
+        _applyWsLocalSummaries(summaries, scan, session);
+        return summaries;
+    } finally {
+        _endWsLocalScan(scan);
+    }
+}
+
+// Quick local-only header update (no remote sync, fire-and-forget safe).
+// Scan-scoped revisions preserve newer terminal writes without retaining per-key history.
+async function updateWorkspaceHeaderStatus() {
+    try {
+        await _refreshWsLocalCaches(_wsRefreshSession);
         _renderWsHeaderBadge();
     } catch (e) {
         var els = [document.getElementById('ws-header-status'), document.getElementById('home-ws-header-status')];
@@ -1038,86 +1127,165 @@ async function updateWorkspaceHeaderStatus() {
     }
 }
 
-// Background refresh: local state for every workspace, then remote state only
-// for workspaces used in the rolling last 7 days, capped to the five MRU.
-// Single-flight: concurrent callers (nav/focus/chat-switch triggers plus the
-// dropdown-open overlap) share ONE in-flight run instead of interleaving
-// _wsHeaderCaches wipes/writes (each run starts by resetting the cache).
+// Header and dropdown refreshes join one batch session while any participant
+// remains active. `covered` survives per-key completion until the whole session
+// settles, so a late overlapping batch never re-fetches or repaints completed keys.
 var _syncHdrInFlight = null;
-function syncAndUpdateWorkspaceHeader() {
-    if (_syncHdrInFlight) return _syncHdrInFlight;
-    _syncHdrInFlight = _syncAndUpdateWorkspaceHeaderInner().finally(function() { _syncHdrInFlight = null; });
+var _wsRefreshSession = null;
+
+function _joinWsRefreshBatch(session, showRefreshing) {
+    session.participants++;
+    var wasShowing = session.showRefreshing;
+    try {
+        if (showRefreshing !== false && !session.showRefreshing) {
+            session.showRefreshing = true;
+            _paintWsRefreshing(session, Object.keys(session.jobs));
+        }
+    } catch (e) {
+        session.showRefreshing = wasShowing;
+        _endWsRefreshBatch(session);
+        throw e;
+    }
+    return session;
+}
+
+function _beginWsRefreshBatch(showRefreshing) {
+    var session = _wsRefreshSession;
+    if (!session) {
+        session = { covered: {}, jobs: {}, deleted: {}, showRefreshing: false, participants: 0 };
+        _wsRefreshSession = session;
+    }
+    return _joinWsRefreshBatch(session, showRefreshing);
+}
+
+function _endWsRefreshBatch(session) {
+    if (session.participants > 0) session.participants--;
+    if (session.participants === 0 && _wsRefreshSession === session) _wsRefreshSession = null;
+}
+
+function _renderWsDropdownKey(wk) {
+    if (!_wsDropdown || !_wsHeaderCaches[wk]) return;
+    var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
+    if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
+}
+
+function _paintWsRefreshing(session, keys) {
+    var previous = {};
+    try {
+        keys.forEach(function(wk) {
+            if (!session.jobs[wk] || !_wsHeaderCaches[wk] || _wsHeaderCaches[wk].syncStatus === 'refreshing') return;
+            previous[wk] = _wsHeaderCaches[wk].syncStatus;
+            _wsHeaderCaches[wk].syncStatus = 'refreshing';
+            _renderWsDropdownKey(wk);
+        });
+        if (Object.keys(previous).length) _renderWsHeaderBadge();
+    } catch (e) {
+        Object.keys(previous).forEach(function(wk) {
+            if (_wsHeaderCaches[wk] && _wsHeaderCaches[wk].syncStatus === 'refreshing') {
+                _wsHeaderCaches[wk].syncStatus = previous[wk];
+            }
+        });
+        throw e;
+    }
+}
+
+async function _applyWsRefreshResult(session, wk, syncResult) {
+    if (syncResult && syncResult.deleted) {
+        _deleteWsTerminalCache(session, wk);
+        if (_wsDropdown) {
+            var gone = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
+            if (gone) gone.remove();
+        }
+        _resetBaseCacheAfterAutoDelete(syncResult);
+        if (syncResult.base_workspace) _renderWsDropdownKey(syncResult.base_workspace);
+        _renderWsHeaderBadge();
+        return;
+    }
+    var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
+    var meta = await getWorkspaceMeta(wk);
+    if (!meta) {
+        _deleteWsTerminalCache(session, wk);
+        _reconcileDropdownSections();
+        _renderWsHeaderBadge();
+        return;
+    }
+    var isIgnored = await wsGetIgnoreFilterLocal(wk);
+    var files = await getAllWorkspaceFiles(wk);
+    meta = await getWorkspaceMeta(wk);
+    if (!meta) {
+        _deleteWsTerminalCache(session, wk);
+        _reconcileDropdownSections();
+        _renderWsHeaderBadge();
+        return;
+    }
+    var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
+    _commitWsTerminalCache(wk, function() {
+        _wsHeaderCaches[wk] = {
+            wk: wk, meta: meta, dirtyCount: dirtyFiles.length, dirtyFiles: dirtyFiles,
+            syncStatus: syncStatus,
+            behindFiles: syncResult ? syncResult.behindFiles || [] : [],
+            conflictFiles: syncResult ? syncResult.conflictFiles || [] : []
+        };
+    });
+    _renderWsHeaderBadge();
+    _renderWsDropdownKey(wk);
+    if (_wsDropdown) _reconcileThisChatSection();
+}
+
+function _refreshWsKeyInSession(session, wk) {
+    if (session.covered[wk]) return session.jobs[wk] || Promise.resolve();
+    session.covered[wk] = true;
+    var job = _wsSyncOnce(wk).then(function(syncResult) {
+        return _applyWsRefreshResult(session, wk, syncResult);
+    }).catch(function() {
+        _commitWsTerminalCache(wk, function() {
+            if (_wsHeaderCaches[wk]) _wsHeaderCaches[wk].syncStatus = 'offline';
+        });
+        _renderWsHeaderBadge();
+        _renderWsDropdownKey(wk);
+    }).finally(function() {
+        delete session.jobs[wk];
+    });
+    session.jobs[wk] = job;
+    if (session.showRefreshing) _paintWsRefreshing(session, [wk]);
+    return job;
+}
+
+function _runWsRefreshBatch(session, keys) {
+    return _wsRunBounded(keys, _WS_REFRESH_CONCURRENCY, function(wk) {
+        return _refreshWsKeyInSession(session, wk);
+    });
+}
+
+// Background header refresh: local state for every workspace, then remote state
+// for the five most-recent workspaces used in the rolling last seven days.
+// Pass false for routine nav/focus refreshes; explicit callers default to visible.
+function syncAndUpdateWorkspaceHeader(showRefreshing) {
+    if (_syncHdrInFlight) {
+        if (showRefreshing !== false && _wsRefreshSession && !_wsRefreshSession.showRefreshing) {
+            _wsRefreshSession.showRefreshing = true;
+            _paintWsRefreshing(_wsRefreshSession, Object.keys(_wsRefreshSession.jobs));
+        }
+        return _syncHdrInFlight;
+    }
+    var session = _beginWsRefreshBatch(showRefreshing);
+    _syncHdrInFlight = _syncAndUpdateWorkspaceHeaderInner(session).finally(function() {
+        _syncHdrInFlight = null;
+        _endWsRefreshBatch(session);
+    });
     return _syncHdrInFlight;
 }
-async function _syncAndUpdateWorkspaceHeaderInner() {
-    try {
-        var summaries = await getAllWorkspaceSummaries();
-        _wsHeaderCaches = {};
-        summaries.forEach(function(s) { _wsHeaderCaches[s.wk] = s; });
-        _renderWsHeaderBadge();
 
-        var eagerKeys = _wsEagerRefreshKeys(summaries.map(function(s) { return s.meta; }));
-        var eager = summaries.filter(function(s) { return eagerKeys.indexOf(s.wk) !== -1; });
-        eager.forEach(function(s) { s.syncStatus = 'refreshing'; _wsHeaderCaches[s.wk].syncStatus = 'refreshing'; });
+async function _syncAndUpdateWorkspaceHeaderInner(session) {
+    try {
+        var summaries = await _refreshWsLocalCaches(session);
         _renderWsHeaderBadge();
-        await _wsRunBounded(eager, _WS_REFRESH_CONCURRENCY, function(s) {
-            return _wsSyncOnce(s.wk).then(async function(syncResult) {
-                if (syncResult && syncResult.deleted) {
-                    // Workspace auto-removed (merged head branch) — drop from caches.
-                    delete _wsHeaderCaches[s.wk];
-                    _resetBaseCacheAfterAutoDelete(syncResult);
-                    _renderWsHeaderBadge();
-                    return;
-                }
-                var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
-                // Re-read after sync (files may have been cleaned)
-                var meta = await getWorkspaceMeta(s.wk);
-                // A local delete may race this remote sync. `wsSyncWithRemote`
-                // returns null when metadata vanished; never turn that into an
-                // "offline" cache entry that exists only in the pill dropdown.
-                if (!meta) {
-                    delete _wsHeaderCaches[s.wk];
-                    _renderWsHeaderBadge();
-                    _reconcileDropdownSections();
-                    return;
-                }
-                var isIgnored = await wsGetIgnoreFilterLocal(s.wk);
-                var files = await getAllWorkspaceFiles(s.wk);
-                // Final post-await existence check closes the delete-vs-sync race:
-                // if deletion committed while files/ignore state loaded, do not
-                // reinsert the old meta into the header cache.
-                meta = await getWorkspaceMeta(s.wk);
-                if (!meta) {
-                    delete _wsHeaderCaches[s.wk];
-                    _renderWsHeaderBadge();
-                    _reconcileDropdownSections();
-                    return;
-                }
-                var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
-                _wsHeaderCaches[s.wk] = {
-                    wk: s.wk, meta: meta, dirtyCount: dirtyFiles.length, dirtyFiles: dirtyFiles,
-                    syncStatus: syncStatus,
-                    behindFiles: syncResult ? syncResult.behindFiles || [] : [],
-                    conflictFiles: syncResult ? syncResult.conflictFiles || [] : []
-                };
-                _renderWsHeaderBadge();
-            }).catch(function() {
-                if (_wsHeaderCaches[s.wk]) _wsHeaderCaches[s.wk].syncStatus = 'offline';
-                _renderWsHeaderBadge();
-                if (_wsDropdown) {
-                    var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(s.wk) + '"]');
-                    if (section && _wsHeaderCaches[s.wk]) _renderDropdownSection(section, _wsHeaderCaches[s.wk]);
-                    _reconcileThisChatSection();
-                }
-            });
-        });
+        var eagerKeys = _wsEagerRefreshKeys(summaries.map(function(s) { return s.meta; }));
+        await _runWsRefreshBatch(session, eagerKeys);
     } catch (e) {
-        // Never leave a "Refreshing…" badge/section stranded after a batch-level
-        // failure (for example a local summary read error). Preserve existence
-        // guards because deletion may have committed while the batch was active.
-        Object.keys(_wsHeaderCaches).forEach(function(wk) {
+        Object.keys(session.jobs).forEach(function(wk) {
             if (_wsHeaderCaches[wk] && _wsHeaderCaches[wk].syncStatus === 'refreshing') {
-                _wsHeaderCaches[wk].syncStatus = 'offline';
+                _commitWsTerminalCache(wk, function() { _wsHeaderCaches[wk].syncStatus = 'offline'; });
             }
         });
         _renderWsHeaderBadge();
@@ -1127,17 +1295,27 @@ async function _syncAndUpdateWorkspaceHeaderInner() {
 
 async function toggleWorkspaceDropdown() {
     if (_wsDropdown) { hideWorkspaceDropdown(); return; }
-    // Only one header dropdown open at a time
-    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('workspace');
-    // Open INSTANTLY from the cached header state (_wsHeaderCaches is kept warm
-    // by startup + every sync). The user mostly wants dirty files / PR links,
-    // which the cache already has — everything else refreshes lazily below.
-    var hadCache = Object.keys(_wsHeaderCaches).length > 0;
-    if (!hadCache) {
-        // First-ever open with a cold cache: one local scan so we know what exists.
-        await updateWorkspaceHeaderStatus();
+    // Register the explicit gesture before any awaited local scan so an active
+    // quiet header session cannot settle and disappear while this open is suspended.
+    var session = _beginWsRefreshBatch(true);
+    var sessionEnded = false;
+    function endOpeningParticipant() {
+        if (sessionEnded) return;
+        sessionEnded = true;
+        _endWsRefreshBatch(session);
     }
-    showWorkspaceDropdown();
+    try {
+        // Only one header dropdown open at a time
+        if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('workspace');
+        // Open INSTANTLY from the cached header state (_wsHeaderCaches is kept warm
+        // by startup + every sync). The user mostly wants dirty files / PR links,
+        // which the cache already has — everything else refreshes lazily below.
+        var hadCache = Object.keys(_wsHeaderCaches).length > 0;
+        if (!hadCache) {
+            // First-ever open with a cold cache: one local scan so we know what exists.
+            await updateWorkspaceHeaderStatus();
+        }
+        showWorkspaceDropdown();
 
     // Lazy phase 1 — resolve extension-dev mode (gates the per-repo pin button,
     // same condition the Reload button is shown under) without blocking the
@@ -1157,91 +1335,39 @@ async function toggleWorkspaceDropdown() {
         _reconcileDropdownSections();
     }
 
-    // Opening the pill is the explicit refresh gesture for ALL locally visible
-    // workspaces, including deferred/older ones. Run at most three requests at a
-    // time and progressively repaint each section.
-    _syncDropdownInBackground();
+        // Opening the pill is the explicit refresh gesture for ALL locally visible
+        // workspaces, including deferred/older ones. Transfer the opening participant
+        // into the dropdown batch without allowing the shared session to clear.
+        _syncDropdownInBackground(session).catch(function() {});
+        endOpeningParticipant();
+    } catch (e) {
+        endOpeningParticipant();
+        throw e;
+    }
 }
 
-// Operation-level single-flight: repeated opens during one dropdown refresh
-// share the exact batch snapshot. No workspace is added twice to that batch.
-function _syncDropdownInBackground() {
+// Repeated opens share one dropdown participant. If a header batch is already
+// active, the dropdown joins its session: completed keys remain covered while
+// pending keys upgrade to visible refreshing.
+function _syncDropdownInBackground(joinedSession) {
     if (_wsDropdownSyncInFlight) return _wsDropdownSyncInFlight;
-    _wsDropdownSyncInFlight = _syncDropdownBatch(Object.keys(_wsHeaderCaches)).finally(function() {
+    var session = joinedSession && joinedSession === _wsRefreshSession
+        ? _joinWsRefreshBatch(joinedSession, true)
+        : _beginWsRefreshBatch(true);
+    // Defer startup into the promise so a synchronous renderer/worker throw still
+    // reaches the shared cleanup and cannot strand a participant or session.
+    _wsDropdownSyncInFlight = Promise.resolve().then(function() {
+        return _syncDropdownBatch(session, Object.keys(_wsHeaderCaches));
+    }).finally(function() {
         _wsDropdownSyncInFlight = null;
+        _endWsRefreshBatch(session);
     });
     return _wsDropdownSyncInFlight;
 }
 
-async function _syncDropdownBatch(keys) {
-    keys.forEach(function(wk) {
-        if (_wsHeaderCaches[wk]) _wsHeaderCaches[wk].syncStatus = 'refreshing';
-        if (_wsDropdown) {
-            var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
-            if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
-        }
-    });
-    await _wsRunBounded(keys, _WS_REFRESH_CONCURRENCY, function(wk) {
-        return _wsSyncOnce(wk).then(async function(syncResult) {
-            if (syncResult && syncResult.deleted) {
-                // Workspace auto-removed (merged head branch). Drop it from the
-                // dropdown + caches and refresh the badge.
-                delete _wsHeaderCaches[wk];
-                if (_wsDropdown) {
-                    var _goneSection = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
-                    if (_goneSection) _goneSection.remove();
-                }
-                _resetBaseCacheAfterAutoDelete(syncResult);
-                if (_wsDropdown && syncResult.base_workspace && _wsHeaderCaches[syncResult.base_workspace]) {
-                    var _bSection = _wsDropdown.querySelector('[data-ws="' + CSS.escape(syncResult.base_workspace) + '"]');
-                    if (_bSection) _renderDropdownSection(_bSection, _wsHeaderCaches[syncResult.base_workspace]);
-                }
-                _renderWsHeaderBadge();
-                return;
-            }
-            var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
-            var meta = await getWorkspaceMeta(wk);
-            // The workspace can be deleted while this remote request is in
-            // flight. Drop the stale cache section instead of resurrecting it.
-            if (!meta) {
-                delete _wsHeaderCaches[wk];
-                _reconcileDropdownSections();
-                _renderWsHeaderBadge();
-                return;
-            }
-            var isIgnored = await wsGetIgnoreFilterLocal(wk);
-            var files = await getAllWorkspaceFiles(wk);
-            // Re-check after all awaits so a concurrent local delete cannot be
-            // undone by this background renderer's stale metadata snapshot.
-            meta = await getWorkspaceMeta(wk);
-            if (!meta) {
-                delete _wsHeaderCaches[wk];
-                _reconcileDropdownSections();
-                _renderWsHeaderBadge();
-                return;
-            }
-            var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
-            _wsHeaderCaches[wk] = {
-                wk: wk, meta: meta, dirtyCount: dirtyFiles.length, dirtyFiles: dirtyFiles,
-                syncStatus: syncStatus,
-                behindFiles: syncResult ? syncResult.behindFiles || [] : [],
-                conflictFiles: syncResult ? syncResult.conflictFiles || [] : []
-            };
-            _renderWsHeaderBadge();
-            // Re-render dropdown section for this repo if still open
-            if (_wsDropdown) {
-                var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
-                if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
-                _reconcileThisChatSection();
-            }
-        }).catch(function() {
-            if (_wsHeaderCaches[wk]) _wsHeaderCaches[wk].syncStatus = 'offline';
-            if (_wsDropdown) {
-                var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
-                if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
-            }
-        });
-    });
+function _syncDropdownBatch(session, keys) {
+    _paintWsRefreshing(session, keys);
+    return _runWsRefreshBatch(session, keys);
 }
 
 function hideWorkspaceDropdown() {
@@ -2110,10 +2236,18 @@ var _MODAL_EFFORT_LEVELS = [
     { v: '', label: 'Default' }
 ];
 var _MODAL_EFFORT_DEFAULT_IDX = _MODAL_EFFORT_LEVELS.length - 1;
-function _modalEffortLabelHtml(idx) {
+// authKind: 'chatgpt' | 'claude' | 'endpoint' — passed explicitly while the
+// modal HTML is still being built (the radio group is not in the DOM yet);
+// later callers omit it and the live radio selection is read.
+function _modalEffortLabelHtml(idx, authKind) {
     var e = _MODAL_EFFORT_LEVELS[idx] || _MODAL_EFFORT_LEVELS[_MODAL_EFFORT_DEFAULT_IDX];
+    var kind = authKind || _selectedModelAuthKind();
+    // ChatGPT OAuth: transformToResponses (background.js) clamps xhigh/max to
+    // 'high' (the Responses API rejects them) — surface that on the slider.
+    var clampedOnChatGPT = kind === 'chatgpt' && (e.v === 'xhigh' || e.v === 'max');
     return '<span class="model-menu-effort-name">' + e.label + '</span>' +
-        (e.v === '' ? '<span class="model-row-badge">server decides</span>' : '');
+        (e.v === '' ? '<span class="model-row-badge">server decides</span>' : '') +
+        (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
 }
 function onModalEffortSliderInput(v) {
     var idx = parseInt(v, 10);
@@ -2358,7 +2492,7 @@ function showAddApiProviderModal(editingProvider) {
                             '<input type="range" class="model-menu-effort-slider" id="modal-effort-slider" min="0" max="5" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onModalEffortSliderInput(this.value)">' +
                             '<span class="effort-disc" id="modal-effort-disc"></span>' +
                         '</div>' +
-                        '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx) + '</div>' +
+                        '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx, authKind) + '</div>' +
                     '</div>' +
                     '<input type="hidden" id="provider-effort" value="' + escapeHtml(provider.effort || '') + '">' +
                 '</div>' +
@@ -2431,6 +2565,10 @@ function selectModelAuthKind(kind) {
     }
     var custom = document.getElementById('provider-custom-fields');
     if (custom) custom.style.cssText = kind === 'endpoint' ? 'display:flex;flex-direction:column;gap:var(--space-8)' : 'display:none';
+    // Effort label: the "sent as high on ChatGPT" badge depends on the auth kind.
+    var effortLabel = document.getElementById('modal-effort-label');
+    var effortSlider = document.getElementById('modal-effort-slider');
+    if (effortLabel && effortSlider) effortLabel.innerHTML = _modalEffortLabelHtml(parseInt(effortSlider.value, 10), kind);
     // Populate (chatgpt) or clear (claude/endpoint) the Model ID suggestions.
     refreshCodexModelOptions();
 }
@@ -2899,7 +3037,8 @@ function triggerNavWorkspaceSync() {
     if (typeof syncAndUpdateWorkspaceHeader !== 'function') return;
     _navWsSyncInFlight = true;
     Promise.resolve()
-        .then(function() { return syncAndUpdateWorkspaceHeader(); })
+        // Routine navigation refreshes update final status without flashing a loader.
+        .then(function() { return syncAndUpdateWorkspaceHeader(false); })
         .catch(function() {})
         .then(function() { _navWsSyncInFlight = false; });
 }

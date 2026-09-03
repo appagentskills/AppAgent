@@ -38,9 +38,25 @@ function getGlobalMaxTokens() {
     var v = parseInt(globalMaxTokens, 10);
     return (isFinite(v) && v > 0) ? v : DEFAULT_MAX_TOKENS;
 }
+// 0 is a deliberate value here: "thinking OFF" (Settings → Thinking Budget =
+// 0). callOpenRouterStreaming (app/010-llm-streaming.js) turns it into
+// reasoning:{enabled:false}, which transformToAnthropic / transformToResponses
+// (background.js) honour by sending no thinking object. Only an unset /
+// unparseable / negative value falls back to the default.
 function getGlobalThinkingBudget() {
     var v = parseInt(globalThinkingBudget, 10);
+    if (v === 0) return 0;
     return (isFinite(v) && v > 0) ? v : DEFAULT_THINKING_BUDGET;
+}
+// parseInt that keeps an explicit 0 (thinking off) instead of letting
+// `|| DEFAULT` swallow it; anything else that is not a positive finite
+// number (NaN, negative, -0) falls back to the default so the stored value is
+// always 0 or > 0. Used by saveGlobalThinkingBudget and the IDB hydration in
+// loadAssumedContextTokens — the two writers of globalThinkingBudget.
+function _parseThinkingBudgetSetting(value) {
+    var n = parseInt(value, 10);
+    if (n === 0 && !Object.is(n, -0)) return 0;
+    return (isFinite(n) && n > 0) ? n : DEFAULT_THINKING_BUDGET;
 }
 
 // Persist new values (Settings page onchange handlers in
@@ -54,7 +70,7 @@ async function saveGlobalMaxTokens(value) {
     return getGlobalMaxTokens();
 }
 async function saveGlobalThinkingBudget(value) {
-    globalThinkingBudget = parseInt(value, 10) || DEFAULT_THINKING_BUDGET;
+    globalThinkingBudget = _parseThinkingBudgetSetting(value);
     if (typeof setSetting === 'function') {
         await setSetting(THINKING_BUDGET_SETTING_KEY, globalThinkingBudget);
     }
@@ -180,8 +196,8 @@ var DEFAULT_API_PROVIDERS = [
         // output. Thinking is always-on adaptive (effort via output_config,
         // same as Fable 5); the SW additionally opts this model into the
         // thinking-display-updates + thinking-binding-controls betas and the
-        // block_binding drop_block opt-out — see FABLE_5_1_PLUS_RE in
-        // src/platform/extension/background.js. Existing installs pick this
+        // block_binding drop_block opt-out — see FABLE_5_1_PLUS_RE below
+        // (shared with the SW via WORKER_SHARED_FILES). Existing installs pick this
         // entry up via the name-keyed default merge in
         // loadApiProviders (core/130-indexeddb.js).
         name: 'Fable 5.1',
@@ -270,6 +286,30 @@ function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
 
+// Fable 5.1+ / Mythos 5.1+ (Sept 2026) — the preserved-thinking models. Their
+// thinking blocks are bound to the exact system/tools/prior-message prefix AND
+// chained to each other across turns: the client must replay EVERY assistant
+// thinking block unchanged on every request (including turn-final ones and
+// empty ones), because removing a block from the middle of the history
+// invalidates every block after it (leading blocks may still be trimmed).
+// Matches the dateless pinned ids (claude-fable-5-1) and dated variants
+// (claude-fable-5-1-2026MMDD); does NOT match the 5.0 ids (claude-fable-5,
+// claude-fable-5-20260501) — the (?!\d) lookahead keeps an 8-digit date
+// suffix on a 5.0 id from reading as a minor version (1–2 digit minors only).
+// SINGLE SOURCE OF TRUTH — loaded in BOTH bundles (page core tier +
+// WORKER_SHARED_FILES; background.js sees it via importScripts('sw-bundle.js')).
+// Consumers: getAnthropicBetas + transformToAnthropic
+// (src/platform/extension/background.js — beta headers, thinking object).
+// buildAPIMessages (app/020-api-messages.js) no longer gates on it: every
+// model now replays all completed-turn reasoning_details (the API ignores
+// previous-turn thinking on older Claude models, unbilled).
+// Docs: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+//       https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
+var FABLE_5_1_PLUS_RE = /claude-(?:fable|mythos)-5-[1-9]\d?(?!\d)/;
+function isFable51Plus(model) {
+    return FABLE_5_1_PLUS_RE.test(String(model || '').toLowerCase());
+}
+
 var currentProvider = 'Opus 5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
 
 // Old default-provider names → their renamed successors (the Opus 4.8
@@ -317,15 +357,6 @@ var PROVIDER_RENAMES = {
 // Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
 var SUBAGENT_TIER_NAMES = ['small', 'medium', 'large'];
 var TIER_ALIASES_SETTING_KEY = 'subagentTierAliases';
-// Defaults derived from DEFAULT_API_PROVIDERS: cheapest/fastest → small,
-// balanced → medium, strongest → large. Keep names in sync with the
-// DEFAULT_API_PROVIDERS entries above when models are renamed.
-var DEFAULT_TIER_ALIASES = {
-    small: 'Sonnet 5',
-    medium: 'Opus 5',
-    large: 'Fable 5'
-};
-var subAgentTierAliases = null; // null = not yet hydrated from IDB
 // Special alias value: a tier mapped to TIER_ALIAS_SAME resolves to NO
 // concrete provider — spawns through that tier behave exactly like an
 // explicit tier:'same' spawn (dynamic follow of the spawning agent's
@@ -335,8 +366,24 @@ var subAgentTierAliases = null; // null = not yet hydrated from IDB
 // collide with a real apiProviders name shown in the pickers. Consumers:
 // checkTier in _resolveSpawnProvider (core/097-sub-agent-registry.js) and
 // the two tier-picker UIs (ui/040-tools-settings.js renderTierAliasSettings,
-// ui/160-notifications.js _tierMenuRowsHtml).
+// ui/160-notifications.js _tierMenuRowsHtml). Declared BEFORE
+// DEFAULT_TIER_ALIASES because the `large` default references it.
 var TIER_ALIAS_SAME = '__same__';
+// Defaults derived from DEFAULT_API_PROVIDERS: cheapest/fastest → small,
+// balanced → medium. Keep names in sync with the DEFAULT_API_PROVIDERS
+// entries above when models are renamed. `large` deliberately defaults to
+// the "Same" sentinel (follow the spawning agent's current model) rather
+// than a hard-coded top model: a concrete default here silently pinned
+// every tier:'large' sub to that model even when the user never selected
+// it (e.g. 'Fable 5' showing up in runs with a different current model).
+// Users who want a specific large model pick it in Settings → Sub-Agent
+// Model Tiers.
+var DEFAULT_TIER_ALIASES = {
+    small: 'Sonnet 5',
+    medium: 'Opus 5',
+    large: TIER_ALIAS_SAME
+};
+var subAgentTierAliases = null; // null = not yet hydrated from IDB
 
 // Merged view: stored overrides win, defaults fill the gaps.
 function getTierAliasMap() {
@@ -435,7 +482,7 @@ async function loadAssumedContextTokens() {
             }
             var storedBudget = await getSetting(THINKING_BUDGET_SETTING_KEY, null);
             if (storedBudget !== null && storedBudget !== undefined && storedBudget !== '') {
-                globalThinkingBudget = parseInt(storedBudget, 10) || DEFAULT_THINKING_BUDGET;
+                globalThinkingBudget = _parseThinkingBudgetSetting(storedBudget);
             }
             var storedDeferred = await getSetting(DEFERRED_TOOLS_SETTING_KEY, null);
             if (storedDeferred !== null && storedDeferred !== undefined) {

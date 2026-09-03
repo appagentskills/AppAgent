@@ -169,7 +169,11 @@ async function sendMessage() {
                     // would store.clear()+rewrite away every sibling chat.
                     chat: chats[_chatId],
                     text: _text,
-                    images: _images
+                    images: _images,
+                    // Mirrors run-agent's post: the SW cannot read localStorage, so
+                    // without this a provider switched while idle stays stale in the
+                    // SW until the next run-agent (send-message also starts runs).
+                    currentProvider: (typeof currentProvider !== 'undefined') ? currentProvider : ''
                 });
             } catch (e) {
                 _retryOrGiveUp();

@@ -242,7 +242,12 @@ function _sendPanelHello() {
         _agentBusPort.postMessage({
             type: 'panel-hello',
             inflightToolCalls: inflight,
-            completedToolResults: completed
+            completedToolResults: completed,
+            // Let a (re)started SW adopt the user's current model BEFORE its
+            // checkpoint-resume gate (which waits on the first panel-hello)
+            // starts any loop — otherwise a resumed un-pinned chat runs on
+            // the SW's stale/default currentProvider.
+            currentProvider: (typeof currentProvider !== 'undefined') ? currentProvider : ''
         });
     } catch (e) {
         console.error('[agent-bus] panel-hello post failed', e);
@@ -1400,9 +1405,13 @@ async function runAgent(overrideChatId) {
     return _pendingEntry.promise;
 }
 
-// Notify the authoritative worker that the foreground provider changed.
+// Notify the authoritative worker that the global provider changed.
 // The worker updates its global selection and aborts only the named foreground
 // run/backoff; pinned sub-agents keep resolving their chat.provider unchanged.
+// `chatId` is OPTIONAL: changeProvider (ui/160-notifications.js) passes it
+// only for the ChatGPT-OAuth abort case; a null chatId is a pure "adopt this
+// provider" notification (the SW's currentProvider is otherwise only refreshed
+// by run-agent / send-message posts).
 // Latest-wins generation counter: rapid provider switches during a port-down
 // window used to stack independent immortal 50ms retry chains, each posting a
 // STALE provider-change once the port returned. Each call captures its own
@@ -1410,7 +1419,8 @@ async function runAgent(overrideChatId) {
 // = 5s) so a permanently dead port cannot leak a timer chain forever.
 var _providerChangeGen = 0;
 function pushProviderChangeToOffscreen(providerId, chatId) {
-    if (!providerId || !chatId) return;
+    if (!providerId) return;
+    chatId = chatId || null;
     _providerChangeGen++;
     var _gen = _providerChangeGen;
     var _tries = 0;

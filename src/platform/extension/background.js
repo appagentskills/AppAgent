@@ -2228,6 +2228,25 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                 if (eventType === 'message_start' && eventData.message) {
                     msgId = eventData.message.id || '';
                     Object.assign(anthropicUsage, eventData.message.usage || {});
+                    // Fable 5.1+ (thinking-binding-controls beta): with
+                    // block_binding.prefix_mismatch_behavior:'drop_block' the API
+                    // silently removes replayed thinking blocks whose bound prefix
+                    // no longer matches (prefix_binding_mismatch) or that the
+                    // current model cannot read (model_binding_mismatch) — and
+                    // every thinking block after them. It reports each drop here,
+                    // on message_start, as { type:'thinking_dropped', path, reason }.
+                    // Empty/absent = history intact. Non-empty = the prompt cache
+                    // restarted at that block — log it so drops are not invisible.
+                    // Console only (SW console): the page-side 'status' envelope
+                    // raises a snackbar, and a drop repeats on every request until
+                    // the block ages out, which would be pure noise there.
+                    var _inputTx = eventData.message.input_transformations;
+                    if (Array.isArray(_inputTx) && _inputTx.length > 0) {
+                        var _txSummary = _inputTx.map(function(t) {
+                            return (t && t.type || '?') + '@' + (t && t.path || '?') + ' (' + (t && t.reason || 'no reason') + ')';
+                        }).join(', ');
+                        console.warn('[AppAgent] ' + model + ': ' + _inputTx.length + ' input_transformations reported by the API — ' + _txSummary, _inputTx);
+                    }
                     sink({ type: 'sse', data: 'data: ' + JSON.stringify({
                         id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
                         choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]
@@ -3259,6 +3278,41 @@ function _openaiContentParts(content, textType) {
     return parts;
 }
 
+// Encrypted-reasoning replay for the stateless (store:false) Codex Responses
+// endpoint. OpenAI reasoning guide: "When you create a response in stateless
+// mode, reasoning items in the response's output array include an
+// encrypted_content property by default" and "If the model calls multiple
+// functions consecutively, you should pass back all reasoning items, function
+// call items, and function call output items, since the last user message"; "To
+// use all_turns with store: false, preserve every output item, append the next
+// user message, and replay the complete history". The translator stores each
+// completed `reasoning` output item on the assistant message's
+// reasoning_details using OpenRouter's documented `reasoning.encrypted` shape
+// ({type, id, data, format, index} + the item's summary) so the SAME history
+// stays a valid chat-completions body if the chat later runs on OpenRouter,
+// and is skipped by transformMessageToAnthropic (no `signature`). This helper
+// turns those entries back into the Responses item the API returned:
+// {type:'reasoning', id, summary, encrypted_content}. Anything that is not a
+// Codex entry (Anthropic thinking blocks, redacted_thinking, OpenRouter text
+// reasoning) is dropped — the endpoint would 400 on unknown item types.
+var OPENAI_REASONING_FORMAT = 'openai-responses-v1';
+function _openaiReasoningItemsOf(reasoningDetails) {
+    var out = [];
+    if (!Array.isArray(reasoningDetails)) return out;
+    for (var i = 0; i < reasoningDetails.length; i++) {
+        var rd = reasoningDetails[i];
+        if (!rd || rd.type !== 'reasoning.encrypted' || rd.format !== OPENAI_REASONING_FORMAT) continue;
+        if (!rd.id || typeof rd.data !== 'string' || !rd.data) continue;
+        out.push({
+            type: 'reasoning',
+            id: rd.id,
+            summary: Array.isArray(rd.summary) ? rd.summary : [],
+            encrypted_content: rd.data
+        });
+    }
+    return out;
+}
+
 function transformToResponses(body) {
     var messages = (body && body.messages) || [];
     var input = [];
@@ -3287,6 +3341,16 @@ function transformToResponses(body) {
             continue;
         }
         if (m.role === 'assistant') {
+            // Replay the turn's reasoning items FIRST (the Responses output order
+            // is reasoning → message / function_call). Stored by the SSE
+            // translator in runChatGPTOAuthStream as OpenRouter-shaped
+            // `reasoning.encrypted` entries (format 'openai-responses-v1') on the
+            // assistant message's reasoning_details; _openaiReasoningItemsOf
+            // ignores every other entry (Anthropic thinking blocks from a
+            // provider switch mid-chat) so nothing foreign reaches the endpoint.
+            // History without stored items is byte-identical to before.
+            var rItems = _openaiReasoningItemsOf(m.reasoning_details);
+            for (var ri = 0; ri < rItems.length; ri++) input.push(rItems[ri]);
             var aText = _openaiTextOf(m.content);
             if (aText) {
                 input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: aText }] });
@@ -3325,6 +3389,12 @@ function transformToResponses(body) {
 
     var reasoning = {};
     var effort = null;
+    // Explicit off switch from the request builder (global Thinking Budget = 0,
+    // no provider effort → reasoning:{enabled:false}, callOpenRouterStreaming).
+    // The Responses API has no `enabled` field: send NO `reasoning` object at
+    // all (server default effort, no summaries requested) instead of the usual
+    // effort + summary:'auto'.
+    var thinkingOff = !!(body && body.reasoning && typeof body.reasoning === 'object' && body.reasoning.enabled === false);
     if (body && body.reasoning && typeof body.reasoning === 'object') effort = body.reasoning.effort;
     else if (body && body.reasoning_effort) effort = body.reasoning_effort;
     // AppAgent providers can carry Anthropic-flavoured efforts (e.g. 'xhigh')
@@ -3334,6 +3404,7 @@ function transformToResponses(body) {
         reasoning.effort = OK_EFFORTS[String(effort).toLowerCase()] ? String(effort).toLowerCase() : 'high';
     }
     reasoning.summary = 'auto';
+    if (thinkingOff) reasoning = null;
     // SCOPING (reviewer item): upstream applies reasoning.context='all_turns' and
     // parallel_tool_calls=false ONLY on the responses-lite path — selected from
     // the live Codex model catalog (`use_responses_lite`, packages/core/src/
@@ -3353,7 +3424,7 @@ function transformToResponses(body) {
     var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-5.6-sol';
     var quirks = _openaiModelQuirks[modelSlug] || {};
     var askedCtx = (body && body.reasoning && typeof body.reasoning === 'object') ? body.reasoning.context : null;
-    if (askedCtx && !quirks.noReasoningContext) reasoning.context = askedCtx;
+    if (reasoning && askedCtx && !quirks.noReasoningContext) reasoning.context = askedCtx;
 
     var out = {
         model: modelSlug,
@@ -3362,9 +3433,9 @@ function transformToResponses(body) {
         stream: true,
         store: false,
         include: ['reasoning.encrypted_content'],
-        parallel_tool_calls: !(body && body.parallel_tool_calls === false) && !quirks.noParallelToolCalls,
-        reasoning: reasoning
+        parallel_tool_calls: !(body && body.parallel_tool_calls === false) && !quirks.noParallelToolCalls
     };
+    if (reasoning) out.reasoning = reasoning;
     if (tools.length) {
         out.tools = tools;
         // chat-completions puts the forced tool name under .function.name;
@@ -3724,6 +3795,7 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
         var nextToolIndex = 0;
         var sawToolCall = false;
         var finished = false;
+        var reasoningItemIndex = 0; // reasoning_details[].index for captured reasoning items
 
         while (true) {
             // Cancel the body on abort — without this the fetch stream is left
@@ -3780,11 +3852,38 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
                         emitDelta({ tool_calls: [{ index: dIdx, function: { arguments: ev.delta } }] });
                     }
                 } else if (et === 'response.function_call_arguments.done' || et === 'response.output_item.done') {
+                    var doneItem = ev.item || {};
+                    // Completed encrypted reasoning item (store:false + include
+                    // reasoning.encrypted_content). Forward it as a chat-completions
+                    // reasoning_details delta so 010-llm-streaming.js's by-index
+                    // merge stores it on the assistant message and
+                    // transformToResponses (_openaiReasoningItemsOf) replays it
+                    // as {type:'reasoning', id, summary, encrypted_content} on the
+                    // next request. Shape = OpenRouter `reasoning.encrypted`
+                    // (type/id/data/format/index) so the entry is also a valid
+                    // chat-completions reasoning_details element. No text/thinking
+                    // key on purpose: the summary is already displayed through
+                    // the reasoning_summary_text.delta events above, and the
+                    // merge would otherwise render the encrypted blob.
+                    if (et === 'response.output_item.done' && doneItem.type === 'reasoning') {
+                        if (doneItem.id && typeof doneItem.encrypted_content === 'string' && doneItem.encrypted_content) {
+                            emitDelta({
+                                reasoning_details: [{
+                                    index: reasoningItemIndex++,
+                                    type: 'reasoning.encrypted',
+                                    format: OPENAI_REASONING_FORMAT,
+                                    id: doneItem.id,
+                                    data: doneItem.encrypted_content,
+                                    summary: Array.isArray(doneItem.summary) ? doneItem.summary : []
+                                }]
+                            });
+                        }
+                        continue;
+                    }
                     // Some models (e.g. the codex-spark family) return tool-call
                     // arguments in ONE shot with no incremental deltas — synthesize
                     // the full-arguments chunk from the terminal event.
                     // (chat-stream.ts:167-190 in EvanZhouDev/openai-oauth.)
-                    var doneItem = ev.item || {};
                     var dnKey = ev.item_id || doneItem.id || doneItem.call_id;
                     var dnIdx = toolIndexes[dnKey];
                     if (dnIdx === undefined || toolArgsSeen[dnKey]) continue;
@@ -3965,10 +4064,12 @@ function convertContentPart(part) {
 // (thinking object) — keep those two in lock-step.
 // Docs: https://platform.claude.com/docs/en/models/fable-5-1/whats-new-fable-5-1
 //       https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
-var FABLE_5_1_PLUS_RE = /claude-(?:fable|mythos)-5-[1-9]\d?(?!\d)/;
-function isFable51Plus(model) {
-    return FABLE_5_1_PLUS_RE.test(String(model || '').toLowerCase());
-}
+//
+// FABLE_5_1_PLUS_RE / isFable51Plus are DEFINED in src/js/core/030-config.js
+// (single source of truth, shared with buildAPIMessages in the page + SW
+// bundles) and reach this file through importScripts('sw-bundle.js') at the
+// top. Do not redeclare them here — a second copy is exactly the drift the
+// shared definition exists to prevent.
 
 // Beta flags for the OAuth /v1/messages call. The base trio is unconditional
 // (OAuth access, interleaved thinking, cache scope); Fable 5.1+ additionally
@@ -3978,6 +4079,20 @@ function isFable51Plus(model) {
 // so they are gated on the same regex.
 var ANTHROPIC_BASE_BETAS = ['oauth-2025-04-20', 'interleaved-thinking-2025-05-14', 'prompt-caching-scope-2026-01-05'];
 var ANTHROPIC_FABLE_5_1_BETAS = ['thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18'];
+
+// Claude models that ACCEPT thinking:{type:'adaptive'} (+ output_config.effort):
+// Opus / Sonnet 4.6 and later. Everything the adaptive-ONLY pattern matches
+// (ADAPTIVE_ONLY_CLAUDE_RE / isAdaptiveOnlyClaude in src/js/core/030-config.js,
+// loaded here via importScripts('sw-bundle.js') like isFable51Plus) is a
+// superset of this — transformToAnthropic ORs the two. Anything else
+// (Sonnet/Opus ≤4.5, Haiku, 3.x) is treated as LEGACY and gets budget-style
+// thinking:{type:'enabled', budget_tokens} — deliberately conservative: a
+// budget is accepted by every pre-adaptive model, `adaptive` is not.
+var ADAPTIVE_CAPABLE_CLAUDE_RE = /claude-(?:opus|sonnet)-4[.-](?:[6-9]|\d{2,})/;
+// Legacy budget for an effort-only provider on a pre-4.6 model (the API has
+// no effort control there). Default (no effort, no budget) is
+// DEFAULT_THINKING_BUDGET (32000, core/030-config.js).
+var LEGACY_EFFORT_BUDGET_TOKENS = { low: 4096, medium: 16000, high: 32000, xhigh: 64000, max: 64000 };
 function getAnthropicBetas(model) {
     var betas = ANTHROPIC_BASE_BETAS.slice();
     if (isFable51Plus(model)) betas = betas.concat(ANTHROPIC_FABLE_5_1_BETAS);
@@ -4102,23 +4217,64 @@ function transformToAnthropic(body) {
     //                        input_transformations instead of failing the request
     //                        with a 400 (beta thinking-binding-controls-2026-08-01).
     // Both betas are added by getAnthropicBetas for the same FABLE_5_1_PLUS_RE match.
+    //   thinkingOff — the request builder's explicit off switch (global Thinking
+    //                 Budget = 0, no provider effort → reasoning:{enabled:false},
+    //                 see callOpenRouterStreaming). Fable 5.1+ IGNORES it: its
+    //                 thinking is always-on and there is no accepted 'disabled'
+    //                 shape, so the forced branch below stays unconditional (the
+    //                 Settings hint says "not for Fable 5.1+").
     var fable51 = isFable51Plus(body.model);
+    var thinkingOff = !!(body.reasoning && body.reasoning.enabled === false);
+    var effort = (body.reasoning && !thinkingOff) ? body.reasoning.effort : null;
+    var budget = (body.reasoning && !thinkingOff) ? body.reasoning.max_tokens : null;
+    var modelLower = String(body.model || '').toLowerCase();
+    var adaptiveOnly = isAdaptiveOnlyClaude(modelLower);
+    var adaptiveCapable = adaptiveOnly || ADAPTIVE_CAPABLE_CLAUDE_RE.test(modelLower);
     if (fable51) {
         result.thinking = { type: 'adaptive', display: 'updates', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
-    }
-
-    if (body.reasoning) {
-        if (body.reasoning.effort) {
-            // Claude 4.6 adaptive thinking — model decides how much to think based on effort level
-            // display: 'summarized' is required for Opus 4.7+ (default changed to 'omitted')
-            if (!fable51) result.thinking = { type: 'adaptive', display: 'summarized' };
-            result.output_config = { effort: body.reasoning.effort };
-        } else if (body.reasoning.max_tokens) {
-            // Use adaptive thinking for all models (enabled is deprecated for newer models)
-            // display: 'summarized' is required for Opus 4.7+ (default changed to 'omitted')
-            if (!fable51) result.thinking = { type: 'adaptive', display: 'summarized' };
-            result.output_config = { effort: 'high' };
+    } else if (!thinkingOff) {
+        if (adaptiveCapable) {
+            // Claude 4.6+ adaptive thinking — the model decides how much to think
+            // from output_config.effort. display:'summarized' is required for
+            // Opus 4.7+ (default changed to 'omitted'). Adaptive-ONLY models get
+            // the object even with NO effort/budget configured: without it their
+            // thinking is invisible, and budget_tokens is a 400 there —
+            // output_config is still omitted so "(default)" effort keeps meaning
+            // the model-default effort.
+            if (effort || budget || adaptiveOnly) {
+                result.thinking = { type: 'adaptive', display: 'summarized' };
+            }
+        } else if (effort || budget) {
+            // LEGACY Claude (≤4.5): budget-style thinking is the only shape.
+            // An effort-only provider is mapped to a budget (no effort control
+            // on these models; output_config omitted). API rules: 1024 ≤
+            // budget_tokens < max_tokens — the budget is clamped under the
+            // (user-configured) max_tokens rather than raising max_tokens past a
+            // model's output cap. Only when max_tokens is too small to fit the
+            // 1024 minimum (max_tokens < 2048) is the pair forced to the smallest
+            // valid shape (budget 1024 / max_tokens 2048) — bounded, so it can
+            // never exceed any model's output cap.
+            var budgetTokens = budget || LEGACY_EFFORT_BUDGET_TOKENS[String(effort).toLowerCase()] ||
+                (typeof DEFAULT_THINKING_BUDGET === 'number' ? DEFAULT_THINKING_BUDGET : 32000);
+            budgetTokens = Math.max(1024, budgetTokens | 0);
+            var budgetCap = result.max_tokens - 1024;
+            if (budgetTokens > budgetCap) {
+                if (budgetCap >= 1024) {
+                    budgetTokens = budgetCap;
+                } else {
+                    budgetTokens = 1024;
+                    result.max_tokens = 2048;
+                }
+            }
+            result.thinking = { type: 'enabled', budget_tokens: budgetTokens };
         }
+    }
+    // output_config.effort only exists on adaptive models (4.6+ / Fable 5.1+).
+    // A budget-only request on an adaptive model keeps the historical mapping
+    // to effort:'high' (the budget itself has no adaptive equivalent).
+    if (!thinkingOff && (fable51 || adaptiveCapable)) {
+        if (effort) result.output_config = { effort: effort };
+        else if (budget) result.output_config = { effort: 'high' };
     }
 
     result.metadata = { user_id: 'appagent_extension' };

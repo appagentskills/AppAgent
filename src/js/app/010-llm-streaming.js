@@ -142,13 +142,30 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // thinkingBudget still stored on old providers is IGNORED here (global
     // wins) — only the adaptive-only legacy branch below reads the raw
     // stored value.
-    var thinkingBudget = provider.effort ? 0 : getGlobalThinkingBudget();
+    //
+    // A global budget of exactly 0 is the user's "thinking OFF" switch
+    // (Settings → Thinking Budget; getGlobalThinkingBudget returns 0 only for
+    // an explicit 0). It is a separate flag from the `thinkingBudget = 0`
+    // below, which merely means "effort-style provider, don't inject a
+    // budget" — an effort set on the provider is a thinking request and wins
+    // over the off switch.
+    var globalBudget = getGlobalThinkingBudget();
+    var thinkingOff = globalBudget === 0 && !provider.effort;
+    var thinkingBudget = provider.effort ? 0 : globalBudget;
     if (thinkingBudget && !isAdaptiveOnly) {
         requestBody.reasoning = { max_tokens: thinkingBudget };
     }
     if (provider.effort) {
         if (!requestBody.reasoning) requestBody.reasoning = {};
         requestBody.reasoning.effort = provider.effort;
+    }
+    if (thinkingOff) {
+        // OpenRouter's documented off switch (reasoning.enabled:false). The
+        // OAuth transforms in background.js read the same flag:
+        // transformToAnthropic sends no `thinking` object (except Fable 5.1+,
+        // whose thinking cannot be disabled) and transformToResponses drops
+        // `reasoning` entirely.
+        requestBody.reasoning = { enabled: false };
     }
     if (isAdaptiveOnly && provider.thinkingBudget && !requestBody.reasoning) {
         // A legacy thinkingBudget was suppressed above and no effort is
@@ -537,6 +554,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                                 if (rd.text) existing.text = (existing.text || '') + rd.text;
                                 if (rd.thinking) existing.thinking = (existing.thinking || '') + rd.thinking;
                                 if (rd.content) existing.content = (existing.content || '') + rd.content;
+                                // reasoning.summary entries (OpenRouter / OpenAI Responses)
+                                // stream their text in `summary` chunks — accumulate like
+                                // `thinking`, or only the last chunk survives into the
+                                // stored (and replayed) reasoning_details.
+                                if (rd.summary) existing.summary = (existing.summary || '') + rd.summary;
                                 if (rd.signature && rd.signature.length > 0) existing.signature = rd.signature;
                                 if (rd.data) existing.data = rd.data;
                             } else {
