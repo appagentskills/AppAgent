@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.26
+
+### Features
+- The workspace pill now refreshes recently-used workspaces in a bounded way, shows loading indicators while syncing, and lets you delete a local workspace clone directly.
+
+### Fixes
+- Mutating REST calls (POST/PUT/PATCH/DELETE) are no longer replayed twice when a chat resumes from a checkpoint, and the replay guard no longer flags legitimate calls as duplicates.
+- Build-time write-site ratchet baselines updated for the new workspace delete and REST replay primitives, so Reload builds cleanly.
+
+---
+
 ## v1.1.25
 
 ### Features

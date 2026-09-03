@@ -577,10 +577,83 @@ async function updateDeployDirButton() {
     }
 }
 
+// Workspace recency is persisted as meta.last_used_at whenever resolveWorkspace
+// selects an explicit/default workspace (the actual tool-use path). New clones
+// initialize it too. Older rows safely fall back to cloned_at; rows with neither
+// timestamp remain visible but are deferred until the pill is opened.
+var _WS_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+var _WS_EAGER_REFRESH_LIMIT = 5;
+var _WS_REFRESH_CONCURRENCY = 3;
+var _wsRemoteSyncInFlight = {};
+var _wsRemoteSyncQueue = [];
+var _wsRemoteSyncActive = 0;
+var _wsDropdownSyncInFlight = null;
+
+function _wsRecencyTimestamp(meta) {
+    return Number(meta && (meta.last_used_at || meta.cloned_at)) || 0;
+}
+
+function _wsEagerRefreshKeys(metas) {
+    var cutoff = Date.now() - _WS_RECENT_WINDOW_MS;
+    return (metas || []).filter(function(m) { return _wsRecencyTimestamp(m) >= cutoff; })
+        .sort(function(a, b) { return _wsRecencyTimestamp(b) - _wsRecencyTimestamp(a); })
+        .slice(0, _WS_EAGER_REFRESH_LIMIT)
+        .map(function(m) { return m.repo; });
+}
+
+async function _wsRunBounded(items, limit, worker) {
+    var next = 0;
+    var count = Math.min(Math.max(1, limit || 1), items.length);
+    var runners = [];
+    for (var i = 0; i < count; i++) {
+        runners.push((async function() {
+            while (next < items.length) {
+                var item = items[next++];
+                await worker(item);
+            }
+        })());
+    }
+    await Promise.all(runners);
+}
+
+function _wsDrainRemoteSyncQueue() {
+    while (_wsRemoteSyncActive < _WS_REFRESH_CONCURRENCY && _wsRemoteSyncQueue.length) {
+        var job = _wsRemoteSyncQueue.shift();
+        _wsRemoteSyncActive++;
+        Promise.resolve().then(job.run).then(job.resolve, job.reject).finally(function() {
+            _wsRemoteSyncActive--;
+            _wsDrainRemoteSyncQueue();
+        });
+    }
+}
+
+// One global UI scheduler owns every wsSyncWithRemote call. Settings, startup,
+// focus/header refresh and dropdown batches all share these same three slots.
+// The per-workspace map is populated before enqueueing, so queued and active
+// requests are both single-flight.
+function _wsSyncOnce(wk) {
+    if (_wsRemoteSyncInFlight[wk]) return _wsRemoteSyncInFlight[wk];
+    var scheduled = new Promise(function(resolve, reject) {
+        _wsRemoteSyncQueue.push({
+            run: function() { return wsSyncWithRemote(wk); },
+            resolve: resolve,
+            reject: reject
+        });
+        _wsDrainRemoteSyncQueue();
+    });
+    _wsRemoteSyncInFlight[wk] = scheduled.finally(function() { delete _wsRemoteSyncInFlight[wk]; });
+    return _wsRemoteSyncInFlight[wk];
+}
+
+function _wsLoadingHtml(label) {
+    return '<span class="ws-refresh-indicator"><span class="dropdown-loading-spinner" aria-hidden="true"></span>' + escapeHtml(label || 'Refreshing…') + '</span>';
+}
+
 // GitHub repos list in settings
 async function renderGitHubReposList() {
     var container = document.getElementById('github-repos-list');
     if (!container) return;
+    container.innerHTML = '<div class="ws-settings-loading">' + _wsLoadingHtml('Loading local workspaces…') + '</div>';
     try {
         var database = await openDatabase();
         var tx = database.transaction([workspaceMetaStoreName], 'readonly');
@@ -593,23 +666,24 @@ async function renderGitHubReposList() {
             return;
         }
 
-        // Check remote HEAD for each repo (non-blocking — render first, update after)
+        // Load LOCAL details concurrently so every repository becomes visible
+        // without waiting for sequential per-workspace IndexedDB reads.
         var html = '';
-        var repoData = [];
-        for (var i = 0; i < repos.length; i++) {
-            var meta = repos[i];
-            var wk = meta.repo; // workspace key (owner/repo::branch)
+        var eagerKeys = _wsEagerRefreshKeys(repos);
+        var eagerSet = {};
+        eagerKeys.forEach(function(k) { eagerSet[k] = true; });
+        var repoData = await Promise.all(repos.map(async function(meta) {
+            var wk = meta.repo;
             var githubRepo = meta.github_repo || parseWsKey(wk).repo;
-            var files = await getAllWorkspaceFiles(wk);
+            var pair = await Promise.all([getAllWorkspaceFiles(wk), wsGetIgnoreFilterLocal(wk)]);
+            var files = pair[0];
+            var isIgnored = pair[1];
             var totalFiles = files.length;
-            var isIgnored = await wsGetIgnoreFilter(wk);
             var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
             var dirtyCount = dirtyFiles.length;
             var totalSize = 0;
             files.forEach(function(f) { totalSize += (f.content || '').length; });
             var sizeStr = totalSize > 1048576 ? (totalSize / 1048576).toFixed(1) + ' MB' : totalSize > 1024 ? (totalSize / 1024).toFixed(0) + ' KB' : totalSize + ' B';
-
-            // Determine status label and PR info
             var pushedPrs = {};
             dirtyFiles.forEach(function(f) {
                 if (f.pushed_pr && f.pushed_pr.url) {
@@ -619,17 +693,15 @@ async function renderGitHubReposList() {
                 }
             });
             var prLinks = Object.keys(pushedPrs).map(function(key) { return pushedPrs[key]; });
-
-            // Count files that are dirty but NOT pushed to any PR (truly local-only changes)
             var unpushedDirty = dirtyFiles.filter(function(f) { return !f.pushed_pr; });
-
-            repoData.push({ meta: meta, wk: wk, githubRepo: githubRepo, totalFiles: totalFiles, dirtyFiles: dirtyFiles, dirtyCount: dirtyCount, sizeStr: sizeStr, prLinks: prLinks, unpushedDirty: unpushedDirty });
-        }
+            return { meta: meta, wk: wk, githubRepo: githubRepo, totalFiles: totalFiles, dirtyFiles: dirtyFiles, dirtyCount: dirtyCount, sizeStr: sizeStr, prLinks: prLinks, unpushedDirty: unpushedDirty, eager: !!eagerSet[wk] };
+        }));
 
         for (var ri = 0; ri < repoData.length; ri++) {
             var rd = repoData[ri];
 
-            // Remote sync status — always checked async
+            // Remote sync status: eager only for recent MRU workspaces; older
+            // local rows stay deferred until the workspace pill is opened.
             var syncSpanId = 'repo-sync-' + ri;
 
             // Dirty count for header line
@@ -651,7 +723,7 @@ async function renderGitHubReposList() {
                     '<div style="font-size:var(--text-caption);color:var(--text-muted);margin-top:var(--space-2);display:flex;gap:var(--space-6);flex-wrap:wrap;">' +
                         '<span>' + rd.totalFiles + ' files</span>' +
                         '<span>' + rd.sizeStr + '</span>' +
-                        '<span id="' + syncSpanId + '" style="color:var(--text-muted);">checking...</span>' +
+                        '<span id="' + syncSpanId + '" style="color:var(--text-muted);">' + (rd.eager ? _wsLoadingHtml('Refreshing…') : 'Refreshes when workspace pill opens') + '</span>' +
                         '<span id="repo-dirty-' + ri + '">' + dirtyLabel + '</span>' +
                     '</div>' +
                     detailHtml +
@@ -673,12 +745,19 @@ async function renderGitHubReposList() {
             repoData[fi].dirtyFiles.forEach(function(f) { fillEl.appendChild(_dirtyFileRow(f)); });
         }
 
-        // Smart sync for ALL repos (async, update in place)
+        // Only the five most-recent workspaces used in the rolling last 7 days
+        // refresh eagerly. Older rows remain visible from local data and are
+        // refreshed, with bounded concurrency, when the workspace pill opens.
+        var eagerJobs = [];
         for (var ci = 0; ci < repoData.length; ci++) {
-            (function(idx, rd) {
+            if (repoData[ci].eager) eagerJobs.push({ idx: ci, rd: repoData[ci] });
+        }
+        _wsRunBounded(eagerJobs, _WS_REFRESH_CONCURRENCY, function(job) {
+                var idx = job.idx;
+                var rd = job.rd;
                 var el = document.getElementById('repo-sync-' + idx);
-                if (!el) return;
-                wsSyncWithRemote(rd.wk).then(function(syncResult) {
+                if (!el) return Promise.resolve();
+                return _wsSyncOnce(rd.wk).then(function(syncResult) {
                     if (!el || !el.parentNode) return;
                     if (syncResult && syncResult.deleted) {
                         // Workspace auto-removed (merged head branch) — drop its row.
@@ -706,7 +785,7 @@ async function renderGitHubReposList() {
                         el.textContent = 'up to date';
                     }
                     // Re-render file list after sync
-                    wsGetIgnoreFilter(rd.wk).then(function(isIgnored) {
+                    wsGetIgnoreFilterLocal(rd.wk).then(function(isIgnored) {
                         getAllWorkspaceFiles(rd.wk).then(function(freshFiles) {
                             var freshDirty = freshFiles.filter(function(f) { return f.dirty && !isIgnored(f.path); });
                             var countEl = document.getElementById('repo-dirty-' + idx);
@@ -739,8 +818,7 @@ async function renderGitHubReposList() {
                 }).catch(function() {
                     if (el && el.parentNode) { el.style.color = 'var(--text-muted)'; el.textContent = 'offline'; }
                 });
-            })(ci, repoData[ci]);
-        }
+        }).catch(function() {});
     } catch (e) {
         container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-body-sm);">Error loading repos: ' + escapeHtml(e.message) + '</div>';
     }
@@ -814,30 +892,45 @@ async function recloneGitHubRepo(repo, branch) {
 }
 
 async function deleteGitHubRepo(repo) {
-    // Instant UI: drop just this one row. A full renderGitHubReposList() re-render
-    // re-reads every workspace's files from IndexedDB AND re-runs a remote GitHub
-    // sync ("checking...") for every OTHER repo — that round-trip is what made
-    // removal feel slow. Remove the row now; clean up storage in the background.
+    // Remove the workspace from every in-memory surface immediately. Persistence
+    // is verified below; on failure the canonical IDB-backed renders restore it.
+    delete _wsHeaderCaches[repo];
+    if (_wsDropdown) {
+        var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(repo) + '"]');
+        if (section) section.remove();
+        _reconcileThisChatSection();
+        if (Object.keys(_wsHeaderCaches).length === 0) hideWorkspaceDropdown();
+    }
+    _renderWsHeaderBadge();
+
     var container = document.getElementById('github-repos-list');
     if (container) {
         var rows = container.querySelectorAll('.settings-page-row[data-wk]');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].getAttribute('data-wk') === repo) { rows[i].remove(); break; }
         }
-        // Last one gone — show the empty state.
         if (!container.querySelector('.settings-page-row[data-wk]')) {
             container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">No repositories cloned yet.</div>';
         }
     }
+
     try {
-        await deleteWorkspaceFiles(repo);
-        await deleteWorkspaceMeta(repo);
+        await deleteLocalWorkspaceData(repo);
+        var remainingMeta = await getWorkspaceMeta(repo);
+        var remainingFiles = await getAllWorkspaceFiles(repo);
+        if (remainingMeta || remainingFiles.length > 0) throw new Error('Local workspace data could not be fully removed');
         try { gcWorkspaceBlobs(); } catch (e) {}
+        try { AgentEvents.emit('workspaceMutated', { action: 'delete_local_workspace', repo: repo }); } catch (e2) {}
+        await updateWorkspaceHeaderStatus();
+        _reconcileDropdownSections();
+        return { success: true };
     } catch (e) {
-        // Storage cleanup failed — re-render so the list matches reality.
+        // Restore every surface from persistence when cleanup did not complete.
+        await updateWorkspaceHeaderStatus();
+        _reconcileDropdownSections();
         renderGitHubReposList();
+        return { success: false, error: e && e.message ? e.message : String(e) };
     }
-    updateWorkspaceHeaderStatus();
 }
 
 // ============================================
@@ -859,7 +952,7 @@ async function getAllWorkspaceSummaries() {
         var meta = all[i];
         var wk = meta.repo;
         var files = await getAllWorkspaceFiles(wk);
-        var isIgnored = await wsGetIgnoreFilter(wk);
+        var isIgnored = await wsGetIgnoreFilterLocal(wk);
         var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
         var prev = _wsHeaderCaches[wk];
         summaries.push({
@@ -867,7 +960,7 @@ async function getAllWorkspaceSummaries() {
             meta: meta,
             dirtyCount: dirtyFiles.length,
             dirtyFiles: dirtyFiles,
-            syncStatus: prev ? prev.syncStatus : 'unknown',
+            syncStatus: prev ? prev.syncStatus : 'deferred',
             behindFiles: prev ? prev.behindFiles || [] : [],
             conflictFiles: prev ? prev.conflictFiles || [] : []
         });
@@ -901,16 +994,21 @@ function _renderWsHeaderBadge() {
     var totalDirty = 0;
     var reposWithChanges = 0;
     var anyBehind = false;
+    var anyRefreshing = false;
     keys.forEach(function(k) {
         var c = _wsHeaderCaches[k];
         totalDirty += c.dirtyCount;
         if (c.dirtyCount > 0) reposWithChanges++;
         if (c.syncStatus === 'behind') anyBehind = true;
+        if (c.syncStatus === 'refreshing') anyRefreshing = true;
     });
 
     els.forEach(function(el) {
         if (!el) return;
-        if (anyBehind) {
+        if (anyRefreshing) {
+            el.className = 'ws-header-status modified';
+            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + _wsLoadingHtml('Refreshing…');
+        } else if (anyBehind) {
             el.className = 'ws-header-status modified';
             el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>behind';
         } else if (totalDirty > 0) {
@@ -940,9 +1038,10 @@ async function updateWorkspaceHeaderStatus() {
     }
 }
 
-// Full sync with remote for all workspaces + update header (awaitable).
+// Background refresh: local state for every workspace, then remote state only
+// for workspaces used in the rolling last 7 days, capped to the five MRU.
 // Single-flight: concurrent callers (nav/focus/chat-switch triggers plus the
-// dropdown Pull button) share ONE in-flight run instead of interleaving
+// dropdown-open overlap) share ONE in-flight run instead of interleaving
 // _wsHeaderCaches wipes/writes (each run starts by resetting the cache).
 var _syncHdrInFlight = null;
 function syncAndUpdateWorkspaceHeader() {
@@ -957,9 +1056,12 @@ async function _syncAndUpdateWorkspaceHeaderInner() {
         summaries.forEach(function(s) { _wsHeaderCaches[s.wk] = s; });
         _renderWsHeaderBadge();
 
-        // Sync all repos in parallel
-        await Promise.all(summaries.map(function(s) {
-            return wsSyncWithRemote(s.wk).then(async function(syncResult) {
+        var eagerKeys = _wsEagerRefreshKeys(summaries.map(function(s) { return s.meta; }));
+        var eager = summaries.filter(function(s) { return eagerKeys.indexOf(s.wk) !== -1; });
+        eager.forEach(function(s) { s.syncStatus = 'refreshing'; _wsHeaderCaches[s.wk].syncStatus = 'refreshing'; });
+        _renderWsHeaderBadge();
+        await _wsRunBounded(eager, _WS_REFRESH_CONCURRENCY, function(s) {
+            return _wsSyncOnce(s.wk).then(async function(syncResult) {
                 if (syncResult && syncResult.deleted) {
                     // Workspace auto-removed (merged head branch) — drop from caches.
                     delete _wsHeaderCaches[s.wk];
@@ -970,8 +1072,27 @@ async function _syncAndUpdateWorkspaceHeaderInner() {
                 var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
                 // Re-read after sync (files may have been cleaned)
                 var meta = await getWorkspaceMeta(s.wk);
-                var isIgnored = await wsGetIgnoreFilter(s.wk);
+                // A local delete may race this remote sync. `wsSyncWithRemote`
+                // returns null when metadata vanished; never turn that into an
+                // "offline" cache entry that exists only in the pill dropdown.
+                if (!meta) {
+                    delete _wsHeaderCaches[s.wk];
+                    _renderWsHeaderBadge();
+                    _reconcileDropdownSections();
+                    return;
+                }
+                var isIgnored = await wsGetIgnoreFilterLocal(s.wk);
                 var files = await getAllWorkspaceFiles(s.wk);
+                // Final post-await existence check closes the delete-vs-sync race:
+                // if deletion committed while files/ignore state loaded, do not
+                // reinsert the old meta into the header cache.
+                meta = await getWorkspaceMeta(s.wk);
+                if (!meta) {
+                    delete _wsHeaderCaches[s.wk];
+                    _renderWsHeaderBadge();
+                    _reconcileDropdownSections();
+                    return;
+                }
                 var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
                 _wsHeaderCaches[s.wk] = {
                     wk: s.wk, meta: meta, dirtyCount: dirtyFiles.length, dirtyFiles: dirtyFiles,
@@ -981,12 +1102,26 @@ async function _syncAndUpdateWorkspaceHeaderInner() {
                 };
                 _renderWsHeaderBadge();
             }).catch(function() {
-                _wsHeaderCaches[s.wk].syncStatus = 'offline';
+                if (_wsHeaderCaches[s.wk]) _wsHeaderCaches[s.wk].syncStatus = 'offline';
+                _renderWsHeaderBadge();
+                if (_wsDropdown) {
+                    var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(s.wk) + '"]');
+                    if (section && _wsHeaderCaches[s.wk]) _renderDropdownSection(section, _wsHeaderCaches[s.wk]);
+                    _reconcileThisChatSection();
+                }
             });
-        }));
+        });
     } catch (e) {
-        var els = [document.getElementById('ws-header-status'), document.getElementById('home-ws-header-status')];
-        els.forEach(function(el) { if (el) el.style.display = 'none'; });
+        // Never leave a "Refreshing…" badge/section stranded after a batch-level
+        // failure (for example a local summary read error). Preserve existence
+        // guards because deletion may have committed while the batch was active.
+        Object.keys(_wsHeaderCaches).forEach(function(wk) {
+            if (_wsHeaderCaches[wk] && _wsHeaderCaches[wk].syncStatus === 'refreshing') {
+                _wsHeaderCaches[wk].syncStatus = 'offline';
+            }
+        });
+        _renderWsHeaderBadge();
+        if (_wsDropdown) _reconcileDropdownSections();
     }
 }
 
@@ -1022,14 +1157,32 @@ async function toggleWorkspaceDropdown() {
         _reconcileDropdownSections();
     }
 
-    // Lazy phase 3 — remote sync per repo, progressive section re-render.
+    // Opening the pill is the explicit refresh gesture for ALL locally visible
+    // workspaces, including deferred/older ones. Run at most three requests at a
+    // time and progressively repaint each section.
     _syncDropdownInBackground();
 }
 
-async function _syncDropdownInBackground() {
-    var keys = Object.keys(_wsHeaderCaches);
-    await Promise.all(keys.map(function(wk) {
-        return wsSyncWithRemote(wk).then(async function(syncResult) {
+// Operation-level single-flight: repeated opens during one dropdown refresh
+// share the exact batch snapshot. No workspace is added twice to that batch.
+function _syncDropdownInBackground() {
+    if (_wsDropdownSyncInFlight) return _wsDropdownSyncInFlight;
+    _wsDropdownSyncInFlight = _syncDropdownBatch(Object.keys(_wsHeaderCaches)).finally(function() {
+        _wsDropdownSyncInFlight = null;
+    });
+    return _wsDropdownSyncInFlight;
+}
+
+async function _syncDropdownBatch(keys) {
+    keys.forEach(function(wk) {
+        if (_wsHeaderCaches[wk]) _wsHeaderCaches[wk].syncStatus = 'refreshing';
+        if (_wsDropdown) {
+            var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(wk) + '"]');
+            if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
+        }
+    });
+    await _wsRunBounded(keys, _WS_REFRESH_CONCURRENCY, function(wk) {
+        return _wsSyncOnce(wk).then(async function(syncResult) {
             if (syncResult && syncResult.deleted) {
                 // Workspace auto-removed (merged head branch). Drop it from the
                 // dropdown + caches and refresh the badge.
@@ -1048,8 +1201,25 @@ async function _syncDropdownInBackground() {
             }
             var syncStatus = !syncResult ? 'offline' : syncResult.behind ? 'behind' : (syncResult.dirty_remaining > 0 ? 'modified' : 'up-to-date');
             var meta = await getWorkspaceMeta(wk);
-            var isIgnored = await wsGetIgnoreFilter(wk);
+            // The workspace can be deleted while this remote request is in
+            // flight. Drop the stale cache section instead of resurrecting it.
+            if (!meta) {
+                delete _wsHeaderCaches[wk];
+                _reconcileDropdownSections();
+                _renderWsHeaderBadge();
+                return;
+            }
+            var isIgnored = await wsGetIgnoreFilterLocal(wk);
             var files = await getAllWorkspaceFiles(wk);
+            // Re-check after all awaits so a concurrent local delete cannot be
+            // undone by this background renderer's stale metadata snapshot.
+            meta = await getWorkspaceMeta(wk);
+            if (!meta) {
+                delete _wsHeaderCaches[wk];
+                _reconcileDropdownSections();
+                _renderWsHeaderBadge();
+                return;
+            }
             var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
             _wsHeaderCaches[wk] = {
                 wk: wk, meta: meta, dirtyCount: dirtyFiles.length, dirtyFiles: dirtyFiles,
@@ -1071,7 +1241,7 @@ async function _syncDropdownInBackground() {
                 if (section) _renderDropdownSection(section, _wsHeaderCaches[wk]);
             }
         });
-    }));
+    });
 }
 
 function hideWorkspaceDropdown() {
@@ -1093,7 +1263,8 @@ function _getSyncLabel(syncStatus) {
         syncStatus === 'behind' ? '<span class="ws-sync behind">behind remote</span>' :
         syncStatus === 'modified' ? '<span class="ws-sync behind">local changes</span>' :
         syncStatus === 'offline' ? '<span class="ws-sync">offline</span>' :
-        '<span class="ws-sync">syncing…</span>';
+        syncStatus === 'deferred' ? '<span class="ws-sync">opens to refresh</span>' :
+        '<span class="ws-sync">' + _wsLoadingHtml('Refreshing…') + '</span>';
 }
 
 // Pin button HTML — filled (full opacity) for the pinned workspace, dimmed
@@ -1112,6 +1283,31 @@ function _wsCloneBtnHtml(repo, branch) {
     var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.refresh) ? UI_ICONS.refresh : '\u21BB';
     return '<button class="ws-clone-btn" data-clone-repo="' + escapeHtml(repo) + '" data-clone-branch="' + escapeHtml(branch) +
         '" title="Re-clone this repo (fetch the latest from remote)" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);line-height:1;vertical-align:middle;color:var(--text-secondary);">' + icon + '</button>';
+}
+
+function _wsDeleteBtnHtml(wk) {
+    var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.trash) ? UI_ICONS.trash : '\u00d7';
+    return '<button class="ws-delete-btn" data-delete-ws="' + escapeHtml(wk) +
+        '" title="Delete this local workspace" aria-label="Delete local workspace ' + escapeHtml(wk) + '">' + icon + '</button>';
+}
+
+async function _deleteWorkspaceFromDropdown(wk) {
+    var parsed = parseWsKey(wk);
+    var cache = _wsHeaderCaches[wk];
+    var dirtyCount = cache ? cache.dirtyCount : 0;
+    var dirtyWarning = dirtyCount > 0
+        ? '<br><br><strong>This permanently discards ' + dirtyCount + ' uncommitted local change' + (dirtyCount === 1 ? '' : 's') + '.</strong>'
+        : '';
+    var confirmed = await showConfirmModal('Delete local workspace?',
+        'Delete <strong>' + escapeHtml(parsed.repo) + ' (' + escapeHtml(parsed.branch) + ')</strong> from this browser?' + dirtyWarning +
+        '<br><br>The GitHub repository and remote branch will not be deleted.', 'danger');
+    if (!confirmed) return;
+
+    var result = await deleteGitHubRepo(wk);
+    if (typeof showSnackbar === 'function') {
+        if (result && result.success) showSnackbar('Deleted local workspace ' + parsed.repo + ' (' + parsed.branch + ')');
+        else showSnackbar('Delete failed: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
 }
 
 // Re-clone a repo from the workspace dropdown. Re-cloning replaces the local clone, so
@@ -1433,12 +1629,13 @@ function _renderDropdownSection(section, cache) {
         // Clone button is always available; pin button only in extension-dev mode
         // (deploy folder connected), matching the Reload button's visibility gate.
         var cloneBtn = _wsCloneBtnHtml(parsed.repo, parsed.branch);
+        var deleteBtn = _wsDeleteBtnHtml(cache.wk);
         var pinBtn = _wsExtDevMode ? _wsPinBtnHtml(cache.wk, !!(cache.meta && cache.meta.pinned)) : '';
         var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
         var changeCount = _wsSectionChangeCount(cache);
         var countChip = changeCount > 0 ? '<span class="ws-change-count" title="' + changeCount + ' change' + (changeCount > 1 ? 's' : '') + '">' + changeCount + '</span>' : '';
         var repoIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>';
-        header.innerHTML = '<span class="ws-dd-title">' + chevron + repoIcon + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + '</span>' + _getSyncLabel(cache.syncStatus);
+        header.innerHTML = '<span class="ws-dd-title">' + chevron + repoIcon + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + deleteBtn + '</span>' + _getSyncLabel(cache.syncStatus);
     }
     var body = section.querySelector('.ws-dropdown-body');
     if (!body) return;
@@ -1576,9 +1773,15 @@ async function showWorkspaceDropdown() {
         dd.appendChild(_createDropdownSection(wk, idx));
     });
 
-    // Delegated pin-toggle handler — header innerHTML is re-rendered on every
-    // sync, so a per-button listener would be lost; delegation survives it.
+    // Delegated action handler — header innerHTML is re-rendered on every sync,
+    // so per-button listeners would be lost; delegation survives it.
     dd.addEventListener('click', function(e) {
+        var deleteBtn = e.target.closest('[data-delete-ws]');
+        if (deleteBtn) {
+            e.stopPropagation();
+            _deleteWorkspaceFromDropdown(deleteBtn.getAttribute('data-delete-ws'));
+            return;
+        }
         var cloneBtn = e.target.closest('[data-clone-repo]');
         if (cloneBtn) {
             e.stopPropagation();

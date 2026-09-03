@@ -193,11 +193,22 @@ function recordToolResult(chat, toolCallId, name, content) {
         m.content = content;
         if (name) m.name = name;
         delete m._placeholder;
+        delete m._dispatched;
         return m;
     }
     var newMsg = { role: 'tool', tool_call_id: toolCallId, name: name || 'unknown', content: content };
     chat.messages.push(newMsg);
     return newMsg;
+}
+
+// Sanctioned durable-result path for replay guards: one persistence write site
+// shared by every branch that must not advance until its replacement result is
+// committed. saveChatsToStorage's SW implementation coalesces concurrent saves
+// and resolves its waiter only after a save capturing current state commits.
+async function recordDurableToolResult(chat, toolCallId, name, content) {
+    var row = recordToolResult(chat, toolCallId, name, content);
+    await saveChatsToStorage();
+    return row;
 }
 
 // SPAWN-REPLAY GUARD (runaway-spawn incident): tools that CREATE new agents /
@@ -225,6 +236,74 @@ function synthesizeNonReplayableResult(toolName) {
             + ' (non-idempotent: re-running it would duplicate its side effects, e.g. spawn a'
             + ' second agent). If the action is still needed, check current state first'
             + ' (e.g. agent_status for existing sub-agents) and only then issue a NEW call.]'
+    });
+}
+
+// MUTATING-REST-REPLAY GUARD: a headless request can commit remotely and then
+// lose its local result if the MV3 runtime dies before recordToolResult + the
+// chat save become durable. The surviving placeholder is replayed on resume.
+// Reads are safe to replay, but a write is not: settle its placeholder with an
+// explicit indeterminate result and require remote-state verification first.
+var MUTATING_REST_METHODS = { POST: true, PUT: true, PATCH: true, DELETE: true };
+
+function getMutatingRestReplayInfo(toolName, args) {
+    if (toolName !== 'servicenow_api' && toolName !== 'web_fetch') return null;
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+    var rawMethod = args.method;
+    // web_fetch defaults to GET. servicenow_api requires method, so a missing or
+    // non-string value remains malformed and is handled by the normal replay
+    // validation/execution path rather than being guessed to be a write.
+    var method = (typeof rawMethod === 'string') ? rawMethod.trim().toUpperCase()
+        : (toolName === 'web_fetch' && rawMethod == null ? 'GET' : null);
+    if (!method || !MUTATING_REST_METHODS[method]) return null;
+    return { tool: toolName, method: method };
+}
+
+// A placeholder alone does NOT prove the request left the runtime: Pause mid
+// batch and approval-pending-at-crash both leave un-run placeholders. Only a
+// placeholder carrying `_dispatched: true` (written durably right before the
+// request is issued) is an indeterminate replay; anything else is safe to run.
+function findPlaceholderRow(chat, toolCallId) {
+    if (!chat || !chat.messages || !toolCallId) return null;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m.role === 'tool' && m.tool_call_id === toolCallId) return m._placeholder ? m : null;
+    }
+    return null;
+}
+
+function isMutationDispatched(chat, toolCallId) {
+    var row = findPlaceholderRow(chat, toolCallId);
+    if (!row || !row._dispatched) return false;
+    // A still-pending approval row proves the gated request never left the
+    // runtime (the mark precedes the approval wait) — safe to re-run/re-ask.
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var a = chat.messages[i];
+        if (a.role === 'approval' && a.toolCallId === toolCallId) return a.status !== 'pending' && a.status !== 'denied';
+    }
+    return true;
+}
+
+// Called immediately before a mutating REST request is issued. Marks the
+// placeholder and waits for the mark to commit so a crash after this point is
+// correctly classified as indeterminate on replay. Reads are not marked.
+async function markMutationDispatched(chat, toolCallId, toolName, args) {
+    if (!getMutatingRestReplayInfo(toolName, args)) return;
+    var row = findPlaceholderRow(chat, toolCallId);
+    if (!row || row._dispatched) return;
+    row._dispatched = true;
+    await saveChatsToStorage();
+}
+
+function synthesizeIndeterminateMutationReplayResult(info) {
+    return JSON.stringify({
+        success: false,
+        replay_blocked: true,
+        outcome: 'indeterminate',
+        tool: info.tool,
+        method: info.method,
+        error: 'Prior ' + info.tool + ' ' + info.method + ' may have completed remotely, but the agent runtime restarted before its result became durable. The request was NOT automatically re-executed to avoid duplicate side effects.',
+        next_action: 'Verify the remote state before deciding whether to issue a new request.'
     });
 }
 
@@ -482,16 +561,20 @@ async function executePendingApprovedTools(chat) {
         // Skip programmatic tool calls (from js_eval chaining) - they're handled internally
         if (msg.toolCallId && msg.toolCallId.startsWith('prog_')) continue;
         
-        // Check if there's already a tool result for this tool call
-        var hasResult = false;
-        for (var j = i + 1; j < chat.messages.length; j++) {
-            if (chat.messages[j].role === 'tool' && chat.messages[j].tool_call_id === msg.toolCallId) {
-                hasResult = true;
-                break;
-            }
+        // Atomic placeholders/results live in the tool-result slot immediately
+        // after the assistant message, which is BEFORE the approval row. Search
+        // the whole transcript: a durable row means this approval is complete;
+        // only a matching placeholder is an indeterminate in-flight replay.
+        var hasDurableResult = false;
+        var hasUnresolvedPlaceholder = false;
+        for (var j = 0; j < chat.messages.length; j++) {
+            var approvedResultRow = chat.messages[j];
+            if (approvedResultRow.role !== 'tool' || approvedResultRow.tool_call_id !== msg.toolCallId) continue;
+            if (approvedResultRow._placeholder) hasUnresolvedPlaceholder = !!approvedResultRow._dispatched;
+            else { hasDurableResult = true; break; }
         }
         
-        if (!hasResult) {
+        if (!hasDurableResult) {
             // Execute this pending tool
             var toolName = msg.actualToolName || msg.toolName;
             var args = msg.args;
@@ -505,6 +588,16 @@ async function executePendingApprovedTools(chat) {
                 recordToolResult(chat, msg.toolCallId, toolName, synthesizeNonReplayableResult(toolName));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: chat && chat.id, toolCallId: msg.toolCallId, name: toolName, result: { success: false, _synthesized: true }, force: true });
+                continue;
+            }
+
+            var approvedMutationReplay = hasUnresolvedPlaceholder && getMutatingRestReplayInfo(toolName, args);
+            if (approvedMutationReplay) {
+                console.warn('[agent-loop] approved-replay blocked indeterminate mutation ' + toolName + ' ' + approvedMutationReplay.method + ' (' + msg.toolCallId + ')');
+                // Wait for the chat row containing the replacement result to commit
+                // before emitting the checkpoint boundary / advancing the loop.
+                await recordDurableToolResult(chat, msg.toolCallId, toolName, synthesizeIndeterminateMutationReplayResult(approvedMutationReplay));
+                AgentEvents.emit('toolCallResult', { chatId: chat && chat.id, toolCallId: msg.toolCallId, name: toolName, result: { success: false, replay_blocked: true, outcome: 'indeterminate' }, force: true });
                 continue;
             }
             
@@ -521,7 +614,8 @@ async function executePendingApprovedTools(chat) {
             AgentEvents.emit('toolCallStarted', { chatId: _chatId, toolCallId: msg.toolCallId, name: toolName, displayName: msg.toolName, input: args });
             try {
                 // executeTool checks for existing approval via requestProgrammaticToolApproval
-                var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
+                await markMutationDispatched(chat, msg.toolCallId, toolName, args);
+            var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
                 processed.content = appendContextNotice(chat, processed.content);
@@ -722,7 +816,7 @@ async function runAgent(overrideChatId) {
         for (var pci = 0; pci < pendingToolCalls.length; pci++) {
             if (isChatPaused(streamingChatId)) break;
             var tc = pendingToolCalls[pci].tc;
-            var toolName = tc.function.name;
+            var toolName = tc && tc.function && tc.function.name ? tc.function.name : 'unknown';
             // SPAWN-REPLAY GUARD: never re-execute spawn-class tools on a
             // restart replay — synthesize a result instead (see
             // NON_REPLAYABLE_TOOLS above).
@@ -735,18 +829,32 @@ async function runAgent(overrideChatId) {
             }
             var args;
             try {
-                args = JSON.parse(tc.function.arguments || '{}');
+                args = JSON.parse((tc && tc.function && tc.function.arguments) || '{}');
                 args = normalizeToolArgs(args);
+                if (!args || typeof args !== 'object' || Array.isArray(args)) {
+                    throw new Error('arguments must be a JSON object');
+                }
             } catch (parseErr) {
-                console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
-                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
+                console.error('Failed to parse tool arguments:', tc && tc.function ? tc.function.arguments : undefined, parseErr);
+                recordToolResult(chat, tc && tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
             }
 
+            var mutationReplay = isMutationDispatched(chat, tc.id) && getMutatingRestReplayInfo(toolName, args);
+            if (mutationReplay) {
+                console.warn('[agent-loop] pending-replay blocked indeterminate mutation ' + toolName + ' ' + mutationReplay.method + ' (' + tc.id + ')');
+                // Wait for the replacement result to commit before the emitted
+                // checkpoint can make this resume look complete.
+                await recordDurableToolResult(chat, tc.id, toolName, synthesizeIndeterminateMutationReplayResult(mutationReplay));
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: { success: false, replay_blocked: true, outcome: 'indeterminate' } });
+                continue;
+            }
+
             var displayName = getToolDisplayName(toolName, args.method || args.action);
             AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            await markMutationDispatched(chat, tc.id, toolName, args);
             // Match main: tool throws propagate to the outer try/finally → runCrashed.
             // Before re-throwing we drop the _placeholder marker on this and every
             // subsequent unrun tool (record a real result), otherwise the next
@@ -1372,6 +1480,7 @@ async function runAgent(overrideChatId) {
 
             var displayName = getToolDisplayName(toolName, args.method || args.action);
             AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            await markMutationDispatched(chat, tc.id, toolName, args);
             // Every tool_use already has a placeholder tool_result (seeded by
             // `seedPlaceholderToolResults` when the assistant turn was finalized).
             // `recordToolResult` overwrites that placeholder in-place; the chat

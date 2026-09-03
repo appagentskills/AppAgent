@@ -2908,7 +2908,10 @@ async function resolveWorkspace(workspace) {
     if (workspace) {
         var meta = await getWorkspaceMeta(workspace);
         if (meta) {
-            try { meta.last_used_at = Date.now(); setWorkspaceMeta(meta); } catch (e) {}
+            // Targeted, fresh-read update: never put the stale object read above
+            // back over concurrent pin/PR/sync metadata changes. Await the IDB
+            // commit before the resolved workspace is used by the tool call.
+            try { await touchWorkspaceLastUsed(workspace); } catch (e) { console.warn('Failed to persist workspace recency:', e); }
             return workspace;
         }
         return { error: 'Workspace "' + workspace + '" not found. Use workspace clone first.' };
@@ -2934,7 +2937,7 @@ async function resolveWorkspace(workspace) {
                 break;
             }
         }
-        try { chosen.last_used_at = Date.now(); setWorkspaceMeta(chosen); } catch (e) {}
+        try { await touchWorkspaceLastUsed(chosen.repo); } catch (e) { console.warn('Failed to persist workspace recency:', e); }
         return chosen.repo;
     } catch (e) {
         return { error: 'Failed to resolve workspace: ' + e.message };
@@ -3066,11 +3069,57 @@ async function getWorkspaceMeta(repo) {
 }
 
 async function setWorkspaceMeta(meta) {
-    try {
-        var database = await openDatabase();
-        var tx = database.transaction([workspaceMetaStoreName], 'readwrite');
-        tx.objectStore(workspaceMetaStoreName).put(meta);
-    } catch (e) { console.error('Failed to save workspace meta:', e); }
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx;
+        try {
+            tx = database.transaction([workspaceMetaStoreName], 'readwrite');
+            var store = tx.objectStore(workspaceMetaStoreName);
+            // Preserve a newer recency stamp if this caller built `meta` from an
+            // older snapshot. Read + put live in one transaction, so concurrent
+            // targeted touches and ordinary metadata writes serialize safely.
+            var getReq = store.get(meta.repo);
+            getReq.onsuccess = function() {
+                var current = getReq.result;
+                var toWrite = Object.assign({}, meta);
+                if (current && Number(current.last_used_at) > Number(toWrite.last_used_at || 0)) {
+                    toWrite.last_used_at = current.last_used_at;
+                }
+                store.put(toWrite);
+            };
+            getReq.onerror = function() { try { tx.abort(); } catch (e) {} };
+            tx.oncomplete = function() { resolve(); };
+            tx.onerror = function() { reject(tx.error || new Error('Failed to save workspace meta')); };
+            tx.onabort = function() { reject(tx.error || new Error('Failed to save workspace meta')); };
+        } catch (e) { reject(e); }
+    });
+}
+
+// Atomically update only workspace recency. The get happens inside the same
+// readwrite transaction as the put, so unrelated fields always come from the
+// freshest committed row and the Promise resolves only after commit.
+async function touchWorkspaceLastUsed(repo, usedAt) {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx;
+        var found = false;
+        try {
+            tx = database.transaction([workspaceMetaStoreName], 'readwrite');
+            var store = tx.objectStore(workspaceMetaStoreName);
+            var getReq = store.get(repo);
+            getReq.onsuccess = function() {
+                var current = getReq.result;
+                if (!current) return;
+                found = true;
+                current.last_used_at = Math.max(Number(current.last_used_at) || 0, Number(usedAt) || Date.now());
+                store.put(current);
+            };
+            getReq.onerror = function() { try { tx.abort(); } catch (e) {} };
+            tx.oncomplete = function() { resolve(found); };
+            tx.onerror = function() { reject(tx.error || new Error('Failed to update workspace recency')); };
+            tx.onabort = function() { reject(tx.error || new Error('Failed to update workspace recency')); };
+        } catch (e) { reject(e); }
+    });
 }
 
 // ---- Content-addressed blob helpers (workspace_blobs store) ----
@@ -3318,21 +3367,43 @@ async function getAllWorkspaceFilesAllRepos() {
     } catch (e) { return []; }
 }
 
+// ─── Workspace-store delete primitives (write-site ratchet: ONE delete
+// site per store) ───
+// Every removal of workspace_files / workspace_meta rows routes through
+// these two transaction-scoped helpers — the standalone best-effort wrappers
+// (deleteWorkspaceFiles / deleteWorkspaceMeta) and the atomic
+// deleteLocalWorkspaceData below all share them, so the per-file
+// idbStoreDelete count stays at its baseline and a new ad-hoc delete call
+// anywhere still trips the ratchet for review.
+
+// Queue deletes for every workspace_files row of `repo` on `tx` (a readwrite
+// transaction that includes workspaceFilesStoreName). Resolves with the
+// deleted-key count once the deletes are queued (they commit with `tx`);
+// rejects if the key scan fails.
+function deleteWorkspaceFileRowsIn(tx, repo) {
+    return new Promise(function(resolve, reject) {
+        var store = tx.objectStore(workspaceFilesStoreName);
+        var request = store.index('repo').getAllKeys(repo);
+        request.onsuccess = function() {
+            var keys = request.result || [];
+            keys.forEach(function(k) { store.delete(k); });
+            resolve(keys.length);
+        };
+        request.onerror = function() { reject(request.error || new Error('Failed to enumerate workspace files')); };
+    });
+}
+
+// Queue the delete of the workspace_meta row of `repo` on `tx` (a readwrite
+// transaction that includes workspaceMetaStoreName).
+function deleteWorkspaceMetaRowIn(tx, repo) {
+    tx.objectStore(workspaceMetaStoreName).delete(repo);
+}
+
 async function deleteWorkspaceFiles(repo) {
     try {
         var database = await openDatabase();
         var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
-        var store = tx.objectStore(workspaceFilesStoreName);
-        var index = store.index('repo');
-        var request = index.getAllKeys(repo);
-        return new Promise(function(resolve) {
-            request.onsuccess = function() {
-                var keys = request.result || [];
-                keys.forEach(function(k) { store.delete(k); });
-                resolve(keys.length);
-            };
-            request.onerror = function() { resolve(0); };
-        });
+        return await deleteWorkspaceFileRowsIn(tx, repo);
     } catch (e) { return 0; }
 }
 
@@ -3340,8 +3411,32 @@ async function deleteWorkspaceMeta(repo) {
     try {
         var database = await openDatabase();
         var tx = database.transaction([workspaceMetaStoreName], 'readwrite');
-        tx.objectStore(workspaceMetaStoreName).delete(repo);
+        deleteWorkspaceMetaRowIn(tx, repo);
     } catch (e) {}
+}
+
+// Atomically remove one LOCAL workspace (metadata + file rows) and resolve only
+// after IndexedDB commits. Unlike the legacy best-effort wrappers above, this
+// rejects transaction/request failures so user-facing delete flows can restore
+// their optimistic UI instead of leaving Settings and the header out of sync.
+// Both stores are removed through the shared primitives in ONE transaction.
+async function deleteLocalWorkspaceData(repo) {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx;
+        try {
+            tx = database.transaction([workspaceFilesStoreName, workspaceMetaStoreName], 'readwrite');
+            deleteWorkspaceMetaRowIn(tx, repo);
+            deleteWorkspaceFileRowsIn(tx, repo).catch(function() {
+                try { tx.abort(); } catch (e) {}
+            });
+            tx.oncomplete = function() { resolve(); };
+            tx.onerror = function() { reject(tx.error || new Error('Failed to delete local workspace')); };
+            tx.onabort = function() { reject(tx.error || new Error('Failed to delete local workspace')); };
+        } catch (e) {
+            reject(e);
+        }
+    });
 }
 
 // GitHub settings helpers

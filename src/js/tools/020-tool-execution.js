@@ -2993,7 +2993,8 @@ async function wsClone(repo, branch) {
         head_sha: headSha,
         tree_sha: treeRes.body.sha,
         lazy: true,
-        cloned_at: Date.now()
+        cloned_at: Date.now(),
+        last_used_at: Date.now()
     };
     if (existing) {
         if (existing.pinned) _newMeta.pinned = true;
@@ -4105,6 +4106,16 @@ function parseGitignore(content) {
         }
         return ignored;
     };
+}
+
+// Strictly local ignore filter for summary/render paths. Never hydrates a stub
+// and therefore cannot trigger GitHub traffic while enumerating workspaces.
+async function wsGetIgnoreFilterLocal(wk) {
+    try {
+        var gitignoreFile = await getWorkspaceFile(wk, '.gitignore');
+        if (gitignoreFile && !gitignoreFile.stub && gitignoreFile.content) return parseGitignore(gitignoreFile.content);
+    } catch (e) {}
+    return function() { return false; };
 }
 
 async function wsGetIgnoreFilter(wk) {

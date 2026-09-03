@@ -569,11 +569,11 @@ async function mergeSidebarPR(event, btn) {
         try {
             if (typeof syncAndUpdateWorkspaceHeader === 'function') {
                 await syncAndUpdateWorkspaceHeader();
-            } else if (typeof wsSyncWithRemote === 'function' && typeof getAllWorkspaceMetas === 'function') {
+            } else if (typeof _wsSyncOnce === 'function' && typeof getAllWorkspaceMetas === 'function') {
                 var metas = await getAllWorkspaceMetas();
                 await Promise.all(metas.filter(function(m) {
                     return (m.github_repo || parseWsKey(m.repo).repo) === info.repo;
-                }).map(function(m) { return wsSyncWithRemote(m.repo).catch(function() {}); }));
+                }).map(function(m) { return _wsSyncOnce(m.repo).catch(function() {}); }));
             }
             // syncAndUpdateWorkspaceHeader swallows errors (marks repos 'offline'
             // in _wsHeaderCaches instead) — check the cache before claiming success.

@@ -16,7 +16,7 @@
     },
     "saveChatsToStorage": {
       "src/js/app/020-api-messages.js": 2,
-      "src/js/app/030-agent-loop.js": 22,
+      "src/js/app/030-agent-loop.js": 24,
       "src/js/app/040-send-message.js": 3,
       "src/js/app/050-image-attachments.js": 1,
       "src/js/core/097-sub-agent-registry.js": 10,

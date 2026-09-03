@@ -475,6 +475,18 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     // an `allowed` approval message and no loop to consume it. Always re-kick on the
     // target chat when there's no live resolver, regardless of caller.
     if (action !== 'deny') {
+        // The approval was still PENDING when the original loop died, so the
+        // gated request was never issued. Clear any dispatch marker so the
+        // approved-replay guard runs it instead of treating it as indeterminate.
+        if (msg.toolCallId && chat.messages) {
+            for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
+                var _pm = chat.messages[_pi];
+                if (_pm.role === 'tool' && _pm.tool_call_id === msg.toolCallId) {
+                    if (_pm._placeholder) delete _pm._dispatched;
+                    break;
+                }
+            }
+        }
         await runAgent(chatId);
     }
 }
