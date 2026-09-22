@@ -678,7 +678,7 @@ function _swSettleRemotePrompt(msg, fromPort) {
 // userInterruptedChats / fires the interrupt resolver / aborts the stream.
 // WHOLE-message match only (optional "it/that/this", "no thanks", trailing
 // punctuation): "no problem, go ahead" / "wait, actually yes" are answers.
-var _SW_STOP_PHRASE_RE = /^\s*(?:stop|cancel|abort|halt|wait|hold\s+on|no(?:\s+thanks)?|nope|(?:don['\u2019]?t|do\s+not)(?:\s+do)?)(?:\s+(?:it|that|this))?\s*[.!,]*\s*$/i;
+var _SW_STOP_PHRASE_RE = /^\s*(?:stop|cancel|abort|halt|wait|hold\s+on|no\s+thanks|no|nope|(?:don['\u2019]?t|do\s+not)(?:\s+do)?)(?:\s+(?:it|that|this))?\s*[.!,]*\s*$/i;
 function _swIsStopPhrase(text) {
     return typeof text === 'string' && _SW_STOP_PHRASE_RE.test(text);
 }
