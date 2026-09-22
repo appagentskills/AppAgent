@@ -208,7 +208,7 @@ var pr = (await gh('/repos/{o}/{r}/pulls/{n}')).data;
 if (pr.merged) return { already: true };
 // poll until GitHub finishes computing mergeable
 for (var i = 0; i < 5 && pr.mergeable === null; i++) {
-  await new Promise(function (r) { setTimeout(r, 1200); });
+  await sleep(1200); // js_eval's service-worker-backed sleep — raw setTimeout is throttled in the sandbox
   pr = (await gh('/repos/{o}/{r}/pulls/{n}')).data;
 }
 if (!pr.mergeable) return { blocked: pr.mergeable_state };   // dirty / blocked / behind ...
@@ -256,7 +256,7 @@ To merge branches directly without opening a PR, `POST /repos/{o}/{r}/merges` wi
 ### Resolve / unresolve a review thread (GraphQL only)
 
 **REST cannot resolve review threads** — there is no endpoint for it. Use the GraphQL API at
-`POST https://api.github.com/graphql` (same host, so the token auto-attaches; send `{"query": "…"}`).
+`POST https://api.github.com/graphql` (same host, so the token auto-attaches on github.com; on GHE it is `<instance>/api/graphql`, outside `/api/v3`, so add the `Authorization` header yourself; send `{"query": "…"}`).
 
 1. Get the thread IDs (and which inline comment opened each):
 ```graphql
@@ -304,4 +304,6 @@ tighter limit (~30/min). Batch and cache; avoid tight loops.
 - **422** = validation error on a write (bad/duplicate params) — read `.errors` in the body.
 - Always `JSON.parse(res.body)`; for writes pass `method` + a JSON string `body`.
 - Token scope: the same PAT/OAuth used for git now powers REST reads/writes, so its scope
-  applies to both. Write calls (POST/PATCH/DELETE) act as the connected user — confirm intent.
+  applies to both. Write calls (POST/PUT/DELETE) act as the connected user — confirm intent.
+- `web_fetch` `method` enum is GET/POST/PUT/DELETE only — **no PATCH**. PATCH-only endpoints (edit PR/issue title/body, edit a comment) are therefore not reachable via `web_fetch`; to refresh a PR's title/body use `workspace push` with `pr_title`/`pr_body` on the same `branch_name`.
+- GraphQL on GitHub Enterprise lives at `<instance>/api/graphql` — **outside** the `/api/v3` REST base, so the token is NOT auto-attached; pass `Authorization: Bearer <token>` yourself (on github.com `api.github.com/graphql` is on the REST host and does auto-attach).

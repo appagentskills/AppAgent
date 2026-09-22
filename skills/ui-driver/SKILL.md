@@ -31,7 +31,7 @@ Without a pinned tab, `iframe_tool` can silently read the **WRONG browser tab** 
    ```javascript
    const ift = a => executeTool("iframe_tool", Object.assign({instance, tab_id: TAB}, a));
    ```
-4. If reads look unrelated to the page you think you're on → **STOP**, `list_instances refresh:true`, re-pin.
+4. If reads look unrelated to the page you think you're on → **STOP**, `list_instances` (it always re-probes live; `refresh` is a deprecated no-op), re-pin.
 
 ## The approach: write a disposable driver script each time
 

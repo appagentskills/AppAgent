@@ -6,8 +6,24 @@
 // abandoned the instant the user sends a new message. The orphan promise keeps
 // running in the background and its result is discarded — the agent loop pushes
 // a placeholder tool_result and moves on with the user's queued message.
+// Security follow-up #6: a tool ARM that throws (e.g. ReferenceError
+// `executeRunTests is not defined` in a stale bundle) used to reject out of
+// executeToolWithInterrupt; the loop's catch arms below record a failed result
+// and then RE-THROW ("match main"), which for a sub-agent surfaces as
+// `_markErrored(aid, 'agent loop crashed: …')` (core/097) — the whole sub dies
+// on one bad tool call. Convert the throw into a normal failed tool result so
+// the model sees {success:false, error} and the run keeps going (the same
+// shape the page-side batch path at ~:875 already records).
+function _toolThrowToResult(toolName, e) {
+    var msg = (e && e.message) ? e.message : String(e);
+    try { console.error('[agent-loop] tool "' + toolName + '" threw \u2014 recorded as a failed result instead of crashing the run', e); } catch (e0) {}
+    return { success: false, error: msg, tool_threw: true };
+}
 function executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, opts) {
-    var toolPromise = executeTool(toolName, args, assistantMsgIndex, opts);
+    var toolPromise;
+    try { toolPromise = Promise.resolve(executeTool(toolName, args, assistantMsgIndex, opts)); }
+    catch (eSync) { toolPromise = Promise.resolve(_toolThrowToResult(toolName, eSync)); }
+    toolPromise = toolPromise.catch(function(e) { return _toolThrowToResult(toolName, e); });
     if (!streamingChatId) return toolPromise;
     return new Promise(function(resolve, reject) {
         var settled = false;
@@ -145,8 +161,9 @@ function getChatContextTokens(chat) {
 // >=50% warns (main: delegate to sub-agents; sub: wrap up + report_to_parent
 // suggesting a fresh successor); >=60% is the FINAL WARNING (the agent has
 // ignored the 50% tier — stop all work and report/wrap up IMMEDIATELY);
-// >=100% has NO hard stop but maximum urgency
-// (stop and report NOW). Exactly ONE tier fires per tool result (highest
+// >=100% has NO hard stop here but maximum urgency (stop and report NOW) —
+// the only hard stop is the flag-gated SUB-AGENT one in
+// maybeSubSaturationHardStop below (#3, P4_SUB_SATURATION_HARDSTOP). Exactly ONE tier fires per tool result (highest
 // matching wins — no double warnings). No one-shot/re-arm logic — fires on every tool
 // result while over threshold, goes quiet if occupancy drops. Wording is
 // deliberately PERCENTAGE-ONLY (never absolute token counts — the model
@@ -178,6 +195,74 @@ function appendContextNotice(chat, content) {
     } catch (_) { return content; }
 }
 
+// #3 (Phase 4) — sub-agent saturation HARD STOP. Called once per LLM call in
+// the loop (right before the assistant row is opened), only for sub chats
+// and only when getP4Flag('P4_SUB_SATURATION_HARDSTOP') is ON. Stateless,
+// like the progress nudge: firings are found by scanning THIS turn's rows
+// (back to the last `user` row) for the tagged `_saturationHardStop` context
+// row — nothing persisted, nothing to drift across SW restarts.
+//   1. sub at >= SUBAGENT_HARDSTOP_PCT and no row yet → push ONE mandatory
+//      context row → 'injected'.
+//   2. row present AND >= SUBAGENT_HARDSTOP_GRACE_TURNS assistant rows after
+//      it AND the registry record is still 'running' → auto-report
+//      need_input on the sub's behalf via SubAgents.report (which parks the
+//      chat, so the caller must `break`) → 'reported'.
+//   3. anything else (main chat, under threshold, grace not exhausted, rec
+//      not running — e.g. legitimately mid report_to_parent) → null.
+// No tool_choice forcing: the row is a plain context nudge.
+function maybeSubSaturationHardStop(chat, streamingChatId) {
+    try {
+        if (!chat || !chat.isSubAgent || !chat.messages) return null;
+        if (typeof getP4Flag !== 'function' || !getP4Flag('P4_SUB_SATURATION_HARDSTOP')) return null;
+        var _hsLimit = (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
+        var _hsTokens = getChatContextTokens(chat);
+        if (!_hsLimit || !_hsTokens) return null;
+        var _hsPct = Math.round(100 * _hsTokens / _hsLimit);
+        var _hsThreshold = (typeof SUBAGENT_HARDSTOP_PCT === 'number') ? SUBAGENT_HARDSTOP_PCT : 60;
+        var _hsGrace = (typeof SUBAGENT_HARDSTOP_GRACE_TURNS === 'number') ? SUBAGENT_HARDSTOP_GRACE_TURNS : 2;
+        if (_hsPct < _hsThreshold) return null;
+        var _hsRowSeen = false, _hsTurnsSince = 0;
+        for (var _hi = chat.messages.length - 1; _hi >= 0; _hi--) {
+            var _hm = chat.messages[_hi];
+            if (!_hm) continue;
+            if (_hm.role === 'user') break; // start of this turn
+            if (_hm.role === 'context' && _hm._saturationHardStop) { _hsRowSeen = true; break; }
+            if (_hm.role === 'assistant') _hsTurnsSince++;
+        }
+        if (!_hsRowSeen) {
+            chat.messages.push({
+                role: 'context',
+                _saturationHardStop: true,
+                content: '\u26d4 [MANDATORY \u2014 context ~' + _hsPct + '%: you are saturated. Write a short handover doc (document create, shared scope: what is done, what is left, exact next steps) and call report_to_parent NOW with status need_input. Do NO other work \u2014 if you have not reported within ' + _hsGrace + ' more turns the runtime will report on your behalf with your last message as the summary.]'
+            });
+            return 'injected';
+        }
+        if (_hsTurnsSince < _hsGrace) return null;
+        if (typeof SubAgents === 'undefined' || !SubAgents || typeof SubAgents.report !== 'function') return null;
+        var _hsRec = (typeof SubAgents.getByChatId === 'function') ? SubAgents.getByChatId(streamingChatId) : null;
+        if (!_hsRec || _hsRec.state !== 'running') return null;
+        var _hsLast = (_hsRec.last_assistant_text && String(_hsRec.last_assistant_text)) || '(no assistant text)';
+        // R4 SF3: reportToParent (core/097) is synchronous and returns
+        // {success:false,...} on validation / already-settled failures WITHOUT
+        // parking the chat — returning 'reported' then would make the loop break
+        // and the run end 'completed' with no report. Only claim 'reported' on
+        // success (a promise-shaped return is treated as accepted).
+        var _hsRes = SubAgents.report({
+            status: 'need_input',
+            summary: '[auto-handoff at ~' + _hsPct + '% context \u2014 the sub-agent did not report after the mandatory stop; its last message follows]\n\n' + _hsLast,
+            data: { auto_handoff: true, context_pct: _hsPct }
+        }, { chatId: streamingChatId });
+        if (_hsRes && typeof _hsRes.then !== 'function' && _hsRes.success === false) {
+            console.warn('[hardstop] auto-handoff report rejected for ' + streamingChatId + ': ' + (_hsRes.error || 'unknown'));
+            return null;
+        }
+        return 'reported';
+    } catch (e) {
+        console.warn('[hardstop] maybeSubSaturationHardStop failed', e && e.message);
+        return null;
+    }
+}
+
 function recordToolResult(chat, toolCallId, name, content) {
     if (!chat || !chat.messages || !toolCallId) return null;
     // SAVE-DROP RESCUE (runaway-spawn incident): a result recorded while the
@@ -194,6 +279,9 @@ function recordToolResult(chat, toolCallId, name, content) {
         if (name) m.name = name;
         delete m._placeholder;
         delete m._dispatched;
+        delete m._widgetEvalDispatched;
+        delete m._widgetEvalRun;
+        delete m._widgetEvalIds;
         return m;
     }
     var newMsg = { role: 'tool', tool_call_id: toolCallId, name: name || 'unknown', content: content };
@@ -228,6 +316,15 @@ var NON_REPLAYABLE_TOOLS = {
     agent_message: true,     // delivers (and may wake the recipient) per call
     start_chat: true         // creates a new chat (and may run it) per call
 };
+
+// A nested widget eval marks its OUTER placeholder durably. Replaying the
+// enclosing js_eval/skill would generate fresh child IDs and repeat effects.
+function getWidgetProgramReplayResult(chat, toolCallId, toolName) {
+    var row = findPlaceholderRow(chat, toolCallId);
+    if (toolName === 'widget_eval' || !row || !row._widgetEvalDispatched) return null;
+    return JSON.stringify({ success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
+        error: 'This program dispatched a widget evaluation before interruption. It was NOT replayed; verify live state before a NEW call.' });
+}
 
 function synthesizeNonReplayableResult(toolName) {
     return JSON.stringify({
@@ -451,12 +548,159 @@ function injectInterruptedToolResults(chat) {
     return injected;
 }
 
+// #6a (Phase 4, flag P4_BOOT_PLACEHOLDER_SWEEP) — SW-boot sweep for STRANDED
+// placeholder rows. `_placeholder: true` tool rows are seeded only inside a
+// running loop (seedPlaceholderToolResults); after an SW restart only chats
+// with a RUNNING checkpoint are resumed (worker/130-port-bridge.js
+// resumeRunningCheckpoints), so a chat whose loop died without a live
+// checkpoint keeps '[Tool call pending — …]' forever and the model reads it
+// as a real result on the next user turn (injectInterruptedToolResults only
+// runs from the send path). Called from both boot paths (130 after the resume
+// forEach, worker/190-entry.js empty-list path) with the set of chat ids that
+// reached runAgent in this scan. For every OTHER chat — not `_deleted`, not
+// in runningChatIds, not a sub whose registry record is still 'running' —
+// walk back from the tail to the last `user` row and rewrite each
+// placeholder in place through recordToolResult (drops `_placeholder`) with
+// an honest `runtime_restarted` failure. NEVER re-executes the tool (no
+// checkpoint = no approval context to replay under). One save at the end.
+// Returns the number of rows rewritten.
+// B11 (sweep follow-up): PAUSED chats are skipped too. A user-paused chat
+// (chat.pausedByUser / pausedChats, rehydrated by worker/115-storage.js) or a
+// sub paused THROUGH its parent's Pause button (rec.paused_by_parent_chat /
+// the in-memory _pausedByParentChat map rebuilt by 097
+// _resumeOrOrphanSubAtBoot) has a 'paused' checkpoint that the resume scan
+// deliberately does not pick up, so it is neither in `resumedIds` nor in
+// runningChatIds — yet its placeholder rows are NOT stranded: the eventual
+// Resume re-queues the loop, which replays the parked tool calls against
+// those very rows. Rewriting them here would make the replay record a
+// duplicate result (or drop it) and the model would read a bogus
+// runtime_restarted failure. Leave them for the resume replay.
+function _sweepIsPausedChat(id, chat, rec) {
+    try {
+        if (chat && chat.pausedByUser === true) return true;
+        if (typeof pausedChats !== 'undefined' && pausedChats && pausedChats[id]) return true;
+        if (typeof _pausedByParentChat !== 'undefined' && _pausedByParentChat && _pausedByParentChat[id]) return true;
+        if (rec && rec.paused_by_parent_chat) return true;
+    } catch (e) { /* fall through — treat as not paused */ }
+    return false;
+}
+function sweepStrandedPlaceholders(resumedIds) {
+    var rewritten = 0;
+    try {
+        if (typeof chats === 'undefined' || !chats) return 0;
+        var resumed = resumedIds || {};
+        var running = (typeof runningChatIds !== 'undefined' && runningChatIds) || {};
+        var payload = JSON.stringify({
+            success: false,
+            error: 'runtime restarted before this tool produced a result (not re-executed); re-issue the call if still needed',
+            code: 'runtime_restarted'
+        });
+        var ids = Object.keys(chats);
+        var rewrittenIds = [];
+        for (var ci = 0; ci < ids.length; ci++) {
+            var id = ids[ci];
+            var chat = chats[id];
+            if (!chat || chat._deleted === true || !chat.messages || !chat.messages.length) continue;
+            if (resumed[id] || running[id]) continue;
+            var rec = null;
+            if (chat.isSubAgent && typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.getByChatId === 'function') {
+                try { rec = SubAgents.getByChatId(id); } catch (eRec) { rec = null; }
+                if (rec && rec.state === 'running') continue;
+            }
+            // B11: paused (user or via parent) — placeholder rows survive for the resume replay.
+            if (_sweepIsPausedChat(id, chat, rec)) continue;
+            var stranded = [];
+            for (var mi = chat.messages.length - 1; mi >= 0; mi--) {
+                var row = chat.messages[mi];
+                if (!row) continue;
+                if (row.role === 'user') break;
+                if (row.role === 'tool' && row._placeholder && row.tool_call_id) stranded.push(row);
+            }
+            var before = rewritten;
+            for (var si = 0; si < stranded.length; si++) {
+                if (recordToolResult(chat, stranded[si].tool_call_id, stranded[si].name, payload)) rewritten++;
+            }
+            if (rewritten > before) rewrittenIds.push(id);
+            if (stranded.length) {
+                console.warn('[sweep] rewrote ' + stranded.length + ' stranded placeholder row(s) in chat ' + id + ' (runtime_restarted)');
+            }
+        }
+        if (rewritten && typeof saveChatsToStorage === 'function') {
+            try { saveChatsToStorage(); } catch (eSave) {}
+        }
+        // R4 SF4: the save alone leaves connected / soon-connecting panels showing
+        // the stale '[Tool call pending…]' text until their next pull. Emit the
+        // same chat-inlining event the SW uses after other message mutations
+        // (messagesAppended — EVENTS_WITH_CHAT_INLINE in worker/100). The rows
+        // were rewritten IN PLACE below any delta watermark, which the delta
+        // builder would not carry — drop the watermark first so the envelope
+        // falls back to a full slim snapshot (at SW boot there is none anyway).
+        // Guarded: 030 is loaded in both the page and SW tiers.
+        if (rewrittenIds.length && typeof AgentEvents !== 'undefined' && AgentEvents && typeof AgentEvents.emit === 'function') {
+            for (var bi = 0; bi < rewrittenIds.length; bi++) {
+                try {
+                    if (typeof _chatDeltaSync !== 'undefined' && _chatDeltaSync) delete _chatDeltaSync[rewrittenIds[bi]];
+                    AgentEvents.emit('messagesAppended', { chatId: rewrittenIds[bi], reason: 'stranded_placeholder_sweep' });
+                } catch (eEmit) { /* broadcast is best-effort */ }
+            }
+        }
+    } catch (e) {
+        console.warn('[sweep] sweepStrandedPlaceholders failed', e && e.message);
+    }
+    return rewritten;
+}
+
 // Flush a pending user injection (text + images) into the chat.
 // Per-chat: only consumes a queue that was actually destined for THIS chat.
 // The globals (`pendingInjection` / `pendingInjectionImages`) are kept in sync
 // for the foreground stream so legacy UI code keeps working, but they are NOT
 // consulted when the per-chat entry is missing — otherwise a background chat's
 // loop would steal the foreground chat's queued message.
+// #9 — empty final assistant message. A response with NO text, NO thinking
+// and NO tool calls used to be persisted as an empty assistant row and end the
+// run silently. The loop now tags such rows `_empty` and, once per run
+// (chat._emptyRetries, reset at run start), pushes a role:'context' nudge and
+// continues so the model gives its answer; a second empty turn ends the run.
+var EMPTY_RESPONSE_NUDGE = 'Your last response was empty (no text, no tool calls) — give your final answer now.';
+function _isEmptyAssistantTurn(assistantMsg) {
+    if (!assistantMsg || assistantMsg.role !== 'assistant') return false;
+    if (assistantMsg.tool_calls && assistantMsg.tool_calls.length) return false;
+    if (assistantMsg.thinking) return false;
+    var c = assistantMsg.content;
+    if (!c) return true;
+    return typeof c === 'string' && !c.trim();
+}
+// #16: turn key for the progress-card stamp — index of the last ORGANIC
+// (non-injected) user row at or before `lastUserMsgIndex`; falls back to
+// `lastUserMsgIndex` itself when every user row is injected / none exists.
+function _progressCardTurnKey(chat, lastUserMsgIndex) {
+    var msgs = (chat && chat.messages) || [];
+    for (var i = lastUserMsgIndex; i >= 0; i--) {
+        var m = msgs[i];
+        if (m && m.role === 'user' && !m.injected) return i;
+    }
+    return lastUserMsgIndex;
+}
+// #16: run-start reset of the progress-card stamp — clears chat._progressCardAt
+// when the run belongs to a different organic user turn than the one the
+// stamp was taken under. Returns true when the stamp was cleared.
+function _resetProgressCardStampForTurn(chat, lastUserMsgIndex) {
+    var key = _progressCardTurnKey(chat, lastUserMsgIndex);
+    if (chat._progressCardTurn === key) return false;
+    var had = !!chat._progressCardAt;
+    chat._progressCardAt = null;
+    chat._progressCardTurn = key;
+    return had;
+}
+// Returns true when a nudge row was pushed (the caller must `continue`).
+function _pushEmptyResponseNudge(chat) {
+    var tries = chat._emptyRetries || 0;
+    if (tries >= 1) return false;
+    chat._emptyRetries = tries + 1;
+    chat.messages.push({ role: 'context', content: EMPTY_RESPONSE_NUDGE, _emptyNudge: true });
+    return true;
+}
+
 function flushPendingInjection(chat) {
     var chatId = chat && chat.id;
     var entry = chatId ? pendingInjectionsByChatId[chatId] : null;
@@ -525,6 +769,33 @@ function flushPendingInjection(chat) {
 // Normalize tool args after JSON.parse: fix string-ified arrays/objects
 // The Anthropic API sometimes delivers array/object params as strings,
 // with trailing XML parameter tags bleeding into the value.
+// Params that CARRY TEXT (file/document bodies, code, markup, messages). A
+// string value here that happens to start with `{`/`[` (a .json file, a JS
+// object literal, markdown starting with a link list) must NEVER be JSON-parsed
+// into an object — downstream `content.indexOf`/`.split` would throw (#5).
+var NORMALIZE_ARGS_STRING_ONLY = { content: 1, code: 1, html: 1, script: 1, body: 1, pr_body: 1, commit_message: 1, message: 1, summary: 1, text: 1, find: 1, replace: 1, value: 1, css: 1, template: 1, description: 1, output: 1, label: 1, title: 1, query: 1, pattern: 1 };
+// #19: build the error text recorded when a tool_call's `arguments` string does
+// not parse. The streaming layer (010-llm-streaming.js) just concatenates the
+// argument deltas and does not track finish_reason 'length', so a response that
+// hits max_tokens mid-call (typical: document create / file write with a big
+// `content`) surfaces here as a bare SyntaxError. Detect the truncation shape
+// (end-of-input / unterminated string / parser position at the very end) and
+// tell the model WHAT happened and HOW to recover (split the content). Any other
+// parse error keeps the parser's own message unchanged.
+function _toolArgsParseErrorMessage(rawArgs, parseErr) {
+    var em = String((parseErr && parseErr.message) || parseErr || '');
+    var base = 'Invalid tool arguments: ' + em;
+    var raw = typeof rawArgs === 'string' ? rawArgs : '';
+    if (!raw || !(parseErr instanceof SyntaxError)) return base;
+    var truncated = /unexpected end of (json )?input|unterminated string|end of data/i.test(em);
+    if (!truncated) {
+        var pm = em.match(/position\s+(\d+)/i);
+        if (pm && parseInt(pm[1], 10) >= raw.length - 1) truncated = true;
+    }
+    if (!truncated) return base;
+    return base + ' — the arguments JSON was cut off after ' + raw.length + ' chars (the response most likely hit max_tokens). Re-issue the call with smaller arguments: split large content into several calls (e.g. create the document/file with the first part, then append the rest with edit/update), or raise max_tokens.';
+}
+
 function normalizeToolArgs(args) {
     if (!args || typeof args !== 'object') return args;
     var xmlTagRe = new RegExp('\\n?' + '<' + 'param' + 'eter[\\s\\S]*', 'i');
@@ -532,6 +803,7 @@ function normalizeToolArgs(args) {
         if (!args.hasOwnProperty(key)) continue;
         var val = args[key];
         if (typeof val !== 'string') continue;
+        if (NORMALIZE_ARGS_STRING_ONLY[key]) continue;
         var trimmed = val.trim();
         // Only attempt parse on values that look like JSON arrays or objects
         if ((trimmed[0] === '[' && trimmed.indexOf(']') > -1) || (trimmed[0] === '{' && trimmed.indexOf('}') > -1)) {
@@ -591,6 +863,12 @@ async function executePendingApprovedTools(chat) {
                 continue;
             }
 
+            var approvedWidgetReplay = getWidgetProgramReplayResult(chat, msg.toolCallId, toolName);
+            if (approvedWidgetReplay) {
+                await recordDurableToolResult(chat, msg.toolCallId, toolName, approvedWidgetReplay);
+                AgentEvents.emit('toolCallResult', { chatId: chat.id, toolCallId: msg.toolCallId, name: toolName, result: { success: false, replay_blocked: true, outcome: 'indeterminate' }, force: true });
+                continue;
+            }
             var approvedMutationReplay = hasUnresolvedPlaceholder && getMutatingRestReplayInfo(toolName, args);
             if (approvedMutationReplay) {
                 console.warn('[agent-loop] approved-replay blocked indeterminate mutation ' + toolName + ' ' + approvedMutationReplay.method + ' (' + msg.toolCallId + ')');
@@ -615,7 +893,7 @@ async function executePendingApprovedTools(chat) {
             try {
                 // executeTool checks for existing approval via requestProgrammaticToolApproval
                 await markMutationDispatched(chat, msg.toolCallId, toolName, args);
-            var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id });
+            var result = await executeTool(toolName, args, assistantMsgIndex, { toolCallId: msg.toolCallId, chatId: chat.id, widgetEvalRecoverOnly: toolName === 'widget_eval' && args.action === 'eval' });
 
                 var processed = processToolResultForCache(chat.id, msg.toolCallId, toolName, result);
                 processed.content = appendContextNotice(chat, processed.content);
@@ -750,6 +1028,17 @@ async function runAgent(overrideChatId) {
             break;
         }
     }
+    // #9: one empty-response nudge per run.
+    chat._emptyRetries = 0;
+    // #16: the progress-card stamp (chat._progressCardAt, set by
+    // executeUpdateActionState) silences the progress nudge for the TURN the
+    // card belongs to only. Remember which organic user row the stamp was
+    // taken under; when a run starts on a different turn the stale stamp is
+    // cleared so a card from an earlier turn cannot silence later turns. A
+    // resumed run on the SAME turn (SW restart / page reload) keeps it, and
+    // so does a run started by an INJECTED user-role row (sub-agent report /
+    // wake notice, `injected:true`) — those continue the organic turn.
+    _resetProgressCardStampForTurn(chat, lastUserMsgIndex);
     
     // Accumulate metrics from assistant messages in this turn (after last user message)
     // This preserves stats when continuing after page reload
@@ -836,12 +1125,18 @@ async function runAgent(overrideChatId) {
                 }
             } catch (parseErr) {
                 console.error('Failed to parse tool arguments:', tc && tc.function ? tc.function.arguments : undefined, parseErr);
-                recordToolResult(chat, tc && tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
+                recordToolResult(chat, tc && tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc && tc.function && tc.function.arguments, parseErr) }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
             }
 
+            var widgetReplay = getWidgetProgramReplayResult(chat, tc.id, toolName);
+            if (widgetReplay) {
+                await recordDurableToolResult(chat, tc.id, toolName, widgetReplay);
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: { success: false, replay_blocked: true, outcome: 'indeterminate' } });
+                continue;
+            }
             var mutationReplay = isMutationDispatched(chat, tc.id) && getMutatingRestReplayInfo(toolName, args);
             if (mutationReplay) {
                 console.warn('[agent-loop] pending-replay blocked indeterminate mutation ' + toolName + ' ' + mutationReplay.method + ' (' + tc.id + ')');
@@ -855,7 +1150,9 @@ async function runAgent(overrideChatId) {
             var displayName = getToolDisplayName(toolName, args.method || args.action);
             AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
             await markMutationDispatched(chat, tc.id, toolName, args);
-            // Match main: tool throws propagate to the outer try/finally → runCrashed.
+            // Tool throws are now converted into failed results by _toolThrowToResult
+            // (executeToolWithInterrupt); this catch arm is a SAFETY NET for
+            // throws from elsewhere in the dispatch and still crashes the run.
             // Before re-throwing we drop the _placeholder marker on this and every
             // subsequent unrun tool (record a real result), otherwise the next
             // runAgent's pending-replay sees them as unprocessed placeholders and
@@ -865,7 +1162,7 @@ async function runAgent(overrideChatId) {
             // "[interrupted]" content these recordToolResult calls write here.
             var result;
             try {
-                result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId });
+                result = await executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgIndex, { toolCallId: tc.id, chatId: streamingChatId, widgetEvalRecoverOnly: toolName === 'widget_eval' && args.action === 'eval' });
             } catch (toolErr) {
                 console.error('[agent-loop] tool execution threw during pending-replay for ' + toolName, toolErr);
                 recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: (toolErr && toolErr.message) ? toolErr.message : String(toolErr) }));
@@ -1060,7 +1357,14 @@ async function runAgent(overrideChatId) {
         // counter to drift across SW restarts. Answer-card hook calls
         // (set_chat_title/set_tldr/set_links) are excluded from the count so a
         // failed-hook retry pass at the very end can never trip a useless nudge.
-        if (typeof PROGRESS_NUDGE_TOOL_CALLS === 'number' && PROGRESS_NUDGE_TOOL_CALLS > 0) {
+        // #16: `chat._progressCardAt` is stamped by executeUpdateActionState
+        // (tools/120-actions.js; mirrored to the SW chat via the
+        // _progress_card_persist result marker in worker/120-tool-routing.js)
+        // and cleared at run start when the user turn changed — it covers
+        // cards created earlier in THIS turn before an injected user-role
+        // notice and cards created from inside js_eval (no tool_calls entry),
+        // which the transcript scan below cannot see.
+        if (typeof PROGRESS_NUDGE_TOOL_CALLS === 'number' && PROGRESS_NUDGE_TOOL_CALLS > 0 && !chat._progressCardAt) {
             var _pnToolCalls = 0, _pnHasCard = false, _pnNudges = 0;
             var _pnSkip = { set_chat_title: true, set_tldr: true, set_links: true, set_caveat: true };
             for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
@@ -1090,6 +1394,18 @@ async function runAgent(overrideChatId) {
                     _progressNudge: true,
                     content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the PROGRESS UPDATES policy, create one NOW — batch the update_action_state call ALONGSIDE your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
                 });
+            }
+        }
+
+        // #3 (Phase 4, flag P4_SUB_SATURATION_HARDSTOP): sub-agent saturation
+        // hard stop — see maybeSubSaturationHardStop. 'reported' means
+        // SubAgents.report parked this chat on the sub's behalf: persist and
+        // leave the loop (the paused-chat checks would exit anyway, but do
+        // not open an assistant row / spend an LLM call first).
+        if (chat.isSubAgent && typeof maybeSubSaturationHardStop === 'function') {
+            if (maybeSubSaturationHardStop(chat, streamingChatId) === 'reported') {
+                saveChatsToStorage();
+                break;
             }
         }
 
@@ -1182,6 +1498,11 @@ async function runAgent(overrideChatId) {
                     assistantMsg.content = final.content || '';
                     assistantMsg.tool_calls = final.tool_calls;
                     assistantMsg.reasoning_details = final.reasoning_details; // Preserve for OpenRouter API continuity
+                    // Anthropic content-block order (Opus 5.5 / Fable 5.1+ thinking
+                    // binding) — replayed by transformMessageToAnthropic. Absent for
+                    // non-Claude-OAuth streams; never leave a stale value behind.
+                    if (Array.isArray(final.block_order) && final.block_order.length > 0) assistantMsg.block_order = final.block_order;
+                    else delete assistantMsg.block_order;
                     assistantMsg.isStreaming = false;
                 },
                 function(status, count) {
@@ -1209,20 +1530,22 @@ async function runAgent(overrideChatId) {
                 delete providerChangedChats[streamingChatId];
             }
             var isUserAbort = _isAbortError || userInterruptedChats[streamingChatId];
+            // Remove THIS request's partial assistant row by identity — rows may
+            // have been appended after it (sub-agent report, injected user row),
+            // so pop() would either miss the partial or strip the wrong row.
+            var _uncommittedAssistantIndex = chat.messages.indexOf(assistantMsg);
             if (isProviderChangeAbort) {
                 delete providerChangedChats[streamingChatId];
                 // Drop only the uncommitted assistant turn. The issued request body
                 // is immutable; the next iteration rebuilds against the new provider.
-                if (chat.messages[chat.messages.length - 1] === assistantMsg) chat.messages.pop();
+                if (_uncommittedAssistantIndex >= 0) chat.messages.splice(_uncommittedAssistantIndex, 1);
                 AgentEvents.emit('streamAborted', { chatId: streamingChatId, reason: 'provider_change' });
                 continue;
             }
             if (isUserAbort) {
                 userInterruptedChats[streamingChatId] = false;
                 // Drop the partial in-flight assistant message entirely — we never use it.
-                if (chat.messages[chat.messages.length - 1] === assistantMsg) {
-                    chat.messages.pop();
-                }
+                if (_uncommittedAssistantIndex >= 0) chat.messages.splice(_uncommittedAssistantIndex, 1);
                 if (flushPendingInjection(chat)) {
                     saveChatsToStorage();
                     AgentEvents.emit('userInjected', { chatId: streamingChatId });
@@ -1267,9 +1590,7 @@ async function runAgent(overrideChatId) {
             // an already-exhausted bounded transport retry sequence.
             if (_throttleClass && (!e || e.retryable !== false) && throttleRetries < AGENT_THROTTLE_MAX_RETRIES) {
                 throttleRetries++;
-                if (chat.messages[chat.messages.length - 1] === assistantMsg) {
-                    chat.messages.pop();
-                }
+                if (_uncommittedAssistantIndex >= 0) chat.messages.splice(_uncommittedAssistantIndex, 1);
                 var _waitMs = Math.min(4000 * Math.pow(2, throttleRetries - 1), 30000);
                 // Jitter: concurrent chats shed at the same instant must not
                 // retry in lockstep (same rationale as the transport backoff).
@@ -1318,7 +1639,7 @@ async function runAgent(overrideChatId) {
                 errEnv = { message: String(e) };
             }
             lastApiError = { message: errEnv.message, chatId: streamingChatId, timestamp: Date.now() };
-            chat.messages.pop();
+            if (_uncommittedAssistantIndex >= 0) chat.messages.splice(_uncommittedAssistantIndex, 1);
             AgentEvents.emit('error', { chatId: streamingChatId, error: errEnv, recoverable: true });
             // If this chat is a background Action, the PM only sees the action
             // button — a silent crash leaves it spinning forever with no result.
@@ -1406,10 +1727,20 @@ async function runAgent(overrideChatId) {
         // overwrites the placeholder content in-place when it completes.
         seedPlaceholderToolResults(chat, assistantMsg.tool_calls);
 
+        // #9: tag empty turns BEFORE the save/emit so the persisted row and the
+        // page mirror agree.
+        if (_isEmptyAssistantTurn(assistantMsg)) assistantMsg._empty = true;
         saveChatsToStorage();
         AgentEvents.emit('assistantMessage', { chatId: streamingChatId, turn: lastUserMsgIndex, message: assistantMsg, metrics: assistantMsg.metrics });
 
         if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+            // #9: empty response → nudge once and go round again (before the
+            // injection flush so the ORIGINAL question gets its answer first;
+            // any queued user text is flushed on the next no-tool_calls pass).
+            if (assistantMsg._empty && _pushEmptyResponseNudge(chat)) {
+                saveChatsToStorage();
+                continue;
+            }
             // If there's a pending injection, push it and continue the loop
             // so the agent sees the user's message in the next API call
             if (flushPendingInjection(chat)) {
@@ -1472,7 +1803,7 @@ async function runAgent(overrideChatId) {
             } catch (parseErr) {
                 console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
                 _answerCardOnlyTurn = false; // let the model see the parse error
-                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: 'Invalid tool arguments: ' + parseErr.message }));
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc.function.arguments, parseErr) }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
@@ -1488,7 +1819,9 @@ async function runAgent(overrideChatId) {
             // eviction between here and the per-tool save can never strand an
             // orphan `tool_use`.
             //
-            // Match main: tool throws propagate to the outer try/finally → runCrashed.
+            // Tool throws are now converted into failed results by _toolThrowToResult
+            // (executeToolWithInterrupt); this catch arm is a SAFETY NET for
+            // throws from elsewhere in the dispatch and still crashes the run.
             // Before re-throwing we drop the _placeholder marker on this and every
             // subsequent unrun tool (record a real result), otherwise the next
             // runAgent's pending-replay sees them as unprocessed placeholders and
@@ -1539,7 +1872,32 @@ async function runAgent(overrideChatId) {
                 var _btPaused = !_wasUserMessage && !_wasProviderChange && isChatPaused(streamingChatId);
                 for (var ri2 = i; !_btPaused && ri2 < assistantMsg.tool_calls.length; ri2++) {
                     var rtc2 = assistantMsg.tool_calls[ri2];
-                    recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _placeholder);
+                    // #18 prompt_user continuity: normally the SW fast path
+                    // (worker/130-port-bridge.js → _swAnswerPendingPromptViaChat)
+                    // settles a pending prompt with the user's text and never
+                    // interrupts. If we still get here for a prompt_user call
+                    // (untracked/legacy entry), tell the model the answer is the
+                    // next user message instead of claiming the call was abandoned.
+                    // Stop-phrase lane: _swAnswerPendingPromptViaChat settles the
+                    // prompt row as cancelled (status:'cancelled' + cancelled_via_chat)
+                    // and returns false so the interrupt still fires; when the
+                    // interrupt wins the race we land here and must NOT tell the
+                    // model the prompt was answered — hand it the cancel shape.
+                    var _phIsPrompt = _wasUserMessage && rtc2.function && rtc2.function.name === 'prompt_user';
+                    var _phRow = null;
+                    if (_phIsPrompt && Array.isArray(chat.messages)) {
+                        for (var pr2 = chat.messages.length - 1; pr2 >= 0; pr2--) {
+                            var prm2 = chat.messages[pr2];
+                            if (prm2 && prm2.role === 'prompt_user' && prm2.toolCallId === rtc2.id) { _phRow = prm2; break; }
+                        }
+                    }
+                    var _phCancelled = !!(_phRow && (_phRow.cancelled_via_chat || _phRow.status === 'cancelled'));
+                    var _phText = _phIsPrompt
+                        ? JSON.stringify(_phCancelled
+                            ? { success: false, cancelled: true, cancelled_via_chat: !!_phRow.cancelled_via_chat, answered_via_chat: true, error: 'User cancelled the prompt' + (_phRow.cancelled_via_chat ? ' via chat — see the next user message' : '') }
+                            : { success: true, answered_via_chat: true, text: '[user answered in chat — see the next user message]' })
+                        : _placeholder;
+                    recordToolResult(chat, rtc2.id, rtc2.function ? rtc2.function.name : 'unknown', _phText);
                     // MP-3: settle + clean the SW pending/parked entry and the
                     // executor panel's prompt resolver for every abandoned call
                     // (see worker/120-tool-routing.js abandonPendingUIToolCall).
@@ -1777,7 +2135,9 @@ async function runAgent(overrideChatId) {
         // typeof guard: the page bundle no longer carries a (dead) copy of
         // executeAfterResponseHooks — only the SW bundle defines it
         // (worker/020-page-stubs.js), and only the SW runs this loop.
-        if (typeof executeAfterResponseHooks === 'function') executeAfterResponseHooks(streamingChatId);
+        // #9: pass the run's own user-row anchor so a user message that landed
+        // after the final answer does not move the hook target span.
+        if (typeof executeAfterResponseHooks === 'function') executeAfterResponseHooks(streamingChatId, lastUserMsgIndex);
     }
     // Hook decision made: executeAfterResponseHooks' recursive runAgent (if it
     // fired) has already synchronously re-set runningChatIds[streamingChatId].

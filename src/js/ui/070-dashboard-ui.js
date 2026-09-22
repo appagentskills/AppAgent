@@ -53,6 +53,7 @@ function setupDashboardResponsive() {
 
 // Expand widget to fullscreen
 function expandDashboardWidget(widgetId) {
+    WidgetStore.project(widgetId);
     var widget = dashboardWidgets[widgetId];
     if (!widget) return;
     
@@ -72,8 +73,12 @@ function expandDashboardWidget(widgetId) {
         '<span class="widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>' +
         '<div class="widget-modal-controls">' +
         '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
-        (widget.history && widget.history.length > 0 ? '<button class="widget-modal-btn" onclick="closeExpandedWidget();showWidgetHistory(\'' + widgetId + '\')" title="History (' + widget.history.length + ')">' + UI_ICONS.history + '</button>' : '') +
+        // Saved revisions live in WidgetStore (widget.history is no longer written).
+        // The button opens the version picker attachWidgetVersionPicker mounted
+        // above this modal's iframe; it only shows when there is history to pick.
+        (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="History (' + WidgetStore.versions(widgetId).length + ' versions)">' + UI_ICONS.history + '</button>' : '') +
         '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
+        '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="Open in New Tab" aria-label="Open in New Tab">' + UI_ICONS.externalLink + '</button>' +
         '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
         // Dashboard twin of the chat toolbar's manual code editor
         // (tools/080-widget-tools.js:429). Distinct from the "Edit" button above:
@@ -101,7 +106,7 @@ function expandDashboardWidget(widgetId) {
         iframe.style.cssText = 'width:100%;height:100%;border:none;background:var(--bg-white);';
         iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
         content.appendChild(iframe);
-        writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id));
+        writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id), widget.id);
     }
 }
 
@@ -732,24 +737,68 @@ function injectWidgetTokens(html) {
 
 // Write widget HTML to iframe via the manifest-sandboxed widget page
 // CSP blocks inline scripts in the extension page, so we route through widget-sandbox.html
-function writeWidgetHtml(iframe, html) {
+// options.preview: the mount is a scaled, aria-hidden, non-interactive
+// thumbnail (chat sidebar strip / Widget Library gallery). It is NOT
+// registered as a live widget_eval instance — otherwise `widget_eval list`
+// reports it as surface:'chat', indistinguishable from the real inline render.
+// The version picker still attaches (CSS hides it in thumbnails).
+function writeWidgetHtml(iframe, html, widgetId, options) {
+    options = options || {};
+    attachWidgetVersionPicker(iframe, widgetId);
+    // Shared by chat, dashboard and fullscreen; native fullscreen still needs
+    // a user gesture in the widget. No top-page overlay or privileged eval.
+    iframe.setAttribute('allow', "fullscreen *");
+    iframe.setAttribute('allowfullscreen', '');
+    var _liveWidget = registerWidgetInstance(iframe, options.preview ? null : widgetId);
     // Inject once, before the handshake, so the same string is posted no matter
     // how many ready messages arrive.
     var _html = injectWidgetTokens(html);
+    // LEAK GUARD: the ready listener closes over the full widget HTML. If the
+    // iframe is torn down before the sandbox reports ready (re-render, modal
+    // close, chat switch) the listener used to stay registered forever, one
+    // closure per render. Make removal idempotent and reachable from (a) the
+    // ready handshake, (b) a re-write on the SAME iframe, (c) the iframe's
+    // __widgetCleanup hook, and (d) a bounded timeout fallback for callers
+    // that assign their own __widgetCleanup AFTER this call (widget-tools).
+    if (typeof iframe.__wwhCancel === 'function') { try { iframe.__wwhCancel(); } catch (e) {} }
+    var _wwhTimer = null;
+    var _wwhDone = false;
+    function _wwhCancel() {
+        if (_wwhDone) return;
+        _wwhDone = true;
+        window.removeEventListener('message', onMsg);
+        if (_wwhTimer) { clearTimeout(_wwhTimer); _wwhTimer = null; }
+        if (iframe.__wwhCancel === _wwhCancel) iframe.__wwhCancel = null;
+    }
     function onMsg(e) {
         if (e.source !== iframe.contentWindow) return;
         if (e.data && e.data.type === 'widgetSandboxReady') {
-            window.removeEventListener('message', onMsg);
+            _wwhCancel();
             // Resolve the theme at POST time (not at call time) so a flip during
             // the handshake can't ship a stale value.
             iframe.contentWindow.postMessage({
                 type: 'loadWidget',
+                instance_id: _liveWidget ? _liveWidget.instance_id : null,
                 html: _html,
                 theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'
             }, '*');
         }
     }
     window.addEventListener('message', onMsg);
+    iframe.__wwhCancel = _wwhCancel;
+    // Chain into the iframe's cleanup hook (dashboard/fullscreen paths call it
+    // on removal). Callers that overwrite __widgetCleanup later still get the
+    // timeout fallback below; the local sandbox page loads in milliseconds.
+    var _prevCleanup = iframe.__widgetCleanup;
+    iframe.__widgetCleanup = function() {
+        _wwhCancel();
+        unregisterWidgetInstance(iframe);
+        if (typeof _prevCleanup === 'function') _prevCleanup();
+    };
+    _wwhTimer = setTimeout(function() {
+        _wwhTimer = null;
+        if (!_wwhDone) { console.warn('[widget] widgetSandboxReady never arrived; dropping stale loadWidget listener'); _wwhCancel(); }
+    }, 60000);
     iframe.src = 'widget-sandbox.html';
 }
 
@@ -835,7 +884,8 @@ window.addEventListener('message', async function(event) {
         // start_chat can default to the CALLING widget without trusting the
         // widget's own claim. null when the iframe has no data-widget-id
         // ancestor (e.g. a preview/fullscreen container) — never fabricated.
-        var _srcWidgetId = _widgetIdForIframe(_srcIframe);
+        var _srcInstance = widgetInstanceForIframe(_srcIframe);
+        var _srcWidgetId = _srcInstance ? _srcInstance.widget_id : _widgetIdForIframe(_srcIframe);
 
         try {
             // executeTool checks permissions via requestProgrammaticToolApproval
@@ -844,7 +894,7 @@ window.addEventListener('message', async function(event) {
             // the sub-agent dispatch gates (tools/020-tool-execution.js,
             // worker/120-tool-routing.js) exempt them from the display-only
             // tool-call counter.
-            var result = await executeTool(name, args, null, { chatId: currentChatId, widgetName: widgetName, widgetId: _srcWidgetId, fromWidget: true });
+            var result = await executeTool(name, args, null, { chatId: currentChatId, widgetName: widgetName, widgetId: _srcWidgetId, widgetInstanceId: _srcInstance ? _srcInstance.instance_id : null, fromWidget: true });
 
             // Persist screenshot to chat.screenshots map so screenshot_by_id can find it after reload
             // (NOT chat.messages — inserting there breaks tool_use/tool_result ordering for the API)
@@ -872,12 +922,22 @@ window.addEventListener('message', async function(event) {
                 event.source.postMessage({ type: 'widgetToolResult', id: id, result: result }, '*');
             }
         } catch (e) {
-            event.source.postMessage({ type: 'widgetToolResult', id: id, error: e.message }, '*');
+            // Normalize: a non-Error throw (string/undefined) would otherwise post
+            // error: undefined and the widget shim would RESOLVE with undefined
+            // instead of rejecting. The reply post itself can throw when the
+            // widget iframe was torn down mid-call — swallow, nobody is listening.
+            var _wtcErr = String((e && e.message) || e || 'Unknown error');
+            try {
+                event.source.postMessage({ type: 'widgetToolResult', id: id, error: _wtcErr }, '*');
+            } catch (_postErr) {
+                console.warn('[widget] tool call ' + name + ' failed and reply could not be delivered:', _wtcErr);
+            }
         }
     }
 });
 
 function renderWidgetContent(widget) {
+    widget = Object.assign({}, widget, WidgetStore.view(widget.id) || {}, { width: widget.width, height: widget.height });
     // Use dashboard-specific ID to avoid conflict with chat widget containers
     var container = document.getElementById('dashboard-widget-content-' + widget.id);
     if (!container) {
@@ -903,7 +963,7 @@ function renderWidgetContent(widget) {
     iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
 
     shadow.appendChild(iframe);
-    writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id));
+    writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id), widget.id);
 }
 
 // Add a chat widget to a dashboard ('main' = dashboard page, 'home' = home page)
@@ -994,6 +1054,8 @@ function updateWidgetPinButtons(widgetId) {
         btn.innerHTML = pinned ? UI_ICONS.pinFilled : UI_ICONS.pin;
         btn.title = pinned ? 'Pinned — click to change' : 'Pin to dashboard…';
     });
+    // Widget Library rows/cards carry their own pin badge + labelled button.
+    if (typeof refreshWidgetLibraryEntry === 'function') refreshWidgetLibraryEntry(widgetId);
 }
 
 // Small popover letting the user choose the pin target (Home / Dashboard / Unpin).
@@ -1307,84 +1369,21 @@ function closeWidgetEditorPanel() {
     }
 }
 
-// Revert widget to a previous version from history
-async function revertWidgetToHistory(widgetId, historyIndex) {
-    var widget = dashboardWidgets[widgetId];
-    if (!widget || !widget.history || !widget.history[historyIndex]) {
-        showSnackbar('History version not found', 'error');
-        return;
-    }
-    
-    var historyEntry = widget.history[historyIndex];
-    
-    // Save current html as a safety snapshot before reverting — but only when
-    // it would actually preserve something: skip when reverting to identical
-    // content (no-op revert), and skip when the current html already exists
-    // anywhere in history (bouncing A<->B must not stack duplicate entries).
-    // saveDashboardWidget is called with skipHistory=true below, so its own
-    // dedup guard and cap never run here — we enforce both ourselves.
-    if (widget.html && widget.html !== historyEntry.html) {
-        var alreadyPreserved = widget.history.some(function(entry) {
-            return entry && entry.html === widget.html;
-        });
-        if (!alreadyPreserved) {
-            widget.history.push({
-                html: widget.html,
-                timestamp: Date.now(),
-                prompt: 'Auto-saved before revert'
-            });
-            // Keep only last 10 versions — mirrors the cap in saveDashboardWidget
-            // (src/js/ui/020-dashboard.js); no shared constant exists, keep in sync.
-            if (widget.history.length > 10) {
-                widget.history = widget.history.slice(-10);
-            }
-        }
-    }
-    
-    // Restore the old HTML
-    widget.html = historyEntry.html;
-    widget.error = null;
-    
-    await saveDashboardWidget(widget, true); // Skip history tracking since we're managing it manually
-    refreshVisibleDashboards();
-    showSnackbar('Widget reverted to previous version', 'success');
-}
-
-// Show widget history panel
+// History = the per-mount version picker (attachWidgetVersionPicker, core/135-
+// widget-store.js): focus/open the one rendered in the fullscreen modal when it
+// is up, otherwise open the widget modal, which mounts its own picker. Choosing
+// a version never restores over latest.
 function showWidgetHistory(widgetId) {
-    var widget = dashboardWidgets[widgetId];
-    if (!widget || !widget.history || widget.history.length === 0) {
-        showSnackbar('No history available for this widget', 'info');
+    var content = document.getElementById('widget-fullscreen-content');
+    var picker = content && content.querySelector('.widget-version-picker');
+    if (picker) {
+        picker.focus();
+        if (typeof picker.showPicker === 'function') { try { picker.showPicker(); } catch (e) { /* needs a user gesture; focus is enough */ } }
         return;
     }
-    
-    var html = '<div class="widget-history-modal">';
-    html += '<div class="widget-history-header"><span>Widget History</span><button onclick="closeWidgetHistory()">×</button></div>';
-    html += '<div class="widget-history-list">';
-    
-    widget.history.forEach(function(entry, idx) {
-        var date = new Date(entry.timestamp);
-        var timeStr = date.toLocaleString();
-        html += '<div class="widget-history-item" onclick="revertWidgetToHistory(\'' + widgetId + '\', ' + idx + '); closeWidgetHistory();">';
-        html += '<div class="widget-history-time">' + timeStr + '</div>';
-        html += '<div class="widget-history-prompt">' + escapeHtml((entry.prompt || 'No prompt').substring(0, 100)) + '</div>';
-        html += '</div>';
-    });
-    
-    html += '</div></div>';
-    
-    var modal = document.createElement('div');
-    modal.id = 'widget-history-modal-overlay';
-    modal.className = 'modal-overlay show';
-    modal.innerHTML = html;
-    modal.onclick = function(e) { if (e.target === modal) closeWidgetHistory(); };
-    document.body.appendChild(modal);
+    openWidgetModal(widgetId);
 }
-
-function closeWidgetHistory() {
-    var modal = document.getElementById('widget-history-modal-overlay');
-    if (modal) modal.remove();
-}
+function closeWidgetHistory() { closeWidgetModal(); }
 
 // Run a prompt for a widget in the background (for batch regeneration)
 // Creates a real chat that stays in history, similar to single widget regenerate

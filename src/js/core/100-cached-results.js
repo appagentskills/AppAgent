@@ -6,6 +6,60 @@
 // Cache limit function - use cacheTokenLimit setting (~4 chars per token)
 function getCacheCharLimit() { return cacheTokenLimit * 4; }
 
+// #11 — parse a cached-content path into key parts. Supports quoted bracket
+// segments for dotted keys (`result["server.js"]`, `a['k.ey']`), numeric
+// indices (`[0]`) and plain dotted segments. Leading `$`/`.` must already be
+// stripped by the caller. Unbalanced brackets are kept literally.
+function _cachePathParts(path) {
+    var parts = [], buf = '', i = 0, s = String(path == null ? '' : path), n = s.length;
+    while (i < n) {
+        var ch = s[i];
+        if (ch === '[') {
+            var q = s[i + 1];
+            if (q === '"' || q === "'") {
+                var qEnd = s.indexOf(q + ']', i + 2);
+                if (qEnd >= 0) {
+                    if (buf) { parts.push(buf); buf = ''; }
+                    parts.push(s.slice(i + 2, qEnd)); i = qEnd + 2; continue;
+                }
+            } else {
+                var close = s.indexOf(']', i + 1);
+                if (close >= 0) {
+                    if (buf) { parts.push(buf); buf = ''; }
+                    parts.push(s.slice(i + 1, close)); i = close + 1; continue;
+                }
+            }
+            buf += ch; i++; continue;
+        }
+        if (ch === '.') { if (buf) { parts.push(buf); buf = ''; } i++; continue; }
+        buf += ch; i++;
+    }
+    if (buf) parts.push(buf);
+    return parts;
+}
+
+// Walk `root` along `parts` (from _cachePathParts). Numeric parts index
+// arrays; when a plain part is not a key of the current object the remaining
+// parts are greedily joined with '.' ('server','js' → 'server.js') until a key
+// exists — so dotted keys written without quotes (as search results emit them)
+// still resolve. Returns { found, value }.
+function _cacheNavigate(root, parts) {
+    var cur = root;
+    for (var i = 0; i < parts.length; i++) {
+        if (cur === null || typeof cur !== 'object') return { found: false };
+        var key = parts[i];
+        if (Array.isArray(cur) && /^\d+$/.test(key)) { cur = cur[parseInt(key, 10)]; continue; }
+        if (key in cur) { cur = cur[key]; continue; }
+        var joined = key, matched = false;
+        for (var j = i + 1; j < parts.length; j++) {
+            joined += '.' + parts[j];
+            if (joined in cur) { cur = cur[joined]; i = j; matched = true; break; }
+        }
+        if (!matched) return { found: false };
+    }
+    return { found: true, value: cur };
+}
+
 // Code field names that should use code outline instead of JSON outline
 var CODE_FIELD_NAMES = ['script', 'client_script', 'html', 'css', 'template', 'server_script', 'processing_script', 'code', 'source', 'body'];
 
@@ -313,21 +367,8 @@ function processToolResultForCache(chatId, toolCallId, toolName, result) {
             var cleanPath = cf.path.replace(/^\$\.?/, '');
 
             // Navigate to the code field to get its content
-            var codeContent = result;
-            var pathParts = cleanPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
-            for (var j = 0; j < pathParts.length; j++) {
-                if (codeContent && typeof codeContent === 'object') {
-                    var key = pathParts[j];
-                    if (Array.isArray(codeContent) && /^\d+$/.test(key)) {
-                        codeContent = codeContent[parseInt(key)];
-                    } else {
-                        codeContent = codeContent[key];
-                    }
-                } else {
-                    codeContent = null;
-                    break;
-                }
-            }
+            var _cfNav = _cacheNavigate(result, _cachePathParts(cleanPath));
+            var codeContent = _cfNav.found ? _cfNav.value : null;
 
             if (typeof codeContent === 'string' && codeContent.length > 0) {
                 // Use content type from stats (already detected with field name hint)
@@ -470,19 +511,9 @@ async function executeCachedContentOutline(chatId, args) {
         // Normalize path: strip leading $ and . (search results use $.path.to.value format)
         var normalizedPath = path.replace(/^\$\.?/, '').replace(/^\./, '');
         if (normalizedPath) {
-            var pathParts = normalizedPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
-            for (var i = 0; i < pathParts.length; i++) {
-                if (targetData && typeof targetData === 'object') {
-                    var key = pathParts[i];
-                    if (Array.isArray(targetData) && /^\d+$/.test(key)) {
-                        targetData = targetData[parseInt(key)];
-                    } else {
-                        targetData = targetData[key];
-                    }
-                } else {
-                    return { success: false, error: 'Path "' + path + '" not found in cached content' };
-                }
-            }
+            var _oNav = _cacheNavigate(targetData, _cachePathParts(normalizedPath));
+            if (!_oNav.found) return { success: false, error: 'Path "' + path + '" not found in cached content' };
+            targetData = _oNav.value;
         }
         // Check if path resolved to undefined
         if (targetData === undefined) {
@@ -498,7 +529,7 @@ async function executeCachedContentOutline(chatId, args) {
         var fieldName = null;
         if (path) {
             var normalizedPath = path.replace(/^\$\.?/, '').replace(/^\./, '');
-            var pathParts = normalizedPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
+            var pathParts = _cachePathParts(normalizedPath);
             // Get last non-numeric part as field name
             for (var pi = pathParts.length - 1; pi >= 0; pi--) {
                 if (!/^\d+$/.test(pathParts[pi])) {
@@ -668,19 +699,9 @@ async function executeCachedContentSearch(chatId, args) {
     if (searchPath) {
         var normalizedPath = searchPath.replace(/^\$\.?/, '').replace(/^\./, '');
         if (normalizedPath) {
-            var pathParts = normalizedPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
-            for (var p = 0; p < pathParts.length; p++) {
-                if (searchTarget && typeof searchTarget === 'object') {
-                    var key = pathParts[p];
-                    if (Array.isArray(searchTarget) && /^\d+$/.test(key)) {
-                        searchTarget = searchTarget[parseInt(key)];
-                    } else {
-                        searchTarget = searchTarget[key];
-                    }
-                } else {
-                    return { success: false, error: 'Path "' + searchPath + '" not found in cached content' };
-                }
-            }
+            var _sNav = _cacheNavigate(searchTarget, _cachePathParts(normalizedPath));
+            if (!_sNav.found) return { success: false, error: 'Path "' + searchPath + '" not found in cached content' };
+            searchTarget = _sNav.value;
         }
     }
 
@@ -813,19 +834,9 @@ async function executeCachedContentRead(chatId, args) {
         if (!normalizedPath) {
             // Path was just "$" - return root
         } else {
-            var pathParts = normalizedPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
-            for (var i = 0; i < pathParts.length; i++) {
-                if (targetData && typeof targetData === 'object') {
-                    var key = pathParts[i];
-                    if (Array.isArray(targetData) && /^\d+$/.test(key)) {
-                        targetData = targetData[parseInt(key)];
-                    } else {
-                        targetData = targetData[key];
-                    }
-                } else {
-                    return { success: false, error: 'Path "' + path + '" not found in cached content' };
-                }
-            }
+            var _rNav = _cacheNavigate(targetData, _cachePathParts(normalizedPath));
+            if (!_rNav.found) return { success: false, error: 'Path "' + path + '" not found in cached content' };
+            targetData = _rNav.value;
         }
     }
 
@@ -866,13 +877,30 @@ async function executeCachedContentRead(chatId, args) {
 
         // Check if the selected content is too large
         if (content.length > getCacheCharLimit()) {
-            return {
+            // #11 — suggest a range that actually FITS: walk from sLine
+            // accumulating (prefix + line + '\n') until ~90% of the cap. The old
+            // hint (sLine+99) re-proposed the same rejected range when it was
+            // already ≤100 long lines.
+            var _budget = Math.floor(getCacheCharLimit() * 0.9), _acc = 0, _fitEnd = sLine - 1;
+            for (var _li = sLine - 1; _li < eLine; _li++) {
+                var _ll = String(_li + 1).length + 2 + lines[_li].length + 1;
+                if (_acc + _ll > _budget) break;
+                _acc += _ll; _fitEnd = _li + 1;
+            }
+            var _tooLarge = {
                 success: false,
                 error: 'Selected range too large (' + Math.round(content.length / 1024) + 'KB, limit is ' + Math.round(getCacheCharLimit() / 1024) + 'KB)',
                 requestedLines: eLine - sLine + 1,
-                totalLines: totalLines,
-                hint: 'Request fewer lines (current range: ' + sLine + '-' + eLine + '). Try a smaller range like start_line: ' + sLine + ', end_line: ' + Math.min(sLine + 99, eLine) + '.'
+                totalLines: totalLines
             };
+            if (_fitEnd >= sLine) {
+                _tooLarge.suggested_end_line = _fitEnd;
+                _tooLarge.hint = 'Request fewer lines (current range: ' + sLine + '-' + eLine + '). A range that fits: start_line: ' + sLine + ', end_line: ' + _fitEnd + '.';
+            } else {
+                _tooLarge.line_too_long = true;
+                _tooLarge.hint = 'Line ' + sLine + ' alone exceeds the limit (' + Math.round(lines[sLine - 1].length / 1024) + 'KB). Use cached_content_search with a narrower path/regex to extract the part you need.';
+            }
+            return _tooLarge;
         }
 
         return {

@@ -96,13 +96,13 @@
                 </div>
                 <div class="header-controls">
                     <div class="header-actions" id="header-actions"></div>
-                    <span class="ext-status ext-sn-status" id="ext-sn-status" style="display:none" title="ServiceNow connection"></span>
+                    <span class="ext-status ext-sn-status" id="ext-sn-status" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
                     <span class="ext-status ext-active-tab" id="active-tab-indicator" style="display:none" title="Active tab"><span class="ext-status-dot"></span><span id="active-tab-url">No active tab</span></span>
                     <button class="ext-panel-btn ext-expand-btn" id="ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
                     <div class="browser-controls" id="browser-controls" style="display:none">
                         <input type="text" id="browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl()" aria-label="Enter URL path" />
                     </div>
-                    <span class="ws-header-status" id="ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="ws-header-status" id="ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
                     <span class="credits-display" id="credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" aria-hidden="true"></span>...</span>
                     <span class="storage-display" id="storage-display" onclick="updateStorageIndicator()" onkeydown="if(event.key==='Enter'||event.key===' ')updateStorageIndicator()" title="Local storage remaining" style="display:none" role="button" tabindex="0" aria-label="Storage remaining, click to refresh"><span class="storage-icon" aria-hidden="true"></span>...</span>
                     <div class="model-name" id="model-name" style="display:none" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><button type="button" class="model-login-btn" id="model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
@@ -237,6 +237,10 @@
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
                 <span class="dashboard-title">Dashboard</span>
                 <div class="dashboard-actions" id="dashboard-actions">
+                    <div class="segmented-toggle dashboard-mode-toggle" role="group" aria-label="Dashboard page mode">
+                        <button type="button" class="dashboard-mode-btn active" data-mode="dashboard" aria-pressed="true" onclick="setDashboardPageMode('dashboard')" title="Pinned widgets grid">Dashboard</button>
+                        <button type="button" class="dashboard-mode-btn" data-mode="library" aria-pressed="false" onclick="setDashboardPageMode('library')" title="Every saved widget">All widgets</button>
+                    </div>
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="importDashboard()" title="Import"><span class="action-icon"></span>Import</button>
                     <button class="skills-action-btn dashboard-action-collapsible" onclick="exportDashboard()" title="Export"><span class="action-icon"></span>Export</button>
@@ -252,6 +256,7 @@
                 </div>
             </div>
             <div class="dashboard-grid" id="dashboard-grid" ondragover="handleWidgetDragOver(event)" ondrop="handleWidgetDrop(event)"></div>
+            <div class="widget-library" id="widget-library" style="display:none;"></div>
         </div>
         <div class="home-panel" id="home-panel" style="display:none;">
             <canvas class="home-trail-canvas" id="home-trail-canvas"></canvas>
@@ -260,12 +265,12 @@
                 <span class="home-title">New Chat</span>
                 <div class="header-controls">
                     <div class="header-actions" id="home-header-actions"></div>
-                    <span class="ext-status ext-sn-status" id="home-ext-sn-status" style="display:none" title="ServiceNow connection"></span>
+                    <span class="ext-status ext-sn-status" id="home-ext-sn-status" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
                     <button class="ext-panel-btn ext-expand-btn" id="home-ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
                     <div class="browser-controls" id="home-browser-controls" style="display:none">
                         <input type="text" id="home-browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl('home')" aria-label="Enter URL path" />
                     </div>
-                    <span class="ws-header-status" id="home-ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="ws-header-status" id="home-ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
                     <span class="credits-display" id="home-credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" id="home-credits-icon" aria-hidden="true"></span>...</span>
                     <div class="model-name" id="home-model-name" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><button type="button" class="model-login-btn" id="home-model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
                     <div class="jobs-badge-wrapper" id="home-jobs-badge-wrapper">

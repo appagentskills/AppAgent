@@ -370,7 +370,7 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
 
     var chat = chats[chatId];
-    if (!chat || !Array.isArray(chat.messages)) return;
+    if (!chat || chat._deleted || !Array.isArray(chat.messages)) return;
 
     // PR383-F3: the pending entry holds the authoritative row index (kept
     // current by _mergePagePendingRows' re-key); a caller-supplied index from a
@@ -403,15 +403,45 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     if (action === 'allow') {
         msg.status = 'allowed';
     } else if (action === 'session') {
+        // "Allow for this chat" (internal action name kept as 'session').
         msg.status = 'session_allowed';
         if (msg.permissionKey) {
-            sessionPermissions[msg.permissionKey] = 'allow';
-            // Session-only permission: not persisted to IDB, so the SW
-            // boot-time `loadToolPermissionsInWorker` won't pick it up. Push
-            // it to the SW now so the next tool call from the SW's agent
-            // loop sees 'allow' instead of falling through to 'ask'.
+            // Grant is keyed by ROOT chat + permission key (core/070-permissions.js
+            // chatPermKey) so this chat AND its sub-agents (any depth) inherit it.
+            var _grantRoot = (typeof resolveRootChatId === 'function') ? resolveRootChatId(chatId) : chatId;
+            sessionPermissions[chatPermKey(_grantRoot, msg.permissionKey)] = 'allow';
+            // Optimistic replica update + push. The SW ALSO self-applies the
+            // grant from the exec-approval-prompt-result verdict (status
+            // 'session_allowed' → swGrantChatPermission) and persists it to
+            // chrome.storage.session, so this push is belt-and-braces.
             if (typeof pushPermissionsToOffscreen === 'function') {
                 pushPermissionsToOffscreen({ sessionPermissions: sessionPermissions });
+            }
+            // Auto-resolve every OTHER pending approval in this panel with the
+            // same root chat + permission key: flip its row, drop its
+            // resolver, resolve(true). Each resolver's exec-approval-prompt
+            // handler (app/045) then posts its own 'session_allowed' verdict,
+            // which the SW treats as first-verdict-wins (or as a no-op when
+            // swGrantChatPermission already settled that sibling).
+            for (var _sk in pendingToolApprovals) {
+                var _se = pendingToolApprovals[_sk];
+                if (!_se || _se.toolCallId === msg.toolCallId) continue;
+                var _sroot = (typeof resolveRootChatId === 'function') ? resolveRootChatId(_se.chatId) : _se.chatId;
+                if (_sroot !== _grantRoot) continue;
+                var _schat = chats[_se.chatId];
+                if (!_schat || !Array.isArray(_schat.messages)) continue;
+                var _srow = null;
+                for (var _si = 0; _si < _schat.messages.length; _si++) {
+                    var _sm = _schat.messages[_si];
+                    if (_sm && _sm.role === 'approval' && _sm.toolCallId === _se.toolCallId) { _srow = _sm; break; }
+                }
+                if (!_srow || _srow.status !== 'pending' || _srow.permissionKey !== msg.permissionKey) continue;
+                _srow.status = 'session_allowed';
+                delete pendingToolApprovals[_sk];
+                try { _se.resolve(true); } catch (eSib) {}
+                if (typeof clearApprovalNotificationsForChat === 'function' && _se.chatId !== chatId) {
+                    try { clearApprovalNotificationsForChat(_se.chatId); } catch (eSibN) {}
+                }
             }
         }
     } else if (action === 'auto') {
@@ -572,20 +602,30 @@ function updateClaudeOAuthStatus() {
 
 // --- ChatGPT (OpenAI) OAuth UI ---
 // Same shape as the Claude pair above. The 'openai-oauth-updated' broadcast is
-// fired by saveChatGPTOAuthCreds / the logout + device-poll failure paths in
+// fired by saveChatGPTOAuthCreds / the logout + device-poll failure paths /
+// the browser exchange failure + owned-OpenAI-tab close paths in
 // background.js, so the dot flips as soon as the device code is approved.
 function initChatGPTOAuth() {
     chrome.runtime.onMessage.addListener(function(msg) {
         if (msg.type === 'openai-oauth-updated') {
             updateChatGPTOAuthStatus();
             if (msg.error) {
+                // Declined/failed browser exchange, expired device code, or the
+                // owned OpenAI tab was closed: no pending login survives, so drop
+                // BOTH dialogs and ignore any late 'openai-oauth-login' reply.
+                _chatGPTLoginGeneration++;
+                closeChatGPTBrowserModal();
                 closeChatGPTDeviceCodeModal();
                 try { showSnackbar('ChatGPT login failed: ' + msg.error, 'error'); } catch (e) {}
             } else if (msg.openaiOAuth) {
+                _chatGPTLoginGeneration++;
+                closeChatGPTBrowserModal();
                 closeChatGPTDeviceCodeModal();
                 try { showSnackbar('Logged in to ChatGPT', 'success'); } catch (e) {}
             } else {
                 // Logout/credential removal: no pending code remains valid.
+                _chatGPTLoginGeneration++;
+                closeChatGPTBrowserModal();
                 closeChatGPTDeviceCodeModal();
             }
         }
@@ -608,7 +648,10 @@ function updateChatGPTOAuthStatus() {
             return;
         }
         if (response.loggedIn && !response.expired) setLLMConnectionStatus('connected');
-        else if (response.pending) setLLMConnectionStatus('pending');
+        else if (response.pending) {
+            setLLMConnectionStatus('pending');
+            if (response.method === 'browser') showChatGPTBrowserModal(response);
+        }
         else if (response.error) setLLMConnectionStatus('error');
         else setLLMConnectionStatus('disconnected');
     });
@@ -714,14 +757,17 @@ function _modelMenuRowHtml(p) {
     var check = sel
         ? '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>'
         : '';
-    return '<div class="model-menu-row' + (sel ? ' selected' : '') + '" onclick="selectModelFromMenu(\'' + escapeJsString(p.name) + '\')">' +
-        '<span class="model-row-icon">' + UI_ICONS.model + '</span>' +
-        '<div class="model-row-main">' +
-            '<div class="model-row-title"><span class="model-row-name" title="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + '</span>' + badges + '</div>' +
-            (sub ? '<div class="model-row-sub">' + sub + '</div>' : '') +
-        '</div>' +
-        '<button class="model-row-edit" title="Edit model" aria-label="Edit model" onclick="event.stopPropagation();editModelFromMenu(\'' + escapeJsString(p.name) + '\')">' + UI_ICONS.edit + '</button>' +
-        check +
+    // Separate native buttons: Enter/Space work without a keydown shim, and
+    // activating Edit can never bubble into model selection. Keep row styling.
+    return '<div class="model-menu-row' + (sel ? ' selected' : '') + '">' +
+        '<button type="button" class="model-row-main model-row-select" aria-pressed="' + sel + '" aria-label="Select model ' + escapeHtml(p.name) + '" onclick="selectModelFromMenu(\'' + escapeJsString(p.name) + '\')">' +
+            '<span class="model-row-icon">' + UI_ICONS.model + '</span>' +
+            '<span class="model-row-main">' +
+                '<span class="model-row-title"><span class="model-row-name" title="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + '</span>' + badges + '</span>' +
+                (sub ? '<span class="model-row-sub">' + sub + '</span>' : '') +
+            '</span>' + check +
+        '</button>' +
+        '<button type="button" class="model-row-edit" title="Edit model" aria-label="Edit model ' + escapeHtml(p.name) + '" onclick="event.stopPropagation();editModelFromMenu(\'' + escapeJsString(p.name) + '\')">' + UI_ICONS.edit + '</button>' +
     '</div>';
 }
 
@@ -755,7 +801,8 @@ function _effortSliderLabelHtml(idx) {
     var isDef = e.v === _providerDefaultEffort(provider);
     // ChatGPT OAuth: transformToResponses (background.js) clamps xhigh/max to
     // 'high' (the Responses API rejects them) — say so instead of silently lying.
-    var clampedOnChatGPT = !!(provider && provider.isChatGPTOAuth && (e.v === 'xhigh' || e.v === 'max'));
+    // GPT-6 Astra/Sol/Luna take xhigh/max natively (chatGPTSupportsExtendedEffort).
+    var clampedOnChatGPT = !!(provider && provider.isChatGPTOAuth && !chatGPTSupportsExtendedEffort(provider.model) && (e.v === 'xhigh' || e.v === 'max'));
     return '<span class="model-menu-effort-name">' + e.label + '</span>' +
         (isDef ? '<span class="model-row-badge">default</span>' : '') +
         (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
@@ -884,6 +931,7 @@ function toggleModelMenu(event) {
     var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>Reasoning effort</div>';
     var defEffort = _providerDefaultEffort(provider);
     var curEffort = (provider && provider.effort) || defEffort;
+    if (provider && provider.isChatGPTOAuth && isChatGPTAstraModel(provider.model) && /^(none|minimal)$/i.test(curEffort)) curEffort = 'low';
     var effortIdx = _EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(curEffort);
     if (effortIdx < 0) effortIdx = 2; // unknown stored value — show High
     var effortDots = '';
@@ -926,14 +974,25 @@ function toggleModelMenu(event) {
     if (provider && provider.isClaudeOAuth) {
         html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>Claude Subscription</div>';
         var oauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
-        html += '<div class="custom-dropdown-option" onclick="modelMenuOAuthToggle()">' + oauthLabel + '</div>';
+        html += '<button type="button" class="custom-dropdown-option" onclick="modelMenuOAuthToggle()">' + oauthLabel + '</button>';
     } else if (provider && provider.isChatGPTOAuth) {
         html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>ChatGPT Subscription</div>';
         var gptOauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
-        html += '<div class="custom-dropdown-option" onclick="modelMenuChatGPTOAuthToggle()">' + gptOauthLabel + '</div>';
+        html += '<button type="button" class="custom-dropdown-option" onclick="modelMenuChatGPTOAuthToggle()">' + gptOauthLabel + '</button>';
     }
     menu.innerHTML = html;
     document.body.appendChild(menu);
+    menu.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            _closeModelMenu();
+            anchor.focus();
+        }
+    });
+    // A keyboard-opened popup starts at its first native control, not at the
+    // end of the page's tab order. Mouse opening keeps the existing behavior.
+    if (event && event.type === 'keydown') menu.querySelector('input, button, [tabindex="0"]').focus();
 
     // Tier aliases hydrate lazily from IDB (subAgentTierAliases === null until
     // loadTierAliases runs). First open: kick hydration, then refresh the tier
@@ -1058,19 +1117,119 @@ function modelMenuChatGPTOAuthToggle() {
 // toast's Log in action (snackbarLoginClick, ui/220-notification-system.js).
 // The pill dot refreshes via updateChatGPTOAuthStatus / the
 // 'openai-oauth-updated' broadcast once the device code is approved.
-function startChatGPTOAuthLogin(returnFocusEl) {
+function startChatGPTOAuthLogin(returnFocusEl, method) {
+    var loginGeneration = ++_chatGPTLoginGeneration;
+    method = method === 'device' ? 'device' : 'browser';
     _chatGPTDeviceReturnFocus = returnFocusEl || document.activeElement;
     // Only flip the visible pill status when the ChatGPT provider is the one
     // selected — the button can also be clicked from an error toast.
     var p = getProviderById(currentProvider);
     if (p && p.isChatGPTOAuth) setLLMConnectionStatus('pending');
-    chrome.runtime.sendMessage({ type: 'openai-oauth-login' }, function(response) {
-        if (chrome.runtime.lastError) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
-        else if (response && response.error) { closeChatGPTDeviceCodeModal(); showSnackbar('Sign-in error: ' + response.error, 'error'); }
-        else if (response && response.userCode) { showChatGPTDeviceCodeModal(response); }
-        else { showSnackbar('Starting ChatGPT device login\u2026', 'info'); }
+    chrome.runtime.sendMessage({ type: 'openai-oauth-login', method: method }, function(response) {
+        if (loginGeneration !== _chatGPTLoginGeneration) return;
+        if (chrome.runtime.lastError || !response || response.error) {
+            closeChatGPTDeviceCodeModal();
+            showSnackbar('Sign-in did not start or was cancelled. Choose a login method to try again.', 'error');
+            showChatGPTBrowserModal({});
+        } else if (response.userCode) { closeChatGPTBrowserModal(); showChatGPTDeviceCodeModal(response); }
+        else if (response.method === 'browser') { closeChatGPTDeviceCodeModal(); showChatGPTBrowserModal(response); }
         updateChatGPTOAuthStatus();
     });
+}
+
+// Browser dialog reuses the existing accessible modal styling. The callback
+// input is transient password text: never a chat message, document, or log.
+var _chatGPTLoginGeneration = 0;
+var _chatGPTBrowserTimer = null;
+var _chatGPTBrowserKeyHandler = null;
+var _chatGPTBrowserReturnFocus = null;
+function closeChatGPTBrowserModal() {
+    var modal = document.getElementById('chatgpt-browser-modal');
+    if (modal) {
+        var input = modal.querySelector('input');
+        if (input) input.value = '';
+        modal.remove();
+    }
+    if (_chatGPTBrowserTimer) clearInterval(_chatGPTBrowserTimer);
+    _chatGPTBrowserTimer = null;
+    if (_chatGPTBrowserKeyHandler) document.removeEventListener('keydown', _chatGPTBrowserKeyHandler);
+    _chatGPTBrowserKeyHandler = null;
+    if (_chatGPTBrowserReturnFocus && document.contains(_chatGPTBrowserReturnFocus)) _chatGPTBrowserReturnFocus.focus();
+    _chatGPTBrowserReturnFocus = null;
+}
+function cancelChatGPTBrowserLogin() {
+    _chatGPTLoginGeneration++;
+    _oauthStatusGeneration++;
+    closeChatGPTBrowserModal();
+    chrome.runtime.sendMessage({ type: 'openai-oauth-cancel' }, function(response) {
+        if (chrome.runtime.lastError || !response || response.error) showSnackbar('Could not cancel sign-in. Close the OpenAI tab and try again.', 'error');
+        updateChatGPTOAuthStatus();
+    });
+}
+function useChatGPTDeviceLogin() {
+    closeChatGPTBrowserModal();
+    closeChatGPTDeviceCodeModal();
+    startChatGPTOAuthLogin(null, 'device');
+}
+function submitChatGPTBrowserCallback() {
+    var input = document.getElementById('chatgpt-browser-callback');
+    var feedback = document.getElementById('chatgpt-browser-feedback');
+    if (!input || !input.value.trim()) return;
+    var url = input.value.trim();
+    input.value = '';
+    var button = document.getElementById('chatgpt-browser-submit');
+    if (button) button.disabled = true;
+    chrome.runtime.sendMessage({ type: 'openai-oauth-browser-callback', url: url }, function(response) {
+        if (!document.contains(feedback)) return;
+        if (button) button.disabled = false;
+        if (chrome.runtime.lastError || !response || response.error) feedback.textContent = 'Callback not accepted. Check the address or choose device-code login.';
+        else closeChatGPTBrowserModal();
+        updateChatGPTOAuthStatus();
+    });
+    url = ''; // do not retain the local callback beyond the transport call
+}
+function showChatGPTBrowserModal(info) {
+    if (document.getElementById('chatgpt-browser-modal')) return;
+    _chatGPTBrowserReturnFocus = document.activeElement;
+    var overlay = document.createElement('div');
+    overlay.id = 'chatgpt-browser-modal';
+    overlay.className = 'modal-overlay show chatgpt-device-modal';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'chatgpt-browser-title');
+    overlay.innerHTML = '<div class="modal-dialog"><div class="modal-header" id="chatgpt-browser-title">Sign in to ChatGPT</div>' +
+        '<div class="modal-body"><p>Approve sign-in in the OpenAI tab. AppAgent will try to finish automatically.</p>' +
+        '<p>If localhost shows a connection error, copy the full address from that tab and paste it here only — never into chat. Automatic capture is not guaranteed.</p>' +
+        '<label for="chatgpt-browser-callback">Local callback address (optional fallback)</label>' +
+        '<input id="chatgpt-browser-callback" class="form-input" type="password" autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?…">' +
+        '<button type="button" class="modal-btn secondary" id="chatgpt-browser-submit">Finish with pasted address</button>' +
+        '<p id="chatgpt-browser-feedback" role="status" aria-live="polite"></p></div>' +
+        '<div class="modal-actions"><button type="button" class="modal-btn secondary" id="chatgpt-browser-device">Use device code instead</button><button type="button" class="modal-btn primary" id="chatgpt-browser-cancel">Cancel sign-in</button></div></div>';
+    document.body.appendChild(overlay);
+    overlay.querySelector('#chatgpt-browser-submit').addEventListener('click', submitChatGPTBrowserCallback);
+    overlay.querySelector('#chatgpt-browser-device').addEventListener('click', useChatGPTDeviceLogin);
+    overlay.querySelector('#chatgpt-browser-cancel').addEventListener('click', cancelChatGPTBrowserLogin);
+    overlay.addEventListener('click', function(event) { if (event.target === overlay) cancelChatGPTBrowserLogin(); });
+    _chatGPTBrowserKeyHandler = function(event) {
+        if (event.key === 'Escape') { event.preventDefault(); cancelChatGPTBrowserLogin(); return; }
+        if (event.key !== 'Tab') return;
+        var nodes = overlay.querySelectorAll('input:not([disabled]), button:not([disabled])');
+        var first = nodes[0], last = nodes[nodes.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', _chatGPTBrowserKeyHandler);
+    var expiresAt = info && info.expiresAt;
+    function expiry() {
+        var expired = !expiresAt || expiresAt <= Date.now();
+        overlay.querySelector('#chatgpt-browser-feedback').textContent = expired ? 'Sign-in is unavailable or expired. Cancel and retry, or use device code.' : 'Waiting for approval. Sign-in expires in ' + Math.ceil((expiresAt - Date.now()) / 60000) + ' minutes.';
+        overlay.querySelector('#chatgpt-browser-submit').disabled = expired;
+        overlay.querySelector('#chatgpt-browser-callback').disabled = expired;
+        if (expired && _chatGPTBrowserTimer) { clearInterval(_chatGPTBrowserTimer); _chatGPTBrowserTimer = null; }
+    }
+    _chatGPTBrowserTimer = setInterval(expiry, 10000);
+    expiry();
+    overlay.querySelector('#chatgpt-browser-device').focus();
 }
 
 var _chatGPTDeviceExpiryTimer = null;

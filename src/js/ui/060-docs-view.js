@@ -152,6 +152,12 @@ function renderDashboard(dashboard) {
     var container = dashboardGridEl(dashboard);
     if (!container) return;
 
+    // Widget Library (ui/065-widget-library.js) may own the dashboard page: it
+    // shows #widget-library instead of #dashboard-grid from the persisted mode
+    // and renders itself; switching back calls renderDashboard again, so the
+    // grid picks up pin/delete changes made from the library.
+    if (dashboard === 'main' && typeof syncDashboardPageMode === 'function' && syncDashboardPageMode()) return;
+
     // Increment generation to invalidate any pending render callbacks
     dashboardRenderGeneration[dashboard]++;
     var currentGeneration = dashboardRenderGeneration[dashboard];

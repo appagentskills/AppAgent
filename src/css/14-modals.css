@@ -1,3 +1,50 @@
+/* Reload preflight is scoped; permission cards keep their own interactive layer. */
+.reload-preflight .modal-dialog { width: calc(100% - 24px); max-width: 580px; max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); display: flex; flex-direction: column; color: var(--text-primary); }
+.reload-preflight .modal-header { margin: 0; padding: var(--space-8) var(--space-9); flex: 0 0 auto; }
+.reload-preflight .modal-body { min-height: 0; overflow-y: auto; padding: var(--space-8) var(--space-9); font-size: var(--text-body); line-height: var(--leading-normal); }
+.reload-preflight .reload-preflight-status { margin: 0 0 var(--space-6); overflow-wrap: anywhere; }
+.reload-preflight .reload-preflight-progress-text { margin: 0 0 var(--space-3); color: var(--text-secondary); font-size: var(--text-body-sm); }
+.reload-preflight .reload-preflight-progress { display: block; appearance: none; width: 100%; height: 5px; margin: 0 0 var(--space-8); border: 0; border-radius: var(--radius-pill); overflow: hidden; background: var(--secondary-light); accent-color: var(--primary); }
+.reload-preflight .reload-preflight-progress::-webkit-progress-bar { background: var(--secondary-light); }
+.reload-preflight .reload-preflight-progress::-webkit-progress-value { background: var(--primary); border-radius: var(--radius-pill); }
+.reload-preflight .reload-preflight-progress::-moz-progress-bar { background: var(--primary); }
+.reload-preflight .reload-preflight-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--space-6); row-gap: var(--space-2); border-top: 1px solid var(--secondary-border); padding: var(--space-6) 0; }
+.reload-preflight .reload-preflight-label { display: flex; align-items: center; gap: var(--space-4); min-width: 0; font-weight: var(--font-medium); color: var(--text-primary); }
+.reload-preflight .reload-preflight-check { appearance: none; width: 16px; height: 16px; margin: 0; flex: 0 0 16px; border: 1px solid var(--secondary-border); border-radius: var(--radius-sm); background: var(--bg-white); opacity: 1; position: relative; }
+.reload-preflight .reload-preflight-check:checked { background: var(--success); border-color: var(--success); }
+.reload-preflight .reload-preflight-check:checked::after { content: ''; position: absolute; width: 4px; height: 8px; border: solid var(--bg-white); border-width: 0 2px 2px 0; transform: rotate(45deg); left: 5px; top: 1px; }
+.reload-preflight .reload-preflight-spinner { display: none; width: 16px; height: 16px; flex: 0 0 16px; box-sizing: border-box; border: 2px solid var(--secondary-border); border-top-color: var(--primary); border-radius: var(--radius-full); animation: reload-preflight-spin .8s linear infinite; }
+.reload-preflight .reload-preflight-row[data-state="running"] .reload-preflight-check { display: none; }
+.reload-preflight .reload-preflight-row[data-state="running"] .reload-preflight-spinner { display: block; }
+.reload-preflight .reload-preflight-result { display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-1); }
+.reload-preflight .reload-preflight-state { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-secondary); }
+.reload-preflight .reload-preflight-row[data-state="running"] .reload-preflight-state { color: var(--primary); }
+.reload-preflight .reload-preflight-row[data-state="pass"] .reload-preflight-state { color: var(--success-hover); }
+.reload-preflight .reload-preflight-row[data-state="fail"] .reload-preflight-state,
+.reload-preflight .reload-preflight-row[data-state="error"] .reload-preflight-state { color: var(--danger); }
+.reload-preflight .reload-preflight-counts { font-size: var(--text-body-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.reload-preflight .reload-preflight-message { grid-column: 1 / -1; margin: var(--space-2) 0; color: var(--danger); overflow-wrap: anywhere; white-space: pre-wrap; }
+.reload-preflight .reload-preflight-row[data-state="skipped"] .reload-preflight-message { color: var(--text-secondary); }
+.reload-preflight .reload-preflight-details { grid-column: 1 / -1; color: var(--text-secondary); font-size: var(--text-body-sm); min-width: 0; }
+.reload-preflight .reload-preflight-details summary { width: fit-content; cursor: pointer; padding: var(--space-1) 0; }
+.reload-preflight .reload-preflight-details summary:focus-visible,
+.reload-preflight button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--radius-sm); }
+.reload-preflight .reload-preflight-file { display: block; margin-top: var(--space-4); font-family: var(--font-mono); font-size: inherit; overflow-wrap: anywhere; }
+.reload-preflight .reload-preflight-detail { margin: var(--space-4) 0 0; padding: var(--space-4); border-radius: var(--radius-sm); background: var(--secondary-lighter); color: var(--text-secondary); white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; max-height: 160px; overflow-y: auto; }
+.reload-preflight .reload-preflight-technical { border-top: 1px solid var(--secondary-border); padding-top: var(--space-6); }
+.reload-preflight .reload-preflight-technical p { margin: var(--space-4) 0 0; overflow-wrap: anywhere; }
+.reload-preflight .modal-actions { flex: 0 0 auto; padding: var(--space-6) var(--space-9); flex-wrap: wrap; }
+.reload-preflight button:disabled { opacity: .55; cursor: not-allowed; }
+.reload-preflight [hidden] { display: none !important; }
+@keyframes reload-preflight-spin { to { transform: rotate(360deg); } }
+@media (max-width: 420px) {
+    .reload-preflight .modal-header, .reload-preflight .modal-body, .reload-preflight .modal-actions { padding-left: var(--space-6); padding-right: var(--space-6); }
+    .reload-preflight .reload-preflight-counts { grid-column: 1 / -1; }
+    .reload-preflight .reload-preflight-result { display: contents; }
+    .reload-preflight .reload-preflight-state { text-align: right; }
+}
+@media (prefers-reduced-motion: reduce) { .reload-preflight .reload-preflight-spinner { animation: none; } }
+
 /* Modal Dialog */
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg-overlay); z-index: var(--z-modal); display: none; align-items: center; justify-content: center; }
 .modal-overlay.show { display: flex; }

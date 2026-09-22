@@ -129,7 +129,13 @@ async function downscaleImageHighQuality(source, scale) {
     return { base64: out, width: newW, height: newH };
 }
 
-async function executeTakeScreenshot(args) {
+// `options.chatId` (when the caller threads executeTool's options through) is the
+// chat this capture RUNS for; browser-tab routing must use its targetTabId, not
+// the VIEWED chat's. Falls back to currentChatId when options is absent.
+async function executeTakeScreenshot(args, options) {
+    var _ssChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
+        ? options.chatId
+        : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined);
     var target = args.target;
     var widgetId = args.widget_id;
     var selector = args.selector;
@@ -151,7 +157,7 @@ async function executeTakeScreenshot(args) {
 
         if (target === 'browser') {
             // Use Chrome Debugger API via background service worker
-            var ssResult = await Platform.sendBrowserAction('take_screenshot', {});
+            var ssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
             if (ssResult.error) {
                 return { success: false, error: ssResult.error };
             }
@@ -414,10 +420,10 @@ async function executeTakeScreenshot(args) {
                         await new Promise(function(r){ setTimeout(r, 700); });
                     }
                     // Temporarily point sendBrowserAction at the widget tab
-                    var _wssChat = chats[currentChatId];
+                    var _wssChat = chats[_ssChatId];
                     var _wssOrigTabId = _wssChat && _wssChat.targetTabId;
                     if (_wssChat) _wssChat.targetTabId = _wssTab.id;
-                    var _wssResult = await Platform.sendBrowserAction('take_screenshot', {});
+                    var _wssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
                     if (_wssChat) _wssChat.targetTabId = _wssOrigTabId;
                     if (_wssResult.error) {
                         return { success: false, error: 'Widget screenshot failed: ' + _wssResult.error };
@@ -497,7 +503,7 @@ async function executeTakeScreenshot(args) {
             }
 
             // Get element rect from tab, take full screenshot, then crop
-            var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector });
+            var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector }, _ssChatId);
             if (elProps.error || !elProps.properties) {
                 return { success: false, error: 'Element not found: ' + selector };
             }
@@ -507,7 +513,7 @@ async function executeTakeScreenshot(args) {
             }
 
             // Take full page screenshot
-            var fullSs = await Platform.sendBrowserAction('take_screenshot', {});
+            var fullSs = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
             if (fullSs.error) {
                 return { success: false, error: fullSs.error };
             }

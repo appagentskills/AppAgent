@@ -69,14 +69,32 @@ async function sendMessage() {
         // live in the offscreen runtime. The local calls below are no-ops in the
         // page bundle (empty maps) but we keep them as a safety net AND push the
         // queued message + interrupt over the bus so offscreen does the real work.
-        userInterruptedChats[currentChatId] = true;
-        var ac = currentStreamAbortControllers[currentChatId];
-        if (ac && typeof ac.abort === 'function') {
-            try { ac.abort(); } catch (e) {}
+        //
+        // #18 prompt_user continuity (page mirror of the SW fast path in
+        // worker/130-port-bridge.js _handlePanelSendMessage): when the chat's
+        // LAST prompt_user row is still pending and the user typed text, the
+        // message is the ANSWER to that question — skip the local interrupt
+        // no-ops and show "answer sent" instead of "interrupting". The SW makes
+        // the authoritative decision (it may still interrupt for an untracked
+        // call); this only shapes the immediate feedback.
+        var _ansViaChat = false;
+        if (message && chats[currentChatId] && Array.isArray(chats[currentChatId].messages)) {
+            var _pmRows = chats[currentChatId].messages;
+            for (var _pi = _pmRows.length - 1; _pi >= 0; _pi--) {
+                var _pm = _pmRows[_pi];
+                if (_pm && _pm.role === 'prompt_user') { _ansViaChat = (_pm.status === 'pending'); break; }
+            }
         }
-        var interruptFn = interruptResolversByChatId[currentChatId];
-        if (typeof interruptFn === 'function') {
-            try { interruptFn(); } catch (e) {}
+        if (!_ansViaChat) {
+            userInterruptedChats[currentChatId] = true;
+            var ac = currentStreamAbortControllers[currentChatId];
+            if (ac && typeof ac.abort === 'function') {
+                try { ac.abort(); } catch (e) {}
+            }
+            var interruptFn = interruptResolversByChatId[currentChatId];
+            if (typeof interruptFn === 'function') {
+                try { interruptFn(); } catch (e) {}
+            }
         }
         // Push the queued message + interrupt to offscreen. Offscreen will
         // append the user message to its chats[chatId].messages, set its own
@@ -202,10 +220,10 @@ async function sendMessage() {
             delete _silentHookChats[currentChatId];
         }
         // Update spinner immediately so the user sees instant acknowledgement.
-        showSpinner('Interrupting…', currentChatId);
+        showSpinner(_ansViaChat ? 'Answer sent to the pending question…' : 'Interrupting…', currentChatId);
         // Re-render so the queued bubble appears immediately under the chat.
         renderMessages();
-        showSnackbar('Message sent — interrupting current step.');
+        showSnackbar(_ansViaChat ? 'Message sent as the answer to the pending question.' : 'Message sent — interrupting current step.');
         return;
     }
 
@@ -266,7 +284,9 @@ async function sendMessage() {
         renderMessages();
     }
 
-    chat.messages.push({ role: 'user', content: userMessageContent });
+    var composerWidgetId = consumeWidgetComposerTarget(input, userMessageContent);
+    chat.messages.push({ role: 'user', content: userMessageContent,
+        isWidgetRequest: !!composerWidgetId, widgetId: composerWidgetId || undefined });
 
     // Add pending attachments as screenshot/pdf/file/document messages
     if (pendingImageAttachments.length > 0) {
@@ -277,6 +297,7 @@ async function sendMessage() {
                 var docId = img.sdocId;
                 chat.messages.push({
                     role: 'context',
+                    attachment: { fileType: 'document', name: docTitle, sdocId: docId },
                     content: '[User referenced Smart Document "' + docTitle + '" (doc_id: ' + docId + '). Use the document tool with action "read" and this doc_id to access its content.]'
                 });
                 return;
@@ -375,7 +396,7 @@ async function sendWidgetMessage(message) {
     
     // Build widget context message for main agent
     var widgetContext = '[WIDGET MODE] You are editing widget "' + widget.title + '" (ID: ' + widget.id + '). ' +
-        'Use the html_widget tool with widget_id="' + widget.id + '" to update this widget. ' +
+        'First read html_widget action=read with widget_id="' + widget.id + '". Then save the SAME widget_id with expected_version from that read and a unique operation_id. Never create a second widget for this iteration. ' +
         'Create a complete, self-contained HTML widget with styles and scripts. ' +
         'For ServiceNow API calls, use: await executeTool("servicenow_api", {method:"GET", table:"...", ...})\n\n' +
         'User request: ' + message;

@@ -317,7 +317,9 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
                 _cpDone = writeAgentCheckpoint(chatId, _expSnap) || Promise.resolve();
             }
         } catch (errCp) {}
-        cancelParkedToolCall(chatId, toolCallId, 'parked tool call exceeded max lifetime (' + Math.round(PARKED_TOOL_MAX_LIFETIME_MS / 60000) + ' min) with no panel connected');
+        // `expired:true` marks this as a TTL expiry (no human ever saw it) so the
+        // approval stub below reports a neutral "expired" instead of "DENIED by user".
+        cancelParkedToolCall(chatId, toolCallId, 'parked tool call exceeded max lifetime (' + Math.round(PARKED_TOOL_MAX_LIFETIME_MS / 60000) + ' min) with no panel connected', { expired: true });
         // Release the SW DB connection only AFTER the errored checkpoint has
         // committed. Closing it synchronously here would abort the checkpoint's
         // transaction: when `db` is cached, openDatabase() resolves on a
@@ -331,7 +333,13 @@ function parkUIToolCall(chatId, toolCallId, name, input, resolve, reject, sandbo
     }, PARKED_TOOL_MAX_LIFETIME_MS);
 }
 
-function cancelParkedToolCall(chatId, toolCallId, reason) {
+// Resolves the parked entry with a FAILURE result. The shape is a tool result
+// ({success:false, error}) for parked exec-tools, plus `cancelled:true` (+
+// `expired:true` when `extra.expired` is set by the TTL closure) so consumers
+// that treat the value as an approval verdict (the requestProgrammaticToolApproval
+// stub below, parked '__approval_prompt__' entries) can tell "nobody answered"
+// apart from an explicit user denial. `extra` is optional.
+function cancelParkedToolCall(chatId, toolCallId, reason, extra) {
     var arr = parkedToolCallsByChatId[chatId];
     if (!arr) return;
     for (var i = 0; i < arr.length; i++) {
@@ -342,7 +350,14 @@ function cancelParkedToolCall(chatId, toolCallId, reason) {
             // id that's now cancelled.
             try { if (entry._ttlTimer) { clearTimeout(entry._ttlTimer); entry._ttlTimer = null; } } catch (eT) {}
             try {
-                entry.resolve({ success: false, error: 'Tool call cancelled: ' + (reason || 'unknown') });
+                entry.resolve({
+                    success: false,
+                    error: 'Tool call cancelled: ' + (reason || 'unknown'),
+                    cancelled: true,
+                    expired: !!(extra && extra.expired),
+                    reason: (extra && extra.expired) ? 'approval_timeout' : 'cancelled',
+                    cancelReason: reason || 'unknown'
+                });
             } catch (e) {}
             AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: toolCallId, reason: reason });
             return;
@@ -514,14 +529,16 @@ function dispatchUIToolToPort(port, chatId, toolCallId, name, input, resolve, re
     // to the parent tool_result slot when called from inside a js_eval / skill.
     if (sandboxCtx) {
         if (sandboxCtx.fromSandbox) msg.fromSandbox = true;
+        if (sandboxCtx.widgetEvalRecoverOnly) msg.widgetEvalRecoverOnly = true;
         if (sandboxCtx.parentToolCallId) msg.parentToolCallId = sandboxCtx.parentToolCallId;
         if (typeof sandboxCtx.messageIndex === 'number') msg.messageIndex = sandboxCtx.messageIndex;
     }
     port.postMessage(msg);
 }
 
-function resolvePendingUIToolCall(toolCallId, result, error) {
+function resolvePendingUIToolCall(toolCallId, result, error, sourcePort) {
     var pending = _pendingUIToolCalls[toolCallId];
+    if (pending && pending.widgetEvalPortRequired && sourcePort !== pending.port) return;
     if (pending) {
         // Settling — clear any redispatch backstop so its timer can't later fire
         // against a re-registered entry for the same (stable) toolCallId.
@@ -642,6 +659,66 @@ function _swSettleRemotePrompt(msg, fromPort) {
     AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-result' });
 }
 
+// #18 prompt_user continuity — a chat message typed while the LAST prompt_user
+// row of the chat is still pending is the ANSWER to that question, not an
+// interrupt. Called by worker/130-port-bridge.js _handlePanelSendMessage
+// (running branch) BEFORE it marks userInterruptedChats / fires the interrupt
+// resolver / aborts the stream. Returns true when the prompt was settled
+// (caller must then NOT interrupt — the queued injection still lands as the
+// next user row via flushPendingInjection after the tool batch), false when
+// the normal interrupt path must run. Deliberately conservative: only a
+// pending row whose toolCallId is still tracked (pending map or parked entry)
+// is answered — an untracked call falls back to the interrupt so the user's
+// message is never swallowed. Pause / provider-change paths are untouched.
+//
+// Interrupt lane: a STOP PHRASE ("stop", "no", "cancel", …) typed against an
+// open prompt is a denial, not an answer — the prompt is settled with the
+// standard prompt_user cancel shape ({success:false, cancelled:true}, plus
+// cancelled_via_chat + text) and this returns FALSE so the caller still marks
+// userInterruptedChats / fires the interrupt resolver / aborts the stream.
+// WHOLE-message match only (optional "it/that/this", "no thanks", trailing
+// punctuation): "no problem, go ahead" / "wait, actually yes" are answers.
+var _SW_STOP_PHRASE_RE = /^\s*(?:stop|cancel|abort|halt|wait|hold\s+on|no(?:\s+thanks)?|nope|(?:don['\u2019]?t|do\s+not)(?:\s+do)?)(?:\s+(?:it|that|this))?\s*[.!,]*\s*$/i;
+function _swIsStopPhrase(text) {
+    return typeof text === 'string' && _SW_STOP_PHRASE_RE.test(text);
+}
+function _swAnswerPendingPromptViaChat(chatId, text) {
+    if (typeof text !== 'string' || !text.trim()) return false;
+    var chat = chatId && chats[chatId];
+    if (!chat || !Array.isArray(chat.messages)) return false;
+    var row = null;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m && m.role === 'prompt_user') { row = m; break; }
+    }
+    if (!row || row.status !== 'pending' || !row.promptId || !row.toolCallId) return false;
+    var tracked = !!_pendingUIToolCalls[row.toolCallId];
+    if (!tracked) {
+        var arr = parkedToolCallsByChatId[chatId];
+        if (arr) for (var pi = 0; pi < arr.length; pi++) { if (arr[pi] && arr[pi].toolCallId === row.toolCallId) { tracked = true; break; } }
+    }
+    if (!tracked) return false;
+    var trimmed = text.trim();
+    if (_swIsStopPhrase(trimmed)) {
+        row.cancelled_via_chat = true;
+        _swSettleRemotePrompt({
+            chatId: chatId,
+            promptId: row.promptId,
+            toolCallId: row.toolCallId,
+            result: { success: false, cancelled: true, cancelled_via_chat: true, message: 'User cancelled the form via chat: "' + trimmed.slice(0, 80) + '"', text: trimmed }
+        }, null);
+        return false; // caller proceeds to the interrupt lane
+    }
+    row.answered_via_chat = true;
+    _swSettleRemotePrompt({
+        chatId: chatId,
+        promptId: row.promptId,
+        toolCallId: row.toolCallId,
+        result: { success: true, answered_via_chat: true, text: trimmed }
+    }, null);
+    return true;
+}
+
 // =============================================================
 // AB (approval broadcast) helpers — clone of the MP prompt_user pattern
 // above, for permission approvals. Consumed by the dispatch below, by
@@ -696,6 +773,64 @@ function _swSettleApprovalRow(chatId, toolCallId, status, allowed) {
         status: (row && row.status !== 'pending' && row.status) || status || (allowed ? 'allowed' : 'denied'),
         allowed: !!allowed
     });
+}
+
+// "Allow for this chat": the SW self-applies the grant from the approval
+// verdict (exec-approval-prompt-result status 'session_allowed',
+// worker/130-port-bridge.js) so it no longer depends on the separate
+// 'permissions-update' push surviving a flapping port. Sets
+// sessionPermissions[chatPermKey(root, permKey)], persists to
+// chrome.storage.session, rebroadcasts 'permissions-changed' to every panel
+// (their replicas converge), then auto-resolves every OTHER pending approval
+// (live _pendingUIToolCalls entry or parked '__approval_prompt__') that has
+// the same root chat AND permission key — each is settled 'session_allowed'
+// so panels dismiss the sibling cards via 'approvalSettled'. Returns the
+// number of siblings resolved.
+function swGrantChatPermission(chatId, permKey, excludeRequestId) {
+    if (!chatId || !permKey || typeof resolveRootChatId !== 'function') return 0;
+    var root = resolveRootChatId(chatId);
+    if (!root) return 0;
+    if (!sessionPermissions || typeof sessionPermissions !== 'object') sessionPermissions = {};
+    sessionPermissions[chatPermKey(root, permKey)] = 'allow';
+    // ADDITIVE dirty flag (not the full-map-replace one): if the boot-time
+    // loadSessionPermissionsInWorker read is still in flight, it must MERGE
+    // the stored grants under this one instead of discarding them (F6
+    // boot race — worker/025). The replace flag stays reserved for the
+    // 'permissions-update' full-map / reset-all path (worker/130).
+    if (typeof _swPermsDirty !== 'undefined') _swPermsDirty.sessionPermissionsAdditive = true;
+    if (typeof persistSessionPermissionsInWorker === 'function') persistSessionPermissionsInWorker();
+    if (typeof _swPanelPorts !== 'undefined') {
+        var _pc = { type: 'permissions-changed', sessionPermissions: sessionPermissions };
+        _swPanelPorts.forEach(function(p) { try { p.postMessage(_pc); } catch (e) { /* dead port */ } });
+    }
+    var n = 0;
+    // Live pending approvals (a panel is showing them).
+    Object.keys(_pendingUIToolCalls).forEach(function(rid) {
+        var ent = _pendingUIToolCalls[rid];
+        if (!ent || !ent.isApproval || rid === excludeRequestId) return;
+        var env = ent.envelope || {};
+        if (env.permissionKey !== permKey) return;
+        if (resolveRootChatId(ent.chatId) !== root) return;
+        resolvePendingUIToolCall(rid, { allowed: true }, null);
+        _swSettleApprovalRow(ent.chatId, ent.toolCallId, 'session_allowed', true);
+        n++;
+    });
+    // Parked approvals (no panel was connected when they were requested).
+    Object.keys(parkedToolCallsByChatId).forEach(function(cid) {
+        var arr = parkedToolCallsByChatId[cid];
+        if (!arr || arr.length === 0 || resolveRootChatId(cid) !== root) return;
+        arr.slice().forEach(function(entry) {
+            if (!entry || entry.name !== '__approval_prompt__' || !entry.input || entry.input.permissionKey !== permKey) return;
+            var idx = arr.indexOf(entry);
+            if (idx !== -1) arr.splice(idx, 1);
+            try { if (entry._ttlTimer) { clearTimeout(entry._ttlTimer); entry._ttlTimer = null; } } catch (eT) {}
+            try { entry.resolve({ allowed: true }); } catch (eR) {}
+            _swSettleApprovalRow(cid, entry.input.toolCallId, 'session_allowed', true);
+            AgentEvents.emit('toolUnparked', { chatId: cid, toolCallId: entry.toolCallId, reason: 'chat-grant' });
+            n++;
+        });
+    });
+    return n;
 }
 
 // AB-3: broadcast an exec-approval-prompt envelope to EVERY connected panel.
@@ -782,6 +917,192 @@ function pickExecutorPort() {
 //   • for headless tools → calls the original locally
 //   • for UI tools → routes to a panel; parks if no panel
 // =============================================================
+// widget_eval cannot use first-panel-wins or parked replay: the target is a
+// particular live DOM render. Probe connected foreground panels, then dispatch
+// only its owner. The offscreen helper is not an _agentSubscribers member.
+var _widgetEvalCalls = new Map();
+var _widgetEvalRun = crypto.randomUUID();
+// Per-panel `list` probe budget. Probes run in parallel, so this bounds the
+// whole discovery phase rather than accumulating per panel.
+var _WIDGET_EVAL_PROBE_MS = 5000;
+function _widgetEvalIndeterminate() {
+    return { success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
+        error: 'Prior widget evaluation may have run. No automatic re-execution; verify live state before issuing a NEW call.' };
+}
+
+function _widgetEvalPanelCall(port, chatId, input, options, waitMs) {
+    var isEval = input.action === 'eval';
+    var id = isEval ? options.toolCallId : 'widget_eval_' + crypto.randomUUID();
+    return new Promise(function(resolve) {
+        var timer = setTimeout(function() {
+            delete _pendingUIToolCalls[id];
+            resolve(isEval ? _widgetEvalIndeterminate() : { success: false, code: 'PANEL_UNAVAILABLE', error: 'Live panel did not respond in time.' });
+        }, waitMs);
+        function finish(result) { clearTimeout(timer); resolve(result); }
+        var adopted = isEval && _panelAdoptedTools[id];
+        if (adopted) {
+            delete _panelAdoptedTools[id];
+            var buffered = _adoptedResults[id];
+            if (buffered) {
+                delete _adoptedResults[id];
+                finish(buffered.error ? _widgetEvalIndeterminate() : buffered.result);
+            } else {
+                // Adopt live work or a dispatched tombstone; NEVER resend it.
+                _pendingUIToolCalls[id] = { resolve: finish, reject: function() { finish(_widgetEvalIndeterminate()); },
+                    startedAt: Date.now(), port: adopted.port || null, chatId: chatId, widgetEvalPortRequired: true };
+            }
+            return;
+        }
+        try {
+            dispatchUIToolToPort(port, chatId, id, 'widget_eval', input, finish, function(error) {
+                finish(isEval ? _widgetEvalIndeterminate() : { success: false, code: 'PANEL_UNAVAILABLE', error: String(error) });
+            }, { fromSandbox: !!(options && options.fromSandbox), parentToolCallId: options && options.parentToolCallId,
+                widgetEvalRecoverOnly: isEval && options.widgetEvalRecoverOnly });
+            // Disconnect clean-rejects nameless pending entries; never re-park
+            // an eval which might already have executed a side effect.
+            var pending = _pendingUIToolCalls[id];
+            if (pending) { pending.name = null; pending.widgetEvalPortRequired = true; }
+        } catch (error) {
+            delete _pendingUIToolCalls[id];
+            finish(isEval ? _widgetEvalIndeterminate() : { success: false, code: 'PANEL_UNAVAILABLE', error: String(error) });
+        }
+    });
+}
+
+async function _routeLiveWidgetTool(args, options) {
+    args = args || {};
+    options = Object.assign({}, options);
+    if (args.action !== 'eval') return _routeLiveWidgetToolOnce(args, options);
+    var callerError = _widgetEvalCallerError(options);
+    if (callerError) return callerError;
+    // Stable logical identity is mandatory, including calls nested in js_eval.
+    if (!options.toolCallId || (options.fromSandbox && !options.parentToolCallId)) return _widgetEvalIndeterminate();
+    var id = options.toolCallId;
+    if (_widgetEvalCalls.has(id)) return _widgetEvalCalls.get(id);
+    var work = _routeLiveWidgetToolOnce(args, options);
+    _widgetEvalCalls.set(id, work);
+    try { return await work; } finally { _widgetEvalCalls.delete(id); }
+}
+
+// A best-effort chat save is NOT a dispatch barrier (it can resolve on request
+// success or swallow aborts). RMW only the existing durable placeholder, leaving
+// payload references and other realms' fields intact, and await TX COMMIT.
+async function _commitWidgetEvalIntent(chatId, options) {
+    var rootId = options.parentToolCallId || options.toolCallId;
+    function liveRow() {
+        var chat = chats[chatId];
+        if (!chat || chat.id !== chatId || chat._deleted || chat._payloadsEvicted) return null;
+        if (typeof _chatDeleteLedgerGranted === 'function' && _chatDeleteLedgerGranted(chatId)) return null;
+        return findPlaceholderRow(chat, rootId);
+    }
+    if (typeof _chatsHydrated === 'undefined' || !_chatsHydrated || !liveRow()) throw new Error('Widget intent requires a hydrated unresolved chat placeholder.');
+    var intent = await withStore([chatStoreName], 'readwrite', function(tx) {
+        return new Promise(function(resolve, reject) {
+            var committedIntent;
+            function fail(error) {
+                reject(error || new Error('Widget intent transaction failed.'));
+                try { tx.abort(); } catch (_) { /* already aborted/completed */ }
+            }
+            tx.onabort = function() { reject(tx.error || new Error('Widget intent transaction aborted.')); };
+            tx.onerror = function() { fail(tx.error); };
+            tx.oncomplete = function() {
+                if (committedIntent) resolve(committedIntent);
+                else reject(new Error('Widget intent transaction committed without a placeholder.'));
+            };
+            try {
+                var store = tx.objectStore(chatStoreName);
+                var request = store.get(chatId);
+                request.onerror = function() { fail(request.error); };
+                request.onsuccess = function() {
+                    try {
+                        var stored = request.result;
+                        var memory = liveRow();
+                        var row = stored && stored.id === chatId && !stored._deleted && !stored._payloadsEvicted
+                            ? findPlaceholderRow(stored, rootId) : null;
+                        if (!memory || !row || memory.name !== row.name) throw new Error('Durable widget placeholder is missing or mismatched.');
+                        if (options.fromSandbox && ((row._widgetEvalDispatched && row._widgetEvalRun !== _widgetEvalRun)
+                            || (memory._widgetEvalDispatched && memory._widgetEvalRun !== _widgetEvalRun))) {
+                            throw new Error('Prior widget program cannot be replayed.');
+                        }
+                        var ids = Array.isArray(row._widgetEvalIds) ? row._widgetEvalIds.slice() : [];
+                        var recoverOnly = !!options.widgetEvalRecoverOnly || ids.indexOf(options.toolCallId) !== -1;
+                        if (ids.indexOf(options.toolCallId) === -1) ids.push(options.toolCallId);
+                        // Recovery never claims an earlier worker's enclosing program.
+                        var run = row._widgetEvalDispatched ? row._widgetEvalRun : _widgetEvalRun;
+                        row._widgetEvalDispatched = true;
+                        row._widgetEvalRun = run;
+                        row._widgetEvalIds = ids;
+                        committedIntent = { ids: ids, run: run, recoverOnly: recoverOnly };
+                        var put = store.put(stored);
+                        put.onerror = function() { fail(put.error); };
+                        // No put.onsuccess resolution: the transaction may still abort.
+                    } catch (error) { fail(error); }
+                };
+            } catch (error) { fail(error); }
+        });
+    });
+    var current = liveRow();
+    if (!current) throw new Error('Widget placeholder changed before dispatch.');
+    current._widgetEvalDispatched = true;
+    current._widgetEvalRun = intent.run;
+    current._widgetEvalIds = intent.ids;
+    options.widgetEvalRecoverOnly = intent.recoverOnly;
+}
+
+async function _routeLiveWidgetToolOnce(args, options) {
+    var chatId = options && options.chatId || activeStreamingChatId;
+    if (args.action === 'eval') {
+        var callerError = _widgetEvalCallerError(options);
+        if (callerError) return callerError;
+    }
+    if (args.action === 'eval') {
+        // Commit the dispatch intent before sending any script. For nested
+        // calls mark the OUTER placeholder, so replay cannot restart the whole
+        // sandbox with fresh nested IDs and repeat arbitrary earlier effects.
+        try { await _commitWidgetEvalIntent(chatId, options); }
+        catch (error) {
+            var failure = _widgetEvalIndeterminate();
+            failure.error = 'Widget intent was not confirmed durable; no script dispatched. ' + String(error && error.message || error);
+            return failure;
+        }
+        if (_panelAdoptedTools[options.toolCallId]) return _widgetEvalPanelCall(null, chatId, args, options, 90000);
+    }
+    var ports = Array.from(_agentSubscribers);
+    if (args.action === 'eval' && options.widgetEvalRecoverOnly && !ports.length) return _widgetEvalIndeterminate();
+    if (!ports.length) return { success: false, code: 'INSTANCE_UNAVAILABLE', error: 'No foreground panel connected. Live widgets are never recreated or evaluated offscreen.' };
+    if (args.action !== 'list' && args.action !== 'eval') return { success: false, code: 'INVALID_ARGUMENT', error: 'action must be list or eval.' };
+    if (args.action === 'eval' && (typeof args.instance_id !== 'string' || !args.instance_id)) return { success: false, code: 'INVALID_ARGUMENT', error: 'eval requires an explicit live instance_id.' };
+    var instances = [];
+    var owner = null;
+    // Parallel discovery (B5): every connected panel is probed at once with a
+    // SHORT `list` timeout, so one unresponsive panel no longer stalls the call
+    // for 60 s per panel. Fail-closed is preserved: ANY probe that is denied,
+    // times out or returns a malformed result fails the whole call — no eval
+    // is dispatched on a partial view of the live renders. `widget_eval:list`
+    // is a read key (default allow), so probing in parallel does not fan out
+    // write prompts.
+    var probes = await Promise.allSettled(ports.map(function(port) {
+        return _widgetEvalPanelCall(port, chatId, { action: 'list' }, options, _WIDGET_EVAL_PROBE_MS);
+    }));
+    for (var i = 0; i < probes.length; i++) {
+        var probe = probes[i];
+        var result = probe.status === 'fulfilled' ? probe.value : null;
+        if (!result || !result.success) return result || { success: false, code: 'PANEL_UNAVAILABLE', error: 'Panel discovery failed.' };
+        if (!Array.isArray(result.instances)) return { success: false, error: 'Invalid panel discovery result.' };
+        for (var j = 0; j < result.instances.length; j++) {
+            var instance = result.instances[j];
+            instances.push(instance);
+            if (args.action === 'eval' && instance.instance_id === args.instance_id) {
+                if (owner) return { success: false, code: 'AMBIGUOUS_INSTANCE', error: 'Duplicate live instance ID; refusing execution.' };
+                owner = ports[i];
+            }
+        }
+    }
+    if (args.action === 'list') return { success: true, instances: instances };
+    if (!owner || !_agentSubscribers.has(owner)) return options.widgetEvalRecoverOnly ? _widgetEvalIndeterminate() : { success: false, code: 'INSTANCE_UNAVAILABLE', error: 'Exact live render not found. No saved-id fallback or parked replay.' };
+    return _widgetEvalPanelCall(owner, chatId, args, options, 90000);
+}
+
 var _executeToolLocal = executeTool;
 executeTool = async function(name, args, messageIndex, options) {
     var _isHeadless = (typeof isHeadlessTool === 'function') && isHeadlessTool(name);
@@ -825,6 +1146,8 @@ executeTool = async function(name, args, messageIndex, options) {
             SubAgents.onToolCallInSubAgent(_subChatId);
         }
     }
+
+    if (name === 'widget_eval') return _routeLiveWidgetTool(args, options);
 
     // UI-required tool. Route to a panel; if none connected, park.
     var chatId = (options && options.chatId) || activeStreamingChatId;
@@ -998,7 +1321,10 @@ executeTool = async function(name, args, messageIndex, options) {
                 // place so the SW's authoritative chat — and its diff-save rewrite —
                 // carries the post-edit html.
                 var _wpIdx = _wpChat.widgets.findIndex(function(w) { return w && w.id === _wp.id; });
-                if (_wpIdx !== -1) _wpChat.widgets[_wpIdx] = _wp;
+                if (_wpIdx !== -1) {
+                    if ((_wp.contentVersion || 0) > (_wpChat.widgets[_wpIdx].contentVersion || 0))
+                        _wpChat.widgets[_wpIdx] = Object.assign({}, _wp, { msgIndex: _wpChat.widgets[_wpIdx].msgIndex });
+                }
                 else _wpChat.widgets.push(_wp);
             }
             delete result._widget_persist;
@@ -1009,6 +1335,14 @@ executeTool = async function(name, args, messageIndex, options) {
         if (result._target_tab_persist != null) {
             chats[chatId].targetTabId = result._target_tab_persist;
             delete result._target_tab_persist;
+        }
+        // #16: update_action_state ran on the page (read-only chat mirror);
+        // apply its "this chat has a progress card" stamp to the authoritative
+        // chat so the agent loop's progress nudge stays quiet. Strip the
+        // marker so it never reaches the model / the persisted tool row.
+        if (result._progress_card_persist != null) {
+            chats[chatId]._progressCardAt = result._progress_card_persist;
+            delete result._progress_card_persist;
         }
         // A SUB-AGENT's update_action_state progress card. The page-side tool
         // attached the normalized snapshot to its result (its chats/SubAgents
@@ -1098,12 +1432,21 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             methodOrAction = args.action;
         } else if (toolName === 'workspace' && args && args.action) {
             methodOrAction = args.action;
-        } else if (toolName === 'document' && args && args.action) {
+        } else if ((toolName === 'document' || toolName === 'widget_eval') && args && args.action) {
+            // widget_eval {action:'list'} resolves to the read-ish
+            // 'widget_eval:list' key (core/070 resolvePermissionKey) — must
+            // match the page twin (ui/150-tool-approval.js) or the SW prompts
+            // for a read the page auto-allows.
             methodOrAction = args.action;
         }
 
+        // Resolve the target chat FIRST: "Allow for this chat" grants are keyed
+        // by ROOT chat (core/070-permissions.js), so the lookup needs the
+        // calling chat — options.chatId is set by the agent loop (chat.id) and
+        // by widget/sandbox dispatches; activeStreamingChatId is the fallback.
+        var targetChatId = options.chatId || activeStreamingChatId;
         var permissionKey = resolvePermissionKey(toolName, methodOrAction);
-        var permission = getToolPermission(toolName, methodOrAction);
+        var permission = getToolPermission(toolName, methodOrAction, targetChatId);
         var displayName = getToolDisplayName(toolName, methodOrAction);
 
         var baseResult = { permission: permission, displayName: displayName, permissionKey: permissionKey };
@@ -1128,8 +1471,10 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         }
 
         // 'ask' (or 'auto' + confirm:true): check pre-existing approval
-        // recorded in the chat by an earlier panel-side run.
-        var targetChatId = options.chatId || activeStreamingChatId;
+        // recorded in the chat by an earlier panel-side run. A row settled
+        // 'session_allowed' ("Allow for this chat") for THIS toolCallId is an
+        // approval of this exact call; the chat-wide grant itself was already
+        // honoured above via getToolPermission(…, targetChatId).
         var toolCallId = options.toolCallId
             || ('prog_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
         var chat = chats[targetChatId];
@@ -1244,11 +1589,24 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             var approved = await approvalPromise;
             // RES-6: user verdict — stamps user_interactions.last_user_approval_at
             // and notifies the parent on denial.
+            // A parked prompt that was cancelled/expired (cancelParkedToolCall —
+            // e.g. PARKED_TOOL_MAX_LIFETIME_MS TTL with no panel ever connected)
+            // is NOT a user verdict: nobody saw the prompt. Report it as a neutral
+            // expiry, not as the STOP-on-denial instruction.
+            var _apCancelled = !!(approved && approved.cancelled && !approved.allowed);
             if (_subApprovalChat) {
-                try { SubAgents.onSubApprovalEvent(targetChatId, (approved && approved.allowed) ? 'approved' : 'denied', { displayName: displayName }); } catch (eN2) {}
+                try { SubAgents.onSubApprovalEvent(targetChatId, (approved && approved.allowed) ? 'approved' : (_apCancelled ? 'aborted' : 'denied'), { displayName: displayName }); } catch (eN2) {}
             }
             if (approved && approved.allowed) {
                 return Object.assign({ allowed: true }, baseResult);
+            }
+            if (_apCancelled) {
+                return Object.assign({
+                    allowed: false,
+                    expired: !!approved.expired,
+                    reason: approved.expired ? 'approval_timeout' : 'approval_cancelled',
+                    error: displayName + ' approval request ' + (approved.expired ? 'expired' : 'was cancelled') + ' with no user response (' + (approved.cancelReason || 'no reason') + '). This is NOT a user denial — the user never saw the prompt; you may ask again / retry the call if it is still relevant.'
+                }, baseResult);
             }
             return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
         } catch (e) {

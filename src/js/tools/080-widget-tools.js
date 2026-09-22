@@ -2,35 +2,35 @@
 // =============================================
 
 async function executeHtmlWidget(args, messageIndex, options) {
-    var title = args.title || 'Widget';
-    var html = args.html || '';
-    var height = args.height || '400px';
-    var width = args.width || '400px';
-    
-    if (!html) {
-        return { success: false, error: 'html content is required' };
-    }
-    
-    // Use activeStreamingChatId if available (preserves correct chat during navigation)
-    // Otherwise fall back to currentChatId
-    var widgetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
-
-    // Resolve the index where THIS tool's tool_result will land. With the
-    // atomic-placeholder seeding the SW does before dispatching the first
-    // tool of an assistant turn, `chat.messages` already contains a
-    // `role:'tool'` placeholder for our toolCallId — `recordToolResult`
-    // overwrites it in place, so the final tool_result index equals the
-    // placeholder's current index, NOT `chat.messages.length`. Using the
-    // length here would write a `msgIndex` past every placeholder; then
-    // `getWidgetHtmlForMessage(actualToolResultIdx)` would filter to zero
-    // widgets, the `widget-inline` div would never be rendered, and
-    // `getWidgetIframe` would always return null on later iframe_tool calls
-    // (the bug that surfaced as "Widget not found" for click/fill/get_dom
-    // immediately after html_widget created the widget).
+    options = options || {};
+    var widgetChatId = options.chatId || activeStreamingChatId || currentChatId;
     var chat = chats[widgetChatId];
-    if (!chat) {
-        return { success: false, error: 'No active chat' };
+    try { await WidgetStore.init(); } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
+    if (args.action === 'list') return { success: true, widgets: WidgetStore.list() };
+    if (args.create_new && args.widget_id) return { success: false, error: 'Choose widget_id OR create_new, not both' };
+    var targetId = args.widget_id || (!args.create_new && widgetEditTarget(chat));
+    if (args.action === 'read') {
+        if (!targetId) return { success: false, error: 'widget_id is required' };
+        await WidgetStore.read(targetId);
+        var selected = WidgetStore.view(targetId, args.version);
+        return selected ? { success: true, widget: selected, versions: WidgetStore.versions(targetId), latest_version: selected.latestVersion }
+            : { success: false, code: 'WIDGET_NOT_FOUND', error: 'Widget/version not found: ' + targetId };
     }
+    if (args.action && args.action !== 'save') return { success: false, error: 'Unknown widget action' };
+    if (!args.html || typeof args.html !== 'string') return { success: false, error: 'html content is required' };
+    if (!chat) return { success: false, error: 'No active chat' };
+    var previous = targetId ? WidgetStore.view(targetId) : null;
+    if (targetId && !previous) {
+        await WidgetStore.read(targetId);
+        previous = WidgetStore.view(targetId);
+        if (!previous) return { success: false, code: 'WIDGET_NOT_FOUND', error: 'Widget not found: ' + targetId };
+    }
+    if (targetId && !Number.isInteger(args.expected_version)) return { success: false, code: 'VERSION_REQUIRED', error: 'Read this widget then supply expected_version to avoid overwriting concurrent edits.', widget_id: targetId, latest_version: previous.latestVersion };
+    previous = targetId ? (WidgetStore.view(targetId, args.expected_version) || previous) : previous;
+    var title = args.title || previous && previous.title || 'Widget';
+    var html = args.html;
+    var height = args.height || previous && previous.height || '400px';
+    var width = args.width || previous && previous.width || '400px';
     var toolResultMsgIndex = -1;
     var widgetToolCallId = options && options.toolCallId;
     // Eager-render path: when html_widget is invoked via executeTool from INSIDE a
@@ -65,62 +65,27 @@ async function executeHtmlWidget(args, messageIndex, options) {
         toolResultMsgIndex = chat ? chat.messages.length : -1;
     }
     
-    var widgetId = 'widget_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    var widget = {
-        id: widgetId,
-        title: title,
-        html: html,
-        height: height,
-        width: width,
-        createdAt: Date.now(),
-        msgIndex: toolResultMsgIndex,
-        chatId: widgetChatId
-    };
-
-    // Store widget in chat object for persistence
-    if (!chat.widgets) {
-        chat.widgets = [];
+    var operationId = await widgetOperationId(args, options);
+    var widgetId = targetId || await widgetIdForOperation(operationId);
+    var committed;
+    try {
+        committed = await WidgetStore.commit(widgetId, { title: title, html: html, height: height, width: width },
+            targetId ? args.expected_version : 0, operationId,
+            { createdAt: Date.now(), msgIndex: toolResultMsgIndex, chatId: widgetChatId });
+    } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
+    if (!committed.success) return committed;
+    var widget = WidgetStore.view(widgetId);
+    // A revision never relocates the original card or inserts a foreign one.
+    if (!targetId) {
+        if (!chat.widgets) chat.widgets = [];
+        if (!chat.widgets.some(function(w) { return w.id === widgetId; })) chat.widgets.push(widget);
+        chatWidgets[widgetChatId] = chat.widgets;
+        delete chat.isTemporary;
     }
-    chat.widgets.push(widget);
-    
-    // Sync in-memory cache with chat.widgets (they should be the same reference)
-    chatWidgets[widgetChatId] = chat.widgets;
-    
-    // Ensure chat is saved with the widget (remove temporary flag if present)
-    delete chat.isTemporary;
-    // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms' save
-    // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2035,
-    // worker/115-storage.js:178) and the page loader flags every chat outside the
-    // newest KEEP_HYDRATED chats (ui/070-dashboard-ui.js:1828-1839), so a widget
-    // created into a non-recent chat (sub-agent / background run) is dropped from
-    // disk and gone on reload. Hydrate AFTER the push above and immediately BEFORE
-    // the save. Same pattern as tools/100-prompt-user.js; ensureChatPayloads never
-    // rejects and is a no-op when the flag is clear (core/130-indexeddb.js:1075).
-    // Never `delete chat._payloadsEvicted` by hand — extractChatPayloadsForPut
-    // would then put a payload-STRIPPED record and destroy a legacy-inline row's
-    // only durable base64 (core/130-indexeddb.js:887-937).
-    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-        try { await ensureChatPayloads(widgetChatId); } catch (e) {}
-    }
-    saveChatsToStorage();
-    
-    // If this is a regeneration, update the dashboard widget with new HTML.
-    // B-B2: pendingWidgetRegeneration was a single-slot global that two parallel
-    // regenerations could stomp on. It's now a Set keyed by the widget id of the
-    // most recent prior incarnation, populated by the regeneration code path. We
-    // pop the matching entry by source-chat lookup so concurrent regenerations
-    // don't claim each other's results.
-    var regenSourceId = consumePendingWidgetRegeneration(widgetChatId);
-    if (regenSourceId && dashboardWidgets[regenSourceId]) {
-        var dashWidget = dashboardWidgets[regenSourceId];
-        dashWidget.html = html;
-        dashWidget.title = title;
-        dashWidget.chatId = widgetChatId;
-        dashWidget.msgIndex = toolResultMsgIndex;
-        dashWidget.error = null;
-        saveDashboardWidget(dashWidget);
-    }
-    
+    WidgetStore.project(widgetId);
+    // Compatibility mirrors are not the durable authority.
+    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') await ensureChatPayloads(widgetChatId);
+    await saveChatsToStorage();
     // Update sidebar widget list
     renderWidgetSidebar();
 
@@ -141,13 +106,17 @@ async function executeHtmlWidget(args, messageIndex, options) {
 
     return {
         success: true,
-        message: 'Widget "' + title + '" created successfully' + (pinnedTo ? ' and pinned to the ' + (pinnedTo === 'home' ? 'home dashboard' : 'dashboard page') : ''),
+        message: 'Widget "' + title + '" saved as version ' + committed.version + (pinnedTo ? ' and pinned to the ' + (pinnedTo === 'home' ? 'home dashboard' : 'dashboard page') : ''),
         pinned: pinnedTo,
         pin_error: pinError || undefined,
         // Normalized: `id` matches display / take_screenshot conventions.
         // `widgetId` kept for any caller still relying on it.
         id: widgetId,
         widgetId: widgetId,
+        widget_id: widgetId,
+        version: committed.version,
+        latest_version: committed.latest_version,
+        deduplicated: !!committed.deduplicated,
         _debug_hint: 'To debug this widget, use iframe_tool with widget_id="' + widgetId + '". Actions: get_visible_text (extract text), get_dom (get HTML), click (click elements), fill (fill inputs). For visual analysis, use take_screenshot tool.',
         // SW-side wrapper reads this to persist chat.widgets on its own chat
         // object. Without it, the SW's chat snapshot wipes the page-side
@@ -182,25 +151,21 @@ async function executePinWidget(args) {
 }
 
 function getWidgetsForChat(chatId) {
-    // First check in-memory cache
-    if (chatWidgets[chatId] && chatWidgets[chatId].length > 0) {
-        return chatWidgets[chatId];
-    }
-    // Fall back to chat object (persisted widgets)
-    var chat = chats[chatId];
-    if (chat && chat.widgets && chat.widgets.length > 0) {
-        // Populate cache from persisted data
-        chatWidgets[chatId] = chat.widgets;
-        return chat.widgets;
-    }
-    return [];
+    var seen = new Set();
+    var all = ((chats[chatId] && chats[chatId].widgets) || chatWidgets[chatId] || []).slice();
+    WidgetStore.list().forEach(function(w) { var saved = WidgetStore.view(w.id); if (chats[chatId] && saved.chatId === chatId && !all.some(function(old) { return old.id === w.id; })) all.push(saved); });
+    return all.filter(function(w) {
+        if (!w || seen.has(w.id)) return false;
+        seen.add(w.id); return true;
+    }).map(function(w) { return Object.assign({}, w, WidgetStore.view(w.id) || {}, { msgIndex: w.msgIndex, chatId: w.chatId || chatId }); });
 }
 
 function getWidgetById(widgetId) {
+    var canonical = WidgetStore.view(widgetId);
     // First check in-memory cache
     var allCachedWidgets = Object.values(chatWidgets).flat();
     var found = allCachedWidgets.find(function(w) { return w.id === widgetId; });
-    if (found) return found;
+    if (found) return Object.assign(found, canonical || {});
     
     // Fall back to searching persisted widgets in all chats
     var chatIds = Object.keys(chats);
@@ -214,7 +179,7 @@ function getWidgetById(widgetId) {
                 if (!chatWidgets[chatIds[i]].find(function(w) { return w.id === widgetId; })) {
                     chatWidgets[chatIds[i]] = chat.widgets;
                 }
-                return widget;
+                return Object.assign(widget, canonical || {});
             }
         }
     }
@@ -224,12 +189,12 @@ function getWidgetById(widgetId) {
     // without this fallback every getWidgetById caller (editWidgetCode:535,
     // saveWidgetCodeEdit:585, screenshotWidget:482, printWidgetFullscreen:466...)
     // reported 'Widget not found' for it. Checked LAST on purpose: while the chat
-    // copy still exists it stays authoritative, because the chat surface renders
-    // from chats[cid].widgets and saveWidgetCodeEdit persists into that array.
+    // copy still exists its placement metadata is retained; canonical saved
+    // content always overrides compatibility projections on every surface.
     if (typeof dashboardWidgets !== 'undefined' && dashboardWidgets[widgetId]) {
-        return dashboardWidgets[widgetId];
+        return canonical ? Object.assign({}, dashboardWidgets[widgetId], canonical) : dashboardWidgets[widgetId];
     }
-    return null;
+    return canonical;
 }
 
 function toggleWidgetRunning(widgetId, event) {
@@ -292,6 +257,7 @@ function _appendWidgetScript(widgetHtml, script) {
 
 function renderWidgetInContainer(widget, container, options) {
     options = options || {};
+    widget = WidgetStore.view(widget.id, options.version) || widget;
     var isFullscreen = options.fullscreen || false;
     // Create iframe for complete CSS and script isolation
     var iframe = document.createElement('iframe');
@@ -299,7 +265,10 @@ function renderWidgetInContainer(widget, container, options) {
     iframe.style.cssText = 'width:100%; border:none; display:block;';
     iframe.setAttribute('scrolling', 'no');
 
-    var isThumbnail = container.closest('.widgets-container') !== null;
+    // Chat sidebar strip (.widgets-container) and the dashboard-page Widget
+    // Library (.widget-library-thumb, ui/065-widget-library.js) both want the
+    // scaled, non-interactive preview.
+    var isThumbnail = container.closest('.widgets-container, .widget-library-thumb') !== null;
 
     // Build widget HTML with bridge
     var widgetHtml = injectWidgetBridge(widget.html, widget.title, widget.id);
@@ -357,7 +326,10 @@ function renderWidgetInContainer(widget, container, options) {
     }
 
     container.appendChild(iframe);
-    writeWidgetHtml(iframe, widgetHtml);
+    iframe.__versionSuffix = heightScript || '';
+    // Thumbnails are previews, not live renders: keep them out of the
+    // widget_eval instance registry (ui/070-dashboard-ui.js writeWidgetHtml).
+    writeWidgetHtml(iframe, widgetHtml, widget.id, { preview: isThumbnail });
 
     // Thumbnail mode: pure CSS scaled preview, no auto-resize
     if (isThumbnail) {
@@ -377,6 +349,19 @@ function renderWidgetInContainer(widget, container, options) {
         iframe.style.height = (widget.lastHeight + 2) + 'px';
     }
 
+    bindWidgetVersionResize(iframe, widget, isFullscreen);
+
+    // For fullscreen, fill the container
+    if (isFullscreen) {
+        iframe.style.height = '100%';
+        iframe.style.flex = '1';
+    }
+    
+    return iframe;
+}
+
+function bindWidgetVersionResize(iframe, widget, isFullscreen) {
+    iframe.__versionFullscreen = isFullscreen;
     // Listen for height updates from the in-widget height reporter (cross-origin)
     function onWidgetResize(e) {
         if (e.source !== iframe.contentWindow) return;
@@ -398,17 +383,12 @@ function renderWidgetInContainer(widget, container, options) {
     window.addEventListener('message', onWidgetResize);
 
     // Store cleanup function on iframe for proper resource cleanup when removed
+    var _mountCleanup = iframe.__widgetCleanup;
     iframe.__widgetCleanup = function() {
+        if (typeof _mountCleanup === 'function') _mountCleanup();
         window.removeEventListener('message', onWidgetResize);
     };
     
-    // For fullscreen, fill the container
-    if (isFullscreen) {
-        iframe.style.height = '100%';
-        iframe.style.flex = '1';
-    }
-    
-    return iframe;
 }
 
 function openWidgetFullscreen(widgetId, event) {
@@ -596,6 +576,9 @@ function editWidgetCode(widgetId) {
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
     
+    var versionEditor = content.querySelector('textarea');
+    versionEditor.dataset.widgetBaseVersion = String(widget.contentVersion);
+    versionEditor.dataset.widgetOperationId = 'manual:' + crypto.randomUUID();
     // Focus editor
     setTimeout(function() {
         var editor = document.getElementById('widget-code-editor');
@@ -620,131 +603,14 @@ async function saveWidgetCodeEdit(widgetId) {
     var widget = getWidgetById(widgetId);
     if (!widget) { showSnackbar('Widget not found', 'error'); return; }
     
-    var _prevHtml = widget.html;
-    widget.html = editor.value;
-    // Bump the monotonic content version on every html change, exactly like the
-    // AGENT edit path (tools/010-iframe-tool.js:906). take_screenshot cannot
-    // rasterize the widget's sandboxed cross-origin iframe, so it re-renders the
-    // widget in a temp tab via the ?widget= deep link and only accepts the frame
-    // whose broadcast contentVersion matches the one it requested
-    // (tools/060-take-screenshot.js:265 + :353). Without this bump a screenshot
-    // taken right after a MANUAL code edit can be satisfied by a stale frame.
-    // contentVersion is in DASHBOARD_CONTENT_FIELDS (ui/020-dashboard.js:45), so
-    // the saveDashboardWidget merge below persists it for dashboard copies too.
-    widget.contentVersion = (widget.contentVersion || 0) + 1;
-    widget.updatedAt = Date.now();
-    
-    // Save to appropriate store.
-    // B-B3: write to the widget's *owning* chat, not the foreground chat. Editing
-    // a widget that lives in chat A from a UI route that fires while the user is
-    // viewing chat B previously updated chat B's array (or no-op'd if B had no
-    // widget array of its own).
-    if (dashboardWidgets[widgetId]) {
-        // PLACEMENT: saveDashboardWidget MERGES the content fields onto the
-        // existing dashboard record (ui/020-dashboard.js DASHBOARD_CONTENT_FIELDS)
-        // instead of replacing it, so gridX/gridY/dashboard/prompt and the NUMERIC
-        // grid width/height survive even though `widget` here is usually the CHAT
-        // copy, which has none of them. _prevHtml is passed because the record may
-        // BE `widget` (a dashboard-only widget resolved by getWidgetById's
-        // dashboard fallback at :199): the in-place edit above would otherwise
-        // defeat the history diff.
-        await saveDashboardWidget(widget, false, _prevHtml);
-    }
-    // CACHE-DETACH: write through to the owning chat's LIVE widgets array.
-    // `chatWidgets` only caches the array REFERENCE (:87, :179, :201) and goes
-    // DETACHED as soon as an SW chat-snapshot replaces the chat wholesale —
-    // app/045-agent-port-bridge-page.js:550 `chats[chatId] = _inChat` (a
-    // structured-clone with a brand-new array; its merge guards re-point
-    // versionHistory and carry pending rows/meta, but NOT `widgets`). Writing only
-    // into the cache therefore persisted NOTHING, because saveChatsToStorage
-    // serialises `chats` (ui/070-dashboard-ui.js:1969), and the old
-    // `if (chatWidgets[owningChatId])` guard skipped the save ENTIRELY when the
-    // owning chat had never been visited in this panel session. The agent route
-    // already writes the live array (tools/010-iframe-tool.js:913-914); this is
-    // the manual "edit widget code" route.
-    var owningChatId = widget.chatId || currentChatId;
-    var _holdsWidget = function(c) {
-        return !!(c && Array.isArray(c.widgets)
-            && c.widgets.some(function(w) { return w && w.id === widgetId; }));
-    };
-    var _owningChat = owningChatId ? chats[owningChatId] : null;
-    // widget.chatId is stamped at creation (:77), but legacy/imported widgets
-    // predate it and currentChatId is null outside a chat view
-    // (core/030-config.js:450) — so when the declared owner does not hold this id,
-    // fall back to the live chat that actually does.
-    if (!_holdsWidget(_owningChat)) {
-        var _cIds = Object.keys(chats);
-        for (var _ci = 0; _ci < _cIds.length; _ci++) {
-            if (_holdsWidget(chats[_cIds[_ci]])) {
-                owningChatId = _cIds[_ci];
-                _owningChat = chats[owningChatId];
-                break;
-            }
-        }
-        // A DASHBOARD-ONLY widget (source chat deleted — resolvable only since
-        // getWidgetById gained its dashboardWidgets fallback at :199) has no chat
-        // home. Without this, the block below would graft it into whatever chat
-        // happens to be in view (chats[currentChatId]) and it would start
-        // rendering there. The dashboard write above is its durable copy.
-        if (!_holdsWidget(_owningChat) && dashboardWidgets[widgetId] === widget) {
-            _owningChat = null;
-        }
-    }
-    var _savedToChat = false;
-    if (_owningChat) {
-        if (!Array.isArray(_owningChat.widgets)) _owningChat.widgets = [];
-        var idx = _owningChat.widgets.findIndex(function(w) { return w && w.id === widgetId; });
-        if (idx !== -1) _owningChat.widgets[idx] = widget;
-        else _owningChat.widgets.push(widget);
-        chatWidgets[owningChatId] = _owningChat.widgets;   // re-point the stale cache
-        // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms' save
-        // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2035,
-        // worker/115-storage.js:178) and the page loader flags every chat outside
-        // the newest KEEP_HYDRATED chats, so the await below would otherwise commit
-        // NOTHING and the edit would be lost on reload. Same pattern as
-        // tools/100-prompt-user.js; ensureChatPayloads never rejects and is a no-op
-        // when the flag is clear. Never `delete _owningChat._payloadsEvicted` by
-        // hand — extractChatPayloadsForPut would put a payload-STRIPPED record and
-        // destroy a legacy-inline row's only durable base64
-        // (core/130-indexeddb.js:887-937).
-        if (_owningChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-            try { await ensureChatPayloads(owningChatId); } catch (e) {}
-        }
-        await saveChatsToStorage();
-        _savedToChat = true;
-        // SW-MIRROR: the write above landed in the PAGE realm only. Once the SW
-        // has adopted this chat (worker/130-port-bridge.js `if (!chats[chatId])`)
-        // it keeps its OWN copy and re-puts EVERY held chat from SW memory after
-        // every tool result (worker/115-storage.js) — without a mirror this
-        // manual edit is silently reverted by the next tool result in ANY chat.
-        // The agent edit path mirrors via result._widget_persist on the tool
-        // result (tools/010-iframe-tool.js edit_html -> worker/120-tool-routing.js);
-        // a manual save has no tool result flowing to the SW, so post the same
-        // upsert over the agent bus instead ('widget-persist' handler in
-        // worker/130-port-bridge.js). This file is page-only (not in
-        // WORKER_SHARED_FILES), but _agentBusPort can be null before the bridge
-        // connects — same guard as trackRecordMutation (tools/020-tool-execution.js).
-        try {
-            if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
-                _agentBusPort.postMessage({ type: 'widget-persist', chatId: owningChatId, widget: widget });
-            }
-        } catch (e) { /* stale port — the page IDB save above holds the edit until the next SW save */ }
-    } else {
-        // No live chat holds this widget: the pre-fix code fell through silently and
-        // still told the user "Widget saved" for an edit that was never persisted.
-        console.warn('[widgets] saveWidgetCodeEdit: no owning chat for ' + widgetId
-            + ' — chat edit NOT persisted (dashboard copy: '
-            + !!dashboardWidgets[widgetId] + ')');
-    }
-    
+    var result;
+    try { result = await saveWidgetRevision(widget, editor.value, Number(editor.dataset.widgetBaseVersion), editor.dataset.widgetOperationId); }
+    catch (e) { showSnackbar('Widget save failed: ' + e.message, 'error'); return; }
+    if (!result.success) { showSnackbar(result.error, 'error'); return; }
     closeWidgetCodeEdit();
     renderMessages();
     refreshVisibleDashboards();
-    if (_savedToChat || dashboardWidgets[widgetId]) {
-        showSnackbar('Widget saved', 'success');
-    } else {
-        showSnackbar('Widget updated in memory only — no owning chat found', 'error');
-    }
+    showSnackbar('Widget saved as version ' + result.version, 'success');
 }
 
 function openWidgetModal(widgetId) {
@@ -800,7 +666,7 @@ function closeWidgetModal() {
 }
 
 function renderWidgetSidebar() {
-    var widgets = getWidgetsForChat(currentChatId);
+    var widgets = getSidebarWidgets();
     var container = document.getElementById('widget-sidebar-list');
     if (!container) return;
     
@@ -896,6 +762,7 @@ function editWidgetWithAgent(widgetId, event) {
         // starts on line 2. autoResizeTextarea below runs AFTER the value is set so
         // the textarea grows to 2 rows, and setSelectionRange puts the caret there.
         input.value = 'Edit widget ' + widgetId + ':\n';
+        input.dataset.widgetEditTarget = widgetId;
         if (typeof autoResizeTextarea === 'function') autoResizeTextarea(input);
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);

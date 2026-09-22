@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.28
+
+### Features
+- Claude Opus 5.5 is now supported, and ChatGPT subscriptions get GPT-6 Astra, Sol and Luna with a browser sign-in. Saved GPT-5.x models move to GPT-6 automatically, and GPT-5.6 Terra is retired.
+- Widgets keep a version history, and a new Widget Library on the dashboard lists every saved widget.
+- Approvals can be allowed for the whole chat, and a new Dev instance tier skips tool approvals entirely.
+
+### Fixes
+- Claude Fable 5.1+ and Opus 5.5 keep their reasoning across tool calls, and the prompt cache no longer breaks when skills are activated in a different order.
+- js_eval calls no longer time out while waiting for approval, which could cause duplicate writes.
+- ChatGPT subscription PDF attachments are no longer dropped, and usage-limit errors show when the limit resets.
+
+---
+
 ## v1.1.27
 
 ### Features

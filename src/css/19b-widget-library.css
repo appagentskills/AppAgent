@@ -1,0 +1,86 @@
+/* Widget Library — dashboard page "All widgets" view (ui/065-widget-library.js) */
+.segmented-toggle { display: inline-flex; align-items: stretch; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); overflow: hidden; background: var(--secondary-light); flex-shrink: 0; }
+.segmented-toggle button { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-6); background: none; border: none; font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-secondary); cursor: pointer; white-space: nowrap; transition: all var(--transition-fast); }
+.segmented-toggle button + button { border-left: 1px solid var(--secondary-border); }
+.segmented-toggle button:hover { color: var(--text-primary); background: var(--secondary-border); }
+.segmented-toggle button.active { background: var(--bg-white); color: var(--primary); }
+.segmented-toggle button .ui-icon { width: 14px; height: 14px; }
+.dashboard-mode-toggle button { padding: var(--space-4) var(--space-8); font-size: var(--text-body); }
+
+.widget-library { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.widget-library-header { display: flex; align-items: center; gap: var(--space-6); padding: var(--space-6) var(--space-8); background: var(--bg-white); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; }
+.widget-library-search { flex: 1; display: flex; align-items: center; gap: var(--space-3); max-width: 420px; padding: var(--space-3) var(--space-6); background: var(--bg-light); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); color: var(--text-muted); transition: border-color var(--transition-fast); }
+.widget-library-search:focus-within { border-color: var(--primary); }
+.widget-library-search .ui-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.widget-library-search-input { flex: 1; min-width: 0; border: none; background: none; outline: none; font-size: var(--text-body); color: var(--text-primary); }
+.widget-library-count { font-size: var(--text-body-sm); color: var(--text-muted); white-space: nowrap; }
+
+.widget-library-items { flex: 1; overflow-y: auto; padding: var(--space-8); padding-bottom: 120px; }
+.widget-library-items.layout-rows { display: flex; flex-direction: column; gap: var(--space-4); }
+.widget-library-items.layout-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--space-4); align-content: start; }
+.widget-library-empty { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 300px; color: var(--text-muted); text-align: center; padding: var(--space-12); }
+.widget-library-empty .ui-icon { width: 48px; height: 48px; margin-bottom: var(--space-8); opacity: 0.5; }
+.widget-library-empty p { margin: 0; font-size: var(--text-body-lg); }
+.widget-library-empty-hint { margin-top: var(--space-4); font-size: var(--text-body-sm); max-width: 320px; }
+
+.widget-library-item { position: relative; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); transition: box-shadow var(--transition-fast), border-color var(--transition-fast); }
+.widget-library-item:hover { box-shadow: var(--shadow-sm); border-color: var(--primary-light); }
+
+/* Thumbnail: fixed box, scaled non-interactive iframe (renderWidgetInContainer thumbnail mode).
+   Every child (placeholder, overlay, ::after click-catcher, the injected iframe with inline
+   position:absolute; width:250%; height:250%; transform:scale(.4)) is absolutely positioned, so the
+   box gets NO height from content: rows give it an explicit 160x100, gallery uses the padding-top
+   trick (see below). Do NOT switch the gallery back to aspect-ratio on a flex item — Chrome sized
+   the grid row from an intrinsic pass where the percent-width flex item resolved to 0 height, so
+   every card collapsed to the caption height and overflow:hidden clipped the caption away. */
+.widget-library-thumb { position: relative; overflow: hidden; box-sizing: border-box; background: var(--bg-code); cursor: pointer; border-radius: var(--radius-md); flex-shrink: 0; outline: none; }
+.widget-library-thumb:focus-visible { box-shadow: 0 0 0 2px var(--primary); }
+.widget-library-thumb iframe { pointer-events: none; }
+.widget-library-thumb .widget-version-picker { display: none; }
+.widget-library-thumb::after { content: ''; position: absolute; inset: 0; z-index: 1; }
+.widget-library-thumb-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
+.widget-library-thumb-placeholder .ui-icon { width: 24px; height: 24px; opacity: 0.5; }
+.widget-library-overlay { display: none; }
+
+.widget-library-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.widget-library-title { font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.widget-library-meta { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; font-size: var(--text-caption); color: var(--text-muted); }
+.widget-library-badge { display: inline-flex; align-items: center; gap: var(--space-1); padding: 1px var(--space-4); border-radius: var(--radius-full); background: var(--secondary-light); border: 1px solid var(--secondary-border); color: var(--text-secondary); font-size: var(--text-caption); white-space: nowrap; }
+.widget-library-badge.pinned { background: var(--primary-lighter); border-color: var(--primary-light); color: var(--primary); }
+.widget-library-badge .ui-icon { width: 10px; height: 10px; }
+.widget-library-chat { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); color: var(--text-secondary); min-width: 0; }
+.widget-library-chat .ui-icon { width: 12px; height: 12px; flex-shrink: 0; }
+.widget-library-chat span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.widget-library-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2); flex-wrap: wrap; flex-shrink: 0; max-width: 45%; }
+.widget-library-btn { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); background: var(--secondary-light); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); font-size: var(--text-caption); font-weight: var(--font-medium); color: var(--text-primary); cursor: pointer; white-space: nowrap; transition: all var(--transition-fast); }
+.widget-library-btn:hover { background: var(--secondary-border); }
+.widget-library-btn:disabled { opacity: 0.5; cursor: default; }
+.widget-library-btn .ui-icon { width: 12px; height: 12px; }
+.widget-library-btn.on-dashboard { color: var(--primary); border-color: var(--primary-light); background: var(--primary-lighter); }
+.widget-library-btn.danger { color: var(--danger); background: var(--danger-light); border-color: var(--danger-light); }
+.widget-library-btn.danger:hover { background: var(--danger-lighter); }
+
+/* Rows layout: fixed 160x100 thumb (16:10), caption + full action bar to the right */
+.layout-rows .widget-library-item { display: flex; align-items: center; gap: var(--space-8); padding: var(--space-6); }
+.layout-rows .widget-library-thumb { flex: 0 0 160px; width: 160px; height: 100px; }
+
+/* Gallery layout: block card (not a flex column — see .widget-library-thumb note), 16:10 thumb via
+   height:0 + padding-top:62.5% (resolves against the card width, which the grid has already fixed
+   when it sizes rows), always-visible caption (title + pin badge + vN) underneath, Open/Pin in the
+   hover overlay over the thumb only. At the 240px column minimum the thumb is 150px tall. */
+.layout-gallery .widget-library-item { display: block; overflow: hidden; }
+.layout-gallery .widget-library-thumb { display: block; width: 100%; height: 0; padding-top: 62.5%; border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
+.layout-gallery .widget-library-info { display: flex; flex-direction: row; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); min-height: 40px; box-sizing: border-box; }
+.layout-gallery .widget-library-title { flex: 1; min-width: 0; font-size: var(--text-body-sm); line-height: 1.3; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.layout-gallery .widget-library-meta { flex-shrink: 0; flex-wrap: nowrap; gap: var(--space-2); }
+.layout-gallery .widget-library-meta .widget-library-date, .layout-gallery .widget-library-chat, .layout-gallery .widget-library-actions { display: none; }
+.layout-gallery .widget-library-overlay { display: flex; position: absolute; inset: 0; z-index: 2; align-items: flex-end; justify-content: center; gap: var(--space-4); padding: var(--space-6); background: linear-gradient(to bottom, transparent 40%, var(--bg-overlay)); opacity: 0; pointer-events: none; transition: opacity var(--transition-fast); }
+.layout-gallery .widget-library-thumb:hover .widget-library-overlay, .layout-gallery .widget-library-thumb:focus-within .widget-library-overlay, .layout-gallery .widget-library-thumb:focus-visible .widget-library-overlay { opacity: 1; pointer-events: auto; }
+.layout-gallery .widget-library-overlay .widget-library-btn { background: var(--bg-white); }
+
+@media (max-width: 768px) {
+    .layout-rows .widget-library-item { flex-wrap: wrap; }
+    .layout-rows .widget-library-thumb { width: 120px; height: 75px; }
+    .widget-library-actions { max-width: 100%; justify-content: flex-start; }
+}

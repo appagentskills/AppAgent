@@ -490,8 +490,16 @@ function generateDiff(args) {
     if (changes.length) {
         var lineNum = 0;
         changes.forEach(function(line) {
+            // B10: skip null / non-string / non-object entries instead of throwing
+            // (typeof null === 'object' reached `.type` and a number reached
+            // `.charAt`, both TypeErrors that killed the whole template).
+            if (line == null) return;
             var type = 'ctx', text = line;
-            if (typeof line === 'object') { type = line.type || 'ctx'; text = line.text || line.content || ''; }
+            // Constrain caller-supplied type to the known set: it is concatenated into a
+            // class attribute (display-diff-add/del/ctx), so an arbitrary string like
+            // 'add" onmouseover="...' would break out of the attribute. Unknown → ctx.
+            if (typeof line === 'object') { type = (line.type === 'add' || line.type === 'del') ? line.type : 'ctx'; text = String(line.text || line.content || ''); }
+            else if (typeof line !== 'string') return;
             else if (line.charAt(0) === '+') { type = 'add'; text = line.substring(1); }
             else if (line.charAt(0) === '-') { type = 'del'; text = line.substring(1); }
             if (type === 'add') addCount++;

@@ -85,8 +85,10 @@
 .instance-tier-toggle .radio-option { padding: var(--space-2) var(--space-3); white-space: nowrap; display: inline-flex; align-items: center; gap: var(--space-2); }
 .instance-tier-toggle .radio-option .ui-icon { width: 12px; height: 12px; flex-shrink: 0; }
 
-/* Auto tier disabled state for instance permissions */
+/* Auto / Dev tier: per-tool controls are ignored, so they render greyed out */
 .tier-auto .tool-permission-control { opacity: 0.35; pointer-events: none; }
+/* Dev option in the Manual / Auto / Dev toggle — amber when selected (approvals OFF) */
+.instance-tier-toggle .radio-option.tier-opt-dev.selected { background: var(--warning-light); color: var(--warning-text); border-color: var(--warning); font-weight: var(--font-semibold); }
 .radio-group-disabled { opacity: 0.35; pointer-events: none; }
 
 /* "View source" inline icon button next to a tool name or group title */

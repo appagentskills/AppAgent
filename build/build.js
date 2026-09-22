@@ -137,6 +137,7 @@ const WORKER_SHARED_FILES = [
     'js/core/055-emoji-shortcodes.js',
     'js/core/060-ui-constants.js',
     'js/core/070-permissions.js',
+    'js/core/075-test-run-policy.js',
     // 078-tool-profiles declares TOOL_PROFILES + getToolNamesForProfiles,
     // used by 097-sub-agent-registry (spawn-time tool_roster filter) and
     // worker/025-permissions-helpers (main-chat profile filter). Must load
@@ -177,6 +178,10 @@ const WORKER_SHARED_FILES = [
     'js/tools/050-file-tools.js',
     'js/tools/070-screenshot-by-id.js',
     'js/tools/110-smart-documents.js',
+    // 160-run-tests: executeRunJsFile + executeRunTests (js_eval-sandbox test
+    // runner: reads workspace files, runs them via the js_eval arm) —
+    // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
+    'js/tools/160-run-tests.js',
     'js/tools/020-tool-execution.js',
     // app (the agent loop + LLM streaming + API message builder + event bus)
     'js/app/035-agent-events.js',
@@ -610,6 +615,81 @@ function checkChatMetaSharedLists(srcByFile, bundles) {
     return failures;
 }
 
+// Policy artifact tripwire, not a parser/security boundary for hostile source.
+// Validate the assembled bytes, not just a builder's explicit source whitelist.
+function checkTestPolicyArtifacts(artifacts, policySource) {
+    var failures = [];
+    var required = ['app.js', 'sw-bundle.js', 'background.js', 'offscreen.html', 'offscreen-helper.js', 'sandbox.html', 'test-run-policy.js'];
+    required.forEach(function(name) {
+        if (typeof artifacts[name] !== 'string' || !artifacts[name].trim()) failures.push(name + ': required policy artifact missing or empty');
+    });
+    // Both builders emit the dependency-free policy as the byte-zero fragment.
+    // Only line comments may precede its declaration: no string, template,
+    // interpolation, block comment or earlier fragment can supply lexical context.
+    // This is a narrow assembly contract, NOT a JavaScript lexer/evaluator.
+    if (typeof policySource !== 'string' ||
+        !/^(?:\/\/[^\r\n]*\r?\n)*var TestRunPolicy = \(function\(\) \{/.test(policySource)) {
+        failures.push('src/js/core/075-test-run-policy.js: canonical policy declaration missing');
+        return failures;
+    }
+    ['app.js', 'sw-bundle.js'].forEach(function(name) {
+        var source = typeof artifacts[name] === 'string' ? artifacts[name] : '';
+        // Require exact canonical bytes at the executable boundary. Reject any
+        // additional declaration-shaped line conservatively (even ambiguous text)
+        // rather than accepting a quoted/commented declaration as evidence.
+        var rest = source.slice(policySource.length);
+        if (source.indexOf(policySource) !== 0 || source.split(policySource).length !== 2 ||
+            (rest && rest[0] !== '\n') || /^[ \t]*(?:var|let|const)\s+TestRunPolicy\s*=/m.test(rest)) {
+            failures.push(name + ': expected exactly one canonical TestRunPolicy declaration; check the worker shared-file list and rebuild all artifacts');
+        }
+    });
+    if (artifacts['test-run-policy.js'] !== policySource) failures.push('test-run-policy.js: differs from canonical host policy source');
+    var html = (typeof artifacts['offscreen.html'] === 'string' ? artifacts['offscreen.html'] : '').replace(/<!--[\s\S]*?-->/g, '');
+    // Consume complete quoted values before considering another attribute; text
+    // such as data-note='type=module async' must not become an execution flag.
+    function scriptAttributes(text) {
+        var attrs = Object.create(null), m;
+        while (text.trim()) {
+            m = /^[\t\n\f\r ]+([^\t\n\f\r "'<>\/=\x60]+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"([^"]*)"|'([^']*)'|([^\t\n\f\r "'=<>\x60]+)))?/.exec(text);
+            if (!m) return null; // malformed/ambiguous attributes fail closed
+            var name = m[1].toLowerCase();
+            if (Object.prototype.hasOwnProperty.call(attrs, name)) return null;
+            attrs[name] = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : '';
+            text = text.slice(m[0].length);
+        }
+        return attrs;
+    }
+    function synchronousClassic(attrs) {
+        if ('async' in attrs || 'defer' in attrs || 'nomodule' in attrs) return false;
+        // Reject legacy language-based selection rather than infer a MIME type.
+        if (!('type' in attrs)) return !('language' in attrs);
+        var type = attrs.type.trim().toLowerCase();
+        return type === '' || /^(?:application\/(?:x-)?(?:java|ecma)script|text\/(?:(?:x-)?(?:java|ecma)script|javascript1\.[0-5]|jscript|livescript))$/.test(type);
+    }
+    var scripts = [], match, invalidScript = false;
+    var tags = /<script\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi;
+    var closeTag = /<\/script[\t\n\f\r ]*>/gi;
+    while ((match = tags.exec(html))) {
+        // Script bodies are raw text, not more dependency tags. Consume through
+        // a complete end tag before searching for another opening. Accept ASCII
+        // whitespace/case variants, not prefixes such as </script-example>.
+        closeTag.lastIndex = tags.lastIndex;
+        var end = closeTag.exec(html);
+        if (!end) { invalidScript = true; break; }
+        tags.lastIndex = closeTag.lastIndex;
+        var attrs = scriptAttributes(match[1]);
+        if (!attrs) { invalidScript = true; continue; }
+        if ('src' in attrs) scripts.push({ name: attrs.src, attributes: attrs });
+    }
+    var policy = scripts.filter(function(s) { return s.name === 'test-run-policy.js'; });
+    var helper = scripts.filter(function(s) { return s.name === 'offscreen-helper.js'; });
+    if (invalidScript || policy.length !== 1 || helper.length !== 1 || scripts.indexOf(policy[0]) >= scripts.indexOf(helper[0]) ||
+        policy.concat(helper).some(function(s) { return !synchronousClassic(s.attributes); })) {
+        failures.push('offscreen.html: load test-run-policy.js exactly once before offscreen-helper.js as synchronous classic scripts');
+    }
+    return failures;
+}
+
 // ─── Guard-region sync helpers ────────────────────────────────────────
 // This whole marked region exists twice (build/build.js and
 // skills/extension-dev/build.js); a comment was previously the only
@@ -801,11 +881,16 @@ function buildExtension() {
     const manifestPath = path.join(SRC, 'platform/extension/manifest.json');
     const version = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')).version;
 
-    // 1. Concatenate JS: CSP polyfill (first!) + tiered bundle + platform bridge (last)
+    // 1. The dependency-free policy is a byte-zero prelude, making its lexical
+    // boundary verifiable without parsing/executing generated JavaScript.
+    // Select from the real file lists: an omitted policy must still fail validation.
+    const policyFile = 'js/core/075-test-run-policy.js';
+    const isPolicyFile = f => f.split(path.sep).join('/') === policyFile;
     const jsFiles = getOrderedJsFiles();
-    const coreJS = concatFiles(jsFiles);
+    const policyPrelude = concatFiles(jsFiles.filter(isPolicyFile));
+    const coreJS = concatFiles(jsFiles.filter(f => !isPolicyFile(f)));
 
-    // CSP polyfill MUST run first - it overrides innerHTML/setAttribute to intercept
+    // CSP polyfill MUST run before DOM-touching code - it overrides innerHTML/setAttribute to intercept
     // inline event handlers before they reach the DOM (which would trigger CSP violations)
     const polyfillPath = path.join(SRC, 'platform/extension/csp-polyfill.js');
     const polyfillJS = fs.existsSync(polyfillPath) ? fs.readFileSync(polyfillPath, 'utf-8') : '';
@@ -819,7 +904,7 @@ function buildExtension() {
     const docsRendererPath = path.join(ROOT, 'docs', 'docs-renderer.js');
     const docsRendererJS = fs.existsSync(docsRendererPath) ? fs.readFileSync(docsRendererPath, 'utf-8') : '';
 
-    let appJS = (polyfillJS ? polyfillJS + '\n' : '') + (docsRendererJS ? docsRendererJS + '\n' : '') + coreJS + (bridgeJS ? '\n' + bridgeJS : '');
+    let appJS = policyPrelude + '\n' + (polyfillJS ? polyfillJS + '\n' : '') + (docsRendererJS ? docsRendererJS + '\n' : '') + coreJS + (bridgeJS ? '\n' + bridgeJS : '');
 
     // Embed skills from skills/ directory
     const extSkills = buildEmbeddedSkills();
@@ -907,7 +992,8 @@ ${processedBody}
     const workerBundleFiles = getWorkerBundleFiles();
     let workerJS = '';
     if (workerBundleFiles.length > 0) {
-        workerJS = concatFiles(workerBundleFiles);
+        // Only promote a listed fragment; do not silently repair a stale whitelist.
+        workerJS = concatFiles(workerBundleFiles.filter(isPolicyFile).concat(workerBundleFiles.filter(f => !isPolicyFile(f))));
         workerJS = workerJS.split('__VERSION__').join(version);
         // Embed the same docs/README placeholders the page bundle uses — the
         // shared system-prompt / docs code reads __DOCS_MARKDOWN_B64__ and
@@ -988,6 +1074,31 @@ ${processedBody}
         console.log(`  Decl-parity: ${declParityManifest.length} SW runtime globals declared in both bundles (${DECL_PARITY_SW_ONLY.size} SW-only allowlisted)`);
     }
 
+    // POLICY_ARTIFACT_STAGE_BEGIN — read ALL outputs before any mutation,
+    // including --update-ratchet writes, dist removal and binary icon copies.
+    const outputFiles = {
+        'app.html': versionedHTML, 'app.js': appJS, 'app.css': cssContent,
+        'sw-bundle.js': workerJS
+    };
+    if (themeInitJS) outputFiles['theme-init.js'] = themeInitJS;
+    if (viewInitJS) outputFiles['view-init.js'] = viewInitJS;
+    const extSrcDir = path.join(SRC, 'platform/extension');
+    for (const file of ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js']) {
+        const srcPath = path.join(extSrcDir, file);
+        if (fs.existsSync(srcPath)) outputFiles[file] = fs.readFileSync(srcPath, 'utf-8');
+    }
+    const testRunPolicySource = readSrcFile('js/core/075-test-run-policy.js');
+    outputFiles['test-run-policy.js'] = testRunPolicySource;
+    const iconsDir = path.join(extSrcDir, 'icons');
+    if (fs.existsSync(iconsDir)) {
+        for (const icon of fs.readdirSync(iconsDir)) {
+            outputFiles['icons/' + icon] = fs.readFileSync(path.join(iconsDir, icon));
+        }
+    }
+    const policyArtifactFailures = checkTestPolicyArtifacts(outputFiles, testRunPolicySource);
+    if (policyArtifactFailures.length) throw new Error('Build aborted — host policy artifacts: ' + policyArtifactFailures.join(' || ') + ' (dist/ untouched).');
+    // POLICY_ARTIFACT_STAGE_END
+
     // 6b. Write-site ratchet (RFC Flux Phase 1) — enforced before the
     // dist/ wipe for the same reason as the gap/parity checks above.
     runWriteSiteRatchet();
@@ -1022,47 +1133,17 @@ ${processedBody}
     }
     console.log('  Guard-region sync: build/build.js ↔ skills/extension-dev/build.js byte-identical (fnv1a ' + fnv1aHex(extractGuardRegion(guardRegionBuildSrc)) + ')');
 
-    // 7. Write output files
-    // Wipe outDir first so files removed from src/ don't linger as cruft in
-    // dist/extension/ (e.g. if a worker-tier file is renamed/deleted, the old
-    // copy would otherwise still get bundled into the .zip and confuse the
-    // browser at install time). `fs.rmSync(..., { recursive: true })` is a
-    // no-op when the directory doesn't exist (force: true).
+    // POLICY_ARTIFACT_WRITE_BEGIN — only validated, staged bytes reach disk.
+    // Wipe stale outputs only after every preflight succeeds.
     const outDir = path.join(DIST, 'extension');
     fs.rmSync(outDir, { recursive: true, force: true });
     fs.mkdirSync(outDir, { recursive: true });
-
-    fs.writeFileSync(path.join(outDir, 'app.html'), versionedHTML, 'utf-8');
-    fs.writeFileSync(path.join(outDir, 'app.js'), appJS, 'utf-8');
-    fs.writeFileSync(path.join(outDir, 'app.css'), cssContent, 'utf-8');
-    if (themeInitJS) fs.writeFileSync(path.join(outDir, 'theme-init.js'), themeInitJS, 'utf-8');
-    if (viewInitJS) fs.writeFileSync(path.join(outDir, 'view-init.js'), viewInitJS, 'utf-8');
-    if (workerJS) {
-        fs.writeFileSync(path.join(outDir, 'sw-bundle.js'), workerJS, 'utf-8');
+    for (const [file, content] of Object.entries(outputFiles)) {
+        fs.mkdirSync(path.dirname(path.join(outDir, file)), { recursive: true });
+        fs.writeFileSync(path.join(outDir, file), content, 'utf-8');
     }
-
-    // 8. Copy extension-specific files
-    const extSrcDir = path.join(SRC, 'platform/extension');
-    for (const file of ['manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js']) {
-        const srcPath = path.join(extSrcDir, file);
-        if (fs.existsSync(srcPath)) {
-            fs.copyFileSync(srcPath, path.join(outDir, file));
-            console.log(`  Copied: ${file}`);
-        }
-    }
-
-    // 9. Copy icons if they exist
-    const iconsDir = path.join(extSrcDir, 'icons');
-    if (fs.existsSync(iconsDir)) {
-        const outIconsDir = path.join(outDir, 'icons');
-        fs.mkdirSync(outIconsDir, { recursive: true });
-        for (const icon of fs.readdirSync(iconsDir)) {
-            fs.copyFileSync(path.join(iconsDir, icon), path.join(outIconsDir, icon));
-        }
-        console.log(`  Copied: icons/`);
-    }
-
     console.log(`  Output: ${outDir}/`);
+    // POLICY_ARTIFACT_WRITE_END
 }
 
 // ─── Main ───

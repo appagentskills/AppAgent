@@ -155,7 +155,8 @@ function renderToolPermissions() {
     var html = '';
     var host = getConnectedInstanceHost();
     var instPerms = host ? (instancePermissions[host] || { tier: 'manual', tools: {} }) : null;
-    var isAutoTier = instPerms && instPerms.tier === 'auto';
+    // auto AND dev ignore per-tool settings — both grey out the per-tool controls.
+    var isAutoTier = instPerms && (instPerms.tier === 'auto' || instPerms.tier === 'dev');
 
     // Reset link (only when non-default)
     if (hasNonDefaultPermissions()) {
@@ -328,19 +329,32 @@ function _renderPermRadio(containerId, selectedValue, permKey, isInstance, isAut
 function _renderInstanceTierToggle(currentTier) {
     var container = document.getElementById('instance-tier-toggle');
     if (!container) return;
-    // Icon-only toggle with tooltips
-    var manualSelected = currentTier === 'manual';
-    container.innerHTML = '<div class="radio-group radio-group-small">' +
-        '<div class="radio-option' + (manualSelected ? ' selected' : '') + '" title="Manual: You control each permission" ' +
-            'onclick="event.stopPropagation(); setInstanceTier(\'manual\', this)">' + UI_ICONS.lock + ' Manual</div>' +
-        '<div class="radio-option' + (!manualSelected ? ' selected' : '') + '" title="Auto: Agent decides for write operations" ' +
-            'onclick="event.stopPropagation(); setInstanceTier(\'auto\', this)">' + UI_ICONS.sparkle + ' Auto</div>' +
-    '</div>';
+    container.innerHTML = _instanceTierToggleHtml(currentTier, '');
+}
+
+// Shared 3-way segmented control (Manual / Auto / Dev) used by the pill
+// dropdown (above) and Settings (ui/040-tools-settings.js). `extraOnClick`
+// is appended to each option's handler (Settings re-renders itself).
+var INSTANCE_TIERS = ['manual', 'auto', 'dev'];
+function _instanceTierToggleHtml(currentTier, extraOnClick) {
+    var tier = INSTANCE_TIERS.indexOf(currentTier) !== -1 ? currentTier : 'manual';
+    var opts = [
+        { v: 'manual', label: 'Manual', icon: UI_ICONS.lock, title: 'Manual: You control each permission' },
+        { v: 'auto', label: 'Auto', icon: UI_ICONS.sparkle, title: 'Auto: Agent decides for write operations' },
+        { v: 'dev', label: 'Dev', icon: UI_ICONS.zap, title: 'Dev: NO approvals — every tool call on this instance runs without asking' }
+    ];
+    var html = '<div class="radio-group radio-group-small">';
+    opts.forEach(function(o) {
+        html += '<div class="radio-option tier-opt-' + o.v + (tier === o.v ? ' selected' : '') + '" title="' + escapeHtml(o.title) + '" ' +
+            'onclick="event.stopPropagation(); setInstanceTier(\'' + o.v + '\', this);' + (extraOnClick || '') + '">' + o.icon + ' ' + o.label + '</div>';
+    });
+    return html + '</div>';
 }
 
 function setInstanceTier(tier, element) {
     var host = getConnectedInstanceHost();
     if (!host) return;
+    if (INSTANCE_TIERS.indexOf(tier) === -1) tier = 'manual';
     if (!instancePermissions[host]) instancePermissions[host] = { tier: 'manual', tools: {} };
     instancePermissions[host].tier = tier;
     saveInstancePermissions();
@@ -448,6 +462,14 @@ function getEnabledTools(chatId, opts) {
         seenToolNames[n] = true;
         return true;
     });
+    // Deterministic order (prompt-cache / thinking-binding stability):
+    // getActiveSkillTools follows activeSkills insertion order, which varies
+    // with activation order and SW rehydration, so sort skill tools by name.
+    // Core TOOLS keep their static order. Keep in sync with the worker twin.
+    skillToolDefs.sort(function(a, b) {
+        var x = a.function.name, y = b.function.name;
+        return x < y ? -1 : (x > y ? 1 : 0);
+    });
     var allTools = baseTools.concat(skillToolDefs);
 
     // Sub-agent / parent visibility filter. Honors the per-sub tool_roster
@@ -519,17 +541,23 @@ function getEnabledTools(chatId, opts) {
     return allTools;
 }
 
-function getToolPermission(toolName, methodOrAction) {
+// `chatId` (optional): the calling chat — "Allow for this chat" grants are
+// keyed by ROOT chat (core/070-permissions.js chatPermKey) and checked FIRST.
+function getToolPermission(toolName, methodOrAction, chatId) {
     var permKey = resolvePermissionKey(toolName, methodOrAction);
 
     // Instance-scoped permissions
     if (isInstancePermissionKey(permKey)) {
-        return getInstanceToolPermission(permKey);
+        return getInstanceToolPermission(permKey, chatId);
     }
 
     // Global permissions
-    // Check session permissions first (highest priority)
-    if (sessionPermissions[permKey] === 'allow') return 'allow';
+    // An explicit 'disabled' (Settings > Tool permissions) is the user's hard
+    // stop and wins over any "Allow for this chat" grant — the grant may have
+    // been made BEFORE the user disabled the tool. Mirrors worker/025.
+    if (toolPermissions[permKey] === 'disabled') return 'disabled';
+    // Then the chat grant (beats every fallback below)
+    if (hasChatPermissionGrant(permKey, chatId)) return 'allow';
 
     // Then check stored permissions
     if (toolPermissions[permKey]) {
@@ -547,15 +575,25 @@ function getToolPermission(toolName, methodOrAction) {
 }
 
 // Get effective permission for an instance-scoped tool
-function getInstanceToolPermission(permKey) {
+function getInstanceToolPermission(permKey, chatId) {
     var host = getConnectedInstanceHost();
+    var instPerms = host ? instancePermissions[host] : null;
+    if (!instPerms) instPerms = { tier: 'manual', tools: {} };
+    // Dev tier: EVERY instance-scoped call is 'allow' — no prompt, confirm:true
+    // ignored, per-tool settings incl. 'disabled' ignored (like auto). Mirrors
+    // worker/025-permissions-helpers.js.
+    if (host && instPerms.tier === 'dev') return 'allow';
+    // Explicit per-tool 'disabled' on the connected instance (manual tier) is
+    // the user's hard stop and wins over any chat grant — mirrors
+    // worker/025-permissions-helpers.js. The auto tier ignores per-tool settings.
+    if (host && instPerms.tier !== 'auto' && instPerms.tools && instPerms.tools[permKey] === 'disabled') return 'disabled';
+    // "Allow for this chat" beats every fallback below (no-instance 'ask',
+    // auto tier, per-tool, defaults).
+    if (hasChatPermissionGrant(permKey, chatId)) return 'allow';
     if (!host) {
         // No instance connected — read operations allow, write operations ask
         return isReadPermissionKey(permKey) ? 'allow' : 'ask';
     }
-
-    var instPerms = instancePermissions[host];
-    if (!instPerms) instPerms = { tier: 'manual', tools: {} };
 
     // Auto tier: ignore per-tool settings
     if (instPerms.tier === 'auto') {
@@ -563,8 +601,7 @@ function getInstanceToolPermission(permKey) {
         return isReadPermissionKey(permKey) ? 'allow' : 'auto';
     }
 
-    // Manual tier: check session, then per-tool, then defaults
-    if (sessionPermissions[permKey] === 'allow') return 'allow';
+    // Manual tier: per-tool, then defaults (chat grant already checked above)
     if (instPerms.tools && instPerms.tools[permKey]) {
         return instPerms.tools[permKey];
     }

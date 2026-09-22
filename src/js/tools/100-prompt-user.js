@@ -129,11 +129,26 @@ function openBackgroundPromptPopup(chatId, promptId) {
     }
     if (!msg || msg.status !== 'pending') return;
 
+    // Only one popup host at a time: a second click on the bell (or on
+    // another chat's bell) must not stack a duplicate #bg-popup-host with a
+    // duplicate prompt-form-<id> — close/submit use getElementById and would
+    // hit the first (stale) one. Same prompt already open → just refocus it.
+    var existingHost = document.getElementById('bg-popup-host');
+    if (existingHost) {
+        if (existingHost.getAttribute('data-prompt-id') === promptId) {
+            var cur = existingHost.querySelector('input.prompt-field-input, textarea.prompt-field-input');
+            if (cur) cur.focus();
+            return;
+        }
+        existingHost.remove();
+    }
+
     var fieldsHtml = (msg.fields || []).map(function(f) { return renderPromptField(f, promptId); }).join('');
     var descHtml = promptDescriptionHtml(msg.description);
 
     var host = document.createElement('div');
     host.id = 'bg-popup-host';
+    host.setAttribute('data-prompt-id', promptId);
     host.innerHTML =
         '<div class="modal-backdrop bg-popup-backdrop" onclick="closeBackgroundPromptPopup(event)">' +
             '<div class="modal bg-popup-modal" onclick="event.stopPropagation()">' +
@@ -538,6 +553,16 @@ function renderPromptField(field, promptId) {
     var clearInvalid = ' oninput="promptClearInvalid(this)"';
     var placeholder = field.placeholder ? ' placeholder="' + escapeHtml(field.placeholder) + '"' : '';
     var options = field.options || [];
+    // FOCUS-KEEP: stable identity for focusable controls so a transcript
+    // rebuild (renderMessages / _tryIncrementalRender, ui/250-message-render)
+    // can re-focus the rebuilt twin via _restoreTranscriptFocus. Deliberately
+    // NOT a `name` attribute: HTMLFormElement is [LegacyOverrideBuiltIns], so
+    // a field named e.g. "id" would shadow form.id (read by promptCaptureDraft).
+    var fieldKey = ' data-prompt-field="' + escapeHtml(name) + '"';
+    // Option-level identity (B7): chip/pill <button>s and checklist <input>s
+    // are N controls per field, so the field key alone is ambiguous — add the
+    // option index so the SAME chip regains keyboard focus after a rebuild.
+    function optKey(i) { return fieldKey + ' data-prompt-idx="' + i + '"'; }
 
     var html = '<div class="prompt-field">';
     if (type !== 'boolean') {
@@ -545,16 +570,16 @@ function renderPromptField(field, promptId) {
     }
 
     if (type === 'textarea') {
-        html += '<textarea class="prompt-field-input prompt-field-textarea" data-field-name="' + escapeHtml(name) + '" data-field-type="' + type + '"' + required + reqAttr + clearInvalid + placeholder + '>' + escapeHtml(String(value)) + '</textarea>';
+        html += '<textarea class="prompt-field-input prompt-field-textarea" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="' + type + '"' + required + reqAttr + clearInvalid + placeholder + '>' + escapeHtml(String(value)) + '</textarea>';
     } else if (type === 'select') {
         if (options.length && options.length <= 6) {
             // Few options: one-click pill group (no dropdown to open)
             html += '<div class="prompt-chip-group" role="radiogroup" data-field-name="' + escapeHtml(name) + '" data-field-type="select"' + reqAttr + '>';
-            options.forEach(function(opt) {
+            options.forEach(function(opt, oi) {
                 var optVal = typeof opt === 'object' ? opt.value : opt;
                 var optLabel = typeof opt === 'object' ? (opt.label || opt.value) : opt;
                 var selected = value !== '' && String(optVal) === String(value) ? ' selected' : '';
-                html += '<button type="button" role="radio" class="prompt-chip' + selected + '" data-value="' + escapeHtml(String(optVal)) + '" onclick="promptPickPill(this)">' + escapeHtml(String(optLabel)) + '</button>';
+                html += '<button type="button" role="radio" class="prompt-chip' + selected + '"' + optKey(oi) + ' data-value="' + escapeHtml(String(optVal)) + '" onclick="promptPickPill(this)">' + escapeHtml(String(optLabel)) + '</button>';
             });
             html += '</div>';
         } else {
@@ -562,7 +587,7 @@ function renderPromptField(field, promptId) {
                 var ov = typeof opt === 'object' ? opt.value : opt;
                 return String(ov) === String(value);
             });
-            html += '<select class="prompt-field-input" data-field-name="' + escapeHtml(name) + '" data-field-type="' + type + '"' + required + (options.length ? reqAttr : '') + ' onchange="promptClearInvalid(this)">';
+            html += '<select class="prompt-field-input" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="' + type + '"' + required + (options.length ? reqAttr : '') + ' onchange="promptClearInvalid(this)">';
             // Required + no default: placeholder option so the browser can't silently submit the first option
             if (field.required && !hasDefault) html += '<option value="" disabled selected hidden>Select…</option>';
             options.forEach(function(opt) {
@@ -578,36 +603,36 @@ function renderPromptField(field, promptId) {
         if (field.widget === 'checkboxes' || field.style === 'checkboxes') {
             // Vertical checkbox list — opt-in, better for long option labels
             html += '<div class="prompt-checklist" data-field-name="' + escapeHtml(name) + '" data-field-type="multi-select"' + (options.length ? reqAttr : '') + '>';
-            options.forEach(function(opt) {
+            options.forEach(function(opt, oi) {
                 var optVal = typeof opt === 'object' ? opt.value : opt;
                 var optLabel = typeof opt === 'object' ? (opt.label || opt.value) : opt;
                 var checked = selectedValues.indexOf(String(optVal)) >= 0 ? ' checked' : '';
-                html += '<label class="prompt-field-checkbox"><input type="checkbox" class="prompt-field-check" data-value="' + escapeHtml(String(optVal)) + '"' + checked + ' onchange="promptClearInvalid(this)"> <span>' + escapeHtml(String(optLabel)) + '</span></label>';
+                html += '<label class="prompt-field-checkbox"><input type="checkbox" class="prompt-field-check"' + optKey(oi) + ' data-value="' + escapeHtml(String(optVal)) + '"' + checked + ' onchange="promptClearInvalid(this)"> <span>' + escapeHtml(String(optLabel)) + '</span></label>';
             });
             html += '</div>';
         } else {
             // Checkbox chips — one click per toggle (replaces ctrl-click native multi-select)
             html += '<div class="prompt-chip-group" data-field-name="' + escapeHtml(name) + '" data-field-type="multi-select"' + (options.length ? reqAttr : '') + '>';
-            options.forEach(function(opt) {
+            options.forEach(function(opt, oi) {
                 var optVal = typeof opt === 'object' ? opt.value : opt;
                 var optLabel = typeof opt === 'object' ? (opt.label || opt.value) : opt;
                 var selected = selectedValues.indexOf(String(optVal)) >= 0 ? ' selected' : '';
-                html += '<button type="button" class="prompt-chip prompt-chip-multi' + selected + '" data-value="' + escapeHtml(String(optVal)) + '" onclick="promptToggleChip(this)">' + escapeHtml(String(optLabel)) + '</button>';
+                html += '<button type="button" class="prompt-chip prompt-chip-multi' + selected + '"' + optKey(oi) + ' data-value="' + escapeHtml(String(optVal)) + '" onclick="promptToggleChip(this)">' + escapeHtml(String(optLabel)) + '</button>';
             });
             html += '</div>';
         }
     } else if (type === 'boolean') {
         // Toggle switch — single click, label rendered once
         html += '<label class="prompt-switch-row"><span class="prompt-switch-label">' + escapeHtml(label) + '</span>' +
-            '<span class="prompt-switch"><input type="checkbox" data-field-name="' + escapeHtml(name) + '" data-field-type="boolean"' + (value ? ' checked' : '') + '>' +
+            '<span class="prompt-switch"><input type="checkbox" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="boolean"' + (value ? ' checked' : '') + '>' +
             '<span class="prompt-switch-track"><span class="prompt-switch-thumb"></span></span></span></label>';
     } else if (type === 'number') {
-        html += '<input type="number" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '" data-field-type="number" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + placeholder + '>';
+        html += '<input type="number" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="number" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + placeholder + '>';
     } else if (type === 'date') {
-        html += '<input type="date" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '" data-field-type="date" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + '>';
+        html += '<input type="date" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="date" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + '>';
     } else {
         // text (default)
-        html += '<input type="text" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '" data-field-type="text" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + placeholder + '>';
+        html += '<input type="text" class="prompt-field-input" data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="text" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + placeholder + '>';
     }
 
     html += '<div class="prompt-field-error">This field is required</div></div>';

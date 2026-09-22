@@ -2,7 +2,7 @@ var TOOL_DEFINITION = {
   type: "function",
   function: {
     name: "run_audit",
-    description: "Run comprehensive ServiceNow instance audits. Can run all audits, specific categories, or individual checks. Returns findings organized by severity (critical, warning, info, passed).",
+    description: "Run comprehensive ServiceNow instance audits. Can run all audits, specific categories, or individual checks. Returns findings organized by severity (critical, warning, info, passed) plus an `errors` bucket for checks whose queries failed (never reported as passed).",
     parameters: {
       type: "object",
       properties: {
@@ -19,6 +19,10 @@ var TOOL_DEFINITION = {
         days_threshold: {
           type: "number",
           description: "Days threshold for stale record checks. Default: 30"
+        },
+        instance: {
+          type: "string",
+          description: "Target ServiceNow instance by short name (e.g. 'dev12345') or URL. Optional - defaults to the active instance."
         }
       }
     }
@@ -29,38 +33,73 @@ async function run_audit(args) {
   const category = args.category || "all";
   const specificChecks = args.checks || [];
   const daysThreshold = args.days_threshold || 30;
+  const instance = (typeof args.instance === "string" && args.instance.trim()) ? args.instance.trim() : null;
 
   const findings = {
     critical: [],
     warning: [],
     info: [],
     passed: [],
+    // Checks whose data could not be fetched (API error / {success:false}).
+    // Kept separate from `warning` so a failed query is never mistaken for
+    // a clean instance and never lands in `passed`.
+    errors: [],
     metadata: {
-      instance: "",
+      instance: instance || "",
       audit_time: new Date().toISOString(),
       category: category,
       checks_run: []
     }
   };
 
-  // Helper function to make API calls via executeTool
+  // Helper function to make API calls via executeTool.
+  // Throws a tagged error (err.auditQueryFailed = true) when the call throws
+  // OR returns { success:false } / no result array. It never returns [] on
+  // failure: callers must not be able to interpret a failed fetch as "no
+  // records" and push a `passed` finding. The per-check runner below catches
+  // the throw and files it under findings.errors with the real message.
   async function query(table, options = {}) {
+    const apiArgs = {
+      method: "GET",
+      scope: "global",
+      table: table,
+      query: options.query,
+      fields: options.fields,
+      limit: options.limit || 50,
+      url_params: options.display_value ? { sysparm_display_value: "true" } : undefined
+    };
+    // Only set `instance` when the caller gave one so the active-instance
+    // fallback in servicenow_api still applies otherwise.
+    if (instance) apiArgs.instance = instance;
+
+    let res;
     try {
-      const res = await executeTool("servicenow_api", {
-        method: "GET",
-        scope: "global",
-        table: table,
-        query: options.query,
-        fields: options.fields,
-        limit: options.limit || 50,
-        url_params: options.display_value ? { sysparm_display_value: "true" } : undefined
-      });
-      // executeTool returns { success, status, data: { result } }; older shape was { result }
-      return (res && res.data && res.data.result) || (res && res.result) || [];
+      res = await executeTool("servicenow_api", apiArgs);
     } catch (e) {
-      console.error("Query failed:", e);
-      return [];
+      throw tagQueryError(table, (e && e.message) || String(e));
     }
+    if (!res || res.success === false) {
+      // servicenow_api returns { success:false, status, data:{ error:{ message, detail } } }
+      // on HTTP failure (no top-level `error`) - surface the real message + status.
+      const snErr = res && res.data && res.data.error;
+      const msg = (res && (res.error || res.message))
+        || (snErr && (snErr.message || snErr.detail))
+        || "success=false";
+      throw tagQueryError(table, msg + (res && res.status ? " (HTTP " + res.status + ")" : ""));
+    }
+    // executeTool returns { success, status, data: { result } }; older shape was { result }
+    const rows = (res.data && res.data.result) || res.result;
+    if (!Array.isArray(rows)) {
+      throw tagQueryError(table, "servicenow_api returned no result array (status " + (res.status || "?") + ")");
+    }
+    return rows;
+  }
+
+  function tagQueryError(table, message) {
+    const err = new Error("Query on " + table + " failed: " + message);
+    err.auditQueryFailed = true;
+    err.table = table;
+    return err;
   }
 
   // Define all audit checks
@@ -490,12 +529,13 @@ async function run_audit(args) {
     },
 
     // SYSTEM CHECKS
+    // syslog.level: -1 = Debug, 0 = Information, 1 = Warning, 2 = Error
     error_logs: {
       category: "system",
       name: "Error Logs",
       run: async () => {
         const errors = await query("syslog", {
-          query: "level=0^sys_created_on>javascript:gs.daysAgoStart(7)",
+          query: "level=2^sys_created_on>javascript:gs.daysAgoStart(7)",
           fields: "level,source,message,sys_created_on",
           limit: 20
         });
@@ -532,12 +572,14 @@ async function run_audit(args) {
       }
     },
 
+    // Evaluator warnings (1) and errors (2) both indicate script problems, so
+    // this check deliberately includes both levels (see syslog.level note above).
     script_errors: {
       category: "system",
-      name: "Script Errors",
+      name: "Script Errors & Warnings",
       run: async () => {
         const errors = await query("syslog", {
-          query: "source=Evaluator^levelIN0,1^sys_created_on>javascript:gs.daysAgoStart(7)",
+          query: "source=Evaluator^levelIN1,2^sys_created_on>javascript:gs.daysAgoStart(7)",
           fields: "message,sys_created_on",
           limit: 30
         });
@@ -554,18 +596,18 @@ async function run_audit(args) {
         if (recurring.length > 0) {
           findings.warning.push({
             check: "script_errors",
-            title: "Recurring Script Errors",
+            title: "Recurring Script Errors/Warnings",
             count: recurring.length,
-            detail: `${recurring.length} recurring script errors detected`,
+            detail: `${recurring.length} recurring script errors/warnings (Evaluator, level warning or error) detected`,
             items: recurring.slice(0, 5).map(([msg, count]) => `(${count}x) ${msg.substring(0, 60)}...`),
             recommendation: "Fix recurring script errors to improve stability"
           });
         } else if (errors.length > 0) {
           findings.info.push({
             check: "script_errors",
-            title: "Script Errors",
+            title: "Script Errors/Warnings",
             count: errors.length,
-            detail: `${errors.length} script errors in last 7 days (no recurring patterns)`
+            detail: `${errors.length} script errors/warnings (Evaluator, level warning or error) in last 7 days (no recurring patterns)`
           });
         }
       }
@@ -641,9 +683,10 @@ async function run_audit(args) {
       fields: "value",
       limit: 1
     });
-    findings.metadata.instance = instanceProps[0]?.value || "unknown";
+    findings.metadata.instance = instanceProps[0]?.value || instance || "unknown";
   } catch (e) {
-    findings.metadata.instance = "unknown";
+    // Not a check: keep whatever the caller passed, else "unknown".
+    findings.metadata.instance = instance || "unknown";
   }
 
   // Determine which checks to run
@@ -663,10 +706,15 @@ async function run_audit(args) {
       findings.metadata.checks_run.push(checkId);
       await auditChecks[checkId].run();
     } catch (error) {
-      findings.warning.push({
+      // Query failures (tagged by query()) and any other exception land in
+      // `errors`, never in `passed`/`warning`, so the caller can see the
+      // check did not run rather than reading a false "clean" result.
+      findings.errors.push({
         check: checkId,
-        title: `Check Failed: ${checkId}`,
-        detail: error.message || "Unknown error"
+        title: `Check Failed: ${auditChecks[checkId].name || checkId}`,
+        detail: (error && error.message) || "Unknown error",
+        table: (error && error.table) || undefined,
+        recommendation: "Check instance connectivity / ACLs for this table and re-run the check"
       });
     }
   }
@@ -677,6 +725,7 @@ async function run_audit(args) {
     warning_count: findings.warning.length,
     info_count: findings.info.length,
     passed_count: findings.passed.length,
+    error_count: findings.errors.length,
     total_checks: checksToRun.length
   };
 

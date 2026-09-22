@@ -55,6 +55,15 @@ function handleGlobalSearch(e) {
     }
     
     chatSearchDebounceTimer = setTimeout(function() {
+        // Query emptied by typing (not via the clear button) while message
+        // highlights are showing — route through clearGlobalSearch, the ONE
+        // render site in this file that drops the stale highlights (write-site
+        // ratchet: no second renderMessages() call). Same end state: query /
+        // cache / highlight cleared, chat list + messages re-rendered.
+        if (!value && window.currentSearchHighlight) {
+            clearGlobalSearch();
+            return;
+        }
         lastSearchQuery = value;
         chatSearchQuery = value;
         searchMatchesCache = {}; // Clear cache on new search

@@ -585,6 +585,17 @@ async function executeRuntimeInspect(args) {
                 var state = await _riPullSwDebugState();
                 return { success: true, state: _riSafeSerialize(state) };
             }
+            case 'sandbox_registry': {
+                // #17 — js_eval sandbox bookkeeping + offscreen-document state,
+                // pulled from the SW's 'pull-debug-state' reply (same 5 s timeout
+                // as sw_state). Read-only.
+                var _sbState = await _riPullSwDebugState();
+                return {
+                    success: true,
+                    sandboxes: _riSafeSerialize((_sbState && _sbState.sandboxes) || null),
+                    offscreen: _riSafeSerialize((_sbState && _sbState.offscreen) || null)
+                };
+            }
             case 'screenshot':
                 return await _riScreenshot();
             case 'new_chat': {
@@ -609,7 +620,7 @@ async function executeRuntimeInspect(args) {
                 if (!args.view) return { success: false, error: "action 'set_view' requires 'view'" };
                 return _riSetView(args.view);
             default:
-                return { success: false, error: "Unknown action '" + args.action + "'. Valid: ui_state, get, call, set, dispatch, db, sw_state, screenshot, new_chat, focus_chat, set_view" };
+                return { success: false, error: "Unknown action '" + args.action + "'. Valid: ui_state, get, call, set, dispatch, db, sw_state, sandbox_registry, screenshot, new_chat, focus_chat, set_view" };
         }
     } catch (e2) {
         return { success: false, error: String((e2 && e2.message) || e2) };

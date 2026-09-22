@@ -171,6 +171,10 @@
 .model-row-icon svg { width: 18px; height: 18px; }
 .model-menu-row.selected .model-row-icon { color: var(--success); }
 .model-row-main { flex: 1; min-width: 0; }
+/* Native selection and Edit buttons are siblings, never nested controls. */
+.model-menu .model-row-select { display: flex; align-items: center; gap: var(--space-3); background: none; border: 0; padding: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.model-row-select .model-row-sub { display: block; }
+.model-menu .model-row-select:focus-visible, .model-menu .model-row-edit:focus-visible, .model-menu button.custom-dropdown-option:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .model-row-title { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The name is a real element (not an anonymous flex item) so text-overflow
    can actually ellipsize it; badges keep their full width next to it. */
@@ -180,7 +184,7 @@
 .model-row-badge { font-size: 9px; line-height: 1; text-transform: uppercase; letter-spacing: 0.04em; font-weight: var(--font-semibold); padding: 2px 5px; border-radius: var(--radius-sm); background: var(--secondary-light); color: var(--text-secondary); border: 1px solid var(--border); flex-shrink: 0; }
 .model-row-badge.oauth { background: var(--success-light); color: var(--success-hover); border-color: var(--success-light); }
 .model-row-edit { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; background: none; border: none; cursor: pointer; padding: var(--space-2); border-radius: var(--radius-sm); color: var(--text-muted); opacity: 0; transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast); }
-.model-menu-row:hover .model-row-edit { opacity: 1; }
+.model-menu-row:hover .model-row-edit, .model-menu-row:focus-within .model-row-edit { opacity: 1; }
 .model-row-edit:hover { background: var(--bg-hover); color: var(--text-primary); }
 .model-row-edit .ui-icon { width: 13px; height: 13px; }
 .model-row-check { width: 16px; height: 16px; flex-shrink: 0; color: var(--success); display: inline-flex; align-items: center; justify-content: center; }
@@ -197,6 +201,7 @@
 .model-menu .model-section-body .model-menu-row:last-child { border-bottom: none; }
 /* OAuth login/logout row reuses .custom-dropdown-option — keep it full-width + divided to match the rows above */
 .model-menu .custom-dropdown-option { padding: var(--space-3) var(--space-4); cursor: pointer; font-size: var(--text-body-sm); color: var(--text-primary); border-bottom: 1px solid var(--secondary-border); transition: background var(--transition-fast); }
+.model-menu button.custom-dropdown-option { width: 100%; border: 0; background: none; font-family: inherit; text-align: left; }
 .model-menu .custom-dropdown-option:last-child { border-bottom: none; }
 .model-menu .custom-dropdown-option:hover { background: var(--bg-hover); }
 /* Sub-agent tier mapping rows (label + compact provider select) */
@@ -236,6 +241,10 @@
 .ext-sn-status .ext-status-dot { background: var(--success); }
 .ext-sn-status.disconnected .ext-status-dot { background: var(--danger); }
 .ext-status-tier { font-size: 10px; opacity: 0.7; margin-left: var(--space-1); }
+/* Dev tier: approvals are OFF for this instance — amber pill so it is unmissable */
+.ext-sn-status.tier-dev { color: var(--warning-text); background: var(--warning-lighter); border-color: var(--warning-light); }
+.ext-sn-status.tier-dev .ext-status-dot { background: var(--warning); }
+.ext-sn-status.tier-dev .ext-status-tier { opacity: 1; font-weight: var(--font-semibold); color: var(--warning-hover); }
 .ext-browser-status .ext-status-dot { background: var(--primary); }
 /* Chrome (bg/border/radius/shadow) comes from the shared .header-menu class above. */
 .ext-instance-dropdown { position: fixed; z-index: var(--z-dropdown); min-width: 220px; padding: 0 0 var(--space-1); overflow: hidden; }
@@ -368,6 +377,14 @@
 .ext-instance-tier { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; padding: 2px 4px; border-radius: var(--radius-sm); transition: background 0.15s; color: var(--text-muted); font-size: var(--text-caption); white-space: nowrap; }
 .ext-instance-tier:hover { background: var(--bg-hover); color: var(--text-primary); }
 .ext-instance-tier .ui-icon { width: 12px; height: 12px; flex-shrink: 0; }
+/* Segmented Manual / Auto / Dev control inside the picker row */
+.ext-instance-tier { gap: 0; padding: 1px; border: 1px solid var(--border); background: var(--bg-tertiary); }
+.ext-instance-tier:hover { background: var(--bg-tertiary); color: var(--text-muted); }
+.ext-tier-opt { display: inline-flex; align-items: center; gap: var(--space-1); padding: 1px 4px; border-radius: var(--radius-sm); color: var(--text-muted); transition: background 0.15s, color 0.15s; }
+.ext-tier-opt:hover { background: var(--bg-hover); color: var(--text-primary); }
+.ext-tier-opt.selected { background: var(--bg-white); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+.ext-tier-opt.dev.selected { background: var(--warning-light); color: var(--warning-text); font-weight: var(--font-semibold); }
+.ext-instance-tier.tier-dev { border-color: var(--warning-light); }
 .provider-select { padding: var(--space-2) var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-body-sm); background: var(--bg-white); cursor: pointer; }
 .provider-select:focus { outline: none; border-color: var(--text-muted); }
 .toggle-sidebar-btn { background: none; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); padding: var(--space-3) var(--space-5); cursor: pointer; font-size: var(--text-body-lg); transition: background var(--transition-fast); height: 33px; width: 38px; display: none; align-items: center; justify-content: center; color: var(--text-secondary); -webkit-tap-highlight-color: transparent; }

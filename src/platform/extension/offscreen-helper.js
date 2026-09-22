@@ -61,9 +61,10 @@
     // (e.g. 10 min) keep the eval alive — with a single un-chunked request
     // nothing would touch the clock between start and resolve.
     var SW_SLEEP_CHUNK_MS = 4 * 60 * 1000;
-    function swSleep(totalMs, chatId) {
+    function swSleep(totalMs, chatId, isCancelled) {
         var deadline = Date.now() + Math.max(0, Number(totalMs) || 0);
         function attempt() {
+            if (isCancelled && isCancelled()) return Promise.resolve({ ok: true });
             var remaining = deadline - Date.now();
             if (remaining <= 0) return Promise.resolve({ ok: true });
             return chrome.runtime.sendMessage({ type: 'sw-sleep', payload: { ms: Math.min(remaining, SW_SLEEP_CHUNK_MS), chatId: chatId || null } })
@@ -75,6 +76,7 @@
                     return { ok: true };
                 })
                 .catch(function() {
+                    if (isCancelled && isCancelled()) return { ok: true };
                     // Channel dropped (SW suspended mid-wait / not up yet).
                     // Small native backoff so a dead SW never causes a hot
                     // retry loop, then re-arm for the remaining time. Worst
@@ -86,13 +88,26 @@
         return attempt();
     }
 
+    // Only invocation-scoped tokens issued by the SW transport are cancellable.
+    // Never cancel by chat id: same-chat nested/sibling sandboxes may be live.
+    var activeSandboxes = Object.create(null);
+
     // ----- request dispatcher (chrome.runtime.sendMessage from SW) -----
     chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         if (!message || !message.type) return;
+        if (!sender || sender.id !== chrome.runtime.id || sender.tab ||
+            (sender.url && sender.url !== chrome.runtime.getURL('background.js'))) return;
         // SW → offscreen requests are dispatched by type. Each handler
         // returns a promise and we resolve `sendResponse` with the
         // {ok, result|error} envelope when done. Return true to keep
         // the response channel open for the async work.
+        if (message.type === 'helper-cancel-sandbox') {
+            var requestId = message.payload && message.payload.sandboxRequestId;
+            var cancel = typeof requestId === 'string' && activeSandboxes[requestId];
+            if (cancel) cancel();
+            sendResponse({ ok: true, result: { cancelled: !!cancel } });
+            return;
+        }
         if (message.type === 'helper-js-eval') {
             runJsEvalSandbox(message.payload || {})
                 .then(function(result) { sendResponse({ ok: true, result: result }); })
@@ -108,26 +123,48 @@
     });
 
     // ----- sandbox iframe runner (used by both js_eval and skill tools) -----
-    function runSandboxWithCode(code, globals, chatId, messageIndex, parentToolCallId) {
+    function runSandboxWithCode(code, globals, chatId, messageIndex, parentToolCallId, requestId) {
         var MSG_TOOL_CALL = 'sandboxToolCall';
         var MSG_TOOL_RESULT = 'sandboxToolResult';
         var MSG_DONE = 'sandboxDone';
         return new Promise(function(resolve, reject) {
-            var sandbox = document.createElement('iframe');
-            sandbox.style.display = 'none';
+            if (requestId && activeSandboxes[requestId]) {
+                reject(new Error('Duplicate sandbox request id'));
+                return;
+            }
+            var sandbox = null;
             var settled = false;
+            var started = false;
+            var readyTimer = null;   // P4 #1: 60s 'sandboxReady' deadline (cleared in cleanup)
             function cleanup() {
+                clearTimeout(readyTimer);
                 window.removeEventListener('message', onMessage);
-                if (sandbox && sandbox.parentNode) {
-                    try { sandbox.parentNode.removeChild(sandbox); } catch (e) {}
+                if (requestId && activeSandboxes[requestId] === cancel) delete activeSandboxes[requestId];
+                if (sandbox) {
+                    sandbox.removeEventListener('error', onFrameError);
+                    if (sandbox.parentNode) sandbox.parentNode.removeChild(sandbox);
+                    sandbox = null;
                 }
             }
+            function finish(error, result) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (error) reject(error);
+                else resolve(result);
+            }
+            function cancel() { finish(new Error('Sandbox execution cancelled')); }
+            function onFrameError() { finish(new Error('Sandbox iframe failed to load')); }
             function onMessage(e) {
-                if (!sandbox || e.source !== sandbox.contentWindow) return;
+                if (settled || !sandbox || e.source !== sandbox.contentWindow) return;
                 var d = e.data;
                 if (!d || !d.type) return;
                 if (d.type === 'sandboxReady') {
-                    sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: code, globals: globals || {} }, '*');
+                    if (started) return;
+                    started = true;
+                    try {
+                        sandbox.contentWindow.postMessage({ type: 'sandboxExec', code: code, globals: globals || {} }, '*');
+                    } catch (err) { finish(err); }
                     return;
                 }
                 if (d.type === MSG_TOOL_CALL) {
@@ -139,10 +176,10 @@
                         // tool dispatcher: it is not a real tool (no approval,
                         // no transcript entry, no prog_ id needed).
                         var sleepMs = Math.max(0, Number(d.args && d.args.ms) || 0);
-                        swSleep(sleepMs, chatId).then(function() {
-                            if (!sandbox || !sandbox.contentWindow) return;
+                        swSleep(sleepMs, chatId, function() { return settled; }).then(function() {
+                            if (settled || !sandbox || !sandbox.contentWindow) return;
                             sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, result: { __sleep_ok: true, slept_ms: sleepMs } }, '*');
-                        });
+                        }).catch(function(err) { finish(err); });
                         return;
                     }
                     // Forward sandbox-side tool call to the SW dispatcher.
@@ -180,40 +217,100 @@
                         payload: {
                             name: d.name,
                             args: d.args,
+                            sandboxRequestId: requestId,
                             chatId: chatId,
                             messageIndex: messageIndex,
                             toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + d.id,
                             parentToolCallId: parentToolCallId || null
                         }
                     }).then(function(resp) {
-                        if (!sandbox || !sandbox.contentWindow) return;
+                        if (settled || !sandbox || !sandbox.contentWindow) return;
                         if (resp && resp.ok) {
                             sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, result: resp.result }, '*');
                         } else {
                             sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, error: (resp && resp.error) || 'Tool call failed' }, '*');
                         }
                     }).catch(function(err) {
-                        if (!sandbox || !sandbox.contentWindow) return;
+                        if (settled || !sandbox || !sandbox.contentWindow) return;
                         sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, error: err && err.message ? err.message : String(err) }, '*');
                     });
                     return;
                 }
                 if (d.type === MSG_DONE) {
-                    if (settled) return;
-                    settled = true;
-                    cleanup();
-                    if (d.error) reject(new Error(d.error));
-                    else resolve(d.result);
+                    finish(d.error ? new Error(d.error) : null, d.result);
                     return;
                 }
             }
-            window.addEventListener('message', onMessage);
-            sandbox.src = 'sandbox.html';
-            document.body.appendChild(sandbox);
+            // Register before append: cancellation can find this exact invocation
+            // even if the sandbox never emits ready/done. Setup failures use the
+            // same cleanup path as completion, timeout cancellation and load errors.
+            if (requestId) activeSandboxes[requestId] = cancel;
+            try {
+                sandbox = document.createElement('iframe');
+                sandbox.style.display = 'none';
+                sandbox.addEventListener('error', onFrameError);
+                window.addEventListener('message', onMessage);
+                sandbox.src = 'sandbox.html';
+                document.body.appendChild(sandbox);
+                // P4 #1: an iframe that never posts 'sandboxReady' (hung load,
+                // CSP/network failure without an 'error' event) used to sit
+                // until the SW's 5-minute inactivity watchdog. Fail fast and
+                // dispose through the same cleanup path. Unconditional (no
+                // flag). 60s, not 15s (#923 follow-up): the iframe shares this
+                // offscreen main thread, so ANOTHER chat's CPU-bound sync
+                // js_eval can starve its load for tens of seconds — when the
+                // hog ends the expired timer task ran before the (late)
+                // 'sandboxReady' message and killed a healthy sandbox.
+                readyTimer = setTimeout(function() {
+                    if (started || settled) return;
+                    var e = new Error('Sandbox iframe never signalled ready within 60s (sandbox_never_ready)');
+                    e.code = 'sandbox_never_ready';
+                    finish(e);
+                }, 60000);
+            } catch (err) { finish(err); }
         });
     }
 
+    // A partial deploy must fail before creating ANY sandbox, even normal eval.
+    // Return a rejected promise at ingress so the message handler surfaces it.
+    function offscreenTestPolicyStartupError() {
+        if (typeof TestRunPolicy === 'undefined' || !TestRunPolicy || !TestRunPolicy.registry ||
+            typeof TestRunPolicy.runFrame !== 'function' ||
+            !['open', 'descriptor', 'revoke', 'denials', 'gate'].every(function(name) { return typeof TestRunPolicy.registry[name] === 'function'; })) {
+            return new Error('Inconsistent extension installation: offscreen TestRunPolicy is missing or incompatible. Rebuild all extension artifacts using the header Reload; sandbox execution remains blocked.');
+        }
+        return null;
+    }
+
     function runJsEvalSandbox(payload) {
+        var policyError = offscreenTestPolicyStartupError();
+        if (policyError) return Promise.reject(policyError);
+        if (payload.testRunPolicy) {
+            // Only the authenticated SW transport supplies this descriptor. It is
+            // never read from a sandbox message or exposed in sandbox globals.
+            var id = payload.sandboxRequestId;
+            if (typeof id !== 'string' || !id || activeSandboxes[id]) return Promise.reject(new Error('Invalid test invocation'));
+            var context = TestRunPolicy.registry.open(payload.testRunPolicy);
+            var controller = new AbortController();
+            activeSandboxes[id] = function() { controller.abort(); };
+            return TestRunPolicy.runFrame({
+                registry: TestRunPolicy.registry, context: context,
+                code: String(payload.code || ''), document: document, window: window,
+                signal: controller.signal,
+                dispatch: function(name, args, callId) {
+                    if (name === '__sandbox_sleep') return swSleep(args.ms, payload.chatId, function() { return controller.signal.aborted; }).then(function() { return { __sleep_ok: true }; });
+                    return chrome.runtime.sendMessage({ type: 'sw-exec-tool', payload: {
+                        name: name, args: args, sandboxRequestId: id,
+                        chatId: payload.chatId, messageIndex: payload.messageIndex,
+                        toolCallId: 'prog_' + (payload.parentToolCallId || 'test') + '_' + callId,
+                        parentToolCallId: payload.parentToolCallId || null
+                    } }).then(function(r) {
+                        if (!r || !r.ok) throw new Error(r && r.error || 'Test relay failed');
+                        return r.result;
+                    });
+                }
+            }).finally(function() { controller.abort(); delete activeSandboxes[id]; });
+        }
         var code = String(payload.code || '');
         var globals = payload.globals || {};
         // messageIndex: type-checked (not `|| null`) because index 0 is a
@@ -222,10 +319,13 @@
         // message 0 were stamped -1 and dropped from the inline Artifacts block.
         return runSandboxWithCode(code, globals, payload.chatId || null,
             (typeof payload.messageIndex === 'number' && payload.messageIndex >= 0) ? payload.messageIndex : null,
-            payload.parentToolCallId || null);
+            payload.parentToolCallId || null,
+            typeof payload.sandboxRequestId === 'string' ? payload.sandboxRequestId : null);
     }
 
     function runSkillSandbox(payload) {
+        var policyError = offscreenTestPolicyStartupError();
+        if (policyError) return Promise.reject(policyError);
         var toolCode = String(payload.toolCode || '');
         var toolName = String(payload.toolName || '');
         var args = payload.args || {};
@@ -235,6 +335,7 @@
         // Type-checked (not `|| null`) because index 0 is a legitimate value.
         return runSandboxWithCode(code, {}, payload.chatId || null,
             (typeof payload.messageIndex === 'number' && payload.messageIndex >= 0) ? payload.messageIndex : null,
-            payload.parentToolCallId || null);
+            payload.parentToolCallId || null,
+            typeof payload.sandboxRequestId === 'string' ? payload.sandboxRequestId : null);
     }
 })();

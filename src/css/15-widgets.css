@@ -147,3 +147,6 @@ details.tool-call.highlight-flash, details.tool-result.highlight-flash { animati
 .sn-artifact-icon-btn:hover { background: var(--secondary-light); border-color: var(--secondary-border); color: var(--primary); }
 .sn-artifact-icon-btn.danger:hover { background: var(--danger-lighter); border-color: var(--danger-light); color: var(--danger); }
 .sn-artifact-icon-btn svg, .sn-artifact-icon-btn .ui-icon { width: 14px; height: 14px; }
+
+/* Every saved-widget render exposes non-destructive revision selection. */
+.widget-version-picker { display:block; max-width:100%; margin:4px; padding:3px 6px; font:inherit; font-size:11px; color:var(--text-primary); background:var(--bg-main); border:1px solid var(--border); border-radius:4px; position:relative; z-index:1; }

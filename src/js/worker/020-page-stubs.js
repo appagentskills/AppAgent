@@ -123,6 +123,7 @@ if (typeof refreshClaudeOAuthUsage !== 'function') var refreshClaudeOAuthUsage =
 if (typeof executeIframeTool !== 'function') var executeIframeTool = async function() { return { success: false, error: 'iframe_tool unavailable in SW context' }; };
 if (typeof executeDisplay !== 'function') var executeDisplay = function() { return { success: false, error: 'display unavailable in SW context' }; };
 if (typeof executeHtmlWidget !== 'function') var executeHtmlWidget = function() { return { success: false, error: 'html_widget unavailable in SW context' }; };
+if (typeof executeWidgetEval !== 'function') var executeWidgetEval = async function() { return { success: false, error: 'widget_eval requires the exact foreground widget render; unavailable in SW context' }; };
 if (typeof executePinWidget !== 'function') var executePinWidget = async function() { return { success: false, error: 'pin_widget unavailable in SW context' }; };
 if (typeof executeStartChat !== 'function') var executeStartChat = async function() { return { success: false, error: 'start_chat unavailable in SW context' }; };
 if (typeof executePromptUser !== 'function') var executePromptUser = async function() { return { success: false, error: 'prompt_user unavailable in SW context' }; };
@@ -256,6 +257,9 @@ async function loadHooksSettings() {
 // lands while the boot-time IDB reads below are still in flight, the earlier
 // read must NOT clobber the fresher edit when it finally resolves — the edit
 // was already applied AND persisted by the handler (single writer).
+// Slots: toolPermissions / instancePermissions / sessionPermissions (full-map
+// replace — the stale read is SKIPPED) and sessionPermissionsAdditive (a
+// single chat grant landed — the read is MERGED under it; worker/025).
 var _swPermsDirty = {};
 async function loadToolPermissionsInWorker() {
     if (typeof getSetting !== 'function') return;
@@ -275,9 +279,38 @@ async function loadToolPermissionsInWorker() {
 // executeSetTldr / executeSetLinks implementations, so gating and attachment
 // always agree on the same target message.
 
-function executeAfterResponseHooks(chatId) {
+// #9: `anchorUserIdx` = the finished run's own lastUserMsgIndex (030-agent-loop.js)
+// so the answer-target search is pinned to THAT turn even when a new user row
+// landed after the answer. Hook runs pass a hook-row index, which
+// findHookAnswerSpan rejects and falls back to the backward scan.
+// #16 TLDR gating: a turn "needs" a TL;DR when it used tools (any assistant
+// tool_calls inside the hook answer span, answer-card/meta calls excluded) OR
+// the answer itself is long (>= HOOK_TLDR_MIN_CHARS). Short no-tool chat
+// replies return false and skip the hook. Fail-OPEN (true) when the span
+// cannot be computed so the hook behaves exactly as before.
+var HOOK_TLDR_MIN_CHARS = 600;
+var _hkTldrSkipTools = { set_chat_title: true, set_tldr: true, set_links: true, set_caveat: true, update_action_state: true };
+function _hkTurnNeedsTldr(chat, anchorUserIdx, target) {
+    var span = (typeof findHookAnswerSpan === 'function') ? findHookAnswerSpan(chat, anchorUserIdx) : null;
+    if (!span || !target) return true;
+    var c = target.content;
+    var len = (typeof c === 'string') ? c.length : (c ? String(JSON.stringify(c) || '').length : 0);
+    if (len >= HOOK_TLDR_MIN_CHARS) return true;
+    for (var i = span.lastUserIdx + 1; i <= span.endIdx; i++) {
+        var m = chat.messages[i];
+        if (!m || m.role !== 'assistant' || !m.tool_calls || !m.tool_calls.length) continue;
+        for (var j = 0; j < m.tool_calls.length; j++) {
+            var tn = m.tool_calls[j] && m.tool_calls[j].function && m.tool_calls[j].function.name;
+            if (tn && !_hkTldrSkipTools[tn]) return true;
+        }
+    }
+    return false;
+}
+
+function executeAfterResponseHooks(chatId, anchorUserIdx) {
     var chat = chats[chatId];
     if (!chat || !chat.messages || chat.messages.length < 2) return;
+    var _hkAnchor = (typeof anchorUserIdx === 'number') ? anchorUserIdx : undefined;
 
     // Auto-title hook. Provisional titles (first-message snippet set by the
     // page's updateChatTitle) still need upgrading to a model-generated title.
@@ -312,8 +345,12 @@ function executeAfterResponseHooks(chatId) {
     // never rendered there, so the extra hook LLM run would be pure waste.
     var needsTldr = false;
     if (hooksEnabled.autoTldr && !chat.isBackground) {
-        var tldrTarget = findHookAnswerTarget(chat);
-        if (tldrTarget && !tldrTarget.tldr && relocateAnswerCard(chat, 'tldr')) {
+        var tldrTarget = findHookAnswerTarget(chat, _hkAnchor);
+        // #16: plain chat answers (no tool calls this turn AND a short answer)
+        // do not need a TL;DR — the extra hook LLM run was pure cost on
+        // conversational turns. Tool-using turns and long answers keep it.
+        if (tldrTarget && !tldrTarget.tldr && !_hkTurnNeedsTldr(chat, _hkAnchor, tldrTarget)) tldrTarget = null;
+        if (tldrTarget && !tldrTarget.tldr && relocateAnswerCard(chat, 'tldr', _hkAnchor)) {
             // A spontaneous mid-run set_tldr attached the card to an earlier
             // message of this turn — relocateAnswerCard moved it onto the
             // final answer. The hook is satisfied; no extra LLM run. Re-emit
@@ -344,7 +381,7 @@ function executeAfterResponseHooks(chatId) {
     // also satisfies the hook (no extra LLM run to ask for links).
     if (typeof mergeChatAutoLinks === 'function' && mergeChatAutoLinks(chat)) {
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
-        var _alTarget = findHookAnswerTarget(chat);
+        var _alTarget = findHookAnswerTarget(chat, _hkAnchor);
         if (_alTarget && _alTarget.links && typeof AgentEvents !== 'undefined' && AgentEvents.emit) {
             AgentEvents.emit('linksChanged', { chatId: chatId, links: _alTarget.links });
         }
@@ -356,8 +393,8 @@ function executeAfterResponseHooks(chatId) {
     // to call set_links. Skipped on background chats (never rendered there).
     var needsLinks = false;
     if (hooksEnabled.autoLinks && !chat.isBackground) {
-        var linksTarget = findHookAnswerTarget(chat);
-        if (linksTarget && !linksTarget.links && relocateAnswerCard(chat, 'links')) {
+        var linksTarget = findHookAnswerTarget(chat, _hkAnchor);
+        if (linksTarget && !linksTarget.links && relocateAnswerCard(chat, 'links', _hkAnchor)) {
             // Spontaneous mid-run set_links — same relocation as the TLDR
             // branch above; hook satisfied without an extra LLM run.
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -388,8 +425,8 @@ function executeAfterResponseHooks(chatId) {
     var caveatEligible = false;
     var caveatTarget = null;
     if (hooksEnabled.autoCaveat && !chat.isBackground) {
-        caveatTarget = findHookAnswerTarget(chat);
-        if (caveatTarget && !caveatTarget.caveat && relocateAnswerCard(chat, 'caveat')) {
+        caveatTarget = findHookAnswerTarget(chat, _hkAnchor);
+        if (caveatTarget && !caveatTarget.caveat && relocateAnswerCard(chat, 'caveat', _hkAnchor)) {
             // Spontaneous mid-run set_caveat — relocate onto the final answer,
             // same as the tldr/links branches; hook satisfied, no extra LLM run.
             chat._caveatHookTries = 0;
@@ -425,7 +462,7 @@ function executeAfterResponseHooks(chatId) {
     var progressEligible = false;
     var progressTarget = null;
     if (hooksEnabled.autoProgress && !chat.isBackground) {
-        progressTarget = findHookAnswerTarget(chat);
+        progressTarget = findHookAnswerTarget(chat, _hkAnchor);
         if (progressTarget && !progressTarget._progressAsked) {
             var _progLatestState = null;   // state of the LATEST update_action_state call
             var _progHasCard = false;      // chat has ANY update_action_state call

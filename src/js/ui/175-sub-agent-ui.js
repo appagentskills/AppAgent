@@ -32,7 +32,7 @@ var SUB_REPORT_STATUSES = { done: 1, error: 1, partial: 1, need_input: 1, cancel
 // missing values render no badge. Inline styles keep the badge
 // self-contained (no companion CSS edit needed).
 var SUB_REVIEW_BADGES = {
-    pending:            { label: 'review pending',     bg: '#5c4d10', fg: '#ffe289' },
+    pending:            { label: 'review pending',     bg: 'var(--warning-bg, #5c4d10)', fg: 'var(--warning-text, #ffe289)' },
     accepted:           { label: 'accepted',           bg: '#1d5c2e', fg: '#a9f5c1' },
     revision_requested: { label: 'revision requested', bg: '#6b271d', fg: '#ffbfae' },
     cross_checked:      { label: 'cross-checked',      bg: '#1d3f6b', fg: '#aecdf5' }
@@ -237,13 +237,13 @@ function toggleSubReportExpand(btn, event) {
 // ({state, icon, label, tasks, output, at}). Render it as a state pill +
 // label head + tasks checklist. Class names are whitelist-interpolated —
 // same defense-in-depth rationale as SUB_REPORT_STATUSES above.
-var SUB_ACTION_STATES = { running: 1, stuck: 1, done: 1, error: 1 };
+var SUB_ACTION_STATES = { running: 1, waiting: 1, stuck: 1, done: 1, error: 1, finished: 1, pr_opened: 1, finished_with_caveat: 1 };
 var SUB_ACTION_TASK_STATUSES = { pending: 1, running: 1, done: 1, error: 1 };
 function _subActionStateHtml(st) {
     if (!st) return '';
     var tasks = Array.isArray(st.tasks) ? st.tasks : [];
     if (!st.label && !tasks.length) return '';
-    var stClass = SUB_ACTION_STATES[st.state] ? st.state : 'running';
+    var stClass = Object.prototype.hasOwnProperty.call(SUB_ACTION_STATES, st.state) ? st.state : 'running';
     var head = '';
     if (st.label) {
         head = '<div class="sub-report-action-head">' +
@@ -252,7 +252,7 @@ function _subActionStateHtml(st) {
         '</div>';
     }
     var rows = tasks.map(function(t) {
-        var ts = (t && SUB_ACTION_TASK_STATUSES[t.status]) ? t.status : 'pending';
+        var ts = (t && Object.prototype.hasOwnProperty.call(SUB_ACTION_TASK_STATUSES, t.status)) ? t.status : 'pending';
         var glyph = (ts === 'done') ? '\u2713'
                   : (ts === 'error') ? '\u2715'
                   : (ts === 'running') ? '<span class="sub-report-spinner sub-report-task-spinner" aria-hidden="true"></span>'
@@ -361,6 +361,56 @@ function _subThreadTime(at) {
     } catch (_) { return ''; }
 }
 
+// Queue disappearance is not delivery. Text-only transcript evidence can
+// confirm a unique payload, but cannot identify which identical resend arrived.
+// Keep ambiguous attempts unconfirmed, including legacy and archived entries.
+// 'injected' is terminal, so once the transcript scan confirms it we memoize
+// per item (B9): _subParentHistoryKey is recomputed on every render tick and
+// otherwise re-scans the sub chat's messages for every historical item. Keyed
+// on the item OBJECT (WeakMap) rather than mutating the page's read-only
+// mirror of chat state; a rehydrated item simply recomputes once. The memo
+// hangs off the function itself so source-slicing tests stay self-contained.
+function _subParentMessageState(item, msg) {
+    if (item.state === 'injected') return 'injected';
+    var memo = _subParentMessageState._memo;
+    if (!memo && typeof WeakMap === 'function') memo = _subParentMessageState._memo = new WeakMap();
+    var memoable = !!(memo && item && typeof item === 'object');
+    if (memoable && memo.get(item)) return 'injected';
+    var chat = typeof chats !== 'undefined' && chats[msg.subChatId];
+    var rows = chat && Array.isArray(chat.messages) ? chat.messages : [];
+    if (!item.deliveryText || item.ambiguousDelivery) return 'pending';
+    var phases = (Array.isArray(msg.phases) ? msg.phases : []).concat([msg]);
+    var ambiguous = phases.some(function(phase) {
+        // Pruned history may hide a competing occurrence; don't guess.
+        if (phase.parentMessagesDropped > 0) return true;
+        return (Array.isArray(phase.parentMessages) ? phase.parentMessages : []).some(function(other) {
+            return other !== item && other.deliveryText === item.deliveryText;
+        });
+    });
+    if (ambiguous) return 'pending';
+    for (var i = item.startIndex || 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (!row || row.role !== 'user' || !row.injected || typeof row.content !== 'string') continue;
+        // Delimiters matter: a later longer message with the same prefix is
+        // not evidence that this exact queue segment made it into the chat.
+        if (('\n\n' + row.content + '\n\n').indexOf('\n\n' + item.deliveryText + '\n\n') !== -1) {
+            if (memoable) memo.set(item, true);
+            return 'injected';
+        }
+    }
+    return 'pending';
+}
+
+function _subParentHistoryKey(msg) {
+    var phases = (Array.isArray(msg.phases) ? msg.phases : []).concat([msg]);
+    return phases.map(function(phase) {
+        var history = Array.isArray(phase.parentMessages) ? phase.parentMessages : [];
+        return history.length + ':' + (phase.parentMessagesDropped | 0) + ':' + history.map(function(item) {
+            return _subParentMessageState(item, msg);
+        }).join(',');
+    }).join('/');
+}
+
 function _subThreadEntries(msg, liveRec) {
     var entries = [];
     function push(role, kind, text, at) {
@@ -374,6 +424,14 @@ function _subThreadEntries(msg, liveRec) {
             if (p) push('worker', p.lifecycle ? 'notice' : 'update', p.text, p.at);
         }
     }
+    function pushParentHistory(phase) {
+        var history = Array.isArray(phase.parentMessages) ? phase.parentMessages : [];
+        if (phase.parentMessagesDropped) push('parent', 'notice', '[' + phase.parentMessagesDropped + ' earlier parent messages truncated]', null);
+        history.forEach(function(item) {
+            push(item.from === 'parent' ? 'parent' : 'worker',
+                (item.kind === 'instruction' ? 'wake · ' : 'message · ') + _subParentMessageState(item, msg), item.text, item.at);
+        });
+    }
     var phases = Array.isArray(msg.phases) ? msg.phases : [];
     // Wake inputs carry no timestamp of their own — a wake fires right after
     // the previous phase's report, so that report's `at` is the closest
@@ -386,6 +444,7 @@ function _subThreadEntries(msg, liveRec) {
         // were trimmed by the 10-phase cap, in which case it's a wake.
         push('parent', (i === 0 && !msg.phasesDropped) ? 'spawn' : 'wake', ph.input, prevAt);
         pushProgress(ph.progress);
+        pushParentHistory(ph);
         if (ph.report) {
             push('worker', 'report \u00b7 ' + (ph.report.status || 'done'), ph.report.summary || '(no summary)', ph.report.at);
             if (typeof ph.report.at === 'number') prevAt = ph.report.at;
@@ -398,6 +457,7 @@ function _subThreadEntries(msg, liveRec) {
     var curIsSpawn = !phases.length && !msg.phasesDropped && !msg.currentInput;
     push('parent', curIsSpawn ? 'spawn' : 'wake', curInput, prevAt);
     pushProgress(msg.progress);
+    pushParentHistory(msg);
     var rep = msg.report;
     if (rep && rep.status && rep.status !== 'running' && rep.status !== 'partial') {
         push('worker', 'report \u00b7 ' + rep.status, rep.summary || '(no summary)', rep.at);
@@ -414,6 +474,23 @@ function _subThreadEntries(msg, liveRec) {
                 it.content, it.at);
         }
     }
+    // Keep parent replies interleaved with progress rather than grouped by role.
+    // Legacy entries with unknown timestamps stay anchored where they were
+    // pushed: each inherits the last known `at` before it in insertion order,
+    // and insertion index breaks ties. (The former comparator returned 0 for
+    // any null `at`, which is intransitive — x<y, y~z, z~x — so the result was
+    // engine-defined and could scramble even timestamped entries.)
+    var lastAt = -Infinity;
+    for (var n = 0; n < entries.length; n++) {
+        if (entries[n].at !== null) lastAt = entries[n].at;
+        entries[n]._sortAt = lastAt;
+        entries[n]._sortIdx = n;
+    }
+    entries.sort(function(a, b) {
+        if (a._sortAt !== b._sortAt) return a._sortAt < b._sortAt ? -1 : 1;
+        return a._sortIdx - b._sortIdx;
+    });
+    entries.forEach(function(e) { delete e._sortAt; delete e._sortIdx; });
     return entries;
 }
 
@@ -513,7 +590,7 @@ function renderSubReport(msg, index) {
             var _apTool = (_rvRec.awaiting_approval && _rvRec.awaiting_approval.tool) || 'a tool call';
             reviewHtml += '<span class="sub-report-approval" title="' + escapeHtml(_apTool) + ' is awaiting user approval in the sub\u2019s chat"'
                 + ' style="margin-left:6px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
-                + 'background:#5c4d10;color:#ffe289;">awaiting approval</span>';
+                + 'background:var(--warning-bg, #5c4d10);color:var(--warning-text, #ffe289);">awaiting approval</span>';
         }
     }
     var summary = report.summary || '';
@@ -964,7 +1041,24 @@ var SUB_LIFECYCLE_RE = /\[sub-agent lifecycle\] ([^\n(]{1,200}?) \(([A-Za-z0-9_-
 // '[N message(s) from parent / inbox]' followed by '- (label) content' lines.
 var PARENT_INBOX_RE = /\[(\d{1,3}) message\(s\) from parent \/ inbox\]\n?/g;
 
-function renderSubReportNotices(text) {
+// Match the producer's exact normalization (agentMessage in core/097).
+// Only the redundant lifecycle segment disappears; the standalone sub_msg
+// retains full markdown and the original user row still reaches the model.
+// `messages` is ONLY the visible prefix before this lifecycle row, never future
+// rows: an old unmatched notice cannot consume a later standalone occurrence.
+function _hasStandaloneSubMessage(messages, agentId, headline, used) {
+    if (!Array.isArray(messages) || headline.indexOf('sent a message: ') !== 0) return false;
+    var normalized = headline.slice('sent a message: '.length);
+    return messages.some(function(row) {
+        if (!row || row.role !== 'sub_msg' || row.subAgentId !== agentId || used.indexOf(row) !== -1) return false;
+        if (String(row.text || '').replace(/\s*\n+\s*/g, ' ').slice(0, 3800) !== normalized) return false;
+        used.push(row);
+        return true;
+    });
+}
+
+function renderSubReportNotices(text, messages, usedSubMessages) {
+    usedSubMessages = usedSubMessages || [];
     if (typeof text !== 'string') return null;
     // Cheap pre-checks before the heavy regexes — almost every user row skips.
     var hasFinal = text.indexOf('Sub-agent "') !== -1 && text.indexOf('await_handle(') !== -1;
@@ -990,6 +1084,10 @@ function renderSubReportNotices(text) {
             // Derive a status tint from the headline wording (best-effort —
             // unknown headlines fall back to the neutral 'running' accent).
             var hl = m[3];
+            if (_hasStandaloneSubMessage(messages, m[2], hl, usedSubMessages)) {
+                matches.push({ start: m.index, end: m.index + m[0].length, html: '' });
+                continue;
+            }
             var lst = /^errored|DENIED/.test(hl) ? 'error'
                 : /STUCK|APPROVAL/.test(hl) ? 'need_input'
                 : 'running';
@@ -1321,7 +1419,7 @@ function _workerProgressInner(rec, opts) {
     var selfCard = !!(opts && opts.selfCard);
     // Open-chat affordance. Live records reveal by agent_id (follows chat_id
     // changes); reconstructed/purged records use the persisted chat_id and only
-    // when that chat still exists (GC deletes the sub's chat row too).
+    // when that chat still exists (retired chats survive GC, but may be deleted).
     var openAttr = '';
     if (rec && rec._reconstructed) {
         if (rec.chat_id && typeof chats !== 'undefined' && chats[rec.chat_id]) {
@@ -1331,18 +1429,18 @@ function _workerProgressInner(rec, opts) {
         openAttr = 'data-sub-agent-reveal="' + escapeHtml(rec.agent_id) + '"';
     }
     if (openAttr && !selfCard) {
-        inner += '<a class="worker-progress-open" ' + openAttr + ' role="button" tabindex="0" title="Open chat">' +
+        inner += '<button type="button" class="worker-progress-open" ' + openAttr + ' title="Open chat">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
-            '<span>Open chat</span></a>';
+            '<span>Open chat</span></button>';
     }
     // "Chat view" affordance — opens the sub's inline chat card (the SAME
     // renderSubReport card shown in the parent chat: inputs + progress +
     // outputs) inside the global modal overlay. Only offered when a
     // persisted sub_report card for this agent can actually be located.
     if (rec && rec.agent_id && _findSubReportMsg(rec.agent_id)) {
-        inner += '<a class="worker-progress-open worker-progress-chat-view" data-worker-modal="' + escapeHtml(rec.agent_id) + '" role="button" tabindex="0" title="View this sub-agent\'s inputs and outputs in a modal">' +
+        inner += '<button type="button" class="worker-progress-open worker-progress-chat-view" data-worker-modal="' + escapeHtml(rec.agent_id) + '" title="View this sub-agent\'s inputs and outputs in a modal">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>' +
-            '<span>View more</span></a>';
+            '<span>View more</span></button>';
     }
     return inner;
 }
@@ -1414,6 +1512,8 @@ var _workerModalAgentId = null;
 var _workerModalKey = null;
 var _workerModalListener = null;
 var _workerModalRefreshScheduled = false;
+var _workerModalClickListener = null;
+var _handleSubAgentUiClick = null;
 
 // Cheap change-key over everything the modal body renders — mirrors the
 // _subReportKey fields (status / progress / phases / live state) plus the
@@ -1424,7 +1524,7 @@ function _workerModalContentKey(msg, rec) {
     var phn = Array.isArray(msg.phases) ? msg.phases.length : 0;
     var act = (msg.actionState && msg.actionState.at) || 0;
     var live = rec ? (rec.state + ':' + ((rec.action_state && rec.action_state.at) || 0) + ':' + (Array.isArray(rec.inbox) ? rec.inbox.length : 0)) : '';
-    return st + ':' + prog + ':' + phn + ':' + (msg.phasesDropped | 0) + ':' + act + ':' + live;
+    return st + ':' + prog + ':' + (msg.progressDropped | 0) + ':' + phn + ':' + (msg.phasesDropped | 0) + ':' + act + ':' + live + ':' + _subParentHistoryKey(msg);
 }
 
 // (Re)paint the modal body via renderSubReport — the EXACT renderer the
@@ -1478,6 +1578,18 @@ function openWorkerChatModal(agentId) {
         '<div class="modal-header-actions">' +
         '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
     if (actions) actions.innerHTML = '';
+    // The shared .modal-dialog stops click bubbling before document. Route
+    // report controls from the body instead, after their own target handlers.
+    // Keep this listener scoped to the worker modal and remove it on teardown.
+    if (!_workerModalClickListener) {
+        _workerModalClickListener = function(evt) {
+            if (!overlay.classList.contains('worker-chat-modal')) return;
+            _handleSubAgentUiClick(evt);
+            // Same boundary as the dialog; never route this click twice.
+            evt.stopPropagation();
+        };
+        body.addEventListener('click', _workerModalClickListener);
+    }
     _workerModalAgentId = agentId;
     _workerModalKey = null; // force first paint
     _renderWorkerChatModalBody();
@@ -1498,6 +1610,9 @@ function openWorkerChatModal(agentId) {
 // EVERY close path (close button, backdrop click, Escape) so the live
 // listener never outlives the modal.
 function _teardownWorkerChatModal() {
+    var body = document.getElementById('modal-body');
+    if (body && _workerModalClickListener) body.removeEventListener('click', _workerModalClickListener);
+    _workerModalClickListener = null;
     if (_workerModalListener && typeof SubAgents !== 'undefined' && SubAgents.removeListener) {
         try { SubAgents.removeListener(_workerModalListener); } catch (_) {}
     }
@@ -1568,6 +1683,13 @@ function updateSubAgentSelfCard() {
         return;
     }
     var rec = msg.subAgentId ? _resolveSubRec(msg.subAgentId) : null;
+    // A retired child opened directly after reload has no live/cache record:
+    // the parent Workers strip has not run. Reuse its display-only history
+    // reconstruction on demand, without changing the persisted run state.
+    if (!rec && msg.subAgentId) {
+        _mergeReconstructedSubs([], chat.parentChatId);
+        rec = _resolveSubRec(msg.subAgentId);
+    }
     var parentChatId = chat.parentChatId || (rec && rec.parent_chat_id) || '';
     var parentTitle = (parentChatId && chats[parentChatId] && chats[parentChatId].title) ? chats[parentChatId].title : '';
     // Change-key: same fields as the worker chat-view modal, plus chat id
@@ -1801,7 +1923,7 @@ function _workerCardHtml(r, opts) {
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
                 '<span class="worker-name">' + escapeHtml(label) + '</span>' +
                 '<span class="worker-approval-badge" data-worker-approval title="a tool call is awaiting user approval in this sub\u2019s chat"' +
-                ' style="margin-left:4px;padding:0 5px;border-radius:8px;font-size:9px;font-weight:600;white-space:nowrap;background:#5c4d10;color:#ffe289;"' +
+                ' style="margin-left:4px;padding:0 5px;border-radius:8px;font-size:9px;font-weight:600;white-space:nowrap;background:var(--warning-bg, #5c4d10);color:var(--warning-text, #ffe289);"' +
                 (awaitingAp ? '' : ' hidden') + '>approval</span>' +
             '</span>' +
             '<span class="worker-card-row worker-card-sub">' +
@@ -2041,7 +2163,7 @@ function renderWorkersStrip() {
                 // icon slot ('' suffix on legacy records keeps old keys stable).
                 if (r) live = r.state + ':' + _subActivityKey(r);
             }
-            parts.push((m.subAgentId || '') + ':' + st + ':' + prog + ':' + phn + ':' + ((m.phasesDropped | 0)) + ':' + live);
+            parts.push((m.subAgentId || '') + ':' + st + ':' + prog + ':' + (m.progressDropped | 0) + ':' + phn + ':' + ((m.phasesDropped | 0)) + ':' + live + ':' + _subParentHistoryKey(m));
         }
         return parts.join('|');
     }
@@ -2104,7 +2226,7 @@ function renderWorkersStrip() {
     // escape single quotes, which made the inline form an XSS surface
     // if any agent_id ever contained one.
     if (typeof document !== 'undefined') {
-        document.addEventListener('click', function(evt) {
+        _handleSubAgentUiClick = function(evt) {
             // −/+ string-collapse toggles inside sub-report panels carry
             // data-sub-collapse (stable pref key) + data-sub-collapse-id
             // (stable DOM id). Toggle via the shared toggleJsonCollapse,
@@ -2190,7 +2312,8 @@ function renderWorkersStrip() {
                 }
                 t = t.parentNode;
             }
-        });
+        };
+        document.addEventListener('click', _handleSubAgentUiClick);
         // Record the user's open/collapse choice for sub-report cards so the
         // next repaint honors it. Listen for the native 'toggle' event in the
         // CAPTURE phase (toggle does not bubble) — it fires for EVERY way a

@@ -35,7 +35,15 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // For Anthropic: normalize ALL messages to array format, then add cache_control at branching points
     // Cache points: system prompt + last 2 user messages + last message
     // This allows branching without cache invalidation
-    var messagesWithCache = messages.map(function(m) { return Object.assign({}, m); });
+    var messagesWithCache = messages.map(function(m) {
+        var copy = Object.assign({}, m);
+        // block_order is AppAgent-internal replay metadata consumed only by
+        // transformMessageToAnthropic (Claude OAuth, background.js). Every other
+        // provider gets the raw body (OpenRouter chat-completions passthrough) —
+        // never leak unknown message fields there.
+        if (!provider.isClaudeOAuth) delete copy.block_order;
+        return copy;
+    });
     var modelLower = provider.model.toLowerCase();
     var isAnthropic = (modelLower.includes('anthropic') || modelLower.includes('claude'));
     if (isAnthropic && messagesWithCache.length > 0) {
@@ -112,7 +120,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         // falling back to DEFAULT_MAX_TOKENS (core/030-config.js). Legacy
         // per-provider maxTokens still stored on old providers in IndexedDB
         // is deliberately IGNORED — pure-global design, global wins.
-        max_tokens: getGlobalMaxTokens(),
+        // Passing the model lets an UNSET setting resolve to the model-aware
+        // default (Opus 5.5+ → 128000); an explicit user value is verbatim.
+        max_tokens: getGlobalMaxTokens(provider.model),
         usage: { include: true }  // Required to get cache info in response
     };
     // Claude 4.7+ returns 400 on any non-default sampling param (temperature/
@@ -159,20 +169,25 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         if (!requestBody.reasoning) requestBody.reasoning = {};
         requestBody.reasoning.effort = provider.effort;
     }
-    if (thinkingOff) {
+    if (thinkingOff && !isThinkingBindingModel(modelLower)) {
         // OpenRouter's documented off switch (reasoning.enabled:false). The
         // OAuth transforms in background.js read the same flag:
-        // transformToAnthropic sends no `thinking` object (except Fable 5.1+,
-        // whose thinking cannot be disabled) and transformToResponses drops
-        // `reasoning` entirely.
+        // transformToAnthropic sends no `thinking` object and
+        // transformToResponses drops `reasoning` entirely.
+        // NOT for thinking-bound models (Fable/Mythos 5.1+, Opus 5.5+ —
+        // isThinkingBindingModel, core/030-config.js): their thinking is
+        // always-on and 'disabled' is a 400, so the off switch is a no-op
+        // there and reasoning stays absent (model default adaptive).
         requestBody.reasoning = { enabled: false };
     }
-    if (isAdaptiveOnly && provider.thinkingBudget && !requestBody.reasoning) {
+    if (isAdaptiveOnly && provider.thinkingBudget && !requestBody.reasoning && !thinkingOff) {
         // A legacy thinkingBudget was suppressed above and no effort is
         // configured: send the documented default effort explicitly so
         // OpenRouter doesn't fall back to budget-style thinking. When the
         // provider has NEITHER thinkingBudget nor effort, leave reasoning
         // absent — "(default)" effort must keep meaning the model default.
+        // Skipped when thinking is OFF: a thinking-bound model then sends no
+        // `reasoning` at all (model default), not an injected effort:'high'.
         requestBody.reasoning = { effort: 'high' };
     }
 	if (provider.provider) {
@@ -412,6 +427,17 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     var toolCallBuffers = {};
     var reasoningDetails = []; // Preserve for API continuity
     var reasoningDetailsMap = {}; // Merge streaming fragments by index
+    // Anthropic content-block order (Claude OAuth SSE only — background.js emits
+    // delta.anthropic_block on every content_block_start). Entries:
+    //   {t:'r', i:<reasoning_details index>}  thinking / redacted_thinking
+    //   {t:'x', s:<start>, e:<end>}            text, offsets into `content`
+    //   {t:'u', id:<tool_use id>}              tool_use
+    // Stays null for every other provider (no markers) → legacy replay.
+    var blockOrder = null;
+    var openTextEntry = null;
+    function closeOpenTextEntry() {
+        if (openTextEntry) { openTextEntry.e = content.length; openTextEntry = null; }
+    }
     var isAnthropicModel = modelLower.includes('anthropic') || modelLower.includes('claude');
 
     var chunkCount = 0;
@@ -455,8 +481,16 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
             var jsonStr = line.substring(6);
 
-            try {
-                var data = JSON.parse(jsonStr);
+            // Only malformed wire JSON is skippable. Errors thrown while
+            // PROCESSING a parsed event (callbacks, API errors) must propagate —
+            // the old whole-block catch swallowed any error whose message
+            // contained 'JSON'/'Unexpected token' or had no message at all.
+            var data;
+            try { data = JSON.parse(jsonStr); }
+            catch (parseError) { continue; }
+            // Event-processing block (kept as a scope block after the try was
+            // narrowed to JSON.parse, so the indentation below is unchanged).
+            {
 
                 // Detect error responses in stream (backend errors sent mid-stream)
                 if (data.error) {
@@ -468,10 +502,13 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                         if (data.error.code !== undefined) apiErr.code = data.error.code;
                         if (data.error.retryable !== undefined) apiErr.retryable = data.error.retryable;
                     }
-                    // Flag so the parse-error swallow below can't eat a genuine
-                    // in-stream API error whose text happens to contain 'JSON'
-                    // or 'Unexpected token'.
+                    // Marks a genuine in-stream API error (vs. a malformed-wire
+                    // parse error) so callers/tests can tell them apart.
                     apiErr.isApiError = true;
+                    // Diagnostics: keep what streamed before the API error so
+                    // the caller can surface/inspect it instead of losing it.
+                    apiErr.partialContent = content;
+                    apiErr.partialThinking = thinking;
                     throw apiErr;
                 }
 
@@ -526,12 +563,40 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 if (choice.finish_reason === 'refusal' || choice.finish_reason === 'content_filter') {
                     refusalFinish = choice.finish_reason;
                 }
+                // G-3: max_output_tokens truncation (OpenRouter 'length'; the
+                // ChatGPT-OAuth relay in background.js maps response.incomplete
+                // /max_output_tokens to the same finish_reason) is NOT an error —
+                // the partial content is kept and the stream ends normally. The
+                // flag rides the request metrics so callers/logs can tell a
+                // truncated turn from a complete one.
+                if (choice.finish_reason === 'length') {
+                    reqMetrics.truncated = true;
+                }
 
                 var delta = choice.delta;
                 var thinkingChunk = null;
 
                 // Check for thinking/reasoning in delta
                 if (delta) {
+                    if (delta.anthropic_block && typeof delta.anthropic_block === 'object') {
+                        var ab = delta.anthropic_block;
+                        closeOpenTextEntry();
+                        if (!blockOrder) blockOrder = [];
+                        if (ab.type === 'text') {
+                            openTextEntry = { t: 'x', s: content.length, e: content.length };
+                            blockOrder.push(openTextEntry);
+                        } else if (ab.type === 'thinking' || ab.type === 'redacted_thinking') {
+                            // Same index fallback as the SSE handler's rd index.
+                            blockOrder.push({ t: 'r', i: (typeof ab.index === 'number') ? ab.index : 0 });
+                        } else if (ab.type === 'tool_use') {
+                            blockOrder.push({ t: 'u', id: ab.id || '' });
+                        } else {
+                            // Unknown block type (server tools etc.) — cannot be
+                            // replayed from our flattened fields; the '?' entry
+                            // fails validation so replay uses the legacy path.
+                            blockOrder.push({ t: '?', type: String(ab.type || '') });
+                        }
+                    }
                     
                     // ALWAYS accumulate reasoning_details when present (for API continuity)
                     // Also extract text for display as fallback
@@ -554,11 +619,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                                 if (rd.text) existing.text = (existing.text || '') + rd.text;
                                 if (rd.thinking) existing.thinking = (existing.thinking || '') + rd.thinking;
                                 if (rd.content) existing.content = (existing.content || '') + rd.content;
-                                // reasoning.summary entries (OpenRouter / OpenAI Responses)
-                                // stream their text in `summary` chunks — accumulate like
-                                // `thinking`, or only the last chunk survives into the
-                                // stored (and replayed) reasoning_details.
-                                if (rd.summary) existing.summary = (existing.summary || '') + rd.summary;
+                                // String summary chunks accumulate. Responses summary
+                                // arrays are complete replay snapshots: replace, never
+                                // stringify/concatenate them on a repeated item update.
+                                if (Array.isArray(rd.summary)) existing.summary = rd.summary;
+                                else if (rd.summary) existing.summary = (existing.summary || '') + rd.summary;
                                 if (rd.signature && rd.signature.length > 0) existing.signature = rd.signature;
                                 if (rd.data) existing.data = rd.data;
                             } else {
@@ -567,9 +632,19 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                         });
                     }
                     
-                    // Priority order for DISPLAY: reasoning > reasoning_content > thinking > reasoning_details
+                    // Priority order for DISPLAY: OAuth snapshot > reasoning > reasoning_content > thinking > reasoning_details
                     var thinkingSource = null;
-                    if (delta.reasoning) {
+                    // The subscription adapter may correct a public terminal
+                    // summary or insert an earlier indexed part. This internal
+                    // full-text snapshot overrides display deltas, not replay data.
+                    // An EXPLICIT empty-string snapshot is a valid full-text
+                    // state too (B13): it clears the displayed thinking rather
+                    // than falling through to append an ordinary delta.
+                    var hasReasoningSnapshot = provider.isChatGPTOAuth && typeof delta.reasoning_snapshot === 'string';
+                    if (hasReasoningSnapshot) {
+                        thinkingChunk = delta.reasoning_snapshot;
+                        thinkingSource = 'delta.reasoning_snapshot';
+                    } else if (delta.reasoning) {
                         thinkingChunk = delta.reasoning;
                         thinkingSource = 'delta.reasoning';
                     } else if (delta.reasoning_content) {
@@ -583,7 +658,10 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                         thinkingSource = 'reasoning_details.text';
                     }
                     
-                    if (thinkingChunk) {
+                    if (hasReasoningSnapshot) {
+                        thinking = thinkingChunk;
+                        onThinking(thinking);
+                    } else if (thinkingChunk) {
                         thinking += thinkingChunk;
                         onThinking(thinking);
                     }
@@ -671,11 +749,6 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                     }
                 }
 
-            } catch (e) {
-                // Re-throw real errors (e.g. API errors detected in stream)
-                // Only silently continue for JSON parse errors
-                if (e && e.isApiError) throw e;
-                if (e.message && !e.message.includes('JSON') && !e.message.includes('Unexpected token')) throw e;
             }
         }
     }
@@ -692,12 +765,19 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // Capture usage from OpenRouter if available in final data
     // OpenRouter typically includes usage in X-headers or final message
     
+    // Close the last text block BEFORE any synthetic refusal text is appended,
+    // so its end offset covers only what the model streamed.
+    closeOpenTextEntry();
+
     // Surface refusals as visible assistant text (see refusalFinish capture in
     // the chunk loop). 'content_filter' only counts when the model produced no
     // content at all — some providers use it for partial output filtering.
     if (refusalFinish && (refusalFinish === 'refusal' || !content)) {
+        var preRefusalLen = content.length;
         content += (content ? '\n\n' : '') + '[Request declined by the model (' + provider.model + '). Refused requests can often be served by a different model — switch the provider and retry.]';
         onContent(content);
+        // The synthetic notice replays as its own trailing text block.
+        if (blockOrder) blockOrder.push({ t: 'x', s: preRefusalLen, e: content.length });
     }
 
     // IMPORTANT: Only pass back reasoning_details that came from the API
@@ -706,7 +786,8 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         thinking: thinking,
         content: content,
         tool_calls: toolCalls.length > 0 ? toolCalls : null,
-        reasoning_details: reasoningDetails.length > 0 ? reasoningDetails : null
+        reasoning_details: reasoningDetails.length > 0 ? reasoningDetails : null,
+        block_order: (blockOrder && blockOrder.length > 0) ? blockOrder : null
     });
 }
 

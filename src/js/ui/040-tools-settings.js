@@ -224,6 +224,24 @@ function renderSettingsPage() {
                 '<div><div class="settings-page-row-label">Deferred tool loading (experimental)</div><div class="settings-page-row-hint">Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.</div></div>' +
                 '<input type="checkbox" ' + (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive() ? 'checked' : '') + ' onchange="toggleDeferredTools(this.checked)">' +
             '</div>' +
+
+            // P4 kill-switches (core/030-config.js P4_FLAG_DEFAULTS). Default off.
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">P4: offscreen self-heal (experimental)</div><div class="settings-page-row-hint">When the offscreen sandbox document exists but its keep-alive port never connects, close and recreate it once instead of waiting minutes. Default off.</div></div>' +
+                '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_OFFSCREEN_SELF_HEAL') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_OFFSCREEN_SELF_HEAL\', this.checked)">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">P4: sub-agent saturation hard-stop (experimental)</div><div class="settings-page-row-hint">At ~60% context a sub-agent gets a mandatory hand-over notice; after two more turns it is auto-reported to its parent as need_input. Default off.</div></div>' +
+                '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_SUB_SATURATION_HARDSTOP') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_SUB_SATURATION_HARDSTOP\', this.checked)">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">P4: boot placeholder sweep (experimental)</div><div class="settings-page-row-hint">On service-worker boot, finalize tool-result placeholders stranded by a crashed run so the chat can continue. Default off.</div></div>' +
+                '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_BOOT_PLACEHOLDER_SWEEP') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_BOOT_PLACEHOLDER_SWEEP\', this.checked)">' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">P4: action watchdog re-kick (experimental)</div><div class="settings-page-row-hint">On page boot, re-start background actions whose agent run never began (interrupted before the first assistant turn). When off, such actions are marked as an error instead. Default off.</div></div>' +
+                '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_ACTION_WATCHDOG') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_ACTION_WATCHDOG\', this.checked)">' +
+            '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.hook + ' Hooks</div>' +
@@ -275,14 +293,14 @@ function renderSettingsPage() {
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Max Tokens</div><div class="settings-page-row-hint">Max output tokens per request, for all providers. Default: 64000</div></div>' +
+                '<div><div class="settings-page-row-label">Max Tokens</div><div class="settings-page-row-hint">Max output tokens per request, for all providers. Default: 64000 (128000 for Opus 5.5+ until you set a value)</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-max-tokens" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.maxTokens.min + '" max="' + SETTINGS_NUMBER_LIMITS.maxTokens.max + '" step="1000" value="' + getGlobalMaxTokens() + '" onchange="updateGlobalMaxTokens(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). 0 = thinking off (not for Fable 5.1+; a model with an Effort set still thinks). Default: 32000</div></div>' +
+                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). 0 = thinking off (not for Fable 5.1+ or Opus 5.5+, whose thinking is always on; a model with an Effort set still thinks). Default: 32000</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.min + '" max="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.max + '" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
                     '<span class="settings-input-suffix">tokens</span>' +
@@ -1295,9 +1313,9 @@ async function _syncAndUpdateWorkspaceHeaderInner(session) {
 
 async function toggleWorkspaceDropdown() {
     if (_wsDropdown) { hideWorkspaceDropdown(); return; }
-    // Register the explicit gesture before any awaited local scan so an active
-    // quiet header session cannot settle and disappear while this open is suspended.
-    var session = _beginWsRefreshBatch(true);
+    // Join quietly before any awaited local scan so an active header session
+    // cannot settle while this open is suspended. Keep cached status visible.
+    var session = _beginWsRefreshBatch(false);
     var sessionEnded = false;
     function endOpeningParticipant() {
         if (sessionEnded) return;
@@ -1347,13 +1365,13 @@ async function toggleWorkspaceDropdown() {
 }
 
 // Repeated opens share one dropdown participant. If a header batch is already
-// active, the dropdown joins its session: completed keys remain covered while
-// pending keys upgrade to visible refreshing.
+// active, the dropdown joins its session: completed keys remain covered and
+// pending keys keep refreshing without adding an opening spinner.
 function _syncDropdownInBackground(joinedSession) {
     if (_wsDropdownSyncInFlight) return _wsDropdownSyncInFlight;
     var session = joinedSession && joinedSession === _wsRefreshSession
-        ? _joinWsRefreshBatch(joinedSession, true)
-        : _beginWsRefreshBatch(true);
+        ? _joinWsRefreshBatch(joinedSession, false)
+        : _beginWsRefreshBatch(false);
     // Defer startup into the promise so a synchronous renderer/worker throw still
     // reaches the shared cleanup and cannot strand a participant or session.
     _wsDropdownSyncInFlight = Promise.resolve().then(function() {
@@ -1366,7 +1384,7 @@ function _syncDropdownInBackground(joinedSession) {
 }
 
 function _syncDropdownBatch(session, keys) {
-    _paintWsRefreshing(session, keys);
+    if (session.showRefreshing) _paintWsRefreshing(session, keys);
     return _runWsRefreshBatch(session, keys);
 }
 
@@ -2197,6 +2215,8 @@ function autoNameFromModelId(modelId) {
 // dirty flag and stops the mirroring (clearing the field re-arms it).
 var _modelNameDirty = false;
 function onModelIdInput(value) {
+    var effortSlider = document.getElementById('modal-effort-slider');
+    if (effortSlider) onModalEffortSliderInput(effortSlider.value);
     if (_modelNameDirty) return;
     var nameField = document.getElementById('provider-name');
     if (nameField) nameField.value = autoNameFromModelId(value);
@@ -2239,14 +2259,20 @@ var _MODAL_EFFORT_DEFAULT_IDX = _MODAL_EFFORT_LEVELS.length - 1;
 // authKind: 'chatgpt' | 'claude' | 'endpoint' — passed explicitly while the
 // modal HTML is still being built (the radio group is not in the DOM yet);
 // later callers omit it and the live radio selection is read.
-function _modalEffortLabelHtml(idx, authKind) {
+function _modalEffortLabelHtml(idx, authKind, model) {
     var e = _MODAL_EFFORT_LEVELS[idx] || _MODAL_EFFORT_LEVELS[_MODAL_EFFORT_DEFAULT_IDX];
     var kind = authKind || _selectedModelAuthKind();
     // ChatGPT OAuth: transformToResponses (background.js) clamps xhigh/max to
     // 'high' (the Responses API rejects them) — surface that on the slider.
-    var clampedOnChatGPT = kind === 'chatgpt' && (e.v === 'xhigh' || e.v === 'max');
+    if (model === undefined) {
+        var modelInput = document.getElementById('provider-model');
+        model = modelInput && modelInput.value;
+    }
+    var astra = kind === 'chatgpt' && isChatGPTAstraModel(model);
+    // GPT-6 Astra/Sol/Luna take xhigh/max natively (chatGPTSupportsExtendedEffort).
+    var clampedOnChatGPT = kind === 'chatgpt' && !chatGPTSupportsExtendedEffort(model) && (e.v === 'xhigh' || e.v === 'max');
     return '<span class="model-menu-effort-name">' + e.label + '</span>' +
-        (e.v === '' ? '<span class="model-row-badge">server decides</span>' : '') +
+        (e.v === '' ? '<span class="model-row-badge">' + (astra ? 'high on Astra' : 'server decides') + '</span>' : '') +
         (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
 }
 function onModalEffortSliderInput(v) {
@@ -2417,7 +2443,9 @@ function showAddApiProviderModal(editingProvider) {
 
     // Reasoning-effort slider (same control as the model pill menu, plus a
     // trailing 'Default' stop at the high end = the old select's empty option).
-    var effortIdx = _MODAL_EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(provider.effort || '');
+    var displayedEffort = provider.effort || '';
+    if (authKind === 'chatgpt' && isChatGPTAstraModel(provider.model) && /^(none|minimal)$/i.test(displayedEffort)) displayedEffort = 'low';
+    var effortIdx = _MODAL_EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(displayedEffort);
     if (effortIdx < 0) effortIdx = _MODAL_EFFORT_DEFAULT_IDX;
     var effortDots = '';
     for (var di = 0; di < 6; di++) {
@@ -2492,9 +2520,9 @@ function showAddApiProviderModal(editingProvider) {
                             '<input type="range" class="model-menu-effort-slider" id="modal-effort-slider" min="0" max="5" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onModalEffortSliderInput(this.value)">' +
                             '<span class="effort-disc" id="modal-effort-disc"></span>' +
                         '</div>' +
-                        '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx, authKind) + '</div>' +
+                        '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx, authKind, provider.model) + '</div>' +
                     '</div>' +
-                    '<input type="hidden" id="provider-effort" value="' + escapeHtml(provider.effort || '') + '">' +
+                    '<input type="hidden" id="provider-effort" value="' + escapeHtml(displayedEffort) + '">' +
                 '</div>' +
             '</div>' +
             '<div class="modal-actions">' +
@@ -2685,7 +2713,7 @@ async function confirmDeleteApiProvider(providerName) {
 async function deleteApiProviderAndRefresh(providerName) {
     var wasCurrent = currentProvider === providerName;
     var replacement = wasCurrent
-        ? (apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus 5')
+        ? (apiProviders.length > 1 ? apiProviders.find(function(p) { return p.name !== providerName; }).name : 'Opus 5.5')
         : currentProvider;
     try {
         await deleteApiProvider(providerName);
@@ -2817,6 +2845,18 @@ async function toggleDeferredTools(enabled) {
     }
 }
 
+// Settings toggles for the P4 kill-switches (core/030-config.js
+// P4_FLAG_DEFAULTS / saveP4Flag). No offscreen push needed: the SW re-reads
+// the flags on every run-agent gate via loadAssumedContextTokens().
+async function toggleP4Flag(name, enabled) {
+    if (typeof saveP4Flag === 'function') {
+        await saveP4Flag(name, !!enabled);
+    }
+    if (typeof showSnackbar === 'function') {
+        showSnackbar(String(name) + ' ' + (enabled ? 'enabled' : 'disabled'), 'success');
+    }
+}
+
 function updateSystemPromptTokenCount() {
     var textarea = document.getElementById('system-prompt-textarea');
     var tokenDisplay = document.getElementById('system-prompt-token-display');
@@ -2859,7 +2899,8 @@ function renderSettingsToolPermissions() {
     var html = '';
     var host = getConnectedInstanceHost();
     var instPerms = host ? (instancePermissions[host] || { tier: 'manual', tools: {} }) : null;
-    var isAutoTier = instPerms && instPerms.tier === 'auto';
+    // auto AND dev ignore per-tool settings — both grey out the per-tool controls.
+    var isAutoTier = instPerms && (instPerms.tier === 'auto' || instPerms.tier === 'dev');
 
     // Reset link (only when non-default)
     if (hasNonDefaultPermissions()) {
@@ -2999,13 +3040,8 @@ function renderSettingsToolPermissions() {
         var tierContainer = document.getElementById('settings-instance-tier-toggle');
         if (tierContainer) {
             var currentTier = instPerms ? instPerms.tier : 'manual';
-            var manualSelected = currentTier === 'manual';
-            tierContainer.innerHTML = '<div class="radio-group radio-group-small">' +
-                '<div class="radio-option' + (manualSelected ? ' selected' : '') + '" title="Manual: You control each permission" ' +
-                    'onclick="event.stopPropagation(); setInstanceTier(\'manual\', this); renderSettingsToolPermissions();">' + UI_ICONS.lock + ' Manual</div>' +
-                '<div class="radio-option' + (!manualSelected ? ' selected' : '') + '" title="Auto: Agent decides for write operations" ' +
-                    'onclick="event.stopPropagation(); setInstanceTier(\'auto\', this); renderSettingsToolPermissions();">' + UI_ICONS.sparkle + ' Auto</div>' +
-            '</div>';
+            // Shared Manual / Auto / Dev control (ui/140-dropdowns.js _instanceTierToggleHtml).
+            tierContainer.innerHTML = _instanceTierToggleHtml(currentTier, ' renderSettingsToolPermissions();');
         }
     }
 
@@ -3022,7 +3058,9 @@ function renderSettingsToolPermissions() {
     // Render global permission radios
     GLOBAL_PERMISSION_KEYS.concat(skillToolKeys).forEach(function(key) {
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
-        var perm = toolPermissions[key] || (isReadPermissionKey(key) || key === 'workspace:push' ? 'allow' : 'auto');
+        // Keep in sync with ui/140-dropdowns.js:281 and the worker default in
+        // worker/025-permissions-helpers.js (get_cookie → 'allow').
+        var perm = toolPermissions[key] || (isReadPermissionKey(key) || key === 'workspace:push' || key === 'get_cookie' ? 'allow' : 'auto');
         _renderPermRadio(containerId, perm, key, false, false);
     });
 }

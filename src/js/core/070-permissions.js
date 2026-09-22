@@ -37,6 +37,7 @@ var GLOBAL_READ_KEYS = [
     'cached_content_search',
     'cached_content_read',
     'get_skill',
+    'widget_eval:list',
     'get_tool_schema',
     'display',
     'prompt_user',
@@ -61,6 +62,10 @@ var GLOBAL_READ_KEYS = [
 // (except web_fetch → 'ask', get_cookie → 'allow', workspace:push → 'allow')
 var GLOBAL_WRITE_KEYS = [
     'js_eval',
+    // run_js_file / run_tests execute workspace code inside the js_eval sandbox — same tier as js_eval.
+    'run_js_file',
+    'run_tests',
+    'widget_eval',
     'html_widget',
     'pin_widget',
     'web_fetch',
@@ -133,8 +138,56 @@ function resolvePermissionKey(toolName, methodOrAction) {
     if ((toolName === 'manage_skill' || toolName === 'workspace' || toolName === 'document') && methodOrAction) {
         return toolName + ':' + methodOrAction;
     }
+    if (toolName === 'widget_eval' && methodOrAction === 'list') return 'widget_eval:list';
     // Direct match for global tools
     return toolName;
+}
+
+// ── "Allow for this chat" grants (sessionPermissions) ─────────────────────
+// sessionPermissions is keyed by ROOT chat + permission key:
+//   chatPermKey(rootChatId, permKey) === rootChatId + '::' + permKey
+// A grant made in a chat covers that chat AND every sub-agent spawned under
+// it (any nesting depth) — sub chats resolve to the same root via the
+// sub-agent registry. A start_chat background chat is its own root (no
+// inheritance). Shared by both twins (worker/025-permissions-helpers.js and
+// ui/140-dropdowns.js) — this file is in WORKER_SHARED_FILES.
+function chatPermKey(rootChatId, permKey) {
+    return String(rootChatId) + '::' + String(permKey);
+}
+
+// Walk a (possibly sub-agent) chat id up to its top-level root chat id.
+// Primary source: the sub-agent registry record for the chat
+// (SubAgents.getByChatId → root_chat_id / parent_chat_id, both twins load
+// core/097). Fallback: chats[id].parentChatId when the registry has no
+// record. Bounded + cycle-guarded; returns the input when it is not a sub.
+function resolveRootChatId(chatId) {
+    if (!chatId) return null;
+    var cur = String(chatId);
+    var seen = {};
+    for (var i = 0; i < 16; i++) {
+        seen[cur] = true;
+        var next = null;
+        try {
+            var rec = (typeof SubAgents !== 'undefined' && SubAgents && SubAgents.getByChatId)
+                ? SubAgents.getByChatId(cur) : null;
+            if (rec) next = rec.root_chat_id || rec.parent_chat_id || null;
+            else if (typeof chats !== 'undefined' && chats && chats[cur] && chats[cur].parentChatId) next = chats[cur].parentChatId;
+        } catch (e) { next = null; }
+        if (!next || next === cur || seen[next]) break;
+        cur = String(next);
+    }
+    return cur;
+}
+
+// True when the chat (or its root) holds an "Allow for this chat" grant for
+// permKey. Tolerates a missing chatId (→ false) so callers that cannot
+// identify the chat fall through to the tier/instance/default rules.
+function hasChatPermissionGrant(permKey, chatId) {
+    if (!chatId || !permKey) return false;
+    if (typeof sessionPermissions === 'undefined' || !sessionPermissions) return false;
+    var root = resolveRootChatId(chatId);
+    if (!root) return false;
+    return sessionPermissions[chatPermKey(root, permKey)] === 'allow';
 }
 
 // Check if a permission key is instance-scoped

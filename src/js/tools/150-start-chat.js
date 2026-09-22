@@ -137,6 +137,20 @@ async function executeStartChat(args, options) {
         }
     }
 
+    // Origin is supplied only by the parent bridge's event.source lookup, not
+    // by widget-supplied args. It is attached ONLY for background sends: the
+    // calling render survives those (currentChatId never moves), so the agent
+    // can target this exact live copy. Foreground send/draft switch the view
+    // to a new chat, which tears the calling widget down — referencing its
+    // instance_id there would point the agent at a dead render, and the
+    // agent-facing prefix would also land in the user-visible composer.
+    var originInstanceId = background ? (options.widgetInstanceId || null) : null;
+    if (originInstanceId) {
+        finalMessage = 'Live widget origin: instance_id=' + originInstanceId +
+            '. Use widget_eval with this explicit instance_id to inspect or update this live render. ' +
+            'If it closes or rerenders, report unavailable; never substitute another copy.\n\n' + finalMessage;
+    }
+
     var explicitTitle = (typeof args.title === 'string' && args.title.trim()) ? args.title.trim().substring(0, 120) : null;
 
     // ─── background send ────────────────────────────────────────────────
@@ -162,6 +176,7 @@ async function executeStartChat(args, options) {
             messages: [{ role: 'user', content: finalMessage }],
             createdAt: Date.now(),
             updatedAt: Date.now(),
+            originWidgetInstanceId: originInstanceId,
             sourceChatId: options.chatId || ((typeof currentChatId !== 'undefined') ? currentChatId : null) || null
         };
         // Same provisional-title helper sendMessage() uses (app/040-send-message.js
@@ -189,6 +204,7 @@ async function executeStartChat(args, options) {
             mode: mode,
             sent: true,
             background: true,
+            origin_instance_id: originInstanceId,
             widget_id: widgetId || null,
             widget_context_included: widgetContextIncluded,
             message: finalMessage,

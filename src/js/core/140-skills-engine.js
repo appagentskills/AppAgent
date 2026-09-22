@@ -322,7 +322,28 @@ function getActiveSkillTools() {
     return tools;
 }
 
-var LARGE_RESPONSE_LINE_LIMIT = 50; // Max lines to show for large responses
+var LARGE_RESPONSE_LINE_LIMIT = 50; // Line count above which a skill-tool result is ALSO stored in `lastLargeResponse`
+
+// #10: a skill-tool result above LARGE_RESPONSE_LINE_LIMIT used to be replaced by a
+// 50-line preview for the agent. That short-circuited processToolResultForCache,
+// so the cached_content_* tools never saw the full data. Now the FULL result is
+// returned (the normal >16 KB `_cached` path takes over) and the object is still
+// stored per chat so js_eval's `lastLargeResponse` keeps working. The stored
+// object is the original reference; the notice goes on a shallow copy so the
+// stored value is not mutated. Arrays / primitives are returned untouched (no
+// key to hang a notice on). Sandbox callers (fromSandbox) never reach this.
+// VERIFIED (security follow-up #5): the value returned here flows out of
+// executeTool's isSkillTool arm (tools/020-tool-execution.js) into the agent
+// loop, which ALWAYS passes tool results through processToolResultForCache
+// (app/030-agent-loop.js batch/replay/main paths) before recordToolResult — so
+// a >16 KB result is `_cached` for the model, never inlined raw.
+function _skillLargeResult(chatId, result, totalLines) {
+    setLastLargeResponse(chatId, result); // CONC-FIX: per-chat, not shared global; LEAK-FIX: bounded (evicts oldest past cap)
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+    var out = Object.assign({}, result);
+    out._notice = 'Large response (' + totalLines + ' lines). Full data is returned here (when >16 KB it is cached: use cached_content_outline / cached_content_search / cached_content_read) AND stored in the `lastLargeResponse` variable for js_eval (filter, map, count, extract fields).';
+    return out;
+}
 
 // Execute skill tool in isolated sandbox (same security model as js_eval)
 async function executeSkillTool(toolName, args, options, messageIndex) {
@@ -348,7 +369,25 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
         // chrome.runtime.sendMessage type='sw-exec-tool' handler in
         // background.js.
         if (typeof Platform !== 'undefined' && Platform.isWorker) {
-            var swResult = await Platform.callOffscreenHelper('helper-skill-sandbox', {
+            // B12: same INACTIVITY watchdog + abort-signal teardown as the SW
+            // js_eval path (tools/020-tool-execution.js). callOffscreenHelper's
+            // timeoutMs only gates offscreen READINESS, so a hung skill iframe
+            // used to stall the run forever. Race the call against a 15 s-tick
+            // inactivity clock (reset by inner sandbox tool calls via
+            // _sandboxActivity, held while an inner call is in flight via
+            // _sandboxPending, hold capped by _SANDBOX_HOLD_MAX_MS) and abort
+            // in `finally` so the helper sends 'helper-cancel-sandbox' for THIS
+            // request id (background.js onAbort → offscreen activeSandboxes[id]())
+            // and the exact iframe is disposed. The rejection falls through to
+            // the outer catch → {success:false}.
+            var _skTimer = null;
+            var _skAbort = (typeof AbortController === 'function') ? new AbortController() : null;
+            var _skHoldMax = (typeof _SANDBOX_HOLD_MAX_MS === 'number') ? _SANDBOX_HOLD_MAX_MS : 60000;
+            var _skInactivityMs = 5 * 60 * 1000;
+            var swResult;
+            try {
+            swResult = await Promise.race([
+            Platform.callOffscreenHelper('helper-skill-sandbox', {
                 toolCode: toolInfo.code,
                 toolName: toolName,
                 args: args,
@@ -363,21 +402,33 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
                 // → background.js executeTool). NOT `messageIndex || null` —
                 // index 0 is a legitimate value.
                 messageIndex: (typeof messageIndex === 'number' && messageIndex >= 0) ? messageIndex : null
-            }, 5 * 60 * 1000);
-            var swResultStr = JSON.stringify(swResult, null, 2);
+            }, 5 * 60 * 1000, _skAbort ? _skAbort.signal : undefined),
+            new Promise(function(_, rej) {
+                var _skLast = Date.now();
+                _skTimer = setInterval(function() {
+                    if (chatId && typeof _sandboxPending !== 'undefined' && _sandboxPending && _sandboxPending[chatId] > 0) {
+                        var _held = (typeof _sandboxActivity !== 'undefined' && _sandboxActivity && _sandboxActivity[chatId]) || _skLast;
+                        if (Date.now() - _held < _skHoldMax) return;
+                    }
+                    var _act = chatId && typeof _sandboxActivity !== 'undefined' && _sandboxActivity && _sandboxActivity[chatId];
+                    if (_act && _act > _skLast) _skLast = _act;
+                    if (Date.now() - _skLast >= _skInactivityMs) {
+                        rej(new Error('skill tool ' + toolName + ' timed out after 5 minutes of inactivity (no tool calls or completion)'));
+                    }
+                }, 15000);
+            })
+            ]);
+            } finally {
+                if (_skTimer) clearInterval(_skTimer);
+                // Promise.race alone only abandons the helper promise — abort
+                // disposes the exact iframe on timeout; a completed call has
+                // already detached its abort listener, so success is unchanged.
+                if (_skAbort) { try { _skAbort.abort(); } catch (eAb) {} }
+            }
+            var swResultStr = String(JSON.stringify(swResult === undefined ? null : swResult, null, 2) ?? '');
             var swLines = swResultStr.split('\n');
             if (swLines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {
-                setLastLargeResponse(chatId, swResult); // CONC-FIX: per-chat, not shared global; LEAK-FIX: bounded (evicts oldest past cap)
-                var swPreview = swLines.slice(0, LARGE_RESPONSE_LINE_LIMIT).join('\n');
-                return {
-                    success: swResult.success !== undefined ? swResult.success : true,
-                    status: swResult.status,
-                    _response_truncated: true,
-                    _total_lines: swLines.length,
-                    _preview_lines: LARGE_RESPONSE_LINE_LIMIT,
-                    _notice: 'Response too large (' + swLines.length + ' lines). Showing first ' + LARGE_RESPONSE_LINE_LIMIT + ' lines. Full data stored in `lastLargeResponse` variable - use js_eval to process it (e.g., filter, map, count items, extract specific fields).',
-                    preview: swPreview
-                };
+                return _skillLargeResult(chatId, swResult, swLines.length); // #10: full result + notice, no preview
             }
             return swResult;
         }
@@ -476,25 +527,9 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
         var lines = resultStr.split('\n');
 
         if (lines.length > LARGE_RESPONSE_LINE_LIMIT && !(options && options.fromSandbox)) {
-            // Store full response in a per-chat slot for Agent manipulation (CONC-FIX:
-            // not a shared global — avoids cross-chat bleed when two chats run at once;
-            // LEAK-FIX: bounded setter evicts the oldest slot past the cap).
-            setLastLargeResponse(chatId, result);
-
-            // Create truncated preview (first 50 lines)
-            var preview = lines.slice(0, LARGE_RESPONSE_LINE_LIMIT).join('\n');
-            var totalLines = lines.length;
-
-            // Return truncated result with metadata
-            return {
-                success: result.success !== undefined ? result.success : true,
-                status: result.status,
-                _response_truncated: true,
-                _total_lines: totalLines,
-                _preview_lines: LARGE_RESPONSE_LINE_LIMIT,
-                _notice: 'Response too large (' + totalLines + ' lines). Showing first ' + LARGE_RESPONSE_LINE_LIMIT + ' lines. Full data stored in `lastLargeResponse` variable - use js_eval to process it (e.g., filter, map, count items, extract specific fields).',
-                preview: preview
-            };
+            // #10: store per chat for js_eval AND return the full result (no preview)
+            // so the normal `_cached` path / cached_content_* tools see all of it.
+            return _skillLargeResult(chatId, result, lines.length);
         }
 
         return result;

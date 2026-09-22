@@ -37,7 +37,14 @@ function queryWidgetViaPostMessage(iframe, action, args) {
 // this, the page-side chats[].targetTabId write for NON-navigate actions is
 // wiped by the next agent-event, so the "pins subsequent browser actions in
 // this chat to that tab" contract was broken for everything except navigate.
-async function executeIframeTool(args) {
+// `options` (from executeTool) may carry chatId — the chat the tool is RUNNING
+// for (offscreen exec-tool bridge). Browser-action routing must use THAT chat's
+// targetTabId, not the chat the user is currently VIEWING (currentChatId), or a
+// sub-agent/background chat drives the wrong tab. Falls back to currentChatId.
+async function executeIframeTool(args, options) {
+    var _ifChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
+        ? options.chatId
+        : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined);
     var _pinTab = null;
     if (args && args.tab_id != null && !args.widget_id &&
         typeof chrome !== 'undefined' && chrome.tabs &&
@@ -61,8 +68,8 @@ async function executeIframeTool(args) {
     if (args && !args.widget_id && args.tab_id == null && _NOPIN_ACTIONS.indexOf(args.action) !== -1 &&
         typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query &&
         typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode') &&
-        !(typeof chats !== 'undefined' && typeof currentChatId !== 'undefined' &&
-          chats[currentChatId] && chats[currentChatId].targetTabId)) {
+        !(typeof chats !== 'undefined' && _ifChatId !== undefined &&
+          chats[_ifChatId] && chats[_ifChatId].targetTabId)) {
         try {
             // Same query background.js getActiveTabId uses (currentWindow), so
             // the stamped unpinned_tab matches the tab the action actually hit.
@@ -70,7 +77,7 @@ async function executeIframeTool(args) {
             if (_actTabs && _actTabs[0] && _actTabs[0].url) _noPinTab = { id: _actTabs[0].id, url: _actTabs[0].url };
         } catch (e) { /* tabs API unavailable — skip the guard */ }
     }
-    var _ftResult = await _executeIframeToolImpl(args);
+    var _ftResult = await _executeIframeToolImpl(args, _ifChatId, options);
     if (_noPinTab && _ftResult && typeof _ftResult === 'object' && _ftResult.success) {
         _ftResult.unpinned_tab = { tab_id: _noPinTab.id, url: _noPinTab.url };
         var _instOrigin = null, _tabOrigin = null;
@@ -86,7 +93,8 @@ async function executeIframeTool(args) {
     return _ftResult;
 }
 
-async function _executeIframeToolImpl(args) {
+async function _executeIframeToolImpl(args, _ifChatId, options) {
+    if (_ifChatId === undefined && typeof currentChatId !== 'undefined') _ifChatId = currentChatId;
     var action = args.action;
     var widgetId = args.widget_id;
 
@@ -107,8 +115,8 @@ async function _executeIframeToolImpl(args) {
             // tab_id already validated by the executeIframeTool wrapper, which also
             // mirrors this pin to the SW chat snapshot (_target_tab_persist), so a
             // subsequent browser action that omits tab_id stays pinned to this tab.
-            if (chats[currentChatId]) {
-                chats[currentChatId].targetTabId = args.tab_id;
+            if (chats[_ifChatId]) {
+                chats[_ifChatId].targetTabId = args.tab_id;
                 if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
             }
         }
@@ -121,7 +129,7 @@ async function _executeIframeToolImpl(args) {
             if (args.preset && presets[args.preset]) { rw = presets[args.preset].w; rh = presets[args.preset].h; }
             else { rw = args.width; rh = args.height; }
             if (!rw && !rh) return { success: false, error: 'Provide width/height or a preset (mobile, tablet, desktop, fullhd)' };
-            var extResize = await Platform.sendBrowserAction('resize', { width: rw, height: rh });
+            var extResize = await Platform.sendBrowserAction('resize', { width: rw, height: rh }, _ifChatId);
             if (extResize.error) return { success: false, error: extResize.error };
             var resizeMsg = 'Resized to ' + rw + 'x' + rh;
             if (extResize.emulated) {
@@ -134,7 +142,7 @@ async function _executeIframeToolImpl(args) {
                 var _settleDeadline = Date.now() + 1500;
                 while (Date.now() < _settleDeadline) {
                     var _pi;
-                    try { _pi = await Platform.sendBrowserAction('get_page_info', {}); } catch (e) { _pi = null; }
+                    try { _pi = await Platform.sendBrowserAction('get_page_info', {}, _ifChatId); } catch (e) { _pi = null; }
                     if (_pi && !_pi.error) {
                         var _wOk = !rw || Math.abs((_pi.viewportWidth || 0) - rw) <= 2;
                         var _hOk = !rh || Math.abs((_pi.viewportHeight || 0) - rh) <= 2;
@@ -168,7 +176,7 @@ async function _executeIframeToolImpl(args) {
                             var _baseUrl = _navInstanceUrl || Platform.instanceUrl;
                             if (_baseUrl) fullTabNavUrl = _baseUrl + fullTabNavUrl;
                         }
-                        var _ftChat = chats[currentChatId];
+                        var _ftChat = chats[_ifChatId];
                         var _existingTabId = _ftChat && _ftChat.targetTabId;
                         var _reuseTab = false;
                         // If targeting a different instance, try to find an existing tab on it first
@@ -202,7 +210,7 @@ async function _executeIframeToolImpl(args) {
                                 var _otherChatTabIds = {};
                                 try {
                                     Object.keys(chats || {}).forEach(function(_cid) {
-                                        if (_cid !== currentChatId && chats[_cid] && chats[_cid].targetTabId) {
+                                        if (_cid !== _ifChatId && chats[_cid] && chats[_cid].targetTabId) {
                                             _otherChatTabIds[chats[_cid].targetTabId] = true;
                                         }
                                     });
@@ -336,7 +344,7 @@ async function _executeIframeToolImpl(args) {
                                     (async function _pollReady() {
                                         while (Date.now() < _readyDeadline) {
                                             try {
-                                                var _ping = await Platform.sendBrowserAction('get_page_info', {});
+                                                var _ping = await Platform.sendBrowserAction('get_page_info', {}, _ifChatId);
                                                 if (_ping && !_ping.error) { resolve(); return; }
                                             } catch (e) { /* not ready yet */ }
                                             await new Promise(function(r){ setTimeout(r, 150); });
@@ -397,7 +405,7 @@ async function _executeIframeToolImpl(args) {
                 // Side panel mode close: expand back to full page after response completes
                 if (action === 'close' && document.body.classList.contains('sidepanel-mode')) {
                     var _expandCheck = setInterval(function() {
-                        if (typeof isChatRunning !== 'function' || !isChatRunning(currentChatId)) {
+                        if (typeof isChatRunning !== 'function' || !isChatRunning(_ifChatId)) {
                             clearInterval(_expandCheck);
                             saveChatsToStorage().then(function() {
                                 expandSidePanel();
@@ -417,7 +425,7 @@ async function _executeIframeToolImpl(args) {
                 };
                 var extResult;
                 try {
-                    extResult = await Platform.sendBrowserAction(action, args);
+                    extResult = await Platform.sendBrowserAction(action, args, _ifChatId);
                 } catch (e) {
                     extResult = { error: 'Extension browser action failed: ' + e.message };
                 }
@@ -430,13 +438,13 @@ async function _executeIframeToolImpl(args) {
                     while (_portAttempt < _maxPortRetries && extResult && extResult.error && _isPortError(extResult.error)) {
                         _portAttempt++;
                         try {
-                            var _retryChat = chats[currentChatId];
+                            var _retryChat = chats[_ifChatId];
                             var _retryTabId = _retryChat && _retryChat.targetTabId;
                             if (_retryTabId) chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _retryTabId });
                         } catch (e) { /* defensive */ }
                         await new Promise(function(r){ setTimeout(r, 300 * _portAttempt); });
                         try {
-                            extResult = await Platform.sendBrowserAction(action, args);
+                            extResult = await Platform.sendBrowserAction(action, args, _ifChatId);
                         } catch (e2) {
                             extResult = { error: 'Extension browser action failed: ' + e2.message };
                         }
@@ -448,7 +456,7 @@ async function _executeIframeToolImpl(args) {
                 // Persist target tab ID on the chat so it survives restarts
                 var _spPersist = null;
                 if (action === 'navigate' && extResult.tabId) {
-                    var _navChat = chats[currentChatId];
+                    var _navChat = chats[_ifChatId];
                     if (_navChat) {
                         _navChat.targetTabId = extResult.tabId;
                         saveChatsToStorage();
@@ -885,138 +893,16 @@ async function _executeIframeToolImpl(args) {
                 };
 
             case 'edit_html':
-                if (!widgetId) return { success: false, error: 'widget_id is required for edit_html action' };
-                if (!args.edits || !Array.isArray(args.edits)) return { success: false, error: 'edits array is required for edit_html action. Format: [{ find: "old text", replace: "new text" }]' };
-                var widget = getWidgetById(widgetId);
-                if (!widget) return { success: false, error: 'Widget not found: ' + widgetId };
-                
+                if (!widgetId) return { success: false, error: 'widget_id is required for edit_html' };
+                if (!Array.isArray(args.edits)) return { success: false, error: 'edits array is required' };
+                if (!Number.isInteger(args.expected_version)) return { success: false, code: 'VERSION_REQUIRED', error: 'Read html_widget action=read, then pass expected_version for a safe saved edit.' };
+                await WidgetStore.read(widgetId);
+                var widget = WidgetStore.view(widgetId, args.expected_version);
+                if (!widget) return { success: false, error: 'Widget/base version not found: ' + widgetId };
                 var editResult = applySearchReplaceEdits(widget.html, args.edits);
-                if (editResult.error) {
-                    return { success: false, error: 'Edit failed', validationErrors: editResult.messages };
-                }
-                
-                // Update widget HTML (keep the pre-edit html: saveDashboardWidget's
-                // history diff needs it when the record IS `widget`, see below)
-                var _prevHtml = widget.html;
-                widget.html = editResult.content;
-                // Bump a monotonic content version whenever the HTML changes. The
-                // widget runs in a cross-origin (sandboxed, opaque-origin) iframe,
-                // so its live DOM can't be rasterized directly — take_screenshot
-                // re-renders it in a temp tab via the ?widget= deep link. Keying that
-                // deep link on this version (see 060-take-screenshot.js) guarantees a
-                // fresh render after edit_html instead of a stale cached frame.
-                widget.contentVersion = (widget.contentVersion || 0) + 1;
-                widget.updatedAt = Date.now();
-                
-                // DASHBOARD COPY (#737): a pinned widget's dashboard record is a
-                // SEPARATE object in its own store — update it through the same
-                // merge path the manual editor uses (tools/080-widget-tools.js:627-637).
-                // saveDashboardWidget MERGES DASHBOARD_CONTENT_FIELDS onto the existing
-                // record so grid placement survives; _prevHtml keeps the history diff
-                // working when the record IS `widget` (a dashboard-only widget resolved
-                // by getWidgetById's dashboardWidgets fallback, tools/080-widget-tools.js:229).
-                if (typeof dashboardWidgets !== 'undefined' && dashboardWidgets[widgetId]
-                    && typeof saveDashboardWidget === 'function') {
-                    try { await saveDashboardWidget(widget, false, _prevHtml); } catch (e) {}
-                }
-                
-                // Persist changes into the OWNING chat — mirror saveWidgetCodeEdit
-                // (tools/080-widget-tools.js:650-677): resolve the chat that actually
-                // HOLDS the widget (widget.chatId is stamped at creation, but legacy
-                // widgets predate it and the declared owner may be gone), push-if-
-                // missing, and for a DASHBOARD-ONLY widget (source chat deleted) skip
-                // the chat write — the dashboard write above is its durable copy —
-                // instead of silently dropping the edit while reporting success (#737).
-                var _owningChatId = widget.chatId || currentChatId;
-                var _holdsWidget = function(c) {
-                    return !!(c && Array.isArray(c.widgets)
-                        && c.widgets.some(function(w) { return w && w.id === widgetId; }));
-                };
-                var chat = _owningChatId ? chats[_owningChatId] : null;
-                if (!_holdsWidget(chat)) {
-                    var _cIds = Object.keys(chats);
-                    for (var _ci = 0; _ci < _cIds.length; _ci++) {
-                        if (_holdsWidget(chats[_cIds[_ci]])) {
-                            _owningChatId = _cIds[_ci];
-                            chat = chats[_owningChatId];
-                            break;
-                        }
-                    }
-                    if (!_holdsWidget(chat) && typeof dashboardWidgets !== 'undefined'
-                        && dashboardWidgets[widgetId] === widget) {
-                        chat = null;
-                    }
-                }
-                if (chat) {
-                    if (!Array.isArray(chat.widgets)) chat.widgets = [];
-                    var idx = chat.widgets.findIndex(function(w) { return w.id === widgetId; });
-                    if (idx !== -1) {
-                        chat.widgets[idx].html = widget.html;
-                        chat.widgets[idx].contentVersion = widget.contentVersion;
-                        chat.widgets[idx].updatedAt = widget.updatedAt;
-                    } else {
-                        chat.widgets.push(widget);
-                    }
-                    // MEMFIX: rehydrate evicted payloads BEFORE persisting — both realms'
-                    // put-loops skip a _payloadsEvicted chat (ui/070-dashboard-ui.js:2011,
-                    // worker/115-storage.js:178), and the page loader flags every chat
-                    // outside the newest 8 (ui/070-dashboard-ui.js:1804-1815). Without this
-                    // the await below commits NOTHING for a cross-chat / non-recent owning
-                    // chat and the edit is lost on reload. Must run AFTER the mutation above
-                    // and immediately BEFORE the save: hydration awaits, so doing it earlier
-                    // lets an SW chat-snapshot replace (app/045-agent-port-bridge-page.js:550)
-                    // land mid-await and leave `chat` dangling; doing it after the save is
-                    // useless because the put has already been skipped.
-                    // Same pattern as tools/100-prompt-user.js:267-278 and
-                    // ui/170-chat-management.js:1086-1093. ensureChatPayloads never rejects
-                    // and is a cheap no-op when the flag is clear; never clear
-                    // _payloadsEvicted by hand — extractChatPayloadsForPut would then put a
-                    // stripped record and destroy a legacy-inline row's only durable base64.
-                    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-                        try { await ensureChatPayloads(_owningChatId); } catch (e) {}
-                    }
-                    // Await the IndexedDB commit: a take_screenshot(widget) that runs
-                    // right after this edit deep-links a temp tab that reads the widget
-                    // html back from IndexedDB. If the write hasn't committed the temp
-                    // tab renders the PRE-edit html, broadcasts the old contentVersion,
-                    // never matches the capture guard, and falls back to a stale frame
-                    // after the 5s safety-net.
-                    await saveChatsToStorage();
-                } else if (typeof dashboardWidgets === 'undefined' || !dashboardWidgets[widgetId]) {
-                    // No chat holds it and it has no dashboard record: the edit is
-                    // in-memory only. Same loud warn as saveWidgetCodeEdit's no-home path.
-                    console.warn('[iframe-tool] edit_html: no owning chat or dashboard record for '
-                        + widgetId + ' — edit NOT persisted');
-                }
-                
-                // Refresh inline widget if visible
-                var inlineContainer = document.getElementById('widget-content-' + widgetId);
-                if (inlineContainer) {
-                    // Release the old iframe's onWidgetResize 'message' listener
-                    // before nuking it — every other teardown path calls
-                    // __widgetCleanup (tools/080-widget-tools.js deactivate/modal,
-                    // ui/250-message-render.js); innerHTML='' alone leaked one
-                    // inert listener per agent inline edit.
-                    var _oldIframe = inlineContainer.querySelector('iframe');
-                    if (_oldIframe && _oldIframe.__widgetCleanup) { try { _oldIframe.__widgetCleanup(); } catch (e) {} }
-                    inlineContainer.innerHTML = '';
-                    renderWidgetInContainer(widget, inlineContainer);
-                }
-                
-                var result = { success: true, message: 'Widget HTML updated', appliedEdits: editResult.appliedEdits.length };
-                if (editResult.partialSuccess) {
-                    result.warning = 'Some edits failed';
-                    result.failedEdits = editResult.failedEdits;
-                }
-                // Propagate the updated html + contentVersion to the service worker's
-                // authoritative chat object. The SW's saveChatsToStorage() does a full
-                // store.clear()+rewrite of the chat store from SW memory after each tool
-                // result; without this the SW still holds the PRE-edit widget and
-                // clobbers the page-side IndexedDB save back to the old html. The
-                // take_screenshot deep-link temp tab then loadChatsFromStorage()'s that
-                // stale html and re-renders the OLD widget — the byte-identical
-                // post-edit screenshot. The SW mirror upserts by id (worker/120-tool-routing.js).
-                result._widget_persist = widget;
+                if (editResult.error) return { success: false, error: 'Edit failed', validationErrors: editResult.messages };
+                var result = await saveWidgetRevision(widget, editResult.content, args.expected_version, await widgetOperationId(args, options));
+                if (result.success) result.appliedEdits = editResult.appliedEdits.length;
                 return result;
 
             // Hidden actions (not in tool schema - used by skill tools via executeTool)
@@ -1242,7 +1128,7 @@ async function _executeIframeToolImpl(args) {
                         if (!stopRes.ok) return { success: false, error: 'Failed to stop impersonation: HTTP ' + stopRes.status };
                         impersonateOriginalUserSysId = null;
                         appStorage.removeItem('impersonateOriginalUserSysId');
-                        Platform.sendBrowserAction('reload', {});
+                        Platform.sendBrowserAction('reload', {}, _ifChatId);
                         return { success: true, message: 'Impersonation ended. Switched back to original user. Iframe reloaded.' };
                     }
                     // Store original user sys_id before first impersonation
@@ -1278,7 +1164,7 @@ async function _executeIframeToolImpl(args) {
                     if (!impRes.ok) {
                         return { success: false, error: 'Impersonation failed: HTTP ' + impRes.status };
                     }
-                    Platform.sendBrowserAction('reload', {});
+                    Platform.sendBrowserAction('reload', {}, _ifChatId);
                     return { success: true, message: 'Now impersonating user (sys_id: ' + userSysId + '). Iframe reloaded.' };
                 } catch(e) {
                     return { success: false, error: 'Impersonate failed: ' + e.message };

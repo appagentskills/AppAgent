@@ -16,10 +16,21 @@
     var _BLOCKED_NAMES = { eval:1, Function:1, fetch:1, XMLHttpRequest:1, WebSocket:1, Worker:1,
         SharedWorker:1, ServiceWorker:1, importScripts:1, chrome:1, browser:1 };
     var _BLOCKED_PROPS = { __proto__:1, constructor:1, prototype:1 };
+    // Leading segments that resolve back to the global object. _call/_val walk
+    // dotted paths from `window`, so `window.fetch`, `globalThis.eval`,
+    // `self.top.fetch` or `document.defaultView.fetch` reach the same dangerous
+    // API as the bare name — strip these aliases before the blocklist check.
+    var _GLOBAL_ALIASES = { window:1, globalThis:1, self:1, top:1, parent:1, frames:1 };
 
     function _isBlockedPath(name) {
         var parts = name.split('.');
-        if (_BLOCKED_NAMES[parts[0]]) return true;
+        var i = 0;
+        while (i < parts.length - 1) {
+            if (_GLOBAL_ALIASES[parts[i]]) i++;
+            else if (parts[i] === 'document' && parts[i + 1] === 'defaultView' && i + 1 < parts.length - 1) i += 2;
+            else break;
+        }
+        if (_BLOCKED_NAMES[parts[i]]) return true;
         for (var i = 0; i < parts.length; i++) {
             if (_BLOCKED_PROPS[parts[i]]) return true;
         }

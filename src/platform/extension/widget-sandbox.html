@@ -13,9 +13,68 @@
 // deaf the moment a widget rendered: live dark/light flips broadcast by
 // broadcastWidgetTheme (ui/240-layout.js) never reached rendered widgets, so
 // they kept the load-time theme until a full page reload.
+var _widgetEvalInstanceId = null;
+var _widgetEvalPort = null;
+
+function closeWidgetEvalDocument() {
+    if (!_widgetEvalPort) return;
+    _widgetEvalPort.postMessage({ type: 'widgetDocumentGone' });
+    _widgetEvalPort.close();
+    _widgetEvalPort = null;
+}
+
+function connectWidgetEvalDocument() {
+    if (!_widgetEvalInstanceId || _widgetEvalPort) return;
+    var channel = new MessageChannel();
+    var port = _widgetEvalPort = channel.port1;
+    port.onmessage = function(event) {
+        var data = event.data;
+        if (!data || port !== _widgetEvalPort) return;
+        if (data.type === 'widgetInstanceProbe') {
+            port.postMessage({ type: 'widgetContentLoaded', probe_id: data.probe_id });
+        } else if (data.type === 'widgetEval') {
+            evaluateWidgetScript(data, port);
+        }
+    };
+    port.start();
+    window.addEventListener('pagehide', closeWidgetEvalDocument);
+    // Outbound only. Parent never sends a port or eval code to the reusable
+    // WindowProxy, including during readiness/probe handshakes.
+    window.parent.postMessage({ type: 'widgetEvalChannel', instance_id: _widgetEvalInstanceId }, '*', [channel.port2]);
+}
+
+// Runs ONLY in this manifest-sandboxed frame (never the privileged panel).
+// JSON boundary rejects unsupported values instead of silently dropping them.
+async function evaluateWidgetScript(data, port) {
+    if (!_widgetEvalInstanceId || data.instance_id !== _widgetEvalInstanceId || typeof data.request_id !== 'string' || typeof data.code !== 'string' || data.code.length > 65536) return;
+    var json;
+    try {
+        var AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+        var value = await new AsyncFunction(data.code).call(window);
+        json = JSON.stringify({ success: true, result: value === undefined ? null : value }, function(key, v) {
+            var type = typeof v;
+            if (type === 'function' || type === 'symbol' || type === 'bigint' || type === 'undefined' || (type === 'number' && !Number.isFinite(v))) throw new Error('Result is not JSON-compatible.');
+            if (v && type === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) throw new Error('Return plain JSON data, not DOM nodes or class instances.');
+            return v;
+        });
+        if (json.length > 65536) throw new Error('Result exceeds 65536 characters.');
+    } catch (error) {
+        var message;
+        try { message = String(error && error.message || error).slice(0, 1024); }
+        catch (_) { message = 'Script rejected with an unserializable error.'; }
+        json = JSON.stringify({ success: false, error: message });
+    }
+    if (port === _widgetEvalPort) port.postMessage({ type: 'widgetEvalResult', instance_id: data.instance_id, request_id: data.request_id, json: json });
+}
+
 function onParentMessage(e) {
     if (e.source !== window.parent) return;
+    // Window messages are bootstrap/theme only; eval and probes require the
+    // original document-owned MessagePort.
     if (e.data && e.data.type === 'loadWidget') {
+        closeWidgetEvalDocument();
+        _widgetEvalInstanceId = e.data.instance_id || null;
+        window._widgetInstanceId = _widgetEvalInstanceId;
         document.open();
         document.write(e.data.html);
         document.close();
@@ -44,7 +103,8 @@ function onParentMessage(e) {
         // hidden tab; rAF still wins in a visible/foreground tab (timing unchanged there).
         var _nextFrame = function(cb){ var done=false; var fire=function(){ if(done) return; done=true; try{ cb(); }catch(e){} }; try{ requestAnimationFrame(fire); }catch(e){} setTimeout(fire, 50); };
         var _signalRendered = function() {
-            try { window.parent.postMessage({ type: 'widgetContentLoaded' }, '*'); } catch (err) {}
+            connectWidgetEvalDocument();
+            try { window.parent.postMessage({ type: 'widgetContentLoaded', instance_id: _widgetEvalInstanceId }, '*'); } catch (err) {}
         };
         var _afterLayout = function() {
             _nextFrame(function() { _nextFrame(_signalRendered); });

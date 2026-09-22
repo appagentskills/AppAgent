@@ -404,7 +404,7 @@ function _openAgentBus() {
     // and ships its in-memory session map DOWN in the 'hello' envelope. The
     // old boot-time mirror push here was the QW9 wipe bug: a fresh panel's
     // `{}` sessionPermissions passed the typeof guard, the SW applied it as
-    // a change, and the rebroadcast revoked "Allow for session" grants in
+    // a change, and the rebroadcast revoked "Allow for this chat" grants in
     // EVERY panel. The only thing sent on (re)connect now is a queued EDIT
     // that failed while the port was down (pushPermissionsToOffscreen's
     // queue) — an explicit user action, never a boot-state mirror.
@@ -765,6 +765,14 @@ function _handleAgentBusMessage(msg) {
                         }
                     });
                 }
+                // Saved content always resolves from the committed canonical revision,
+                // including same-counter legacy ties. Snapshot membership stays scoped.
+                if (typeof WidgetStore !== 'undefined' && Array.isArray(_inChat.widgets)) {
+                    _inChat.widgets = _inChat.widgets.map(function(w) {
+                        return Object.assign({}, w, WidgetStore.view(w.id) || {}, { msgIndex: w.msgIndex, chatId: w.chatId });
+                    });
+                    chatWidgets[msg.detail.chatId] = _inChat.widgets;
+                }
                 // FLUX-ADOPT (#836): guarded adopt — runs the RES-5 pending-row,
                 // JOBS-UNREAD meta and MEMFIX-EVDELTA heavy-payload merges, then
                 // assigns. A refusal (incoming row staler than the page copy —
@@ -861,11 +869,16 @@ function _handleAgentBusMessage(msg) {
             // BEFORE arming the grace reconcile below, so the timer knows
             // whether it may need its one-shot extension.
             _swResumeScanSettledSeen = !!msg.resumeScanSettled;
+            // B11: a deferred never-started action sweep (tools/120-actions.js)
+            // waits for exactly this signal — run it now instead of on its timer.
+            if (_swResumeScanSettledSeen && typeof _onResumeScanSettledForActions === 'function') {
+                try { _onResumeScanSettledForActions(); } catch (e) {}
+            }
             // F6: the hello envelope carries the SW's authoritative in-memory
             // session permission map. Overwrite — not merge — the page
             // replica: a fresh SW legitimately resets session grants (RFC
             // §4.5 phase-3 semantics), and a live SW seeds panels that
-            // connect after "Allow for session" was granted elsewhere.
+            // connect after "Allow for this chat" was granted elsewhere.
             if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
                 sessionPermissions = msg.sessionPermissions;
                 // FLUX-4/1: the hello map is applied SW authority — arm the
@@ -1085,6 +1098,10 @@ function _handleAgentBusMessage(msg) {
             // (or its one-shot extension) fires on schedule and re-checks
             // live state then.
             _swResumeScanSettledSeen = true;
+            // B11: release the deferred never-started action sweep (tools/120-actions.js).
+            if (typeof _onResumeScanSettledForActions === 'function') {
+                try { _onResumeScanSettledForActions(); } catch (e) {}
+            }
             return;
 
         case 'subagent-snapshot':
@@ -1165,6 +1182,29 @@ function _postExecToolResult(envelope) {
 }
 
 async function _handleExecToolFromOffscreen(msg) {
+    // toolCallId dedupe: the SW adoption path (worker/120-tool-routing.js) is
+    // best-effort, so a re-dispatch for an id this panel is ALREADY executing
+    // or has ALREADY finished must never re-run the UI tool (e.g. type the
+    // same text into a form twice). In flight → ignore; the original
+    // invocation posts + buffers its result. Completed (within TTL) → re-post
+    // the cached result; a duplicate exec-tool-result is a clean no-op on the
+    // SW side (resolvePendingUIToolCall on an already-settled id).
+    if (_inflightToolCalls[msg.toolCallId]) return;
+    var _dupDone = _completedToolResults[msg.toolCallId];
+    if (_dupDone) {
+        _postExecToolResult(_dupDone.error
+            ? { type: 'exec-tool-result', toolCallId: msg.toolCallId, error: _dupDone.error }
+            : { type: 'exec-tool-result', toolCallId: msg.toolCallId, result: _dupDone.result });
+        return;
+    }
+    // Recovery may ONLY reuse a retained result/in-flight call above. A cache
+    // miss (eviction, panel replacement, or lost dispatch) is indeterminate,
+    // never permission to execute arbitrary widget code again.
+    if (msg.name === 'widget_eval' && msg.widgetEvalRecoverOnly) {
+        _postExecToolResult({ type: 'exec-tool-result', toolCallId: msg.toolCallId, result: { success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
+            error: 'Prior widget evaluation result is unavailable. NOT re-executed; verify state before a NEW call.' } });
+        return;
+    }
     _inflightToolCalls[msg.toolCallId] = {
         chatId: msg.chatId,
         name: msg.name,
@@ -1358,7 +1398,18 @@ async function runAgent(overrideChatId) {
         // that's already running. Caller's await still completes when
         // the existing run does.
         if (_pendingRunAgents[chatId]) return _pendingRunAgents[chatId].promise;
-        return;
+        // No pending entry (the run was started by the SW itself — checkpoint
+        // resume, another panel, a sub-agent kick — and hello/runStarted
+        // re-populated runningChatIds). Returning immediately let callers
+        // (sendWidgetMessage, summarize) finalize mid-run. Register an entry
+        // WITHOUT posting run-agent: it settles through the same paths as any
+        // other entry — the runFinished/runCrashed relay, the hello grace
+        // reconcile, or the 15s no-hello safety — so it cannot hang longer
+        // than a normal runAgent await.
+        var _joinResolve;
+        var _joinPromise = new Promise(function(resolve) { _joinResolve = resolve; });
+        _pendingRunAgents[chatId] = { resolve: _joinResolve, promise: _joinPromise };
+        return _joinPromise;
     }
     // Mark running locally so the UI (chat list pill, pause button) reflects
     // it immediately. Offscreen will emit runStarted soon, which will set
@@ -1380,9 +1431,36 @@ async function runAgent(overrideChatId) {
 
     // Make sure the port is open. The async retry in _openAgentBus
     // means it may not be there yet at boot; queue and try shortly.
+    //
+    // Bounded, single chain per pending entry. The old chain was immortal:
+    // every Retry/Send while the SW was dead spawned another 50ms loop that
+    // outlived the 15s safety settle and burst stale run-agent posts on the
+    // next reconnect (starting runs the user no longer asked for). Now:
+    //   • entry identity — once the entry is settled (deleted from
+    //     _pendingRunAgents by runFinished / hello grace / safety timer) or
+    //     replaced, the chain stops;
+    //   • deadline — no retries past BUS_HELLO_SAFETY_MS, mirroring the
+    //     no-hello window after which the promise is settled anyway;
+    //   • one chain per entry — a second runAgent on the same pending entry
+    //     cancels the earlier chain's timer instead of stacking a new one.
+    if (_pendingEntry._retryTimer) { try { clearTimeout(_pendingEntry._retryTimer); } catch (e) {} }
+    _pendingEntry._retryTimer = null;
+    var _attemptStartedAt = Date.now();
     var attempt = function() {
+        _pendingEntry._retryTimer = null;
+        if (_pendingRunAgents[chatId] !== _pendingEntry) return; // settled or replaced
+        if (Date.now() - _attemptStartedAt > BUS_HELLO_SAFETY_MS) {
+            // Deadline: the port never came (cold boot where _openAgentBus
+            // keeps failing, or a dead SW with no onDisconnect-armed safety
+            // timer). Settle the entry ourselves so the caller's await and the
+            // local running pill don't hang forever — the run was never posted.
+            delete _pendingRunAgents[chatId];
+            delete runningChatIds[chatId];
+            try { _pendingEntry.resolve(); } catch (e) {}
+            return;
+        }
         if (!_agentBusPort) {
-            setTimeout(attempt, 50);
+            _pendingEntry._retryTimer = setTimeout(attempt, 50);
             return;
         }
         try {
@@ -1398,7 +1476,7 @@ async function runAgent(overrideChatId) {
             });
         } catch (e) {
             // Port died between check and post — retry.
-            setTimeout(attempt, 50);
+            _pendingEntry._retryTimer = setTimeout(attempt, 50);
         }
     };
     attempt();
@@ -1579,9 +1657,16 @@ function _permDiff(base, cur) {
     });
     return any ? { set: set, del: del } : null;
 }
-// Queue only the DURABLE slots: replaying a stale SESSION map on reconnect
-// would resurrect grants a fresh SW legitimately reset (RFC §4.5 — session
-// grants die with the SW). A session grant lost to a port flap re-prompts.
+// Queue only the DURABLE slots. The session slot ("Allow for this chat"
+// grants) is deliberately NOT queued — and that is now SAFE rather than
+// lossy: the SW self-applies the grant from the approval verdict itself
+// (exec-approval-prompt-result status 'session_allowed' →
+// swGrantChatPermission, worker/120-tool-routing.js) and persists it to
+// chrome.storage.session, so the grant never depended on this push. If the
+// port is down when the user clicks, the verdict cannot be posted either and
+// the SW re-prompts on reconnect — the user's next click grants again.
+// Replaying a stale session map here could still clobber a newer grant made
+// from another panel, so the omission stays.
 function _queuePermPatch(patch) {
     var q = null;
     if (patch.toolPermissions) { q = q || {}; q.toolPermissions = patch.toolPermissions; }

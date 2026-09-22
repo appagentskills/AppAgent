@@ -356,6 +356,18 @@ async function executeUpdateActionState(args, options) {
             };
         }
     }
+    // #16: remember that this chat HAS a progress card. The agent loop's
+    // progress nudge (app/030-agent-loop.js) consults chat._progressCardAt so
+    // a card created earlier in the SAME turn (before an injected user-role
+    // notice, or from inside js_eval) is never nudged for again; the loop
+    // clears the stamp when a NEW user turn starts. On the page this chat is
+    // a read-only mirror, so the stamp is ALSO carried on the result
+    // (_progress_card_persist) for the SW tool-routing layer to apply to the
+    // authoritative chat. Stamped ONLY on a successful card update — every
+    // early error return below (invalid state, running subs, action not
+    // found) leaves the chat unstamped so a rejected call never counts as
+    // "has a card".
+    var _pcAt = Date.now();
     var icon = args.icon || 'spinner';
     // Coerce off-list icons to spinner so the agent can't sneak in icons outside the tool def enum.
     if (ALLOWED_ACTION_ICONS.indexOf(icon) < 0) icon = 'spinner';
@@ -421,7 +433,8 @@ async function executeUpdateActionState(args, options) {
         a.updatedAt = Date.now();
         await persistActionState(actionId);
         notifyActionStateChanged(actionId);
-        return { success: true };
+        chat._progressCardAt = _pcAt;
+        return { success: true, _progress_card_persist: _pcAt };
     }
 
     // Foreground chat: nothing to mutate in activeActions — the timeline renderer
@@ -499,7 +512,8 @@ async function executeUpdateActionState(args, options) {
     // `tasks: null` means "not provided, keep previous"; output uses an
     // explicit clearOutput marker for the output:null "clear" signal so the
     // merge in recordSubActionState can tell clear apart from absent.
-    var _uasResult = { success: true };
+    chat._progressCardAt = _pcAt;
+    var _uasResult = { success: true, _progress_card_persist: _pcAt };
     if (_subSnap) {
         _uasResult._sub_action_state = _subSnap;
     }
@@ -607,12 +621,25 @@ async function startAction(skillId, actionName, extraContext) {
         userMsg += '\n\n**Context from the caller:**\n' + extraContext;
     }
     chats[bgChatId].messages.push({ role: 'user', content: userMsg });
-    saveChatsToStorage();
+    // #6b: await the IDB copy so a SW boot scan / page reload never sees an
+    // action whose chat is missing its seed user message.
+    try { await saveChatsToStorage(); } catch (e) {}
 
     notifyActionStateChanged(actionId);
 
-    // Start the agent loop on the background chat
-    runAgent(bgChatId);
+    // Start the agent loop on the background chat. #6b action watchdog: the
+    // page runAgent NEVER rejects (no-port deadline resolves silently without
+    // ever posting run-agent), so both settle paths run the never-started
+    // check — if the chat still has only its seed user row and no run is
+    // live/pending, the action is flipped to an honest error instead of
+    // staying 'running' forever or being finalized as a false 'Complete'.
+    var _runP;
+    try { _runP = runAgent(bgChatId); } catch (e) { _runP = Promise.reject(e); }
+    Promise.resolve(_runP).then(function() {
+        return _watchdogCheckNeverStarted(actionId);
+    }, function(e) {
+        return _watchdogCheckNeverStarted(actionId, e);
+    }).catch(function() {});
 }
 
 // Pause / resume an action's background chat without dropping its state.
@@ -793,6 +820,9 @@ async function finishActionIfDone(chatId) {
     // just-paused action to 'Complete' and destroy resumability. Guard INSIDE
     // finishActionIfDone so every caller (page handler + loop) is covered.
     if (a.state === 'running' && !a._isPaused && !(typeof isChatPaused === 'function' && isChatPaused(a.chatId))) {
+        // #6b: a run that ended with the chat still at its seed user row never
+        // actually started — report that honestly instead of a false 'Complete'.
+        if (_chatNeverStarted(chat)) { return _watchdogCheckNeverStarted(chat.actionId); }
         a.state = 'done';
         a.icon = 'check';
         if (!a.label || a.label === 'Starting…') a.label = 'Complete';
@@ -800,6 +830,129 @@ async function finishActionIfDone(chatId) {
         await persistActionState(chat.actionId);
         notifyActionStateChanged(chat.actionId);
     }
+}
+
+// ---------- #6b action watchdog ----------
+// A background Action chat that still holds exactly its seed user message and
+// no assistant row never got picked up by the agent runtime.
+function _chatNeverStarted(chat) {
+    var ms = (chat && Array.isArray(chat.messages)) ? chat.messages : [];
+    var users = 0, assistants = 0;
+    ms.forEach(function(m) {
+        if (!m) return;
+        if (m.role === 'user') users++;
+        else if (m.role === 'assistant') assistants++;
+    });
+    return users === 1 && assistants === 0;
+}
+// Flip a still-'running', never-started action to an honest error. No-op when
+// the action already left 'running', is paused, the chat progressed, or a run
+// is live (runningChatIds) / pending (_pendingRunAgents) for its chat.
+async function _watchdogCheckNeverStarted(actionId, err) {
+    var a = activeActions[actionId];
+    if (!a || a.state !== 'running' || a._isPaused) return false;
+    var chat = (typeof chats !== 'undefined' && chats) ? chats[a.chatId] : null;
+    if (!chat || !_chatNeverStarted(chat)) return false;
+    if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[a.chatId]) return false;
+    if (typeof _pendingRunAgents !== 'undefined' && _pendingRunAgents && _pendingRunAgents[a.chatId]) return false;
+    a.state = 'error';
+    a.icon = 'alert';
+    a.reloadInterrupted = false;
+    if (err) {
+        // runAgent itself rejected — the runtime really never picked the chat up.
+        a.label = 'Action never started';
+        a.output = 'The agent runtime never picked up this action: ' + String((err && err.message) || err).slice(0, 2000);
+    } else {
+        // R4 SF2: no error in hand. The chat has 1 user / 0 assistant rows, but the
+        // loop also pops the streaming assistant row on API error, Stop and throttle
+        // retry (030-agent-loop.js) — so this is NOT necessarily "SW unavailable".
+        // Word it neutrally and surface the run's API error when the page stamped one.
+        var _apiErr = chat._lastApiError && (chat._lastApiError.message || chat._lastApiError);
+        a.label = 'Action did not produce a response';
+        a.output = 'The action chat has no assistant reply (the run ended before the first model response \u2014 API error, stop, or runtime restart).' +
+            (_apiErr ? ' Last API error: ' + String(_apiErr).slice(0, 2000) : '') +
+            ' Open the chat for details or click the action again to retry.';
+    }
+    a.updatedAt = Date.now();
+    try { await persistActionState(actionId); } catch (e) {}
+    notifyActionStateChanged(actionId);
+    return true;
+}
+// One-shot boot scan (armed from core/120-init.js next to reconcileStaleApprovals,
+// after the SW 'hello' repopulated runningChatIds). Interrupted-by-reload actions
+// whose chat never started: flag P4_ACTION_WATCHDOG ON → re-kick runAgent once;
+// OFF → honest error via _watchdogCheckNeverStarted. Requires the SW resume
+// scan to have settled (_swResumeScanSettledSeen) so a checkpoint resume can
+// never race a re-kick.
+// B11 (sweep follow-up): the guard used to be a SINGLE +9 s re-arm, after
+// which the sweep ran regardless — a cold boot whose resume gate chain
+// (_swBootReady → _swResumeGate → Platform.ready → loadApiProviders) took
+// longer than ~13 s still let a re-kick race the checkpoint resume (two loops
+// on one chat) or flipped a soon-to-resume action to a false error. Now the
+// sweep WAITS for the settle signal: it re-arms every
+// NEVER_STARTED_SWEEP_REARM_MS while `_swResumeScanSettledSeen` is false (up
+// to NEVER_STARTED_SWEEP_MAX_REARMS, ~54 s), and the page bridge fires
+// _onResumeScanSettledForActions() the moment the SW reports the scan
+// settled (hello payload / 'resume-scan-done', app/045) so the deferred sweep
+// runs immediately instead of waiting out the timer. If the cap is exhausted
+// with no settle (wedged / dead SW) the sweep still runs — a stuck spinner
+// must not live forever — but with the re-kick DISABLED: without a settled
+// scan runningChatIds is not authoritative, so only the honest-error branch
+// (which re-checks live state per action) is safe.
+var NEVER_STARTED_SWEEP_REARM_MS = 9000;
+var NEVER_STARTED_SWEEP_MAX_REARMS = 6;
+var _neverStartedSweepDone = false;
+var _neverStartedSweepRearms = 0;
+var _neverStartedSweepTimer = null;
+function _neverStartedSweepClearTimer() {
+    if (_neverStartedSweepTimer) { try { clearTimeout(_neverStartedSweepTimer); } catch (e) {} }
+    _neverStartedSweepTimer = null;
+}
+function reconcileNeverStartedActions() {
+    if (_neverStartedSweepDone) return;
+    var settled = (typeof _swResumeScanSettledSeen === 'undefined') || !!_swResumeScanSettledSeen;
+    if (!settled && _neverStartedSweepRearms < NEVER_STARTED_SWEEP_MAX_REARMS) {
+        _neverStartedSweepRearms++;
+        _neverStartedSweepClearTimer();
+        try {
+            _neverStartedSweepTimer = setTimeout(function() {
+                _neverStartedSweepTimer = null;
+                try { reconcileNeverStartedActions(); } catch (e) {}
+            }, NEVER_STARTED_SWEEP_REARM_MS);
+        } catch (e) {}
+        return;
+    }
+    _neverStartedSweepDone = true;
+    _neverStartedSweepClearTimer();
+    if (!settled) console.warn('[actions] never-started sweep: SW resume scan never settled after ' + _neverStartedSweepRearms + ' re-arms — sweeping without re-kick');
+    if (typeof activeActions === 'undefined' || !activeActions || typeof chats === 'undefined' || !chats) return;
+    var rekick = settled && typeof getP4Flag === 'function' && getP4Flag('P4_ACTION_WATCHDOG');
+    Object.keys(activeActions).forEach(function(id) {
+        var a = activeActions[id];
+        if (!a || a.state !== 'running' || !a.reloadInterrupted || a._isPaused) return;
+        var chat = chats[a.chatId];
+        if (!chat || !_chatNeverStarted(chat)) return;
+        if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[a.chatId]) return;
+        if (typeof _pendingRunAgents !== 'undefined' && _pendingRunAgents && _pendingRunAgents[a.chatId]) return;
+        if (rekick) {
+            a.reloadInterrupted = false;
+            a.updatedAt = Date.now();
+            try { persistActionState(id); } catch (e) {}
+            var _p;
+            try { _p = runAgent(a.chatId); } catch (e) { _p = Promise.reject(e); }
+            Promise.resolve(_p).then(function() { return _watchdogCheckNeverStarted(id); }, function(e) { return _watchdogCheckNeverStarted(id, e); }).catch(function() {});
+        } else {
+            Promise.resolve(_watchdogCheckNeverStarted(id)).catch(function() {});
+        }
+    });
+}
+// B11: page bridge hook (app/045-agent-port-bridge-page.js) — the SW just
+// reported its resume scan settled. Run the DEFERRED sweep now (only when a
+// prior call already deferred it: before init's first call there is nothing
+// to run early, and after completion it is a no-op).
+function _onResumeScanSettledForActions() {
+    if (_neverStartedSweepDone || !_neverStartedSweepRearms) return;
+    try { reconcileNeverStartedActions(); } catch (e) {}
 }
 
 // ---------- Button rendering helpers ----------

@@ -73,6 +73,14 @@ function getEnabledTools(chatId, opts) {
         seenToolNames[n] = true;
         return true;
     });
+    // Deterministic order (prompt-cache / thinking-binding stability):
+    // getActiveSkillTools follows activeSkills insertion order, which varies
+    // with activation order and SW rehydration, so sort skill tools by name.
+    // Core TOOLS keep their static order. Keep in sync with the page twin.
+    skillToolDefs.sort(function(a, b) {
+        var x = a.function.name, y = b.function.name;
+        return x < y ? -1 : (x > y ? 1 : 0);
+    });
     var allTools = baseTools.concat(skillToolDefs);
 
     // Sub-agent / parent visibility filter — keep in sync with page-side
@@ -135,12 +143,18 @@ function getEnabledTools(chatId, opts) {
     return allTools;
 }
 
-function getToolPermission(toolName, methodOrAction) {
+// `chatId` (optional): the calling chat — "Allow for this chat" grants are
+// keyed by ROOT chat (core/070-permissions.js chatPermKey) and checked FIRST.
+function getToolPermission(toolName, methodOrAction, chatId) {
     var permKey = resolvePermissionKey(toolName, methodOrAction);
     if (isInstancePermissionKey(permKey)) {
-        return getInstanceToolPermission(permKey);
+        return getInstanceToolPermission(permKey, chatId);
     }
-    if (sessionPermissions[permKey] === 'allow') return 'allow';
+    // An explicit 'disabled' (Settings > Tool permissions) is the user's hard
+    // stop and wins over any "Allow for this chat" grant — the grant may have
+    // been made BEFORE the user disabled the tool. Mirrors ui/140-dropdowns.js.
+    if (toolPermissions[permKey] === 'disabled') return 'disabled';
+    if (hasChatPermissionGrant(permKey, chatId)) return 'allow';
     if (toolPermissions[permKey]) return toolPermissions[permKey];
     // workspace:push defaults to 'allow' — PR pushes never prompt unless overridden
     if (permKey === 'workspace:push') return 'allow';
@@ -156,21 +170,96 @@ function getToolPermission(toolName, methodOrAction) {
     return isReadPermissionKey(permKey) ? 'allow' : 'auto';
 }
 
-function getInstanceToolPermission(permKey) {
+function getInstanceToolPermission(permKey, chatId) {
     var host = getConnectedInstanceHost();
+    var instPerms = host ? instancePermissions[host] : null;
+    if (!instPerms) instPerms = { tier: 'manual', tools: {} };
+    // Dev tier: EVERY instance-scoped call is 'allow' — no prompt, confirm:true
+    // ignored (requestProgrammaticToolApproval returns on 'allow' before the
+    // confirm check), per-tool settings incl. 'disabled' ignored exactly like
+    // the auto tier ignores them. Mirrors ui/140-dropdowns.js.
+    if (host && instPerms.tier === 'dev') return 'allow';
+    // Explicit per-tool 'disabled' on the connected instance (manual tier) is
+    // the user's hard stop and wins over any chat grant — mirrors
+    // ui/140-dropdowns.js. The auto tier ignores per-tool settings entirely.
+    if (host && instPerms.tier !== 'auto' && instPerms.tools && instPerms.tools[permKey] === 'disabled') return 'disabled';
+    // "Allow for this chat" beats every fallback below (no-instance 'ask',
+    // auto tier, per-tool, defaults).
+    if (hasChatPermissionGrant(permKey, chatId)) return 'allow';
     if (!host) {
         return isReadPermissionKey(permKey) ? 'allow' : 'ask';
     }
-    var instPerms = instancePermissions[host];
-    if (!instPerms) instPerms = { tier: 'manual', tools: {} };
     if (instPerms.tier === 'auto') {
         return isReadPermissionKey(permKey) ? 'allow' : 'auto';
     }
-    if (sessionPermissions[permKey] === 'allow') return 'allow';
     if (instPerms.tools && instPerms.tools[permKey]) {
         return instPerms.tools[permKey];
     }
     return isReadPermissionKey(permKey) ? 'allow' : 'ask';
+}
+
+// ── "Allow for this chat" grant persistence (SW-owned) ─────────────────
+// sessionPermissions (root-chat-scoped grants, core/070-permissions.js) is
+// mirrored to chrome.storage.session so it survives MV3 SW eviction and an
+// extension Reload within the browser session (storage.session is cleared
+// when the browser closes — the intended lifetime). Guarded for contexts
+// without chrome.storage.session (tests / non-extension hosts): there the
+// map stays in-memory only, exactly the pre-persistence behaviour.
+var SW_CHAT_GRANTS_STORAGE_KEY = 'appagent_chatPermissionGrants';
+function persistSessionPermissionsInWorker() {
+    try {
+        if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) return;
+        var payload = {};
+        payload[SW_CHAT_GRANTS_STORAGE_KEY] = (sessionPermissions && typeof sessionPermissions === 'object') ? sessionPermissions : {};
+        var p = chrome.storage.session.set(payload);
+        if (p && typeof p.catch === 'function') p.catch(function(e) { console.warn('[sw-runtime] chat-grant persist failed', e); });
+    } catch (e) { console.warn('[sw-runtime] chat-grant persist threw', e); }
+}
+// Boot hydration — runs next to loadToolPermissionsInWorker (worker/190-entry).
+// Honours the _swPermsDirty boot-race guard (worker/020-page-stubs.js), which
+// distinguishes two kinds of in-flight edit:
+//   • sessionPermissions (FULL-MAP REPLACE: panel push / reset-all,
+//     worker/130 'permissions-update') — the stored map is stale by
+//     definition (a reset-all wiped it on purpose), so it is SKIPPED.
+//   • sessionPermissionsAdditive (single "Allow for this chat" grant,
+//     swGrantChatPermission in worker/120) — the grant landed on an EMPTY
+//     boot map and was persisted as a 1-entry map, so skipping would drop
+//     every earlier grant. Merge stored ∪ memory (memory wins) and
+//     re-persist so storage regains the union.
+async function loadSessionPermissionsInWorker() {
+    try {
+        if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) return;
+        var got = await chrome.storage.session.get(SW_CHAT_GRANTS_STORAGE_KEY);
+        var saved = got && got[SW_CHAT_GRANTS_STORAGE_KEY];
+        if (!saved || typeof saved !== 'object') return;
+        var dirty = (typeof _swPermsDirty !== 'undefined' && _swPermsDirty) ? _swPermsDirty : {};
+        if (dirty.sessionPermissions) return;
+        // sessionPermissionsDelta: a per-key {set,del} delta ('permissions-update'
+        // with sessionPermissionsDelta, e.g. the deleteChat grant prune in
+        // ui/170) landed during the boot window. Like the additive grant it
+        // must MERGE the stored map (other chats' grants) — but keys it
+        // explicitly deleted (dirty.sessionPermissionsDeleted) must NOT be
+        // resurrected from storage.
+        if (dirty.sessionPermissionsAdditive || dirty.sessionPermissionsDelta) {
+            if (!sessionPermissions || typeof sessionPermissions !== 'object') sessionPermissions = {};
+            var mem = sessionPermissions;
+            var deleted = (dirty.sessionPermissionsDeleted && typeof dirty.sessionPermissionsDeleted === 'object') ? dirty.sessionPermissionsDeleted : {};
+            var added = false;
+            Object.keys(saved).forEach(function(k) {
+                if (deleted[k]) return;
+                if (!Object.prototype.hasOwnProperty.call(mem, k)) { mem[k] = saved[k]; added = true; }
+            });
+            if (added) {
+                persistSessionPermissionsInWorker();
+                if (typeof _swPanelPorts !== 'undefined' && _swPanelPorts && typeof _swPanelPorts.forEach === 'function') {
+                    var _pc = { type: 'permissions-changed', sessionPermissions: mem };
+                    _swPanelPorts.forEach(function(p) { try { p.postMessage(_pc); } catch (e) { /* dead port */ } });
+                }
+            }
+            return;
+        }
+        sessionPermissions = saved;
+    } catch (e) { console.warn('[sw-runtime] chat-grant hydrate failed', e); }
 }
 
 function getConnectedInstanceHost() {

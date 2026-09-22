@@ -250,9 +250,9 @@ async function saveChatsToStorage() {
                     // FLUX-QW3: read-merge-write — preserve the page-owned
                     // whitelist from the stored record instead of a blind
                     // full-record put (_preservePageChatFields above). A
-                    // failed get falls back to putting the un-merged record
-                    // (preventDefault contains the request error so it can't
-                    // abort the whole tx).
+                    // failed get skips this row: a blind put could erase a
+                    // committed widget journal or another realm's metadata.
+                    // Other rows still progress and all save waiters settle.
                     pending++;
                     _putRecords++;
                     (function(_rec, _getReq) {
@@ -297,11 +297,11 @@ async function saveChatsToStorage() {
                             putRequest.onerror = settleOne;
                             settleOne(); // settle the get's slot
                         }
-                        if (!_getReq) { _issuePut(null); return; }
+                        if (!_getReq) { settleOne(); return; }
                         _getReq.onsuccess = function() { _issuePut(_getReq.result); };
                         _getReq.onerror = function(ev) {
                             if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
-                            _issuePut(null);
+                            settleOne(); // failed read: never blindly overwrite unknown durable fields
                         };
                     })(extracted.record, (function() { try { return store.get(id); } catch (eGet) { return null; } })());
                 });

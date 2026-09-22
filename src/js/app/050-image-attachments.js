@@ -14,27 +14,56 @@ function handleImageFileSelect(event) {
     event.target.value = '';
 }
 
+// Complete an upload into its originating draft, not whichever composer is visible.
+// Read the latest map entry on completion: navigation copies arrays, and another
+// upload or a send may have replaced/consumed the original array in the meantime.
+function appendPendingImageForContext(contextKey, attachment) {
+    if (contextKey !== 'home' && (!chats[contextKey] || chats[contextKey]._deleted)) {
+        // The origin chat vanished while the file was being read: the upload
+        // has nowhere to land. Say so instead of silently dropping it.
+        if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" was dropped: its chat was deleted', 'warning');
+        return;
+    }
+    if (getCurrentPendingContext() === contextKey) {
+        pendingImageAttachments.push(attachment);
+        renderPendingImages();
+    } else {
+        chatPendingImages[contextKey] = (chatPendingImages[contextKey] || []).concat([attachment]);
+        persistPendingImagesToSession();
+        updateHomePendingIndicator();
+        renderChatList();
+    }
+}
+
 // Process an image, PDF, or spreadsheet file and add it to pending attachments
 function processImageFile(file) {
+    var originContext = getCurrentPendingContext();
     // Handle PDF files
     if (file.type === 'application/pdf') {
-        if (file.size > 25 * 1024 * 1024) {
-            showSnackbar('PDF too large (max 25MB)', 'error');
+        // 10MB, same cap as images/text. The PDF is inlined as base64 (×1.33)
+        // straight into the chat transcript / IDB with NO compression step
+        // (unlike images), and the old 25MB cap let a ~33MB payload through —
+        // over the provider's ~32MB request limit, so it failed at send time.
+        if (file.size > 10 * 1024 * 1024) {
+            showSnackbar('PDF too large (max 10MB)', 'error');
             return;
         }
 
         var reader = new FileReader();
+        // A read failure (permission revoked, file moved, I/O error) never
+        // fires onload — surface it instead of silently dropping the attachment.
+        reader.onerror = function() {
+            showSnackbar('Could not read PDF', 'error');
+        };
         reader.onload = function(e) {
             var name = file.name || 'document.pdf';
 
-            pendingImageAttachments.push({
+            appendPendingImageForContext(originContext, {
                 base64: e.target.result,
                 name: name,
                 fileType: 'pdf',
                 file_id: newFileId()
             });
-
-            renderPendingImages();
         };
         reader.readAsDataURL(file);
         return;
@@ -55,11 +84,14 @@ function processImageFile(file) {
         }
 
         var reader = new FileReader();
+        reader.onerror = function() {
+            showSnackbar('Could not read file', 'error');
+        };
         reader.onload = function(e) {
             var name = file.name || 'file';
             var content = e.target.result;
 
-            pendingImageAttachments.push({
+            appendPendingImageForContext(originContext, {
                 content: content,
                 name: name,
                 fileType: 'file',
@@ -67,8 +99,6 @@ function processImageFile(file) {
                 size: file.size,
                 file_id: newFileId()
             });
-
-            renderPendingImages();
         };
         reader.readAsText(file);
         return;
@@ -119,15 +149,13 @@ function processImageFile(file) {
 
             // Compress if over 5MB API limit
             compressBase64Image(base64).then(function(compressed) {
-                pendingImageAttachments.push({
+                appendPendingImageForContext(originContext, {
                     base64: compressed,
                     name: name,
                     width: width,
                     height: height,
                     file_id: newFileId()
                 });
-
-                renderPendingImages();
             }).catch(function() {
                 // Bug-sweep F8: surface compression failures instead of dropping silently.
                 showSnackbar('Could not read image', 'error');
@@ -138,6 +166,11 @@ function processImageFile(file) {
             showSnackbar('Could not read image', 'error');
         };
         img.src = e.target.result;
+    };
+    // Same as the PDF/text readers: a FileReader failure never reaches
+    // img.onerror, so it needs its own handler.
+    reader.onerror = function() {
+        showSnackbar('Could not read image', 'error');
     };
     reader.readAsDataURL(file);
 }
@@ -490,8 +523,9 @@ function clearPendingImages() {
 function savePendingImagesForContext(contextKey) {
     if (pendingImageAttachments.length > 0) {
         chatPendingImages[contextKey] = pendingImageAttachments.slice();
+    } else {
+        delete chatPendingImages[contextKey];
     }
-    // Don't delete when empty — persistPendingImagesToSession handles cleanup
 }
 
 function restorePendingImagesForContext(contextKey) {
@@ -584,6 +618,34 @@ function resendMessage(msgIndex) {
     sendMessage();
 }
 
+// Attachments written by sendMessage are contiguous rows immediately after the
+// user row. Stop at the first non-attachment so later/tool-generated files cannot
+// leak into the edited turn. Legacy Smart Document rows predate explicit metadata.
+function getEditedTurnAttachments(messages, msgIndex) {
+    var attachments = [];
+    for (var i = msgIndex + 1; i < messages.length; i++) {
+        var row = messages[i];
+        var attachment;
+        if (row.role === 'screenshot' || row.role === 'pdf' || row.role === 'file') {
+            attachment = Object.assign({}, row);
+            attachment.fileType = row.role === 'screenshot' ? 'image' : row.role;
+            delete attachment.role;
+        } else if (row.role === 'context') {
+            if (row.attachment && row.attachment.fileType === 'document') {
+                attachment = Object.assign({}, row.attachment);
+            } else {
+                var match = /^\[User referenced Smart Document "([\s\S]*)" \(doc_id: ([A-Za-z0-9_-]+)\)\. Use the document tool with action "read" and this doc_id to access its content\.\]$/.exec(row.content || '');
+                if (!match) break;
+                attachment = { fileType: 'document', name: match[1], sdocId: match[2] };
+            }
+        } else {
+            break;
+        }
+        attachments.push(attachment);
+    }
+    return attachments;
+}
+
 // Edit a user message - creates a new chat branch with history up to that point
 function editMessage(msgIndex) {
     var chat = chats[currentChatId];
@@ -592,11 +654,21 @@ function editMessage(msgIndex) {
     if (userMsg.role !== 'user') return;
     
     // Copy all messages up to (but not including) this message
-    // Include everything to preserve artifacts and cache prefix
-    var historyMessages = chat.messages.slice(0, msgIndex);
+    // Include everything to preserve artifacts and cache prefix. Only the
+    // branched slice is cloned (never the rows after msgIndex), and via
+    // structuredClone — the JSON round-trip re-serialised every base64
+    // attachment row in the prefix on each edit.
+    var _branchSlice = chat.messages.slice(0, msgIndex);
+    var historyMessages;
+    try {
+        historyMessages = (typeof structuredClone === 'function') ? structuredClone(_branchSlice) : JSON.parse(JSON.stringify(_branchSlice));
+    } catch (e) {
+        historyMessages = JSON.parse(JSON.stringify(_branchSlice));
+    }
+    var editedAttachments = getEditedTurnAttachments(chat.messages, msgIndex);
     
     // Create a new chat with the history
-    var newChatId = 'chat_' + Date.now();
+    var newChatId = 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
     chats[newChatId] = {
         id: newChatId,
         title: chat.title + ' (edited)',
@@ -623,35 +695,19 @@ function editMessage(msgIndex) {
     // Note: Widgets are NOT copied to avoid ID conflicts with dashboard
     // The branched chat can create new widgets as needed
 
-    // Switch to new chat without full navigation - keep UI seamless
-    currentChatId = newChatId;
-    appStorage.setItem('lastChatId', newChatId);
-    // B6: this seamless branch bypasses selectChat — tell the SW the focused chat
-    // changed so the sub-agent GC paths don't reclaim a transcript now in view.
-    if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(newChatId);
+    // Seed ONLY this turn's draft. selectChat saves the source composer before
+    // restoring the branch, resets run UI, and updates the SW focus/history.
+    // Rows whose base64 was evicted from the source transcript cannot be
+    // re-sent (renderPendingImages would show <img src="undefined">), so they
+    // are skipped. file_id is kept on purpose: the blob lives in the file store
+    // under that id and get_file/rehydration in the branch resolve through it.
+    chatPendingImages[newChatId] = editedAttachments.filter(function(a) { return !a._b64Evicted; });
+    chatPendingTexts[newChatId] = userMsg.content;
     saveChatsToStorage();
+    selectChat(newChatId);
+    persistPendingTextsToStorage();
+    document.getElementById('message-input').focus();
 
-    // Load version history for the new chat so artifacts are displayed
-    loadVersionHistory();
-
-    // Re-render messages to show truncated history (messages after edited one disappear)
-    renderMessages();
-    renderChatList();
-    updateChatTitleHeader();
-    // The branched chat has no sub-agents of its own — hide/reset the
-    // strip so chips from the source chat don't carry over. This path
-    // bypasses selectChat (intentionally seamless), so we trigger the
-    // strip refresh here.
-    if (typeof renderWorkersStrip === 'function') {
-        try { renderWorkersStrip(); } catch (e) {}
-    }
-    
-    // Put the original message content in the input for editing
-    var input = document.getElementById('message-input');
-    input.value = userMsg.content;
-    input.focus();
-    autoResizeTextarea(input);
-    
     showSnackbar('Editing message - modify and send to branch', 'success');
 }
 

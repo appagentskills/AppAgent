@@ -382,7 +382,8 @@ function codexUsageModelFromRl(rl) {
             if (!isNaN(after) && !isNaN(capturedAt)) resetMs = capturedAt + after * 1000;
         }
         if (resetMs != null && resetMs <= Date.now()) resetMs = null; // already past
-        var winMin = parseFloat(rl['x-codex-' + prefix + '-window-minutes']);
+        var winRaw = rl['x-codex-' + prefix + '-window-minutes'];
+        var winMin = (typeof winRaw === 'string' || typeof winRaw === 'number') ? Number(winRaw) : NaN;
         return { percent: pct, resetMs: resetMs, windowMinutes: isNaN(winMin) ? null : winMin };
     }
     var primary = bucket('primary');
@@ -398,8 +399,14 @@ function codexUsageModelFromRl(rl) {
         resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
     }
     function weeklyLabel(b) {
-        if (b.windowMinutes == null || Math.round(b.windowMinutes) === 10080) return 'Weekly limit';
-        return Math.round(b.windowMinutes / 1440) + '-day limit';
+        var minutes = b.windowMinutes;
+        // Optional headers do not imply a duration. Keep exact available units
+        // rather than rounding a short/unknown secondary window into zero days.
+        if (!Number.isFinite(minutes) || minutes <= 0) return 'Secondary limit';
+        if (minutes === 10080) return 'Weekly limit';
+        if (minutes % 1440 === 0) return (minutes / 1440) + '-day limit';
+        if (minutes % 60 === 0) return (minutes / 60) + '-hour limit';
+        return minutes + '-minute limit';
     }
     var limits = [];
     if (primary) limits.push({ group: 'session', percent: primary.percent, resets_at: primary.resetMs ? Math.round(primary.resetMs / 1000) : null });
@@ -806,17 +813,6 @@ function newChat() {
     savePendingImagesForContext(prevContext);
     savePendingTextForContext(prevContext);
 
-    // Close skills or dashboard view if open
-    if (currentView === 'skills') {
-        closeSkillsView();
-    } else if (currentView === 'dashboard') {
-        closeDashboardView();
-    } else if (currentView === 'home') {
-        closeHomeView();
-    } else if (currentView === 'settings-page') {
-        closeSettingsPageView();
-    }
-
     // Reset UI state for new chat (don't clear pendingToolApprovals - they're per-chat)
     // newChat: resetting foreground UI state only. Background loops keep running.
     isRunning = false;
@@ -837,6 +833,8 @@ function newChat() {
     // selectChat clears both via its own branch below; newChat needs the
     // same treatment since it bypasses selectChat entirely.
     lastApiError = null;
+    // Like selectChat, a fresh chat must not inherit a previous search's marks.
+    window.currentSearchHighlight = null;
     // B14: newChat must also hide the dead Retry button + the (non-auto-dismiss)
     // error snackbar left over from the previous chat, like selectChat /
     // openChatFromHistory. Clearing only lastApiError left the button visible-but-dead
@@ -848,6 +846,19 @@ function newChat() {
 
     currentChatId = generateId();
     chats[currentChatId] = { id: currentChatId, title: 'New Chat', messages: [], createdAt: Date.now(), isTemporary: true };
+
+    // Close the previous view only after switching identity and resetting the UI.
+    // These helpers call showChatView(), which marks the focused chat as seen.
+    // Closing first would consume the previous chat's unread state without a view.
+    if (currentView === 'skills') {
+        closeSkillsView();
+    } else if (currentView === 'dashboard') {
+        closeDashboardView();
+    } else if (currentView === 'home') {
+        closeHomeView();
+    } else if (currentView === 'settings-page') {
+        closeSettingsPageView();
+    }
 
     appStorage.setItem('lastChatId', currentChatId);
     // Don't save empty chat
@@ -945,6 +956,11 @@ function selectChat(chatId, options) {
     // it on chat switch prevents an error from a previous chat bleeding into the
     // newly-viewed chat's UI; renderMessages will re-derive any per-chat error.
     lastApiError = null;
+    // Search highlights are a foreground-UI global too: drop the stale query
+    // so the newly-viewed chat doesn't render <mark>s from a previous search.
+    // navigateToSearchMatch re-sets it right after selectChat, so jumping to
+    // a match still highlights.
+    window.currentSearchHighlight = null;
     // R-2: clear the dead Retry button + the (non-auto-dismiss) error snackbar
     // left over from the previous chat, then re-derive Retry from THIS chat's
     // persisted error (R-1 stores an unfocused foreground chat's error on the
@@ -962,6 +978,7 @@ function selectChat(chatId, options) {
         // 036-agent-event-handlers-page.js).
         var _selHook = typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId);
         if (_selHook) {
+            if (_messagesEl) _messagesEl.classList.remove('is-streaming');
             if (typeof hidePauseButton === 'function') hidePauseButton();
         } else {
             if (_messagesEl) _messagesEl.classList.add('is-streaming');
@@ -1302,6 +1319,31 @@ function _notifyWorkerChatDeleted(chatId) {
     }
 }
 
+// "Allow for this chat" grants (sessionPermissions, keyed chatPermKey(root,
+// permKey) = root + '::' + permKey, core/070-permissions.js) are ROOT-chat
+// scoped and were never pruned when the chat was deleted: a re-created chat
+// id could never collide, but the entries leaked in memory, in every panel
+// replica and in chrome.storage.session for the browser session. Drops the
+// deleted chat's keys from this panel's replica and sends the SW an explicit
+// per-key DELETION delta (worker/130 'permissions-update' → persist +
+// rebroadcast) — never a full-map replace, which could clobber a grant made
+// concurrently from another panel. Returns the number of pruned keys.
+function _pruneChatPermissionGrants(chatId) {
+    if (!chatId || typeof sessionPermissions === 'undefined' || !sessionPermissions || typeof sessionPermissions !== 'object') return 0;
+    var _pfx = String(chatId) + '::';
+    var keys = Object.keys(sessionPermissions).filter(function(k) { return k.indexOf(_pfx) === 0; });
+    if (!keys.length) return 0;
+    keys.forEach(function(k) { delete sessionPermissions[k]; });
+    try {
+        if ((typeof _agentBusPort === 'undefined' || !_agentBusPort) && typeof _openAgentBus === 'function') _openAgentBus();
+        if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
+            _agentBusPort.postMessage({ type: 'permissions-update', toolPermissions: null, instancePermissions: null, sessionPermissions: null,
+                sessionPermissionsDelta: { set: {}, del: keys } });
+        }
+    } catch (e) { /* SW unreachable: replica already pruned; the SW copy is session-scoped */ }
+    return keys.length;
+}
+
 async function deleteChat(chatId, e) {
     e.stopPropagation();
     var chat = chats[chatId];
@@ -1350,9 +1392,18 @@ async function deleteChat(chatId, e) {
     // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
     // (the runFinished cleanup in app/045 only prunes on a NON-paused terminal event).
     try { if (typeof _pruneChatPauseTokens === 'function') _pruneChatPauseTokens(chatId); } catch (ePt) {}
+    // Chat-scoped approval grants ("Allow for this chat") die with the chat.
+    try { _pruneChatPermissionGrants(chatId); } catch (ePg) {}
     // MEMFIX (leak prunes): drop per-chat caches that used to survive deletion.
     // chatWidgets map (tools/080-widget-tools.js) holds the chat's widget array.
     try { if (typeof chatWidgets !== 'undefined' && chatWidgets) delete chatWidgets[chatId]; } catch (eCw) {}
+    // Other chatId-keyed maps: message-window start (ui/250-message-render.js),
+    // stick-to-bottom flag (core/050-streaming.js), pending injection
+    // (core/030-config.js), pending widget regeneration (core/130-indexeddb.js).
+    try { if (typeof _msgWindowStart !== 'undefined' && _msgWindowStart) delete _msgWindowStart[chatId]; } catch (eMw) {}
+    try { if (typeof stickToBottomByChatId !== 'undefined' && stickToBottomByChatId) delete stickToBottomByChatId[chatId]; } catch (eSb) {}
+    try { if (typeof pendingInjectionsByChatId !== 'undefined' && pendingInjectionsByChatId) delete pendingInjectionsByChatId[chatId]; } catch (ePi) {}
+    try { if (typeof pendingWidgetRegenerationByChatId !== 'undefined' && pendingWidgetRegenerationByChatId) delete pendingWidgetRegenerationByChatId[chatId]; } catch (ePw) {}
     // Expanded-state maps (core/030-config.js) are keyed by chatId+':'+…
     try {
         var _pfx = chatId + ':';

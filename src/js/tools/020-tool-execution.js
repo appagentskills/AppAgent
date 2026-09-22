@@ -262,20 +262,37 @@ function executeSetChatTitle(args, options) {
 // Find the final-answer span of the last REAL (non-hook) turn. Returns
 // { target, lastUserIdx, endIdx } (target may be null when the turn has no
 // usable answer message) or null when the chat has no real user turn.
-function findHookAnswerSpan(chat) {
+// #9: `anchorUserIdx` (optional) is the run's OWN user-row index
+// (lastUserMsgIndex in the agent loop). When it points at a real (non-hook)
+// user row it wins over the backward scan, so a user message that landed AFTER
+// the final answer does not move the anchor and orphan the answer ("No answer
+// message found to attach tldr"). With an explicit anchor the span also ends
+// before the next ORGANIC user row (injected mid-run rows — sub-agent notices,
+// queued user text flushed by flushPendingInjection — carry `injected:true`
+// and stay inside the span). Invalid anchors fall back to the old scan.
+function findHookAnswerSpan(chat, anchorUserIdx) {
     if (!chat || !chat.messages) return null;
     var lastUserIdx = -1;
-    for (var i = chat.messages.length - 1; i >= 0; i--) {
-        var m = chat.messages[i];
-        if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
+    var anchored = false;
+    if (typeof anchorUserIdx === 'number' && anchorUserIdx >= 0 && anchorUserIdx < chat.messages.length) {
+        var _am = chat.messages[anchorUserIdx];
+        if (_am && _am.role === 'user' && !_am.isHookMessage) { lastUserIdx = anchorUserIdx; anchored = true; }
+    }
+    if (!anchored) {
+        for (var i = chat.messages.length - 1; i >= 0; i--) {
+            var m = chat.messages[i];
+            if (m.role === 'user' && !m.isHookMessage) { lastUserIdx = i; break; }
+        }
     }
     if (lastUserIdx === -1) return null;
     // Anchor the search span to the REAL turn: stop before the first hook
     // user message after the last real user message — prose replies to hook
-    // runs must never become targets.
+    // runs must never become targets. (Anchored: also stop before the next
+    // organic user row, see above.)
     var endIdx = chat.messages.length - 1;
     for (var h = lastUserIdx + 1; h < chat.messages.length; h++) {
-        if (chat.messages[h].role === 'user' && chat.messages[h].isHookMessage) { endIdx = h - 1; break; }
+        var _hm = chat.messages[h];
+        if (_hm.role === 'user' && (_hm.isHookMessage || (anchored && !_hm.injected))) { endIdx = h - 1; break; }
     }
     // Prefer messages NOT carrying a set_tldr / set_links tool call — those
     // are usually "say nothing else" hook responses whose prose is filler.
@@ -319,16 +336,16 @@ function findHookAnswerSpan(chat) {
 }
 
 // Just the target message — the afterResponse hook gating uses this.
-function findHookAnswerTarget(chat) {
-    var span = findHookAnswerSpan(chat);
+function findHookAnswerTarget(chat, anchorUserIdx) {
+    var span = findHookAnswerSpan(chat, anchorUserIdx);
     return (span && span.target) || null;
 }
 
 // Attach `value` to the final answer as msg[prop], clearing earlier copies in
 // the same turn span so a spontaneous mid-run call followed by the
 // afterResponse hook never leaves two cards on one answer (TLDR-3).
-function attachAnswerCard(chat, prop, value) {
-    var span = findHookAnswerSpan(chat);
+function attachAnswerCard(chat, prop, value, anchorUserIdx) {
+    var span = findHookAnswerSpan(chat, anchorUserIdx);
     if (!span) return { success: false, error: 'No user turn found' };
     if (!span.target) return { success: false, error: 'No answer message found to attach ' + prop };
     for (var c = span.lastUserIdx + 1; c <= span.endIdx; c++) {
@@ -348,8 +365,8 @@ function attachAnswerCard(chat, prop, value) {
 // gating — which only checks the NEW final message — never sees the card and
 // burns an extra hook LLM run re-asking for it (the "spontaneous call + hook
 // duplicate" bug).
-function relocateAnswerCard(chat, prop) {
-    var span = findHookAnswerSpan(chat);
+function relocateAnswerCard(chat, prop, anchorUserIdx) {
+    var span = findHookAnswerSpan(chat, anchorUserIdx);
     if (!span || !span.target) return null;
     if (span.target[prop]) return span.target[prop];
     for (var i = span.endIdx; i > span.lastUserIdx; i--) {
@@ -609,6 +626,17 @@ function applySearchReplaceEdits(content, edits) {
             errors.push('Edit ' + i + ': Missing "replace" property. Received keys: [' + receivedKeys + ']. Expected: {find: "...", replace: "..."}');
             continue;
         }
+        // Guard: find MUST be a non-empty string. indexOf('', pos) always
+        // returns pos, so an empty find would spin the occurrence-count loop
+        // below forever; a non-string would blow up on .substring/.length.
+        if (typeof findText !== 'string' || findText.length === 0) {
+            errors.push('Edit ' + i + ': edit[' + i + '].find must be a non-empty string (got ' + (typeof findText === 'string' ? 'empty string' : typeof findText) + ')');
+            continue;
+        }
+        if (typeof replaceText !== 'string') {
+            errors.push('Edit ' + i + ': edit[' + i + '].replace must be a string (got ' + typeof replaceText + ')');
+            continue;
+        }
 
         // Count occurrences
         var occurrences = 0;
@@ -623,6 +651,44 @@ function applySearchReplaceEdits(content, edits) {
         if (occurrences === 0) {
             errors.push('Edit ' + i + ': Text not found: "' + findText.substring(0, 80) + (findText.length > 80 ? '...' : '') + '"');
             continue;
+        }
+
+        // #14 opt-in multi-match handling: replace_all replaces every occurrence;
+        // occurrence:n (1-based) targets the n-th match. Both skip the uniqueness gate.
+        var _replaceAll = (edit.replace_all === true || edit.replace_all === 'true');
+        var _hasOccurrence = (edit.occurrence !== undefined && edit.occurrence !== null);
+        if (_replaceAll && _hasOccurrence) {
+            errors.push('Edit ' + i + ': replace_all and occurrence are mutually exclusive — pass only one of them');
+            continue;
+        }
+        if (_replaceAll) {
+            // Count NON-overlapping matches (split/join semantics). The counting
+            // loop above steps +1 per hit, so it counts overlapping ones too
+            // ('aa' in 'aaa' = 2) while split/join replaces only 1.
+            var _raParts = modifiedContent.split(findText);
+            var _raCount = _raParts.length - 1;
+            modifiedContent = _raParts.join(replaceText);
+            appliedEdits.push({ index: i, action: 'replace_all', count: _raCount, removed: findText.length * _raCount, added: replaceText.length * _raCount });
+            continue;
+        }
+        if (_hasOccurrence) {
+            var _occ = Number(edit.occurrence);
+            if (!(Number.isInteger(_occ) && _occ >= 1)) {
+                errors.push('Edit ' + i + ': occurrence must be a positive integer (1-based), got ' + JSON.stringify(edit.occurrence));
+                continue;
+            }
+            // Step NON-overlapping, matching replace_all's split/join semantics
+            // ('aa' in 'aaa' has ONE occurrence, not two): the counting loop
+            // above steps +1 per hit and so over-counts self-overlapping finds.
+            var _nonOverlap = modifiedContent.split(findText).length - 1;
+            if (_occ > _nonOverlap) {
+                errors.push('Edit ' + i + ': occurrence ' + _occ + ' requested but the text was found only ' + _nonOverlap + ' time(s)');
+                continue;
+            }
+            var _n = 0, _p = -findText.length;
+            while (_n < _occ) { _p = modifiedContent.indexOf(findText, _p + findText.length); _n++; }
+            foundIndex = _p;
+            occurrences = 1;
         }
 
         if (occurrences > 1) {
@@ -642,7 +708,7 @@ function applySearchReplaceEdits(content, edits) {
                 }
                 charCount = lineEnd + 1; // +1 for newline
             }
-            errors.push('Edit ' + i + ': Text found ' + occurrences + ' times at: ' + positions.join(', ') + '. Add more surrounding context to make it unique. Text: "' + findText.substring(0, 50) + '..."');
+            errors.push('Edit ' + i + ': Text found ' + occurrences + ' times at: ' + positions.join(', ') + '. Add more surrounding context to make it unique, or pass replace_all:true / occurrence:<n> on this edit. Text: "' + findText.substring(0, 50) + '..."');
             continue;
         }
 
@@ -808,7 +874,14 @@ async function executeDiffEdit(args, messageIndex, options) {
         if (!getData.result) {
             return { success: false, error: 'Record not found or empty response for ' + args.table + '/' + args.sys_id };
         }
+        // A field that does not exist on the table (or is not readable for this
+        // user) is simply ABSENT from the Table API result — do not treat it as
+        // an empty string, which would surface as a misleading "Text not found".
+        if (getData.result[args.field] === undefined) {
+            return { success: false, error: 'field "' + args.field + '" does not exist on table ' + args.table + ' (or is not readable). Check the field name (sys_dictionary element) before editing.' };
+        }
         currentContent = getData.result[args.field] || '';
+        if (typeof currentContent !== 'string') currentContent = String(currentContent);
 
         var originalLength = currentContent.length;
 
@@ -965,10 +1038,11 @@ var _sandboxEvalCount = {};
 var _sandboxGen = {};
 
 // PR383-F2: max time the watchdogs honor a _sandboxPending hold without any
-// fresh activity. The page bridge already posts a 30s timeout error back to
-// the sandbox while the underlying tool promise keeps running — a wedged
-// orphan (unanswered approval, never-settling handle) must not disable the
-// inactivity kill switch permanently.
+// fresh activity. The page bridge posts a 30s EXECUTION timeout error back to
+// the sandbox (armed only once the approval verdict is in — see
+// _onApprovalSettled) while the underlying tool promise keeps running — a
+// wedged orphan (unanswered approval, never-settling handle) must not disable
+// the inactivity kill switch permanently.
 var _SANDBOX_HOLD_MAX_MS = 60 * 60 * 1000;
 
 function _sandboxEvalCleanup(chatId) {
@@ -1042,8 +1116,42 @@ async function executeTool(name, args, messageIndex, options) {
     return _executeToolInner(name, args, messageIndex, options);
 }
 
+// Live widget code shares its existing tool bridge and asynchronous callbacks
+// with the widget. V1 cannot preserve a sub-agent's narrower roster there, so
+// execute is root-chat-only (list remains available). Use trusted dispatch
+// options, NEVER args or focused-chat fallback; ambiguous identity fails closed.
+function _widgetEvalCallerError(options) {
+    var id = options && options.chatId;
+    var chat = typeof id === 'string' && typeof chats !== 'undefined' && chats && chats[id];
+    if (!chat || chat.id !== id || chat._deleted) {
+        return { success: false, code: 'UNTRUSTED_CONTEXT', error: 'widget_eval execution requires an identified, live top-level chat.' };
+    }
+    if (chat.isSubAgent || chat.subAgentId || chat.parentChatId) {
+        return { success: false, code: 'RESTRICTED_CONTEXT', error: 'widget_eval execution is unsupported for sub-agents, including full-roster subs. List is allowed; ask the top-level agent to review and execute.' };
+    }
+    try {
+        if (typeof SubAgents !== 'undefined' && SubAgents.getByChatId && SubAgents.getByChatId(id)) {
+            return { success: false, code: 'RESTRICTED_CONTEXT', error: 'widget_eval execution is unsupported for sub-agent contexts.' };
+        }
+    } catch (error) {
+        return { success: false, code: 'UNTRUSTED_CONTEXT', error: 'Cannot verify widget_eval caller identity.' };
+    }
+    return null;
+}
+
 async function _executeToolInner(name, args, messageIndex, options) {
+    if (name === 'widget_eval' && args && args.action === 'eval') {
+        var callerError = _widgetEvalCallerError(options);
+        if (callerError) return callerError;
+    }
     var approval = await requestProgrammaticToolApproval(name, args, options);
+    // Optional hook for callers that want to time EXECUTION only (the page
+    // js_eval sandbox bridge below): fires once the approval verdict is in,
+    // whether allowed or denied, so time the user spends on the approval
+    // prompt is not counted against the nested tool's execution timeout.
+    if (options && typeof options._onApprovalSettled === 'function') {
+        try { options._onApprovalSettled(approval); } catch (eApprovalHook) {}
+    }
     if (!approval.allowed) {
         return { success: false, error: approval.error, _denied: true };
     }
@@ -1327,6 +1435,24 @@ async function _executeToolInner(name, args, messageIndex, options) {
         try {
             var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
 
+            // Test authority is a host-only opaque key, never a js_eval argument.
+            var _testKey = options && options._testRunContext;
+            if (_testKey && !(typeof Platform !== 'undefined' && Platform.isWorker)) {
+                return { success: true, result: await TestRunPolicy.runFrame({
+                    registry: TestRunPolicy.registry, context: _testKey,
+                    code: args.code, document: document, window: window,
+                    signal: options._testRunSignal,
+                    dispatch: function(tool, toolArgs, id) {
+                        if (tool === '__sandbox_sleep') return new Promise(function(resolve) { setTimeout(function() { resolve({ __sleep_ok: true }); }, toolArgs.ms); });
+                        return executeTool(tool, toolArgs, messageIndex, {
+                            chatId: chatId, fromSandbox: true,
+                            toolCallId: 'prog_' + (options.toolCallId || 'test') + '_' + id,
+                            parentToolCallId: options.toolCallId
+                        });
+                    }
+                }) };
+            }
+
             // SW context bridges js_eval to the offscreen helper which
             // hosts the real sandbox iframe. Page context falls through
             // to the existing DOM-based path further below.
@@ -1346,12 +1472,22 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 // orchestrations (> 5 min) survive. The rejection falls through to
                 // the catch below, which returns {success:false}.
                 var _swEvalTimer = null;
+                // Per invocation, not per chat: a nested/sibling eval must survive
+                // this eval's timeout. Abort also prevents dispatch after late readiness.
+                var _swEvalAbort = new AbortController();
+                var _testAbort = function() { _swEvalAbort.abort(); };
+                if (_testKey && options._testRunSignal) {
+                    TestRunPolicy.registry.descriptor(_testKey);
+                    if (options._testRunSignal.aborted) _testAbort();
+                    else options._testRunSignal.addEventListener('abort', _testAbort, { once: true });
+                }
                 var swEvalResult;
                 if (chatId) _sandboxEvalCount[chatId] = (_sandboxEvalCount[chatId] || 0) + 1; // PR383-F1
                 try {
                     swEvalResult = await Promise.race([
                         Platform.callOffscreenHelper('helper-js-eval', {
-                            code: sanitizedCodeSw,
+                            code: _testKey ? args.code : sanitizedCodeSw,
+                            _testRunContext: _testKey || null,
                             chatId: chatId,
                             messageIndex: messageIndex,
                             // Plumb the js_eval toolCallId down so display calls from
@@ -1359,7 +1495,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                             // tool's result slot. See executeDisplay's eager-render path.
                             parentToolCallId: options && options.toolCallId,
                             globals: { lastLargeResponse: (chatId && lastLargeResponseByChatId[chatId]) || null } // CONC-FIX: this chat's own slot, not the shared global
-                        }, 5 * 60 * 1000),
+                        }, 5 * 60 * 1000, _swEvalAbort.signal),
                         new Promise(function(_, rej) {
                             var _swLast = Date.now();
                             _swEvalTimer = setInterval(function() {
@@ -1383,6 +1519,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     ]);
                 } finally {
                     if (_swEvalTimer) clearInterval(_swEvalTimer);
+                    if (_testKey && options._testRunSignal) options._testRunSignal.removeEventListener('abort', _testAbort);
+                    // Promise.race alone only abandons the helper promise. Dispose
+                    // its exact iframe on timeout; completed calls already detached
+                    // the abort listener, so normal success/error remain unchanged.
+                    _swEvalAbort.abort();
                     _sandboxEvalCleanup(chatId); // RES-1 + PR383-F1 (last-eval-out teardown)
                 }
                 var jsEvalResultSw = { success: true, result: swEvalResult };
@@ -1472,15 +1613,34 @@ async function _executeToolInner(name, args, messageIndex, options) {
                         // so executePendingApprovedTools keeps skipping it (no
                         // double-execution) and must be a STRING (bare numeric d.id
                         // throws on .startsWith).
+                        // EXECUTION-only timeout: the 30s clock must NOT include the
+                        // time the user spends on an approval prompt. Previously the
+                        // timer started at dispatch, so a slow approve (> 30s) made the
+                        // sandbox see "timed out" while the tool still ran on approve
+                        // (duplicate writes on retry). The timer is armed by the
+                        // _onApprovalSettled hook (fired in _executeToolInner once the
+                        // verdict is in), i.e. only from the moment execution begins.
+                        var _execTimer = null;
+                        var _armExecTimeout = null;
+                        var timeoutPromise = new Promise(function(_, rej) {
+                            _armExecTimeout = function() {
+                                if (_execTimer) return;
+                                _execTimer = setTimeout(function() { rej(new Error('Tool call timed out after 30s')); }, 30000);
+                            };
+                        });
+                        var _clearExecTimeout = function() {
+                            if (_execTimer) { clearTimeout(_execTimer); _execTimer = null; }
+                        };
                         var toolPromise = executeTool(e.data.name, e.data.args, messageIndex, {
                             chatId: chatId,
                             fromSandbox: true,
                             toolCallId: 'prog_' + ((options && options.toolCallId) || 'np') + '_' + e.data.id,
-                            parentToolCallId: options && options.toolCallId
+                            parentToolCallId: options && options.toolCallId,
+                            _onApprovalSettled: function() { if (_armExecTimeout) _armExecTimeout(); }
                         });
-                        var timeoutPromise = new Promise(function(_, rej) { setTimeout(function() { rej(new Error('Tool call timed out after 30s')); }, 30000); });
                         Promise.race([toolPromise, timeoutPromise])
                             .then(async function(result) {
+                                _clearExecTimeout();
                                 if (result && result._screenshotMessage) {
                                     var ssMsg = result._screenshotMessage;
                                     if (ssMsg.screenshot_id) {
@@ -1518,6 +1678,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                                 sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: e.data.id, result: result }, '*');
                             })
                             .catch(function(err) {
+                                _clearExecTimeout();
                                 sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: e.data.id, error: err.message }, '*');
                             });
                     } else if (e.data && e.data.type === MSG_DONE) {
@@ -2094,7 +2255,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'servicenow_diff_edit') {
         return await executeDiffEdit(args, messageIndex, options);
     } else if (name === 'iframe_tool') {
-        return await executeIframeTool(args);
+        // Pass options so the RUNNING chat (options.chatId, set by the offscreen
+        // exec-tool bridge) is used for targetTabId routing — not the VIEWED chat.
+        return await executeIframeTool(args, options);
     } else if (name === 'set_chat_title') {
         return executeSetChatTitle(args, options);
     } else if (name === 'set_tldr') {
@@ -2131,13 +2294,15 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // before the dispatcher runs, so executeGitHubSetup (tools/130-github-setup.js,
         // page bundle only) is always defined here.
         return await executeGitHubSetup(args);
+    } else if (name === 'widget_eval') {
+        return executeWidgetEval(args, options);
     } else if (name === 'html_widget') {
         return await executeHtmlWidget(args, messageIndex, options);
     } else if (name === 'pin_widget') {
         // Page-only (headless: false) — dashboardWidgets + dashboard renderers are page globals.
         return await executePinWidget(args);
     } else if (name === 'take_screenshot') {
-        return await executeTakeScreenshot(args);
+        return await executeTakeScreenshot(args, options);
     } else if (name === 'screenshot_by_id') {
         return executeScreenshotById(args);
     } else if (name === 'get_file') {
@@ -2149,6 +2314,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // (HEADLESS_TOOLS.get_cookie = true) so it executes in the SW — the only
         // context where chrome.cookies exists (the js_eval sandbox has none).
         return await executeGetCookie(args);
+    } else if (name === 'run_js_file') {
+        // Impl: executeRunJsFile in tools/160-run-tests.js (WORKER_SHARED_FILES,
+        // so present in BOTH bundles). Headless like js_eval + workspace: reads
+        // via wsReadRaw (below) and executes via executeTool('js_eval').
+        // Guarded: a stale build (bundle predates tools/160-run-tests.js) must
+        // return a readable error, not throw ReferenceError out of executeTool.
+        if (typeof executeRunJsFile !== 'function') return _runTestsImplMissing('run_js_file');
+        return await executeRunJsFile(args, messageIndex, options);
+    } else if (name === 'run_tests') {
+        // Impl: executeRunTests in tools/160-run-tests.js. Runs test/*.test.js
+        // inside the js_eval sandbox with test/harness.js — same headless
+        // routing as js_eval (HEADLESS_TOOLS.run_tests = true).
+        if (typeof executeRunTests !== 'function') return _runTestsImplMissing('run_tests');
+        return await executeRunTests(args, messageIndex, options);
     } else if (name === 'web_fetch') {
         try {
             var _wfSaveFile = args.save_file;
@@ -2644,6 +2823,66 @@ function _wsCheckCrossChatConflict(file, chatId) {
     };
 }
 
+// Stale-bundle guard for the run_tests / run_js_file arms of executeTool: the
+// implementations live in tools/160-run-tests.js, which an older deployed
+// build may not contain. Returns the standard failure shape.
+function _runTestsImplMissing(toolName) {
+    return { success: false, error: toolName + ' impl not loaded in this bundle \u2014 rebuild/Reload the extension (tools/160-run-tests.js missing)' };
+}
+
+// #7 ownership transfer — re-stamp every workspace file whose
+// last_modified_by_chat_id is `fromChatId` with `toChatId` (default: the ROOT
+// chat of `fromChatId` via _wsRootChatId). Called best-effort by the sub-agent
+// registry (core/097 _subReleaseWorkspaceOwnership) when a sub is parked /
+// stopped / errored: once the sub's registry record is GC'd, _wsRootChatId
+// degrades to the sub id itself and the orchestrator's later edits would hit a
+// false cross_chat_conflict against a dead chat. Stamping the root id keeps
+// same-lineage ownership resolvable without the registry. The timestamp is
+// preserved (a transfer is not an edit); the title follows the target chat
+// when known, else is cleared (never a stale sub title on a root id). Never
+// throws; returns the number of files persisted.
+//
+// Concurrency: this runs on EVERY report_to_parent while the parent (same
+// lineage) may be editing the very files being re-stamped. So (1) candidates
+// are enumerated from the RAW rows (getAllWorkspaceFilesAllRepos — no blob
+// resolution; dirty + stamped-by-`from` only) and (2) each row is re-read
+// with getWorkspaceFile immediately before its put and skipped when it is
+// gone or its owner changed in between. Only the two stamp fields are
+// written, onto the FRESH row — never content captured earlier, so a parent
+// edit landing between enumeration and put is preserved.
+//
+// Rows the sub took over with force:true from a FOREIGN chat (force_taken_from
+// set, see _wsConflictDecision) are NOT transferred: handing them to the root
+// would launder the takeover. They stay owned by the sub (so status / push
+// keep warning about them) and their paths are collected into
+// `out.skipped_force_taken` when the optional `out` object is passed.
+async function _wsTransferOwnership(fromChatId, toChatId, out) {
+    if (out && !Array.isArray(out.skipped_force_taken)) out.skipped_force_taken = [];
+    if (!fromChatId) return 0;
+    var target = toChatId || _wsRootChatId(fromChatId) || null;
+    if (!target || target === fromChatId) return 0;
+    if (typeof getAllWorkspaceFilesAllRepos !== 'function' || typeof getWorkspaceFile !== 'function' || typeof setWorkspaceFile !== 'function') return 0;
+    var title = (typeof chats !== 'undefined' && chats && chats[target] && chats[target].title) || null;
+    var n = 0;
+    try {
+        var rows = await getAllWorkspaceFilesAllRepos();
+        for (var ri = 0; ri < (rows || []).length; ri++) {
+            var r = rows[ri];
+            if (!r || !r.dirty || r.last_modified_by_chat_id !== fromChatId) continue;
+            var fresh = null;
+            try { fresh = await getWorkspaceFile(r.repo, r.path); } catch (eG) { fresh = null; }
+            // Gone, or re-owned (parent edit / force take-over / discard) since
+            // the enumeration → leave it alone.
+            if (!fresh || fresh.last_modified_by_chat_id !== fromChatId) continue;
+            if (fresh.force_taken_from) { if (out) out.skipped_force_taken.push(fresh.path); continue; }
+            fresh.last_modified_by_chat_id = target;
+            fresh.last_modified_by_chat_title = title;
+            try { await setWorkspaceFile(fresh); n++; } catch (eS) { /* best-effort */ }
+        }
+    } catch (e) { /* best-effort */ }
+    return n;
+}
+
 // Foreign-ownership metadata for read-only listings (ls / grep / diff): when a
 // dirty file's uncommitted changes were stamped by ANOTHER chat, return a
 // compact descriptor so the reading agent is told someone else is working on
@@ -2679,14 +2918,37 @@ function _wsForeignOwnership(f, chatId) {
 // - gitignored path (e.g. dist/, .env): always allow — generated artefacts shouldn't gate cross-chat work.
 // - other chat dormant (hard=false): allow, surface as warning only.
 // - other chat running (hard=true): block.
-// Returns { block, warn } — at most one is non-null.
+// Returns { block, warn } — at most one is non-null. When force=true overrides
+// a FOREIGN-owner conflict (another lineage's stamp), `force_taken_from` carries
+// that previous owner's chat id so the mutator can stamp the row: a sub-agent's
+// park/stop release (_wsTransferOwnership) then leaves such rows alone instead
+// of silently handing the other chat's work to the root chat.
+// B11 (sweep follow-up): next `force_taken_from` value for a mutator stamping
+// a row. A NEW force takeover (decision.force_taken_from) always wins. An
+// existing marker is CLEARED when the chat now mutating the file is the very
+// owner it was taken from (same lineage) — the original owner has reclaimed
+// the file, so the row is theirs again and status/push must stop warning
+// about a takeover that no longer describes the row (and
+// _wsTransferOwnership must be free to transfer it on the reclaiming sub's
+// park). Otherwise the marker is carried unchanged (a second chat piling on
+// does not launder the first takeover).
+function _wsNextForceTakenFrom(decision, prev, chatId) {
+    if (decision && decision.force_taken_from) return decision.force_taken_from;
+    if (!prev) return null;
+    if (chatId && typeof _wsSameChatLineage === 'function' && _wsSameChatLineage(prev, chatId)) return null;
+    return prev;
+}
+
 async function _wsConflictDecision(wk, filePath, file, chatId, force) {
-    if (force) return { block: null, warn: null };
     if (filePath) {
         try {
             var isIgnored = await wsGetIgnoreFilter(wk);
-            if (isIgnored(filePath)) return { block: null, warn: null };
+            if (isIgnored(filePath)) return { block: null, warn: null }; // gitignored: never gated, never marked force-taken
         } catch (e) { /* ignore filter failure — fall through to normal check */ }
+    }
+    if (force) {
+        var fc = _wsCheckCrossChatConflict(file, chatId);
+        return { block: null, warn: null, force_taken_from: (fc && fc.last_modified_by_chat_id) || null };
     }
     var conflict = _wsCheckCrossChatConflict(file, chatId);
     if (!conflict) return { block: null, warn: null };
@@ -2726,48 +2988,24 @@ async function executeWorkspaceTool(args, options) {
                 var _lFiles = await getAllWorkspaceFiles(_lm.repo);
                 var _lIgnored = await wsGetIgnoreFilter(_lm.repo);
                 var _lDirty = _lFiles.filter(function(f) { return f.dirty && !_lIgnored(f.path); });
-                // LEAN PR summary: the stored meta.prs entries carry heavy push
-                // metadata (per-file arrays with old_sha/new_sha, chat ownership)
-                // needed by push PR-reuse / merge-lifecycle sync / the sidebar —
-                // those consumers read meta.prs directly. The list action only
-                // needs to TELL the agent which PRs exist, so return a trimmed
-                // view: {number, title, state, url, branch, merged_at?}. All
-                // open/unmerged PRs are kept; merged PRs are capped to the 3
-                // most recent (merged_prs_omitted reports how many were cut).
-                var _lPrsFull = _lm.prs || [];
-                var _lOpenPrs = [];
-                var _lMergedPrs = [];
-                for (var _lp = 0; _lp < _lPrsFull.length; _lp++) {
-                    var _lpr = _lPrsFull[_lp];
-                    if (!_lpr) continue;
-                    var _lean = { number: _lpr.number, title: _lpr.title, state: _lpr.state, url: _lpr.url, branch: _lpr.branch };
-                    if (_lpr.merged_at) _lean.merged_at = _lpr.merged_at;
-                    if (_lpr.state === 'merged' || _lpr.merged_at) { _lean._idx = _lp; _lMergedPrs.push(_lean); }
-                    else _lOpenPrs.push(_lean);
-                }
-                var _lMergedOmitted = 0;
-                if (_lMergedPrs.length > 3) {
-                    _lMergedPrs.sort(function(a, b) {
-                        var ta = a.merged_at ? new Date(a.merged_at).getTime() : 0;
-                        var tb = b.merged_at ? new Date(b.merged_at).getTime() : 0;
-                        if (tb !== ta) return tb - ta;
-                        return b._idx - a._idx; // fallback: later array entries are more recent
-                    });
-                    _lMergedOmitted = _lMergedPrs.length - 3;
-                    _lMergedPrs = _lMergedPrs.slice(0, 3);
-                }
-                for (var _lc = 0; _lc < _lMergedPrs.length; _lc++) delete _lMergedPrs[_lc]._idx;
+                // LEAN PR summary (shared with `status` via _wsLeanPrs): the stored
+                // meta.prs entries carry heavy push metadata (per-file arrays with
+                // old_sha/new_sha, chat ownership) needed by push PR-reuse /
+                // merge-lifecycle sync / the sidebar — those consumers read
+                // meta.prs directly. The list action only needs to TELL the agent
+                // which PRs exist, so return the trimmed view.
+                var _lLean = _wsLeanPrs(_lm.prs);
                 var _lEntry = {
                     workspace: _lm.repo,
                     repo: _lm.github_repo || parseWsKey(_lm.repo).repo,
                     branch: _lm.branch,
                     files: _lFiles.length,
                     dirty: _lDirty.length,
-                    prs: _lOpenPrs.concat(_lMergedPrs),
+                    prs: _lLean.prs,
                     pinned: !!_lm.pinned,
                     forked_from: _lm.forked_from || null
                 };
-                if (_lMergedOmitted) _lEntry.merged_prs_omitted = _lMergedOmitted;
+                if (_lLean.merged_omitted) _lEntry.merged_prs_omitted = _lLean.merged_omitted;
                 workspaces.push(_lEntry);
             }
             return { success: true, workspaces: workspaces, total: workspaces.length };
@@ -2804,9 +3042,9 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'delete') {
             result = await wsDelete(wk, args.path, chatId, chatTitle, force);
         } else if (action === 'grep') {
-            result = await wsGrep(wk, args.pattern, args.path, _incIgnored, args.force === true, chatId, args.limit);
+            result = await wsGrep(wk, args.pattern, args.path, _incIgnored, args.force === true, chatId, args.limit, args.ignore_case);
         } else if (action === 'status') {
-            result = await wsStatus(wk, _incIgnored, chatId);
+            result = await wsStatus(wk, _incIgnored, chatId, args.include_prs);
         } else if (action === 'diff') {
             result = await wsDiff(wk, args.path, _incIgnored, chatId);
         } else if (action === 'push') {
@@ -2814,6 +3052,8 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'deploy') {
             result = await wsDeploy(wk, args.path, args.dest);
         } else if (action === 'discard') {
+            // files/dest are not supported selectors; do not turn them into discard-all.
+            if (args.files != null || args.dest != null) return { success: false, error: 'workspace discard accepts only path, not files or dest' };
             result = await wsDiscard(wk, args.path, chatId, chatTitle, force);
         } else if (action === 'pin') {
             // Pin (or unpin) a workspace. At most one pinned workspace per
@@ -2850,6 +3090,38 @@ async function executeWorkspaceTool(args, options) {
     } catch (e) {
         return { success: false, error: e.message };
     }
+}
+
+// Lean PR projection shared by the `list` and `status` actions (#12). Each
+// entry is {number, title, state, url, branch, merged_at?} — no files[] /
+// chat ownership. All open/unmerged PRs are kept; merged PRs are capped to the
+// `mergedCap` (default 3) most recent by merged_at (array order as fallback).
+// Returns { prs, merged_omitted }.
+function _wsLeanPrs(prsFull, mergedCap) {
+    var cap = (typeof mergedCap === 'number' && mergedCap >= 0) ? mergedCap : 3;
+    var full = Array.isArray(prsFull) ? prsFull : [];
+    var open = [], merged = [];
+    for (var i = 0; i < full.length; i++) {
+        var pr = full[i];
+        if (!pr) continue;
+        var lean = { number: pr.number, title: pr.title, state: pr.state, url: pr.url, branch: pr.branch };
+        if (pr.merged_at) lean.merged_at = pr.merged_at;
+        if (pr.state === 'merged' || pr.merged_at) { lean._idx = i; merged.push(lean); }
+        else open.push(lean);
+    }
+    var omitted = 0;
+    if (merged.length > cap) {
+        merged.sort(function(a, b) {
+            var ta = a.merged_at ? new Date(a.merged_at).getTime() : 0;
+            var tb = b.merged_at ? new Date(b.merged_at).getTime() : 0;
+            if (tb !== ta) return tb - ta;
+            return b._idx - a._idx; // fallback: later array entries are more recent
+        });
+        omitted = merged.length - cap;
+        merged = merged.slice(0, cap);
+    }
+    for (var c = 0; c < merged.length; c++) delete merged[c]._idx;
+    return { prs: open.concat(merged), merged_omitted: omitted };
 }
 
 // Decode a REST blob API response body ({content, encoding}) into workspace
@@ -3072,6 +3344,10 @@ async function wsHydrate(wk, matcher) {
         await setWorkspaceFile(rec);
         if (rec.file_id && !fileIndex.has(rec.file_id)) {
             registerFile(rec.file_id, { type: 'workspace', workspace: wk, path: rec.path });
+        } else if (rec.file_id && typeof invalidateWorkspaceFilePointer === 'function') {
+            // Already indexed (e.g. resolved once, then discarded back to a
+            // stub) — drop the memoized snapshot so get_file sees new content.
+            invalidateWorkspaceFilePointer(rec.file_id);
         }
         hydrated++;
     }
@@ -3200,7 +3476,11 @@ async function wsLs(wk, dirPath, includeIgnored, chatId) {
     return _lsRes;
 }
 
-async function wsRead(repo, filePath, offset, limit, chatId) {
+// Shared by wsRead (line-numbered agent view) and run_js_file / loadFile
+// (tools/160-run-tests.js, raw text). Resolves + lazily hydrates the record and
+// applies the deleted/binary guards. Returns { success:true, file } or the
+// same error objects wsRead used to return.
+async function wsReadRaw(repo, filePath) {
     if (!filePath) return { success: false, error: 'path is required for read' };
     var file = await getWorkspaceFile(repo, filePath);
     if (!file) return { success: false, error: 'File not found: ' + filePath };
@@ -3227,6 +3507,13 @@ async function wsRead(repo, filePath, offset, limit, chatId) {
 
     if (file.deleted) return { success: false, error: 'File was deleted: ' + filePath + '. Use workspace write to recreate it.' };
     if (file.content.indexOf('::binary::') === 0) return { success: false, error: 'Binary file — cannot read as text. Use get_file to download.', file_id: file.file_id || null };
+    return { success: true, file: file };
+}
+
+async function wsRead(repo, filePath, offset, limit, chatId) {
+    var _raw = await wsReadRaw(repo, filePath);
+    if (!_raw.success) return _raw;
+    var file = _raw.file;
 
     var lines = file.content.split('\n');
     var startLine = (offset || 1) - 1;
@@ -3253,6 +3540,10 @@ async function wsRead(repo, filePath, offset, limit, chatId) {
 async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
     if (!filePath) return { success: false, error: 'path is required for write' };
     if (content === undefined || content === null) return { success: false, error: 'content is required for write' };
+    // A non-string (e.g. an object from a programmatic executeTool call that
+    // bypassed normalizeToolArgs) would be stored as-is and later blow up in
+    // grep/read/diff/push on f.content.indexOf — reject it up front.
+    if (typeof content !== 'string') return { success: false, error: 'content must be a string (got ' + typeof content + '); JSON.stringify objects before writing' };
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
@@ -3284,6 +3575,11 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         repo: repo,
         path: filePath,
         sha: existing ? existing.sha : null,
+        // A stub whose hydration failed above still has no base content:
+        // keep its stub flag (with the sha) so wsDiscard's new-file test
+        // (`original_content === null && !(stub && sha)`) restores the
+        // tracked stub instead of deleting the path from the workspace.
+        stub: !!(existing && existing.stub && _origForWrite == null),
         content: content,
         original_content: _origForWrite,
         dirty: _isDirty,
@@ -3293,7 +3589,8 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         pushed_shas: (existing && !wasDeleted) ? existing.pushed_shas : null,
         last_modified_by_chat_id: _isDirty ? (chatId || null) : null,
         last_modified_by_chat_title: _isDirty ? (chatTitle || null) : null,
-        last_modified_at: _isDirty ? Date.now() : null
+        last_modified_at: _isDirty ? Date.now() : null,
+        force_taken_from: _isDirty ? _wsNextForceTakenFrom(_wWriteDecision, existing && existing.force_taken_from, chatId) : null
     });
     registerFile(_wrFileId, { type: 'workspace', workspace: repo, path: filePath });
     var action = wasDeleted ? 'Restored' : (existing && !existing.deleted ? 'Updated' : 'Created');
@@ -3337,12 +3634,15 @@ async function wsEdit(repo, filePath, edits, chatId, chatTitle, force) {
         file.last_modified_by_chat_id = chatId || null;
         file.last_modified_by_chat_title = chatTitle || null;
         file.last_modified_at = Date.now();
+        file.force_taken_from = _wsNextForceTakenFrom(_wEditDecision, file.force_taken_from, chatId);
     } else {
         file.last_modified_by_chat_id = null;
         file.last_modified_by_chat_title = null;
         file.last_modified_at = null;
+        file.force_taken_from = null;
     }
     await setWorkspaceFile(file);
+    if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(file.file_id);
 
     var resp = { success: true, editsApplied: result.appliedEdits };
     if (result.partialSuccess) { resp.partialSuccess = true; resp.failedEdits = result.failedEdits; }
@@ -3432,6 +3732,7 @@ async function wsDelete(wk, filePath, chatId, chatTitle, force) {
         file.last_modified_by_chat_id = chatId || null;
         file.last_modified_by_chat_title = chatTitle || null;
         file.last_modified_at = Date.now();
+        file.force_taken_from = _wsNextForceTakenFrom(_wDelDecision, file.force_taken_from, chatId);
         await setWorkspaceFile(file);
     }
     var resp = { success: true, message: 'Deleted: ' + filePath };
@@ -3519,7 +3820,9 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force) {
             f.last_modified_by_chat_id = null;
             f.last_modified_by_chat_title = null;
             f.last_modified_at = null;
+            f.force_taken_from = null;
             await setWorkspaceFile(f);
+            if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(f.file_id);
             discarded.push({ path: f.path, action: 'restored' });
         }
     }
@@ -3918,7 +4221,7 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
 // Heuristic: extensions GitHub's GraphQL Blob.text reports as isBinary — these
 // land on the REST fallback (extra round trips the GraphQL batch count misses).
 function _wsLikelyBinaryPath(p) {
-    return /\.(png|jpe?g|gif|webp|ico|bmp|tiff?|woff2?|ttf|otf|eot|zip|gz|tgz|bz2|xz|7z|rar|jar|pdf|mp[34]|mov|avi|webm|wasm|exe|dll|so|dylib|class|bin)$/i.test(p);
+    return /\.(png|jpe?g|gif|webp|ico|bmp|tiff?|woff2?|ttf|otf|eot|zip|gz|tgz|bz2|xz|7z|rar|jar|pdf|mp[34]|mov|avi|webm|wasm|exe|dll|so|dylib|class|bin|psd|ai|sketch|ogg|flac|heic|avif)$/i.test(p);
 }
 
 function _wsEstimateHydration(stubs) {
@@ -3942,15 +4245,23 @@ function _wsEstimateHydration(stubs) {
     return { batches: batches, bytes: bytes, binary_files: binCount, seconds: seconds };
 }
 
-async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, limit) {
+async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, limit, ignoreCase) {
     if (!pattern) return { success: false, error: 'pattern is required for grep' };
+    // #13: accept a Perl/Python-style leading (?i) — JS RegExp rejects it. The
+    // regex below is case-insensitive ('gim') unless ignore_case:false opts
+    // out — and an explicit inline (?i) HONOURS the caller's intent, i.e. it
+    // forces case-insensitive matching even when ignore_case is false instead
+    // of being silently dropped.
+    pattern = String(pattern);
+    var _inlineIgnoreCase = /^\(\?i\)/.test(pattern);
+    if (_inlineIgnoreCase) { pattern = pattern.replace(/^\(\?i\)/, ''); ignoreCase = true; }
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
     var files = await getAllWorkspaceFiles(repo);
     var isIgnored = includeIgnored ? function() { return false; } : await wsGetIgnoreFilter(repo);
     var regex;
-    try { regex = new RegExp(pattern, 'gim'); } catch (e) { return { success: false, error: 'Invalid regex: ' + e.message }; }
+    try { regex = new RegExp(pattern, ignoreCase === false ? 'gm' : 'gim'); } catch (e) { return { success: false, error: 'Invalid regex: ' + e.message }; }
 
     // Lazy clone: hydrate all in-scope stubs (prefix + ignore filter) before scanning
     var _gScope = function(p) {
@@ -3962,8 +4273,13 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, 
     // scope (est. > 60s) is refused with a per-folder breakdown so the agent
     // can narrow the scope via `path` — or override with {"force": true}.
     if (!force) {
+        // #13: likely-binary stubs (media, fonts, archives) are deliberately
+        // never hydrated by grep (see the wsHydrate filter below) and are
+        // skipped by the scan loop — exclude them from the estimate so media
+        // dirs never trigger slow_grep. Text-ish files (.svg, .lock) are NOT
+        // in _wsLikelyBinaryPath, so they stay greppable.
         var _gStubs = files.filter(function(f) {
-            return f.stub && f.content == null && !f.deleted && _gScope(f.path);
+            return f.stub && f.content == null && !f.deleted && _gScope(f.path) && !_wsLikelyBinaryPath(f.path);
         });
         if (_gStubs.length > 0) {
             var _gEst = _wsEstimateHydration(_gStubs);
@@ -3993,7 +4309,7 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, 
     }
 
     try {
-        var _gHyd = await wsHydrate(repo, _gScope);
+        var _gHyd = await wsHydrate(repo, function(p) { return _gScope(p) && !_wsLikelyBinaryPath(p); });
         if (_gHyd && _gHyd.hydrated > 0) files = await getAllWorkspaceFiles(repo);
     } catch (e) { /* failed stubs are skipped in the scan loop below */ }
 
@@ -4009,6 +4325,9 @@ async function wsGrep(repo, pattern, pathPrefix, includeIgnored, force, chatId, 
         var f = files[i];
         if (f.deleted || isIgnored(f.path)) continue;
         if (f.content == null) {
+            // Likely-binary stub: intentionally excluded from hydration above —
+            // not an incomplete search, so never counted as unscanned.
+            if (_wsLikelyBinaryPath(f.path)) continue;
             // Stub whose hydration failed — it was NOT scanned. Count it so the
             // result can say the search was incomplete.
             if (!pathPrefix || f.path.indexOf(pathPrefix) === 0) _gUnscanned++;
@@ -4134,7 +4453,9 @@ async function wsGetIgnoreFilter(wk) {
     return function() { return false; };
 }
 
-async function wsStatus(wk, includeIgnored, chatId) {
+// includePrs: 'full' → every stored PR entry incl. files[] (heavy); anything
+// else → the lean projection shared with `list` (#12).
+async function wsStatus(wk, includeIgnored, chatId, includePrs) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
@@ -4210,6 +4531,14 @@ async function wsStatus(wk, includeIgnored, chatId) {
     });
     var activeFiles = files.filter(function(f) { return !f.deleted; });
     var result = { success: true, workspace: wk, repo: meta.github_repo || parseWsKey(wk).repo, branch: meta.branch, dirty_files: dirty, total_files: activeFiles.length, prs: meta.prs || [] };
+    if (includePrs !== 'full') {
+        // Lean prs by default — the full entries (files[] with old/new shas per
+        // PR) blew `status` past the 16 KB cache cap on busy repos. dirty_files
+        // still carry pushed_pr per file, which is what agents rely on.
+        var _sLean = _wsLeanPrs(meta.prs);
+        result.prs = _sLean.prs;
+        if (_sLean.merged_omitted) result.merged_prs_omitted = _sLean.merged_omitted;
+    }
     var _stubCount = files.filter(function(f) { return f.stub && f.content == null && !f.deleted; }).length;
     if (_stubCount > 0) result.stub_files = _stubCount;
     if (foreignCount > 0) {
@@ -5058,6 +5387,7 @@ async function wsPull(wk) {
                     _stubFile.sha = r.bf.remoteSha;
                     if (r.bf.remoteSize != null) _stubFile.size = r.bf.remoteSize;
                     await setWorkspaceFile(_stubFile);
+                    if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(_stubFile.file_id);
                     pulled++;
                 } else {
                     // Hydrated (or mutated) between sync and pull — its content is
@@ -5105,6 +5435,7 @@ async function wsPull(wk) {
                     existing.last_modified_by_chat_title = null;
                     existing.last_modified_at = null;
                     await setWorkspaceFile(existing);
+                    if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(existing.file_id);
                 }
             }
             pulled++;
@@ -5124,6 +5455,17 @@ async function wsPull(wk) {
     if (conflicts.length > 0) result.conflicts = conflicts;
     if (failedPulls.length > 0) result.failed = failedPulls;
     return result;
+}
+
+// #20: GitHub rejects tree/commit/ref writes that touch .github/workflows/ with
+// a 404/422 when the token lacks the `workflow` scope — the raw body says
+// nothing useful. Append an explanatory hint in that case.
+function _wsWorkflowScopeHint(res, treeEntries) {
+    var st = res && res.status;
+    if (st !== 404 && st !== 422 && st !== 403) return '';
+    var touches = (treeEntries || []).some(function(e) { return e && typeof e.path === 'string' && e.path.indexOf('.github/workflows/') === 0; });
+    if (!touches) return '';
+    return ' — this commit touches .github/workflows/; the GitHub token likely lacks the `workflow` scope (required to create or update workflow files). Add the scope to the PAT or leave workflow files out of this push (files: [...]).';
 }
 
 async function wsPush(wk, args, chatId, chatTitle) {
@@ -5223,6 +5565,8 @@ async function wsPush(wk, args, chatId, chatTitle) {
     // paths. Unlisted dirty files stay dirty locally and are NOT committed, so
     // unrelated work (e.g. from another chat) doesn't leak into the PR.
     var _filesSkipped = 0;
+    var _filesSkippedPaths = [];
+    var _filesIgnoredClean = [];
     if (Array.isArray(args.files) && args.files.length) {
         var _requested = {};
         args.files.forEach(function(p) { _requested[String(p).replace(/^\/+/, '')] = true; });
@@ -5230,10 +5574,21 @@ async function wsPush(wk, args, chatId, chatTitle) {
         var _matchedPaths = {};
         _matched.forEach(function(f) { _matchedPaths[f.path] = true; });
         var _missing = Object.keys(_requested).filter(function(p) { return !_matchedPaths[p]; });
-        if (_missing.length) {
-            return { success: false, error: 'Some requested files are not modified (or not in the workspace): ' + _missing.join(', ') + '. Use workspace status to list dirty files; only dirty files can be pushed.' };
+        // #19: a requested path that exists but is CLEAN is a warning, not a
+        // rejection (files_ignored_clean); an UNKNOWN path is still an error.
+        var _allPaths = {};
+        files.forEach(function(f) { _allPaths[f.path] = true; });
+        var _unknown = _missing.filter(function(p) { return !_allPaths[p]; });
+        _filesIgnoredClean = _missing.filter(function(p) { return _allPaths[p]; });
+        if (_unknown.length) {
+            return { success: false, error: 'Some requested files are not in the workspace: ' + _unknown.join(', ') + (_filesIgnoredClean.length ? ' (clean, would be ignored: ' + _filesIgnoredClean.join(', ') + ')' : '') + '. Use workspace status to list dirty files; only dirty files can be pushed.', files_unknown: _unknown, files_ignored_clean: _filesIgnoredClean };
+        }
+        if (_matched.length === 0) {
+            return { success: false, error: 'None of the requested files are modified (all clean): ' + _filesIgnoredClean.join(', ') + '. Nothing to push.', files_ignored_clean: _filesIgnoredClean };
         }
         _filesSkipped = dirtyFiles.length - _matched.length;
+        // #4: report WHICH dirty files were left out, with the reason.
+        _filesSkippedPaths = dirtyFiles.filter(function(f) { return !_matchedPaths[f.path]; }).map(function(f) { return { path: f.path, reason: 'not listed in args.files' }; });
         dirtyFiles = _matched;
     }
 
@@ -5331,8 +5686,19 @@ async function wsPush(wk, args, chatId, chatTitle) {
     // pr_title is optional. In every other case this push opens a new PR (or
     // reopens a closed one), which needs a title — require it now, BEFORE any
     // remote mutation, so a missing title never leaves an orphan branch/commit.
+    var _previousPrNumber = null;
+    var _previousPrMerged = false; // merged-mid-task: true when the stale branch's last PR was MERGED (vs merely closed)
     if (!openPrForBranch && !args.pr_title) {
-        return { success: false, error: 'pr_title is required (no open PR exists for branch "' + args.branch_name + '" to append to)' };
+        if (staleBranchRecreated) {
+            // Security follow-up (review of #919 #8): this path FORCE-RESETS the
+            // remote branch. A missing pr_title most likely means the agent
+            // expected an append onto a live PR — never silently default the
+            // title and proceed with the reset; hard-fail BEFORE any remote
+            // mutation so the agent confirms the intent by passing pr_title.
+            return { success: false, error: 'branch "' + args.branch_name + '" exists remotely but has no open PR (its previous PR was merged or closed); pushing would force-reset it onto the current "' + baseBranch + '" head and open a NEW PR. Pass pr_title (and confirm you intend to reset it) to recreate, or pick a new branch_name. Nothing was pushed.' };
+        } else {
+            return { success: false, error: 'pr_title is required: no open PR exists for branch "' + args.branch_name + '" to append to (' + (branchExists ? 'the branch exists but its PR was merged/closed' : 'the branch does not exist yet') + '), so this push opens a NEW PR.' };
+        }
     }
 
     // Base for NEW branches (including recreated stale ones): the CURRENT remote
@@ -5469,6 +5835,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // rather than silently pushing an empty blob over real remote content.
             return { success: false, error: 'Internal: dirty file has no content (un-hydrated stub): ' + f.path + '. Read or discard the file, then retry the push.' };
         }
+        if (typeof f.content !== 'string') f.content = JSON.stringify(f.content, null, 2); // #5: coerced non-string content
         var isBinary = f.content.indexOf('::binary::') === 0;
         var blobContent = isBinary ? f.content.substring('::binary::'.length) : btoa(unescape(encodeURIComponent(f.content)));
         var blobRes = await githubApi('POST', '/repos/' + githubRepo + '/git/blobs', { content: blobContent, encoding: 'base64' });
@@ -5484,7 +5851,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
         treeEntries.push({ path: f.path, mode: '100644', type: 'blob', sha: null });
     });
     var treeRes = await githubApi('POST', '/repos/' + githubRepo + '/git/trees', { base_tree: baseTreeSha, tree: treeEntries });
-    if (!treeRes.ok) return { success: false, error: 'Failed to create tree: ' + JSON.stringify(treeRes.body) };
+    if (!treeRes.ok) return { success: false, error: 'Failed to create tree: ' + JSON.stringify(treeRes.body) + _wsWorkflowScopeHint(treeRes, treeEntries) };
 
     // 3. Determine the parent commit. Append on the branch tip ONLY when the
     //    branch still has an open PR (a previous push to the same PR). For a
@@ -5498,7 +5865,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
         tree: treeRes.body.sha,
         parents: [parentSha]
     });
-    if (!commitRes.ok) return { success: false, error: 'Failed to create commit: ' + JSON.stringify(commitRes.body) };
+    if (!commitRes.ok) return { success: false, error: 'Failed to create commit: ' + JSON.stringify(commitRes.body) + _wsWorkflowScopeHint(commitRes, treeEntries) };
 
     // 4. Create the branch ref (new branch) or fast-forward it (existing PR branch).
     //    force:false so a concurrent push to the same branch is NOT clobbered —
@@ -5544,6 +5911,10 @@ async function wsPush(wk, args, chatId, chatTitle) {
     } else if (branchExists) {
         var listRes = await githubApi('GET', '/repos/' + githubRepo + '/pulls?state=all&head=' + encodeURIComponent(ownerName + ':' + args.branch_name));
         if (listRes && listRes.ok && Array.isArray(listRes.body) && listRes.body.length > 0) {
+            // Most recent PR for this head (GitHub lists newest first) — the one
+            // whose merge/close made the branch stale. Surfaced as previous_pr_number.
+            _previousPrNumber = listRes.body[0].number || null;
+            _previousPrMerged = !!listRes.body[0].merged_at;
             var _openPr = null, _reopenable = null;
             for (var _i = 0; _i < listRes.body.length; _i++) {
                 var _candidate = listRes.body[_i];
@@ -5566,6 +5937,8 @@ async function wsPush(wk, args, chatId, chatTitle) {
         // Refresh the PR title ONLY when a pr_title was passed (it is optional when
         // appending to an existing open PR) and the body ONLY when a non-empty body
         // was passed — otherwise we'd wipe the existing PR title/description on append.
+        // A pr_title DEFAULTED from the commit message (#8) must not clobber a
+        // reopened PR's real title either.
         var _prPatch = {};
         if (typeof args.pr_title === 'string' && args.pr_title !== '') _prPatch.title = args.pr_title;
         if (typeof args.pr_body === 'string' && args.pr_body !== '') _prPatch.body = args.pr_body;
@@ -5589,7 +5962,6 @@ async function wsPush(wk, args, chatId, chatTitle) {
         prUrl = prRes.body.html_url;
         prNumber = prRes.body.number;
     }
-
     // 6. Track PR on dirty files and in workspace meta — files stay dirty locally,
     //    but cross-chat ownership is released since the work has been published to a PR.
     //    Without this, the pusher's chat would keep blocking other chats from editing
@@ -5709,10 +6081,12 @@ async function wsPush(wk, args, chatId, chatTitle) {
                 // Keep only the last 20 pushed shas — older ones are unlikely to match
                 if (dirtyFiles[k].pushed_shas.length > 20) dirtyFiles[k].pushed_shas = dirtyFiles[k].pushed_shas.slice(-20);
             }
-            // Release cross-chat ownership now that the work is in a PR
+            // Release cross-chat ownership now that the work is in a PR (incl.
+            // the force-takeover marker — the PR is now the review artifact)
             dirtyFiles[k].last_modified_by_chat_id = null;
             dirtyFiles[k].last_modified_by_chat_title = null;
             dirtyFiles[k].last_modified_at = null;
+            dirtyFiles[k].force_taken_from = null;
             await setWorkspaceFile(dirtyFiles[k]);
             // Snapshot old/new content for the durable PR diff (see _prFiles
             // above). old_sha reuses the row's base sha when present — its blob
@@ -5792,6 +6166,8 @@ async function wsPush(wk, args, chatId, chatTitle) {
         pr_number: prNumber,
         files_pushed: dirtyFiles.length,
         files_skipped: _filesSkipped,
+        files_skipped_paths: _filesSkippedPaths.length ? _filesSkippedPaths : undefined,
+        files_ignored_clean: _filesIgnoredClean.length ? _filesIgnoredClean : undefined,
         files: _pushedFileOwnership,
         cross_chat_warnings: _pushCrossChatWarnings.length ? _pushCrossChatWarnings : undefined,
         excluded_foreign_files: _excludedForeign.length ? _excludedForeign : undefined,
@@ -5799,12 +6175,17 @@ async function wsPush(wk, args, chatId, chatTitle) {
         base_branch: (prReused && existingPr && existingPr.base && existingPr.base.ref) ? existingPr.base.ref : baseBranch,
         pr_reused: prReused,
         stale_branch_recreated: staleBranchRecreated,
+        previous_pr_number: _previousPrNumber || undefined,
+        previous_pr_merged: _previousPrNumber ? _previousPrMerged : undefined,
         base_advanced: baseAdvanced,
         base_override_warning: _baseOverrideWarning || undefined,
         warning: _postPrWarning || undefined,
         message: (prReused
             ? ('Added a commit (' + dirtyFiles.length + ' file(s)) to existing PR #' + prNumber + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : ''))
             : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)' + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : '')))
+            + (_filesSkippedPaths.length ? (' (skipped: ' + _filesSkippedPaths.map(function(s) { return s.path; }).join(', ') + ')') : '')
+            + (_filesIgnoredClean.length ? ('; ' + _filesIgnoredClean.length + ' requested file(s) were clean and ignored: ' + _filesIgnoredClean.join(', ')) : '')
+            + (staleBranchRecreated ? (' \u26a0 STALE BRANCH RECREATED: the branch had no open PR' + (_previousPrNumber ? ' (its previous PR #' + _previousPrNumber + ' was ' + (_previousPrMerged ? 'MERGED' : 'closed') + ' mid-task)' : '') + ', it was reset onto the current base head and ' + (prReused ? 'closed PR #' + prNumber + ' was reopened' : 'a NEW PR was opened') + '; this PR contains ONLY the files pushed now') : '')
             + (_excludedForeign.length ? ('; ' + _excludedForeign.length + ' foreign in-progress file(s) excluded from the commit — see excluded_foreign_files') : '')
             + (_pushCrossChatWarnings.length ? ('; \u26a0 ' + _pushCrossChatWarnings.length + ' cross-chat warning(s) — committed file(s) belonging to another chat or another PR, see cross_chat_warnings') : '')
     };
@@ -5826,7 +6207,7 @@ var DEPLOY_ICONS_PATH = 'src/platform/extension/icons';
 // tool (bundles, html shells, platform files) — KEEP IN SYNC with
 // skills/extension-dev/build.js outputFiles/extFiles. Anything else at the
 // folder root is presumed user-owned and is never deleted.
-var DEPLOY_ROOT_MANAGED = ['app.html', 'app.js', 'app.css', 'sw-bundle.js', 'theme-init.js', 'view-init.js', 'manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js'];
+var DEPLOY_ROOT_MANAGED = ['app.html', 'app.js', 'app.css', 'sw-bundle.js', 'theme-init.js', 'view-init.js', 'manifest.json', 'background.js', 'content-script.js', 'rules.json', 'sandbox.html', 'widget-sandbox.html', 'file-download.html', 'file-download.js', 'offscreen.html', 'offscreen-helper.js', 'test-run-policy.js'];
 
 // Deploy workspace files to the connected disk folder.
 // srcPath: workspace path prefix to deploy (default DEPLOY_PATH). destSubdir:

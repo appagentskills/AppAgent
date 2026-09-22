@@ -147,6 +147,8 @@ async function exportAllData() {
             return idx === 0 ? line : '  ' + line;
         }).join('\n'));
 
+        await writable.write(',\n  "widgets": ' + JSON.stringify(await WidgetStore.exportRecords()));
+
         // Get and write API providers
         var apiProvidersData = [];
         if (database.objectStoreNames.contains(apiProvidersStoreName)) {
@@ -215,33 +217,90 @@ async function importAllData() {
             }
             
             // Handle full data import
-            if (!importData.chats || !importData.settings) {
+            if (!Array.isArray(importData.chats) || !Array.isArray(importData.settings)) {
                 throw new Error('Invalid backup file format');
             }
-            
-            if (!await showConfirmModal('Import Data', 'This will merge imported data with existing data. Continue?')) {
+
+            // ROW VALIDATION: every store below uses an in-line keyPath (chats
+            // 'id', settings 'key', dashboardWidgets 'id', apiProviders 'name').
+            // put() on a row missing its key throws a synchronous DataError,
+            // which used to abort the loop mid-way and leave a PARTIAL import
+            // (earlier puts committed, later rows never written). Filter the
+            // invalid rows up front, count them, and report the count.
+            var _impSkipped = 0;
+            var _hasKey = function(row, keyField) {
+                var k = (row && typeof row === 'object' && !Array.isArray(row)) ? row[keyField] : undefined;
+                return typeof k === 'string' ? k.length > 0 : (typeof k === 'number' && isFinite(k));
+            };
+            var _validRows = function(rows, keyField) {
+                var out = [];
+                if (!Array.isArray(rows)) return out;
+                for (var r = 0; r < rows.length; r++) {
+                    if (_hasKey(rows[r], keyField)) out.push(rows[r]);
+                    else _impSkipped++;
+                }
+                return out;
+            };
+            var _impChats = _validRows(importData.chats, 'id');
+            var _impSettings = _validRows(importData.settings, 'key');
+            var _impDashboardWidgets = _validRows(importData.dashboardWidgets, 'id');
+            var _impProviders = _validRows(importData.apiProviders, 'name');
+            if (_impChats.length === 0 && _impSettings.length === 0 && _impDashboardWidgets.length === 0 && _impProviders.length === 0) {
+                throw new Error('Invalid backup file format (no importable rows' + (_impSkipped ? '; ' + _impSkipped + ' invalid row(s)' : '') + ')');
+            }
+
+            // Reject malformed revision backups before confirmation or any write.
+            var _impWidgets = importData.widgets === undefined ? [] : importData.widgets;
+            WidgetStore.validateRecords(_impWidgets);
+
+            var _impConfirmMsg = 'This will merge imported data with existing data (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
+                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) will be skipped' : '') + '). Continue?';
+            if (!await showConfirmModal('Import Data', _impConfirmMsg)) {
                 return;
             }
             
             var database = await openDatabase();
             
-            // Import chats
-            var chatTransaction = database.transaction([chatStoreName], 'readwrite');
-            var chatStore = chatTransaction.objectStore(chatStoreName);
-            for (var i = 0; i < importData.chats.length; i++) {
-                // TRANSIENT-FLAG STRIP (core/130-indexeddb.js): backup files
-                // exported before the strip existed can carry legacy
-                // '_'-prefixed session flags — shed them at this put too so
-                // an import cannot re-seed retired transient schema.
-                chatStore.put(stripTransientChatFieldsForPut(importData.chats[i]));
+            var _impStores = {};
+            _impStores[chatStoreName] = _impChats.map(stripTransientChatFieldsForPut);
+            _impStores[settingsStoreName] = _impSettings;
+            if (database.objectStoreNames.contains(dashboardWidgetsStoreName)) _impStores[dashboardWidgetsStoreName] = _impDashboardWidgets;
+
+            // Prepare API providers (if present). Old backups may also contain
+            // llmEndpoints; inline their matched connection fields before writing
+            // provider rows. The helper preserves all custom fields, credentials,
+            // and unmatched endpointId providers. New exports never emit the store.
+            if (_impProviders.length > 0 && database.objectStoreNames.contains(apiProvidersStoreName)) {
+                var importedProviders = _impProviders;
+                if (Array.isArray(importData.llmEndpoints)) {
+                    // Canonical endpoint list for endpointId preservation: after the
+                    // reload below, the BACKUP's own settings 'llmEndpoints' row (put
+                    // above) is what loadLlmEndpoints hydrates — judging id survival
+                    // against THIS device's live in-memory list keeps/drops endpointId
+                    // wrongly. Prefer the imported settings row; fall back to the live
+                    // global only when the backup carries none.
+                    var _canonicalEndpoints = (typeof llmEndpoints !== 'undefined' && Array.isArray(llmEndpoints)) ? llmEndpoints : [];
+                    for (var e3 = 0; e3 < importData.settings.length; e3++) {
+                        var _eRow = importData.settings[e3] || {};
+                        if (_eRow.key === 'llmEndpoints' && Array.isArray(_eRow.value)) { _canonicalEndpoints = _eRow.value; break; }
+                    }
+                    importedProviders = inlineLegacyEndpointProviders(importedProviders, importData.llmEndpoints,
+                        _canonicalEndpoints).providers;
+                }
+                _impStores[apiProvidersStoreName] = [];
+                for (var m = 0; m < importedProviders.length; m++) {
+                    // inlineLegacyEndpointProviders may reshape rows; re-check the key so
+                    // one bad row cannot abort the whole provider transaction.
+                    var _pRow = importedProviders[m];
+                    if (!_hasKey(_pRow, 'name')) { _impSkipped++; continue; }
+                    _impStores[apiProvidersStoreName].push(_pRow);
+                }
+
             }
             
-            // Import settings
-            var settingsTransaction = database.transaction([settingsStoreName], 'readwrite');
-            var settingsStore = settingsTransaction.objectStore(settingsStoreName);
-            for (var j = 0; j < importData.settings.length; j++) {
-                settingsStore.put(importData.settings[j]);
-            }
+            // No store is changed until all widget conflicts have been checked in
+            // this same transaction; publish permissions only AFTER it commits.
+            await WidgetStore.importRecords(_impWidgets, _impStores);
 
             // F6: permission maps are SW-owned at runtime — the generic put
             // above restores the IDB rows, but a live SW (which outlives the
@@ -265,44 +324,8 @@ async function importAllData() {
                 }
             }
 
-            // Import dashboard widgets (if present)
-            if (importData.dashboardWidgets && importData.dashboardWidgets.length > 0 && database.objectStoreNames.contains(dashboardWidgetsStoreName)) {
-                var dashboardTransaction = database.transaction([dashboardWidgetsStoreName], 'readwrite');
-                var dashboardStore = dashboardTransaction.objectStore(dashboardWidgetsStoreName);
-                for (var k = 0; k < importData.dashboardWidgets.length; k++) {
-                    dashboardStore.put(importData.dashboardWidgets[k]);
-                }
-            }
-            
-            // Import API providers (if present). Old backups may also contain
-            // llmEndpoints; inline their matched connection fields before writing
-            // provider rows. The helper preserves all custom fields, credentials,
-            // and unmatched endpointId providers. New exports never emit the store.
-            if (importData.apiProviders && importData.apiProviders.length > 0 && database.objectStoreNames.contains(apiProvidersStoreName)) {
-                var importedProviders = importData.apiProviders;
-                if (Array.isArray(importData.llmEndpoints)) {
-                    // Canonical endpoint list for endpointId preservation: after the
-                    // reload below, the BACKUP's own settings 'llmEndpoints' row (put
-                    // above) is what loadLlmEndpoints hydrates — judging id survival
-                    // against THIS device's live in-memory list keeps/drops endpointId
-                    // wrongly. Prefer the imported settings row; fall back to the live
-                    // global only when the backup carries none.
-                    var _canonicalEndpoints = (typeof llmEndpoints !== 'undefined' && Array.isArray(llmEndpoints)) ? llmEndpoints : [];
-                    for (var e3 = 0; e3 < importData.settings.length; e3++) {
-                        var _eRow = importData.settings[e3] || {};
-                        if (_eRow.key === 'llmEndpoints' && Array.isArray(_eRow.value)) { _canonicalEndpoints = _eRow.value; break; }
-                    }
-                    importedProviders = inlineLegacyEndpointProviders(importedProviders, importData.llmEndpoints,
-                        _canonicalEndpoints).providers;
-                }
-                var apiProvidersTransaction = database.transaction([apiProvidersStoreName], 'readwrite');
-                var apiProvidersStore = apiProvidersTransaction.objectStore(apiProvidersStoreName);
-                for (var m = 0; m < importedProviders.length; m++) {
-                    apiProvidersStore.put(importedProviders[m]);
-                }
-            }
-            
-            showSnackbar('Data imported successfully! Reloading...', 'success');
+            showSnackbar('Data imported successfully! (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
+                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) skipped' : '') + ') Reloading...', 'success');
             window.location.reload();
         } catch (e) {
             console.error('Import failed:', e);
@@ -323,22 +346,17 @@ async function deleteAllData() {
     try {
         var database = await openDatabase();
 
-        // Clear chats (and their payload blobs — chat_payloads holds the
-        // base64 content the records reference; orphaning it here would
-        // leave the heaviest data behind after "delete ALL data")
-        var chatTransaction = database.transaction([chatStoreName, chatPayloadsStoreName], 'readwrite');
-        chatTransaction.objectStore(chatStoreName).clear();
-        chatTransaction.objectStore(chatPayloadsStoreName).clear();
-
-        // Clear settings
-        var settingsTransaction = database.transaction([settingsStoreName], 'readwrite');
-        settingsTransaction.objectStore(settingsStoreName).clear();
-
-        // Clear dashboard widgets
-        if (database.objectStoreNames.contains(dashboardWidgetsStoreName)) {
-            var dashboardTransaction = database.transaction([dashboardWidgetsStoreName], 'readwrite');
-            dashboardTransaction.objectStore(dashboardWidgetsStoreName).clear();
-        }
+        // Clear all affected stores together and wait for durable completion.
+        var resetStores = [chatStoreName, chatPayloadsStoreName, settingsStoreName, widgetStoreName, dashboardWidgetsStoreName]
+            .filter(function(name) { return database.objectStoreNames.contains(name); });
+        await new Promise(function(resolve, reject) {
+            var tx = database.transaction(resetStores, 'readwrite'), failure;
+            tx.oncomplete = resolve;
+            tx.onerror = tx.onabort = function() { reject(failure || tx.error || new Error('Reset transaction failed')); };
+            try { resetStores.forEach(function(name) { tx.objectStore(name).clear(); }); }
+            catch (e) { failure = e; tx.abort(); }
+        });
+        WidgetStore.clearCache(true);
 
         showSnackbar('All data deleted! Reloading...', 'success');
         window.location.reload();

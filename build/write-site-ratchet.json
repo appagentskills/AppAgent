@@ -16,14 +16,15 @@
     },
     "saveChatsToStorage": {
       "src/js/app/020-api-messages.js": 2,
-      "src/js/app/030-agent-loop.js": 24,
+      "src/js/app/030-agent-loop.js": 27,
       "src/js/app/040-send-message.js": 3,
       "src/js/app/050-image-attachments.js": 1,
       "src/js/core/097-sub-agent-registry.js": 10,
+      "src/js/core/135-widget-store.js": 1,
       "src/js/core/140-skills-engine.js": 1,
-      "src/js/tools/010-iframe-tool.js": 5,
+      "src/js/tools/010-iframe-tool.js": 4,
       "src/js/tools/020-tool-execution.js": 7,
-      "src/js/tools/080-widget-tools.js": 3,
+      "src/js/tools/080-widget-tools.js": 2,
       "src/js/tools/090-display-templates.js": 2,
       "src/js/tools/100-prompt-user.js": 8,
       "src/js/tools/110-smart-documents.js": 1,
@@ -49,7 +50,6 @@
       "src/js/app/036-agent-event-handlers-page.js": 15,
       "src/js/app/040-send-message.js": 5,
       "src/js/app/045-agent-port-bridge-page.js": 4,
-      "src/js/app/050-image-attachments.js": 1,
       "src/js/core/120-init.js": 2,
       "src/js/tools/020-tool-execution.js": 3,
       "src/js/tools/080-widget-tools.js": 1,
@@ -70,7 +70,6 @@
       "src/js/ui/250-message-render.js": 5
     },
     "currentChatIdAssign": {
-      "src/js/app/050-image-attachments.js": 1,
       "src/js/core/030-config.js": 1,
       "src/js/core/120-init.js": 2,
       "src/js/ui/025-history-nav.js": 1,
@@ -81,6 +80,7 @@
     "idbStoreDelete": {
       "src/js/core/097-sub-agent-registry.js": 3,
       "src/js/core/130-indexeddb.js": 10,
+      "src/js/core/135-widget-store.js": 1,
       "src/js/core/140-skills-engine.js": 2,
       "src/js/tools/020-tool-execution.js": 4,
       "src/js/tools/110-smart-documents.js": 1,
@@ -89,17 +89,17 @@
       "src/js/worker/110-agent-checkpoint.js": 2
     },
     "chatFieldPoke": {
-      "src/js/app/030-agent-loop.js": 5,
+      "src/js/app/030-agent-loop.js": 9,
       "src/js/app/036-agent-event-handlers-page.js": 1,
       "src/js/app/050-image-attachments.js": 2,
       "src/js/core/100-cached-results.js": 2,
       "src/js/core/130-indexeddb.js": 2,
-      "src/js/tools/010-iframe-tool.js": 2,
+      "src/js/tools/010-iframe-tool.js": 1,
       "src/js/tools/020-tool-execution.js": 7,
       "src/js/tools/080-widget-tools.js": 3,
       "src/js/tools/090-display-templates.js": 1,
       "src/js/tools/110-smart-documents.js": 1,
-      "src/js/tools/120-actions.js": 8,
+      "src/js/tools/120-actions.js": 10,
       "src/js/tools/150-start-chat.js": 1,
       "src/js/ui/070-dashboard-ui.js": 1,
       "src/js/ui/090-version-history.js": 3,
@@ -109,7 +109,7 @@
       "src/js/ui/270-iframe-panel.js": 2,
       "src/js/worker/020-page-stubs.js": 8,
       "src/js/worker/115-storage.js": 1,
-      "src/js/worker/120-tool-routing.js": 4
+      "src/js/worker/120-tool-routing.js": 5
     },
     "deleteChatsEntry": {
       "src/js/core/097-sub-agent-registry.js": 1,
@@ -123,7 +123,7 @@
       "src/js/ui/070-dashboard-ui.js": 1,
       "src/js/ui/270-iframe-panel.js": 1,
       "src/js/worker/010-platform-stub.js": 2,
-      "src/platform/extension/background.js": 15,
+      "src/platform/extension/background.js": 16,
       "src/platform/extension/platform-bridge.js": 6
     }
   }

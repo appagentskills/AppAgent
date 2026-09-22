@@ -356,8 +356,8 @@ function _registerPanel(port) {
             resumeScanSettled: _swResumeScanSettled,
             // F6: ship the SW's authoritative in-memory session permission
             // map so a connecting panel converges — a new panel learns
-            // existing "Allow for session" grants; a panel reconnecting
-            // after SW eviction sees the legitimate reset. Replaces the
+            // existing "Allow for this chat" grants (rehydrated from
+            // chrome.storage.session after SW eviction). Replaces the
             // panels' old hello-time UPWARD mirror push (the QW9 boot-wipe
             // bug: a fresh panel pushed `{}` and revoked grants everywhere).
             sessionPermissions: (sessionPermissions && typeof sessionPermissions === 'object') ? sessionPermissions : {},
@@ -656,7 +656,7 @@ function _handlePanelMessage(port, msg) {
                                 // Running branch of _handlePanelSendMessage: merge into
                                 // pendingInjectionsByChatId + interrupt/abort — the loop's
                                 // flushPendingInjection pushes it next iteration.
-                                _handlePanelSendMessage({ chatId: msg.chatId, text: _unseen.text, images: _unseen.images });
+                                _swDispatchPanelSendMessage({ chatId: msg.chatId, text: _unseen.text, images: _unseen.images });
                             } else {
                                 // _runCleanupGuard window (finish→hook-rerun): the loop is
                                 // between iterations — queue the injection WITHOUT firing an
@@ -814,8 +814,7 @@ function _handlePanelMessage(port, msg) {
             // (the next LLM step of an un-pinned chat reads currentProvider).
             _swAdoptProvider(msg.currentProvider);
             if (msg.chatId && runningChatIds[msg.chatId]) {
-                try { _handlePanelSendMessage(msg); }
-                catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
+                _swDispatchPanelSendMessage(msg);
                 return;
             }
             (self._swBootReady || Promise.resolve())
@@ -827,8 +826,7 @@ function _handlePanelMessage(port, msg) {
                 // DEFAULT_TIER_ALIASES fallback of an unhydrated SW).
                 .then(function() { return (typeof loadTierAliases === 'function') ? loadTierAliases() : null; })
                 .then(function() {
-                    try { _handlePanelSendMessage(msg); }
-                    catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', e); }
+                    _swDispatchPanelSendMessage(msg);
                 })
                 .catch(function(e) {
                     // A gate failure (IDB/provider load) must surface — without
@@ -1068,14 +1066,40 @@ function _handlePanelMessage(port, msg) {
                         _dbgPending.push({ toolCallId: tcid, startedAt: (_pe && _pe.startedAt) || null });
                     });
                 }
-                port.postMessage({ type: 'debug-state', requestId: msg.requestId, state: {
+                // #17 sandbox_registry: js_eval sandbox bookkeeping (tools/020-tool-execution.js
+                // globals, SW bundle) + offscreen-document state (background.js
+                // self._swOffscreenDebug). All typeof-guarded — additive, read-only.
+                var _dbgSandboxes = {
+                    evalCount: (typeof _sandboxEvalCount !== 'undefined') ? _sandboxEvalCount : null,
+                    pending: (typeof _sandboxPending !== 'undefined') ? _sandboxPending : null,
+                    activity: (typeof _sandboxActivity !== 'undefined') ? _sandboxActivity : null,
+                    gen: (typeof _sandboxGen !== 'undefined') ? _sandboxGen : null
+                };
+                var _dbgOffscreen = null;
+                try { if (typeof self._swOffscreenDebug === 'function') _dbgOffscreen = self._swOffscreenDebug(); } catch (e1) { _dbgOffscreen = null; }
+                var _dbgState = {
                     runningChatIds: (typeof runningChatIds !== 'undefined') ? Object.keys(runningChatIds).filter(function(c) { return runningChatIds[c]; }) : [],
                     pendingUIToolCalls: _dbgPending,
                     parkedToolCalls: _dbgParked,
                     connectedPorts: (typeof _swPanelPorts !== 'undefined') ? _swPanelPorts.size : null,
                     resumeScanSettled: (typeof _swResumeScanSettled !== 'undefined') ? !!_swResumeScanSettled : null,
-                    devMode: !!self._swDevModeActive
-                } });
+                    devMode: !!self._swDevModeActive,
+                    sandboxes: _dbgSandboxes,
+                    offscreen: null
+                };
+                // chrome.offscreen.hasDocument() is async — resolve it, then post.
+                // A rejection or missing API yields hasDocument:null; a dead port
+                // is swallowed by the inner try (the page side times out after 5s).
+                var _hasDocP;
+                try {
+                    _hasDocP = (typeof chrome !== 'undefined' && chrome.offscreen && typeof chrome.offscreen.hasDocument === 'function') ? chrome.offscreen.hasDocument() : null;
+                } catch (e2) { _hasDocP = null; }
+                Promise.resolve(_hasDocP).catch(function() { return null; }).then(function(hasDoc) {
+                    _dbgState.offscreen = Object.assign({ hasDocument: (hasDoc === null || hasDoc === undefined) ? null : !!hasDoc }, _dbgOffscreen || {});
+                    try {
+                        port.postMessage({ type: 'debug-state', requestId: msg.requestId, state: _dbgState });
+                    } catch (e3) { /* port died — the page side times out after 5s */ }
+                });
             } catch (e) { /* port died — the page side times out after 5s */ }
             return;
 
@@ -1231,7 +1255,10 @@ function _handlePanelMessage(port, msg) {
                     }
                     if (!Array.isArray(wpChat.widgets)) wpChat.widgets = [];
                     var wpIdx = wpChat.widgets.findIndex(function(w) { return w && w.id === wpW.id; });
-                    if (wpIdx !== -1) wpChat.widgets[wpIdx] = wpW;
+                    if (wpIdx !== -1) {
+                        if ((wpW.contentVersion || 0) > (wpChat.widgets[wpIdx].contentVersion || 0))
+                            wpChat.widgets[wpIdx] = Object.assign({}, wpW, { msgIndex: wpChat.widgets[wpIdx].msgIndex });
+                    }
                     else wpChat.widgets.push(wpW);
                     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                 } catch (e) { console.error('[port-bridge] widget-persist upsert failed', msg.chatId, e); }
@@ -1246,7 +1273,7 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'exec-tool-result':
-            resolvePendingUIToolCall(msg.toolCallId, msg.result, msg.error);
+            resolvePendingUIToolCall(msg.toolCallId, msg.result, msg.error, port);
             return;
 
         case 'exec-approval-prompt-result':
@@ -1263,6 +1290,16 @@ function _handlePanelMessage(port, msg) {
                     msg.toolCallId || _abEntry.toolCallId,
                     msg.status || null,
                     !!msg.allowed);
+                // "Allow for this chat": self-apply the grant from the verdict
+                // (root chat + permission key), persist, rebroadcast, and
+                // auto-resolve same-root/same-key sibling prompts — see
+                // swGrantChatPermission (worker/120-tool-routing.js). The
+                // panel's own permissions-update push is now redundant.
+                if (msg.allowed && msg.status === 'session_allowed' && typeof swGrantChatPermission === 'function') {
+                    var _abEnv = _abEntry.envelope || {};
+                    var _abPermKey = _abEnv.permissionKey || msg.permissionKey || null;
+                    if (_abPermKey) swGrantChatPermission(_abEntry.chatId || msg.chatId, _abPermKey, msg.approvalRequestId);
+                }
             }
             return;
 
@@ -1319,13 +1356,21 @@ function _handlePanelMessage(port, msg) {
             // Panel mutated a permission source. Three independent slots:
             //   • toolPermissions   — "Always allow" + settings-page edits
             //   • instancePermissions — per-host overrides
-            //   • sessionPermissions — "Allow for session" (in-memory only)
+            //   • sessionPermissions — "Allow for this chat" (root-chat-scoped,
+            //     mirrored to chrome.storage.session)
             // Each is sent individually (null when unchanged) so the panel can
             // push just the slot that moved. Without this, the SW's
             // getToolPermission keeps returning 'ask' after the user picks
-            // "Allow for session" / "Always allow", and the approval prompt
+            // "Allow for this chat" / "Always allow", and the approval prompt
             // keeps firing on every tool call.
             var _permChanged = {};
+            // SEC-1: slots touched ONLY by a delta (never a full map in this
+            // message) must raise a delta-specific boot-race flag below, not the
+            // full-replace one — the replace flag makes
+            // loadSessionPermissionsInWorker (worker/025) SKIP the stored map,
+            // dropping every other chat's persisted grant when e.g. a
+            // deleteChat prune lands during the SW boot window.
+            var _permDeltaOnly = {};
             // FLUX-4/1 (per-key merge): panels with a synced baseline dispatch
             // DELTAS ({set:{k:v}, del:[k]}, app/045 pushPermissionsToOffscreen)
             // instead of whole maps, so two panels editing DIFFERENT keys
@@ -1343,9 +1388,17 @@ function _handlePanelMessage(port, msg) {
                     Object.keys(d.set).forEach(function(k) { map[k] = d.set[k]; });
                 }
                 if (Array.isArray(d.del)) {
-                    d.del.forEach(function(k) { delete map[k]; });
+                    d.del.forEach(function(k) {
+                        delete map[k];
+                        if (slot === 'sessionPermissions' && typeof _swPermsDirty !== 'undefined') {
+                            // Remembered so the boot merge never resurrects it.
+                            _swPermsDirty.sessionPermissionsDeleted = _swPermsDirty.sessionPermissionsDeleted || {};
+                            _swPermsDirty.sessionPermissionsDeleted[k] = true;
+                        }
+                    });
                 }
                 _permChanged[slot] = map;
+                _permDeltaOnly[slot] = true;
                 return map;
             };
             toolPermissions = _applyPermDelta('toolPermissions', toolPermissions);
@@ -1362,15 +1415,18 @@ function _handlePanelMessage(port, msg) {
             if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
                 sessionPermissions = msg.sessionPermissions;
                 _permChanged.sessionPermissions = sessionPermissions;
+                _permDeltaOnly.sessionPermissions = false;
             }
             // F6 (single IDB writer): the SW persists the durable slots
             // itself — panels no longer write permission maps to IDB at all
             // (ui/080-scope.js dispatches here instead of setSetting).
-            // sessionPermissions is deliberately NOT persisted: session
-            // grants live and die with the SW (RFC §4.5). The dirty flag
-            // stops a boot-time loadToolPermissionsInWorker whose IDB read
-            // resolves AFTER this dispatch from clobbering the fresher edit
-            // (worker/020-page-stubs.js).
+            // sessionPermissions ("Allow for this chat" grants) is mirrored to
+            // chrome.storage.session (persistSessionPermissionsInWorker,
+            // worker/025) so it survives SW eviction / Reload within the
+            // browser session. The dirty flags stop a boot-time
+            // loadToolPermissionsInWorker / loadSessionPermissionsInWorker
+            // whose read resolves AFTER this dispatch from clobbering the
+            // fresher edit (worker/020-page-stubs.js).
             if (_permChanged.toolPermissions) {
                 _swPermsDirty.toolPermissions = true;
                 if (typeof setSetting === 'function') {
@@ -1382,6 +1438,15 @@ function _handlePanelMessage(port, msg) {
                 if (typeof setSetting === 'function') {
                     try { Promise.resolve(setSetting('instancePermissions', instancePermissions)).catch(function(e) { console.warn('[sw-runtime] instancePermissions persist threw', e); }); } catch (e) { console.warn('[sw-runtime] instancePermissions persist threw (sync)', e); }
                 }
+            }
+            if (_permChanged.sessionPermissions) {
+                // Delta-only edit → additive-style merge flag (stored grants of
+                // other chats survive the boot race; explicit deletions are
+                // tracked in _swPermsDirty.sessionPermissionsDeleted). A full
+                // map / reset-all keeps the replace flag.
+                if (_permDeltaOnly.sessionPermissions) _swPermsDirty.sessionPermissionsDelta = true;
+                else _swPermsDirty.sessionPermissions = true;
+                if (typeof persistSessionPermissionsInWorker === 'function') persistSessionPermissionsInWorker();
             }
             // QW9 (flux single-writer, step 1): after applying, REBROADCAST
             // the changed slots to every connected panel as
@@ -1769,7 +1834,7 @@ var _swProviderAdopted = false;
 function _swAdoptProvider(name) {
     if (!name || typeof name !== 'string') return;
     // Persist on the FIRST adoption of this SW lifetime even when the name
-    // equals the bundle default (030-config.js seeds 'Opus 5'): otherwise a
+    // equals the bundle default (030-config.js seeds 'Opus 5.5'): otherwise a
     // user whose selection IS the default would never refresh the stored
     // fallback and a panel-less resume could revive an older selection.
     var _first = !_swProviderAdopted;
@@ -1787,8 +1852,40 @@ async function _swHydrateProviderFallback() {
     if (_swProviderAdopted || typeof getSetting !== 'function') return;
     try {
         var stored = await getSetting(SW_PROVIDER_SETTING_KEY, null);
+        // A stored RETIRED default name (e.g. 'Opus 5') follows PROVIDER_RENAMES,
+        // but only when that old name no longer exists (#950 guard).
+        if (stored && typeof stored === 'string' && typeof PROVIDER_RENAMES !== 'undefined'
+            && PROVIDER_RENAMES[stored] && typeof getProviderById === 'function'
+            && !getProviderById(stored) && getProviderById(PROVIDER_RENAMES[stored])) {
+            stored = PROVIDER_RENAMES[stored];
+        }
         if (stored && typeof stored === 'string' && !_swProviderAdopted) currentProvider = stored;
     } catch (e) { /* keep the bundle default */ }
+}
+
+// Dispatch wrapper for _handlePanelSendMessage. The handler is `async`, so a
+// bare `try { _handlePanelSendMessage(msg) } catch` at the call sites could
+// never catch anything — every throw (sync or after an await) surfaces as a
+// REJECTED promise → unhandled rejection, and the user's message was lost
+// silently. Catch the rejection here, log it, and (idle chats only) emit
+// runCrashed so the panel's spinner/streaming UI is unstuck — same guard as
+// the send-message gate-chain catch.
+function _swDispatchPanelSendMessage(msg) {
+    var p;
+    try { p = _handlePanelSendMessage(msg); }
+    catch (e) { console.error('[port-bridge] _handlePanelSendMessage threw', msg && msg.chatId, e); return; }
+    if (p && typeof p.catch === 'function') {
+        p.catch(function(e) {
+            console.error('[port-bridge] _handlePanelSendMessage rejected', msg && msg.chatId, e);
+            try {
+                if (msg && msg.chatId && typeof AgentEvents !== 'undefined' && AgentEvents.emit
+                    && !runningChatIds[msg.chatId]
+                    && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[msg.chatId])) {
+                    AgentEvents.emit('runCrashed', { chatId: msg.chatId });
+                }
+            } catch (e2) {}
+        });
+    }
 }
 
 async function _handlePanelSendMessage(msg) {
@@ -1819,6 +1916,11 @@ async function _handlePanelSendMessage(msg) {
         // become canonical and the buffered edit is applied a second time by a
         // later adopt.
         var _smChat = msg.chat || { id: chatId, messages: [] };
+        // Normalize the snapshot BEFORE it becomes canonical: a panel snapshot
+        // without a messages array would make the idle-branch push below throw
+        // (message lost). Done here, on the not-yet-adopted object, rather than
+        // as a chats[chatId].messages poke after adoption (write-site ratchet).
+        if (!Array.isArray(_smChat.messages)) _smChat.messages = [];
         try {
             _swOverlayChatMeta(_swChatMetaPendingByChatId[chatId], _smChat);
             delete _swChatMetaPendingByChatId[chatId];
@@ -1826,14 +1928,12 @@ async function _handlePanelSendMessage(msg) {
         chats[chatId] = _smChat;
     }
 
-    // MEMFIX: rehydrate a payload-evicted chat BEFORE the idle branch pushes
-    // the user's message and awaits saveChatsToStorage — the save put-loop
-    // skips evicted chats, so without this the just-typed message would never
-    // persist (lost on SW death). Also needed so the run that follows can
-    // inline vision blocks. ensureChatPayloads never rejects.
-    if (typeof ensureChatPayloads === 'function') {
-        try { await ensureChatPayloads(chatId); } catch (e) {}
-    }
+    // NOTE: no `await` may appear ABOVE the runningChatIds branch below. The
+    // 'send-message' fast path relies on the running branch executing
+    // SYNCHRONOUSLY within the port message handler (QUEUE-SYNC-FIX): the
+    // interrupt resolver / stream abort must land while the targeted step is
+    // still current. The MEMFIX rehydrate (ensureChatPayloads) therefore lives
+    // in the idle branch only — the running branch touches in-memory maps.
 
     // B10: the user sending a message means they intend this chat to run now —
     // clear any stale SW-side pause flag (mirrors the run-agent handler @:172).
@@ -1875,6 +1975,17 @@ async function _handlePanelSendMessage(msg) {
                 images: msg.images || null
             };
         }
+        // #18 prompt_user continuity: if the chat's LAST prompt_user row is still
+        // pending (and its call is tracked), the message IS the answer — settle
+        // the prompt and return WITHOUT interrupting (no userInterruptedChats,
+        // no resolver, no stream abort). The injection merged above still lands
+        // as the next user row after the tool batch (flushPendingInjection), so
+        // the transcript keeps the user's words. Pause / provider-change lanes
+        // above are unaffected. Falls through to the interrupt otherwise —
+        // including when the text is a STOP PHRASE ("stop"/"no"/"cancel"): the
+        // helper then settles the prompt as cancelled and returns false so the
+        // interrupt lane below still runs.
+        if (typeof _swAnswerPendingPromptViaChat === 'function' && _swAnswerPendingPromptViaChat(chatId, msg.text)) return;
         userInterruptedChats[chatId] = true;
         if (interruptResolversByChatId[chatId]) {
             try { interruptResolversByChatId[chatId](); } catch (e) {}
@@ -1886,16 +1997,45 @@ async function _handlePanelSendMessage(msg) {
     }
 
     // Idle — push immediately and start the loop.
+    // MEMFIX: rehydrate a payload-evicted chat BEFORE pushing the user's
+    // message and awaiting saveChatsToStorage — the save put-loop skips
+    // evicted chats, so without this the just-typed message would never
+    // persist (lost on SW death). Also needed so the run that follows can
+    // inline vision blocks. ensureChatPayloads never rejects (try/catch is
+    // defensive). Moved here from above the running branch — see NOTE.
+    if (typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
     if (msg.text || (msg.images && msg.images.length)) {
         if (msg.text) chats[chatId].messages.push({ role: 'user', content: msg.text });
         if (msg.images && msg.images.length) {
+            // Mirror flushPendingInjection (app/030-agent-loop.js, shared with
+            // the SW bundle) / sendMessage (app/040-send-message.js): a
+            // 'document' attachment is a Smart Document REFERENCE (context
+            // row with its doc_id, no payload) — previously it fell into the
+            // screenshot arm with base64:undefined; and every payload row
+            // gets a file_id (generated when the panel did not supply one)
+            // registered in the file index so get_file / screenshot_by_id
+            // resolve it.
             msg.images.forEach(function(img) {
+                if (!img) return;
+                if (img.fileType === 'document') {
+                    chats[chatId].messages.push({
+                        role: 'context',
+                        content: '[User referenced Smart Document "' + (img.name || 'Untitled') + '" (doc_id: ' + img.sdocId + '). Use the document tool with action "read" and this doc_id to access its content.]'
+                    });
+                    return;
+                }
+                var _fid = img.file_id || (typeof newFileId === 'function' ? newFileId() : null);
                 if (img.fileType === 'pdf') {
-                    chats[chatId].messages.push({ role: 'pdf', base64: img.base64, name: img.name, description: 'User attached PDF', timestamp: Date.now(), file_id: img.file_id });
+                    chats[chatId].messages.push({ role: 'pdf', base64: img.base64, name: img.name, description: 'User attached PDF', timestamp: Date.now(), file_id: _fid });
                 } else if (img.fileType === 'file') {
-                    chats[chatId].messages.push({ role: 'file', content: img.content, name: img.name, mimeType: img.mimeType, size: img.size, description: 'User attached file', timestamp: Date.now(), file_id: img.file_id });
+                    chats[chatId].messages.push({ role: 'file', content: img.content, name: img.name, mimeType: img.mimeType, size: img.size, description: 'User attached file', timestamp: Date.now(), file_id: _fid });
                 } else {
-                    chats[chatId].messages.push({ role: 'screenshot', base64: img.base64, name: img.name, description: 'User attached image', timestamp: Date.now(), width: img.width, height: img.height, file_id: img.file_id });
+                    chats[chatId].messages.push({ role: 'screenshot', base64: img.base64, name: img.name, description: 'User attached image', timestamp: Date.now(), width: img.width, height: img.height, file_id: _fid });
+                }
+                if (_fid && typeof registerFile === 'function') {
+                    try { registerFile(_fid, { type: 'chat', chatId: chatId, msgIndex: chats[chatId].messages.length - 1 }); } catch (eRf) {}
                 }
             });
         }
@@ -1962,6 +2102,10 @@ function resumeRunningCheckpoints(checkpoints) {
             }));
         })
         .then(function() {
+            // #6a (Phase 4): chat ids that reach runAgent in THIS scan — the
+            // stranded-placeholder sweep below must not touch them (runAgent
+            // runs in a promise chain, so runningChatIds is not set yet).
+            var _p4ResumedIds = {};
             checkpoints.forEach(function(cp) {
                 // Do NOT repopulate parkedToolCallsByChatId here. The persisted
                 // entries' resolve/reject are gone (the original agent loop died
@@ -2085,6 +2229,7 @@ function resumeRunningCheckpoints(checkpoints) {
                         return;
                     }
                     _ckptResumeCounts[cp.chatId] = _resumeN;
+                    _p4ResumedIds[cp.chatId] = true;
                     if (_looksSub && _subRec) {
                         // ZR1-R1: the boot decision in 097 already claimed this
                         // sub's pool slot; a runAgent failure here (sync throw OR
@@ -2161,6 +2306,18 @@ function resumeRunningCheckpoints(checkpoints) {
                     }
                 }
             });
+            // #6a (Phase 4, flag P4_BOOT_PLACEHOLDER_SWEEP): rewrite stranded
+            // `_placeholder` tool rows in every chat that was NOT resumed above
+            // (app/030-agent-loop.js sweepStrandedPlaceholders — honest
+            // runtime_restarted failure, never re-executed). Strictly AFTER the
+            // resume forEach and only once the SW chats map is hydrated.
+            try {
+                if (typeof getP4Flag === 'function' && getP4Flag('P4_BOOT_PLACEHOLDER_SWEEP')
+                    && typeof sweepStrandedPlaceholders === 'function'
+                    && typeof _chatsHydrated !== 'undefined' && _chatsHydrated) {
+                    sweepStrandedPlaceholders(_p4ResumedIds);
+                }
+            } catch (eSweep) { console.warn('[port-bridge] stranded-placeholder sweep failed', eSweep); }
             // REG-AUDIT-2: every checkpoint has been re-armed (runAgent fires
             // runStarted synchronously enough for the page's grace re-check) —
             // the resume scan is settled.

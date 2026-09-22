@@ -24,7 +24,10 @@ When an Action button is clicked, call `update_action_state` frequently to show 
 
 ### Action Lifecycle: Full Audit
 
-Same as Quick Audit but more detailed — include full findings for every category and render a rich dashboard widget. Use tasks for each category: Security, Users, ITSM, System, Config.
+1. `update_action_state` → `running`, icon `shield`, label "Auditing instance…", with one task per category: Security, Users, ITSM, System, Config (all `pending`).
+2. Call `run_audit({ category: "all" })` once (or one call per category, marking each task `done` as it returns).
+3. Build a dashboard widget from the result (see example below) with **all** findings for every category, including the `errors` bucket — a check that failed to fetch data is not a pass.
+4. Finish with `update_action_state` → `done` (or `finished_with_caveat` if `summary.error_count > 0`) and an `output` markdown summary of the counts plus the top critical items.
 
 ## How to Run Audits
 
@@ -36,7 +39,17 @@ Do **not** create widgets that call `executeTool()` on load — this triggers pe
 run_audit({ "category": "all" })
 run_audit({ "category": "security" })
 run_audit({ "checks": ["admin_accounts", "breached_slas"] })
+run_audit({ "category": "all", "instance": "dev12345" })   // optional: target a specific connected instance
 ```
+
+### Result shape
+
+`run_audit` returns `{ critical, warning, info, passed, errors, metadata, summary }`.
+
+- `critical` / `warning` / `info` / `passed` — findings `{ check, title, detail, count?, items?, recommendation? }`.
+- `errors` — checks whose `servicenow_api` query threw or returned `success:false` (`{ check, title, detail, table?, recommendation }`). The `detail` carries the actual API error. **A check in `errors` did not run — never present it as passed.**
+- `summary` — `{ critical_count, warning_count, info_count, passed_count, error_count, total_checks }`.
+- `metadata` — `{ instance, audit_time, category, checks_run }`.
 
 ## Available Audit Checks
 
@@ -50,11 +63,11 @@ run_audit({ "checks": ["admin_accounts", "breached_slas"] })
 | `groups_no_manager` | users | Groups without assigned managers |
 | `stale_incidents` | itsm | Incidents not updated in 30+ days |
 | `breached_slas` | itsm | Active SLAs that are breached |
-| `pending_changes` | itsm | Changes past scheduled dates |
+| `pending_changes` | itsm | Active changes in pre-closure states (New → Review), flags volume and high-risk items |
 | `active_problems` | itsm | Open problems by priority |
 | `unassigned_critical` | itsm | Critical tickets without assignee |
-| `error_logs` | system | Recent errors in syslog |
-| `script_errors` | system | Recurring script/evaluator errors |
+| `error_logs` | system | Recent syslog errors (`level=2`) and warnings (`level=1`) in the last 7 days |
+| `script_errors` | system | Recurring Evaluator script errors **and warnings** (`levelIN1,2`) |
 | `update_sets` | system | Non-default update sets in progress |
 | `non_operational_cis` | config | CIs marked non-operational |
 
@@ -66,7 +79,7 @@ const audit = await executeTool('run_audit', { category: 'all' });
 const s = audit.summary;
 
 function severityColor(sev) {
-  return { critical: '#ef4444', warning: '#f59e0b', info: '#3b82f6', passed: '#22c55e' }[sev];
+  return { critical: '#ef4444', warning: '#f59e0b', info: '#3b82f6', passed: '#22c55e', errors: '#a855f7' }[sev];
 }
 
 function renderFindings(items, severity) {
@@ -103,6 +116,7 @@ const html = `
   ${renderFindings(audit.warning, 'warning')}
   ${renderFindings(audit.info, 'info')}
   ${renderFindings(audit.passed, 'passed')}
+  ${audit.errors.length ? '<h3 style="color:#a855f7;margin:16px 0 8px;">Checks that could not run (' + s.error_count + ')</h3>' + renderFindings(audit.errors, 'errors') : ''}
 </div>`;
 
 const widget = await executeTool('html_widget', { title: 'Instance Audit', html, width: '700px', height: '600px' });
@@ -113,6 +127,6 @@ return widget.widgetId;
 
 Display the audit results widget with:
 - Dark theme (background: #0f172a, cards: #1e293b)
-- Stats grid: Critical (red #ef4444), Warning (yellow #f59e0b), Info (blue #3b82f6), Passed (green #22c55e)
+- Stats grid: Critical (red #ef4444), Warning (yellow #f59e0b), Info (blue #3b82f6), Passed (green #22c55e); add an Errors tile (purple #a855f7) when `summary.error_count > 0`
 - Sections with colored left border by severity
 - Badge with count, bullet list of items, recommendation box

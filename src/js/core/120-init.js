@@ -518,6 +518,9 @@ async function init() {
     // left by an abandoned/reloaded run (else a permission bell shows forever
     // on a chat with nothing there). One-shot; guarded inside the function.
     try { setTimeout(function() { try { if (typeof reconcileStaleApprovals === 'function') reconcileStaleApprovals(); } catch (e) {} }, 4000); } catch (e) {}
+    // #6b action watchdog boot scan (tools/120-actions.js): same delay; the
+    // function itself re-arms once (+9 s) until the SW resume scan settled.
+    try { setTimeout(function() { try { if (typeof reconcileNeverStartedActions === 'function') reconcileNeverStartedActions(); } catch (e) {} }, 4000); } catch (e) {}
     await loadApiProviders();
     await loadProviderFromStorage();
     await loadToolPermissions();
@@ -537,6 +540,8 @@ async function init() {
     // is false there and the button stays hidden. (Regression from the gating PR.)
     if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
     await loadDashboardWidgets();
+    await WidgetStore.init();
+    WidgetStore.list().forEach(function(w) { WidgetStore.project(w.id); });
     await loadAllDocuments();
     await loadAllActionStates(); // restore in-flight action states from IDB
     // Restore sub-agent records from IDB. Subs that were `running` at
@@ -809,7 +814,11 @@ async function init() {
                 wf.setAttribute('data-widget-id', deepLinkWidgetId);
             }
             window.addEventListener('message', _dlOnWidgetMsg);
-            writeWidgetHtml(wf, _dlHtml);
+            // Interactive deep-links are real live renders, just like chat and
+            // fullscreen mounts. Give the parent registry the saved widget ID so
+            // start_chat can receive an authoritative per-render origin. Static
+            // snapshots stay unregistered and cannot become eval targets.
+            writeWidgetHtml(wf, _dlHtml, _dlIsStaticSnap ? null : deepLinkWidgetId);
             return;
         }
     }

@@ -16,7 +16,10 @@ var dbName = STORAGE_PREFIX + 'AppAgentDB';
 // rewriting every payload. The upgrade itself only creates the store —
 // row migration is LAZY, at save time (see the note in onupgradeneeded:
 // an eager in-upgrade migration crashed the browser on large stores).
-var dbVersion = 16;
+// v17: canonical widget identities and append-only revisions.
+// v18 was used by reverted PR #938; v19 is the current version with the v17 store layout (no migration needed).
+var dbVersion = 19;
+var widgetStoreName = 'widgets';
 var workspaceMetaStoreName = 'workspace_meta';
 var workspaceFilesStoreName = 'workspace_files';
 // Content-addressed blob store: { sha, content }. Shared across all
@@ -109,6 +112,12 @@ var pendingWidgetRegenerationByChatId = {};
 function setPendingWidgetRegeneration(chatId, widgetId) {
     if (!chatId || !widgetId) return;
     pendingWidgetRegenerationByChatId[chatId] = widgetId;
+    // Persist intent in the transcript, which crosses page/SW snapshots and reload.
+    var targetChat = chats[chatId];
+    if (targetChat && targetChat.messages) {
+        var request = targetChat.messages.slice().reverse().find(function(m) { return m.role === 'user'; });
+        if (request) { request.widgetId = widgetId; request.isWidgetRequest = true; }
+    }
     pendingWidgetRegeneration = widgetId; // mirror legacy global for any external readers
 }
 function consumePendingWidgetRegeneration(chatId) {
@@ -321,6 +330,9 @@ function openDatabase() {
             }
             if (!database.objectStoreNames.contains(skillAssetsStoreName)) {
                 database.createObjectStore(skillAssetsStoreName, { keyPath: 'id' });
+            }
+            if (!database.objectStoreNames.contains(widgetStoreName)) {
+                database.createObjectStore(widgetStoreName, { keyPath: 'id' });
             }
             if (!database.objectStoreNames.contains(dashboardWidgetsStoreName)) {
                 database.createObjectStore(dashboardWidgetsStoreName, { keyPath: 'id' });
@@ -690,7 +702,19 @@ function _runTxWithDeadline(database, storeNames, mode, fn, deadlineOverrideMs) 
                 });
             });
         }, deadlineMs);
-        Promise.resolve().then(function() { return fn(tx); }).then(function(value) {
+        // A readwrite result must wait for the actual commit/abort, not just
+        // request success: callers that resolve on request onsuccess would
+        // otherwise report "saved" before the commit, and a commit-time abort
+        // (quota, constraint, late request error) would be silently lost.
+        // Readonly keeps resolving on the body alone (nothing to commit).
+        var committed = (mode === 'readwrite') ? new Promise(function(done, fail) {
+            tx.addEventListener('complete', function() { done(); });
+            tx.addEventListener('abort', function() {
+                fail(tx.error || new Error('IndexedDB transaction on [' + storeNames + '] (' + mode + ') aborted before commit'));
+            });
+        }) : Promise.resolve();
+        Promise.all([Promise.resolve().then(function() { return fn(tx); }), committed]).then(function(values) {
+            var value = values[0];
             if (settled) return;
             settled = true;
             clearTimeout(timer);
@@ -2256,6 +2280,9 @@ var OPUS5_DEFAULT_REPOINT_KEY = 'appagent_opus5_default_repointed';
 // a deliberate post-repoint re-selection (the picker offers names present in
 // apiProviders, and none of the five aliases are), so it is left alone.
 var OPUS5_DEFAULT_REPOINT_KEY_V2 = 'appagent_opus5_default_repointed_v2';
+// Repoint TARGET: was 'Opus 5' (July 2026); 'Opus 5' and 'Opus-4-8' were both
+// retired in Sept 2026 and fold into 'Opus 5.5' (the new config default).
+var OPUS5_REPOINT_TARGET = 'Opus 5.5';
 
 // One-shot 'Opus-4-8' → 'Opus 5' DEFAULT repoint (July 2026): the config default
 // moved to the new 'Opus 5' entry. This is NOT a rename — BOTH providers exist
@@ -2283,7 +2310,9 @@ function applyOpus5DefaultRepoint() {
     // selection. Guaranteed on the fresh path (apiProviders =
     // DEFAULT_API_PROVIDERS.slice(), core/030-config.js) and after the
     // default-merge on the existing-install path.
-    if (!apiProviders.some(function(p) { return p.name === 'Opus 5'; })) return;
+    // Sept 2026: 'Opus 5' itself was retired (PROVIDER_RENAMES → 'Opus 5.5'),
+    // so the repoint now lands on the current default OPUS5_REPOINT_TARGET.
+    if (!apiProviders.some(function(p) { return p.name === OPUS5_REPOINT_TARGET; })) return;
     var v1Done = !!appStorage.getItem(OPUS5_DEFAULT_REPOINT_KEY);
     var v2Done = !!appStorage.getItem(OPUS5_DEFAULT_REPOINT_KEY_V2);
     if (v1Done && v2Done) return;               // both one-shots already spent
@@ -2311,17 +2340,20 @@ function applyOpus5DefaultRepoint() {
     // core/030-config.js.
     var resolvedName = (typeof PROVIDER_RENAMES !== 'undefined'
         && PROVIDER_RENAMES[storedName]) || storedName;
-    if (resolvedName !== 'Opus-4-8') return;
+    // 'Opus-4-8' itself now resolves to OPUS5_REPOINT_TARGET via PROVIDER_RENAMES
+    // (Sept 2026), as do its legacy aliases — accept both spellings.
+    if (resolvedName !== 'Opus-4-8' && resolvedName !== OPUS5_REPOINT_TARGET) return;
+    if (storedName === OPUS5_REPOINT_TARGET) return; // already on the target
     // v1 already burned => this is the #739 rescue pass, which must only move the
     // scenario-(c) cohort (stored value is a legacy alias). A literal 'Opus-4-8'
     // here means the user re-selected it AFTER a correct repoint — never drag
     // them forward again.
     if (v1Done && storedName === 'Opus-4-8') return;
-    try { appStorage.setItem('appagent_provider', 'Opus 5'); } catch (e) {}
+    try { appStorage.setItem('appagent_provider', OPUS5_REPOINT_TARGET); } catch (e) {}
     // Keep the in-memory copy consistent: the rename / removal migrations may
     // already have set currentProvider to 'Opus-4-8', and loadProviderFromStorage
     // runs later (core/120-init.js).
-    if (currentProvider === 'Opus-4-8') currentProvider = 'Opus 5';
+    if (currentProvider === 'Opus-4-8' || currentProvider === 'Opus 5') currentProvider = OPUS5_REPOINT_TARGET;
 }
 
 // API Providers Management
@@ -2424,8 +2456,8 @@ async function loadApiProviders() {
                     if (legacyInline.changed) await saveAllApiProviders();
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
-                    // sonnet-5, gpt-5.2 → gpt-5.6-sol (chain-collapsed through the
-                    // retired gpt-5.5 default), Gemini 3 Flash Preview →
+                    // sonnet-5, gpt-5.2 → gpt-6-sol (chain-collapsed through the
+                    // retired gpt-5.5 / gpt-5.6-sol defaults), Gemini 3 Flash Preview →
                     // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5, and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
@@ -2455,22 +2487,40 @@ async function loadApiProviders() {
                         { to: 'sonnet-5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
                         { to: 'sonnet-5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
-                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
-                        { to: 'gpt-5.6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
+                        { to: 'gpt-6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'gpt-6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
+                        // Sept 2026: GPT-6 Sol supersedes the gpt-5.6-sol OpenRouter default
+                        { to: 'gpt-6-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
                         // Two Opus snapshots: effort was 'high' before the xhigh
                         // retune below, 'xhigh' after — match both vintages.
-                        { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
-                        { to: 'Opus-4-8', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
+                        // (targets chain-collapsed to 'Opus 5.5': the 'Opus-4-8'
+                        // default was itself retired in Sept 2026)
+                        { to: 'Opus 5.5', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
+                        { to: 'Opus 5.5', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         { to: 'Sonnet 5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
                         // ChatGPT-subscription seeds shipped with ASSUMED slugs
                         // (gpt-5.1-codex / gpt-5.1) that the Codex backend does
                         // not serve to ChatGPT accounts — retarget onto the
-                        // GPT-5.6 slugs the live catalog actually advertises.
-                        { to: 'GPT-5.6 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
-                        { to: 'GPT-5.6 Terra (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } }
+                        // GPT-6 slugs the live catalog actually advertises.
+                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        // Sept 22 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds;
+                        // GPT-5.6 Terra has no GPT-6 successor and folds into
+                        // Sol (same target Codex's own model migration uses).
+                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.6 Sol (ChatGPT)', model: 'gpt-5.6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.6 Terra (ChatGPT)', model: 'gpt-5.6-terra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        { to: 'GPT-6 Luna (ChatGPT)', from: { name: 'GPT-5.6 Luna (ChatGPT)', model: 'gpt-5.6-luna', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        // Sept 2026 model-list tidy-up: Opus 5 and Opus-4-8 retire
+                        // into Opus 5.5, Fable 5 into Fable 5.1. Opus-4-8 matches
+                        // both seed vintages (with / without the pre-global
+                        // maxTokens + context_length fields).
+                        { to: 'Opus 5.5', from: { name: 'Opus 5', model: 'claude-opus-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
+                        { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
+                        { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
+                        { to: 'Fable 5.1', from: { name: 'Fable 5', model: 'claude-fable-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } }
                     ].forEach(function(mig) {
                         var idx = -1;
                         for (var i = 0; i < apiProviders.length; i++) {
@@ -2492,10 +2542,10 @@ async function loadApiProviders() {
                             // Removed default — drop the untouched copy and repoint
                             // any persisted selection at the config default.
                             apiProviders.splice(idx, 1);
-                            if (currentProvider === mig.from.name) currentProvider = 'Opus-4-8';
+                            if (currentProvider === mig.from.name) currentProvider = 'Opus 5.5';
                             if (typeof appStorage !== 'undefined'
                                 && appStorage.getItem('appagent_provider') === mig.from.name) {
-                                try { appStorage.setItem('appagent_provider', 'Opus-4-8'); } catch (e) {}
+                                try { appStorage.setItem('appagent_provider', 'Opus 5.5'); } catch (e) {}
                             }
                             migratedDefaults = true;
                             return;
@@ -3635,6 +3685,43 @@ function _mergeChatMessagesForPut(rec, stored) {
     return rec.concat(tail);
 }
 
+// Widget intent is a safety journal on an UNRESOLVED logical tool call, not
+// ordinary prefix content. A queued page/worker save must not erase its durable
+// marker even at equal lengths or when the incoming prefix otherwise wins.
+// Authored removal/completion still wins: never append a missing call or carry
+// intent onto a completed row. Different chats/calls never share this journal.
+function _mergeWidgetIntentsForPut(rec, stored) {
+    if (!Array.isArray(rec) || !Array.isArray(stored)) return null;
+    var out = null;
+    for (var i = 0; i < rec.length; i++) {
+        var row = rec[i];
+        if (!row || row.role !== 'tool' || !row._placeholder || !row.tool_call_id) continue;
+        var prior = null;
+        for (var j = stored.length - 1; j >= 0; j--) {
+            var candidate = stored[j];
+            if (candidate && candidate.role === 'tool' && candidate.tool_call_id === row.tool_call_id) { prior = candidate; break; }
+        }
+        if (!prior) continue;
+        if (!prior._placeholder) {
+            // Even a PRE-intent snapshot is stale once this same logical call
+            // completed. Never let its unmarked placeholder erase the result
+            // and make the enclosing program eligible for replay again.
+            if (!out) out = rec.slice();
+            out[i] = prior;
+            continue;
+        }
+        if (!prior._widgetEvalDispatched) continue;
+        var ids = Array.isArray(prior._widgetEvalIds) ? prior._widgetEvalIds.slice() : [];
+        if (Array.isArray(row._widgetEvalIds)) row._widgetEvalIds.forEach(function(id) {
+            if (ids.indexOf(id) === -1) ids.push(id);
+        });
+        if (!out) out = rec.slice();
+        out[i] = Object.assign({}, row, { _widgetEvalDispatched: true,
+            _widgetEvalRun: prior._widgetEvalRun, _widgetEvalIds: ids });
+    }
+    return out;
+}
+
 // Per-display union (FLUX-QW7 semantics, now shared): keep the base entry
 // unless the other side's _toggledAt is STRICTLY newer; add other-only ids.
 // Never mutates either map — returns a fresh merged map, or null when the
@@ -3662,6 +3749,10 @@ function _mergeChatRowForPut(rec, stored) {
     function claim() { if (out === rec) out = Object.assign({}, rec); return out; }
     var mm = _mergeChatMessagesForPut(rec.messages, stored.messages);
     if (mm) claim().messages = mm;
+    if (rec.id && rec.id === stored.id) {
+        var intents = _mergeWidgetIntentsForPut(out.messages, stored.messages);
+        if (intents) claim().messages = intents;
+    }
     var md = _unionChatDisplaysForPut(rec.displays, stored.displays);
     if (md) claim().displays = md;
     // Omission safety for future fields: carry forward stored fields the

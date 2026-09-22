@@ -156,7 +156,7 @@ function copyCodeBlock(btn, event) {
     var text = '';
     // Check if wrapper has raw copy ID
     var copyId = wrapper.getAttribute('data-copy-id');
-    if (copyId && window._rawCopyStore[copyId]) {
+    if (copyId && Object.prototype.hasOwnProperty.call(window._rawCopyStore, copyId)) {
         text = window._rawCopyStore[copyId];
     } else {
         // Fallback: get text content

@@ -546,6 +546,24 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             return false;
         }
         var p = message.payload || {};
+        // Only the trusted offscreen host can relay an invocation. Every frame,
+        // including unrestricted js_eval, is registered by callOffscreenHelper.
+        // A worker restart loses registrations and therefore FAILS CLOSED.
+        if (!sender || sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('offscreen.html')) {
+            sendResponse({ ok: false, error: 'Untrusted sandbox relay sender' });
+            return false;
+        }
+        var policyError = swTestPolicyStartupError();
+        if (policyError) {
+            sendResponse({ ok: false, error: policyError.message });
+            return false;
+        }
+        var decision = TestRunPolicy.registry.relay(p.sandboxRequestId, p.name, p.args);
+        if (!decision.ok) {
+            sendResponse({ ok: false, error: decision.reason });
+            return false;
+        }
+        p.args = decision.args;
         var execPromise;
         try {
             execPromise = executeTool(p.name, p.args, p.messageIndex, {
@@ -1697,6 +1715,65 @@ function formatResetDelta(epochSec) {
     return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
 }
 
+// Turn a chatgpt.com/backend-api/codex 429 body into a human-readable,
+// actionable headline. The raw body looks like
+//   {"type":"usage_limit_reached","message":"The usage limit has been reached",
+//    "plan_type":"plus","resets_at":1788470346,"eligible_promo":null,
+//    "resets_in_seconds":2319}
+// and conciseApiErrorBody() would reduce it to just "The usage limit has been
+// reached" — dropping the plan, the reset countdown and the wall-clock reset
+// time, which are exactly what the user needs to decide whether to wait or
+// switch provider. Returns { headline, plan, resetsAt, resetsIn, raw } or
+// null when the body is not a recognizable usage-limit payload.
+function describeChatGPTUsageLimit(bodyText) {
+    var raw = String(bodyText == null ? '' : bodyText).trim();
+    if (!raw || raw.charAt(0) !== '{') return null;
+    var obj;
+    try { obj = JSON.parse(raw); } catch (e) { return null; }
+    if (!obj || typeof obj !== 'object') return null;
+    // Some responses nest under .error (OpenAI style) — accept both shapes.
+    var o = (obj.error && typeof obj.error === 'object') ? obj.error : obj;
+    var type = String(o.type || o.code || '');
+    var msg = typeof o.message === 'string' ? o.message : '';
+    if (!/usage_limit|usage limit|quota|plan_limit|insufficient/i.test(type + ' ' + msg)) return null;
+    var now = Date.now();
+    var resetsAt = null;
+    if (typeof o.resets_at === 'number' && o.resets_at > 0) {
+        resetsAt = o.resets_at > 9999999999 ? Math.floor(o.resets_at / 1000) : Math.floor(o.resets_at);
+    } else if (typeof o.resets_at === 'string' && o.resets_at) {
+        var parsed = Date.parse(o.resets_at);
+        if (!isNaN(parsed)) resetsAt = Math.floor(parsed / 1000);
+    }
+    if (resetsAt == null && typeof o.resets_in_seconds === 'number' && o.resets_in_seconds > 0) {
+        resetsAt = Math.floor(now / 1000) + Math.round(o.resets_in_seconds);
+    }
+    var plan = o.plan_type ? String(o.plan_type) : '';
+    var planLabel = plan ? plan.charAt(0).toUpperCase() + plan.slice(1).toLowerCase() + ' plan' : '';
+    var resetIn = formatResetDelta(resetsAt);
+    var resetClock = '';
+    if (resetsAt) {
+        try {
+            var d = new Date(resetsAt * 1000);
+            var sameDay = d.toDateString() === new Date(now).toDateString();
+            resetClock = sameDay
+                ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : d.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+        } catch (e) { resetClock = ''; }
+    }
+    var headline = 'ChatGPT usage limit reached' + (planLabel ? ' (' + planLabel + ')' : '');
+    if (resetIn) {
+        headline += ' \u2014 resets in ' + resetIn + (resetClock ? ' (at ' + resetClock + ')' : '');
+    } else if (resetsAt) {
+        headline += ' \u2014 limit should have reset' + (resetClock ? ' at ' + resetClock : '') + '; try again';
+    } else {
+        headline += ' \u2014 no reset time reported';
+    }
+    headline += '.';
+    if (o.eligible_promo) headline += ' A promo is available on your account: ' + String(o.eligible_promo) + '.';
+    headline += ' Retrying won\'t help until the limit resets \u2014 wait, or switch to another provider/model in Settings.';
+    return { headline: headline, plan: plan, resetsAt: resetsAt, resetsIn: resetIn, message: msg, raw: raw };
+}
+
 async function startClaudeOAuth() {
     var sessionKey = await getClaudeCookie('sessionKey');
     if (!sessionKey) {
@@ -2018,6 +2095,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
         var parks = 0;
         var errBodyText = null;
         var triedReauth = false;
+        var triedCliVersionBump = false;
         var usageProbed = false;
         for (var attempt = 0; attempt <= maxRetries; attempt++) {
             if (aborted) {
@@ -2057,12 +2135,55 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                 triedReauth = true;
                 try {
                     oauth = await renewClaudeToken(oauth);
+                    // Same shape as the version-gate retry below: the re-auth
+                    // retry is budgeted by triedReauth (once), so it must not
+                    // burn a timed-backoff attempt, and the 401 body is never
+                    // read here — clear any stale 429 body so a later failure
+                    // re-reads its OWN body in the !res.ok handler.
+                    attempt--;
+                    errBodyText = null;
                     continue;
                 } catch (e) {
                     sink({ type: 'error', error: 'Session expired and silent re-auth failed: ' + e.message + '. Open https://claude.ai, sign in, then retry.' });
                     sink({ type: 'done' });
                     return;
                 }
+            }
+
+            // Claude Code version gate: a 400 whose body says "version A.B.C or
+            // newer is required" (error_code claude_code_version_too_old) means
+            // the spoofed claude-cli User-Agent is below the per-model minimum
+            // (see CLAUDE_CLI_VERSION). Raise the DNR rule to the demanded
+            // version, persist it, and retry the SAME request ONCE. The body is
+            // consumed here (single-use), so on any non-recoverable 400 it is
+            // handed to the !res.ok handler via errBodyText and the surfaced
+            // error stays exactly what it was without this block.
+            if (res.status === 400 && !triedCliVersionBump) {
+                triedCliVersionBump = true;
+                var body400 = '';
+                try { body400 = await res.text(); } catch (e) { body400 = ''; }
+                var requiredCliVersion = parseRequiredClaudeCliVersion(body400);
+                if (requiredCliVersion) {
+                    var bumped = false;
+                    try { bumped = await bumpClaudeCliVersion(requiredCliVersion); }
+                    catch (e) { console.warn('[AppAgent] claude-cli version bump to ' + requiredCliVersion + ' failed:', e && e.message); }
+                    if (bumped) {
+                        console.warn('[AppAgent] API requires Claude Code ' + requiredCliVersion + ' — claude-cli User-Agent raised, retrying once');
+                        sink({ type: 'status', status: 'retrying', reason: 'claude_code_version_too_old', message: 'Model requires Claude Code ' + requiredCliVersion + ' — updating and retrying…' });
+                        // The bump retry is budgeted by triedCliVersionBump
+                        // (once): compensate the for-loop increment so it never
+                        // eats the last attempt (which used to exit the loop
+                        // with THIS consumed 400 as res → the !res.ok handler
+                        // re-read a used body or surfaced a stale 429 body).
+                        // body400 is consumed and belongs to this attempt only,
+                        // so clear errBodyText for the retried response.
+                        attempt--;
+                        errBodyText = null;
+                        continue;
+                    }
+                }
+                errBodyText = body400;
+                break;
             }
 
             // 429 (rate-limit) and 529 (overloaded) are transient shed-load
@@ -2256,6 +2377,27 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                     var block = eventData.content_block || {};
                     if (block.type === 'tool_use') {
                         currentToolId = block.id || ('call_' + Math.random().toString(36).substr(2, 8));
+                    }
+                    // Block-order marker (Fable 5.1+ / Opus 5.5 thinking binding):
+                    // the OpenAI-chunk translation below flattens the turn into
+                    // content / tool_calls / reasoning_details, losing the order
+                    // of the content blocks. Replaying a turn reordered (e.g.
+                    // [thinking,text,thinking,tool_use] → [thinking,thinking,text,
+                    // tool_use]) changes the prefix bound to the later thinking
+                    // blocks, which the API then silently drops. The page side
+                    // (010-llm-streaming.js) records these markers into
+                    // assistantMsg.block_order; transformMessageToAnthropic
+                    // replays in that order when it still validates.
+                    sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                        id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                        choices: [{ index: 0, delta: { anthropic_block: {
+                            index: typeof eventData.index === 'number' ? eventData.index : null,
+                            type: block.type || '',
+                            tool_index: block.type === 'tool_use' ? toolIdx : null,
+                            id: block.type === 'tool_use' ? currentToolId : null
+                        } }, finish_reason: null }]
+                    }) + '\n\n' });
+                    if (block.type === 'tool_use') {
                         sink({ type: 'sse', data: 'data: ' + JSON.stringify({
                             id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
                             choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, id: currentToolId, type: 'function', function: { name: block.name || '', arguments: '' } }] }, finish_reason: null }]
@@ -2265,7 +2407,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                         var blockIdx = eventData.index || 0;
                         sink({ type: 'sse', data: 'data: ' + JSON.stringify({
                             id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
-                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: '' }] }, finish_reason: null }]
+                            choices: [{ index: 0, delta: { reasoning_details: [{ index: blockIdx, thinking: typeof block.thinking === 'string' ? block.thinking : '' }] }, finish_reason: null }]
                         }) + '\n\n' });
                     }
                     else if (block.type === 'redacted_thinking') {
@@ -2330,6 +2472,13 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                             var sd = (eventData.delta || {}).stop_details || null;
                             var sdCat = (sd && (sd.category || sd.reason || sd.type)) || '';
                             var refusalNote = '\n\n[Request declined by the model (' + model + ')' + (sdCat ? ' (category: ' + sdCat + ')' : '') + '. Refused requests can often be served by a different model — switch the provider and retry.]';
+                            // Synthetic text — give it its own block-order entry so it
+                            // never merges into (or breaks the tiling of) the model's
+                            // own text blocks on replay.
+                            sink({ type: 'sse', data: 'data: ' + JSON.stringify({
+                                id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
+                                choices: [{ index: 0, delta: { anthropic_block: { index: null, type: 'text', tool_index: null, id: null } }, finish_reason: null }]
+                            }) + '\n\n' });
                             sink({ type: 'sse', data: 'data: ' + JSON.stringify({
                                 id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
                                 choices: [{ index: 0, delta: { content: refusalNote }, finish_reason: null }]
@@ -2434,6 +2583,8 @@ var OPENAI_OAUTH = {
     deviceTokenUrl: 'https://auth.openai.com/api/accounts/deviceauth/token',
     tokenUrl: 'https://auth.openai.com/oauth/token',
     redirectUri: 'https://auth.openai.com/deviceauth/callback',
+    browserRedirectUri: 'http://localhost:1455/auth/callback',
+    authorizeUrl: 'https://auth.openai.com/oauth/authorize',
     verifyUrl: 'https://auth.openai.com/codex/device',
     scopes: 'openid profile email offline_access',
     responsesUrl: 'https://chatgpt.com/backend-api/codex/responses',
@@ -2601,11 +2752,11 @@ var _openaiModelQuirks = {};
 // Net for when the LIVE catalog fetch below fails. openai/codex deleted its
 // hardcoded presets (codex-rs/models-manager/src/model_presets.rs: "model
 // listings are now derived from the active catalog"), so a hardcoded list is
-// always a guess with a shelf life — these three are the GPT-5.6 slugs
-// advertised for ChatGPT accounts by EvanZhouDev/openai-oauth (README:
-// "Available Models: gpt-5.6-terra, gpt-5.6-sol, ...") and present in
-// codex-rs/model-provider/src/provider.rs.
-var OPENAI_FALLBACK_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+// always a guess with a shelf life — these are the GPT-6 slugs Codex lists
+// for ChatGPT accounts (codex-rs model-selection popup snapshot, 2026-09-22:
+// GPT-6-Astra / GPT-6-Sol / GPT-6-Luna). GPT-5.6 Terra was dropped (no GPT-6
+// Terra); Codex migrates gpt-5.6-terra/-sol → gpt-6-sol, gpt-5.6-luna → gpt-6-luna.
+var OPENAI_FALLBACK_MODELS = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
 var OPENAI_MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
 var _openaiModelCatalog = null;
 var _openaiModelCatalogAt = 0;
@@ -2780,10 +2931,24 @@ async function saveChatGPTOAuthCreds(tokenData, existing, generation, signal) {
         accountId: _openaiAccountId(idToken, accessToken) || existing.accountId || null,
         expiresAt: _openaiExpiresAt({ access_token: accessToken, expires_in: tokenData.expires_in })
     };
+    // Both commit and rollback stay in the storage lane. No newer login/refresh
+    // or logout can write between the snapshot and rollback of this attempt.
+    function writeCreds(value) {
+        if (value === undefined) return chrome.storage.local.remove('openaiOAuth');
+        return chrome.storage.local.set({ openaiOAuth: value });
+    }
     await _openaiQueueOAuthStorage(async function() {
         _openaiAssertGeneration(generation, signal);
-        await chrome.storage.local.set({ openaiOAuth: creds });
+        var before = (await chrome.storage.local.get('openaiOAuth')).openaiOAuth;
         _openaiAssertGeneration(generation, signal);
+        await writeCreds(creds);
+        try { _openaiAssertGeneration(generation, signal); }
+        catch (e) {
+            // Chrome cannot abort a storage write already issued. Undo only this
+            // lane-owned commit before allowing cancellation/newer writers in.
+            await writeCreds(before);
+            throw e;
+        }
     });
     if ((existing.accountId || null) !== creds.accountId) _openaiInvalidateModelCatalog();
     chrome.runtime.sendMessage({ type: 'openai-oauth-updated', openaiOAuth: creds }).catch(function() {});
@@ -2980,9 +3145,10 @@ function startChatGPTOAuth() {
     if (openaiStartLoginInFlight) return openaiStartLoginInFlight;
     openaiStartLoginInFlight = (async function() {
         try { return await _startChatGPTOAuth(); }
-        finally { openaiStartLoginInFlight = null; }
+        finally { if (openaiStartLoginInFlight === loginPromise) openaiStartLoginInFlight = null; }
     })();
-    return openaiStartLoginInFlight;
+    var loginPromise = openaiStartLoginInFlight;
+    return loginPromise;
 }
 
 // Open — or FOCUS, when it is already open — the device-approval page. EVERY
@@ -3105,28 +3271,255 @@ function renewChatGPTToken(oauth, callerSignal) {
     return _openaiAwaitWithSignal(openaiRenewInFlight, callerSignal);
 }
 
+// Browser PKCE uses the Codex client's registered loopback redirect. Chrome may
+// not report a failed localhost navigation: manual LOCAL paste and device code
+// remain explicit alternatives. No redirect injection or new permissions.
+var openaiBrowserStartInFlight = null;
+var openaiBrowserExchange = null;
+var OPENAI_BROWSER_PENDING_KEY = 'openaiPendingBrowserAuth';
+
+function _openaiTrustedAuthSender(sender) {
+    return !!(sender && sender.id === chrome.runtime.id && typeof sender.url === 'string' && sender.url.indexOf(chrome.runtime.getURL('')) === 0);
+}
+
+async function _openaiCancelPendingLogin() {
+    // Invalidate synchronously before any await: late network/storage completions
+    // cannot publish credentials for an abandoned method or cancelled dialog.
+    openaiAuthGeneration++;
+    openaiActiveDeviceAuthId = null;
+    openaiDeviceLoginInFlight = false;
+    openaiStartLoginInFlight = null;
+    openaiBrowserStartInFlight = null;
+    if (openaiDeviceAbortController) openaiDeviceAbortController.abort();
+    if (openaiStartAbortController) openaiStartAbortController.abort();
+    var exchange = openaiBrowserExchange;
+    if (exchange) exchange.controller.abort();
+    openaiBrowserExchange = null;
+    await _openaiQueueOAuthStorage(async function() {
+        var stored = await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY);
+        var pending = stored[OPENAI_BROWSER_PENDING_KEY];
+        await chrome.storage.session.remove(OPENAI_BROWSER_PENDING_KEY);
+        await chrome.storage.local.remove('openaiPendingDeviceAuth');
+        var tabId = pending ? pending.tabId : exchange && exchange.tabId;
+        if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); } catch (e) {} }
+    });
+}
+
+function _openaiBrowserPublic(pending) {
+    return { pending: true, method: 'browser', expiresAt: pending.expiresAt };
+}
+
+async function _openaiStartBrowserLogin() {
+    var generation = openaiAuthGeneration;
+    var tab = null;
+    try {
+        var pkce = await makePkce();
+        _openaiAssertGeneration(generation);
+        // Persist the owned tab BEFORE navigating to authorize; a fast consent
+        // redirect must not race the pending record. session is trusted-only by
+        // Chrome's default access level and does not survive browser shutdown.
+        tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+        _openaiAssertGeneration(generation);
+        if (!tab || !Number.isInteger(tab.id)) throw new Error('tab unavailable');
+        var pending = { state: pkce.state, verifier: pkce.verifier, tabId: tab.id, expiresAt: Date.now() + OPENAI_DEVICE_AUTH_TTL_MS };
+        await _openaiQueueOAuthStorage(async function() {
+            _openaiAssertGeneration(generation);
+            await chrome.storage.session.set({ openaiPendingBrowserAuth: pending });
+            _openaiAssertGeneration(generation);
+        });
+        var url = new URL(OPENAI_OAUTH.authorizeUrl);
+        url.search = new URLSearchParams({ response_type: 'code', client_id: OPENAI_OAUTH.clientId, redirect_uri: OPENAI_OAUTH.browserRedirectUri, scope: OPENAI_OAUTH.scopes, code_challenge: pkce.challenge, code_challenge_method: 'S256', state: pkce.state, id_token_add_organizations: 'true', codex_cli_simplified_flow: 'true', originator: OPENAI_OAUTH.originator }).toString();
+        _openaiAssertGeneration(generation);
+        await chrome.tabs.update(tab.id, { url: url.href });
+        _openaiAssertGeneration(generation);
+        return _openaiBrowserPublic(pending);
+    } catch (e) {
+        // Never reflect authorize/callback URLs, authorization codes or token
+        // endpoint bodies into errors, console logs, or conversation history.
+        if (generation === openaiAuthGeneration) await _openaiCancelPendingLogin();
+        else if (tab && Number.isInteger(tab.id)) { try { await chrome.tabs.remove(tab.id); } catch (ignored) {} }
+        throw new Error('Browser sign-in could not start. Choose device-code login to try another method.');
+    }
+}
+
+function _openaiBrowserCallback(url, pending, tabId) {
+    if (!pending || pending.tabId !== tabId || pending.expiresAt <= Date.now()) return null;
+    var parsed;
+    try { parsed = new URL(url); } catch (e) { return null; }
+    if (parsed.origin !== 'http://localhost:1455' || parsed.pathname !== '/auth/callback' || parsed.username || parsed.password || parsed.hash) return null;
+    var params = parsed.searchParams;
+    if (params.getAll('state').length !== 1 || params.get('state') !== pending.state) return null;
+    if (params.has('error')) return { denied: true };
+    if (params.getAll('code').length !== 1 || !params.get('code')) return null;
+    return { code: params.get('code') };
+}
+
+async function _openaiHandleBrowserCallback(tabId, url) {
+    var generation = openaiAuthGeneration;
+    // Claim/remove one-time state in the SAME lane as cancellation and logout.
+    // If the worker dies after consumption, require a fresh login, never replay.
+    var claimedTab = false;
+    var exchange;
+    var claim;
+    try { claim = await _openaiQueueOAuthStorage(async function() {
+        _openaiAssertGeneration(generation);
+        var stored = await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY);
+        var pending = stored[OPENAI_BROWSER_PENDING_KEY];
+        var callback = _openaiBrowserCallback(url, pending, tabId);
+        if (!callback) return null;
+        claimedTab = true;
+        // Own the exchange BEFORE removing pending state: a method switch or tab
+        // close must still find/abort us during the awaited one-time consumption.
+        exchange = { tabId: tabId, controller: new AbortController() };
+        openaiBrowserExchange = exchange;
+        await chrome.storage.session.remove(OPENAI_BROWSER_PENDING_KEY);
+        _openaiAssertGeneration(generation, exchange.controller.signal);
+        return { pending: pending, callback: callback, exchange: exchange };
+    }); } catch (e) {
+        // Cancellation during the awaited one-time removal has already erased
+        // the record, so its cleanup cannot discover this tab. We still own it.
+        if (openaiBrowserExchange === exchange) openaiBrowserExchange = null;
+        if (claimedTab) { try { await chrome.tabs.remove(tabId); } catch (ignored) {} }
+        throw e;
+    }
+    if (!claim) return false;
+    var signal = claim.exchange.controller.signal;
+    try {
+        if (claim.callback.denied) throw new Error('denied');
+        // USA-1: a tab closed during the storage claim no longer fails the
+        // exchange — the callback was already validated against the owned
+        // tab id (_openaiBrowserCallback); user cancel / method switch still
+        // abort via generation + signal.
+        _openaiAssertGeneration(generation, signal);
+        var response = await fetch(OPENAI_OAUTH.tokenUrl, {
+            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+            body: new URLSearchParams({ grant_type: 'authorization_code', code: claim.callback.code, client_id: OPENAI_OAUTH.clientId, redirect_uri: OPENAI_OAUTH.browserRedirectUri, code_verifier: claim.pending.verifier }).toString(), signal: signal
+        });
+        if (!response.ok) throw new Error('exchange failed');
+        var token = await response.json();
+        if (!token || !token.access_token) throw new Error('missing token');
+        _openaiAssertGeneration(generation, signal);
+        await saveChatGPTOAuthCreds(token, null, generation, signal);
+        return true;
+    } catch (e) {
+        if (generation === openaiAuthGeneration && !signal.aborted) {
+            chrome.runtime.sendMessage({ type: 'openai-oauth-updated', error: claim.callback.denied ? 'Browser sign-in was declined. Choose a login method to try again.' : 'Browser token exchange failed. Start a new login or choose device code.' }).catch(function() {});
+        }
+        return false;
+    } finally {
+        if (openaiBrowserExchange === claim.exchange) openaiBrowserExchange = null;
+        // Only the owned auth tab is closed, never a pasted URL's source tab.
+        try { await chrome.tabs.remove(tabId); } catch (e) {}
+    }
+}
+
+async function _openaiBrowserStatus() {
+    var stored = await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY);
+    var pending = stored[OPENAI_BROWSER_PENDING_KEY];
+    if (!pending) return null;
+    if (pending.expiresAt <= Date.now()) {
+        await _openaiQueueOAuthStorage(async function() {
+            var current = (await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY))[OPENAI_BROWSER_PENDING_KEY];
+            if (current && current.state === pending.state) {
+                await chrome.storage.session.remove(OPENAI_BROWSER_PENDING_KEY);
+                try { await chrome.tabs.remove(current.tabId); } catch (e) {}
+            }
+        });
+        return null;
+    }
+    return _openaiBrowserPublic(pending);
+}
+
+chrome.tabs.onUpdated.addListener(function(tabId, changeInfo) {
+    if (changeInfo.url && changeInfo.url.indexOf(OPENAI_OAUTH.browserRedirectUri) === 0) _openaiHandleBrowserCallback(tabId, changeInfo.url).catch(function() {});
+});
+chrome.tabs.onRemoved.addListener(function(tabId) {
+    // Read + ownership check in the serialized lane; a stale close event must
+    // never cancel a newer tab's login. Exchange cancellation is synchronous.
+    // USA-1 (#895): once the callback URL has been CAPTURED (an exchange owns
+    // this tab — the user already approved on auth.openai.com and the ~1s
+    // token exchange is in flight) closing the auth tab is NOT a cancel: users
+    // routinely close the localhost redirect page themselves and the exchange
+    // closes it in its finally anyway. Let the exchange finish. Only a close
+    // BEFORE the callback is captured (pending record still owns the tab)
+    // cancels below. Explicit cancel / logout / method switch still abort the
+    // exchange through _openaiCancelPendingLogin (generation + controller).
+    _openaiQueueOAuthStorage(async function() {
+        var pending = (await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY))[OPENAI_BROWSER_PENDING_KEY];
+        var ownedPending = !!(pending && pending.tabId === tabId);
+        if (ownedPending) await chrome.storage.session.remove(OPENAI_BROWSER_PENDING_KEY);
+        // Only an OWNED tab dismisses the UI's "Waiting for approval" dialog
+        // (same {error} shape as the exchange-failure broadcast). Cancel /
+        // logout / method switch clear ownership in this lane BEFORE removing
+        // the tab, so their close events fall through silently here.
+        if (ownedPending) {
+            chrome.runtime.sendMessage({ type: 'openai-oauth-updated', error: 'Sign-in window was closed. Choose a login method to try again.' }).catch(function() {});
+        }
+    }).catch(function() {});
+});
+
 // --- ChatGPT OAuth message handlers ---
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'openai-oauth-login') {
-        // Manual login re-enables resume in the same ordered OAuth lane. If
-        // logout wins first, the generation check prevents this remove from
-        // landing after logout's suppression write.
-        var manualLoginGeneration = openaiAuthGeneration;
-        _openaiQueueOAuthStorage(async function() {
-            _openaiAssertGeneration(manualLoginGeneration);
-            await chrome.storage.local.remove(['openaiOAuthSuppressAutoLogin']);
-            _openaiAssertGeneration(manualLoginGeneration);
-        }).then(function() { return startChatGPTOAuth(); }).then(function(info) {
-            sendResponse({
-                success: true, pending: true,
-                userCode: info.userCode,
-                verificationUrl: info.verificationUrl || OPENAI_OAUTH.verifyUrl,
-                reused: !!info.reused,
-                tabOpened: info.tabOpened !== false
-            });
-        }).catch(function(err) {
-            sendResponse({ error: err.message });
+        if (!_openaiTrustedAuthSender(sender)) { sendResponse({ error: 'Sign-in must be started from AppAgent.' }); return false; }
+        var method = message.method === 'device' ? 'device' : 'browser';
+        if (!openaiBrowserStartInFlight || openaiBrowserStartInFlight.method !== method) {
+            var attempt = { method: method, generation: openaiAuthGeneration };
+            var previous = openaiBrowserStartInFlight;
+            // A consumed browser callback no longer has a pending record/start
+            // promise. Its exchange still owns login, including an awaited token
+            // commit: invalidate synchronously before starting another method.
+            var clearing = previous || openaiBrowserExchange ? _openaiCancelPendingLogin() : Promise.resolve();
+            attempt.generation = openaiAuthGeneration;
+            attempt.promise = clearing.then(async function() {
+                _openaiAssertGeneration(attempt.generation);
+                var browser = (await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY))[OPENAI_BROWSER_PENDING_KEY];
+                _openaiAssertGeneration(attempt.generation);
+                if (method === 'browser' && browser && browser.expiresAt > Date.now()) {
+                    try {
+                        await chrome.tabs.update(browser.tabId, { active: true });
+                        _openaiAssertGeneration(attempt.generation);
+                        return _openaiBrowserPublic(browser);
+                    } catch (e) { _openaiAssertGeneration(attempt.generation); }
+                }
+                if (browser || openaiBrowserExchange || method === 'browser') {
+                    var cancellation = _openaiCancelPendingLogin();
+                    attempt.generation = openaiAuthGeneration;
+                    openaiBrowserStartInFlight = attempt;
+                    await cancellation;
+                    _openaiAssertGeneration(attempt.generation);
+                }
+                await _openaiQueueOAuthStorage(async function() {
+                    _openaiAssertGeneration(attempt.generation);
+                    await chrome.storage.local.remove(['openaiOAuthSuppressAutoLogin']);
+                    _openaiAssertGeneration(attempt.generation);
+                });
+                _openaiAssertGeneration(attempt.generation);
+                return method === 'device' ? startChatGPTOAuth() : _openaiStartBrowserLogin();
+            }).finally(function() { if (openaiBrowserStartInFlight === attempt) openaiBrowserStartInFlight = null; });
+            openaiBrowserStartInFlight = attempt;
+        }
+        openaiBrowserStartInFlight.promise.then(function(info) {
+            sendResponse(Object.assign({ success: true }, info));
+        }).catch(function() {
+            sendResponse({ error: 'Sign-in did not start or was cancelled. Choose a login method to try again.' });
         });
+        return true;
+    }
+    if (message.type === 'openai-oauth-cancel' || message.type === 'openai-oauth-browser-callback') {
+        if (!_openaiTrustedAuthSender(sender)) { sendResponse({ error: 'Use the AppAgent sign-in dialog.' }); return false; }
+        if (message.type === 'openai-oauth-cancel') {
+            _openaiCancelPendingLogin().then(function() { sendResponse({ success: true }); }).catch(function() { sendResponse({ error: 'Could not cancel sign-in.' }); });
+        } else {
+            (async function() {
+                var pending = (await chrome.storage.session.get(OPENAI_BROWSER_PENDING_KEY))[OPENAI_BROWSER_PENDING_KEY];
+                if (!pending) return false;
+                // The paste is only an alternate transport for our OWN live tab.
+                // Never store, echo, log, or forward its URL outside this exchange.
+                try { await chrome.tabs.get(pending.tabId); } catch (e) { return false; }
+                return _openaiHandleBrowserCallback(pending.tabId, String(message.url || ''));
+            })().then(function(ok) { sendResponse(ok ? { success: true } : { error: 'Callback was not accepted. Check the address, or start a new login.' }); }).catch(function() { sendResponse({ error: 'Callback was not accepted. Start a new login.' }); });
+        }
         return true;
     }
     // "Open the page again" in the device-code modal. One place owns the
@@ -3147,6 +3540,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     }
     if (message.type === 'openai-oauth-status') {
         chrome.storage.local.get(['openaiOAuth', 'openaiPendingDeviceAuth', 'openaiOAuthSuppressAutoLogin'], async function(data) {
+            try {
+                var browserStatus = await _openaiBrowserStatus();
+                if (browserStatus && !data.openaiOAuthSuppressAutoLogin) { sendResponse(Object.assign({ loggedIn: false }, browserStatus)); return; }
+            } catch (e) { /* Session storage unavailable: device flow remains usable. */ }
             if (!data.openaiOAuth) {
                 // No token yet. Device-code cannot log in silently, so instead of
                 // starting a login we RESUME an approved-but-unpolled device auth
@@ -3188,6 +3585,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
     if (message.type === 'openai-oauth-logout') {
+        if (!_openaiTrustedAuthSender(sender)) { sendResponse({ error: 'Use AppAgent to log out.' }); return false; }
+        _openaiCancelPendingLogin().catch(function() {});
         openaiAuthGeneration++;
         openaiActiveDeviceAuthId = null;
         openaiDeviceLoginInFlight = false;
@@ -3271,6 +3670,26 @@ function _openaiContentParts(content, textType) {
             continue;
         }
         if (p.type === 'input_image') { parts.push(p); continue; }
+        if (p.type === 'file' || p.type === 'input_file') {
+            // buildAPIMessages emits chat-completions file parts for PDFs.
+            // Codex Responses needs the file fields flattened into input_file;
+            // otherwise the text fallback below silently keeps only its label.
+            var file = (p.type === 'file' ? p.file : p) || {};
+            var filename = typeof file.filename === 'string' && file.filename ? file.filename : 'document.pdf';
+            var fileData = file.file_data;
+            // AppAgent attachments carry full base64 data URLs. Do not forward
+            // local file-store IDs as upstream file IDs or stringify bad data.
+            // Require complete base64 quartets and correctly sized final padding,
+            // as emitted by FileReader. Alphabet-only checks also accept invalid
+            // one-character bodies and extra padding (A, ABC==, AAAA=).
+            var encoded = typeof fileData === 'string' && /^data:[^;,]+;base64,([A-Za-z0-9+/]+={0,2})(?![\s\S])/.exec(fileData);
+            if (encoded && encoded[1].length % 4 === 0) {
+                parts.push({ type: 'input_file', filename: filename, file_data: fileData });
+            } else {
+                parts.push({ type: textType, text: '[File content unavailable: ' + filename + '. Missing or invalid base64 data URL.]' });
+            }
+            continue;
+        }
         var t = p.text != null ? p.text : '';
         if (t) parts.push({ type: textType, text: t });
     }
@@ -3403,8 +3822,34 @@ function transformToResponses(body) {
         var OK_EFFORTS = { minimal: 1, low: 1, medium: 1, high: 1 };
         reasoning.effort = OK_EFFORTS[String(effort).toLowerCase()] ? String(effort).toLowerCase() : 'high';
     }
-    reasoning.summary = 'auto';
-    if (thinkingOff) reasoning = null;
+    // Public summaries only, never hidden raw reasoning. Default 'auto' —
+    // the value every reference Codex client sends to this backend:
+    //   OpenCode packages/opencode/src/provider/transform.ts (reasoningSummary:"auto"),
+    //   Pi packages/ai/src/api/openai-codex-responses.ts (summary: ?? "auto"),
+    //   Codex codex-rs/protocol/src/config_types.rs ReasoningSummary #[default] Auto.
+    // 'detailed' was never shown to yield more than heading-only summaries here
+    // (openai/codex#34873); an explicit caller value is still honoured.
+    var askedSummary = (body && body.reasoning && typeof body.reasoning === 'object' && typeof body.reasoning.summary === 'string')
+        ? body.reasoning.summary.toLowerCase() : '';
+    reasoning.summary = (askedSummary === 'detailed' || askedSummary === 'concise') ? askedSummary : 'auto';
+    if (isChatGPTAstraModel(body && body.model)) {
+        // Astra requires reasoning, including when the global thinking budget
+        // is off. Its five supported levels must not take the legacy clamp.
+        var astraEffort = String(effort || 'high').toLowerCase();
+        if (thinkingOff || astraEffort === 'none' || astraEffort === 'minimal') astraEffort = 'low';
+        reasoning.effort = ['low', 'medium', 'high', 'xhigh', 'max'].indexOf(astraEffort) >= 0 ? astraEffort : 'high';
+    } else if (isChatGPTGpt6SolLunaModel(body && body.model)) {
+        // GPT-6 Sol/Luna accept none|low|medium|high|xhigh|max natively: no
+        // legacy xhigh/max clamp. Thinking off maps to the documented 'none'
+        // (not an omitted object, which would get the server's medium).
+        // 'minimal' is not listed for these models → low; unknown → high.
+        var slEffort = effort ? String(effort).toLowerCase() : '';
+        if (thinkingOff || slEffort === 'none') reasoning = { effort: 'none' };
+        else if (slEffort) {
+            if (slEffort === 'minimal') slEffort = 'low';
+            reasoning.effort = ['low', 'medium', 'high', 'xhigh', 'max'].indexOf(slEffort) >= 0 ? slEffort : 'high';
+        }
+    } else if (thinkingOff) reasoning = null;
     // SCOPING (reviewer item): upstream applies reasoning.context='all_turns' and
     // parallel_tool_calls=false ONLY on the responses-lite path — selected from
     // the live Codex model catalog (`use_responses_lite`, packages/core/src/
@@ -3421,8 +3866,10 @@ function transformToResponses(body) {
     // are both this value, and runChatGPTOAuthStream keys the degrade-and-retry
     // memo off responsesBody.model — so key parity is structural, not a
     // convention two call sites have to remember.
-    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-5.6-sol';
+    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-6-sol';
     var quirks = _openaiModelQuirks[modelSlug] || {};
+    if (reasoning && quirks.reasoningSummary === 'omit') delete reasoning.summary;
+    else if (reasoning && quirks.reasoningSummary === 'auto') reasoning.summary = 'auto';
     var askedCtx = (body && body.reasoning && typeof body.reasoning === 'object') ? body.reasoning.context : null;
     if (reasoning && askedCtx && !quirks.noReasoningContext) reasoning.context = askedCtx;
 
@@ -3539,7 +3986,7 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
     var created = Math.floor(Date.now() / 1000);
     // Echoed back in every chat.completion.chunk — normalise so the UI shows
     // the slug we actually sent upstream.
-    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-5.6-sol';
+    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-6-sol';
     function emit(payload) {
         sink({ type: 'sse', data: 'data: ' + JSON.stringify(payload) + '\n\n' });
     }
@@ -3551,6 +3998,31 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
             model: model,
             choices: [{ index: 0, delta: delta, finish_reason: finishReason === undefined ? null : finishReason }]
         });
+    }
+
+    // Only explicit rejection of this field/value may degrade public summaries.
+    // Authentication, capacity and unrelated 400s keep their existing handling.
+    function reasoningSummaryFallback(errorText, current) {
+        var error = {};
+        try { var parsed = JSON.parse(errorText); error = parsed.error || parsed; } catch (e) { error = { message: String(errorText || '') }; }
+        var message = String(error.message || '');
+        if (error.param && error.param !== 'reasoning.summary') return null;
+        var exactParam = error.param === 'reasoning.summary';
+        var namesParam = /["']?reasoning\.summary["']?/i.test(message);
+        if (!exactParam && !namesParam) return null;
+        if ((exactParam && error.code === 'unsupported_parameter') ||
+            /unsupported (?:parameter|field)[:\s]+["']?reasoning\.summary["']?/i.test(message) ||
+            /["']?reasoning\.summary["']? (?:parameter )?is not supported/i.test(message)) return 'omit';
+        if (current !== 'detailed' && current !== 'concise') return null; // 'auto' has no lower summary rung
+        // Structured param + rejection code identifies the requested value even
+        // when the message does not echo it. Without param, require one clause
+        // linking this field to rejection of detailed, not unrelated words.
+        if (exactParam && (/^(?:unsupported_value|invalid_value|invalid_enum)$/.test(error.code || '') ||
+            /^(?:unsupported|invalid) value\b/i.test(message))) return 'auto';
+        if (/["']?reasoning\.summary["']?\s+(?:does not support|doesn't support)\s+["']?detailed\b/i.test(message) ||
+            /["']?detailed["']?\s+(?:is not supported|is invalid|is unsupported)\s+(?:for|by)\s+["']?reasoning\.summary\b/i.test(message) ||
+            /(?:unsupported|invalid)\s+(?:value\s*[:=]?\s*)?["']?detailed["']?\s+(?:for|of)\s+(?:parameter\s+)?["']?reasoning\.summary\b/i.test(message)) return 'auto';
+        return null;
     }
 
     try {
@@ -3673,7 +4145,13 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
                 if (/newer version|upgrade to the latest|out of date|outdated/i.test(errBodyText || '')) break;
                 var quirk = _openaiModelQuirks[responsesBody.model] || (_openaiModelQuirks[responsesBody.model] = {});
                 var degraded = null;
-                if (responsesBody.reasoning && responsesBody.reasoning.context !== undefined) {
+                var summaryFallback = responsesBody.reasoning && reasoningSummaryFallback(errBodyText, responsesBody.reasoning.summary);
+                if (summaryFallback && responsesBody.reasoning.summary !== undefined && attempt < maxRetries) {
+                    if (summaryFallback === 'omit') delete responsesBody.reasoning.summary;
+                    else responsesBody.reasoning.summary = summaryFallback;
+                    quirk.reasoningSummary = summaryFallback;
+                    degraded = 'reasoning.summary (' + summaryFallback + ')';
+                } else if (responsesBody.reasoning && responsesBody.reasoning.context !== undefined) {
                     delete responsesBody.reasoning.context;
                     quirk.noReasoningContext = true;
                     degraded = 'reasoning.context';
@@ -3703,7 +4181,15 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
             // that whole budget again. Surface a machine-readable terminal error on
             // the FIRST response so every layer can preserve the no-retry decision.
             if (res.status === 429 && /usage[ _-]?(?:limit|quota)|quota(?:[ _-]?(?:exceeded|exhausted))?|insufficient[ _-]?quota|plan(?:[ _-]?(?:limit|exhausted))|billing[ _-]?hard[ _-]?limit/i.test(errBodyText || '')) {
-                sink({ type: 'error', error: 'ChatGPT usage limit reached: ' + (conciseApiErrorBody(errBodyText) || 'plan or quota exhausted'), code: 'usage_exhausted', retryable: false });
+                // Prefer the structured usage_limit_reached payload (plan,
+                // resets_at / resets_in_seconds, eligible_promo) so the user
+                // sees WHEN they can retry, not just "limit has been reached".
+                var usageInfo = describeChatGPTUsageLimit(errBodyText);
+                var usageMsg = usageInfo
+                    ? usageInfo.headline
+                    : 'ChatGPT usage limit reached: ' + (conciseApiErrorBody(errBodyText) || 'plan or quota exhausted');
+                console.error('[AppAgent] ChatGPT 429 usage limit — raw body:', errBodyText);
+                sink({ type: 'error', error: usageMsg, code: 'usage_exhausted', retryable: false, resetsAt: usageInfo ? usageInfo.resetsAt : null, plan: usageInfo ? usageInfo.plan : null });
                 sink({ type: 'done' });
                 return;
             }
@@ -3796,6 +4282,139 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
         var sawToolCall = false;
         var finished = false;
         var reasoningItemIndex = 0; // reasoning_details[].index for captured reasoning items
+        var reasoningById = new Map();
+        var reasoningByOutput = new Map();
+        var reasoningItems = [];
+        var visibleReasoning = '';
+        var reasoningDirty = false; // set when a part/record actually changes; flushReasoning is a no-op otherwise
+        var replayedReasoning = new Map();
+
+        // Display only explicitly public text. Opaque replay data is a separate
+        // lane; neither encrypted_content nor redacted blocks are display text.
+        function reasoningRecord(ev, item) {
+            var id = ev.item_id || item.id;
+            var oi = Number.isInteger(ev.output_index) && ev.output_index >= 0 ? ev.output_index : null;
+            var byId = id ? reasoningById.get(id) : null;
+            var byOutput = oi !== null ? reasoningByOutput.get(oi) : null;
+            var record = byId || byOutput;
+            if (!record) {
+                // Legacy unkeyed deltas can stream, but cannot safely be matched
+                // to a later identified item without an identity bridge.
+                record = !id && oi === null ? reasoningById.get('') : null;
+                if (!record) {
+                    record = { order: reasoningItems.length, output: oi, parts: new Map() };
+                    reasoningItems.push(record);
+                }
+            }
+            if (byId && byOutput && byId !== byOutput) {
+                reasoningDirty = true; // records merge → join order/content may change
+
+                byOutput.parts.forEach(function(part, key) {
+                    var prior = record.parts.get(key);
+                    if (!prior || part.rank > prior.rank || (part.rank === prior.rank && part.text.startsWith(prior.text))) record.parts.set(key, part);
+                });
+                reasoningById.forEach(function(value, key) { if (value === byOutput) reasoningById.set(key, record); });
+                reasoningByOutput.forEach(function(value, key) { if (value === byOutput) reasoningByOutput.set(key, record); });
+                reasoningItems.splice(reasoningItems.indexOf(byOutput), 1);
+            }
+            if (id) reasoningById.set(id, record);
+            else if (oi === null) reasoningById.set('', record);
+            if (oi !== null) {
+                if (record.output !== oi) reasoningDirty = true; // sort key changed
+                record.output = oi; reasoningByOutput.set(oi, record);
+            }
+            return record;
+        }
+        function reconcileReasoning(record, lane, index, text, rank, isDelta) {
+            if (typeof text !== 'string' || !text) return; // missing/empty is not an erasure
+            var pi = Number.isInteger(index) && index >= 0 ? index : 0;
+            var key = lane + ':' + pi;
+            var part = record.parts.get(key);
+            if (!part) { part = { lane: lane, index: pi, text: '', rank: -1 }; record.parts.set(key, part); }
+            if (isDelta) {
+                if (part.rank > 0) return; // a terminal snapshot already owns this part
+                part.text += text;
+            } else {
+                if (rank < part.rank) return;
+                // Repeated/stale snapshots must not truncate an equal-authority
+                // prefix; a HIGHER-authority terminal revision may replace it.
+                if (rank === part.rank && part.text.startsWith(text)) return;
+                if (part.text !== text) reasoningDirty = true;
+                part.text = text;
+            }
+            if (isDelta) reasoningDirty = true;
+            part.rank = rank;
+        }
+        function recoverReasoningItem(ev, item, rank) {
+            if (item.type !== 'reasoning') return;
+            var record = reasoningRecord(ev, item);
+            if (Array.isArray(item.summary)) item.summary.forEach(function(part, index) {
+                if (part && part.type === 'summary_text') reconcileReasoning(record, 'summary', index, part.text, rank, false);
+            });
+            if (Array.isArray(item.content)) item.content.forEach(function(part, index) {
+                if (part && part.type === 'reasoning_text') reconcileReasoning(record, 'text', index, part.text, rank, false);
+            });
+        }
+        function flushReasoning() {
+            // Only rebuild the joined text when a part/record changed since the
+            // last flush: output_item.added/done for NON-reasoning items, stale
+            // snapshots and no-op events used to re-sort + re-join every part
+            // and re-run startsWith on the whole text (O(n²) over a stream).
+            if (!reasoningDirty) return;
+            reasoningDirty = false;
+            var text = reasoningItems.slice().sort(function(a, b) {
+                return (a.output === null ? a.order : a.output) - (b.output === null ? b.order : b.output);
+            }).map(function(record) {
+                return Array.from(record.parts.values()).sort(function(a, b) {
+                    return a.lane === b.lane ? a.index - b.index : (a.lane === 'summary' ? -1 : 1);
+                }).map(function(part) { return part.text; }).filter(Boolean).join('\n\n');
+            }).filter(Boolean).join('\n\n');
+            if (text === visibleReasoning) return;
+            if (text.startsWith(visibleReasoning)) emitDelta({ reasoning: text.slice(visibleReasoning.length) });
+            else emitDelta({ reasoning_snapshot: text }); // correction/insertion, NOT an append
+            visibleReasoning = text;
+        }
+        function captureReasoningReplay(item) {
+            if (!item.id || typeof item.encrypted_content !== 'string' || !item.encrypted_content) return;
+            var summary = Array.isArray(item.summary) ? item.summary : [];
+            var fingerprint = JSON.stringify([item.encrypted_content, summary]);
+            var prior = replayedReasoning.get(item.id);
+            if (prior && prior.fingerprint === fingerprint) return;
+            var index = prior ? prior.index : reasoningItemIndex++;
+            replayedReasoning.set(item.id, { index: index, fingerprint: fingerprint });
+            emitDelta({ reasoning_details: [{ index: index, type: 'reasoning.encrypted',
+                format: OPENAI_REASONING_FORMAT, id: item.id, data: item.encrypted_content, summary: summary }] });
+        }
+        function processReasoningEvent(ev) {
+            var type = ev.type;
+            // Legacy public-summary aliases (response.reasoning_summary.delta/done)
+            // share canonical indexing and snapshot authority.
+            if (type === 'response.reasoning_summary.delta' || type === 'response.reasoning_summary.done') {
+                type = type.replace('reasoning_summary.', 'reasoning_summary_text.');
+            }
+            if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta' ||
+                type === 'response.reasoning_summary_text.done' || type === 'response.reasoning_text.done') {
+                var summary = type.indexOf('reasoning_summary_') !== -1;
+                var isDelta = type.endsWith('.delta');
+                reconcileReasoning(reasoningRecord(ev, {}), summary ? 'summary' : 'text',
+                    summary ? ev.summary_index : ev.content_index, isDelta ? ev.delta : ev.text, isDelta ? 0 : 1, isDelta);
+            } else if (type === 'response.reasoning_summary_part.added' || type === 'response.reasoning_summary_part.done') {
+                var part = ev.part || {};
+                if (part.type === 'summary_text') reconcileReasoning(reasoningRecord(ev, {}), 'summary', ev.summary_index,
+                    part.text, type.endsWith('.done') ? 2 : 0, false);
+            } else if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+                var item = ev.item || {};
+                recoverReasoningItem(ev, item, type.endsWith('.done') ? 3 : 0);
+                if (type.endsWith('.done') && item.type === 'reasoning') captureReasoningReplay(item);
+            } else if (type === 'response.completed' && ev.response && Array.isArray(ev.response.output)) {
+                ev.response.output.forEach(function(item, index) {
+                    if (!item) return;
+                    recoverReasoningItem({ output_index: index }, item, 4);
+                    if (item.type === 'reasoning') captureReasoningReplay(item);
+                });
+            } else return; // ordinary answer/tool deltas do not rebuild reasoning text
+            flushReasoning();
+        }
 
         while (true) {
             // Cancel the body on abort — without this the fetch stream is left
@@ -3824,10 +4443,14 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
                     emitDelta({ role: 'assistant' });
                 }
 
+                // Reconcile public snapshots before completion commits the turn.
+                // Late/repeated events after success must not mutate its final state.
+                if (finished) continue;
+                processReasoningEvent(ev);
+
                 if (et === 'response.output_text.delta') {
                     if (ev.delta) emitDelta({ content: ev.delta });
-                } else if (et === 'response.reasoning_summary_text.delta' || et === 'response.reasoning_text.delta') {
-                    if (ev.delta) emitDelta({ reasoning: ev.delta });
+
                 } else if (et === 'response.output_item.added') {
                     var item = ev.item || {};
                     if (item.type === 'function_call') {
@@ -3853,33 +4476,8 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
                     }
                 } else if (et === 'response.function_call_arguments.done' || et === 'response.output_item.done') {
                     var doneItem = ev.item || {};
-                    // Completed encrypted reasoning item (store:false + include
-                    // reasoning.encrypted_content). Forward it as a chat-completions
-                    // reasoning_details delta so 010-llm-streaming.js's by-index
-                    // merge stores it on the assistant message and
-                    // transformToResponses (_openaiReasoningItemsOf) replays it
-                    // as {type:'reasoning', id, summary, encrypted_content} on the
-                    // next request. Shape = OpenRouter `reasoning.encrypted`
-                    // (type/id/data/format/index) so the entry is also a valid
-                    // chat-completions reasoning_details element. No text/thinking
-                    // key on purpose: the summary is already displayed through
-                    // the reasoning_summary_text.delta events above, and the
-                    // merge would otherwise render the encrypted blob.
-                    if (et === 'response.output_item.done' && doneItem.type === 'reasoning') {
-                        if (doneItem.id && typeof doneItem.encrypted_content === 'string' && doneItem.encrypted_content) {
-                            emitDelta({
-                                reasoning_details: [{
-                                    index: reasoningItemIndex++,
-                                    type: 'reasoning.encrypted',
-                                    format: OPENAI_REASONING_FORMAT,
-                                    id: doneItem.id,
-                                    data: doneItem.encrypted_content,
-                                    summary: Array.isArray(doneItem.summary) ? doneItem.summary : []
-                                }]
-                            });
-                        }
-                        continue;
-                    }
+                    // Public display and opaque replay were reconciled above.
+                    if (et === 'response.output_item.done' && doneItem.type === 'reasoning') continue;
                     // Some models (e.g. the codex-spark family) return tool-call
                     // arguments in ONE shot with no incremental deltas — synthesize
                     // the full-arguments chunk from the terminal event.
@@ -3931,8 +4529,19 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
                     if (finished) continue;
                     var incomplete = (ev.response && ev.response.incomplete_details) || ev.incomplete_details || {};
                     var incompleteReason = incomplete.reason || incomplete.message || 'unknown reason';
-                    emit({ error: { message: 'ChatGPT response incomplete: ' + incompleteReason, type: 'incomplete_response', recoverable: true } });
-                    finished = true;
+                    if (incompleteReason === 'max_output_tokens') {
+                        // G-3: a max_output_tokens truncation is NOT an error —
+                        // the streamed text is complete-so-far. Finish the
+                        // synthetic stream like OpenRouter does (final chunk
+                        // finish_reason 'length'), so app/010-llm-streaming keeps
+                        // the partial content instead of throwing on data.error
+                        // and discarding everything streamed so far.
+                        finished = true;
+                        emitDelta({}, 'length');
+                    } else {
+                        emit({ error: { message: 'ChatGPT response incomplete: ' + incompleteReason, type: 'incomplete_response', recoverable: true } });
+                        finished = true;
+                    }
                 } else if (et === 'response.failed' || et === 'error') {
                     if (finished) continue;
                     var errObj = (ev.response && ev.response.error) || ev.error || {};
@@ -4065,20 +4674,23 @@ function convertContentPart(part) {
 // Docs: https://platform.claude.com/docs/en/models/fable-5-1/whats-new-fable-5-1
 //       https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
 //
-// FABLE_5_1_PLUS_RE / isFable51Plus are DEFINED in src/js/core/030-config.js
-// (single source of truth, shared with buildAPIMessages in the page + SW
-// bundles) and reach this file through importScripts('sw-bundle.js') at the
-// top. Do not redeclare them here — a second copy is exactly the drift the
-// shared definition exists to prevent.
+// FABLE_5_1_PLUS_RE / isFable51Plus and the wider THINKING_BINDING_RE /
+// isThinkingBindingModel (Fable/Mythos 5.1+ OR Opus 5.5+ — the set this file
+// actually gates on) are DEFINED in src/js/core/030-config.js (single source
+// of truth, shared with buildAPIMessages in the page + SW bundles) and reach
+// this file through importScripts('sw-bundle.js') at the top. Do not
+// redeclare them here — a second copy is exactly the drift the shared
+// definition exists to prevent.
 
 // Beta flags for the OAuth /v1/messages call. The base trio is unconditional
-// (OAuth access, interleaved thinking, cache scope); Fable 5.1+ additionally
-// needs the two thinking betas that back the block_binding / display:'updates'
-// fields transformToAnthropic emits for it — sending those fields WITHOUT the
-// betas is a 400, and sending the betas to older models is harmless but noisy,
-// so they are gated on the same regex.
+// (OAuth access, interleaved thinking, cache scope); the bound-thinking models
+// (Fable/Mythos 5.1+ AND Opus 5.5+ — THINKING_BINDING_RE / isThinkingBindingModel
+// in src/js/core/030-config.js) additionally need the two thinking betas that
+// back the block_binding / display fields transformToAnthropic emits for them —
+// sending those fields WITHOUT the betas is a 400, and sending the betas to
+// older models is harmless but noisy, so they are gated on the same regex.
 var ANTHROPIC_BASE_BETAS = ['oauth-2025-04-20', 'interleaved-thinking-2025-05-14', 'prompt-caching-scope-2026-01-05'];
-var ANTHROPIC_FABLE_5_1_BETAS = ['thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18'];
+var ANTHROPIC_THINKING_BINDING_BETAS = ['thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18'];
 
 // Claude models that ACCEPT thinking:{type:'adaptive'} (+ output_config.effort):
 // Opus / Sonnet 4.6 and later. Everything the adaptive-ONLY pattern matches
@@ -4095,7 +4707,7 @@ var ADAPTIVE_CAPABLE_CLAUDE_RE = /claude-(?:opus|sonnet)-4[.-](?:[6-9]|\d{2,})/;
 var LEGACY_EFFORT_BUDGET_TOKENS = { low: 4096, medium: 16000, high: 32000, xhigh: 64000, max: 64000 };
 function getAnthropicBetas(model) {
     var betas = ANTHROPIC_BASE_BETAS.slice();
-    if (isFable51Plus(model)) betas = betas.concat(ANTHROPIC_FABLE_5_1_BETAS);
+    if (isThinkingBindingModel(model)) betas = betas.concat(ANTHROPIC_THINKING_BINDING_BETAS);
     return betas.join(',');
 }
 
@@ -4174,10 +4786,11 @@ function transformToAnthropic(body) {
         model: body.model,
         // body.max_tokens is always set by the request builder
         // (callOpenRouterStreaming in src/js/app/010-llm-streaming.js, from
-        // the global Max Tokens setting) — the literal below is a
-        // last-resort fallback. 64000 = DEFAULT_MAX_TOKENS in
-        // src/js/core/030-config.js (not importable here) — keep in sync.
-        max_tokens: body.max_tokens || 64000,
+        // the global Max Tokens setting) — this is a last-resort fallback.
+        // getDefaultMaxTokensForModel (src/js/core/030-config.js, shared into
+        // the SW bundle) gives 128000 for Opus 5.5+ / 64000 otherwise; the
+        // literal 64000 = DEFAULT_MAX_TOKENS guards a realm without it.
+        max_tokens: body.max_tokens || (typeof getDefaultMaxTokensForModel === 'function' ? getDefaultMaxTokensForModel(body.model) : 64000),
         stream: true,
         messages: merged
     };
@@ -4204,34 +4817,38 @@ function transformToAnthropic(body) {
         result.tool_choice = { type: 'auto' };
     }
 
-    // Fable 5.1+: thinking is always-on adaptive (type 'enabled'/'disabled' → 400),
-    // so the thinking object is sent UNCONDITIONALLY for it — even when the
+    // Bound-thinking models (Fable/Mythos 5.1+, Opus 5.5+ — isThinkingBindingModel):
+    // thinking is always-on adaptive (type 'enabled'/'disabled' → 400), so the
+    // thinking object is sent UNCONDITIONALLY for them — even when the
     // provider has no effort/budget configured (effort then stays at the model
     // default; output_config is only emitted when body.reasoning asks for one).
-    //   display:'updates'  — readable progress-update thinking blocks between
-    //                        tool calls (beta thinking-display-updates-2026-08-18).
+    //   display:'summarized' — public reasoning summaries AND progress updates;
+    //                        'updates' alone keeps reasoning summaries hidden.
+    //                        See docs/en/models/fable-5-1/whats-new-fable-5-1.
     //   block_binding.prefix_mismatch_behavior:'drop_block' — replayed thinking
     //                        blocks whose bound prefix no longer matches (edited
     //                        system prompt, tool roster change, context compaction)
     //                        are dropped server-side and reported in the response's
     //                        input_transformations instead of failing the request
     //                        with a 400 (beta thinking-binding-controls-2026-08-01).
-    // Both betas are added by getAnthropicBetas for the same FABLE_5_1_PLUS_RE match.
+    // Both betas are added by getAnthropicBetas for the same THINKING_BINDING_RE match.
     //   thinkingOff — the request builder's explicit off switch (global Thinking
     //                 Budget = 0, no provider effort → reasoning:{enabled:false},
-    //                 see callOpenRouterStreaming). Fable 5.1+ IGNORES it: its
-    //                 thinking is always-on and there is no accepted 'disabled'
-    //                 shape, so the forced branch below stays unconditional (the
-    //                 Settings hint says "not for Fable 5.1+").
-    var fable51 = isFable51Plus(body.model);
+    //                 see callOpenRouterStreaming). Bound-thinking models IGNORE
+    //                 it: their thinking is always-on and there is no accepted
+    //                 'disabled' shape (on Opus 5.5 an omitted `thinking` is
+    //                 equivalent to adaptive anyway), so the forced branch below
+    //                 stays unconditional (the Settings hint says "not for
+    //                 Fable 5.1+").
+    var thinkingBound = isThinkingBindingModel(body.model);
     var thinkingOff = !!(body.reasoning && body.reasoning.enabled === false);
     var effort = (body.reasoning && !thinkingOff) ? body.reasoning.effort : null;
     var budget = (body.reasoning && !thinkingOff) ? body.reasoning.max_tokens : null;
     var modelLower = String(body.model || '').toLowerCase();
     var adaptiveOnly = isAdaptiveOnlyClaude(modelLower);
     var adaptiveCapable = adaptiveOnly || ADAPTIVE_CAPABLE_CLAUDE_RE.test(modelLower);
-    if (fable51) {
-        result.thinking = { type: 'adaptive', display: 'updates', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
+    if (thinkingBound) {
+        result.thinking = { type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
     } else if (!thinkingOff) {
         if (adaptiveCapable) {
             // Claude 4.6+ adaptive thinking — the model decides how much to think
@@ -4269,16 +4886,127 @@ function transformToAnthropic(body) {
             result.thinking = { type: 'enabled', budget_tokens: budgetTokens };
         }
     }
-    // output_config.effort only exists on adaptive models (4.6+ / Fable 5.1+).
-    // A budget-only request on an adaptive model keeps the historical mapping
-    // to effort:'high' (the budget itself has no adaptive equivalent).
-    if (!thinkingOff && (fable51 || adaptiveCapable)) {
+    // output_config.effort only exists on adaptive models (4.6+ / Fable 5.1+ /
+    // Opus 5.5+). A budget-only request on an adaptive model keeps the
+    // historical mapping to effort:'high' (the budget itself has no adaptive
+    // equivalent).
+    if (!thinkingOff && (thinkingBound || adaptiveCapable)) {
         if (effort) result.output_config = { effort: effort };
         else if (budget) result.output_config = { effort: 'high' };
     }
 
     result.metadata = { user_id: 'appagent_extension' };
     return result;
+}
+
+// One stored reasoning_details entry → Anthropic thinking block, or null when
+// it cannot be replayed. redacted_thinking blocks (safety-redacted reasoning)
+// carry an opaque `data` payload instead of thinking+signature; the API
+// requires them to be replayed verbatim during tool-use continuations
+// (captured by the SSE handler in runClaudeOAuthStream as
+// { type:'redacted_thinking', data }). Unsigned thinking is never replayed.
+function anthropicThinkingBlockFromRd(rd) {
+    if (!rd) return null;
+    if (rd.type === 'redacted_thinking') {
+        return rd.data ? { type: 'redacted_thinking', data: rd.data } : null;
+    }
+    if (!rd.signature) return null;
+    return { type: 'thinking', thinking: rd.thinking || rd.text || rd.content || '', signature: rd.signature };
+}
+
+function anthropicToolUseBlockFromCall(tc) {
+    var func = tc.function || {};
+    var args = func.arguments || '{}';
+    var input = (typeof args === 'string') ? (function() { try { return JSON.parse(args); } catch(e) { return {}; } })() : args;
+    return { type: 'tool_use', id: tc.id, name: func.name, input: input };
+}
+
+// Replay an assistant turn in its ORIGINAL content-block order (Opus 5.5 /
+// Fable 5.1+ thinking binding: a thinking block is bound to everything before
+// it, so reordering [thinking,text,thinking,tool_use] silently drops the later
+// thinking). msg.block_order is recorded page-side (010-llm-streaming.js) from
+// the SSE handler's delta.anthropic_block markers. Returns the block array, or
+// null when the order is absent or no longer matches the message exactly —
+// the caller then uses the legacy thinking→text→tool_use layout unchanged.
+// Validation: text entries must tile the text contiguously from 0 to its full
+// length; every reasoning_details entry and every tool call must be referenced
+// exactly once (by rd.index / tool call id); no unknown entry types.
+function buildOrderedAnthropicAssistantBlocks(msg) {
+    var order = msg.block_order;
+    if (!Array.isArray(order) || order.length === 0) return null;
+
+    // Text + cache_control. By replay time callOpenRouterStreaming has
+    // normalized a string content into [{type:'text', text, cache_control?}].
+    var text = '';
+    var cc = null;
+    if (typeof msg.content === 'string') {
+        text = msg.content;
+    } else if (Array.isArray(msg.content)) {
+        if (msg.content.length > 1) return null;
+        if (msg.content.length === 1) {
+            var part = msg.content[0];
+            if (!part || part.type !== 'text' || typeof part.text !== 'string') return null;
+            text = part.text;
+            cc = part.cache_control || null;
+        }
+    } else if (msg.content != null && msg.content !== '') {
+        return null;
+    }
+
+    var rds = Array.isArray(msg.reasoning_details) ? msg.reasoning_details : [];
+    var rdByIdx = {};
+    for (var r = 0; r < rds.length; r++) {
+        var rd = rds[r];
+        if (!rd || typeof rd.index !== 'number' || rdByIdx.hasOwnProperty(rd.index)) return null;
+        rdByIdx[rd.index] = rd;
+    }
+    var tcs = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    var tcById = {};
+    for (var t = 0; t < tcs.length; t++) {
+        var tc = tcs[t];
+        if (!tc || !tc.id || tcById.hasOwnProperty(tc.id)) return null;
+        tcById[tc.id] = tc;
+    }
+
+    var out = [];
+    var usedRd = {}, usedRdCount = 0;
+    var usedTc = {}, usedTcCount = 0;
+    var pos = 0;
+    var lastTextOut = -1;
+    for (var k = 0; k < order.length; k++) {
+        var entry = order[k];
+        if (!entry || typeof entry !== 'object') return null;
+        if (entry.t === 'r') {
+            if (!rdByIdx.hasOwnProperty(entry.i) || usedRd.hasOwnProperty(entry.i)) return null;
+            usedRd[entry.i] = true; usedRdCount++;
+            var tb = anthropicThinkingBlockFromRd(rdByIdx[entry.i]);
+            if (tb) out.push(tb); // unsigned / empty-redacted: skipped, as legacy
+        } else if (entry.t === 'x') {
+            if (typeof entry.s !== 'number' || typeof entry.e !== 'number') return null;
+            if (entry.s !== pos || entry.e < entry.s || entry.e > text.length) return null;
+            pos = entry.e;
+            var piece = text.slice(entry.s, entry.e);
+            // Empty / whitespace-only text blocks are rejected by the API as
+            // request input; skip them (the tiling check still covers them).
+            // Note: skipping one that precedes a later thinking entry can change the replayed prefix.
+            if (piece.trim()) { out.push({ type: 'text', text: piece }); lastTextOut = out.length - 1; }
+        } else if (entry.t === 'u') {
+            if (typeof entry.id !== 'string' || !tcById.hasOwnProperty(entry.id) || usedTc.hasOwnProperty(entry.id)) return null;
+            usedTc[entry.id] = true; usedTcCount++;
+            out.push(anthropicToolUseBlockFromCall(tcById[entry.id]));
+        } else {
+            return null;
+        }
+    }
+    if (pos !== text.length) return null;
+    if (usedRdCount !== rds.length || usedTcCount !== tcs.length) return null;
+    // cache_control stays on the (last) text piece — the block the page-side
+    // cache pass put it on. No text block emitted to carry it → legacy.
+    if (cc) {
+        if (lastTextOut < 0) return null;
+        out[lastTextOut].cache_control = cc;
+    }
+    return out.length > 0 ? out : null;
 }
 
 function transformMessageToAnthropic(msg) {
@@ -4309,20 +5037,14 @@ function transformMessageToAnthropic(msg) {
     }
 
     if (msg.role === 'assistant') {
+        var ordered = buildOrderedAnthropicAssistantBlocks(msg);
+        if (ordered) return { role: 'assistant', content: ordered };
+        // Legacy layout (no/invalid block_order): thinking → text → tool_use.
         var blocks = [];
         if (msg.reasoning_details && Array.isArray(msg.reasoning_details)) {
             msg.reasoning_details.forEach(function(rd) {
-                // redacted_thinking blocks (safety-redacted reasoning) carry an
-                // opaque `data` payload instead of thinking+signature; the API
-                // requires them to be replayed verbatim during tool-use
-                // continuations. Captured by the SSE handler in
-                // runClaudeOAuthStream as { type:'redacted_thinking', data }.
-                if (rd.type === 'redacted_thinking') {
-                    if (rd.data) blocks.push({ type: 'redacted_thinking', data: rd.data });
-                    return;
-                }
-                if (!rd.signature) return;
-                blocks.push({ type: 'thinking', thinking: rd.thinking || rd.text || rd.content || '', signature: rd.signature });
+                var tb = anthropicThinkingBlockFromRd(rd);
+                if (tb) blocks.push(tb);
             });
         }
         if (msg.content) {
@@ -4334,10 +5056,7 @@ function transformMessageToAnthropic(msg) {
         }
         if (msg.tool_calls) {
             msg.tool_calls.forEach(function(tc) {
-                var func = tc.function || {};
-                var args = func.arguments || '{}';
-                var input = (typeof args === 'string') ? (function() { try { return JSON.parse(args); } catch(e) { return {}; } })() : args;
-                blocks.push({ type: 'tool_use', id: tc.id, name: func.name, input: input });
+                blocks.push(anthropicToolUseBlockFromCall(tc));
             });
         }
         return { role: 'assistant', content: blocks.length > 0 ? blocks : '' };
@@ -4556,6 +5275,8 @@ if (chrome.runtime.onSuspend && chrome.runtime.onSuspend.addListener) {
 
 var _swOffscreenCreating = null;          // Promise while creation is in flight (avoid races)
 var _swOffscreenKeepAlivePort = null;     // Persistent port opened by offscreen → SW
+var _swOffscreenClosing = null;           // P4 #1: Promise while an idle-close is in flight (ensureOffscreenDocument awaits it)
+var _swOffscreenHealing = null;           // P4 #1: Promise while a zombie self-heal (close → recreate) is in flight — single-flight across concurrent waitForOffscreenReady timeouts
 var _swOffscreenIdleSince = 0;            // ms when last run finished; 0 = busy or unknown
 var _swOffscreenReadyResolvers = [];      // Awaiters that need offscreen up + handlers registered
 var OFFSCREEN_IDLE_GRACE_MS = 60 * 1000;  // close offscreen 60s after the last run ends
@@ -4564,6 +5285,14 @@ async function ensureOffscreenDocument() {
     if (typeof chrome.offscreen === 'undefined') {
         console.error('[SW] chrome.offscreen API unavailable — manifest "offscreen" permission missing?');
         return;
+    }
+    // P4 #1 (flag P4_OFFSCREEN_SELF_HEAL, read at CALL time — bg.js loads
+    // BEFORE the SW bundle that defines self.getP4Flag): never race a create
+    // against an in-flight idle-close. hasDocument() still reports the doc
+    // being torn down, so without this we would skip creation and the next
+    // waitForOffscreenReady would time out on a document that is gone.
+    if (_swOffscreenClosing && typeof self.getP4Flag === 'function' && self.getP4Flag('P4_OFFSCREEN_SELF_HEAL')) {
+        try { await _swOffscreenClosing; } catch (e) { /* close failure is non-fatal */ }
     }
     var exists = false;
     try {
@@ -4596,40 +5325,178 @@ async function ensureOffscreenDocument() {
 function waitForOffscreenReady(timeoutMs) {
     if (_swOffscreenKeepAlivePort) return Promise.resolve(true);
     ensureOffscreenDocument();
-    return new Promise(function(resolve) {
-        var done = false;
-        var entry = function() { if (!done) { done = true; resolve(true); } };
-        _swOffscreenReadyResolvers.push(entry);
-        setTimeout(function() {
-            if (!done) {
-                done = true;
-                var idx = _swOffscreenReadyResolvers.indexOf(entry);
-                if (idx >= 0) _swOffscreenReadyResolvers.splice(idx, 1);
-                resolve(false);
-            }
-        }, timeoutMs || 5000);
+    // P4 #1: cap the readiness wait (callers pass their execution timeout
+    // here, sometimes minutes — a dead document should fail fast). Hard cap
+    // 60s, not 20s (#923 follow-up): a long-running caller whose offscreen
+    // document is merely BUSY (another chat's CPU-bound js_eval starving the
+    // keep-alive connect) must not be failed early — the caller's own
+    // timeout stays authoritative below the cap. Kept inline (no module
+    // constant) so the test slice of this function stays self-contained.
+    var cap = Math.min(timeoutMs || 5000, 60000);
+    function waitOnce() {
+        return new Promise(function(resolve) {
+            var done = false;
+            var entry = function() { if (!done) { done = true; resolve(true); } };
+            _swOffscreenReadyResolvers.push(entry);
+            setTimeout(function() {
+                if (!done) {
+                    done = true;
+                    var idx = _swOffscreenReadyResolvers.indexOf(entry);
+                    if (idx >= 0) _swOffscreenReadyResolvers.splice(idx, 1);
+                    resolve(false);
+                }
+            }, cap);
+        });
+    }
+    return waitOnce().then(function(ready) {
+        if (ready) return true;
+        // P4 #1 one-shot self-heal (flag P4_OFFSCREEN_SELF_HEAL, read at call
+        // time via self.getP4Flag — see ensureOffscreenDocument). A "zombie"
+        // offscreen document exists but never connected its keep-alive port
+        // (handlers not registered — hung load / stuck realm). Previously
+        // every call timed out forever: hasDocument() said true, so nothing
+        // ever recreated it. Close it ONCE, recreate, wait one more cap.
+        // Never while persistence is busy (same guard as the idle-close).
+        if (!(typeof self.getP4Flag === 'function' && self.getP4Flag('P4_OFFSCREEN_SELF_HEAL'))) return false;
+        if (_swOffscreenKeepAlivePort) return true;
+        // SINGLE-FLIGHT (R4 SF1): several callers can time out in the same
+        // window. Only the first runs the heal; the others join its promise.
+        // Without this the 2nd caller saw hasDocument() true for the document
+        // the 1st heal had JUST recreated and closeDocument()'d the healthy one.
+        // Resolves true when a close+recreate happened, false when there was
+        // nothing to heal (no document / persistence busy).
+        if (!_swOffscreenHealing) {
+            _swOffscreenHealing = (async function() {
+                var exists = false;
+                try {
+                    exists = !!(typeof chrome.offscreen !== 'undefined' && typeof chrome.offscreen.hasDocument === 'function'
+                        && await chrome.offscreen.hasDocument());
+                } catch (e) { exists = false; }
+                if (!exists) return false;
+                if (typeof persistenceBusyReason === 'function' && persistenceBusyReason()) return false;
+                // Publish the close via _swOffscreenClosing so a concurrent
+                // ensureOffscreenDocument waits for it instead of racing a create
+                // against the teardown (same contract as maybeCloseOffscreenIfIdle).
+                var closing = (async function() {
+                    try { await chrome.offscreen.closeDocument(); } catch (e) { /* already gone */ }
+                    _swOffscreenKeepAlivePort = null;
+                })();
+                _swOffscreenClosing = closing;
+                try { await closing; } finally { if (_swOffscreenClosing === closing) _swOffscreenClosing = null; }
+                console.warn('[SW] offscreen self-heal: zombie document (no keep-alive port within ' + cap + 'ms) closed; recreating');
+                try { await ensureOffscreenDocument(); } catch (e) { /* creation errors are logged there */ }
+                return true;
+            })().finally(function() { _swOffscreenHealing = null; });
+        }
+        return _swOffscreenHealing.then(function(healed) {
+            if (!healed) return false;
+            if (_swOffscreenKeepAlivePort) return true;
+            return waitOnce();
+        });
     });
+}
+
+// Fail closed on hybrid installs before allocating an invocation or relaying tools.
+// Keep normal eval unrestricted when the host is healthy; never bypass its registry.
+function swTestPolicyStartupError() {
+    if (typeof TestRunPolicy === 'undefined' || !TestRunPolicy || !TestRunPolicy.registry ||
+        !['bind', 'descriptor', 'unbind', 'relay'].every(function(name) { return typeof TestRunPolicy.registry[name] === 'function'; })) {
+        return new Error('Inconsistent extension installation: SW TestRunPolicy is missing or incompatible. Rebuild all extension artifacts using the header Reload; sandbox execution remains blocked.');
+    }
+    return null;
 }
 
 // Called by the SW runtime (sw-bundle.js, worker/010-platform-stub.js)
 // any time the agent loop needs DOM (js_eval, skills sandbox, image).
-// Returns the helper's response or throws on timeout.
-async function callOffscreenHelper(type, payload, timeoutMs) {
-    var ready = await waitForOffscreenReady(timeoutMs || 5000);
-    if (!ready) throw new Error('Offscreen helper not available');
-    // Promise-style sendMessage — Chrome MV3 supports it. The offscreen
-    // returns a {ok:true, result} or {ok:false, error} envelope.
-    var resp = await chrome.runtime.sendMessage({
-        type: type,
-        payload: payload
+// timeoutMs gates readiness, not execution. Sandbox callers may additionally
+// supply an AbortSignal to dispose just their invocation after an outer timeout.
+async function callOffscreenHelper(type, payload, timeoutMs, signal) {
+    return new Promise(function(resolve, reject) {
+        var settled = false;
+        var dispatched = false;
+        // Generated here, never derived from chat/tool ids or supplied by code.
+        // Two nested evals in the same chat must have different cancellation keys.
+        var isSandbox = type === 'helper-js-eval' || type === 'helper-skill-sandbox';
+        var policyError = isSandbox ? swTestPolicyStartupError() : null;
+        if (policyError) { reject(policyError); return; }
+        var requestId = isSandbox ? 'sandbox_' + crypto.randomUUID() : null;
+        var testKey = payload && payload._testRunContext || null;
+        var wirePayload = Object.assign({}, payload);
+        delete wirePayload._testRunContext;
+        delete wirePayload.testRunPolicy;
+        if (requestId) {
+            TestRunPolicy.registry.bind(requestId, testKey);
+            if (testKey) wirePayload.testRunPolicy = TestRunPolicy.registry.descriptor(testKey);
+            wirePayload.sandboxRequestId = requestId;
+        }
+        function finish(error, result) {
+            if (settled) return;
+            settled = true;
+            if (requestId) TestRunPolicy.registry.unbind(requestId);
+            if (signal) signal.removeEventListener('abort', onAbort);
+            if (error) reject(error);
+            else resolve(result);
+        }
+        function onAbort() {
+            if (settled) return;
+            var error = new Error('Offscreen helper execution cancelled');
+            error.name = 'AbortError';
+            finish(error);
+            if (dispatched) {
+                // Never call ensureOffscreenDocument/callOffscreenHelper here:
+                // cancelling a dead request must not create a new helper realm.
+                // The helper owns iframe/listener cleanup and settles the original
+                // response channel too. Failure here cannot mask the outer timeout.
+                try {
+                    chrome.runtime.sendMessage({ type: 'helper-cancel-sandbox', payload: { sandboxRequestId: requestId } })
+                        .catch(function(err) { console.warn('[SW] sandbox cancellation delivery failed', err); });
+                } catch (err) { console.warn('[SW] sandbox cancellation delivery failed', err); }
+            }
+        }
+        if (signal) {
+            if (signal.aborted) { onAbort(); return; }
+            signal.addEventListener('abort', onAbort, { once: true });
+        }
+        waitForOffscreenReady(timeoutMs || 5000).then(function(ready) {
+            // An outer timeout may have won while readiness was pending. Its
+            // cancelled invocation must NEVER spring to life when the helper wakes.
+            if (settled) return;
+            if (!ready) {
+                // P4 #1: decorated so callers/logs can tell "keep-alive port
+                // never connected" from a helper runtime error. The message
+                // keeps the /not available/ contract (tests + worker stub).
+                var e = new Error('Offscreen helper not available (offscreen_not_ready: keep-alive port never connected within '
+                    + Math.min(timeoutMs || 5000, 60000) + 'ms)');
+                e.code = 'offscreen_not_ready';
+                throw e;
+            }
+            dispatched = true;
+            return chrome.runtime.sendMessage({
+                type: type,
+                payload: wirePayload
+            });
+        }).then(function(resp) {
+            if (settled) return; // late helper response after abort
+            if (!resp) throw new Error('Offscreen helper returned no response');
+            if (!resp.ok) throw new Error(resp.error || 'Offscreen helper error');
+            finish(null, resp.result);
+        }).catch(function(err) { finish(err); });
     });
-    if (!resp) throw new Error('Offscreen helper returned no response');
-    if (!resp.ok) throw new Error(resp.error || 'Offscreen helper error');
-    return resp.result;
 }
 // Expose to the imported SW bundle.
 self.callOffscreenHelper = callOffscreenHelper;
 self.ensureOffscreenDocument = ensureOffscreenDocument;
+// #17 runtime_inspect action:'sandbox_registry' — read-only snapshot of the
+// offscreen-document bookkeeping for the SW 'pull-debug-state' reply
+// (worker/130-port-bridge.js). Synchronous; hasDocument() is awaited there.
+self._swOffscreenDebug = function() {
+    return {
+        keepAlivePort: !!_swOffscreenKeepAlivePort,
+        idleSince: _swOffscreenIdleSince,
+        creating: !!_swOffscreenCreating,
+        readyWaiters: _swOffscreenReadyResolvers.length
+    };
+};
 
 async function maybeCloseOffscreenIfIdle() {
     if (!_swOffscreenIdleSince) return;
@@ -4657,13 +5524,19 @@ async function maybeCloseOffscreenIfIdle() {
             return;
         }
     }
-    try {
-        if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) {
-            await chrome.offscreen.closeDocument();
-        }
-    } catch (e) { /* ignore — already gone */ }
-    _swOffscreenIdleSince = 0;
-    _swOffscreenKeepAlivePort = null;
+    // P4 #1: publish the in-flight close so ensureOffscreenDocument (flag
+    // P4_OFFSCREEN_SELF_HEAL) can await it instead of racing a create against
+    // a document that hasDocument() still reports.
+    _swOffscreenClosing = (async function() {
+        try {
+            if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) {
+                await chrome.offscreen.closeDocument();
+            }
+        } catch (e) { /* ignore — already gone */ }
+        _swOffscreenIdleSince = 0;
+        _swOffscreenKeepAlivePort = null;
+    })().finally(function() { _swOffscreenClosing = null; });
+    return _swOffscreenClosing;
 }
 self.markOffscreenMaybeIdle = function() { _swOffscreenIdleSince = Date.now(); };
 
@@ -4810,13 +5683,109 @@ async function _swResumeIfNeeded() {
 chrome.runtime.onStartup.addListener(function() { _swResumeIfNeeded(); });
 chrome.runtime.onInstalled.addListener(function() { _swResumeIfNeeded(); });
 
-// DNR rule: spoof User-Agent for Anthropic API requests
-chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [3000],
-    addRules: [{
-        id: 3000,
-        priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: 'claude-cli/2.1.257 (external, cli)' }] },
-        condition: { urlFilter: 'api.anthropic.com/*', resourceTypes: ['xmlhttprequest'] }
-    }]
-}).catch(function() {});
+// --- Claude CLI User-Agent version gate ---
+// DNR rule 3000 spoofs `User-Agent: claude-cli/<version> (external, cli)` on
+// every api.anthropic.com request. Anthropic enforces a SERVER-SIDE per-model
+// minimum Claude Code version read from that header (we send no billing
+// system block, so the UA is the only version signal): a too-old version is a
+// 400 invalid_request_error with error_code 'claude_code_version_too_old' and
+// the message "Claude Code X.Y.Z does not support this model; version A.B.C
+// or newer is required" (Opus 5.5 needs 2.1.280). CLAUDE_CLI_VERSION is the
+// shipped floor; when the API asks for a newer one, runClaudeOAuthStream
+// persists it under claudeCliVersionOverride, re-installs the rule and retries
+// the request once — so the next model bump does not need an extension
+// release. Startup applies max(shipped, stored override): a release that
+// ships a floor ABOVE an old override wins, an override ABOVE the floor keeps
+// winning until the floor catches up.
+var CLAUDE_CLI_VERSION = '2.1.280';
+var CLAUDE_CLI_VERSION_OVERRIDE_KEY = 'claudeCliVersionOverride';
+var CLAUDE_CLI_UA_RULE_ID = 3000;
+var CLAUDE_CLI_SEMVER_RE = /^\d+\.\d+\.\d+$/;
+// "version A.B.C or newer is required" — the version the API demands.
+var CLAUDE_CLI_REQUIRED_VERSION_RE = /version\s+(\d+\.\d+\.\d+)\s+or\s+newer\s+is\s+required/i;
+// The version currently installed in rule 3000 (best-effort mirror; updated
+// by applyClaudeCliUaRule). Starts at the shipped floor so a bump decision
+// made before the async startup install resolves still compares sanely.
+var _claudeCliVersionApplied = CLAUDE_CLI_VERSION;
+
+// Numeric dotted-version compare: -1 / 0 / 1. Non-numeric or missing segments
+// count as 0, so '2.1' < '2.1.1' and '2.1.280' > '2.1.257'.
+function compareSemver(a, b) {
+    var pa = String(a || '').split('.'), pb = String(b || '').split('.');
+    var n = Math.max(pa.length, pb.length);
+    for (var i = 0; i < n; i++) {
+        var x = parseInt(pa[i], 10) || 0, y = parseInt(pb[i], 10) || 0;
+        if (x !== y) return x < y ? -1 : 1;
+    }
+    return 0;
+}
+
+// Given a non-2xx response body (raw text, usually JSON), return the Claude
+// Code version the API says is required, or null when the body is not a
+// version gate. Detects the gate by the documented message shape OR the
+// error_code; only the message carries the version, so an error_code hit with
+// no parsable version is still null (logged — nothing to bump to).
+function parseRequiredClaudeCliVersion(errText) {
+    var text = String(errText || '');
+    if (!text) return null;
+    var m = CLAUDE_CLI_REQUIRED_VERSION_RE.exec(text);
+    if (m && CLAUDE_CLI_SEMVER_RE.test(m[1])) return m[1];
+    var gated = /claude_code_version_too_old/i.test(text);
+    if (!gated) {
+        try {
+            var parsed = JSON.parse(text);
+            var err = parsed && (parsed.error || parsed);
+            gated = !!(err && (err.error_code === 'claude_code_version_too_old' || err.code === 'claude_code_version_too_old'));
+        } catch (e) { /* not JSON */ }
+    }
+    if (gated) console.warn('[AppAgent] claude_code_version_too_old without a parsable required version:', text.slice(0, 300));
+    return null;
+}
+
+// Install (replace) DNR rule 3000 with the given claude-cli version. Resolves
+// once the rule is live — the NEXT fetch carries the new header.
+function applyClaudeCliUaRule(version) {
+    if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return Promise.reject(new Error('applyClaudeCliUaRule: invalid version ' + version));
+    return chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [CLAUDE_CLI_UA_RULE_ID],
+        addRules: [{
+            id: CLAUDE_CLI_UA_RULE_ID,
+            priority: 1,
+            action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: 'claude-cli/' + version + ' (external, cli)' }] },
+            condition: { urlFilter: 'api.anthropic.com/*', resourceTypes: ['xmlhttprequest'] }
+        }]
+    }).then(function() { _claudeCliVersionApplied = version; });
+}
+
+// Startup: rule = max(shipped floor, persisted override).
+async function installClaudeCliUaRule() {
+    var version = CLAUDE_CLI_VERSION;
+    try {
+        var stored = (await chrome.storage.local.get(CLAUDE_CLI_VERSION_OVERRIDE_KEY))[CLAUDE_CLI_VERSION_OVERRIDE_KEY];
+        if (stored && CLAUDE_CLI_SEMVER_RE.test(String(stored)) && compareSemver(stored, version) > 0) version = String(stored);
+    } catch (e) { /* storage unavailable — shipped floor */ }
+    await applyClaudeCliUaRule(version);
+    return version;
+}
+
+// Version-gate recovery for runClaudeOAuthStream: persist the demanded version
+// as the override and re-install the rule. Returns true when the header was
+// actually raised (caller retries once), false when the demanded version is
+// not above what is already installed (retrying would fail identically —
+// surface the original error instead).
+async function bumpClaudeCliVersion(version) {
+    if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return false;
+    if (compareSemver(version, _claudeCliVersionApplied) <= 0) return false;
+    try {
+        var payload = {};
+        payload[CLAUDE_CLI_VERSION_OVERRIDE_KEY] = version;
+        await chrome.storage.local.set(payload);
+    } catch (e) { /* persist is best-effort; the in-session rule still applies */ }
+    await applyClaudeCliUaRule(version);
+    return true;
+}
+
+installClaudeCliUaRule().catch(function(e) {
+    console.warn('[AppAgent] claude-cli User-Agent rule install failed:', e && e.message);
+});
+// --- end Claude CLI User-Agent version gate ---

@@ -46,6 +46,198 @@ window.sleep = function(ms) {
 };
 window.delay = window.sleep;
 
+// Workspace file loading — bridge to the `run_js_file` tool (impl:
+// src/js/tools/160-run-tests.js executeRunJsFile). loadFile returns the RAW
+// file text (not the line-numbered `workspace read` view); runFile evaluates
+// it HERE, in this sandbox, so exported functions stay callable (a nested
+// sandbox could only hand back structured-cloneable data).
+window.loadFile = function(path, workspace) {
+    return window.executeTool('run_js_file', { path: path, mode: 'source', workspace: workspace }).then(function(r) {
+        if (!r || !r.success) throw new Error('loadFile(' + path + '): ' + ((r && r.error) || 'unknown error'));
+        return r.content;
+    });
+};
+// Lexical mask: returns a same-length copy of `src` where the BODIES of string
+// literals ('…' "…"), template literals (text parts only — `${…}` expressions
+// stay visible), regex literals and the whole of `//` and `/* */` comments are
+// blanked to spaces (newlines kept), so the regex scans below
+// (_topLevelDeclNames, evalModules' var pre-seed + typeof rewrite) never fire
+// inside a string or comment. Indices map 1:1 onto the original, so a match in
+// the mask is spliced into the original by index. Regex-vs-division is a
+// heuristic (previous significant char/keyword); an unterminated literal or
+// comment returns the raw source (old behaviour) rather than a wrong mask.
+window._maskJsSource = function(src) {
+    var s = String(src), n = s.length, out = s.split(''), i = 0, stack = [];
+    function blank(from, to) { for (var k = from; k < to; k++) if (out[k] !== '\n') out[k] = ' '; }
+    function regexAllowedAt(pos) {
+        var p = pos - 1;
+        while (p >= 0 && /\s/.test(out[p])) p--;
+        if (p < 0) return true;
+        if (/[(,=:\[!&|?{};+\-*%<>~^]/.test(out[p])) return true;
+        if (/[\w$]/.test(out[p])) {
+            var q = p; while (q >= 0 && /[\w$]/.test(out[q])) q--;
+            return /^(?:return|typeof|case|throw|in|of|delete|void|new|do|else|instanceof|yield|await)$/.test(out.slice(q + 1, p + 1).join(''));
+        }
+        return false;
+    }
+    while (i < n) {
+        var top = stack.length ? stack[stack.length - 1] : null, c = s[i], d = s[i + 1];
+        if (top === 'tpl') {
+            if (c === '\\') { out[i] = ' '; if (i + 1 < n && s[i + 1] !== '\n') out[i + 1] = ' '; i += 2; continue; }
+            if (c === '`') { stack.pop(); i++; continue; }
+            if (c === '$' && d === '{') { stack.push({ depth: 0 }); i += 2; continue; }
+            if (c !== '\n') out[i] = ' ';
+            i++; continue;
+        }
+        if (top && c === '{') { top.depth++; i++; continue; }
+        if (top && c === '}') { if (top.depth === 0) stack.pop(); else top.depth--; i++; continue; }
+        if (c === '/' && d === '/') { var le = s.indexOf('\n', i); if (le < 0) le = n; blank(i, le); i = le; continue; }
+        if (c === '/' && d === '*') { var be = s.indexOf('*/', i + 2); if (be < 0) return s; blank(i, be + 2); i = be + 2; continue; }
+        if (c === '"' || c === "'") {
+            var j = i + 1;
+            while (j < n && s[j] !== c) { if (s[j] === '\\') j++; else if (s[j] === '\n') return s; j++; }
+            if (j >= n) return s;
+            blank(i + 1, j); i = j + 1; continue;
+        }
+        if (c === '`') { stack.push('tpl'); i++; continue; }
+        if (c === '/' && regexAllowedAt(i)) {
+            var r = i + 1, inClass = false, closed = false;
+            while (r < n) {
+                var ch = s[r];
+                if (ch === '\\') { r += 2; continue; }
+                if (ch === '\n') break;
+                if (inClass) { if (ch === ']') inClass = false; }
+                else if (ch === '[') inClass = true;
+                else if (ch === '/') { closed = true; break; }
+                r++;
+            }
+            if (closed) { blank(i + 1, r); i = r + 1; while (i < n && /[a-z]/.test(s[i])) i++; continue; }
+        }
+        i++;
+    }
+    if (stack.length) return s;
+    return out.join('');
+};
+// Column-0 `function`/`var`/`let`/`const` names — the namespace runFile returns
+// for browser-global-style files that neither set module.exports nor `return`.
+// Scans the lexical mask so declarations inside block comments/strings don't count.
+window._topLevelDeclNames = function(src) {
+    var names = [], seen = {}, m;
+    var re = /^(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)|^(?:var|let|const|class)\s+([A-Za-z_$][\w$]*)/gm;
+    src = window._maskJsSource(src);
+    while ((m = re.exec(src))) {
+        var n = m[1] || m[2];
+        if (n && !seen[n] && n !== 'module' && n !== 'exports' && n !== 'args') { seen[n] = true; names.push(n); }
+    }
+    return names;
+};
+// Evaluate `src` as a CommonJS-style module in this sandbox. Resolution order:
+// a top-level `return X` wins; else module.exports if the file assigned/filled
+// it; else a namespace object of the file's top-level declarations.
+window.evalModule = async function(src, filename, args) {
+    var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    var module = { exports: {} };
+    var names = window._topLevelDeclNames(String(src));
+    var ns = '{' + names.map(function(n) { return JSON.stringify(n) + ': (typeof ' + n + ' === "undefined" ? undefined : ' + n + ')'; }).join(', ') + '}';
+    var tail = '\n;return (module.exports === __origExports && Object.keys(__origExports).length === 0) ? ' + ns + ' : module.exports;';
+    var fn = new AsyncFunction('module', 'exports', 'args', '__filename', '__origExports', String(src) + tail);
+    return await fn(module, module.exports, args || {}, filename || '<anonymous>', module.exports);
+};
+window.runFile = function(path, args, workspace) {
+    return window.loadFile(path, workspace).then(function(src) { return window.evalModule(src, path, args); });
+};
+
+// ─── Real-module loader ──────────────────────────────────────────────────────
+// loadModules([paths], opts) evaluates several browser-global-style src/js/**
+// files into ONE shared scope, in order (mirrors build concatenation), and
+// returns the merged namespace of their column-0 declarations
+// (function/async function/var/let/const/class). Free identifiers resolve
+// through a `with (__scope)` Proxy: opts.globals (stubs, e.g. harness
+// fakeChrome()/fakeWindow()) first, then the ECMAScript intrinsics + a few
+// safe web APIs below (SANDBOX_PASSTHROUGH_GLOBALS), else it THROWS
+// `runFile: global X not stubbed`. `typeof X` guards are lenient (return
+// undefined, name recorded in namespace.__unstubbed); opts.lenient:true makes
+// EVERY unstubbed read lenient. `globalThis`/`self` map to opts.globals.window.
+// Notes: `var` names are pre-seeded so hoisted reads yield undefined; a
+// file-level 'use strict' is inert inside the with block; top-level `return`
+// is NOT supported here (use runFile/evalModule for CommonJS-style files).
+// namespace.__scope is the raw scope object (implicit globals land there).
+// Passthrough plain functions (atob, structuredClone, setTimeout, …) are bound
+// to the real window — called through the `with` Proxy they would otherwise get
+// this=Proxy and throw "Illegal invocation"; constructors (own `prototype`) are
+// returned as-is so their statics (Object.keys, Promise.resolve) stay reachable.
+// NOTE: `Function`/`eval` passthrough means the stub scope is a convenience for
+// isolating modules under test, NOT a security boundary — `new Function('return this')()`
+// reaches the real sandbox window.
+window.SANDBOX_PASSTHROUGH_GLOBALS = ('Object Function Array Number parseFloat parseInt Infinity NaN undefined Boolean String Symbol Date Promise RegExp Error AggregateError EvalError RangeError ReferenceError SyntaxError TypeError URIError JSON Math Intl ArrayBuffer SharedArrayBuffer Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array Uint8ClampedArray BigUint64Array BigInt64Array DataView Map BigInt Set WeakMap WeakSet Proxy Reflect FinalizationRegistry WeakRef decodeURI decodeURIComponent encodeURI encodeURIComponent escape unescape eval isFinite isNaN console setTimeout clearTimeout setInterval clearInterval queueMicrotask structuredClone TextEncoder TextDecoder URL URLSearchParams atob btoa crypto performance AbortController Blob').split(' ');
+window.evalModules = async function(srcs, names, opts) {
+    opts = opts || {};
+    var globals = opts.globals || {};
+    var lenient = opts.lenient === true;
+    var passthrough = window.SANDBOX_PASSTHROUGH_GLOBALS.concat(opts.passthrough || []);
+    var target = Object.create(null);
+    Object.keys(globals).forEach(function(k) { target[k] = globals[k]; });
+    var unstubbed = [], lenientName = null;
+    target.__leniently = function(name, fn) { lenientName = name; try { return fn(); } finally { lenientName = null; } };
+    var joined = srcs.map(function(s, i) { return '\n// ---- ' + ((names && names[i]) || ('module' + i)) + ' ----\n' + String(s); }).join('\n;');
+    var masked = window._maskJsSource(joined);
+    var m, reVar = /^var\s+([A-Za-z_$][\w$]*)/gm;
+    while ((m = reVar.exec(masked))) { if (!(m[1] in target)) target[m[1]] = undefined; }
+    var KEYWORDS = { undefined: 1, null: 1, this: 1, true: 1, false: 1, function: 1, new: 1, await: 1, typeof: 1, void: 1, delete: 1, arguments: 1, eval: 1 };
+    // typeof rewrite: match on the mask (never inside strings/comments), splice into the original by index.
+    var reTypeof = /\btypeof\s+([A-Za-z_$][\w$]*)\b(?!\s*[.\[(])/g, body = '', last = 0;
+    while ((m = reTypeof.exec(masked))) {
+        if (KEYWORDS[m[1]]) continue;
+        body += joined.slice(last, m.index) + '__leniently(' + JSON.stringify(m[1]) + ', function(){ return typeof ' + m[1] + '; })';
+        last = m.index + m[0].length;
+    }
+    body += joined.slice(last);
+    var bound = Object.create(null);
+    var scope = new Proxy(target, {
+        has: function() { return true; },
+        get: function(t, k) {
+            if (typeof k === 'symbol') return undefined;
+            if (k in t) return t[k];
+            if (passthrough.indexOf(k) >= 0) {
+                var v = window[k];
+                if (typeof v !== 'function' || v.prototype !== undefined) return v;
+                if (!(k in bound)) bound[k] = v.bind(window);
+                return bound[k];
+            }
+            if ((k === 'globalThis' || k === 'self') && ('window' in t)) return t.window;
+            if (lenientName === k || lenient) { if (unstubbed.indexOf(k) < 0) unstubbed.push(k); return undefined; }
+            throw new Error('runFile: global ' + String(k) + ' not stubbed');
+        },
+        set: function(t, k, v) { t[k] = v; return true; }
+    });
+    var declNames = window._topLevelDeclNames(joined); // masks internally
+    var ns = '{' + declNames.map(function(n) { return JSON.stringify(n) + ': __leniently(' + JSON.stringify(n) + ', function(){ return typeof ' + n + ' === "undefined" ? undefined : ' + n + '; })'; }).join(', ') + '}';
+    var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    var fn = new AsyncFunction('__scope', 'with (__scope) {' + body + '\n;return ' + ns + ';}');
+    var out = await fn.call(globals.window || undefined, scope);
+    Object.defineProperty(out, '__scope', { value: target, enumerable: false });
+    Object.defineProperty(out, '__unstubbed', { value: unstubbed, enumerable: false });
+    return out;
+};
+window.loadModules = async function(paths, opts) {
+    opts = opts || {};
+    var srcs = [];
+    for (var i = 0; i < paths.length; i++) srcs.push(await window.loadFile(paths[i], opts.workspace));
+    return window.evalModules(srcs, paths, opts);
+};
+// Page-bundle build order (build/build.js JS_TIERS: core → ui → tools → app,
+// numeric prefix within a tier) via `workspace ls`; opts.tiers narrows it.
+window.buildOrder = async function(opts) {
+    opts = opts || {};
+    var tiers = opts.tiers || ['core', 'ui', 'tools', 'app'], out = [];
+    for (var i = 0; i < tiers.length; i++) {
+        var r = await window.executeTool('workspace', { action: 'ls', path: 'src/js/' + tiers[i], workspace: opts.workspace });
+        var entries = ((r && r.entries) || []).map(function(e) { return String(e).replace(/\s*\*$/, ''); }).filter(function(e) { return /\.js$/.test(e); }).sort();
+        entries.forEach(function(e) { out.push('src/js/' + tiers[i] + '/' + e); });
+    }
+    return out;
+};
+
 // setTimeout shim — best-effort mitigation for existing code that calls
 // setTimeout directly: delays >= 1000ms are transparently routed through the
 // SW-backed sleep; sub-second ones stay native. Semantics preserved: returns

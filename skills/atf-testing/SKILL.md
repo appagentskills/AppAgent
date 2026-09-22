@@ -266,36 +266,15 @@ while (vv.next()) {
 }
 ```
 
-### 3. HTTP 414 — `servicenow_run_script` URL too long
-The `script` parameter is sent in the request URI. Embedding many RSS test bodies as string literals in **one** creation script easily blows past the limit (~8KB on most instances), and you get back:
+### 3. Large creation scripts are fine (no HTTP 414 any more)
+`servicenow_run_script` POSTs the script as a form-encoded body to `sys.scripts.do` (it used to send it in the GET query string, which hit the ~8KB URL limit and failed with `HTTP 414 Request-URI Too Large`). There is no script-size limit in the tool, so create the suite, helpers and all N tests in **one** call — no need to split across calls or stash sys_ids in `sys_properties` via `gs.setProperty`. Only the per-call timeout (~120s) matters: if a single script would run for minutes (e.g. it also *executes* tests), split by runtime, not by size.
 
-```
-HTTP 414 Request-URI Too Large
-```
+Still-useful hygiene:
 
-**Fix:** Split creation across multiple `servicenow_run_script` calls — typically one call to create the suite + helpers, then one call per 2–3 tests. Pass shared IDs between calls via `gs.setProperty`:
-
-```javascript
-// === Call 1: suite + first batch ===
-var SCOPE_ID = /* lookup */;
-var SUITE_ID = /* insert sys_atf_test_suite */;
-gs.setProperty('atf.myapp.scope_id', SCOPE_ID);
-gs.setProperty('atf.myapp.suite_id', SUITE_ID);
-// ... create T1, T2, T3 ...
-
-// === Call 2: more tests ===
-var SCOPE_ID = gs.getProperty('atf.myapp.scope_id');
-var SUITE_ID = gs.getProperty('atf.myapp.suite_id');
-// ... create T4, T5, T6 ...
-```
-
-Additional tactics that buy headroom:
-
-- **Shorten RSS param names.** ATF passes positional args, so you can rename them inside the IIFE. The compact form is ~25% smaller per test:
+- **Shorten RSS param names** if you like — ATF passes positional args, so you can rename them inside the IIFE:
   ```javascript
   "(function(o,s,p,sr,aE){ ... aE({name:'x',shouldbe:true,value:y}); })(outputs,steps,params,stepResult,assertEqual);"
   ```
-- **Inline helpers, drop comments**, use single-letter locals inside the script body string.
 - **Cleanup by prefix, not by exact name.** When working with a marker like `[ATF-FOO]`, use `nameSTARTSWITH[ATF-FOO]` so a single cleanup wipes the whole family without listing each test:
   ```javascript
   cleanup('sys_atf_test_suite', 'nameSTARTSWITH' + MARKER);
@@ -338,8 +317,8 @@ ATF business rules try to regenerate the step description on save (using a `desc
 Most real work is **"write N tests for module X"**, not a single test. The pattern that scales:
 
 1. **Plan the tests first** (table — defaults, BRs, integrity, edge cases). Confirm with the user before creating records.
-2. **Call 1**: enable the runner, look up scope, cleanup by marker prefix, create the suite, stash IDs in `gs.setProperty`, create the first 2–3 tests, attach to suite.
-3. **Call 2..N**: pull IDs from `gs.setProperty`, create more tests, attach.
+2. **Create everything in one `servicenow_run_script` call**: enable the runner, look up scope, cleanup by marker prefix, create the suite, create all tests, attach to suite. Script size is not a constraint (see gotcha 3); keep sys_ids in local variables.
+3. **Return the created sys_ids** (`gs.print(JSON.stringify({...}))`) so later calls can reference them without re-querying by name.
 4. **Trigger** the suite via `sn_atf.UserTestSuiteExecutor` (single call).
 5. **Poll** `sys_atf_test_suite_result` from the agent side every ~3s until `end_time` is set, then drill into `sys_atf_test_result` for per-test status + output.
 

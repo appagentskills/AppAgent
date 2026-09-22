@@ -179,6 +179,81 @@ function checkChatMetaSharedLists(srcByFile, bundles) {
     return failures;
 }
 
+// Policy artifact tripwire, not a parser/security boundary for hostile source.
+// Validate the assembled bytes, not just a builder's explicit source whitelist.
+function checkTestPolicyArtifacts(artifacts, policySource) {
+    var failures = [];
+    var required = ['app.js', 'sw-bundle.js', 'background.js', 'offscreen.html', 'offscreen-helper.js', 'sandbox.html', 'test-run-policy.js'];
+    required.forEach(function(name) {
+        if (typeof artifacts[name] !== 'string' || !artifacts[name].trim()) failures.push(name + ': required policy artifact missing or empty');
+    });
+    // Both builders emit the dependency-free policy as the byte-zero fragment.
+    // Only line comments may precede its declaration: no string, template,
+    // interpolation, block comment or earlier fragment can supply lexical context.
+    // This is a narrow assembly contract, NOT a JavaScript lexer/evaluator.
+    if (typeof policySource !== 'string' ||
+        !/^(?:\/\/[^\r\n]*\r?\n)*var TestRunPolicy = \(function\(\) \{/.test(policySource)) {
+        failures.push('src/js/core/075-test-run-policy.js: canonical policy declaration missing');
+        return failures;
+    }
+    ['app.js', 'sw-bundle.js'].forEach(function(name) {
+        var source = typeof artifacts[name] === 'string' ? artifacts[name] : '';
+        // Require exact canonical bytes at the executable boundary. Reject any
+        // additional declaration-shaped line conservatively (even ambiguous text)
+        // rather than accepting a quoted/commented declaration as evidence.
+        var rest = source.slice(policySource.length);
+        if (source.indexOf(policySource) !== 0 || source.split(policySource).length !== 2 ||
+            (rest && rest[0] !== '\n') || /^[ \t]*(?:var|let|const)\s+TestRunPolicy\s*=/m.test(rest)) {
+            failures.push(name + ': expected exactly one canonical TestRunPolicy declaration; check the worker shared-file list and rebuild all artifacts');
+        }
+    });
+    if (artifacts['test-run-policy.js'] !== policySource) failures.push('test-run-policy.js: differs from canonical host policy source');
+    var html = (typeof artifacts['offscreen.html'] === 'string' ? artifacts['offscreen.html'] : '').replace(/<!--[\s\S]*?-->/g, '');
+    // Consume complete quoted values before considering another attribute; text
+    // such as data-note='type=module async' must not become an execution flag.
+    function scriptAttributes(text) {
+        var attrs = Object.create(null), m;
+        while (text.trim()) {
+            m = /^[\t\n\f\r ]+([^\t\n\f\r "'<>\/=\x60]+)(?:[\t\n\f\r ]*=[\t\n\f\r ]*(?:"([^"]*)"|'([^']*)'|([^\t\n\f\r "'=<>\x60]+)))?/.exec(text);
+            if (!m) return null; // malformed/ambiguous attributes fail closed
+            var name = m[1].toLowerCase();
+            if (Object.prototype.hasOwnProperty.call(attrs, name)) return null;
+            attrs[name] = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : '';
+            text = text.slice(m[0].length);
+        }
+        return attrs;
+    }
+    function synchronousClassic(attrs) {
+        if ('async' in attrs || 'defer' in attrs || 'nomodule' in attrs) return false;
+        // Reject legacy language-based selection rather than infer a MIME type.
+        if (!('type' in attrs)) return !('language' in attrs);
+        var type = attrs.type.trim().toLowerCase();
+        return type === '' || /^(?:application\/(?:x-)?(?:java|ecma)script|text\/(?:(?:x-)?(?:java|ecma)script|javascript1\.[0-5]|jscript|livescript))$/.test(type);
+    }
+    var scripts = [], match, invalidScript = false;
+    var tags = /<script\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi;
+    var closeTag = /<\/script[\t\n\f\r ]*>/gi;
+    while ((match = tags.exec(html))) {
+        // Script bodies are raw text, not more dependency tags. Consume through
+        // a complete end tag before searching for another opening. Accept ASCII
+        // whitespace/case variants, not prefixes such as </script-example>.
+        closeTag.lastIndex = tags.lastIndex;
+        var end = closeTag.exec(html);
+        if (!end) { invalidScript = true; break; }
+        tags.lastIndex = closeTag.lastIndex;
+        var attrs = scriptAttributes(match[1]);
+        if (!attrs) { invalidScript = true; continue; }
+        if ('src' in attrs) scripts.push({ name: attrs.src, attributes: attrs });
+    }
+    var policy = scripts.filter(function(s) { return s.name === 'test-run-policy.js'; });
+    var helper = scripts.filter(function(s) { return s.name === 'offscreen-helper.js'; });
+    if (invalidScript || policy.length !== 1 || helper.length !== 1 || scripts.indexOf(policy[0]) >= scripts.indexOf(helper[0]) ||
+        policy.concat(helper).some(function(s) { return !synchronousClassic(s.attributes); })) {
+        failures.push('offscreen.html: load test-run-policy.js exactly once before offscreen-helper.js as synchronous classic scripts');
+    }
+    return failures;
+}
+
 // ─── Guard-region sync helpers ────────────────────────────────────────
 // This whole marked region exists twice (build/build.js and
 // skills/extension-dev/build.js); a comment was previously the only
@@ -321,7 +396,8 @@ async function extension_build(args) {
         return contents.filter(function(c) { return c !== null; }).join('\n');
     }
 
-    // 1. Concatenate JS: CSP polyfill (first) + core JS + platform bridge (last)
+    // 1. Concatenate JS: dependency-free policy prelude, then CSP polyfill
+    // (before any DOM-touching code), core JS and platform bridge.
     // Version is sourced from manifest.json and substituted into the bundle wherever __VERSION__ appears.
     var manifestRaw = await readFile('src/platform/extension/manifest.json');
     var version = manifestRaw ? JSON.parse(manifestRaw).version : '';
@@ -333,7 +409,10 @@ async function extension_build(args) {
     var tierLists = await Promise.all(JS_TIERS.map(function(t) { return getOrderedFiles('src/js/' + t, '.js'); }));
     var jsFiles = [];
     for (var i = 0; i < tierLists.length; i++) jsFiles = jsFiles.concat(tierLists[i]);
-    var coreJS = await concatFiles(jsFiles);
+    // Select the prelude from the real lists; omissions must fail, not be repaired.
+    var policyFile = 'src/js/core/075-test-run-policy.js';
+    var policyPrelude = await concatFiles(jsFiles.filter(function(f) { return f === policyFile; }));
+    var coreJS = await concatFiles(jsFiles.filter(function(f) { return f !== policyFile; }));
 
     // Worker (service worker) bundle composition. Mirror of build/build.js
     // WORKER_JS_TIERS + WORKER_SHARED_FILES. The SW hosts the agent loop
@@ -348,6 +427,7 @@ async function extension_build(args) {
         'src/js/core/055-emoji-shortcodes.js',
         'src/js/core/060-ui-constants.js',
         'src/js/core/070-permissions.js',
+        'src/js/core/075-test-run-policy.js',
         // 078-tool-profiles — TOOL_PROFILES table + profile helpers used by
         // the roster filter (097) and worker/025. Before 080-tools/097.
         'src/js/core/078-tool-profiles.js',
@@ -369,6 +449,11 @@ async function extension_build(args) {
         'src/js/tools/050-file-tools.js',
         'src/js/tools/070-screenshot-by-id.js',
         'src/js/tools/110-smart-documents.js',
+        // 160-run-tests: executeRunJsFile + executeRunTests (js_eval-sandbox test
+        // runner: reads workspace files, runs them via the js_eval arm) —
+        // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
+        // Keep in sync with build/build.js WORKER_SHARED_FILES.
+        'src/js/tools/160-run-tests.js',
         'src/js/tools/020-tool-execution.js',
         'src/js/app/035-agent-events.js',
         'src/js/app/020-api-messages.js',
@@ -379,7 +464,7 @@ async function extension_build(args) {
     var workerPre = workerTierFiles.filter(function(f) { return /\/0\d\d-/.test(f); });
     var workerPost = workerTierFiles.filter(function(f) { return workerPre.indexOf(f) < 0; });
     var workerBundleFiles = workerPre.concat(WORKER_SHARED_FILES).concat(workerPost);
-    var workerJS = await concatFiles(workerBundleFiles);
+    var workerJS = await concatFiles(workerBundleFiles.filter(function(f) { return f === policyFile; }).concat(workerBundleFiles.filter(function(f) { return f !== policyFile; })));
 
     var polyfillJS = await readFile('src/platform/extension/csp-polyfill.js') || '';
     var bridgeJS = await readFile('src/platform/extension/platform-bridge.js') || '';
@@ -388,7 +473,7 @@ async function extension_build(args) {
     // load it directly). Inject it into the bundle before 060-docs-view.js uses it.
     var docsRendererJS = await readFile('docs/docs-renderer.js') || '';
 
-    var appJS = (polyfillJS ? polyfillJS + '\n' : '') + (docsRendererJS ? docsRendererJS + '\n' : '') + coreJS + (bridgeJS ? '\n' + bridgeJS : '');
+    var appJS = policyPrelude + '\n' + (polyfillJS ? polyfillJS + '\n' : '') + (docsRendererJS ? docsRendererJS + '\n' : '') + coreJS + (bridgeJS ? '\n' + bridgeJS : '');
 
     // 2. Embed skills
     var SKILLS_START = '/*EMBEDDED_SKILLS_START*/';
@@ -645,7 +730,8 @@ async function extension_build(args) {
         };
     }
 
-    // 7. Write output files to dist/extension/ in workspace
+    // POLICY_ARTIFACT_STAGE_BEGIN — no writes or icon deployment until valid.
+    // 7. Stage output files for dist/extension/ in workspace
     var outputFiles = [
         { path: 'dist/extension/app.html', content: appHTML },
         { path: 'dist/extension/app.js', content: appJS },
@@ -670,6 +756,21 @@ async function extension_build(args) {
         }
     }
 
+    var testRunPolicySource = await readFile('src/js/core/075-test-run-policy.js');
+    outputFiles.push({ path: 'dist/extension/test-run-policy.js', content: testRunPolicySource });
+    var policyArtifacts = {};
+    outputFiles.forEach(function(f) { policyArtifacts[f.path.substring('dist/extension/'.length)] = f.content; });
+    var policyArtifactFailures = checkTestPolicyArtifacts(policyArtifacts, testRunPolicySource);
+    if (policyArtifactFailures.length) {
+        return {
+            success: false,
+            error: 'Build aborted — host policy artifacts: ' + policyArtifactFailures.join(' || ') + ' (workspace outputs and deploy folder untouched).',
+            built_from: defaultWorkspace || null
+        };
+    }
+    // POLICY_ARTIFACT_STAGE_END
+
+    // POLICY_ARTIFACT_WRITE_BEGIN
     // 9. Icons: deploy directly from source to preserve binary integrity.
     // workspace read/write corrupts binary files (PNG) — there is no "copy" action.
     // Instead, deploy the original git clone blobs straight from src/.
@@ -760,4 +861,5 @@ async function extension_build(args) {
             filesDeployed: filesDeployed
         }
     };
+    // POLICY_ARTIFACT_WRITE_END
 }

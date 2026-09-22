@@ -67,6 +67,10 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     var loadCustom = (typeof loadCustomSystemPrompt === 'function') ? loadCustomSystemPrompt() : Promise.resolve();
     var loadHooks = (typeof loadHooksSettings === 'function') ? loadHooksSettings() : Promise.resolve();
     var loadPerms = (typeof loadToolPermissionsInWorker === 'function') ? loadToolPermissionsInWorker() : Promise.resolve();
+    // "Allow for this chat" grants (sessionPermissions) — rehydrated from
+    // chrome.storage.session so an MV3 eviction / Reload does not re-prompt
+    // for tools the user already granted in a chat (worker/025).
+    var loadChatGrants = (typeof loadSessionPermissionsInWorker === 'function') ? loadSessionPermissionsInWorker() : Promise.resolve();
     // Assumed-context-window setting (core/030-config.js). The SW agent loop's
     // appendContextNotice and the registry's saturation gauges read it via
     // getAssumedContextTokens; without hydration the SW would always use the
@@ -104,6 +108,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         safe(loadCustom, 'customSystemPrompt'),
         safe(loadHooks, 'hooksEnabled'),
         safe(loadPerms, 'toolPermissions'),
+        safe(loadChatGrants, 'chatPermissionGrants'),
         safe(loadCtxWindow, 'assumedContextTokens'),
         safe(loadDocs, 'smartDocuments'),
         safe(loadSubs, 'subAgents'),
@@ -189,6 +194,18 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
             if (typeof self._orphanUnresumedSubs === 'function') {
                 try { self._orphanUnresumedSubs('resume aborted: checkpoint list empty at boot'); } catch (e2) {}
             }
+            // #6a (Phase 4, flag P4_BOOT_PLACEHOLDER_SWEEP): the common boot —
+            // NO running checkpoint, so resumeRunningCheckpoints never runs and
+            // its sweep never fires; a chat whose loop died before writing a
+            // checkpoint may still carry stranded `_placeholder` rows. Nothing
+            // was resumed here, so the exclusion set is empty.
+            try {
+                if (typeof getP4Flag === 'function' && getP4Flag('P4_BOOT_PLACEHOLDER_SWEEP')
+                    && typeof sweepStrandedPlaceholders === 'function'
+                    && typeof _chatsHydrated !== 'undefined' && _chatsHydrated) {
+                    sweepStrandedPlaceholders({});
+                }
+            } catch (eSweep) { console.warn('[sw-runtime] stranded-placeholder sweep failed', eSweep); }
             // REG-AUDIT-2: no interrupted runs — the resume scan is decided;
             // settle so panels stop extending the hello-grace window.
             if (typeof self._settleResumeScan === 'function') self._settleResumeScan();

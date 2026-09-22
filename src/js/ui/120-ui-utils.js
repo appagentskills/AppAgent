@@ -838,8 +838,9 @@ function renderVersionSidebar() {
         html += '</div>';
     }
     
-    // Widgets Section
-    var widgets = getWidgetsForChat(currentChatId);
+    // Current chat's widgets only (core/135-widget-store.js getSidebarWidgets);
+    // all saved widgets live in the dashboard Widget Library.
+    var widgets = getSidebarWidgets();
     if (widgets.length > 0) {
         html += '<div class="version-widgets-section">';
         html += '<div class="version-section-title">' + UI_ICONS.widget + ' Widgets (' + widgets.length + ')</div>';

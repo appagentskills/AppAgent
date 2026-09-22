@@ -484,15 +484,17 @@ function sdocRenderPrompt(doc, prompt) {
         html += '<div class="sdoc-prompt-item-desc markdown-body">' + descInner + '</div>';
     }
 
-    html += '<form class="sdoc-prompt-form" id="' + fid + '" onsubmit="event.preventDefault(); sdocSubmitPrompt(\'' + escDisplay(doc.id) + '\', \'' + escDisplay(pid) + '\')">';
+    // input/change bubble from every field to the form: one delegated marker
+    // records which fields the USER touched (see _sdocCarryPromptDrafts).
+    html += '<form class="sdoc-prompt-form" id="' + fid + '" oninput="sdocMarkPromptDirty(event.target)" onchange="sdocMarkPromptDirty(event.target)" onsubmit="event.preventDefault(); sdocSubmitPrompt(\'' + escDisplay(doc.id) + '\', \'' + escDisplay(pid) + '\')">';
     (prompt.fields || []).forEach(function(field) {
         var val = (prompt.responses && prompt.responses[field.name] !== undefined) ? prompt.responses[field.name] : (field.value !== undefined ? field.value : '');
         html += '<div class="sdoc-prompt-field">';
         html += '<label class="sdoc-prompt-label">' + escDisplay(field.label) + '</label>';
         if (field.type === 'textarea') {
-            html += '<textarea class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-field-type="textarea">' + escDisplay(val) + '</textarea>';
+            html += '<textarea class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-prompt-field="' + escDisplay(field.name) + '" data-field-type="textarea">' + escDisplay(val) + '</textarea>';
         } else if (field.type === 'select') {
-            html += '<select class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-field-type="select">';
+            html += '<select class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-prompt-field="' + escDisplay(field.name) + '" data-field-type="select">';
             (field.options || []).forEach(function(opt) {
                 var ov = typeof opt === 'object' ? opt.value : opt;
                 var ol = typeof opt === 'object' ? opt.label : opt;
@@ -500,9 +502,9 @@ function sdocRenderPrompt(doc, prompt) {
             });
             html += '</select>';
         } else if (field.type === 'boolean') {
-            html += '<label class="sdoc-prompt-check-label"><input type="checkbox" data-field-name="' + escDisplay(field.name) + '" data-field-type="boolean"' + (val ? ' checked' : '') + '> ' + escDisplay(field.label) + '</label>';
+            html += '<label class="sdoc-prompt-check-label"><input type="checkbox" data-field-name="' + escDisplay(field.name) + '" data-prompt-field="' + escDisplay(field.name) + '" data-field-type="boolean"' + (val ? ' checked' : '') + '> ' + escDisplay(field.label) + '</label>';
         } else {
-            html += '<input type="' + (field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text') + '" class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-field-type="' + escDisplay(field.type || 'text') + '" value="' + escDisplay(val) + '"' + (field.placeholder ? ' placeholder="' + escDisplay(field.placeholder) + '"' : '') + '>';
+            html += '<input type="' + (field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text') + '" class="sdoc-prompt-input" data-field-name="' + escDisplay(field.name) + '" data-prompt-field="' + escDisplay(field.name) + '" data-field-type="' + escDisplay(field.type || 'text') + '" value="' + escDisplay(val) + '"' + (field.placeholder ? ' placeholder="' + escDisplay(field.placeholder) + '"' : '') + '>';
         }
         html += '</div>';
     });
@@ -903,11 +905,61 @@ function sdocReRenderAll(docId) {
     if (typeof document === 'undefined') return;
     var doc = smartDocuments[docId];
     if (!doc) return;
+    // FOCUS-KEEP: the helpers live in the ui tier (250-message-render.js),
+    // which the SW bundle doesn't ship — guard so this file stays loadable there.
+    var keepFocus = typeof _captureTranscriptFocus === 'function' && typeof _restoreTranscriptFocus === 'function';
     document.querySelectorAll('[data-doc-id="' + docId + '"]').forEach(function(el) {
         var tmp = document.createElement('div');
         tmp.innerHTML = sdocRender(doc);
-        if (tmp.firstElementChild) el.replaceWith(tmp.firstElementChild);
+        var fresh = tmp.firstElementChild;
+        if (!fresh) return;
+        // Carry the user's unsaved prompt drafts onto the fresh markup (which
+        // is built from prompt.responses / field.value only), then re-focus
+        // the field they were typing in. Root = the surviving parent so the
+        // ancestor-id chain is scoped to THIS instance (inline vs modal copy).
+        _sdocCarryPromptDrafts(el, fresh);
+        var snap = keepFocus ? _captureTranscriptFocus(el.parentNode || document.body) : null;
+        el.replaceWith(fresh);
+        if (snap) _restoreTranscriptFocus(snap);
     });
+}
+
+// Marks a prompt field as user-touched (delegated from the form's input /
+// change events). Only touched fields are carried across re-renders, so an
+// agent-updated default on a field the user never edited is NOT clobbered by
+// the stale rendered value.
+function sdocMarkPromptDirty(target) {
+    var field = target && typeof target.closest === 'function' ? target.closest('[data-field-name]') : null;
+    if (field) field.setAttribute('data-sdoc-dirty', '1');
+}
+
+// Copy live values of every USER-TOUCHED prompt field in `oldRoot` onto the
+// matching field (same form id + data-field-name + tag) in `newRoot`. Without
+// this an agent update / user edit-save re-rendered the forms from stored
+// state and silently dropped whatever the user had typed but not yet
+// submitted. Untouched fields take the fresh (possibly agent-updated) value.
+function _sdocCarryPromptDrafts(oldRoot, newRoot) {
+    // CSS-context escape (attribute selector values), NOT HTML-escape.
+    var sel = function(v) {
+        v = String(v == null ? '' : v);
+        return (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
+    };
+    var oldForms = oldRoot.querySelectorAll('form.sdoc-prompt-form[id]');
+    for (var i = 0; i < oldForms.length; i++) {
+        var oldForm = oldForms[i];
+        var newForm = null;
+        try { newForm = newRoot.querySelector('form.sdoc-prompt-form[id="' + sel(oldForm.id) + '"]'); } catch (e) {}
+        if (!newForm) continue;
+        oldForm.querySelectorAll('[data-field-name][data-sdoc-dirty="1"]').forEach(function(oldField) {
+            var newField = null;
+            try { newField = newForm.querySelector('[data-field-name="' + sel(oldField.getAttribute('data-field-name')) + '"]'); } catch (e) {}
+            if (!newField || newField.tagName !== oldField.tagName) return;
+            if (oldField.type === 'checkbox') newField.checked = oldField.checked;
+            else newField.value = oldField.value;
+            // Keep the marker so the draft survives the NEXT re-render too.
+            newField.setAttribute('data-sdoc-dirty', '1');
+        });
+    }
 }
 
 // ─── Time formatting ───

@@ -287,6 +287,110 @@ function _sigHasWidget(sig) {
     return typeof sig === 'string' && sig.slice(-2) === ':w';
 }
 
+// FOCUS-KEEP: preserve the user's focused field + caret across transcript
+// rebuilds. Both render paths below (the R1 tail `outerHTML` swap and the
+// full `innerHTML` rebuild) recreate message nodes from chat state, including
+// a PENDING prompt_user form (renderPromptUserMessage, tools/100-prompt-user).
+// promptCaptureDraft keeps the typed TEXT alive (it writes back into
+// msg.fields[].value, which renderPromptField bakes into the markup), but the
+// focused <input>/<textarea> node itself is destroyed, so focus fell to <body>
+// and the caret was lost on EVERY render — i.e. on every sub-agent progress
+// tick (messagesAppended → renderMessages) while the user was typing.
+// Snapshot the focused control before the swap, then re-focus its rebuilt
+// twin right after. Also used by sdocReRenderAll (tools/110-smart-documents).
+//
+// Identity resolution for the rebuilt twin (in order): same `id`; same
+// `data-prompt-field` / `name` inside the same ancestor-id chain (form id,
+// msg-N id …) scoped under `root` so duplicate ids elsewhere in the document
+// (e.g. an sdoc rendered inline AND in the preview modal) can't hijack it.
+function _focusCssEsc(v) {
+    v = String(v == null ? '' : v);
+    if (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') return CSS.escape(v);
+    return v.replace(/["\\]/g, '\\$&');
+}
+
+function _captureTranscriptFocus(root) {
+    if (typeof document === 'undefined') return null;
+    root = root || document.getElementById('messages');
+    var el = document.activeElement;
+    if (!root || !el || el === document.body || el === document.documentElement || !root.contains(el)) return null;
+    var tag = el.tagName;
+    var editable = !!el.isContentEditable;
+    // Chip/pill <button>s carry a data-prompt-field identity (B7) so keyboard
+    // users tabbing through a prompt_user form keep their place too.
+    var keyedButton = tag === 'BUTTON' && el.hasAttribute('data-prompt-field');
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !editable && !keyedButton) return null;
+    // Ancestor ids between root (exclusive) and el (exclusive), outermost
+    // first — replayed as a narrowing querySelector chain on restore.
+    var ancestorIds = [];
+    for (var p = el.parentNode; p && p !== root && p.nodeType === 1; p = p.parentNode) {
+        if (p.id) ancestorIds.unshift(p.id);
+    }
+    var snap = {
+        el: el,
+        root: root,
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        fieldKey: el.getAttribute('data-prompt-field') || '',
+        fieldIdx: el.getAttribute('data-prompt-idx'),
+        ancestorIds: ancestorIds,
+        selStart: null,
+        selEnd: null,
+        selDir: 'none',
+        scrollTop: el.scrollTop || 0,
+        isContentEditable: editable
+    };
+    // selectionStart is null / throws for input types without a text
+    // selection (number, date, email in some browsers) — guard it.
+    try {
+        if (typeof el.selectionStart === 'number') {
+            snap.selStart = el.selectionStart;
+            snap.selEnd = el.selectionEnd;
+            snap.selDir = el.selectionDirection || 'none';
+        }
+    } catch (e) {}
+    return snap;
+}
+
+function _restoreTranscriptFocus(snap) {
+    if (!snap || typeof document === 'undefined') return;
+    var active = document.activeElement;
+    // The original node survived the rebuild (its subtree wasn't touched)
+    // and still holds focus — nothing to do.
+    if (snap.el && snap.el.isConnected && active === snap.el) return;
+    // Never steal focus: if the user already moved to something OUTSIDE the
+    // transcript (the composer, a modal …) between capture and restore, keep
+    // it there. Focus that fell to <body> (or into the rebuilt root) is ours.
+    if (active && active !== document.body && active !== document.documentElement &&
+        !(snap.root && snap.root.isConnected && snap.root.contains(active))) return;
+    var scope = (snap.root && snap.root.isConnected) ? snap.root : document;
+    for (var ai = 0; ai < snap.ancestorIds.length; ai++) {
+        var narrower = null;
+        try { narrower = scope.querySelector('#' + _focusCssEsc(snap.ancestorIds[ai])); } catch (e) {}
+        if (narrower) scope = narrower; // missing ancestors are skipped, not fatal
+    }
+    var el = null;
+    try {
+        if (snap.id) el = scope.querySelector('#' + _focusCssEsc(snap.id));
+        if (!el && snap.fieldKey) {
+            var keySel = '[data-prompt-field="' + _focusCssEsc(snap.fieldKey) + '"]';
+            // Per-option controls (chips, checklist boxes) need the index too;
+            // a keyed control without an index must not match an indexed one.
+            el = scope.querySelector(snap.fieldIdx != null
+                ? keySel + '[data-prompt-idx="' + _focusCssEsc(snap.fieldIdx) + '"]'
+                : keySel + ':not([data-prompt-idx])');
+        }
+        if (!el && snap.name) el = scope.querySelector('[name="' + _focusCssEsc(snap.name) + '"]');
+    } catch (e) {}
+    if (!el || !el.isConnected || el === active) return;
+    try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+    if (!snap.isContentEditable && snap.selStart != null) {
+        // Clamped by the browser when the rebuilt value is shorter.
+        try { el.setSelectionRange(snap.selStart, snap.selEnd, snap.selDir); } catch (e) {}
+    }
+    if (snap.scrollTop) { try { el.scrollTop = snap.scrollTop; } catch (e) {} }
+}
+
 // FIX4c: safety net for widgets parked on document.body by the moveBefore
 // preservation dance below. The park → rebuild → reclaim sequence is
 // synchronous, so at the END of any render every legitimately parked widget
@@ -380,9 +484,14 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
         probe.innerHTML = mappedParts[tailIdx];
         if (probe.children.length !== 1 || probe.childNodes.length !== 1) return false;
         if (probe.firstElementChild.id !== ('msg-' + tailIdx)) return false;
+        // FOCUS-KEEP: the tail may be a pending prompt_user form the user is
+        // typing into (every keystroke changes its sig via promptCaptureDraft,
+        // so a mid-typing render ALWAYS lands here). Re-focus the rebuilt field.
+        var tailFocusSnap = _captureTranscriptFocus(container);
         tailEl.outerHTML = mappedParts[tailIdx];
         newTailEl = document.getElementById('msg-' + tailIdx);
         if (!newTailEl) return false; // defensive — should be unreachable
+        _restoreTranscriptFocus(tailFocusSnap);
     }
 
     // Append new messages right AFTER the tail node (not beforeend) so a
@@ -442,6 +551,33 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
     _sweepOrphanedParkedWidgets();
     if (typeof gcRawCopyStore === 'function') gcRawCopyStore();
     return true;
+}
+
+// Both streaming insertion and a full timeline rebuild own thinking state by
+// the source message, not the block's shifting timeline position. Read legacy
+// keys/nodes only as a fallback so an explicit collapsed state stays collapsed.
+function _renderCompactThinking(msgIdx, thinking, blockIndex, tlIdx, defaultOpen) {
+    var key = 'msg-' + msgIdx;
+    var chatKey = (currentChatId || '_') + ':';
+    var expanded = thinkingExpandedState[chatKey + key];
+    if (expanded === undefined) {
+        var owned = document.querySelector('.thinking[data-thinking-msg="' + msgIdx + '"]');
+        if (owned && (!owned.hasAttribute('data-thinking-chat') || owned.getAttribute('data-thinking-chat') === (currentChatId || '_'))) expanded = owned.open;
+    }
+    if (expanded === undefined && blockIndex != null && tlIdx != null) {
+        expanded = thinkingExpandedState[chatKey + blockIndex + '-' + tlIdx];
+        if (expanded === undefined) {
+            var legacy = document.querySelector('#msg-' + blockIndex + ' .thinking[data-tl-idx="' + tlIdx + '"]');
+            // Never borrow a different message's state after timeline reordering.
+            if (legacy && !legacy.hasAttribute('data-thinking-msg')) expanded = legacy.open;
+        }
+    }
+    if (expanded === undefined) expanded = defaultOpen;
+    return '<details class="thinking" data-thinking-msg="' + msgIdx + '" data-thinking-chat="' + escapeHtml(currentChatId || '_') + '"' +
+        (tlIdx != null ? ' data-tl-idx="' + tlIdx + '"' : '') + (expanded ? ' open' : '') +
+        ' ontoggle="toggleThinkingState(\'' + key + '\', this)">' +
+        '<summary><span class="thinking-status">Thought process</span></summary>' +
+        '<div class="thinking-content">' + escapeHtml(thinking) + '</div></details>';
 }
 
 function renderMessages() {
@@ -718,6 +854,7 @@ function renderMessages() {
     // Track attachments already rendered as part of a group
     var processedAttachments = {};
 
+    var usedSubMessages = []; // One standalone callout suppresses only its paired lifecycle notice.
     var mappedParts = chat.messages.map(function(msg, index) {
         // MEMWIN: out-of-window messages produce NO markup (not even a hidden
         // placeholder div). winStart sits on a turn boundary, so attachment
@@ -819,7 +956,8 @@ function renderMessages() {
                 // bubble; mixed injected rows (notice coalesced with other
                 // queued text) keep non-notice segments on the normal path.
                 var subNoticeHtml = (msg.injected && typeof renderSubReportNotices === 'function')
-                    ? renderSubReportNotices(rawUser) : null;
+                    ? renderSubReportNotices(rawUser, chat.messages.slice(winStart, index), usedSubMessages) : null;
+                if (subNoticeHtml === '') return '<div id="msg-' + index + '" hidden></div>';
                 if (subNoticeHtml != null) {
                     isSubNoticeRow = true;
                     userBodyHtml = subNoticeHtml;
@@ -959,18 +1097,7 @@ function renderMessages() {
                     // Use EXACT same rendering as non-compact mode
                     block.timeline.forEach(function(timelineItem, tlIdx) {
                         if (timelineItem.type === 'thinking') {
-                            // B2: scope thinking expand-state by chatId to avoid cross-chat collisions.
-                            // The onclick handler still receives `thinkingKey` (msgIdx-tlIdx) and prepends chatId.
-                            var thinkingKey = index + '-' + tlIdx;
-                            var thinkingFullKey = (currentChatId || '_') + ':' + thinkingKey;
-                            var thinkingExpanded = thinkingExpandedState[thinkingFullKey];
-                            if (thinkingExpanded === undefined) {
-                                var thinkingEl = document.querySelector('#msg-' + index + ' .thinking[data-tl-idx="' + tlIdx + '"]');
-                                thinkingExpanded = thinkingEl ? thinkingEl.open : false;
-                            }
-                            html += '<details class="thinking" data-tl-idx="' + tlIdx + '"' + (thinkingExpanded ? ' open' : '') + ' ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
-                            html += '<summary><span class="thinking-status">Thought process</span></summary>';
-                            html += '<div class="thinking-content">' + escapeHtml(timelineItem.thinking) + '</div></details>';
+                            html += _renderCompactThinking(timelineItem.msgIdx, timelineItem.thinking, index, tlIdx, false);
                         } else if (timelineItem.type === 'content') {
                             // Show intermediate content in their chronological location
                             // Skip last assistant content (shown in its own message div after screenshots)
@@ -1205,7 +1332,7 @@ function renderMessages() {
                             : '<span class="tool-result-badge" title="Tool call succeeded">' + UI_ICONS.check + '</span>';
                     }
                     if (approval) {
-                        var statusLabel = approval.msg.status === 'pending' ? 'Pending' : (approval.msg.status === 'allowed' ? 'Allowed' : (approval.msg.status === 'always_allowed' ? 'Always' : (approval.msg.status === 'session_allowed' ? 'Session' : 'Denied')));
+                        var statusLabel = approval.msg.status === 'pending' ? 'Pending' : (approval.msg.status === 'allowed' ? 'Allowed' : (approval.msg.status === 'always_allowed' ? 'Always' : (approval.msg.status === 'session_allowed' ? 'This chat' : 'Denied')));
                         html += '<span class="tool-status ' + approval.msg.status + '">' + statusLabel + '</span>';
                     }
                     html += '</summary>';
@@ -1393,6 +1520,11 @@ function renderMessages() {
         });
     }
 
+    // FOCUS-KEEP: snapshot the focused transcript field (pending prompt_user
+    // input/textarea) before either innerHTML swap below destroys it; restored
+    // right after the widget un-park so the rebuilt DOM is final.
+    var focusSnap = _captureTranscriptFocus(container);
+
     if (existingStreamingEl) {
         var inner = container.querySelector('#messages-inner');
         if (!inner) {
@@ -1461,6 +1593,8 @@ function renderMessages() {
             }
         }
     }
+
+    _restoreTranscriptFocus(focusSnap);
 
     // Scope post-render queries to the rebuilt content area only
     var contentRoot = container.querySelector('#messages-inner') || container;
@@ -1602,6 +1736,39 @@ function updateStreamingMessage(index, msg, streamingChatId) {
     });
 }
 
+// Patch every existing parallel row without replacing details/scroll state.
+function _patchStreamingToolRow(row, tc) {
+    var argsEl = row && row.querySelector('.tool-args');
+    if (!argsEl) return false;
+    var argsText = tc.function.arguments || '';
+    if (argsText) argsEl.textContent = argsText;
+    else argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
+    var wrapper = row.querySelector('.tool-args-wrapper');
+    if (wrapper) {
+        var copyId = wrapper.getAttribute('data-copy-id');
+        if (!copyId) {
+            copyId = storeRawCopy(argsText);
+            wrapper.setAttribute('data-copy-id', copyId);
+        } else {
+            window._rawCopyStore = window._rawCopyStore || {};
+            window._rawCopyStore[copyId] = argsText;
+        }
+    }
+    var status = extractStatusMessage(argsText);
+    var statusEl = row.querySelector('.tool-status-message');
+    if (statusEl) statusEl.textContent = status || '';
+    else if (status) {
+        var summary = row.querySelector('summary');
+        if (summary) {
+            statusEl = document.createElement('span');
+            statusEl.className = 'tool-status-message';
+            statusEl.textContent = status;
+            summary.appendChild(statusEl);
+        }
+    }
+    return true;
+}
+
 function _updateStreamingMessageNow(index, msg, streamingChatId) {
     // If we navigated away from the streaming chat, skip DOM updates but let streaming continue
     if (streamingChatId && currentChatId !== streamingChatId) {
@@ -1636,63 +1803,23 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
     // repair it, since the message DATA at that index is unchanged).
     if (msgEl.classList && !msgEl.classList.contains('assistant')) return;
 
-    // Optimization: try to do incremental update for tool call arguments during streaming
-    // This avoids rebuilding the entire HTML when only the tool args are changing
-    if (msg.isStreaming && msg.tool_calls && msg.tool_calls.length > 0) {
-        var lastTcIdx = msg.tool_calls.length - 1;
-        var lastTc = msg.tool_calls[lastTcIdx];
-        var tcKey = 'tc-' + index + '-' + lastTcIdx;
-        var existingTcEl = document.getElementById(tcKey);
-
-        // If the tool call element already exists, just update the args text and status message
-        if (existingTcEl) {
-            var argsEl = existingTcEl.querySelector('.tool-args');
-            if (argsEl) {
-                var argsText = lastTc.function.arguments || '';
-                // Show streaming placeholder if args are empty (API sends args in one chunk at the end)
-                if (argsText.length === 0) {
-                    argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
-                } else {
-                    argsEl.textContent = argsText;
-                }
-
-                // Update status message in header if present (extract from partial JSON)
-                var streamingStatusMsg = extractStatusMessage(argsText);
-                var statusMsgEl = existingTcEl.querySelector('.tool-status-message');
-                if (streamingStatusMsg) {
-                    if (statusMsgEl) {
-                        statusMsgEl.textContent = streamingStatusMsg;
-                    } else {
-                        // Create status message element if it doesn't exist
-                        var summaryEl = existingTcEl.querySelector('summary');
-                        if (summaryEl) {
-                            var newStatusEl = document.createElement('span');
-                            newStatusEl.className = 'tool-status-message';
-                            newStatusEl.textContent = streamingStatusMsg;
-                            // Insert after tool-name span
-                            var toolNameEl = summaryEl.querySelector('.tool-name');
-                            if (toolNameEl && toolNameEl.nextSibling) {
-                                summaryEl.insertBefore(newStatusEl, toolNameEl.nextSibling);
-                            } else {
-                                summaryEl.appendChild(newStatusEl);
-                            }
-                        }
-                    }
-                }
-
-                // Also update compact mode collapsible header if present.
-                // Pick the LAST streaming compact area in the DOM — if a chat ever
-                // has multiple streaming blocks (e.g. message-injected mid-tool-call),
-                // we want the most recent one, not the first.
-                var streamingCompactStatusEls = document.querySelectorAll('.compact-tools-area.streaming .compact-tools-status');
-                var compactStatusEl = streamingCompactStatusEls.length ? streamingCompactStatusEls[streamingCompactStatusEls.length - 1] : null;
-                if (compactStatusEl && streamingStatusMsg) {
-                    compactStatusEl.textContent = streamingStatusMsg;
-                }
-
-                scrollToBottomIfAllowed();
-                return; // Skip full rebuild
-            }
+    // Args, thinking and text are independent lanes; an args patch must not
+    // starve the other two. Missing rows deliberately keep the insertion path.
+    var allToolRowsPatched = !!(msg.tool_calls && msg.tool_calls.length);
+    if (msg.isStreaming && msg.tool_calls) {
+        msg.tool_calls.forEach(function(tc, tcIdx) {
+            if (!_patchStreamingToolRow(document.getElementById('tc-' + index + '-' + tcIdx), tc)) allToolRowsPatched = false;
+        });
+    }
+    if (!compactToolCalls && msg.isStreaming && allToolRowsPatched) {
+        var standardThinking = msgEl.querySelector('.thinking-content');
+        if (standardThinking) {
+            standardThinking.textContent = msg.thinking || '';
+            var standardStatus = msgEl.querySelector('.thinking-status');
+            if (standardStatus) standardStatus.textContent = msg.thinking ? 'Thinking...' : 'Preparing tool call...';
+            if (msg.content) updateStreamingText(msg, index);
+            scrollToBottomIfAllowed();
+            return;
         }
     }
 
@@ -1707,147 +1834,48 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
         // During streaming in compact mode, try incremental updates to avoid spinner freeze
         if (isStreaming) {
             var compactArea = msgEl.querySelector('.compact-tools-area');
-
-            // If compact area doesn't exist in this message, the compact area is on the
-            // first assistant message. This message's div is hidden during streaming.
-            // Update streaming text and the first assistant's compact area directly - never call renderMessages().
             if (!compactArea) {
-                if (hasContent) {
-                    updateStreamingText(msg, index);
-                }
-                // Update the first assistant's compact area status text directly
-                if (hasToolCalls || hasThinking) {
-                    // Same scoping rule as above: prefer the LAST streaming compact area.
-                    var streamingCompactStatusEls2 = document.querySelectorAll('.compact-tools-area.streaming .compact-tools-status');
-                    var compactStatusEl = streamingCompactStatusEls2.length ? streamingCompactStatusEls2[streamingCompactStatusEls2.length - 1] : null;
-                    if (compactStatusEl) {
-                        var lastTc = hasToolCalls ? msg.tool_calls[msg.tool_calls.length - 1] : null;
-                        var statusMsg = lastTc ? (extractStatusMessage(lastTc.function.arguments) || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) : 'Thinking...';
-                        compactStatusEl.textContent = statusMsg;
-                    } else {
-                        // No compact area spinner yet - need one full rebuild, then incremental
-                        renderMessages();
-                        return;
-                    }
-                }
-                scrollToBottomIfAllowed();
+                var areas = document.querySelectorAll('.compact-tools-area.streaming');
+                compactArea = areas.length ? areas[areas.length - 1] : null;
+            }
+            if (!compactArea) {
+                renderMessages();
                 return;
             }
-
-            // Handle thinking-only streaming (no tool calls yet)
-            if (compactArea && !hasToolCalls) {
-                // Update thinking content inside the compact area
-                var thinkingEl = compactArea.querySelector('.thinking-content');
-                if (hasThinking) {
-                    if (thinkingEl) {
-                        // Update existing thinking element
-                        thinkingEl.textContent = msg.thinking;
-                    } else {
-                        // Create thinking element if it doesn't exist yet
-                        var compactContent = compactArea.querySelector('.compact-tools-content');
-                        if (compactContent) {
-                            var thinkingKey = index + '-0';
-                            var thinkingHtml = '<details class="thinking" data-tl-idx="0" open ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
-                            thinkingHtml += '<summary><span class="thinking-status">Thought process</span></summary>';
-                            thinkingHtml += '<div class="thinking-content">' + escapeHtml(msg.thinking) + '</div></details>';
-                            compactContent.insertAdjacentHTML('beforeend', thinkingHtml);
-                        }
-                    }
+            var compactContent = compactArea.querySelector('.compact-tools-content');
+            if (hasThinking && compactContent) {
+                var thinkingEl = compactContent.querySelector('[data-thinking-msg="' + index + '"] .thinking-content');
+                if (thinkingEl) thinkingEl.textContent = msg.thinking;
+                else {
+                    compactContent.insertAdjacentHTML('beforeend', _renderCompactThinking(index, msg.thinking, null, null, true));
                 }
-                // All streaming content goes to #streaming-text
-                if (hasContent) {
-                    updateStreamingText(msg, index);
-                }
-                scrollToBottomIfAllowed();
-                return; // Skip full rebuild - spinner continues spinning
             }
-
-            // Incremental update: update status text and tool args without rebuilding DOM
-            if (compactArea && hasToolCalls) {
-                // Also update thinking if present (may continue streaming alongside tool calls)
-                if (hasThinking) {
-                    var thinkingEl = compactArea.querySelector('.thinking-content');
-                    if (thinkingEl) {
-                        thinkingEl.textContent = msg.thinking;
-                    } else {
-                        // Create thinking element if it doesn't exist yet
-                        var compactContentForThinking = compactArea.querySelector('.compact-tools-content');
-                        if (compactContentForThinking) {
-                            var thinkingKey = index + '-0';
-                            var thinkingHtml = '<details class="thinking" data-tl-idx="0" open ontoggle="toggleThinkingState(\'' + thinkingKey + '\', this)">';
-                            thinkingHtml += '<summary><span class="thinking-status">Thought process</span></summary>';
-                            thinkingHtml += '<div class="thinking-content">' + escapeHtml(msg.thinking) + '</div></details>';
-                            compactContentForThinking.insertAdjacentHTML('afterbegin', thinkingHtml);
-                        }
-                    }
+            if (hasContent) updateStreamingText(msg, index);
+            var lastTc = hasToolCalls ? msg.tool_calls[msg.tool_calls.length - 1] : null;
+            var statusEl = compactArea.querySelector('.compact-tools-status');
+            if (statusEl) {
+                if (lastTc) {
+                    statusEl.textContent = extractStatusMessage(lastTc.function.arguments) || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name || 'Processing...';
+                } else {
+                    // Text-only streaming (no tool call yet on THIS message): keep
+                    // the block's last status_message / tool name that the full
+                    // render put here (B9) instead of forcing a bare 'Thinking...'
+                    // — only fill in when the line is empty or a generic placeholder.
+                    var _cur = (statusEl.textContent || '').trim();
+                    if (!_cur || _cur === 'Awaiting response…' || _cur === 'Processing...') statusEl.textContent = 'Thinking...';
                 }
-
-                // All streaming content goes to #streaming-text
-                if (hasContent) {
-                    updateStreamingText(msg, index);
-                }
-
-                var lastTc = msg.tool_calls[msg.tool_calls.length - 1];
-                var lastTcIdx = msg.tool_calls.length - 1;
-                var tcKey = 'tc-' + index + '-' + lastTcIdx;
-                var tcEl = document.getElementById(tcKey);
-
-                // Update the collapsible header status
-                var statusEl = compactArea.querySelector('.compact-tools-status');
-                if (statusEl) {
-                    var streamingStatusMsg = extractStatusMessage(lastTc.function.arguments);
-                    var newStatus = streamingStatusMsg || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name || 'Processing...';
-                    statusEl.textContent = newStatus;
-                }
-
-                // If tool call element exists, update its args
-                if (tcEl) {
-                    var argsEl = tcEl.querySelector('.tool-args');
-                    if (argsEl) {
-                        var argsText = lastTc.function.arguments || '';
-                        if (argsText.length === 0) {
-                            argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
-                        } else {
-                            argsEl.textContent = argsText;
-                        }
-                    }
-
-                    // Update status message in tool call header
-                    var tcStatusMsg = extractStatusMessage(lastTc.function.arguments);
-                    var tcStatusEl = tcEl.querySelector('.tool-status-message');
-                    if (tcStatusMsg) {
-                        if (tcStatusEl) {
-                            tcStatusEl.textContent = tcStatusMsg;
-                        } else {
-                            var summaryEl = tcEl.querySelector('summary');
-                            if (summaryEl) {
-                                var newStatusEl = document.createElement('span');
-                                newStatusEl.className = 'tool-status-message';
-                                newStatusEl.textContent = tcStatusMsg;
-                                var toolNameEl = summaryEl.querySelector('.tool-name');
-                                if (toolNameEl && toolNameEl.nextSibling) {
-                                    summaryEl.insertBefore(newStatusEl, toolNameEl.nextSibling);
-                                } else {
-                                    summaryEl.appendChild(newStatusEl);
-                                }
-                            }
-                        }
-                    }
-
-                    scrollToBottomIfAllowed();
-                    return; // Skip full rebuild
-                }
-
-                // Tool call element doesn't exist yet - add it incrementally to avoid spinner freeze
-                var compactContent = compactArea.querySelector('.compact-tools-content');
-                if (compactContent) {
-                    var tcStatusMsg = extractStatusMessage(lastTc.function.arguments);
+            }
+            if (hasToolCalls && compactContent) {
+                msg.tool_calls.forEach(function(tc, tcIdx) {
+                    var tcKey = 'tc-' + index + '-' + tcIdx;
+                    if (document.getElementById(tcKey)) return;
+                    var tcStatusMsg = extractStatusMessage(tc.function.arguments);
                     var statusMsgHtml = tcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(tcStatusMsg) + '</span>' : '';
-                    var newTcHtml = '<details class="tool-call" id="' + tcKey + '" open onclick="toggleToolCallExpanded(' + index + ', ' + lastTcIdx + ', this)">';
-                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(lastTc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name) + '</span>' + statusMsgHtml + '</summary>';
+                    var newTcHtml = '<details class="tool-call" id="' + tcKey + '" open onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)">';
+                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + '</summary>';
                     newTcHtml += '<div class="tool-args-wrapper">';
                     newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
-                    var argsText = lastTc.function.arguments || '';
+                    var argsText = tc.function.arguments || '';
                     if (argsText.length === 0) {
                         newTcHtml += '<pre class="tool-args"><span class="tool-args-streaming">Generating arguments...</span></pre>';
                     } else {
@@ -1858,16 +1886,9 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
 
                     // Insert the new tool call at the end of the content
                     compactContent.insertAdjacentHTML('beforeend', newTcHtml);
-                    scrollToBottomIfAllowed();
-                    return; // Skip full rebuild
-                }
-
-                // compactContent not found - just scroll and return, never rebuild during streaming
-                scrollToBottomIfAllowed();
-                return;
+                    _patchStreamingToolRow(document.getElementById(tcKey), tc);
+                });
             }
-
-            // compactArea exists but no tool calls - just return to prevent spinner restart
             scrollToBottomIfAllowed();
             return;
         }
@@ -2065,23 +2086,7 @@ function formatContent(content) {
     // Bug-sweep F13: callers (assistant / tldr / caveat render paths) don't all
     // coerce — a non-string content (null, number, object) used to throw on .replace.
     if (typeof content !== 'string') content = content == null ? '' : String(content);
-    // Extract document placeholders BEFORE escaping
-    var documentBlocks = [];
-    // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids
-    // ([a-z0-9_]) — the class below covers both; hyphen kept for safety.
-    var html = content.replace(/<!--document:([A-Za-z0-9_-]+)-->/g, function(match, docId) {
-        var rendered = typeof renderDocumentPlaceholder === 'function' ? renderDocumentPlaceholder(docId) : '<div class="sdoc-error">Document: ' + docId + '</div>';
-        documentBlocks.push(rendered);
-        return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
-    });
-
-    // Extract display template placeholders BEFORE escaping
-    var displayBlocks = [];
-    html = html.replace(/<!--display:(dsp_\w+)-->/g, function(match, displayId) {
-        var rendered = renderDisplayPlaceholder(displayId);
-        displayBlocks.push(rendered);
-        return '%%DISPLAY' + (displayBlocks.length - 1) + '%%';
-    });
+    var html = content;
 
     // Extract code blocks BEFORE escaping
     var codeBlocks = [];
@@ -2097,11 +2102,37 @@ function formatContent(content) {
         return '%%CODEBLOCK' + (codeBlocks.length - 1) + '%%';
     });
     
+    // Stash inline code before EVERY markdown/placeholder transform. Restore
+    // last, after line/table processing and whitespace cleanup, just like fences.
+    // Choose a marker absent from input so literal user text cannot impersonate it.
+    var inlineCode = [];
+    var inlinePrefix = '\u0000INLINE';
+    while (content.indexOf(inlinePrefix) !== -1) inlinePrefix += 'I';
+    html = html.replace(/`([^`]+)`/g, function(match, code) {
+        inlineCode.push('<code class="inline-code">' + escapeHtml(code) + '</code>');
+        return inlinePrefix + (inlineCode.length - 1) + '\u0000';
+    });
+
+    // Extract document placeholders BEFORE escaping
+    var documentBlocks = [];
+    // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids
+    // ([a-z0-9_]) — the class below covers both; hyphen kept for safety.
+    html = html.replace(/<!--document:([A-Za-z0-9_-]+)-->/g, function(match, docId) {
+        var rendered = typeof renderDocumentPlaceholder === 'function' ? renderDocumentPlaceholder(docId) : '<div class="sdoc-error">Document: ' + docId + '</div>';
+        documentBlocks.push(rendered);
+        return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
+    });
+
+    // Extract display template placeholders BEFORE escaping
+    var displayBlocks = [];
+    html = html.replace(/<!--display:(dsp_\w+)-->/g, function(match, displayId) {
+        var rendered = renderDisplayPlaceholder(displayId);
+        displayBlocks.push(rendered);
+        return '%%DISPLAY' + (displayBlocks.length - 1) + '%%';
+    });
+
     // Now escape the rest of the HTML
     html = escapeHtml(html);
-    
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
     
     // Bold
     html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -2111,9 +2142,9 @@ function formatContent(content) {
 
     // Auto-linkify BARE URLs (http/https) so links are clickable even when the
     // agent did not use markdown link syntax. We first stash any already-formed
-    // anchors (from the markdown-link pass above) and inline <code> spans so the
-    // autolinker can't nest a link inside an existing <a> or turn a URL that was
-    // deliberately shown as inline code into a link. Restored immediately after.
+    // anchors (from the markdown-link pass above) so the autolinker cannot
+    // nest a link inside an existing <a>. Inline code is still stashed as tokens
+    // until the final restore; the code-span alternative also protects supplied spans.
     var _protectedSpans = [];
     html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>|<code\b[^>]*>[\s\S]*?<\/code>/g, function(m) {
         _protectedSpans.push(m);
@@ -2141,9 +2172,9 @@ function formatContent(content) {
     html = decorateIdMentions(html);
 
     // Emoji shortcodes: convert :name: (e.g. :rocket:, :bug:) to real emoji.
-    // Runs AFTER inline <code>, markdown links and bare-URL autolinking (and
-    // while fenced code is still a %%CODEBLOCK%% placeholder), so a ':' that
-    // belongs to code or a URL is never rewritten. Helper + curated map live
+    // Runs after markdown links and bare-URL autolinking while inline/fenced
+    // code is still stashed as placeholders, so a ':' belonging to code or a
+    // URL is never rewritten. Helper + curated map live
     // in core/055-emoji-shortcodes.js (replaceEmojiShortcodes /
     // SECTION_ICON_SHORTCODES) — CORE tier, so it is defined before every
     // renderer in the page bundle and shipped to the SW via
@@ -2314,6 +2345,10 @@ function formatContent(content) {
         html = html.replace('%%DOCUMENT' + i + '%%', function() { return documentBlocks[i]; });
     }
     
+    for (var i = 0; i < inlineCode.length; i++) {
+        html = html.replace(inlinePrefix + i + '\u0000', function() { return inlineCode[i]; });
+    }
+
     // Apply search highlighting if active
     if (window.currentSearchHighlight) {
         html = applySearchHighlight(html, window.currentSearchHighlight);

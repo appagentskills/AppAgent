@@ -1,11 +1,47 @@
 // Apply search term highlighting to HTML content
 function applySearchHighlight(html, query) {
-    if (!query) return html;
-    // Escape special regex characters in query
-    var escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Case-insensitive replace, but preserve original case
-    var regex = new RegExp('(' + escapedQuery + ')(?![^<]*>)', 'gi');
-    return html.replace(regex, '<mark class="search-highlight">$1</mark>');
+    if (!query || !html) return html;
+    // The input is ALREADY HTML-escaped, so match the escaped form of the
+    // query: a query of `a&b` must find `a&amp;b`, `<div>` must find
+    // `&lt;div&gt;`. Without this, queries containing < > & " ' never
+    // highlight.
+    var needle = (typeof escapeHtml === 'function') ? escapeHtml(query) : query;
+    // Escape special regex characters in the (escaped) query
+    var escapedQuery = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Case-insensitive match, original case preserved via the callback
+    var regex = new RegExp(escapedQuery, 'gi');
+    var entityRe = /&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#[xX][0-9a-fA-F]+);/g;
+    var MARK_OPEN = '<mark class="search-highlight">', MARK_CLOSE = '</mark>';
+
+    // Highlight one text run (no tags). A match may only start/end on an
+    // entity boundary, never strictly inside one — otherwise short queries
+    // like `amp` / `quot` / `gt` would split `&amp;` into `&<mark>amp</mark>;`.
+    function highlightText(text) {
+        if (text.indexOf('&') === -1) {
+            return text.replace(regex, function(m) { return MARK_OPEN + m + MARK_CLOSE; });
+        }
+        var ranges = [], em;
+        entityRe.lastIndex = 0;
+        while ((em = entityRe.exec(text)) !== null) ranges.push([em.index, em.index + em[0].length]);
+        function insideEntity(pos) {
+            for (var i = 0; i < ranges.length; i++) {
+                if (pos > ranges[i][0] && pos < ranges[i][1]) return true;
+            }
+            return false;
+        }
+        return text.replace(regex, function(m, offset) {
+            if (insideEntity(offset) || insideEntity(offset + m.length)) return m;
+            return MARK_OPEN + m + MARK_CLOSE;
+        });
+    }
+
+    // Split into tag / text segments; only text segments (even indices) are
+    // highlighted so attribute values and tag names are never touched.
+    var parts = html.split(/(<[^>]*>)/);
+    for (var p = 0; p < parts.length; p += 2) {
+        if (parts[p]) parts[p] = highlightText(parts[p]);
+    }
+    return parts.join('');
 }
 
 function formatMetrics(metrics) {

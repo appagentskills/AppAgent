@@ -285,6 +285,10 @@
     setInterval(function() { Platform.refreshInstances(); }, 2 * 60 * 1000);
 
     // --- Status indicators ---
+    // Instance permission tiers (cycle order for the picker-row wrapper click).
+    // Declared here (before any render runs) — used by _tierSegmentsHtml and
+    // the .ext-instance-tier click handler in renderInstanceDropdown.
+    var TIER_ORDER = ['manual', 'auto', 'dev'];
     var _snStatusState = 'unknown'; // 'connected', 'disconnected', 'unknown'
 
     // Pure renderer — displays whatever _snStatusState says
@@ -307,14 +311,16 @@
         var shortName = host.split('.')[0];
         var isOk = _snStatusState === 'connected';
         var instPerms = (typeof instancePermissions !== 'undefined' && instancePermissions[host]) || { tier: 'manual' };
-        var tierLabel = instPerms.tier === 'auto' ? 'Auto' : 'Manual';
+        var tierLabel = instPerms.tier === 'auto' ? 'Auto' : (instPerms.tier === 'dev' ? 'Dev' : 'Manual');
+        // Dev = approvals OFF for this instance: amber pill (04-header.css .tier-dev).
+        var tierClass = (isOk && instPerms.tier === 'dev') ? ' tier-dev' : '';
 
         els.forEach(function(el) {
             if (!el) return;
-            el.className = 'ext-status ext-sn-status' + (isOk ? '' : ' disconnected');
+            el.className = 'ext-status ext-sn-status' + (isOk ? '' : ' disconnected') + tierClass;
             el.innerHTML = '<span class="ext-status-dot"></span>' + escapeHtml(shortName) +
                 (isOk ? ' <span class="ext-status-tier">' + escapeHtml(tierLabel) + '</span>' : '');
-            el.title = isOk ? 'Connected to ' + host + ' (' + tierLabel + ' mode)' : 'Disconnected from ' + host;
+            el.title = isOk ? 'Connected to ' + host + ' (' + tierLabel + ' mode' + (instPerms.tier === 'dev' ? ' — no tool approvals' : '') + ')' : 'Disconnected from ' + host;
             el.style.display = '';
         });
     }
@@ -429,8 +435,24 @@
                 return Promise.reject(new Error('No ServiceNow instance connected. Visit a ServiceNow page first.'));
             }
             var fullUrl = Platform.instanceUrl + url;
-            opts = opts || {};
-            opts.headers = opts.headers || {};
+            // Work on a shallow COPY so the caller's opts object is never mutated
+            // (callers reuse option objects across requests), and normalize
+            // headers to a plain object: a Headers instance or an array of
+            // pairs would otherwise get X-UserToken set as a JS expando the
+            // fetch layer ignores, silently sending the request unauthenticated.
+            opts = Object.assign({}, opts || {});
+            var _inHeaders = opts.headers;
+            var _plainHeaders = {};
+            if (typeof Headers !== 'undefined' && _inHeaders instanceof Headers) {
+                _inHeaders.forEach(function(v, k) { _plainHeaders[k] = v; });
+            } else if (Array.isArray(_inHeaders)) {
+                for (var _hi = 0; _hi < _inHeaders.length; _hi++) {
+                    if (_inHeaders[_hi] && _inHeaders[_hi].length >= 2) _plainHeaders[_inHeaders[_hi][0]] = _inHeaders[_hi][1];
+                }
+            } else if (_inHeaders && typeof _inHeaders === 'object') {
+                _plainHeaders = Object.assign({}, _inHeaders);
+            }
+            opts.headers = _plainHeaders;
             opts.headers['X-UserToken'] = window.sessionToken || '';
             opts.credentials = 'include';
 
@@ -523,11 +545,16 @@
 
     // Browser action proxy - routes iframe_tool actions through background service worker
     // All actions (including screenshot) go through background so it can target the correct tab
-    // targetTabId is read from the current chat so each chat targets its own tested tab
-    Platform.sendBrowserAction = function(action, args) {
+    // targetTabId is read from the chat that OWNS the action so each chat targets its
+    // own tested tab. Callers running on behalf of a non-viewed chat (sub-agents /
+    // background chats dispatched via the offscreen exec-tool bridge) pass chatId;
+    // otherwise the viewed chat (currentChatId) is used, as before.
+    Platform.sendBrowserAction = function(action, args, chatId) {
         var targetTabId = null;
-        if (typeof chats !== 'undefined' && typeof currentChatId !== 'undefined' && chats[currentChatId]) {
-            targetTabId = chats[currentChatId].targetTabId || null;
+        if (typeof chats !== 'undefined') {
+            var _baChatId = (chatId && chats[chatId]) ? chatId
+                : ((typeof currentChatId !== 'undefined') ? currentChatId : null);
+            if (_baChatId && chats[_baChatId]) targetTabId = chats[_baChatId].targetTabId || null;
         }
         return new Promise(function(resolve) {
             chrome.runtime.sendMessage({
@@ -1027,9 +1054,7 @@
                     badgeHtml +
                     disabledPill +
                     '<a class="ext-instance-open" href="' + escapeHtml(inst.url) + '" target="_blank" title="Open ' + escapeHtml(host) + '">' + openIcon + '</a>' +
-                    '<span class="ext-instance-tier" title="' + (currentTier === 'auto' ? 'Auto: Agent decides for write operations' : 'Manual: You control each permission') + '">' +
-                        (currentTier === 'auto' ? (typeof UI_ICONS !== 'undefined' ? UI_ICONS.sparkle : '&#x2728;') + ' Auto' : (typeof UI_ICONS !== 'undefined' ? UI_ICONS.lock : '&#x1F512;') + ' Manual') +
-                    '</span>' +
+                    _tierSegmentsHtml(currentTier) +
                     controlHtml +
                     '<button class="ext-instance-test" style="display:none;">Test</button>';
 
@@ -1053,9 +1078,12 @@
                         return;
                     }
                     if (e.target.closest('.ext-instance-tier')) {
-                        // Toggle tier on click
+                        // Segmented Manual / Auto / Dev control: a click on a segment
+                        // selects that tier; a click on the wrapper cycles to the next.
                         e.stopPropagation();
-                        var newTier = currentTier === 'manual' ? 'auto' : 'manual';
+                        var seg = e.target.closest('.ext-tier-opt');
+                        var newTier = seg ? seg.getAttribute('data-tier') : TIER_ORDER[(TIER_ORDER.indexOf(currentTier) + 1) % TIER_ORDER.length];
+                        if (TIER_ORDER.indexOf(newTier) === -1) newTier = 'manual';
                         if (!instancePermissions[host]) instancePermissions[host] = { tier: 'manual', tools: {} };
                         instancePermissions[host].tier = newTier;
                         saveInstancePermissions();
@@ -1369,6 +1397,27 @@
         return { label: 'Unavailable', title: 'Connection failed (HTTP ' + status + '). Click to retry.' };
     }
 
+    // Per-row tier control in the instance picker: three icon segments
+    // (Manual lock / Auto sparkle / Dev zap); the selected one also shows its
+    // label. Dev renders amber (04-header.css .ext-tier-opt.dev.selected) —
+    // it disables ALL tool approvals for that instance.
+    function _tierSegmentsHtml(currentTier) {
+        var ic = typeof UI_ICONS !== 'undefined' ? UI_ICONS : {};
+        var defs = [
+            { v: 'manual', label: 'Manual', icon: ic.lock || '&#x1F512;', title: 'Manual: You control each permission' },
+            { v: 'auto', label: 'Auto', icon: ic.sparkle || '&#x2728;', title: 'Auto: Agent decides for write operations' },
+            { v: 'dev', label: 'Dev', icon: ic.zap || '&#x26A1;', title: 'Dev: NO approvals — every tool call on this instance runs without asking' }
+        ];
+        var tier = TIER_ORDER.indexOf(currentTier) !== -1 ? currentTier : 'manual';
+        var html = '<span class="ext-instance-tier tier-' + tier + '" title="Permission tier for this instance">';
+        defs.forEach(function(d) {
+            var sel = d.v === tier;
+            html += '<span class="ext-tier-opt ' + d.v + (sel ? ' selected' : '') + '" data-tier="' + d.v + '" title="' + d.title + '">' +
+                d.icon + (sel ? ' ' + d.label : '') + '</span>';
+        });
+        return html + '</span>';
+    }
+
     function testInstanceConnection(inst, row) {
         var btn = row.querySelector('.ext-instance-test');
         var dot = row.querySelector('.ext-instance-dot');
@@ -1466,6 +1515,12 @@
                 el.addEventListener('click', function(e) {
                     e.stopPropagation();
                     showInstancePicker();
+                });
+                el.addEventListener('keydown', function(e) {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!e.repeat) el.click();
                 });
             }
         });

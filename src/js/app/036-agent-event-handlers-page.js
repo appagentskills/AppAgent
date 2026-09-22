@@ -646,9 +646,16 @@ AgentEvents.on('runFinished', function(e) {
     if (typeof renderChatList === 'function') renderChatList();
     if (typeof renderJobsBadge === 'function') renderJobsBadge();
     if (typeof _getOpenJobsDropdown === 'function' && typeof renderJobsDropdown === 'function') { var _jdFin = _getOpenJobsDropdown(); if (_jdFin) renderJobsDropdown(_jdFin); }
-    var messagesEl = document.getElementById('messages');
-    if (messagesEl) messagesEl.classList.remove('is-streaming');
-    if (chatId === currentChatId) renderMessages();
+    // Foreground gating (same as runStarted, which only ADDS .is-streaming for
+    // chatId === currentChatId, and the runCrashed handler below): a background
+    // sub-agent / Action chat finishing must NOT strip the foreground's
+    // streaming layout mid-stream. #messages only ever shows currentChatId, and
+    // chat switches re-sync the class themselves (ui/170-chat-management.js).
+    if (chatId === currentChatId) {
+        var messagesEl = document.getElementById('messages');
+        if (messagesEl) messagesEl.classList.remove('is-streaming');
+        renderMessages();
+    }
     updateContextIndicator();
     if (e.isPaused) {
         // Same gate as the 'paused' handler — sub-agent natural-finish flips

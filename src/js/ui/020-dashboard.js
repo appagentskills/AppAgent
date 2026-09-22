@@ -65,20 +65,10 @@ async function saveDashboardWidget(widget, skipHistory, prevHtml) {
         }
         target.updatedAt = Date.now();
         
-        // Track HTML history (max 10 versions)
-        if (!skipHistory && target.html) {
-            if (basisHtml && basisHtml !== target.html) {
-                if (!target.history) target.history = [];
-                target.history.push({
-                    html: basisHtml,
-                    timestamp: Date.now(),
-                    prompt: target.lastPrompt || ''
-                });
-                // Keep only last 10 versions
-                if (target.history.length > 10) {
-                    target.history = target.history.slice(-10);
-                }
-            }
+        // Content is canonical; pin/move/loading saves may not overwrite revisions.
+        var canonical = WidgetStore.view(target.id);
+        if (canonical) {
+            ['html', 'title', 'contentVersion'].forEach(function(k) { target[k] = canonical[k]; });
         }
         target.lastPrompt = target.prompt;
         

@@ -82,7 +82,26 @@ function _subAssumedContextTokens() {
     return (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
 }
 var SUBAGENT_SATURATION_RATIO       = 0.5;
+// #3 (Phase 4, flag P4_SUB_SATURATION_HARDSTOP): a sub at >= HARDSTOP_PCT of
+// its assumed window gets ONE mandatory `_saturationHardStop` context row;
+// if it still has not reported after GRACE_TURNS further assistant turns the
+// loop auto-reports need_input on its behalf (app/030-agent-loop.js
+// maybeSubSaturationHardStop). Read with typeof guards in the loop.
+var SUBAGENT_HARDSTOP_PCT           = 60;
+var SUBAGENT_HARDSTOP_GRACE_TURNS   = 2;
 var SUBAGENT_DEFAULT_SUMMARY_KB = 4;
+// #15: spawn arg `summary_cap_kb` overrides the per-sub report summary cap.
+// Integer KB, clamped to [1, 16]; anything non-numeric falls back to the
+// default. Exposed on the registry for tests / agent_status.
+function _subSummaryCapBytes(kb) {
+    if (kb == null || kb === '') return SUBAGENT_DEFAULT_SUMMARY_KB * 1024; // omitted (Number(null) would be 0 → 1 KB)
+    var n = Number(kb);
+    if (!Number.isFinite(n)) return SUBAGENT_DEFAULT_SUMMARY_KB * 1024;
+    n = Math.floor(n);
+    if (n < 1) n = 1;
+    if (n > 16) n = 16;
+    return n * 1024;
+}
 var SUBAGENT_MAX_ARTIFACTS      = 32;
 // Soft cap on the inbox queue (sleeping sub). Older messages are dropped
 // with a synthetic marker so a noisy parent/sibling can't grow the inbox
@@ -577,6 +596,7 @@ function _resumeOrOrphanSubAtBoot(rec) {
 function _orphanErrorSubAtBoot(rec) {
     rec.state = 'errored';
     rec.settled_at = Date.now();
+    _subReleaseWorkspaceOwnership(rec);
     rec.last_report = rec.last_report || {
         status: 'error',
         summary: 'sub-agent orphaned by offscreen restart before completion',
@@ -1714,7 +1734,7 @@ function spawnSubAgent(args, ctx) {
         // markReportCollected). Persisted, so an undelivered report can be
         // identified — and replayed/queried — after an MV3 SW restart.
         report_collected: false,
-        summary_cap_bytes: SUBAGENT_DEFAULT_SUMMARY_KB * 1024,
+        summary_cap_bytes: _subSummaryCapBytes(args.summary_cap_kb), // #15: spawn arg, clamped 1–16 KB, default 4
         created_at: now,
         last_activity_at: now,
         // DISPLAY-ONLY tool-call counter — there is no cap and no enforcement.
@@ -3433,7 +3453,35 @@ function reportToParent(args, ctx) {
 // separate operation (stop_sub_agent) — there is no "stop" idle policy.
 // No-ops on already-terminal subs (stopped/errored) so we don't clobber a
 // crashed sub's state with 'sleeping' on the auto_report tail.
+// #7: hand the sub's dirty workspace files to its ROOT chat when the sub
+// parks / stops / errors (see tools/020-tool-execution.js _wsTransferOwnership).
+// Fire-and-forget: ownership metadata must never block a state transition.
+// Rows the sub force-took from a FOREIGN chat (force_taken_from) are NOT
+// handed to the root: they stay owned by the sub, are logged, recorded on
+// rec.workspace_force_taken (agent_status) and appended to last_report.summary.
+function _subReleaseWorkspaceOwnership(rec) {
+    if (!rec || !rec.chat_id) return;
+    if (typeof _wsTransferOwnership === 'function') {
+        try {
+            var out = {};
+            var p = _wsTransferOwnership(rec.chat_id, rec.root_chat_id || rec.parent_chat_id || null, out);
+            if (p && typeof p.then === 'function') p.then(function() { _subNoteForceTaken(rec, out.skipped_force_taken); }).catch(function() {});
+        } catch (e) { /* best-effort */ }
+    }
+}
+function _subNoteForceTaken(rec, paths) {
+    if (!rec || !Array.isArray(paths) || !paths.length) return;
+    var note = '\u26A0 Workspace files force-taken from another chat stay owned by this sub (NOT handed to the root chat): ' + paths.join(', ') + '. Push them (releases ownership) or discard.';
+    try { console.warn('[SubAgents] ' + rec.agent_id + ' ' + note); } catch (e0) {}
+    rec.workspace_force_taken = paths.slice();
+    if (rec.last_report && typeof rec.last_report.summary === 'string' && rec.last_report.summary.indexOf('force-taken from another chat') < 0) {
+        rec.last_report.summary += '\n\n' + note;
+    }
+    try { _subAgentsPersist(rec); } catch (e1) {}
+}
+
 function _parkSubAgent(rec) {
+    _subReleaseWorkspaceOwnership(rec);
     if (rec.state === 'stopped' || rec.state === 'errored') {
         if (typeof pausedChats !== 'undefined') pausedChats[rec.chat_id] = true;
         _releasePoolSlot(rec.agent_id);
@@ -3561,6 +3609,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // the record, so a crashed sub can be woken and continue where it left
     // off instead of redoing everything from scratch. Refuse only when the
     // transcript itself is gone (nothing left to resume into).
+    var _wakeWasRunning = rec.state === 'running';
     var _resurrectedFrom = (rec.state === 'stopped' || rec.state === 'errored') ? rec.state : null;
     if (_resurrectedFrom && (typeof chats === 'undefined' || !chats[rec.chat_id])) {
         return { success: false, error: 'wake_sub_agent: sub is ' + _resurrectedFrom + ' and its chat transcript is no longer available — cannot resurrect. Spawn a fresh sub instead.' };
@@ -3728,18 +3777,22 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         var _wakeLive = !!(_subPool.running[rec.agent_id]
             || (typeof runningChatIds !== 'undefined' && runningChatIds[rec.chat_id]));
         if (_wakeLive && typeof pendingInjectionsByChatId !== 'undefined') {
+            var _wHistoryStart = chats[rec.chat_id].messages.length;
             var _wExisting = pendingInjectionsByChatId[rec.chat_id];
             var _wPrev = (_wExisting && _wExisting.text) ? _wExisting.text + '\n\n' : '';
             pendingInjectionsByChatId[rec.chat_id] = {
                 text: _wPrev + combined,
                 images: (_wExisting && _wExisting.images) ? _wExisting.images : []
             };
+            if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'pending', _wHistoryStart);
         } else {
             // injected:true is a RENDER gate (250-message-render.js) — it lets
             // renderSubReportNotices upgrade this parent→sub row to the
             // .sub-notice-inbound card. Content is unchanged; the live-loop
             // branch above gets the same flag from flushPendingInjection.
+            var _wDirectStart = chats[rec.chat_id].messages.length;
             chats[rec.chat_id].messages.push({ role: 'user', content: combined, injected: true });
+            if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'injected', _wDirectStart);
         }
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
     }
@@ -3816,6 +3869,8 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
                 // stream was trimmed — archive it and reset below so the
                 // new phase doesn't show a phantom '[N truncated]' stub.
                 progressDropped: _wkCard.progressDropped | 0,
+                parentMessages: Array.isArray(_wkCard.parentMessages) ? _wkCard.parentMessages : [],
+                parentMessagesDropped: _wkCard.parentMessagesDropped | 0,
                 // The sub's last update_action_state card belongs to the
                 // phase it was posted in — archive it and reset below so the
                 // new phase doesn't open showing the previous run's stale
@@ -3846,6 +3901,8 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             _wkCard.currentInput = _wkInput;
             _wkCard.progress = [];
             _wkCard.progressDropped = 0;
+            _wkCard.parentMessages = [];
+            _wkCard.parentMessagesDropped = 0;
             _wkCard.actionState = null;
             _wkCard.report = { status: 'running', summary: '', from: rec.agent_id, from_name: rec.name, at: Date.now() };
             _repaintParent(rec.parent_chat_id);
@@ -3939,6 +3996,44 @@ function _formatInboxDrain(items) {
         lines.push('- (' + label + ') ' + (it.content || ''));
     }
     return lines.join('\n');
+}
+
+// UI-only directional history. Transport remains the existing safe-point queue.
+// A pending row is NOT an acknowledgement: the renderer requires transcript
+// evidence before labelling it injected. Caps match the progress stream.
+function _recordSubParentMessage(rec, items, combined, state, startIndex) {
+    var card = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
+    if (!card) return;
+    if (!Array.isArray(card.parentMessages)) card.parentMessages = [];
+    var deliveryText = combined.length <= 65536 ? combined : null;
+    var ambiguousDelivery = false;
+    var phases = (Array.isArray(card.phases) ? card.phases : []).concat([card]);
+    phases.forEach(function(phase) {
+        if (phase.parentMessagesDropped > 0) ambiguousDelivery = true;
+        (Array.isArray(phase.parentMessages) ? phase.parentMessages : []).forEach(function(previous) {
+            if (deliveryText && previous.deliveryText === deliveryText) {
+                // No transport token distinguishes identical pending attempts.
+                // Persist ambiguity so pruning/archival cannot later turn one
+                // transcript occurrence into a false individual acknowledgement.
+                previous.ambiguousDelivery = true;
+                ambiguousDelivery = true;
+            }
+        });
+    });
+    items.forEach(function(item) {
+        var text = String(item.content || '');
+        card.parentMessages.push({
+            from: item.from, kind: item.kind, text: text.slice(0, 4096), at: item.at,
+            state: state, startIndex: startIndex,
+            // Oversized payloads stay unconfirmed rather than matching a prefix.
+            deliveryText: deliveryText, ambiguousDelivery: ambiguousDelivery
+        });
+    });
+    while (card.parentMessages.length > 50) {
+        card.parentMessages.shift();
+        card.parentMessagesDropped = (card.parentMessagesDropped || 0) + 1;
+    }
+    _repaintParent(rec.parent_chat_id);
 }
 
 // ---------- agent_message ----------
@@ -4163,6 +4258,7 @@ function agentMessage(args, ctx, _regMissRetried) {
         var live = !!(_subPool.running[dst.agent_id]
             || (typeof runningChatIds !== 'undefined' && runningChatIds[dst.chat_id]));
         var combined = _formatInboxDrain([item]);
+        var historyStart = chats[dst.chat_id] && chats[dst.chat_id].messages ? chats[dst.chat_id].messages.length : 0;
         if (live) {
             // Merge with existing pending text if any (multiple agent_messages
             // arriving back-to-back coalesce into a single user turn).
@@ -4174,6 +4270,7 @@ function agentMessage(args, ctx, _regMissRetried) {
                         text: prevText + combined,
                         images: (existing && existing.images) ? existing.images : []
                     };
+                    _recordSubParentMessage(dst, [item], combined, 'pending', historyStart);
                 }
             } catch (_) { /* fall through to direct push */ }
         } else {
@@ -4182,6 +4279,7 @@ function agentMessage(args, ctx, _regMissRetried) {
             // card (renderSubReportNotices, ui/175) — content is unchanged.
             if (chats[dst.chat_id]) {
                 chats[dst.chat_id].messages.push({ role: 'user', content: combined, injected: true });
+                _recordSubParentMessage(dst, [item], combined, 'injected', historyStart);
                 if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
             }
         }
@@ -4342,6 +4440,7 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     _cascadeStopDescendants(rec, 'parent sub-agent stopped: ' + (args.reason || rec.name));
     var reason = args.reason || 'stopped by parent';
     rec.state = 'stopped';
+    _subReleaseWorkspaceOwnership(rec);
     // SA-STOP-CANCEL (BUGFIX): mark this as an intentional, user-initiated stop
     // BEFORE the abort/handle settlement below. The aborted run loop will still
     // reach onSubAgentRunFinished; without this flag its auto_report branch can
@@ -4548,6 +4647,7 @@ function _markErrored(agentId, errMsg) {
     _cascadeStopDescendants(rec, 'parent sub-agent errored: ' + rec.name);
     rec.state = 'errored';
     rec.settled_at = Date.now();
+    _subReleaseWorkspaceOwnership(rec);
     // RES-6: structured error diagnostics for agent_status / the parent.
     var _meTransient = _isTransientSubError(errMsg);
     // Concise headline for every surface below (last_error, last_report,
@@ -4741,6 +4841,7 @@ function agentStatus(args, ctx) {
         if ((rec.inbox || []).length) e.inbox_size = rec.inbox.length;
         if (rec.last_error) e.last_error = rec.last_error;
         if (rec.crash_cause) e.crash_cause = rec.crash_cause;
+        if ((rec.workspace_force_taken || []).length) e.workspace_force_taken = rec.workspace_force_taken;
         if (rec.revisions_requested) e.revisions_requested = rec.revisions_requested;
         var esc = _escalationSuggestion(rec);
         if (esc) e.escalation_suggestion = esc;

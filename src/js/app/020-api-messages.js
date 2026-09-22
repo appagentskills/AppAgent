@@ -73,6 +73,14 @@ function buildAPIMessages(chatMessages, chatId) {
             if (m.reasoning_details && m.reasoning_details.length > 0 && (msg.content || msg.tool_calls)) {
                 msg.reasoning_details = m.reasoning_details;
             }
+            // Anthropic content-block order captured at stream time (see
+            // 010-llm-streaming.js). Consumed only by transformMessageToAnthropic,
+            // which validates it against content/tool_calls/reasoning_details and
+            // falls back to legacy ordering on any mismatch. callOpenRouterStreaming
+            // strips it for every non-Claude-OAuth provider.
+            if (Array.isArray(m.block_order) && m.block_order.length > 0 && (msg.content || msg.tool_calls)) {
+                msg.block_order = m.block_order;
+            }
             // Skip empty assistant messages (streaming placeholders) - they have no content,
             // no tool_calls, and no reasoning. Sending them causes hangs with image+tool combos.
             if (!msg.content && !msg.tool_calls && !msg.reasoning_details) return null;

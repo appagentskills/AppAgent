@@ -89,11 +89,11 @@ Platform.getReferer = function() {
 // lives in background.js (callOffscreenHelper); we re-export here so
 // shared code can rely on a single API.
 // =============================================================
-Platform.callOffscreenHelper = function(type, payload, timeoutMs) {
+Platform.callOffscreenHelper = function(type, payload, timeoutMs, signal) {
     if (typeof self.callOffscreenHelper !== 'function') {
         return Promise.reject(new Error('Offscreen helper bridge not initialized'));
     }
-    return self.callOffscreenHelper(type, payload, timeoutMs);
+    return self.callOffscreenHelper(type, payload, timeoutMs, signal);
 };
 
 // =============================================================

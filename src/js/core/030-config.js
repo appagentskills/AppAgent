@@ -24,19 +24,43 @@
 // isAdaptiveOnlyClaude below.
 // Loaded in BOTH bundles (page core tier + WORKER_SHARED_FILES).
 // src/platform/extension/background.js keeps a literal 64000 fallback in
-// transformToAnthropic (it can't see these globals) — keep in sync.
+// transformToAnthropic (only as a guard when these globals are missing) —
+// keep in sync.
+// 128000 = model-aware default for Opus 5.5+ (OPUS_5_5_PLUS_RE below): at
+// effort xhigh it thinks far more per turn and 64000 truncates long
+// think+tool turns. Applied ONLY while the user has not set Max Tokens
+// explicitly (globalMaxTokensExplicit) — an explicit value, larger or
+// smaller, always wins. See getDefaultMaxTokensForModel / getGlobalMaxTokens.
 var DEFAULT_MAX_TOKENS = 64000;
+var OPUS_5_5_DEFAULT_MAX_TOKENS = 128000;
 var DEFAULT_THINKING_BUDGET = 32000;
 var MAX_TOKENS_SETTING_KEY = 'globalMaxTokens';
 var THINKING_BUDGET_SETTING_KEY = 'globalThinkingBudget';
 var globalMaxTokens = DEFAULT_MAX_TOKENS;
+// true once the user stored a Max Tokens value (saveGlobalMaxTokens, or IDB
+// hydration in loadAssumedContextTokens found one). Until then the value is
+// the built-in default and may be raised per model.
+var globalMaxTokensExplicit = false;
 var globalThinkingBudget = DEFAULT_THINKING_BUDGET;
 
+// Built-in (non-user) max_tokens default for a model id: 128000 for Opus
+// 5.5+, DEFAULT_MAX_TOKENS for everything else.
+function getDefaultMaxTokensForModel(model) {
+    return OPUS_5_5_PLUS_RE.test(String(model || '').toLowerCase())
+        ? OPUS_5_5_DEFAULT_MAX_TOKENS
+        : DEFAULT_MAX_TOKENS;
+}
+
 // THE accessors the request builder reads. Always return a sane positive
-// number (default until hydration / on bad input).
-function getGlobalMaxTokens() {
+// number (default until hydration / on bad input). With a `model`, an
+// UNSET setting resolves to the model-aware default (Opus 5.5+ → 128000);
+// an explicit user value is returned verbatim. Without a model (Settings UI
+// display) it returns the stored/global value as before.
+function getGlobalMaxTokens(model) {
     var v = parseInt(globalMaxTokens, 10);
-    return (isFinite(v) && v > 0) ? v : DEFAULT_MAX_TOKENS;
+    if (!(isFinite(v) && v > 0)) v = DEFAULT_MAX_TOKENS;
+    if (!globalMaxTokensExplicit && model) return getDefaultMaxTokensForModel(model);
+    return v;
 }
 // 0 is a deliberate value here: "thinking OFF" (Settings → Thinking Budget =
 // 0). callOpenRouterStreaming (app/010-llm-streaming.js) turns it into
@@ -64,6 +88,7 @@ function _parseThinkingBudgetSetting(value) {
 // window below.
 async function saveGlobalMaxTokens(value) {
     globalMaxTokens = parseInt(value, 10) || DEFAULT_MAX_TOKENS;
+    globalMaxTokensExplicit = true;
     if (typeof setSetting === 'function') {
         await setSetting(MAX_TOKENS_SETTING_KEY, globalMaxTokens);
     }
@@ -137,8 +162,10 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high'
     },
     {
-        name: 'gpt-5.6-sol',
-        model: 'openai/gpt-5.6-sol',
+        // GPT-6 Sol (2026-09-22) replaces the gpt-5.6-sol OpenRouter default
+        // (untouched copies are renamed by loadApiProviders, core/130-indexeddb.js)
+        name: 'gpt-6-sol',
+        model: 'openai/gpt-6-sol',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: '',
         effort: 'low'
@@ -152,40 +179,36 @@ var DEFAULT_API_PROVIDERS = [
         // the global 64k default was chosen to fit under exactly this cap
     },
     {
-        // Opus 5 (July 2026) — the current default (see currentProvider below
-        // and DEFAULT_TIER_ALIASES.medium). Same Anthropic-OAuth shape as the
-        // Opus-4-8 entry below, which is deliberately KEPT so anyone who
-        // prefers it can still select it.
-        name: 'Opus 5',
-        model: 'claude-opus-5',
+        // Opus 5.5 (Sept 2026, Claude Code 2.1.280+) — dateless pinned id, 1M
+        // context, 128k max output. Adaptive thinking is ALWAYS ON (no
+        // 'enabled'/'disabled' shape, default effort medium) and its thinking
+        // blocks are conversation-bound like Fable 5.1 — the SW opts it into
+        // the thinking-binding-controls + thinking-display-updates betas and
+        // the block_binding drop_block opt-out via THINKING_BINDING_RE below.
+        // Requires the claude-cli User-Agent spoof to be ≥ 2.1.280 (server-side
+        // per-model minimum-version gate — see CLAUDE_CLI_VERSION in
+        // background.js). THE default provider (currentProvider and
+        // DEFAULT_TIER_ALIASES.medium below) since Sept 2026, when the Opus 5
+        // and Opus-4-8 entries were retired (PROVIDER_RENAMES → 'Opus 5.5').
+        // Existing installs pick this entry up via the name-keyed default
+        // merge in loadApiProviders (core/130-indexeddb.js).
+        name: 'Opus 5.5',
+        model: 'claude-opus-5-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
-        // xhigh is supported on Opus 5 and is the documented recommended
+        // xhigh is supported on Opus 5.5 and is the documented recommended
         // starting point for coding/agentic work
         effort: 'xhigh',
         isClaudeOAuth: true
     },
-    {
-        name: 'Opus-4-8',
-        model: 'claude-opus-4-8',
-        endpoint: 'https://api.anthropic.com/v1/messages',
-        apiKey: 'oauth',
-        // xhigh is supported on Opus 4.8 (and Fable/Mythos 5) and is the
-        // documented recommended starting point for coding/agentic work
-        effort: 'xhigh',
-        isClaudeOAuth: true
-    },
+    // Sept 2026 tidy-up: the 'Opus 5' (claude-opus-5) and 'Opus-4-8'
+    // (claude-opus-4-8) seeds were removed → 'Opus 5.5', and 'Fable 5'
+    // (claude-fable-5) → 'Fable 5.1'. Untouched copies are migrated by
+    // loadApiProviders (core/130-indexeddb.js); stale selections / tier
+    // aliases / chat pins follow PROVIDER_RENAMES below.
     {
         name: 'Sonnet 5',
         model: 'claude-sonnet-5',
-        endpoint: 'https://api.anthropic.com/v1/messages',
-        apiKey: 'oauth',
-        effort: 'high',
-        isClaudeOAuth: true
-    },
-    {
-        name: 'Fable 5',
-        model: 'claude-fable-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
         effort: 'high',
@@ -207,7 +230,7 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high',
         isClaudeOAuth: true
     },
-    // --- ChatGPT subscription (OAuth device-code) ---
+    // --- ChatGPT subscription (OAuth) ---
     // Routed through the SW adapter runChatGPTOAuthStream, which converts the
     // chat-completions body below into a Codex Responses API request. The
     // endpoint string is informational (the adapter hardcodes the upstream URL)
@@ -218,31 +241,50 @@ var DEFAULT_API_PROVIDERS = [
     // These entries seed the generic provider list. The model menu also lists
     // the account's live catalog (GET codex/models?client_version=), which stays
     // authoritative for availability.
+    // Sept 22 2026: GPT-6 Sol/Luna replace the GPT-5.6 Sol/Luna seeds and GPT-5.6
+    // Terra is dropped (no GPT-6 Terra) — untouched 5.6 copies are migrated by
+    // loadApiProviders (core/130-indexeddb.js), mirroring Codex's own
+    // gpt-5.6-terra/-sol → gpt-6-sol and gpt-5.6-luna → gpt-6-luna migration.
     {
-        name: 'GPT-5.6 Sol (ChatGPT)',
-        model: 'gpt-5.6-sol',
+        name: 'GPT-6 Astra (ChatGPT)',
+        model: 'gpt-6-astra',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
         effort: 'high',
         isChatGPTOAuth: true
     },
     {
-        name: 'GPT-5.6 Terra (ChatGPT)',
-        model: 'gpt-5.6-terra',
+        name: 'GPT-6 Sol (ChatGPT)',
+        model: 'gpt-6-sol',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
-        effort: 'medium',
+        effort: 'high',
         isChatGPTOAuth: true
     },
     {
-        name: 'GPT-5.6 Luna (ChatGPT)',
-        model: 'gpt-5.6-luna',
+        name: 'GPT-6 Luna (ChatGPT)',
+        model: 'gpt-6-luna',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
         effort: 'medium',
         isChatGPTOAuth: true
     }
 ];
+
+// Shared slug predicate; callers scope the capability to ChatGPT subscription.
+function isChatGPTAstraModel(model) {
+    return String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, '') === 'gpt-6-astra';
+}
+// GPT-6 Sol / Luna (2026-09-22): reasoning.effort none|low|medium(default)|
+// high|xhigh|max (developers.openai.com/api/docs/models/gpt-6-sol, gpt-6-luna).
+// Exact slugs only — '-pro' variants are not assumed to share the capability.
+function isChatGPTGpt6SolLunaModel(model) {
+    return /^gpt-6-(?:sol|luna)$/.test(String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, ''));
+}
+// Models whose Codex request keeps xhigh/max as-is (no legacy clamp to high).
+function chatGPTSupportsExtendedEffort(model) {
+    return isChatGPTAstraModel(model) || isChatGPTGpt6SolLunaModel(model);
+}
 
 // API providers (loaded from IndexedDB, initialized with defaults on first load)
 // Named LLM endpoints (Settings → LLM Endpoints): { id, name, url, apiKey }.
@@ -310,7 +352,30 @@ function isFable51Plus(model) {
     return FABLE_5_1_PLUS_RE.test(String(model || '').toLowerCase());
 }
 
-var currentProvider = 'Opus 5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
+// Opus 5.5+ (Sept 2026) — Opus joins the preserved/bound-thinking family:
+// thinking is always-on adaptive ('enabled'/'disabled' → 400), inter-tool-call
+// text arrives as thinking blocks (empty at the default display:'omitted'),
+// and thinking blocks are bound to the model + the exact prefix, so a replay
+// after a system/tools change is a 400 unless the request opts into
+// block_binding.prefix_mismatch_behavior:'drop_block' under the
+// thinking-binding-controls-2026-08-01 beta. Matches opus-5-5 … opus-5-99,
+// opus-6+ and opus-10+, with '.' or '-' separators and dated variants
+// (claude-opus-5-5-2026MMDD); does NOT match Opus 5.0 (claude-opus-5,
+// claude-opus-5-20260701 — the (?!\d) lookahead keeps an 8-digit date suffix
+// from reading as a minor version) or Opus 5.1–5.4.
+// Docs: https://platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5
+var OPUS_5_5_PLUS_RE = /claude-opus-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d{2,})/;
+// Every model whose thinking blocks are conversation-bound = Fable/Mythos 5.1+
+// OR Opus 5.5+. SINGLE SOURCE OF TRUTH for the SW: getAnthropicBetas adds the
+// two thinking betas and transformToAnthropic sends the unconditional
+// {type:'adaptive', display:'summarized', block_binding:{drop_block}} thinking
+// object for exactly this set (src/platform/extension/background.js).
+var THINKING_BINDING_RE = new RegExp(FABLE_5_1_PLUS_RE.source + '|' + OPUS_5_5_PLUS_RE.source);
+function isThinkingBindingModel(model) {
+    return THINKING_BINDING_RE.test(String(model || '').toLowerCase());
+}
+
+var currentProvider = 'Opus 5.5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
 
 // Old default-provider names → their renamed successors (the Opus 4.8
 // alignment). Used by loadProviderFromStorage (ui/070-dashboard-ui.js) as a
@@ -323,28 +388,41 @@ var currentProvider = 'Opus 5'; // Default provider name (must match a provider 
 // (page core tier + WORKER_SHARED_FILES).
 var PROVIDER_RENAMES = {
     // Removed defaults (July 2026 alignment) fall back to the config default
-    'opus-4.6': 'Opus-4-8',
-    'opus-4.8': 'Opus-4-8',
-    'haiku-4.5': 'Opus-4-8',
-    'Proxy': 'Opus-4-8',
+    // (chain-collapsed straight to 'Opus 5.5': the old 'Opus-4-8' target was
+    // retired in Sept 2026)
+    'opus-4.6': 'Opus 5.5',
+    'opus-4.8': 'Opus 5.5',
+    'haiku-4.5': 'Opus 5.5',
+    'Proxy': 'Opus 5.5',
+    // Sept 2026 tidy-up: Opus 5 / Opus-4-8 retired → Opus 5.5; Fable 5 →
+    // Fable 5.1
+    'Opus 5': 'Opus 5.5',
+    'Opus-4-8': 'Opus 5.5',
+    'Fable 5': 'Fable 5.1',
     // Renamed defaults → their July 2026 successors
     'sonnet-4.5': 'sonnet-5',
     'sonnet-4.6': 'sonnet-5',
     'Kimi K2.5': 'GLM 5.2',
-    // (gpt-5.2 chain-collapses straight to gpt-5.6-sol: the old gpt-5.5
-    // target no longer exists in the defaults)
-    'gpt-5.2': 'gpt-5.6-sol',
-    'gpt-5.5': 'gpt-5.6-sol',
+    // (gpt-5.2 / gpt-5.5 chain-collapse straight to gpt-6-sol: the old
+    // gpt-5.5 / gpt-5.6-sol targets no longer exist in the defaults)
+    'gpt-5.2': 'gpt-6-sol',
+    'gpt-5.5': 'gpt-6-sol',
+    'gpt-5.6-sol': 'gpt-6-sol',
     'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
     'Sonnet 4.6 OAuth': 'Sonnet 5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
     // default names (same providers, friendlier labels)
-    'Opus-4-8 OAuth': 'Opus-4-8',
+    'Opus-4-8 OAuth': 'Opus 5.5',
     'Sonnet 5 OAuth': 'Sonnet 5',
     // ChatGPT-OAuth seeds: the assumed gpt-5.1* slugs never existed on the
     // Codex backend for ChatGPT accounts
-    'GPT-5.1 Codex': 'GPT-5.6 Sol (ChatGPT)',
-    'GPT-5.1': 'GPT-5.6 Terra (ChatGPT)'
+    'GPT-5.1 Codex': 'GPT-6 Sol (ChatGPT)',
+    'GPT-5.1': 'GPT-6 Sol (ChatGPT)',
+    // Sept 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds; Terra has no
+    // GPT-6 successor and folds into Sol (Codex's own migration target)
+    'GPT-5.6 Sol (ChatGPT)': 'GPT-6 Sol (ChatGPT)',
+    'GPT-5.6 Terra (ChatGPT)': 'GPT-6 Sol (ChatGPT)',
+    'GPT-5.6 Luna (ChatGPT)': 'GPT-6 Luna (ChatGPT)'
 };
 
 // ─── Per-spawn model selection (Orchestrator §1) ────────────────────
@@ -380,7 +458,7 @@ var TIER_ALIAS_SAME = '__same__';
 // Model Tiers.
 var DEFAULT_TIER_ALIASES = {
     small: 'Sonnet 5',
-    medium: 'Opus 5',
+    medium: 'Opus 5.5',
     large: TIER_ALIAS_SAME
 };
 var subAgentTierAliases = null; // null = not yet hydrated from IDB
@@ -416,10 +494,18 @@ async function loadTierAliases() {
             // Recover stored aliases that still point at RENAMED default
             // provider names (e.g. 'Sonnet 5 OAuth' → 'Sonnet 5') — provider
             // lookups are exact-string, so a stale name would silently break
-            // tier resolution after a default rename.
+            // tier resolution after a default rename. Only rename when the
+            // old name no longer exists among the configured providers: the
+            // IDB migration deliberately KEEPS user-customized legacy presets
+            // (e.g. an edited 'GPT-5.6 Terra (ChatGPT)'), and a tier pinned to
+            // such a preset must keep pointing at it (same guard as
+            // loadProviderFromStorage in ui/070-dashboard-ui.js).
             for (var _tm in subAgentTierAliases) {
                 var _tv = subAgentTierAliases[_tm];
-                if (_tv && PROVIDER_RENAMES[_tv]) subAgentTierAliases[_tm] = PROVIDER_RENAMES[_tv];
+                if (_tv && PROVIDER_RENAMES[_tv]
+                    && !(apiProviders || []).some(function(p) { return p && p.name === _tv; })) {
+                    subAgentTierAliases[_tm] = PROVIDER_RENAMES[_tv];
+                }
             }
         } else if (subAgentTierAliases === null) {
             subAgentTierAliases = {};
@@ -479,6 +565,7 @@ async function loadAssumedContextTokens() {
             var storedMax = await getSetting(MAX_TOKENS_SETTING_KEY, null);
             if (storedMax !== null && storedMax !== undefined && storedMax !== '') {
                 globalMaxTokens = parseInt(storedMax, 10) || DEFAULT_MAX_TOKENS;
+                globalMaxTokensExplicit = true;
             }
             var storedBudget = await getSetting(THINKING_BUDGET_SETTING_KEY, null);
             if (storedBudget !== null && storedBudget !== undefined && storedBudget !== '') {
@@ -487,6 +574,13 @@ async function loadAssumedContextTokens() {
             var storedDeferred = await getSetting(DEFERRED_TOOLS_SETTING_KEY, null);
             if (storedDeferred !== null && storedDeferred !== undefined) {
                 deferredToolsEnabled = !!storedDeferred;
+            }
+            // P4 kill-switches (see P4_FLAG_DEFAULTS below). Hydrated here so
+            // page boot, SW boot and the SW run-agent gate all pick them up
+            // with zero extra call sites. Missing setting → default.
+            for (var _p4k in P4_FLAG_DEFAULTS) {
+                var _p4v = await getSetting('p4_' + _p4k, null);
+                _p4Flags[_p4k] = (_p4v === null || _p4v === undefined) ? P4_FLAG_DEFAULTS[_p4k] : !!_p4v;
             }
         }
     } catch (e) {}
@@ -534,6 +628,12 @@ function _resolveChatProviderNameFollow(chatId, seen) {
             if (ch.provider) {
                 var pinned = ch.provider;
                 if (typeof getProviderById === 'function' && getProviderById(pinned)) return pinned;
+                // A pin on a RETIRED default name (e.g. 'Opus 5' → 'Opus 5.5')
+                // follows PROVIDER_RENAMES — reached only when the old name no
+                // longer exists (a customized legacy preset kept by the IDB
+                // migration matched above and stays pinned; #950 semantics).
+                var renamed = (typeof PROVIDER_RENAMES !== 'undefined') ? PROVIDER_RENAMES[pinned] : null;
+                if (renamed && typeof getProviderById === 'function' && getProviderById(renamed)) return renamed;
                 console.warn('[provider] chat ' + chatId + ' pinned to unknown provider "' + pinned + '" — falling back to "' + currentProvider + '"');
             }
         }
@@ -634,6 +734,33 @@ var lastRequestMetrics = null; // Track token usage and performance
 // the agent loop appends a reminder to delegate heavy work to sub-agents
 // (model quality degrades at long context). Set to 0 to disable the nudge.
 var SUBAGENT_NUDGE_TOKEN_THRESHOLD = 70000;
+// P4 kill-switches (fix-all/4-high). Each high-risk fix is gated behind one of
+// these flags so it can be turned on/off from Settings without a rebuild.
+// Hydrated from the IDB settings store ('p4_<NAME>') by
+// loadAssumedContextTokens() — page boot, SW boot and the SW run-agent gate.
+// Until hydration, the default (OFF) applies.
+var P4_FLAG_DEFAULTS = {
+    P4_OFFSCREEN_SELF_HEAL: false,      // #1  offscreen zombie self-heal
+    P4_SUB_SATURATION_HARDSTOP: false,  // #3  sub-agent saturation hard-stop / auto-handoff
+    P4_BOOT_PLACEHOLDER_SWEEP: false,   // #6a SW boot sweep of stranded tool placeholders
+    P4_ACTION_WATCHDOG: false           // #6b action never-started boot re-kick
+};
+var _p4Flags = Object.assign({}, P4_FLAG_DEFAULTS);
+function getP4Flag(name) {
+    return _p4Flags[name] === true;
+}
+// Persist a new value (Settings page toggle in ui/040-tools-settings.js).
+async function saveP4Flag(name, value) {
+    if (!(name in P4_FLAG_DEFAULTS)) return false;
+    _p4Flags[name] = !!value;
+    if (typeof setSetting === 'function') {
+        await setSetting('p4_' + name, !!value);
+    }
+    return _p4Flags[name];
+}
+// background.js is loaded BEFORE the SW bundle, so it reads self.getP4Flag at
+// call time (typeof-guarded) rather than referencing the bundle global.
+if (typeof self !== 'undefined') { self.getP4Flag = getP4Flag; }
 // After a nudge fires, it re-arms once the context has grown this many tokens
 // PAST the size at which the last nudge fired (appended as a fresh trailing
 // context message — never mutates history, so the prompt cache stays intact).
@@ -651,9 +778,9 @@ var currentIframeUrl = '/'; // Track last browser tab URL for AI context
 var settingsPanelOpen = false; // Track settings panel state
 var llmConnectionStatus = 'unknown'; // 'connected', 'disconnected', 'unknown'
 var toolPermissions = {}; // Global (non-instance) tool permissions: 'allow', 'auto', 'ask', 'disabled'
-var instancePermissions = {}; // Per-instance permissions: { 'host': { tier: 'manual'|'auto', tools: { key: 'allow'|'auto'|'ask'|'disabled' } } }
+var instancePermissions = {}; // Per-instance permissions: { 'host': { tier: 'manual'|'auto'|'dev', tools: { key: 'allow'|'auto'|'ask'|'disabled' } } }. 'dev' = every instance-scoped tool call resolves 'allow' (no prompts, confirm:true ignored, per-tool settings ignored).
 var cacheTokenLimit = 4000; // Cache limit in tokens (default ~4k tokens = ~16KB)
-var sessionPermissions = {}; // Session-only permissions (cleared on page reload)
+var sessionPermissions = {}; // "Allow for this chat" grants keyed by rootChatId + '::' + permKey (core/070 chatPermKey); SW-owned, mirrored to chrome.storage.session
 var pendingToolApprovals = {}; // Track pending tool approval requests by chatId:approvalIndex
 var cachedUserSysId = null; // Cache user sys_id to avoid repeated API calls
 var impersonateOriginalUserSysId = null; // Store original user sys_id before impersonation

@@ -30,7 +30,260 @@ function expandSidePanel() {
     setTimeout(function() { window.close(); }, 300);
 }
 
-async function reloadExtension() {
+// Native Reload is single-flight in this page AND across extension panels.
+var _reloadInFlight = null;
+var RELOAD_PREFLIGHT_FILES = Object.freeze([
+    'test/test-run-policy.test.js', 'test/run-tests-tool.test.js',
+    'test/js-eval-sandbox-lifecycle.test.js', 'test/harness.test.js',
+    'test/reload-preflight.test.js'
+]);
+function reloadExtension() {
+    if (_reloadInFlight) return _reloadInFlight;
+    var buttons = ['ext-reload-btn', 'home-ext-reload-btn'].map(function(id) { return document.getElementById(id); });
+    var disabled = buttons.map(function(b) { return b && b.disabled; });
+    buttons.forEach(function(b) { if (b) b.disabled = true; });
+    // Set the page guard synchronously, before requesting the origin lock.
+    _reloadInFlight = Promise.resolve().then(function() {
+        if (!navigator.locks || !navigator.locks.request) throw new Error('Safe Reload requires Web Locks. Close other panels and restart Chrome.');
+        return navigator.locks.request('appagent-reload-preflight', { ifAvailable: true }, async function(lock) {
+            if (!lock) throw new Error('Reload is already running in another panel.');
+            return _reloadExtensionLocked();
+        });
+    }).catch(function(e) {
+        if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: ' + e.message);
+    }).finally(function() {
+        buttons.forEach(function(b, i) { if (b) b.disabled = disabled[i]; });
+        _reloadInFlight = null;
+    });
+    return _reloadInFlight;
+}
+
+// Local reads only: no sync, permission bypass or invented chat identity.
+async function _reloadWorkspace() {
+    var metas = await getAllWorkspaceMetas();
+    var matches = metas.filter(function(m) { return /\/AppAgent(::|$)/.test(m.repo); });
+    var selected = matches.find(function(m) { return m.pinned; }) ||
+        matches.find(function(m) { return /::(main|master)$/.test(m.repo); }) || matches[0] || metas[0];
+    if (!selected || !selected.repo) throw new Error('No workspace available for Reload');
+    return selected.repo;
+}
+async function _reloadFingerprint(workspace) {
+    var meta = await getWorkspaceMeta(workspace), files = await getAllWorkspaceFiles(workspace);
+    if (!meta || !Array.isArray(files) || !files.length) throw new Error('Cannot verify workspace source');
+    // Clean lazy rows are identified by blob SHA; hydration alone is not an edit.
+    // Dirty contents + deletion/new-path inventory catch same-size edits as well.
+    var rows = files.map(function(f) {
+        if (!f.path || (!f.deleted && f.dirty && typeof f.content !== 'string')) throw new Error('Incomplete workspace source');
+        return [f.path, f.sha || '', !!f.deleted, !!f.dirty, f.dirty ? f.content : null];
+    }).sort(function(a, b) { return a[0].localeCompare(b[0]); });
+    var bytes = new TextEncoder().encode(JSON.stringify([meta.head_sha, meta.branch, rows]));
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))).map(function(n) { return n.toString(16).padStart(2, '0'); }).join('');
+}
+function _reloadSuiteResult(result, file) {
+    var f = result && Array.isArray(result.files) && result.files.length === 1 && result.files[0];
+    var s = result && result.summary;
+    var valid = f && f.file === file && s && s.files === 1 &&
+        ['passed', 'failed', 'skipped', 'no_assertions'].every(function(k) { return Number.isSafeInteger(s[k]) && s[k] >= 0; }) &&
+        ['passed', 'failed', 'skipped'].every(function(k) { return Number.isSafeInteger(f[k]) && f[k] >= 0 && f[k] === s[k]; }) &&
+        s.total === s.passed + s.failed + s.skipped;
+    var unsupported = valid && f.skipped > 0 && Array.isArray(f.skips) && f.skips.length === f.skipped &&
+        f.skips.every(function(skip) { return /unsupported.*(contract|runtime)|(contract|runtime).*unsupported/i.test(skip.reason || ''); });
+    var safe = valid && result.isolation && result.isolation.ok === true && result.isolation.host_verified === true &&
+        Array.isArray(result.denied_calls) && result.denied_calls.length === 0;
+    var pass = safe && result.success === true && f.status === 'pass' && f.passed > 0 && !f.failed &&
+        !s.no_assertions && !f.no_assertions && !f.aborted && !result.aborted && (!f.skipped || unsupported);
+    var state = pass ? 'pass' : valid && !f.passed && !f.failed && f.skipped ? 'skipped' : valid && f.failed ? 'fail' : 'error';
+    var detail = valid ? f.passed + ' passed; ' + f.failed + ' failed; ' + f.skipped + ' skipped (unchecked)' : 'Malformed or incomplete test result';
+    if (!pass) detail += '\n' + (result && result.error || 'Required supported assertions or verified isolation missing');
+    // Keep runner startup/file diagnostics even when its count envelope is invalid.
+    if (!pass && f && f.error) detail += '\n' + String(f.error);
+    if (f && f.failures) detail += '\n' + JSON.stringify(f.failures);
+    if (f && f.skips && f.skips.length) detail += '\n' + JSON.stringify(f.skips);
+    return { state: state, detail: detail.slice(0, 6000) };
+}
+
+function _reloadChecklist(controller) {
+    var previous = document.activeElement, choice, resolveChoice;
+    var decision = new Promise(function(resolve) { resolveChoice = resolve; });
+    function node(tag, cls, text, parent) {
+        var el = document.createElement(tag); el.className = cls;
+        if (text) el.textContent = text;
+        if (parent) parent.appendChild(el);
+        return el;
+    }
+    var overlay = node('div', 'modal-overlay show reload-preflight');
+    var dialog = node('section', 'modal-dialog', '', overlay);
+    dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-labelledby', 'reload-preflight-title');
+    dialog.setAttribute('aria-describedby', 'reload-preflight-status');
+    var title = node('h2', 'modal-header', 'Checking before Reload…', dialog); title.id = 'reload-preflight-title';
+    var body = node('div', 'modal-body', '', dialog);
+    var status = node('p', 'reload-preflight-status', 'Preparing workspace…', body); status.id = 'reload-preflight-status'; status.setAttribute('aria-live', 'polite');
+    var progressText = node('p', 'reload-preflight-progress-text', '0 of 5 suites complete', body); progressText.setAttribute('aria-live', 'polite'); progressText.setAttribute('aria-atomic', 'true');
+    var progress = node('progress', 'reload-preflight-progress', '', body); progress.max = RELOAD_PREFLIGHT_FILES.length; progress.value = 0; progress.setAttribute('aria-label', 'Suites complete');
+    var labels = ['Policy checks', 'Test runner', 'Sandbox lifecycle', 'Test harness', 'Reload checks'];
+    var summaries = [];
+    var rows = RELOAD_PREFLIGHT_FILES.map(function(file, index) {
+        var row = node('div', 'reload-preflight-row', '', body);
+        var label = node('label', 'reload-preflight-label', '', row), box = node('input', 'reload-preflight-check', '', label);
+        box.type = 'checkbox'; box.disabled = true; box.setAttribute('aria-label', labels[index] + ': Pending');
+        var spinner = node('span', 'reload-preflight-spinner', '', label); spinner.setAttribute('aria-hidden', 'true');
+        node('span', '', labels[index], label);
+        var result = node('div', 'reload-preflight-result', '', row);
+        var state = node('span', 'reload-preflight-state', 'Pending', result);
+        var counts = node('span', 'reload-preflight-counts', '', result); counts.hidden = true;
+        var message = node('p', 'reload-preflight-message', '', row); message.hidden = true;
+        var details = node('details', 'reload-preflight-details', '', row);
+        var summary = node('summary', '', 'Details', details); summary.setAttribute('aria-label', 'Details for ' + labels[index]); summaries.push(summary);
+        node('code', 'reload-preflight-file', file, details);
+        var detail = node('pre', 'reload-preflight-detail', '', details); detail.hidden = true;
+        row.dataset.state = 'pending';
+        return { row: row, box: box, state: state, counts: counts, message: message, detail: detail, complete: false };
+    });
+    var technical = node('details', 'reload-preflight-details reload-preflight-technical', '', body);
+    summaries.push(node('summary', '', 'Coverage and workspace', technical));
+    var workspace = node('p', 'reload-preflight-workspace', 'Workspace: preparing…', technical);
+    node('p', '', 'Unit and canary checks use workspace sources in the installed runtime, not the new build. Contract and runtime layers are unsupported; skipped checks are not passes. Permission prompts remain separate.', technical);
+    var actions = node('div', 'modal-actions', '', dialog);
+    var cancel = node('button', 'modal-btn secondary', 'Cancel', actions); cancel.type = 'button';
+    var force = node('button', 'modal-btn warning', 'Force build', actions); force.type = 'button'; force.hidden = true; force.disabled = true;
+    function choose(value) {
+        if (choice) return;
+        choice = value;
+        if (value === 'cancel') { controller.abort(); status.textContent = 'Cancelling — revoking test authority…'; }
+        resolveChoice(value);
+    }
+    cancel.addEventListener('click', function() { choose('cancel'); });
+    force.addEventListener('click', function() { if (!force.disabled) choose('force'); });
+    overlay.addEventListener('keydown', function(e) {
+        // Details keep native keyboard activation; Enter must never choose Force.
+        if (e.key === 'Enter') { if (summaries.indexOf(e.target) < 0) e.preventDefault(); e.stopPropagation(); }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); choose('cancel'); }
+        // Include native summaries, but never steal focus from separate permission prompts.
+        if (e.key === 'Tab') {
+            var controls = summaries.concat([cancel]);
+            if (!force.hidden && !force.disabled) controls.push(force);
+            var active = controls.indexOf(document.activeElement);
+            if (active >= 0) { e.preventDefault(); controls[(active + (e.shiftKey ? controls.length - 1 : 1)) % controls.length].focus(); }
+        }
+    });
+    function updateProgress() {
+        var complete = rows.filter(function(r) { return r.complete; }).length;
+        var failed = rows.filter(function(r) { return r.row.dataset.state === 'fail'; }).length;
+        var errors = rows.filter(function(r) { return r.row.dataset.state === 'error'; }).length;
+        progress.value = complete;
+        progressText.textContent = complete + ' of ' + rows.length + ' suites complete' + (failed ? ' · ' + failed + ' failed' : '') + (errors ? ' · ' + errors + (errors === 1 ? ' error' : ' errors') : '');
+        progress.setAttribute('aria-valuetext', progressText.textContent);
+    }
+    document.body.appendChild(overlay); cancel.focus();
+    return {
+        decision: decision,
+        cancelled: function() { return choice === 'cancel'; },
+        update: function(index, state, detail) {
+            var r = rows[index];
+            r.row.dataset.state = state; r.box.checked = state === 'pass';
+            var stateLabels = { pending: 'Pending', running: 'Running', pass: 'Passed', fail: 'Failed', skipped: 'Skipped', error: 'Error' };
+            r.state.textContent = state === 'skipped' && detail === 'Not run' ? 'Not run' : (stateLabels[state] || state);
+            r.box.setAttribute('aria-label', labels[index] + ': ' + r.state.textContent);
+            r.complete = ['pass', 'fail', 'skipped', 'error'].indexOf(state) >= 0 && detail !== 'Not run';
+            // Format the existing gate diagnostic without changing eligibility or inventing counts.
+            var lines = String(detail || '').split('\n');
+            var counts = /^(\d+) passed; (\d+) failed; (\d+) skipped(?: \(unchecked\))?$/.exec(lines[0]);
+            r.counts.textContent = counts ? counts[1] + ' passed · ' + counts[2] + ' failed · ' + counts[3] + ' skipped' : '';
+            r.counts.hidden = !counts;
+            if (counts) lines.shift();
+            lines = lines.filter(function(line) { return line.trim() && line.trim() !== '[]'; });
+            var text = lines.map(function(line) { try { return JSON.stringify(JSON.parse(line), null, 2); } catch (_) { return line; } }).join('\n');
+            r.detail.textContent = text; r.detail.hidden = !text;
+            var needsAttention = state === 'fail' || state === 'error' || state === 'skipped';
+            var headline = lines.find(function(line) { return line !== 'Malformed or incomplete test result' && line !== 'Required supported assertions or verified isolation missing'; }) || lines[0];
+            headline = headline || 'This suite did not pass.';
+            r.message.textContent = needsAttention ? (headline.length > 240 ? headline.slice(0, 240) + '…' : headline) : '';
+            r.message.hidden = !needsAttention;
+            updateProgress();
+        },
+        status: function(text) {
+            if (text.indexOf('Workspace: ') === 0) { workspace.textContent = text; status.textContent = 'Checking supported assertions before building.'; }
+            else if (text.indexOf('All five supported suites passed') === 0) { title.textContent = 'All checks passed'; status.textContent = 'Building the checked workspace…'; }
+            else status.textContent = text;
+        },
+        failure: function(text, settled) { title.textContent = 'Checks need attention'; status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
+        close: function() { overlay.remove(); if (previous && previous.isConnected) previous.focus(); }
+    };
+}
+
+// Bounds preparation/approval waits too. Abort immediately revokes live runner
+// authority; a late approval reaches an already-aborted host signal and cannot run.
+async function _reloadWait(promise, signal, ms) {
+    var timer, abort;
+    try {
+        return await Promise.race([promise, new Promise(function(_, reject) {
+            abort = function() { reject(new Error('Reload cancelled')); };
+            if (signal.aborted) { abort(); return; }
+            signal.addEventListener('abort', abort, { once: true });
+            timer = setTimeout(function() { reject(new Error('Reload preflight timed out')); }, ms);
+        })]);
+    } finally { clearTimeout(timer); if (abort) signal.removeEventListener('abort', abort); }
+}
+async function _runReloadPreflight() {
+    var controller = new AbortController(), ui = _reloadChecklist(controller);
+    var workspace, fingerprint, pending = null, settled = true, index = -1, failed = false;
+    try {
+        workspace = await _reloadWait(_reloadWorkspace(), controller.signal, 15000);
+        ui.status('Workspace: ' + workspace);
+        fingerprint = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
+        for (index = 0; index < RELOAD_PREFLIGHT_FILES.length; index++) {
+            if (controller.signal.aborted) throw new Error('Reload cancelled');
+            ui.update(index, 'running', 'Running supported assertions…');
+            settled = false;
+            pending = Promise.resolve().then(function() {
+                if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
+                return executeTool('run_tests', { files: [RELOAD_PREFLIGHT_FILES[index]], tags: ['unit', 'canary'], workspace: workspace, timeout_ms: 120000 }, null, { _runTestsAbortSignal: controller.signal });
+            }).finally(function() { settled = true; });
+            var result = await _reloadWait(pending, controller.signal, 135000);
+            var row = _reloadSuiteResult(result, RELOAD_PREFLIGHT_FILES[index]);
+            ui.update(index, row.state, row.detail);
+            if (row.state !== 'pass') { failed = true; break; }
+        }
+        if (!failed) {
+            var current = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
+            if (current !== fingerprint || await _reloadWait(_reloadWorkspace(), controller.signal, 15000) !== workspace) {
+                RELOAD_PREFLIGHT_FILES.forEach(function(_, i) { ui.update(i, 'error', 'Workspace changed — previous results are stale.'); });
+                throw new Error('Workspace changed during tests. Run Reload again, or explicitly force this workspace build.');
+            }
+            ui.status('All five supported suites passed — building ' + workspace);
+            return { proceed: true, workspace: workspace };
+        }
+    } catch (e) {
+        // Any caught error is a failure. An empty/undefined message used to leave
+        // `failed` falsy: the finally below closed the checklist and then
+        // `await ui.decision` hung forever with the Reload buttons disabled.
+        var reason = String(e && (e.message || (typeof e === 'string' ? e : '')) || '').trim() || 'Preflight failed (unknown error)';
+        if (index >= 0 && index < RELOAD_PREFLIGHT_FILES.length) ui.update(index, 'error', reason);
+        failed = reason;
+    } finally {
+        // Do not offer Force while the host invocation is still settling.
+        if (pending && !settled) {
+            controller.abort();
+            try { await _reloadWait(pending, new AbortController().signal, 12000); } catch (cleanupError) { /* Fail closed below if still unsettled. */ }
+        }
+        if (!failed || ui.cancelled()) ui.close();
+    }
+    if (ui.cancelled()) { ui.close(); return { proceed: false }; }
+    for (var rest = index + 1; rest < RELOAD_PREFLIGHT_FILES.length; rest++) ui.update(rest, 'skipped', 'Not run');
+    ui.failure((typeof failed === 'string' ? failed : 'Required checks did not pass.') + (settled ? ' Cancel or explicitly Force build (tests only; artifact/security checks still apply).' : ' Host cleanup did not settle; Force is unavailable.'), settled && !!workspace);
+    try { return { proceed: (await ui.decision) === 'force', workspace: workspace }; }
+    finally { ui.close(); }
+}
+
+async function _rebuildBeforeReload() {
+    if (typeof isSkillTool !== 'function' || !isSkillTool('extension_build')) return true;
+    if (typeof getDeployDirHandle !== 'function' || !(await getDeployDirHandle())) return true;
+    var gate = await _runReloadPreflight();
+    if (!gate.proceed) return false;
+    return _buildFrozenWorkspace(gate.workspace);
+}
+
+async function _reloadExtensionLocked() {
     // chrome.runtime.reload() restarts the WHOLE extension — including the
     // service worker (background.js + the imported sw-bundle.js, where the
     // agent loop and pause handling live). That is the ONLY reliable way to
@@ -82,6 +335,9 @@ async function reloadExtension() {
     // chrome.runtime.reload() unreached and the old SW running. We always fall
     // back via a short timer.
     function _startReloadSequence() {
+        return new Promise(function(resolve) {
+        var start = _doReload;
+        _doReload = function() { start(); resolve(); };
         // Immediate feedback — the reload tears the page down a moment later.
         if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
         try {
@@ -95,6 +351,7 @@ async function reloadExtension() {
         } catch (e) { /* fall through to the timer */ }
         // Guaranteed fallback: reload even if the storage callback never returns.
         setTimeout(_doReload, 400);
+        });
     }
 
     // Rebuild-then-reload: when running as an installed extension with a deploy
@@ -102,14 +359,14 @@ async function reloadExtension() {
     // redeploy the extension from the workspace FIRST, so chrome.runtime.reload()
     // picks up the freshly built files from disk. Without a connected folder (or
     // build tool) there is nothing on disk to update, so we just reload.
-    _rebuildBeforeReload().then(function(proceed) {
+    return _rebuildBeforeReload().then(function(proceed) {
         if (!proceed) return;
         // Cleanly close every realm's IDB connection BEFORE chrome.runtime.reload()
         // tears the contexts down. An abrupt teardown of an un-closed connection can
         // make Chrome force-close the origin's IndexedDB backing store, which then
         // wedges the DB until a full browser restart (see closeDatabase). Fail-open:
         // this only ever delays the reload by a fixed settle, never blocks it.
-        _prepareRealmsForReload().then(_startReloadSequence);
+        return _prepareRealmsForReload().then(_startReloadSequence);
     });
 }
 
@@ -148,14 +405,8 @@ if (typeof window !== 'undefined' && window.addEventListener) {
 // agent runs — no duplicated build logic. Returns a promise resolving to `true`
 // when the caller should proceed with the reload, or `false` to abort (the user
 // declined to reload after a failed build).
-async function _rebuildBeforeReload() {
+async function _buildFrozenWorkspace(workspace) {
     try {
-        // Need the in-browser build tool — provided by the extension-dev skill.
-        if (typeof isSkillTool !== 'function' || !isSkillTool('extension_build')) return true;
-        // Need a connected deploy folder, else there's nothing on disk to update.
-        if (typeof getDeployDirHandle !== 'function') return true;
-        var handle = await getDeployDirHandle();
-        if (!handle) return true;
 
         if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
         // fromSandbox: bypass the skill-tool large-response truncation in
@@ -167,7 +418,7 @@ async function _rebuildBeforeReload() {
         // message). Agent-side sandbox calls already get the untruncated
         // result via this same flag; this is programmatic consumption, not
         // model output, so truncation would only destroy information.
-        var res = await executeTool('extension_build', {}, null, { fromSandbox: true });
+        var res = await executeTool('extension_build', { workspace: workspace }, null, { fromSandbox: true });
         var ok = !!(res && res.success && res.stats && res.stats.jsFiles > 0 && res.stats.filesDeployed > 0);
         if (ok) {
             // Surface WHICH workspace was built — with pinning + forks the

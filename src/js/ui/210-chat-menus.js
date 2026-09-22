@@ -151,17 +151,26 @@ function importSingleChat() {
             var data = JSON.parse(text);
             
             // Validate the import data
-            if (data.exportType !== 'single_chat' || !data.chat) {
+            if (data.exportType !== 'single_chat' || !data.chat || typeof data.chat !== 'object') {
                 showSnackbar('Invalid chat file format', 'error');
                 return;
             }
             
             var importedChat = data.chat;
             
+            // A chat without a messages array would blow up every later
+            // consumer (chat.messages.length / .filter) — reject it here
+            // with a clear message instead of importing a broken row.
+            if (!Array.isArray(importedChat.messages)) {
+                showSnackbar('Invalid chat file: missing messages array', 'error');
+                return;
+            }
+            
             // Generate a new ID to avoid conflicts
             var newId = 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             importedChat.id = newId;
-            importedChat.title = importedChat.title + ' (imported)';
+            var baseTitle = (typeof importedChat.title === 'string' && importedChat.title.trim()) ? importedChat.title : 'Imported chat';
+            importedChat.title = baseTitle + ' (imported)';
             // The import-time name is authoritative — drop a serialized
             // provisional flag so the auto-title hook doesn't re-title the
             // chat (losing the '(imported)' marker) on its next run.

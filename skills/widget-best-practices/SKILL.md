@@ -11,6 +11,16 @@ The `html_widget` tool creates rich visual presentations inline in chat instead 
 
 > **Note:** Widgets are different from UI Pages. Widgets run in an isolated chat iframe, while UI Pages run in ServiceNow's `gsft_main` frame. See the `ui-pages-best-practices` skill for UI Page guidance.
 
+## Permanent identity and saved versions
+
+- **Iteration is a new version, not a new widget.** Keep the existing `widget_id` for fixes, redesigns, regeneration, and follow-ups. Never infer identity from title/HTML.
+- Read first: `html_widget({action:"read", widget_id:"widget_…"})` returns HTML, `latest_version` and history. Save the SAME `widget_id`, with `expected_version` from that read and a unique `operation_id`. On `VERSION_CONFLICT`, read and reconcile; never blindly overwrite.
+- `action:"list"` discovers retained widgets even after unpin/chat deletion. `action:"read", version:N` reads history without restoring it.
+- Omitted `widget_id` follows the explicit widget-edit target on the **current user request only**. A later ordinary user request does not inherit that target; pass the permanent `widget_id` explicitly to continue editing. The “Edit with agent” composer target is consumed once when its prefilled request is sent. `create_new:true` deliberately creates a distinct artifact, never an iteration. Return `widget_id` and `version` from js_eval.
+- Reuse `operation_id` only for an identical retry; separate edits need new keys. Top-level tool-call IDs are a fallback; sandbox/js_eval retry chains need explicit stable keys.
+- All users can choose Latest or history independently per mounted view. Latest follows saves; history selection never modifies saved content. Reopened views default to Latest.
+- Manual code saves and `iframe_tool edit_html` append versions too; edit_html requires `expected_version`. `widget_eval` remains runtime-only and never auto-saves.
+
 ## When to Use Widgets
 
 Use `html_widget` when showing:
@@ -28,6 +38,26 @@ Use `html_widget` when showing:
 - CSS is fully isolated - use `<style>` tags freely (the app's design tokens ARE pre-injected, see below)
 - **No external dependencies** - no CDN links, external fonts, or libraries
 - Use vanilla HTML/CSS/JS only
+
+### Live script execution: `widget_eval`
+
+Use `widget_eval` to inspect or modify **one exact live render**, without replacing its HTML or losing its JS/DOM state. This is not a persistent job/event system. Changes are not saved to the widget artifact.
+
+1. Discover mounted copies with `widget_eval({action: "list"})`. Each record has `instance_id`, saved `widget_id`, `surface` (`chat`, `dashboard`, `fullscreen`), `ready`, and `visible`. Select the user's intended copy; never choose an arbitrary same-widget match.
+2. Execute an async function body with `widget_eval({action: "eval", instance_id: "wi_…", code: "await Promise.resolve(); return document.title;", timeout_ms: 10000})`.
+3. Success returns `{success: true, instance_id, result}`. Errors return `{success: false, code, error}` (usually also `instance_id`). Return plain JSON data. Top-level `undefined` becomes `null`; circular values, functions, symbols, BigInt, non-finite numbers, nested `undefined`, DOM nodes and non-JSON class objects are rejected. JSON envelopes and input code are limited to **65,536 UTF-16 characters**; error messages to 1,024 characters. JSON `toJSON` conversions (for example Date → ISO string) follow ordinary JSON semantics.
+
+**Identity/lifecycle:** `instance_id` is a random per-render ID, **not** a saved `widget_…` ID. Chat, dashboard and fullscreen copies of the same widget have different IDs. Reopening, rerendering, navigating, or closing invalidates the old ID. Unavailable/not-ready targets return `INSTANCE_UNAVAILABLE`; there is no saved-ID fallback, auto-recreation, offscreen clone or parked replay. The tool probes connected foreground panels and dispatches only to the owning panel. `window._widgetInstanceId` is exposed inside the widget for convenience, but the parent resolves identity from the actual message source, never a widget claim.
+
+**Origin → background agent:** a widget's `executeTool("start_chat", {message: "Update this widget's progress", background: true})` automatically includes its exact live origin in the new agent message, even without `include_widget`. The background chat stays top-level, so it can target that ID while the render remains mounted. Foreground sends/drafts can close or replace the origin; the agent must report that ID unavailable rather than silently use a different copy.
+
+**Security/limits (v1):** execution requires an identified **top-level chat**. Sub-agents, including full-roster subs, may list but cannot execute (`RESTRICTED_CONTEXT`); unknown callers fail closed. A top-level agent may review worker-proposed code and execute it itself. Normal tool approvals still apply (`widget_eval:list` is read-only; execution uses `widget_eval`), and denial is a hard stop. Code runs only in the manifest-sandboxed widget iframe; no privileged-panel eval or private-token injection. The widget's existing `executeTool` bridge and later asynchronous callbacks keep their ordinary widget attribution/permissions — **there is no per-callback evaluating-agent provenance guarantee**. Do not use this tool to transfer a restricted worker's authority into a widget.
+
+`timeout_ms` is an integer from 100–30,000 (default 10,000), bounding the **response wait, not cancellation**. A synchronous infinite loop may freeze its renderer; a timed-out async script can still mutate state or call tools later. One pending evaluation per render returns `INSTANCE_BUSY` for concurrent calls; after timeout this guard no longer implies the older script stopped. Keep scripts short, await intended work, and do not start persistent loops. Transport discovery/approval waits are separately bounded (60s per panel, 90s execution transport).
+
+### Native fullscreen media
+
+Widget iframe mounts delegate native fullscreen. Call `video.requestFullscreen()` (or a local container's method) **directly from a genuine user click**, and catch rejection to show a useful message. Browser activation/policy still applies: an agent script or synthetic click cannot manufacture user activation. Any nested iframe must also delegate fullscreen. Existing AppAgent fullscreen overlays remain distinct renders; do not add floating buttons to unrelated websites.
 
 ### Design tokens (auto-injected)
 

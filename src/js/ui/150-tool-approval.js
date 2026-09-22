@@ -15,12 +15,15 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
         methodOrAction = args.action;
     } else if (toolName === 'workspace' && args && args.action) {
         methodOrAction = args.action;
-    } else if (toolName === 'document' && args && args.action) {
+    } else if ((toolName === 'document' || toolName === 'widget_eval') && args && args.action) {
         methodOrAction = args.action;
     }
 
+    // Resolve the target chat FIRST: "Allow for this chat" grants are keyed by
+    // root chat, so the permission lookup needs the calling chat id.
+    var targetChatId = options.chatId || activeStreamingChatId || currentChatId;
     var permissionKey = resolvePermissionKey(toolName, methodOrAction);
-    var permission = getToolPermission(toolName, methodOrAction);
+    var permission = getToolPermission(toolName, methodOrAction, targetChatId);
     var displayName = getToolDisplayName(toolName, methodOrAction);
 
     var baseResult = { permission: permission, displayName: displayName, permissionKey: permissionKey };
@@ -59,7 +62,6 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     }
 
     // permission === 'ask' OR (auto + confirm:true) - check if already approved, else prompt
-    var targetChatId = options.chatId || activeStreamingChatId || currentChatId;
     var toolCallId = options.toolCallId || ('prog_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
 
     // Check for existing approval for this toolCallId

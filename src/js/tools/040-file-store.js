@@ -18,6 +18,16 @@ function unregisterFile(fileId) {
     if (fileId) fileIndex.delete(fileId);
 }
 
+// Drop the cached resolution of a workspace pointer after its row was
+// mutated (edit / discard / hydrate / pull). getFileAsync memoizes the first
+// resolution in ptr._resolved; without this, get_file, download cards and
+// `workspace write {file_id}` keep returning the pre-mutation snapshot.
+function invalidateWorkspaceFilePointer(fileId) {
+    if (!fileId) return;
+    var ptr = fileIndex.get(fileId);
+    if (ptr && ptr.type === 'workspace' && ptr._resolved) delete ptr._resolved;
+}
+
 function getFile(fileId) {
     if (!fileId) return null;
 
