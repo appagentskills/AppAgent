@@ -683,8 +683,14 @@ async function executeCachedContentSearch(chatId, args) {
     var query = args.query;
     var searchPath = args.path;
     var offset = args.offset || 0;
-    var maxMatches = args.max_matches || 20;
+    // Always >= 1 so a page can never be empty by construction (H12).
+    var maxMatches = Math.max(1, Math.floor(Number(args.max_matches)) || 20);
     var MAX_RESULT_SIZE = 16000; // ~4k tokens
+    // H12: context lines are clipped to a window around the match so one huge
+    // single-line string (minified JSON, base64, a 100KB log line) can't blow
+    // the per-page size budget on its own.
+    var CTX_RADIUS = 200;
+    var MAX_MATCH_SPAN = 400;
 
     var chat = chats[chatId];
     if (!chat || !chat.cachedToolResults || !chat.cachedToolResults[contentId]) {
@@ -709,16 +715,36 @@ async function executeCachedContentSearch(chatId, args) {
         return { success: false, error: 'Path "' + searchPath + '" not found in cached content' };
     }
 
-    // Create regex from query (always global, user can add (?i) for case-insensitive)
+    // Create regex from query (always global, user can add (?i) for case-insensitive).
+    // M5: JS RegExp has no inline-flag syntax — new RegExp('(?i)x') throws
+    // "Invalid group" — so strip the documented leading (?i) and pass the
+    // `i` flag instead.
     var regex;
+    var _reSource = String(query == null ? '' : query);
+    var _reFlags = 'g';
+    if (/^\(\?i\)/.test(_reSource)) {
+        _reSource = _reSource.slice(4);
+        _reFlags = 'gi';
+    }
     try {
-        regex = new RegExp(query, 'g');
+        regex = new RegExp(_reSource, _reFlags);
     } catch (e) {
         return { success: false, error: 'Invalid regex pattern: ' + e.message };
     }
 
     var allMatches = [];
     var totalMatchesFound = 0;
+
+    // H12: window a (possibly huge) line around [idx, idx+len), with markers
+    // naming how many chars were cut on each side. Short lines pass through.
+    function clipLine(line, idx, len) {
+        len = Math.min(len, MAX_MATCH_SPAN);
+        if (line.length <= len + 2 * CTX_RADIUS) return line;
+        var from = Math.max(0, idx - CTX_RADIUS);
+        var to = Math.min(line.length, idx + len + CTX_RADIUS);
+        return (from > 0 ? '…[' + from + ' chars] ' : '') + line.slice(from, to) +
+            (to < line.length ? ' …[+' + (line.length - to) + ' chars]' : '');
+    }
 
     function searchInValue(val, currentPath) {
         if (typeof val === 'string') {
@@ -729,8 +755,9 @@ async function executeCachedContentSearch(chatId, args) {
             for (var lineNum = 0; lineNum < lines.length; lineNum++) {
                 var line = lines[lineNum];
                 regex.lastIndex = 0;
+                var _hit = regex.exec(line);
 
-                if (regex.test(line) && !matchedLines.has(lineNum)) {
+                if (_hit && !matchedLines.has(lineNum)) {
                     matchedLines.add(lineNum);
                     totalMatchesFound++;
 
@@ -744,7 +771,11 @@ async function executeCachedContentSearch(chatId, args) {
 
                     for (var cl = startLineNum; cl <= endLineNum; cl++) {
                         var prefix = (cl === lineNum) ? '> ' : '  ';
-                        contextLines.push('[L' + (cl + 1) + '] ' + prefix + lines[cl]);
+                        // Match line: window around the hit. Line before: its
+                        // tail (nearest the match). Line after: its head.
+                        var ctxText = (cl === lineNum) ? clipLine(lines[cl], _hit.index, _hit[0].length)
+                            : (cl < lineNum ? clipLine(lines[cl], lines[cl].length, 0) : clipLine(lines[cl], 0, 0));
+                        contextLines.push('[L' + (cl + 1) + '] ' + prefix + ctxText);
                     }
 
                     allMatches.push({
@@ -778,7 +809,10 @@ async function executeCachedContentSearch(chatId, args) {
 
     for (var m = 0; m < allMatches.length && matches.length < maxMatches; m++) {
         var entrySize = JSON.stringify(allMatches[m]).length;
-        if (totalResultSize + entrySize > MAX_RESULT_SIZE) {
+        // H12: always emit at least one match per page so nextOffset strictly
+        // advances (a lone oversized entry used to yield 0 matches with
+        // hasMore:true and nextOffset === offset — paging stuck forever).
+        if (matches.length > 0 && totalResultSize + entrySize > MAX_RESULT_SIZE) {
             sizeLimitReached = true;
             break;
         }

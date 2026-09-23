@@ -255,22 +255,100 @@ async function loadHooksSettings() {
 // F6 boot-race guard: set (per slot) by the 'permissions-update' handler in
 // worker/130-port-bridge.js when a panel edit is applied. If that dispatch
 // lands while the boot-time IDB reads below are still in flight, the earlier
-// read must NOT clobber the fresher edit when it finally resolves — the edit
-// was already applied AND persisted by the handler (single writer).
+// read must NOT clobber the fresher edit when it finally resolves.
 // Slots: toolPermissions / instancePermissions / sessionPermissions (full-map
-// replace — the stale read is SKIPPED) and sessionPermissionsAdditive (a
-// single chat grant landed — the read is MERGED under it; worker/025).
+// replace, already persisted by the handler — the stale read is SKIPPED),
+// toolPermissionsDelta / instancePermissionsDelta (a delta landed on an
+// UNHYDRATED slot and was kept in memory only — the read is MERGED under it,
+// then persisted; see below) and sessionPermissionsAdditive /
+// sessionPermissionsDelta (chat grants — the read is MERGED under them;
+// worker/025).
+// B2c-1: panel 'permissions-update' messages are queued behind this load
+// (self._swPermsLoadP, worker/190-entry.js → _swQueuePermissionsUpdate in
+// worker/130-port-bridge.js), so a delta normally merges onto the HYDRATED
+// map. The loader publishes per-slot hydration in self._swPermsLoaded
+// ({toolPermissions, instancePermissions}: true only once that slot's read
+// SUCCEEDED). Degraded path — the load outlives the 20s safe() deadline, or
+// a getSetting read rejects: the queue then applies a delta-only edit to an
+// UNHYDRATED slot in memory only (no setSetting, no rebroadcast of the partial
+// map) and raises _swPermsDirty.<slot>Delta (+ <slot>Deleted for explicit
+// deletions). When that slot's read finally lands (the late loader read, or
+// the re-read _swPermsHydrateSlot kicks off after a failure) the stored map is
+// merged UNDER memory (memory wins, deletions honoured), then persisted and
+// rebroadcast — mirroring sessionPermissionsDelta (worker/025). A full-map
+// edit raises the plain <slot> flag: memory is authoritative, the late read
+// is SKIPPED, and the edit is persisted immediately as before.
 var _swPermsDirty = {};
+var _swPermsSlotReads = {};   // slot → in-flight getSetting read (dedupe)
+function _swPermsLoadState() {
+    var root = (typeof self !== 'undefined' && self) ? self : null;
+    if (!root) return {};
+    if (!root._swPermsLoaded || typeof root._swPermsLoaded !== 'object') {
+        root._swPermsLoaded = { toolPermissions: false, instancePermissions: false };
+    }
+    return root._swPermsLoaded;
+}
+function _swPermsHydrateApply(slot, saved) {
+    var hasSaved = !!(saved && typeof saved === 'object');
+    if (_swPermsDirty[slot]) return;   // full-map replace landed first → stored map is stale
+    if (!_swPermsDirty[slot + 'Delta']) {
+        if (hasSaved) {
+            if (slot === 'toolPermissions') toolPermissions = saved;
+            else instancePermissions = saved;
+        }
+        return;
+    }
+    // A delta landed on this slot while it was unhydrated (in memory only,
+    // never persisted): merge the stored map UNDER it.
+    var mem = (slot === 'toolPermissions') ? toolPermissions : instancePermissions;
+    if (!mem || typeof mem !== 'object') mem = {};
+    var deleted = (_swPermsDirty[slot + 'Deleted'] && typeof _swPermsDirty[slot + 'Deleted'] === 'object') ? _swPermsDirty[slot + 'Deleted'] : {};
+    if (hasSaved) {
+        Object.keys(saved).forEach(function(k) {
+            if (deleted[k]) return;
+            if (!Object.prototype.hasOwnProperty.call(mem, k)) mem[k] = saved[k];
+        });
+    }
+    if (slot === 'toolPermissions') toolPermissions = mem; else instancePermissions = mem;
+    delete _swPermsDirty[slot + 'Delta'];
+    delete _swPermsDirty[slot + 'Deleted'];
+    if (typeof setSetting === 'function') {
+        try { Promise.resolve(setSetting(slot, mem)).catch(function(e) { console.warn('[sw-runtime] ' + slot + ' merge persist failed', e); }); } catch (e) { console.warn('[sw-runtime] ' + slot + ' merge persist threw', e); }
+    }
+    if (typeof _swPanelPorts !== 'undefined' && _swPanelPorts && typeof _swPanelPorts.forEach === 'function') {
+        var _pc = { type: 'permissions-changed' };
+        _pc[slot] = mem;
+        _swPanelPorts.forEach(function(p) { try { p.postMessage(_pc); } catch (e) { /* dead port */ } });
+    }
+}
+// Read one slot from IDB and hydrate it. Deduped per slot; resolves true on
+// success, false on a rejected read (the slot stays unhydrated so a later
+// delta can retry). Never rejects.
+function _swPermsHydrateSlot(slot) {
+    var st = _swPermsLoadState();
+    if (st[slot] === true) return Promise.resolve(true);
+    if (typeof getSetting !== 'function') { st[slot] = true; return Promise.resolve(true); }
+    if (_swPermsSlotReads[slot]) return _swPermsSlotReads[slot];
+    var readP;
+    try { readP = Promise.resolve(getSetting(slot, null)); } catch (e) { readP = Promise.reject(e); }
+    var p = readP.then(function(saved) {
+        _swPermsSlotReads[slot] = null;
+        _swPermsHydrateApply(slot, saved);
+        st[slot] = true;
+        return true;
+    }, function(e) {
+        _swPermsSlotReads[slot] = null;
+        console.warn('[sw-runtime] ' + slot + ' load failed — slot stays unhydrated (deltas kept in memory)', e);
+        return false;
+    });
+    _swPermsSlotReads[slot] = p;
+    return p;
+}
 async function loadToolPermissionsInWorker() {
-    if (typeof getSetting !== 'function') return;
-    try {
-        var saved = await getSetting('toolPermissions', null);
-        if (saved && typeof saved === 'object' && !_swPermsDirty.toolPermissions) toolPermissions = saved;
-    } catch (e) {}
-    try {
-        var savedI = await getSetting('instancePermissions', null);
-        if (savedI && typeof savedI === 'object' && !_swPermsDirty.instancePermissions) instancePermissions = savedI;
-    } catch (e) {}
+    var st = _swPermsLoadState();
+    await _swPermsHydrateSlot('toolPermissions');
+    await _swPermsHydrateSlot('instancePermissions');
+    return st;
 }
 
 // The final-answer target search for the TL;DR / Links hook gating lives in
@@ -311,6 +389,13 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     var chat = chats[chatId];
     if (!chat || !chat.messages || chat.messages.length < 2) return;
     var _hkAnchor = (typeof anchorUserIdx === 'number') ? anchorUserIdx : undefined;
+    // C4: a WAKE run (anchor row = an injected-only user row — a sub-agent
+    // report / lifecycle / message notice) keeps lastUserMsgIndex as its
+    // per-run anchor (findHookAnswerSpan / relocateAnswerCard rely on it),
+    // but the TL;DR / progress wording covers everything since the user's
+    // last message. Normal runs keep the exact original wording.
+    var _hkAnchorRow = (typeof _hkAnchor === 'number') ? chat.messages[_hkAnchor] : null;
+    var _hkWakeRun = !!(_hkAnchorRow && _hkAnchorRow.role === 'user' && _hkAnchorRow.injected && _hkAnchorRow.hasUserText !== true);
 
     // Auto-title hook. Provisional titles (first-message snippet set by the
     // page's updateChatTitle) still need upgrading to a model-generated title.
@@ -468,16 +553,36 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
             var _progHasCard = false;      // chat has ANY update_action_state call
             var _progTurnUsedTools = false;// the last turn (after the last real user msg) used tools
             var _progSeenBoundary = false;
+            // H19a: tool_call_ids whose result row reports {success:false} —
+            // e.g. update_action_state{state:'done'} rejected while sub-agents
+            // run. Result rows FOLLOW their assistant message, so the backward
+            // walk records them before reaching the call. A rejected call did
+            // not change the card and must not count as its latest state (it
+            // used to suppress the finalize nudge). Mirrors
+            // progressToolResultFailed (tools/120-actions.js, page-only):
+            // non-JSON / non-object content counts as executed.
+            var _progFailedIds = {};
             for (var _pi = chat.messages.length - 1; _pi >= 0; _pi--) {
                 var _pm = chat.messages[_pi];
                 if (!_pm) continue;
-                if (!_progSeenBoundary && _pm.role === 'user' && !_pm.isHookMessage) _progSeenBoundary = true;
+                if (_pm.role === 'tool' && _pm.tool_call_id && typeof _pm.content === 'string') {
+                    var _prc = _pm.content.trim();
+                    if (_prc.charAt(0) === '{') {
+                        try { var _pro = JSON.parse(_prc); if (_pro && typeof _pro === 'object' && _pro.success === false) _progFailedIds[_pm.tool_call_id] = true; } catch (e) {}
+                    }
+                }
+                // C3: the boundary is the last REAL user row (_isRealUserRow,
+                // app/020-api-messages.js) — injected-only notice rows (wake
+                // runs) continue the user's turn.
+                if (!_progSeenBoundary && !_pm.isHookMessage && ((typeof _isRealUserRow === 'function') ? _isRealUserRow(_pm)
+                    : (_pm.role === 'user' && (!_pm.injected || _pm.hasUserText === true)))) _progSeenBoundary = true;
                 if (_pm.role === 'assistant' && Array.isArray(_pm.tool_calls) && _pm.tool_calls.length) {
                     if (!_progSeenBoundary) _progTurnUsedTools = true;
                     if (!_progHasCard) {
                         for (var _pj = _pm.tool_calls.length - 1; _pj >= 0; _pj--) {
                             var _ptc = _pm.tool_calls[_pj];
                             if (_ptc && _ptc.function && _ptc.function.name === 'update_action_state') {
+                                if (_ptc.id && _progFailedIds[_ptc.id]) continue; // rejected — look further back
                                 _progHasCard = true;
                                 try { _progLatestState = (JSON.parse(_ptc.function.arguments || '{}') || {}).state || null; } catch (e) {}
                                 break;
@@ -524,7 +629,7 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     // extra LLM run when more than one is needed.
     var tasks = [];
     if (needsTitle) tasks.push('set a concise chat title (max 50 chars) using the set_chat_title tool');
-    if (needsTldr) tasks.push('provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars)');
+    if (needsTldr) tasks.push('provide a TL;DR of ' + (_hkWakeRun ? 'everything since the user\'s last message' : 'your answer') + ' using the set_tldr tool (1-2 short sentences, max 280 chars)');
     if (needsLinks) tasks.push('provide any relevant links using the set_links tool — call it as set_links({links: [{title, url}, ...]}) for anything the user may want to look into (PRs, diffs, ServiceNow records, docs); pass an empty links array if there is nothing worth linking');
     // Piggyback the OPTIONAL caveat task — only when another hook is already
     // firing (tasks.length > 0) and the retry ceiling isn't hit — and set the
@@ -548,7 +653,7 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     var progressPushed = false;
     var progressTaskNum = 0;
     if (progressWillPush) {
-        tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary; SKIP this call entirely if no substantive work was done (pure conversational answer)');
+        tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary' + (_hkWakeRun ? ' of everything since the user\'s last message' : '') + '; SKIP this call entirely if no substantive work was done (pure conversational answer)');
         progressTarget._progressAsked = true;
         chat._progressHookTries = (chat._progressHookTries || 0) + 1;
         progressPushed = true;

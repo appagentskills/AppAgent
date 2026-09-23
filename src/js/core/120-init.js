@@ -56,8 +56,8 @@ async function init() {
 
     var savedCompactToolCalls = appStorage.getItem('compactToolCalls');
     if (savedCompactToolCalls !== null) compactToolCalls = savedCompactToolCalls === 'true';
-    var compactCheckbox = document.getElementById('compact-tool-calls');
-    if (compactCheckbox) compactCheckbox.checked = compactToolCalls;
+    // The Compact tool calls checkbox is rendered by the settings panel
+    // (ui/040-tools-settings.js) from compactToolCalls; no static element to sync.
 
     var savedScreenshotMethod = appStorage.getItem('screenshotMethod');
     if (savedScreenshotMethod) screenshotMethod = savedScreenshotMethod;
@@ -399,6 +399,8 @@ async function init() {
         else if (text.indexOf('Standalone') !== -1) el.innerHTML = UI_ICONS.externalLink;
         else if (text.indexOf('More') !== -1) el.innerHTML = UI_ICONS.moreHorizontal;
     });
+    // Tinted Icon Chips on every page-toolbar action button (ui/047-toolbar-chips.js)
+    if (typeof applyToolbarChips === 'function') applyToolbarChips(document);
     // Initialize dropdown menu icons
     var moreStandaloneIcon = document.getElementById('more-standalone-icon');
     var moreImportIcon = document.getElementById('more-import-icon');
@@ -926,14 +928,53 @@ function updateSkillsButtonState() {
     if (btn) btn.classList.toggle('active', isOpen);
 }
 
+// Skills page search + Rows/Gallery (shared toolbar helpers: ui/045-page-layout.js).
+var SKILLS_PAGE_LAYOUT_KEY = 'skillsPageLayout'; // 'rows' | 'gallery'
+var skillsPageState = { query: '', gen: 0, searchTimer: null };
+var SKILLS_SEARCH_DEBOUNCE_MS = 150;
+// Debounced: typing a query re-renders once the user pauses, not per keystroke.
+function skillsOnSearchInput(value) {
+    skillsPageState.query = String(value || '').trim().toLowerCase();
+    if (skillsPageState.searchTimer) clearTimeout(skillsPageState.searchTimer);
+    skillsPageState.searchTimer = setTimeout(function() {
+        skillsPageState.searchTimer = null;
+        renderSkillsList();
+    }, SKILLS_SEARCH_DEBOUNCE_MS);
+}
+function skillsSetPageLayout(layout) {
+    pageLayoutSet(SKILLS_PAGE_LAYOUT_KEY, layout);
+    renderSkillsList();
+}
+function skillMatchesQuery(s, q) {
+    if (!q) return true;
+    var tags = Array.isArray(s.tags) ? s.tags.join(' ') : String(s.tags || '');
+    return [s.name, s.id, s.description, tags].some(function(v) { return String(v || '').toLowerCase().indexOf(q) !== -1; });
+}
+
 async function renderSkillsList() {
     var container = document.getElementById('skills-list');
     if (!container) return;
+    var gen = ++skillsPageState.gen;
+    var slot = document.getElementById('skills-toolbar-slot');
+    if (slot && !slot.firstChild && typeof pageToolbarControlsHtml === 'function') {
+        slot.innerHTML = pageToolbarControlsHtml({ placeholder: 'Search skills\u2026', inputClass: 'skills-search-input', onInput: 'skillsOnSearchInput', countId: 'skills-count', layoutFn: 'skillsSetPageLayout' });
+    }
+    var layout = typeof pageLayoutGet === 'function' ? pageLayoutGet(SKILLS_PAGE_LAYOUT_KEY) : 'rows';
+    if (typeof pageLayoutSyncButtons === 'function') pageLayoutSyncButtons(slot, layout);
+    container.className = 'skills-list widget-library-items page-list layout-' + layout;
+    var q = skillsPageState.query;
     // devOnly skills stay invisible in the list outside extension dev mode
     // (isSkillDevHidden, core/140-skills-engine.js).
-    var skillList = Object.values(skills).filter(function(s) {
+    var allSkills = Object.values(skills).filter(function(s) {
         return !(typeof isSkillDevHidden === 'function' && isSkillDevHidden(s.id));
     });
+    var skillList = allSkills.filter(function(s) { return skillMatchesQuery(s, q); });
+    var countEl = slot ? slot.querySelector('.widget-library-count') : null;
+    if (countEl) countEl.textContent = q ? skillList.length + ' of ' + allSkills.length : allSkills.length + (allSkills.length === 1 ? ' skill' : ' skills');
+    if (allSkills.length > 0 && skillList.length === 0) {
+        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.search + '</span><p>No skills match \u201c' + escapeHtml(q) + '\u201d</p><p class="skills-empty-hint">Search looks at skill names, ids, descriptions and tags.</p></div>';
+        return;
+    }
     if (skillList.length === 0) {
         container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>No skills yet</p><p class="skills-empty-hint">Create skills to give your AI agent specialized knowledge.</p></div>';
         return;
@@ -946,6 +987,7 @@ async function renderSkillsList() {
     for (var i = 0; i < skillList.length; i++) {
         skillAssets[skillList[i].id] = await getSkillAssets(skillList[i].id);
     }
+    if (gen !== skillsPageState.gen) return; // a newer render (e.g. next keystroke) superseded this one
     
     skillList.forEach(function(skill) {
         var isActive = !!activeSkills[skill.id];

@@ -699,3 +699,7 @@ AppAgent stores data locally in your browser using **IndexedDB**:
 **Version:** v__VERSION__
 
 **License:** Private and Commercial use. Internal modification permitted. Distribution and resale prohibited. All rights reserved.
+
+## Changelog {#changelog}
+
+__CHANGELOG__

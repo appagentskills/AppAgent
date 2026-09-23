@@ -855,7 +855,7 @@ function renderMessages() {
     var processedAttachments = {};
 
     var usedSubMessages = []; // One standalone callout suppresses only its paired lifecycle notice.
-    var mappedParts = chat.messages.map(function(msg, index) {
+    var _renderOneMessagePart = function(msg, index) {
         // MEMWIN: out-of-window messages produce NO markup (not even a hidden
         // placeholder div). winStart sits on a turn boundary, so attachment
         // groups and compact-mode blocks never straddle the cut.
@@ -929,7 +929,9 @@ function renderMessages() {
             // If the message was cached (long paste), show a collapsed scrollable preview with an expand toggle.
             var userBodyHtml;
             var isSubNoticeRow = false;
-            if (msg.cachedContentId) {
+            // SUB-NOTICE-META (B part 2b): an injected notice row that was
+            // cached before 020 stopped caching them renders as cards below.
+            if (msg.cachedContentId && !(typeof _isInjectedSubNoticeRow === 'function' && _isInjectedSubNoticeRow(msg))) {
                 var sizeKB = Math.round((msg.content || '').length / 1024);
                 var lines = (msg.content || '').split('\n').length;
                 var expanded = !!userMsgExpandedState[(currentChatId || '_') + ':' + index];
@@ -956,7 +958,7 @@ function renderMessages() {
                 // bubble; mixed injected rows (notice coalesced with other
                 // queued text) keep non-notice segments on the normal path.
                 var subNoticeHtml = (msg.injected && typeof renderSubReportNotices === 'function')
-                    ? renderSubReportNotices(rawUser, chat.messages.slice(winStart, index), usedSubMessages) : null;
+                    ? renderSubReportNotices(rawUser, chat.messages.slice(winStart, index), usedSubMessages, msg.subNotices) : null;
                 if (subNoticeHtml === '') return '<div id="msg-' + index + '" hidden></div>';
                 if (subNoticeHtml != null) {
                     isSubNoticeRow = true;
@@ -1449,6 +1451,21 @@ function renderMessages() {
             return '<div class="message parked-tool" id="msg-' + index + '">' + escapeHtml(parkedContent) + '</div>';
         }
         return '';
+    };
+    // H1: isolate per-message render failures. One malformed row (e.g. a
+    // prompt_user with bad fields, a corrupt tool_call) used to throw out of
+    // this map, so EVERY later renderMessages() threw and the whole transcript
+    // stayed broken. Now the bad row degrades to a small escaped error row
+    // (keeps id="msg-<index>" so scroll/incremental-render alignment holds).
+    var mappedParts = chat.messages.map(function(msg, index) {
+        try {
+            return _renderOneMessagePart(msg, index);
+        } catch (e) {
+            try { console.warn('[renderMessages] message ' + index + ' failed to render:', e); } catch (_) {}
+            var role = (msg && typeof msg.role === 'string') ? msg.role : 'unknown';
+            return '<div class="message render-error" id="msg-' + index + '"><div class="sdoc-error">⚠ Could not render this ' +
+                escapeHtml(role) + ' message: ' + escapeHtml(String((e && e.message) || e).slice(0, 200)) + '</div></div>';
+        }
     });
     // MEMWIN: "Show earlier messages" notice above the windowed tail. Kept out
     // of mappedParts so msg-index alignment is preserved; the R1 fast path
@@ -2117,8 +2134,25 @@ function formatContent(content) {
     var documentBlocks = [];
     // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids
     // ([a-z0-9_]) — the class below covers both; hyphen kept for safety.
+    // H14: renderDocumentPlaceholder → sdocRender → sdocRenderContent →
+    // formatContent(doc.currentContent) re-enters here, so a doc embedding
+    // itself (or A→B→A) recursed until stack overflow. Track the docs being
+    // rendered + cap nesting depth (3). The stack lives ON the function
+    // (formatContent._docStack) so it is shared across re-entrant calls and
+    // survives tests that slice formatContent out of this file on its own.
+    var _docStack = formatContent._docStack || (formatContent._docStack = []);
     html = html.replace(/<!--document:([A-Za-z0-9_-]+)-->/g, function(match, docId) {
-        var rendered = typeof renderDocumentPlaceholder === 'function' ? renderDocumentPlaceholder(docId) : '<div class="sdoc-error">Document: ' + docId + '</div>';
+        var rendered;
+        if (_docStack.indexOf(docId) !== -1 || _docStack.length >= 3) {
+            var why = _docStack.indexOf(docId) !== -1 ? 'recursive document reference' : 'document nesting too deep';
+            rendered = '<span class="sdoc-error sdoc-recursive-ref" data-doc-ref="' + escapeHtml(docId) + '">↻ ' + why + ': ' + escapeHtml(docId) + '</span>';
+        } else if (typeof renderDocumentPlaceholder === 'function') {
+            _docStack.push(docId);
+            try { rendered = renderDocumentPlaceholder(docId); }
+            finally { _docStack.pop(); }
+        } else {
+            rendered = '<div class="sdoc-error">Document: ' + escapeHtml(docId) + '</div>';
+        }
         documentBlocks.push(rendered);
         return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
     });
@@ -2559,7 +2593,12 @@ function renderQueuedUserBubble(container) {
     // ride pendingInjectionsByChatId) — give the optimistic bubble the same
     // designed-callout treatment as the flushed row so it doesn't flash
     // plain-blob first (renderSubReportNotices, 175-sub-agent-ui.js).
-    var _qNoticeHtml = (text && typeof renderSubReportNotices === 'function') ? renderSubReportNotices(text) : null;
+    // SUB-NOTICE-META (B part 2b): the entry's subNotices + the chat rows
+    // (sub_msg dedupe), same as the flushed row. '' = every notice is
+    // already shown as a standalone callout — no text bubble.
+    var _qNoticeHtml = (text && typeof renderSubReportNotices === 'function')
+        ? renderSubReportNotices(text, (_qChat && _qChat.messages) || [], [], entry.subNotices) : null;
+    if (_qNoticeHtml === '' && images.length === 0) return;
     bubble.className = 'message user queued' + (_qNoticeHtml != null ? ' sub-notice-msg' : '');
     var inner = '<div class="message-content">';
     if (text) {

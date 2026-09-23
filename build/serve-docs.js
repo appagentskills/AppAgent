@@ -5,14 +5,21 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { applyDocsPlaceholders } = require('./docs-placeholders');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const ROOT = path.join(REPO_ROOT, 'docs');
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const MANIFEST_SRC = path.join(REPO_ROOT, 'src', 'platform', 'extension', 'manifest.json');
+const CHANGELOG_SRC = path.join(REPO_ROOT, 'changelog.md');
 
 function readVersion() {
     try { return JSON.parse(fs.readFileSync(MANIFEST_SRC, 'utf-8')).version || ''; }
+    catch (e) { return ''; }
+}
+
+function readChangelog() {
+    try { return fs.readFileSync(CHANGELOG_SRC, 'utf-8'); }
     catch (e) { return ''; }
 }
 
@@ -51,12 +58,13 @@ const server = http.createServer((req, res) => {
             'Cache-Control': 'no-cache',
         };
 
-        // Substitute __VERSION__ on the fly when serving documentation.md.
-        // github pages won't do this — it serves static files raw — so the
+        // Substitute __VERSION__ and __CHANGELOG__ on the fly when serving
+        // documentation.md. github pages won't do this — it serves static
+        // files raw (the Pages workflow substitutes before upload) — so the
         // committed source can stay placeholder'd and dev preview shows the
-        // current manifest version without keeping a duplicate file around.
+        // current manifest version + changelog without a duplicate file.
         if (urlPath === '/documentation.md') {
-            const md = fs.readFileSync(resolved, 'utf-8').split('__VERSION__').join(readVersion());
+            const md = applyDocsPlaceholders(fs.readFileSync(resolved, 'utf-8'), readVersion(), readChangelog());
             res.writeHead(200, headers);
             res.end(md);
             return;

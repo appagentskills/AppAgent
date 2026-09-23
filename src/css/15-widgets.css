@@ -148,5 +148,10 @@ details.tool-call.highlight-flash, details.tool-result.highlight-flash { animati
 .sn-artifact-icon-btn.danger:hover { background: var(--danger-lighter); border-color: var(--danger-light); color: var(--danger); }
 .sn-artifact-icon-btn svg, .sn-artifact-icon-btn .ui-icon { width: 14px; height: 14px; }
 
-/* Every saved-widget render exposes non-destructive revision selection. */
-.widget-version-picker { display:block; max-width:100%; margin:4px; padding:3px 6px; font:inherit; font-size:11px; color:var(--text-primary); background:var(--bg-main); border:1px solid var(--border); border-radius:4px; position:relative; z-index:1; }
+/* Non-destructive revision selection, mounted in the widget HEADER button
+   group (never a content row; headerless surfaces get none). Sized to the
+   28px .widget-ctrl-btn (26px in dashboard card controls). */
+.widget-version-picker { height: 28px; min-width: 0; max-width: 160px; flex-shrink: 1; padding: 0 var(--space-3); font: inherit; font-size: var(--text-caption); color: var(--text-secondary); background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); cursor: pointer; text-overflow: ellipsis; transition: all var(--transition-fast); }
+.widget-version-picker:hover { border-color: var(--primary-light); color: var(--primary); }
+.widget-version-picker:focus-visible { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-lighter); }
+.dashboard-widget-controls .widget-version-picker { height: 26px; border-radius: var(--radius-sm); }

@@ -1578,6 +1578,7 @@
     margin: 0 3px;
 }
 .jobs-row-bell svg { width: 15px; height: 15px; }
+.jobs-row-bell.err { color: var(--danger, #dc2626); }
 /* When a dot/bell is rendered inside the 28px icon slot (Active-tab rows), drop
    the dot's own side margins so it stays centered. */
 .jobs-row-icon .jobs-row-dot { margin: 0; }

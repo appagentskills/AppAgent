@@ -31,6 +31,7 @@
 //   Handles.awaitAny(chatId, handleIds, timeoutMs) -> Promise<{handle, snapshot}>
 //   Handles.awaitAll(chatId, handleIds, timeoutMs) -> Promise<snapshot[]>
 //   Handles.cancel(chatId, handleId, reason) -> { ok, status, error? }
+//   Handles.cancelAwaitersForChat(chatId) -> number of awaiters stopped
 // =============================================================
 
 var HANDLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h after settle
@@ -293,33 +294,68 @@ function _poll(chatId, handleId) {
 // Returns a promise that resolves with the snapshot when the handle settles,
 // or when the timeout elapses (snapshot will still show status:'pending' in
 // that case). The caller decides whether timeout is an error.
-function _await(chatId, handleId, timeoutMs) {
+// Remove one awaiter callback from a pending entry (no-op when absent or the
+// entry already drained). A caller that stopped waiting — await timeout, or an
+// await_any loser — must NOT stay registered: `entry.awaiters.length` is read
+// by the sub-agent registry (_spawnHandleHasAwaiters) as "a parent is blocked
+// on this spawn handle right now", and a stale callback there made
+// _wakeParentOnReport skip the parent wake/notice forever (H16).
+function _removeAwaiter(e, fn) {
+    if (!e || !Array.isArray(e.awaiters)) return;
+    var idx = e.awaiters.indexOf(fn);
+    if (idx !== -1) e.awaiters.splice(idx, 1);
+}
+
+// Internal cancellable await. Returns { promise, cancel }: cancel() resolves
+// the promise with the current snapshot AND deregisters the awaiter.
+function _awaitCancellable(chatId, handleId, timeoutMs) {
     _gcSweep();
     var e = _getEntry(chatId, handleId);
     if (!e) {
-        return Promise.resolve({ handle: handleId, status: 'unknown', error: 'unknown handle: ' + handleId });
+        return { promise: Promise.resolve({ handle: handleId, status: 'unknown', error: 'unknown handle: ' + handleId }), cancel: function() {} };
     }
     if (e.status !== 'pending') {
-        return Promise.resolve(_snapshot(e));
+        return { promise: Promise.resolve(_snapshot(e)), cancel: function() {} };
     }
-    return new Promise(function(resolve) {
-        var settled = false;
-        function done(snap) {
-            if (settled) return;
-            settled = true;
-            resolve(snap);
-        }
+    var settled = false;
+    var resolveFn = null;
+    var timer = null;
+    function done(snap) {
+        if (settled) return;
+        settled = true;
+        // H16 follow-up (a): disarm the timeout timer on EVERY exit (settle,
+        // cancel, chat interrupt) so it does not linger until timeoutMs.
+        if (timer != null) { try { clearTimeout(timer); } catch (_) {} timer = null; }
+        resolveFn(snap);
+    }
+    function stopWaiting() {
+        if (settled) return;
+        // The caller gave up (timeout / lost an await_any race / its chat was
+        // interrupted or paused). The underlying work may still settle later —
+        // that's fine, the entry keeps its promise — but this callback must
+        // leave entry.awaiters so nobody mistakes it for a live, blocked waiter.
+        _removeAwaiter(e, done);
+        done(_snapshot(e));
+    }
+    // H16 follow-up (b): tag the awaiter with the AWAITING chat (handles are
+    // per-chat scoped, so the chatId passed here IS the caller's chat — the
+    // tools/020 dispatch passes options.chatId === the agent loop's
+    // streamingChatId) and its cancel fn, so cancelAwaitersForChat can drop
+    // it when executeToolWithInterrupt abandons the await.
+    done._chatId = _resolvedChatId(chatId);
+    done._stop = stopWaiting;
+    var promise = new Promise(function(resolve) {
+        resolveFn = resolve;
         e.awaiters.push(done);
         if (typeof timeoutMs === 'number' && timeoutMs > 0) {
-            setTimeout(function() {
-                if (settled) return;
-                // Don't remove from awaiters — the underlying promise might
-                // still settle later and that's fine. Just resolve with the
-                // current (pending) snapshot.
-                done(_snapshot(e));
-            }, timeoutMs);
+            timer = setTimeout(stopWaiting, timeoutMs);
         }
     });
+    return { promise: promise, cancel: stopWaiting };
+}
+
+function _await(chatId, handleId, timeoutMs) {
+    return _awaitCancellable(chatId, handleId, timeoutMs).promise;
 }
 
 // Return shape is uniform: always `{ handle, snapshot, timeout, pendingSnapshots? }`.
@@ -350,30 +386,57 @@ function _awaitAny(chatId, handleIds, timeoutMs) {
     }
     return new Promise(function(resolve) {
         var settled = false;
+        var waits = [];
+        var outerTimer = null;
+        var lost = 0;
+        function clearOuter() {
+            if (outerTimer != null) { try { clearTimeout(outerTimer); } catch (_) {} outerTimer = null; }
+        }
+        function finishNoWinner() {
+            if (settled) return;
+            settled = true;
+            clearOuter();
+            var snaps = handleIds.map(function(h) { return _poll(chatId, h); });
+            resolve({ handle: null, snapshot: null, timeout: true, pendingSnapshots: snaps });
+            cancelAll();
+        }
+        // Deregister every still-pending per-handle waiter (the losers) so
+        // they don't linger in entry.awaiters after the race is over (H16).
+        function cancelAll() {
+            for (var ci = 0; ci < waits.length; ci++) {
+                try { waits[ci].cancel(); } catch (_) { /* ignore */ }
+            }
+        }
         function pick(snap, handleId) {
             if (settled) return;
             settled = true;
+            clearOuter(); // H16 follow-up (a): no armed outer timer after a win
             resolve({ handle: handleId, snapshot: snap, timeout: false });
+            cancelAll();
         }
         for (var i = 0; i < known.length; i++) {
             (function(hid) {
-                _await(chatId, hid, timeoutMs).then(function(snap) {
+                var w = _awaitCancellable(chatId, hid, timeoutMs);
+                waits.push(w);
+                w.promise.then(function(snap) {
                     // Only "win" on a genuinely terminal status. Pending
                     // snapshots (timeout fire-throughs) and unknown snapshots
                     // (raced GC) must not win while a real handle is pending.
                     if (snap && snap.status && snap.status !== 'pending' && snap.status !== 'unknown') {
                         pick(snap, hid);
+                    } else if (++lost >= known.length) {
+                        // Every per-handle waiter gave up without a winner
+                        // (their timeouts fired, or cancelAwaitersForChat
+                        // stopped them on interrupt/pause). Resolve now —
+                        // with timeout_ms 0 there is no outer timer, and the
+                        // tools/020 `finally` (unparkAfterAwait) must run.
+                        finishNoWinner();
                     }
                 });
             })(known[i]);
         }
-        if (typeof timeoutMs === 'number' && timeoutMs > 0) {
-            setTimeout(function() {
-                if (settled) return;
-                settled = true;
-                var snaps = handleIds.map(function(h) { return _poll(chatId, h); });
-                resolve({ handle: null, snapshot: null, timeout: true, pendingSnapshots: snaps });
-            }, timeoutMs);
+        if (!settled && typeof timeoutMs === 'number' && timeoutMs > 0) {
+            outerTimer = setTimeout(finishNoWinner, timeoutMs);
         }
     });
 }
@@ -446,6 +509,35 @@ function _cancel(chatId, handleId, reason) {
     return { ok: true, status: 'cancelled', reason: e.cancelReason };
 }
 
+// H16 follow-up (b): stop every awaiter registered BY `chatId` (tagged in
+// _awaitCancellable). Called from executeToolWithInterrupt's interrupt
+// resolver (app/030) — an interrupt/pause abandons the await_handle promise,
+// and with timeout_ms 0 its `done` callback would otherwise stay in
+// entry.awaiters forever, so _spawnHandleHasAwaiters kept reporting "parent
+// blocked" and _wakeParentOnReport skipped the wake (notice lost). Each
+// stopped awaiter resolves with the current (pending) snapshot, which lets
+// the abandoned tools/020 wrapper run its `finally` (unparkAfterAwait).
+// Returns the number of awaiters stopped. Handles are per-chat scoped, so
+// only that chat's bucket can hold its awaiters.
+function _cancelAwaitersForChat(chatId) {
+    var cid = _resolvedChatId(chatId);
+    var bucket = _handles[cid];
+    if (!bucket) return 0;
+    var n = 0;
+    for (var hid in bucket) {
+        var e = bucket[hid];
+        if (!e || !Array.isArray(e.awaiters) || !e.awaiters.length) continue;
+        var aws = e.awaiters.slice();
+        for (var i = 0; i < aws.length; i++) {
+            var fn = aws[i];
+            if (fn && fn._chatId === cid && typeof fn._stop === 'function') {
+                try { fn._stop(); n++; } catch (_) { /* ignore */ }
+            }
+        }
+    }
+    return n;
+}
+
 // Active count of pending handles for a chat. Used by `agent_status` (future
 // Phase 2) and could be surfaced in UI as a "Workers" strip.
 function _pendingCount(chatId) {
@@ -484,7 +576,8 @@ var Handles = {
     cancel: _cancel,
     errorWith: _settleError,
     pendingCount: _pendingCount,
-    markAwaitingApproval: _markAwaitingApproval
+    markAwaitingApproval: _markAwaitingApproval,
+    cancelAwaitersForChat: _cancelAwaitersForChat
 };
 
 // Expose for SW context too (worker bundle runs as a module/script).

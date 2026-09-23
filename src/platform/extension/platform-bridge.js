@@ -118,7 +118,7 @@
         if (_activeRolesFetchedFor === inst.url) return;
         _activeRolesFetchedFor = inst.url;
         var url = inst.url + '/api/now/table/sys_user_has_role'
-            + '?sysparm_query=user=javascript:gs.getUserID()'
+            + '?sysparm_query=user=javascript:gs.getUserID()^inherited=false'
             + '&sysparm_fields=role.name'
             + '&sysparm_limit=500';
         _origFetch.call(window, url, {

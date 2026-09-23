@@ -2,6 +2,14 @@
 // entry point — reads the message-input field, mutates the chat, and kicks
 // off runAgent. Lives with the other send-message helpers; behavior is
 // unchanged.
+// F4: page twin of _SW_STOP_PHRASE_RE (worker/120-tool-routing.js — SW-only
+// bundle, so it can't be shared directly). MUST stay byte-identical; enforced
+// by test/minor-fixes-952-followups.test.js.
+var _PAGE_STOP_PHRASE_RE = /^\s*(?:stop|cancel|abort|halt|wait|hold\s+on|no\s+thanks|no|nope|(?:don['\u2019]?t|do\s+not)(?:\s+do)?)(?:\s+(?:it|that|this))?\s*[.!,]*\s*$/i;
+function _pageIsStopPhrase(text) {
+    return typeof text === 'string' && _PAGE_STOP_PHRASE_RE.test(text);
+}
+
 async function sendMessage() {
     var input = document.getElementById('message-input');
     var message = input.value.trim();
@@ -48,7 +56,14 @@ async function sendMessage() {
         pendingInjectionImages = _mergedImages.length > 0 ? _mergedImages : null;
         // Key the per-chat map by the chat the user is actually typing in — not by
         // activeStreamingChatId, which may point to a different (background) chat.
-        pendingInjectionsByChatId[currentChatId] = { text: pendingInjection, images: pendingInjectionImages };
+        // SUB-NOTICE-META: keep the entry's other fields (subNotices, …) and
+        // flag real user text — a fresh object, so _f9PrevEntry stays intact.
+        var _nextEntry = {};
+        if (_existing && typeof _existing === 'object') Object.keys(_existing).forEach(function(k) { _nextEntry[k] = _existing[k]; });
+        _nextEntry.text = pendingInjection;
+        _nextEntry.images = pendingInjectionImages;
+        if (_newText) _nextEntry.hasUserText = true;
+        pendingInjectionsByChatId[currentChatId] = _nextEntry;
         clearPendingImages();
         input.value = '';
         input.style.height = 'auto';
@@ -85,6 +100,11 @@ async function sendMessage() {
                 if (_pm && _pm.role === 'prompt_user') { _ansViaChat = (_pm.status === 'pending'); break; }
             }
         }
+        // F4: a STOP PHRASE against a pending prompt is a CANCEL on the SW
+        // (_swAnswerPendingPromptViaChat settles it cancelled and the interrupt
+        // lane runs) — mirror that here so the feedback isn't "answer sent".
+        var _cancelViaChat = _ansViaChat && _pageIsStopPhrase(message);
+        if (_cancelViaChat) _ansViaChat = false;
         if (!_ansViaChat) {
             userInterruptedChats[currentChatId] = true;
             var ac = currentStreamAbortControllers[currentChatId];
@@ -220,10 +240,12 @@ async function sendMessage() {
             delete _silentHookChats[currentChatId];
         }
         // Update spinner immediately so the user sees instant acknowledgement.
-        showSpinner(_ansViaChat ? 'Answer sent to the pending question…' : 'Interrupting…', currentChatId);
+        showSpinner(_ansViaChat ? 'Answer sent to the pending question…'
+            : (_cancelViaChat ? 'Cancelling the pending question…' : 'Interrupting…'), currentChatId);
         // Re-render so the queued bubble appears immediately under the chat.
         renderMessages();
-        showSnackbar(_ansViaChat ? 'Message sent as the answer to the pending question.' : 'Message sent — interrupting current step.');
+        showSnackbar(_ansViaChat ? 'Message sent as the answer to the pending question.'
+            : (_cancelViaChat ? 'Pending question cancelled — interrupting current step.' : 'Message sent — interrupting current step.'));
         return;
     }
 

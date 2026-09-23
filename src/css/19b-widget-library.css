@@ -17,7 +17,14 @@
 
 .widget-library-items { flex: 1; overflow-y: auto; padding: var(--space-8); padding-bottom: 120px; }
 .widget-library-items.layout-rows { display: flex; flex-direction: column; gap: var(--space-4); }
-.widget-library-items.layout-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--space-4); align-content: start; }
+/* grid-auto-rows: max-content is REQUIRED, not cosmetic. This list is a flex:1 child of a column
+   flex box, so it has a DEFINITE height, and every gallery card is overflow:hidden (a scroll
+   container), so its automatic min-height is 0. With the default `auto` rows the grid then sizes
+   each row from that 0 minimum and only hands out the container's remaining free space — N rows
+   are squeezed into one viewport (~43px each with ~60 widgets) instead of overflowing and
+   scrolling, clipping the thumb to a strip and the caption away entirely. max-content rows always
+   take the card's full height (16:10 thumb + caption) and the list scrolls. */
+.widget-library-items.layout-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); grid-auto-rows: max-content; gap: var(--space-4); align-content: start; }
 .widget-library-empty { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 300px; color: var(--text-muted); text-align: center; padding: var(--space-12); }
 .widget-library-empty .ui-icon { width: 48px; height: 48px; margin-bottom: var(--space-8); opacity: 0.5; }
 .widget-library-empty p { margin: 0; font-size: var(--text-body-lg); }
@@ -30,13 +37,12 @@
    Every child (placeholder, overlay, ::after click-catcher, the injected iframe with inline
    position:absolute; width:250%; height:250%; transform:scale(.4)) is absolutely positioned, so the
    box gets NO height from content: rows give it an explicit 160x100, gallery uses the padding-top
-   trick (see below). Do NOT switch the gallery back to aspect-ratio on a flex item — Chrome sized
-   the grid row from an intrinsic pass where the percent-width flex item resolved to 0 height, so
-   every card collapsed to the caption height and overflow:hidden clipped the caption away. */
+   trick (see below). The gallery's squeezed-cards bug was really the grid rows shrinking to fit
+   the list's definite height (see the grid-auto-rows note on .layout-gallery above) — keep
+   grid-auto-rows: max-content whatever technique sizes the thumb. */
 .widget-library-thumb { position: relative; overflow: hidden; box-sizing: border-box; background: var(--bg-code); cursor: pointer; border-radius: var(--radius-md); flex-shrink: 0; outline: none; }
 .widget-library-thumb:focus-visible { box-shadow: 0 0 0 2px var(--primary); }
 .widget-library-thumb iframe { pointer-events: none; }
-.widget-library-thumb .widget-version-picker { display: none; }
 .widget-library-thumb::after { content: ''; position: absolute; inset: 0; z-index: 1; }
 .widget-library-thumb-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
 .widget-library-thumb-placeholder .ui-icon { width: 24px; height: 24px; opacity: 0.5; }

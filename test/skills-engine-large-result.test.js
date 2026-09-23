@@ -20,6 +20,7 @@ describe('skills engine large result handling (140-skills-engine.js)', function(
         m.__scope.currentChatId = 'chat-x';
         m.__scope.Platform = { isWorker: true, callOffscreenHelper: async function() { return swResult; } };
         m.skillTools['sk'] = { big_tool: { code: 'async function big_tool(){}', name: 'big_tool', definition: {} } };
+        m.__scope.activeSkills = { sk: {} }; // H20: skill tools only run while their skill is active
         return stored;
     }
     test('SW path, non-sandbox caller: full result returned (no preview), stored for js_eval, notice mentions both channels', async function() {

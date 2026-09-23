@@ -6,7 +6,9 @@ actions:
     icon: stats
     show: [home]
 ---
-# ServiceNow Eval (v6.1)
+# ServiceNow Eval (v6.2)
+
+**v6.2 (2026-09-23) — T3 portability fix:** T3 setup now picks the incident↔problem link field per run (`incident.problem_id` if valid, else `problem.first_reported_by_task`, else `problem.parent`) and publishes it in `x_eval.h3.link`; emits `{infra:true}` if none exists. Verifier uses `getValue()||''` (no `'undefined'` on missing fields), checks the link on the chosen side, and compares traps against seed-time mod counts/link values. Cleanup handles both link modes.
 
 **v6.1 (2026-07-26) — task-spec hardening, spec v3 (saturation fix):** tasks.md fully rewritten to de-saturate the suite (45→68 pts; task count, IDs and categories unchanged): prompts state goals instead of grader literals — key values are derived per run from seeded `x_eval.hN.*` properties; every task seeds near-miss distractors whose lazy handling produces a WRONG end state, backed by negative asserts (population counts + untouched-record `sys_mod_count` checks against a grader-private `x_eval.tN.seed` snapshot); scripted artifacts are graded by EXECUTION (T4 hidden edges + correct-looking decoy include, T6 BR probed on both branches and on update, T9 widget server script evaluated against a verify-time perturbed population, T10 attachment content read back byte-exact). Zero runner/harness changes.
 
@@ -24,7 +26,7 @@ A 20-task evaluation suite that scores whether the current model can perform rep
 |----|----------|--------|---------------|
 | T1 | read | 2 | Filtered counting among active/priority/marker-space distractors; population + untouched asserts |
 | T2 | write | 3 | Record creation from property-derived token; email near-miss caller; OOB impact/urgency priority engine |
-| T3 | link | 3 | Selecting the one qualifying incident among traps; problem link; traps must stay unlinked/untouched |
+| T3 | link | 3 | Selecting the one qualifying incident among traps; problem link via the per-run field in `x_eval.h3.link`; traps must stay unlinked/untouched |
 | T4 | debug | 5 | Fixing a subtly buggy script include; 7 executed hidden edge cases; correct-looking decoy must stay untouched |
 | T5 | batch | 4 | Selective batch resolve (active, state<6, category!=network) with per-record close notes; trap rows untouched |
 | T6 | business_rule | 4 | Insert-only conditional BR graded behaviorally: match/non-match inserts + no-fire-on-update probe |

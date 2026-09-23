@@ -69,13 +69,9 @@
                 <input type="checkbox" id="show-api-stats" onchange="toggleApiStats()"/>
                 <span>Show API call statistics</span>
             </label>
-            <label class="settings-checkbox">
-                <input type="checkbox" id="compact-tool-calls" checked="checked" onchange="toggleCompactToolCalls()"/>
-                <span>Compact tool calls (collapse all in one area)</span>
-            </label>
-            <label class="settings-checkbox">
+            <label class="settings-checkbox" title="Keep the display awake during active tasks and after 5 minutes of inactivity">
                 <input type="checkbox" id="keep-awake-checkbox" checked="checked" onchange="toggleKeepAwake(this.checked)"/>
-                <span>Keep display awake during active tasks and after 5 minutes of inactivity</span>
+                <span>Keep screen awake</span>
             </label>
         </div>
         <div class="settings-panel-footer">
@@ -155,10 +151,11 @@
         </main>
         <div class="skills-panel" id="skills-panel" style="display:none;">
             <div class="skills-list-panel" id="skills-list-panel">
-                <div class="skills-header">
+                <div class="skills-header page-toolbar">
                     <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="skills-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                    <span class="skills-title">Agent Skills</span>
-                    <div class="skills-actions">
+                    <span class="skills-title page-toolbar-title">Agent Skills</span>
+                    <div class="page-toolbar-slot" id="skills-toolbar-slot"></div>
+                    <div class="skills-actions page-toolbar-actions">
                         <span class="skills-action-wrapper">
                             <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-import-dropdown')" title="Import Skills" aria-haspopup="true"><span class="action-icon"></span>Import<span class="dropdown-caret" aria-hidden="true">▾</span></button>
                             <div class="sn-dropdown" id="skills-import-dropdown">
@@ -233,9 +230,10 @@
             </div>
         </div>
         <div class="dashboard-panel" id="dashboard-panel" style="display:none;">
-            <div class="dashboard-header">
+            <div class="dashboard-header page-toolbar">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="dashboard-title">Dashboard</span>
+                <span class="dashboard-title page-toolbar-title">Dashboard</span>
+                <div class="page-toolbar-slot" id="dashboard-toolbar-slot"></div>
                 <div class="dashboard-actions" id="dashboard-actions">
                     <div class="segmented-toggle dashboard-mode-toggle" role="group" aria-label="Dashboard page mode">
                         <button type="button" class="dashboard-mode-btn active" data-mode="dashboard" aria-pressed="true" onclick="setDashboardPageMode('dashboard')" title="Pinned widgets grid">Dashboard</button>
@@ -262,7 +260,7 @@
             <canvas class="home-trail-canvas" id="home-trail-canvas"></canvas>
             <div class="home-header">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="home-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="home-title">New Chat</span>
+                <span class="home-title" aria-hidden="true"></span>
                 <div class="header-controls">
                     <div class="header-actions" id="home-header-actions"></div>
                     <span class="ext-status ext-sn-status" id="home-ext-sn-status" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
@@ -297,25 +295,34 @@
             </div>
         </div>
         <div class="settings-page-panel" id="settings-page-panel" style="display:none;">
-            <div class="settings-page-header">
+            <div class="settings-page-header page-toolbar">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="settings-page-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="settings-page-title">Settings</span>
+                <span class="settings-page-title page-toolbar-title">Settings</span>
+                <div class="page-toolbar-slot" id="settings-toolbar-slot"></div>
+                <div class="skills-actions page-toolbar-actions">
+                    <button class="skills-action-btn" onclick="importAllData()" title="Import Data"><span class="action-icon" id="settings-import-icon"></span>Import Data</button>
+                    <button class="skills-action-btn" onclick="exportAllData()" title="Export Data"><span class="action-icon" id="settings-export-icon"></span>Export Data</button>
+                </div>
             </div>
             <div class="settings-page-content" id="settings-page-content"></div>
         </div>
         <div class="docs-panel" id="docs-panel" style="display:none;">
-            <div class="docs-header">
+            <div class="docs-header page-toolbar">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="docs-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="docs-title">Documentation</span>
-                <button class="skills-action-btn" onclick="downloadDocsAsMarkdown()" title="Download as Markdown"><span class="action-icon" id="docs-download-icon"></span>Download</button>
+                <span class="docs-title page-toolbar-title">Help &amp; Documentation</span>
+                <div class="page-toolbar-slot" id="docs-toolbar-slot"></div>
+                <div class="skills-actions page-toolbar-actions">
+                    <button class="skills-action-btn" onclick="downloadDocsAsMarkdown()" title="Download as Markdown"><span class="action-icon" id="docs-download-icon"></span>Download</button>
+                </div>
             </div>
             <div class="docs-content" id="docs-content"></div>
         </div>
         <div class="documents-panel" id="documents-panel" style="display:none;">
-            <div class="documents-header">
+            <div class="documents-header page-toolbar">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="documents-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="documents-title">Smart Documents</span>
-                <div class="skills-actions">
+                <span class="documents-title page-toolbar-title">Smart Documents</span>
+                <div class="page-toolbar-slot" id="documents-toolbar-slot"></div>
+                <div class="skills-actions page-toolbar-actions">
                     <button class="skills-action-btn" onclick="importDocuments()" title="Import Documents"><span class="action-icon" id="docs-import-icon"></span>Import</button>
                     <button class="skills-action-btn" onclick="exportAllDocuments()" title="Export All Documents"><span class="action-icon" id="docs-export-icon"></span>Export</button>
                     <button class="skills-action-btn primary" onclick="sdocCreateFromPage()" title="Create New Document"><span class="action-icon" id="docs-create-icon"></span>New Document</button>
@@ -324,19 +331,22 @@
             <div class="documents-list" id="documents-list"></div>
         </div>
         <div class="history-panel" id="history-panel" style="display:none;">
-            <div class="history-header">
+            <div class="history-header page-toolbar">
                 <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="history-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="history-title">Chat History</span>
-                <button class="skills-action-btn" onclick="downloadChatHistory()" title="Download all chats"><span class="action-icon" id="history-download-icon"></span>Download All</button>
-            </div>
-            <div class="history-search-bar">
-                <div class="sidebar-search-wrapper history-search-lg">
-                    <span class="sidebar-search-icon" id="history-search-icon" aria-hidden="true"></span>
-                    <input type="text" id="history-search-input" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
+                <span class="history-title page-toolbar-title">Chat History</span>
+                <div class="page-toolbar-slot">
+                    <div class="sidebar-search-wrapper history-search-lg">
+                        <span class="sidebar-search-icon" id="history-search-icon" aria-hidden="true"></span>
+                        <input type="text" id="history-search-input" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
 <button class="sidebar-search-clear" id="history-search-clear" onclick="clearHistorySearch()" title="Clear search" aria-label="Clear search">×</button>
+                    </div>
+                    <span class="history-stats widget-library-count" id="history-stats"></span>
+                    <span class="page-toolbar-layout" id="history-layout-toggle"></span>
+                </div>
+                <div class="page-toolbar-actions">
+                    <button class="skills-action-btn" onclick="downloadChatHistory()" title="Download all chats"><span class="action-icon" id="history-download-icon"></span>Download All</button>
                 </div>
             </div>
-            <div class="history-stats" id="history-stats"></div>
             <div class="history-list" id="history-list"></div>
         </div>
         <div class="screenshot-preview-panel" id="screenshot-preview-panel">

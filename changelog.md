@@ -1,13 +1,33 @@
 # Changelog
 
+## v1.1.29
+
+### Features
+- All main pages share one full-width layout with a single toolbar.
+- The agent works through the API first, and server scripts require admin.
+
+### Fixes
+- Reload is faster and no longer opens two tabs.
+- Sub-agent communication is more reliable.
+
+---
+
 ## v1.1.28
 
 ### Features
 - Claude Opus 5.5 is now supported, and ChatGPT subscriptions get GPT-6 Astra, Sol and Luna with a browser sign-in. Saved GPT-5.x models move to GPT-6 automatically, and GPT-5.6 Terra is retired.
 - Widgets keep a version history, and a new Widget Library on the dashboard lists every saved widget.
 - Approvals can be allowed for the whole chat, and a new Dev instance tier skips tool approvals entirely.
+- The Help page now shows the full changelog under About, next to the version number (also on the documentation site).
+- The feature déroulement skill now runs checks instead of only reasoning. A new helper, `deroulement.js`, parses the changed files, checks that every symbol named in the prose exists, probes branches, runs light mutation testing and builds a claims ledger. The walkthrough is only done when no claim is refuted.
 
 ### Fixes
+- A sub-agent spawned with `wake_parent: false` no longer reports into the void. When it reports and the parent is not waiting on it, the parent chat now gets a passive notice row with the sub's name, status, a one-line headline and a View agent button. The row does not start a parent run or change the parent's context. `wake_sub_agent` also takes an optional `wake_parent` flag, so a revived sub can be switched to wake the parent. Without it, a revived sub keeps its spawn-time setting.
+- The déroulement helper closes the false passes found by its adversarial review. `onclick="document.nope()"` and `Math.nope()` are now refuted. `obj.m = 5`, `{m: make()}`, a call inside a value and `app.obj.m()` no longer verify `obj.m()`. `switch (typeof v)` is no longer a message handler, and `[data-x=".a"]` is no longer a class rule. `/` after `a++` is division, `var id = "x"` is not an id definition, and scripts inside `<template>` or module scripts do not define onclick handlers. `checkSymbols(null)` no longer throws, and prose `constructor()` is no longer reported as an export alias. The remaining limits are documented.
+- The déroulement helper (v1.4.0) closes more false passes. Qualified names such as `obj.run()` (in prose, inline `onclick` handlers and event listeners) pass only when `obj` really has that member, and `var x = 5` no longer counts as a definition of `x()`. Object keys and parameters no longer count as calls, and names found only in JSON or CSS strings are not proof. Handlers written inside strings or templates are ignored, and sandbox-only globals such as `runFile` no longer count as defined. `functions: [...]` now adds to the diff, and a new `functionsOnly: true` option analyses only those functions. An `exclude` pattern that removes every file is flagged, bad inputs to `crossRefs` or `probe` report an error instead of crashing, and one-line arrow functions can be probed.
+- The déroulement helper (v1.3.1) now judges every definition, id, CSS class and reference on the whole masked file: text in multi-line comments, templates, strings or HTML body text no longer counts, and a comment-only symbol is refuted. `waive` can only excuse functions that are defined but never referenced, unknown row statuses fail the gate, CSS with unbalanced braces fails its parse row (rules the parser dropped are flagged), `<template>` contents are checked, files that cannot be read within the lookup budget give unverified rows, and probes report unhandled promise rejections.
+- The déroulement helper (v1.3.0) no longer passes the gate by mistake. A file that cannot be read now fails the run, `waive` and `entryPoints` can only excuse wiring and cross-reference rows (never a syntax error, a failing mutation baseline or a probe failure), and a function counts as wired only when real code calls it, not a comment, a doc or a test. Lookup failures are reported as unverified instead of crashing the run, and static, async, getter/setter and generator methods plus exported aliases like `API.run()` are recognised.
+- The déroulement helper no longer fails the gate by mistake. Promise `.catch()` calls are not treated as catch blocks, a missing stub is reported as unverified instead of refuted, and test files are skipped by the cross-reference and wiring checks. Multi-file diffs map to the right lines, built-in names and test-only definitions no longer count as proof, and a run without a diff shows one summary row for branch-heavy functions instead of one row each.
 - Claude Fable 5.1+ and Opus 5.5 keep their reasoning across tool calls, and the prompt cache no longer breaks when skills are activated in a different order.
 - js_eval calls no longer time out while waiting for approval, which could cause duplicate writes.
 - ChatGPT subscription PDF attachments are no longer dropped, and usage-limit errors show when the limit resets.

@@ -761,7 +761,8 @@ function fillHomeInput(text) {
 
 // Handle keydown in home input
 function handleHomeKeyDown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Skip Enter while user is composing IME input (CJK languages send keyCode 229 / isComposing=true).
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
         e.preventDefault();
         sendHomeMessage();
     }

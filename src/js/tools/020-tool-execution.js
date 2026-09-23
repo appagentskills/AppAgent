@@ -1066,6 +1066,52 @@ function _sandboxEvalCleanup(chatId) {
 // Serialize: at most ONE sys.scripts.do request in flight per instance —
 // later calls queue behind the in-flight one via a promise-chain mutex.
 // Keyed by target instance URL ('' = the active/attached instance).
+// --- servicenow_run_script admin gate ------------------------------------
+// /sys.scripts.do is admin-only; the description alone did not stop agents
+// from calling it as non-admins. Hard-check EFFECTIVE admin (direct OR
+// inherited/group-granted — both can run background scripts) before any POST.
+// Fast path: cached list_instances roles (direct) contain admin. Otherwise a
+// Table API lookup (any inherited value). Lookup failure => refuse (fail-safe).
+// Positive results are cached per instance URL for the session.
+var _rsAdminOk = {};
+async function _rsCheckAdmin(instanceUrl, token) {
+    var key = String(instanceUrl || '').replace(/\/+$/, '');
+    var inst = ((typeof Platform !== 'undefined' && Platform.instances) || []).filter(function(i) {
+        return i && String(i.url || '').replace(/\/+$/, '') === key;
+    })[0] || null;
+    var who = (inst && inst.userName) || 'current user';
+    var where = (inst && inst.shortName) || key.replace(/^https?:\/\//, '').split('.')[0] || 'this instance';
+    if (_rsAdminOk[key]) return { ok: true };
+    if (inst && Array.isArray(inst.roles) && inst.roles.indexOf('admin') !== -1) { _rsAdminOk[key] = true; return { ok: true }; }
+    var denied = 'User ' + who + ' lacks the admin role on ' + where + '; server scripts require admin — use servicenow_api (Table API) instead.';
+    try {
+        var res = await fetch(key + '/api/now/table/sys_user_has_role?sysparm_query=' + encodeURIComponent('user=javascript:gs.getUserID()^role.name=admin') + '&sysparm_fields=sys_id&sysparm_limit=1', {
+            method: 'GET', credentials: 'include',
+            headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
+        });
+        if (!res.ok) return { ok: false, error: 'Admin-role check failed on ' + where + ' (HTTP ' + res.status + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
+        var data = await res.json();
+        if (data && Array.isArray(data.result) && data.result.length) { _rsAdminOk[key] = true; return { ok: true }; }
+        return { ok: false, error: denied };
+    } catch (e) {
+        return { ok: false, error: 'Admin-role check failed on ' + where + ' (' + (e && e.message) + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
+    }
+}
+
+// Fresh DIRECT (inherited=false) role names for list_instances include_roles.
+async function _liFetchDirectRoles(instanceUrl, token) {
+    var key = String(instanceUrl || '').replace(/\/+$/, '');
+    var res = await fetch(key + '/api/now/table/sys_user_has_role?sysparm_query=' + encodeURIComponent('user=javascript:gs.getUserID()^inherited=false') + '&sysparm_fields=role.name&sysparm_limit=500', {
+        method: 'GET', credentials: 'include',
+        headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var data = await res.json();
+    var out = [];
+    ((data && data.result) || []).forEach(function(r) { var n = r && r['role.name']; if (n && out.indexOf(n) === -1) out.push(n); });
+    return out;
+}
+
 var _sysScriptsQueues = {};
 function _enqueueSysScripts(instanceKey, fn) {
     var prev = _sysScriptsQueues[instanceKey] || Promise.resolve();
@@ -1513,6 +1559,15 @@ async function _executeToolInner(name, args, messageIndex, options) {
                                 if (_act && _act > _swLast) _swLast = _act;
                                 if (Date.now() - _swLast >= 5 * 60 * 1000) {
                                     rej(new Error('js_eval timed out after 5 minutes of inactivity (no tool calls or completion)'));
+                                    // H18: a sync-looping eval freezes the offscreen document;
+                                    // ping it and let background.js recreate it if wedged.
+                                    // Fire-and-forget: the caller gets the timeout error now
+                                    // and the user code is never re-run.
+                                    try {
+                                        if (typeof self !== 'undefined' && self && typeof self.checkOffscreenResponsive === 'function') {
+                                            Promise.resolve(self.checkOffscreenResponsive('js_eval timeout')).catch(function() {});
+                                        }
+                                    } catch (_pingErr) { /* health check is best-effort */ }
                                 }
                             }, 15000);
                         })
@@ -1826,9 +1881,28 @@ async function _executeToolInner(name, args, messageIndex, options) {
         var _liNorm = function(u) { return String(u || '').replace(/\/+$/, ''); };
         var _liDisabled = Platform.instances.filter(function(inst) { return _liDisabledMap[_liNorm(inst.url)]; })
             .map(function(inst) { return { shortName: inst.shortName, url: inst.url, disabled: true }; });
+        // include_roles: re-fetch DIRECT roles (inherited=false) per connected
+        // instance instead of trusting the cached probe; errors surface per row.
+        var _liFresh = {};
+        if (args && args.include_roles) {
+            await Promise.all(Platform.instances.filter(function(inst) { return inst.token && !_liDisabledMap[_liNorm(inst.url)]; }).map(async function(inst) {
+                try {
+                    var _tok = (Platform.getTokenForInstance && await Platform.getTokenForInstance(inst.url)) || inst.token;
+                    _liFresh[inst.url] = { roles: await _liFetchDirectRoles(inst.url, _tok) };
+                } catch (e) { _liFresh[inst.url] = { error: 'roles lookup failed: ' + (e && e.message) }; }
+            }));
+        }
         return {
             success: true,
             instances: Platform.instances.filter(function(inst) { return !_liDisabledMap[_liNorm(inst.url)]; }).map(function(inst) {
+                var _fr = _liFresh[inst.url];
+                if (_fr) return {
+                    shortName: inst.shortName, url: inst.url,
+                    activeTabs: (inst.tabs || []).map(function(t) { return { id: t.id, title: t.title, url: t.url }; }),
+                    connected: !!inst.token, userName: inst.userName || '',
+                    roles: _fr.roles || [], rolesSource: 'direct', rolesError: _fr.error,
+                    tabCount: (inst.tabs || []).length
+                };
                 return {
                     shortName: inst.shortName,
                     url: inst.url,
@@ -2155,6 +2229,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 return { success: false, error: 'No token available for instance "' + args.instance + '".' };
             }
         }
+        // Hard admin gate (see _rsCheckAdmin) — never POST as a non-admin.
+        var _rsGate = await _rsCheckAdmin(_rsTargetUrl || Platform.resolveInstanceUrl(null) || '', _rsTargetToken || Platform.getSessionToken() || '');
+        if (!_rsGate.ok) return { success: false, error: _rsGate.error };
         var _rsScope = args.scope || 'global';
         var _rsParams = [
             'script=' + encodeURIComponent(args.script),
@@ -2477,7 +2554,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // page bundle only) is always defined here. `options` carries widgetId /
         // fromWidget / chatId from the widget bridge (ui/070-dashboard-ui.js).
         return await executeStartChat(args, options);
-    } else if (isSkillTool(name)) {
+    } else if (isSkillTool(name) || (typeof getInactiveSkillToolOwner === 'function' && getInactiveSkillToolOwner(name))) {
         // Pass messageIndex so nested tool calls from inside the skill
         // sandbox stamp real per-message indexes on version-history entries
         // (core/140-skills-engine.js plumbs it into both the offscreen
@@ -2856,6 +2933,29 @@ function _runTestsImplMissing(toolName) {
 // would launder the takeover. They stay owned by the sub (so status / push
 // keep warning about them) and their paths are collected into
 // `out.skipped_force_taken` when the optional `out` object is passed.
+// Compare-and-swap write of ONE workspace row (H3–H9 race fixes): delegates to
+// the IDB-level transactional setWorkspaceFileIf (core/130-indexeddb.js) —
+// writes `newRow` (or deletes the row when newRow === null) only if the stored
+// row still matches `expected` (null → must be absent). Returns {ok:true} or
+// {ok:false, conflict:true, current} / {ok:false, error}. Bundles/tests that
+// lack the primitive fall back to the legacy unconditional write.
+var WS_CAS_MAX_TRIES = 5;
+async function _wsCasWrite(repo, path, expected, newRow) {
+    if (typeof setWorkspaceFileIf === 'function') {
+        var r = await setWorkspaceFileIf(repo, path, expected, newRow);
+        return r || { ok: false, error: 'CAS returned no result' };
+    }
+    if (newRow) await setWorkspaceFile(newRow);
+    else if (newRow === null && expected && expected.id && typeof openDatabase === 'function') {
+        // Legacy delete arm (no CAS primitive loaded): unconditional delete.
+        var database = await openDatabase();
+        var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
+        tx.objectStore(workspaceFilesStoreName).delete(expected.id);
+        await new Promise(function(resolve, reject) { tx.oncomplete = resolve; tx.onerror = function() { reject(tx.error); }; });
+    }
+    return { ok: true, legacy: true };
+}
+
 async function _wsTransferOwnership(fromChatId, toChatId, out) {
     if (out && !Array.isArray(out.skipped_force_taken)) out.skipped_force_taken = [];
     if (!fromChatId) return 0;
@@ -2875,9 +2975,14 @@ async function _wsTransferOwnership(fromChatId, toChatId, out) {
             // the enumeration → leave it alone.
             if (!fresh || fresh.last_modified_by_chat_id !== fromChatId) continue;
             if (fresh.force_taken_from) { if (out) out.skipped_force_taken.push(fresh.path); continue; }
+            var _toExpected = Object.assign({}, fresh);
             fresh.last_modified_by_chat_id = target;
             fresh.last_modified_by_chat_title = title;
-            try { await setWorkspaceFile(fresh); n++; } catch (eS) { /* best-effort */ }
+            // H3: CAS against the re-read row — a parent edit landing between
+            // the re-read and the put makes the swap fail; the row is then
+            // left alone (the next transfer re-stamps it) instead of reverting
+            // that edit.
+            try { var _toCas = await _wsCasWrite(fresh.repo || r.repo, fresh.path || r.path, _toExpected, fresh); if (_toCas && _toCas.ok) n++; } catch (eS) { /* best-effort */ }
         }
     } catch (e) { /* best-effort */ }
     return n;
@@ -3556,7 +3661,15 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         try { await wsHydrate(repo, [filePath]); } catch (e) { /* see comment above */ }
         existing = (await getWorkspaceFile(repo, filePath)) || existing;
     }
-    var _wWriteDecision = await _wsConflictDecision(repo, filePath, existing, chatId, force);
+    // H3: compare-and-swap with bounded retry (mirrors wsEdit). A concurrent
+    // same-lineage mutation (parent + sub, Promise.all in js_eval, SW
+    // pull/sync/push write-back) landing between our read and our write makes
+    // the CAS fail; we then re-derive sha / original_content / pushed_* and the
+    // cross-chat decision from the FRESH row instead of clobbering them with
+    // values captured from the stale `existing`.
+    var _wWriteDecision, wasDeleted, _wrFileId;
+    for (var _wTry = 0; ; _wTry++) {
+    _wWriteDecision = await _wsConflictDecision(repo, filePath, existing, chatId, force);
     if (_wWriteDecision.block) {
         var blocked = _wWriteDecision.block;
         blocked.success = false;
@@ -3564,13 +3677,13 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         blocked.path = filePath;
         return blocked;
     }
-    var wasDeleted = existing && existing.deleted;
-    var _wrFileId = (existing && existing.file_id) || newFileId();
+    wasDeleted = existing && existing.deleted;
+    _wrFileId = (existing && existing.file_id) || _wrFileId || newFileId();
     // Net-zero edits (content matches original) should not be marked dirty.
     // A never-committed new file (original_content === null) is always dirty.
     var _origForWrite = existing ? existing.original_content : null;
     var _isDirty = (_origForWrite === null) ? true : (content !== _origForWrite);
-    await setWorkspaceFile({
+    var _wCas = await _wsCasWrite(repo, filePath, existing || null, {
         id: repo + '::' + filePath,
         repo: repo,
         path: filePath,
@@ -3592,6 +3705,12 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         last_modified_at: _isDirty ? Date.now() : null,
         force_taken_from: _isDirty ? _wsNextForceTakenFrom(_wWriteDecision, existing && existing.force_taken_from, chatId) : null
     });
+    if (_wCas.ok) break;
+    if (!_wCas.conflict) return { success: false, error: 'Failed to save write: ' + (_wCas.error || 'unknown error'), path: filePath };
+    if (_wTry + 1 >= WS_CAS_MAX_TRIES) return { success: false, error: 'Write not applied: ' + filePath + ' kept changing concurrently (' + WS_CAS_MAX_TRIES + ' compare-and-swap attempts). Re-read and retry.', concurrent_modification: true, path: filePath };
+    // Retry against the fresh row (null = removed concurrently → create).
+    existing = _wCas.current || null;
+    }
     registerFile(_wrFileId, { type: 'workspace', workspace: repo, path: filePath });
     var action = wasDeleted ? 'Restored' : (existing && !existing.deleted ? 'Updated' : 'Created');
     var resp = { success: true, message: action + ': ' + filePath, size: content.length, file_id: _wrFileId };
@@ -3614,6 +3733,12 @@ async function wsEdit(repo, filePath, edits, chatId, chatTitle, force) {
         if (!file || file.content == null) return { success: false, error: 'Failed to fetch file content from GitHub: ' + filePath + (_eCause ? ' (' + _eCause + ')' : '') };
     }
 
+    // H3: compare-and-swap with bounded retry. A concurrent same-lineage
+    // mutation (parent + sub, Promise.all in js_eval, SW pull/sync) that lands
+    // between our read and our write makes the CAS fail; we then re-apply the
+    // SAME find/replace edits to the FRESH row (normal errors if the finds no
+    // longer match) instead of clobbering the other write.
+    for (var _eTry = 0; ; _eTry++) {
     var _wEditDecision = await _wsConflictDecision(repo, filePath, file, chatId, force);
     if (_wEditDecision.block) {
         var blocked = _wEditDecision.block;
@@ -3626,6 +3751,7 @@ async function wsEdit(repo, filePath, edits, chatId, chatTitle, force) {
     var result = applySearchReplaceEdits(file.content, edits);
     if (result.error) return { success: false, error: 'All edits failed', validationErrors: result.messages };
 
+    var _eExpected = Object.assign({}, file);
     file.content = result.content;
     // Net-zero edits (content matches original after rollback) should not be marked dirty.
     // A never-committed new file (original_content === null) stays dirty.
@@ -3641,7 +3767,15 @@ async function wsEdit(repo, filePath, edits, chatId, chatTitle, force) {
         file.last_modified_at = null;
         file.force_taken_from = null;
     }
-    await setWorkspaceFile(file);
+    var _eCas = await _wsCasWrite(repo, filePath, _eExpected, file);
+    if (_eCas.ok) break;
+    if (!_eCas.conflict) return { success: false, error: 'Failed to save edit: ' + (_eCas.error || 'unknown error'), path: filePath };
+    if (_eTry + 1 >= WS_CAS_MAX_TRIES) return { success: false, error: 'Edit not applied: ' + filePath + ' kept changing concurrently (' + WS_CAS_MAX_TRIES + ' compare-and-swap attempts). Re-read and retry.', concurrent_modification: true, path: filePath };
+    file = _eCas.current;
+    if (!file) return { success: false, error: 'File not found: ' + filePath + ' (removed concurrently)', concurrent_modification: true };
+    if (file.deleted) return { success: false, error: 'File was deleted: ' + filePath + ' (concurrently). Use workspace write to recreate it.', concurrent_modification: true };
+    if (file.content == null) return { success: false, error: 'File content unavailable after a concurrent change: ' + filePath + '. Re-read and retry.', concurrent_modification: true };
+    }
     if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(file.file_id);
 
     var resp = { success: true, editsApplied: result.appliedEdits };
@@ -3711,21 +3845,19 @@ async function wsDelete(wk, filePath, chatId, chatTitle, force) {
     }
 
     if (!file.sha) {
-        // New file (never committed) — safe to remove from IndexedDB entirely
-        try {
-            var database = await openDatabase();
-            var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
-            tx.objectStore(workspaceFilesStoreName).delete(file.id);
-            await new Promise(function(resolve, reject) {
-                tx.oncomplete = resolve;
-                tx.onerror = function() { reject(tx.error); };
-            });
-            unregisterFile(file.file_id);
-        } catch (e) {
-            return { success: false, error: 'Failed to delete: ' + e.message };
+        // New file (never committed) — safe to remove from IndexedDB entirely.
+        // CAS delete against the row read above: a concurrent write since
+        // then keeps the row (H-race fix) instead of silently dropping it.
+        var _delCas;
+        try { _delCas = await _wsCasWrite(wk, filePath, file, null); } catch (e) { _delCas = { ok: false, error: e && e.message }; }
+        if (!_delCas || !_delCas.ok) {
+            if (_delCas && _delCas.conflict) return { success: false, conflict: true, path: filePath, error: 'File changed concurrently — not deleted: ' + filePath + '. Re-read it and retry.' };
+            return { success: false, error: 'Failed to delete: ' + ((_delCas && _delCas.error) || 'unknown error') };
         }
+        unregisterFile(file.file_id);
     } else {
         // Tracked file — mark as tombstone so push can delete from repo
+        var _tombSnap = Object.assign({}, file);
         file.content = '';
         file.dirty = true;
         file.deleted = true;
@@ -3733,14 +3865,21 @@ async function wsDelete(wk, filePath, chatId, chatTitle, force) {
         file.last_modified_by_chat_title = chatTitle || null;
         file.last_modified_at = Date.now();
         file.force_taken_from = _wsNextForceTakenFrom(_wDelDecision, file.force_taken_from, chatId);
-        await setWorkspaceFile(file);
+        var _tombCas = await _wsCasWrite(wk, filePath, _tombSnap, file);
+        if (!_tombCas || !_tombCas.ok) {
+            if (_tombCas && _tombCas.conflict) return { success: false, conflict: true, path: filePath, error: 'File changed concurrently — not deleted: ' + filePath + '. Re-read it and retry.' };
+            return { success: false, error: 'Failed to delete: ' + ((_tombCas && _tombCas.error) || 'unknown error') };
+        }
     }
     var resp = { success: true, message: 'Deleted: ' + filePath };
     if (_wDelDecision.warn) resp.cross_chat_warning = _wDelDecision.warn;
     return resp;
 }
 
-async function wsDiscard(wk, filePath, chatId, chatTitle, force) {
+// opts.expected (single-file mode only): CAS against THIS snapshot row instead
+// of the row read here — wsBranch passes the raw row it copied, so a file
+// edited after the fork copy is kept (reported as conflict) rather than lost.
+async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
@@ -3788,24 +3927,29 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force) {
     }
 
     var discarded = [];
+    var _dRaced = [];
     for (var i = 0; i < proceedable.length; i++) {
         var f = proceedable[i];
+        // CAS expected: the caller's snapshot (single-file) or the row as read
+        // above (copied BEFORE the in-place restore mutation below).
+        var _dSnap = (filePath && opts && opts.expected) ? opts.expected : Object.assign({}, f);
         if (!f.dirty) {
             if (filePath) return { success: false, error: 'File is not modified: ' + filePath };
             continue;
         }
         if (f.original_content === null && !(f.stub && f.sha)) {
-            // New file — remove entirely
-            try {
-                var database = await openDatabase();
-                var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
-                tx.objectStore(workspaceFilesStoreName).delete(f.id);
-                await new Promise(function(resolve, reject) {
-                    tx.oncomplete = resolve;
-                    tx.onerror = function() { reject(tx.error); };
-                });
-                unregisterFile(f.file_id);
-            } catch (e) {}
+            // New file — remove entirely (CAS delete: a row written since the
+            // snapshot is kept, not dropped).
+            var _dDel;
+            try { _dDel = await _wsCasWrite(wk, f.path, _dSnap, null); } catch (e) { _dDel = { ok: false, error: e && e.message }; }
+            if (!_dDel || !_dDel.ok) {
+                if (_dDel && _dDel.conflict) {
+                    _dRaced.push(f.path);
+                    if (filePath) return { success: false, conflict: true, path: f.path, error: 'File changed concurrently — not discarded: ' + f.path };
+                }
+                continue;
+            }
+            unregisterFile(f.file_id);
             discarded.push({ path: f.path, action: 'removed' });
         } else {
             // Modified or deleted file — restore original content. For a
@@ -3821,12 +3965,25 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force) {
             f.last_modified_by_chat_title = null;
             f.last_modified_at = null;
             f.force_taken_from = null;
-            await setWorkspaceFile(f);
+            var _dRes = await _wsCasWrite(wk, f.path, _dSnap, f);
+            if (!_dRes || !_dRes.ok) {
+                if (_dRes && _dRes.conflict) {
+                    _dRaced.push(f.path);
+                    if (filePath) return { success: false, conflict: true, path: f.path, error: 'File changed concurrently — not discarded: ' + f.path };
+                } else if (filePath) {
+                    return { success: false, error: 'Failed to discard ' + f.path + ': ' + ((_dRes && _dRes.error) || 'unknown error') };
+                }
+                continue;
+            }
             if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(f.file_id);
             discarded.push({ path: f.path, action: 'restored' });
         }
     }
     var resp = { success: true, message: 'Discarded changes to ' + discarded.length + ' file(s)', discarded: discarded.length, files: discarded };
+    if (_dRaced.length > 0) {
+        resp.changed_concurrently = _dRaced;
+        resp.message += ' (' + _dRaced.length + ' file(s) changed concurrently and were kept: ' + _dRaced.join(', ') + ')';
+    }
     if (blocking.length > 0) {
         resp.skipped_files = blocking;
         resp.message += ' (' + blocking.length + ' file(s) skipped — locked by another running chat; pass {"force": true} to discard them too)';
@@ -3926,6 +4083,9 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
 
     var copied = 0;
     var dirtyCopied = [];
+    // Raw source rows AS COPIED (H4): the post-copy discard CASes against
+    // these, so a source file edited after its copy keeps the new edit.
+    var _copiedSnap = Object.create(null);
     for (var i = 0; i < allRows.length; i++) {
         var src = allRows[i];
         if (!src || src.repo !== wk) continue;
@@ -3967,7 +4127,7 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
         await setWorkspaceFile(copy);
         registerFile(copy.file_id, { type: 'workspace', workspace: targetWk, path: copy.path });
         copied++;
-        if (src.dirty && !leftBehindSet[src.path]) dirtyCopied.push(src.path);
+        if (src.dirty && !leftBehindSet[src.path]) { dirtyCopied.push(src.path); _copiedSnap[src.path] = src; }
     }
 
     await setWorkspaceMeta({
@@ -3986,24 +4146,24 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     // moveDirty (default): revert the SOURCE's dirty files so the edits live
     // only on the fork. force=true — the copy already preserved the edits.
     var movedOut = false;
+    var _keptOnSource = [];
     if (moveDirty !== false && dirtyCopied.length > 0) {
         try {
-            if (leftBehind.length === 0) {
-                var disc = await wsDiscard(wk, null, chatId, chatTitle, true);
-                movedOut = !!(disc && disc.success);
-            } else {
-                // Foreign-owned dirty rows stayed behind: discard ONLY the
-                // travelled paths so the owning chat's source edits survive.
-                var allDiscarded = true;
-                for (var di = 0; di < dirtyCopied.length; di++) {
-                    var discOne = await wsDiscard(wk, dirtyCopied[di], chatId, chatTitle, true);
-                    if (!discOne || !discOne.success) allDiscarded = false;
+            // Discard ONLY the travelled paths, each CAS'd against the row
+            // snapshot that was copied (never discard-all: rows dirtied after
+            // the scan, or foreign rows left behind, must survive).
+            var allDiscarded = true;
+            for (var di = 0; di < dirtyCopied.length; di++) {
+                var discOne = await wsDiscard(wk, dirtyCopied[di], chatId, chatTitle, true, { expected: _copiedSnap[dirtyCopied[di]] });
+                if (!discOne || !discOne.success) {
+                    allDiscarded = false;
+                    if (discOne && discOne.conflict) _keptOnSource.push(dirtyCopied[di]);
                 }
-                // Only claim moved AFTER the loop completes — a discard that
-                // throws mid-loop must not leave movedOut=true with paths
-                // still undiscarded (the catch below swallows the error).
-                movedOut = allDiscarded;
             }
+            // Only claim moved AFTER the loop completes — a discard that
+            // throws mid-loop must not leave movedOut=true with paths
+            // still undiscarded (the catch below swallows the error).
+            movedOut = allDiscarded;
         } catch (e) {}
     }
 
@@ -4025,6 +4185,11 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     if (leftBehind.length > 0) {
         res.left_behind = leftBehind;
         res.message += ' ' + leftBehind.length + ' dirty file(s) hard-locked by other chats were left behind: the fork got their pristine base version (or no row for never-committed new files) and their uncommitted edits stay in the source workspace: ' + leftBehind.join(', ') + '.';
+    }
+    if (_keptOnSource.length > 0) {
+        res.changed_during_fork = _keptOnSource;
+        res.warning = _keptOnSource.length + ' file(s) changed in the source while forking and were NOT discarded there (the fork holds the earlier version): ' + _keptOnSource.join(', ') + '.';
+        res.message += ' WARNING: ' + res.warning;
     }
     return res;
 }
@@ -4903,6 +5068,21 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
             }
         } catch (e) {}
 
+        // H9: rows dirtied AFTER the `dirty` snapshot above (during the move /
+        // base sync awaits) were never moved — deleting now would lose them.
+        // Re-scan (here and again right before the delete) and KEEP the
+        // workspace with a warning when any exist.
+        async function _wsLateDirty() {
+            var _now = await getAllWorkspaceFiles(wk);
+            return (_now || []).filter(function(f) { return f && f.dirty && !isIgnored(f.path); }).map(function(f) { return f.path; });
+        }
+        function _wsLateDirtyKept(paths) {
+            return { deleted: false, kept: true, workspace: wk, branch: branch, base_branch: baseBranch, pr_number: mergedPr.number, late_dirty: paths, conflicts: [],
+                warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace was KEPT: ' + paths.length + ' file(s) were modified during the merge cleanup and were not moved to "' + baseWk + '": ' + paths.join(', ') + '. Move or push them, then re-sync.' };
+        }
+        var _late1 = await _wsLateDirty();
+        if (_late1.length > 0) return _wsLateDirtyKept(_late1);
+
         // 3. Pin follows the merge — only when this workspace held the pin or
         //    no pin exists for the repo, and only onto a successfully-synced base.
         var wasPinned = !!meta.pinned;
@@ -4955,9 +5135,26 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
             }
         } catch (e) {}
 
-        // 4. Safe to remove the redundant head-branch workspace.
-        await deleteWorkspaceFiles(wk);
-        await deleteWorkspaceMeta(wk);
+        // 4. Safe to remove the redundant head-branch workspace — unless a
+        //    row was dirtied since the H9 re-scan above. H9: the final dirty
+        //    check and the file + meta deletes run in ONE IDB transaction
+        //    (deleteWorkspaceIfClean, core/130), so an edit can no longer land
+        //    between the re-scan and the delete and be swept with it.
+        if (typeof deleteWorkspaceIfClean === 'function') {
+            var _delClean;
+            try { _delClean = await deleteWorkspaceIfClean(wk, isIgnored); }
+            catch (eDel) {
+                return { deleted: false, kept: true, workspace: wk, branch: branch, base_branch: baseBranch, pr_number: mergedPr.number, conflicts: [],
+                    warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace could not be removed (' + ((eDel && eDel.message) || String(eDel)) + '); nothing was deleted. Re-sync to retry.' };
+            }
+            if (!_delClean || _delClean.kept) return _wsLateDirtyKept((_delClean && _delClean.dirty) || []);
+        } else {
+            // Legacy bundles/tests without the atomic primitive.
+            var _late2 = await _wsLateDirty();
+            if (_late2.length > 0) return _wsLateDirtyKept(_late2);
+            await deleteWorkspaceFiles(wk);
+            await deleteWorkspaceMeta(wk);
+        }
         try { gcWorkspaceBlobs(); } catch (e) {}
         try { AgentEvents.emit('workspaceMutated', { action: 'auto_delete_merged', repo: wk, branch: branch, base: baseBranch, base_workspace: baseWk, pr: mergedPr.number, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced }); } catch (e) {}
         var delResult = { deleted: true, workspace: wk, branch: branch, base_branch: baseBranch, base_workspace: baseWk, pr_number: mergedPr.number, pr_url: mergedPr.html_url, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced };
@@ -5036,7 +5233,7 @@ function _wsChatProgressState(chat) {
     var completed = {};
     for (var i = 0; i < chat.messages.length; i++) {
         var m = chat.messages[i];
-        if (m && m.role === 'tool' && m.tool_call_id) completed[m.tool_call_id] = true;
+        if (m && m.role==='tool' && m.tool_call_id && !m._placeholder) { var _c = typeof m.content==='string' ? m.content.trim() : ''; var _failed=false; if (_c.charAt(0)==='{') { try { var _o=JSON.parse(_c); _failed=!!(_o && _o.success===false); } catch(e){} } if (!_failed) completed[m.tool_call_id]=true; }
     }
     var last = null;
     for (var j = 0; j < chat.messages.length; j++) {
@@ -5129,6 +5326,13 @@ async function wsSyncWithRemote(wk) {
     // pushed-sha match path. Stamped state:'merged' on meta.prs after the late
     // meta re-check (which REPLACES `meta`, so stamping earlier would be lost).
     var _mergedPrRefs = [];
+    // H6: paths whose step-3/step-4 CAS write lost a race with a concurrent
+    // local edit/discard. The stored row is kept (never reverted); the path is
+    // skipped in step 4 (its in-memory `files` entry is stale) and HEAD is NOT
+    // advanced, so the next sync re-evaluates it from the fresh row.
+    var _racedPaths = {};
+    var _racedList = [];
+    function _markRaced(p) { if (!_racedPaths[p]) { _racedPaths[p] = true; _racedList.push(p); } }
 
     for (var i = 0; i < files.length; i++) {
         var f = files[i];
@@ -5137,17 +5341,16 @@ async function wsSyncWithRemote(wk) {
         if (f.deleted) {
             // Deleted locally — if also gone from remote, sync it
             if (!remoteTree[f.path]) {
-                try {
-                    var _db = await openDatabase();
-                    var _tx = _db.transaction([workspaceFilesStoreName], 'readwrite');
-                    _tx.objectStore(workspaceFilesStoreName).delete(f.id);
-                    await new Promise(function(resolve, reject) {
-                        _tx.oncomplete = resolve;
-                        _tx.onerror = function() { reject(_tx.error); };
-                    });
-                    unregisterFile(f.file_id);
-                } catch (e) {}
-                synced++;
+                // H6: CAS delete against the snapshot row — a concurrent
+                // un-delete / re-create since getAllWorkspaceFiles keeps it.
+                var _dCas;
+                try { _dCas = await _wsCasWrite(wk, f.path, f, null); } catch (e) { _dCas = { ok: false, error: e && e.message }; }
+                if (_dCas && _dCas.ok) {
+                    try { unregisterFile(f.file_id); } catch (e) {}
+                    synced++;
+                } else {
+                    _markRaced(f.path);
+                }
             }
             continue;
         }
@@ -5166,7 +5369,8 @@ async function wsSyncWithRemote(wk) {
             // workspace's cloned branch IS the PR's own head branch (fork
             // self-sync after push — the match is the push itself, not a merge).
             var _cleanPrRef = f.pushed_pr || null;
-            if (_cleanPrRef && _cleanPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_cleanPrRef) === -1) _mergedPrRefs.push(_cleanPrRef);
+            // H6: snapshot BEFORE mutating — the CAS compares against it.
+            var _cleanSnap = Object.assign({}, f);
             f.original_content = f.content;
             f.sha = localSha;
             f.dirty = false;
@@ -5175,8 +5379,15 @@ async function wsSyncWithRemote(wk) {
             f.last_modified_by_chat_id = null;
             f.last_modified_by_chat_title = null;
             f.last_modified_at = null;
-            await setWorkspaceFile(f);
-            synced++;
+            var _cCas;
+            try { _cCas = await _wsCasWrite(wk, f.path, _cleanSnap, f); } catch (e) { _cCas = { ok: false, error: e && e.message }; }
+            if (_cCas && _cCas.ok) {
+                // Merge evidence only counts when the clean-mark actually landed.
+                if (_cleanPrRef && _cleanPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_cleanPrRef) === -1) _mergedPrRefs.push(_cleanPrRef);
+                synced++;
+            } else {
+                _markRaced(f.path);
+            }
         }
     }
 
@@ -5186,6 +5397,7 @@ async function wsSyncWithRemote(wk) {
     for (var j = 0; j < files.length; j++) {
         var cf = files[j];
         if (isIgnored(cf.path)) continue;
+        if (_racedPaths[cf.path]) continue; // H6: stale in-memory row — re-evaluated next sync
         if (cf.dirty && cf.deleted) {
             // Deleted locally — if remote also changed, that's a conflict (unless we pushed the delete)
             if (remoteTree[cf.path] && cf.sha && remoteTree[cf.path] !== cf.sha) {
@@ -5208,6 +5420,8 @@ async function wsSyncWithRemote(wk) {
                         var _blobRes = await githubApi('GET', '/repos/' + githubRepo + '/git/blobs/' + _remoteSha);
                         if (_blobRes.ok && _blobRes.body.content) {
                             var _remoteContent = _wsDecodeBlobBody(_blobRes.body);
+                            // H6: snapshot BEFORE mutating — the CAS compares against it.
+                            var _mSnap = Object.assign({}, cf);
                             cf.original_content = _remoteContent;
                             cf.sha = _remoteSha;
                             // Remove matched sha and all older ones (they're subsets of the matched content).
@@ -5225,11 +5439,17 @@ async function wsSyncWithRemote(wk) {
                                 // PR's own head branch (fork self-sync after push +
                                 // further edits): the pushed sha appearing there is the
                                 // push itself, not a merge — stamping would falsely
-                                // badge a still-OPEN PR as merged.
-                                if (_mergedPrRef && _mergedPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_mergedPrRef) === -1) _mergedPrRefs.push(_mergedPrRef);
+                                // badge a still-OPEN PR as merged. (Recorded below,
+                                // only once the CAS write lands.)
                             }
-                            await setWorkspaceFile(cf);
-                            synced++;
+                            var _mCas;
+                            try { _mCas = await _wsCasWrite(wk, cf.path, _mSnap, cf); } catch (e) { _mCas = { ok: false, error: e && e.message }; }
+                            if (_mCas && _mCas.ok) {
+                                if (!cf.pushed_shas && _mergedPrRef && _mergedPrRef.branch !== meta.branch && _mergedPrRefs.indexOf(_mergedPrRef) === -1) _mergedPrRefs.push(_mergedPrRef);
+                                synced++;
+                            } else {
+                                _markRaced(cf.path);
+                            }
                         } else {
                             conflictFiles.push({ path: cf.path, remoteSha: _remoteSha });
                         }
@@ -5313,8 +5533,8 @@ async function wsSyncWithRemote(wk) {
         }
     }
 
-    // Only advance HEAD if fully in sync
-    if (!behind) {
+    // Only advance HEAD if fully in sync (H6: and no row write lost a race)
+    if (!behind && _racedList.length === 0) {
         meta.head_sha = remoteHead;
         meta.tree_sha = treeRes.body.sha;
         await setWorkspaceMeta(meta);
@@ -5326,6 +5546,7 @@ async function wsSyncWithRemote(wk) {
     var remaining = (await getAllWorkspaceFiles(wk)).filter(function(f) { return f.dirty && !isIgnored(f.path); }).length;
 
     var _syncRet = { synced: synced, behind: behind, remoteHead: remoteHead, dirty_remaining: remaining, behindFiles: behindFiles, conflictFiles: conflictFiles, _remoteTree: remoteTree, _treeSha: treeRes.body.sha };
+    if (_racedList.length) _syncRet.raced = _racedList;
     if (_mergeWarning) _syncRet.merge_warning = _mergeWarning;
     return _syncRet;
 }
@@ -5341,12 +5562,30 @@ async function wsPull(wk) {
     if (syncResult && syncResult.deleted) {
         return { success: true, deleted: true, pulled: 0, message: 'Workspace auto-deleted — branch "' + syncResult.branch + '" was merged into the locally-cloned base "' + syncResult.base_branch + '".' };
     }
+    // H6: surface the sync's raced rows (writes that lost a CAS race and were
+    // left for the next sync) so the caller sees WHICH paths raced and why
+    // HEAD did not advance.
+    var _pullRaced = (syncResult && Array.isArray(syncResult.raced) && syncResult.raced.length) ? syncResult.raced.slice() : null;
     if (!syncResult || !syncResult.behindFiles || syncResult.behindFiles.length === 0) {
-        return { success: true, message: 'Already up to date', pulled: 0 };
+        var _upRes = { success: true, message: 'Already up to date', pulled: 0 };
+        if (_pullRaced) {
+            _upRes.raced = _pullRaced;
+            _upRes.message = 'No remote changes to pull, but ' + _pullRaced.length + ' file(s) changed concurrently during sync and will be re-evaluated on the next sync: ' + _pullRaced.join(', ');
+        }
+        return _upRes;
     }
 
     var pulled = 0;
     var failedPulls = [];
+    // H5: rows that became dirty / deleted / re-created locally between the
+    // sync snapshot and the write below. They are KEPT (never overwritten with
+    // remote content) and reported as conflicts {localChanged:true}, which
+    // also blocks the HEAD advance.
+    var localConflicts = [];
+    function _localChanged(bf, cur) {
+        localConflicts.push({ path: bf.path, remoteSha: bf.remoteSha || null, localChanged: true, localDeleted: !cur || !!cur.deleted });
+    }
+    function _isLocalChange(cur) { return !!(cur && (cur.dirty || cur.deleted)); }
     var BATCH_SIZE = 15;
     var behindFiles = syncResult.behindFiles;
 
@@ -5362,19 +5601,21 @@ async function wsPull(wk) {
         for (var j = 0; j < results.length; j++) {
             var r = results[j];
             if (r.deleted) {
-                // Remote deleted this file — delete locally
+                // Remote deleted this file — delete locally (H5: only while the
+                // row is still clean; CAS delete against the fresh read).
                 var delFile = await getWorkspaceFile(wk, r.bf.path);
                 if (delFile) {
-                    try {
-                        var _db = await openDatabase();
-                        var _tx = _db.transaction([workspaceFilesStoreName], 'readwrite');
-                        _tx.objectStore(workspaceFilesStoreName).delete(delFile.id);
-                        await new Promise(function(resolve, reject) {
-                            _tx.oncomplete = resolve;
-                            _tx.onerror = function() { reject(_tx.error); };
-                        });
-                        unregisterFile(delFile.file_id);
-                    } catch (e) {}
+                    if (_isLocalChange(delFile)) { _localChanged(r.bf, delFile); continue; }
+                    var _delCas;
+                    try { _delCas = await _wsCasWrite(wk, r.bf.path, delFile, null); } catch (e) { _delCas = { ok: false, error: e && e.message }; }
+                    if (!(_delCas && _delCas.ok) && !(_delCas && _delCas.conflict && !_delCas.current)) {
+                        // (conflict with NO current row = already gone — the
+                        // desired end state, counted as pulled below)
+                        if (_delCas && _delCas.conflict) _localChanged(r.bf, _delCas.current);
+                        else failedPulls.push(r.bf.path);
+                        continue;
+                    }
+                    try { unregisterFile(delFile.file_id); } catch (e) {}
                 }
                 pulled++;
                 continue;
@@ -5383,12 +5624,23 @@ async function wsPull(wk) {
                 // Never-hydrated lazy stub — repoint sha/size and stay a stub;
                 // content is fetched on demand at the new sha.
                 var _stubFile = await getWorkspaceFile(wk, r.bf.path);
-                if (_stubFile && _stubFile.stub && _stubFile.content == null) {
+                if (!_stubFile || _isLocalChange(_stubFile)) {
+                    _localChanged(r.bf, _stubFile);
+                } else if (_stubFile.stub && _stubFile.content == null) {
+                    // H5: copy taken BEFORE mutation — the CAS compares against it.
+                    var _stubSnap = Object.assign({}, _stubFile);
                     _stubFile.sha = r.bf.remoteSha;
                     if (r.bf.remoteSize != null) _stubFile.size = r.bf.remoteSize;
-                    await setWorkspaceFile(_stubFile);
-                    if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(_stubFile.file_id);
-                    pulled++;
+                    var _stubCas;
+                    try { _stubCas = await _wsCasWrite(wk, r.bf.path, _stubSnap, _stubFile); } catch (e) { _stubCas = { ok: false, error: e && e.message }; }
+                    if (_stubCas && _stubCas.ok) {
+                        if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(_stubFile.file_id);
+                        pulled++;
+                    } else if (_stubCas && _stubCas.conflict) {
+                        _localChanged(r.bf, _stubCas.current);
+                    } else {
+                        failedPulls.push(r.bf.path);
+                    }
                 } else {
                     // Hydrated (or mutated) between sync and pull — its content is
                     // at the old sha. Don't repoint and don't advance HEAD; the
@@ -5400,11 +5652,16 @@ async function wsPull(wk) {
             if (!r.ok) { failedPulls.push(r.bf.path); continue; }
             var content = _wsDecodeBlobBody(r.body);
 
+            var _pullCas = null;
             if (r.bf.isNew) {
                 // New file from remote — no local owner
                 var _existingPull = await getWorkspaceFile(wk, r.bf.path);
+                // H5: a local create (dirty/deleted row) landed since the sync
+                // snapshot — keep it. Otherwise CAS against the fresh read
+                // (null → the row must still be absent).
+                if (_isLocalChange(_existingPull)) { _localChanged(r.bf, _existingPull); continue; }
                 var _pullFileId = (_existingPull && _existingPull.file_id) || newFileId();
-                await setWorkspaceFile({
+                try { _pullCas = await _wsCasWrite(wk, r.bf.path, _existingPull || null, {
                     id: wk + '::' + r.bf.path,
                     repo: wk,
                     path: r.bf.path,
@@ -5418,12 +5675,21 @@ async function wsPull(wk) {
                     last_modified_by_chat_id: null,
                     last_modified_by_chat_title: null,
                     last_modified_at: null
-                });
+                }); } catch (e) { _pullCas = { ok: false, error: e && e.message }; }
+                if (!(_pullCas && _pullCas.ok)) {
+                    if (_pullCas && _pullCas.conflict) _localChanged(r.bf, _pullCas.current);
+                    else failedPulls.push(r.bf.path);
+                    continue;
+                }
                 registerFile(_pullFileId, { type: 'workspace', workspace: wk, path: r.bf.path });
             } else {
                 // Updated file — replace local copy with remote, drop any chat-id stamp
                 var existing = await getWorkspaceFile(wk, r.bf.path);
+                // H5: edited / deleted locally since the sync snapshot — never
+                // overwrite the local change with remote content.
+                if (!existing || _isLocalChange(existing)) { _localChanged(r.bf, existing); continue; }
                 if (existing) {
+                    var _updSnap = Object.assign({}, existing); // copy BEFORE mutation
                     existing.content = content;
                     existing.original_content = content;
                     existing.stub = false; // pulled content — no longer a lazy stub
@@ -5434,7 +5700,12 @@ async function wsPull(wk) {
                     existing.last_modified_by_chat_id = null;
                     existing.last_modified_by_chat_title = null;
                     existing.last_modified_at = null;
-                    await setWorkspaceFile(existing);
+                    try { _pullCas = await _wsCasWrite(wk, r.bf.path, _updSnap, existing); } catch (e) { _pullCas = { ok: false, error: e && e.message }; }
+                    if (!(_pullCas && _pullCas.ok)) {
+                        if (_pullCas && _pullCas.conflict) _localChanged(r.bf, _pullCas.current);
+                        else failedPulls.push(r.bf.path);
+                        continue;
+                    }
                     if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(existing.file_id);
                 }
             }
@@ -5442,18 +5713,26 @@ async function wsPull(wk) {
         }
     }
 
-    // Only advance HEAD if no conflicts and no failed downloads remain
-    var conflicts = syncResult.conflictFiles || [];
-    if (conflicts.length === 0 && failedPulls.length === 0) {
+    // Only advance HEAD if no conflicts, no local changes raced the pull, no
+    // failed downloads remain, and the sync itself had no raced rows (H5/H6).
+    var conflicts = (syncResult.conflictFiles || []).concat(localConflicts);
+    var _syncRaced = Array.isArray(syncResult.raced) && syncResult.raced.length > 0;
+    if (conflicts.length === 0 && failedPulls.length === 0 && !_syncRaced) {
         meta = await getWorkspaceMeta(wk);
-        meta.head_sha = syncResult.remoteHead;
-        meta.tree_sha = syncResult._treeSha;
-        await setWorkspaceMeta(meta);
+        if (meta) {
+            meta.head_sha = syncResult.remoteHead;
+            meta.tree_sha = syncResult._treeSha;
+            await setWorkspaceMeta(meta);
+        }
     }
 
     var result = { success: true, message: 'Pulled ' + pulled + ' file(s) from remote', pulled: pulled };
     if (conflicts.length > 0) result.conflicts = conflicts;
     if (failedPulls.length > 0) result.failed = failedPulls;
+    if (_pullRaced) {
+        result.raced = _pullRaced;
+        result.message += ' (' + _pullRaced.length + ' file(s) changed concurrently during sync — HEAD not advanced: ' + _pullRaced.join(', ') + ')';
+    }
     return result;
 }
 
@@ -5560,6 +5839,12 @@ async function wsPush(wk, args, chatId, chatTitle) {
     var isIgnored = await wsGetIgnoreFilter(wk);
     var dirtyFiles = files.filter(function(f) { return f.dirty && !isIgnored(f.path); });
     if (dirtyFiles.length === 0) return { success: false, error: 'No modified files to push (all files match remote after sync)' };
+    // H7: snapshot every dirty row as read, BEFORE the (long, networked) push
+    // mutates the in-memory objects. The post-push write-back CASes against
+    // this snapshot so an edit landing mid-push is never reverted.
+    var _pushSnap = {};
+    dirtyFiles.forEach(function(f) { _pushSnap[f.path] = Object.assign({}, f); });
+    var _changedDuringPush = [];
 
     // Optional scoped push: args.files limits the commit to an explicit list of
     // paths. Unlisted dirty files stay dirty locally and are NOT committed, so
@@ -6087,7 +6372,30 @@ async function wsPush(wk, args, chatId, chatTitle) {
             dirtyFiles[k].last_modified_by_chat_title = null;
             dirtyFiles[k].last_modified_at = null;
             dirtyFiles[k].force_taken_from = null;
-            await setWorkspaceFile(dirtyFiles[k]);
+            // H7: CAS against the pre-push snapshot. On a conflict the row was
+            // edited / discarded / deleted mid-push: keep the CURRENT row (its
+            // new content + ownership stay dirty) and retry once adding ONLY
+            // pushed_pr / pushed_shas so a later sync still recognises the
+            // pushed sha as our merged work.
+            var _pwCas;
+            try { _pwCas = await _wsCasWrite(wk, dirtyFiles[k].path, _pushSnap[dirtyFiles[k].path] || null, dirtyFiles[k]); } catch (e) { _pwCas = { ok: false, error: e && e.message }; }
+            if (!(_pwCas && _pwCas.ok)) {
+                var _cur = _pwCas && _pwCas.conflict ? _pwCas.current : null;
+                var _chg = { path: dirtyFiles[k].path, reason: !_pwCas || !_pwCas.conflict ? 'write_failed' : (!_cur ? 'removed' : (_cur.dirty ? 'edited' : 'discarded')), stamped: false };
+                if (_cur && _cur.dirty) {
+                    var _curSnap = Object.assign({}, _cur);
+                    var _stamped = Object.assign({}, _cur);
+                    _stamped.pushed_pr = prInfo;
+                    var _shas = Array.isArray(_cur.pushed_shas) ? _cur.pushed_shas.slice() : [];
+                    if (_pushSha && _shas.indexOf(_pushSha) === -1) _shas.push(_pushSha);
+                    if (_shas.length > 20) _shas = _shas.slice(-20);
+                    _stamped.pushed_shas = _shas.length ? _shas : null;
+                    var _rc;
+                    try { _rc = await _wsCasWrite(wk, dirtyFiles[k].path, _curSnap, _stamped); } catch (e) { _rc = null; }
+                    _chg.stamped = !!(_rc && _rc.ok);
+                }
+                _changedDuringPush.push(_chg);
+            }
             // Snapshot old/new content for the durable PR diff (see _prFiles
             // above). old_sha reuses the row's base sha when present — its blob
             // is already durable via setWorkspaceFile; new content is keyed by
@@ -6180,6 +6488,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
         base_advanced: baseAdvanced,
         base_override_warning: _baseOverrideWarning || undefined,
         warning: _postPrWarning || undefined,
+        changed_during_push: _changedDuringPush.length ? _changedDuringPush : undefined,
         message: (prReused
             ? ('Added a commit (' + dirtyFiles.length + ' file(s)) to existing PR #' + prNumber + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : ''))
             : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)' + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : '')))
@@ -6188,6 +6497,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
             + (staleBranchRecreated ? (' \u26a0 STALE BRANCH RECREATED: the branch had no open PR' + (_previousPrNumber ? ' (its previous PR #' + _previousPrNumber + ' was ' + (_previousPrMerged ? 'MERGED' : 'closed') + ' mid-task)' : '') + ', it was reset onto the current base head and ' + (prReused ? 'closed PR #' + prNumber + ' was reopened' : 'a NEW PR was opened') + '; this PR contains ONLY the files pushed now') : '')
             + (_excludedForeign.length ? ('; ' + _excludedForeign.length + ' foreign in-progress file(s) excluded from the commit — see excluded_foreign_files') : '')
             + (_pushCrossChatWarnings.length ? ('; \u26a0 ' + _pushCrossChatWarnings.length + ' cross-chat warning(s) — committed file(s) belonging to another chat or another PR, see cross_chat_warnings') : '')
+            + (_changedDuringPush.length ? ('; \u26a0 ' + _changedDuringPush.length + ' file(s) changed locally DURING the push and were kept as-is (the newer edits are NOT in this commit) — see changed_during_push') : '')
     };
 }
 

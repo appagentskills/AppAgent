@@ -75,7 +75,7 @@ function expandDashboardWidget(widgetId) {
         '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
         // Saved revisions live in WidgetStore (widget.history is no longer written).
         // The button opens the version picker attachWidgetVersionPicker mounted
-        // above this modal's iframe; it only shows when there is history to pick.
+        // in this header's controls; it only shows when there is history to pick.
         (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="History (' + WidgetStore.versions(widgetId).length + ' versions)">' + UI_ICONS.history + '</button>' : '') +
         '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
         '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="Open in New Tab" aria-label="Open in New Tab">' + UI_ICONS.externalLink + '</button>' +
@@ -104,7 +104,10 @@ function expandDashboardWidget(widgetId) {
         var iframe = document.createElement('iframe');
         iframe.className = 'widget-iframe';
         iframe.style.cssText = 'width:100%;height:100%;border:none;background:var(--bg-white);';
-        iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
+        // No allow-same-origin: widget-sandbox.html is a manifest sandbox page whose
+        // CSP sandbox already forces an opaque origin, so it was a no-op that only
+        // triggered Chrome's "allow-scripts + allow-same-origin" warning.
+        iframe.sandbox = 'allow-scripts allow-forms';
         content.appendChild(iframe);
         writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id), widget.id);
     }
@@ -741,9 +744,13 @@ function injectWidgetTokens(html) {
 // thumbnail (chat sidebar strip / Widget Library gallery). It is NOT
 // registered as a live widget_eval instance — otherwise `widget_eval list`
 // reports it as surface:'chat', indistinguishable from the real inline render.
-// The version picker still attaches (CSS hides it in thumbnails).
+// Previews get no version picker (the flag also survives version re-renders).
+// Live mounts get the picker in their header button group, and only when the
+// surface HAS a header (attachWidgetVersionPicker, core/135-widget-store.js).
 function writeWidgetHtml(iframe, html, widgetId, options) {
     options = options || {};
+    if (options.preview) iframe.__versionPreview = true;
+    if (iframe.__versionPreview) options = Object.assign({}, options, { preview: true });
     attachWidgetVersionPicker(iframe, widgetId);
     // Shared by chat, dashboard and fullscreen; native fullscreen still needs
     // a user gesture in the widget. No top-page overlay or privileged eval.
@@ -960,7 +967,7 @@ function renderWidgetContent(widget) {
     var iframe = document.createElement('iframe');
     iframe.className = 'widget-iframe';
     iframe.style.cssText = 'width:100%;height:100%;border:none;background:var(--bg-white);';
-    iframe.sandbox = 'allow-scripts allow-same-origin allow-forms';
+    iframe.sandbox = 'allow-scripts allow-forms'; // see expandDashboardWidget: no allow-same-origin
 
     shadow.appendChild(iframe);
     writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id), widget.id);
@@ -1374,8 +1381,8 @@ function closeWidgetEditorPanel() {
 // is up, otherwise open the widget modal, which mounts its own picker. Choosing
 // a version never restores over latest.
 function showWidgetHistory(widgetId) {
-    var content = document.getElementById('widget-fullscreen-content');
-    var picker = content && content.querySelector('.widget-version-picker');
+    var overlay = document.getElementById('widget-fullscreen-overlay');
+    var picker = overlay && overlay.querySelector('.widget-fullscreen-header .widget-version-picker');
     if (picker) {
         picker.focus();
         if (typeof picker.showPicker === 'function') { try { picker.showPicker(); } catch (e) { /* needs a user gesture; focus is enough */ } }

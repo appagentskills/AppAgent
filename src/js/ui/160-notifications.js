@@ -158,7 +158,10 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             if (existingStatus === 'allowed' || existingStatus === 'session_allowed' || existingStatus === 'always_allowed') {
                 resolve(true); return;
             }
-            if (existingStatus === 'denied') {
+            // 'cancelled' (row rejected on Stop / chat teardown) is terminal
+            // too — resolve false instead of rebinding to a row that will
+            // never be answered (would hang the caller forever).
+            if (existingStatus === 'denied' || existingStatus === 'cancelled') {
                 resolve(false); return;
             }
             // Non-terminal (pending): reuse the existing row, rebinding the
@@ -262,7 +265,7 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
             if (existingStatusB === 'allowed' || existingStatusB === 'session_allowed' || existingStatusB === 'always_allowed') {
                 resolve(true); return;
             }
-            if (existingStatusB === 'denied') {
+            if (existingStatusB === 'denied' || existingStatusB === 'cancelled') {
                 resolve(false); return;
             }
             var reuseKeyB = chatId + ':' + existingRowB.index;
@@ -306,7 +309,15 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
 // Global approval handler - called from onclick in rendered HTML
 // skipNotificationClear: true when called from notification (notification handles its own state)
 // targetChatId: optional - used when approving from notification where chatId is known
+// C1 hardening: only the four real verdicts are accepted (call sites:
+// tools/120-actions.js popover, ui/220-notification-system.js cards) and an
+// UNKNOWN action is treated as 'deny' (default-deny, never approve).
+var APPROVAL_ACTIONS = { allow: 1, session: 1, auto: 1, deny: 1 };
 async function handleApproval(approvalIndex, action, skipNotificationClear, targetChatId) {
+    if (!Object.prototype.hasOwnProperty.call(APPROVAL_ACTIONS, action)) action = 'deny';
+    // Legit callers always pass a real row index (a non-negative integer).
+    var _validIndex = typeof approvalIndex === 'number' && isFinite(approvalIndex)
+        && approvalIndex >= 0 && Math.floor(approvalIndex) === approvalIndex;
     // B-A4: when targetChatId is provided, the (chatId, approvalIndex) pair is
     // authoritative — build the composite key directly. Without this, the loop
     // below matched on approvalIndex alone and could resolve a *different* chat's
@@ -346,7 +357,14 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
                     _soleKey = _pk;
                 }
             }
-            if (_soleKey && !_multi) {
+            // C1: the fallback only serves the merge-drift case, where the
+            // caller's index is a REAL (old) in-range row. A negative /
+            // non-integer / out-of-range index (e.g. an injected
+            // handleApproval(-1,'allow',…)) must never adopt the sole pending
+            // approval.
+            var _inRange = _validIndex && _staleChat && Array.isArray(_staleChat.messages)
+                && approvalIndex < _staleChat.messages.length;
+            if (_soleKey && !_multi && _inRange) {
                 approvalKey = _soleKey;
                 chatId = targetChatId;
             }
@@ -397,7 +415,7 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
     if (!msg || msg.role !== 'approval' || msg.status !== 'pending') return;
 
-    var approved = action !== 'deny';
+    var approved = action === 'allow' || action === 'session' || action === 'auto';
 
     // Update status based on action
     if (action === 'allow') {

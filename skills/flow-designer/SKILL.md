@@ -7,6 +7,8 @@ description: A recipe for creating flows in ServiceNow Flow Designer via UI auto
 
 Create ServiceNow flows by driving the Flow Designer UI with `iframe_tool`. No usable REST API exists for flow creation.
 
+> **API first — UI only where there is no API path.** Use the UI only for the flow-authoring steps themselves. Everything around them — looking up tables/users/groups, creating test records that trigger the flow, checking executions (`sys_flow_context`), approvals (`sysapproval_approver`) and resulting records — goes through `servicenow_api`. Impersonate with `iframe_tool` action `impersonate` (REST-based), never the UI menu.
+
 ## URLs
 
 - Home: `/$flow-designer.do`

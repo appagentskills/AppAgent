@@ -25,7 +25,7 @@
 .skills-action-btn.danger { background: var(--danger-light); border-color: var(--danger-light); color: var(--danger); }
 .skills-action-btn.danger:hover { background: var(--danger-lighter); }
 .skills-action-btn .action-icon { width: 14px; height: 14px; }
-.skills-list { padding: var(--space-8) var(--space-10); max-width: 800px; margin: 0 auto; width: 70%; display: flex; flex-direction: column; gap: var(--space-4); }
+.skills-list { padding: var(--space-8); width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: var(--space-4); }
 .skills-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); text-align: center; padding: var(--space-12); }
 .skills-empty-icon { width: 48px; height: 48px; margin-bottom: var(--space-8); opacity: 0.5; }
 .skills-empty-icon svg { width: 48px; height: 48px; }

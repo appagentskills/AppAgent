@@ -29,6 +29,45 @@ var TERMINAL_PROGRESS_STATES = ['done', 'error', 'finished', 'pr_opened', 'pr_me
 function isTerminalProgressState(state) {
     return TERMINAL_PROGRESS_STATES.indexOf(state) >= 0;
 }
+// H19b: ONE task-list normalizer shared by executeUpdateActionState (action
+// button / sub-agent mirror) and collectAllActionUpdates (sidebar card, title
+// pill, popover, jobs rows — which read RAW tool args). Drops null / non-object
+// entries (a `tasks:[null]` arg used to throw on `t.status` and blank the whole
+// right sidebar), caps the list at 20, coerces label to a <=80-char string and
+// status to the documented enum (off-list -> 'pending', so the
+// .status-<x> CSS selector always matches). Non-array -> null ("no tasks").
+var VALID_PROGRESS_TASK_STATUSES = ['pending', 'running', 'done', 'error'];
+function normalizeProgressTasks(tasks) {
+    if (!Array.isArray(tasks)) return null;
+    return tasks.slice(0, 20)
+        .filter(function(t) { return t && typeof t === 'object' && !Array.isArray(t); })
+        .map(function(t) {
+            var status = VALID_PROGRESS_TASK_STATUSES.indexOf(t.status) >= 0 ? t.status : 'pending';
+            return { label: String(t.label == null ? '' : t.label).substring(0, 80), status: status };
+        });
+}
+// H19a: did a role:'tool' result row report failure? Results are stored as
+// JSON.stringify(result) strings (app/030-agent-loop.js recordToolResult), so a
+// rejected update_action_state (terminal state while subs run, invalid state,
+// action not found, stopped action) carries {"success":false,...}. Robust:
+// non-JSON / non-object content (legacy plain-text results) counts as
+// executed; multimodal arrays are checked via their first text part.
+function progressToolResultFailed(content) {
+    var v = content;
+    if (Array.isArray(v)) {
+        var txt = null;
+        for (var i = 0; i < v.length; i++) {
+            if (v[i] && typeof v[i].text === 'string') { txt = v[i].text; break; }
+        }
+        v = txt;
+    }
+    if (typeof v === 'string') {
+        var s = v.trim();
+        if (s.charAt(0) !== '{') return false;
+        try { v = JSON.parse(s); } catch (e) { return false; }
+    }
+    return !!(v && typeof v === 'object' && v.success === false);
+}
 // ONE shared mapping of progress state -> {icon, label, cls} used by every
 // surface that renders a progress state (sidebar timeline badge, chat-progress
 // popover, header title pill in ui/170-chat-management.js, jobs rows / expand
@@ -378,13 +417,8 @@ async function executeUpdateActionState(args, options) {
     // against the documented enum and fall back to 'pending' for anything
     // off-list — otherwise the CSS selector (.task-row.status-…) silently
     // fails to match and the row renders unstyled.
-    var VALID_TASK_STATUSES = ['pending', 'running', 'done', 'error'];
-    var normTasks = Array.isArray(args.tasks)
-        ? args.tasks.slice(0, 20).map(function(t) {
-            var status = t && VALID_TASK_STATUSES.indexOf(t.status) >= 0 ? t.status : 'pending';
-            return { label: String((t && t.label) || '').substring(0, 80), status: status };
-        })
-        : null;
+    // Shared with collectAllActionUpdates (H19b) — see normalizeProgressTasks.
+    var normTasks = normalizeProgressTasks(args.tasks);
 
     // Background chat hooked up to an Action button: drive the live button state.
     // Foreground chats just contribute to the sidebar timeline via their tool_calls.
@@ -393,6 +427,22 @@ async function executeUpdateActionState(args, options) {
         var a = activeActions[actionId];
         if (!a) {
             return { success: false, error: 'Active action not found for this chat.' };
+        }
+        // M4: the user pressed Stop (stopAction sets state='stopped'). An
+        // in-flight update_action_state that lands after the stop must NOT
+        // revive the spinner — reject non-terminal updates without mutating
+        // the action (a terminal done/error report is still accepted so a run
+        // that finishes its last call can record its outcome). The rejection
+        // returns before the _progressCardAt stamp, and collectAllActionUpdates
+        // skips {success:false} results, so the sidebar is not revived either.
+        // Only while the chat is STILL paused: resumeAction / togglePause clear
+        // the pause but leave state='stopped', so without the pause check a
+        // resumed run could never update its card again. isChatPaused exists in
+        // both realms (core/030-config.js page, worker/020-page-stubs.js SW);
+        // if it is somehow absent, stay conservative and keep rejecting.
+        var _stillPaused = (typeof isChatPaused === 'function') ? isChatPaused(a.chatId) : true;
+        if (a.state === 'stopped' && !isTerminalProgressState(state) && _stillPaused) {
+            return { success: false, error: 'Action was stopped by the user' };
         }
         var prevState = a.state;
         a.state = state;
@@ -1221,6 +1271,7 @@ function renderActionUpdatesSection(chat) {
     if (Array.isArray(current.tasks) && current.tasks.length) {
         tasksHtml = '<ul class="action-update-tasks">' +
             current.tasks.map(function(t) {
+                t = t || {}; // H19b: defensive — collectAllActionUpdates already normalizes
                 var taskIcon = t.status === 'done' ? UI_ICONS.check :
                                t.status === 'error' ? UI_ICONS.close :
                                t.status === 'running' ? UI_ICONS.spinner :
@@ -1351,11 +1402,18 @@ function collectAllActionUpdates(chat, includeToolCallId) {
     var out = [];
     if (!chat || !Array.isArray(chat.messages)) return out;
 
-    // Pre-scan: collect every tool_call_id that has produced a result row.
+    // Pre-scan: collect every tool_call_id that has produced a SUCCESSFUL result
+    // row. H19a: a {success:false} result (e.g. terminal state rejected while
+    // sub-agents run — executeUpdateActionState) did not change the card, so
+    // it must not render its raw args (a rejected 'done' used to show DONE on
+    // the sidebar card, title pill, popover and jobs rows). Seeded
+    // `_placeholder` rows (app/030-agent-loop.js seedPlaceholderToolResults)
+    // are not results either — the call hasn't run yet.
     var completed = {};
     for (var i = 0; i < chat.messages.length; i++) {
         var m = chat.messages[i];
-        if (m && m.role === 'tool' && m.tool_call_id) completed[m.tool_call_id] = true;
+        if (m && m.role === 'tool' && m.tool_call_id && !m._placeholder
+            && !progressToolResultFailed(m.content)) completed[m.tool_call_id] = true;
     }
     if (includeToolCallId) completed[includeToolCallId] = true;
 
@@ -1370,11 +1428,14 @@ function collectAllActionUpdates(chat, includeToolCallId) {
             if (tc.id && !completed[tc.id]) return;
             var args = {};
             try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) { /* partial/streaming JSON — skip */ return; }
+            if (!args || typeof args !== 'object') return;
             out.push({
                 state: args.state,
                 icon: args.icon,
                 label: args.label,
-                tasks: args.tasks,
+                // H19b: same normalization as the action button (drops null /
+                // non-object entries) so every renderer gets well-formed rows.
+                tasks: normalizeProgressTasks(args.tasks),
                 output: args.output,
                 status_message: args.status_message
             });
@@ -1551,6 +1612,7 @@ function openChatProgressPopover(anchor, includeToolCallId, chatId) {
     if (Array.isArray(current.tasks) && current.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
             current.tasks.map(function(t) {
+                if (!t) return ''; // H19b: defensive — tasks are normalized upstream
                 var icn = t.status === 'done' ? UI_ICONS.check :
                           (t.status === 'error' ? UI_ICONS.close :
                           (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
@@ -1797,8 +1859,9 @@ function openRunningPopover(btn, actionId) {
     if (Array.isArray(a.tasks) && a.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
             a.tasks.map(function(t) {
+                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
                 var icn = t.status === 'done' ? UI_ICONS.check : (t.status === 'error' ? UI_ICONS.close : (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + t.status + '">' +
+                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
                     '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
                     '</div>';
@@ -1851,8 +1914,9 @@ function openResultPopover(btn, actionId) {
     if (Array.isArray(a.tasks) && a.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
             a.tasks.map(function(t) {
+                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
                 var icn = t.status === 'done' ? UI_ICONS.check : (t.status === 'error' ? UI_ICONS.close : (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + t.status + '">' +
+                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
                     '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
                     '</div>';
@@ -2031,11 +2095,12 @@ function showActionTooltip(btn) {
     if (a && Array.isArray(a.tasks) && a.tasks.length) {
         html += '<div class="action-tooltip-tasks">' +
             a.tasks.map(function(t) {
+                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
                 var icn = t.status === 'done' ? UI_ICONS.check :
                           t.status === 'error' ? UI_ICONS.close :
                           t.status === 'running' ? UI_ICONS.spinner :
                           UI_ICONS.clock;
-                return '<div class="action-task status-' + t.status + '">' +
+                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
                     '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
                     '</div>';
@@ -2961,7 +3026,7 @@ function renderJobsDropdown(dropdown) {
         var _cState = _jobsChatState(c.id);
         var _cPaused = (_cState === 'paused');
         if (_cState === 'unseen') _cState = 'done';
-        var _cIcon = _jobsStateIndicatorHtml(_cState);
+        var _cIcon = _jobsStateIndicatorHtml(_cState, c.id);
         // Show the chat's current progress task under its title (latest
         // update_action_state: the running task label, falling back to the
         // progress label / status_message). Generic 'Running…' only when the
@@ -3398,8 +3463,14 @@ function _jobsRowSignals(chatId, st) {
 // Leading run-state indicator: animated spinner while running, muted gray check
 // once finished (read or not — the trailing blue dot carries unread), colored
 // status dot for the attention / paused / error states. 'unseen' is a finished
-// chat, so it maps to the check.
-function _jobsStateIndicatorHtml(st) {
+// chat, so it maps to the check — UNLESS the chat carries the finished-chat
+// bell (ui/165-finished-chat-badge.js): pass chatId and a chat the header
+// "Active chats" pill is counting in its bell segment renders the SAME bell
+// here, from the same source of truth (getFinishedChatBell), so pill and row
+// can never disagree.
+function _jobsStateIndicatorHtml(st, chatId) {
+    var _bell = (chatId && typeof getFinishedChatBell === 'function') ? getFinishedChatBell(chatId) : null;
+    if (_bell) return '<span class="jobs-row-bell' + (_bell.hasError ? ' err' : '') + '" title="Finished \u2014 not viewed yet">' + (UI_ICONS.bell_filled || UI_ICONS.bell || '') + '</span>';
     if (st === 'running') return '<span class="jobs-row-spinner">' + (UI_ICONS.spinner || '') + '</span>';
     if (st === 'done' || st === 'unseen') return '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
     return '<span class="jobs-row-dot state-' + escapeHtml(st) + '"></span>';
@@ -3432,7 +3503,7 @@ function _jobsChatRowHtml(c, mode, timeW) {
     var timeStr = _jobsHistTimeStr(c);
     // Design A: the leading slot carries RUN state only (spinner / muted check /
     // colored dot); read-state is the bold + blue-dot channel from _jobsRowSignals.
-    var indicator = _jobsStateIndicatorHtml(st);
+    var indicator = _jobsStateIndicatorHtml(st, c.id);
     var sig = _jobsRowSignals(c.id, st);
     return '<div class="jobs-dropdown-row jobs-chat-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
@@ -3455,7 +3526,7 @@ function _jobsTodayRowHtml(c, timeW) {
     // Design A: completed rows show the muted check (or a status dot for edge
     // states) via _jobsStateIndicatorHtml; unread = bold title + trailing blue
     // dot, current = tinted selected row + accent bar — both from _jobsRowSignals.
-    var _todayIndicator = _jobsStateIndicatorHtml(st);
+    var _todayIndicator = _jobsStateIndicatorHtml(st, c.id);
     var sig = _jobsRowSignals(c.id, st);
     return '<div class="jobs-dropdown-row jobs-today-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
@@ -4262,7 +4333,7 @@ function renderJobsExpandModal() {
 function _jobsExpandCardHtml(c) {
     var st = (typeof _jobsChatState === 'function') ? _jobsChatState(c.id) : 'done';
     // Design A: same three channels as the dropdown rows (see _jobsRowSignals).
-    var indicator = _jobsStateIndicatorHtml(st);
+    var indicator = _jobsStateIndicatorHtml(st, c.id);
     var sig = _jobsRowSignals(c.id, st);
     var idJs = escapeJsString(c.id);
     // Progress only in the scrollable body — sub-agent rows live in a drawer

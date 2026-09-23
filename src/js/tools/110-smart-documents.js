@@ -364,9 +364,22 @@ function sdocCopyDisplays(doc, content, options) {
     }
 }
 
+// C1: prompt ids are AGENT-controlled (args.prompts) and are interpolated
+// into an element id AND an inline onsubmit JS string (sdocRenderPrompt).
+// Only a strict [A-Za-z0-9_-]{1,64} charset is accepted; anything else is
+// replaced by a fresh safe id (in place, so sdocSubmitPrompt finds it).
+var SDOC_PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+function _sdocSafePromptId(p) {
+    if (!p || typeof p !== 'object') return '';
+    if (typeof p.id !== 'string' || !SDOC_PROMPT_ID_RE.test(p.id)) {
+        p.id = 'dpr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+    }
+    return p.id;
+}
+
 function sdocInitPrompts(doc) {
     (doc.prompts || []).forEach(function(p) {
-        if (!p.id) p.id = 'dpr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+        _sdocSafePromptId(p);
         if (!p.status) p.status = 'pending';
         if (!p.responses) p.responses = {};
     });
@@ -392,6 +405,10 @@ function renderDocumentPlaceholder(docId) {
     return sdocRender(doc);
 }
 
+// Doc id embedded in a '...' JS string inside an inline on* attribute: JS-escape
+// first (the HTML parser decodes entities before the handler runs), then HTML-escape.
+function sdocJsArg(s) { return escDisplay(String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r?\n/g, '\\n')); }
+
 function sdocRender(doc) {
     var docId = doc.id;
     var cid = 'sdoc_' + docId.replace(/[^a-zA-Z0-9_]/g, '');
@@ -404,23 +421,23 @@ function sdocRender(doc) {
     html += '<span class="sdoc-icon">' + UI_ICONS.file + '</span>';
     html += '<span class="sdoc-title">' + escDisplay(doc.title) + '</span>';
     html += '<input type="text" class="sdoc-title-input" value="' + escDisplay(doc.title) + '" placeholder="Document title..." />';
-    html += '<span class="sdoc-version-badge">v' + doc.currentVersion + '</span>';
+    html += '<span class="sdoc-version-badge">v' + escDisplay(doc.currentVersion) + '</span>';
     html += '</div>';
     html += '<div class="sdoc-header-actions">';
-    html += '<select class="sdoc-version-select" onchange="sdocCompare(\'' + escDisplay(docId) + '\', this.value)" title="Compare with version">';
-    html += '<option value="">v' + doc.currentVersion + '</option>';
+    html += '<select class="sdoc-version-select" onchange="sdocCompare(\'' + sdocJsArg(docId) + '\', this.value, this)" title="Compare with version">';
+    html += '<option value="">v' + escDisplay(doc.currentVersion) + '</option>';
     for (var i = doc.versions.length - 1; i >= 0; i--) {
         var v = doc.versions[i];
         if (v.version === doc.currentVersion) continue;
         var icon = v.author === 'user' ? '\u{1F464}' : '\u{1F916}';
-        html += '<option value="' + v.version + '">v' + v.version + ' ' + icon + ' ' + sdocTimeAgo(v.timestamp) + '</option>';
+        html += '<option value="' + escDisplay(v.version) + '">v' + escDisplay(v.version) + ' ' + icon + ' ' + sdocTimeAgo(v.timestamp) + '</option>';
     }
     html += '</select>';
-    html += '<button class="sdoc-action-btn" onclick="sdocToggleEdit(\'' + escDisplay(docId) + '\')" title="Edit">' + UI_ICONS.edit + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="editDocumentWithAgent(\'' + escDisplay(docId) + '\', event)" title="Edit with agent">' + UI_ICONS.agentEdit + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocExportMd(\'' + escDisplay(docId) + '\')" title="Copy Markdown">' + UI_ICONS.copy + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocOpenNewTab(\'' + escDisplay(docId) + '\')" title="Open in new tab">' + UI_ICONS.expand + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocStartChat(\'' + escDisplay(docId) + '\')" title="New chat">' + UI_ICONS.chat + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocToggleEdit(\'' + sdocJsArg(docId) + '\', this)" title="Edit">' + UI_ICONS.edit + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="editDocumentWithAgent(\'' + sdocJsArg(docId) + '\', event)" title="Edit with agent">' + UI_ICONS.agentEdit + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocExportMd(\'' + sdocJsArg(docId) + '\')" title="Copy Markdown">' + UI_ICONS.copy + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocOpenNewTab(\'' + sdocJsArg(docId) + '\')" title="Open in new tab">' + UI_ICONS.expand + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocStartChat(\'' + sdocJsArg(docId) + '\')" title="New chat">' + UI_ICONS.chat + '</button>';
     html += '</div></div>';
 
     // Diff (hidden)
@@ -433,8 +450,8 @@ function sdocRender(doc) {
     html += '<div class="sdoc-edit" id="' + cid + '-edit" style="display:none;">';
     html += '<textarea class="sdoc-editor" id="' + cid + '-editor">' + escDisplay(doc.currentContent) + '</textarea>';
     html += '<div class="sdoc-edit-actions">';
-    html += '<button class="skills-action-btn primary" onclick="sdocSaveEdit(\'' + escDisplay(docId) + '\')">Save</button>';
-    html += '<button class="skills-action-btn" onclick="sdocCancelEdit(\'' + escDisplay(docId) + '\')">Cancel</button>';
+    html += '<button class="skills-action-btn primary" onclick="sdocSaveEdit(\'' + sdocJsArg(docId) + '\', this)">Save</button>';
+    html += '<button class="skills-action-btn" onclick="sdocCancelEdit(\'' + sdocJsArg(docId) + '\', this)">Cancel</button>';
     html += '</div></div>';
 
     // Prompts
@@ -468,7 +485,9 @@ function sdocRenderContent(doc) {
 }
 
 function sdocRenderPrompt(doc, prompt) {
-    var pid = prompt.id;
+    // C1: sanitize on READ too — docs stored before this fix may carry a
+    // hostile id; _sdocSafePromptId rewrites it to a safe one in place.
+    var pid = _sdocSafePromptId(prompt);
     var answered = prompt.status === 'answered';
     var fid = 'sdoc-prompt-' + pid;
 
@@ -486,8 +505,14 @@ function sdocRenderPrompt(doc, prompt) {
 
     // input/change bubble from every field to the form: one delegated marker
     // records which fields the USER touched (see _sdocCarryPromptDrafts).
-    html += '<form class="sdoc-prompt-form" id="' + fid + '" oninput="sdocMarkPromptDirty(event.target)" onchange="sdocMarkPromptDirty(event.target)" onsubmit="event.preventDefault(); sdocSubmitPrompt(\'' + escDisplay(doc.id) + '\', \'' + escDisplay(pid) + '\')">';
-    (prompt.fields || []).forEach(function(field) {
+    html += '<form class="sdoc-prompt-form" id="' + escDisplay(fid) + '" oninput="sdocMarkPromptDirty(event.target)" onchange="sdocMarkPromptDirty(event.target)" onsubmit="event.preventDefault(); sdocSubmitPrompt(\'' + sdocJsArg(doc.id) + '\', \'' + sdocJsArg(pid) + '\')">';
+    // Iterate the CLEANED field list: a null / non-object entry (legacy or
+    // hand-edited doc) would otherwise throw on field.name below and break the
+    // whole document render.
+    var _sdocFields = (typeof sanitizePromptFields === 'function')
+        ? sanitizePromptFields(prompt.fields)
+        : (prompt.fields || []).filter(function(f) { return f && typeof f === 'object'; });
+    _sdocFields.forEach(function(field) {
         var val = (prompt.responses && prompt.responses[field.name] !== undefined) ? prompt.responses[field.name] : (field.value !== undefined ? field.value : '');
         html += '<div class="sdoc-prompt-field">';
         html += '<label class="sdoc-prompt-label">' + escDisplay(field.label) + '</label>';
@@ -523,8 +548,35 @@ function sdocGetCid(docId) {
     return 'sdoc_' + docId.replace(/[^a-zA-Z0-9_]/g, '');
 }
 
-// Find the right sdoc container — prefer modal instance over inline
-function sdocGetContainer(docId) {
+// H13: the same doc can render several times in one transcript (every
+// <!--doc:--> reference shows the latest version), and every copy shares the
+// same element ids — so getElementById always returned the FIRST copy and an
+// Edit/Save/Cancel/Compare/Submit on a later copy acted on the wrong one.
+// Handlers now pass the clicked element (`this` in the inline attribute; the
+// CSP polyfill, platform/extension/csp-polyfill.js _call, also applies the
+// handler with `this` = the bound element), and the container is resolved
+// from it. Walks past a nested .sdoc for a DIFFERENT doc id.
+function _sdocEl(x) {
+    return (x && x.nodeType === 1 && typeof x.closest === 'function') ? x : null;
+}
+function sdocContainerFrom(el, docId) {
+    var node = _sdocEl(el);
+    var id = String(docId);
+    while (node) {
+        var c = node.closest('.sdoc[data-doc-id]');
+        if (!c) return null;
+        if (c.getAttribute('data-doc-id') === id) return c;
+        node = _sdocEl(c.parentElement);
+    }
+    return null;
+}
+
+// Find the right sdoc container — the one holding the clicked element first;
+// otherwise (programmatic calls, e.g. sdocCreateFromPage) prefer the modal
+// instance over inline, then the first inline copy by id.
+function sdocGetContainer(docId, fromEl) {
+    var own = sdocContainerFrom(fromEl, docId);
+    if (own) return own;
     var modal = document.getElementById('sdoc-preview-modal');
     if (modal) {
         var el = modal.querySelector('[data-doc-id="' + docId + '"]');
@@ -533,8 +585,8 @@ function sdocGetContainer(docId) {
     return document.getElementById(sdocGetCid(docId));
 }
 
-function sdocToggleEdit(docId) {
-    var c = sdocGetContainer(docId);
+function sdocToggleEdit(docId, fromEl) {
+    var c = sdocGetContainer(docId, _sdocEl(fromEl) || _sdocEl(this));
     if (!c) return;
     var body = c.querySelector('.sdoc-body');
     var edit = c.querySelector('.sdoc-edit');
@@ -562,8 +614,8 @@ function sdocToggleEdit(docId) {
     }
 }
 
-async function sdocSaveEdit(docId) {
-    var c = sdocGetContainer(docId);
+async function sdocSaveEdit(docId, fromEl) {
+    var c = sdocGetContainer(docId, _sdocEl(fromEl) || _sdocEl(this));
     if (!c) return;
     var editor = c.querySelector('.sdoc-editor');
     if (!editor) return;
@@ -574,7 +626,7 @@ async function sdocSaveEdit(docId) {
     var newTitle = titleInput ? titleInput.value.trim() : '';
     var newContent = editor.value;
     var titleChanged = newTitle && newTitle !== doc.title;
-    if (newContent === doc.currentContent && !titleChanged) { sdocCancelEdit(docId); return; }
+    if (newContent === doc.currentContent && !titleChanged) { sdocCancelEdit(docId, c); return; }
     c.classList.remove('sdoc-editing');
 
     doc.currentVersion++;
@@ -589,8 +641,8 @@ async function sdocSaveEdit(docId) {
     renderDocumentsPage();
 }
 
-function sdocCancelEdit(docId) {
-    var c = sdocGetContainer(docId);
+function sdocCancelEdit(docId, fromEl) {
+    var c = sdocGetContainer(docId, _sdocEl(fromEl) || _sdocEl(this));
     if (!c) return;
     var body = c.querySelector('.sdoc-body');
     var edit = c.querySelector('.sdoc-edit');
@@ -599,8 +651,8 @@ function sdocCancelEdit(docId) {
     if (c) c.classList.remove('sdoc-editing');
 }
 
-function sdocCompare(docId, versionStr) {
-    var c = sdocGetContainer(docId);
+function sdocCompare(docId, versionStr, fromEl) {
+    var c = sdocGetContainer(docId, _sdocEl(fromEl) || _sdocEl(this));
     if (!c) return;
     var diff = c.querySelector('.sdoc-diff');
     var body = c.querySelector('.sdoc-body');
@@ -796,14 +848,23 @@ function sdocAttachToInput(docId) {
     if (typeof renderPendingImages === 'function') renderPendingImages();
 }
 
-function sdocSubmitPrompt(docId, promptId) {
+// onsubmit keeps its C1-pinned shape (test/smart-doc-prompt-xss.test.js), so the
+// form arrives as the receiver: the CSP polyfill applies handlers with
+// `this` = the bound <form>. An explicit 3rd arg wins when given.
+function sdocSubmitPrompt(docId, promptId, fromEl) {
+    var src = _sdocEl(fromEl) || _sdocEl(this);
     var doc = smartDocuments[docId];
     if (!doc) return;
     var prompt = doc.prompts.find(function(p) { return p.id === promptId; });
     if (!prompt) return;
-    // Scope form search to the correct container (modal or inline) to avoid duplicate ID issues
-    var container = sdocGetContainer(docId);
-    var formEl = container ? container.querySelector('#sdoc-prompt-' + promptId) : document.getElementById('sdoc-prompt-' + promptId);
+    // Scope form search to the correct container (clicked copy, modal or inline) to avoid duplicate ID issues
+    var formEl = null;
+    var srcForm = src ? src.closest('form.sdoc-prompt-form') : null;
+    if (srcForm && srcForm.id === 'sdoc-prompt-' + promptId && sdocContainerFrom(srcForm, docId)) formEl = srcForm;
+    if (!formEl) {
+        var container = sdocGetContainer(docId, src);
+        formEl = container ? container.querySelector('#sdoc-prompt-' + promptId) : document.getElementById('sdoc-prompt-' + promptId);
+    }
     if (!formEl) return;
 
     var responses = {};
@@ -1000,6 +1061,52 @@ function openDocumentsView() {
     pushHistoryState('documents', null);
 }
 
+// Search + Rows/Gallery layout mirror the dashboard's Widget Library
+// (ui/065-widget-library.js) and reuse its CSS (css/19b-widget-library.css:
+// .widget-library-header/-search/-count, .segmented-toggle, .widget-library-items
+// .layout-rows/.layout-gallery, .widget-library-item/-title/-meta/-badge/-btn,
+// .widget-library-empty). The layout persists in appStorage like
+// 'widgetLibraryLayout'; the query is session-only (same as the library).
+var SDOC_PAGE_LAYOUT_KEY = 'documentsPageLayout'; // 'rows' | 'gallery'
+var SDOC_GRID_ICON = '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>';
+var sdocPageState = { query: '' };
+
+function sdocGetPageLayout() {
+    try { return appStorage.getItem(SDOC_PAGE_LAYOUT_KEY) === 'gallery' ? 'gallery' : 'rows'; } catch (e) { return 'rows'; }
+}
+
+function sdocSetPageLayout(layout) {
+    try { appStorage.setItem(SDOC_PAGE_LAYOUT_KEY, layout === 'gallery' ? 'gallery' : 'rows'); } catch (e) {}
+    renderDocumentsPage();
+}
+
+function sdocOnPageSearchInput(value) {
+    // Documents are plain text (no thumbnail iframes to re-mount), so filter
+    // on every keystroke — no debounce needed, unlike the Widget Library.
+    sdocPageState.query = String(value || '').trim().toLowerCase();
+    renderDocumentsPageItems();
+}
+
+function sdocPageItemKey(event, docId) {
+    if (event.target !== event.currentTarget) return; // keys on an action button act on the button
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); sdocOpenPreview(docId); }
+}
+
+// chat-scoped docs are private to their chat — never list them in the global Documents page.
+function sdocPageDocs() {
+    return Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
+}
+
+function sdocPagePreview(doc) {
+    return (doc.currentContent || '').substring(0, 200).replace(/[#*_\x60\n]/g, ' ').trim();
+}
+
+function sdocPageMatches(doc, q) {
+    if (!q) return true;
+    return String(doc.title || '').toLowerCase().indexOf(q) !== -1 ||
+        String(doc.currentContent || '').toLowerCase().indexOf(q) !== -1;
+}
+
 function renderDocumentsPage() {
     var list = document.getElementById('documents-list');
     if (!list) return;
@@ -1008,64 +1115,104 @@ function renderDocumentsPage() {
     var toggleBtn = document.getElementById('documents-toggle-sidebar-btn');
     if (toggleBtn) toggleBtn.innerHTML = UI_ICONS.panelLeftClose;
 
-    // chat-scoped docs are private to their chat — never list them in the global Documents page.
-    var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
+    // Toolbar is built once and kept across re-renders (agent doc updates call
+    // renderDocumentsPage) so the search input never loses focus mid-typing.
+    // The search/count/toggle live in the page toolbar slot (next to the page's
+    // action buttons, ui/045-page-layout.js); fall back to the list if absent.
+    var slot = document.getElementById('documents-toolbar-slot');
+    var host = slot || list;
+    if (slot && !slot.querySelector('.sdoc-page-toolbar') && typeof pageToolbarControlsHtml === 'function') {
+        slot.innerHTML = pageToolbarControlsHtml({ extraClass: 'sdoc-page-toolbar', placeholder: 'Search documents\u2026', inputClass: 'sdoc-page-search-input', onInput: 'sdocOnPageSearchInput', countId: 'documents-count', layoutFn: 'sdocSetPageLayout' });
+    }
+    if (slot && !document.getElementById('documents-items')) {
+        list.innerHTML = '<div class="widget-library-items page-list" id="documents-items"></div>';
+    }
+    if (!host.querySelector('.sdoc-page-toolbar')) {
+        list.innerHTML = '<div class="widget-library-header sdoc-page-toolbar">' +
+            '<label class="widget-library-search">' + UI_ICONS.search +
+                '<input type="search" class="widget-library-search-input sdoc-page-search-input" placeholder="Search documents\u2026" aria-label="Search documents" oninput="sdocOnPageSearchInput(this.value)">' +
+            '</label>' +
+            '<span class="widget-library-count" id="documents-count"></span>' +
+            '<div class="segmented-toggle widget-library-layout" role="group" aria-label="Layout">' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="Rows" onclick="sdocSetPageLayout(\'rows\')">' + UI_ICONS.list + '<span>Rows</span></button>' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="Gallery" onclick="sdocSetPageLayout(\'gallery\')">' + SDOC_GRID_ICON + '<span>Gallery</span></button>' +
+            '</div>' +
+        '</div>' +
+        '<div class="widget-library-items" id="documents-items"></div>';
+    }
+    var layout = sdocGetPageLayout();
+    list.classList.toggle('sdoc-page-gallery', layout === 'gallery');
+    host.querySelectorAll('.widget-library-layout-btn').forEach(function(btn) {
+        var on = btn.dataset.layout === layout;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    var input = host.querySelector('.sdoc-page-search-input');
+    if (input && input.value.trim().toLowerCase() !== sdocPageState.query) input.value = sdocPageState.query;
+    renderDocumentsPageItems();
+}
+
+function renderDocumentsPageItems() {
+    var items = document.getElementById('documents-items');
+    if (!items) return;
+    var layout = sdocGetPageLayout();
+    items.className = 'widget-library-items page-list layout-' + layout;
+    var q = sdocPageState.query;
+    var all = sdocPageDocs();
+    var docs = all.filter(function(doc) { return sdocPageMatches(doc, q); });
     docs.sort(function(a, b) { return b.updatedAt - a.updatedAt; });
 
-    if (docs.length === 0) {
-        list.innerHTML = '<div class="history-empty">' +
-            '<div class="history-empty-icon">' + UI_ICONS.file + '</div>' +
-            '<div class="history-empty-title">No documents yet</div>' +
-            '<div class="history-empty-text">Create a document or ask the agent to create one for you.</div>' +
+    var count = document.getElementById('documents-count');
+    if (count) count.textContent = q ? docs.length + ' of ' + all.length : all.length + (all.length === 1 ? ' document' : ' documents');
+
+    if (all.length === 0) {
+        items.innerHTML = '<div class="widget-library-empty sdoc-page-empty">' + UI_ICONS.file +
+            '<p class="sdoc-page-empty-title">No documents yet</p>' +
+            '<p class="widget-library-empty-hint">Create a document or ask the agent to create one for you.</p>' +
             '<button class="skills-action-btn primary" onclick="sdocCreateFromPage()" style="margin-top:12px">' + UI_ICONS.plus + ' New Document</button>' +
             '</div>';
         return;
     }
+    if (docs.length === 0) {
+        items.innerHTML = '<div class="widget-library-empty sdoc-page-empty">' + UI_ICONS.search +
+            '<p class="sdoc-page-empty-title">No documents match \u201c' + escDisplay(q) + '\u201d</p>' +
+            '<p class="widget-library-empty-hint">Search looks at document titles and content.</p>' +
+            '</div>';
+        return;
+    }
+    items.innerHTML = docs.map(buildDocumentsPageItem).join('');
+}
 
-    var html = '';
-    docs.forEach(function(doc) {
-        var lastVer = doc.versions[doc.versions.length - 1];
-        var authorIcon = lastVer ? (lastVer.author === 'user' ? '\u{1F464}' : '\u{1F916}') : '';
-        var preview = (doc.currentContent || '').substring(0, 200).replace(/[#*_`\n]/g, ' ').trim();
-        var versionCount = doc.versions.length;
+function buildDocumentsPageItem(doc) {
+    var id = sdocJsArg(doc.id);
+    var lastVer = doc.versions[doc.versions.length - 1];
+    var authorIcon = lastVer ? (lastVer.author === 'user' ? '\u{1F464}' : '\u{1F916}') : '';
+    var preview = sdocPagePreview(doc);
+    var versionCount = doc.versions.length;
+    var scope = doc.scope === 'chat' ? 'chat' : 'shared';
+    var when = doc.updatedAt ? new Date(doc.updatedAt).toLocaleString() : '';
 
-        // Action buttons (appear on hover, like history cards)
-        var actionsHtml = '<div class="history-chat-actions">';
-        actionsHtml += '<button class="history-chat-action-btn" onclick="event.stopPropagation(); sdocStartChat(\'' + escDisplay(doc.id) + '\')" title="New chat">' + UI_ICONS.chat + '</button>';
-        actionsHtml += '<button class="history-chat-action-btn" onclick="event.stopPropagation(); sdocDownloadMd(\'' + escDisplay(doc.id) + '\')" title="Export">' + UI_ICONS.download + '</button>';
-        actionsHtml += '<button class="history-chat-action-btn danger" onclick="event.stopPropagation(); sdocDeleteFromPage(\'' + escDisplay(doc.id) + '\')" title="Delete">' + UI_ICONS.trash + '</button>';
-        actionsHtml += '</div>';
-
-        // Preview
-        var previewHtml = '<div class="history-chat-preview-area">';
-        previewHtml += '<div class="history-preview-msg"><span class="history-preview-text">' + escDisplay(preview) + (preview.length >= 200 ? '...' : '') + '</span></div>';
-        previewHtml += '</div>';
-
-        // Stats
-        var statsHtml = '<div class="history-chat-stats">';
-        statsHtml += '<span class="history-chat-stat">' + UI_ICONS.file + versionCount + ' version' + (versionCount > 1 ? 's' : '') + '</span>';
-        if (lastVer) statsHtml += '<span class="history-chat-stat">' + authorIcon + ' ' + lastVer.author + '</span>';
-        statsHtml += '</div>';
-
-        // Meta row
-        var metaHtml = '<div class="history-chat-meta">';
-        metaHtml += '<span>' + UI_ICONS.clock + sdocTimeAgo(doc.updatedAt) + '</span>';
-        metaHtml += '</div>';
-
-        html += '<div class="history-chat-card" onclick="sdocOpenPreview(\'' + escDisplay(doc.id) + '\')" style="cursor:pointer;">';
-        html += '<div class="history-chat-header">';
-        html += '<div class="history-chat-title-row">';
-        html += '<span class="history-chat-title">' + escDisplay(doc.title) + '</span>';
-        html += '<div class="history-chat-badges"><span class="sdoc-version-badge">v' + doc.currentVersion + '</span></div>';
-        html += '</div>';
-        html += actionsHtml;
-        html += '</div>';
-        html += previewHtml;
-        html += statsHtml;
-        html += metaHtml;
-        html += '</div>';
-    });
-    list.innerHTML = html;
+    var html = '<div class="widget-library-item sdoc-lib-item" data-doc-id="' + escDisplay(doc.id) + '" role="button" tabindex="0"' +
+        ' title="Open ' + escDisplay(doc.title) + '" onclick="sdocOpenPreview(\'' + id + '\')" onkeydown="sdocPageItemKey(event, \'' + id + '\')">';
+    html += '<div class="sdoc-lib-icon">' + UI_ICONS.file + '</div>';
+    html += '<div class="sdoc-lib-info">';
+    html += '<div class="widget-library-title sdoc-lib-title">' + escDisplay(doc.title) + '</div>';
+    html += '<div class="sdoc-lib-preview' + (preview ? '' : ' empty') + '">' + (preview ? escDisplay(preview) + (preview.length >= 200 ? '...' : '') : 'Empty document') + '</div>';
+    html += '<div class="widget-library-meta sdoc-lib-meta">';
+    html += '<span class="widget-library-badge sdoc-scope-badge scope-' + scope + '">' + (scope === 'chat' ? 'Chat' : 'Shared') + '</span>';
+    html += '<span class="widget-library-badge sdoc-version-badge">v' + escDisplay(doc.currentVersion) + '</span>';
+    html += '<span class="sdoc-lib-stat sdoc-lib-date" title="' + escDisplay(when) + '">' + UI_ICONS.clock + sdocTimeAgo(doc.updatedAt) + '</span>';
+    html += '<span class="sdoc-lib-stat sdoc-lib-versions">' + versionCount + ' version' + (versionCount > 1 ? 's' : '') + '</span>';
+    if (lastVer) html += '<span class="sdoc-lib-stat sdoc-lib-author">' + authorIcon + ' ' + escDisplay(lastVer.author) + '</span>';
+    html += '</div>';
+    html += '</div>';
+    html += '<div class="sdoc-lib-actions">';
+    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocStartChat(\'' + id + '\')" title="New chat" aria-label="New chat">' + UI_ICONS.chat + '</button>';
+    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocDownloadMd(\'' + id + '\')" title="Export" aria-label="Export">' + UI_ICONS.download + '</button>';
+    html += '<button type="button" class="widget-library-btn danger" onclick="event.stopPropagation(); sdocDeleteFromPage(\'' + id + '\')" title="Delete" aria-label="Delete">' + UI_ICONS.trash + '</button>';
+    html += '</div>';
+    html += '</div>';
+    return html;
 }
 
 async function sdocDeleteFromPage(docId) {

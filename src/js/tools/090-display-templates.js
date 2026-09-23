@@ -128,7 +128,7 @@ function renderDisplayPlaceholder(displayId) {
 }
 
 // ─── Helper ───
-function escDisplay(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escDisplay(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 // Shared named-color map (status cards, chart bars, etc.)
 var DISPLAY_COLOR_MAP = { green: 'var(--success)', red: 'var(--danger)', orange: 'var(--warning)', yellow: 'var(--warning)', blue: 'var(--primary)', purple: '#8b5cf6', gray: 'var(--secondary)' };
@@ -179,7 +179,7 @@ function generateTable(args) {
     }
     html += '<div class="display-table-wrap"><table><thead><tr>';
     columns.forEach(function(col, i) {
-        html += '<th' + (numericCols[i] ? ' class="num"' : '') + ' onclick="displaySortTable(\'' + tableId + '\', ' + i + ')">' + escDisplay(col) + '<span class="display-sort-arrow">&#9650;</span></th>';
+        html += '<th' + (numericCols[i] ? ' class="num"' : '') + ' tabindex="0" onclick="displaySortTable(\'' + tableId + '\', ' + i + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displaySortTable(\'' + tableId + '\', ' + i + ')">' + escDisplay(col) + '<span class="display-sort-arrow">&#9650;</span></th>';
     });
     html += '</tr></thead><tbody>';
     rows.forEach(function(row) {
@@ -254,7 +254,7 @@ function generateCardList(args) {
     html += '<div class="display-cards">';
     cards.forEach(function(card) {
         var hasDetail = !!card.detail;
-        html += '<div class="display-card' + (hasDetail ? ' has-detail' : '') + '"' + (hasDetail ? ' onclick="displayToggleExpand(this)"' : '') + '>';
+        html += '<div class="display-card' + (hasDetail ? ' has-detail' : '') + '"' + (hasDetail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleExpand(this)"' : '') + '>';
         html += '<div class="display-card-header">';
         html += '<div class="display-card-header-content">';
         if (card.icon) html += '<div class="display-card-icon">' + escDisplay(card.icon) + '</div>';
@@ -298,7 +298,7 @@ function generateChecklist(args, displayId) {
         var label = typeof item === 'string' ? item : (item.label || item.text || '');
         var desc = typeof item === 'object' ? (item.description || '') : '';
         var checked = typeof item === 'object' && item.checked;
-        html += '<div class="display-check-item' + (checked ? ' checked' : '') + '" onclick="displayToggleCheck(\'' + listId + '\', this)">';
+        html += '<div class="display-check-item' + (checked ? ' checked' : '') + '" role="checkbox" aria-checked="' + (checked ? 'true' : 'false') + '" tabindex="0" onclick="displayToggleCheck(\'' + listId + '\', this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleCheck(\'' + listId + '\', this)">';
         html += '<div class="display-check-box"></div>';
         html += '<div class="display-check-content"><div class="display-check-label">' + escDisplay(label) + '</div>';
         if (desc) html += '<div class="display-check-desc">' + escDisplay(desc) + '</div>';
@@ -311,6 +311,7 @@ function generateChecklist(args, displayId) {
 
 function displayToggleCheck(listId, el) {
     el.classList.toggle('checked');
+    el.setAttribute('aria-checked', el.classList.contains('checked') ? 'true' : 'false');
     displayUpdateCheckSummary(listId);
     // FLUX-QW7: persist the toggle onto the owning display entry
     // (chat.displays[displayId].args.items[i].checked) through the standard
@@ -374,12 +375,13 @@ function generateStatusSummary(args) {
 }
 
 // ─── Code Template ───
+var _displayCodeSeq = 0; // makes codeId unique when two blocks render in the same millisecond
 function generateCode(args) {
     var code = args.code || '';
     var language = args.language || '';
     if (!code) return null;
 
-    var codeId = 'dcode_' + Date.now();
+    var codeId = 'dcode_' + Date.now() + '_' + (++_displayCodeSeq);
 
     var html = '<div class="display-template display-code-wrap">';
     html += '<div class="display-code-header"><span class="display-code-lang">' + escDisplay(language) + '</span><button class="display-code-copy" onclick="displayCopyCode(\'' + codeId + '\', this)">' + DISPLAY_COPY_ICON + '<span>Copy</span></button></div>';
@@ -408,6 +410,9 @@ function displayCopyCode(codeId, btn) {
             btn.classList.remove('copied');
             if (span) span.textContent = 'Copy';
         }, 1500);
+    }).catch(function() {
+        // Clipboard write can reject (no focus / permission denied) — same feedback as copyCodeBlock.
+        if (typeof showSnackbar === 'function') showSnackbar('Copy failed', 'error');
     });
 }
 
@@ -421,7 +426,7 @@ function generateTimeline(args) {
         var tlColor = displaySafeToken(evt.color, '');
         var colorClass = tlColor ? ' display-tl-' + tlColor : '';
         var detail = evt.detail || evt.description;
-        html += '<div class="display-tl-event' + colorClass + (detail ? ' has-detail' : '') + '"' + (detail ? ' onclick="displayToggleExpand(this)"' : '') + '>';
+        html += '<div class="display-tl-event' + colorClass + (detail ? ' has-detail' : '') + '"' + (detail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleExpand(this)"' : '') + '>';
         if (evt.time || evt.date || evt.timestamp) html += '<div class="display-tl-time">' + escDisplay(evt.time || evt.date || evt.timestamp) + '</div>';
         html += '<div class="display-tl-title">' + escDisplay(evt.title || evt.label || '') + (detail ? '<span class="display-tl-chevron">&#9662;</span>' : '') + '</div>';
         if (detail) html += '<div class="display-tl-detail">' + escDisplay(detail) + '</div>';

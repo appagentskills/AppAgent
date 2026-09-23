@@ -24,12 +24,15 @@ function isPinnedSnackbar(type) {
 // silently dropping an unread error is the exact bug class this queue exists to
 // fix, so mirror it to the console (which already holds the surrounding stack and
 // is where the dropped error's context lives). Auto-dismissing status toasts are
-// noise and are dropped quietly.
+// noise and are dropped quietly. Only ERROR toasts use console.warn: dropped
+// warning toasts (hideSnackbar discards the queue on every chat switch by design)
+// go to console.info so they stay traceable without landing in chrome://extensions.
 function _warnDroppedSnackbar(entry, why) {
     if (!entry || !entry.pinned) return;
+    var isError = entry.type === 'error' || entry.type === true;
     try {
-        console.warn('[snackbar] ' + (why || 'dropped') + ' \u2014 unseen ' +
-            (entry.type === true ? 'error' : entry.type) + ' toast never shown: ' + entry.message);
+        (isError ? console.warn : console.info).call(console, '[snackbar] ' + (why || 'dropped') + ' \u2014 unseen ' +
+            (isError ? 'error' : entry.type) + ' toast never shown: ' + entry.message);
     } catch (e) {}
 }
 
@@ -88,7 +91,7 @@ function renderSnackbar(entry) {
     var typeClass = isError ? ' error' : (isWarning ? ' warning' : ' success');
 
     // Build snackbar content with close button for errors and warnings
-    var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="dismissSnackbar()">' + UI_ICONS.close + '</button>' : '';
+    var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="dismissSnackbar()" aria-label="Dismiss">' + UI_ICONS.close + '</button>' : '';
     // OAuth "not logged in" errors carry a Log in action so the user can fix
     // the failure from the toast itself (same flows as the pill's Connect
     // button — startClaudeOAuthLogin / startChatGPTOAuthLogin in
@@ -349,10 +352,10 @@ function rerenderCurrentNotification() {
             paramsHtml;
 
         actionsHtml =
-            '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + 'Allow</button>' +
-            '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + 'This Chat</button>' +
-            '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + 'Deny</button>' +
-            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + chatId + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
+            '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + 'Allow</button>' +
+            '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + 'This Chat</button>' +
+            '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + 'Deny</button>' +
+            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + escapeJsString(chatId) + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
     } else {
         // Multiple notifications: show grouped format with expandable params for each
         var toolsHtml = '';
@@ -381,9 +384,9 @@ function rerenderCurrentNotification() {
                     '</div>' +
                     '<div class="notification-tool-actions">' +
                         paramsHtml +
-                        '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + '</button>' +
-                        '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + '</button>' +
-                        '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + '</button>' +
+                        '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + '</button>' +
+                        '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + '</button>' +
+                        '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + '</button>' +
                     '</div>' +
                 '</div>';
         }
@@ -391,9 +394,9 @@ function rerenderCurrentNotification() {
         var indicesJson = JSON.stringify(approvalIndices).replace(/"/g, '&quot;');
         var bulkActionsHtml =
             '<div class="notification-bulk-actions">' +
-                '<button class="tool-approval-btn allow" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + 'Allow All (' + chatNotifications.length + ')</button>' +
-                '<button class="tool-approval-btn session" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'session\')" title="Allow all for this chat (and its sub-agents)">' + UI_ICONS.clock + 'All This Chat</button>' +
-                '<button class="tool-approval-btn deny" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + 'Deny All</button>' +
+                '<button class="tool-approval-btn allow" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + 'Allow All (' + chatNotifications.length + ')</button>' +
+                '<button class="tool-approval-btn session" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow all for this chat (and its sub-agents)">' + UI_ICONS.clock + 'All This Chat</button>' +
+                '<button class="tool-approval-btn deny" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + 'Deny All</button>' +
             '</div>';
 
         bodyHtml =
@@ -402,7 +405,7 @@ function rerenderCurrentNotification() {
             bulkActionsHtml;
 
         actionsHtml =
-            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + chatId + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
+            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + escapeJsString(chatId) + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
     }
 
     var expandBtn = '<button class="notification-expand" onclick="toggleNotificationExpand()" title="Expand">' + UI_ICONS.expand + '</button>';
@@ -412,7 +415,7 @@ function rerenderCurrentNotification() {
             '<span class="notification-title">Permission Required</span>' +
             queueBadge +
             expandBtn +
-            '<button class="notification-close" onclick="dismissApprovalNotification()">' + UI_ICONS.close + '</button>' +
+            '<button class="notification-close" onclick="dismissApprovalNotification()" aria-label="Dismiss">' + UI_ICONS.close + '</button>' +
         '</div>' +
         '<div class="notification-body">' + bodyHtml + '</div>' +
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
@@ -449,6 +452,9 @@ function updateNotificationQueueBadge() {
                 title.insertAdjacentElement('afterend', newBadge);
             }
         }
+    } else if (badge) {
+        // Queue drained (e.g. other chat's approvals cleared) - drop the stale badge
+        badge.remove();
     }
 }
 
@@ -522,10 +528,10 @@ function showNextApprovalNotification() {
             paramsHtml;
 
         actionsHtml =
-            '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + 'Allow</button>' +
-            '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + 'This Chat</button>' +
-            '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + 'Deny</button>' +
-            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + chatId + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
+            '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + 'Allow</button>' +
+            '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + 'This Chat</button>' +
+            '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notification.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + 'Deny</button>' +
+            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + escapeJsString(chatId) + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
     } else {
         // Multiple notifications: show grouped format with expandable params for each
         var toolsHtml = '';
@@ -554,9 +560,9 @@ function showNextApprovalNotification() {
                     '</div>' +
                     '<div class="notification-tool-actions">' +
                         paramsHtml +
-                        '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + '</button>' +
-                        '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + '</button>' +
-                        '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + '</button>' +
+                        '<button class="tool-approval-btn allow" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + '</button>' +
+                        '<button class="tool-approval-btn session" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow for this chat (and its sub-agents)">' + UI_ICONS.clock + '</button>' +
+                        '<button class="tool-approval-btn deny" onclick="approveFromNotification(' + notif.approvalIndex + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + '</button>' +
                     '</div>' +
                 '</div>';
         }
@@ -564,9 +570,9 @@ function showNextApprovalNotification() {
         var indicesJson = JSON.stringify(approvalIndices).replace(/"/g, '&quot;');
         var bulkActionsHtml =
             '<div class="notification-bulk-actions">' +
-                '<button class="tool-approval-btn allow" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'allow\')">' + UI_ICONS.check + 'Allow All (' + chatNotifications.length + ')</button>' +
-                '<button class="tool-approval-btn session" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'session\')" title="Allow all for this chat (and its sub-agents)">' + UI_ICONS.clock + 'All This Chat</button>' +
-                '<button class="tool-approval-btn deny" onclick="approveAllFromNotification(' + indicesJson + ', \'' + chatId + '\', \'deny\')">' + UI_ICONS.close + 'Deny All</button>' +
+                '<button class="tool-approval-btn allow" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'allow\')">' + UI_ICONS.check + 'Allow All (' + chatNotifications.length + ')</button>' +
+                '<button class="tool-approval-btn session" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'session\')" title="Allow all for this chat (and its sub-agents)">' + UI_ICONS.clock + 'All This Chat</button>' +
+                '<button class="tool-approval-btn deny" onclick="approveAllFromNotification(' + indicesJson + ', \'' + escapeJsString(chatId) + '\', \'deny\')">' + UI_ICONS.close + 'Deny All</button>' +
             '</div>';
 
         bodyHtml =
@@ -575,7 +581,7 @@ function showNextApprovalNotification() {
             bulkActionsHtml;
 
         actionsHtml =
-            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + chatId + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
+            (isCurrentChat ? '' : '<button class="tool-approval-btn" onclick="goToApprovalChat(\'' + escapeJsString(chatId) + '\')">' + UI_ICONS.chat + 'Go to chat</button>');
     }
 
     var expandBtn = '<button class="notification-expand" onclick="toggleNotificationExpand()" title="Expand">' + UI_ICONS.expand + '</button>';
@@ -585,7 +591,7 @@ function showNextApprovalNotification() {
             '<span class="notification-title">Permission Required</span>' +
             queueBadge +
             expandBtn +
-            '<button class="notification-close" onclick="dismissApprovalNotification()">' + UI_ICONS.close + '</button>' +
+            '<button class="notification-close" onclick="dismissApprovalNotification()" aria-label="Dismiss">' + UI_ICONS.close + '</button>' +
         '</div>' +
         '<div class="notification-body">' + bodyHtml + '</div>' +
         (actionsHtml ? '<div class="notification-actions">' + actionsHtml + '</div>' : '');
@@ -866,7 +872,7 @@ function showModal(title, message, buttons, variant) {
         body.textContent = '';
         body.appendChild(sanitizeModalMessage(message));
         actions.innerHTML = buttons.map(function(btn) {
-            return '<button class="modal-btn ' + (btn.class || 'secondary') + '" onclick="resolveModal(\'' + escapeJsString(btn.value) + '\')">' + escapeHtml(btn.label) + '</button>';
+            return '<button class="modal-btn ' + escapeHtml(btn.class || 'secondary') + '" onclick="resolveModal(\'' + escapeJsString(btn.value) + '\')">' + escapeHtml(btn.label) + '</button>';
         }).join('');
         overlay.classList.add('show');
     });

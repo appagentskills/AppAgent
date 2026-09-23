@@ -42,8 +42,13 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      - name: Substitute __VERSION__ in docs
-        run: sed -i "s/__VERSION__/${{ steps.tag.outputs.version }}/g" docs/documentation.md
+      - name: Substitute __VERSION__ and __CHANGELOG__ in docs
+        run: |
+          if [ -f build/docs-placeholders.js ]; then
+            node build/docs-placeholders.js docs/documentation.md changelog.md "${{ steps.tag.outputs.version }}"
+          else
+            sed -i "s/__VERSION__/${{ steps.tag.outputs.version }}/g" docs/documentation.md
+          fi
 
       - name: Stage README and hero image inside docs/
         run: |

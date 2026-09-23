@@ -91,6 +91,66 @@ var SUBAGENT_HARDSTOP_PCT           = 60;
 var SUBAGENT_HARDSTOP_GRACE_TURNS   = 2;
 var SUBAGENT_DEFAULT_SUMMARY_KB = 4;
 // #15: spawn arg `summary_cap_kb` overrides the per-sub report summary cap.
+// Item 6: literal-newline normaliser for sub → parent text (report_to_parent
+// summary, agent_message content, update_action_state output). CRLF → LF;
+// a double-escaped text (NO real newline and at least 2 literal "\n") is
+// unescaped. Same rule as the render-side _subRenderNewlines in
+// ui/175-sub-agent-ui.js (this file also runs in the SW, where 175 is absent).
+function _subNormalizeNewlines(t) {
+    var s = String(t == null ? '' : t).replace(/\r\n?/g, '\n');
+    if (s.indexOf('\n') === -1 && s.split('\\n').length - 1 >= 2) {
+        s = s.replace(/\\r\\n|\\n/g, '\n');
+    }
+    return s;
+}
+
+// F5: cap `s` at `capBytes` REAL UTF-8 bytes (TextEncoder), marker included.
+// Cuts on a code-point boundary (never a lone surrogate) and closes an open
+// ``` fence before appending `marker`. Unchanged when it already fits.
+function _subUtf8Len(x) {
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(x).length;
+    var n = 0;
+    for (var i = 0; i < x.length; i++) {
+        var c = x.charCodeAt(i);
+        if (c < 0x80) n += 1;
+        else if (c < 0x800) n += 2;
+        else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < x.length && (x.charCodeAt(i + 1) & 0xFC00) === 0xDC00) { n += 4; i++; }
+        else n += 3;
+    }
+    return n;
+}
+function _subCapUtf8(s, capBytes, marker) {
+    s = String(s == null ? '' : s);
+    marker = String(marker || '');
+    // 1b: a missing / non-numeric cap means NO cap (a NaN budget used to
+    // copy the whole text and still append the marker).
+    if (!Number.isFinite(capBytes) || _subUtf8Len(s) <= capBytes) return s;
+    var budget = Math.max(0, capBytes - _subUtf8Len(marker) - 4); // 4 = '\n```'
+    var out = '', used = 0;
+    for (var i = 0; i < s.length; ) {
+        var cp = s.codePointAt(i);
+        var w = (cp < 0x80) ? 1 : (cp < 0x800) ? 2 : (cp < 0x10000) ? 3 : 4;
+        if (used + w > budget) break;
+        var ch = String.fromCodePoint(cp);
+        out += ch; used += w; i += ch.length;
+    }
+    if (((out.match(/^[ \t]*```/gm) || []).length % 2) === 1) out += '\n```';
+    return out + marker;
+}
+
+// Item 8: spawn names are free text but they are interpolated into the
+// model-visible notices (`Sub-agent "NAME" (ID) …`, `[sub-agent lifecycle]
+// NAME (ID): …`) that the renderers parse back — strip quotes, parentheses,
+// newlines and control characters, cap at 80 code points, fall back to the id.
+function _subSanitizeName(name, fallback) {
+    var s = String(name == null ? '' : name)
+        .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029"()]/g, ' ')
+        .replace(/\s+/g, ' ').trim();
+    var cps = Array.from(s);
+    if (cps.length > 80) s = cps.slice(0, 80).join('').trim();
+    return s || String(fallback || '');
+}
+
 // Integer KB, clamped to [1, 16]; anything non-numeric falls back to the
 // default. Exposed on the registry for tests / agent_status.
 function _subSummaryCapBytes(kb) {
@@ -183,25 +243,22 @@ var SUB_AGENT_PREAMBLE = [
     '',
     'YOU ARE A SUB-AGENT.',
     '',
-    'You were spawned by a parent agent to do focused, context-heavy work without polluting the parent\'s context window. Your task is in the first user message.',
+    'A parent agent spawned you for focused, context-heavy work in your own context window, keeping its own lean. Your task is in the first user message.',
     '',
-    'YOUR ROLE: you are the worker/executor — do the substantive work yourself, inline, and report; do not orchestrate or delegate (nested spawning is denied unless the parent passed `allow_nested:true`). If any orchestration/delegation policy appears above (e.g. kept in a custom system prompt), it describes your PARENT\'s job, not yours.',
+    'YOUR ROLE: you are the worker — do the substantive work yourself, inline, and report; do not orchestrate or delegate. Any orchestration/delegation policy above (e.g. in a custom system prompt) is your PARENT\'s job, not yours. spawn_sub_agent / stop_sub_agent / wake_sub_agent are denied unless the parent passed `allow_nested:true`; you may only stop/wake/message your own descendants (enforced server-side).',
     '',
-    'CRITICAL RULES for sub-agents:',
-    '  • DO NOT echo raw tool outputs back to the parent. Summarize.',
-    '  • When the work is complete, call `report_to_parent` with a concise distilled result (≤ 4 KB summary). This is what the parent sees — it never reads your transcript. Write the summary in markdown — it is rendered as markdown to the user in the parent chat.',
-    '  • If you need parent input mid-task, call `report_to_parent({status:"need_input", ...})`. That settles the parent\'s handle and parks you — the parent will wake you with new instructions.',
-    '  • STANDARD REPORT SHAPE: unless your task declares an explicit "Expected output schema" (which then wins), structure report_to_parent\'s `data` as {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers backing each claim (sys_ids, file paths + line numbers, URLs), open_questions = anything you could not resolve.',
-    '  • VERIFY DIRECTLY: you are the executor, so verification is YOUR job — confirm the end state yourself before reporting (read the record back, re-run the query, screenshot it if the browser tools are in your roster) and include that evidence in report_to_parent.',
-    '  • PLAN-APPROVAL GATE: if your report proposes a plan for FURTHER work (beyond the task you were given), report it with `status:"need_input"` and WAIT for the parent to approve — NEVER self-approve your own plan and continue executing it.',
-    '  • If you are idle and waiting, call `sleep_self` to free the worker pool slot.',
-    '  • Use `artifacts: [doc_id, file_id, ...]` in your report for larger payloads — never inline a long list/dump into `summary`.',
-    '  • SCRATCHPAD: stage a long result in a smart doc (`document` tool) and return its doc_id in `artifacts` instead of inlining it — `shared` scope lets the parent read it, `chat` keeps it private to you.',
-    '  • Maintain a progress card with `update_action_state` (state + `tasks` todo list) — it is mirrored LIVE onto your card in the parent chat and exposed to the parent via `agent_status`, so the parent can watch your progress without reading your transcript.',
-    '  • Do NOT spawn nested sub-agents unless explicitly authorized — `spawn_sub_agent`, `stop_sub_agent`, and `wake_sub_agent` are denied by default. The parent must pass `allow_nested:true` at spawn time to grant nested delegation.',
-    '  • You may only `stop`/`wake`/`message` sub-agents that are your own descendants (the ACL is enforced server-side; calls against siblings or ancestors fail).',
+    'RULES:',
+    '- Verify directly — you are the executor: confirm the end state yourself (read the record back, re-run the query, screenshot if browser tools are in your roster) and include that evidence in your report.',
+    '- Keep a progress card with `update_action_state` (state + `tasks`); it is mirrored live onto your card in the parent chat and exposed via `agent_status`.',
+    '- Need parent input mid-task? `report_to_parent({status:"need_input", ...})` settles the parent\'s handle and parks you until it wakes you with instructions.',
+    '- Plan-approval gate: a report proposing further work beyond your task goes out as `status:"need_input"`; wait for approval — never self-approve and continue.',
+    '- Idle and waiting? Call `sleep_self` to free your worker pool slot.',
     '',
-    'The parent agent is awaiting your `report_to_parent` call to unblock its own work. Be focused, be brief, and return early with `status:done` once the task is genuinely complete.'
+    'REPORTING (`report_to_parent` — the parent sees only this, never your transcript):',
+    '- Summarize; never echo raw tool output. `summary` is concise markdown (rendered to the user in the parent chat), ≤ 4 KB by default — the parent may set another cap via spawn `summary_cap_kb` (1–16 KB); longer summaries are truncated by the registry.',
+    '- `data`: unless your task declares an "Expected output schema" (which wins), use {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers per claim (sys_ids, file paths + line numbers, URLs), open_questions = what you could not resolve.',
+    '- Put larger payloads in `artifacts` (doc_ids, file_ids), never long lists/dumps in `summary`; stage long results in a smart doc (`document`: `shared` scope lets the parent read it, `chat` keeps it private).',
+    '- The parent is blocked on your report: stay focused and brief, and return `status:"done"` as soon as the task is genuinely complete.'
 ].join('\n');
 
 // ---------- Module state ----------
@@ -284,14 +341,82 @@ var _subAgentsLoaded = false;
 
 // ---------- Persistence ----------
 
-function _subAgentsPersist(record) {
-    if (typeof openDatabase !== 'function') return Promise.resolve();
+// N1: this realm's registry boot time (bundle evaluation = SW / page boot).
+// A record whose last_report.at / last_activity_at is at or after it was
+// touched in THIS session (see _isLiveThisSession).
+var _subRegistryBootAt = Date.now();
+// A2: agent_ids whose persisted _retry_delayed_until stamp loadAll cleared
+// (the retry timer died with the SW) — the boot scan re-queues them.
+var _subBootRetryDelayed = Object.create(null);
+
+// N1: live in THIS session = spawn deferred, pool slot or queue position, OR
+// touched/reported after this realm booted. A sub that reported this session
+// has consumed its deferred and released its slot, yet its in-memory record
+// is the newest truth — the boot scan must never rewrite (and persist) it.
+function _isLiveThisSession(r) {
+    if (!r) return false;
+    if ((r.spawn_handle_id && _spawnDeferreds[r.spawn_handle_id])
+        || _subPool.running[r.agent_id] || _subPool.queue.indexOf(r.agent_id) >= 0) return true;
+    var lr = r.last_report;
+    if (lr && typeof lr.at === 'number' && lr.at >= _subRegistryBootAt) return true;
+    return typeof r.last_activity_at === 'number' && r.last_activity_at >= _subRegistryBootAt;
+}
+
+function _subPersistRetryable(e) {
+    if (e && e.name === 'TransactionInactiveError') return true;
+    if (typeof _isDbConnectionError === 'function') return _isDbConnectionError(e);
+    return !!(e && (e.name === 'InvalidStateError' || e.name === 'AbortError' || e.name === 'UnknownError'));
+}
+
+// One put, resolved on tx.oncomplete (COMMITTED), rejected on a sync throw,
+// onerror or onabort.
+function _subAgentsPersistOnce(record) {
     return openDatabase().then(function(database) {
-        try {
-            var tx = database.transaction(['sub_agents'], 'readwrite');
-            tx.objectStore('sub_agents').put(record);
-        } catch (e) { /* non-fatal */ }
-    }).catch(function() { /* non-fatal */ });
+        return new Promise(function(resolve, reject) {
+            var tx;
+            try {
+                tx = database.transaction(['sub_agents'], 'readwrite');
+                tx.objectStore('sub_agents').put(record);
+            } catch (e) { reject(e); return; }
+            var _abortErr = function() {
+                if (tx.error) return tx.error;
+                var e = new Error('sub_agents transaction aborted'); e.name = 'AbortError'; return e;
+            };
+            tx.oncomplete = function() { resolve(true); };
+            tx.onabort = function() { reject(_abortErr()); };
+            tx.onerror = function() { reject(_abortErr()); };
+        });
+    });
+}
+
+// N1: resolves true once the row COMMITTED, false on failure — never rejects,
+// so the ~40 fire-and-forget callers stay safe. PREVIOUSLY this resolved
+// before commit, had no oncomplete/onabort, never retried and swallowed every
+// error, so post-report writes could vanish silently on the churned SW
+// connection. A dead/closing connection or aborted transaction drops the
+// cached connection and retries ONCE with the CURRENT in-memory record (never
+// an older snapshot; a record removed meanwhile is not resurrected). Other
+// failures and a failed retry are logged.
+function _subAgentsPersist(record) {
+    if (typeof openDatabase !== 'function' || !record) return Promise.resolve(false);
+    var aid = record.agent_id;
+    return _subAgentsPersistOnce(record).catch(function(e) {
+        if (!_subPersistRetryable(e)) {
+            console.warn('[sub-agents] persist failed for ' + aid + ' (not retryable) — record not saved', e);
+            return false;
+        }
+        var cur = aid ? _subAgents[aid] : record;
+        if (!cur) {
+            console.warn('[sub-agents] persist failed for ' + aid + ' and the record is gone — not retried', e);
+            return false;
+        }
+        console.warn('[sub-agents] persist hit a dead connection for ' + aid + ' — reopening and retrying once', e);
+        try { if (typeof releaseIdleDbConnection === 'function') releaseIdleDbConnection(); } catch (_) { /* best-effort */ }
+        return _subAgentsPersistOnce(cur).catch(function(e2) {
+            console.warn('[sub-agents] persist retry failed for ' + aid + ' — record not saved', e2);
+            return false;
+        });
+    });
 }
 
 function _subAgentsDeleteFromDB(agentId) {
@@ -318,6 +443,13 @@ async function loadAllSubAgents() {
                 var list = req.result || [];
                 var now = Date.now();
                 list.forEach(function(rec) {
+                    // N1: in-memory wins (same rule as
+                    // _rehydrateSubAgentRecordById). A record already in the map
+                    // was created/touched in THIS session (spawned before the drain
+                    // finished, reported, racing rehydrate, repeated loadAll) and
+                    // is newer than this row — replacing it let the boot scan
+                    // persist a stale pre-report snapshot over the post-report row.
+                    if (!rec || !rec.agent_id || _subAgents[rec.agent_id]) return;
                     // GC tombstoned records past TTL.
                     // LEGACY-LEAK FIX: records from old builds have
                     // settled_at:null (only last_report was stamped), which made
@@ -417,6 +549,7 @@ async function loadAllSubAgents() {
                     rec.awaiting_approval = null;
                     // PR383-R5: a persisted retry-delay stamp can't survive a
                     // reboot either (its setTimeout died with the SW) — clear.
+                    if (rec._retry_delayed_until) _subBootRetryDelayed[rec.agent_id] = true; // A2: re-queue at boot
                     delete rec._retry_delayed_until;
                     _subAgents[rec.agent_id] = rec;
                 });
@@ -451,9 +584,8 @@ async function loadAllSubAgents() {
                 // the IDB drain finished) is also state:'running' in the freshly
                 // read records — but it has a live spawn deferred / pool presence
                 // and must NOT be rewritten as orphaned.
-                var _isLiveThisSession = !!(_spawnDeferreds[r.spawn_handle_id]
-                    || _subPool.running[aid] || _subPool.queue.indexOf(aid) >= 0);
-                if (r.state === 'running' && !_isLiveThisSession) {
+                // N1: a sub touched/reported this session also counts as live.
+                if (r.state === 'running' && !_isLiveThisSession(r)) {
                     _bootDecisions.push(_resumeOrOrphanSubAtBoot(r));
                 }
             }
@@ -466,6 +598,10 @@ async function loadAllSubAgents() {
             // includes loadAll, so awaiting here preserves the strict
             // decide-before-resume ordering the port bridge relies on.
             await Promise.all(_bootDecisions);
+            // A2: start re-queued subs (never started / retry-delayed) once the
+            // boot gate opens — runAgent needs the sub chat rows, which
+            // loadChatsFromStorage hydrates concurrently with this loadAll.
+            if (_subPool.queue.length) _subAfterBootReady(_drainPool);
         }
         // Handle rehydration (runs AFTER the resume-or-orphan decisions, so
         // every record is terminal/parked — pre-settled snapshot from
@@ -589,11 +725,76 @@ function _resumeOrOrphanSubAtBoot(rec) {
             _subAgentsPersist(rec);
             return;
         }
-        _orphanErrorSubAtBoot(rec);
+        // A1/A2 read the sub transcript and the parent card, but loadAll runs
+        // CONCURRENTLY with loadChatsFromStorage (worker/190-entry.js) — wait
+        // (bounded) for the chats map, then re-check the ZR1-R2 stand-down.
+        return _subBootWaitForChats().then(function() {
+            if (rec.state !== 'running' || _subPool.running[rec.agent_id] || _subAgents[rec.agent_id] !== rec) return;
+            _subBootDecideNonResumable(rec, cp);
+        });
     });
 }
 
-function _orphanErrorSubAtBoot(rec) {
+// Bounded wait for the SW chats hydration (_chatsHydrated, set by
+// loadChatsFromStorage). Polls a flag — never awaits _swBootReady, which
+// itself waits for loadAll (deadlock). Resolves true when hydrated (or no
+// such flag in this realm), false on timeout. Never rejects.
+var SUB_BOOT_CHATS_WAIT_MS = 8000;
+function _subBootWaitForChats(maxMs) {
+    var ready = function() { return typeof _chatsHydrated === 'undefined' || !!_chatsHydrated; };
+    if (ready()) return Promise.resolve(true);
+    var deadline = Date.now() + ((typeof maxMs === 'number') ? maxMs : SUB_BOOT_CHATS_WAIT_MS);
+    return new Promise(function(resolve) {
+        (function tick() {
+            if (ready()) { resolve(true); return; }
+            if (Date.now() >= deadline) { resolve(false); return; }
+            setTimeout(tick, 50);
+        })();
+    });
+}
+
+// Boot decision for a 'running' sub WITHOUT a live checkpoint.
+// Returns 'parked' | 'requeued' | 'paused' | 'errored'.
+function _subBootDecideNonResumable(rec, cp) {
+    // A1: a sub that actually reported (persisted report, or one recoverable
+    // from its transcript / terminal card) parks with it — checked BEFORE
+    // the paused branch, since report_to_parent's own park leaves a
+    // 'paused' checkpoint behind.
+    var _bootRep = _subBootRecoverableReport(rec);
+    if (_bootRep) { _subBootParkWithReport(rec, _bootRep); return 'parked'; }
+    // A2: the current episode never ran (transcript ends on its user/wake
+    // row — still QUEUED when the SW died; a queued wake keeps the previous
+    // episode's stale checkpoint) or it was waiting out a transient-retry
+    // delay (timer died with the SW) → re-queue; loadAll drains after the
+    // boot gate. No transcript / an episode that already ran is NOT
+    // re-run blindly (a lost post-finish persist must not replay the work).
+    var _retryDelayed = !!_subBootRetryDelayed[rec.agent_id];
+    delete _subBootRetryDelayed[rec.agent_id];
+    if (_retryDelayed || _subBootTranscriptEpisode(rec).started === false) {
+        if (_subPool.queue.indexOf(rec.agent_id) === -1) _subPool.queue.push(rec.agent_id);
+        return 'requeued';
+    }
+    // A2: a 'paused' checkpoint (loop exited on a pause, e.g. the user
+    // paused the sub chat) is neither live nor orphaned — same as the
+    // paused_by_parent_chat branch: stay 'running', claim NO slot.
+    if (cp && cp.status === 'paused') return 'paused';
+    _orphanErrorSubAtBoot(rec);
+    return 'errored';
+}
+
+// A1 + NEW-Z. PREVIOUSLY this errored every caller's sub unconditionally and
+// told nobody: a sub whose report landed (but whose post-report persist was
+// lost) settled the parent's handle with an orphan error, and a true orphan
+// left the parent blind until it polled. NOW: a usable report → park as
+// sleeping with it (handle pre-settles 'done'); otherwise error it AND tell
+// the parent — durable pending wake (drainPendingWakes delivers it once chats
+// load; the live wake helpers bail on !chats[pcid] at boot), or the passive
+// notice for wake_parent:false. opts.silent (rehydrate-by-id path) skips the
+// notice. Returns 'parked' | 'errored'.
+function _orphanErrorSubAtBoot(rec, opts) {
+    opts = opts || {};
+    var _rep = _subBootRecoverableReport(rec);
+    if (_rep) { _subBootParkWithReport(rec, _rep); return 'parked'; }
     rec.state = 'errored';
     rec.settled_at = Date.now();
     _subReleaseWorkspaceOwnership(rec);
@@ -610,6 +811,175 @@ function _orphanErrorSubAtBoot(rec) {
     // already hydrated) so the orphaned sub doesn't keep a
     // spinner alive forever in the parent transcript.
     _finalizeSubAgentCard(rec, rec.last_report);
+    if (!opts.silent) _subNotifyParentOfBootOrphan(rec);
+    return 'errored';
+}
+
+// A1: the report a boot-orphaned 'running' sub already produced, or null.
+// Sources, newest-truth first: (1) rec.last_report — unless registry-made
+// (_orphaned/_synthesized), an error, or older than the current episode
+// (rec.woken_at); (2) a successful report_to_parent in the sub transcript
+// after its last user/wake row (the lost-report case); (3) the parent card's
+// .report (saved by the hardened chats lane).
+function _subBootRecoverableReport(rec) {
+    if (!rec) return null;
+    var since = rec.woken_at || 0;
+    // Pre-upgrade guard: records saved before woken_at existed. When the
+    // transcript shows a successful report BEFORE its last user/wake row and
+    // none after it, this 'running' episode began with a wake after that
+    // report — a persisted last_report / card report is the previous one.
+    var staleEpisode = !rec.woken_at && _subBootTranscriptEpisode(rec).reportBeforeLastUser;
+    var lr = rec.last_report;
+    if (!staleEpisode && lr && !lr._orphaned && !lr._synthesized && lr.status !== 'error' && (lr.at || 0) >= since) return lr;
+    var tr = _subRecoverReportFromTranscript(rec);
+    if (tr) return tr;
+    if (staleEpisode) return null;
+    var card = null;
+    try { card = rec.parent_chat_id ? _findSubAgentCard(rec.parent_chat_id, rec.agent_id) : null; } catch (_) { card = null; }
+    var cr = card && card.report;
+    if (cr && typeof cr === 'object' && cr.status && cr.status !== 'error' && !cr._orphaned && !cr._synthesized && (cr.at || 0) >= since) {
+        var out = {};
+        for (var k in cr) out[k] = cr[k];
+        out.from = rec.agent_id; out.from_name = rec.name; out._recovered = true; out._recovered_from = 'card';
+        return out;
+    }
+    return null;
+}
+
+// Tool rows are {role:'tool', tool_call_id, name, content} (030
+// recordToolResult); content is the serialized result — reportToParent
+// returns {success:true, ok:true}; rejections carry success:false.
+function _subToolResultOk(content) {
+    var c = content;
+    if (Array.isArray(c)) c = c.map(function(b) { return (b && typeof b.text === 'string') ? b.text : ''; }).join('');
+    if (typeof c === 'string') {
+        var s = c;
+        try { c = JSON.parse(s); } catch (_) {
+            // processed content may carry trailing text after the JSON body
+            return /^\s*\{\s*"success"\s*:\s*true\b/.test(s) && !/"already_settled"\s*:\s*true/.test(s);
+        }
+    }
+    return !!(c && typeof c === 'object' && c.success !== false && (c.success === true || c.ok === true) && !c.already_settled);
+}
+
+// A1/A2: shape of the sub transcript's CURRENT episode (rows after its last
+// user/wake row). started: that episode produced assistant/tool rows (null =
+// no transcript in this realm); reportBeforeLastUser: a successful
+// report_to_parent exists BEFORE that user row (an earlier episode's).
+function _subBootTranscriptEpisode(rec) {
+    var out = { started: null, reportBeforeLastUser: false };
+    var chat = (typeof chats !== 'undefined' && rec && rec.chat_id) ? chats[rec.chat_id] : null;
+    var msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : null;
+    if (!msgs) return out;
+    out.started = false;
+    var i = msgs.length - 1;
+    for (; i >= 0; i--) {
+        var m = msgs[i];
+        if (!m) continue;
+        if (m.role === 'user') break;
+        if (m.role === 'assistant' || m.role === 'tool') out.started = true;
+    }
+    for (var j = i - 1; j >= 0; j--) {
+        var p = msgs[j];
+        if (p && p.role === 'tool' && p.name === 'report_to_parent' && _subToolResultOk(p.content)) {
+            out.reportBeforeLastUser = true;
+            break;
+        }
+    }
+    return out;
+}
+
+// Args of the assistant tool_call `callId` (report_to_parent) at or before idx.
+function _subFindToolCallArgs(msgs, idx, callId) {
+    for (var j = idx - 1; j >= 0; j--) {
+        var a = msgs[j];
+        if (!a || a.role !== 'assistant' || !Array.isArray(a.tool_calls)) continue;
+        for (var k = 0; k < a.tool_calls.length; k++) {
+            var tc = a.tool_calls[k];
+            if (!tc || (callId && tc.id !== callId)) continue;
+            var fn = tc.function || {};
+            if ((fn.name || tc.name) && (fn.name || tc.name) !== 'report_to_parent') continue;
+            var raw = (fn.arguments != null) ? fn.arguments : (tc.arguments != null ? tc.arguments : (tc.input != null ? tc.input : tc.args));
+            if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch (_) { raw = null; } }
+            return (raw && typeof raw === 'object') ? raw : null;
+        }
+    }
+    return null;
+}
+
+// A1 lost-report recovery: scan the sub transcript from the end; a user row
+// first means any older report belongs to an earlier (finished) episode.
+function _subRecoverReportFromTranscript(rec) {
+    var chat = (typeof chats !== 'undefined' && rec && rec.chat_id) ? chats[rec.chat_id] : null;
+    var msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : null;
+    if (!msgs) return null;
+    for (var i = msgs.length - 1; i >= 0; i--) {
+        var m = msgs[i];
+        if (!m) continue;
+        if (m.role === 'user') return null;
+        if (m.role !== 'tool' || m.name !== 'report_to_parent' || !_subToolResultOk(m.content)) continue;
+        var args = _subFindToolCallArgs(msgs, i, m.tool_call_id);
+        if (!args) return null;
+        var capB = rec.summary_cap_bytes || _subSummaryCapBytes();
+        return {
+            status: (args.status === 'error' || args.status === 'need_input') ? args.status : 'done',
+            summary: _subCapUtf8(_subNormalizeNewlines(String(args.summary || '')), capB,
+                '\n…[truncated by registry: summary exceeded ' + capB + ' bytes]'),
+            data: (args.data && typeof args.data === 'object') ? args.data : null,
+            artifacts: Array.isArray(args.artifacts) ? args.artifacts.slice(0, SUBAGENT_MAX_ARTIFACTS) : [],
+            from: rec.agent_id,
+            from_name: rec.name,
+            at: (typeof m.timestamp === 'number') ? m.timestamp : ((typeof m.createdAt === 'number') ? m.createdAt : Date.now()),
+            _recovered: true,
+            _recovered_from: 'transcript'
+        };
+    }
+    return null;
+}
+
+// A1: boot-time park (mirrors _parkSubAgent minus the pool release — no slot
+// is held at boot, and _releasePoolSlot would drain the pool before chats load).
+function _subBootParkWithReport(rec, rep) {
+    if (rep._recovered) rec.report_collected = false; // the parent never saw it
+    rec.last_report = rep;
+    rec.state = 'sleeping';
+    rec.last_activity_at = Date.now();
+    _subReleaseWorkspaceOwnership(rec);
+    if (typeof pausedChats !== 'undefined' && rec.chat_id) pausedChats[rec.chat_id] = true;
+    _subAgentsPersist(rec);
+    _finalizeSubAgentCard(rec, rep);
+}
+
+// Run fn after the SW boot gate (chats + registry hydrated); immediate when
+// there is no gate (page realm / tests). Never rejects.
+function _subAfterBootReady(fn) {
+    var gate = (typeof self !== 'undefined' && self && self._swBootReady && typeof self._swBootReady.then === 'function')
+        ? self._swBootReady : Promise.resolve();
+    return gate.then(function() { return fn(); }).catch(function(e) {
+        console.warn('[sub-agents] post-boot step failed', e);
+    });
+}
+
+// NEW-Z: tell the parent a boot orphan errored.
+function _subNotifyParentOfBootOrphan(rec) {
+    try {
+        var pcid = rec && rec.parent_chat_id;
+        if (!pcid) return false;
+        if (rec.wake_parent === false) {
+            _subAfterBootReady(function() { _postPassiveReportNotice(rec, rec.last_report, {}); });
+            return 'passive';
+        }
+        if (typeof persistPendingWake !== 'function') return false;
+        var headline = 'errored — orphaned by a service-worker restart before it reported (wake or resurrect it to retry)';
+        // B2: the persisted wake row is model-visible -> same C1 reminder as _notifySubLifecycle.
+        var text = _withWakeFinalReminder('[sub-agent lifecycle] ' + (rec.name || rec.agent_id) + ' (' + rec.agent_id + '): ' + headline, pcid);
+        var meta = _subNoticeMeta('lifecycle', rec.agent_id, rec.name, rec.state, headline, text);
+        persistPendingWake(pcid, text, rec.agent_id, { subNotices: [meta] });
+        return 'pending_wake';
+    } catch (e) {
+        console.warn('[sub-agents] boot-orphan parent notice failed for', rec && rec.agent_id, e);
+        return false;
+    }
 }
 
 // REG-MISS-1: targeted single-record rehydration from the sub_agents IDB
@@ -674,7 +1044,7 @@ function _rehydrateSubAgentRecordById(agentId) {
         if (rec.state === 'running'
             && !_spawnDeferreds[rec.spawn_handle_id]
             && !_subPool.running[agentId] && _subPool.queue.indexOf(agentId) === -1) {
-            _orphanErrorSubAtBoot(rec);
+            _orphanErrorSubAtBoot(rec, { silent: true }); // NEW-Z: the lookup's caller handles it — no parent notice
         }
         _subAgents[agentId] = rec;
         _subAgentsPersist(rec);
@@ -1102,6 +1472,92 @@ function _retryOrphanGcChatRows() {
 
 var _idleSweepInterval = null;
 
+// ---------- Stuck-worker signal (PR #971 part 2) ----------
+// ONE pure verdict shared by agent_status (snap / snapCompact), the idle
+// sweep's one-shot parent notice and the Workers UI (ui/175 _subActivityInfo),
+// so the model and the user always see the same reason. Derived only from
+// data the record already carries. First match wins:
+//   awaiting_approval         - a tool approval is pending (_pending_approvals /
+//                               awaiting_approval) for > SUB_STUCK_GRACE_MS since
+//                               awaiting_approval.since (no since = not yet).
+//   reported_but_running      - still running with a last_report newer than the
+//                               last wake (rec.woken_at) for > SUB_STUCK_GRACE_MS.
+//   terminal_card_but_running - progress card (rec.action_state) terminal, set this
+//                               episode, for > SUB_STUCK_GRACE_MS while still running.
+// A notice only - never a kill; await defaults are unchanged.
+var SUB_STUCK_GRACE_MS = 2 * 60 * 1000;
+var SUB_STUCK_TERMINAL_CARD_STATES = { done: 1, error: 1, finished: 1, pr_opened: 1, finished_with_caveat: 1 };
+function _subEpisodeStart(rec) { return (rec && (rec.woken_at || rec.created_at)) || 0; }
+function _subStuckSignal(rec, now) {
+    if (!rec || rec.state !== 'running') return null;
+    now = now || Date.now();
+    if ((rec._pending_approvals || 0) > 0 || rec.awaiting_approval) {
+        var ap = rec.awaiting_approval || {};
+        var apSince = ap.since || now;
+        // M1: same grace as the other arms (RES-6: a fresh approval is the
+        // user's modal, never a parent wake); within it the later arms apply.
+        if ((now - apSince) > SUB_STUCK_GRACE_MS) {
+            return { reason: 'awaiting_approval', since: apSince, since_ms: Math.max(0, now - apSince), tool: ap.tool || null };
+        }
+    }
+    var lr = rec.last_report;
+    if (lr && !lr._orphaned && lr.at && lr.at > (rec.woken_at || 0) && (now - lr.at) > SUB_STUCK_GRACE_MS) {
+        return { reason: 'reported_but_running', since: lr.at, since_ms: now - lr.at, status: lr.status || null };
+    }
+    var as = rec.action_state;
+    if (as && SUB_STUCK_TERMINAL_CARD_STATES[as.state] && as.at && as.at >= _subEpisodeStart(rec)
+        && (now - as.at) > SUB_STUCK_GRACE_MS) {
+        return { reason: 'terminal_card_but_running', since: as.at, since_ms: now - as.at, card_state: as.state };
+    }
+    return null;
+}
+function _subStuckHeadline(sig) {
+    var mins = Math.max(1, Math.round((sig.since_ms || 0) / 60000));
+    if (sig.reason === 'awaiting_approval') {
+        return 'appears STUCK (awaiting_approval) - waiting for the user to approve "' + (sig.tool || 'a tool call') + '"';
+    }
+    if (sig.reason === 'reported_but_running') {
+        return 'appears STUCK (reported_but_running) - reported ' + mins + ' min ago but is still running (agent_message or stop_sub_agent it)';
+    }
+    return 'appears STUCK (terminal_card_but_running) - its progress card has said "' + sig.card_state + '" for ' + mins + ' min but it is still running (agent_message or stop_sub_agent it)';
+}
+// Delivery: wake_parent:false gets a passive display row (no wake, no
+// durable pending wake); otherwise the RES-6 lifecycle notice + a wake.
+function _notifySubStuck(rec, sig) {
+    var headline = _subStuckHeadline(sig);
+    if (rec.wake_parent === false) {
+        return _postPassiveReportNotice(rec, { status: 'need_input', summary: headline }, {});
+    }
+    _notifySubLifecycle(rec, headline);
+    _wakeParentOnReport(rec, { status: 'need_input', summary: headline, from: rec.agent_id, from_name: rec.name, at: Date.now(), stuck: sig.reason }, { noticeDelivered: true });
+    return true;
+}
+// Sweep arm (authoritative context only). rec.stuck is the persisted/mirrored
+// stamp; rec._stuck_notified = {episode, reasons:{reason: at}} is the latch -
+// each reason notifies at most ONCE per episode (episode = woken_at, else
+// created_at; a wake/resurrect also deletes the latch), even if the signal
+// clears and re-appears in between.
+function _sweepStuckSignal(rec, now) {
+    var sig = _subStuckSignal(rec, now);
+    var prev = rec.stuck || null;
+    if (!sig) {
+        if (prev) { delete rec.stuck; _subAgentsPersist(rec); _notifyListeners(); }
+        return null;
+    }
+    var changed = !prev || prev.reason !== sig.reason || prev.since !== sig.since;
+    rec.stuck = { reason: sig.reason, since: sig.since };
+    var ep = _subEpisodeStart(rec);
+    var latch = rec._stuck_notified;
+    if (!latch || latch.episode !== ep || !latch.reasons) latch = rec._stuck_notified = { episode: ep, reasons: {} };
+    if (!latch.reasons[sig.reason]) {
+        latch.reasons[sig.reason] = now;
+        changed = true;
+        _notifySubStuck(rec, sig);
+    }
+    if (changed) { _subAgentsPersist(rec); _notifyListeners(); }
+    return sig;
+}
+
 function _idleSweepTick() {
     var now = Date.now();
     // P2: re-attempt chat rows a previous GC could not delete (the authorising
@@ -1149,7 +1605,23 @@ function _idleSweepTick() {
         // waiting for a pool slot, their start refreshes last_activity_at, and
         // erroring one would leave a stale id in _subPool.queue for a later
         // _drainPool to start.
-        if (_authoritativeCtx && r.state === 'running'
+        // H15: a sub parked by a PAUSE (parent-chat pause propagated by
+        // pauseDescendantsOfChat keeps state 'running' — see the paused-exit
+        // arm of onSubAgentRunFinished — or the user's own pause) is idle by
+        // design, not dead: never age it out, or a >2h pause silently errors
+        // the sub and settles the parent's spawn handle.
+        var _sweepPaused = false;
+        try {
+            _sweepPaused = !!(r.paused_by_parent_chat
+                || (r.chat_id && _pausedByParentChat[r.chat_id])
+                || (r.chat_id && typeof isChatPaused === 'function' && isChatPaused(r.chat_id))
+                || (r.chat_id && typeof chats !== 'undefined' && chats[r.chat_id] && chats[r.chat_id].pausedByUser === true));
+        } catch (_) { _sweepPaused = false; }
+        // N4 + N2: a sub blocked in await_handle on its own descendants
+        // (_parked_for_await) or waiting on a human approval is idle BY DESIGN
+        // as well - its last_activity_at does not advance while it waits.
+        var _sweepWaiting = !!(r._parked_for_await || r.awaiting_approval || (r._pending_approvals || 0) > 0);
+        if (_authoritativeCtx && r.state === 'running' && !_sweepPaused && !_sweepWaiting
             && r.last_activity_at && (now - r.last_activity_at) > SUBAGENT_RUNNING_TTL_MS
             && _subPool.queue.indexOf(aid) === -1) {
             var _staleMins = Math.round(SUBAGENT_RUNNING_TTL_MS / 60000);
@@ -1170,6 +1642,9 @@ function _idleSweepTick() {
                 _markErrored(aid, 'stale run reclaimed by the idle sweep: no sub-agent activity for over ' + _staleMins + ' min');
             } catch (e) { console.warn('subAgent GC: stale-running age-out failed', aid, e); }
             continue;
+        }
+        if (_authoritativeCtx) {
+            try { _sweepStuckSignal(r, now); } catch (e) { console.warn('[sub-agents] stuck-signal sweep failed', aid, e); }
         }
         // LEGACY-LEAK FIX: settled_at fallback — see the boot GC twin in
         // loadAllSubAgents (records from old builds have settled_at:null and
@@ -1616,18 +2091,21 @@ function spawnSubAgent(args, ctx) {
     // Unnamed spawns get a unique default name below and are not fused. Loud
     // error — the parent agent must check agent_status and reuse/wake/stop
     // the existing subs instead of spawning more.
-    if (args.name) {
+    // Item 8: ONE sanitized name for the fuse, its error, the handle label
+    // and the record — the fuse compares against STORED (sanitized) names.
+    var _safeName = _subSanitizeName(args.name, '');
+    if (_safeName) {
         var _fuseCount = 0;
         for (var _fid in _subAgents) {
             var _fr = _subAgents[_fid];
-            if (_fr && _fr.parent_chat_id === parentChatId && _fr.name === args.name
+            if (_fr && _fr.parent_chat_id === parentChatId && _fr.name === _safeName
                 && (_fr.state === 'running' || _fr.state === 'sleeping' || _fr.state === 'queued')) {
                 _fuseCount++;
             }
         }
         if (_fuseCount >= SUBAGENT_SAME_NAME_FUSE) {
             return { success: false, error: 'spawn_sub_agent: SPAWN FUSE — ' + _fuseCount
-                + ' ACTIVE sub-agents named "' + args.name + '" already exist for this chat (cap '
+                + ' ACTIVE sub-agents named "' + _safeName + '" already exist for this chat (cap '
                 + SUBAGENT_SAME_NAME_FUSE + '). This usually means a restart/replay loop is re-issuing the same'
                 + ' spawn. Check agent_status: reuse or wake an existing sub, stop stale ones, or pick a'
                 + ' distinct name if you truly need another.' };
@@ -1679,7 +2157,7 @@ function spawnSubAgent(args, ctx) {
     if (typeof chats === 'undefined') {
         return { success: false, error: 'spawn_sub_agent: chats map unavailable.' };
     }
-    var displayName = 'spawn_sub_agent: ' + (args.name || (instructions.slice(0, 40) + '…'));
+    var displayName = 'spawn_sub_agent: ' + (_safeName || (instructions.slice(0, 40) + '…'));
     // We use Handles.start with a runFn that simply waits for a deferred
     // promise the registry exposes — i.e. the handle resolves out-of-band
     // from report_to_parent / stop_sub_agent. The "runFn" never throws on
@@ -1700,7 +2178,7 @@ function spawnSubAgent(args, ctx) {
         root_chat_id: rootChatId,
         // Unnamed spawns fall back to the agent id itself — it is a readable
         // slug now ('worker', 'worker_2', …), not an opaque suffix.
-        name: args.name || agent_id,
+        name: _safeName || agent_id,
         state: 'running',
         spawn_args: args,
         spawn_handle_id: spawn_handle_id,
@@ -2013,6 +2491,36 @@ function pauseDescendantsOfChat(parentChatId) {
     return paused;
 }
 
+// H11: cascade-STOP every sub-agent that descends from `chatId` (depth-1 subs
+// via parent_chat_id + deeper levels via _children, plus any record whose
+// root_chat_id is the chat). Called by the SW tombstone lane
+// (worker/130-port-bridge.js 'update-chat' _deleted branch) BEFORE the
+// tombstone replaces the chat row, so a deleted chat no longer leaves its
+// subs running, holding pool slots and reporting into a dead chat. Uses the
+// internal-cascade stop path (ACL bypass — the actor is the user's delete).
+// Already-terminal subs are no-ops inside _stopSubAgentImpl. Returns the
+// agent ids a stop was issued for.
+function stopDescendantsOfChat(chatId, reason) {
+    var stopped = [];
+    if (!chatId) return stopped;
+    // C5: the chat is being deleted — drop its pending debounced
+    // agent_message wake (the timer would otherwise fire into a tombstone).
+    _cancelAgentMessageWake(chatId);
+    var ids = _descendantsOfChat(chatId);
+    for (var aid in _subAgents) {
+        if (_subAgents[aid] && _subAgents[aid].root_chat_id === chatId && ids.indexOf(aid) === -1) ids.push(aid);
+    }
+    for (var i = 0; i < ids.length; i++) {
+        var rec = _subAgents[ids[i]];
+        if (!rec || rec.state === 'stopped' || rec.state === 'errored') continue;
+        try {
+            var res = _stopSubAgentImpl({ agent_id: ids[i], reason: reason || 'parent chat deleted' }, null, true);
+            if (res && res.success !== false) stopped.push(ids[i]);
+        } catch (e) { console.warn('[sub-agents] stopDescendantsOfChat: stop failed for', ids[i], e); }
+    }
+    return stopped;
+}
+
 // Resume every sub this parent chat paused, and re-enter each sub's run
 // through the SAME pool entry a wake uses (_subPool.queue + _drainPool →
 // runAgent(sub.chat_id)), so the sub resumes with its own pending tool
@@ -2078,6 +2586,11 @@ function resumeDescendantsOfChat(parentChatId) {
         resumed.push(rec.chat_id);
     }
     if (resumed.length) { _drainPool(); _notifyListeners(); }
+    // NEW-W: deliver the durable wakes that queued up while this parent was
+    // paused now, instead of waiting for the next heartbeat drain. Only the
+    // user-initiated resume reaches here (stop/dismiss reuse toggle-pause
+    // without propagate and must not restart the chat).
+    try { _drainPendingWakesForChat(parentChatId); } catch (e) { console.warn('[sub-agents] resume drain failed', parentChatId, e); }
     return resumed;
 }
 
@@ -2200,6 +2713,16 @@ function markReportCollected(callerChatId, handleId) {
 // SW death that this flush never carried).
 var PENDING_WAKE_MAX_ATTEMPTS = 5;
 var _drainPendingWakesInFlight = false;
+// M2: a resume drain refused by the in-flight latch sets this; the latch
+// holder's release consumes it and re-runs ONE full drain (else the resumed
+// parent's wake waits for the 30 s heartbeat).
+var _drainPendingWakesRedrain = false;
+function _releaseDrainPendingWakes() {
+    _drainPendingWakesInFlight = false;
+    if (!_drainPendingWakesRedrain) return;
+    _drainPendingWakesRedrain = false;
+    return drainPendingWakes();
+}
 
 function _pendingWakesStore(mode) {
     // Direct store-access helper (openDatabase → transaction → objectStore);
@@ -2216,7 +2739,7 @@ function _pendingWakesStore(mode) {
 // retrying). Containment dedupe: the end-of-run drain persists the whole
 // COALESCED injection text ('A\n\nB'), which supersedes an individually
 // persisted part; an already-stored superset covers the new text.
-function persistPendingWake(parentChatId, noticeText, subAgentId) {
+function persistPendingWake(parentChatId, noticeText, subAgentId, rowMeta) {
     if (!parentChatId) return Promise.resolve(false);
     return _pendingWakesStore('readwrite').then(function(store) {
         return new Promise(function(resolve) {
@@ -2232,7 +2755,17 @@ function persistPendingWake(parentChatId, noticeText, subAgentId) {
                     dup = rec.notices.some(function(n) { return n && n.text && n.text.indexOf(t) !== -1; });
                     if (!dup) rec.notices = rec.notices.filter(function(n) { return !(n && n.text && t.indexOf(n.text) !== -1); });
                 }
-                if (!dup) rec.notices.push({ text: t, sub_id: subAgentId || null, at: Date.now() });
+                if (!dup) {
+                    var _pwNotice = { text: t, sub_id: subAgentId || null, at: Date.now() };
+                    // SUB-NOTICE-META: keep the row metadata so the heartbeat
+                    // drain re-pushes a structured row (_pushPendingWakeRows).
+                    if (t !== null && rowMeta) {
+                        var _pwSn = _subNoticeList(null, rowMeta.subNotices);
+                        if (_pwSn.length) _pwNotice.subNotices = _pwSn;
+                        if (rowMeta.hasUserText === true) _pwNotice.hasUserText = true;
+                    }
+                    rec.notices.push(_pwNotice);
+                }
                 rec.lastEventAt = Date.now();
                 var putReq = store.put(rec);
                 putReq.onsuccess = function() { resolve(true); };
@@ -2279,6 +2812,57 @@ function _markPendingWakeExhausted(parentChatId, attempts) {
             putReq.onerror = function() { resolve(); };
         });
     }).catch(function() { /* best-effort */ });
+}
+
+// N3: every drain skips a PAUSED parent's record (see _drainOnePendingWake),
+// so it never reached the exhaust TTL and lived forever. Stamp pausedSince
+// once (persisted) and drop the record after PENDING_WAKE_PAUSED_TTL_MS of
+// continuous pause; the next delivery attempt clears the stamp.
+var PENDING_WAKE_PAUSED_TTL_MS = 24 * 60 * 60 * 1000;
+function _notePendingWakePaused(pcid, rec) {
+    var now = Date.now();
+    if (rec && rec.pausedSince) {
+        if ((now - rec.pausedSince) > PENDING_WAKE_PAUSED_TTL_MS) {
+            console.warn('[sub-agents] pending wake for paused parent', pcid, 'expired after', Math.round((now - rec.pausedSince) / 3600000), 'h paused - notice rows stay in the transcript');
+            return clearPendingWake(pcid);
+        }
+        return Promise.resolve();
+    }
+    return _pendingWakesStore('readwrite').then(function(store) {
+        return new Promise(function(resolve) {
+            var getReq = store.get(pcid);
+            getReq.onsuccess = function() {
+                var cur = getReq.result;
+                if (!cur || cur.pausedSince) { resolve(); return; }
+                cur.pausedSince = now;
+                var putReq = store.put(cur);
+                putReq.onsuccess = function() { resolve(); };
+                putReq.onerror = function() { resolve(); };
+            };
+            getReq.onerror = function() { resolve(); };
+        });
+    }).catch(function() { /* best-effort */ });
+}
+// NEW-W: drain ONE parent's durable wake (resumeDescendantsOfChat). SW only;
+// shares the full drain's in-flight latch so the two never race on a record.
+function _drainPendingWakesForChat(pcid) {
+    if (!pcid) return Promise.resolve();
+    if (typeof Platform !== 'undefined' && Platform.isWorker !== true) return Promise.resolve();
+    if (_drainPendingWakesInFlight) { _drainPendingWakesRedrain = true; return Promise.resolve(); }
+    if (typeof _chatsHydrated !== 'undefined' && !_chatsHydrated) return Promise.resolve();
+    _drainPendingWakesInFlight = true;
+    return _pendingWakesStore('readonly').then(function(store) {
+        return new Promise(function(resolve) {
+            var req = store.get(pcid);
+            req.onsuccess = function() { resolve(req.result || null); };
+            req.onerror = function() { resolve(null); };
+        });
+    }).then(function(pw) {
+        if (pw) return _drainOnePendingWake(pw);
+    }).then(function() { return _releaseDrainPendingWakes(); }, function(e) {
+        console.warn('[sub-agents] resume drain failed for', pcid, e);
+        return _releaseDrainPendingWakes();
+    });
 }
 
 function clearPendingWake(parentChatId) {
@@ -2346,6 +2930,7 @@ function _bumpPendingWakeAttempts(parentChatId) {
                 if (!rec) { resolve(); return; }
                 rec.attempts = (rec.attempts || 0) + 1;
                 rec.lastEventAt = Date.now();
+                delete rec.pausedSince; // N3: a delivery attempt means the parent is no longer paused
                 var putReq = store.put(rec);
                 putReq.onsuccess = function() { resolve(); };
                 putReq.onerror = function() { resolve(); };
@@ -2355,13 +2940,108 @@ function _bumpPendingWakeAttempts(parentChatId) {
     }).catch(function() { /* best-effort */ });
 }
 
+// SUB-NOTICE-META (B part 2a): structured per-notice metadata for the
+// renderer, carried on pending-injection entries and injected rows under
+// `subNotices` (NOT `notices` — persistPendingWake's durable record already
+// uses that key for {text, sub_id, at}). One entry per APPENDED notice:
+// {kind:'final'|'mid'|'message'|'lifecycle', agentId, name, status, summary,
+// text} — text is the EXACT string appended to the row/entry content.
+// UI-only: buildAPIMessages (app/020-api-messages.js) sends user rows as
+// role+content, so the model payload is unchanged.
+function _subNoticeMeta(kind, agentId, name, status, summary, text) {
+    return {
+        kind: kind, agentId: agentId || null, name: name || agentId || null,
+        status: status || null,
+        summary: String(summary == null ? '' : summary),
+        text: String(text == null ? '' : text)
+    };
+}
+// C1 CUMULATIVE FINAL: one-line reminder appended to EVERY model-visible
+// parent wake notice (_wakeParentOnReport, _notifySubLifecycle, agentMessage
+// to:'parent'). It is appended to the notice string BEFORE its meta is
+// built, so meta.text covers it: the UI renders the card from meta and
+// hides the whole meta.text span (reminder included) while the model sees
+// it. Own line AFTER the notice body, so SUB_NOTICE_RE's summary capture
+// (terminated by the await_handle line) and the single-line lifecycle
+// headline are unchanged.
+// (Literal kept inside the function so it is self-contained.)
+// C-REVIEW Fix 1: TOP-LEVEL parents only. Pass the recipient parent chat
+// id: a sub-agent parent (nested) gets NO CUMULATIVE FINAL policy (core/110)
+// and has no user, so its text comes back UNCHANGED. Nested = chats[id]
+// .isSubAgent, else (chat not loaded / flag absent) a registry record whose
+// chat_id === id. No id -> reminder (top-level default; app/020
+// _wakeFinalReminderLine derives the line that way). Callers build meta.text
+// from the RETURNED string, so meta.text === row/entry text in both cases.
+// The check stays inline (typeof-guarded) so the helper is self-contained.
+function _withWakeFinalReminder(text, parentChatId) {
+    var s = String(text == null ? '' : text);
+    if (parentChatId) {
+        try {
+            var _pc = (typeof chats !== 'undefined' && chats) ? chats[parentChatId] : null;
+            if (_pc && _pc.isSubAgent) return s;
+            if (typeof _subAgents !== 'undefined' && _subAgents) {
+                for (var _aid in _subAgents) {
+                    if (_subAgents[_aid] && _subAgents[_aid].chat_id === parentChatId) return s;
+                }
+            }
+        } catch (_) { /* unreadable -> top-level default */ }
+    }
+    return s + '\nReminder: your final message must be a cumulative digest of everything since the user\'s last message.';
+}
+function _subNoticeList(prior, add) {
+    var out = Array.isArray(prior) ? prior.slice() : [];
+    (Array.isArray(add) ? add : (add ? [add] : [])).forEach(function(m) { if (m) out.push(m); });
+    return out;
+}
+// Coalesce a notice into chatId's pending-injection entry. KEEPS every
+// existing field (images, subNotices, hasUserText, …) and appends this
+// notice's meta; text/images semantics are unchanged ('\n\n' join).
+function _queueNoticeInjection(chatId, text, metas) {
+    var ex = pendingInjectionsByChatId[chatId];
+    var next = {};
+    if (ex && typeof ex === 'object') Object.keys(ex).forEach(function(k) { next[k] = ex[k]; });
+    next.text = ((ex && ex.text) ? ex.text + '\n\n' : '') + text;
+    next.images = (ex && ex.images) ? ex.images : [];
+    var list = _subNoticeList(ex && ex.subNotices, metas);
+    if (list.length) next.subNotices = list;
+    pendingInjectionsByChatId[chatId] = next;
+    return next;
+}
+// Idle-path injected notice row — same shape flushPendingInjection builds.
+function _noticeRow(text, metas, hasUserText) {
+    var row = { role: 'user', content: text, injected: true };
+    var list = _subNoticeList(null, metas);
+    if (list.length) row.subNotices = list;
+    if (hasUserText === true) row.hasUserText = true;
+    return row;
+}
+// One meta per inbox drain (the drain is ONE appended string). A single
+// drained item that carries a structured notice (a child report/message
+// routed through a sub-parent's inbox or wake instruction) keeps that
+// identity; anything else is an inbound 'message' from its sender.
+function _inboxDrainMeta(items, combined) {
+    var one = (items && items.length === 1) ? items[0] : null;
+    if (one && one.subNotice) {
+        var m = {};
+        Object.keys(one.subNotice).forEach(function(k) { m[k] = one.subNotice[k]; });
+        m.text = String(combined);
+        return m;
+    }
+    var from = (one && one.from) || 'parent';
+    var fromRec = (from !== 'parent' && typeof _subAgents !== 'undefined') ? _subAgents[from] : null;
+    return _subNoticeMeta('message', from, fromRec ? (fromRec.name || from) : from, null,
+        (items || []).map(function(it) { return String((it && it.content) || ''); }).join('\n\n'), combined);
+}
+
 // Push undelivered notice rows into the parent transcript and persist.
 // Same row shape as _wakeParentOnReport's idle arm / flushPendingInjection.
+// items: strings (legacy) or {text, subNotices?, hasUserText?}.
 function _pushPendingWakeRows(pchat, texts) {
     if (!pchat || !texts || !texts.length) return Promise.resolve();
     if (!Array.isArray(pchat.messages)) pchat.messages = [];
     texts.forEach(function(t) {
-        pchat.messages.push({ role: 'user', content: t, injected: true });
+        if (typeof t === 'string') pchat.messages.push(_noticeRow(t));
+        else if (t && t.text) pchat.messages.push(_noticeRow(t.text, t.subNotices, t.hasUserText));
     });
     var saved = (typeof saveChatsToStorage === 'function') ? saveChatsToStorage() : null;
     return Promise.resolve(saved).catch(function(e) {
@@ -2383,7 +3063,12 @@ function _drainOnePendingWake(rec) {
     // messages.length > 0 and resurrect the deleted chat through the storage
     // delete-pass (worker/115-storage.js), and runAgent refuses tombstones
     // anyway, so the record would retry forever. Clear both cases.
-    if (!pchat || pchat._deleted === true) return clearPendingWake(pcid);
+    if (!pchat || pchat._deleted === true) { _cancelAgentMessageWake(pcid); return clearPendingWake(pcid); }
+    // C5: a debounced agent_message wake is pending for this parent — its
+    // timer (_fireAgentMessageWake) owns the run start; draining now would
+    // start the run early and defeat the debounce. After an SW restart the
+    // in-memory timer map is empty, so this drain delivers the record.
+    if (_amDebounceTimers[pcid]) return Promise.resolve();
     // A live run consumes the in-memory queue itself, or — after an SW death
     // wiped it — finishes and lets the next tick deliver. Never inject here.
     if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return Promise.resolve();
@@ -2393,7 +3078,7 @@ function _drainOnePendingWake(rec) {
     // REG391-1: respect an explicit user pause — keep the record parked; the
     // manual resume answers the rows and the answered-check clears it then.
     try {
-        if (typeof isChatPaused === 'function' && isChatPaused(pcid)) return Promise.resolve();
+        if (typeof isChatPaused === 'function' && isChatPaused(pcid)) return _notePendingWakePaused(pcid, rec);
     } catch (_) { /* unreadable pause state — proceed */ }
     var msgs = Array.isArray(pchat.messages) ? pchat.messages : [];
     var notices = Array.isArray(rec.notices) ? rec.notices : [];
@@ -2408,7 +3093,7 @@ function _drainOnePendingWake(rec) {
             var m = msgs[i];
             if (m && m.role === 'user' && typeof m.content === 'string' && m.content.indexOf(n.text) !== -1) { idx = i; break; }
         }
-        if (idx === -1) toPush.push(n.text);
+        if (idx === -1) toPush.push({ text: n.text, subNotices: n.subNotices, hasUserText: n.hasUserText });
         else if (idx > anchor) anchor = idx;
     });
     if (!toPush.length) {
@@ -2464,12 +3149,17 @@ function _drainOnePendingWake(rec) {
             if (!covered) {
                 // The coalesced entry text supersedes any durable notice it
                 // contains (Mode B persists the whole coalesced injection).
-                texts = texts.filter(function(t) { return entry.text.indexOf(t) === -1; });
-                texts.push(entry.text);
+                texts = texts.filter(function(t) { return entry.text.indexOf(t.text) === -1; });
+                texts.push({ text: entry.text, subNotices: entry.subNotices, hasUserText: entry.hasUserText });
             }
         }
         if (entry.images && entry.images.length) {
-            pendingInjectionsByChatId[pcid] = { text: null, images: entry.images };
+            // Keep every other field; the text-bound metadata rode the row.
+            var rest = {};
+            Object.keys(entry).forEach(function(k) { if (k !== 'subNotices' && k !== 'hasUserText') rest[k] = entry[k]; });
+            rest.text = null;
+            rest.images = entry.images;
+            pendingInjectionsByChatId[pcid] = rest;
         } else {
             delete pendingInjectionsByChatId[pcid];
         }
@@ -2567,11 +3257,76 @@ function drainPendingWakes() {
             });
         }));
     }).then(function() {
-        _drainPendingWakesInFlight = false;
+        return _releaseDrainPendingWakes();
     }, function(e) {
-        _drainPendingWakesInFlight = false;
         console.warn('[sub-agents] drainPendingWakes failed', e);
+        return _releaseDrainPendingWakes();
     });
+}
+
+// ---------- C5: debounced idle-parent agent_message wakes ----------
+// SYMPTOM: a chatty sub sending several agent_message(to:'parent') updates
+// to an IDLE parent started one parent run per message. Fix: agentMessage's
+// idle arm still pushes the model row and persists the durable pending wake
+// IMMEDIATELY (an SW death loses nothing — drainPendingWakes delivers the
+// record after a restart, when this in-memory map is empty); only the RUN
+// START is debounced: one timer per parent chat id, a FIXED window of
+// AGENT_MESSAGE_WAKE_DEBOUNCE_MS from the first idle message (later messages
+// join without extending it — worst-case latency = the window). On fire →
+// ONE runAgent that consumes every notice row pushed meanwhile. Immediate
+// wakes cancel it: _wakeParentOnReport's idle arm, and every run start
+// (runAgent claiming the chat, app/030-agent-loop.js — a user message, a
+// resume, the heartbeat drain), since that run answers the same rows. A
+// parent running at fire time gets no second run. setTimeout/clearTimeout
+// are looked up at call time (test seam).
+var AGENT_MESSAGE_WAKE_DEBOUNCE_MS = 20000;
+var _amDebounceTimers = {};
+
+function _scheduleAgentMessageWake(pcid) {
+    if (!pcid) return false;
+    if (_amDebounceTimers[pcid]) return false; // join the open window
+    var entry = { firstAt: Date.now(), timer: null };
+    _amDebounceTimers[pcid] = entry;
+    entry.timer = setTimeout(function() { _fireAgentMessageWake(pcid, entry); }, AGENT_MESSAGE_WAKE_DEBOUNCE_MS);
+    return true;
+}
+
+function _cancelAgentMessageWake(pcid) {
+    var entry = pcid ? _amDebounceTimers[pcid] : null;
+    if (!entry) return false;
+    delete _amDebounceTimers[pcid];
+    try { clearTimeout(entry.timer); } catch (_) { /* best-effort */ }
+    return true;
+}
+
+function _fireAgentMessageWake(pcid, entry) {
+    if (!entry || _amDebounceTimers[pcid] !== entry) return false; // cancelled / superseded
+    delete _amDebounceTimers[pcid];
+    try {
+        var pchat = (typeof chats !== 'undefined') ? chats[pcid] : null;
+        if (!pchat || pchat._deleted === true) return false;
+        if (pchat.isSubAgent) return false; // never a raw runAgent for a sub chat
+        // Running: that run already holds the rows (pushed before it claimed
+        // the chat) — no second run.
+        if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return false;
+        // REG391-1 pause respect (same flags as the idle arm): rows stay
+        // parked; the durable record waits for the manual resume.
+        try {
+            if (typeof isChatPaused === 'function' && isChatPaused(pcid)) return false;
+            if (typeof pausedChats !== 'undefined' && pausedChats[pcid] === true) return false;
+            if (typeof pausedChatIds !== 'undefined' && pausedChatIds[pcid] === true) return false;
+        } catch (_) { /* unreadable pause state — treat as not paused */ }
+        if (typeof runAgent !== 'function') return false;
+        Promise.resolve()
+            .then(function() { return runAgent(pcid); })
+            .catch(function(err) {
+                console.warn('[sub-agents] agent_message(parent): debounced wake run failed for', pcid, err, '— durable pending wake kept for heartbeat retry');
+            });
+        return true;
+    } catch (e) {
+        console.warn('[sub-agents] debounced agent_message wake failed for', pcid, e);
+        return false;
+    }
 }
 
 // ---------- Wake-the-parent on report (P2) ----------
@@ -2603,11 +3358,95 @@ function drainPendingWakes() {
 // _spawnHandleHasAwaiters). opts.noticeDelivered: the caller already pushed
 // a model-visible notice via _notifySubLifecycle (error paths) — only the
 // run-start half is still needed; pushing a second row would duplicate.
+// PASSIVE-NOTICE: one-line headline for the passive report row — the first
+// non-empty summary line, leading markdown heading/list/quote markers
+// stripped, clamped to ~200 chars.
+function _passiveReportHeadline(summary) {
+    var lines = String(summary || '').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].replace(/^\s*(?:#{1,6}\s+|[-*>]\s+)/, '').trim();
+        if (!l) continue;
+        if (l.length > 200) l = l.slice(0, 199).replace(/\s+\S*$/, '') + '\u2026';
+        return l;
+    }
+    return '';
+}
+
+// PASSIVE-NOTICE: the wake_parent:false arm of _wakeParentOnReport. Appends
+// a UI-only role:'sub_msg' row (kind:'passive_report') at the CURRENT end of
+// the parent transcript: sub name, status, one-line headline and a "View
+// agent" button (renderSubAgentMessage, ui/175-sub-agent-ui.js). Like every
+// sub_msg row it is dropped from API payloads (unknown roles map to null in
+// buildAPIMessages, app/020-api-messages.js), so the parent MODEL's context
+// is unchanged, no run is started and no durable pending wake is persisted —
+// the opt-out stays an opt-out. Skipped when:
+//   • opts.noticeDelivered — _notifySubLifecycle already pushed a visible row;
+//   • the parent is live AND blocked in await_handle / await_any / await_all
+//     on this handle (opts.hadAwaiters, sampled before the settle) — the
+//     settle itself delivers the report into that turn.
+// Returns true when a row was (or, for a payload-evicted parent, will be)
+// appended.
+function _postPassiveReportNotice(rec, report, opts) {
+    opts = opts || {};
+    try {
+        if (!rec || opts.noticeDelivered) return false;
+        var pcid = rec.parent_chat_id;
+        if (!pcid || typeof chats === 'undefined' || !chats[pcid]) return false;
+        // Live check — same shape as _wakeParentOnReport / _notifySubLifecycle.
+        var live = !!(typeof runningChatIds !== 'undefined' && runningChatIds[pcid]);
+        if (!live && chats[pcid].isSubAgent && chats[pcid].subAgentId) {
+            var _ppSub = _subAgents[chats[pcid].subAgentId];
+            live = !!(_ppSub && _subPool.running[_ppSub.agent_id]);
+        }
+        if (opts.hadAwaiters && live) return false;
+        var row = {
+            role: 'sub_msg',
+            kind: 'passive_report',
+            subAgentId: rec.agent_id,
+            subAgentName: rec.name,
+            subChatId: rec.chat_id,
+            status: (report && report.status) || 'done',
+            text: _passiveReportHeadline(report && report.summary),
+            handle: rec.spawn_handle_id || null,
+            createdAt: Date.now()
+        };
+        // Hydrate a payload-evicted parent FIRST (same ordering as
+        // _wakeParentOnReport's _wpDeliver): the evicted-put guard
+        // (worker/115-storage.js) would otherwise silently skip the save.
+        var _ppDeliver = function() {
+            var pchat = chats[pcid];
+            if (!pchat) return;
+            if (!Array.isArray(pchat.messages)) pchat.messages = [];
+            pchat.messages.push(row);
+            _repaintParent(pcid); // persists + repaints/broadcasts
+        };
+        if (chats[pcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            ensureChatPayloads(pcid).then(_ppDeliver, _ppDeliver);
+        } else {
+            _ppDeliver();
+        }
+        return true;
+    } catch (e) {
+        console.warn('[sub-agents] _postPassiveReportNotice failed for', rec && rec.agent_id, e);
+        return false;
+    }
+}
+
 function _wakeParentOnReport(rec, report, opts) {
     opts = opts || {};
     try {
         if (!rec) return false;
-        if (rec.wake_parent === false) return false; // spawn-time opt-out
+        // wake_parent:false opt-out (spawn-time, or a wake_sub_agent
+        // override): never wake / inject into the parent MODEL — but still
+        // surface the report to the USER with a passive UI-only row
+        // (PASSIVE-NOTICE, _postPassiveReportNotice). Before this, a
+        // fire-and-forget sub the parent never awaited reported into the
+        // void: the only trace was the spawn-position card far up the
+        // transcript.
+        if (rec.wake_parent === false) {
+            _postPassiveReportNotice(rec, report, opts);
+            return false; // no wake
+        }
         var pcid = rec.parent_chat_id;
         if (!pcid || typeof chats === 'undefined' || !chats[pcid]) return false;
         // Live check — same shape as _notifySubLifecycle.
@@ -2652,9 +3491,11 @@ function _wakeParentOnReport(rec, report, opts) {
         // truthful: await_handle returns the full STRUCTURED report (data +
         // artifacts), not just this summary.
         var _sum = String((report && report.summary) || '').trim();
-        var notice = 'Sub-agent "' + (rec.name || rec.agent_id) + '" (' + rec.agent_id + ') reported ('
+        var notice = _withWakeFinalReminder('Sub-agent "' + (rec.name || rec.agent_id) + '" (' + rec.agent_id + ') reported ('
             + ((report && report.status) || 'done') + ')' + (_sum ? ':\n' + _sum : '')
-            + '\n— full report via await_handle("' + rec.spawn_handle_id + '") or agent_status.';
+            + '\n— full report via await_handle("' + rec.spawn_handle_id + '") or agent_status.', pcid);
+        var _rStatus = (report && report.status) || 'done';
+        var _meta = _subNoticeMeta(_rStatus === 'need_input' ? 'mid' : 'final', rec.agent_id, rec.name, _rStatus, _sum, notice);
         if (live) {
             // (3) Mid-run: queue for flushPendingInjection; coalesce with any
             // earlier reporter / lifecycle notice already waiting.
@@ -2671,16 +3512,12 @@ function _wakeParentOnReport(rec, report, opts) {
                 return false; // _notifySubLifecycle already queued + persisted one
             }
             if (typeof pendingInjectionsByChatId !== 'undefined') {
-                var ex = pendingInjectionsByChatId[pcid];
-                pendingInjectionsByChatId[pcid] = {
-                    text: ((ex && ex.text) ? ex.text + '\n\n' : '') + notice,
-                    images: (ex && ex.images) ? ex.images : []
-                };
+                _queueNoticeInjection(pcid, notice, [_meta]);
                 // WAKE-DUR (Mode A): the in-memory queue above dies with the
                 // MV3 SW. Mirror it durably; flushPendingInjection's targeted
                 // clear (clearDeliveredPendingWakes) drops it on normal
                 // delivery, the heartbeat drain delivers it after an SW death.
-                persistPendingWake(pcid, notice, rec.agent_id);
+                persistPendingWake(pcid, notice, rec.agent_id, { subNotices: [_meta] });
                 return true;
             }
             return false;
@@ -2692,8 +3529,53 @@ function _wakeParentOnReport(rec, report, opts) {
             // the notice (skipped when _notifySubLifecycle already pushed a
             // user row into the sleeping parent's transcript — the bare wake
             // still resumes on that row, keeping safe alternation).
+            // M11: respect a PAUSE of the sub-parent. _wakeSubAgentImpl
+            // deletes pausedChats[chat_id] and re-queues the loop, which
+            // silently overrode a user pause / a parent-chat pause cascade.
+            // (pausedChats alone is NOT a pause signal here — report_to_parent
+            // / sleep_self set it as the sleeping sub's park flag.) Deliver the
+            // notice durably instead and let the resume consume it:
+            //   • running (parent-paused, loop exited) → direct transcript row
+            //     (no live loop — same as agent_message's idle arm), consumed
+            //     when resumeDescendantsOfChat re-queues the sub;
+            //   • sleeping (user-paused) → rec.inbox, drained by the next wake.
+            var _npPaused = false;
+            try {
+                _npPaused = !!(parentSubRec.paused_by_parent_chat
+                    || _pausedByParentChat[pcid]
+                    || (chats[pcid] && chats[pcid].pausedByUser === true));
+            } catch (_) { _npPaused = false; }
+            if (_npPaused) {
+                if (!opts.noticeDelivered) {
+                    if (parentSubRec.state === 'running' && Array.isArray(chats[pcid].messages)) {
+                        // Sanctioned push + persist (_pushPendingWakeRows — same
+                        // row shape as the idle arm below). The evicted-put guard
+                        // (worker/115-storage.js) skips a payload-evicted chat, so
+                        // hydrate FIRST, then push + persist — the same ordering
+                        // as _wpDeliver below (ensureChatPayloads never rejects by
+                        // contract; the rejection arm still delivers). A hydrated
+                        // chat stays fully synchronous. (Write-site ratchet, RFC
+                        // Flux Phase 1: no ad-hoc save / chat-field poke here.)
+                        var _npDeliver = function() {
+                            var _npChat = chats[pcid];
+                            if (_npChat) _pushPendingWakeRows(_npChat, [{ text: notice, subNotices: [_meta] }]);
+                        };
+                        if (chats[pcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                            ensureChatPayloads(pcid).then(_npDeliver, _npDeliver);
+                        } else {
+                            _npDeliver();
+                        }
+                    } else {
+                        parentSubRec.inbox = parentSubRec.inbox || [];
+                        parentSubRec.inbox.push({ kind: 'report', from: rec.agent_id, content: notice, at: Date.now(), subNotice: _meta });
+                    }
+                }
+                parentSubRec.last_activity_at = Date.now();
+                _subAgentsPersist(parentSubRec);
+                return false;
+            }
             var wargs = { agent_id: parentSubRec.agent_id };
-            if (!opts.noticeDelivered) wargs.instruction = notice;
+            if (!opts.noticeDelivered) { wargs.instruction = notice; wargs._subNotices = [_meta]; }
             // PR390-FU-2: a refused wake here is currently structurally
             // unreachable (this arm requires !live, the resurrect guard
             // requires runningChatIds) — but if _wakeSubAgentImpl ever gains a
@@ -2721,6 +3603,12 @@ function _wakeParentOnReport(rec, report, opts) {
             if (typeof pausedChats !== 'undefined' && pausedChats[pcid] === true) _wpPaused = true;
             if (typeof pausedChatIds !== 'undefined' && pausedChatIds[pcid] === true) _wpPaused = true;
         } catch (_) { /* unreadable pause state — treat as not paused */ }
+        // C5: an immediate wake — cancel a pending debounced agent_message
+        // wake NOW (before any async hydration, so its timer can't start a
+        // competing run meanwhile); the run below consumes those
+        // already-pushed notice rows too. Paused: nothing starts here and
+        // the timer's own fire re-checks the pause.
+        if (!_wpPaused) _cancelAgentMessageWake(pcid);
         // MEMFIX-FU (M1): the parent chat may be payload-evicted (the SW
         // loader strips ALL chats at load — worker/115-storage.js) and this
         // arm bypasses the port-bridge run-agent hydration gate. On an
@@ -2739,7 +3627,7 @@ function _wakeParentOnReport(rec, report, opts) {
             var pchat = chats[pcid];
             if (!pchat) return;
             if (!opts.noticeDelivered && Array.isArray(pchat.messages)) {
-                pchat.messages.push({ role: 'user', content: notice, injected: true });
+                pchat.messages.push(_noticeRow(notice, [_meta]));
             }
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
             // WAKE-DUR (Mode C): the async runAgent start below can be lost
@@ -2749,7 +3637,7 @@ function _wakeParentOnReport(rec, report, opts) {
             // assistant reply follows the notice row. noticeDelivered: the
             // row came from _notifySubLifecycle (text unknown here), so
             // persist a run-only wake (text null — only the run is retried).
-            persistPendingWake(pcid, opts.noticeDelivered ? null : notice, rec.agent_id);
+            persistPendingWake(pcid, opts.noticeDelivered ? null : notice, rec.agent_id, opts.noticeDelivered ? null : { subNotices: [_meta] });
             // Paused: leave the notice row parked (see REG391-1 above).
             if (_wpPaused) return;
             if (typeof runAgent === 'function') {
@@ -3041,6 +3929,11 @@ function _notifySubLifecycle(rec, headline) {
         var pcid = rec.parent_chat_id;
         if (!pcid || typeof chats === 'undefined' || !chats[pcid]) return false;
         var text = '[sub-agent lifecycle] ' + (rec.name || rec.agent_id) + ' (' + rec.agent_id + '): ' + headline;
+        // C1: the MODEL-visible notice carries the cumulative-final reminder
+        // (top-level parents only — C-REVIEW Fix 1); the card's progress
+        // stream (UI-only) keeps the bare line.
+        var _lcNotice = _withWakeFinalReminder(text, pcid);
+        var _lcMeta = _subNoticeMeta('lifecycle', rec.agent_id, rec.name, rec.state, headline, _lcNotice);
         // (1) inline callout on the live card (bounded like agentMessage's stream).
         var card = _findSubAgentCard(pcid, rec.agent_id);
         if (card) {
@@ -3060,11 +3953,7 @@ function _notifySubLifecycle(rec, headline) {
             live = !!(prec && _subPool.running[prec.agent_id]);
         }
         if (live && typeof pendingInjectionsByChatId !== 'undefined') {
-            var ex = pendingInjectionsByChatId[pcid];
-            pendingInjectionsByChatId[pcid] = {
-                text: ((ex && ex.text) ? ex.text + '\n\n' : '') + text,
-                images: (ex && ex.images) ? ex.images : []
-            };
+            _queueNoticeInjection(pcid, _lcNotice, [_lcMeta]);
             // WAKE-DUR (Mode A): the in-memory queue above dies with the MV3
             // SW. Mirror the EXACT queued text durably — on normal delivery
             // the flushed injection contains this text, so
@@ -3073,9 +3962,9 @@ function _notifySubLifecycle(rec, headline) {
             // it. Persisting the exact queued text (not _wakeParentOnReport's
             // differently-worded report notice) is what keeps the targeted
             // clear matching.
-            if (typeof persistPendingWake === 'function') persistPendingWake(pcid, text, rec.agent_id);
+            if (typeof persistPendingWake === 'function') persistPendingWake(pcid, _lcNotice, rec.agent_id, { subNotices: [_lcMeta] });
         } else if (Array.isArray(chats[pcid].messages)) {
-            chats[pcid].messages.push({ role: 'user', content: text, injected: true });
+            chats[pcid].messages.push(_noticeRow(_lcNotice, [_lcMeta]));
         }
         _repaintParent(pcid); // persists (saveChatsToStorage) + repaints/broadcasts
         return true;
@@ -3114,6 +4003,10 @@ function onUserMessageToSubChat(subChatId) {
         if (rec.state === 'sleeping') {
             rec.state = 'running';
             rec.settled_at = null;
+            // B1: a new episode, exactly like a wake (_wakeSubAgentImpl): the
+            // previous report is not this episode's (stuck verdict, boot park).
+            rec.woken_at = Date.now();
+            delete rec.stuck; delete rec._stuck_notified; delete rec._halt_at;
             _mintNewSpawnHandle(rec); // re-arms _spawnDeferreds + pending_handles (persists)
         }
         _subAgentsPersist(rec);
@@ -3192,7 +4085,7 @@ function recordSubActionState(subChatId, snap) {
         icon: snap.icon || 'spinner',
         label: snap.label || '',
         tasks: Array.isArray(snap.tasks) ? snap.tasks : (prev.tasks || null),
-        output: (typeof snap.output === 'string') ? snap.output
+        output: (typeof snap.output === 'string') ? _subNormalizeNewlines(snap.output)
               : (snap.clearOutput ? null : (prev.output != null ? prev.output : null)),
         at: snap.at || Date.now()
     };
@@ -3350,11 +4243,12 @@ function reportToParent(args, ctx) {
     if (rec.state === 'sleeping' || !_spawnDeferreds[rec.spawn_handle_id]) {
         return { success: false, already_settled: true, error: 'report_to_parent: this turn already settled the spawn handle (state=' + rec.state + '); the sub is parked. It can report again only after being woken.' };
     }
-    var summary = String(args.summary || '');
-    if (summary.length > rec.summary_cap_bytes) {
-        // Soft-truncate with marker so the parent still sees a usable report.
-        summary = summary.slice(0, rec.summary_cap_bytes - 100) + '\n…[truncated by registry: summary exceeded ' + rec.summary_cap_bytes + ' bytes]';
-    }
+    // Item 6 + F5: normalise a double-escaped summary, then soft-truncate in
+    // REAL bytes with a marker so the parent still sees a usable report.
+    // 1b: a record persisted before #15 has no summary_cap_bytes — default cap.
+    var _capB = rec.summary_cap_bytes || _subSummaryCapBytes();
+    var summary = _subCapUtf8(_subNormalizeNewlines(args.summary || ''), _capB,
+        '\n…[truncated by registry: summary exceeded ' + _capB + ' bytes]');
     var artifacts = Array.isArray(args.artifacts) ? args.artifacts.slice(0, SUBAGENT_MAX_ARTIFACTS) : [];
     var data = (args.data && typeof args.data === 'object') ? args.data : null;
 
@@ -3653,6 +4547,19 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         // still apply, so accept it explicitly alongside concrete providers.
         if (_wkResolved.provider || _wkResolved.tier === 'same') _wakeEscalation = _wkResolved;
     }
+    // ── Optional wake_parent override (PASSIVE-NOTICE) ──
+    // A revived sub KEEPS its spawn-time wake_parent unless the caller
+    // overrides it here — e.g. a fire-and-forget sub (wake_parent:false)
+    // revived for a follow-up whose report the parent now wants to be woken
+    // by. Validated before any other mutation below; applied immediately so
+    // it sticks even when the wake turns out to be a no-op (already running).
+    if (args.wake_parent != null) {
+        if (typeof args.wake_parent !== 'boolean') {
+            return { success: false, error: 'wake_sub_agent: `wake_parent` must be a boolean (true = wake the parent on the next report, false = passive notice row only).' };
+        }
+        rec.wake_parent = args.wake_parent;
+        _subAgentsPersist(rec);
+    }
     // ── Optional deliverable review verdict (Orchestrator §3) ──
     // Explicit parent judgment on the sub's LAST report: accepted /
     // revision_requested. ('pending' is stamped automatically on every
@@ -3746,7 +4653,11 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // unconditionally while delivery was gated on the chat row being present,
     // so a missing/GC'd chat transcript silently dropped the inbox forever.
     if (args.instruction) {
-        pendingMsgs.push({ kind: 'instruction', from: 'parent', content: String(args.instruction), at: Date.now() });
+        var _instItem = { kind: 'instruction', from: 'parent', content: String(args.instruction), at: Date.now() };
+        // SUB-NOTICE-META: an internal cascade wake carrying a child notice
+        // (_wakeParentOnReport / agent_message nested arms) keeps its meta.
+        if (isInternalCascade === true && Array.isArray(args._subNotices) && args._subNotices[0]) _instItem.subNotice = args._subNotices[0];
+        pendingMsgs.push(_instItem);
     }
     // RES-6: a bare resurrection (no instruction, empty inbox) must still tell
     // the revived model WHY it is running again — and guarantees the resumed
@@ -3778,12 +4689,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             || (typeof runningChatIds !== 'undefined' && runningChatIds[rec.chat_id]));
         if (_wakeLive && typeof pendingInjectionsByChatId !== 'undefined') {
             var _wHistoryStart = chats[rec.chat_id].messages.length;
-            var _wExisting = pendingInjectionsByChatId[rec.chat_id];
-            var _wPrev = (_wExisting && _wExisting.text) ? _wExisting.text + '\n\n' : '';
-            pendingInjectionsByChatId[rec.chat_id] = {
-                text: _wPrev + combined,
-                images: (_wExisting && _wExisting.images) ? _wExisting.images : []
-            };
+            _queueNoticeInjection(rec.chat_id, combined, [_inboxDrainMeta(pendingMsgs, combined)]);
             if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'pending', _wHistoryStart);
         } else {
             // injected:true is a RENDER gate (250-message-render.js) — it lets
@@ -3791,7 +4697,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             // .sub-notice-inbound card. Content is unchanged; the live-loop
             // branch above gets the same flag from flushPendingInjection.
             var _wDirectStart = chats[rec.chat_id].messages.length;
-            chats[rec.chat_id].messages.push({ role: 'user', content: combined, injected: true });
+            chats[rec.chat_id].messages.push(_noticeRow(combined, [_inboxDrainMeta(pendingMsgs, combined)]));
             if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'injected', _wDirectStart);
         }
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -3828,6 +4734,8 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // some other write happened to flush it.
     try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (_) { /* best-effort persist */ }
     rec.state = 'running';
+    rec.woken_at = Date.now(); // A1: new episode — an older last_report is not this episode's report
+    delete rec.stuck; delete rec._stuck_notified; delete rec._halt_at; // new episode: fresh stuck latch
     rec.last_activity_at = Date.now();
     if (typeof pausedChats !== 'undefined') delete pausedChats[rec.chat_id];
     _subAgentsPersist(rec);
@@ -3950,7 +4858,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // sub is past 50% of the assumed 200k context window, so the caller
     // spawns a FRESH successor instead of piling on.
     var _satWarn = (args.instruction || pendingMsgs.length) ? _saturationWarning(rec) : null;
-    return { success: true, ok: true, state: 'running', handle: newHandleId, resurrected_from: _resurrectedFrom || undefined, escalation_suggestion: _escalationSuggestion(rec) || undefined, saturation_warning: _satWarn || undefined };
+    return { success: true, ok: true, state: 'running', handle: newHandleId, wake_parent: rec.wake_parent !== false, resurrected_from: _resurrectedFrom || undefined, escalation_suggestion: _escalationSuggestion(rec) || undefined, saturation_warning: _satWarn || undefined };
 }
 
 // Mint a fresh spawn handle for a sub that has already settled its previous
@@ -4071,7 +4979,7 @@ function agentMessage(args, ctx, _regMissRetried) {
             // the cap trims old entries, progressDropped counts them so the
             // renderer (175-sub-agent-ui.js) can show a single
             // '[N earlier updates truncated]' stub instead.
-            var _ptext = String(content);
+            var _ptext = _subNormalizeNewlines(content); // item 6
             if (_ptext.length > 4096) _ptext = _ptext.slice(0, 4096) + '… [truncated]';
             var _entry = { text: _ptext, at: Date.now() };
             if (_pcard) {
@@ -4128,8 +5036,11 @@ function agentMessage(args, ctx, _regMissRetried) {
             try {
                 if (rec.wake_parent !== false) {
                     var _amPcid = rec.parent_chat_id;
-                    var _amNotice = '[sub-agent lifecycle] ' + (rec.name || rec.agent_id) + ' (' + rec.agent_id + '): sent a message: '
-                        + _ptext.replace(/\s*\n+\s*/g, ' ').slice(0, 3800);
+                    var _amNotice = _withWakeFinalReminder('[sub-agent lifecycle] ' + (rec.name || rec.agent_id) + ' (' + rec.agent_id + '): sent a message: '
+                        + _ptext.replace(/\s*\n+\s*/g, ' ').slice(0, 3800), _amPcid);
+                    // kind:'message' summary = the FULL multi-line _ptext (the
+                    // model text above stays flattened).
+                    var _amMeta = _subNoticeMeta('message', rec.agent_id, rec.name, rec.state, _ptext, _amNotice);
                     var _amLive = !!(typeof runningChatIds !== 'undefined' && runningChatIds[_amPcid]);
                     var _amParentSub = null;
                     if (chats[_amPcid].isSubAgent && chats[_amPcid].subAgentId) {
@@ -4141,18 +5052,14 @@ function agentMessage(args, ctx, _regMissRetried) {
                         // queue + durable mirror (WAKE-DUR Mode A), exactly
                         // like _notifySubLifecycle's live arm.
                         if (typeof pendingInjectionsByChatId !== 'undefined') {
-                            var _amEx = pendingInjectionsByChatId[_amPcid];
-                            pendingInjectionsByChatId[_amPcid] = {
-                                text: ((_amEx && _amEx.text) ? _amEx.text + '\n\n' : '') + _amNotice,
-                                images: (_amEx && _amEx.images) ? _amEx.images : []
-                            };
-                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id);
+                            _queueNoticeInjection(_amPcid, _amNotice, [_amMeta]);
+                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id, { subNotices: [_amMeta] });
                         }
                     } else if (_amParentSub) {
                         // Idle NESTED parent: cascade wake (pool-accounted —
                         // never a raw runAgent for a sub chat); the
                         // instruction carries the notice.
-                        var _amWakeRes = _wakeSubAgentImpl({ agent_id: _amParentSub.agent_id, instruction: _amNotice }, null, true);
+                        var _amWakeRes = _wakeSubAgentImpl({ agent_id: _amParentSub.agent_id, instruction: _amNotice, _subNotices: [_amMeta] }, null, true);
                         if (_amWakeRes && _amWakeRes.success === false) {
                             console.warn('[sub-agents] agent_message(parent): nested parent wake refused for', _amParentSub.agent_id, _amWakeRes.error);
                         }
@@ -4173,19 +5080,17 @@ function agentMessage(args, ctx, _regMissRetried) {
                         var _amDeliver = function() {
                             var _amChat = chats[_amPcid];
                             if (!_amChat || !Array.isArray(_amChat.messages)) return;
-                            _amChat.messages.push({ role: 'user', content: _amNotice, injected: true });
+                            _amChat.messages.push(_noticeRow(_amNotice, [_amMeta]));
                             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
                             // WAKE-DUR (Mode C): persist BEFORE the async run
                             // start — the heartbeat drain retries a lost run.
-                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id);
+                            if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id, { subNotices: [_amMeta] });
                             if (_amPaused) return;
-                            if (typeof runAgent === 'function') {
-                                Promise.resolve()
-                                    .then(function() { return runAgent(_amPcid); })
-                                    .catch(function(err) {
-                                        console.warn('[sub-agents] agent_message(parent): wake run failed for', _amPcid, err, '— durable pending wake kept for heartbeat retry');
-                                    });
-                            }
+                            // C5: DEBOUNCE only the run start (row + durable
+                            // record above are immediate): one timer per
+                            // parent; messages inside the window join it and
+                            // its ONE run consumes every row pushed meanwhile.
+                            _scheduleAgentMessageWake(_amPcid);
                         };
                         if (chats[_amPcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
                             ensureChatPayloads(_amPcid).then(_amDeliver, function(err) {
@@ -4264,12 +5169,7 @@ function agentMessage(args, ctx, _regMissRetried) {
             // arriving back-to-back coalesce into a single user turn).
             try {
                 if (typeof pendingInjectionsByChatId !== 'undefined') {
-                    var existing = pendingInjectionsByChatId[dst.chat_id];
-                    var prevText = (existing && existing.text) ? existing.text + '\n\n' : '';
-                    pendingInjectionsByChatId[dst.chat_id] = {
-                        text: prevText + combined,
-                        images: (existing && existing.images) ? existing.images : []
-                    };
+                    _queueNoticeInjection(dst.chat_id, combined, [_inboxDrainMeta([item], combined)]);
                     _recordSubParentMessage(dst, [item], combined, 'pending', historyStart);
                 }
             } catch (_) { /* fall through to direct push */ }
@@ -4278,7 +5178,7 @@ function agentMessage(args, ctx, _regMissRetried) {
             // is the render gate that upgrades the row to the inbound notice
             // card (renderSubReportNotices, ui/175) — content is unchanged.
             if (chats[dst.chat_id]) {
-                chats[dst.chat_id].messages.push({ role: 'user', content: combined, injected: true });
+                chats[dst.chat_id].messages.push(_noticeRow(combined, [_inboxDrainMeta([item], combined)]));
                 _recordSubParentMessage(dst, [item], combined, 'injected', historyStart);
                 if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
             }
@@ -4462,17 +5362,8 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
     // calls would survive stop_sub_agent and their results would still land
     // in the registry. The correct source of truth is the Handles registry
     // itself, scoped to the sub's chat id.
-    if (typeof Handles !== 'undefined' && typeof Handles.list === 'function') {
-        try {
-            var live = Handles.list(rec.chat_id) || [];
-            for (var i = 0; i < live.length; i++) {
-                var h = live[i];
-                if (!h || h.status !== 'pending') continue;
-                if (h.handle === rec.spawn_handle_id) continue; // resolved separately, see below
-                try { Handles.cancel(rec.chat_id, h.handle, reason); } catch (e) { console.warn('stop_sub_agent: cancel failed for', h.handle, e); }
-            }
-        } catch (e) { console.warn('stop_sub_agent: Handles.list failed', e); }
-    }
+    // A3: _haltSubLoop also sets pausedChats and aborts the live loop.
+    _haltSubLoop(rec, reason);
     // Resolve the spawn handle with `cancelled`.
     _resolveSpawnHandle(rec.agent_id, { status: 'cancelled', summary: reason, from: rec.agent_id });
 
@@ -4585,6 +5476,8 @@ function _queueTransientRetry(rec, errMsg) {
         }
     } catch (_) { /* best-effort log — the re-queue below still retries */ }
     rec.state = 'running';
+    rec.woken_at = Date.now(); // A1: new episode — an older last_report is not this episode's report
+    delete rec.stuck; delete rec._stuck_notified; delete rec._halt_at; // new episode: fresh stuck latch
     if (typeof pausedChats !== 'undefined') delete pausedChats[rec.chat_id];
     rec.last_activity_at = Date.now();
     _subAgentsPersist(rec);
@@ -4627,6 +5520,58 @@ function _queueTransientRetry(rec, errMsg) {
     _notifyListeners();
 }
 
+// A3: stop_sub_agent / _markErrored must HALT a live loop, not just flip the
+// state. pausedChats makes the loop stand down at its next pause check; the
+// Pause trio (worker/130 toggle-pause: backoff resolver, tool-interrupt
+// resolver, stream abort) plus cancelling the chat's pending handles (except
+// the spawn handle, which the caller settles) make that check come NOW, so
+// the loop's own finally clears runningChatIds and wake/resurrect is no
+// longer refused. runningChatIds is NOT deleted synchronously (an early
+// delete lets resurrect start a SECOND loop over the same transcript); a
+// watchdog force-clears it after SUB_HALT_WATCHDOG_MS only if the SAME halt
+// still stands (record still terminal, loop never unwound).
+var SUB_HALT_WATCHDOG_MS = 15 * 1000;
+function _haltSubLoop(rec, reason) {
+    if (!rec || !rec.chat_id) return;
+    var cid = rec.chat_id;
+    if (typeof pausedChats !== 'undefined') pausedChats[cid] = true;
+    try {
+        if (typeof providerChangeBackoffResolversByChatId !== 'undefined' && providerChangeBackoffResolversByChatId[cid]) {
+            providerChangeBackoffResolversByChatId[cid]();
+            delete providerChangeBackoffResolversByChatId[cid];
+        }
+    } catch (e) {}
+    try { if (typeof interruptResolversByChatId !== 'undefined' && interruptResolversByChatId[cid]) interruptResolversByChatId[cid](); } catch (e) {}
+    try { if (typeof currentStreamAbortControllers !== 'undefined' && currentStreamAbortControllers[cid]) currentStreamAbortControllers[cid].abort(); } catch (e) {}
+    if (typeof Handles !== 'undefined' && typeof Handles.list === 'function') {
+        try {
+            var live = Handles.list(cid) || [];
+            for (var i = 0; i < live.length; i++) {
+                var h = live[i];
+                if (!h || h.status !== 'pending') continue;
+                if (h.handle === rec.spawn_handle_id) continue; // settled by the caller
+                try { Handles.cancel(cid, h.handle, reason); } catch (e) { console.warn('[sub-agents] halt: cancel failed for', h.handle, e); }
+            }
+        } catch (e) { console.warn('[sub-agents] halt: Handles.list failed', e); }
+    }
+    if (typeof runningChatIds !== 'undefined' && runningChatIds[cid]) {
+        var haltAt = Date.now();
+        rec._halt_at = haltAt;
+        setTimeout(function() {
+            try {
+                var cur = _subAgents[rec.agent_id];
+                if (!cur || cur._halt_at !== haltAt) return; // woken/resurrected or re-halted since
+                if (cur.state !== 'stopped' && cur.state !== 'errored') return;
+                if (typeof runningChatIds !== 'undefined' && runningChatIds[cid]) {
+                    console.warn('[sub-agents] halted loop did not unwind within', SUB_HALT_WATCHDOG_MS, 'ms - clearing runningChatIds so wake/resurrect is not refused:', rec.agent_id);
+                    delete runningChatIds[cid];
+                    _notifyListeners();
+                }
+            } catch (e) {}
+        }, SUB_HALT_WATCHDOG_MS);
+    }
+}
+
 function _markErrored(agentId, errMsg) {
     var rec = _subAgents[agentId];
     if (!rec) return;
@@ -4663,6 +5608,9 @@ function _markErrored(agentId, errMsg) {
         error: { message: rec.last_error.message, transient: _meTransient, retried: rec.last_error.retried, retryable: true, hint: 'resurrectable via wake_sub_agent (full prior context preserved)' }
     };
     _subAgentsPersist(rec);
+    // A3: a live loop must actually stop (no-op when the loop already died,
+    // e.g. the _drainPool .catch path).
+    _haltSubLoop(rec, 'sub-agent errored: ' + errMsg);
     // AUTOLINK-PR: a PR pushed before the crash is still real — queue it on
     // the parent BEFORE _finalizeSubAgentCard so _repaintParent's
     // saveChatsToStorage persists the autoLinkQueue.
@@ -4713,7 +5661,7 @@ function agentStatus(args, ctx) {
     args = args || {};
     function snap(rec, full) {
         var sat = _saturationInfo(rec);
-        return {
+        var o = {
             agent_id: rec.agent_id,
             chat_id: rec.chat_id,
             parent_chat_id: rec.parent_chat_id,
@@ -4798,6 +5746,10 @@ function agentStatus(args, ctx) {
                 && typeof chats !== 'undefined' && chats[rec.chat_id]),
             user_interactions: rec.user_interactions || null
         };
+        // Stuck-worker signal, only when set (same verdict as the sweep + UI).
+        var _stSig = _subStuckSignal(rec, Date.now());
+        if (_stSig) o.stuck = { reason: _stSig.reason, since_ms: _stSig.since_ms };
+        return o;
     }
     // Compact list entry (DEFAULT list shape — pass verbose:true for the full
     // snap). Keeps only the orchestration essentials; diagnostic fields are
@@ -4837,6 +5789,8 @@ function agentStatus(args, ctx) {
         // Only-when-meaningful diagnostics / flow state.
         if (rec._pending_approvals) e.pending_approvals = rec._pending_approvals;
         if (rec.awaiting_approval) e.awaiting_approval = rec.awaiting_approval;
+        var _stSigC = _subStuckSignal(rec, Date.now());
+        if (_stSigC) e.stuck = { reason: _stSigC.reason, since_ms: _stSigC.since_ms };
         if ((rec.pending_handles || []).length) e.pending_handles = rec.pending_handles.length;
         if ((rec.inbox || []).length) e.inbox_size = rec.inbox.length;
         if (rec.last_error) e.last_error = rec.last_error;
@@ -5308,9 +6262,7 @@ function onSubAgentRunFinished(chatId, finishCtx) {
                 break;
             }
         }
-        if (fallback.length > rec.summary_cap_bytes) {
-            fallback = fallback.slice(0, rec.summary_cap_bytes - 100) + '\n…[truncated]';
-        }
+        fallback = _subCapUtf8(fallback, rec.summary_cap_bytes || _subSummaryCapBytes(), '\n…[truncated]'); // F5: real bytes; 1b: legacy rec → default cap
         // Synthesize error vs done based on the agent-loop's finish reason.
         // Without this, a crashed sub still reports back as success.
         var _synthStatus = _runErrored ? 'error' : 'done';
@@ -5460,7 +6412,10 @@ var SubAgents = {
     // PR-PAUSE (R1/R4): parent-pause propagation, called by the SW
     // toggle-pause handler (worker/130-port-bridge.js).
     pauseDescendantsOfChat: pauseDescendantsOfChat,
+    stopDescendantsOfChat: stopDescendantsOfChat,
     resumeDescendantsOfChat: resumeDescendantsOfChat,
+    stuckSignal: _subStuckSignal,
+    drainPendingWakesForChat: _drainPendingWakesForChat,
     // RES-6: unsolicited-event hooks — called by the SW port bridge when the
     // user sends a message into a sub's chat (worker/130-port-bridge.js) and
     // by the SW approval stub around a sub's permission prompts

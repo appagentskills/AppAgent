@@ -52,6 +52,11 @@
         if (heartbeatTimer) return;
         heartbeatTimer = setInterval(function () {
             if (!lockActive) { stopHeartbeat(); return; }
+            // H17 backstop: re-derive run state from the page's runningChatIds
+            // so a bulk clear that emitted no runFinished (SW eviction, hello
+            // reconcile, stale-join cleanup) can't pin the lock forever.
+            reconcileRuns();
+            if (!lockActive) return;
             log('heartbeat — re-asserting lock');
             sendKeepAwake(true);
         }, HEARTBEAT_MS);
@@ -65,16 +70,32 @@
         return false;
     }
 
+    // H17: mirror the page-side runningChatIds (the source of truth the port
+    // bridge keeps) into runningChats, then re-sync the lock. runFinished /
+    // runCrashed only cover per-chat ends; bulk clears (port drop, hello
+    // reconcile, 15s safety settle) emit no event, so 045 calls this through
+    // window.keepAwakeReconcileRuns. No-op when runningChatIds is unavailable.
+    function reconcileRuns() {
+        var src;
+        try { src = (typeof runningChatIds !== 'undefined' && runningChatIds) ? runningChatIds : null; } catch (e) { src = null; }
+        if (!src) return;
+        var k;
+        for (k in runningChats) { if (!src[k]) delete runningChats[k]; }
+        for (k in src) { if (src[k]) runningChats[k] = true; }
+        syncLock();
+    }
+
     // Single source of truth for whether the OS display lock should be held.
     // PRIMARY trigger: an agent run is in progress (long tasks must keep the
     // screen on even with zero mouse/keyboard activity). SECONDARY trigger:
     // the user has been idle for IDLE_MS while just reading. The master
     // setting (foreverDisabled) turns the whole feature off; the per-session
-    // opt-out only suppresses the idle path, never an active run.
+    // opt-out ("Disable this session") also turns it off — for runs too — until
+    // the page reloads (H17: the user asked for the display lock to go away).
     function computeDesired() {
         if (foreverDisabled) return false;
-        if (anyRunActive()) return true;
         if (sessionDisabled) return false;
+        if (anyRunActive()) return true;
         return idleActivated;
     }
 
@@ -202,7 +223,8 @@
         void el.offsetWidth;
         el.classList.add('show');
         el.querySelector('.ka-session').addEventListener('click', function () {
-            // Idle-path opt-out only. An active agent run keeps holding the lock.
+            // Session opt-out: releases the lock unconditionally (even mid-run);
+            // computeDesired() checks sessionDisabled before anyRunActive().
             sessionDisabled = true;
             clearIdle(true);
         });
@@ -299,6 +321,9 @@
         else resetIdleTimer();
     };
     window.getKeepAwakeForeverDisabled = function () { return foreverDisabled; };
+    // H17: called by the port bridge (app/045) after it bulk-clears or
+    // reconciles runningChatIds without emitting runFinished/runCrashed.
+    window.keepAwakeReconcileRuns = function () { reconcileRuns(); };
     // Diagnostics — call window.keepAwakeStatus() in DevTools to see current state.
     window.keepAwakeStatus = function () {
         var s = {

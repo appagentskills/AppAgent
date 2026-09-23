@@ -143,6 +143,8 @@ function openSettingsPageView(scrollToId) {
     // 'github-settings-container'). Deferred a tick so the freshly rendered
     // (and partly async) sections have laid out.
     if (scrollToId && typeof scrollToId === 'string') {
+        // A search filter could hide the target section — clear it first.
+        if (typeof clearSettingsPageSearch === 'function') clearSettingsPageSearch();
         setTimeout(function() {
             var el = document.getElementById(scrollToId);
             if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -319,9 +321,9 @@ function renderSettingsPage() {
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.database + ' Data Management</div>' +
+            // Export / Import live in the page toolbar (body.html #settings-page-panel).
             '<div class="settings-page-row">' +
-                '<button class="skills-action-btn" onclick="exportAllData()">' + UI_ICONS.download + ' Export Data</button>' +
-                '<button class="skills-action-btn" onclick="importAllData()">' + UI_ICONS.upload + ' Import Data</button>' +
+                '<div><div class="settings-page-row-label">Export, import or delete data</div><div class="settings-page-row-hint">Export Data and Import Data are in the toolbar above. Delete All permanently removes chats, skills, widgets and settings.</div></div>' +
                 '<button class="skills-action-btn danger" onclick="deleteAllData()">' + UI_ICONS.trash + ' Delete All</button>' +
             '</div>' +
         '</div>' +
@@ -345,6 +347,13 @@ function renderSettingsPage() {
 
     // Render GitHub settings
     renderGitHubSettings();
+
+    // Toolbar search (ui/046-settings-help-search.js): fill the slot once and
+    // re-apply any active query to the freshly rendered sections.
+    if (typeof ensurePageSearchToolbar === 'function') {
+        ensurePageSearchToolbar('settings-toolbar-slot', { placeholder: 'Search settings\u2026', label: 'Search settings', inputClass: 'settings-search-input', onInput: 'settingsOnSearchInput', countId: 'settings-search-count' });
+        applySettingsPageSearch();
+    }
 }
 
 // Settings page onchange handlers for the global token-budget fields.
@@ -757,7 +766,7 @@ async function renderGitHubReposList() {
             // the header dropdown) — the div starts empty here.
             detailHtml += '</div>';
 
-            html += '<div class="settings-page-row" data-wk="' + escapeHtml(rd.wk) + '" style="padding:var(--space-4) 0;border-bottom:1px solid var(--border);align-items:flex-start;">' +
+            html += '<div class="settings-page-row" data-wk="' + escapeHtml(rd.wk) + '" style="padding-top:var(--space-4);padding-bottom:var(--space-4);border-bottom:1px solid var(--border);align-items:flex-start;">' +
                 '<div style="flex:1;min-width:0;">' +
                     '<div style="display:flex;align-items:center;gap:var(--space-4);">' +
                         '<div class="settings-page-row-label" style="margin:0;">' + escapeHtml(rd.githubRepo) + '</div>' +
@@ -2215,8 +2224,23 @@ function autoNameFromModelId(modelId) {
 // dirty flag and stops the mirroring (clearing the field re-arms it).
 var _modelNameDirty = false;
 function onModelIdInput(value) {
+    // F3: the slider's stops are model-independent (_MODAL_EFFORT_LEVELS) —
+    // only the label badges depend on the model. Refresh the visuals WITHOUT
+    // rewriting #provider-effort, so a saved value the slider can't show
+    // (e.g. none/minimal) survives typing in Model ID. Rewrite it only when it
+    // becomes invalid for the new model (Astra on ChatGPT rejects none/minimal
+    // — same rule as the modal open path).
     var effortSlider = document.getElementById('modal-effort-slider');
-    if (effortSlider) onModalEffortSliderInput(effortSlider.value);
+    if (effortSlider) {
+        var effortHidden = document.getElementById('provider-effort');
+        if (effortHidden && /^(none|minimal)$/i.test(effortHidden.value || '')
+            && _selectedModelAuthKind() === 'chatgpt' && isChatGPTAstraModel(value)) {
+            effortSlider.value = '0';
+            onModalEffortSliderInput('0'); // 'low'
+        } else {
+            onModalEffortSliderInput(effortSlider.value, true);
+        }
+    }
     if (_modelNameDirty) return;
     var nameField = document.getElementById('provider-name');
     if (nameField) nameField.value = autoNameFromModelId(value);
@@ -2275,11 +2299,12 @@ function _modalEffortLabelHtml(idx, authKind, model) {
         (e.v === '' ? '<span class="model-row-badge">' + (astra ? 'high on Astra' : 'server decides') + '</span>' : '') +
         (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
 }
-function onModalEffortSliderInput(v) {
+// keepValue (F3): refresh the slider visuals only, leaving #provider-effort.
+function onModalEffortSliderInput(v, keepValue) {
     var idx = parseInt(v, 10);
     if (isNaN(idx) || idx < 0 || idx > 5) idx = _MODAL_EFFORT_DEFAULT_IDX;
     var hidden = document.getElementById('provider-effort');
-    if (hidden) hidden.value = _MODAL_EFFORT_LEVELS[idx].v;
+    if (hidden && !keepValue) hidden.value = _MODAL_EFFORT_LEVELS[idx].v;
     var label = document.getElementById('modal-effort-label');
     if (label) label.innerHTML = _modalEffortLabelHtml(idx);
     var track = document.getElementById('modal-effort-track');
@@ -3177,4 +3202,8 @@ function updateAllButtonStates() {
     // Update history button active state
     var historyRow = document.getElementById('history-toggle-btn');
     if (historyRow) historyRow.classList.toggle('active', currentView === 'history');
+    // Shared New Chat header (pills) follows the visible page (ui/045-page-layout.js).
+    if (typeof mountSharedPageHeader === 'function') {
+        try { mountSharedPageHeader(currentView); } catch (e) {}
+    }
 }

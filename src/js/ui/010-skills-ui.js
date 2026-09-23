@@ -413,7 +413,8 @@ function _stripYamlQuotes(s) {
     if (!s) return '';
     s = s.trim();
     if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-        return s.substring(1, s.length - 1).replace(/\\"/g, '"').replace(/\\n/g, '\n');
+        // Single pass so an escaped backslash (\\) is not re-read as the start of \n / \"
+        return s.substring(1, s.length - 1).replace(/\\(["n\\])/g, function(_, c) { return c === 'n' ? '\n' : c; });
     }
     return s;
 }
@@ -490,7 +491,7 @@ function _needsYamlQuote(s) {
     return /[:#\[\]{}|>&*!?,\n]/.test(s) || s.startsWith("'") || s.startsWith('"');
 }
 function _yamlScalar(s) {
-    return _needsYamlQuote(s) ? '"' + s.replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"' : s;
+    return _needsYamlQuote(s) ? '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"' : s;
 }
 
 // Sanitize an action before serializing/using it

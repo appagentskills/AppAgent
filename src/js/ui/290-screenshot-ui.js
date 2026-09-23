@@ -70,7 +70,7 @@ function openScreenshotModal(src, title, width, height, url) {
     var navPrev = hasNav ? '<button class="screenshot-nav-prev" onclick="event.stopPropagation();navigateScreenshot(-1)" title="Previous (Left Arrow)"' + (screenshotNav.index <= 0 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronLeft + '</button>' : '';
     var navNext = hasNav ? '<button class="screenshot-nav-next" onclick="event.stopPropagation();navigateScreenshot(1)" title="Next (Right Arrow)"' + (screenshotNav.index >= screenshotNav.list.length - 1 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronRight + '</button>' : '';
 
-    body.innerHTML = navPrev + '<img src="' + src + '" />' + navNext;
+    body.innerHTML = navPrev + '<img src="' + escapeHtml(src) + '" />' + navNext;
     actions.innerHTML = '';
 
     // Store full src for download

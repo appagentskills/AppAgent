@@ -97,6 +97,13 @@ function renderDocsPage() {
             if (fn && typeof window[fn] === 'function') window[fn]();
         });
     });
+
+    // Toolbar search (ui/046-settings-help-search.js): fill the slot once and
+    // re-apply any active query to the freshly rendered topics.
+    if (typeof ensurePageSearchToolbar === 'function') {
+        ensurePageSearchToolbar('docs-toolbar-slot', { placeholder: 'Search help\u2026', label: 'Search help', inputClass: 'docs-search-input', onInput: 'docsOnSearchInput', countId: 'docs-search-count' });
+        applyDocsPageSearch();
+    }
 }
 
 function scrollToDocSection(id) {

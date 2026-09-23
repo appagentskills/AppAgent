@@ -996,84 +996,10 @@
         }
     }
 
-    // --- Console & network interceptors ---
-    // Inject into page context to capture console output and fetch requests
-
-    var interceptorScript = document.createElement('script');
-    interceptorScript.textContent = '(' + function() {
-        // Guard: skip if MAIN world injection from background.js already ran
-        if (window.__appagentInterceptorsActive) return;
-        window.__appagentInterceptorsActive = true;
-        // Console interceptor
-        var origLog = console.log, origWarn = console.warn, origError = console.error;
-        function capture(level, args) {
-            var msg = Array.prototype.slice.call(args).map(function(a) {
-                try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
-                catch(e) { return String(a); }
-            }).join(' ');
-            window.postMessage({ type: 'appagent-console', level: level, message: msg.substring(0, 1000) }, '*');
-        }
-        console.log = function() { capture('log', arguments); origLog.apply(console, arguments); };
-        console.warn = function() { capture('warn', arguments); origWarn.apply(console, arguments); };
-        console.error = function() { capture('error', arguments); origError.apply(console, arguments); };
-
-        // Fetch interceptor
-        var origFetch = window.fetch;
-        window.fetch = function(url, opts) {
-            var method = (opts && opts.method) || 'GET';
-            var start = Date.now();
-            return origFetch.apply(this, arguments).then(function(res) {
-                window.postMessage({
-                    type: 'appagent-network',
-                    method: method,
-                    url: String(url),
-                    status: res.status,
-                    duration: Date.now() - start
-                }, '*');
-                return res;
-            }, function(err) {
-                window.postMessage({
-                    type: 'appagent-network',
-                    method: method,
-                    url: String(url),
-                    status: 0,
-                    duration: Date.now() - start
-                }, '*');
-                throw err;
-            });
-        };
-
-        // XHR interceptor
-        var OrigXHR = window.XMLHttpRequest;
-        window.XMLHttpRequest = function() {
-            var xhr = new OrigXHR();
-            var xhrMethod = 'GET', xhrUrl = '', xhrStart = null;
-            var origOpen = xhr.open;
-            xhr.open = function(method, url) {
-                xhrMethod = method;
-                xhrUrl = url;
-                xhrStart = Date.now();
-                return origOpen.apply(xhr, arguments);
-            };
-            var origSend = xhr.send;
-            xhr.send = function() {
-                xhr.addEventListener('load', function() {
-                    window.postMessage({
-                        type: 'appagent-network',
-                        method: xhrMethod,
-                        url: String(xhrUrl),
-                        status: xhr.status,
-                        duration: Date.now() - xhrStart
-                    }, '*');
-                });
-                return origSend.apply(xhr, arguments);
-            };
-            return xhr;
-        };
-        window.XMLHttpRequest.prototype = OrigXHR.prototype;
-        try { Object.keys(OrigXHR).forEach(function(k) { window.XMLHttpRequest[k] = OrigXHR[k]; }); } catch(e) {}
-    } + ')()';
-    try { document.documentElement.appendChild(interceptorScript); interceptorScript.remove(); } catch(e) {}
+    // Console & network interceptors are installed in the page (MAIN world) by
+    // background.js injectInterceptors() via chrome.scripting.executeScript({world:'MAIN'}).
+    // (An inline <script> injected from here is always blocked by the MV3 isolated-world
+    // CSP, so this file only collects the messages they post.)
 
     // Collect intercepted data from page context
     window.addEventListener('message', function(event) {

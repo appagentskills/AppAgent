@@ -101,6 +101,13 @@
         // returns a promise and we resolve `sendResponse` with the
         // {ok, result|error} envelope when done. Return true to keep
         // the response channel open for the async work.
+        // H18 liveness ping (background.js pingOffscreenDocument). Answered
+        // synchronously on the event loop: a busy-but-healthy document (async
+        // evals awaiting tools/sleeps) replies; only a sync loop blocks it.
+        if (message.type === 'helper-ping') {
+            sendResponse({ ok: true, result: { pong: true, active: Object.keys(activeSandboxes).length } });
+            return;
+        }
         if (message.type === 'helper-cancel-sandbox') {
             var requestId = message.payload && message.payload.sandboxRequestId;
             var cancel = typeof requestId === 'string' && activeSandboxes[requestId];
@@ -136,6 +143,13 @@
             var settled = false;
             var started = false;
             var readyTimer = null;   // P4 #1: 60s 'sandboxReady' deadline (cleared in cleanup)
+            // S1: HOST-minted per-run call counter for the stable prog_ id.
+            // d.id is sandbox-controlled (a hostile script can post any id to
+            // collide with an already-approved call), so it is used ONLY to
+            // route the reply back. The counter restarts at 0 for every run,
+            // so a re-run of the same code still yields the same ids in the
+            // same order (double-approval fix preserved).
+            var hostCallSeq = 0;
             function cleanup() {
                 clearTimeout(readyTimer);
                 window.removeEventListener('message', onMessage);
@@ -209,9 +223,12 @@
                     //    never re-executes a sandbox call as a top-level tool
                     //    (skipping that prefix would trade a double-prompt for a
                     //    double-EXECUTION).
-                    //  • Must be DETERMINISTIC across re-dispatch — d.id is
-                    //    ++window._callId, which re-increments in the same order
-                    //    when the sandbox code re-runs from the top.
+                    //  • Must be DETERMINISTIC across re-dispatch — hostCallSeq
+                    //    (S1: host-minted, NOT the sandbox's d.id) re-increments
+                    //    in the same order when the sandbox code re-runs from
+                    //    the top. Recorded approvals are additionally bound to
+                    //    the tool name + args (worker/120, ui/150).
+                    var hostSeq = ++hostCallSeq;
                     chrome.runtime.sendMessage({
                         type: 'sw-exec-tool',
                         payload: {
@@ -220,7 +237,7 @@
                             sandboxRequestId: requestId,
                             chatId: chatId,
                             messageIndex: messageIndex,
-                            toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + d.id,
+                            toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + hostSeq,
                             parentToolCallId: parentToolCallId || null
                         }
                     }).then(function(resp) {

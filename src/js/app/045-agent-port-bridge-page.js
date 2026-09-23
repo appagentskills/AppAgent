@@ -252,6 +252,10 @@ function _sendPanelHello() {
     } catch (e) {
         console.error('[agent-bus] panel-hello post failed', e);
     }
+    // Widget deletes made while the bus was down (or before a SW restart
+    // re-hydrated stale chats) converge here: re-send every tombstone. The
+    // SW 'widget-remove' handler is idempotent (no-op for absent ids).
+    try { if (typeof WidgetStore !== 'undefined' && WidgetStore.resendDeletes) WidgetStore.resendDeletes(); } catch (e) {}
     // runtime_inspect dev-mode handshake: (re)push the dev-mode flag on every
     // bus (re)connect so a restarted SW relearns it — the SW keeps it only in
     // memory (tools/140-runtime-inspect.js).
@@ -278,6 +282,13 @@ function _hookLocalWorkspaceRelay() {
             if (_agentBusPort) _agentBusPort.postMessage({ type: 'relay-agent-event', eventType: 'workspaceMutated', detail: ev });
         } catch (e) { /* stale port — the reconnect path reopens the bus */ }
     });
+}
+
+// H17: runningChatIds shrinks here without a runFinished/runCrashed (port
+// drop, hello reconcile, stale-join / deadline cleanup), so tell keep-awake
+// (app/060) to re-derive its run set and release the display lock if idle.
+function _syncKeepAwakeRuns() {
+    try { if (typeof window !== 'undefined' && typeof window.keepAwakeReconcileRuns === 'function') window.keepAwakeReconcileRuns(); } catch (e) {}
 }
 
 function _openAgentBus() {
@@ -315,6 +326,7 @@ function _openAgentBus() {
         try {
             Object.keys(runningChatIds).forEach(function(cid) { delete runningChatIds[cid]; });
         } catch (e) {}
+        if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
         // SWM-S2: do NOT settle _pendingRunAgents here. On a transient flap the SW
         // keeps streaming, and resolving now returns `await runAgent()` callers
         // mid-run (widget spinners die, summarize finalizes early). The promises
@@ -349,6 +361,7 @@ function _openAgentBus() {
             var _settledCids = [];
             try { _settledCids = Object.keys(_pendingRunAgents); } catch (e) {}
             _settleAllPendingRunAgents();
+            if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
             _settledCids.forEach(function(cid) {
                 try {
                     var _c = (typeof chats !== 'undefined') ? chats[cid] : null;
@@ -768,6 +781,9 @@ function _handleAgentBusMessage(msg) {
                 // Saved content always resolves from the committed canonical revision,
                 // including same-counter legacy ties. Snapshot membership stays scoped.
                 if (typeof WidgetStore !== 'undefined' && Array.isArray(_inChat.widgets)) {
+                    // A snapshot taken before the SW processed 'widget-remove'
+                    // must not resurrect a permanently deleted widget.
+                    if (WidgetStore.isDeleted) _inChat.widgets = _inChat.widgets.filter(function(w) { return !(w && WidgetStore.isDeleted(w.id)); });
                     _inChat.widgets = _inChat.widgets.map(function(w) {
                         return Object.assign({}, w, WidgetStore.view(w.id) || {}, { msgIndex: w.msgIndex, chatId: w.chatId });
                     });
@@ -940,6 +956,7 @@ function _handleAgentBusMessage(msg) {
                 msg.runningChatIds.forEach(function(cid) {
                     runningChatIds[cid] = true;
                 });
+                if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
                 if (typeof renderChatList === 'function') renderChatList();
                 // Reopening the panel while a background chat runs must also
                 // surface it in the jobs badge/dropdown. renderChatList alone
@@ -1126,6 +1143,11 @@ function _handleAgentBusMessage(msg) {
                     renderMessages();
                 }
             }
+            return;
+
+        case 'running-state':
+            // F1: reply to a JOIN-waiter liveness probe (_queryRunningOnSW).
+            _resolveRunningState(msg);
             return;
 
         case 'debug-state':
@@ -1381,6 +1403,86 @@ function _handleRemotePromptResult(msg) {
     if (typeof currentChatId !== 'undefined' && currentChatId === msg.chatId && typeof renderMessages === 'function') renderMessages();
 }
 
+// F1: SW liveness probe for runAgent JOIN waiters. 'query-running' is answered
+// by worker/130-port-bridge.js with 'running-state' {requestId, running}.
+// Resolves true/false, or null when there is no port / no reply in time.
+var _runQueryPending = {};
+var RUN_JOIN_PROBE_INTERVAL_MS = 20000;
+var RUN_JOIN_PROBE_TIMEOUT_MS = 5000;
+var RUN_JOIN_PROBE_MAX_SILENT = 3;
+function _queryRunningOnSW(chatId) {
+    return new Promise(function(resolve) {
+        if (!_agentBusPort) { resolve(null); return; }
+        var rid = 'rq_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        var timer = setTimeout(function() { delete _runQueryPending[rid]; resolve(null); }, RUN_JOIN_PROBE_TIMEOUT_MS);
+        _runQueryPending[rid] = { resolve: resolve, timer: timer };
+        try {
+            _agentBusPort.postMessage({ type: 'query-running', requestId: rid, chatId: chatId });
+        } catch (e) {
+            try { clearTimeout(timer); } catch (e2) {}
+            delete _runQueryPending[rid];
+            resolve(null);
+        }
+    });
+}
+function _resolveRunningState(msg) {
+    if (!msg || !msg.requestId) return;
+    var p = _runQueryPending[msg.requestId];
+    if (!p) return;
+    delete _runQueryPending[msg.requestId];
+    try { clearTimeout(p.timer); } catch (e) {}
+    p.resolve(!!msg.running);
+}
+// Keeps a JOIN entry honest while it is pending:
+//   • page flag gone (disconnect / hello reconcile cleared it) → stop; the
+//                   hello grace / no-hello safety own the entry;
+//   • SW running  → re-probe later (the normal runFinished settle wins);
+//   • SW idle on the FIRST probe (join time) → the page flag was STALE when
+//                   the caller asked for a run: clear it and do a real
+//                   runAgent (skipped for a missing/deleted chat); the join
+//                   caller resolves when that run settles. The SW run-agent
+//                   handler guards on runningChatIds + _runCleanupGuard;
+//   • SW idle on a LATER probe → the joined run ended with its terminal
+//                   event lost: clear the flag and settle — NEVER start a
+//                   run the joiner only meant to wait for;
+//   • no answer   → port down: see above; port up but SW silent
+//                   RUN_JOIN_PROBE_MAX_SILENT times → settle (flag kept).
+function _watchJoinedRun(chatId, entry) {
+    if (_pendingRunAgents[chatId] !== entry) return; // settled or replaced
+    if (!runningChatIds[chatId]) return;
+    var _firstProbe = !entry._probed;
+    entry._probed = true;
+    _queryRunningOnSW(chatId).then(function(running) {
+        if (_pendingRunAgents[chatId] !== entry) return; // settled or replaced
+        if (!runningChatIds[chatId]) return;
+        if (running === false) {
+            delete _pendingRunAgents[chatId];
+            delete runningChatIds[chatId];
+            if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
+            var _done = function() { try { entry.resolve(); } catch (e) {} };
+            var _jc = chats[chatId];
+            if (_firstProbe && _jc && !_jc._deleted) {
+                Promise.resolve().then(function() { return runAgent(chatId); }).then(_done, _done);
+            } else {
+                _done();
+                if (typeof renderChatList === 'function') { try { renderChatList(); } catch (e) {} }
+            }
+            return;
+        }
+        if (running === null && _agentBusPort) {
+            entry._silentProbes = (entry._silentProbes || 0) + 1;
+            if (entry._silentProbes >= RUN_JOIN_PROBE_MAX_SILENT) {
+                delete _pendingRunAgents[chatId];
+                try { entry.resolve(); } catch (e) {}
+                return;
+            }
+        } else if (running === true) {
+            entry._silentProbes = 0;
+        }
+        entry._probeTimer = setTimeout(function() { _watchJoinedRun(chatId, entry); }, RUN_JOIN_PROBE_INTERVAL_MS);
+    });
+}
+
 // =============================================================
 // runAgent shim — overrides the in-page implementation from
 // app/030-agent-loop.js (last function declaration wins).
@@ -1408,7 +1510,12 @@ async function runAgent(overrideChatId) {
         // than a normal runAgent await.
         var _joinResolve;
         var _joinPromise = new Promise(function(resolve) { _joinResolve = resolve; });
-        _pendingRunAgents[chatId] = { resolve: _joinResolve, promise: _joinPromise };
+        var _joinEntry = { resolve: _joinResolve, promise: _joinPromise, _join: true };
+        _pendingRunAgents[chatId] = _joinEntry;
+        // F1: those settle paths all assume the running flag is TRUE. If it is
+        // stale (a terminal event was lost on a healthy port) none of them
+        // fire and the join would hang forever — probe the SW (bounded).
+        _watchJoinedRun(chatId, _joinEntry);
         return _joinPromise;
     }
     // Mark running locally so the UI (chat list pill, pause button) reflects
@@ -1456,6 +1563,7 @@ async function runAgent(overrideChatId) {
             // local running pill don't hang forever — the run was never posted.
             delete _pendingRunAgents[chatId];
             delete runningChatIds[chatId];
+            if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
             try { _pendingEntry.resolve(); } catch (e) {}
             return;
         }

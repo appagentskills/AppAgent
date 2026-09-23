@@ -7,6 +7,11 @@ description: "Comprehensive UI testing skill for ServiceNow UI Pages. Covers ful
 
 A structured, thorough approach to testing ServiceNow UI Pages. This skill ensures complete coverage by following a strict testing sequence: explore first, validate everything, and document any bugs found.
 
+> ## ⛔ API first — UI only for the thing under test
+> - **Setup, teardown, seeding, prerequisite records and backend verification go through the Table API (`servicenow_api`)** — never through forms. Only drive the UI (`iframe_tool` click/fill/navigate) for the specific form/page/flow that is actually under test. E.g. testing an approval page? Create the request/approval records via `servicenow_api`, then open only the approval page in the UI.
+> - **Impersonate with `iframe_tool` action `impersonate`** (`user`: username / display name / sys_id) — it calls the impersonation REST API directly. **Never** use the UI impersonation menu/dialog (avatar → Impersonate User). Always end with `iframe_tool` `impersonate` `user: "stop"`.
+> - If you must fall back to the UI for something that isn't under test, say why (no API path).
+
 ## When to Use This Skill
 
 - When asked to "test" a UI page
@@ -59,7 +64,7 @@ Test the page from the perspective of these personas. Not every persona applies 
 
 During testing, for each relevant persona:
 1. **Identify which personas apply** based on the page's purpose and the roles it checks (from Phase 0 source review).
-2. **Switch personas with impersonation** — use `iframe_tool` with action `impersonate` and `user` set to the persona's username/name/sys_id; pass `user: "stop"` to end impersonation. Always stop impersonation when finished with a persona.
+2. **Switch personas with impersonation** — use `iframe_tool` with action `impersonate` and `user` set to the persona's username/name/sys_id (REST-based — never click the UI impersonation menu); pass `user: "stop"` to end impersonation. Always stop impersonation when finished with a persona. Find persona users via `servicenow_api` (e.g. `sys_user_has_role` with `role.name=itil`) rather than browsing the UI.
 3. **Test the happy path as each persona** — at minimum the Admin and the most restrictive relevant persona.
 4. **Verify role-based UI differences** — elements that should be hidden, disabled, or absent for lower-privilege personas.
 5. **Verify backend enforcement** — even if the UI hides a button, use `servicenow_api` to call the underlying API directly and confirm the backend also blocks the action for unauthorized roles.
@@ -129,12 +134,12 @@ Before testing, ensure the UI has data to display. Empty pages with no data hide
 
 1. **Check what data the page needs** - Based on Phase 0, determine what ServiceNow records the page queries.
 2. **Verify data exists** - Use `servicenow_api` to query the relevant tables and confirm records exist.
-3. **Create test data if needed** - Use `servicenow_api` to INSERT records so the page has content to render. Create enough records to test:
+3. **Create test data if needed** - Use `servicenow_api` to INSERT records so the page has content to render (never via forms — unless that form is what is under test). Create enough records to test:
    - **Normal case** - A few typical records
    - **Empty case** - You will test with no records later (delete or filter them out)
    - **Long content** - Records with very long strings in text fields (200+ characters)
    - **Many records** - Enough records to trigger pagination or scrolling (if applicable)
-4. **Note the test data created** - Track what you created so you can clean up later if needed.
+4. **Note the test data created** - Track the sys_ids you created so you can clean up afterwards via `servicenow_api` DELETE.
 
 ---
 
@@ -216,7 +221,7 @@ Test important input combinations against the backend to verify server-side vali
 
 Test how the page behaves with no data.
 
-1. **Remove or filter out test data** - Query with filters that return no results, or temporarily remove test records.
+1. **Remove or filter out test data** - Query with filters that return no results, or temporarily remove test records via `servicenow_api` (not through the UI).
 2. **Navigate to the page with no data**.
 3. **Take a screenshot** and verify:
    - Is there a meaningful empty state message? (e.g., "No records found")
@@ -231,7 +236,7 @@ Test how the page behaves with no data.
 Test how the page handles overflow.
 
 1. **Long text content:**
-   - Create records with very long text in key fields (500+ chars)
+   - Create records with very long text in key fields (500+ chars) via `servicenow_api`
    - Navigate to the page and verify text is truncated or wrapped properly
    - Take a screenshot to check for layout breakage (overflow, overlapping elements)
 
@@ -332,12 +337,13 @@ For every bug found during testing, document it with the following format:
 | `iframe_tool` (resize) | Resize viewport (presets: mobile, tablet, desktop, fullhd) |
 | `iframe_tool` (get_properties) | Read computed styles, dimensions, values, attributes of elements |
 | `iframe_tool` (set_style) | Apply CSS styles or toggle classes on elements |
-| `iframe_tool` (impersonate) | Impersonate a user for persona testing (`user: "stop"` to end) |
+| `iframe_tool` (impersonate) | Impersonate a user for persona testing via the REST API (`user: "stop"` to end) — never the UI impersonation menu |
 | `take_screenshot` | Capture the browser panel or a specific element as PNG |
-| `servicenow_api` | Query, create, update ServiceNow records |
+| `servicenow_api` | Query, create, update, delete ServiceNow records — the default for all setup, teardown and backend verification |
 
 ## Key Principles
 
+0. **API first, UI only for the thing under test** - Setup/teardown/verification via `servicenow_api`; impersonation via `iframe_tool` `impersonate`, never the UI menu.
 1. **Explore first, test second** - Never start testing specific features until you have a complete picture of the UI.
 2. **Screenshot everything** - Take screenshots before and after every significant action. Visual bugs are easy to miss with text-only inspection.
 3. **Errors must be visible** - If an error only appears in `console.log` and not in the UI, that is a bug.

@@ -3236,10 +3236,11 @@ async function gcWorkspaceBlobs() {
         var database = await openDatabase();
         // Atomic mark-and-sweep in ONE readwrite tx spanning BOTH stores: the
         // keep-set is built by reading workspace_files INSIDE the same tx that
-        // sweeps workspace_blobs. This closes the TOCTOU where a concurrent
-        // setWorkspaceFile (which writes the blob BEFORE its row) could have its
-        // just-written, not-yet-referenced blob swept by a mark snapshot taken a
-        // moment earlier.
+        // sweeps workspace_blobs. setWorkspaceFile / setWorkspaceFileIf write
+        // the blob AND its referencing row in ONE readwrite tx over both
+        // stores (_wsPutRowTx), so IDB serializes them against this sweep:
+        // either the row is committed before the mark (blob kept) or the
+        // blob is written after the sweep (nothing to collect).
         var tx = database.transaction([workspaceFilesStoreName, workspaceMetaStoreName, workspaceBlobsStoreName], 'readwrite');
         var filesStore = tx.objectStore(workspaceFilesStoreName);
         var metaStore = tx.objectStore(workspaceMetaStoreName);
@@ -3356,34 +3357,114 @@ async function getWorkspaceFile(repo, path) {
     } catch (e) { return null; }
 }
 
-async function setWorkspaceFile(file) {
-    try {
-        // Content-addressed storage: persist pristine content ONCE per sha in
-        // the blob store, then strip it from the row. Persist a CLONE so the
-        // caller's in-memory object keeps its inline content.
-        var toStore = file;
-        if (file && file.sha && file.original_content != null) {
-            var blobOk = await putWorkspaceBlob(file.sha, file.original_content);
-            if (blobOk) {
-                toStore = Object.assign({}, file);
-                delete toStore.original_content;
-                if (!file.dirty && file.content === file.original_content) delete toStore.content;
-            }
-            // blob put failed (e.g. quota) — keep inline content rather than
-            // stripping a row whose blob is not durable.
-        }
+// Revision fingerprint of a workspace_files row for compare-and-swap. Works on
+// RAW rows (content stripped to the blob store) and RESOLVED rows alike: clean
+// content is identified by its sha, dirty content travels inline. `stub` is
+// deliberately excluded (_resolveWorkspaceRows may self-heal it in memory).
+// null/undefined row → null ("row must be absent").
+function _wsRowRevision(row) {
+    if (!row) return null;
+    return JSON.stringify([row.dirty ? 1 : 0, row.deleted ? 1 : 0, row.sha || null,
+        row.last_modified_at || null, row.last_modified_by_chat_id || null,
+        row.dirty ? (row.content == null ? null : String(row.content)) : null]);
+}
+
+// Delete one workspace_files row by primary key. The single delete call site
+// for the store (write-site ratchet) — shared by deleteWorkspaceFileRowsIn and
+// the CAS delete arm of _wsPutRowTx.
+function _wsDeleteFileRowIn(store, key) {
+    return store.delete(key);
+}
+
+// ONE readwrite tx over workspace_files (+ workspace_blobs when the row carries
+// pristine content): optional compare-and-swap check, blob put, row put (or
+// row delete when file === null). Blob + row commit atomically, so the
+// fire-and-forget gcWorkspaceBlobs can never sweep a just-written blob before
+// its row references it (H8). opts.check(currentRaw) → false aborts the write
+// and resolves {ok:false, conflict:true, current}. opts.repo/opts.path locate
+// the current row (default: file.repo/file.path). On a blob-store failure
+// (e.g. quota) retries once row-only with inline content (legacy behavior).
+async function _wsPutRowTx(file, opts) {
+    opts = opts || {};
+    var repo = opts.repo != null ? opts.repo : (file && file.repo);
+    var path = opts.path != null ? opts.path : (file && file.path);
+    var withBlob = !!(file && file.sha && file.original_content != null);
+    function stripped() {
+        var s = Object.assign({}, file);
+        delete s.original_content;
+        if (!file.dirty && file.content === file.original_content) delete s.content;
+        return s;
+    }
+    async function attempt(useBlob) {
         var database = await openDatabase();
-        var tx = database.transaction([workspaceFilesStoreName], 'readwrite');
-        tx.objectStore(workspaceFilesStoreName).put(toStore);
-        await new Promise(function(resolve, reject) {
-            tx.oncomplete = resolve;
+        var stores = useBlob ? [workspaceFilesStoreName, workspaceBlobsStoreName] : [workspaceFilesStoreName];
+        var tx = database.transaction(stores, 'readwrite');
+        var fstore = tx.objectStore(workspaceFilesStoreName);
+        var outcome = { ok: true };
+        return await new Promise(function(resolve, reject) {
+            function write(current) {
+                if (file === null) {
+                    if (current) _wsDeleteFileRowIn(fstore, current.id);
+                    return;
+                }
+                if (useBlob) tx.objectStore(workspaceBlobsStoreName).put({ sha: file.sha, content: file.original_content });
+                fstore.put(useBlob ? stripped() : file);
+            }
+            if (opts.check || file === null) {
+                var req = fstore.index('repo_path').get([repo, path]);
+                req.onsuccess = function() {
+                    var current = req.result || null;
+                    if (opts.check && !opts.check(current)) { outcome = { ok: false, conflict: true, current: current }; return; }
+                    write(current);
+                };
+                req.onerror = function() { reject(req.error); };
+            } else {
+                write(null);
+            }
+            tx.oncomplete = function() { resolve(outcome); };
             tx.onerror = function() { reject(tx.error); };
             // A tx can abort with NO bubbled request error (e.g. forced close
             // during another connection's versionchange) — without this the
             // awaited Promise would hang forever and stall the write loop.
             tx.onabort = function() { reject(tx.error || new DOMException('Transaction aborted', 'AbortError')); };
         });
+    }
+    try { return await attempt(withBlob); }
+    catch (e) {
+        if (!withBlob) throw e;
+        // blob put failed (e.g. quota) — keep inline content rather than
+        // stripping a row whose blob is not durable.
+        return await attempt(false);
+    }
+}
+
+async function setWorkspaceFile(file) {
+    try {
+        // Content-addressed storage: pristine content is stored ONCE per sha in
+        // the blob store and stripped from the persisted row (a CLONE — the
+        // caller's in-memory object keeps its inline content). Blob + row are
+        // written in ONE transaction (see _wsPutRowTx).
+        await _wsPutRowTx(file, null);
     } catch (e) { console.error('Failed to save workspace file:', e); }
+}
+
+// Transactional compare-and-swap for ONE workspace_files row. Inside a single
+// readwrite tx: re-read the row at (repo, path) and write `newRow` (or DELETE
+// the row when newRow === null) ONLY if its _wsRowRevision still equals that
+// of `expected` (expected === null → the row must be absent). Safe across
+// realms (page + service worker share the IDB), unlike an in-memory mutex.
+// Returns {ok:true} | {ok:false, conflict:true, current: <resolved row|null>}
+// | {ok:false, error}. Never throws.
+async function setWorkspaceFileIf(repo, path, expected, newRow) {
+    var want = _wsRowRevision(expected);
+    try {
+        var res = await _wsPutRowTx(newRow, { repo: repo, path: path, check: function(current) { return _wsRowRevision(current) === want; } });
+        if (res && res.conflict && res.current) await _resolveWorkspaceRows([res.current]);
+        return res;
+    } catch (e) {
+        console.error('Failed to CAS workspace file:', e);
+        return { ok: false, error: (e && e.message) || String(e) };
+    }
 }
 
 async function getAllWorkspaceFiles(repo) {
@@ -3436,7 +3517,7 @@ function deleteWorkspaceFileRowsIn(tx, repo) {
         var request = store.index('repo').getAllKeys(repo);
         request.onsuccess = function() {
             var keys = request.result || [];
-            keys.forEach(function(k) { store.delete(k); });
+            keys.forEach(function(k) { _wsDeleteFileRowIn(store, k); });
             resolve(keys.length);
         };
         request.onerror = function() { reject(request.error || new Error('Failed to enumerate workspace files')); };
@@ -3483,6 +3564,53 @@ async function deleteLocalWorkspaceData(repo) {
             tx.oncomplete = function() { resolve(); };
             tx.onerror = function() { reject(tx.error || new Error('Failed to delete local workspace')); };
             tx.onabort = function() { reject(tx.error || new Error('Failed to delete local workspace')); };
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+// H9: atomic "delete this workspace unless it has local work" (merged-branch
+// auto-delete). ONE readwrite transaction over workspace_files +
+// workspace_meta: read every file row of `repo` via the 'repo' index; if any
+// row is dirty (tombstones are dirty too) and not ignored by `isIgnoredFn`
+// (gitignored build output etc.), write NOTHING and resolve
+// {kept:true, dirty:[paths]}; otherwise queue the deletes of all file rows AND
+// the meta row on the same tx and resolve {kept:false, deleted:true, count}
+// after commit. Because the check and the deletes share one transaction, a
+// concurrent write (another realm, the SW, a parallel tool call) either lands
+// before it (seen as dirty → kept) or after it (on a deleted workspace) — it
+// can never be silently swept by the delete. Blob GC stays with the caller
+// (gcWorkspaceBlobs is best-effort / fire-and-forget, as before). Rejects on
+// transaction failure (nothing is deleted in that case).
+async function deleteWorkspaceIfClean(repo, isIgnoredFn) {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx, outcome = null;
+        try {
+            tx = database.transaction([workspaceFilesStoreName, workspaceMetaStoreName], 'readwrite');
+            var req = tx.objectStore(workspaceFilesStoreName).index('repo').getAll(repo);
+            req.onsuccess = function() {
+                var rows = req.result || [];
+                var dirty = [];
+                rows.forEach(function(r) {
+                    if (!r || !r.dirty) return;
+                    var ign = false;
+                    // A throwing filter is treated as NOT ignored (keep = safe).
+                    try { ign = typeof isIgnoredFn === 'function' && !!isIgnoredFn(r.path); } catch (e) { ign = false; }
+                    if (!ign) dirty.push(r.path);
+                });
+                if (dirty.length > 0) { outcome = { kept: true, deleted: false, dirty: dirty }; return; }
+                outcome = { kept: false, deleted: true, count: rows.length };
+                deleteWorkspaceMetaRowIn(tx, repo);
+                deleteWorkspaceFileRowsIn(tx, repo).catch(function() {
+                    try { tx.abort(); } catch (e) {}
+                });
+            };
+            req.onerror = function() { reject(req.error || new Error('Failed to scan workspace files')); };
+            tx.oncomplete = function() { resolve(outcome || { kept: true, deleted: false, dirty: [] }); };
+            tx.onerror = function() { reject(tx.error || new Error('Failed to delete workspace')); };
+            tx.onabort = function() { reject(tx.error || new Error('Failed to delete workspace')); };
         } catch (e) {
             reject(e);
         }

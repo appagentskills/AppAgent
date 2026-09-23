@@ -35,6 +35,12 @@ function executeToolWithInterrupt(streamingChatId, toolName, args, assistantMsgI
             if (interruptResolversByChatId[streamingChatId] === resolverFn) {
                 delete interruptResolversByChatId[streamingChatId];
             }
+            // H16 follow-up: the abandoned tool may be an await_handle /
+            // await_any / await_all (timeout_ms defaults to 0) — drop this
+            // chat's registered awaiters so a later sub report does not read
+            // a stale "parent blocked" and skip the wake notice. Runs in both
+            // the page and SW bundles (095 loads before app/030 in each).
+            try { if (typeof Handles !== 'undefined' && Handles.cancelAwaitersForChat) Handles.cancelAwaitersForChat(streamingChatId); } catch (_) {}
             resolve({ _interrupted: true });
         };
         interruptResolversByChatId[streamingChatId] = resolverFn;
@@ -670,14 +676,21 @@ function _isEmptyAssistantTurn(assistantMsg) {
     if (!c) return true;
     return typeof c === 'string' && !c.trim();
 }
-// #16: turn key for the progress-card stamp — index of the last ORGANIC
-// (non-injected) user row at or before `lastUserMsgIndex`; falls back to
-// `lastUserMsgIndex` itself when every user row is injected / none exists.
+// #16: turn key for the progress-card stamp — index of the last REAL user
+// row (_isRealUserRow, app/020-api-messages.js: organic, or injected with
+// merged user text) at or before `lastUserMsgIndex`; falls back to
+// `lastUserMsgIndex` itself when every user row is a pure injection / none.
+// C-REVIEW Fix 2: after-response hook rows (isHookMessage: role 'user', NOT
+// injected — worker/020-page-stubs.js) are not turns either (same convention
+// as _isLedgerBoundaryRow in app/020 and the progress-hook walk): a hook run
+// must not clear the stamp, and later wake runs must not key on the hook row.
 function _progressCardTurnKey(chat, lastUserMsgIndex) {
     var msgs = (chat && chat.messages) || [];
     for (var i = lastUserMsgIndex; i >= 0; i--) {
         var m = msgs[i];
-        if (m && m.role === 'user' && !m.injected) return i;
+        var _real = (typeof _isRealUserRow === 'function') ? _isRealUserRow(m)
+            : (!!m && m.role === 'user' && (!m.injected || m.hasUserText === true));
+        if (_real && m.isHookMessage !== true) return i;
     }
     return lastUserMsgIndex;
 }
@@ -725,7 +738,13 @@ function flushPendingInjection(chat) {
         // genuinely-new re-send equal to a paragraph of an earlier
         // multi-paragraph message would be silently dropped. The flag survives
         // IDB persistence (structured clone) and port postMessage.
-        chat.messages.push({ role: 'user', content: text, injected: true });
+        var _injRow = { role: 'user', content: text, injected: true };
+        // SUB-NOTICE-META: carry the entry's UI metadata onto the row
+        // (render-only — buildAPIMessages sends user rows as role+content,
+        // so the model payload is unchanged).
+        if (entry && Array.isArray(entry.subNotices) && entry.subNotices.length) _injRow.subNotices = entry.subNotices.slice();
+        if (entry && entry.hasUserText === true) _injRow.hasUserText = true;
+        chat.messages.push(_injRow);
     }
     if (images && images.length > 0) {
         images.forEach(function(img) {
@@ -1000,6 +1019,13 @@ async function runAgent(overrideChatId) {
     // Another chat's error is left alone — the finish decisions are keyed on
     // chatId via _runApiError (see the finish section).
     if (lastApiError && lastApiError.chatId === streamingChatId) lastApiError = null;
+    // C5: this run has claimed the chat (guards passed), so it consumes every
+    // agent_message notice row the idle arm already pushed — cancel a pending
+    // debounced wake (core/097) so its timer can't start a second run for
+    // rows answered here. Covers user sends, resumes and drains alike.
+    if (typeof _cancelAgentMessageWake === 'function') {
+        try { _cancelAgentMessageWake(streamingChatId); } catch (_) { /* best-effort */ }
+    }
     AgentEvents.emit('runStarted', { chatId: streamingChatId, turn: -1 });
 
     // Execute any approved tool calls that don't have results yet
@@ -1338,7 +1364,7 @@ async function runAgent(overrideChatId) {
             }
         }
 
-        // Progress-card nudge: the PROGRESS UPDATES policy asks for an
+        // Progress-card nudge: update_action_state's WHEN TO CALL triggers ask for an
         // update_action_state card once a run exceeds ~3 tool calls, but that
         // static system-prompt paragraph gets ignored on long runs (background
         // Action chats comply because startAction() injects an explicit "You
@@ -1392,7 +1418,7 @@ async function runAgent(overrideChatId) {
                 chat.messages.push({
                     role: 'context',
                     _progressNudge: true,
-                    content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the PROGRESS UPDATES policy, create one NOW — batch the update_action_state call ALONGSIDE your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
+                    content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the WHEN TO CALL triggers in the update_action_state tool description, create one NOW — batch the update_action_state call ALONGSIDE your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
                 });
             }
         }
@@ -2189,7 +2215,7 @@ async function runAgent(overrideChatId) {
                 // core/097) delivers it once the chat is idle/unpaused.
                 // persistPendingWake dedupes by text containment against the
                 // copy the live-parent branch already persisted (Mode A).
-                persistPendingWake(streamingChatId, _pendFollow.text, null);
+                persistPendingWake(streamingChatId, _pendFollow.text, null, { subNotices: _pendFollow.subNotices, hasUserText: _pendFollow.hasUserText });
             }
         }
     } catch (e) { console.warn('[agent-loop] end-of-run report drain check threw', e); }

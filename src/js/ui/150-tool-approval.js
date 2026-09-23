@@ -4,6 +4,25 @@
 // - batch: if true, uses showToolApprovalPromptBatch (caller must render after all prompts added)
 // - chatId: target chat for approval prompt
 // Returns: { allowed: true, permission, displayName, permissionKey } or { allowed: false, error, permission, displayName, permissionKey }
+// S1: a recorded approval row is honoured only for the SAME call — same tool
+// (actualToolName, legacy rows: display name), same permission key (method /
+// action) and same args. A toolCallId alone is not proof: sandbox-originated
+// ids are replayable. Mirror: worker/120-tool-routing.js _swApprovalRowMatchesCall.
+function _approvalStableJson(v) {
+    if (v === undefined) return 'null';
+    if (v === null || typeof v !== 'object') { var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+    if (Array.isArray(v)) return '[' + v.map(_approvalStableJson).join(',') + ']';
+    return '{' + Object.keys(v).sort().filter(function(k) { return v[k] !== undefined && typeof v[k] !== 'function'; })
+        .map(function(k) { return JSON.stringify(k) + ':' + _approvalStableJson(v[k]); }).join(',') + '}';
+}
+function _approvalRowMatchesCall(row, toolName, displayName, permissionKey, args) {
+    if (!row) return false;
+    if (row.actualToolName) { if (row.actualToolName !== toolName) return false; }
+    else if (row.toolName !== displayName) return false;
+    if (row.permissionKey && permissionKey && row.permissionKey !== permissionKey) return false;
+    return _approvalStableJson(row.args || {}) === _approvalStableJson(args || {});
+}
+
 async function requestProgrammaticToolApproval(toolName, args, options) {
     options = options || {};
     var methodOrAction = null;
@@ -70,6 +89,13 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
             if (msg.role === 'approval' && msg.toolCallId === toolCallId) {
+                if (!_approvalRowMatchesCall(msg, toolName, displayName, permissionKey, args)) {
+                    // S1: id collision with a DIFFERENT call — never reuse its
+                    // verdict; prompt fresh under a new id (a new row, so the
+                    // idempotent row seeding can't swallow the prompt).
+                    toolCallId = toolCallId + '_r' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+                    break;
+                }
                 if (msg.status === 'allowed' || msg.status === 'session_allowed' || msg.status === 'always_allowed') {
                     return Object.assign({ allowed: true }, baseResult);
                 } else if (msg.status === 'denied') {

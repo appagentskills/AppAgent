@@ -545,6 +545,215 @@ chrome.runtime.onConnect.addListener(function(port) {
     });
 });
 
+function _swRemoveWidgets(ids) {
+    if (!Array.isArray(ids)) return Promise.resolve(false);
+    ids = ids.filter(function(id) { return typeof id === 'string' && id; });
+    if (!ids.length) return Promise.resolve(false);
+    function hit(w) { return w && ids.indexOf(w.id) !== -1; }
+    return (self._swBootReady || Promise.resolve()).then(function() {
+        var cids = Object.keys(chats).filter(function(cid) {
+            var c = chats[cid];
+            return c && Array.isArray(c.widgets) && c.widgets.some(hit);
+        });
+        if (!cids.length) return false;
+        return Promise.all(cids.map(function(cid) {
+            var c0 = chats[cid];
+            return (c0 && c0._payloadsEvicted && typeof ensureChatPayloads === 'function') ? ensureChatPayloads(cid) : null;
+        })).then(function() {
+            var touched = false;
+            cids.forEach(function(cid) {
+                var c = chats[cid];
+                if (!c || !Array.isArray(c.widgets) || !c.widgets.some(hit)) return;
+                c.widgets = c.widgets.filter(function(w) { return !hit(w); });
+                // F5: ensureChatPayloads never rejects, so a failed rehydrate
+                // shows up as a chat that is STILL evicted — the save below
+                // skips evicted chats, dropping this removal silently. Stamp
+                // the SAVE-DROP RESCUE flag (worker/115-storage.js) so the
+                // put-loop queues _rescueDirtyEvictedChat and persists it.
+                if (c._payloadsEvicted) c._dirtyWhileEvicted = true;
+                touched = true;
+            });
+            if (touched && typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            return touched;
+        });
+    }).catch(function(e) { console.error('[port-bridge] widget-remove failed', ids, e); return false; });
+}
+
+// B2c-1 (SW boot-time permission-map wipe): 'permissions-update' messages are
+// applied through a SERIAL chain gated on the boot-time permission load
+// (self._swPermsLoadP = the safe()-bounded loadToolPermissionsInWorker
+// promise, worker/190-entry.js — it never rejects and settles within the 20s
+// SW_LOADER_DEADLINE_MS). Until that load settles, every update is queued in
+// arrival order and applied on top of the HYDRATED maps, so a per-key delta
+// merges with the stored map instead of replacing it. Once the load has been
+// observed settled and the queue is drained, updates apply synchronously
+// again (the pre-fix behaviour). A rejected/throwing step is caught so the
+// chain never stays rejected and later edits still land.
+// Degraded path: safe() resolves null when the load timed out (or threw) —
+// that is a FAILED load, not a hydrated one. Per-slot hydration comes from
+// self._swPermsLoaded (worker/020 loadToolPermissionsInWorker); when it was
+// never published, a null/rejected load marks every slot unhydrated
+// (_swPermsLoadFailed). _swApplyPermissionsUpdate then keeps a delta for an
+// unhydrated slot in memory only (no setSetting) until the late read merges.
+var _swPermsQ = null;          // tail of the serial apply chain (null = idle)
+var _swPermsQDepth = 0;        // queued-but-not-yet-applied updates
+var _swPermsLoadSeen = false;  // boot permission load observed settled
+var _swPermsLoadFailed = false; // boot load settled null (timeout/failure) or rejected
+function _swPermsSlotHydrated(slot) {
+    if (typeof _swPermsDirty !== 'undefined' && _swPermsDirty && _swPermsDirty[slot]) return true; // full map replaced → memory authoritative
+    var st = (typeof self !== 'undefined' && self) ? self._swPermsLoaded : null;
+    if (st && typeof st === 'object') return st[slot] === true;
+    return !_swPermsLoadFailed;
+}
+function _swQueuePermissionsUpdate(msg) {
+    var loadP = (typeof self !== 'undefined' && self) ? self._swPermsLoadP : null;
+    if (_swPermsQDepth === 0 && (_swPermsLoadSeen || !loadP)) {
+        _swApplyPermissionsUpdate(msg);
+        return;
+    }
+    _swPermsQDepth++;
+    _swPermsQ = (_swPermsQ || Promise.resolve())
+        .then(function() { return loadP; })
+        .then(function(v) {
+            _swPermsLoadSeen = true;
+            if (v === null) _swPermsLoadFailed = true;   // safe() timeout / failure
+        }, function() { _swPermsLoadSeen = true; _swPermsLoadFailed = true; })
+        .then(function() { _swApplyPermissionsUpdate(msg); })
+        .catch(function(e) { console.error('[sw-runtime] permissions-update apply failed', e); })
+        .then(function() {
+            _swPermsQDepth--;
+            if (_swPermsQDepth <= 0) { _swPermsQDepth = 0; _swPermsQ = null; }
+        });
+}
+
+// Body of the 'permissions-update' case (moved verbatim from
+// _handlePanelMessage so the B2c-1 queue above can defer it).
+function _swApplyPermissionsUpdate(msg) {
+    var _permChanged = {};
+    // SEC-1: slots touched ONLY by a delta (never a full map in this
+    // message) must raise a delta-specific boot-race flag below, not the
+    // full-replace one — the replace flag makes
+    // loadSessionPermissionsInWorker (worker/025) SKIP the stored map,
+    // dropping every other chat's persisted grant when e.g. a
+    // deleteChat prune lands during the SW boot window.
+    var _permDeltaOnly = {};
+    // FLUX-4/1 (per-key merge): panels with a synced baseline dispatch
+    // DELTAS ({set:{k:v}, del:[k]}, app/045 pushPermissionsToOffscreen)
+    // instead of whole maps, so two panels editing DIFFERENT keys
+    // concurrently both survive — the whole-map replace below made the
+    // later dispatch clobber the earlier edit. Explicit deletions ride
+    // the delta (a pure per-key merge never deletes). Full maps are
+    // still accepted below: initial sync from a panel with no baseline
+    // yet. Delta application still flows into _permChanged, so the F6
+    // persist + full-map rebroadcast below are unchanged.
+    // B2c-1 degraded path: slots whose boot read has not succeeded yet.
+    // A delta to such a slot is applied in memory only — persisting (or
+    // rebroadcasting) it would write a partial map over the stored one.
+    var _permUnhydrated = {};
+    var _applyPermDelta = function(slot, cur) {
+        var d = msg[slot + 'Delta'];
+        if (!d || typeof d !== 'object') return cur;
+        var map = (cur && typeof cur === 'object') ? cur : {};
+        var trackDel = slot === 'sessionPermissions';
+        if (slot !== 'sessionPermissions' && !_swPermsSlotHydrated(slot)) {
+            _permUnhydrated[slot] = true;
+            trackDel = true;
+        }
+        if (d.set && typeof d.set === 'object') {
+            Object.keys(d.set).forEach(function(k) { map[k] = d.set[k]; });
+        }
+        if (Array.isArray(d.del)) {
+            d.del.forEach(function(k) {
+                delete map[k];
+                if (trackDel && typeof _swPermsDirty !== 'undefined') {
+                    // Remembered so the boot merge never resurrects it.
+                    _swPermsDirty[slot + 'Deleted'] = _swPermsDirty[slot + 'Deleted'] || {};
+                    _swPermsDirty[slot + 'Deleted'][k] = true;
+                }
+            });
+        }
+        _permChanged[slot] = map;
+        _permDeltaOnly[slot] = true;
+        return map;
+    };
+    toolPermissions = _applyPermDelta('toolPermissions', toolPermissions);
+    instancePermissions = _applyPermDelta('instancePermissions', instancePermissions);
+    sessionPermissions = _applyPermDelta('sessionPermissions', sessionPermissions);
+    if (msg.toolPermissions && typeof msg.toolPermissions === 'object') {
+        toolPermissions = msg.toolPermissions;
+        _permChanged.toolPermissions = toolPermissions;
+        delete _permUnhydrated.toolPermissions;   // full map → replace + persist as before
+    }
+    if (msg.instancePermissions && typeof msg.instancePermissions === 'object') {
+        instancePermissions = msg.instancePermissions;
+        _permChanged.instancePermissions = instancePermissions;
+        delete _permUnhydrated.instancePermissions;
+    }
+    ['toolPermissions', 'instancePermissions'].forEach(function(slot) {
+        if (!_permUnhydrated[slot]) return;
+        // In memory only: flag the slot so its late read MERGES the stored
+        // map under it and persists + rebroadcasts the union (worker/020
+        // _swPermsHydrateApply); make sure such a read is pending (re-read
+        // after a rejected getSetting — deduped against an in-flight one).
+        delete _permChanged[slot];
+        _swPermsDirty[slot + 'Delta'] = true;
+        if (typeof _swPermsHydrateSlot === 'function') {
+            try { _swPermsHydrateSlot(slot); } catch (e) { console.warn('[sw-runtime] ' + slot + ' re-read threw', e); }
+        }
+    });
+    if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
+        sessionPermissions = msg.sessionPermissions;
+        _permChanged.sessionPermissions = sessionPermissions;
+        _permDeltaOnly.sessionPermissions = false;
+    }
+    // F6 (single IDB writer): the SW persists the durable slots
+    // itself — panels no longer write permission maps to IDB at all
+    // (ui/080-scope.js dispatches here instead of setSetting).
+    // sessionPermissions ("Allow for this chat" grants) is mirrored to
+    // chrome.storage.session (persistSessionPermissionsInWorker,
+    // worker/025) so it survives SW eviction / Reload within the
+    // browser session. The dirty flags stop a boot-time
+    // loadToolPermissionsInWorker / loadSessionPermissionsInWorker
+    // whose read resolves AFTER this dispatch from clobbering the
+    // fresher edit (worker/020-page-stubs.js).
+    if (_permChanged.toolPermissions) {
+        _swPermsDirty.toolPermissions = true;
+        if (typeof setSetting === 'function') {
+            try { Promise.resolve(setSetting('toolPermissions', toolPermissions)).catch(function(e) { console.warn('[sw-runtime] toolPermissions persist failed', e); }); } catch (e) { console.warn('[sw-runtime] toolPermissions persist threw', e); }
+        }
+    }
+    if (_permChanged.instancePermissions) {
+        _swPermsDirty.instancePermissions = true;
+        if (typeof setSetting === 'function') {
+            try { Promise.resolve(setSetting('instancePermissions', instancePermissions)).catch(function(e) { console.warn('[sw-runtime] instancePermissions persist threw', e); }); } catch (e) { console.warn('[sw-runtime] instancePermissions persist threw (sync)', e); }
+        }
+    }
+    if (_permChanged.sessionPermissions) {
+        // Delta-only edit → additive-style merge flag (stored grants of
+        // other chats survive the boot race; explicit deletions are
+        // tracked in _swPermsDirty.sessionPermissionsDeleted). A full
+        // map / reset-all keeps the replace flag.
+        if (_permDeltaOnly.sessionPermissions) _swPermsDirty.sessionPermissionsDelta = true;
+        else _swPermsDirty.sessionPermissions = true;
+        if (typeof persistSessionPermissionsInWorker === 'function') persistSessionPermissionsInWorker();
+    }
+    // QW9 (flux single-writer, step 1): after applying, REBROADCAST
+    // the changed slots to every connected panel as
+    // 'permissions-changed'. Before this, a permission edited in
+    // panel A never reached panel B's replicas until B reloaded —
+    // and B's next push (settings save, session allow) could then
+    // clobber the SW with stale maps (RFC F6). Echoing to the
+    // sender too is intentional and safe: the page handler only
+    // overwrites its replicas with the applied values and never
+    // re-pushes or persists on receive, so no loop.
+    if (typeof _swPanelPorts !== 'undefined' && (_permChanged.toolPermissions || _permChanged.instancePermissions || _permChanged.sessionPermissions)) {
+        _permChanged.type = 'permissions-changed';
+        _swPanelPorts.forEach(function(p) {
+            try { p.postMessage(_permChanged); } catch (e) { /* dead port — disconnect handler cleans up */ }
+        });
+    }
+}
+
 function _handlePanelMessage(port, msg) {
     if (!msg || !msg.type) return;
     switch (msg.type) {
@@ -670,9 +879,10 @@ function _handlePanelMessage(port, msg) {
                                     var _mImgs;
                                     if (_exInj.images && _unseen.images) _mImgs = _exInj.images.concat(_unseen.images);
                                     else _mImgs = _exInj.images || _unseen.images || null;
-                                    pendingInjectionsByChatId[msg.chatId] = { text: _mTxt, images: _mImgs };
+                                    // SUB-NOTICE-META: keep subNotices & co.
+                                    pendingInjectionsByChatId[msg.chatId] = Object.assign({}, _exInj, { text: _mTxt, images: _mImgs }, _unseen.text ? { hasUserText: true } : {});
                                 } else {
-                                    pendingInjectionsByChatId[msg.chatId] = { text: _unseen.text, images: _unseen.images };
+                                    pendingInjectionsByChatId[msg.chatId] = Object.assign({ text: _unseen.text, images: _unseen.images }, _unseen.text ? { hasUserText: true } : {});
                                 }
                             }
                         }
@@ -1038,6 +1248,22 @@ function _handlePanelMessage(port, msg) {
             }
             return;
 
+        case 'query-running':
+            // F1: liveness probe for a page runAgent JOIN waiter (app/045
+            // runAgent shim). Read-only: reports whether THIS SW is running
+            // the chat (or is in the finish→hook-rerun cleanup window).
+            if (!msg.chatId) return;
+            try {
+                port.postMessage({
+                    type: 'running-state',
+                    requestId: msg.requestId,
+                    chatId: msg.chatId,
+                    running: !!runningChatIds[msg.chatId]
+                        || !!(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[msg.chatId])
+                });
+            } catch (e) { /* port died — the page probe times out */ }
+            return;
+
         case 'dev-mode':
             // runtime_inspect dev-mode flag. Pushed by the page's
             // _pushDevModeToSW (tools/140-runtime-inspect.js) on bus connect
@@ -1135,6 +1361,15 @@ function _handlePanelMessage(port, msg) {
             // chat_payloads blobs (the page-side delete owns those; it has the
             // full pre-delete record AND a hydration gate).
             if (msg.chatId && msg.chat && msg.chat._deleted === true) {
+                // H11: deleting a chat must also stop its sub-agents (the page's
+                // deleteChat only interrupts the chat's OWN run). Cascade-stop
+                // BEFORE swapping in the tombstone so the stop path's parent-
+                // card finalize writes into the old (discarded) record, never
+                // into the tombstone (which must stay messages:[]).
+                if (typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.stopDescendantsOfChat === 'function') {
+                    try { SubAgents.stopDescendantsOfChat(msg.chatId, 'parent chat deleted'); }
+                    catch (eS) { console.warn('[port-bridge] tombstone: sub-agent cascade stop failed for chat ' + msg.chatId, eS); }
+                }
                 chats[msg.chatId] = msg.chat;
                 if (typeof scheduleChatRowDelete === 'function') {
                     try {
@@ -1272,6 +1507,19 @@ function _handlePanelMessage(port, msg) {
             });
             return;
 
+        case 'widget-remove':
+            // Permanent delete from the Widget Library (WidgetStore.remove in
+            // core/135-widget-store.js; re-sent for every tombstone on
+            // panel-hello). The SW's chats[*].widgets is authoritative for the
+            // widget LIST (app/045 snapshot merge) and saveChatsToStorage
+            // re-puts whole chats, so without this the deleted widget came
+            // back and WidgetStore.load() re-migrated it on the next boot.
+            // Strip the ids from every SW chat (rehydrating evicted chats
+            // first — the put loop skips evicted rows), then persist once.
+            // Idempotent: absent ids touch nothing and skip the save.
+            _swRemoveWidgets(msg.widgetIds);
+            return;
+
         case 'exec-tool-result':
             resolvePendingUIToolCall(msg.toolCallId, msg.result, msg.error, port);
             return;
@@ -1363,106 +1611,13 @@ function _handlePanelMessage(port, msg) {
             // getToolPermission keeps returning 'ask' after the user picks
             // "Allow for this chat" / "Always allow", and the approval prompt
             // keeps firing on every tool call.
-            var _permChanged = {};
-            // SEC-1: slots touched ONLY by a delta (never a full map in this
-            // message) must raise a delta-specific boot-race flag below, not the
-            // full-replace one — the replace flag makes
-            // loadSessionPermissionsInWorker (worker/025) SKIP the stored map,
-            // dropping every other chat's persisted grant when e.g. a
-            // deleteChat prune lands during the SW boot window.
-            var _permDeltaOnly = {};
-            // FLUX-4/1 (per-key merge): panels with a synced baseline dispatch
-            // DELTAS ({set:{k:v}, del:[k]}, app/045 pushPermissionsToOffscreen)
-            // instead of whole maps, so two panels editing DIFFERENT keys
-            // concurrently both survive — the whole-map replace below made the
-            // later dispatch clobber the earlier edit. Explicit deletions ride
-            // the delta (a pure per-key merge never deletes). Full maps are
-            // still accepted below: initial sync from a panel with no baseline
-            // yet. Delta application still flows into _permChanged, so the F6
-            // persist + full-map rebroadcast below are unchanged.
-            var _applyPermDelta = function(slot, cur) {
-                var d = msg[slot + 'Delta'];
-                if (!d || typeof d !== 'object') return cur;
-                var map = (cur && typeof cur === 'object') ? cur : {};
-                if (d.set && typeof d.set === 'object') {
-                    Object.keys(d.set).forEach(function(k) { map[k] = d.set[k]; });
-                }
-                if (Array.isArray(d.del)) {
-                    d.del.forEach(function(k) {
-                        delete map[k];
-                        if (slot === 'sessionPermissions' && typeof _swPermsDirty !== 'undefined') {
-                            // Remembered so the boot merge never resurrects it.
-                            _swPermsDirty.sessionPermissionsDeleted = _swPermsDirty.sessionPermissionsDeleted || {};
-                            _swPermsDirty.sessionPermissionsDeleted[k] = true;
-                        }
-                    });
-                }
-                _permChanged[slot] = map;
-                _permDeltaOnly[slot] = true;
-                return map;
-            };
-            toolPermissions = _applyPermDelta('toolPermissions', toolPermissions);
-            instancePermissions = _applyPermDelta('instancePermissions', instancePermissions);
-            sessionPermissions = _applyPermDelta('sessionPermissions', sessionPermissions);
-            if (msg.toolPermissions && typeof msg.toolPermissions === 'object') {
-                toolPermissions = msg.toolPermissions;
-                _permChanged.toolPermissions = toolPermissions;
-            }
-            if (msg.instancePermissions && typeof msg.instancePermissions === 'object') {
-                instancePermissions = msg.instancePermissions;
-                _permChanged.instancePermissions = instancePermissions;
-            }
-            if (msg.sessionPermissions && typeof msg.sessionPermissions === 'object') {
-                sessionPermissions = msg.sessionPermissions;
-                _permChanged.sessionPermissions = sessionPermissions;
-                _permDeltaOnly.sessionPermissions = false;
-            }
-            // F6 (single IDB writer): the SW persists the durable slots
-            // itself — panels no longer write permission maps to IDB at all
-            // (ui/080-scope.js dispatches here instead of setSetting).
-            // sessionPermissions ("Allow for this chat" grants) is mirrored to
-            // chrome.storage.session (persistSessionPermissionsInWorker,
-            // worker/025) so it survives SW eviction / Reload within the
-            // browser session. The dirty flags stop a boot-time
-            // loadToolPermissionsInWorker / loadSessionPermissionsInWorker
-            // whose read resolves AFTER this dispatch from clobbering the
-            // fresher edit (worker/020-page-stubs.js).
-            if (_permChanged.toolPermissions) {
-                _swPermsDirty.toolPermissions = true;
-                if (typeof setSetting === 'function') {
-                    try { Promise.resolve(setSetting('toolPermissions', toolPermissions)).catch(function(e) { console.warn('[sw-runtime] toolPermissions persist failed', e); }); } catch (e) { console.warn('[sw-runtime] toolPermissions persist threw', e); }
-                }
-            }
-            if (_permChanged.instancePermissions) {
-                _swPermsDirty.instancePermissions = true;
-                if (typeof setSetting === 'function') {
-                    try { Promise.resolve(setSetting('instancePermissions', instancePermissions)).catch(function(e) { console.warn('[sw-runtime] instancePermissions persist threw', e); }); } catch (e) { console.warn('[sw-runtime] instancePermissions persist threw (sync)', e); }
-                }
-            }
-            if (_permChanged.sessionPermissions) {
-                // Delta-only edit → additive-style merge flag (stored grants of
-                // other chats survive the boot race; explicit deletions are
-                // tracked in _swPermsDirty.sessionPermissionsDeleted). A full
-                // map / reset-all keeps the replace flag.
-                if (_permDeltaOnly.sessionPermissions) _swPermsDirty.sessionPermissionsDelta = true;
-                else _swPermsDirty.sessionPermissions = true;
-                if (typeof persistSessionPermissionsInWorker === 'function') persistSessionPermissionsInWorker();
-            }
-            // QW9 (flux single-writer, step 1): after applying, REBROADCAST
-            // the changed slots to every connected panel as
-            // 'permissions-changed'. Before this, a permission edited in
-            // panel A never reached panel B's replicas until B reloaded —
-            // and B's next push (settings save, session allow) could then
-            // clobber the SW with stale maps (RFC F6). Echoing to the
-            // sender too is intentional and safe: the page handler only
-            // overwrites its replicas with the applied values and never
-            // re-pushes or persists on receive, so no loop.
-            if (typeof _swPanelPorts !== 'undefined' && (_permChanged.toolPermissions || _permChanged.instancePermissions || _permChanged.sessionPermissions)) {
-                _permChanged.type = 'permissions-changed';
-                _swPanelPorts.forEach(function(p) {
-                    try { p.postMessage(_permChanged); } catch (e) { /* dead port — disconnect handler cleans up */ }
-                });
-            }
+            // B2c-1 (boot race): the apply is SERIALIZED behind the boot-time
+            // permission load (self._swPermsLoadP, worker/190-entry.js) — see
+            // _swQueuePermissionsUpdate. Applying a delta onto the still-empty
+            // boot maps used to persist + rebroadcast a 1-key map and, via the
+            // dirty flag, make the late load skip the stored map: every stored
+            // Always-allow / disabled entry and per-host override was lost.
+            _swQueuePermissionsUpdate(msg);
             return;
 
         case 'chat-meta-update':
@@ -1888,6 +2043,12 @@ function _swDispatchPanelSendMessage(msg) {
     }
 }
 
+// F2: true when the send target was deleted (tombstone) or purged from the map.
+function _swSendTargetDeleted(chatId) {
+    var c = chats[chatId];
+    return !c || !!c._deleted;
+}
+
 async function _handlePanelSendMessage(msg) {
     var chatId = msg.chatId;
     if (!chatId) return;
@@ -1968,12 +2129,14 @@ async function _handlePanelSendMessage(msg) {
             var _mergedImages;
             if (_existingInj.images && msg.images) _mergedImages = _existingInj.images.concat(msg.images);
             else _mergedImages = _existingInj.images || msg.images || null;
-            pendingInjectionsByChatId[chatId] = { text: _mergedText, images: _mergedImages };
+            // SUB-NOTICE-META: keep the entry's other fields (subNotices, …);
+            // hasUserText marks real user text merged into the row.
+            pendingInjectionsByChatId[chatId] = Object.assign({}, _existingInj, { text: _mergedText, images: _mergedImages }, msg.text ? { hasUserText: true } : {});
         } else {
-            pendingInjectionsByChatId[chatId] = {
+            pendingInjectionsByChatId[chatId] = Object.assign({
                 text: msg.text || null,
                 images: msg.images || null
-            };
+            }, msg.text ? { hasUserText: true } : {});
         }
         // #18 prompt_user continuity: if the chat's LAST prompt_user row is still
         // pending (and its call is tracked), the message IS the answer — settle
@@ -2005,6 +2168,14 @@ async function _handlePanelSendMessage(msg) {
     // defensive). Moved here from above the running branch — see NOTE.
     if (typeof ensureChatPayloads === 'function') {
         try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
+    // F2: the tombstone check at the top ran BEFORE the await above. A delete
+    // that landed during the rehydrate (tombstone parked, or the entry purged)
+    // must not get the user message appended and re-saved (resurrecting the
+    // row) nor start a run — bail cleanly.
+    if (_swSendTargetDeleted(chatId)) {
+        console.warn('[port-bridge] send-message dropped: chat ' + chatId + ' was deleted during rehydrate');
+        return;
     }
     if (msg.text || (msg.images && msg.images.length)) {
         if (msg.text) chats[chatId].messages.push({ role: 'user', content: msg.text });
@@ -2051,6 +2222,8 @@ async function _handlePanelSendMessage(msg) {
     if (chats[chatId] && chats[chatId]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
         try { await ensureChatPayloads(chatId); } catch (e) {}
     }
+    // F2: same re-check after the save / second rehydrate awaits.
+    if (_swSendTargetDeleted(chatId)) return;
     // Deliberately not awaited (fire-and-forget run start), but the rejection
     // must be handled — an unhandled async crash here surfaced as a raw
     // uncaught TypeError in the SW console.

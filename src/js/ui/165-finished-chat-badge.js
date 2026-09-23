@@ -46,6 +46,21 @@ function getUnseenFinishedChatsInfo() {
     return { count: count, hasError: hasError };
 }
 
+// Per-row twin of getUnseenFinishedChatsInfo(): true when THIS chat would be
+// counted in the pill's bell segment. Same source of truth (the
+// _unseenFinishedChats map) and the same read-side gates (focused chat is
+// seen; _jobsChatState must resolve to 'unseen'), so a row bell shows exactly
+// when the pill bell counts it and clears when the pill clears it. Returns
+// { hasError } or null. Read-only: pruning stays in the aggregate.
+function getFinishedChatBell(chatId) {
+    if (!chatId || !_unseenFinishedChats[chatId]) return null;
+    if (typeof chats === 'undefined' || !chats[chatId]) return null;
+    if (typeof currentChatId !== 'undefined' && chatId === currentChatId &&
+        (typeof currentView === 'undefined' || currentView === 'chat')) return null;
+    if (typeof _jobsChatState === 'function' && _jobsChatState(chatId) !== 'unseen') return null;
+    return { hasError: !!_unseenFinishedChats[chatId].hasError };
+}
+
 // Called from the notifyFinish handler (036-agent-event-handlers-page.js)
 // when a run finishes on a chat the user is not currently viewing.
 function noteChatFinishedUnseen(chatId, hasError) {
@@ -85,6 +100,15 @@ var _bellPopTimer = null;
 
 function renderFinishedChatsBadge(justAdded) {
     if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+    // The chat ROWS carry the same bell (getFinishedChatBell), so repaint the
+    // open row surfaces too — otherwise the pill lights/clears while an open
+    // Active dropdown / expand modal / home panel keeps the stale row.
+    try {
+        var _jd = (typeof _getOpenJobsDropdown === 'function') ? _getOpenJobsDropdown() : null;
+        if (_jd && typeof renderJobsDropdown === 'function') renderJobsDropdown(_jd);
+    } catch (e) {}
+    try { if (typeof _refreshJobsExpandModal === 'function') _refreshJobsExpandModal(); } catch (e) {}
+    try { if (typeof renderHomeActiveChats === 'function') renderHomeActiveChats(); } catch (e) {}
     if (!justAdded) return;
     var badges = document.querySelectorAll('.jobs-badge');
     badges.forEach(function(badge) {

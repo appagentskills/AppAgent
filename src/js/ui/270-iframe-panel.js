@@ -37,12 +37,27 @@ var RELOAD_PREFLIGHT_FILES = Object.freeze([
     'test/js-eval-sandbox-lifecycle.test.js', 'test/harness.test.js',
     'test/reload-preflight.test.js'
 ]);
+// ONE run_tests call covers every suite (was one call per file): 120s per suite,
+// capped at the tool's 600s maximum; the page-side wait is slightly longer.
+var RELOAD_PREFLIGHT_TIMEOUT_MS = Math.min(600000, 120000 * RELOAD_PREFLIGHT_FILES.length);
+var RELOAD_PREFLIGHT_WAIT_MS = RELOAD_PREFLIGHT_TIMEOUT_MS + 15000;
+var RELOAD_PREFLIGHT_PASS_KEY = 'appagentReloadPreflightPass'; // fingerprint of the last PASSING preflight
+var RELOAD_TIMINGS_KEY = 'appagentLastReloadTimings';
+var RELOAD_BUILD_TIMEOUT_MS = 5 * 60 * 1000;   // one page-side wait window (Keep waiting repeats it)
+var RELOAD_BUILD_LOCK = 'appagent-extension-build'; // cross-panel: held until the build itself settles
+// The running extension_build promise: set when it starts, cleared ONLY when that
+// build settles (never by a page-side timeout). A timed-out build keeps writing the
+// deploy folder, so while this is set nothing may restart or start another build.
+var _reloadBuildInFlight = null;
+var RELOAD_RESTART_FALLBACK_MS = 5000;   // safety net if the marker write never confirms
+var _reloadClock = null;
 function reloadExtension() {
     if (_reloadInFlight) return _reloadInFlight;
     var buttons = ['ext-reload-btn', 'home-ext-reload-btn'].map(function(id) { return document.getElementById(id); });
     var disabled = buttons.map(function(b) { return b && b.disabled; });
     buttons.forEach(function(b) { if (b) b.disabled = true; });
     // Set the page guard synchronously, before requesting the origin lock.
+    try { _reloadClock = _reloadPhaseClock(); } catch (e) { _reloadClock = null; }
     _reloadInFlight = Promise.resolve().then(function() {
         if (!navigator.locks || !navigator.locks.request) throw new Error('Safe Reload requires Web Locks. Close other panels and restart Chrome.');
         return navigator.locks.request('appagent-reload-preflight', { ifAvailable: true }, async function(lock) {
@@ -54,6 +69,7 @@ function reloadExtension() {
     }).finally(function() {
         buttons.forEach(function(b, i) { if (b) b.disabled = disabled[i]; });
         _reloadInFlight = null;
+        _reloadClock = null;
     });
     return _reloadInFlight;
 }
@@ -79,6 +95,42 @@ async function _reloadFingerprint(workspace) {
     var bytes = new TextEncoder().encode(JSON.stringify([meta.head_sha, meta.branch, rows]));
     return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))).map(function(n) { return n.toString(16).padStart(2, '0'); }).join('');
 }
+// Phase timings: console.info per phase plus a summary persisted with the reopen
+// marker. Diagnostics only: every use is guarded and can never break Reload.
+function _reloadPhaseClock() {
+    var start = Date.now(), last = start, phases = {};
+    return {
+        mark: function(name) {
+            var now = Date.now(), ms = now - last; last = now;
+            phases[name] = (phases[name] || 0) + ms;
+            console.info('[reload] ' + name + ' ' + ms + 'ms');
+        },
+        summary: function(requestedAt) { return { requestedAt: requestedAt, total_ms: requestedAt - start, phases: Object.assign({}, phases) }; }
+    };
+}
+function _reloadMark(name) { try { if (_reloadClock) _reloadClock.mark(name); } catch (e) { /* diagnostics only */ } }
+// chrome.storage.local helpers that never throw/reject (null when unavailable).
+function _reloadStorageGet(key) {
+    return new Promise(function(resolve) {
+        try {
+            var local = typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local;
+            if (!local || typeof local.get !== 'function') { resolve(null); return; }
+            local.get(key, function(data) { resolve(!(chrome.runtime && chrome.runtime.lastError) && data ? data[key] : null); });
+        } catch (e) { resolve(null); }
+    });
+}
+function _reloadStorageSet(items) {
+    try {
+        var local = typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local;
+        if (!local || typeof local.set !== 'function') return;
+        local.set(items, function() { var err = chrome.runtime && chrome.runtime.lastError; if (err) console.warn('[reload] storage write failed: ' + (err.message || err)); });
+    } catch (e) { console.warn('[reload] storage write failed: ' + (e && e.message || e)); }
+}
+// Same workspace, same exact sources (fingerprint) and same suite list as the last PASS.
+function _reloadPassMatches(saved, workspace, fingerprint) {
+    return !!(saved && typeof saved === 'object' && typeof fingerprint === 'string' && saved.fingerprint === fingerprint &&
+        saved.workspace === workspace && saved.files === RELOAD_PREFLIGHT_FILES.join('\n'));
+}
 function _reloadSuiteResult(result, file) {
     var f = result && Array.isArray(result.files) && result.files.length === 1 && result.files[0];
     var s = result && result.summary;
@@ -100,6 +152,37 @@ function _reloadSuiteResult(result, file) {
     if (f && f.failures) detail += '\n' + JSON.stringify(f.failures);
     if (f && f.skips && f.skips.length) detail += '\n' + JSON.stringify(f.skips);
     return { state: state, detail: detail.slice(0, 6000) };
+}
+// One run_tests call covers every suite. Each row gets a one-file view of that
+// envelope (its own entry + the shared isolation/denial/abort/error fields) and
+// is judged by the unchanged single-file _reloadSuiteResult. A missing entry or an
+// inconsistent envelope is an explicit failure: nothing passes on a bad envelope.
+function _reloadSuiteRows(result, files) {
+    var list = result && Array.isArray(result.files) ? result.files : null, s = result && result.summary;
+    var envelopeOk = !!(list && s && list.length === files.length && s.files === list.length && list.every(function(f) {
+        return f && ['passed', 'failed', 'skipped'].every(function(k) { return Number.isSafeInteger(f[k]) && f[k] >= 0; });
+    }));
+    if (envelopeOk) {
+        // Same recount as run_tests: an error/empty file counts as one failure.
+        var sum = { passed: 0, failed: 0, skipped: 0, no_assertions: 0 };
+        list.forEach(function(f) {
+            sum.passed += f.passed; sum.failed += f.failed + (f.status === 'error' || f.status === 'empty' ? 1 : 0);
+            sum.skipped += f.skipped; sum.no_assertions += f.no_assertions || 0;
+        });
+        envelopeOk = Object.keys(sum).every(function(k) { return s[k] === sum[k]; }) && s.total === sum.passed + sum.failed + sum.skipped;
+    }
+    var why = (result && result.error) || 'Required supported assertions or verified isolation missing';
+    return files.map(function(file) {
+        if (!list || !s || typeof s !== 'object') return { state: 'error', detail: ('Malformed or incomplete test result\n' + why).slice(0, 6000) };
+        var mine = list.filter(function(f) { return f && f.file === file; });
+        if (mine.length !== 1) return { state: 'error', detail: ((mine.length ? 'Suite reported more than once' : 'Not reported by the test run (it stopped before this suite)') + '\n' + why).slice(0, 6000) };
+        var f = mine[0];
+        return _reloadSuiteResult({
+            success: envelopeOk && f.status === 'pass', error: result.error, aborted: result.aborted,
+            isolation: result.isolation, denied_calls: result.denied_calls, files: [f],
+            summary: { files: 1, total: f.passed + f.failed + f.skipped, passed: f.passed, failed: f.failed, skipped: f.skipped, no_assertions: f.no_assertions || 0 }
+        }, file);
+    });
 }
 
 function _reloadChecklist(controller) {
@@ -226,30 +309,55 @@ async function _reloadWait(promise, signal, ms) {
 }
 async function _runReloadPreflight() {
     var controller = new AbortController(), ui = _reloadChecklist(controller);
-    var workspace, fingerprint, pending = null, settled = true, index = -1, failed = false;
+    var workspace, fingerprint, pending = null, settled = true, running = false, failed = false, files = RELOAD_PREFLIGHT_FILES.slice();
+    var states = files.map(function() { return 'pending'; });
+    function set(i, state, detail) { states[i] = state; ui.update(i, state, detail); }
     try {
         workspace = await _reloadWait(_reloadWorkspace(), controller.signal, 15000);
         ui.status('Workspace: ' + workspace);
         fingerprint = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
-        for (index = 0; index < RELOAD_PREFLIGHT_FILES.length; index++) {
-            if (controller.signal.aborted) throw new Error('Reload cancelled');
-            ui.update(index, 'running', 'Running supported assertions…');
-            settled = false;
-            pending = Promise.resolve().then(function() {
-                if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
-                return executeTool('run_tests', { files: [RELOAD_PREFLIGHT_FILES[index]], tags: ['unit', 'canary'], workspace: workspace, timeout_ms: 120000 }, null, { _runTestsAbortSignal: controller.signal });
-            }).finally(function() { settled = true; });
-            var result = await _reloadWait(pending, controller.signal, 135000);
-            var row = _reloadSuiteResult(result, RELOAD_PREFLIGHT_FILES[index]);
-            ui.update(index, row.state, row.detail);
-            if (row.state !== 'pass') { failed = true; break; }
+        // Same exact sources as the last PASSING preflight: those tests already passed.
+        // The record only decides whether the suites may be SKIPPED: a slow/failed
+        // read counts as "no pass record" (run them). A cancel still cancels.
+        var lastPass = null;
+        try { lastPass = await _reloadWait(_reloadStorageGet(RELOAD_PREFLIGHT_PASS_KEY), controller.signal, 5000); }
+        catch (e) {
+            if (controller.signal.aborted) throw e;
+            console.warn('[reload] pass record unavailable (' + (e && e.message || e) + '); running the suites');
+        }
+        if (_reloadPassMatches(lastPass, workspace, fingerprint)) {
+            console.info('[reload] preflight skipped (unchanged since last pass)');
+            files.forEach(function(_, i) { set(i, 'skipped', 'Preflight skipped (unchanged since last pass)'); });
+            ui.status('Preflight skipped (unchanged since last pass) — building ' + workspace);
+            return { proceed: true, workspace: workspace, skipped: true };
+        }
+        if (controller.signal.aborted) throw new Error('Reload cancelled');
+        // ONE run_tests call for every suite (was one per file); rows map from its entries.
+        files.forEach(function(_, i) { set(i, 'running', 'Running supported assertions…'); });
+        running = true; settled = false;
+        pending = Promise.resolve().then(function() {
+            if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
+            return executeTool('run_tests', { files: files.slice(), tags: ['unit', 'canary'], workspace: workspace, timeout_ms: RELOAD_PREFLIGHT_TIMEOUT_MS }, null, { _runTestsAbortSignal: controller.signal });
+        }).finally(function() { settled = true; });
+        var result = await _reloadWait(pending, controller.signal, RELOAD_PREFLIGHT_WAIT_MS);
+        running = false;
+        _reloadSuiteRows(result, files).forEach(function(row, i) { set(i, row.state, row.detail); });
+        failed = states.some(function(st) { return st !== 'pass'; });
+        // Rows can all pass only on a consistent envelope; still require the run's own verdict.
+        if (!failed && !(result && result.success === true)) {
+            files.forEach(function(_, i) { set(i, 'error', 'Test run did not report success\n' + (result && result.error || '')); });
+            failed = true;
         }
         if (!failed) {
             var current = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
             if (current !== fingerprint || await _reloadWait(_reloadWorkspace(), controller.signal, 15000) !== workspace) {
-                RELOAD_PREFLIGHT_FILES.forEach(function(_, i) { ui.update(i, 'error', 'Workspace changed — previous results are stale.'); });
+                files.forEach(function(_, i) { set(i, 'error', 'Workspace changed — previous results are stale.'); });
                 throw new Error('Workspace changed during tests. Run Reload again, or explicitly force this workspace build.');
             }
+            // Remember this pass: an unchanged workspace skips the preflight next time.
+            var pass = {};
+            pass[RELOAD_PREFLIGHT_PASS_KEY] = { fingerprint: fingerprint, workspace: workspace, files: RELOAD_PREFLIGHT_FILES.join('\n'), at: Date.now() };
+            _reloadStorageSet(pass);
             ui.status('All five supported suites passed — building ' + workspace);
             return { proceed: true, workspace: workspace };
         }
@@ -258,7 +366,7 @@ async function _runReloadPreflight() {
         // `failed` falsy: the finally below closed the checklist and then
         // `await ui.decision` hung forever with the Reload buttons disabled.
         var reason = String(e && (e.message || (typeof e === 'string' ? e : '')) || '').trim() || 'Preflight failed (unknown error)';
-        if (index >= 0 && index < RELOAD_PREFLIGHT_FILES.length) ui.update(index, 'error', reason);
+        if (running) files.forEach(function(_, i) { if (states[i] === 'running') set(i, 'error', reason); });
         failed = reason;
     } finally {
         // Do not offer Force while the host invocation is still settling.
@@ -269,7 +377,7 @@ async function _runReloadPreflight() {
         if (!failed || ui.cancelled()) ui.close();
     }
     if (ui.cancelled()) { ui.close(); return { proceed: false }; }
-    for (var rest = index + 1; rest < RELOAD_PREFLIGHT_FILES.length; rest++) ui.update(rest, 'skipped', 'Not run');
+    files.forEach(function(_, i) { if (states[i] === 'pending') set(i, 'skipped', 'Not run'); });
     ui.failure((typeof failed === 'string' ? failed : 'Required checks did not pass.') + (settled ? ' Cancel or explicitly Force build (tests only; artifact/security checks still apply).' : ' Host cleanup did not settle; Force is unavailable.'), settled && !!workspace);
     try { return { proceed: (await ui.decision) === 'force', workspace: workspace }; }
     finally { ui.close(); }
@@ -277,13 +385,44 @@ async function _runReloadPreflight() {
 
 async function _rebuildBeforeReload() {
     if (typeof isSkillTool !== 'function' || !isSkillTool('extension_build')) return true;
-    if (typeof getDeployDirHandle !== 'function' || !(await getDeployDirHandle())) return true;
+    var dir = typeof getDeployDirHandle === 'function' ? await getDeployDirHandle() : null;
+    _reloadMark('permission');
+    if (!dir) {
+        // getDeployDirHandle() quietly returns null without readwrite permission.
+        // Ask instead of silently restarting on the old files (m4).
+        console.warn('[reload] deploy folder permission not granted; asking before any restart');
+        var choice = await showModal('Deploy folder access needed',
+            'Reload cannot rebuild the extension: readwrite permission for the connected deploy folder is not granted.<br><br>Grant access to rebuild and deploy your workspace changes, Restart anyway to restart on the previously built files, or Cancel.',
+            [{ label: 'Cancel', value: 'cancel', class: 'secondary' }, { label: 'Restart anyway', value: 'restart', class: 'secondary' }, { label: 'Grant access', value: 'grant', class: 'primary' }], 'warning');
+        if (choice === 'restart') return true;
+        if (choice !== 'grant') return false; // Cancel, or superseded by another modal (null)
+        // Straight from the click continuation: the transient user activation lets
+        // getDeployDirHandle()'s own requestPermission() show the browser prompt.
+        dir = typeof getDeployDirHandle === 'function' ? await getDeployDirHandle() : null;
+        _reloadMark('permission-prompt');
+        if (!dir) {
+            if (typeof showSnackbar === 'function') showSnackbar('Deploy folder permission still not granted — Reload cancelled', 'warning');
+            return false;
+        }
+    }
     var gate = await _runReloadPreflight();
+    _reloadMark('preflight');
     if (!gate.proceed) return false;
-    return _buildFrozenWorkspace(gate.workspace);
+    var built = await _buildFrozenWorkspace(gate.workspace);
+    _reloadMark('build+deploy');
+    return built;
 }
 
+// True while an extension build is still running: this page's (stray, timed-out)
+// build or, via RELOAD_BUILD_LOCK, another panel's.
+async function _reloadBuildBusy() {
+    if (_reloadBuildInFlight) return true;
+    if (!navigator.locks || !navigator.locks.request) return false;
+    return navigator.locks.request(RELOAD_BUILD_LOCK, { ifAvailable: true }, function(lock) { return !lock; });
+}
 async function _reloadExtensionLocked() {
+    // M1: refuse EARLY (no preflight, build or restart) while a build still writes files.
+    if (await _reloadBuildBusy()) throw new Error('an extension build is still running — Reload is blocked until it finishes.');
     // chrome.runtime.reload() restarts the WHOLE extension — including the
     // service worker (background.js + the imported sw-bundle.js, where the
     // agent loop and pause handling live). That is the ONLY reliable way to
@@ -314,11 +453,18 @@ async function _reloadExtensionLocked() {
             : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
         if (!(await showConfirmModal('Reload extension?', escapeHtml(msg), 'warning'))) return;
     }
+    _reloadMark('lock/confirm');
 
     // Fire the reload exactly once, and never let anything strand it.
     var _reloaded = false;
     function _doReload() {
         if (_reloaded) return;
+        // Belt and braces (M1): never restart onto a half-written build.
+        if (_reloadBuildInFlight) {
+            console.warn('[reload] extension build still in flight; restart refused');
+            if (typeof showSnackbar === 'function') showSnackbar('Reload blocked: the extension build is still running', 'warning');
+            return;
+        }
         _reloaded = true;
         try {
             chrome.runtime.reload();
@@ -332,25 +478,46 @@ async function _reloadExtensionLocked() {
     // fire the reload. CRITICAL: do NOT gate the reload solely on the storage
     // callback. If the service worker is asleep/busy or storage is blocked, the
     // callback can be delayed or never fire — which previously left
-    // chrome.runtime.reload() unreached and the old SW running. We always fall
-    // back via a short timer.
+    // chrome.runtime.reload() unreached and the old SW running. The write is
+    // raced against a bounded RELOAD_RESTART_FALLBACK_MS timer, so the reload
+    // always fires. The same write carries the phase timings, which the next
+    // boot logs once (_reportLastReloadTimings).
     function _startReloadSequence() {
-        return new Promise(function(resolve) {
-        var start = _doReload;
-        _doReload = function() { start(); resolve(); };
         // Immediate feedback — the reload tears the page down a moment later.
         if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
+        // Timestamp (not `true`): background.js discards a stale marker
+        // instead of consuming it on a much later SW start (the next
+        // toolbar click), which used to open TWO app tabs.
+        var requestedAt = Date.now();
+        var items = { reopenAppTab: requestedAt };
         try {
-            if (chrome.storage && chrome.storage.local) {
-                chrome.storage.local.set({ reopenAppTab: true }, function() {
-                    // Touch lastError so Chrome doesn't log an unchecked-error warning.
-                    if (chrome.runtime.lastError) { /* ignore */ }
-                    _doReload();
+            items[RELOAD_TIMINGS_KEY] = _reloadClock ? _reloadClock.summary(requestedAt) : { requestedAt: requestedAt };
+        } catch (e) { /* timings are diagnostics only; never block the reload */ }
+        var written = new Promise(function(resolve) {
+            try {
+                if (!chrome.storage || !chrome.storage.local) { resolve(); return; }
+                chrome.storage.local.set(items, function() {
+                    // Reading lastError also stops Chrome logging an unchecked-error warning.
+                    if (chrome.runtime.lastError) console.warn('[reload] marker write failed: ' + (chrome.runtime.lastError.message || chrome.runtime.lastError));
+                    resolve();
                 });
+            } catch (e) {
+                console.warn('[reload] marker write threw; restarting anyway: ' + (e && e.message || e));
+                resolve();
             }
-        } catch (e) { /* fall through to the timer */ }
-        // Guaranteed fallback: reload even if the storage callback never returns.
-        setTimeout(_doReload, 400);
+        });
+        // Guaranteed fallback: restart even if the storage callback never returns.
+        var fallbackTimer = null;
+        var fallback = new Promise(function(resolve) {
+            fallbackTimer = setTimeout(function() {
+                console.warn('[reload] marker write not confirmed within ' + RELOAD_RESTART_FALLBACK_MS + 'ms; restarting anyway');
+                resolve();
+            }, RELOAD_RESTART_FALLBACK_MS);
+        });
+        return Promise.race([written, fallback]).then(function() {
+            clearTimeout(fallbackTimer);
+            _reloadMark('restart request');
+            _doReload();
         });
     }
 
@@ -366,7 +533,7 @@ async function _reloadExtensionLocked() {
         // make Chrome force-close the origin's IndexedDB backing store, which then
         // wedges the DB until a full browser restart (see closeDatabase). Fail-open:
         // this only ever delays the reload by a fixed settle, never blocks it.
-        return _prepareRealmsForReload().then(_startReloadSequence);
+        return _prepareRealmsForReload().then(function(){ _reloadMark('prepare'); return _startReloadSequence(); });
     });
 }
 
@@ -399,17 +566,73 @@ if (typeof window !== 'undefined' && window.addEventListener) {
     });
 }
 
+// Boot report: _startReloadSequence stores the phase timings under
+// RELOAD_TIMINGS_KEY right before chrome.runtime.reload(); the restarted page
+// logs them once and clears the entry. Diagnostics only: never throws at boot.
+function _reportLastReloadTimings() {
+    try {
+        if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local || typeof chrome.storage.local.get !== 'function') return;
+        _reloadStorageGet(RELOAD_TIMINGS_KEY).then(function(t) {
+            try {
+                if (!t) return;
+                if (typeof chrome.storage.local.remove === 'function') {
+                    chrome.storage.local.remove(RELOAD_TIMINGS_KEY, function() { if (chrome.runtime && chrome.runtime.lastError) { /* ignore */ } });
+                }
+                console.info('[reload] previous reload: restart ' + (Date.now() - t.requestedAt) + 'ms, total before restart ' + t.total_ms + 'ms, phases ' + JSON.stringify(t.phases));
+            } catch (e) { /* diagnostics only */ }
+        });
+    } catch (e) { /* diagnostics only */ }
+}
+_reportLastReloadTimings();
+
 // Rebuild + redeploy the extension from the workspace before a reload, but only
 // when a deploy folder is connected and the `extension_build` skill tool is
 // loaded (the extension-dev skill is active). Reuses the exact same build the
 // agent runs — no duplicated build logic. Returns a promise resolving to `true`
 // when the caller should proceed with the reload, or `false` to abort (the user
-// declined to reload after a failed build).
+// cancelled a prompt, or declined to reload after a failed build).
+// Starts extension_build under RELOAD_BUILD_LOCK, held until the BUILD settles.
+// Resolves { build } (wrapped: resolving with the promise itself would adopt it and
+// wait for the build), or null when another panel's build holds the lock.
+function _startExtensionBuild(workspace) {
+    return new Promise(function(started, failed) {
+        function run(lock) {
+            if (!lock) { started(null); return; }
+            var build;
+            try { build = Promise.resolve(executeTool('extension_build', { workspace: workspace }, null, { fromSandbox: true })); }
+            catch (e) { build = Promise.reject(e); }
+            function clear() { if (_reloadBuildInFlight === build) _reloadBuildInFlight = null; }
+            // Attached before any caller race: a settled build is cleared before its result is seen.
+            var done = build.then(clear, clear);
+            _reloadBuildInFlight = build;
+            started({ build: build });
+            return done;
+        }
+        if (navigator.locks && navigator.locks.request) navigator.locks.request(RELOAD_BUILD_LOCK, { ifAvailable: true }, run).catch(failed);
+        else run(true);
+    });
+}
+// Waits one RELOAD_BUILD_TIMEOUT_MS window at a time. Resolves { result } once the
+// build settles (rejects with its own error), or null when the user stops waiting.
+async function _awaitExtensionBuild(build) {
+    var TIMED_OUT = {}, minutes = Math.round(RELOAD_BUILD_TIMEOUT_MS / 60000);
+    for (;;) {
+        var timer = null, res;
+        var windowEnd = new Promise(function(resolve) { timer = setTimeout(function() { resolve(TIMED_OUT); }, RELOAD_BUILD_TIMEOUT_MS); });
+        try { res = await Promise.race([build, windowEnd]); } finally { clearTimeout(timer); }
+        if (res !== TIMED_OUT) return { result: res };
+        console.warn('[reload] extension build still running after ' + minutes + ' min');
+        var choice = await showModal('Extension build still running',
+            'The extension build has not finished within ' + minutes + ' minutes and is still writing the deploy folder.<br><br>Reloading now could load a half-written build, so Reload will not restart until it finishes. Keep waiting, or Cancel (Reload stays blocked until the build finishes).',
+            [{ label: 'Cancel', value: 'cancel', class: 'secondary' }, { label: 'Keep waiting', value: 'wait', class: 'primary' }], 'warning');
+        if (choice !== 'wait') return null;
+    }
+}
 async function _buildFrozenWorkspace(workspace) {
     try {
 
         if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
-        // fromSandbox: bypass the skill-tool large-response truncation in
+        // _startExtensionBuild passes fromSandbox to bypass the skill-tool truncation in
         // executeSkillTool (core/140-skills-engine.js) — results over
         // LARGE_RESPONSE_LINE_LIMIT (50) pretty-printed lines are otherwise
         // replaced by a preview envelope that DROPS stats/error/deploy, so the
@@ -418,7 +641,21 @@ async function _buildFrozenWorkspace(workspace) {
         // message). Agent-side sandbox calls already get the untruncated
         // result via this same flag; this is programmatic consumption, not
         // model output, so truncation would only destroy information.
-        var res = await executeTool('extension_build', { workspace: workspace }, null, { fromSandbox: true });
+        // Never a restart while the build runs (M1): each timed-out window asks
+        // Keep waiting / Cancel; Cancel returns false (the build keeps running and
+        // Reload stays blocked until it settles; reloadExtension's finally
+        // re-enables the buttons). A build that settles by rejecting lands in the catch.
+        var start = await _startExtensionBuild(workspace), build = start && start.build;
+        if (!build) {
+            if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: another extension build is still running — Reload is blocked until it finishes', 'warning');
+            return false;
+        }
+        var waited = await _awaitExtensionBuild(build);
+        if (!waited) {
+            if (typeof showSnackbar === 'function') showSnackbar(_reloadBuildInFlight === build ? 'Reload cancelled — the extension build is still running; Reload is blocked until it finishes' : 'Reload cancelled', 'warning');
+            return false;
+        }
+        var res = waited.result;
         var ok = !!(res && res.success && res.stats && res.stats.jsFiles > 0 && res.stats.filesDeployed > 0);
         if (ok) {
             // Surface WHICH workspace was built — with pinning + forks the
@@ -432,6 +669,11 @@ async function _buildFrozenWorkspace(workspace) {
         var err = (res && (res.error || (res.deploy && res.deploy.error))) || 'no files were built/deployed (is the repo cloned?)';
         return await showConfirmModal('Extension rebuild failed', 'Extension rebuild failed:<br>' + escapeHtml(err) + '<br><br>Reload with the previously built files anyway?', 'danger');
     } catch (e) {
+        // Only a SETTLED build may offer the previous files; never while one still writes.
+        if (_reloadBuildInFlight) {
+            if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: ' + (e && e.message ? e.message : String(e)) + ' — the extension build is still running', 'warning');
+            return false;
+        }
         return await showConfirmModal('Extension rebuild error', 'Extension rebuild error:<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>Reload with the previously built files anyway?', 'danger');
     }
 }

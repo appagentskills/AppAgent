@@ -1,6 +1,258 @@
+// SUB-NOTICE-META (B part 2b/2c): an injected sub-agent notice row that
+// reaches the model in full (maybeCacheUserContent never caches it) and
+// renders as cards (250's cached-pill gate). Only notices shown in the
+// PARENT chat count: sub→parent reports (final, need_input 'mid'),
+// lifecycle, sub→parent agent_message. Parent→sub inbox drains ('[N
+// message(s) from parent / inbox]', core/097 _formatInboxDrain /
+// _inboxDrainMeta — the instruction is uncapped) keep today's caching.
+//  - Rows with subNotices: content minus each parent-chat notice's exact
+//    meta.text span (removed once) is what the user added (typed text or
+//    an attachment label — hasUserText is set for both). Not cached while
+//    that remainder is <= the cache limit; cached as today only when the
+//    user's own part alone exceeds it. No locatable parent-chat notice
+//    (drain-only / drifted meta) → the legacy rule.
+//  - Legacy rows: no hasUserText, not an inbox drain, and a report /
+//    lifecycle shape (_hasLegacySubNoticeShape below).
+// B part 2c: the whole predicate lives HERE, with no ui/175 dependency, so
+// it answers the same in the worker bundle (buildAPIMessages; build/build.js
+// WORKER_SHARED_FILES has no ui/175) and in the page (250's cached-pill
+// gate): a row the model gets in full never renders as a cached pill.
+// C3: a REAL user row — role 'user' that is organic (not injected) or an
+// injected row carrying real user text merged in (hasUserText:true, e.g.
+// text typed mid-run coalesced with a queued sub-agent notice). Injected-
+// only rows (sub-agent reports, lifecycle/wake notices) are NOT user turns.
+// Shared file (page + SW bundles); callers typeof-guard it with the same
+// inline fallback.
+function _isRealUserRow(m) {
+    return !!m && m.role === 'user' && (!m.injected || m.hasUserText === true);
+}
+
+var _SUB_INBOX_HEAD_RE = /^\[\d{1,3} message\(s\) from parent \/ inbox\]/;
+var _SUB_INBOX_ANY_RE = /\[\d{1,3} message\(s\) from parent \/ inbox\]/;
+// Non-global copies of ui/175 SUB_NOTICE_RE / SUB_LIFECYCLE_RE, the render
+// path's shapes (.test() on a non-global regex keeps no lastIndex state).
+// Keep them in sync: test/sub-notice-review-fixes.test.js checks this gate
+// against 175's render.
+var _SUB_NOTICE_SHAPE_RE = /Sub-agent "([^"\n]{1,200})" \(([A-Za-z0-9_-]{1,80})\) reported \(([a-z_]{1,24})\)(?::\s?([\s\S]*?))?\s*\u2014 full report via await_handle\("([^"\n]{1,120})"\) or agent_status\./;
+var _SUB_LIFECYCLE_SHAPE_RE = /\[sub-agent lifecycle\] ([^\n(]{1,200}?) \(([A-Za-z0-9_-]{1,80})\): ([^\n]{1,4000})/;
+// Cheap substring pre-checks (the same three as 175 renderSubReportNotices):
+// almost every row fails them all and never reaches a regex.
+function _subNoticePrechecks(text) {
+    return {
+        final: text.indexOf('Sub-agent "') !== -1 && text.indexOf('await_handle(') !== -1,
+        life: text.indexOf('[sub-agent lifecycle]') !== -1,
+        inbox: text.indexOf('message(s) from parent / inbox]') !== -1
+    };
+}
+// Legacy (pre-metadata) shape of a notice shown in the PARENT chat: a
+// sub->parent report or a lifecycle notice, each regex behind its pre-check.
+// Parent->sub inbox drains are not a match (_isInjectedSubNoticeRow
+// excludes them first: they keep today's caching).
+function _hasLegacySubNoticeShape(text, pre) {
+    if (typeof text !== 'string') return false;
+    pre = pre || _subNoticePrechecks(text);
+    return (pre.final && _SUB_NOTICE_SHAPE_RE.test(text))
+        || (pre.life && _SUB_LIFECYCLE_SHAPE_RE.test(text));
+}
+function _isInjectedSubNoticeRow(msg) {
+    if (!msg || !msg.injected || typeof msg.content !== 'string') return false;
+    var t = msg.content;
+    if (Array.isArray(msg.subNotices) && msg.subNotices.length > 0) {
+        var rest = t, found = 0;
+        for (var i = 0; i < msg.subNotices.length; i++) {
+            var sn = msg.subNotices[i];
+            var mt = (sn && typeof sn.text === 'string') ? sn.text : '';
+            // A drain meta's text IS the parent→sub drain: it stays in the
+            // cacheable remainder.
+            if (!mt || _SUB_INBOX_HEAD_RE.test(mt)) continue;
+            var at = rest.indexOf(mt);
+            if (at === -1) continue;
+            rest = rest.slice(0, at) + rest.slice(at + mt.length);
+            found++;
+        }
+        if (found > 0) {
+            var limit = (typeof getCacheCharLimit === 'function') ? getCacheCharLimit() : 16000;
+            return rest.trim().length <= limit;
+        }
+    }
+    if (msg.hasUserText === true) return false;
+    var pre = _subNoticePrechecks(t);
+    if (pre.inbox && _SUB_INBOX_ANY_RE.test(t)) return false;
+    return _hasLegacySubNoticeShape(t, pre);
+}
+
+// C2 UPDATE LEDGER (request-time only, never persisted). On a WAKE run —
+// the latest role:'user' row (the run's anchor) is injected-only
+// (!_isRealUserRow) — buildAPIMessages appends ONE block to that row's
+// OUTGOING content listing every update since the last real user row:
+// structured sub-notice metas (final / mid / message / lifecycle — core/097
+// _subNoticeMeta; parent→sub inbox drains from 'parent' are instructions,
+// not updates) and UI-only sub_msg rows (passive wake_parent:false reports,
+// plus agent_message callouts with no model-visible twin), which stay
+// dropped from the payload themselves. Emitted only with >= 2 items or an
+// item the model was never sent; a lone notice that is the anchor itself
+// gets none. Normal runs (real anchor) are byte-identical. Rows after the
+// anchor are ignored and earlier rows are never touched, so the block is
+// deterministic for a given anchor (prefix-cache stable within a run). No
+// chat row is mutated and no role:'context' row is added (those persist).
+var UPDATE_LEDGER_HEADER = 'Updates since the user\'s last message:';
+var _LEDGER_MAX_ITEMS = 20, _LEDGER_MAX_CHARS = 2000, _LEDGER_LINE_MAX = 200;
+function _ledgerHeadline(s) {
+    var lines = String(s == null ? '' : s).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].replace(/^\s*(?:#{1,6}\s+|[-*>]\s+)/, '').replace(/\s+/g, ' ').trim();
+        if (l) return l;
+    }
+    return '';
+}
+function _ledgerRowItems(row) {
+    var out = [];
+    if (!row) return out;
+    if (row.role === 'sub_msg') {
+        var passive = row.kind === 'passive_report';
+        out.push({ kind: passive ? 'passive report' : 'message', agentId: row.subAgentId || null, name: row.subAgentName || null,
+            status: row.status || null, headline: _ledgerHeadline(row.text), unsent: true,
+            twinOf: passive ? null : String(row.text == null ? '' : row.text) });
+        return out;
+    }
+    if (row.role !== 'user' || _isRealUserRow(row) || !Array.isArray(row.subNotices)) return out;
+    row.subNotices.forEach(function(sn) {
+        if (!sn || typeof sn !== 'object') return;
+        if (sn.kind === 'message' && (!sn.agentId || sn.agentId === 'parent')) return;
+        out.push({ kind: sn.kind || 'notice', agentId: sn.agentId || null, name: sn.name || null, status: sn.status || null,
+            headline: _ledgerHeadline(sn.summary), summary: String(sn.summary == null ? '' : sn.summary) });
+    });
+    return out;
+}
+function _ledgerLine(it) {
+    var who = (it.name && it.agentId && it.name !== it.agentId) ? it.name + ' (' + it.agentId + ')' : (it.agentId || it.name || 'sub-agent');
+    var line = '- [' + it.kind + (it.unsent ? ', not sent to you before' : '') + '] ' + who
+        + (it.status ? ' \u2014 ' + it.status : '') + (it.headline ? ': ' + it.headline : '');
+    return line.length > _LEDGER_LINE_MAX ? line.slice(0, _LEDGER_LINE_MAX - 1) + '\u2026' : line;
+}
+// Newest items win: <= 20 lines and <= ~2000 chars, older ones counted in
+// one leading "…N earlier" line.
+function _formatUpdateLedger(items) {
+    var lines = [], used = UPDATE_LEDGER_HEADER.length, kept = 0;
+    for (var i = items.length - 1; i >= 0 && kept < _LEDGER_MAX_ITEMS; i--) {
+        var l = _ledgerLine(items[i]);
+        if (used + 1 + l.length + (i > 0 ? 48 : 0) > _LEDGER_MAX_CHARS) break;
+        lines.unshift(l); used += 1 + l.length; kept++;
+    }
+    var omitted = items.length - kept;
+    if (omitted > 0) lines.unshift('- \u2026' + omitted + ' earlier update' + (omitted === 1 ? '' : 's') + ' not listed');
+    return UPDATE_LEDGER_HEADER + '\n' + lines.join('\n');
+}
+// LEGACY TWIN: a pre-#968 build delivered an agent_message's model-visible
+// notice as an injected row of only role/content/injected (no subNotices
+// meta), content = core/097 agentMessage to:'parent' '[sub-agent lifecycle]
+// <name> (<agentId>): sent a message: ' + the text flattened
+// (/\s*\n+\s*/g -> ' ') and capped at 3800 (a #969-build row may add a
+// _withWakeFinalReminder line). True when such a row in msgs[start..end]
+// contains this callout's notice, i.e. the callout WAS sent. Anchored on
+// BOTH edges: the flat text never contains '\n' and whatever may follow a
+// notice (the reminder line, the '\n\n' coalescing join) starts with '\n',
+// so a hit counts only at end-of-row or right before a '\n' ("Done" is not
+// "Done with phase 1"); every occurrence in the row is tried. Rows with a
+// non-empty subNotices are left to the meta-twin filter, so windows without
+// legacy rows are byte-identical. Self-contained: the worker bundle has no
+// ui/175.
+function _ledgerLegacyTwinSent(msgs, start, end, agentId, text) {
+    var flat = String(text == null ? '' : text).replace(/\s*\n+\s*/g, ' ').slice(0, 3800);
+    if (!agentId || !flat) return false;
+    var needle = '(' + agentId + '): sent a message: ' + flat;
+    for (var k = start; k <= end; k++) {
+        var r = msgs[k];
+        if (!r || r.role !== 'user' || _isRealUserRow(r)) continue;
+        if (Array.isArray(r.subNotices) && r.subNotices.length > 0) continue;
+        if (typeof r.content !== 'string') continue;
+        for (var at = r.content.indexOf(needle); at !== -1; at = r.content.indexOf(needle, at + 1)) {
+            var next = at + needle.length;
+            if (next === r.content.length || r.content.charAt(next) === '\n') return true;
+        }
+    }
+    return false;
+}
+// C-gate: after-response hook rows (isHookMessage: role 'user', NOT
+// injected — worker/020-page-stubs.js) are neither the anchor nor a window
+// boundary (same convention as findHookAnswerSpan and the progress-hook
+// walk). Otherwise a hook run between two wake runs truncated the window at
+// the hook row, and a hook run's own request dropped the wake anchor's block
+// (payload prefix changed -> prefix-cache miss).
+function _isLedgerBoundaryRow(m) { return _isRealUserRow(m) && m.isHookMessage !== true; }
+// {anchorIdx, block, count} or null (normal run / nothing worth listing).
+function _buildUpdateLedger(msgs) {
+    if (!Array.isArray(msgs)) return null;
+    var ai = -1;
+    for (var i = msgs.length - 1; i >= 0; i--) { if (msgs[i] && msgs[i].role === 'user' && msgs[i].isHookMessage !== true) { ai = i; break; } }
+    if (ai === -1 || _isRealUserRow(msgs[ai])) return null;
+    var start = ai;
+    while (start > 0 && !_isLedgerBoundaryRow(msgs[start - 1])) start--;
+    var items = [];
+    for (var k = start; k <= ai; k++) items.push.apply(items, _ledgerRowItems(msgs[k]));
+    // An agent_message sub_msg callout whose model-visible twin (kind
+    // 'message' meta, same sub, same summary) is in the window is listed once.
+    items = items.filter(function(it) {
+        if (it.twinOf == null) return true;
+        return !items.some(function(o) { return o.twinOf == null && o.kind === 'message' && o.agentId === it.agentId && o.summary === it.twinOf; });
+    });
+    // A callout left without a meta twin whose notice a pre-#968 build
+    // delivered in the window (_ledgerLegacyTwinSent) was sent too: it is
+    // listed as a plain [message] item.
+    items.forEach(function(it) {
+        if (it.twinOf != null && it.unsent && _ledgerLegacyTwinSent(msgs, start, ai, it.agentId, it.twinOf)) { it.unsent = false; it.twinOf = null; }
+    });
+    var unsent = items.some(function(it) { return it.unsent; });
+    if (items.length < 2 && !unsent) return null;
+    return { anchorIdx: ai, block: _formatUpdateLedger(items), count: items.length };
+}
+function _appendLedgerBlock(content, block) {
+    if (!block) return content;
+    if (typeof content === 'string') return content + '\n\n' + block;
+    if (Array.isArray(content)) return content.concat([{ type: 'text', text: block }]);
+    return content;
+}
+// C2b: core/097 _withWakeFinalReminder appends a reminder line to EVERY wake
+// notice, so a coalesced row with N notices repeats it N times. Outgoing
+// USER content keeps ONE whole-line copy (the last); persisted rows and
+// their meta.text spans are untouched. The literal lives ONLY in 097 (its
+// helper stays self-contained — standalone-extracted by
+// test/chat-streaming-worker-dialogue.test.js); the line is derived from it.
+function _wakeFinalReminderLine() {
+    if (typeof _withWakeFinalReminder !== 'function') return '';
+    var s = String(_withWakeFinalReminder(''));
+    return s.charAt(0) === '\n' ? s.slice(1) : s;
+}
+function _collapseReminderText(text, line) {
+    if (typeof text !== 'string' || !line) return text;
+    var first = text.indexOf(line);
+    if (first === -1 || text.indexOf(line, first + line.length) === -1) return text;
+    var lines = text.split('\n'), last = lines.lastIndexOf(line);
+    if (last === -1) return text;
+    var out = lines.filter(function(l, i) { return l !== line || i === last; });
+    return out.length === lines.length ? text : out.join('\n');
+}
+function _collapseWakeReminders(content, line) {
+    if (!line) return content;
+    if (typeof content === 'string') return _collapseReminderText(content, line);
+    if (!Array.isArray(content)) return content;
+    var changed = false;
+    var parts = content.map(function(p) {
+        if (!p || p.type !== 'text' || typeof p.text !== 'string') return p;
+        var t = _collapseReminderText(p.text, line);
+        if (t === p.text) return p;
+        changed = true;
+        return Object.assign({}, p, { text: t }); // keeps cache_control etc.
+    });
+    return changed ? parts : content;
+}
+
 function buildAPIMessages(chatMessages, chatId) {
     // Clone messages to avoid mutating originals
     var cloned = chatMessages.map(function(m) { return Object.assign({}, m); });
+    // C2: request-time update ledger (null on normal runs).
+    // typeof-guarded: some tests extract buildAPIMessages standalone.
+    var _ledger = (typeof _buildUpdateLedger === 'function') ? _buildUpdateLedger(chatMessages) : null;
 
     // Helper: substitute a cache reference for any user message content that exceeds
     // the cache limit. Mirrors how oversized tool results are cached. Mutates the
@@ -9,6 +261,12 @@ function buildAPIMessages(chatMessages, chatId) {
         if (typeof content !== 'string') return content;
         if (typeof processUserMessageForCache !== 'function') return content;
         if (!chatId) return content;
+        // SUB-NOTICE-META (B part 2b): an injected sub-agent notice row is
+        // never cached — the model gets the full notice, even when a stale
+        // cachedContentId is on the row (a cached notice read as "[User
+        // pasted a long message]"). Typed-text rows, normal user rows and
+        // context rows are untouched.
+        if (originalMsg && originalMsg.role === 'user' && typeof _isInjectedSubNoticeRow === 'function' && _isInjectedSubNoticeRow(originalMsg)) return content;
         // Already cached on a previous turn? Reuse the existing reference.
         if (originalMsg && originalMsg.cachedContentId) {
             var chat = chats[chatId];
@@ -37,7 +295,11 @@ function buildAPIMessages(chatMessages, chatId) {
 
     var result = cloned.map(function(m, idx) {
         var original = chatMessages[idx];
-        if (m.role === 'user') return { role: 'user', content: maybeCacheUserContent(original, m.content) };
+        if (m.role === 'user') {
+            var _uc = maybeCacheUserContent(original, m.content);
+            if (_ledger && idx === _ledger.anchorIdx) _uc = _appendLedgerBlock(_uc, _ledger.block);
+            return { role: 'user', content: _uc };
+        }
         if (m.role === 'assistant') {
             var msg = { role: 'assistant' };
             if (m.content) msg.content = m.content;
@@ -168,6 +430,16 @@ function buildAPIMessages(chatMessages, chatId) {
             continue;
         }
         merged.push(cur);
+    }
+    // C2b: one reminder line per outgoing user message (after the merge, so
+    // consecutive rows joined above collapse too). Same reference = no change.
+    var _remLine = (typeof _wakeFinalReminderLine === 'function') ? _wakeFinalReminderLine() : '';
+    if (_remLine && typeof _collapseWakeReminders === 'function') {
+        for (var di = 0; di < merged.length; di++) {
+            if (merged[di].role !== 'user') continue;
+            var _dc = _collapseWakeReminders(merged[di].content, _remLine);
+            if (_dc !== merged[di].content) merged[di] = Object.assign({}, merged[di], { content: _dc });
+        }
     }
     return merged;
 }

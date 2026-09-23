@@ -67,6 +67,16 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     var loadCustom = (typeof loadCustomSystemPrompt === 'function') ? loadCustomSystemPrompt() : Promise.resolve();
     var loadHooks = (typeof loadHooksSettings === 'function') ? loadHooksSettings() : Promise.resolve();
     var loadPerms = (typeof loadToolPermissionsInWorker === 'function') ? loadToolPermissionsInWorker() : Promise.resolve();
+    // B2c-1: keep the BOUNDED (safe(), 20s deadline, never rejects) load
+    // promise on `self` so the 'permissions-update' handler
+    // (worker/130-port-bridge.js _swQueuePermissionsUpdate) can serialize
+    // panel edits behind it — a delta applied onto the still-empty boot maps
+    // used to persist + rebroadcast a 1-key map and wipe the stored ones.
+    // It resolves with the per-slot hydration map (also on
+    // self._swPermsLoaded) on success, or null when safe() hit the deadline
+    // / the loader threw — the queue treats null as a FAILED load and keeps
+    // deltas for unhydrated slots in memory until their late read merges.
+    self._swPermsLoadP = safe(loadPerms, 'toolPermissions');
     // "Allow for this chat" grants (sessionPermissions) — rehydrated from
     // chrome.storage.session so an MV3 eviction / Reload does not re-prompt
     // for tools the user already granted in a chat (worker/025).
@@ -107,7 +117,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         safe(loadActive, 'activeSkills'),
         safe(loadCustom, 'customSystemPrompt'),
         safe(loadHooks, 'hooksEnabled'),
-        safe(loadPerms, 'toolPermissions'),
+        self._swPermsLoadP,
         safe(loadChatGrants, 'chatPermissionGrants'),
         safe(loadCtxWindow, 'assumedContextTokens'),
         safe(loadDocs, 'smartDocuments'),

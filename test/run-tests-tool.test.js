@@ -89,8 +89,10 @@ async function runRunTestsToolSafetyTests(sources) {
     } };
     cfg.files = ['test/a.test.js', 'test/b.test.js']; cfg.sources = ['', ''];
     var program = new (Object.getPrototypeOf(async function() {}).constructor)('evalModule', 'window', 'parent', RT.rtBuildSandboxCode(cfg));
-    var programResult = await program(async function(_, path) { return path === 'test/harness.js' ? H : {}; }, fakeWindow, { postMessage: function(m) { timeoutMessage = m; } });
+    var fileArgs = [];
+    var programResult = await program(async function(_, path, args) { if (path === 'test/harness.js') return H; fileArgs.push(args); return {}; }, fakeWindow, { postMessage: function(m) { timeoutMessage = m; } });
     check('per-test timeout signals trusted host and aborts remaining files', timeoutMessage.type === 'sandboxTestTimeout' && programResult.aborted && filesVisited.length === 1);
+    check('test files receive the resolved workspace as args.workspace', fileArgs.length === 1 && fileArgs[0].workspace === 'owner/repo::main');
     // The actual cleanup snapshot callbacks must stop after their independent
     // deadline even when an already-started read settles late. All clocks/effects fake.
     var clock = 1000, reads = [], statuses = 0, finishLateRead;

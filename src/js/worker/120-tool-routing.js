@@ -863,8 +863,66 @@ function _broadcastApprovalPrompt(envelope, primaryPort) {
 // page resolver via the same remote-result lane. The loop has ALREADY
 // recorded the '[Tool call abandoned …]' placeholder — the orphan promise
 // resolution below is discarded by the loop's _interrupted branch.
+// S1 twin of ui/150-tool-approval.js _approvalRowMatchesCall: a recorded
+// approval row authorizes only the SAME tool + permission key + args.
+function _swApprovalStableJson(v) {
+    if (v === undefined) return 'null';
+    if (v === null || typeof v !== 'object') { var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+    if (Array.isArray(v)) return '[' + v.map(_swApprovalStableJson).join(',') + ']';
+    return '{' + Object.keys(v).sort().filter(function(k) { return v[k] !== undefined && typeof v[k] !== 'function'; })
+        .map(function(k) { return JSON.stringify(k) + ':' + _swApprovalStableJson(v[k]); }).join(',') + '}';
+}
+function _swApprovalRowMatchesCall(row, toolName, displayName, permissionKey, args) {
+    if (!row) return false;
+    if (row.actualToolName) { if (row.actualToolName !== toolName) return false; }
+    else if (row.toolName !== displayName) return false;
+    if (row.permissionKey && permissionKey && row.permissionKey !== permissionKey) return false;
+    return _swApprovalStableJson(row.args || {}) === _swApprovalStableJson(args || {});
+}
+
+// H2: an approval for the abandoned call is keyed by its approvalRequestId
+// (live _pendingUIToolCalls entry {isApproval, toolCallId} / parked
+// '__approval_prompt__' entry with input.toolCallId), NOT by the tool call
+// id — so the plain lookups in abandonPendingUIToolCall miss it and a later
+// click would still execute the abandoned call. Also covers sandbox calls
+// of an abandoned js_eval/skill ('prog_<abandonedId>_<n>').
+function _swApprovalBelongsTo(approvalToolCallId, toolCallId) {
+    if (!approvalToolCallId || !toolCallId) return false;
+    return approvalToolCallId === toolCallId || approvalToolCallId.indexOf('prog_' + toolCallId + '_') === 0;
+}
+function _swCancelApprovalsFor(chatId, toolCallId, reason) {
+    var verdict = { allowed: false, cancelled: true, abandoned: true, cancelReason: reason || 'abandoned' };
+    var settled = [];
+    Object.keys(_pendingUIToolCalls).forEach(function(k) {
+        var e = _pendingUIToolCalls[k];
+        if (!e || !e.isApproval || (chatId && e.chatId && e.chatId !== chatId)) return;
+        if (!_swApprovalBelongsTo(e.toolCallId, toolCallId)) return;
+        if (e._backstopTimer) { clearTimeout(e._backstopTimer); e._backstopTimer = null; }
+        delete _pendingUIToolCalls[k];
+        try { e.resolve(verdict); } catch (e1) {}
+        settled.push(e.toolCallId);
+    });
+    var arr = chatId && parkedToolCallsByChatId[chatId];
+    if (Array.isArray(arr)) {
+        for (var i = arr.length - 1; i >= 0; i--) {
+            var p = arr[i];
+            if (!p || p.name !== '__approval_prompt__' || !p.input || !_swApprovalBelongsTo(p.input.toolCallId, toolCallId)) continue;
+            arr.splice(i, 1);
+            try { if (p._ttlTimer) { clearTimeout(p._ttlTimer); p._ttlTimer = null; } } catch (eT) {}
+            try { p.resolve(verdict); } catch (e2) {}
+            AgentEvents.emit('toolUnparked', { chatId: chatId, toolCallId: p.toolCallId, reason: reason || 'abandoned' });
+            settled.push(p.input.toolCallId);
+        }
+    }
+    // Flip each still-pending approval row + tell every panel to drop its card.
+    settled.forEach(function(tc) { _swSettleApprovalRow(chatId, tc, 'cancelled', false); });
+    return settled.length;
+}
+
 function abandonPendingUIToolCall(chatId, toolCallId, reason) {
     var result = { success: false, cancelled: true, abandoned: true, message: 'Tool call abandoned — ' + (reason || 'interrupted') };
+    // H2: cancel approval prompts (live + parked) for this call first.
+    _swCancelApprovalsFor(chatId, toolCallId, reason);
     // Locate the seeded row FIRST — the page-side resolver map is keyed by
     // promptId, so the forward below must carry the real promptId.
     var row = null;
@@ -1482,6 +1540,14 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             for (var i = 0; i < chat.messages.length; i++) {
                 var msg = chat.messages[i];
                 if (msg.role === 'approval' && msg.toolCallId === toolCallId) {
+                    if (!_swApprovalRowMatchesCall(msg, toolName, displayName, permissionKey, args)) {
+                        // S1: id collision with a DIFFERENT call (sandbox ids
+                        // are replayable) — never reuse its verdict; prompt
+                        // fresh under a new id so _swSeedApprovalRow's
+                        // idempotence can't swallow the new pending row.
+                        toolCallId = toolCallId + '_r' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+                        break;
+                    }
                     if (msg.status === 'allowed' || msg.status === 'session_allowed' || msg.status === 'always_allowed') {
                         return Object.assign({ allowed: true }, baseResult);
                     } else if (msg.status === 'denied') {

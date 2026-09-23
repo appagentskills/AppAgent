@@ -30,8 +30,21 @@ function openHistoryView() {
     pushHistoryState('history', null);
 }
 
+// Rows/Gallery layout for the history page (shared helpers: ui/045-page-layout.js).
+var HISTORY_PAGE_LAYOUT_KEY = 'historyPageLayout'; // 'rows' | 'gallery'
+function historySetPageLayout(layout) {
+    pageLayoutSet(HISTORY_PAGE_LAYOUT_KEY, layout);
+    renderHistoryPage();
+}
+
 function renderHistoryPage() {
     var historyList = document.getElementById('history-list');
+    var layoutSlot = document.getElementById('history-layout-toggle');
+    if (layoutSlot && typeof pageLayoutToggleHtml === 'function' && !layoutSlot.firstChild) {
+        layoutSlot.innerHTML = pageLayoutToggleHtml('historySetPageLayout');
+    }
+    var historyLayout = typeof pageLayoutGet === 'function' ? pageLayoutGet(HISTORY_PAGE_LAYOUT_KEY) : 'rows';
+    if (typeof pageLayoutSyncButtons === 'function') pageLayoutSyncButtons(layoutSlot, historyLayout);
     var historyStats = document.getElementById('history-stats');
     var historySearchIcon = document.getElementById('history-search-icon');
     var historyDownloadIcon = document.getElementById('history-download-icon');
@@ -44,6 +57,8 @@ function renderHistoryPage() {
     
     var q = historySearchQuery ? historySearchQuery.toLowerCase().trim() : '';
     var isSearching = q && q.length >= 2;
+    // Search results reuse the sidebar's compact chat rows, so they always list as rows.
+    historyList.className = 'history-list widget-library-items page-list layout-' + (isSearching ? 'rows' : historyLayout);
     
     // Get filtered chat IDs
     var chatIds = filterHistoryChats(historySearchQuery);

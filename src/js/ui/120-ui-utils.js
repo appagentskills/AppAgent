@@ -11,8 +11,9 @@ function toggleToolCallExpanded(msgIndex, tcIdx, details) {
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     if (!msg.toolCallsExpanded) msg.toolCallsExpanded = {};
-    // onclick may fire before browser toggle - use opposite of PREVIOUS stored state
-    var wasOpen = msg.toolCallsExpanded.hasOwnProperty(tcIdx) ? msg.toolCallsExpanded[tcIdx] : !details.open;
+    // onclick fires before browser toggle - use opposite of PREVIOUS stored state,
+    // or of the current (pre-toggle) open state when nothing is stored yet
+    var wasOpen = msg.toolCallsExpanded.hasOwnProperty(tcIdx) ? msg.toolCallsExpanded[tcIdx] : details.open;
     msg.toolCallsExpanded[tcIdx] = !wasOpen;
 }
 

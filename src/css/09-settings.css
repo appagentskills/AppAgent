@@ -42,7 +42,13 @@
 .tool-permission-select:focus { outline: none; border-color: var(--text-muted); }
 .tool-permission-group { margin-top: var(--space-6); padding-top: var(--space-6); border-top: 1px solid var(--secondary-border); }
 .tool-permission-group-title { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-secondary); margin-bottom: var(--space-4); }
+/* Sub-items keep their label aligned with the group title (negative margin
+   offsets the inner padding) while the hover highlight gets breathing room. */
 .tool-permission-subitem { padding-left: 0; }
+.settings-page-content .tool-permission-subitem { padding-left: var(--space-4); margin-left: calc(var(--space-4) * -1); }
+.tool-permission-item { transition: background-color 0.12s ease; }
+/* Full-width layout: tie the right-aligned control to its label on hover. */
+.tool-permission-item:hover { background: var(--bg-tertiary); }
 .tool-permission-subitem .tool-permission-name { font-size: var(--text-caption); color: var(--icon-color); }
 
 /* Custom Dropdown Component */

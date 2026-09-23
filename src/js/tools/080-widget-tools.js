@@ -1050,6 +1050,8 @@ async function executeManageSkill(args) {
             // Reload tools immediately if the edited file is a JS file on an active skill.
             if (activeSkills[skillId] && assetType === 'js') {
                 await loadSkillTools(skillId);
+                // H20: the SW keeps its own skillTools copy — refresh it too.
+                if (typeof notifySkillToolsChanged === 'function') notifySkillToolsChanged();
             }
             renderSkillsList();
             var fileMsg = 'File edited: ' + editFilename + '. ' + edits.length + ' edit(s) applied.';
@@ -1122,6 +1124,8 @@ async function executeManageSkill(args) {
         // XML files require reactivation to upload to instance
         if (activeSkills[skillId] && ext === 'js') {
             await loadSkillTools(skillId);
+            // H20: the SW keeps its own skillTools copy — refresh it too.
+            if (typeof notifySkillToolsChanged === 'function') notifySkillToolsChanged();
         }
 
         var msg = 'File ' + (action === 'add_file' ? 'added' : 'updated') + ': ' + filename;
@@ -1147,6 +1151,8 @@ async function executeManageSkill(args) {
         // Reload tools if skill is active and it was a JS file
         if (activeSkills[skillId] && delExt === 'js') {
             await loadSkillTools(skillId);
+            // H20: the SW keeps its own skillTools copy — refresh it too.
+            if (typeof notifySkillToolsChanged === 'function') notifySkillToolsChanged();
         }
 
         var msg = 'File deleted: ' + filename;

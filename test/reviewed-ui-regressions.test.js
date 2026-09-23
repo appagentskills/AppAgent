@@ -22,9 +22,11 @@ async function runReviewedUiAudit(sources) {
     var names = ['processImageFile', 'appendPendingImageForContext', 'clearPendingImages',
         'getCurrentPendingContext', 'savePendingImagesForContext', 'restorePendingImagesForContext',
         'savePendingTextForContext', 'restorePendingTextForContext', 'persistPendingTextsToStorage',
-        'persistPendingImagesToSession', 'getEditedTurnAttachments', 'editMessage'];
+        'persistPendingImagesToSession', 'getEditedTurnAttachments', 'editMessage',
+        'setPendingImagesOwner', 'getPendingImagesOwnerContext'];
     var code = names.map(function(n) { return declaration(attachments, n); }).join('\n') + '\n' +
-        declaration(navigation, 'selectChat') + '\n' + declaration(sources['src/js/ui/030-home-view.js'], 'sendHomeMessage');
+        declaration(navigation, 'selectChat') + '\n' + declaration(sources['src/js/ui/030-home-view.js'], 'sendHomeMessage') + '\n' +
+        declaration(sources['src/js/ui/050-history-view.js'], 'openChatFromHistory');
     function fixture(view) {
         var readers = [], images = [], compression = [], renders = [], writes = [], errors = [], elements = {}, api;
         function element(id) {
@@ -35,6 +37,7 @@ async function runReviewedUiAudit(sources) {
         var env = { currentView: view || 'chat', currentChatId: 'A',
             chats: { A: { id: 'A', title: 'Source', messages: [] }, B: { id: 'B', messages: [] } },
             pendingImageAttachments: [], chatPendingImages: {}, chatPendingTexts: {},
+            pendingImagesOwnerContext: null, pendingImagesOwnerList: null,
             runningChatIds: {}, pendingInjectionsByChatId: {}, sidebarCollapsed: true,
             isRunning: false, activeStreamingChatId: null, lastApiError: null,
             pendingInjection: null, pendingInjectionImages: null,
@@ -60,7 +63,7 @@ async function runReviewedUiAudit(sources) {
             'hideContinueButton hideRetryButton hideSnackbar clearUpdateSet loadVersionHistory renderMessages ' +
             'updateChatTitleHeader updateInputPosition refreshContinueButtonForChat pushHistoryState ' +
             'showPendingApprovalNotifications hideAllPanels showChatView updateAllButtonStates').split(' ').forEach(function(n) { env[n] = function() {}; });
-        api = new Function('env', 'with(env){\n' + code + '\nreturn {' + names.concat(['selectChat', 'sendHomeMessage']).map(function(n) { return n + ':' + n; }).join(',') + '};}')(env);
+        api = new Function('env', 'with(env){\n' + code + '\nreturn {' + names.concat(['selectChat', 'sendHomeMessage', 'openChatFromHistory']).map(function(n) { return n + ':' + n; }).join(',') + '};}')(env);
         function switchTo(id) {
             var old = api.getCurrentPendingContext(); api.savePendingImagesForContext(old); api.savePendingTextForContext(old);
             env.currentView = id === 'home' ? 'home' : 'chat'; if (id !== 'home') env.currentChatId = id;
@@ -125,6 +128,25 @@ async function runReviewedUiAudit(sources) {
     });
     await test('saving an empty active draft clears a stale map entry', function() {
         var f = fixture(); f.env.chatPendingImages.A = [{ name: 'stale' }]; f.api.savePendingImagesForContext('A'); check(!f.env.chatPendingImages.A, 'stale draft retained');
+    });
+    await test('A draft survives A -> Home -> History -> open chat (live list is Home, not A)', function() {
+        var f = fixture(); f.env.chatPendingImages.home = [{ name: 'home.png' }]; f.env.pendingImageAttachments = [{ name: 'a.pdf' }];
+        f.switchTo('home'); f.env.currentView = 'history'; f.api.openChatFromHistory('B');
+        check(f.env.chatPendingImages.A && f.env.chatPendingImages.A[0].name === 'a.pdf', 'A draft deleted by history open');
+        check(f.env.chatPendingImages.home[0].name === 'home.png' && !f.env.pendingImageAttachments.length, 'home draft lost or leaked into B');
+        f.api.openChatFromHistory('A'); check(f.env.pendingImageAttachments[0].name === 'a.pdf' && !f.env.chatPendingImages.B, 'A not restored / B polluted');
+    });
+    await test('owning chat that removed all attachments still clears its saved draft on switch', function() {
+        var f = fixture(); f.env.chatPendingImages.A = [{ name: 'x' }]; f.switchTo('A'); f.env.pendingImageAttachments.splice(0, 1);
+        f.switchTo('B'); check(!f.env.chatPendingImages.A, 'emptied owner draft retained');
+    });
+    await test('uploads finishing while History covers Home land in their origin draft only', function() {
+        var f = fixture(); f.env.pendingImageAttachments = [{ name: 'a0' }];
+        f.api.processImageFile(file('text/plain', 'a1.txt')); f.switchTo('home'); f.api.processImageFile(file('text/plain', 'h.txt'));
+        f.env.currentView = 'history'; finish(f.readers[0], 'a1'); finish(f.readers[1], 'h');
+        check(f.env.chatPendingImages.A.map(function(a) { return a.name; }).join() === 'a0,a1.txt', 'A upload lost or A overwritten');
+        check(f.env.pendingImageAttachments.length === 1 && f.env.chatPendingImages.home[0].name === 'h.txt', 'home upload misrouted');
+        f.api.openChatFromHistory('B'); check(f.env.chatPendingImages.A.length === 2 && f.env.chatPendingImages.home.length === 1, 'drafts lost on history open');
     });
     var legacyDoc = { role: 'context', content: '[User referenced Smart Document "Legacy" (doc_id: old_doc). Use the document tool with action "read" and this doc_id to access its content.]' };
     await test('edit branch preserves earlier history and all attachment metadata, isolates source draft and transcript', function() {
@@ -258,5 +280,5 @@ async function runReviewedUiAudit(sources) {
     return results;
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css"];
+var PATHS = ["src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css"];
 await registerRunner('reviewed-ui-regressions', async function() { return runReviewedUiAudit(await loadSources(PATHS)); });

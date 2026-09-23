@@ -1,0 +1,14 @@
+/* Settings + Help pages on the shared full-width layout (ui/045-page-layout.js,
+   ui/046-settings-help-search.js). Toolbar = title · search · count · actions.
+   Selectors are panel-scoped so they beat 18-panels.css and 20-responsive.css
+   (the 70% / 90% / 800px narrow containers). */
+.settings-page-panel > .settings-page-content,
+.docs-panel > .docs-content { width: 100%; max-width: none; margin: 0; box-sizing: border-box; }
+.settings-page-panel > .settings-page-content { padding: var(--space-8) var(--space-8) var(--space-12); }
+.docs-panel > .docs-content { padding: 0; }
+.docs-panel .docs-main { min-width: 0; }
+
+/* Search filtering */
+.page-search-hidden { display: none !important; }
+.settings-page-content > .page-search-empty,
+.docs-main > .page-search-empty { margin: var(--space-8) 0; }

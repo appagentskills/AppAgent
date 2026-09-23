@@ -43,7 +43,7 @@
       "src/js/worker/100-agent-event-broadcast.js": 1,
       "src/js/worker/115-storage.js": 4,
       "src/js/worker/120-tool-routing.js": 5,
-      "src/js/worker/130-port-bridge.js": 4,
+      "src/js/worker/130-port-bridge.js": 5,
       "src/platform/extension/background.js": 1
     },
     "renderMessages": {

@@ -32,6 +32,9 @@ function syncDashboardPageMode() {
     var library = mode === 'library';
     grid.style.display = library ? 'none' : '';
     lib.style.display = library ? 'flex' : 'none';
+    // Library search/toggle only apply in "All widgets" mode; the empty slot still spaces the toolbar.
+    var slot = document.getElementById('dashboard-toolbar-slot');
+    if (slot) slot.classList.toggle('slot-idle', !library);
     document.querySelectorAll('#dashboard-actions .dashboard-mode-btn').forEach(function(btn) {
         var on = btn.dataset.mode === mode;
         btn.classList.toggle('active', on);
@@ -101,7 +104,24 @@ function onWidgetLibraryKeydown(e) {
 function renderWidgetLibrary() {
     var lib = document.getElementById('widget-library');
     if (!lib) return;
-    if (!lib.querySelector('.widget-library-header')) {
+    // Search/count/layout sit in the dashboard page toolbar slot, next to the
+    // page actions (ui/045-page-layout.js); fall back to the library itself.
+    var slot = typeof pageLayoutToggleHtml === 'function' ? document.getElementById('dashboard-toolbar-slot') : null;
+    var host = slot || lib;
+    if (slot && !slot.querySelector('.widget-library-header')) {
+        widgetLibraryState.bound = null;
+        slot.innerHTML = '<div class="widget-library-header">' +
+            '<label class="widget-library-search">' + UI_ICONS.search +
+                '<input type="search" class="widget-library-search-input" placeholder="Search widgets\u2026" aria-label="Search widgets">' +
+            '</label>' +
+            '<span class="widget-library-count" id="widget-library-count"></span>' +
+            pageLayoutToggleHtml('setWidgetLibraryLayout') +
+        '</div>';
+    }
+    if (slot && !document.getElementById('widget-library-items')) {
+        lib.innerHTML = '<div class="widget-library-items" id="widget-library-items"></div>';
+    }
+    if (!host.querySelector('.widget-library-header')) {
         widgetLibraryState.bound = null; // header rebuilt → child listeners must be re-bound
         lib.innerHTML = '<div class="widget-library-header">' +
             '<label class="widget-library-search">' + UI_ICONS.search +
@@ -122,7 +142,7 @@ function renderWidgetLibrary() {
         // Debounced like the chat search (ui/180-search.js, 250ms): every
         // render tears down and re-mounts thumbnail iframes, so per-keystroke
         // rendering thrashed the library on long queries.
-        lib.querySelector('.widget-library-search-input').addEventListener('input', function(e) {
+        host.querySelector('.widget-library-search-input').addEventListener('input', function(e) {
             var value = (e.target.value || '').trim().toLowerCase();
             if (widgetLibraryState.searchTimer) clearTimeout(widgetLibraryState.searchTimer);
             widgetLibraryState.searchTimer = setTimeout(function() {
@@ -131,7 +151,7 @@ function renderWidgetLibrary() {
                 renderWidgetLibraryItems();
             }, 250);
         });
-        lib.querySelectorAll('.widget-library-layout-btn').forEach(function(btn) {
+        if (!slot) lib.querySelectorAll('.widget-library-layout-btn').forEach(function(btn) {
             btn.addEventListener('click', function() { setWidgetLibraryLayout(btn.dataset.layout); });
         });
         // Named references: re-binding the SAME element after a header rebuild
@@ -141,12 +161,12 @@ function renderWidgetLibrary() {
         lib.addEventListener('keydown', onWidgetLibraryKeydown);
     }
     var layout = getWidgetLibraryLayout();
-    lib.querySelectorAll('.widget-library-layout-btn').forEach(function(btn) {
+    host.querySelectorAll('.widget-library-layout-btn').forEach(function(btn) {
         var on = btn.dataset.layout === layout;
         btn.classList.toggle('active', on);
         btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
-    var input = lib.querySelector('.widget-library-search-input');
+    var input = host.querySelector('.widget-library-search-input');
     if (input && input.value.trim().toLowerCase() !== widgetLibraryState.query) input.value = widgetLibraryState.query;
     renderWidgetLibraryItems();
 }

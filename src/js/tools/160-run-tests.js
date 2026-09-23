@@ -86,7 +86,7 @@ function rtBuildSandboxCode(cfg) {
         '  var file = cfg.files[i], t0 = Date.now(), entry = { file: file, status: "pass", passed: 0, failed: 0, skipped: 0, failures: [] };',
         '  H.reset(file);',
         '  try {',
-        '    await evalModule(cfg.sources[i], file, {});',
+        '    await evalModule(cfg.sources[i], file, { workspace: cfg.workspace });',
         '    var r = await H.run({ tags: cfg.tags, timeout_ms: cfg.test_timeout_ms, read_only_host: true, onTimeout: function() { parent.postMessage({ type: "sandboxTestTimeout" }, "*"); } });',
         '    entry.passed = r.passed; entry.failed = r.failed; entry.skipped = r.skipped; entry.no_assertions = r.no_assertions || 0; entry.tests = r.tests.length;',
         '    entry.skips = r.tests.filter(function(t) { return t.status === "skip"; }).map(function(t) { return { name: t.name, reason: t.reason }; });',

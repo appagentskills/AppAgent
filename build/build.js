@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { applyDocsPlaceholders } = require('./docs-placeholders');
 
 const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'src');
@@ -960,12 +961,15 @@ ${processedBody}
     // Embed the documentation markdown (docs/documentation.md) and the project
     // README (README.md) as base64 strings. Both are merged at runtime via
     // mergeReadmeIntoDocs (see src/js/ui/060-docs-view.js + docs/docs-renderer.js).
-    // __VERSION__ is substituted inside documentation.md before encoding so the
-    // runtime never sees the placeholder.
+    // __VERSION__ and __CHANGELOG__ (changelog.md) are substituted inside
+    // documentation.md before encoding so the runtime never sees the
+    // placeholders — see build/docs-placeholders.js for the ordering rules.
+    const changelogMdPath = path.join(ROOT, 'changelog.md');
+    const changelogMd = fs.existsSync(changelogMdPath) ? fs.readFileSync(changelogMdPath, 'utf-8') : '';
+    if (!changelogMd) console.warn(`  Docs: ${changelogMdPath} not found — Help page changelog will show a fallback`);
     const docsMdPath = path.join(ROOT, 'docs', 'documentation.md');
     if (fs.existsSync(docsMdPath)) {
-        let docsMd = fs.readFileSync(docsMdPath, 'utf-8');
-        docsMd = docsMd.split('__VERSION__').join(version);
+        const docsMd = applyDocsPlaceholders(fs.readFileSync(docsMdPath, 'utf-8'), version, changelogMd);
         const docsB64 = Buffer.from(docsMd, 'utf-8').toString('base64');
         appJS = appJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
         console.log(`  Docs: ${docsMd.length} bytes embedded`);
@@ -1001,7 +1005,7 @@ ${processedBody}
         // they'd just be inert strings, but substituting keeps parity with
         // the page bundle behavior.
         const docsMdForWorker = fs.existsSync(path.join(ROOT, 'docs', 'documentation.md'))
-            ? fs.readFileSync(path.join(ROOT, 'docs', 'documentation.md'), 'utf-8').split('__VERSION__').join(version)
+            ? applyDocsPlaceholders(fs.readFileSync(path.join(ROOT, 'docs', 'documentation.md'), 'utf-8'), version, changelogMd)
             : '';
         if (docsMdForWorker) workerJS = workerJS.split('__DOCS_MARKDOWN_B64__').join(Buffer.from(docsMdForWorker, 'utf-8').toString('base64'));
         const readmeMdForWorker = fs.existsSync(path.join(ROOT, 'README.md'))

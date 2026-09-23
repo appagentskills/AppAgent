@@ -439,7 +439,7 @@ function renderChatItem(c) {
                            (match.type === 'tool_call' ? (TOOL_DISPLAY_NAMES[match.toolName] || match.toolName) : 
                            (TOOL_DISPLAY_NAMES[match.toolName] || match.toolName) + ' result');
             snippetsHtml += '<div class="chat-result-snippet-item" onclick="event.stopPropagation(); handleSearchSnippetClick(\'' + c.id + '\', ' + idx + ')">' +
-                '<span class="snippet-type">' + typeIcon + ' ' + typeLabel + '</span>' +
+                '<span class="snippet-type">' + typeIcon + ' ' + escapeHtml(typeLabel) + '</span>' +
                 '<span class="snippet-text">' + match.snippet + '</span>' +
             '</div>';
         });

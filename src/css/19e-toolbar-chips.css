@@ -1,0 +1,49 @@
+/* Tinted Icon Chips — page-toolbar action buttons (tagged by ui/047-toolbar-chips.js).
+   `.tb-chip-btn` = the button, `.tb-chip` = the icon (no background box), `.tb-chip-<tint>` = its icon colour.
+   Tints: violet (open/external), green (import), amber (export/download), sky (more/other),
+   rose (destructive). Light theme = :root tokens; dark = :root[data-theme="dark"].
+
+   Height: every toolbar control (chip buttons, segmented toggles, search) matches the
+   header status pills (04-header.css .model-name / .credits-display / .storage-display /
+   .ws-header-status: 12px text + var(--space-2) 4px padding top/bottom + 1px border ≈ 26px). */
+:root { --toolbar-control-h: 26px; }
+
+.skills-action-btn.tb-chip-btn { height: var(--toolbar-control-h); box-sizing: border-box; padding: 0 var(--space-5); gap: var(--space-3); border-radius: var(--radius-lg); font-size: var(--text-body-sm); font-weight: var(--font-medium); line-height: 1; white-space: nowrap; background: var(--bg-white); border: 1px solid var(--secondary-border); color: var(--text-primary); }
+.skills-action-btn.tb-chip-btn:hover { background: var(--secondary-light); }
+
+.skills-action-btn .action-icon.tb-chip { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: auto; height: auto; margin: 0; padding: 0; background: none; border-radius: 0; }
+/* Neutral icon colour at low specificity so the .tb-chip-<tint> rules below always win */
+.tb-chip { color: var(--text-secondary); }
+.skills-action-btn .action-icon.tb-chip .ui-icon, .skills-action-btn .action-icon.tb-chip > svg { width: 12px; height: 12px; }
+
+/* Primary (Add Widget / New Skill / New Document): the extension's primary tinted-pill
+   language — same recipe as the header .storage-display pill, so it adapts per theme. */
+.skills-action-btn.tb-chip-btn.primary,
+:root[data-theme="dark"] .skills-action-btn.tb-chip-btn.primary { background: var(--primary-lighter); border-color: var(--primary-light); color: var(--primary); }
+.skills-action-btn.tb-chip-btn.primary:hover,
+:root[data-theme="dark"] .skills-action-btn.tb-chip-btn.primary:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary-hover); }
+.skills-action-btn.tb-chip-btn.primary .action-icon.tb-chip { color: var(--primary); }
+.skills-action-btn.tb-chip-btn.primary:hover .action-icon.tb-chip { color: var(--primary-hover); }
+
+/* Light theme icon tints (deeper colours so icons stay readable on white) */
+.tb-chip.tb-chip-violet { color: #6d28d9; }
+.tb-chip.tb-chip-green  { color: #047857; }
+.tb-chip.tb-chip-amber  { color: #b45309; }
+.tb-chip.tb-chip-sky    { color: #0369a1; }
+.tb-chip.tb-chip-rose   { color: #be185d; }
+
+/* Dark theme — the picked "Tinted Icon Chips" spec (secondary buttons + tints) */
+:root[data-theme="dark"] .skills-action-btn.tb-chip-btn { background: #1c1f23; border-color: #2a2e34; color: #dde1e6; }
+:root[data-theme="dark"] .skills-action-btn.tb-chip-btn:hover { background: #23272c; }
+:root[data-theme="dark"] .tb-chip.tb-chip-violet { color: #b9a4ff; }
+:root[data-theme="dark"] .tb-chip.tb-chip-green  { color: #5fe0ae; }
+:root[data-theme="dark"] .tb-chip.tb-chip-amber  { color: #fbcd5a; }
+:root[data-theme="dark"] .tb-chip.tb-chip-sky    { color: #6cc8f5; }
+:root[data-theme="dark"] .tb-chip.tb-chip-rose   { color: #f58cc4; }
+
+/* Same height for the toolbar's segmented toggles (Rows/Gallery, Dashboard/All widgets)
+   and search — height/padding only, colours untouched. */
+.page-toolbar .segmented-toggle { height: var(--toolbar-control-h); box-sizing: border-box; align-items: stretch; }
+.page-toolbar .segmented-toggle button { height: 100%; box-sizing: border-box; padding: 0 var(--space-6); line-height: 1; }
+.page-toolbar .widget-library-search,
+.page-toolbar .history-search-lg { height: var(--toolbar-control-h); box-sizing: border-box; padding-top: 0; padding-bottom: 0; }

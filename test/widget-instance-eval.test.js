@@ -158,12 +158,17 @@ async function runWidgetEvalTests(sources) {
         n.getAttribute = function(k) { return attrs[k]; };
         n.removeAttribute = function(k) { delete attrs[k]; };
         n.appendChild = function(child) { child.parentNode = n; n.children.push(child); return child; };
-        n.insertBefore = function(child, before) { child.parentNode = n; n.children.splice(n.children.indexOf(before), 0, child); };
         n.remove = function() { if (n.parentNode) n.parentNode.children.splice(n.parentNode.children.indexOf(n), 1); n.parentNode = null; n.isConnected = false; };
         n.replaceWith = function(fresh) { var p = n.parentNode; p.children.splice(p.children.indexOf(n), 1, fresh); fresh.parentNode = p; n.parentNode = null; n.isConnected = false; };
         n.replaceChildren = function() { n.children = []; };
         n.getRootNode = function() { return root || (n.parentNode ? n.parentNode.getRootNode() : dlDoc); };
-        n.closest = function(selector) { return selector === '[data-widget-id]' && attrs['data-widget-id'] ? n : null; };
+        n.closest = function(selector) {
+            if (selector === '[data-widget-id]') return attrs['data-widget-id'] ? n : null;
+            // Header scope lookup (widgetVersionSlot): walk light-DOM parents.
+            if (n.versionSlot) return n;
+            return n.parentNode && n.parentNode.closest ? n.parentNode.closest(selector) : null;
+        };
+        n.insertBefore = function(child, before) { child.parentNode = n; var i = n.children.indexOf(before); n.children.splice(i < 0 ? 0 : i, 0, child); };
         n.getClientRects = function() { return n.isConnected ? [1] : []; };
         n.contentWindow = { postMessage: function() {} };
         n.cloneNode = function() { var f = treeNode(tag, root); f.dataset = Object.assign({}, n.dataset); f.style = Object.assign({}, n.style); f.className = n.className; Object.keys(attrs).forEach(function(k) { f.setAttribute(k, attrs[k]); }); return f; };
@@ -223,17 +228,29 @@ async function runWidgetEvalTests(sources) {
     dlFirst.__widgetCleanup(); dlFirst.isConnected = false;
     check('closed deep-link origin is unavailable, not redirected to same saved widget', (await live.eval({ action: 'eval', instance_id: oldOrigin, code: 'return 1;' })).code === 'INSTANCE_UNAVAILABLE' && !!live.lookup(dlSecond));
     check('deep-link saved widget ID is not an execution fallback', (await live.eval({ action: 'eval', instance_id: 'widget_same', code: 'return 1;' })).code === 'INSTANCE_UNAVAILABLE');
-    check('saved render mounts actual Latest picker', dlSecond.__versionPicker.value === '' && dlSecond.__versionPicker.children[0].textContent === 'Latest (v1)');
-    var originalInstance = live.lookup(dlSecond).instance_id;
-    dlSecond.__versionPicker.value = '1'; dlSecond.__versionPicker.emit('change');
+    // Deep-link tab / side panel is headerless: the picker must not render.
+    check('headerless deep-link render mounts no version picker', !dlSecond.__versionPicker && dlSecond.dataset.savedWidgetId === 'widget_same');
+    // Headed card: scope node with a header button-group slot.
+    function headedCard() {
+        var card = treeNode('div'), slot = treeNode('div'); card.versionSlot = true;
+        card.appendChild(slot); card.querySelector = function() { return slot; };
+        dlDoc.body.appendChild(card); return { card: card, slot: slot };
+    }
+    var chatCard = headedCard(), headed = treeNode('iframe'); headed.className = 'widget-iframe';
+    chatCard.card.appendChild(headed); mount(headed, '<p>one</p>', 'widget_same');
+    check('headed render mounts actual Latest picker in the header slot', headed.__versionPicker && headed.__versionPicker.parentNode === chatCard.slot && headed.__versionPicker.value === '' && headed.__versionPicker.children[0].textContent === 'Latest (v1)');
+    var originalInstance = live.lookup(headed).instance_id;
+    headed.__versionPicker.value = '1'; headed.__versionPicker.emit('change');
     var historical = pickerApi.frames().find(function(f) { return f.dataset.selectedWidgetVersion === '1'; });
-    check('history selection replaces render and invalidates old eval instance', historical !== dlSecond && !live.list().some(function(e) { return e.instance_id === originalInstance; }));
+    check('history selection replaces render and invalidates old eval instance', historical !== headed && !live.list().some(function(e) { return e.instance_id === originalInstance; }));
+    check('replacement picker stays in the header slot (no duplicate)', historical.__versionPicker.parentNode === chatCard.slot && chatCard.slot.children.length === 1);
     check('history selection preserves immutable HEAD', pickerStore.view().version === 1 && revisions.length === 1);
     // Dashboard open shadow root + a Latest chat copy of the same saved widget.
-    var host = treeNode('div'), shadow = treeNode('shadow'); host.className = 'widget-shadow-host'; host.shadowRoot = shadow; shadow.host = host; shadow.getRootNode = function() { return shadow; }; dlDoc.body.appendChild(host);
+    var dashCard = headedCard();
+    var host = treeNode('div'), shadow = treeNode('shadow'); host.className = 'widget-shadow-host'; host.shadowRoot = shadow; shadow.host = host; shadow.getRootNode = function() { return shadow; }; dashCard.card.appendChild(host);
     var dashboardFrame = treeNode('iframe', shadow); dashboardFrame.className = 'widget-iframe'; shadow.appendChild(dashboardFrame); mount(dashboardFrame, '<p>one</p>', 'widget_same');
     var chatFrame = treeNode('iframe'); chatFrame.className = 'widget-iframe'; dlDoc.body.appendChild(chatFrame); mount(chatFrame, '<p>one</p>', 'widget_same');
-    check('dashboard picker styles are installed inside shadow root', !!shadow.querySelector('style[data-widget-version-style]'));
+    check('dashboard shadow render puts its picker in the light-DOM card header, not the shadow root', dashboardFrame.__versionPicker && dashboardFrame.__versionPicker.parentNode === dashCard.slot && shadow.children.length === 1);
     var historicalInstance = live.lookup(historical).instance_id;
     revisions.push({ version: 2, contentVersion: 2, html: '<p>two</p>', title: 'Saved', createdAt: 2 });
     pickerApi.refresh('widget_same');
@@ -243,7 +260,7 @@ async function runWidgetEvalTests(sources) {
     check('Latest chat refreshes to same committed revision', chatLatest !== chatFrame && chatLatest.dataset.savedWidgetVersion === '2');
     check('historical render selection and eval instance survive new commits', historical.dataset.selectedWidgetVersion === '1' && live.lookup(historical).instance_id === historicalInstance);
     check('historical picker menu receives new revision without resetting selection', historical.__versionPicker.value === '1' && historical.__versionPicker.children[0].textContent === 'Latest (v2)' && historical.__versionPicker.children.length === 3);
-    check('shadow stylesheet is not duplicated on replacement', shadow.querySelectorAll('style[data-widget-version-style]').length === 1);
+    check('dashboard header keeps exactly one picker after refresh', dashCard.slot.children.length === 1 && shadowLatest.__versionPicker && shadowLatest.__versionPicker.parentNode === dashCard.slot);
     var countBeforeInvalid = pickerApi.frames().length;
     pickerApi.select(historical, '999');
     check('missing revision never replaces live render', historical.isConnected && pickerApi.frames().length === countBeforeInvalid);

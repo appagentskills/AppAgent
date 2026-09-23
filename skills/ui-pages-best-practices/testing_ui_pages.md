@@ -4,6 +4,8 @@
 
 Define the test scenarios for the UI page before starting to test. What should the page do? What user interactions should work?
 
+> **API first:** create/clean up test data and verify backend effects with `servicenow_api`; use the UI only for the page under test. Impersonate with `iframe_tool` `impersonate` (REST-based), never the UI impersonation menu.
+
 ## Available Tools
 
 ### Inspection Tools
@@ -29,7 +31,7 @@ Define the test scenarios for the UI page before starting to test. What should t
 | `iframe_tool` | `scroll` | Scroll to `position` (top/bottom), coordinates (`x`/`y`), or a CSS `selector` |
 | `iframe_tool` | `resize` | Resize viewport with `preset` (mobile, tablet, desktop, fullhd) or custom `width`/`height` |
 | `iframe_tool` | `set_style` | Apply CSS styles (`styles` object) or toggle classes (`className`: "add:cls", "remove:cls", "toggle:cls") |
-| `iframe_tool` | `impersonate` | Impersonate a ServiceNow user by username, name, or sys_id. Use `user: "stop"` to end |
+| `iframe_tool` | `impersonate` | Impersonate a ServiceNow user by username, name, or sys_id via the REST API (never the UI menu). Use `user: "stop"` to end |
 
 ### Editing Tools
 

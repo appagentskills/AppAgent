@@ -104,7 +104,40 @@ textarea.sdoc-prompt-input { min-height: 60px; resize: vertical; }
 .documents-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg-light); overflow-y: auto; }
 .documents-header { display: flex; align-items: center; gap: var(--space-6); padding: var(--space-6) var(--space-8); background: var(--bg-white); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; height: 48px; box-sizing: border-box; position: sticky; top: 0; z-index: 10; }
 .documents-title { font-size: var(--text-xl); font-weight: var(--font-semibold); color: var(--text-primary); flex: 1; }
-.documents-list { padding: var(--space-8) var(--space-10); max-width: 800px; margin: 0 auto; width: 70%; display: flex; flex-direction: column; gap: var(--space-6); }
+.documents-list { width: 100%; display: flex; flex-direction: column; box-sizing: border-box; }
+
+/* Search + Rows/Gallery — reuses the Widget Library classes (css/19b-widget-library.css);
+   only the documents-specific bits live here. The panel (not the list) scrolls, so the
+   library's own scroll box / bottom padding is neutralised and the toolbar sticks under
+   the 48px page header. */
+.documents-list .sdoc-page-toolbar { position: sticky; top: 48px; z-index: 5; border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); padding: var(--space-4) var(--space-6); }
+
+.sdoc-lib-item { cursor: pointer; outline: none; }
+.sdoc-lib-item:focus-visible { box-shadow: 0 0 0 2px var(--primary); }
+.sdoc-lib-icon { flex: 0 0 36px; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-md); background: var(--primary-lighter); color: var(--primary); }
+.sdoc-lib-icon .ui-icon { width: 18px; height: 18px; }
+.sdoc-lib-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.sdoc-lib-preview { order: 1; font-size: var(--text-body-sm); line-height: 1.45; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sdoc-lib-preview.empty { font-style: italic; color: var(--text-muted); }
+.sdoc-lib-info .sdoc-lib-meta { order: 2; }
+.sdoc-lib-stat { display: inline-flex; align-items: center; gap: var(--space-1); white-space: nowrap; }
+.sdoc-lib-stat .ui-icon { width: 11px; height: 11px; }
+.sdoc-scope-badge.scope-shared { background: var(--primary-lighter); border-color: var(--primary-light); color: var(--primary); }
+.sdoc-lib-actions { display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0; }
+.sdoc-page-empty .skills-action-btn .ui-icon { width: 14px; height: 14px; margin: 0; opacity: 1; }
+
+/* Rows: compact list, actions revealed on hover / keyboard focus */
+.layout-rows .sdoc-lib-item { padding: var(--space-5) var(--space-6); gap: var(--space-6); }
+.layout-rows .sdoc-lib-actions { opacity: 0; transition: opacity var(--transition-fast); }
+.layout-rows .sdoc-lib-item:hover .sdoc-lib-actions, .layout-rows .sdoc-lib-item:focus-within .sdoc-lib-actions { opacity: 1; }
+
+/* Gallery: card = title, meta, multi-line content preview, action footer */
+.layout-gallery .sdoc-lib-item { display: flex; flex-direction: column; padding: var(--space-6); gap: var(--space-4); }
+.layout-gallery .sdoc-lib-icon { display: none; }
+.layout-gallery .sdoc-lib-info { gap: var(--space-3); }
+.layout-gallery .sdoc-lib-info .sdoc-lib-meta { flex-wrap: wrap; }
+.layout-gallery .sdoc-lib-preview { order: 3; white-space: normal; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; height: calc(5 * 1.45em); box-sizing: content-box; padding: var(--space-4) var(--space-5); background: var(--bg-light); border-radius: var(--radius-md); }
+.layout-gallery .sdoc-lib-actions { justify-content: flex-end; border-top: 1px solid var(--secondary-border); padding-top: var(--space-4); }
 
 /* ─── Right Sidebar (version-sidebar) Documents Section ─── */
 .version-documents-section { padding: var(--space-6); border-bottom: 1px solid var(--secondary-border); }

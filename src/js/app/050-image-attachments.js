@@ -24,7 +24,10 @@ function appendPendingImageForContext(contextKey, attachment) {
         if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" was dropped: its chat was deleted', 'warning');
         return;
     }
-    if (getCurrentPendingContext() === contextKey) {
+    // Compare against the context that OWNS the live list, not the visible view:
+    // on History/other panels getCurrentPendingContext() still names the last chat
+    // even though the live list may be Home's draft.
+    if (getPendingImagesOwnerContext() === contextKey) {
         pendingImageAttachments.push(attachment);
         renderPendingImages();
     } else {
@@ -264,25 +267,25 @@ function renderPendingImages() {
                 html += '<div class="pending-image-item pending-file-item" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">DOC</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'pdf') {
                 html += '<div class="pending-image-item pending-pdf-item" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-pdf-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-pdf-label">PDF</span></div>';
                 html += '<div class="pending-pdf-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'file') {
                 var fileExt = (img.name || '').split('.').pop().toUpperCase();
                 html += '<div class="pending-image-item pending-file-item" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">' + escapeHtml(fileExt) + '</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
                 html += '</div>';
             } else {
                 html += '<div class="pending-image-item" onclick="viewPendingImage(' + idx + ')">';
-                html += '<img src="' + img.base64 + '" alt="' + escapeHtml(img.name) + '" />';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove">×</button>';
+                html += '<img src="' + escapeHtml(img.base64) + '" alt="' + escapeHtml(img.name) + '" />';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
                 html += '</div>';
             }
         });
@@ -513,14 +516,41 @@ function openPdfFromMessage(msgIndex) {
 
 // Clear all pending images
 function clearPendingImages() {
+    // The attachments being consumed are the live list, so clear its owner's draft.
+    var ownerContext = getPendingImagesOwnerContext();
     pendingImageAttachments = [];
+    setPendingImagesOwner(ownerContext);
     // Also clear from per-chat map
-    delete chatPendingImages[getCurrentPendingContext()];
+    delete chatPendingImages[ownerContext];
     renderPendingImages();
 }
 
-// Save current pending images for a chat/view key, then restore for a new key
+// Which draft context owns the live composer list. Recorded together with the
+// array identity: other modules reassign pendingImageAttachments directly
+// (newChat, sendHomeMessage, unsent-message restore) while their composer is on
+// screen; once the array is replaced the record is stale and the visible
+// context is the owner again.
+var pendingImagesOwnerContext = null;
+var pendingImagesOwnerList = null;
+
+function setPendingImagesOwner(contextKey) {
+    pendingImagesOwnerContext = contextKey;
+    pendingImagesOwnerList = pendingImageAttachments;
+}
+
+function getPendingImagesOwnerContext() {
+    if (pendingImagesOwnerContext !== null && pendingImagesOwnerList === pendingImageAttachments) {
+        return pendingImagesOwnerContext;
+    }
+    return getCurrentPendingContext();
+}
+
+// Save current pending images for a chat/view key, then restore for a new key.
+// Only the context that owns the live list may save or delete from it: after
+// chat A -> Home -> History the live list is Home's draft while
+// getCurrentPendingContext() still says A, and saving it as A would wipe A.
 function savePendingImagesForContext(contextKey) {
+    if (contextKey !== getPendingImagesOwnerContext()) return;
     if (pendingImageAttachments.length > 0) {
         chatPendingImages[contextKey] = pendingImageAttachments.slice();
     } else {
@@ -530,6 +560,7 @@ function savePendingImagesForContext(contextKey) {
 
 function restorePendingImagesForContext(contextKey) {
     pendingImageAttachments = (chatPendingImages[contextKey] || []).slice();
+    setPendingImagesOwner(contextKey);
     renderPendingImages();
 }
 
@@ -571,8 +602,9 @@ async function restorePendingTextsFromStorage() {
 }
 
 function persistPendingImagesToSession() {
-    // Keep in-memory map in sync with active images
-    var ctx = getCurrentPendingContext();
+    // Keep in-memory map in sync with active images, under the live list's owner
+    var ctx = getPendingImagesOwnerContext();
+    setPendingImagesOwner(ctx);
     if (pendingImageAttachments.length > 0) {
         chatPendingImages[ctx] = pendingImageAttachments.slice();
     } else {

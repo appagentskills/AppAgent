@@ -345,17 +345,60 @@ function _skillLargeResult(chatId, result, totalLines) {
     return out;
 }
 
+// ---- H20: skill tools are callable ONLY while their skill is active ----
+// `skillTools` is a per-realm cache that can hold entries for a skill that is
+// no longer in `activeSkills` (a stale realm that has not re-run
+// loadActiveSkills yet, or the window inside activateSkill between
+// loadSkillTools and the activeSkills write). Every "is this tool callable /
+// visible" question therefore checks `activeSkills` too. Fail closed: no
+// `activeSkills` object means no skill is active.
+function _isSkillActive(skillId) {
+    try {
+        return !!(typeof activeSkills === 'object' && activeSkills && activeSkills[skillId]);
+    } catch (e) { return false; }
+}
+
+// Id of the first ACTIVE skill that registers `toolName`, or null. When
+// `visibleOnly` is set, devOnly-hidden skills are skipped too.
+function _findActiveSkillToolOwner(toolName, visibleOnly) {
+    for (var skillId in skillTools) {
+        if (!skillTools[skillId] || !skillTools[skillId][toolName]) continue;
+        if (!_isSkillActive(skillId)) continue;
+        if (visibleOnly && isSkillDevHidden(skillId)) continue;
+        return skillId;
+    }
+    return null;
+}
+
+// Id of an INACTIVE skill whose (stale) registry entry still names
+// `toolName`, or null. Only used to build a clear error message.
+function getInactiveSkillToolOwner(toolName) {
+    for (var skillId in skillTools) {
+        if (skillTools[skillId] && skillTools[skillId][toolName] && !_isSkillActive(skillId)) return skillId;
+    }
+    return null;
+}
+
+// Tell the service worker (which keeps its OWN activeSkills/skillTools copy)
+// to re-run loadActiveSkills after any activation-state or tool-code change.
+// pushSkillToolsRefreshToOffscreen lives in app/045-agent-port-bridge-page.js
+// (page bundle only); in the SW realm it is undefined and this is a no-op.
+function notifySkillToolsChanged() {
+    try {
+        if (typeof pushSkillToolsRefreshToOffscreen === 'function') pushSkillToolsRefreshToOffscreen();
+    } catch (e) { /* port down: the panel-hello refresh self-heals */ }
+}
+
 // Execute skill tool in isolated sandbox (same security model as js_eval)
 async function executeSkillTool(toolName, args, options, messageIndex) {
-    var toolInfo = null;
-    for (var skillId in skillTools) {
-        if (skillTools[skillId][toolName]) {
-            toolInfo = skillTools[skillId][toolName];
-            break;
-        }
-    }
+    var ownerId = _findActiveSkillToolOwner(toolName, false);
+    var toolInfo = ownerId ? skillTools[ownerId][toolName] : null;
 
     if (!toolInfo) {
+        var inactiveOwner = getInactiveSkillToolOwner(toolName);
+        if (inactiveOwner) {
+            return { success: false, error: 'Skill tool "' + toolName + '" belongs to skill "' + inactiveOwner + '", which is not active. Activate the skill first (manage_skill action:"activate" or the Skills page).' };
+        }
         return { success: false, error: 'Skill tool not found: ' + toolName };
     }
 
@@ -546,11 +589,9 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
     }
 }
 
+// True only for a tool registered under a skill that is currently ACTIVE (H20).
 function isSkillTool(toolName) {
-    for (var skillId in skillTools) {
-        if (skillTools[skillId][toolName]) return true;
-    }
-    return false;
+    return _findActiveSkillToolOwner(toolName, false) !== null;
 }
 
 // Same as isSkillTool, but honours the devOnly gate that getActiveSkillTools()
@@ -558,11 +599,7 @@ function isSkillTool(toolName) {
 // uncallable) outside extension dev mode. Any code path that treats "is a
 // skill tool" as "is allowed to run" must use THIS, not isSkillTool.
 function isVisibleSkillTool(toolName) {
-    for (var skillId in skillTools) {
-        if (!skillTools[skillId][toolName]) continue;
-        return !isSkillDevHidden(skillId);
-    }
-    return false;
+    return _findActiveSkillToolOwner(toolName, true) !== null;
 }
 
 // Skill Activation/Deactivation with XML loading and version tracking
@@ -585,6 +622,7 @@ async function activateSkill(skillId) {
     if (xmlAssets.length === 0) {
         activeSkills[skillId] = { xmlBackups: {}, activatedAt: Date.now() };
         await saveActiveSkills();
+        notifySkillToolsChanged(); // H20: SW re-reads activeSkills (persisted above)
         renderSkillsList();
         var msg = 'Skill activated with ' + toolCount + ' tool(s)';
         return { success: true, message: msg };
@@ -632,6 +670,7 @@ async function activateSkill(skillId) {
     
     activeSkills[skillId] = { xmlBackups: backups, activatedAt: Date.now() };
     await saveActiveSkills();
+    notifySkillToolsChanged(); // H20: SW re-reads activeSkills (persisted above)
     renderSkillsList();
     
     var msg = 'Skill activated';
@@ -672,6 +711,7 @@ async function deactivateSkill(skillId) {
     
     delete activeSkills[skillId];
     await saveActiveSkills();
+    notifySkillToolsChanged(); // H20: SW drops this skill's tools too
 
     // Mark embedded skills as user-modified so import doesn't re-activate
     var skill = skills[skillId];
@@ -708,7 +748,13 @@ async function saveActiveSkills() {
 }
 
 async function loadActiveSkills() {
-    activeSkills = await getSetting('activeSkills', {});
+    activeSkills = (await getSetting('activeSkills', {})) || {};
+    // H20: drop tools of skills that are no longer active. Without this a
+    // re-run (the SW 'skills-refresh' handler) only ever ADDED tools, so a
+    // skill deactivated in the panel stayed callable in the SW.
+    Object.keys(skillTools).forEach(function(loadedId) {
+        if (!activeSkills[loadedId]) unloadSkillTools(loadedId);
+    });
     // Load JS tools for all active skills
     for (var skillId in activeSkills) {
         await loadSkillTools(skillId);

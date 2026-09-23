@@ -108,11 +108,13 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         var f=fixture(false,1),m=message(1);f.env.chats.A.messages=[m];f.api.updateStreamingMessage(0,message(1),'A');m.isStreaming=false;f.frames.shift()();
         m.isStreaming=true;f.api.updateStreamingMessage(0,m,'A');f.env.currentChatId='B';f.frames.shift()();check(f.paints.length===0,'stale frame painted');
     });
-    var uiNames=['_subActionStateHtml','_subParentMessageState','_subParentHistoryKey','_subThreadEntries','_workerModalContentKey','_hasStandaloneSubMessage','renderSubReportNotices','renderSubAgentMessage'];
+    var uiNames=['_subActionStateHtml','_subParentMessageState','_subParentHistoryKey','_subThreadEntries','_workerModalContentKey','_hasStandaloneSubMessage','renderSubReportNotices','renderSubAgentMessage','_subRenderNewlines','renderSubMarkdown','_applySectionIcons','_liftSectionIcon'];
     function uiFixture(chats, realMarkdown) {
         var env={chats:chats||{},escapeHtml:escape,formatContent:function(s){return '<md>'+escape(s)+'</md>';},
             SUB_NOTICE_VIEW_ICON:'eye',_subNoticeCardHtml:function(name,id,state,text){return '<notice>'+escape(text)+'</notice>';},_parentMsgCardHtml:function(n,text){return '<inbox>'+escape(text)+'</inbox>';}};
         var vars=['SUB_ACTION_STATES','SUB_ACTION_TASK_STATUSES','SUB_LIFECYCLE_RE','PARENT_INBOX_RE','SUB_NOTICE_RE'].map(function(n){var m=ui.match(new RegExp('^var '+n+' = .*;$','m'));check(m,'missing '+n);return m[0];});
+        // renderSubMarkdown (the shared sub renderer) lifts section icons — load the real emoji-lead regex block.
+        vars.push(ui.slice(ui.indexOf('var _SECTION_EMOJI_RE = '), ui.indexOf('function _liftSectionIcon(')));
         if (realMarkdown) {
             env.window={currentSearchHighlight:null};env.UI_ICONS={copy:'copy'};env.storeRawCopy=function(){return 'copy';};
             env.highlightJS=escape;env._knownDocIdRegex=function(){return null;};
@@ -169,7 +171,7 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
             _findSubAgentCard:function(){return card;},_repaintParent:noop,_subAgentsPersist:noop,saveChatsToStorage:noop,_notifyListeners:noop,
             _callerOwnsTarget:function(){return true;},_drainPool:noop,_mintNewSpawnHandle:function(){return 'h';},_saturationWarning:function(){return null;},
             _escalationSuggestion:function(){return null;},_applyChatModelStamp:noop,_notifySubLifecycle:noop,_providerToTier:function(){return 'same';},console:console};
-        var names=['agentMessage','_wakeSubAgentImpl','_recordSubParentMessage','_formatInboxDrain'];
+        var names=['agentMessage','_withWakeFinalReminder','_wakeSubAgentImpl','_recordSubParentMessage','_formatInboxDrain','_subNormalizeNewlines','_subNoticeMeta','_subNoticeList','_queueNoticeInjection','_noticeRow','_inboxDrainMeta'];
         var api=load(env,names.map(function(n){return declaration(core,n);}),names);
         return {env:env,api:api,card:card,rec:rec,ui:uiFixture(env.chats)};
     }
@@ -271,6 +273,10 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         f.api.agentMessage({to:'parent',content:'**bold**\n\n- item'},{chatId:'child'});
         var notice=f.env.pendingInjectionsByChatId.parent.text,rows=f.env.chats.parent.messages;
         check(notice.indexOf('sent a message: **bold** - item')>=0,'model injection missing');
+        // C1: the model notice ends with the cumulative-final reminder, and meta.text covers it (UI hides the span).
+        check(/ - item\nReminder: your final message must be a cumulative digest of everything since the user's last message\.$/.test(notice),'cumulative-final reminder missing from model notice');
+        var _nm=f.env.pendingInjectionsByChatId.parent.subNotices;
+        check(Array.isArray(_nm) && _nm.length===1 && _nm[0].text===notice && _nm[0].summary==='**bold**\n\n- item','meta.text must cover the whole notice incl. reminder');
         var u=uiFixture({},true),standalone=rows[rows.length-1],html=u.renderSubAgentMessage(standalone,1);
         check(html.indexOf('<strong>bold</strong>')>=0 && html.indexOf('<li>')>=0,'real markdown pipeline lost block formatting');
         var mixed=u.renderSubReportNotices('**before**\n\n'+notice+'\n\n**after**',rows);

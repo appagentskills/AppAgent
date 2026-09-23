@@ -1,349 +1,163 @@
----
-name: feature-deroulement
-description: Mandatory mental walkthrough (déroulement) the agent performs after building or modifying any user-facing feature. Surfaces wiring bugs, hallucinated symbols, and missed edge cases by forcing the agent to narrate the full lifecycle in prose with named functions, files, CSS classes, and grep-verified references. Includes a reverse-mode (branch-coverage) pass mandatory whenever the changed code has more than 5 branch points.
----
-
 # Feature Déroulement
 
-A **déroulement** is a structured mental walkthrough — in prose — of what happens when a user interacts with a feature. No tests, no harness, no renderer. The act of writing it forces you to confront what you actually wired vs. what you assume is wired, and that's where bugs surface.
-
-Used in three modes:
-- **Audit mode (top-down):** start from user actions, trace forward to find bugs.
-- **Reverse mode (bottom-up):** start from the code, derive the input/state required to fire every branch. Catches dead arms, impossible conditions, and scenarios the top-down pass missed.
-- **Fix-verification mode:** after fixing bugs, re-trace each scenario through the new code to confirm the fix works and doesn't regress anything.
-
-The two analysis modes are complementary. **Audit mode** answers "do realistic users hit a bug?" **Reverse mode** answers "is any code path unreachable, or reachable only by something we forgot to think about?" Use both on anything non-trivial.
-
-## When to do this
-
-Trigger automatically:
-- After implementing a new feature (button, panel, tool, flow).
-- After modifying any user-facing behavior (state machine, click handler, render path).
-- **Before declaring a fix done** — fix-verification déroulement is mandatory.
-- Before pushing a PR.
-- When the user asks to "déroule", "walk through", "trace", or "simulate" a scenario.
-
-**Reverse mode is the default for anything branchy.** After completing audit mode, count branch points (see Process step 5) — if >5 in the changed code, reverse mode is mandatory, not optional. Don't wait to be asked. Audit mode answers "does the user happy-path work"; reverse mode answers "is every `else` reachable, defensive, or a hidden bug." Real bug density on the second pass is consistently non-zero on guard-heavy code.
-
-If a change is purely internal (refactor, rename, comment) and has no user-visible behavior, a déroulement is optional — say so explicitly.
-
-## Depth — three axes you tune per scenario
-
-Déroulement is not uniform. You match granularity to where the bugs hide. Three independent dials:
-
-### Axis 1 — Breadth (how many scenarios)
-
-Function of state-machine size + branch points. Heuristic: **1 happy + 1 modifier + 1 negative per state, hard cap ~12.** List the rest in a "Skipped scenarios" section so the user can ask for any. For a feature with N states, scenarios beyond ~3·N are usually theater.
-
-In **reverse mode** the breadth is dictated by branch count, not state count — see the Reverse Mode section.
-
-### Axis 2 — Trace granularity (within a scenario)
-
-Pick per-step, not per-scenario. Four levels:
-
-| Level | What it looks like | When to use |
-|---|---|---|
-| **L1 — Function-call** | "User clicks → `onActionButtonClick` → `startAction` → `runAgent`" | Pass-through plumbing, well-named, low-risk glue |
-| **L2 — Step-by-step** | "`startAction:377` sets `state='running'`, calls `persistActionState`, then `notifyActionStateChanged`" | Default for most steps |
-| **L3 — Line-by-line** | "Line 351 existing-check, line 357 dismiss old, line 362 new chatId, line 377 assign activeActions[actionId] = {…}" | State mutators, validators, guards, anything where ordering or off-by-one matters |
-| **L4 — Branch-by-branch** | Every `if`/`switch` arm enumerated, including the `else` that does nothing | Tool dispatch, click routers, switch-on-state patterns |
-
-A healthy mix on a medium feature: ~65% L2, ~20% L3 on the high-risk functions, ~10% L1 on glue and ~5% L4 on routers. Tracing everything at L3 buries the signal. Tracing everything at L1 misses off-by-ones.
-
-**Where to spend L3/L4 budget:** state mutators, guard expressions, validation, switch-on-state. **Where L1 is fine:** renderers, leaf utilities, well-tested helpers, IDB writes.
-
-Reverse mode forces L4 by definition — you are enumerating arms.
-
-### Axis 3 — Read-or-trust (per called function)
-
-For each function the trace mentions, decide: read its body, or trust its name?
-
-- **Read the body** when it's the function being tested, when it mutates state, or when its name is generic (`handle*`, `process*`, `update*`, `manage*`).
-- **Trust the name** when it's a leaf utility already verified elsewhere (`escapeHtml`, `getBoundingClientRect`) or when it's named so specifically there's no ambiguity (`persistActionState` → IDB write).
-
-If you trust a name and turn out to be wrong, that's the bug the gap pass should catch. **Spot-check trusted calls during the gap pass** with one grep each.
-
-The Action audit produced 2 false positives because I trusted CSS-by-proximity ("I'd have seen it if it existed") instead of dropping to L2-with-literal-grep. That class of failure motivates the negative-claim rule.
-
-## Mandatory structure (audit mode)
-
-### 1. Scope
-One sentence: feature, paths covered, branch/files. State the spec source: dedicated doc, data-model comment, system-prompt blurb, or tool definition.
-
-### 2. Cast
-Table of every symbol referenced: function name, file:line, role.
-
-### 3. Scenarios — happy path(s)
-Per step:
-- What the user sees.
-- What code runs (function name + file:line, at the granularity dictated by Axis 2).
-- What state mutates.
-- Which CSS rule fires (selector + file:line).
-- How re-renders happen.
-
-### 4. Scenarios — modifiers / variants
-Paused, interrupted, disabled, collapsed, error overlay.
-
-### 5. Negative paths
-Three-column table: **Path | Where it's handled | Risk if broken**. ≥6 entries: invalid input, concurrent calls, backwards transition, missing dependency, permission denied, stale reference.
-
-### 6. Gap pass
-Numbered list (3+) of glossed-over points. Most valuable section. Empty = didn't try.
-
-### 7. Verified bug list (if bugs found)
-Table: **# | Severity | Location | Issue | Verification evidence**. No evidence = no bug.
-
-## Reverse mode (branch-coverage déroulement)
-
-Goal: for every conditional in the changed/audited code, construct the **minimal scenario** (input + prior state + environment) that drives execution into each arm — including the empty `else`. Code paths with no constructible scenario are dead, unreachable, or guarded by something you missed; either way that's a finding.
-
-This is the dual of audit mode. Audit mode walks forward from a user action. Reverse mode walks **backward from a line of code** to the world-state needed to reach it.
-
-### When to use it
-
-**Default:** any function with branch count > 5 in the changed/audited region. Don't wait to be asked.
-
-Stronger triggers (run reverse mode even on smaller functions):
-- Routers / dispatchers with switch-on-state.
-- Validators and guards (anything with cascading `if`/`return`).
-- State machines where transitions depend on multiple flags.
-- Code you suspect contains a dead arm.
-- Whenever audit mode wraps up and you can't articulate why each `else` branch exists.
-
-Skip it (audit-mode coverage is enough) on:
-- Pure renderers with no mutation.
-- Leaf utilities (≤2 branches).
-- Pass-through glue.
-
-### Mandatory structure
-
-#### R1. Branch inventory
-Enumerate every decision point in the target file/function set. Table:
-
-| # | File:line | Construct | Arms | Notes |
-|---|---|---|---|---|
-| 1 | `actions.js:377` | `if (existing && existing.chatId !== chatId)` | T / F | guards re-entry from another tab |
-| 2 | `actions.js:412` | `switch (state)` | running / stuck / done / error / default | 5 arms |
-| 3 | `actions.js:455` | `a.label?.length > 60 ? clamp : keep` | clamp / keep | string |
-
-Include ternaries, short-circuit `&&`/`||` used for control flow, optional chaining where it skips a call, and default-parameter expressions. Don't include trivial null-coalesce on display strings.
-
-#### R2. Scenario per arm
-For each arm, **one row**:
-
-| Branch # / arm | Trigger scenario (state + input) | Reachable? | Observable effect | Already covered by audit scenario? |
-|---|---|---|---|---|
-| 1·T | Tab A has action `foo` running; Tab B calls `startAction('foo')` | ✅ | Tab A's record dismissed, Tab B claims it | yes — "concurrent claim" |
-| 1·F | Fresh `startAction('foo')`, no existing record | ✅ | Normal start path | yes — happy path |
-| 2·default | `state` is any value not in {running, stuck, done, error} | ❓ | Falls through, no UI update | **no** — investigate: is this dead? |
-
-Trigger scenario must be **constructible** — concrete state + concrete call/input. "Some weird state" is not a scenario.
-
-**Sub-arm hygiene:** when a single branch number has multiple meaningful sub-arms (e.g. "≤60 / >60 / missing" for a clamp+default expression, or "T-with-X / T-with-Y" for a compound condition), enumerate each sub-arm on its own row. "Variant of X — already covered" is a corner-cut and the cutting-corners check will flag it.
-
-#### R3. Unreachable / suspect arms
-Promote every `❓` and `❌` from R2 here. For each:
-1. **Why I think it's unreachable** (one sentence).
-2. **Three search variants** showing no caller can produce the required state (negate-the-negation rule).
-3. **Verdict:** dead / defensive / reachable-by-bug / reachable-via-path-I-missed.
-
-Defensive code (`default:` that just `return`s) is fine — note it and move on. **Dead code that mutates state is a bug.** Reachable-by-bug means the only way to enter the arm is via a separate bug — log both.
-
-#### R4. Combinatorial blow-up handling
-If two branches are independent (`if (A) … if (B) …`), you have 4 combinations, not 2. Don't enumerate all 2^N — instead:
-1. List combinations explicitly only for **interacting** flags (one's outcome changes the other's effect).
-2. For independent flags, note "branches are independent; covered separately."
-3. Pairwise (all-pairs) coverage is enough; full combinatorial is theater.
-
-#### R5. Mapping back to audit scenarios
-Two-column reconciliation:
-
-| Audit scenario | Branches it exercises |
-|---|---|
-| Happy path | 1·F, 2·running, 3·keep |
-| Concurrent tab claim | 1·T, 2·running |
-| Long label | 3·clamp |
-
-After this table, list **branches not covered by any audit scenario**. These are either: (a) gaps in audit-mode breadth that need a new scenario, (b) genuinely unreachable, or (c) defensive. Classify each.
-
-#### R6. New bugs surfaced
-Anything from R3/R5 that's a real defect. Use the same verified-bug-list format as audit mode.
-
-### Hard rules (reverse mode specific)
-
-1. **Don't skip the empty `else`.** A missing `else` is a decision: was it intentional? An empty `else` block is also a decision: why is it there?
-2. **Short-circuits count.** `x && doThing()` has two arms.
-3. **Optional chaining counts** when it gates a side effect: `obj?.method()` is an `if (obj) obj.method()`.
-4. **Try/catch counts.** Both the try-success and catch arms need scenarios. An empty catch is a finding.
-5. **Default parameters count** if the default has observable behavior different from a passed value.
-6. **Loops** count as a branch only if the body's behavior depends on iteration index/state, or if the zero-iteration case has distinct meaning. Don't enumerate every iteration.
-7. **Each arm gets one concrete scenario, not a hand-wave.** "Some race condition" is not a trigger.
-8. **Reachability claims need grep evidence**, same as negative claims in audit mode.
-9. **Sub-arms expand inline.** "Variant of S1 — already covered" is the corner-cut. Walk the actual sequence with the actual line numbers.
-
-### Anti-patterns
-
-❌ "Branch 7·F is the error path." — what error, from where?
-✅ "Branch 7·F: `validateInput` returns false when `payload.tasks` is non-array. Triggered by `update_action_state({tasks: 'oops'})`. Reaches `:412` early-return."
-
-❌ Listing 64 combinations for 6 independent booleans.
-✅ "Flags A,B,C interact (A gates B's effect, C overrides both). Enumerate the 5 meaningful combinations. Flags D,E,F are independent — covered separately."
-
-❌ "The default case is unreachable." (no grep)
-✅ "The `default:` arm at `:438` requires `state ∉ {running, stuck, done, error}`. `executeUpdateActionState:312` validates against that exact enum and rejects others. Grep for `state =` shows 4 assignment sites, all from the enum. Verdict: defensive, safe to leave."
-
-❌ "Variant of S1 — verified above."
-✅ Walk the sequence with the new args. Especially when sub-arms (default values, missing fields, edge numerics) differ from S1.
-
-## Mandatory structure (fix-verification mode)
-
-For EACH fix, ALL FIVE — not just some:
-
-1. **Diff summary** — function + new file:line.
-2. **Before trace** — what the bug looked like.
-3. **After trace** — STEP-BY-STEP through the new code path. Same Axis-2 granularity rules. **Two-line summary is not an after-trace.** Default L2; drop to L3 on the changed lines.
-4. **Regression candidates** — ≥3 ways the fix could break things. Mark each ✅ / ⚠️ / 🐞.
-5. **Acknowledged limitations** — what the fix doesn't cover.
-
-After all per-fix entries, **second pass at the whole-change level**:
-- Stale comments / dead-code references to anything you removed?
-- Bypass paths re-introducing the bug elsewhere (other call sites, imports, agent-facing tools)?
-- Function signatures or contracts you changed that callers depend on?
-
-**If the fix changed a conditional** (added/removed a branch, flipped a guard, changed an enum), run a mini reverse pass on just that conditional: scenario for each new arm, scenario for each old arm to confirm it still triggers.
-
-## Hard rules — anti-hallucination
-
-1. **Every function name and file:line must be real.** Verify via `grep` or `read` BEFORE writing.
-2. **Every CSS class must be real.** Grep the selector. Quote file:line.
-3. **Every state machine transition must be traceable** to the line that performs the mutation.
-4. **Don't claim "and then it re-renders"** without naming the listener, function, and DOM nodes.
-5. **Deduplicate similar flows by reference,** not copy-paste.
-6. **Cite line numbers as `file:line` ranges.**
-7. **"X is called from Y" needs a grep showing the call site.** A definition is not proof of use. Confirm a call expression separately.
-
-## Negative-claim verification
-
-Negative claims (X is missing, broken, dead, unhandled) carry higher proof burden — they fail silently.
-
-1. **Grep for the literal symbol you say is missing**, not adjacent symbols.
-2. **Quote the empty (or non-empty) result.**
-3. **Negate-the-negation:** assume X exists; try three search variants before concluding it doesn't.
-4. **For "dead code":** count call expressions separately from the definition.
-5. **For "no validation":** read the function top-to-bottom for guards, `Math.min`, `.substring`, `.indexOf`, enum checks.
-6. **For "unreachable arm":** see Reverse mode R3 — three search variants showing no caller can produce the required state.
-
-## Bug-finding hygiene
-
-1. List as **candidates** first.
-2. **Verification pass** — batched in `js_eval`.
-3. **Promote only verified ones.** Demote false positives explicitly with `❌ FALSE POSITIVE — see grep`.
-4. **Score yourself.** "X candidates, Y confirmed, Z debunked." 100% suspicious; 70–90% healthy; <50% slow down.
-5. **Re-verify before fixing** — some weird-looking behavior is intentional per the spec.
-
-## Cutting-corners self-check (before publishing a fix-verification)
-
-This was added because I cut corners and the user had to ask if I'd actually walked every fix. Self-check:
-
-1. Count regression candidates per fix. Below 3 = redo.
-2. After-trace under ~50 words on a non-trivial fix = you summarized. Expand.
-3. Did you grep for bypass paths for any fix changing a guard or validation?
-4. Did you re-read changed comments? Edits that delete or rename functions often leave stale references nearby.
-5. Did you walk a user through the full lifecycle once more after the fix?
-6. **If you ran reverse mode:** did every `❓` from R3 get resolved to dead/defensive/reachable, with grep evidence?
-7. **Did you skip reverse mode?** If branch count >5 in the changed code, you owe one. "It looked simple" is not a reason — count the branches.
-8. **Sub-arm hygiene:** any scenario in your walkthrough that says "variant of X — already covered"? Expand it. The cases that look like variants are exactly where sub-arms (default values, missing optional fields, numeric edges) differ from the parent.
-
-If you can't answer yes to all eight, ship the deeper pass before the PR.
-
-## Process — recommended order
-
-1. Read the code. Build the Cast.
-2. Read the spec / closest equivalent.
-3. List intended scenarios (audit mode). Pick depth dials per scenario (Axes 1–3).
-4. Write each scenario user-visible first, code trace second.
-5. **Branch count gate.** Count decision points (`if`, `else if`, ternaries, `switch` arms, control-flow `&&`/`||`, optional-chaining-with-side-effect, try/catch) in the changed/audited region. **>5 ⇒ reverse mode is mandatory. ≤5 ⇒ inline R1+R2 in the audit pass is enough.** State the count explicitly so the user can sanity-check the decision.
-6. **Reverse pass (if gated in):** R1 branch inventory → R2 scenario per arm (one row per sub-arm, no "variant of") → R3 unreachable arms → R5 mapping back → log gaps. Mandatory L4.
-7. Gap pass with critical eye; spot-check trusted calls.
-8. Verification pass on every bug candidate (audit + reverse).
-9. Re-verify high-impact candidates before fixing.
-10. Publish verified bug list.
-11. If fixing: edit, build, write fix-verification with the cutting-corners check, push.
-
-For tiny features (≤5 branches), R1+R2 inline in the audit pass is fine — don't manufacture a separate Reverse section. For anything with a switch, nested guards, or a state machine, run reverse mode as its own section.
-
-## Output format
-
-Markdown directly in chat. Tables for Cast, Negative paths, Verified bugs, Regression candidates, Branch inventory, Scenario per arm. Numbered lists for code traces. Inline `code` for symbols; bold for state names; italic for what the user sees. 200–500 lines for medium features; reverse-mode adds ~50–150 lines depending on branch count.
-
-## What a good déroulement is NOT
-
-- Not a unit test.
-- Not a design doc — design comes before code.
-- Not a changelog — describe behavior, not the diff.
-- Not pseudocode — real code, real line numbers.
-- Not exhaustive — main flows + high-risk edges, calibrated by Axis 1. **Reverse mode is exhaustive on branches but not on combinations** — pairwise, not full Cartesian.
-
-## Trigger phrases
-
-- "Déroule [feature]"
-- "Walk me through what happens when…"
-- "Trace the lifecycle of…"
-- "Verify the wiring of…"
-- "Did you actually hook up X?" / "Have you gone through every scenario?"
-- "Check that the fix doesn't break anything" → fix-verification mode
-- **"Cover every branch" / "find a scenario for each if/else" / "any dead code?" / "reverse it" → reverse mode**
-
-But don't wait for these phrases when the branch-count gate triggers — the gate is the default.
-
-## Worked examples
-
-> **Note (predates the service-worker move):** The examples and anti-patterns below cite the old page-side coordination model — `BroadcastChannel('appagent-actions')` at `53e-actions.js`, `executeUpdateActionState`, `notifyActionStateChanged`, `refreshActionButtons`, and halting via `pausedChats[deletedChatId] = true`. The *methodology* (depth calibration, reverse mode, branch-count gate) is still valid, but the cited file:line anchors are stale. Current run/pause/resume sequencing lives in the service worker, not the page: `runningChatIds` (declared in `core/030-config.js` for the page and `worker/000-runtime-globals.js` for the SW; consumed by `app/045-agent-port-bridge-page.js` alongside `_pendingRunAgents`), `worker/120-tool-routing.js` (`parkUIToolCall` / `replayParkedToolCalls`), and `worker/130-port-bridge.js` (`_swPanelPorts`, run-agent handler). Grep there, not in `53e-actions.js`.
-
-### Picking depth in practice (Action audit)
-- `executeUpdateActionState` — **L3 line-by-line.** State validator, alias normalization, label clamping, timer arming. Off-by-one country.
-- `onActionButtonClick` — **L4 branch-by-branch.** Switch on 7 states, each with different routing.
-- `renderActionButton` — **L2 step-by-step.** Builds HTML, no mutation. Mid-risk.
-- `escapeHtml`, `persistActionState` — **L1 trust + grep spot-check.** Leaf utilities.
-- `getActionId` — **L3 line-by-line.** Single line, but that line is the collision hash. Read every regex.
-
-### Reverse mode catching a dead arm
-Branch inventory of `onActionButtonClick` listed 7 switch arms. R2 showed arm `state === 'queued'` had no constructible scenario — R3 grep for `state = 'queued'` returned zero assignment sites in the codebase. Verdict: dead arm left over from an earlier design. Bug filed; fix removed it. **Lesson:** the user-first audit pass walked the 4 *common* states and never noticed the 3 unused arms.
-
-### Reverse mode catching a missing scenario
-Branch 12·F at `validate:88` (`if (!payload.tasks)` false case) was covered by every audit scenario. Branch 12·T (tasks missing) was covered by zero. R5 reconciliation flagged the gap. Added "no-tasks update" scenario to audit mode; uncovered a render crash because the empty-tasks branch dereferenced `tasks.length` two lines later. **Lesson:** R5's "branches not covered" column is where audit-mode breadth gaps surface.
-
-### Reverse mode finding 4 issues that audit-mode missed (PR #194)
-22-branch reverse pass on `executeUpdateActionState` (`53e-actions.js:219`). Audit mode had walked happy/stuck/done from the user's side and reported clean. Reverse mode surfaced: silent state coercion (off-list states quietly rewritten to `'running'` instead of erroring); `output:null` no-op (typeof null === 'object' skipped the assignment guard); done→error keeping the original dismiss timer (error visible for whatever ms remained on the done countdown); 1ms `auto_dismiss_ms` accepted (button vanishes before render). None are crashes. All four are the same shape: defensive sinks that hide agent bugs. **Lesson:** real bug density on the second pass is consistently non-zero on guard-heavy code — that's the justification for the branch-count gate at Process step 5.
-
-### Sub-arm corner-cut caught by the user (same PR)
-First pass on PR #194 wrote "S3. Variant of S1; verified above" for the auto-dismiss flow. User asked "did you really walk all of those?" Honest re-count found 5 sub-arms missed: `state`-omitted, `icon`-omitted, `label`-missing, task `label` missing, `output:42` (number). Each got its own scenario in the second pass. **Lesson:** "variant of X" is the exact shape of the corner-cut; sub-arm rules in R2 + check #8 in cutting-corners self-check both forbid it.
-
-### False positive caught by verification
-Audit claimed `state-needs_input` had no CSS. Verification grep returned 13 hits at `23-actions.css:448–462`. **Lesson:** grep for the literal symbol you say is missing.
-
-### Behavior that LOOKS like a bug but isn't
-Audit flagged `finishActionIfDone` only finalizing from `running`. Re-verification: `stuck` is the agent's "I'm blocked" signal — auto-finalizing would lie. **Lesson:** read the spec before assuming weirdness is a bug.
-
-### Cutting corners caught by the user
-First-pass fix-verification gave fixes #6 and #16 only 2 regression candidates each. Brief after-traces. Deeper pass found 2 stale comments and 4 bypass paths for the collision check. **Lesson:** the cutting-corners self-check costs 30 seconds and saves a follow-up PR.
-
-## Anti-patterns
-
-❌ "When the user clicks, the button updates."
-✅ "`onActionButtonClick:862` reads `data-skill-id`, calls `startAction:377` which sets `activeActions[actionId].state = 'running'` and calls `notifyActionStateChanged`. The listener at `:1464` runs `refreshActionButtons` patching `className` and `.action-btn-badge` innerHTML."
-
-❌ "There's a race condition handler somewhere."
-✅ "Tab races coordinated by `BroadcastChannel('appagent-actions')` at `53e-actions.js:118`; receiver at `:151–169` deletes from `activeActions` and halts loops via `pausedChats[deletedChatId] = true`."
-
-❌ "Fixed it, looks good."
-✅ "Fixed at `53e-actions.js:443`. Before: `_dismissTimer` survived `stopAction`. After: `if (a._dismissTimer) clearTimeout(...)` at top. Regression candidates: ✅ idempotent with `dismissAction:463`; ✅ no further `update_action_state` after `stopped`; ⚠️ if it did, `:285` only re-arms on `done|error`."
-
-❌ Tracing every step at L3.
-✅ L2 default, L3 on mutators/guards/validation, L1 on glue, spot-check trusted calls in gap pass.
-
-❌ "All branches covered" with no inventory.
-✅ R1 table with file:line for every conditional, R2 row for every arm, R3 evidence for every unreachable claim.
-
-❌ Skipping reverse mode because the function "looked simple."
-✅ Count branches at Process step 5. >5 ⇒ reverse mode runs. State the count explicitly.
+A **déroulement** is a structured walkthrough of what happens when a user interacts with a feature. You write the prose first, then you **execute** checks against it. Writing forces you to face what you actually wired. Running `deroulement.js` catches the claims you only *believed*: invented symbols, wrong line numbers, unwired functions, dead arms, weak tests.
+
+Modes:
+- **Audit (top-down):** start from the user's actions and trace forward to find bugs.
+- **Reverse (bottom-up):** start from the code and build the input and state that fire every branch arm.
+- **Fix-verification:** re-trace each fix through the new code and look for regressions.
+
+## When
+- After you build or change a user-facing feature (button, panel, tool, flow, state machine, click handler, render path).
+- **Before you declare a fix done**, and before a PR.
+- When the user says "déroule", "walk through", "trace", "simulate", "did you hook up X?", or "cover every branch".
+- Purely internal changes (rename, comment) can skip it, but say so explicitly.
+
+## Research basis: why prose alone is not enough
+- **Self-Debugging** (Chen et al., arXiv 2304.05128): a model that only explains its code gains about +2–3%. With execution feedback it gains up to about +12%.
+- **Chain-of-Verification** (2309.11495): answer each verification question *independently* of the draft, and fewer hallucinated facts survive.
+- **CodeT** (2207.10397) and **AlphaCodium** (2401.08500): generated tests plus iterating on real execution results beat single-pass reasoning.
+- **Agentless** (2407.01489): simple localize → repair → validate pipelines work when the validate step is a real run.
+- **Fagan inspection:** a checklist-driven, staged review with a recorded defect log. That is the ancestor of this audit structure and of the ledger.
+- **Mutation testing:** a check that cannot tell a mutated function from the original proves nothing.
+
+**The finding:** executed or external signals beat self-narration. So every déroulement ends with a run of `deroulement.js` and a claims ledger, not just a confident paragraph.
+
+## Process (mandatory order)
+1. **Read the code and the spec.** Build the Cast.
+2. **Draft the prose** (audit structure below). Put every symbol in single backticks: `fn()`, `fn:123`, `.class`, `#id`, `path/file.js:10`. The helper checks only backticked tokens.
+3. **Run the executable phase** (next section) on the changed files and the prose.
+4. **Probe** the main scenario and the edge cases. For a function with **more than 5 branch points**, also run reverse mode R1–R6 and **mutation-lite**.
+5. **Build the claims ledger** (`D.format(rep)`). Fix or retract every refuted claim, then re-run.
+6. **Done-gate:** `rep.gate.pass === true` (0 refuted). The final answer must list **every unverified claim** explicitly (`rep.gate.unverified`) with a reason. Never hide them.
+
+## Executable phase: `deroulement.js`
+It is a plain helper next to this file. It is not a tool. It has no dependencies (only RegExp, Function, DOMParser and CSSStyleSheet), and every result is JSON.
+
+**In-repo (AppAgent workspace, js_eval or tests):**
+```js
+var D = await runFile('skills/feature-deroulement/deroulement.js');
+var FILES = ['<changed-file-1>.js', '<changed-file-2>.css'];      // PLACEHOLDERS: replace with your changed files
+if (FILES.some(function (f) { return /^</.test(f); })) throw new Error('replace the placeholder FILES first');
+var rep = await D.run({
+  files: FILES,                                               // an unreadable file is a refuted row
+  workspace: 'owner/AppAgent::main',                          // live grep/read/diff/ls
+  prose: DRAFT,                                               // your prose, with backticked symbols
+  probes: [{ file: 'src/js/ui/280-foo.js', fn: 'renderFoo', inputs: [[{ items: [1] }], [{ items: [] }]],
+             edge: true, stubs: { escapeHtml: function (s) { return String(s); } } }],
+  mutation: [{ file: 'src/js/ui/280-foo.js', fn: 'fooState', cases: [{ args: ['a'], expect: 1 }, { args: [''], expect: 0 }] }]
+});
+return { summary: rep.summary, refuted: rep.gate.refuted, unverified: rep.gate.unverified, md: D.format(rep) };
+```
+Alternative: `run_js_file {path:'skills/feature-deroulement/deroulement.js', args:{run:true, files:[...], prose:'...'}}` returns the report directly.
+
+**Generic (any environment, the source never enters your context):**
+```js
+var SOURCE_TEXT = 'function add(a, b) { return a + b; }\nadd(1, 2);\n';  // replace: the code under review
+var DRAFT = 'On load `add()` sums its inputs.';                        // replace: your prose
+var f = await executeTool('get_skill', { skill_id: 'feature-deroulement', action: 'read_file', filename: 'deroulement.js' });
+if (!f || !f.success || typeof f.content !== 'string') throw new Error('deroulement.js unavailable: ' + (f && f.error) + ' (stale runtime skill copy? Reload, or use runFile in-repo)');
+var AF = Object.getPrototypeOf(async function () {}).constructor, mod = { exports: {} };
+var D = await new AF('module', 'exports', 'args', f.content + '\n;return module.exports;')(mod, mod.exports, {});
+var rep = await D.run({ files: { 'feature.js': SOURCE_TEXT }, corpus: { 'feature.js': SOURCE_TEXT }, prose: DRAFT });
+return { summary: rep.summary, refuted: rep.gate.refuted, unverified: rep.gate.unverified };
+```
+Pass test files through `corpus` (or leave them in `files`: `exclude` defaults to `[/^test\//]`, so they only get the parse gate), never as analysed targets: their string fixtures are not wiring. Without a diff, name the functions you changed in `functions: [...]`, otherwise functions with more than 5 branches collapse into one summary row. `functions` is added to the diff (a union); pass `functionsOnly: true` to analyse only the named functions. If `exclude` removes every file, a config row is unverified. A qualified name (`obj.run()` in prose, an inline `onclick="obj.run()"`, a listener `obj.run`) is verified only when `obj` is a repo object literal, class or `obj.run =` assignment, so `D.run()` on a `runFile()` result is unverified: cite the real object (`DEROULEMENT.run()`) or the bare function. The member must hold a function, class, arrow or identifier (`obj.run = 5` is unverified), only single-segment qualifiers resolve (`app.obj.run()` is unverified), and a missing member of a built-in (`onclick="document.nope()"`) is refuted. See `DR_LIMITATIONS` for the documented gaps. A built-in name with no repo definition (`find`, `open`) is at best `verified-builtin` (low confidence), and a definition found only under `test/` verifies nothing.
+
+With `corpus`, lookups are offline and deterministic: it is the only code base searched. Without it, lookups go live through `loadFile` and workspace grep/diff/ls. **When grep is unavailable, or capped at 100 hits with no definition among them, the result is "unverified", never "0 hits".** That also applies to listener targets and inline HTML handlers. A lookup that throws is recorded in `rep.ioErrors` with an unverified row, a bad workspace makes file citations unverified, and `run()` never throws: an internal error is a refuted row. Probes check DOM post-conditions only for DOM/HTML producers unless you pass `domCheck: true`.
+
+Every grep hit is judged on the **whole-file** mask of its file (comments, strings, templates and regex bodies blanked), so a symbol inside a multi-line comment or template string is never a definition or a reference. Masks are cached per run and the reads are budgeted: `maxMaskReads` (default 400) and `maskBudgetMs` (default 30000 ms). A hit whose file cannot be read, masked or reached within the budget is *unreadable*: it proves nothing either way, so its row is **unverified** (never verified, never "0 hits").
+
+What `run()` does:
+- **(a) parse gate:** `parseGateJs` / `parseGateHtml`. Syntax, duplicate ids, inline handlers calling undefined functions, inline `<script>` bodies; the HTML walk includes the contents of `<template>`. CSS: unbalanced braces (comments and strings stripped) are refuted, and blocks the parser dropped are unverified.
+- **(b) existence:** `proseSymbols` → `checkSymbols`. Functions need a definition, CSS classes need a rule, file:line citations must be in range. `crossRefs` checks that ids have a definition, JS-used classes have CSS (default `cssDir: 'src/css'`), and message types have both a sender and a handler.
+- **(c) wiring:** `parseDiff` → `changedFunctions`. Each changed function must be referenced by real code outside its own body: mentions in comments, strings, `.md` files or self-recursion do not count, and references only under `test/` are unverified ("referenced only in tests"). `listeners` flags `addEventListener` inside render-like functions (re-binding risk).
+- **(d)** `branches` / `matrix` gives the R1 inventory and the matrix skeleton, and sets `reverseModeRequired` when there are more than 5 branch points.
+- **(e)** `probe` rebuilds the function with `__t('B#')` probes and caller stubs. It reports per-run traces, arms hit and missed, and missing stubs. A run that throws, or leaves an unhandled promise rejection (e.g. a stub returning `Promise.reject`), is recorded in `run.threw`.
+- **(f)** `edgeInputs` (empty, whitespace, null, undefined, NaN, 0, -1, huge, emoji, RTL, zero-width, XSS, [], {}) and `domPostconditions` (literal `undefined`/`NaN`/`[object Object]` text, unnamed buttons, live XSS, duplicate ids).
+- **(g)** `mutationTest`: negated `if`s and swapped comparison/logic operators. A survivor means a weak check or an equivalent mutant.
+- **(h)** `ledger` / `format`: every claim is marked verified, refuted or unverified, with evidence and the gate. Use `entryPoints: [...]` or `waive: {name: 'reason'}` (a non-empty reason string is required) for dynamic dispatch. Both apply **only** to "defined but not referenced" wiring rows and downgrade them to unverified, never to verified. They cannot excuse a missing symbol, id, listener/inline/message handler, a parse error, an unreadable file, a failing mutation baseline or a probe failure: a waive on any other row is ignored and says so in the evidence. The only statuses are `verified`, `refuted` and `unverified` (`verified-builtin` becomes low-confidence verified); any other status in a report passed to `D.ledger` counts as **refuted**. A `claims` check that returns anything but `true`/`false` gives unverified. Add `claims: [{claim, check: bool|fn, evidence}]` for your own assertions.
+
+**Extension UI:** probe renderers with `edge: true`. For behaviour on a real DOM, mount with `test/ui-helpers.js`:
+`var U = await runFile('test/ui-helpers.js'); var m = await U.mountDom({ html, css: ['src/css/23-actions.css'] }); D.domPostconditions(m.root); m.cleanup();`
+For anything that should outlive the chat, write a `test/*.test.js` case and run `run_tests`.
+
+**Read `rep.limitations`** before trusting a green gate. There is no AST, only regexes over a lexical mask. Dynamic ids, classes and dispatch are invisible. Ternary and short-circuit arms are in the matrix but not probed. Rejections that fire more than two event-loop ticks after a probe run are missed, a malformed declaration inside a CSS rule the parser kept is not detected, and HTML built in JS strings is not parsed.
+
+### ServiceNow variant
+Tables and fields do not live in a repo, so verify them with the Table API instead of grep:
+- a table exists: `sys_db_object?name=<t>`
+- a field exists: `sys_dictionary?name=<t>^element=<f>`, including parents via `super_class`
+- a script include, business rule or UI action exists: `sys_script_include` / `sys_script` / `sys_ui_action` by name
+
+Feed the results into `claims: [{claim, check}]`, or inject a custom `io` (`{live, read, grep, diff, ls}`) that queries the instance. Fetch script bodies with the Table API and pass them as `files: {name: script}` + `corpus`. These still apply unchanged: **parse gate, branches/matrix, probe (stub `GlideRecord`/`gs`), mutation-lite, ledger**. Cross-refs for CSS and messages mostly do not apply.
+
+## Audit structure
+1. **Scope:** one sentence covering the feature, paths and files, and the spec source.
+2. **Cast:** a table of every symbol with `file:line` and its role.
+3. **Happy path:** for each step, what the user sees, what code runs (fn + file:line), which state mutates, which CSS rule fires, and how the re-render happens (listener + function + DOM nodes).
+4. **Modifiers:** paused, interrupted, disabled, collapsed, error overlay.
+5. **Negative paths:** a table of *Path | Where handled | Risk*, with at least 6 rows: invalid input, concurrent calls, backwards transition, missing dependency, permission denied, stale reference.
+6. **Gap pass:** at least 3 glossed-over points, with a grep spot-check of each trusted call. An empty gap pass means you did not try.
+7. **Verified bugs:** *# | Severity | Location | Issue | Evidence*. No evidence, no bug.
+
+**Depth:** default to L2 (step by step). Use L3 (line by line) on mutators, guards and validators, L1 on glue, and L4 (every arm) on routers. Read the body of any function that mutates state or has a generic name (`handle*`, `update*`). Trust a name only for verified leaf utilities, and spot-check those.
+
+## Reverse mode (mandatory when a changed function has more than 5 branch points)
+- **R1 Inventory:** `D.branches(src, fn)` / `rep.changedFunctions[i].branches`. Include ternaries, control-flow `&&`/`||`, optional chaining that gates a side effect, try/catch, defaults with observable effect, and loops only when the zero-iteration case matters.
+- **R2 One concrete scenario per arm (sub-arms on their own rows):** state + input → reachable? → observable effect → covered by an audit scenario? Then **probe it**, so the trace proves the arm is hit.
+- **R3 Suspect arms:** give three search variants showing that no caller can produce the state. Verdict: dead, defensive, reachable-by-bug, or missed path. Dead code that mutates state is a bug.
+- **R4 Combinations:** enumerate only interacting flags. Pairwise is enough.
+- **R5 Map back:** audit scenario → arms. List the arms that no scenario covers.
+- **R6 New bugs:** same format as the verified bug list.
+- **Mutation-lite** on every function over 5 branches: `mutation: [{file, fn, cases}]`. Every surviving mutant is either a missing test case or an explained equivalent mutant.
+
+Rules: never skip the empty `else`. Short-circuits count. Each arm gets a concrete trigger, never "some race". "Variant of S1, already covered" is a corner cut: expand the sub-arm.
+
+## Fix-verification (all five, for each fix)
+1. Diff summary: function and new file:line.
+2. Before trace.
+3. After trace, step by step (L3 on changed lines; two lines is not a trace).
+4. At least 3 regression candidates, each marked ✅ / ⚠️ / 🐞.
+5. Limitations.
+
+Then a whole-change pass: stale comments, bypass paths, changed contracts. If a conditional changed, run a mini reverse pass on it **and re-run `deroulement.js`**.
+
+## Anti-hallucination rules
+1. Every function, file:line, CSS class and id must be real. The ledger checks the backticked ones. Anything else needs a grep or read you can quote.
+2. Every state transition must trace to the line that mutates the state.
+3. Never write "and then it re-renders" without naming the listener, the function and the DOM nodes.
+4. "X is called from Y" needs a call site, not a definition. The helper's `wiring` rows count references outside the definition.
+5. Cite `file:line` ranges. Deduplicate similar flows by reference.
+
+## Negative claims (missing, dead, unhandled, unreachable)
+They fail silently, so the proof burden is higher:
+- Grep for the **literal** symbol and quote the result.
+- Negate the negation: assume the symbol exists and try **3 search variants** first.
+- For dead code, count call expressions separately from the definition.
+- For "no validation", read the function top to bottom (guards, `Math.min`, `.substring`, enum checks).
+- An *unverified* ledger row is **not** a negative proof. "grep unavailable" or a capped grep proves nothing.
+
+Bug hygiene: list candidates first, verify them in one batched `js_eval`, and promote only the verified ones. Mark rejected ones `❌ FALSE POSITIVE — <evidence>`. Score yourself as "X candidates, Y confirmed, Z debunked": under 50% confirmed means slow down, and 100% is suspicious. Before fixing, re-read the spec: some weirdness is intentional.
+
+## Self-check before you publish
+1. Did `deroulement.js` run on the final code, with the gate at **0 refuted**? Is its summary in your answer?
+2. Is every **unverified** claim listed with a reason?
+3. Was every function with more than 5 branches probed arm by arm, and mutation-tested, with survivors explained?
+4. Did edge inputs run on every renderer or validator you touched?
+5. Does each fix have at least 3 regression candidates and an after-trace of more than about 50 words?
+6. Did you grep for bypass paths of every guard you changed, and re-read the comments you changed?
+7. Did you walk the full user lifecycle once more after the fix?
+8. Are there no "variant of X" rows, and is every R3 ❓ resolved with evidence?
+
+If any answer is no, do the deeper pass before the PR.
+
+## Output
+Markdown in chat, in this order:
+- Cast
+- scenarios, as numbered traces
+- the tables (negatives, R1/R2, bugs, regressions)
+- the **claims ledger** (`D.format(rep)`, trimmed to the relevant rows)
+- **Unverified claims:** an explicit list
+
+Aim for 200–500 lines on a medium feature. A déroulement is not a unit test, a design doc, a changelog or pseudocode: use real code and real line numbers. It is exhaustive on branches, but only pairwise on combinations.

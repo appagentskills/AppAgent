@@ -15,8 +15,8 @@ async function contentFixture(html,win){
 }
 describe('content script real dispatch',function(){
     test('installs once, ignores foreign message type, and reports unknown actions',async function(){
-        var f=await contentFixture();assert.strictEqual(f.listeners.length,1);assert.strictEqual(f.messages.length,1);assert.strictEqual(f.scripts.length,1);assert.strictEqual(f.win.__appagentContentScriptInjected,true);
-        await loadModules(['src/platform/extension/content-script.js'],{globals:f.globals});assert.strictEqual(f.listeners.length,1);assert.strictEqual(f.scripts.length,1);
+        var f=await contentFixture();assert.strictEqual(f.listeners.length,1);assert.strictEqual(f.messages.length,1);assert.strictEqual(f.scripts.length,0,'no inline <script>: interceptors are MAIN-world injected by background.js');assert.strictEqual(f.win.__appagentContentScriptInjected,true);
+        await loadModules(['src/platform/extension/content-script.js'],{globals:f.globals});assert.strictEqual(f.listeners.length,1);assert.strictEqual(f.scripts.length,0,'no inline <script>: interceptors are MAIN-world injected by background.js');
         var responses=[];assert.strictEqual(f.listeners[0]({type:'unrelated'},{},function(r){responses.push(r);}),undefined);assert.deepStrictEqual(responses,[]);
         assert.deepStrictEqual(f.action('unknown').response,{error:'Unknown action: unknown'});assert.deepStrictEqual(f.m.__unstubbed,[]);
     });

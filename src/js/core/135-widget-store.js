@@ -11,6 +11,36 @@ var WidgetStore = (function() {
             height: typeof widget.height === 'string' ? widget.height : '400px' };
     }
     function latest(record) { return record.versions[record.versions.length - 1]; }
+    // Delete tombstones: ids removed via remove(). Stale chat/dashboard
+    // projections (an SW chat snapshot re-put after the delete, an evicted
+    // chat row) must never re-migrate them in load()/read(). localStorage
+    // (page-only, per-origin, survives reload); capped; cleared when the id
+    // is committed/imported again. Missing localStorage = in-memory only.
+    var TOMBSTONE_KEY = 'appagent-widget-tombstones-' + dbName, MAX_TOMBSTONES = 500;
+    function readTombstones() {
+        try { var v = JSON.parse(localStorage.getItem(TOMBSTONE_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+    }
+    var tombstones = readTombstones();
+    function writeTombstones() {
+        if (tombstones.length > MAX_TOMBSTONES) tombstones.splice(0, tombstones.length - MAX_TOMBSTONES);
+        try { localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(tombstones)); } catch (e) {}
+    }
+    function isTombstoned(id) { return tombstones.indexOf(id) !== -1; }
+    function setTombstone(id, on) {
+        tombstones = readTombstones();
+        var i = tombstones.indexOf(id);
+        if (on && i === -1) tombstones.push(id);
+        else if (!on && i !== -1) tombstones.splice(i, 1);
+        else return;
+        writeTombstones();
+    }
+    // Tell the SW (authoritative chats[*].widgets) to drop the id; no-op when
+    // the bus is down — panel-hello re-sends every tombstone on reconnect.
+    function notifyWorkerRemoved(ids) {
+        try {
+            if (ids.length && typeof _agentBusPort !== 'undefined' && _agentBusPort) _agentBusPort.postMessage({ type: 'widget-remove', widgetIds: ids });
+        } catch (e) { console.warn('Widget delete: worker notify failed', e); }
+    }
     // Retained revisions per widget. Older ones are pruned on commit inside the
     // same transaction; the latest version is always the last element and is
     // never pruned. Unbounded histories stored every saved HTML forever.
@@ -136,7 +166,7 @@ var WidgetStore = (function() {
         data[widgetStoreName].forEach(function(r) { records[r.id] = compactForBoot(r); });
         var groups = Object.create(null);
         function add(w, chatId) {
-            if (!w || !w.id || records[w.id]) return;
+            if (!w || !w.id || records[w.id] || isTombstoned(w.id)) return;
             if (!groups[w.id]) groups[w.id] = { id: w.id, items: [] };
             groups[w.id].items.push(Object.assign({}, w, { chatId: w.chatId || chatId }));
         }
@@ -151,7 +181,7 @@ var WidgetStore = (function() {
     async function read(id) {
         await init();
         var record = await fetchRecord(id);
-        if (!record) {
+        if (!record && !isTombstoned(id)) {
             var items = [];
             Object.keys(chats).forEach(function(cid) { (chats[cid].widgets || []).forEach(function(w) { if (w.id === id) items.push(Object.assign({}, w, { chatId: w.chatId || cid })); }); });
             if (dashboardWidgets[id]) items.push(dashboardWidgets[id]);
@@ -186,6 +216,7 @@ var WidgetStore = (function() {
             return { record: record, result: { success: true, id: id, version: version, latest_version: version } };
         });
         if (result.success) {
+            setTombstone(id, false);
             if (channel) channel.postMessage({ id: id });
             project(id);
         }
@@ -242,17 +273,23 @@ var WidgetStore = (function() {
     // so the row persister is the only path, same as tools/080-widget-tools.js.
     async function remove(id) {
         await init();
+        // Tombstone BEFORE the delete commits: a concurrent read() can't remigrate.
+        setTombstone(id, true);
         var database = await openDatabase();
-        await new Promise(function(resolve, reject) {
-            var tx = database.transaction([widgetStoreName], 'readwrite');
-            tx.objectStore(widgetStoreName).delete(id);
-            tx.oncomplete = function() { resolve(); };
-            tx.onerror = tx.onabort = function() { reject(tx.error || new Error('Widget delete failed')); };
-        });
+        try {
+            await new Promise(function(resolve, reject) {
+                var tx = database.transaction([widgetStoreName], 'readwrite');
+                tx.objectStore(widgetStoreName).delete(id);
+                tx.oncomplete = function() { resolve(); };
+                tx.onerror = tx.onabort = function() { reject(tx.error || new Error('Widget delete failed')); };
+            });
+        } catch (e) { setTombstone(id, false); throw e; }
         if (dashboardWidgets[id]) {
             if (typeof removeWidgetFromDashboard === 'function') await removeWidgetFromDashboard(id);
             else await deleteDashboardWidget(id);
         }
+        // SW first: its chats[*].widgets snapshot is authoritative for membership.
+        notifyWorkerRemoved([id]);
         var touchedChats = forget(id);
         if (touchedChats && typeof saveChatsToStorage === 'function') {
             try { await saveChatsToStorage(); } catch (e) { console.warn('Widget delete: chat projection save failed', e); }
@@ -262,6 +299,7 @@ var WidgetStore = (function() {
     }
     if (channel) channel.onmessage = function(event) {
         if (!event.data) return;
+        tombstones = readTombstones();
         if (event.data.reset) { clearCache(false); return; }
         if (event.data.removed) { forget(event.data.removed); return; }
         if (event.data.reload) {
@@ -341,6 +379,7 @@ var WidgetStore = (function() {
                 });
             } catch (e) { failure = e; tx.abort(); }
         });
+        rows.forEach(function(row) { setTombstone(row.id, false); });
         records = Object.create(null);
         ready = null;
         await init();
@@ -365,7 +404,9 @@ var WidgetStore = (function() {
         });
         if (broadcast && channel) channel.postMessage({ reset: true });
     }
-    return { init: init, read: read, commit: commit, view: view, project: project, remove: remove, migrate: migrate, exportRecords: exportRecords, importRecords: importRecords, validateRecords: validateRecords, clearCache: clearCache,
+    return { init: init, read: read, commit: commit, view: view, project: project, remove: remove,
+        isDeleted: function(id) { return isTombstoned(id); },
+        resendDeletes: function() { tombstones = readTombstones(); notifyWorkerRemoved(tombstones.slice()); }, migrate: migrate, exportRecords: exportRecords, importRecords: importRecords, validateRecords: validateRecords, clearCache: clearCache,
         list: function() { return Object.values(records).map(function(r) { return { id: r.id, title: latest(r).title, latest_version: latest(r).version, versions: r.versions.length }; }); },
         versions: function(id) { return records[id] ? records[id].versions.map(function(v) { return { version: v.version, createdAt: v.createdAt, source: v.source }; }) : []; } };
 })();
@@ -418,23 +459,23 @@ async function saveWidgetRevision(widget, html, expectedVersion, operationId) {
 function attachWidgetVersionPicker(iframe, widgetId) {
     var versions = WidgetStore.versions(widgetId);
     if (!versions.length || !iframe.parentNode) return;
-    var root = iframe.getRootNode();
-    if (root.host && !root.querySelector('style[data-widget-version-style]')) {
-        var style = document.createElement('style');
-        style.setAttribute('data-widget-version-style', '');
-        style.textContent = ':host{display:flex;flex-direction:column;height:100%} iframe{flex:1;min-height:0} .widget-version-picker{display:block;max-width:100%;margin:4px;padding:3px 6px;font:inherit;font-size:11px;color:var(--text-primary);background:var(--bg-main);border:1px solid var(--border);border-radius:4px;position:relative;z-index:1}';
-        root.appendChild(style);
-    }
     iframe.dataset.savedWidgetId = widgetId;
     iframe.dataset.savedWidgetVersion = String((WidgetStore.view(widgetId, iframe.dataset.selectedWidgetVersion) || {}).contentVersion || '');
+    // Previews (scaled thumbnails) are non-interactive: no picker.
+    if (iframe.__versionPreview) return;
     var picker = iframe.__versionPicker;
     if (!picker) {
+        var slot = widgetVersionSlot(iframe);
+        if (!slot) return;
         picker = document.createElement('select');
         picker.className = 'widget-version-picker';
         picker.setAttribute('aria-label', 'Widget version');
-        iframe.parentNode.insertBefore(picker, iframe);
+        picker.title = 'Widget version';
+        slot.insertBefore(picker, slot.firstChild);
         iframe.__versionPicker = picker;
         picker.addEventListener('change', function() { selectWidgetRenderVersion(iframe, picker.value); });
+        // Header clicks/drags (dashboard card drag, thumbnail open) must not fire.
+        ['click', 'mousedown'].forEach(function(t) { picker.addEventListener(t, function(e) { if (e && e.stopPropagation) e.stopPropagation(); }); });
     }
     picker.replaceChildren();
     var latest = document.createElement('option');
@@ -461,6 +502,7 @@ function selectWidgetRenderVersion(iframe, version, hydrated) {
     fresh.dataset.selectedWidgetVersion = version || '';
     fresh.__versionSuffix = iframe.__versionSuffix || '';
     fresh.__versionFullscreen = iframe.__versionFullscreen;
+    fresh.__versionPreview = iframe.__versionPreview;
     if (iframe.__widgetCleanup) iframe.__widgetCleanup();
     if (iframe.__versionPicker) iframe.__versionPicker.remove();
     iframe.replaceWith(fresh);
@@ -489,6 +531,26 @@ function refreshWidgetVersionViews(widgetId) {
         if (latest && iframe.dataset.savedWidgetVersion !== String(latest.contentVersion)) selectWidgetRenderVersion(iframe, '');
         else attachWidgetVersionPicker(iframe, widgetId);
     });
+}
+
+// The picker lives in the surface's HEADER button group, never as a row in the
+// content. Scope = the card/modal that owns both the header and the mount
+// (.widget-inline chat card, .widget-modal, .widget-fullscreen-modal chat +
+// dashboard expand, .dashboard-widget main card whose header is display:none,
+// so the picker hides with it). Headerless mounts (home cards, deep-link tab /
+// side panel, bare containers) find no slot and get NO picker. Walks out of
+// open shadow roots (dashboard cards mount the iframe in .widget-shadow-host).
+var WIDGET_VERSION_SCOPE = '.widget-inline, .widget-modal, .widget-fullscreen-modal, .dashboard-widget';
+var WIDGET_VERSION_SLOT = '.widget-controls, .widget-modal-controls, .dashboard-widget-controls';
+function widgetVersionSlot(iframe) {
+    var node = iframe;
+    while (node) {
+        var scope = node.closest ? node.closest(WIDGET_VERSION_SCOPE) : null;
+        if (scope) return scope.querySelector(WIDGET_VERSION_SLOT);
+        var root = node.getRootNode ? node.getRootNode() : null;
+        node = root && root.host ? root.host : null;
+    }
+    return null;
 }
 
 // Chat sidebar widget list (renderWidgetSidebar in tools/080-widget-tools.js

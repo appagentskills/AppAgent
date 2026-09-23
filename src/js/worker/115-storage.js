@@ -65,6 +65,15 @@ function _rescueDirtyEvictedChat(id) {
     Promise.resolve().then(function() { return ensureChatPayloads(id); })
         .then(function() {
             var c = (typeof chats !== 'undefined') ? chats[id] : null;
+            // H10: ensureChatPayloads NEVER rejects — a failed hydration logs,
+            // KEEPS _payloadsEvicted and resolves (core/130-indexeddb.js). Only
+            // clear the dirty stamp once hydration really succeeded; otherwise
+            // keep it so the NEXT save's evicted-put guard re-triggers this
+            // rescue instead of silently dropping the mutation forever.
+            if (c && c._payloadsEvicted) {
+                console.warn('[worker-storage] evicted-chat rescue: hydration did not complete for ' + id + ' — keeping _dirtyWhileEvicted for the next save to retry');
+                return;
+            }
             if (c) delete c._dirtyWhileEvicted;
             return saveChatsToStorage();
         })
@@ -147,7 +156,8 @@ async function saveChatsToStorage() {
     // resolved promise and proceed; persistence is skipped, loudly.
     if (!_chatsHydrated) {
         console.error('[worker-storage] saveChatsToStorage blocked: chats not hydrated — refusing to persist to avoid wiping stored chats');
-        return;
+        // M3: same outcome shape as the waiter path — nothing was persisted.
+        return { ok: false, error: 'chats not hydrated' };
     }
     var _commit = new Promise(function(res) { _workerSaveWaiters.push(res); });
     if (_workerSavePending) {
@@ -155,6 +165,14 @@ async function saveChatsToStorage() {
         return _commit;
     }
     _workerSavePending = true;
+    // M3: outcome handed to every parked waiter — {ok:true} on commit,
+    // {ok:false,error} when the save threw or the transaction aborted (the old
+    // code resolved waiters as if the save had committed). Set ONLY in the
+    // catch below: an abort always surfaces there too (_runTxWithDeadline's
+    // `committed` promise rejects on 'abort', core/130-indexeddb.js), while a
+    // write in transaction.onabort would stick across withStore's reopen-retry
+    // and report a retried-and-committed save as failed.
+    var _saveOutcome = { ok: true };
     try {
         // CONGESTION-BACKOFF: honour the hold-off armed by a previous
         // timed-out save. Callers arriving during the wait coalesce via the
@@ -326,6 +344,7 @@ async function saveChatsToStorage() {
         }
     } catch (e) {
         console.error('[worker-storage] save failed', e);
+        _saveOutcome = { ok: false, error: String((e && (e.message || e.name)) || e || 'save failed') };
         // CONGESTION-BACKOFF: the timed-out transaction is still queued and
         // will commit in the background — hold the next save back so it
         // drains instead of stacking another transaction on the jam.
@@ -345,9 +364,14 @@ async function saveChatsToStorage() {
         } else {
             var _w = _workerSaveWaiters;
             _workerSaveWaiters = [];
-            _w.forEach(function(r) { try { r(); } catch (e) {} });
+            _w.forEach(function(r) { try { r(_saveOutcome); } catch (e) {} });
         }
     }
+    // M3: the LEADING caller (the one that ran this save) returns its outcome
+    // directly — it never awaits _commit, so without this it resolved
+    // undefined. Same timing as before: it does not wait for a pending-again
+    // re-run (its own mutation is captured by this committed save).
+    return _saveOutcome;
 }
 
 // EXPLICIT-DELETE (chat-delete durability, mirrors ui/070-dashboard-ui.js):

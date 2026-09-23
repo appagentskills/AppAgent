@@ -304,6 +304,95 @@ function compareGuardRegions(buildSrc, skillSrc) {
 }
 // ─── End write-site ratchet shared logic ─────────────────────────────
 
+// ─── Docs placeholders (__VERSION__ / __CHANGELOG__) ──────────────────
+// KEEP IN SYNC with build/docs-placeholders.js (used by build/build.js,
+// build/serve-docs.js and the Pages workflow). This sandbox can't require()
+// it, so the logic is copied; output parity is enforced by
+// test/docs-placeholders.test.js. ORDER: __VERSION__ is substituted in
+// documentation.md FIRST, then changelog.md is spliced in — the changelog
+// mentions the literal `__VERSION__` placeholder and must stay verbatim.
+var CHANGELOG_FALLBACK = 'No changelog available.';
+
+function formatChangelogForDocs(changelogMd) {
+    var lines = String(changelogMd || '').replace(/\r\n/g, '\n').split('\n');
+    var out = [];
+    var inFence = false;
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (/^\s*\x60{3}/.test(line)) { inFence = !inFence; out.push(line); continue; }
+        if (inFence) { out.push(line); continue; }
+        var m = line.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+        if (!m) { out.push(line); continue; }
+        var level = m[1].length;
+        var title = m[2];
+        if (level === 1) continue;
+        if (level === 2) {
+            var slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+            out.push('### ' + title + (slug ? ' {#changelog-' + slug + '}' : ''));
+            continue;
+        }
+        out.push('**' + title + '**');
+    }
+    return out.join('\n').trim();
+}
+
+function applyDocsPlaceholders(docsMd, version, changelogMd) {
+    var md = String(docsMd || '');
+    if (version) md = md.split('__VERSION__').join(version);
+    var changelog = formatChangelogForDocs(changelogMd) || CHANGELOG_FALLBACK;
+    return md.split('__CHANGELOG__').join(changelog);
+}
+// ─── End docs placeholders ────────────────────────────────────────────
+
+// ─── Self-load from the workspace ─────────────────────────────────────
+// This tool's code is the copy EMBEDDED in the installed extension (seeded
+// into skillTools by importEmbeddedSkills), so an edit to THIS file used to
+// take effect only on the SECOND Reload: the first Reload ran the old
+// installed copy (e.g. one that only filled __VERSION__, leaving
+// __CHANGELOG__ literal on the Help page). To make build-logic edits apply on
+// the FIRST Reload, extension_build loads skills/extension-dev/build.js from
+// the workspace being built and delegates to it. Falls back to the installed
+// copy (returns null) when the file can't be read, is truncated, doesn't
+// compile or lacks extension_build. Runtime errors of the workspace build are
+// NOT masked by a fallback rebuild. `_fromWorkspaceBuildJs` stops recursion.
+var WORKSPACE_BUILD_JS_PATH = 'skills/extension-dev/build.js';
+
+function _stripReadLineNumbers(content) {
+    return String(content).split('\n').map(function(line) {
+        return line.replace(/^\s*\d+\t/, '');
+    }).join('\n');
+}
+
+async function _readWorkspaceBuildJs(args, workspace) {
+    var params = { action: 'read', path: WORKSPACE_BUILD_JS_PATH };
+    if (args.branch) params.branch = args.branch;
+    if (workspace) params.workspace = workspace;
+    var r = await executeTool('workspace', params);
+    if (!r || !r.success || typeof r.content !== 'string') return null;
+    var src = _stripReadLineNumbers(r.content);
+    // Partial read (line cap) → don't run a truncated build.
+    if (typeof r.total_lines === 'number' && src.split('\n').length < r.total_lines) return null;
+    return src;
+}
+
+async function _runWorkspaceBuildJs(args, workspace, readSource) {
+    if (args && args._fromWorkspaceBuildJs) return null;
+    var src = null;
+    try { src = await (readSource || _readWorkspaceBuildJs)(args || {}, workspace); } catch (e) { src = null; }
+    if (!src || !/^async function extension_build\s*\(/m.test(src)) return null;
+    var runner;
+    try {
+        var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+        runner = new AsyncFunction('args', src + '\n;return await extension_build(args);');
+    } catch (e) { return null; }
+    var next = Object.assign({}, args, { _fromWorkspaceBuildJs: true });
+    if (workspace) next.workspace = workspace;
+    var res = await runner(next);
+    if (res && typeof res === 'object' && !Array.isArray(res)) res.build_js = 'workspace';
+    return res;
+}
+// ─── End self-load ────────────────────────────────────────────────────
+
 async function extension_build(args) {
     // Auto-detect the AppAgent workspace if the caller didn't provide one
     var defaultWorkspace = args.workspace || null;
@@ -333,6 +422,11 @@ async function extension_build(args) {
             }
         } catch (e) { /* non-fatal */ }
     }
+
+    // Run the WORKSPACE copy of this file (see "Self-load" above) so build
+    // changes apply on the first Reload, not the second.
+    var delegated = await _runWorkspaceBuildJs(args, defaultWorkspace);
+    if (delegated) return delegated;
 
     var ws = function(action, params) {
         params.action = action;
@@ -638,12 +732,12 @@ async function extension_build(args) {
     var appHTML = '<!DOCTYPE html>\n' + processedHead + '\n    <link rel="stylesheet" href="app.css">\n</head>\n' + processedBody + '\n<script src="app.js"><\/script>\n</body>\n</html>';
 
     // Embed docs/documentation.md and README.md as base64 strings (same scheme
-    // as build/build.js). Substitute __VERSION__ inside documentation.md first
-    // so the runtime never sees the placeholder. Both get merged at runtime
-    // via mergeReadmeIntoDocs.
+    // as build/build.js). Substitute __VERSION__ and __CHANGELOG__ inside
+    // documentation.md first (applyDocsPlaceholders) so the runtime never sees
+    // the placeholders. Both get merged at runtime via mergeReadmeIntoDocs.
     var docsMd = await readFile('docs/documentation.md');
     if (docsMd) {
-        if (version) docsMd = docsMd.split('__VERSION__').join(version);
+        docsMd = applyDocsPlaceholders(docsMd, version, (await readFile('changelog.md')) || '');
         var docsB64 = btoa(unescape(encodeURIComponent(docsMd)));
         appJS = appJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
         workerJS = workerJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);

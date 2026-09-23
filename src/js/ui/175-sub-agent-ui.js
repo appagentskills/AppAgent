@@ -165,6 +165,50 @@ function _applySectionIcons(html) {
 // replaceEmojiShortcodes moved to src/js/core/055-emoji-shortcodes.js — see
 // the note above SECTION_ICON_SHORTCODES.
 
+// F1 — literal-newline normaliser shared by every sub surface. CRLF → LF;
+// a double-escaped text (NO real newline and at least 2 literal "\n"
+// sequences) is unescaped. A lone literal "\n" in real prose or code, or
+// any text that already has real newlines, is left alone. Same rule as the
+// producer-side _subNormalizeNewlines (core/097-sub-agent-registry.js), kept
+// separate so this render file has no core dependency (legacy rows).
+function _subRenderNewlines(t) {
+    var s = String(t == null ? '' : t).replace(/\r\n?/g, '\n');
+    if (s.indexOf('\n') === -1 && s.split('\\n').length - 1 >= 2) {
+        s = s.replace(/\\r\\n|\\n/g, '\n');
+    }
+    return s;
+}
+
+// F1 — the ONE markdown renderer for every sub-agent surface: collapsible
+// input/output panels, progress stream, notice + lifecycle cards, the
+// sub_msg callout and the progress-card output. formatContent
+// (250-message-render.js) + the section-icon lift, never throws: a missing
+// or throwing formatContent degrades to escaped text with <br> breaks.
+function renderSubMarkdown(t) {
+    var s = _subRenderNewlines(t);
+    try {
+        if (typeof formatContent !== 'function') throw new Error('formatContent unavailable');
+        return _applySectionIcons(formatContent(s));
+    } catch (_) {
+        return '<span class="md-paragraph">' + escapeHtml(s).replace(/\n/g, '<br>') + '</span>';
+    }
+}
+
+// F3 — a long ERROR summary renders as markdown inside the <details>;
+// only a raw JSON body or a stack trace (synthesized / crash headlines)
+// stays escaped pre-wrap text.
+function _subIsRawErrorPayload(s) {
+    var t = String(s || '').trim();
+    // A JSON document opens with a key / value — a markdown link or
+    // checkbox ("[docs](…)", "[x] …") is prose, not a payload.
+    if (/^\{\s*["}]/.test(t) || /^\[\s*[\[{"\d\]-]/.test(t)) return true;
+    // V8 stack frame: "at fn (file.js:12:5)" / "at file.js:12:5" — not
+    // prose such as "at 10:30 the deploy failed".
+    if (/(?:^|\n)[ \t]*at\s+(?:[^\n]*\(\S+:\d+(?::\d+)?\)|\S+:\d+:\d+)/.test(t)) return true;
+    if (t.indexOf('```') === -1 && /\{\s*"[^"\n]{1,64}"\s*:/.test(t)) return true;
+    return false;
+}
+
 // Markdown variant of _renderSubCollapsibleText — same structure (collapse
 // toggle + expanded element + collapsed preview, SAME ids/classes/data
 // attributes so the delegated [data-sub-collapse] listener and _subPanelPref
@@ -178,14 +222,10 @@ function _renderSubCollapsibleMarkdown(text, prefKey, domId) {
     if (typeof formatContent !== 'function') {
         return _renderSubCollapsibleText(text, prefKey, domId);
     }
-    var rendered;
-    try {
-        rendered = _applySectionIcons(formatContent(text));
-    } catch (_) {
-        // Same fallback shape as _subProgressHtml, with newlines preserved
-        // (the surrounding pre.sub-md resets white-space to normal).
-        rendered = '<span class="md-paragraph">' + escapeHtml(text).replace(/\n/g, '<br>') + '</span>';
-    }
+    text = _subRenderNewlines(text);
+    // F1: shared renderer (its catch keeps the escaped md-paragraph + <br>
+    // fallback shape — the surrounding pre.sub-md resets white-space).
+    var rendered = renderSubMarkdown(text);
     var lines = text.split('\n');
     var lineCount = lines.length;
     if (lineCount <= 1 && text.length <= 80) {
@@ -242,7 +282,10 @@ var SUB_ACTION_TASK_STATUSES = { pending: 1, running: 1, done: 1, error: 1 };
 function _subActionStateHtml(st) {
     if (!st) return '';
     var tasks = Array.isArray(st.tasks) ? st.tasks : [];
-    if (!st.label && !tasks.length) return '';
+    // F6: update_action_state `output` (saved by recordSubActionState,
+    // core/097) is rendered under the tasks — it alone keeps the card.
+    var output = (typeof st.output === 'string') ? st.output.trim() : '';
+    if (!st.label && !tasks.length && !output) return '';
     var stClass = Object.prototype.hasOwnProperty.call(SUB_ACTION_STATES, st.state) ? st.state : 'running';
     var head = '';
     if (st.label) {
@@ -262,7 +305,8 @@ function _subActionStateHtml(st) {
             '<span class="sub-report-task-label">' + escapeHtml(String((t && t.label) || '')) + '</span>' +
         '</div>';
     }).join('');
-    return '<div class="sub-report-action-state sub-action-' + stClass + '">' + head + rows + '</div>';
+    var outHtml = output ? '<div class="sub-notice-body markdown-body">' + renderSubMarkdown(output) + '</div>' : '';
+    return '<div class="sub-report-action-state sub-action-' + stClass + '">' + head + rows + outHtml + '</div>';
 }
 
 // Resolve the status to SHOW for a sub_report card. Terminal stored statuses
@@ -294,7 +338,18 @@ function _subReportLiveStatus(msg) {
 // spinner / bot-icon fallback for null so old snapshots, non-running states
 // and cleared activity render exactly as before.
 function _subActivityInfo(rec) {
-    if (!rec || rec.state !== 'running' || !rec.activity || !rec.activity.phase) return null;
+    if (!rec || rec.state !== 'running') return null;
+    // Stuck-worker signal: the SAME pure verdict agent_status reports (core/097
+    // _subStuckSignal), recomputed on the mirrored record so the label and the
+    // model agree; falls back to the SW-stamped rec.stuck.
+    var st = null;
+    try { st = (typeof _subStuckSignal === 'function') ? _subStuckSignal(rec, Date.now()) : (rec.stuck || null); }
+    catch (_) { st = rec.stuck || null; }
+    if (st && st.reason) {
+        var sIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS && (UI_ICONS.alert || UI_ICONS.warning || UI_ICONS.thinking)) || '';
+        return { phase: 'stuck', tool: null, reason: st.reason, icon: sIcon, label: 'stuck: ' + st.reason };
+    }
+    if (!rec.activity || !rec.activity.phase) return null;
     var act = rec.activity;
     if (act.phase === 'tool' && act.tool) {
         var icon = (typeof getToolIcon === 'function') ? getToolIcon(act.tool) : '';
@@ -313,7 +368,7 @@ function _subActivityInfo(rec) {
 // renderable activity, so legacy keys stay byte-identical to today's.
 function _subActivityKey(rec) {
     var act = _subActivityInfo(rec);
-    return act ? (act.phase + ':' + (act.tool || '')) : '';
+    return act ? (act.phase + ':' + (act.tool || act.reason || '')) : '';
 }
 
 // In-place patch of a worker card's activity icon + state-line label (strip
@@ -664,9 +719,8 @@ function renderSubReport(msg, index) {
         if (!progArr.length && !dropped) return '';
         var items = progArr.map(function(p) {
             var t = (p && p.text) ? String(p.text) : '';
-            var rendered = (typeof formatContent === 'function' && t)
-                ? formatContent(t)
-                : ('<span class="md-paragraph">' + escapeHtml(t) + '</span>');
+            // F1: shared renderer (try/catch + section icons).
+            var rendered = t ? renderSubMarkdown(t) : '<span class="md-paragraph"></span>';
             return '<div class="sub-report-progress-item">' +
                 '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
                 '<div class="sub-report-progress-text markdown-body">' + rendered + '</div>' +
@@ -925,29 +979,26 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
              : (st === 'need_input') ? '?'
              : (st === 'cancelled') ? '⊘'
              : '…';
-    var mdOk = (typeof formatContent === 'function');
     var body = '';
+    summary = _subRenderNewlines(summary);
     if (summary) {
-        var rendered;
-        try {
-            rendered = mdOk ? _applySectionIcons(formatContent(summary))
-                            : escapeHtml(summary).replace(/\n/g, '<br>');
-        } catch (_) {
-            rendered = escapeHtml(summary).replace(/\n/g, '<br>');
-        }
+        var rendered = renderSubMarkdown(summary);
         // Long ERROR payloads collapse behind a one-line preview — the
         // construction layer already shortens crash headlines, so this is
         // the defense-in-depth arm for anything that slips through (any
         // provider, not just 429). Short errors render fully; non-error
-        // summaries (real reports) are never collapsed. The full text is
-        // shown escaped/pre-wrap inside the <details>, scroll-capped by CSS.
+        // summaries (real reports) are never collapsed. F3: the full body is
+        // markdown inside the <details> (scroll-capped by CSS); only a raw
+        // JSON / stack payload (_subIsRawErrorPayload) stays escaped.
         if (st === 'error' && summary.length > 280) {
             var preview = summary.slice(0, 150).replace(/\s+\S*$/, '');
+            var rawErr = _subIsRawErrorPayload(summary);
             body = '<div class="sub-notice-body markdown-body">'
                 + '<details class="sub-notice-collapse">'
                 + '<summary><span class="sub-notice-err-preview">' + escapeHtml(preview) + '\u2026</span>'
                 + '<span class="sub-notice-collapse-more">show full error</span></summary>'
-                + '<div class="sub-notice-collapse-full">' + escapeHtml(summary) + '</div>'
+                + (rawErr ? '<div class="sub-notice-collapse-full">' + escapeHtml(summary) + '</div>'
+                          : '<div class="sub-notice-collapse-full markdown-body" style="white-space:normal">' + rendered + '</div>')
                 + '</details></div>';
         } else {
             body = '<div class="sub-notice-body markdown-body">' + rendered + '</div>';
@@ -967,7 +1018,11 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
     var viewBtn = agentId
         ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
         : '';
-    return '<div class="sub-notice sub-report-' + st + ' sub-notice-' + (isMid ? 'mid' : 'final') + '" data-sub-agent-id="' + escapeHtml(agentId || '') + '">' +
+    // opts.rowIndex: rendered as a top-level transcript row (the passive
+    // report sub_msg row) — same `message` class + msg-N id as
+    // renderSubAgentMessage's own wrapper.
+    var _rowIdx = (opts && typeof opts.rowIndex === 'number') ? opts.rowIndex : null;
+    return '<div class="' + (_rowIdx != null ? 'message ' : '') + 'sub-notice sub-report-' + st + ' sub-notice-' + (isMid ? 'mid' : 'final') + '"' + (_rowIdx != null ? ' id="msg-' + _rowIdx + '"' : '') + ' data-sub-agent-id="' + escapeHtml(agentId || '') + '">' +
         '<div class="sub-notice-header">' +
             '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>' +
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
@@ -1001,18 +1056,20 @@ function _parentMsgCardHtml(count, bodyText, fmt) {
 // the at-a-glance transcript surface. Called from 250-message-render.js.
 function renderSubAgentMessage(msg, index) {
     var name = msg.subAgentName || msg.subAgentId || 'sub-agent';
+    // PASSIVE-NOTICE: kind:'passive_report' rows come from
+    // _postPassiveReportNotice (core/097) — a wake_parent:false sub reported
+    // and the parent was NOT woken. Render the same final-report card as the
+    // model-visible notices (_subNoticeCardHtml: status icon + name + badge +
+    // View agent), headline only, with a muted "not woken" hint.
+    if (msg.kind === 'passive_report') {
+        return _subNoticeCardHtml(name, msg.subAgentId, String(msg.status || 'done'), String(msg.text || ''), 'final',
+            { hint: 'Parent not woken (wake_parent:false) \u2014 open the agent for the full report', rowIndex: index });
+    }
     var text = String(msg.text || '');
     var body = '';
     if (text) {
-        var rendered;
-        try {
-            rendered = (typeof formatContent === 'function')
-                ? formatContent(text)
-                : escapeHtml(text).replace(/\n/g, '<br>');
-        } catch (_) {
-            rendered = escapeHtml(text).replace(/\n/g, '<br>');
-        }
-        body = '<div class="sub-notice-body markdown-body">' + rendered + '</div>';
+        // F1: shared renderer (try/catch + section icons).
+        body = '<div class="sub-notice-body markdown-body">' + renderSubMarkdown(text) + '</div>';
     }
     // Same delegated-click "View agent" affordance as _subNoticeCardHtml —
     // data-worker-modal is handled by _wireSubAgentUi → openWorkerChatModal.
@@ -1057,9 +1114,17 @@ function _hasStandaloneSubMessage(messages, agentId, headline, used) {
     });
 }
 
-function renderSubReportNotices(text, messages, usedSubMessages) {
+function renderSubReportNotices(text, messages, usedSubMessages, subNotices) {
     usedSubMessages = usedSubMessages || [];
     if (typeof text !== 'string') return null;
+    // SUB-NOTICE-META (B part 2b): a row carrying structured metadata
+    // renders its cards from it (_renderSubNoticesFromMeta). null = a meta
+    // could not be located (drifted text) → the WHOLE row takes the legacy
+    // regex path below, exactly as a row without metadata.
+    if (Array.isArray(subNotices) && subNotices.length) {
+        var metaHtml = _renderSubNoticesFromMeta(text, subNotices, messages, usedSubMessages);
+        if (metaHtml != null) return metaHtml;
+    }
     // Cheap pre-checks before the heavy regexes — almost every user row skips.
     var hasFinal = text.indexOf('Sub-agent "') !== -1 && text.indexOf('await_handle(') !== -1;
     var hasLife = text.indexOf('[sub-agent lifecycle]') !== -1;
@@ -1149,6 +1214,118 @@ function renderSubReportNotices(text, messages, usedSubMessages) {
     var after = text.slice(last).trim();
     if (after) out += '<div class="user-text user-text-md">' + fmt(after) + '</div>';
     return out;
+}
+
+// SUB-NOTICE-META (B part 2b): cards from the row's subNotices
+// ({kind, agentId, name, status, summary, text} — core/097 _subNoticeMeta).
+// Each meta's EXACT text is located with indexOf (first occurrence not
+// already claimed, so repeated identical notices pair one-to-one). Text
+// outside the matched spans (user text, legacy notices) goes through the
+// legacy regex path. Any miss / malformed meta returns null so the caller
+// renders the whole row the legacy way — content is never dropped.
+function _renderSubNoticesFromMeta(text, metas, messages, used) {
+    var spans = [];
+    for (var i = 0; i < metas.length; i++) {
+        var meta = metas[i];
+        var t = (meta && typeof meta.text === 'string') ? meta.text : '';
+        if (!t) return null;
+        var from = 0, pos;
+        while ((pos = text.indexOf(t, from)) !== -1) {
+            var clash = false;
+            for (var s = 0; s < spans.length; s++) {
+                if (pos < spans[s].end && pos + t.length > spans[s].start) { clash = true; break; }
+            }
+            if (!clash) break;
+            from = pos + 1;
+        }
+        if (pos === -1) return null;
+        spans.push({ start: pos, end: pos + t.length, meta: meta });
+    }
+    spans.sort(function(a, b) { return a.start - b.start; });
+    var out = '', last = 0;
+    for (var k = 0; k < spans.length; k++) {
+        out += _subNoticeLeftoverHtml(text.slice(last, spans[k].start), messages, used);
+        out += _subNoticeMetaCardHtml(spans[k].meta, messages, used);
+        last = spans[k].end;
+    }
+    return out + _subNoticeLeftoverHtml(text.slice(last), messages, used);
+}
+
+// Same markdown fallback chain as renderSubReportNotices' inline fmt.
+function _subNoticeFmt(seg) {
+    try { return (typeof formatContent === 'function') ? formatContent(seg) : escapeHtml(seg).replace(/\n/g, '<br>'); }
+    catch (_) { return escapeHtml(seg).replace(/\n/g, '<br>'); }
+}
+
+// Text outside the meta spans: legacy notice cards when it still holds
+// notice-shaped text, else the normal user-text markdown bubble segment.
+function _subNoticeLeftoverHtml(seg, messages, used) {
+    var s = String(seg || '').trim();
+    if (!s) return '';
+    var html = renderSubReportNotices(s, messages, used);
+    return (html != null) ? html : '<div class="user-text user-text-md">' + _subNoticeFmt(s) + '</div>';
+}
+
+function _subNoticeMetaCardHtml(meta, messages, used) {
+    var agentId = meta.agentId ? String(meta.agentId) : '';
+    var name = String(meta.name || agentId || 'sub-agent');
+    var summary = String(meta.summary == null ? '' : meta.summary);
+    if (meta.kind === 'final' || meta.kind === 'mid') {
+        var rst = String(meta.status || 'done');
+        // B part 2c: a need_input REPORT is produced as kind:'mid' (core/097
+        // _wakeParentOnReport; rows persisted by #968 carry it too). Render
+        // it exactly like the legacy final need_input card — filled amber
+        // "Final report · needs input" badge, not a muted progress update.
+        var cardKind = (meta.kind === 'mid' && rst === 'need_input') ? 'final' : meta.kind;
+        return _subNoticeCardHtml(name, agentId, rst, summary.trim(), cardKind);
+    }
+    if (meta.kind === 'lifecycle') {
+        if (_hasStandaloneSubMessage(messages, agentId, summary, used)) return '';
+        // Same headline-derived tint + compact error treatment as the
+        // legacy lifecycle arm of renderSubReportNotices.
+        var hl = summary;
+        var lst = /^errored|DENIED/.test(hl) ? 'error' : /STUCK|APPROVAL/.test(hl) ? 'need_input' : 'running';
+        var lopts = null;
+        if (lst === 'error') {
+            var hm = hl.match(/\s*(?:[\u2014\u2013-]\s*|\()resurrectable via wake_sub_agent[^)\n]*\)?\s*$/i);
+            if (hm) {
+                lopts = { hint: 'Resurrectable via wake_sub_agent' };
+                hl = hl.slice(0, hm.index).trim();
+            }
+            hl = hl.replace(/^errored\s*[\u2014\u2013-]\s*/i, '');
+        }
+        return _subNoticeCardHtml(name, agentId, lst, hl, 'mid', lopts);
+    }
+    if (meta.kind === 'message') {
+        // Parent→sub inbox drain (_inboxDrainMeta, core/097): the inbound
+        // "From parent" card, exactly as the legacy path renders the span.
+        if (/^\[\d{1,3} message\(s\) from parent \/ inbox\]/.test(meta.text)) return _subNoticeLeftoverHtml(meta.text, messages, used);
+        // Sub→parent agent_message: hidden when its standalone sub_msg
+        // callout is already in the transcript (same one-to-one pairing as
+        // the legacy 'sent a message: ' lifecycle segment), else the FULL
+        // multi-line markdown (the model notice text is flattened).
+        var norm = summary.replace(/\s*\n+\s*/g, ' ').slice(0, 3800);
+        if (_hasStandaloneSubMessage(messages, agentId, 'sent a message: ' + norm, used)) return '';
+        return _subMessageNoticeCardHtml(name, agentId, summary);
+    }
+    // Unknown kind: the legacy path renders this span.
+    return _subNoticeLeftoverHtml(meta.text, messages, used);
+}
+
+// "Message to parent" card for a kind:'message' notice inside an injected
+// row — renderSubAgentMessage's markup minus the top-level row class/id.
+function _subMessageNoticeCardHtml(name, agentId, text) {
+    var body = text ? '<div class="sub-notice-body markdown-body">' + renderSubMarkdown(text) + '</div>' : '';
+    var viewBtn = agentId
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        : '';
+    return '<div class="sub-notice sub-notice-mid sub-notice-outbound" data-sub-agent-id="' + escapeHtml(agentId) + '">' +
+        '<div class="sub-notice-header">' +
+            '<span class="sub-report-icon" aria-hidden="true">\u2190</span>' +
+            '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
+            '<span class="sub-notice-badge">Message to parent</span>' +
+            viewBtn +
+        '</div>' + body + '</div>';
 }
 
 // Used by the "open transcript →" link on a sub_report callout and by the
