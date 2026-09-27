@@ -25,6 +25,14 @@
     var noticeEl = null;
     var noticeDismissed = false;       // user closed the notice but lock still on
     var noticeFadeTimer = null;        // grace period before hiding notice after activity
+    // RELOAD-ZOMBIE: once keepAwakeDisarmUnload() ran, nothing may re-add the
+    // unload-type listeners (init() may still be awaiting getSetting).
+    var disarmed = false;
+    var listenersAttached = false;
+    var CLEAN_RELOAD_ACK_MS = 1500;    // appCleanReload: SW ack deadline before a direct reload
+    var CLEAN_RELOAD_ACK_MAX_MS = 60000; // appCleanReload: opts.timeoutMs is capped here
+    var CLEAN_RELOAD_POST_ACK_MS = 10000; // appCleanReload post-ack watchdog: still alive this long after the ack -> the SW never reloaded
+    var cleanReloadPromise = null;     // appCleanReload is single-shot per page
     var DEBUG = false;                 // ship with logging off (window.keepAwakeStatus() still works for diagnostics)
     function log() {
         if (!DEBUG) return;
@@ -231,10 +239,7 @@
         el.querySelector('.ka-forever').addEventListener('click', function () {
             foreverDisabled = true;
             try { if (typeof setSetting === 'function') setSetting('keepAwakeForeverDisabled', true); } catch (e) {}
-            try {
-                var cb = document.getElementById('keep-awake-checkbox');
-                if (cb) cb.checked = false;
-            } catch (e) {}
+            syncKeepAwakeCheckboxes();
             clearIdle(true);
         });
         el.querySelector('.ka-close').addEventListener('click', function () {
@@ -271,20 +276,27 @@
     // ---------- Lifecycle ----------
     function onActivity(evt) { resetIdleTimer(evt); }
 
+    // Named so keepAwakeDisarmUnload() can remove them before chrome.runtime.reload().
+    function onBeforeUnload() { forceRelease(); }
+    function onPageHide() { forceRelease(); }
+    function onVisibilityChange() {
+        // Hiding the panel drops the idle desire but NOT an active-run lock
+        // (chrome.power is machine-global, so the screen should stay awake
+        // while a run streams even if this document is backgrounded).
+        if (document.hidden) clearIdle(true);
+        else resetIdleTimer();
+    }
+
     function attachListeners() {
+        if (disarmed || listenersAttached) return;
         var events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'click', 'wheel'];
         for (var i = 0; i < events.length; i++) {
             window.addEventListener(events[i], onActivity, { passive: true, capture: true });
         }
-        document.addEventListener('visibilitychange', function () {
-            // Hiding the panel drops the idle desire but NOT an active-run lock
-            // (chrome.power is machine-global, so the screen should stay awake
-            // while a run streams even if this document is backgrounded).
-            if (document.hidden) clearIdle(true);
-            else resetIdleTimer();
-        });
-        window.addEventListener('pagehide', function () { forceRelease(); });
-        window.addEventListener('beforeunload', function () { forceRelease(); });
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        window.addEventListener('pagehide', onPageHide);
+        window.addEventListener('beforeunload', onBeforeUnload);
+        listenersAttached = true;
     }
 
     async function init() {
@@ -293,12 +305,11 @@
                 foreverDisabled = !!(await getSetting('keepAwakeForeverDisabled', false));
             }
         } catch (e) { /* getSetting not ready yet; default to enabled */ }
+        // Disarmed (a reload started) while awaiting: attach nothing, never re-acquire the lock.
+        if (disarmed) return;
         log('init — foreverDisabled=' + foreverDisabled + ' idleMs=' + IDLE_MS);
         // Sync any checkbox in the UI now that the saved setting is loaded.
-        try {
-            var cb = document.getElementById('keep-awake-checkbox');
-            if (cb) cb.checked = !foreverDisabled;
-        } catch (e) {}
+        syncKeepAwakeCheckboxes();
         attachListeners();
         attachRunListeners();
         // A run may already be in flight when this panel (re)loads — e.g. a
@@ -313,9 +324,18 @@
         syncLock();
     }
 
+    // A8B-02: keep both twins (gear #keep-awake-checkbox, Settings-page
+    // #settings-keep-awake) in step with foreverDisabled.
+    function syncKeepAwakeCheckboxes() {
+        ['keep-awake-checkbox', 'settings-keep-awake'].forEach(function (id) {
+            try { var cb = document.getElementById(id); if (cb) cb.checked = !foreverDisabled; } catch (e) {}
+        });
+    }
+
     // Expose a tiny API the settings UI can call to re-enable.
     window.setKeepAwakeForeverDisabled = function (disabled) {
         foreverDisabled = !!disabled;
+        syncKeepAwakeCheckboxes();
         try { if (typeof setSetting === 'function') setSetting('keepAwakeForeverDisabled', foreverDisabled); } catch (e) {}
         if (foreverDisabled) { hideNotice(); syncLock(); }
         else resetIdleTimer();
@@ -324,6 +344,93 @@
     // H17: called by the port bridge (app/045) after it bulk-clears or
     // reconciles runningChatIds without emitting runFinished/runCrashed.
     window.keepAwakeReconcileRuns = function () { reconcileRuns(); };
+    // RELOAD-ZOMBIE: on chrome.runtime.reload() Chrome closes this extension's
+    // tabs with CLOSE_NONE. When the page OR any subframe (e.g. a ServiceNow
+    // iframe) has a beforeunload, unload, pagehide or visibilitychange handler
+    // (all four count for NeedToFireBeforeUnloadOrUnloadEvents), the close is
+    // deferred to dispatch them; the old renderer dies mid-dispatch and the tab
+    // survives as a zombie (ERR_BLOCKED_BY_CLIENT / "Aw, Snap!"). Releases the
+    // OS lock, removes THIS file's beforeunload/pagehide/visibilitychange
+    // listeners (and blocks init() from re-adding them), nulls the
+    // on(before)unload/onpagehide properties and detaches every frame. Other
+    // files' listeners are untouched, which is why appCleanReload() (below)
+    // has the SW close the app tabs first (P1). `out` reports what was actually
+    // removed. Idempotent; never throws.
+    window.keepAwakeDisarmUnload = function () {
+        var out = { beforeunload: false, pagehide: false, visibilitychange: false, iframes: 0 };
+        disarmed = true;
+        try { forceRelease(); } catch (e) {}
+        if (listenersAttached) {
+            listenersAttached = false;
+            try { window.removeEventListener('beforeunload', onBeforeUnload); out.beforeunload = true; } catch (e) {}
+            try { window.removeEventListener('pagehide', onPageHide); out.pagehide = true; } catch (e) {}
+            try { document.removeEventListener('visibilitychange', onVisibilityChange); out.visibilitychange = true; } catch (e) {}
+        }
+        try { window.onbeforeunload = null; window.onunload = null; window.onpagehide = null; } catch (e) {}
+        try {
+            var frames = (document.querySelectorAll && document.querySelectorAll('iframe, frame')) || [];
+            for (var i = 0; i < frames.length; i++) {
+                try { if (frames[i].parentNode) { frames[i].parentNode.removeChild(frames[i]); out.iframes++; } } catch (e) {}
+            }
+        } catch (e) {}
+        return out;
+    };
+    // RELOAD-ZOMBIE (P1): page half of a clean extension reload. Disarms FIRST,
+    // then asks the SW ('app-clean-reload') to close every app tab and THEN
+    // chrome.runtime.reload(). Only {ok:true, ack:'app-clean-reload'} hands the
+    // reload to the SW; on lastError, any other/undefined reply, a throw, a
+    // missing sendMessage or no reply within CLEAN_RELOAD_ACK_MS the page calls
+    // chrome.runtime.reload() itself, exactly once (window.location.reload() if
+    // that throws). After a valid ack the promise stays PENDING (callers keep
+    // the Reload lock / buttons held): the SW's reload kills this page first.
+    // If the page is still alive CLEAN_RELOAD_POST_ACK_MS after the ack, the SW
+    // never reloaded, so the page does that same single direct reload and
+    // resolves 'ack-timeout'. Single-shot per page (later calls get the same
+    // promise); late replies and stale timers are ignored. Resolves with the
+    // outcome ('ack-timeout' | 'error' | 'invalid' | 'threw' | 'no-sendMessage'
+    // | 'timeout'; 'ack' only if the watchdog could not be armed, leaving the
+    // reload to the SW); never throws or rejects.
+    window.appCleanReload = function (opts) {
+        if (cleanReloadPromise) return cleanReloadPromise;
+        opts = opts || {};
+        // Non-finite or <= 0 -> the default; capped (Chrome fires delays past 2^31-1 ms at once).
+        var waitMs = opts.timeoutMs;
+        if (typeof waitMs !== 'number' || !isFinite(waitMs) || waitMs <= 0) waitMs = CLEAN_RELOAD_ACK_MS;
+        else if (waitMs > CLEAN_RELOAD_ACK_MAX_MS) waitMs = CLEAN_RELOAD_ACK_MAX_MS;
+        try { window.keepAwakeDisarmUnload(); } catch (e) {}
+        cleanReloadPromise = new Promise(function (resolve) {
+            var settled = false, acked = false, timer = null, watchdog = null;
+            function finish(outcome) {
+                if (settled) return;
+                settled = true;
+                if (timer) { try { clearTimeout(timer); } catch (e) {} timer = null; }
+                if (watchdog) { try { clearTimeout(watchdog); } catch (e) {} watchdog = null; }
+                if (outcome !== 'ack') {
+                    try { chrome.runtime.reload(); } catch (e) { try { window.location.reload(); } catch (e2) {} }
+                }
+                resolve(outcome);
+            }
+            // Valid ack: drop the ack deadline but stay pending; the watchdog runs from the ack.
+            function onAck() {
+                acked = true;
+                if (timer) { try { clearTimeout(timer); } catch (e) {} timer = null; }
+                try { watchdog = setTimeout(function () { finish('ack-timeout'); }, CLEAN_RELOAD_POST_ACK_MS); } catch (e) { finish('ack'); }
+            }
+            try { timer = setTimeout(function () { if (!acked) finish('timeout'); }, waitMs); } catch (e) {}
+            try {
+                if (typeof chrome.runtime.sendMessage !== 'function') { finish('no-sendMessage'); return; }
+                chrome.runtime.sendMessage({ type: 'app-clean-reload', reason: String(opts.reason || 'unknown'), at: Date.now() }, function (resp) {
+                    var err = null;
+                    try { err = chrome.runtime.lastError; } catch (e) { err = e; }
+                    if (settled || acked) return;   // late or duplicate reply: ignored
+                    if (err) finish('error');
+                    else if (resp && resp.ok === true && resp.ack === 'app-clean-reload') onAck();
+                    else finish('invalid');
+                });
+            } catch (e) { if (!acked) finish('threw'); }
+        });
+        return cleanReloadPromise;
+    };
     // Diagnostics — call window.keepAwakeStatus() in DevTools to see current state.
     window.keepAwakeStatus = function () {
         var s = {

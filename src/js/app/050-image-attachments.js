@@ -14,6 +14,14 @@ function handleImageFileSelect(event) {
     event.target.value = '';
 }
 
+// S0B2-06: aggregate cap across one draft's pending attachments. The per-file
+// caps (10MB each) alone let several files together exceed the provider's
+// ~32MB request limit, which then failed at send time.
+var MAX_PENDING_ATTACHMENT_CHARS = 30 * 1024 * 1024;
+function _attachmentChars(a) {
+    return (a && typeof a.base64 === 'string' ? a.base64.length : 0) + (a && typeof a.content === 'string' ? a.content.length : 0);
+}
+
 // Complete an upload into its originating draft, not whichever composer is visible.
 // Read the latest map entry on completion: navigation copies arrays, and another
 // upload or a send may have replaced/consumed the original array in the meantime.
@@ -22,6 +30,13 @@ function appendPendingImageForContext(contextKey, attachment) {
         // The origin chat vanished while the file was being read: the upload
         // has nowhere to land. Say so instead of silently dropping it.
         if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" was dropped: its chat was deleted', 'warning');
+        return;
+    }
+    var list = getPendingImagesOwnerContext() === contextKey ? pendingImageAttachments : (chatPendingImages[contextKey] || []);
+    var total = _attachmentChars(attachment);
+    for (var i = 0; i < list.length; i++) total += _attachmentChars(list[i]);
+    if (total > MAX_PENDING_ATTACHMENT_CHARS) {
+        if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" skipped: attachments would exceed ~30 MB', 'error');
         return;
     }
     // Compare against the context that OWNS the live list, not the visible view:
@@ -41,6 +56,13 @@ function appendPendingImageForContext(contextKey, attachment) {
 // Process an image, PDF, or spreadsheet file and add it to pending attachments
 function processImageFile(file) {
     var originContext = getCurrentPendingContext();
+    // S0B2-03: only the chat and Home composers can take an attachment. On other
+    // views (dashboard, skills, settings, docs, history, documents) the file
+    // would land in a hidden draft, and with no chat it was reported as "deleted".
+    if ((currentView !== 'chat' && currentView !== 'home') || originContext === 'none') {
+        if (typeof showSnackbar === 'function') showSnackbar('Open a chat or Home to attach "' + ((file && file.name) || 'file') + '"', 'info');
+        return;
+    }
     // Handle PDF files
     if (file.type === 'application/pdf') {
         // 10MB, same cap as images/text. The PDF is inlined as base64 (×1.33)
@@ -73,12 +95,11 @@ function processImageFile(file) {
     }
 
     // Handle text files (CSV, plain text, etc.)
-    var isTextFile = file.type.startsWith('text/') ||
-                     file.name.toLowerCase().endsWith('.csv') ||
-                     file.name.toLowerCase().endsWith('.txt') ||
-                     file.name.toLowerCase().endsWith('.json') ||
-                     file.name.toLowerCase().endsWith('.xml') ||
-                     file.name.toLowerCase().endsWith('.md');
+    // S0B2-05: every extension the pickers' accept lists offer (body.html) is read
+    // as text; YAML often reports application/x-yaml or an empty MIME type.
+    var TEXT_ATTACHMENT_EXTS = ['.csv', '.txt', '.json', '.xml', '.md', '.log', '.yml', '.yaml'];
+    var lower = (file.name || '').toLowerCase();
+    var isTextFile = file.type.startsWith('text/') || TEXT_ATTACHMENT_EXTS.some(function(x) { return lower.endsWith(x); });
 
     if (isTextFile) {
         if (file.size > 10 * 1024 * 1024) {
@@ -203,14 +224,47 @@ function handlePasteForImages(e) {
 
 // Track drag enter/leave depth for nested elements
 var dragDepth = 0;
+// S0B2-02: a lost dragleave (e.g. the element under the pointer is replaced
+// mid-drag) left dragDepth > 0 and the overlay stuck. While a file drag is
+// really over the page, dragover keeps firing and re-arms this heartbeat;
+// once it stops, the overlay resets itself.
+var DROP_OVERLAY_HEARTBEAT_MS = 1000, _dropHb = null;
+
+// S0B2-01: only drags that carry files are ours. Text, link and in-page
+// (e.g. dashboard) drags keep their native behavior: no preventDefault,
+// no overlay, no depth change.
+function isFileDrag(e) {
+    var t = e && e.dataTransfer && e.dataTransfer.types;
+    return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
+}
+
+function resetDropOverlay() {
+    dragDepth = 0;
+    if (_dropHb) { clearTimeout(_dropHb); _dropHb = null; }
+    var o = document.getElementById('drop-overlay');
+    if (o) o.classList.remove('visible');
+}
+
+function _armDropHeartbeat() {
+    if (_dropHb) clearTimeout(_dropHb);
+    _dropHb = setTimeout(resetDropOverlay, DROP_OVERLAY_HEARTBEAT_MS);
+}
 
 // Handle drag enter/over for the full page
 function handleDragOver(e) {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
+    if (dragDepth < 1) {
+        dragDepth = 1;
+        var overlay = document.getElementById('drop-overlay');
+        if (overlay) overlay.classList.add('visible');
+    }
+    _armDropHeartbeat();
 }
 
 function handleDragEnter(e) {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepth++;
@@ -218,28 +272,25 @@ function handleDragEnter(e) {
         var overlay = document.getElementById('drop-overlay');
         if (overlay) overlay.classList.add('visible');
     }
+    _armDropHeartbeat();
 }
 
 // Handle drag leave for the full page
 function handleDragLeave(e) {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepth--;
-    if (dragDepth <= 0) {
-        dragDepth = 0;
-        var overlay = document.getElementById('drop-overlay');
-        if (overlay) overlay.classList.remove('visible');
-    }
+    if (dragDepth <= 0) resetDropOverlay();
 }
 
 // Handle drop for the full page
 function handleDrop(e) {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
 
-    dragDepth = 0;
-    var overlay = document.getElementById('drop-overlay');
-    if (overlay) overlay.classList.remove('visible');
+    resetDropOverlay();
 
     var files = e.dataTransfer && e.dataTransfer.files;
     if (!files || files.length === 0) return;
@@ -372,7 +423,7 @@ function openPdfModal(base64, title, msgIndex) {
     headerHtml += '<button class="modal-close-icon" onclick="downloadPdfFromModal()" title="Download">' + UI_ICONS.download + '</button>';
     headerHtml += '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
     header.innerHTML = headerHtml;
-    body.innerHTML = '<iframe src="' + base64 + '" style="width:100%;height:100%;border:none;" title="PDF Preview"></iframe>';
+    body.innerHTML = '<iframe src="' + escapeAttr(base64) + '" style="width:100%;height:100%;border:none;" title="PDF Preview"></iframe>';
     actions.innerHTML = '';
 
     // Store base64 for download
@@ -440,7 +491,7 @@ function viewPdfAnnotations(msgIndex) {
                     if (part.type === 'text') {
                         contentHtml += '<div class="pdf-ann-text">' + escapeHtml(part.text).replace(/\n/g, '<br>') + '</div>';
                     } else if (part.type === 'image_url' && part.image_url) {
-                        contentHtml += '<div class="pdf-ann-image"><img src="' + part.image_url.url + '" alt="Parsed image" /></div>';
+                        contentHtml += '<div class="pdf-ann-image"><img src="' + escapeAttr(part.image_url.url || '') + '" alt="Parsed image" /></div>';
                     }
                 });
             }
@@ -459,7 +510,9 @@ function downloadPdfFromModal() {
 
     var link = document.createElement('a');
     link.href = body.dataset.pdfSrc;
-    link.download = (body.dataset.pdfName || 'document') + '.pdf';
+    // A3A2-01: the stored name usually already ends in .pdf (e.g. "x.pdf").
+    var name = body.dataset.pdfName || 'document';
+    link.download = /\.pdf$/i.test(name) ? name : name + '.pdf';
     link.click();
 }
 
@@ -580,11 +633,16 @@ function savePendingTextForContext(contextKey) {
     }
 }
 
+// A6A3-02: the static #message-input placeholder (= src/html/body.html:136). A transient hint
+// (e.g. openAddWidgetModal's) must not stick as every chat's placeholder.
+var DEFAULT_COMPOSER_PLACEHOLDER = 'Send a message...';
+
 function restorePendingTextForContext(contextKey) {
     var inputId = contextKey === 'home' ? 'home-message-input' : 'message-input';
     var input = document.getElementById(inputId);
     if (input) {
         input.value = chatPendingTexts[contextKey] || '';
+        if (inputId === 'message-input') input.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
         autoResizeTextarea(input);
     }
 }

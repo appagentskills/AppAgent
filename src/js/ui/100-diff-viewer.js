@@ -31,6 +31,7 @@ function toggleDiffFocus() {
 
 // State for diff viewer
 var currentDiffFile = null;
+var _diffViewSeq = 0; // A3B3-01: bumped by every updateDiffView call and by closeDiffViewer
 
 // Open fullscreen diff viewer
 async function openDiffViewer(table, sysId, displayName) {
@@ -57,7 +58,19 @@ async function openDiffViewer(table, sysId, displayName) {
     var overlay = document.createElement('div');
     overlay.className = 'diff-viewer-overlay';
     overlay.id = 'diff-viewer-overlay';
-    overlay.onclick = function(e) { if (e.target === overlay) closeDiffViewer(); };
+    overlay.tabIndex = -1; // TA4-5: focus target once (re)opened
+    // TA4-1: only a click whose mousedown STARTED on the backdrop closes, so a
+    // text-selection drag from the modal that ends on the backdrop keeps it open
+    // (same contract as ui/040-tools-settings.js showLlmEndpointModal). Synthetic
+    // calls (onclick({target: overlay}) replays, programmatic .click()) are not
+    // isTrusted and still close.
+    var backdropPressed = false;
+    overlay.addEventListener('mousedown', function(e) { backdropPressed = (e.target === overlay); });
+    overlay.onclick = function(e) {
+        if (!e || e.target !== overlay) return;
+        if (e.isTrusted && !backdropPressed) return;
+        closeDiffViewer();
+    };
 
     // Create modal
     var modal = document.createElement('div');
@@ -110,12 +123,19 @@ async function openDiffViewer(table, sysId, displayName) {
     modal.appendChild(header);
     modal.appendChild(content);
     overlay.appendChild(modal);
+    // TA4-5: a re-open REPLACES the viewer. A stacked second #diff-viewer-overlay
+    // was unreachable: getElementById (updateDiffView, closeDiffViewer) only ever
+    // sees the first, stale copy. Drop every existing one, then focus the new one.
+    Array.prototype.forEach.call(document.querySelectorAll('#diff-viewer-overlay'), function(o) { o.remove(); });
     document.body.appendChild(overlay);
+    try { overlay.focus({ preventScroll: true }); } catch (e) {}
 
     // Fetch historical versions and populate dropdown
     if (hasComparableVersions) {
         var chatVersionIds = versions.map(function(v) { return v.versionId; });
+        var openedFile = currentDiffFile; // RC7B1B-F1
         var historicalVersions = await getHistoricalVersions(table, sysId, chatVersionIds);
+        if (currentDiffFile !== openedFile || !content.isConnected) return; // closed or reopened mid-fetch
 
         // Combine and sort all versions
         var allVersions = versions.concat(historicalVersions);
@@ -171,6 +191,9 @@ async function updateDiffView() {
     var content = document.getElementById('diff-viewer-content');
     var headerStats = document.getElementById('diff-header-stats');
     if (!content) return;
+    // A3B3-01: a newer call, a close or a reopen supersedes this call; re-check after every await.
+    var seq = ++_diffViewSeq, file = currentDiffFile;
+    function stale() { return seq !== _diffViewSeq || currentDiffFile !== file || !content.isConnected; }
 
     content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>Loading...</div>';
     if (headerStats) headerStats.innerHTML = '';
@@ -191,6 +214,7 @@ async function updateDiffView() {
             // Shared helper (ui/090-version-history.js): chat version → live
             // version → <table>.do?XML export fallback for data tables.
             var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
+            if (stale()) return;
             if (!xml) {
                 content.innerHTML = '<div class="diff-error">Could not load record data.</div>';
                 return;
@@ -211,6 +235,7 @@ async function updateDiffView() {
 
             if (headerStats) headerStats.innerHTML = '<span class="diff-preview-label">' + lines.length + ' lines</span>';
         } catch (e) {
+            if (stale()) return;
             content.innerHTML = '<div class="diff-error">Failed to load version data: ' + escapeHtml(e.message) + '</div>';
         }
         return;
@@ -226,6 +251,7 @@ async function updateDiffView() {
     try {
         var oldXml = await getVersionXml(compareVersionId);
         var newXml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : oldXml;
+        if (stale()) return;
 
         if (!oldXml) {
             content.innerHTML = '<div class="diff-error">Could not load version data. The version may have been deleted.</div>';
@@ -344,12 +370,14 @@ async function updateDiffView() {
         }
 
     } catch (e) {
+        if (stale()) return;
         content.innerHTML = '<div class="diff-error">Failed to load version data: ' + escapeHtml(e.message) + '</div>';
     }
 }
 
 // Close diff viewer
 function closeDiffViewer() {
+    _diffViewSeq++; // A3B3-01: in-flight updateDiffView calls become stale
     currentDiffFile = null;
     var overlay = document.getElementById('diff-viewer-overlay');
     if (overlay) overlay.remove();
@@ -358,13 +386,16 @@ function closeDiffViewer() {
 // Download from diff viewer
 async function downloadFromDiffViewer() {
     if (!currentDiffFile) return;
+    // Capture the record: closeDiffViewer() nulls currentDiffFile (and a reopen
+    // swaps it) while the fetch below is in flight.
+    var file = currentDiffFile;
 
     showSpinner('Downloading...');
     try {
         // getLatestRecordXml falls back to the <table>.do?XML export for data
         // tables (no sys_update_version rows) — the old getLatestAfterVersion
         // early-return made Download dead-end with "No version to download".
-        var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
+        var xml = await getLatestRecordXml(file.table, file.sysId);
         if (!xml) {
             hideSpinner();
             showSnackbar('No version to download', 'warning');
@@ -376,12 +407,12 @@ async function downloadFromDiffViewer() {
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
-            a.download = currentDiffFile.displayName.replace(/[^a-zA-Z0-9_-]/g, '_') + '.xml';
+            a.download = file.displayName.replace(/[^a-zA-Z0-9_-]/g, '_') + '.xml';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            showSnackbar('Downloaded ' + currentDiffFile.displayName, 'success');
+            showSnackbar('Downloaded ' + file.displayName, 'success');
         }
     } catch (e) {
         showSnackbar('Download failed: ' + e.message, 'error');
@@ -395,7 +426,7 @@ async function revertFromDiffViewer() {
 
     if (currentDiffFile.isNew) {
         // Delete new record
-        if (!await showConfirmModal('Delete Record', 'Delete "' + currentDiffFile.displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
+        if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(currentDiffFile.displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
 
         showSpinner('Deleting...');
         try {
@@ -435,7 +466,7 @@ async function revertFromDiffViewer() {
         hideSpinner();
     } else if (currentDiffFile.firstBeforeVersion) {
         // Revert to before chat
-        if (!await showConfirmModal('Revert Changes', 'Revert "' + currentDiffFile.displayName + '" to its state before this chat? You can redo this later.')) return;
+        if (!await showConfirmModal('Revert Changes', 'Revert "' + escapeHtml(currentDiffFile.displayName) + '" to its state before this chat? You can redo this later.')) return;
 
         showSpinner('Reverting...');
         try {

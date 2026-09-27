@@ -150,7 +150,11 @@ document.addEventListener('click', function(e) {
 
 function renderToolPermissions() {
     var container = document.getElementById('tool-permissions-list');
-    if (!container) return;
+    if (!container) {
+        // Header list was removed; the Settings page list is the only mounted one.
+        if (typeof renderSettingsToolPermissions === 'function') renderSettingsToolPermissions();
+        return;
+    }
 
     var html = '';
     var host = getConnectedInstanceHost();

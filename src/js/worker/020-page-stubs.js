@@ -140,6 +140,7 @@ if (typeof executeManageSkill !== 'function') var executeManageSkill = async fun
 if (typeof escDisplay !== 'function') var escDisplay = function(s) { return String(s == null ? '' : s); };
 if (typeof showNotification !== 'function') var showNotification = function() {};
 if (typeof showConfirmModal !== 'function') var showConfirmModal = async function() { return false; };
+if (typeof showModal !== 'function') var showModal = async function() { return 'cancel'; };
 if (typeof hideAllPanels !== 'function') var hideAllPanels = function() {};
 if (typeof showChatView !== 'function') var showChatView = function() {};
 if (typeof newChat !== 'function') var newChat = function() {};

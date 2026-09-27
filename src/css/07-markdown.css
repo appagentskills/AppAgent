@@ -76,7 +76,7 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .md-table td:last-child, .md-table th:last-child { border-right: none; }
 .md-table tr:last-child td { border-bottom: none; }
 .md-table tr:nth-child(even) { background: var(--bg-light); }
-.md-table tr:first-child td { font-weight: var(--font-semibold); background: var(--bg-code); color: var(--text-primary); }
+.md-table th, .md-table tbody:first-child tr:first-child td { font-weight: var(--font-semibold); background: var(--bg-code); color: var(--text-primary); }
 
 /* Blockquotes — left border + indent. Works in chat (.message-content) and any
    .markdown-body container (popovers, action update outputs, smart docs). */

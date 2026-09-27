@@ -165,18 +165,6 @@ function scrollToFirstToolCall(msgIdx) {
     }
 }
 
-function toggleFileChanges(fileKey) {
-    var el = document.getElementById('changes-' + fileKey);
-    if (!el) return;
-    var isExpanded = el.style.display !== 'none';
-    el.style.display = isExpanded ? 'none' : 'block';
-    // Update expand icon
-    var icon = document.getElementById('icon-' + fileKey);
-    if (icon) {
-        icon.textContent = isExpanded ? '\u25b6' : '\u25bc';
-    }
-}
-
 // RIGHT chat/version sidebar (#version-sidebar) manual-hide state — driven by
 // openVersionSidebar()/closeVersionSidebar(), persisted as appStorage key
 // 'versionSidebarHidden' (do NOT rename the key — existing users' saved prefs).
@@ -399,45 +387,73 @@ function _orphanedSubPrBelongsHere(pr, ownerChatId) {
 // truncated/lost). wsPush durably tracks every PR in workspace meta.prs
 // ({url, number, branch, title}), so the sidebar merges those in as a fallback
 // and can show the real PR title (not just the branch) in other chats.
-// Scoped to the DEFAULT workspace (pin > MRU — same resolution as
-// resolveWorkspace in 130-indexeddb.js, read-only) rather than dumping every
-// workspace's PR history into every chat.
+// PR-CHIP (PR-2): the list is the UNION of every workspace's meta.prs, deduped
+// by URL (_sidebarMetaPRsUnion). It used to read only the DEFAULT workspace
+// (pin > MRU), so a PR tracked in any other meta — a push to another repo, a
+// web_fetch-created PR (_wfMaybeTrackGitHubPr files it under the PR's own
+// repo), a branch fork's meta — never reached the sidebar once the message
+// scan missed it. That no longer dumps every workspace's history into every
+// chat: renderVersionSidebar's per-chat owner gate (chatId stamp / live sub /
+// root_chat_id / orphan backfill) scopes each entry.
 // renderVersionSidebar is synchronous and meta lives in IDB, so the list is
 // cached here and refreshed async (lazily on first render + on every
 // workspaceMutated event); a refresh that changes the list re-renders once.
 var _sidebarMetaPRs = null; // null = never loaded; [] = loaded, none
 var _sidebarMetaPRsLoading = false;
+// PR-CHIP (S-1): a refresh requested while a load is in flight (e.g. the
+// workspaceMutated burst of one push) used to be DROPPED, so a PR written
+// after the in-flight read stayed hidden until some later mutation. It now
+// marks the cache dirty and the load re-runs once when it settles.
+var _sidebarMetaPRsDirty = false;
+
+// Union of every workspace meta's prs, deduped by URL. Pinned metas first,
+// then most recently used — per repo that is the meta the trackers write to
+// (wsPush, _wfMaybeTrackGitHubPr: pinned wins, else MRU) — and the first
+// copy of a URL wins. A later duplicate (e.g. a fork's meta and its base's)
+// only lends a merged/closed state the kept copy lacks, so the Merged chip
+// still seeds from the durable meta. Meta objects are never mutated.
+function _sidebarMetaPRsUnion(all) {
+    var metas = (all || []).filter(function(m) { return m && m.repo && Array.isArray(m.prs); });
+    metas.sort(function(a, b) {
+        if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+        return (b.last_used_at || b.cloned_at || 0) - (a.last_used_at || a.cloned_at || 0);
+    });
+    var out = [];
+    var byUrl = {};
+    metas.forEach(function(m) {
+        m.prs.forEach(function(p) {
+            if (!p || !p.url) return;
+            if (byUrl[p.url] === undefined) { byUrl[p.url] = out.length; out.push(p); return; }
+            var kept = out[byUrl[p.url]];
+            if (!kept.state && (p.state === 'merged' || p.state === 'closed')) {
+                out[byUrl[p.url]] = Object.assign({}, kept, { state: p.state });
+            }
+        });
+    });
+    return out;
+}
 
 function _refreshSidebarMetaPRs() {
-    if (_sidebarMetaPRsLoading) return;
-    if (typeof getAllWorkspaceMetas !== 'function' || typeof parseWsKey !== 'function') return;
+    if (_sidebarMetaPRsLoading) { _sidebarMetaPRsDirty = true; return; }
+    if (typeof getAllWorkspaceMetas !== 'function') return;
     _sidebarMetaPRsLoading = true;
+    _sidebarMetaPRsDirty = false; // this load satisfies any earlier request
     getAllWorkspaceMetas().then(function(all) {
-        // Pick the default workspace: most-recently-used, overridden by a
-        // pinned sibling of the same owner/repo (mirrors resolveWorkspace,
-        // but read-only — no last_used_at bump).
-        var chosen = null;
-        (all || []).forEach(function(m) {
-            if (!m || !m.repo) return;
-            if (!chosen || (m.last_used_at || m.cloned_at || 0) > (chosen.last_used_at || chosen.cloned_at || 0)) chosen = m;
-        });
-        if (chosen) {
-            var chosenRepo = chosen.github_repo || parseWsKey(chosen.repo).repo;
-            for (var i = 0; i < all.length; i++) {
-                var pm = all[i];
-                if (pm && pm.pinned && (pm.github_repo || parseWsKey(pm.repo).repo) === chosenRepo) { chosen = pm; break; }
-            }
-        }
-        var prs = (chosen && chosen.prs) ? chosen.prs.filter(function(p) { return p && p.url; }) : [];
+        var prs = _sidebarMetaPRsUnion(all);
         var changed = JSON.stringify(prs) !== JSON.stringify(_sidebarMetaPRs);
         _sidebarMetaPRs = prs;
         _sidebarMetaPRsLoading = false;
         if (changed) renderVersionSidebar();
-    }).catch(function() { _sidebarMetaPRsLoading = false; });
+    }).catch(function() { _sidebarMetaPRsLoading = false; }).then(function() {
+        if (_sidebarMetaPRsDirty && !_sidebarMetaPRsLoading) {
+            _sidebarMetaPRsDirty = false;
+            _refreshSidebarMetaPRs();
+        }
+    });
 }
 
-// Keep the cache warm: meta.prs changes on push, and the default workspace
-// changes on clone/pin/branch/delete. AgentEvents (app tier) may load after
+// Keep the cache warm: meta.prs changes on push / PR tracking / sync, and the
+// set of workspaces changes on clone/pin/branch/delete. AgentEvents (app tier) may load after
 // this file — retry briefly, same pattern as _wsfHookMutations
 // (115-workspace-files-sidebar.js). The re-render itself is triggered by
 // _refreshSidebarMetaPRs when the list actually changed.
@@ -517,7 +533,7 @@ async function mergeSidebarPR(event, btn) {
     var info = parsePrUrl(url);
     if (!info) { showSnackbar('Could not parse PR URL: ' + url, 'error'); return; }
     var ok = await showConfirmModal('Merge PR #' + info.number,
-        'Merge pull request #' + info.number + ' (' + info.repo + ') on GitHub and sync the local workspace?', 'warning');
+        'Merge pull request #' + info.number + ' (' + escapeHtml(info.repo) + ') on GitHub and sync the local workspace?', 'warning');
     if (!ok) return;
     _sidebarPRState[url] = 'merging';
     renderVersionSidebar();
@@ -683,8 +699,8 @@ function renderVersionSidebar() {
             pushedPRs.push(pr);
         });
     });
-    // Durable fallback: append PRs tracked in the default workspace's meta.prs
-    // that the message scan missed (see _refreshSidebarMetaPRs). Message-scan
+    // Durable fallback: append PRs tracked in any workspace's meta.prs (the
+    // union cached by _refreshSidebarMetaPRs) that the message scan missed. Message-scan
     // entries win (they also carry base); meta entries now carry a title too, so
     // other chats show the real PR title. Entries are deduped by URL and skipped
     // once known merged/closed — the fallback surfaces actionable PRs, not the
@@ -855,7 +871,7 @@ function renderVersionSidebar() {
                 '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-sidebar-actions">' +
-                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Show in Panel">' + UI_ICONS.panelRight + '</button>' +
+                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
                 '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
                 '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
                 '</div>' +
@@ -1063,7 +1079,7 @@ function renderVersionSidebar() {
 
 // Redo changes that were previously reverted
 async function redoFileChanges(versionSysId, table, sysId, displayName) {
-    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + displayName + '"? This will restore the AI-made changes.')) return;
+    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + escapeHtml(displayName) + '"? This will restore the AI-made changes.')) return;
     
     try {
         showSpinner('Restoring ' + displayName + '...');
@@ -1157,7 +1173,7 @@ async function redoAllChanges() {
 
 // Revert a single file to its state before this chat
 async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
-    if (!await showConfirmModal('Undo All Changes', 'Undo all changes to "' + displayName + '"? This will restore the file to how it was before this chat session.')) return;
+    if (!await showConfirmModal('Undo All Changes', 'Undo all changes to "' + escapeHtml(displayName) + '"? This will restore the file to how it was before this chat session.')) return;
     
     try {
         showSpinner('Reverting ' + displayName + '...');
@@ -1209,8 +1225,8 @@ async function revertAllChanges() {
         return;
     }
     
-    var fileNames = changedFiles.map(function(f) { return f.displayName; }).join(', ');
-    if (!await showConfirmModal('Undo All Changes', 'Undo ALL changes made in this chat? This will revert: ' + changedFiles.map(function(f) { return f.displayName; }).join(', ') + '. You can always redo these changes later.')) return;
+    var fileNames = changedFiles.map(function(f) { return escapeHtml(f.displayName); }).join(', ');
+    if (!await showConfirmModal('Undo All Changes', 'Undo ALL changes made in this chat? This will revert: ' + fileNames + '. You can always redo these changes later.')) return;
     
     var successCount = 0;
     var failCount = 0;

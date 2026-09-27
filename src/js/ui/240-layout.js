@@ -4,7 +4,7 @@ function copyMessageText(msgIndex) {
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     navigator.clipboard.writeText(msg.content).then(function() {
-        showSnackbar('Message copied', 'success');
+        showSnackbar('Message copied', 'success', undefined, { transient: true });
     }).catch(function() {
         // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
         showSnackbar('Copy failed', 'error');
@@ -40,7 +40,7 @@ function copyAiMessage(userMsgIdx) {
     }
     
     navigator.clipboard.writeText(content.join('\n\n')).then(function() {
-        showSnackbar('Response copied', 'success');
+        showSnackbar('Response copied', 'success', undefined, { transient: true });
     }).catch(function() {
         // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
         showSnackbar('Copy failed', 'error');
@@ -48,10 +48,20 @@ function copyAiMessage(userMsgIdx) {
 }
 
 // Toggle API stats display
-function toggleApiStats() {
-    showApiStats = !showApiStats;
+// A8B-01: both twins (gear #show-api-stats, Settings-page
+// #settings-show-api-stats) pass this.checked, so the value follows the box
+// that was clicked (no-arg calls keep the flip), and both boxes are synced.
+function toggleApiStats(checked) {
+    showApiStats = (typeof checked === 'boolean') ? checked : !showApiStats;
     appStorage.setItem('showApiStats', showApiStats);
+    syncApiStatsCheckboxes();
     renderMessages();
+}
+function syncApiStatsCheckboxes() {
+    ['show-api-stats', 'settings-show-api-stats'].forEach(function(id) {
+        var cb = document.getElementById(id);
+        if (cb) cb.checked = showApiStats;
+    });
 }
 
 // Toggle compact tool calls display
@@ -141,7 +151,9 @@ function syncSettingsPanelTheme() {
     var group = document.getElementById('settings-panel-theme');
     if (!group) return;
     group.querySelectorAll('.radio-option').forEach(function(o) {
-        o.classList.toggle('selected', o.getAttribute('data-value') === appTheme);
+        var on = o.getAttribute('data-value') === appTheme;
+        o.classList.toggle('selected', on);
+        o.setAttribute('aria-checked', on ? 'true' : 'false');
     });
 }
 

@@ -8,7 +8,7 @@
 // payloads inline, hydration falls back to record-inline base64, and the next
 // save re-extracts them into chat_payloads. Mutates and returns `chat`, which
 // is always a throwaway copy fetched from IDB — never the in-memory object.
-async function inlineChatPayloadsForExport(database, chat) {
+async function inlineChatPayloadsForExport(database, chat, stats) {
     if (!chat || !chat._payloadsEvicted) return chat;
     var ids = {};
     if (Array.isArray(chat.messages)) {
@@ -27,13 +27,17 @@ async function inlineChatPayloadsForExport(database, chat) {
     var idList = Object.keys(ids);
     if (idList.length) {
         var byId = {};
+        // S0B-07: each id counts as missing until its payload is found, so a
+        // failed get or a throw (the caller logs it and exports the chat as-is)
+        // is reported in the export result instead of a plain success.
+        if (stats) stats.missing += idList.length;
         var tx = database.transaction([chatPayloadsStoreName], 'readonly');
         var store = tx.objectStore(chatPayloadsStoreName);
         await Promise.all(idList.map(function(id) {
             return new Promise(function(resolve) {
                 var req = store.get(id);
                 req.onsuccess = function() {
-                    if (req.result && req.result.base64) byId[id] = req.result.base64;
+                    if (req.result && req.result.base64) { byId[id] = req.result.base64; if (stats) stats.missing--; }
                     resolve();
                 };
                 req.onerror = function(ev) {
@@ -63,7 +67,31 @@ async function inlineChatPayloadsForExport(database, chat) {
     return chat;
 }
 
+// S0B-06: API keys are stored in plaintext, so a backup leaves them out unless
+// the user opts in. Each provider row / settings llmEndpoints entry then gets
+// apiKey:'' plus _apiKeyRedacted, and importing it keeps that device's own key
+// (importAllData). The 'oauth' apiKey marker is not a secret and is kept; OAuth,
+// GitHub and instance tokens live in chrome.storage.local and are not exported.
+function _redactApiKey(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row) || row.apiKey === 'oauth') return row;
+    var out = Object.assign({}, row);
+    out.apiKey = '';
+    out._apiKeyRedacted = true;
+    return out;
+}
+
+// S0B3-03: device-local settings never leave or enter a backup. A
+// FileSystemDirectoryHandle serializes to {}, and an old backup's value:{} must
+// not replace this device's live deploy-folder handle. S0B3-01: deployDirForeignOk
+// is that folder's foreign-folder consent, so it is device-local too.
+var DEVICE_LOCAL_SETTING_KEYS = { deployDirHandle: 1, deployDirForeignOk: 1 };
+function _isDeviceLocalSetting(row) {
+    return !!row && typeof row === 'object' && typeof row.key === 'string' &&
+        Object.prototype.hasOwnProperty.call(DEVICE_LOCAL_SETTING_KEYS, row.key);
+}
+
 async function exportAllData() {
+    var writable = null; // S0B-07: aborted in the catch so a failed export leaves no file
     try {
         // Use File System Access API for streaming large exports
         if (!window.showSaveFilePicker) {
@@ -71,14 +99,27 @@ async function exportAllData() {
             return;
         }
 
+        // S0B-06: ask first; the safe default leaves the keys out. The modal click
+        // keeps the user activation the file picker needs. Cancel/dismiss: nothing
+        // is written.
+        var keyChoice = await showModal('Export Data',
+            'API keys are stored in <b>plaintext</b>: anyone who gets a backup that includes them can use them.<br><br>' +
+            '<b>Export without API keys</b> (recommended): importing this backup later keeps the API keys already on that device.',
+            [{ label: 'Cancel', value: 'cancel', class: 'secondary' },
+                { label: 'Export without API keys', value: 'nokeys', class: 'primary' },
+                { label: 'Include API keys (plaintext)', value: 'keys', class: 'warning' }], 'warning');
+        if (keyChoice !== 'nokeys' && keyChoice !== 'keys') return;
+        var redactKeys = keyChoice !== 'keys';
+
         var fileHandle = await window.showSaveFilePicker({
             suggestedName: 'appagent-backup-' + new Date().toISOString().split('T')[0] + '.json',
             types: [{ description: 'JSON Files', accept: { 'application/json': ['.json'] } }]
         });
 
-        var writable = await fileHandle.createWritable();
+        writable = await fileHandle.createWritable();
         var database = await openDatabase();
         var chatCount = 0;
+        var exportStats = { missing: 0 }; // S0B-07: attachments that could not be inlined
 
         // Write header
         await writable.write('{\n  "version": 3,\n  "exportDate": "' + new Date().toISOString() + '",\n  "chats": [\n');
@@ -105,7 +146,7 @@ async function exportAllData() {
             if (chat) {
                 // PAYLOAD-STORE: re-inline this record's payloads from
                 // chat_payloads so the backup is self-contained.
-                try { chat = await inlineChatPayloadsForExport(database, chat); } catch (eInline) { console.error('export: payload inlining failed for', chat && chat.id, eInline); }
+                try { chat = await inlineChatPayloadsForExport(database, chat, exportStats); } catch (eInline) { console.error('export: payload inlining failed for', chat && chat.id, eInline); }
                 if (chatCount > 0) await writable.write(',\n');
                 // Pretty print each chat with 4-space indent, then add 4 spaces to each line
                 var prettyChat = JSON.stringify(chat, null, 4).split('\n').map(function(line) {
@@ -123,6 +164,12 @@ async function exportAllData() {
             var request = settingsStore.getAll();
             request.onsuccess = function() { resolve(request.result || []); };
             request.onerror = function() { resolve([]); };
+        });
+        settingsData = settingsData.filter(function(row) { return !_isDeviceLocalSetting(row); }); // S0B3-03
+        // S0B-06: the llmEndpoints setting holds one apiKey per endpoint.
+        if (redactKeys) settingsData = settingsData.map(function(row) {
+            if (!row || row.key !== 'llmEndpoints' || !Array.isArray(row.value)) return row;
+            return Object.assign({}, row, { value: row.value.map(_redactApiKey) });
         });
 
         await writable.write('\n  ],\n  "settings": ');
@@ -160,6 +207,7 @@ async function exportAllData() {
                 request.onerror = function() { resolve([]); };
             });
         }
+        if (redactKeys) apiProvidersData = apiProvidersData.map(_redactApiKey);
 
         await writable.write(',\n  "apiProviders": ');
         await writable.write(JSON.stringify(apiProvidersData, null, 2).split('\n').map(function(line, idx) {
@@ -173,12 +221,92 @@ async function exportAllData() {
 
         await writable.close();
 
-        showSnackbar('Data exported successfully! (' + chatCount + ' chats)', 'success');
+        // S0B-07: payloads that could not be re-inlined are reported, not hidden.
+        if (exportStats.missing) showSnackbar('Exported ' + chatCount + ' chats; ' + exportStats.missing + ' attachments could not be included', 'warning');
+        else showSnackbar('Data exported successfully! (' + chatCount + ' chats)', 'success');
     } catch (e) {
+        // S0B-07: a failed write must not leave a (swap) file behind.
+        if (writable) try { await writable.abort(); } catch (_) {}
         if (e.name === 'AbortError') return; // User cancelled file picker
         console.error('Export failed:', e);
         showSnackbar('Export failed: ' + e.message, 'error');
     }
+}
+
+// S0B-04: a single-chat file must be a plain object with a messages array.
+function _validateImportedChat(chat) {
+    if (!chat || typeof chat !== 'object' || Array.isArray(chat) || !Array.isArray(chat.messages)) throw new Error('Invalid chat file');
+    return chat;
+}
+
+// S0B-01: read-only snapshot of the rows an import would REPLACE. Runs in its own
+// readonly transaction BEFORE the confirm; the write itself stays one atomic tx.
+async function _readImportExisting(database, names) {
+    var out = {};
+    await new Promise(function(resolve, reject) {
+        var tx = database.transaction(names, 'readonly');
+        tx.oncomplete = resolve;
+        tx.onerror = tx.onabort = function() { reject(tx.error || new Error('Import pre-check failed')); };
+        names.forEach(function(n) {
+            var st = tx.objectStore(n);
+            var keysOnly = (n === chatStoreName || n === dashboardWidgetsStoreName) && typeof st.getAllKeys === 'function';
+            var rq = keysOnly ? st.getAllKeys() : st.getAll();
+            rq.onsuccess = function() { out[n] = { keysOnly: keysOnly, rows: rq.result || [] }; };
+        });
+    });
+    return out;
+}
+
+// First 5 names, HTML-escaped (the confirm message is rendered as markup).
+function _importConflictNames(list) {
+    if (!list.length) return '';
+    return ': ' + list.slice(0, 5).map(function(s) { return escapeHtml(String(s)); }).join(', ') + (list.length > 5 ? ', …' : '');
+}
+
+// S0B-02: the SW only re-reads IDB at its own boot, so after an import restart
+// the WHOLE extension the way Reload does (timestamped reopenAppTab marker raced
+// against a bounded timer, then chrome.runtime.reload()) - without Reload's
+// rebuild step. Reload's _startReloadSequence is nested inside
+// _reloadExtensionLocked (ui/270-iframe-panel.js), so it cannot be reused here.
+// No extension runtime (web preview/tests) or a build still writing files:
+// plain page reload, synchronously.
+async function _restartAfterImport() {
+    if (typeof chrome === 'undefined' || !chrome || !chrome.runtime || typeof chrome.runtime.reload !== 'function' ||
+        (typeof _reloadBuildInFlight !== 'undefined' && _reloadBuildInFlight)) {
+        window.location.reload();
+        return;
+    }
+    try { if (typeof _prepareRealmsForReload === 'function') await _prepareRealmsForReload(); } catch (e) {}
+    await new Promise(function(resolve) {
+        var timer = setTimeout(resolve, 1500);
+        var done = function() { clearTimeout(timer); resolve(); };
+        try {
+            if (!chrome.storage || !chrome.storage.local) { done(); return; }
+            // Timestamp (not true): background.js discards a stale marker.
+            chrome.storage.local.set({ reopenAppTab: Date.now() }, function() { void chrome.runtime.lastError; done(); });
+        } catch (e) { done(); }
+    });
+    // RELOAD-ZOMBIE (P1): app/060 appCleanReload (SW closes app tabs, then reloads; direct-reload fallback).
+    var clean = null;
+    try { if (typeof window.appCleanReload === 'function') clean = window.appCleanReload({ reason: 'restart-after-import' }); } catch (e) { clean = null; }
+    if (clean && typeof clean.then === 'function') { try { await clean; } catch (e) {} return; }
+    try { if (typeof window.keepAwakeDisarmUnload === 'function') window.keepAwakeDisarmUnload(); } catch (e) {}
+    try { chrome.runtime.reload(); } catch (e) { window.location.reload(); }
+}
+
+// S0B-03: the import result survives the restart as a one-shot notice that the
+// next boot shows once (core/120-init.js). A notice older than 5 minutes is
+// dropped so a leftover key never resurfaces long after the import.
+var POST_IMPORT_NOTICE_KEY = 'appagentPostImportNotice';
+function consumePostImportNotice() {
+    if (typeof appStorage === 'undefined') return;
+    var raw = appStorage.getItem(POST_IMPORT_NOTICE_KEY);
+    if (!raw) return;
+    appStorage.removeItem(POST_IMPORT_NOTICE_KEY);
+    var notice = null;
+    try { notice = JSON.parse(raw); } catch (e) { return; }
+    if (!notice || typeof notice.msg !== 'string' || !(Date.now() - notice.at < 5 * 60 * 1000)) return;
+    showSnackbar(notice.msg, notice.type || 'success');
 }
 
 async function importAllData() {
@@ -192,13 +320,17 @@ async function importAllData() {
         try {
             var text = await file.text();
             var importData = JSON.parse(text);
+            // S0B-05: refuse files from a newer format (missing version = legacy, accepted).
+            if (importData && typeof importData.version === 'number' && importData.version > 3) {
+                throw new Error('Backup is from a newer version');
+            }
             
             // Handle single chat import
             if (importData.exportType === 'single_chat' && importData.chat) {
-                var importedChat = importData.chat;
+                var importedChat = _validateImportedChat(importData.chat);
                 var newId = 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
                 importedChat.id = newId;
-                importedChat.title = importedChat.title + ' (imported)';
+                importedChat.title = (typeof importedChat.title === 'string' && importedChat.title.trim() ? importedChat.title : 'Imported chat') + ' (imported)';
                 // The import-time name is authoritative — drop a serialized
                 // provisional flag so the auto-title hook doesn't re-title the
                 // chat (losing the '(imported)' marker) on its next run.
@@ -232,17 +364,20 @@ async function importAllData() {
                 var k = (row && typeof row === 'object' && !Array.isArray(row)) ? row[keyField] : undefined;
                 return typeof k === 'string' ? k.length > 0 : (typeof k === 'number' && isFinite(k));
             };
-            var _validRows = function(rows, keyField) {
+            var _validRows = function(rows, keyField, extraOk) {
                 var out = [];
                 if (!Array.isArray(rows)) return out;
                 for (var r = 0; r < rows.length; r++) {
-                    if (_hasKey(rows[r], keyField)) out.push(rows[r]);
+                    if (_hasKey(rows[r], keyField) && (!extraOk || extraOk(rows[r]))) out.push(rows[r]);
                     else _impSkipped++;
                 }
                 return out;
             };
-            var _impChats = _validRows(importData.chats, 'id');
-            var _impSettings = _validRows(importData.settings, 'key');
+            // S0B-05: a chat row without a messages array is invalid (counted as skipped).
+            var _impChats = _validRows(importData.chats, 'id', function(row) { return Array.isArray(row.messages); });
+            // S0B3-03: device-local rows are skipped (not invalid), so they are never
+            // written and never counted as a settings conflict.
+            var _impSettings = _validRows(importData.settings, 'key').filter(function(row) { return !_isDeviceLocalSetting(row); });
             var _impDashboardWidgets = _validRows(importData.dashboardWidgets, 'id');
             var _impProviders = _validRows(importData.apiProviders, 'name');
             if (_impChats.length === 0 && _impSettings.length === 0 && _impDashboardWidgets.length === 0 && _impProviders.length === 0) {
@@ -253,12 +388,7 @@ async function importAllData() {
             var _impWidgets = importData.widgets === undefined ? [] : importData.widgets;
             WidgetStore.validateRecords(_impWidgets);
 
-            var _impConfirmMsg = 'This will merge imported data with existing data (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
-                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) will be skipped' : '') + '). Continue?';
-            if (!await showConfirmModal('Import Data', _impConfirmMsg)) {
-                return;
-            }
-            
+            // S0B-01: nothing is written until the conflict confirm below.
             var database = await openDatabase();
             
             var _impStores = {};
@@ -298,6 +428,118 @@ async function importAllData() {
 
             }
             
+            // S0B-01: list every same-key row the backup would REPLACE (settings:
+            // only keys whose value changes) and write nothing unless confirmed.
+            var _existing = await _readImportExisting(database, Object.keys(_impStores));
+            // S0B-06: a backup exported without API keys flags each blanked key with
+            // _apiKeyRedacted - keep this device's same-name provider / same-id
+            // endpoint key (none: '') and drop the flag before any compare or write.
+            var _localByKey = function(name, keyField) {
+                var e = _existing[name], out = Object.create(null);
+                if (e && !e.keysOnly) e.rows.forEach(function(r) { if (r && r[keyField] !== undefined && r[keyField] !== null) out[r[keyField]] = r; });
+                return out;
+            };
+            // R1d: a local key is only ever copied onto a row that talks to the SAME
+            // host (endpoint/url; none on both sides = the provider's default host).
+            // R1f: same ORIGIN (scheme+host+port, so https->http never keeps a key);
+            // a present but non-string or unparseable value is null = never matches.
+            // R1g: an llmEndpoints entry (isEp) is used through its url only
+            // (040-tools-settings ep.url), so it matches on url alone - an `endpoint`
+            // field never selects or lends its key; providers keep endpoint/url.
+            var _keyHost = function(r, isEp) {
+                var u = r && (isEp ? r.url : (r.endpoint || r.url));
+                if (!u || (typeof u === 'string' && !u.trim())) return '';
+                if (typeof u !== 'string') return null;
+                try { var o = new URL(u.trim()).origin; } catch (eUrl) { return null; }
+                return o && o !== 'null' ? o : null;
+            };
+            // R1e: `locals` = candidate rows in preference order; the first one that
+            // has a key for the same host wins. R1g: rowIsEp = row is an llmEndpoints
+            // entry; a candidate is one when it is this device's _localEps entry.
+            var _keepLocalKey = function(row, locals, rowIsEp) {
+                if (!row || typeof row !== 'object' || !row._apiKeyRedacted) return row;
+                var out = Object.assign({}, row);
+                delete out._apiKeyRedacted;
+                var host = _keyHost(row, rowIsEp);
+                var local = host === null ? null : [].concat(locals).filter(function(l) { return l && typeof l.apiKey === 'string' && l.apiKey && _keyHost(l, _localEps[l.id] === l) === host; })[0];
+                out.apiKey = local ? local.apiKey : '';
+                return out;
+            };
+            var _localEpRow = _localByKey(settingsStoreName, 'key').llmEndpoints, _localEps = Object.create(null);
+            if (_localEpRow && Array.isArray(_localEpRow.value)) _localEpRow.value.forEach(function(ep) { if (ep && ep.id !== undefined && ep.id !== null) _localEps[ep.id] = ep; });
+            var _provFlagged = Object.create(null), _provCleared = Object.create(null), _provReplaced = Object.create(null);
+            if (_impStores[apiProvidersStoreName]) {
+                var _localProviders = _localByKey(apiProvidersStoreName, 'name');
+                var _epIdOf = function(r) { return (r && r.endpointId !== undefined && r.endpointId !== null) ? String(r.endpointId) : ''; };
+                _impStores[apiProvidersStoreName] = _impStores[apiProvidersStoreName].map(function(row) {
+                    if (!row._apiKeyRedacted) return row;
+                    _provFlagged[row.name] = true;
+                    // R1d: prefer this device's key for the row's endpointId, then (R1e:
+                    // whatever its endpointId) the same-name provider's - same host only.
+                    var epId = _epIdOf(row), same = _localProviders[row.name];
+                    var kept = _keepLocalKey(row, [epId && _localEps[epId], same]);
+                    // R1e: a same-name key that is not carried over is cleared - report it;
+                    // R1f: one REPLACED by the endpointId key is not "kept" either.
+                    if (same && typeof same.apiKey === 'string' && same.apiKey && kept.apiKey !== same.apiKey) {
+                        if (kept.apiKey) _provReplaced[row.name] = true; else _provCleared[row.name] = true;
+                    }
+                    return kept;
+                });
+            }
+            var _epCleared = [];
+            _impStores[settingsStoreName] = _impStores[settingsStoreName].map(function(row) {
+                if (row.key !== 'llmEndpoints' || !Array.isArray(row.value)) return row;
+                return Object.assign({}, row, { value: row.value.map(function(ep) {
+                    var loc = ep && _localEps[ep.id], kept = _keepLocalKey(ep, loc, true);
+                    // R1f (4): name an endpoint whose local key is cleared (other origin).
+                    if (ep && ep._apiKeyRedacted && loc && typeof loc.apiKey === 'string' && loc.apiKey && !kept.apiKey) _epCleared.push(ep.name || ep.id);
+                    return kept;
+                }) });
+            });
+            var _conflicts = function(name, keyField) {
+                var e = _existing[name], have = Object.create(null);
+                if (!e) return [];
+                e.rows.forEach(function(r) { var k = e.keysOnly ? r : (r && r[keyField]); if (k !== undefined && k !== null) have[k] = e.keysOnly ? true : r; });
+                return (_impStores[name] || []).filter(function(row) {
+                    if (!(row[keyField] in have)) return false;
+                    return keyField !== 'key' || JSON.stringify(have[row[keyField]].value) !== JSON.stringify(row.value);
+                });
+            };
+            var _cChats = _conflicts(chatStoreName, 'id'), _cSettings = _conflicts(settingsStoreName, 'key');
+            var _cDash = _conflicts(dashboardWidgetsStoreName, 'id'), _cProviders = _conflicts(apiProvidersStoreName, 'name');
+            // R1d: unflagged rows (the 'oauth' marker, or a backup made with keys)
+            // take the backup value - say so instead of "local API keys kept".
+            // R1e: flagged rows whose local key is cleared are named too, never "kept";
+            // R1f: so are rows whose local key is replaced by the endpointId key.
+            var _cProvBackup = _cProviders.filter(function(p) { return !_provFlagged[p.name]; });
+            var _cProvCleared = _cProviders.filter(function(p) { return _provCleared[p.name]; });
+            var _cProvReplaced = _cProviders.filter(function(p) { return _provReplaced[p.name]; });
+            var _provNames = function(list) { return _importConflictNames(list.map(function(p) { return p.name; })).slice(1); };
+            var _provKeyNotes = [];
+            if (_cProvBackup.length + _cProvCleared.length + _cProvReplaced.length < _cProviders.length) _provKeyNotes.push('local API keys kept' + (_cProvBackup.length ? ', except the backup value for' + _provNames(_cProvBackup) : ''));
+            else if (_cProvBackup.length) _provKeyNotes.push('API keys revert to the backup value for' + _provNames(_cProvBackup));
+            if (_cProvCleared.length) _provKeyNotes.push('key cleared for' + _provNames(_cProvCleared) + ' (different or invalid endpoint)');
+            if (_cProvReplaced.length) _provKeyNotes.push('local key replaced for' + _provNames(_cProvReplaced) + ' (endpoint key)');
+            // R1g: no provider conflicts = no key note (not "0 providers (API keys revert ...)").
+            var _provKeyNote = !_cProviders.length ? '' : _cProvBackup.length === _cProviders.length ? 'API keys revert to the backup value' : _provKeyNotes.join('; ');
+            var _impLines = ['<b>Rows with the same id are REPLACED by the backup version:</b>',
+                _cChats.length + ' of ' + _impChats.length + ' chats' + _importConflictNames(_cChats.map(function(c) { return (typeof c.title === 'string' && c.title) || c.id; })),
+                _cSettings.length + ' settings' + (_epCleared.length ? ' (key cleared for' + _importConflictNames(_epCleared).slice(1) + ' (different or invalid endpoint))' : '') + _importConflictNames(_cSettings.map(function(s) { return s.key; })),
+                _cProviders.length + ' providers' + (_provKeyNote ? ' (' + _provKeyNote + ')' : '') + _importConflictNames(_cProviders.map(function(p) { return p.name; })),
+                _cDash.length + ' dashboard widgets; ' + ((_impWidgets && _impWidgets.length) || 0) + ' widget histories (newest kept)',
+                'Everything else is added. This cannot be undone.'];
+            if (_impSkipped) _impLines.push(_impSkipped + ' invalid row(s) will be skipped.');
+            // S0B-02: the import restarts the extension (below), which stops every
+            // in-flight agent run - warn in this SAME confirm (Reload's count loop).
+            var _impRunning = 0;
+            if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+                for (var _rcid in runningChatIds) { if (runningChatIds[_rcid]) _impRunning++; }
+            }
+            if (_impRunning) _impLines.unshift('<b>' + _impRunning + ' agent run(s) in progress; importing restarts the extension and stops them.</b>');
+            if (!await showConfirmModal('Import Data – replace existing?', _impLines.join('<br>'), 'warning')) {
+                return;
+            }
+
             // No store is changed until all widget conflicts have been checked in
             // this same transaction; publish permissions only AFTER it commits.
             await WidgetStore.importRecords(_impWidgets, _impStores);
@@ -324,9 +566,16 @@ async function importAllData() {
                 }
             }
 
-            showSnackbar('Data imported successfully! (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
-                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) skipped' : '') + ') Reloading...', 'success');
-            window.location.reload();
+            var _impResult = 'Data imported successfully! (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
+                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) skipped' : '') + ')';
+            showSnackbar(_impResult + ' Reloading...', 'success');
+            // S0B-03: the restart below wipes that snackbar at once - hand the result
+            // to the next boot. appStorage (localStorage), not sessionStorage:
+            // chrome.runtime.reload() closes this page and a NEW tab is reopened.
+            try {
+                if (typeof appStorage !== 'undefined') appStorage.setItem(POST_IMPORT_NOTICE_KEY, JSON.stringify({ msg: _impResult, type: 'success', at: Date.now() }));
+            } catch (eNotice) { /* best-effort; never blocks the restart */ }
+            await _restartAfterImport();
         } catch (e) {
             console.error('Import failed:', e);
             showSnackbar('Import failed: ' + e.message, 'error');
@@ -335,19 +584,103 @@ async function importAllData() {
     input.click();
 }
 
+// S8D-02: Delete All scope. Every IndexedDB store is in exactly one list
+// (test/data-management-import-export.test.js checks the schema). These are
+// the core *StoreName values as literals, so this file still loads standalone.
+var DELETE_ALL_STORES = ['chats', 'chat_payloads', 'settings', 'widgets', 'dashboardWidgets',
+    'skills', 'skillAssets', 'apiProviders', 'documents', 'action_state', 'agent_runs',
+    'sub_agents', 'pending_wakes'];
+// Kept: local repository clones (workspace tool), which may hold unpushed edits.
+var DELETE_ALL_KEEP_STORES = ['workspace_meta', 'workspace_files', 'workspace_blobs'];
+// chrome.storage.local keys removed by exact name (never clear() the area: it
+// also holds service-worker keys): tokens, sign-ins, the chat-title mirror and
+// the ServiceNow instance-picker cache (platform-bridge.js _INSTANCES_CACHE_KEY).
+var DELETE_ALL_LOCAL_KEYS = ['githubToken', 'githubUser', 'githubInstanceUrl',
+    'sessionToken', 'instanceUrl', 'userName', 'instanceTokens',
+    'claudeOAuth', 'claudeAutoLoginFailedFor', 'openaiOAuth', 'openaiPendingDeviceAuth',
+    'appagent_chat_index', 'snInstancesCache'];
+// The service worker's own sign-out handlers: they set the *SuppressAutoLogin
+// flags (the ChatGPT one also stops an in-flight token renewal), so the claude.ai / ChatGPT
+// browser session is not silently re-used after the delete.
+var DELETE_ALL_LOGOUT_MESSAGES = ['claude-oauth-logout', 'openai-oauth-logout'];
+
+// TA-4: every Delete All chrome call is bounded. A service worker that never
+// answers (asleep, crashed, mid-update) must not hang the delete before its
+// restart: after DELETE_ALL_CALL_TIMEOUT_MS the call counts as failed.
+var DELETE_ALL_CALL_TIMEOUT_MS = 3000;
+// Runs fn(done); resolves true only when done fires with no
+// chrome.runtime.lastError and no resp.error, false on a throw or on timeout.
+// Never rejects; the timer is cleared once the race settles.
+function _deleteAllCall(fn) {
+    var c = typeof chrome !== 'undefined' ? chrome : null;
+    var runtime = c && c.runtime, timer = null;
+    var op = new Promise(function(resolve) {
+        try { fn(function(resp) { resolve(!(runtime && runtime.lastError) && !(resp && resp.error)); }); }
+        catch (e) { resolve(false); }
+    });
+    var timeout = new Promise(function(resolve) {
+        timer = setTimeout(function() { resolve(false); }, DELETE_ALL_CALL_TIMEOUT_MS);
+    });
+    return Promise.race([op, timeout]).then(function(ok) { clearTimeout(timer); return ok; });
+}
+
+// Resolves true when every sign-out and key removal succeeded; never rejects.
+function _deleteAllLocalSecrets() {
+    var c = typeof chrome !== 'undefined' ? chrome : null;
+    var runtime = c && c.runtime, local = c && c.storage && c.storage.local;
+    var logouts = (runtime && typeof runtime.sendMessage === 'function')
+        ? DELETE_ALL_LOGOUT_MESSAGES.map(function(type) { return _deleteAllCall(function(done) { runtime.sendMessage({ type: type }, done); }); })
+        : [];
+    return Promise.all(logouts).then(function(results) {
+        var ok = results.every(Boolean);
+        if (!local || typeof local.remove !== 'function') return ok;
+        return _deleteAllCall(function(done) { local.remove(DELETE_ALL_LOCAL_KEYS, done); }).then(function(removed) { return ok && removed; });
+    });
+}
+
 async function deleteAllData() {
-    if (!await showConfirmModal('Delete All Data', 'Are you sure you want to delete ALL data? This cannot be undone!', 'danger')) {
+    // S8D-01: Delete All restarts the whole extension (below), which stops every
+    // in-flight agent run - warn in the FIRST confirm (import's count loop).
+    var _delRunning = 0;
+    if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+        for (var _drcid in runningChatIds) { if (runningChatIds[_drcid]) _delRunning++; }
+    }
+    var _delWarn = _delRunning ? '<b>' + _delRunning + ' agent run(s) in progress; deleting restarts the extension and stops them.</b><br><br>' : '';
+    if (!await showConfirmModal('Delete All Data', _delWarn + 'This permanently deletes <strong>all chats and their agent runs, skills (built-in skills are restored), widgets, documents, settings and permissions, saved API keys and sign-ins (GitHub, ServiceNow, Claude, ChatGPT) and the cached ServiceNow instance list</strong>.<br><br><strong>Kept:</strong> local repository clones, including unpushed edits. This cannot be undone.', 'danger')) {
         return;
     }
-    if (!await showConfirmModal('Confirm Delete', 'This will delete all chats, settings, and preferences. Are you REALLY sure?', 'danger')) {
+    if (!await showConfirmModal('Confirm Delete', 'All chats, skills, widgets, documents, settings, saved API keys and sign-ins will be deleted. Local repository clones are kept. Then the extension restarts, which closes every open AppAgent panel. Are you REALLY sure?', 'danger')) {
         return;
     }
 
+    // TA-3: the save fences set below; lifted again only when the clear did not commit.
+    var _delRt = null, _delLockSent = false, _delCleared = false, _delHydratedSet = false, _delPrevHydrated;
     try {
         var database = await openDatabase();
 
-        // Clear all affected stores together and wait for durable completion.
-        var resetStores = [chatStoreName, chatPayloadsStoreName, settingsStoreName, widgetStoreName, dashboardWidgetsStoreName]
+        // TA-3: fence every chat save before the clear, so a late save cannot
+        // re-write a chat row into the emptied stores. Stop the runs, lock the
+        // SW saves (bounded by _deleteAllCall and fail-open: a silent SW never
+        // blocks the delete), then close the page wipe guard (ui/070 save).
+        if (typeof runningChatIds !== 'undefined' && runningChatIds && typeof pushInterruptToOffscreen === 'function') {
+            for (var _dicid in runningChatIds) {
+                if (!runningChatIds[_dicid]) continue;
+                try { pushInterruptToOffscreen(_dicid, false); } catch (eInt) { /* best-effort; the restart stops it too */ }
+            }
+        }
+        _delRt = (typeof chrome !== 'undefined' && chrome && chrome.runtime) || null;
+        if (_delRt && typeof _delRt.sendMessage === 'function') {
+            _delLockSent = true;
+            await _deleteAllCall(function(done) { _delRt.sendMessage({ type: 'delete-all-save-lock', locked: true }, done); });
+        }
+        if (typeof _chatsHydrated !== 'undefined') {
+            _delPrevHydrated = _chatsHydrated;
+            _delHydratedSet = true;
+            _chatsHydrated = false;
+        }
+
+        // Clear every Delete All store together and wait for durable completion.
+        var resetStores = DELETE_ALL_STORES
             .filter(function(name) { return database.objectStoreNames.contains(name); });
         await new Promise(function(resolve, reject) {
             var tx = database.transaction(resetStores, 'readwrite'), failure;
@@ -356,11 +689,33 @@ async function deleteAllData() {
             try { resetStores.forEach(function(name) { tx.objectStore(name).clear(); }); }
             catch (e) { failure = e; tx.abort(); }
         });
+        _delCleared = true;
         WidgetStore.clearCache(true);
+        // Sign-ins and tokens live in chrome.storage.local: removed only after the commit.
+        var secretsRemoved = await _deleteAllLocalSecrets();
 
-        showSnackbar('All data deleted! Reloading...', 'success');
-        window.location.reload();
+        // S8D-01: the SW keeps enforcing its in-memory permission maps and writes
+        // them back to IDB on the next delta - hand it the cleared (empty) maps.
+        if (typeof pushPermissionsToOffscreen === 'function') {
+            try { pushPermissionsToOffscreen({ toolPermissions: {}, instancePermissions: {} }); } catch (ePerm) { /* the restart below re-reads IDB */ }
+        }
+        var _delResult = secretsRemoved ? 'All data deleted' : 'All data deleted, but some saved sign-ins could not be removed';
+        var _delKind = secretsRemoved ? 'success' : 'error';
+        showSnackbar(_delResult + '. Restarting...', _delKind);
+        // The restart wipes that snackbar: hand the result to the next boot (S0B-03).
+        try {
+            if (typeof appStorage !== 'undefined') appStorage.setItem(POST_IMPORT_NOTICE_KEY, JSON.stringify({ msg: _delResult, type: _delKind, at: Date.now() }));
+        } catch (eNotice) { /* best-effort; never blocks the restart */ }
+        // Only now, with the delete committed: restart the SW too, like import.
+        await _restartAfterImport();
     } catch (e) {
+        // TA-3: nothing was cleared - lift the fences again. Restore the PREVIOUS
+        // wipe-guard value (never a literal true: a degraded page stays guarded)
+        // and unlock the SW saves (bounded, never rejects).
+        if (!_delCleared) {
+            if (_delHydratedSet) _chatsHydrated = _delPrevHydrated;
+            if (_delLockSent) await _deleteAllCall(function(done) { _delRt.sendMessage({ type: 'delete-all-save-lock', locked: false }, done); });
+        }
         console.error('Delete failed:', e);
         showSnackbar('Delete failed: ' + e.message, 'error');
     }
@@ -439,6 +794,16 @@ function closeSettingsPanelOnOutsideClick(e) {
 function closeSettingsPanel() {
     settingsPanelOpen = false;
     var panel = document.getElementById('settings-panel');
+    // T2b: focus inside the panel (Esc, a link item) goes back to the VISIBLE gear
+    // instead of falling to <body>; offsetParent skips the hidden header/home twin.
+    var ae = document.activeElement;
+    var refocus = !!(panel && ae && panel.contains(ae));
     if (panel) panel.classList.remove('visible');
     document.removeEventListener('click', closeSettingsPanelOnOutsideClick);
+    if (refocus) {
+        var gears = document.querySelectorAll('.settings-btn');
+        for (var i = 0; i < gears.length; i++) {
+            if (gears[i].offsetParent !== null) { gears[i].focus(); break; }
+        }
+    }
 }

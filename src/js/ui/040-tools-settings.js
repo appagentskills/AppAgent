@@ -4,6 +4,9 @@ function showToolInspector(toolName, skillId) {
     // Route through the close fn so a re-open also removes the previous
     // modal's document-level Escape listener.
     if (document.getElementById('tool-inspector-modal')) closeToolInspectorModal();
+    // A8B3-01: remember the opener to return focus on close (close() above has
+    // already restored the previous opener, so re-opens chain correctly).
+    var opener = document.activeElement;
 
     var schema, source, displayName, description;
 
@@ -28,10 +31,13 @@ function showToolInspector(toolName, skillId) {
     overlay.id = 'tool-inspector-modal';
     overlay.className = 'modal-overlay show';
     overlay.onclick = function(e) { if (e.target === overlay) closeToolInspectorModal(); };
+    // A8B3-01: dialog semantics, labelled by the header.
+    overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'tool-inspector-title'); overlay._opener = opener;
 
     overlay.innerHTML =
         '<div class="modal-dialog" style="max-width:720px;width:90vw;">' +
-            '<div class="modal-header">' + escapeHtml(displayName) + '</div>' +
+            '<div class="modal-header" id="tool-inspector-title">' + escapeHtml(displayName) + '</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-6);max-height:70vh;overflow-y:auto;">' +
                 (description ? '<div style="font-size:var(--text-body-sm);color:var(--text-muted);">' + escapeHtml(description) + '</div>' : '') +
                 '<div class="tool-code-section">' +
@@ -55,18 +61,27 @@ function showToolInspector(toolName, skillId) {
         '</div>';
 
     document.body.appendChild(overlay);
+    // A8B3-01: move focus into the dialog (its Close button).
+    var _first = overlay.querySelector('.modal-actions .modal-btn'); if (_first) _first.focus();
 
     // Escape to close. The global Escape handler in core/120-init.js only
     // knows the permanent #modal-overlay — this dynamic twin wires its own
     // document-level key and removes it again on close.
     overlay._escHandler = function(e) {
-        if (e.key !== 'Escape') return;
+        if (e.key !== 'Escape' && e.key !== 'Tab') return;
         // Sweep 753-773 (F2-escape-inspector-doubleclose): defer to ANY visible
         // overlay (permanent #modal-overlay or a dynamic twin), not just the
         // permanent confirm — otherwise one Escape closes both the twin (via
         // the global ladder) and this inspector on the same keypress.
+        // A8B3-01: this on-top guard runs FIRST for Tab too, so the trap never fights a confirm.
         if (document.querySelector('.modal-overlay.show:not(#tool-inspector-modal)')) return; // something on top — its own/global handler closes it
-        closeToolInspectorModal();
+        if (e.key === 'Escape') { closeToolInspectorModal(); return; }
+        // A8B3-01: Tab / Shift+Tab wrap inside the dialog (and pull focus back in from outside).
+        var n = overlay.querySelectorAll('button:not([disabled]), [tabindex="0"]');
+        if (!n.length) return;
+        var first = n[0], last = n[n.length - 1], a = document.activeElement;
+        if (e.shiftKey && (a === first || !overlay.contains(a))) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && (a === last || !overlay.contains(a))) { e.preventDefault(); first.focus(); }
     };
     document.addEventListener('keydown', overlay._escHandler);
 }
@@ -75,7 +90,10 @@ function closeToolInspectorModal() {
     var modal = document.getElementById('tool-inspector-modal');
     if (!modal) return;
     if (modal._escHandler) document.removeEventListener('keydown', modal._escHandler);
+    // A8B3-01: return focus to the opener (a Settings re-render may have detached it).
+    var o = modal._opener;
     modal.remove();
+    if (o && document.contains(o) && typeof o.focus === 'function') { try { o.focus(); } catch (e) {} }
 }
 
 function copyInspectorContent(type) {
@@ -211,7 +229,7 @@ function renderSettingsPage() {
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Show API Statistics</div><div class="settings-page-row-hint">Display token usage and cost after API calls</div></div>' +
-                '<input type="checkbox" ' + (showApiStats ? 'checked' : '') + ' onchange="toggleApiStats()">' +
+                '<input type="checkbox" id="settings-show-api-stats" ' + (showApiStats ? 'checked' : '') + ' onchange="toggleApiStats(this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">Compact Tool Calls</div><div class="settings-page-row-hint">Collapse all tool calls in a single area</div></div>' +
@@ -323,7 +341,7 @@ function renderSettingsPage() {
             '<div class="settings-page-section-title">' + UI_ICONS.database + ' Data Management</div>' +
             // Export / Import live in the page toolbar (body.html #settings-page-panel).
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Export, import or delete data</div><div class="settings-page-row-hint">Export Data and Import Data are in the toolbar above. Delete All permanently removes chats, skills, widgets and settings.</div></div>' +
+                '<div><div class="settings-page-row-label">Export, import or delete data</div><div class="settings-page-row-hint">Export Data and Import Data are in the toolbar above. Delete All permanently removes chats, skills, widgets, documents, settings, saved API keys and sign-ins. Local repository clones are kept.</div></div>' +
                 '<button class="skills-action-btn danger" onclick="deleteAllData()">' + UI_ICONS.trash + ' Delete All</button>' +
             '</div>' +
         '</div>' +
@@ -491,16 +509,31 @@ function renderTierAliasSettings() {
         doRender();
     }
 }
-function setTierAlias(tier, providerName) {
-    var map = getTierAliasMap();
+// A8B2-01: store ONLY explicit overrides. Copying getTierAliasMap()'s merged
+// view pinned the other tiers' current defaults forever. Hydrate first so a
+// pre-hydration change (model menu) never replaces the stored overrides.
+async function setTierAlias(tier, providerName) {
+    if (subAgentTierAliases === null && typeof loadTierAliases === 'function') await loadTierAliases();
+    // TA-7: the stored overrides could not be read, so saving now would replace
+    // them all with this one key. Refuse (resolve false; the callers ignore the
+    // promise) and let the next change retry the read. A map that an earlier
+    // good read hydrated still merges below.
+    if (subAgentTierAliases === null && typeof subAgentTierAliasesReadFailed !== 'undefined' && subAgentTierAliasesReadFailed) {
+        if (typeof showSnackbar === 'function') showSnackbar('Could not read the saved sub-agent tiers, so this change was not saved. Try again.', 'error');
+        return false;
+    }
+    var map = Object.assign({}, subAgentTierAliases || {});
     map[tier] = providerName;
-    saveTierAliases(map);
+    return saveTierAliases(map);
 }
 // "Reset to defaults" (section header button). Writes an EMPTY override map
 // through saveTierAliases (core/030-config.js) — getTierAliasMap then fills
 // every tier from DEFAULT_TIER_ALIASES, in the page AND in the SW (its gates
 // re-run loadTierAliases, which reads the same IDB key). Then repaints.
 async function resetTierAliases() {
+    // A8B2-02: one click used to wipe every tier override with no undo; ask first.
+    var ok = await showConfirmModal('Reset Sub-Agent Tiers', 'Clear your tier overrides? small, medium and large will go back to the built-in defaults for every new sub-agent.', 'warning');
+    if (!ok) return;
     try {
         await saveTierAliases({});
     } catch (e) {
@@ -512,6 +545,19 @@ async function resetTierAliases() {
 }
 
 // GitHub settings UI
+// S0B3-04: the deploy-folder row renders whether or not GitHub is connected
+// (Reload / extension_build deploy without GitHub) and carries its own
+// Disconnect, shown only while a folder is stored.
+function _deployDirRowHtml() {
+    return '<div class="settings-page-row" style="margin-top:var(--space-8);align-items:center;">' +
+        '<div><div class="settings-page-row-label">Extension Deploy Folder</div><div class="settings-page-row-hint">Point to your unpacked extension directory. Find it at <code>chrome://extensions</code> → your extension → the path shown under "ID".</div></div>' +
+        '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
+            '<button class="skills-action-btn" id="deploy-dir-btn" onclick="connectDeployDir()">Connect Folder</button>' +
+            '<button class="skills-action-btn danger" id="deploy-dir-disconnect-btn" onclick="disconnectDeployDir()" style="display:none">Disconnect</button>' +
+        '</div>' +
+    '</div>';
+}
+
 async function renderGitHubSettings() {
     var container = document.getElementById('github-settings-container');
     if (!container) return;
@@ -535,16 +581,13 @@ async function renderGitHubSettings() {
                 '</div>' +
                 '<div id="github-repos-list" style="margin-bottom:var(--space-4);"></div>' +
                 '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
-                    '<input type="text" id="github-add-repo-input" placeholder="owner/repo" style="flex:1;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
-                    '<input type="text" id="github-add-branch-input" placeholder="branch (optional)" style="width:130px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
+                    '<input type="text" id="github-add-repo-input" placeholder="owner/repo" aria-label="Repository (owner/repo)" style="flex:1;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
+                    '<input type="text" id="github-add-branch-input" placeholder="branch (optional)" aria-label="Branch (optional)" style="width:130px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
                     '<button class="skills-action-btn" onclick="cloneGitHubRepo()">Clone</button>' +
                 '</div>' +
-                '<div id="github-clone-status" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
+                '<div id="github-clone-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
             '</div>' +
-            '<div class="settings-page-row" style="margin-top:var(--space-8);align-items:center;">' +
-                '<div><div class="settings-page-row-label">Extension Deploy Folder</div><div class="settings-page-row-hint">Point to your unpacked extension directory. Find it at <code>chrome://extensions</code> → your extension → the path shown under "ID".</div></div>' +
-                '<button class="skills-action-btn" id="deploy-dir-btn" onclick="connectDeployDir()">Connect Folder</button>' +
-            '</div>';
+            _deployDirRowHtml();
         renderGitHubReposList();
         updateDeployDirButton();
     } else {
@@ -552,31 +595,34 @@ async function renderGitHubSettings() {
         var instanceVal = gh.instanceUrl || 'https://github.com';
         container.innerHTML =
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Instance URL</div><div class="settings-page-row-hint">Use https://github.com for public GitHub</div></div>' +
+                '<div><label class="settings-page-row-label" for="github-instance-url" style="display:block;">Instance URL</label><div class="settings-page-row-hint">Use https://github.com for public GitHub</div></div>' +
                 '<input type="text" id="github-instance-url" value="' + escapeHtml(instanceVal) + '" placeholder="https://github.com" style="width:260px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" />' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Personal Access Token</div><div class="settings-page-row-hint">Requires <code>repo</code> scope</div></div>' +
-                '<input type="password" id="github-pat-input" placeholder="ghp_..." style="width:260px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" />' +
+                '<div><label class="settings-page-row-label" for="github-pat-input" style="display:block;">Personal Access Token</label><div class="settings-page-row-hint">Requires <code>repo</code> scope</div></div>' +
+                '<input type="password" id="github-pat-input" placeholder="ghp_..." style="width:260px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')connectGitHub()" />' +
             '</div>' +
             '<div class="settings-page-row" style="justify-content:flex-end;gap:var(--space-4);">' +
                 '<a id="github-generate-link" href="#" target="_blank" onclick="openGitHubTokenPage(event)" style="font-size:var(--text-body-sm);color:var(--accent);">Generate token</a>' +
                 '<button class="skills-action-btn" id="github-connect-btn" onclick="connectGitHub()">Connect</button>' +
             '</div>' +
-            '<div id="github-status-msg" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>';
+            '<div id="github-status-msg" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
+            _deployDirRowHtml();
+        updateDeployDirButton();
     }
 }
 
 function openGitHubTokenPage(e) {
     e.preventDefault();
     var instanceInput = document.getElementById('github-instance-url');
-    var instanceUrl = (instanceInput && instanceInput.value.trim()) || 'https://github.com';
-    var url = instanceUrl.replace(/\/$/, '') + '/settings/tokens/new?scopes=repo&description=AppAgent';
+    var instanceUrl = normalizeGitHubInstanceUrl(instanceInput && instanceInput.value); // TA-1: https:// default
+    var url = instanceUrl + '/settings/tokens/new?scopes=repo&description=AppAgent';
     window.open(url, '_blank');
 }
 
 async function connectGitHub() {
     var btn = document.getElementById('github-connect-btn');
+    if (btn && btn.disabled) return; // S8C-04: Enter while validating must not double-submit
     var statusMsg = document.getElementById('github-status-msg');
     var tokenInput = document.getElementById('github-pat-input');
     var instanceInput = document.getElementById('github-instance-url');
@@ -602,24 +648,75 @@ async function connectGitHub() {
 }
 
 async function disconnectGitHub() {
-    await clearGitHubSettings();
-    renderGitHubSettings();
+    // S8C-03: one click removed the only copy of the token - confirm first (Cancel keeps it).
+    var gh = await loadGitHubSettings();
+    var who = escapeHtml((gh.user && gh.user.login) || 'your GitHub account');
+    if (!await showConfirmModal('Disconnect GitHub', 'Disconnect <strong>' + who + '</strong>? The stored access token is removed from this browser ' +
+        '(GitHub shows a token only once, so you may need a new one). Local clones are kept.', 'danger')) return;
+    try { await clearGitHubSettings(); }
+    catch (e) { showSnackbar('Could not disconnect GitHub: ' + ((e && e.message) || e), 'error'); return; }
+    await renderGitHubSettings();
+    showSnackbar('GitHub disconnected', 'info');
 }
 
 async function connectDeployDir() {
-    var handle = await pickDeployDir();
-    if (handle) {
+    // S0B3-02: "Grant access" re-grants the stored folder inside this click's
+    // user activation; otherwise open the folder picker. TB-4: a 'denied' grant
+    // also reads "Grant access" but cannot be re-requested (requestPermission
+    // answers 'denied' without a prompt), so its click re-picks the folder.
+    var btn = document.getElementById('deploy-dir-btn');
+    var regrant = !!(btn && btn.dataset.state === 'prompt');
+    try {
+        var handle = regrant ? await getDeployDirHandle({ interactive: true }) : await pickDeployDir();
+        if (regrant && !handle) updateDeployDirButton();
+        if (handle) {
+            updateDeployDirButton();
+            // The Reload button is only meaningful in extension-dev mode — reveal it now
+            // that a deploy folder is connected.
+            if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
+        }
+    } catch (e) {
+        // S0B-14: picker/persist failures (not a cancel) are reported, never silent.
+        showSnackbar('Could not connect folder: ' + ((e && e.message) || e), 'error');
         updateDeployDirButton();
-        // The Reload button is only meaningful in extension-dev mode — reveal it now
-        // that a deploy folder is connected.
-        if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
     }
+}
+
+// S0B3-04: explicit Disconnect — forgets only the stored folder reference
+// (nothing on disk is touched); a failure is reported, never silent.
+async function disconnectDeployDir() {
+    try {
+        await clearDeployDirHandle();
+    } catch (e) {
+        showSnackbar('Could not disconnect folder: ' + ((e && e.message) || e), 'error');
+    }
+    await updateDeployDirButton();
+    if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
 }
 
 async function updateDeployDirButton() {
     var btn = document.getElementById('deploy-dir-btn');
     if (!btn) return;
+    // S0B3-04: Disconnect is offered whenever a folder is stored.
+    var disc = document.getElementById('deploy-dir-disconnect-btn');
+    // S0B3-02: passive status (never prompts) — a stored folder whose grant
+    // lapsed ('prompt' OR 'denied', TB-4) reads "Grant access", not "Connect
+    // Folder"; the click re-grants ('prompt') or re-picks ('denied') it.
+    if (typeof getDeployDirStatus === 'function') {
+        var st = await getDeployDirStatus();
+        btn.dataset.state = st.state;
+        if (disc) disc.style.display = st.state === 'none' ? 'none' : '';
+        if (st.state === 'granted') {
+            btn.textContent = st.name;
+            btn.classList.add('connected');
+        } else {
+            btn.textContent = st.state === 'none' ? 'Connect Folder' : 'Grant access';
+            btn.classList.remove('connected');
+        }
+        return;
+    }
     var handle = await getDeployDirHandle();
+    if (disc) disc.style.display = handle ? '' : 'none';
     if (handle) {
         btn.textContent = handle.name;
         btn.classList.add('connected');
@@ -782,8 +879,8 @@ async function renderGitHubReposList() {
                 '</div>' +
                 '<div style="display:flex;gap:var(--space-3);align-items:center;flex-shrink:0;">' +
                     '<button class="skills-action-btn" onclick="_toggleWorkspacePinFromUi(\'' + escapeJsString(rd.wk) + '\')" title="' + (rd.meta.pinned ? 'Pinned — Reload and default resolution use this workspace. Click to unpin.' : 'Pin this workspace (Reload + default resolution will use it)') + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);' + (rd.meta.pinned ? '' : 'opacity:0.4;filter:grayscale(1);') + '">\uD83D\uDCCC</button>' +
-                    '<button class="skills-action-btn" onclick="recloneGitHubRepo(\'' + escapeJsString(rd.githubRepo) + '\', \'' + escapeJsString(rd.meta.branch) + '\')" title="Re-clone (fetch latest)" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
-                    '<button class="skills-action-btn danger" onclick="deleteGitHubRepo(\'' + escapeJsString(rd.wk) + '\')" title="Delete local clone" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
+                    '<button class="skills-action-btn" onclick="_recloneWorkspaceFromDropdown(\'' + escapeJsString(rd.githubRepo) + '\', \'' + escapeJsString(rd.meta.branch) + '\')" title="Re-clone (fetch latest)" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
+                    '<button class="skills-action-btn danger" onclick="_deleteWorkspaceFromDropdown(\'' + escapeJsString(rd.wk) + '\')" title="Delete local clone" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
                 '</div>' +
             '</div>';
         }
@@ -897,6 +994,7 @@ function _refreshBaseRowAfterAutoDelete(syncResult, repoData) {
     }
 }
 
+var _ghSettingsCloneBusy = false; // S8C-02: Enter + Clone must not start parallel clones
 async function cloneGitHubRepo() {
     var repoInput = document.getElementById('github-add-repo-input');
     var branchInput = document.getElementById('github-add-branch-input');
@@ -911,35 +1009,27 @@ async function cloneGitHubRepo() {
         if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Format: owner/repo'; }
         return;
     }
-    if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Cloning ' + repo + '...'; }
+    if (_ghSettingsCloneBusy) return;
+    _ghSettingsCloneBusy = true;
     try {
-        var result = await wsClone(repo, branch);
-        if (result.success) {
-            if (statusEl) { statusEl.style.color = 'var(--success)'; statusEl.textContent = result.message; }
-            repoInput.value = '';
-            if (branchInput) branchInput.value = '';
-            renderGitHubReposList();
-        } else {
-            if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = result.error; }
+        // RC16B-F1: never silently replace an existing (possibly dirty) clone.
+        if (!(await _confirmReplaceExistingClone(repo, branch))) return;
+        if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Cloning ' + repo + '...'; }
+        try {
+            var result = await wsClone(repo, branch);
+            if (result.success) {
+                if (statusEl) { statusEl.style.color = 'var(--success)'; statusEl.textContent = result.message; }
+                repoInput.value = '';
+                if (branchInput) branchInput.value = '';
+                renderGitHubReposList();
+            } else {
+                if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = result.error; }
+            }
+        } catch (e) {
+            if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = e.message; }
         }
-    } catch (e) {
-        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = e.message; }
-    }
-}
-
-async function recloneGitHubRepo(repo, branch) {
-    var statusEl = document.getElementById('github-clone-status');
-    if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Re-cloning ' + repo + '...'; }
-    try {
-        var result = await wsClone(repo, branch);
-        if (result.success) {
-            if (statusEl) { statusEl.style.color = 'var(--success)'; statusEl.textContent = result.message; }
-            renderGitHubReposList();
-        } else {
-            if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = result.error; }
-        }
-    } catch (e) {
-        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = e.message; }
+    } finally {
+        _ghSettingsCloneBusy = false;
     }
 }
 
@@ -1144,14 +1234,48 @@ async function _refreshWsLocalCaches(session) {
 
 // Quick local-only header update (no remote sync, fire-and-forget safe).
 // Scan-scoped revisions preserve newer terminal writes without retaining per-key history.
+// Coalesced: at most ONE local scan runs per page (getAllWorkspaceSummaries loads every
+// clone's file contents). Calls arriving while it runs share ONE trailing scan, started in
+// the same tick the running scan settles — the Reload build's parallel dist writes each
+// emit workspaceMutated (twice in the origin tab), and one overlapping scan per event
+// exhausted the renderer heap. Each returned promise settles only after a scan that STARTED
+// after the call, so awaiting callers read fresh _wsHeaderCaches.
+var _wsHeaderScanRunning = false;
+var _wsHeaderScanTrailing = null; // { promise, resolve } shared by calls that arrived during a scan
+
+function _startWsHeaderScan() {
+    _wsHeaderScanRunning = true; // claimed before the scan body runs (re-entrant calls queue)
+    var scan = (async function() {
+        try {
+            await _refreshWsLocalCaches(_wsRefreshSession);
+            _renderWsHeaderBadge();
+        } catch (e) {
+            var els = [document.getElementById('ws-header-status'), document.getElementById('home-ws-header-status')];
+            els.forEach(function(el) { if (el) el.style.display = 'none'; });
+        }
+    })();
+    scan.then(_settleWsHeaderScan, _settleWsHeaderScan);
+    return scan;
+}
+
+// Release the slot and start the trailing scan in the SAME tick, so no call can
+// slip in between and start a second concurrent scan.
+function _settleWsHeaderScan() {
+    _wsHeaderScanRunning = false;
+    var trailing = _wsHeaderScanTrailing;
+    if (!trailing) return;
+    _wsHeaderScanTrailing = null;
+    trailing.resolve(_startWsHeaderScan());
+}
+
 async function updateWorkspaceHeaderStatus() {
-    try {
-        await _refreshWsLocalCaches(_wsRefreshSession);
-        _renderWsHeaderBadge();
-    } catch (e) {
-        var els = [document.getElementById('ws-header-status'), document.getElementById('home-ws-header-status')];
-        els.forEach(function(el) { if (el) el.style.display = 'none'; });
+    if (!_wsHeaderScanRunning) return _startWsHeaderScan();
+    if (!_wsHeaderScanTrailing) {
+        var trailing = {};
+        trailing.promise = new Promise(function(resolve) { trailing.resolve = resolve; });
+        _wsHeaderScanTrailing = trailing;
     }
+    return _wsHeaderScanTrailing.promise;
 }
 
 // Header and dropdown refreshes join one batch session while any participant
@@ -1444,16 +1568,32 @@ function _wsDeleteBtnHtml(wk) {
         '" title="Delete this local workspace" aria-label="Delete local workspace ' + escapeHtml(wk) + '">' + icon + '</button>';
 }
 
+// Fresh dirty count for the re-clone / delete confirms (S8C-01): the Settings repo rows also
+// use the wrappers below, and from there _wsHeaderCaches can be missing or stale. Same rule
+// as the Settings rows (dirty and not gitignored). null = could not be checked (unknown).
+async function _wsDirtyCountFresh(wk) {
+    try {
+        var pair = await Promise.all([getAllWorkspaceFiles(wk), wsGetIgnoreFilterLocal(wk)]);
+        var isIgnored = pair[1];
+        return pair[0].filter(function(f) { return f.dirty && !isIgnored(f.path); }).length;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function _deleteWorkspaceFromDropdown(wk) {
     var parsed = parseWsKey(wk);
     var cache = _wsHeaderCaches[wk];
-    var dirtyCount = cache ? cache.dirtyCount : 0;
+    var fresh = await _wsDirtyCountFresh(wk);
+    var dirtyCount = Math.max(cache ? (cache.dirtyCount || 0) : 0, fresh || 0);
     var dirtyWarning = dirtyCount > 0
-        ? '<br><br><strong>This permanently discards ' + dirtyCount + ' uncommitted local change' + (dirtyCount === 1 ? '' : 's') + '.</strong>'
+        ? '<br><br><strong>This permanently discards ' + dirtyCount + ' uncommitted local change' + (dirtyCount === 1 ? '' : 's') +
+            (fresh === null ? ' (last known count; the current state could not be checked)' : '') + '.</strong>'
         : '';
+    if (fresh === null && dirtyCount === 0) dirtyWarning += '<br><br><strong>Any uncommitted local changes will be permanently discarded (they could not be checked).</strong>';
     var confirmed = await showConfirmModal('Delete local workspace?',
         'Delete <strong>' + escapeHtml(parsed.repo) + ' (' + escapeHtml(parsed.branch) + ')</strong> from this browser?' + dirtyWarning +
-        '<br><br>The GitHub repository and remote branch will not be deleted.', 'danger');
+        '<br><br>Gitignored files' + (dirtyCount > 0 ? ' (not counted above)' : '') + ' and the workspace\u2019s PR tracking are deleted too. The GitHub repository and remote branch will not be deleted.', 'danger');
     if (!confirmed) return;
 
     var result = await deleteGitHubRepo(wk);
@@ -1465,14 +1605,17 @@ async function _deleteWorkspaceFromDropdown(wk) {
 
 // Re-clone a repo from the workspace dropdown. Re-cloning replaces the local clone, so
 // guard against silently discarding uncommitted changes, then report via snackbar (the
-// settings #github-clone-status element used by recloneGitHubRepo isn't present here).
+// Settings #github-clone-status element isn't present here).
 async function _recloneWorkspaceFromDropdown(repo, branch) {
     var wk = repo + '::' + branch;
     var c = _wsHeaderCaches[wk];
-    if (c && c.dirtyCount > 0) {
+    var fresh = await _wsDirtyCountFresh(wk);
+    var n = Math.max(c ? (c.dirtyCount || 0) : 0, fresh || 0);
+    if (n > 0 || fresh === null) {
         var ok = await showConfirmModal('Re-clone ' + repo + '?',
-            'Re-cloning ' + escapeHtml(repo) + ' (' + escapeHtml(branch) + ') fetches the latest from remote and <strong>discards ' +
-            c.dirtyCount + ' local change' + (c.dirtyCount > 1 ? 's' : '') + '</strong>. Continue?');
+            'Re-cloning ' + escapeHtml(repo) + ' (' + escapeHtml(branch) + ') fetches the latest from remote and <strong>' +
+            (n > 0 ? 'discards ' + n + ' local change' + (n > 1 ? 's' : '') : 'may discard local changes (they could not be checked)') +
+            '</strong>. Gitignored files (not counted) are replaced too; the workspace\u2019s PR tracking is kept. Continue?', 'danger');
         if (!ok) return;
     }
     if (typeof showSnackbar === 'function') showSnackbar('Re-cloning ' + repo + '\u2026');
@@ -1488,6 +1631,36 @@ async function _recloneWorkspaceFromDropdown(repo, branch) {
     } catch (e) {
         if (typeof showSnackbar === 'function') showSnackbar('Re-clone failed: ' + (e && e.message ? e.message : String(e)), 'error');
     }
+}
+
+// RC16B-F1: the Settings Clone form (cloneGitHubRepo) and the github_setup popup
+// (tools/130 cloneGitHubRepoFromSetupModal) call wsClone, which REPLACES an existing clone of
+// the same repo::branch (tools/020 wsClone): every local row goes, incl. uncommitted edits and
+// gitignored files; the PR tracking (meta.prs) is kept (TA-2). Ask first, ALWAYS when a clone exists (the
+// user asked to clone, not to replace). No branch OR an explicit (typed / prefilled) 'main' =
+// main with wsClone's master fallback: wsClone switches to repo::master (and replaces THAT
+// clone) whenever branch === 'main' and the remote has no main, so both keys are checked.
+// true = go ahead, false = cancelled (Cancel / Escape / backdrop).
+async function _confirmReplaceExistingClone(repo, branch) {
+    var fb = !branch || branch === 'main'; // RC16B-F1 revision: typed 'main' falls back too
+    var branches = fb ? ['main', 'master'] : [branch];
+    var lines = [];
+    for (var i = 0; i < branches.length; i++) {
+        var wk = repo + '::' + branches[i];
+        var c = _wsHeaderCaches[wk];
+        if (!c && !(await getWorkspaceMeta(wk))) continue;
+        var fresh = await _wsDirtyCountFresh(wk);
+        var n = Math.max(c ? (c.dirtyCount || 0) : 0, fresh || 0);
+        lines.push('<strong>' + escapeHtml(repo) + ' (' + escapeHtml(branches[i]) + ')</strong>: ' +
+            (n > 0 ? '<strong>permanently discards ' + n + ' uncommitted local change' + (n === 1 ? '' : 's') + '</strong>'
+                : fresh === null ? '<strong>may discard uncommitted local changes (they could not be checked)</strong>'
+                : 'no uncommitted local changes found'));
+    }
+    if (!lines.length) return true;
+    return await showConfirmModal('Replace existing clone?',
+        'Already cloned in this browser. Cloning again replaces the local clone.<br><br>' + lines.join('<br>') +
+        (fb ? '<br><br>' + (branch ? '' : 'No branch entered: ') + 'main is cloned, or master if the remote has no main.' : '') +
+        '<br><br>Gitignored files (not counted) are lost too; the workspace\u2019s PR tracking is kept. Continue?', 'danger');
 }
 
 // Toggle a workspace pin from the UI — shared logic lives in setWorkspacePin
@@ -2125,7 +2298,7 @@ async function confirmDeleteLlmEndpoint(endpointId) {
     var ep = getLlmEndpointById(endpointId);
     if (!ep) return;
     var useCount = apiProviders.filter(function(p) { return findEndpointForProvider(p) === ep; }).length;
-    var msg = 'Delete endpoint "' + ep.name + '"?' + (useCount ? ' ' + useCount + ' model' + (useCount === 1 ? '' : 's') + ' reference it and will keep the current URL/key until re-saved.' : '') + ' This cannot be undone.';
+    var msg = 'Delete endpoint "' + escapeHtml(ep.name) + '"?' + (useCount ? ' ' + useCount + (useCount === 1 ? ' model references' : ' models reference') + ' it and will keep the current URL/key until re-saved.' : '') + ' This cannot be undone.';
     if (await showConfirmModal('Delete Endpoint', msg, 'danger')) {
         var nextEndpoints = llmEndpoints.filter(function(e) { return e.id !== endpointId; }).map(function(e) { return Object.assign({}, e); });
         try {
@@ -2137,6 +2310,7 @@ async function confirmDeleteLlmEndpoint(endpointId) {
         }
         llmEndpoints = nextEndpoints;
         renderLlmEndpointsList();
+        renderApiProvidersList(); // A8A3-02: the deleted endpoint's models regroup (same as the save path)
         showSnackbar('Endpoint deleted', 'success');
     }
 }
@@ -2662,6 +2836,14 @@ async function saveApiProviderFromModal(originalName) {
         return;
     }
     
+    // A8A3-01: models are keyed by name in IndexedDB (130-indexeddb.js, keyPath 'name'),
+    // so a put under another model's name silently replaces it. Same guard as
+    // saveLlmEndpointFromModal; editing a model without renaming is fine.
+    var nameClash = apiProviders.some(function(p) { return p.name === name && p.name !== originalName; });
+    if (nameClash) {
+        showSnackbar('A model with that name already exists', 'error');
+        return; // keep modal open with the user's input intact
+    }
     var renamingCurrent = !!(originalName && originalName !== name && currentProvider === originalName);
     
     // No maxTokens / thinkingBudget on the saved provider — token budgets
@@ -2700,10 +2882,11 @@ async function saveApiProviderFromModal(originalName) {
     if (renamingCurrent) {
         currentProvider = name;
         saveProviderToStorage();
+        updateModelDisplay();
     }
     closeApiProviderModal();
+    renderLlmEndpointsList(); // S8A-04: refresh the endpoints' "N models" tags
     renderApiProvidersList();
-    populateProviderDropdown();
     showSnackbar(originalName ? 'Provider updated' : 'Provider added', 'success');
 }
 
@@ -2720,7 +2903,7 @@ function editApiProvider(providerName) {
 async function deleteApiProviderFromModal(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
-    if (await showConfirmModal('Delete Model', 'Delete model "' + provider.name + '"? This cannot be undone.', 'danger')) {
+    if (await showConfirmModal('Delete Model', 'Delete model "' + escapeHtml(provider.name) + '"? This cannot be undone.', 'danger')) {
         closeApiProviderModal();
         await deleteApiProviderAndRefresh(providerName);
     }
@@ -2730,7 +2913,7 @@ async function confirmDeleteApiProvider(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
     
-    if (await showConfirmModal('Delete Provider', 'Delete provider "' + provider.name + '"? This cannot be undone.', 'danger')) {
+    if (await showConfirmModal('Delete Provider', 'Delete provider "' + escapeHtml(provider.name) + '"? This cannot be undone.', 'danger')) {
         await deleteApiProviderAndRefresh(providerName);
     }
 }
@@ -2752,8 +2935,8 @@ async function deleteApiProviderAndRefresh(providerName) {
         currentProvider = replacement;
         saveProviderToStorage();
     }
+    renderLlmEndpointsList(); // S8A-04: refresh the endpoints' "N models" tags
     renderApiProvidersList();
-    populateProviderDropdown();
     updateModelDisplay();
     showSnackbar('Provider deleted', 'success');
 }
@@ -3128,6 +3311,19 @@ window.addEventListener('focus', _onExtensionTabReturn);
 
 // Helper to hide all panels
 function hideAllPanels() {
+    // A2A2-01: leaving Home for Dashboard/Skills/Docs/… never saved the home
+    // composer draft, so it was gone on the way back. Every view change runs
+    // through here, so save it (and persist it) while Home is still visible.
+    // Non-destructive: an empty composer is skipped, because renderHome()
+    // recreates it empty and openHomeView() refills it 100ms later; clears
+    // are already saved by the live input listener and sendHomeMessage().
+    var hp = document.getElementById('home-panel');
+    if (hp && hp.style.display && hp.style.display !== 'none' && typeof savePendingTextForContext === 'function') {
+        var hpInput = document.getElementById('home-message-input');
+        if (hpInput && hpInput.value) {
+            try { savePendingTextForContext('home'); if (typeof persistPendingTextsToStorage === 'function') persistPendingTextsToStorage(); } catch (e) {}
+        }
+    }
     var panels = ['main-area', 'skills-panel', 'dashboard-panel', 'home-panel', 'settings-page-panel', 'docs-panel', 'history-panel', 'documents-panel'];
     panels.forEach(function(id) {
         var el = document.getElementById(id);
@@ -3183,6 +3379,9 @@ function showChatView() {
         if (typeof dispatchChatMeta === 'function') dispatchChatMeta(currentChatId, { lastViewedAt: Date.now() }); // FLUX-4C lane
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
     }
+    // CHAT-CONTROLS SSOT: every return-to-chat path repaints Pause/Continue/Retry here
+    // (#main-area was hidden by hideAllPanels and nothing else re-derived on the way back).
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(typeof currentChatId !== 'undefined' ? currentChatId : null);
 }
 
 // Update all sidebar button states

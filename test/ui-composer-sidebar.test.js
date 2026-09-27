@@ -135,6 +135,18 @@ describe('ui composer › Enter / Shift+Enter / IME', function() {
         c.m.restorePendingTextForContext('c1');
         assert.strictEqual(ta.value, '');
     }, { tags: ['unit'] });
+    test('switching chat resets a stale composer hint (A6A3-02)', async function() {
+        var c = await mountComposer();
+        var ta = c.dom.$('#message-input'), home = c.dom.$('#home-message-input');
+        assert.strictEqual(ta.placeholder, 'Send a message...', 'body.html default');
+        ta.placeholder = 'Describe the widget you want to create...';
+        c.m.restorePendingTextForContext('c1');
+        assert.strictEqual(ta.placeholder, 'Send a message...', 'the widget hint must not stick to another chat');
+        // The home composer is never touched.
+        home.placeholder = 'home hint';
+        c.m.restorePendingTextForContext('home');
+        assert.strictEqual(home.placeholder, 'home hint');
+    }, { tags: ['unit'] });
 });
 
 describe('ui composer › running: queue + pause/resume', function() {
@@ -262,7 +274,7 @@ describe('ui composer › attachment chips + drag overlay', function() {
     test('drag overlay: nested enter/leave depth, drop hides it', async function() {
         var c = await mountComposer();
         var ov = c.dom.$('#drop-overlay');
-        function ev() { return { prevented: 0, preventDefault: function() { this.prevented++; }, stopPropagation: noop }; }
+        function ev() { return { prevented: 0, preventDefault: function() { this.prevented++; }, stopPropagation: noop, dataTransfer: { types: ['Files'] } }; }
         assert.strictEqual(U.css(ov, 'display'), 'none');
         c.m.handleDragEnter(ev()); c.m.handleDragEnter(ev());
         assert.strictEqual(ov.classList.contains('visible'), true);
@@ -272,12 +284,37 @@ describe('ui composer › attachment chips + drag overlay', function() {
         c.m.handleDragLeave(ev());
         assert.strictEqual(ov.classList.contains('visible'), false);
         c.m.handleDragEnter(ev());
-        var d = ev(); d.dataTransfer = { files: [] };
+        var d = ev(); d.dataTransfer = { types: ['Files'], files: [] };
         c.m.handleDrop(d);
         assert.strictEqual(d.prevented, 1);
         assert.strictEqual(ov.classList.contains('visible'), false);
         c.m.handleDragEnter(ev());
         assert.strictEqual(ov.classList.contains('visible'), true, 'depth reset by drop');
+        c.m.handleDragLeave(ev());
+    }, { tags: ['unit'] });
+    test('drag overlay self-heals after a lost dragleave (heartbeat)', async function() {
+        var c = await mountComposer();
+        c.s.DROP_OVERLAY_HEARTBEAT_MS = 20;
+        var ov = c.dom.$('#drop-overlay');
+        function ev() { return { preventDefault: noop, stopPropagation: noop, dataTransfer: { types: ['Files'] } }; }
+        function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+        c.m.handleDragEnter(ev()); c.m.handleDragEnter(ev()); c.m.handleDragLeave(ev());
+        assert.strictEqual(ov.classList.contains('visible'), true);
+        assert.strictEqual(c.s.dragDepth, 1, 'one dragleave was lost');
+        await wait(50);
+        assert.strictEqual(ov.classList.contains('visible'), false, 'overlay stuck after the drag stopped');
+        assert.strictEqual(c.s.dragDepth, 0);
+        c.m.handleDragEnter(ev()); c.m.handleDragLeave(ev());
+        assert.strictEqual(ov.classList.contains('visible'), false, 'next drag left the overlay up');
+        c.m.handleDragEnter(ev());
+        for (var t = 0; t < 6; t++) { await wait(10); c.m.handleDragOver(ev()); }
+        assert.strictEqual(ov.classList.contains('visible'), true, 'heartbeat hid a live drag');
+        c.m.handleDragLeave(ev());
+        assert.strictEqual(ov.classList.contains('visible'), false);
+    }, { tags: ['unit'] });
+    test('drop overlay copy names text files', async function() {
+        var c = await mountComposer();
+        assert.strictEqual(c.dom.$('#drop-overlay span').textContent, 'Drop image, PDF or text file here');
     }, { tags: ['unit'] });
 });
 
@@ -563,6 +600,37 @@ describe('ui sidebar › search', function() {
         assert.strictEqual(t.dom.$('#sidebar').classList.contains('searching'), false);
         assert.strictEqual(t.dom.$$('#chat-list > .chat-item').length, 2);
         assert.strictEqual(t.g.renderMessages.calls.length, 1, 'messages re-rendered to drop highlights');
+    }, { tags: ['unit'] });
+    test('clear inside the 250 ms debounce cancels the pending search (A1C-01)', async function() {
+        var t = await mountSidebar({
+            a: chat('a', 'Alpha', { messages: [{ role: 'user', content: 'find the needle' }] }),
+            b: chat('b', 'Beta', { messages: [{ role: 'user', content: 'nothing' }] })
+        });
+        var si = t.dom.$('#chat-search-input');
+        si.value = 'needle';
+        U.fireInline(si, 'input', t.m);
+        t.m.clearGlobalSearch();
+        await new Promise(function(r) { setTimeout(r, 320); });
+        assert.strictEqual(t.s.chatSearchQuery, '', 'the pending timer must not restore the cleared query');
+        assert.strictEqual(si.value, '');
+        assert.strictEqual(t.dom.$$('#chat-list > .chat-item').length, 2);
+        assert.strictEqual(t.dom.$$('#chat-list > .chat-item.searching').length, 0);
+    }, { tags: ['unit'] });
+    test('retyping back to the committed query cancels the pending timer (A1C-01)', async function() {
+        var t = await mountSidebar({
+            a: chat('a', 'Alpha', { messages: [{ role: 'user', content: 'find the needle' }] }),
+            b: chat('b', 'Beta', { messages: [{ role: 'user', content: 'nothing' }] })
+        });
+        var si = t.dom.$('#chat-search-input');
+        function type(v) { si.value = v; U.fireInline(si, 'input', t.m); }
+        function settle() { return new Promise(function(r) { setTimeout(r, 320); }); }
+        type('ne');
+        await settle();
+        assert.strictEqual(t.s.chatSearchQuery, 'ne');
+        type('nee');
+        type('ne');
+        await settle();
+        assert.strictEqual(t.s.chatSearchQuery, 'ne', 'the stale "nee" timer must not fire');
     }, { tags: ['unit'] });
     test('1-char query does not filter; skills/tools/widgets sections appear with headers', async function() {
         var t = await mountSidebar({ a: chat('a', 'Alpha') }, { chatSearchQuery: 'x',

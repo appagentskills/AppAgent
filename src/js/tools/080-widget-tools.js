@@ -197,6 +197,15 @@ function getWidgetById(widgetId) {
     return canonical;
 }
 
+// A6A3-01: the dashboard record (dashboardWidgets[id]) is a SEPARATE object from
+// the chat copy, and getWidgetById returns a merged COPY for dashboard-only
+// widgets, so the deactivated flag is honoured when EITHER one carries it.
+function isWidgetDeactivated(widgetId) {
+    var w = getWidgetById(widgetId);
+    var dw = (typeof dashboardWidgets !== 'undefined') ? dashboardWidgets[widgetId] : null;
+    return !!((w && w.deactivated) || (dw && dw.deactivated));
+}
+
 function toggleWidgetRunning(widgetId, event) {
     if (event) event.stopPropagation();
     // Find the widget object and check persisted deactivated state
@@ -204,23 +213,34 @@ function toggleWidgetRunning(widgetId, event) {
     if (!widget && dashboardWidgets[widgetId]) widget = dashboardWidgets[widgetId];
     if (!widget) return;
 
-    var isDeactivated = widget.deactivated;
+    // A6A3-01: read + write the flag on the chat copy AND the dashboard record,
+    // and persist the dashboard record too (it was never written before).
+    var dw = (typeof dashboardWidgets !== 'undefined') ? dashboardWidgets[widgetId] : null;
+    var isDeactivated = !!(widget.deactivated || (dw && dw.deactivated));
 
-    // Find the widget container (inline or dashboard)
-    var container = document.getElementById('widget-content-' + widgetId)
-        || document.getElementById('dashboard-widget-content-' + widgetId);
+    // TA-11: update EVERY present widget container (inline chat card AND
+    // dashboard card). Picking only the first one let a hidden inline card (the
+    // chat view stays mounted while the dashboard page is shown) shadow the
+    // dashboard card, which then never re-rendered or tore down on toggle.
+    var containers = [document.getElementById('widget-content-' + widgetId),
+        document.getElementById('dashboard-widget-content-' + widgetId)].filter(Boolean);
 
     if (isDeactivated) {
-        // Activate: clear deactivated flag and re-render
+        // Activate: clear deactivated flag and re-render each card
         widget.deactivated = false;
-        if (container) {
+        if (dw) dw.deactivated = false;
+        containers.forEach(function(container) {
             container.innerHTML = '';
-            renderWidgetInContainer(widget, container);
-        }
+            // The dashboard grid mounts via renderWidgetContent (.widget-shadow-host);
+            // renderWidgetInContainer is the inline-chat renderer.
+            if (String(container.id).indexOf('dashboard-widget-content-') === 0) renderWidgetContent(dw || widget);
+            else renderWidgetInContainer(widget, container);
+        });
     } else {
         // Deactivate: kill iframe and persist
         widget.deactivated = true;
-        if (container) {
+        if (dw) dw.deactivated = true;
+        containers.forEach(function(container) {
             var iframe = container.querySelector('iframe');
             if (iframe) {
                 // Release the onWidgetResize 'message' listener registered by
@@ -231,11 +251,14 @@ function toggleWidgetRunning(widgetId, event) {
                 iframe.remove();
             }
             container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
-        }
+        });
     }
 
     // Persist deactivated state
     saveChatsToStorage();
+    if (dw && typeof saveDashboardWidget === 'function') {
+        Promise.resolve(saveDashboardWidget(dw, true)).catch(function() {}); // skipHistory: no revision
+    }
 
     // Update all toggle buttons for this widget
     var buttons = document.querySelectorAll('.widget-stop-btn[data-widget-id="' + widgetId + '"]');
@@ -424,12 +447,11 @@ function openWidgetFullscreen(widgetId, event) {
             // fullscreen twin was the only .widget-stop-btn in the app the loop could
             // not find - the dashboard expand-modal twin (ui/070-dashboard-ui.js:97)
             // has always carried it.
-            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + (isWidgetDeactivated(widget.id) ? 'Activate Widget' : 'Deactivate Widget') + '">' + (isWidgetDeactivated(widget.id) ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
             dashBtn +
             '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen()" title="Print">' + UI_ICONS.printer + '</button>' +
             '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="Open in New Tab">' + UI_ICONS.externalLink + '</button>' +
-            '<button class="widget-ctrl-btn widget-panel-btn" onclick="openWidgetInIframePanel(\'' + widget.id + '\')" title="Open in Side Panel">' + UI_ICONS.panelRight + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="Open in new tab" aria-label="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
             '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
             // Manual code editor (editWidgetCode -> saveWidgetCodeEdit), alongside the
             // agent-edit button. closeWidgetFullscreen() FIRST is load-bearing, not
@@ -438,7 +460,7 @@ function openWidgetFullscreen(widgetId, event) {
             // (css/00-tokens.css:174-175), so leaving it open would bury the editor
             // behind this backdrop and desync the Escape order (core/120-init.js:209-211).
             '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="Edit code">' + UI_ICONS.code + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetFullscreen()">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetFullscreen()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     // Content
@@ -451,7 +473,14 @@ function openWidgetFullscreen(widgetId, event) {
     document.body.appendChild(overlay);
     
     // Render widget
-    renderWidgetInContainer(widget, content, { fullscreen: true });
+    if (isWidgetDeactivated(widget.id)) {
+        // NEW-T23-1: a deactivated widget (chat copy OR dashboard record - the
+        // merged flag) must not mount or run its iframe in fullscreen either; show
+        // the same placeholder toggleWidgetRunning (:253) and the chat re-render use.
+        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+    } else {
+        renderWidgetInContainer(widget, content, { fullscreen: true });
+    }
     
     // Close on backdrop click
     overlay.addEventListener('click', function(e) {
@@ -477,17 +506,11 @@ function openWidgetLink(widgetId) {
 function printWidgetFullscreen() {
     var widget = expandedWidgetId ? getWidgetById(expandedWidgetId) : null;
     if (!widget || !widget.html) return;
-    var win = window.open('', '_blank');
-    if (!win) return;
-    // Route the print window through the token injection too, otherwise every
-    // var(--...) in a token-based widget resolves to nothing on paper. This is a
-    // plain window.open document that never receives data-appagent-theme, so the
-    // LIGHT set applies regardless of the app theme - which is what you want for
-    // print. typeof-guarded because injectWidgetTokens lives in the ui tier.
-    win.document.write(typeof injectWidgetTokens === 'function' ? injectWidgetTokens(widget.html) : widget.html);
-    win.document.close();
-    win.focus();
-    setTimeout(function() { win.print(); }, 500);
+    // S0C2-02: print through the persistent app.html?widget= deep link (same API
+    // as openWidgetLink). It renders in the real widget sandbox with the polyfill,
+    // so widget JS/handlers run; an about:blank popup inherits the MV3 CSP and
+    // only static markup printed. 120-init calls window.print() once rendered.
+    chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widget.id || expandedWidgetId) + '&print=1' });
 }
 
 async function screenshotWidget(widgetId) {
@@ -512,7 +535,11 @@ async function screenshotWidget(widgetId) {
         base64Data = await svgToPng(sanitizeSvgDataUrl(svgUrl), w, h, ratio);
     } else {
         var url = chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId);
-        var tab = await chrome.tabs.create({ url: url, active: false });
+        // A6A2-01: a failed tab open surfaces as 'Screenshot failed', not an
+        // unhandled rejection from the inline onclick.
+        var tab = null;
+        try { tab = await chrome.tabs.create({ url: url, active: false }); } catch (eCreate) { tab = null; }
+        if (!tab) { showSnackbar('Screenshot failed', 'error'); return; }
         await new Promise(function(resolve) {
             function onUpdated(tabId, info) {
                 if (tabId === tab.id && info.status === 'complete') {
@@ -524,12 +551,18 @@ async function screenshotWidget(widgetId) {
             chrome.tabs.onUpdated.addListener(onUpdated);
             var fb = setTimeout(function() { chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }, 5000);
         });
-        var chat = chats[currentChatId];
-        var origTabId = chat && chat.targetTabId;
-        if (chat) chat.targetTabId = tab.id;
-        var result = await Platform.sendBrowserAction('take_screenshot', {});
-        if (chat) chat.targetTabId = origTabId;
-        try { chrome.tabs.remove(tab.id); } catch(e) {}
+        // A6A2-01: target the temp tab explicitly (the SW honours
+        // message.targetTabId) instead of re-pointing the viewed chat's
+        // targetTabId, which a concurrent agent run in that chat would follow;
+        // the temp tab is closed on every path.
+        var result;
+        try {
+            result = await new Promise(function(res) {
+                chrome.runtime.sendMessage({ type: 'browser-action', action: 'take_screenshot', args: {}, targetTabId: tab.id },
+                    function(r) { res(r || { error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'No response' }); });
+            });
+        } catch (e) { result = { error: (e && e.message) || String(e) }; }
+        finally { try { chrome.tabs.remove(tab.id); } catch (e2) {} }
         if (result.error) { showSnackbar('Screenshot failed', 'error'); return; }
         base64Data = result.base64;
     }
@@ -563,7 +596,7 @@ function editWidgetCode(widgetId) {
         '<span class="widget-title">Edit Widget: ' + escapeHtml(widget.title) + '</span>' +
         '<div class="widget-modal-controls">' +
             '<button class="widget-ctrl-btn primary" onclick="saveWidgetCodeEdit(\'' + widget.id + '\')" title="Save">' + UI_ICONS.save + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetCodeEdit()">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetCodeEdit()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     var content = document.createElement('div');
@@ -634,7 +667,7 @@ function openWidgetModal(widgetId) {
         '<div class="widget-modal-controls">' +
             '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
             '<button class="widget-ctrl-btn" onclick="closeWidgetModal();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetModal()">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetModal()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     // Content
@@ -685,7 +718,7 @@ function renderWidgetSidebar() {
             '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
             '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
             '<div class="widget-sidebar-actions">' +
-            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Show in Panel">' + UI_ICONS.panelRight + '</button>' +
+            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
             '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
             '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
             '</div>' +
@@ -695,9 +728,27 @@ function renderWidgetSidebar() {
     container.innerHTML = html;
 }
 
+// NEW-V15-1: is this inline widget card actually shown on screen? False when
+// it is missing or detached; inside a closed <details> (e.g. a collapsed
+// "Widgets" group, ui/250-message-render.js:1194-1195), unless the path enters
+// through that details' own <summary>, which stays visible; not rendered (no
+// client rects, e.g. under a display:none view); or zero-size.
+function _isWidgetCardShown(el) {
+    if (!el || !el.isConnected) return false;
+    for (var child = el, p = el.parentElement; p; child = p, p = p.parentElement) {
+        if (p.tagName === 'DETAILS' && !p.open && p.querySelector(':scope > summary') !== child) return false;
+    }
+    if (!el.getClientRects().length) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+}
+
 function scrollToWidget(widgetId) {
     var widgetEl = document.getElementById('widget-' + widgetId);
-    if (widgetEl) {
+    // NEW-V15-1: scroll/highlight only a card that is on screen; a hidden or
+    // collapsed card used to be scrolled to + highlighted invisibly (a silent
+    // no-op), so it falls back to the modal like an absent card.
+    if (widgetEl && _isWidgetCardShown(widgetEl)) {
         widgetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         // Briefly highlight the widget
         widgetEl.classList.add('highlight');
@@ -705,7 +756,7 @@ function scrollToWidget(widgetId) {
             widgetEl.classList.remove('highlight');
         }, 1500);
     } else {
-        // Widget not in view, open modal instead
+        // Widget not on screen (absent, hidden or collapsed), open modal instead
         openWidgetModal(widgetId);
     }
 }
@@ -714,7 +765,8 @@ function scrollToWidget(widgetId) {
 // emitted by decorateIdMentions in ui/250-message-render.js). scrollToWidget is
 // the right default: it scrolls+highlights the inline card when that widget is
 // rendered in the message list on screen, and falls back to openWidgetModal
-// (:592) otherwise — e.g. an ID the user pasted from another chat.
+// (:642) otherwise — e.g. an ID the user pasted from another chat, or a card
+// that is hidden or inside a collapsed "Widgets" group (NEW-V15-1).
 function openWidgetMention(widgetId, event) {
     if (event) {
         event.stopPropagation();

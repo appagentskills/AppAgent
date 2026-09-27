@@ -213,15 +213,29 @@ function broadcastActionChange(type, actionId, chatId) {
     try { _actionsBC.postMessage({ type: type, actionId: actionId, chatId: chatId || null }); } catch (e) {}
 }
 
-// Re-sync the chat-page Pause/Continue UI when a chat's pause state flipped
-// outside of `togglePause`/`continueAgent` — e.g. via the action popover
+// Re-sync the chat-page Pause/Continue/Retry controls when a chat's pause state
+// flipped outside of `togglePause`/`continueAgent` — e.g. via the action popover
 // (pauseAction/resumeAction/stopAction/dismissAction) or via BroadcastChannel
 // from another tab. Only touches UI when the affected chat is the one the user
 // is currently viewing; otherwise the next navigation into that chat will sync
 // it via selectChat / openChatFromHistory / popstate.
+// CHAT-CONTROLS SSOT: routed through syncChatControlsUI (app/020), the one
+// writer of the three buttons' visibility + the Pause/Resume label. The derive
+// reads the page's pausedChats, which mirrors the action's _isPaused wherever it
+// is set or cleared: pauseAction/resumeAction, the cross-tab pauseChat/resumeChat
+// arms and the boot re-seed in loadAllActionStates all write it through the
+// FLUX-P1 facade setChatPausedPersistent, whose page lane (dispatchChatMeta,
+// app/045) applies the derived pausedChats cache synchronously. So a paused
+// action chat paints Resume here AND on every later re-derive (selectChat /
+// hello / runFinished), and the click (togglePause reads the same map) resumes.
+// stopAction/dismissAction halt with pausedChats=true. A stopped action's paused chat
+// derives no control (app/020 _isStoppedActionChat); dismiss's halt paints Resume until its 5 s clear.
+// Page-only file (not in WORKER_SHARED_FILES); the typeof guards cover harnesses
+// that load 120 without 020. Fallback: the label-only syncPauseButtonUI.
 function _syncChatPagePauseUIForChat(chatId) {
     if (!chatId || typeof currentChatId === 'undefined' || chatId !== currentChatId) return;
-    if (typeof syncPauseButtonUI === 'function') syncPauseButtonUI(chatId);
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
+    else if (typeof syncPauseButtonUI === 'function') syncPauseButtonUI(chatId);
 }
 
 async function _reloadActionFromDB(actionId) {
@@ -238,6 +252,10 @@ async function _reloadActionFromDB(actionId) {
             req.onerror = function() { resolve(); };
         });
         notifyActionStateChanged(actionId);
+        // CHAT-CONTROLS SSOT: a cross-tab stop's pauseChat arm derived from the stale record;
+        // re-derive against the reloaded one (no-op unless that chat is displayed).
+        var _ra = activeActions[actionId];
+        if (_ra && _ra.chatId) _syncChatPagePauseUIForChat(_ra.chatId);
     } catch (e) {}
 }
 
@@ -255,9 +273,12 @@ if (_actionsBC) {
                 if (existing && existing.chatId) {
                     var deletedChatId = existing.chatId;
                     pausedChats[deletedChatId] = true;
+                    _dismissHaltChats[deletedChatId] = true;
                     // Halt any in-flight loop on this chat — then drop the flag so
                     // pausedChats doesn't grow forever as actions are dismissed.
-                    setTimeout(function() { delete pausedChats[deletedChatId]; }, 5000);
+                    // CHAT-CONTROLS SSOT: re-derive once the transient halt clears, else the
+                    // displayed chat keeps a stale Resume whose click would pause instead.
+                    setTimeout(function() { delete _dismissHaltChats[deletedChatId]; delete pausedChats[deletedChatId]; _syncChatPagePauseUIForChat(deletedChatId); }, 5000);
                     // Mirror dismissAction's reveal so the orphaned background chat
                     // surfaces in this tab's chat list. Without this, the chat is
                     // hidden (isBackground && !_revealed) until the tab reloads.
@@ -276,6 +297,7 @@ if (_actionsBC) {
                     // FLUX-P1: user pause from another tab — through the lane facade
                     // (idempotent with the SW's 'chat-meta-changed' echo).
                     setChatPausedPersistent(msg.chatId, true);
+                    delete _dismissHaltChats[msg.chatId]; // a real pause: resumable again
                     // B-A2 (cross-tab): unblock any approval the local loop is parked on,
                     // otherwise the cross-tab pause is silently a no-op for this chat.
                     if (typeof rejectPendingApprovalsForChat === 'function') {
@@ -287,6 +309,7 @@ if (_actionsBC) {
             case 'resumeChat':
                 if (msg.chatId) {
                     setChatPausedPersistent(msg.chatId, false); // FLUX-P1 lane facade
+                    delete _dismissHaltChats[msg.chatId];
                     _syncChatPagePauseUIForChat(msg.chatId);
                 }
                 break;
@@ -700,6 +723,7 @@ async function pauseAction(actionId) {
     // pausedByUser, so a PM-paused action now stays paused across an SW restart
     // (the old live-map-only write silently unpaused on the next boot fold).
     setChatPausedPersistent(a.chatId, true);
+    delete _dismissHaltChats[a.chatId]; // a real pause supersedes the dismiss halt
     // B9: the agent loop now runs in the service worker, which reads its OWN
     // pausedChats copy — setting only the page copy never halts it. Mirror the
     // pause + interrupt into the SW (as togglePause does) so Pause actually stops
@@ -729,6 +753,7 @@ async function resumeAction(actionId) {
     var a = activeActions[actionId];
     if (!a) return;
     setChatPausedPersistent(a.chatId, false); // FLUX-P1 lane facade
+    delete _dismissHaltChats[a.chatId];
     a._isPaused = false;
     a.reloadInterrupted = false;
     a.updatedAt = Date.now();
@@ -737,7 +762,6 @@ async function resumeAction(actionId) {
     // B-C1: re-hydrate other tabs.
     broadcastActionChange('update', actionId, a.chatId);
     notifyActionStateChanged(actionId);
-    _syncChatPagePauseUIForChat(a.chatId);
     // SWM14-F2: clear the SW-side pause copy too, mirroring togglePause
     // (020-api-messages.js:200-202). resumeAction only cleared the page's
     // pausedChats; the SW keeps its own copy (set on pause via
@@ -756,6 +780,10 @@ async function resumeAction(actionId) {
     // running the loop, it just resumes there. Tabs that weren't running rely
     // on the user clicking Resume in their own tab to re-kick locally.
     if (!runningChatIds[a.chatId]) runAgent(a.chatId);
+    // CHAT-CONTROLS SSOT: re-derive AFTER the kick. The runAgent shim marks
+    // runningChatIds synchronously, so an idle paused chat goes Resume -> Pause
+    // here instead of showing no control until the SW's runStarted lands.
+    _syncChatPagePauseUIForChat(a.chatId);
 }
 
 // Stop a running action (PM clicks Stop). The streaming turn in flight finishes,
@@ -782,6 +810,8 @@ async function stopAction(actionId) {
     a.label = 'Stopped';
     a._isPaused = false;
     a.updatedAt = Date.now();
+    // CHAT-CONTROLS SSOT: re-derive before the persist await, so no Resume lingers.
+    _syncChatPagePauseUIForChat(a.chatId);
     await persistActionState(actionId);
     broadcastActionChange('pauseChat', actionId, a.chatId);
     // B-C1: also broadcast `update` so other tabs re-hydrate the action's state
@@ -799,6 +829,9 @@ async function stopAction(actionId) {
 // Dismiss an action (reset to idle). Also halts any still-running loop so a
 // blocked/stuck agent doesn't linger in memory waiting on a promise nobody
 // will resolve.
+// Chats under the transient 5s dismiss/delete halt: the derive (020 _isStoppedActionChat)
+// shows no control, else an idle chat paints a Resume whose click starts a spurious turn.
+var _dismissHaltChats = {};
 async function dismissAction(actionId) {
     var a = activeActions[actionId];
     // B-C2: capture chatId before the local delete so we can broadcast it.
@@ -813,6 +846,7 @@ async function dismissAction(actionId) {
         if (a.chatId) {
             var dchat = a.chatId;
             pausedChats[dchat] = true;
+            _dismissHaltChats[dchat] = true;
             // B9: also halt the SW-side loop (its own pausedChats copy) + abort any
             // in-flight stream/tool, else a dismissed action's background loop keeps
             // running in the service worker after the button is gone.
@@ -826,8 +860,9 @@ async function dismissAction(actionId) {
             // paused). Reuses the same latest-wins generation mechanism as the toggle retry chains.
             var _dismissPauseGen = (typeof _pauseToggleGen !== 'undefined' && _pauseToggleGen) ? _pauseToggleGen[dchat] : undefined;
             setTimeout(function() {
+                delete _dismissHaltChats[dchat];
                 // Superseded by a newer pause/resume toggle for this chatId — leave its state alone.
-                if (typeof _pauseToggleGen !== 'undefined' && _pauseToggleGen && _pauseToggleGen[dchat] !== _dismissPauseGen) return;
+                if (typeof _pauseToggleGen !== 'undefined' && _pauseToggleGen && _pauseToggleGen[dchat] !== _dismissPauseGen) { _syncChatPagePauseUIForChat(dchat); return; }
                 delete pausedChats[dchat];
                 // SWM14-F3: also clear the SW-side pause copy. The push above set
                 // pausedChats[dchat]=true in the SW too; the page-only delete here
@@ -835,6 +870,10 @@ async function dismissAction(actionId) {
                 // flag for this chatId forever and a later reuse of the same chatId
                 // would start up paused.
                 if (typeof pushPauseToggleToOffscreen === 'function') pushPauseToggleToOffscreen(dchat, false);
+                // CHAT-CONTROLS SSOT: re-derive the displayed chat now the transient halt
+                // is gone, else its Resume stays painted and the click (togglePause reads
+                // pausedChats) would pause instead of resume.
+                _syncChatPagePauseUIForChat(dchat);
             }, 5000);
             _syncChatPagePauseUIForChat(dchat);
             // Reveal the chat in the sidebar before dismissing the action.
@@ -3441,12 +3480,13 @@ function _jobsProgressBadgeHtml(chatId) {
 //              nothing else). Reuses _chatHasUnseenActivity — no new tracking.
 //   current -> .is-current: a lifted white tab — the row/card renders as an
 //              elevated rounded card (CSS-only, see 23-actions.css); no
-//              trailing label. The chat open in the main view is NEVER
+//              trailing label. The chat open in the chat view is NEVER
 //              unread/bold (viewing it = reading it).
 //   read    -> .jobs-read: seen, finished rows dim like read emails.
 // Run-state lives ONLY in the leading slot (_jobsStateIndicatorHtml below).
 function _jobsRowSignals(chatId, st) {
-    var isCur = (typeof currentChatId !== 'undefined' && chatId === currentChatId);
+    var isCur = (typeof currentChatId !== 'undefined' && chatId === currentChatId) &&
+        (typeof currentView === 'undefined' || currentView === 'chat');
     var unread = !isCur && _chatHasUnseenActivity(chatId);
     var read = !isCur && !unread && (st === 'done' || st === 'unseen');
     return {
@@ -3582,12 +3622,12 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount, selectedTab) {
     // reads it from the live DOM and passes it through (defaults to Active).
     var selTab = selectedTab === 'done' ? 'done' : 'active';
     h += '<div class="jobs-tabs" role="tablist">' +
-            '<button class="jobs-tab' + (selTab === 'active' ? ' active' : '') + '" data-tab="active" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
-            '<button class="jobs-tab' + (selTab === 'done' ? ' active' : '') + '" data-tab="done" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
+            '<button class="jobs-tab' + (selTab === 'active' ? ' active' : '') + '" data-tab="active" type="button" role="tab" aria-selected="' + (selTab === 'active') + '" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
+            '<button class="jobs-tab' + (selTab === 'done' ? ' active' : '') + '" data-tab="done" type="button" role="tab" aria-selected="' + (selTab === 'done') + '" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
             '<button type="button" class="jobs-expand-btn" onclick="expandJobsDropdown()" title="Expand to full screen" aria-label="Expand to full screen"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>' +
         '</div>';
-    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active"' + (selTab === 'active' ? '' : ' style="display:none"') + '>' + activePanel + pinnedHtml + todayHtml + '</div>';
-    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done"' + (selTab === 'done' ? '' : ' style="display:none"') + '>' +
+    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active" role="tabpanel"' + (selTab === 'active' ? '' : ' style="display:none"') + '>' + activePanel + pinnedHtml + todayHtml + '</div>';
+    h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done" role="tabpanel"' + (selTab === 'done' ? '' : ' style="display:none"') + '>' +
             _renderJobsHistoryPanel(doneChats) + '</div>';
     return h;
 }
@@ -3730,7 +3770,10 @@ function switchJobsTab(tabName) {
     if (!target) return;
     var tabs = dd.querySelectorAll('.jobs-tab');
     for (var i = 0; i < tabs.length; i++) {
-        tabs[i].classList.toggle('active', tabs[i].getAttribute('data-tab') === tabName);
+        // NEW-T14-1: aria-selected mirrors .active (renderJobsDropdown reads .jobs-tab.active).
+        var _sel = tabs[i].getAttribute('data-tab') === tabName;
+        tabs[i].classList.toggle('active', _sel);
+        tabs[i].setAttribute('aria-selected', String(_sel));
     }
     var panels = dd.querySelectorAll('.jobs-tab-panel');
     for (var j = 0; j < panels.length; j++) {

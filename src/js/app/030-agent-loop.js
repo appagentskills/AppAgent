@@ -184,17 +184,23 @@ function appendContextNotice(chat, content) {
         if (pct < 50) return content;
         var isSub = !!(chat && chat.isSubAgent);
         var notice;
+        // Subs stopping at the context limit hand back a PARTIAL result, not a
+        // failure: without an explicit status they defaulted to 'error' and the
+        // parent showed a red "Final report \u00b7 error" card. need_input is
+        // the non-error status report_to_parent accepts (done|error|need_input)
+        // and the one the saturation hard stop below already asks for.
+        var subStatus = ' Use status "need_input" (a context-limited partial result is NOT an error; reserve "error" for real failures) and say in the summary what is done and what is left.';
         if (pct >= 100) {
             notice = isSub
-                ? '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). STOP immediately and call report_to_parent NOW with everything you have, recommending a handoff to a fresh sub-agent for the remainder.'
+                ? '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). STOP immediately and call report_to_parent NOW with everything you have, recommending a handoff to a fresh sub-agent for the remainder.' + subStatus
                 : '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). Stop working now: give the user your conclusion/report immediately with what you have. Delegate anything unfinished to a sub-agent.';
         } else if (pct >= 60) {
             notice = isSub
-                ? '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP all work NOW and call report_to_parent immediately with what you have; the parent must hand remaining work to a fresh sub-agent.'
+                ? '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP all work NOW and call report_to_parent immediately with what you have; the parent must hand remaining work to a fresh sub-agent.' + subStatus
                 : '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP taking on new work NOW: wrap up and give the user your conclusion this turn, and delegate anything unfinished to sub-agents (spawn_sub_agent).';
         } else {
             notice = isSub
-                ? '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step NOW and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.'
+                ? '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step NOW and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.' + subStatus
                 : '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Model quality degrades from here. Delegate ALL remaining heavy or verbose work to sub-agents (spawn_sub_agent) and keep this thread lean \u2014 orchestrate, don\'t do.';
         }
         return appendNoticeToContent(content, notice, '_context_notice');
@@ -935,6 +941,29 @@ async function executePendingApprovedTools(chat) {
             }
         }
     }
+}
+
+// A2B3-01: stamp a summarize turn's reply with isSummary IN THE SW REALM (called
+// from runAgent's finish), so the SW's own saves and snapshots carry the flag. The
+// page-side stamp in completeSummaryAndCreateNewChat only touched the page mirror
+// and was lost on the SW's next put. Scans back to the turn's user row and stamps
+// only the tool-free, non-aggregate assistant reply of an isSummaryRequest turn.
+// Returns true when it stamped (the caller saves).
+function _stampSummaryReply(chat) {
+    var ms = chat && chat.messages;
+    if (!Array.isArray(ms)) return false;
+    for (var i = ms.length - 1; i >= 0; i--) {
+        var m = ms[i];
+        if (!m || m.role === 'user') return false;
+        if (m.role !== 'assistant' || !m.content || (m.metrics && m.metrics.isAggregate)) continue;
+        if (m.tool_calls && m.tool_calls.length) return false;
+        var u = i - 1;
+        while (u >= 0 && !(ms[u] && ms[u].role === 'user')) u--;
+        if (u < 0 || !ms[u].isSummaryRequest || m.isSummary) return false;
+        m.isSummary = true;
+        return true;
+    }
+    return false;
 }
 
 async function runAgent(overrideChatId) {
@@ -2003,6 +2032,10 @@ async function runAgent(overrideChatId) {
     // isChatPaused() there would no longer tell a pause-exit from a natural
     // finish. Consumed by SubAgents.onSubAgentRunFinished via finishCtx.paused.
     var _exitedPaused = isChatPaused(streamingChatId);
+    // A2B3-01: mark a summarize turn's reply isSummary here, in the SW realm, so
+    // it persists. Not on a pause exit (the resumed turn continues). With
+    // callCount > 1 the aggregate push below saves anyway.
+    if (!_exitedPaused && _stampSummaryReply(chat) && aggregateMetrics.callCount <= 1) saveChatsToStorage();
 
     // Show aggregate summary if there were multiple API calls
     if (aggregateMetrics.callCount > 1) {

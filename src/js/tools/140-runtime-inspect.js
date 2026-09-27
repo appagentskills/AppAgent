@@ -497,8 +497,13 @@ function _riDispatchDom(args) {
     }
     if (!el) return { success: true, target: 'dom', matched: false, dispatched: false };
     if (args.event === 'click' && !args.options) {
-        el.click();
-        return { success: true, target: 'dom', matched: true, tagName: el.tagName, dispatched: true };
+        // A2A-01: report what really happened. el.click() fires nothing on a
+        // disabled control (dispatched:false), and a handler may cancel it.
+        var seen = null, cap = function(ev) { if (!seen) seen = ev; };
+        el.addEventListener('click', cap, true);
+        try { el.click(); } finally { el.removeEventListener('click', cap, true); }
+        return { success: true, target: 'dom', matched: true, tagName: el.tagName,
+                 dispatched: !!seen, defaultPrevented: !!(seen && seen.defaultPrevented) };
     }
     var init = { bubbles: true, cancelable: true };
     if (args.options) {
@@ -511,8 +516,9 @@ function _riDispatchDom(args) {
     else if (args.event.indexOf('key') === 0) evt = new KeyboardEvent(args.event, init);
     else if (args.event === 'input' && typeof InputEvent !== 'undefined') evt = new InputEvent(args.event, init);
     else evt = new Event(args.event, init);
-    el.dispatchEvent(evt);
-    return { success: true, target: 'dom', matched: true, tagName: el.tagName, dispatched: true };
+    var notCanceled = el.dispatchEvent(evt);
+    return { success: true, target: 'dom', matched: true, tagName: el.tagName,
+             dispatched: true, defaultPrevented: evt.defaultPrevented, notCanceled: notCanceled };
 }
 
 function _riDispatch(args) {

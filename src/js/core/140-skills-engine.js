@@ -70,6 +70,46 @@ async function deleteSkillAssets(skillId) {
     }
 }
 
+// Run fn(tx) inside ONE IndexedDB transaction. Resolves (with fn's return value)
+// only on tx.oncomplete, i.e. after the writes are committed; rejects on
+// error/abort, or if fn throws (the transaction is then aborted). Unlike the
+// fire-and-forget helpers above, failures are never swallowed.
+async function idbTx(stores, mode, fn) {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx = database.transaction(stores, mode), out;
+        tx.oncomplete = function() { resolve(out); };
+        tx.onerror = tx.onabort = function(ev) {
+            reject(tx.error || (ev && ev.target && ev.target.error) || new Error('IndexedDB transaction failed'));
+        };
+        try { out = fn(tx); } catch (e) { try { tx.abort(); } catch (_) {} reject(e); }
+    });
+}
+
+// S0B-08 write-then-swap skill import: put the skill row and every staged asset,
+// and delete this skill's stale assets, in ONE readwrite transaction. Resolves
+// only after the commit; on any failure nothing is written, so the old row and
+// assets stay intact. The in-memory skills map is published only after the
+// commit. Callers cycle activation only after this resolves.
+async function commitSkillImport(skill, assets) {
+    await idbTx([skillsStoreName, skillAssetsStoreName], 'readwrite', function(tx) {
+        var assetStore = tx.objectStore(skillAssetsStoreName), keep = {};
+        tx.objectStore(skillsStoreName).put(skill);
+        (assets || []).forEach(function(a) {
+            var assetId = skill.id + '_' + a.filename;
+            keep[assetId] = 1;
+            assetStore.put({ id: assetId, skillId: skill.id, filename: a.filename, type: a.type, content: a.content });
+        });
+        var rq = assetStore.getAll();
+        rq.onsuccess = function() {
+            (rq.result || []).forEach(function(r) {
+                if (r && r.skillId === skill.id && !keep[r.id]) assetStore.delete(r.id);
+            });
+        };
+    });
+    skills[skill.id] = skill; // publish only after commit
+}
+
 // Skill Tools - JS tools loaded from skill assets (run in isolated sandbox)
 // JS Tool File Format (valid JS):
 // ```

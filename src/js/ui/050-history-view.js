@@ -37,6 +37,11 @@ function historySetPageLayout(layout) {
     renderHistoryPage();
 }
 
+function _historyChatVisible(c) {
+    if (!c || c.isSubAgent || c.isTemporary) return false; // A7B-01
+    return !(c.isBackground && !c._revealed);
+}
+
 function renderHistoryPage() {
     var historyList = document.getElementById('history-list');
     var layoutSlot = document.getElementById('history-layout-toggle');
@@ -72,11 +77,7 @@ function renderHistoryPage() {
     // workers spawned by a parent agent, not user-facing runs, so they are
     // hidden from the history page unconditionally (regardless of the
     // _revealed flag). Background action chats keep the reveal-gate.
-    function _isVisibleHistoryChat(c) {
-        if (!c) return false;
-        if (c.isSubAgent) return false;
-        return !(c.isBackground && !c._revealed);
-    }
+    function _isVisibleHistoryChat(c) { return _historyChatVisible(c); }
     var visibleChatIds = Object.keys(chats).filter(function(id) { return _isVisibleHistoryChat(chats[id]); });
     var totalChats = visibleChatIds.length;
     var filteredCount = chatIds.length;
@@ -400,14 +401,13 @@ function openChatFromHistory(chatId) {
     // render. selectChat does this on line 434; this entry-point bypasses
     // selectChat so it has to do it itself.
     if (typeof lastApiError !== 'undefined') lastApiError = null;
-    // R-2: also hide the dead Retry button + stale error snackbar (selectChat's
-    // counterpart does the same), then re-derive Retry from this chat's persisted
-    // _lastApiError so a previously-unfocused errored chat stays recoverable when
-    // opened from history.
-    if (typeof hideRetryButton === 'function') hideRetryButton();
+    // R-2: also hide the stale error snackbar (selectChat's counterpart does the
+    // same) and restore lastApiError from this chat's persisted _lastApiError so a
+    // previously-unfocused errored chat stays recoverable when opened from history.
+    // Retry itself is painted by the syncChatControlsUI derive at the end.
     if (typeof hideSnackbar === 'function') hideSnackbar();
     var _histErr = chats[chatId] && chats[chatId]._lastApiError;
-    if (_histErr) { lastApiError = _histErr; if (typeof showRetryButton === 'function') showRetryButton(); }
+    if (_histErr) lastApiError = _histErr;
     // Re-sync the messages container's `is-streaming` class to the target
     // chat's actual run state. Without this, the class would carry over from
     // whichever chat was last viewed — a streaming chat would visually
@@ -441,20 +441,19 @@ function openChatFromHistory(chatId) {
         try { restorePendingImagesForContext(chatId); } catch (e) { /* non-fatal */ }
     }
     pushHistoryState('chat', chatId);
-    // Sync Pause/Continue button state for the target chat. Without this, the
-    // Pause button could leak in from a previously-viewed streaming chat because
-    // this entry point bypasses selectChat.
+    // Sync the streaming state for the target chat, then let the CHAT-CONTROLS SSOT
+    // (syncChatControlsUI, app/020-api-messages.js) paint exactly one of Pause/Resume,
+    // Retry or Continue. It runs last, after the view, the displayed chat and
+    // lastApiError are settled. Without it, Pause could leak in from a
+    // previously-viewed streaming chat because this entry point bypasses selectChat.
     if (typeof runningChatIds !== 'undefined' && runningChatIds[chatId]) {
         isRunning = true;
         activeStreamingChatId = chatId;
-        showPauseButton(chatId);
-        if (typeof hideContinueButton === 'function') hideContinueButton();
     } else {
         isRunning = false;
         activeStreamingChatId = null;
-        hidePauseButton();
-        if (typeof refreshContinueButtonForChat === 'function') refreshContinueButtonForChat(chatId);
     }
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
     // B-D1: surface any pending approval notifications for this chat. selectChat
     // does this; this entry-point bypasses selectChat so it has to do it itself.
     if (typeof showPendingApprovalNotifications === 'function') {
@@ -488,11 +487,7 @@ function filterHistoryChats(query) {
     // Always apply the visibility predicate — see renderHistoryPage for the
     // long-form rationale. Sub-agent chats are hidden from history
     // unconditionally, action chats stay reveal-gated.
-    function _vis(c) {
-        if (!c) return false;
-        if (c.isSubAgent) return false;
-        return !(c.isBackground && !c._revealed);
-    }
+    function _vis(c) { return _historyChatVisible(c); }
     if (!q || q.length < 2) {
         return Object.keys(chats).filter(function(id) { return _vis(chats[id]); });
     }
@@ -523,64 +518,86 @@ function clearHistorySearch() {
 async function exportChatFromHistory(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
-    // MEMFIX: rehydrate evicted base64 payloads so the export contains the
-    // full messages, not stripped ones. Never rejects.
-    if (typeof ensureChatPayloads === 'function') {
-        try { await ensureChatPayloads(chatId); } catch (e) {}
-    }
-    var exportData = {
-        title: chat.title || 'Untitled Chat',
-        messages: chat.messages || [],
-        createdAt: chat.createdAt,
-        updatedAt: chat.updatedAt,
-        model: chat.model,
-        totalCost: chat.totalCost
-    };
-    var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = (chat.title || 'chat').replace(/[^a-z0-9]/gi, '_') + '.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showSnackbar('Chat exported', 'success');
-}
-
-async function downloadChatHistory() {
-    // MEMFIX: rehydrate every evicted chat first so the export contains full
-    // base64 payloads, not stripped messages. Never rejects.
-    if (typeof ensureChatPayloads === 'function') {
-        try {
-            await Promise.all(Object.keys(chats).map(function(id) { return ensureChatPayloads(id); }));
-        } catch (e) {}
-    }
-    var exportData = {
-        exportedAt: new Date().toISOString(),
-        totalChats: Object.keys(chats).length,
-        chats: {}
-    };
-    Object.keys(chats).forEach(function(chatId) {
-        var chat = chats[chatId];
-        exportData.chats[chatId] = {
+    // S0B2-07: report any failure (rehydration, serialisation, Blob/URL) as an
+    // error snackbar; an async throw from the inline onclick would otherwise be
+    // an unhandled rejection with no feedback.
+    try {
+        // MEMFIX: rehydrate evicted base64 payloads so the export contains the
+        // full messages, not stripped ones. Never rejects.
+        var payloadsOk = true;
+        if (typeof ensureChatPayloads === 'function') {
+            try { await ensureChatPayloads(chatId); } catch (e) { payloadsOk = false; }
+        }
+        if (chat._payloadsEvicted) payloadsOk = false; // A7B2-01
+        var exportData = {
             title: chat.title || 'Untitled Chat',
             messages: chat.messages || [],
             createdAt: chat.createdAt,
             updatedAt: chat.updatedAt,
             model: chat.model,
-            totalCost: chat.totalCost,
-            pinned: chat.pinned
+            totalCost: chat.totalCost
         };
-    });
-    var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'appagent_chat_history_' + new Date().toISOString().split('T')[0] + '.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showSnackbar('Chat history exported (' + Object.keys(chats).length + ' chats)', 'success');
+        var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = (chat.title || 'chat').replace(/[^a-z0-9]/gi, '_') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        if (payloadsOk) showSnackbar('Chat exported', 'success');
+        else showSnackbar('Chat exported (some attachments could not be restored)', 'warning');
+    } catch (e) {
+        showSnackbar('Chat export failed: ' + ((e && e.message) || e), 'error');
+    }
+}
+
+async function downloadChatHistory() {
+    // S0B2-07: rehydrate and serialise ONE chat at a time into Blob parts (no
+    // Promise.all over every chat, no single giant pretty-printed string that
+    // can exceed V8's max string length), count chats left incomplete, and
+    // report failures instead of always claiming success.
+    try {
+        var ids = Object.keys(chats), parts = [''], n = 0, bad = 0;
+        for (var i = 0; i < ids.length; i++) {
+            // MEMFIX: rehydrate evicted base64 payloads so the export contains
+            // full messages, not stripped ones. ensureChatPayloads never rejects
+            // and clears chat._payloadsEvicted only on a full restore, so a chat
+            // still flagged afterwards is exported incomplete.
+            var failed = false;
+            if (typeof ensureChatPayloads === 'function') {
+                try { await ensureChatPayloads(ids[i]); } catch (e) { failed = true; }
+            }
+            var c = chats[ids[i]];
+            if (!c) continue; // deleted while exporting
+            if (failed || c._payloadsEvicted) bad++;
+            parts.push((n ? ',' : '') + JSON.stringify(ids[i]) + ':' + JSON.stringify({
+                title: c.title || 'Untitled Chat',
+                messages: c.messages || [],
+                createdAt: c.createdAt,
+                updatedAt: c.updatedAt,
+                model: c.model,
+                totalCost: c.totalCost,
+                pinned: c.pinned
+            }));
+            n++;
+        }
+        // Header last, from the exported count, so a chat deleted mid-export
+        // does not skew totalChats.
+        parts[0] = '{"exportedAt":' + JSON.stringify(new Date().toISOString()) + ',"totalChats":' + n + ',"chats":{';
+        parts.push('}}');
+        var blob = new Blob(parts, { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'appagent_chat_history_' + new Date().toISOString().split('T')[0] + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showSnackbar('Chat history exported (' + n + ' chats' + (bad ? ', ' + bad + ' incomplete' : '') + ')', bad ? 'warning' : 'success');
+    } catch (e) {
+        showSnackbar('Chat history export failed: ' + ((e && e.message) || e), 'error');
+    }
 }

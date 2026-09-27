@@ -69,16 +69,18 @@ function expandDashboardWidget(widgetId) {
     
     var header = document.createElement('div');
     header.className = 'widget-fullscreen-header';
+    // A6A3-01: same merged flag toggleWidgetRunning reads (chat copy OR dashboard record).
+    var isDeact = (typeof isWidgetDeactivated === 'function') ? isWidgetDeactivated(widgetId) : !!widget.deactivated;
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
         '<span class="widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>' +
         '<div class="widget-modal-controls">' +
-        '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (widget.deactivated ? 'Activate Widget' : 'Deactivate Widget') + '">' + (widget.deactivated ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+        '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (isDeact ? 'Activate Widget' : 'Deactivate Widget') + '">' + (isDeact ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
         // Saved revisions live in WidgetStore (widget.history is no longer written).
         // The button opens the version picker attachWidgetVersionPicker mounted
         // in this header's controls; it only shows when there is history to pick.
         (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="History (' + WidgetStore.versions(widgetId).length + ' versions)">' + UI_ICONS.history + '</button>' : '') +
         '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
-        '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="Open in New Tab" aria-label="Open in New Tab">' + UI_ICONS.externalLink + '</button>' +
+        '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="Open in new tab" aria-label="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
         '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
         // Dashboard twin of the chat toolbar's manual code editor
         // (tools/080-widget-tools.js:429). Distinct from the "Edit" button above:
@@ -86,8 +88,8 @@ function expandDashboardWidget(widgetId) {
         // the raw HTML editor. Same title/icon pair the chat fullscreen uses, so
         // the two surfaces stay learnable.
         '<button class="widget-modal-btn widget-code-btn" data-widget-id="' + widgetId + '" onclick="editDashboardWidgetCode(\'' + widgetId + '\', event)" title="Edit code">' + UI_ICONS.code + '</button>' +
-        '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
-        '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="Close">' + UI_ICONS.close + '</button>' +
+        '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="Remove from dashboard" aria-label="Remove from dashboard">' + UI_ICONS.trash + '</button>' +
+        '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     var content = document.createElement('div');
@@ -99,8 +101,11 @@ function expandDashboardWidget(widgetId) {
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
     
-    // Render widget in fullscreen
-    if (widget.html) {
+    // Render widget in fullscreen. TA-10: a stopped widget gets the same
+    // placeholder as its grid card (renderWidgetContent) and no live iframe.
+    if (isDeact) {
+        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+    } else if (widget.html) {
         var iframe = document.createElement('iframe');
         iframe.className = 'widget-iframe';
         iframe.style.cssText = 'width:100%;height:100%;border:none;background:var(--bg-white);';
@@ -564,9 +569,34 @@ function injectWidgetBridge(html, widgetTitle, widgetId) {
             // Widget query handler - allows parent to inspect/interact with widget DOM via postMessage
             'if(e.data&&e.data.type==="widgetQuery"){' +
                 'var _wqId=e.data.id,_wqAct=e.data.action,_wqArgs=e.data.args||{},_wqR;' +
+                // S0C4-03b: inline mirror of the S0C4-03 secret-input predicate (content-script.js isSecretInput,
+                // 010-iframe-tool.js _ifIsSecretInput). Real widgets run in an opaque-origin sandbox, so this bridge
+                // (not the in-page twin) answers every widget get_visible_text / get_dom. TB-2: lowercased localName (XHTML-safe).
+                'var _wqSec=function(n){return !!n&&String(n.localName||n.tagName||"").toLowerCase()==="input"&&(String(n.type).toLowerCase()==="password"||' +
+                    '/(^|\\s)(current-password|new-password|one-time-code)(\\s|$)/.test(String((n.getAttribute&&n.getAttribute("autocomplete"))||"").toLowerCase()));};' +
+                // TB-1: inline mirror of content-script.js S0C4-01 / 010-iframe-tool.js: SVG/MathML nodes have no .click(),
+                // so dispatch a real bubbling click on the node itself (a non-Window `view` throws in the init).
+                'var _wqClk=function(n){if(typeof n.click==="function")n.click();else n.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true,composed:true,view:(n.ownerDocument&&n.ownerDocument.defaultView)||null}));};' +
+                // TB-3: inline mirror of content-script.js userInputEvent / 010-iframe-tool.js _ifInputEvent: a composed
+                // InputEvent insertText (deleteContentBackward/null for an empty write), else the old plain Event.
+                'var _wqIn=function(d){var _s=d==null?"":String(d);try{if(typeof InputEvent==="function")return new InputEvent("input",_s?{bubbles:true,composed:true,inputType:"insertText",data:_s}:{bubbles:true,composed:true,inputType:"deleteContentBackward",data:null});}catch(_e0){}return new Event("input",{bubbles:true});};' +
                 'try{' +
                     'if(_wqAct==="get_dom"){' +
                         'var _h=document.documentElement.outerHTML;' +
+                        // S0C4-03b: mirror _ifSafeOuterHTML (010-iframe-tool.js): when a secret input holds a non-empty
+                        // value attribute, serialize an INERT DOMParser copy with value="[redacted]" (the live widget DOM
+                        // is never mutated); otherwise the outerHTML is returned unchanged.
+                        'var _hs=function(n){return _wqSec(n)&&!!n.getAttribute("value");};' +
+                        'var _lv=Array.prototype.filter.call(document.documentElement.getElementsByTagName("input"),_hs);' +
+                        'if(_lv.length){' +
+                            'var _in=new DOMParser().parseFromString(_h,"text/html");' +
+                            'Array.prototype.forEach.call(_in.querySelectorAll("input"),function(n){if(_hs(n))n.setAttribute("value","[redacted]");});' +
+                            '_h=_in.documentElement.outerHTML;' +
+                            // TA3-6: mirror content-script.js redactSecretText (the re-parse is not faithful under <textarea>/<svg>):
+                            // every live secret still in _h, raw or attribute/text-escaped, becomes [redacted] (split/join, no backslashes).
+                            '_lv.forEach(function(n){var _s=n.getAttribute("value"),_a=_s.split("&").join("&amp;").split(String.fromCharCode(160)).join("&nbsp;"),_q=_a.split(String.fromCharCode(34)).join("&quot;");' +
+                                '[_s,_q,_a.split("<").join("&lt;").split(">").join("&gt;"),_q.split("<").join("&lt;").split(">").join("&gt;")].forEach(function(v,i,all){if(all.indexOf(v)===i&&_h.indexOf(v)!==-1)_h=_h.split(v).join("[redacted]");});});' +
+                        '}' +
                         'var _ml=(typeof _wqArgs.max_length==="number"?_wqArgs.max_length:200000);' +
                         'if(_h.length>_ml)_h=_h.substring(0,_ml)+"... [truncated, total: "+_h.length+" chars]";' +
                         '_wqR={success:true,html:_h,note:"DOM retrieved (from widget)"};' +
@@ -587,7 +617,7 @@ function injectWidgetBridge(html, widgetTitle, widgetId) {
                                 'var il=n.tagName==="LABEL"||n.tagName==="LEGEND";' +
                                 'var dt="";for(var i=0;i<n.childNodes.length;i++)if(n.childNodes[i].nodeType===3)dt+=n.childNodes[i].textContent.trim();' +
                                 'if(dt||ii||im||ih||il){' +
-                                    'var tv=n.tagName==="INPUT"?(n.value||n.placeholder||""):n.tagName==="TEXTAREA"?(n.value||""):n.tagName==="IMG"?(n.alt||n.title||""):dt;' +
+                                    'var tv=n.tagName==="INPUT"?(_wqSec(n)?(n.value?"[redacted password]":(n.placeholder||"")):(n.value||n.placeholder||"")):n.tagName==="TEXTAREA"?(n.value||""):n.tagName==="IMG"?(n.alt||n.title||""):dt;' +
                                     'if(tv.trim()||ii){' +
                                         'var tp=ih?"heading":ii?(n.tagName==="A"?"link":n.tagName==="BUTTON"?"button":"input"):im?"media":il?"label":"text";' +
                                         'var ed={tag:n.tagName.toLowerCase(),type:tp,text:tv.trim().substring(0,500)};' +
@@ -608,13 +638,13 @@ function injectWidgetBridge(html, widgetTitle, widgetId) {
                         'var _el=_wqArgs.selector?document.querySelector(_wqArgs.selector):' +
                             '(_wqArgs.x!==undefined?document.elementFromPoint(_wqArgs.x,_wqArgs.y):null);' +
                         'if(!_el){_wqR={success:false,error:"Element not found: "+(_wqArgs.selector||_wqArgs.x+","+_wqArgs.y)};}' +
-                        'else{_el.click();var _ci=_el.tagName.toLowerCase();if(_el.id)_ci+="#"+_el.id;' +
+                        'else{_wqClk(_el);var _ci=_el.tagName.toLowerCase();if(_el.id)_ci+="#"+_el.id;' +
                             '_wqR={success:true,message:"Clicked "+_ci+" in widget"};}' +
                     '}else if(_wqAct==="fill"){' +
                         'var _el=_wqArgs.selector?document.querySelector(_wqArgs.selector):' +
                             '(_wqArgs.x!==undefined?document.elementFromPoint(_wqArgs.x,_wqArgs.y):null);' +
                         'if(!_el){_wqR={success:false,error:"Element not found: "+(_wqArgs.selector||_wqArgs.x+","+_wqArgs.y)};}' +
-                        'else{_el.value=_wqArgs.value;_el.dispatchEvent(new Event("input",{bubbles:true}));' +
+                        'else{_el.value=_wqArgs.value;_el.dispatchEvent(_wqIn(_wqArgs.value));' +
                             '_el.dispatchEvent(new Event("change",{bubbles:true}));' +
                             'var _fi=_el.tagName.toLowerCase();if(_el.id)_fi+="#"+_el.id;' +
                             '_wqR={success:true,message:"Filled "+_fi+" in widget"};}' +
@@ -627,7 +657,7 @@ function injectWidgetBridge(html, widgetTitle, widgetId) {
                             'for(var _k=0;_k<_tv.length;_k++){var _ch=_tv.charAt(_k);' +
                                 'try{_el.dispatchEvent(new KeyboardEvent("keydown",{bubbles:true,key:_ch}));}catch(_e1){}' +
                                 '_cur+=_ch;_el.value=_cur;' +
-                                '_el.dispatchEvent(new Event("input",{bubbles:true}));' +
+                                '_el.dispatchEvent(_wqIn(_ch));' +
                                 'try{_el.dispatchEvent(new KeyboardEvent("keyup",{bubbles:true,key:_ch}));}catch(_e2){}' +
                             '}' +
                             '_el.dispatchEvent(new Event("change",{bubbles:true}));' +
@@ -870,9 +900,21 @@ window.addEventListener('message', function(event) {
         if (!_isWidgetSource(event.source)) return;
         var fileId = event.data.fileId;
         var name = event.data.name || 'download';
-        // Open file-download page in a new tab (not sandboxed, can trigger download)
-        var url = chrome.runtime.getURL('file-download.html?id=' + encodeURIComponent(fileId) + '&name=' + encodeURIComponent(name));
-        chrome.tabs.create({ url: url });
+        var reqId = event.data.reqId;
+        var src = event.source;
+        // Ack the real outcome so the card (tools/040-file-store.js) can show it.
+        // Cards without a reqId simply ignore the ack. The reply post can throw
+        // when the widget iframe was torn down: swallow, nobody is listening.
+        var reply = function(ok, error) {
+            try { src.postMessage({ type: 'widgetDownloadResult', reqId: reqId, ok: ok, error: error }, '*'); } catch (e) {}
+        };
+        Promise.resolve().then(function() {
+            // Open file-download page in a new tab (not sandboxed, can trigger download)
+            var url = chrome.runtime.getURL('file-download.html?id=' + encodeURIComponent(fileId) + '&name=' + encodeURIComponent(name));
+            return chrome.tabs.create({ url: url });
+        }).then(function() { reply(true, null); }, function(e) {
+            reply(false, String((e && e.message) || e || 'Could not open the download tab'));
+        });
     }
 });
 
@@ -949,6 +991,11 @@ function renderWidgetContent(widget) {
     var container = document.getElementById('dashboard-widget-content-' + widget.id);
     if (!container) {
         console.warn('Dashboard widget container not found:', 'dashboard-widget-content-' + widget.id);
+        return;
+    }
+    // A6A3-01: honour the persisted deactivated flag on every grid (re-)render.
+    if (widget.deactivated || (typeof isWidgetDeactivated === 'function' ? isWidgetDeactivated(widget.id) : (dashboardWidgets[widget.id] || {}).deactivated)) {
+        container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
         return;
     }
     if (!widget.html) {
@@ -1098,7 +1145,12 @@ function closeWidgetPinMenu() {
 async function pinWidgetTo(widgetId, target) {
     closeWidgetPinMenu();
     if (target === 'none') {
+        // NEW-T23-2: the pin menu's Unpin confirms like Pin/Move do. Read the
+        // dashboard BEFORE the removal deletes the record; the toast lives here,
+        // not in removeWidgetFromDashboard (Remove toasts itself, agent path stays silent).
+        var from = dashboardWidgets[widgetId] ? widgetDashboardOf(dashboardWidgets[widgetId]) : null;
         await removeWidgetFromDashboard(widgetId);
+        if (from) showSnackbar(from === 'home' ? 'Removed from Home' : 'Removed from dashboard', 'success');
         return;
     }
     if (target !== 'home' && target !== 'main') {
@@ -1194,7 +1246,7 @@ function updateHomeDashboardExpandBtn(expanded) {
     btn.title = expanded ? 'Collapse' : 'Expand';
 }
 
-// Show widget in the browser/iframe panel
+// Sidebar/version-row "Open in new tab": opens the app.html?widget= deep link in a new tab (openWidgetInIframePanel, ui/270-iframe-panel.js)
 function showWidgetInPanel(widgetId) {
     var widget = getWidgetById(widgetId);
     if (!widget) { showSnackbar('Widget not found', 'error'); return; }
@@ -1495,7 +1547,12 @@ async function confirmDeleteDashboardWidget(widgetId) {
     var widget = dashboardWidgets[widgetId];
     if (!widget) return;
     
-    var confirmed = await showConfirmModal('Delete Widget', 'Are you sure you want to delete "' + escapeHtml(widget.title) + '"?', 'danger');
+    // A6B-01: this only UNPINS — the WidgetStore record, its saved versions and
+    // the library item stay (the real delete is confirmDeleteLibraryWidget in
+    // 065-widget-library.js), so the modal says "Remove", never "delete".
+    var where = widgetDashboardOf(widget) === 'home' ? 'Home' : 'the dashboard';
+    // TA-8: the title names Home too; the main dashboard keeps "Remove from Dashboard".
+    var confirmed = await showConfirmModal('Remove from ' + (where === 'Home' ? where : 'Dashboard'), 'Remove "' + escapeHtml(widget.title) + '" from ' + where + '? The widget and its saved versions stay in your library.', 'danger');
     if (!confirmed) return;
     
     // Close widget editor if open for this widget
@@ -1505,25 +1562,12 @@ async function confirmDeleteDashboardWidget(widgetId) {
         if (dashboardPanel) dashboardPanel.style.display = 'flex';
     }
     
-    await deleteDashboardWidget(widgetId);
+    // Shared unpin path (no confirm of its own): drops the dashboardWidgets row,
+    // the grid card, the empty state, the home section, AND refreshes the chat
+    // pin buttons + version sidebar, which this path used to leave "pinned".
+    await removeWidgetFromDashboard(widgetId);
     
-    // Remove just this widget's DOM element instead of re-rendering all widgets
-    var widgetEl = document.querySelector('.dashboard-widget[data-widget-id="' + widgetId + '"]');
-    if (widgetEl) {
-        // Clean up widget iframe event listeners to prevent memory leaks
-        var iframe = widgetEl.querySelector('iframe');
-        if (iframe && iframe.__widgetCleanup) iframe.__widgetCleanup();
-        widgetEl.remove();
-    }
-
-    // Show empty state if no widgets left on this widget's dashboard
-    var container = dashboardGridEl(widgetDashboardOf(widget));
-    if (container && dashboardWidgetsFor(widgetDashboardOf(widget)).length === 0) {
-        container.innerHTML = widgetDashboardOf(widget) === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
-    }
-    if (widgetDashboardOf(widget) === 'home' && typeof renderHomeDashboard === 'function') renderHomeDashboard();
-    
-    showSnackbar('Widget deleted', 'success');
+    showSnackbar(where === 'Home' ? 'Removed from Home' : 'Removed from dashboard', 'success');
 }
 
 function openDashboardInNewTab() {
@@ -1537,26 +1581,32 @@ function openDashboardInNewTab() {
 }
 
 function exportDashboard() {
-    var widgetList = Object.values(dashboardWidgets);
-    if (widgetList.length === 0) {
-        showSnackbar('No widgets to export', 'error');
-        return;
+    // S0B-15: any throw (a widget getter, serialisation, Blob/URL) gives an error
+    // snackbar instead of an uncaught exception with no feedback.
+    try {
+        var widgetList = Object.values(dashboardWidgets);
+        if (widgetList.length === 0) {
+            showSnackbar('No widgets to export', 'error');
+            return;
+        }
+
+        var exportData = {
+            type: 'appagent-dashboard',
+            version: 1,
+            widgets: widgetList
+        };
+
+        var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'dashboard-' + new Date().toISOString().slice(0, 10) + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+        showSnackbar('Dashboard exported', 'success');
+    } catch (e) {
+        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
     }
-    
-    var exportData = {
-        type: 'appagent-dashboard',
-        version: 1,
-        widgets: widgetList
-    };
-    
-    var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'dashboard-' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    URL.revokeObjectURL(url);
-    showSnackbar('Dashboard exported', 'success');
 }
 
 async function importDashboard() {
@@ -1571,38 +1621,42 @@ async function importDashboard() {
             var text = await file.text();
             var data = JSON.parse(text);
             
-            var imported = 0;
-            var updated = 0;
-            
-            if (data.type === 'appagent-dashboard-widget' && data.widget) {
-                // Single widget import
-                var widget = data.widget;
-                if (dashboardWidgets[widget.id]) {
-                    updated++;
-                } else {
-                    imported++;
-                }
-                await saveDashboardWidget(widget);
-            } else if (data.type === 'appagent-dashboard' && data.widgets) {
-                // Full dashboard import
-                for (var i = 0; i < data.widgets.length; i++) {
-                    var widget = data.widgets[i];
-                    if (dashboardWidgets[widget.id]) {
-                        updated++;
-                    } else {
-                        imported++;
-                    }
-                    await saveDashboardWidget(widget);
-                }
-            } else {
+            // S0B-10: validate every row BEFORE any write (an object `widgets`, or a
+            // null / id-less row, used to import partially and then abort without a
+            // refresh), confirm before updating existing widgets, and always refresh,
+            // reporting how many rows were saved. Ids naming Object.prototype members
+            // (__proto__, constructor, ...) are rejected: dashboardWidgets[id] would
+            // resolve to the prototype and saveDashboardWidget would merge into it.
+            var rows = data && data.type === 'appagent-dashboard-widget' && data.widget ? [data.widget]
+                : data && data.type === 'appagent-dashboard' && Array.isArray(data.widgets) ? data.widgets : null;
+            if (!rows) {
                 showSnackbar('Invalid dashboard file format', 'error');
                 return;
             }
-            
-            refreshVisibleDashboards();
-            var msg = 'Imported ' + imported + ' widget(s)';
-            if (updated > 0) msg += ', updated ' + updated;
-            showSnackbar(msg, 'success');
+            var seen = {};
+            var bad = rows.filter(function(w) {
+                var ok = !!w && typeof w === 'object' && typeof w.id === 'string' && !!w.id && !(w.id in Object.prototype) && !seen[w.id];
+                if (ok) seen[w.id] = 1;
+                return !ok;
+            });
+            if (bad.length) {
+                showSnackbar('Invalid dashboard file: ' + bad.length + ' widget(s) lack a valid unique id', 'error');
+                return;
+            }
+            var existing = rows.filter(function(w) { return dashboardWidgets[w.id]; }).length;
+            if (existing && !(await showConfirmModal('Import dashboard', existing + ' widget(s) already exist; their title/content will be updated (layout kept). Continue?', 'warning'))) return;
+            var done = 0;
+            try {
+                for (var i = 0; i < rows.length; i++) {
+                    await saveDashboardWidget(rows[i]);
+                    done++;
+                }
+                showSnackbar('Imported ' + (rows.length - existing) + ' widget(s)' + (existing ? ', updated ' + existing : ''), 'success');
+            } catch (err) {
+                showSnackbar('Failed to import (' + done + ' of ' + rows.length + ' saved): ' + ((err && err.message) || err), 'error');
+            } finally {
+                refreshVisibleDashboards();
+            }
         } catch (e) {
             showSnackbar('Failed to import: ' + e.message, 'error');
         }
@@ -1810,6 +1864,24 @@ async function loadChatsFromStorage() {
     return _chatsLoadInFlight;
 }
 
+// BOOT-OOM (F1): strip one freshly read record's heavy payloads (inline
+// base64, long tool/thinking/tool_call text, cached tool results) as soon as
+// its batch has been tallied, so the boot load never holds every record's
+// bodies at once. stripChatPayloadsInPlace (core/130-indexeddb.js) flags the
+// row _payloadsEvicted whenever it strips, so the put-skip guard keeps the
+// stored record intact and ensureChatPayloads restores the row on demand.
+// Returns false when the strip is unavailable or threw.
+function _bootStripLoadedChat(chat) {
+    if (typeof stripChatPayloadsInPlace !== 'function') return false;
+    try { stripChatPayloadsInPlace(chat, true); return true; }
+    catch (e) { console.error('chat payload eviction failed during hydration:', e); return false; }
+}
+
+// Boot breadcrumb for the chat load (appBootCrumb is optional; never throws).
+function _chatsLoadCrumb(phase, extra) {
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb(phase, extra); } catch (e) {} }
+}
+
 async function _loadChatsFromStorageImpl() {
     try {
         // Phase 1 — keys only (cheap, no payloads). Bounds a wedged backend to
@@ -1826,6 +1898,7 @@ async function _loadChatsFromStorageImpl() {
                 req.onerror = function() { reject(req.error || new Error('chats getAllKeys failed')); };
             });
         }, { deadlineMs: BOOT_CHATS_TX_DEADLINE_MS });
+        _chatsLoadCrumb('pre-chats', { n: allKeys.length });
 
         // Phase 2 — fetch records in bounded, disjoint key-range batches.
         // getAllKeys() returns keys in ascending order, so consecutive slices map
@@ -1840,6 +1913,12 @@ async function _loadChatsFromStorageImpl() {
         // (a keys-only Phase 1 timing out = starvation, records can't be big).
         var _loadT0 = Date.now();
         var _acctB64 = 0, _acctTopB64 = 0, _acctTopId = null;
+        // BOOT-OOM (F1): ids whose in-loop strip failed. They are never kept
+        // hydrated: the post-swap pass flags them evicted before re-stripping.
+        var _bootStripFailed = {};
+        // At most 5 progress crumbs per load (every max(500, n/5) records).
+        var _crumbEvery = Math.max(500, Math.ceil(allKeys.length / 5));
+        var _nextCrumbAt = _crumbEvery;
         for (var _start = 0; _start < allKeys.length; _start += CHATS_LOAD_CHUNK_SIZE) {
             var batchKeys = allKeys.slice(_start, _start + CHATS_LOAD_CHUNK_SIZE);
             var range = IDBKeyRange.bound(batchKeys[0], batchKeys[batchKeys.length - 1]);
@@ -1870,7 +1949,16 @@ async function _loadChatsFromStorageImpl() {
                         _acctB64 += _cb64;
                         if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
                     }
+                    // BOOT-OOM (F1): strip AFTER the base64 tally above, while
+                    // only this batch's bodies are live. The newest K chats are
+                    // re-hydrated after the swap by _hydrateRecent.
+                    if (!_bootStripLoadedChat(chat)) _bootStripFailed[chat.id] = true;
                 }
+            }
+            var _doneKeys = _start + batchKeys.length;
+            if (_doneKeys >= _nextCrumbAt) {
+                _chatsLoadCrumb('chats-progress', { n: _doneKeys });
+                while (_nextCrumbAt <= _doneKeys) _nextCrumbAt += _crumbEvery;
             }
         }
         // FIX (691-R1): an unconditional swap drops any in-memory temp/
@@ -1931,12 +2019,31 @@ async function _loadChatsFromStorageImpl() {
             if (typeof stripChatPayloadsInPlace === 'function') {
                 var _ids = Object.keys(chats);
                 _ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
-                for (var _si = KEEP_HYDRATED; _si < _ids.length; _si++) {
-                    // MEMFIX-BODY (Fix A): evictBodies=true — the page also
-                    // drops heavy message text (tool results, thinking,
-                    // tool_calls args) of non-recent chats at boot; restored
-                    // with the payloads by ensureChatPayloads on open.
-                    stripChatPayloadsInPlace(chats[_ids[_si]], true);
+                // BOOT-OOM (F1): every disk record was already stripped in the
+                // batch loop. Keep set (K in total) = the CURRENT chat FIRST,
+                // whatever its recency rank or retired state (like the runtime
+                // sweep's current-chat guard), unless its in-loop strip failed;
+                // then the newest chats that are not retired sub-agent chats and
+                // whose in-loop strip succeeded. _hydrateRecent below restores
+                // them in that order, so the chat on screen is re-hydrated (and
+                // repainted) first. Every other chat is flagged evicted FIRST,
+                // then (re-)stripped: a no-op for rows stripped in the loop, the
+                // real strip for in-memory carry-overs.
+                var _keepIds = [], _keepSet = {};
+                var _curKeepId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
+                if (_curKeepId && chats[_curKeepId] && !_bootStripFailed[_curKeepId] && _keepIds.length < KEEP_HYDRATED) {
+                    _keepIds.push(_curKeepId);
+                    _keepSet[_curKeepId] = true;
+                }
+                for (var _ki = 0; _ki < _ids.length && _keepIds.length < KEEP_HYDRATED; _ki++) {
+                    var _kc = chats[_ids[_ki]];
+                    if (_kc && !_keepSet[_ids[_ki]] && _kc.retiredSubAgent !== true && !_bootStripFailed[_ids[_ki]]) {
+                        _keepIds.push(_ids[_ki]);
+                        _keepSet[_ids[_ki]] = true;
+                    }
+                }
+                for (var _si = 0; _si < _ids.length; _si++) {
+                    if (_keepSet[_ids[_si]]) continue;
                     // WRITE-AMP root fix (mirrors worker/115-storage.js): strip
                     // only flags chats it stripped base64 from, so pure-TEXT
                     // chats stayed in the put set and the page re-wrote every
@@ -1947,7 +2054,13 @@ async function _loadChatsFromStorageImpl() {
                     // chats), which clears the flag and re-admits the chat to
                     // the put set.
                     chats[_ids[_si]]._payloadsEvicted = true;
+                    // MEMFIX-BODY (Fix A): evictBodies=true — the page also
+                    // drops heavy message text (tool results, thinking,
+                    // tool_calls args) of non-recent chats at boot; restored
+                    // with the payloads by ensureChatPayloads on open.
+                    _bootStripLoadedChat(chats[_ids[_si]]);
                 }
+                _chatsLoadCrumb('post-strip', { n: _ids.length, kept: _keepIds.length });
                 if (typeof ensureChatPayloads === 'function') {
                     (function _hydrateRecent(recentIds) {
                         var _hi = 0;
@@ -1966,7 +2079,7 @@ async function _loadChatsFromStorageImpl() {
                                 _next();
                             }, _next);
                         })();
-                    })(_ids.slice(0, KEEP_HYDRATED));
+                    })(_keepIds);
                 }
             }
         } catch (e) { console.error('chat payload eviction failed during hydration:', e); }
@@ -2496,7 +2609,15 @@ function hasNonDefaultPermissions() {
     return false;
 }
 
-function resetAllPermissionsToDefaults() {
+async function resetAllPermissionsToDefaults() {
+    // S8B-02: one click wiped every tool permission, the instance tier and this
+    // session's grants with no way back - ask first (Cancel = nothing changes).
+    var host0 = getConnectedInstanceHost();
+    var ok = await showConfirmModal('Reset all permissions?',
+        'Every tool permission returns to its default' +
+        (host0 ? ', <strong>' + escapeHtml(host0) + '</strong> goes back to the <strong>Manual</strong> tier' : '') +
+        ', and this session\'s grants are cleared. This cannot be undone.', 'danger');
+    if (!ok) return;
     // Reset global permissions
     toolPermissions = {};
     GLOBAL_READ_KEYS.forEach(function(key) {
@@ -2515,8 +2636,10 @@ function resetAllPermissionsToDefaults() {
     });
     saveToolPermissions();
 
-    // Reset instance permissions for connected instance
-    var host = getConnectedInstanceHost();
+    // Reset instance permissions for the instance the dialog named (TA4-6): the
+    // connected host can change while the confirm is open, and re-reading it here
+    // would reset a host the user was never asked about.
+    var host = host0;
     if (host) {
         instancePermissions[host] = { tier: 'manual', tools: {} };
         // Instance read → allow, write → ask

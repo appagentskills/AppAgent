@@ -101,6 +101,57 @@ describe('ui shell › theme switching (real CSS tokens)', function() {
         assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'light');
     }, { tags: ['unit'] });
 
+    // A1E-02: the gear-panel options are real keyboard radios (Enter/Space; every option tabindex 0, like the settings-page radios).
+    test('gear theme options are keyboard radios (role, aria-checked, tabindex 0 on every option, Enter/Space)', async function() {
+        var s = await setup();
+        var group = s.dom.$('#settings-panel-theme');
+        assert.strictEqual(group.getAttribute('role'), 'radiogroup');
+        assert.strictEqual(group.getAttribute('aria-label'), 'Theme');
+        var opts = Array.prototype.slice.call(group.querySelectorAll('.radio-option'));
+        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('role'); }), ['radio', 'radio', 'radio']);
+        s.m.syncSettingsPanelTheme(); // appTheme is 'light'
+        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'true', 'false']);
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0]);
+        var space = U.fireInline(opts[2], 'keydown', s.m, { key: ' ' });
+        assert.strictEqual(space.prevented, true, 'Space does not scroll the panel');
+        assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'dark');
+        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'false', 'true']);
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0]);
+        var enter = U.fireInline(opts[0], 'keydown', s.m, { key: 'Enter' });
+        assert.strictEqual(enter.prevented, true);
+        assert.strictEqual(s.m.__scope.appTheme, 'system');
+        assert.strictEqual(opts[0].getAttribute('aria-checked'), 'true');
+        var other = U.fireInline(opts[1], 'keydown', s.m, { key: 'a' });
+        assert.strictEqual(other.prevented, false, 'other keys are left alone');
+        assert.strictEqual(s.m.__scope.appTheme, 'system');
+    }, { tags: ['unit'] });
+
+    // A1E-02 (R-C1 point 9): with a roving tabindex and no Arrow keys only the selected option was
+    // Tab-reachable, so keyboard users could never switch theme. A NON-selected option must stay
+    // reachable (tabIndex 0) before and after a switch, and Enter/Space on it must switch the theme.
+    test('gear theme: a non-selected option stays Tab-reachable (tabIndex 0) before and after a switch, and Enter/Space on it switches theme', async function() {
+        var s = await setup();
+        var opts = Array.prototype.slice.call(s.dom.$('#settings-panel-theme').querySelectorAll('.radio-option'));
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0], 'markup: every option is in the Tab order');
+        s.m.syncSettingsPanelTheme(); // appTheme is 'light': System and Dark are the non-selected options
+        assert.strictEqual(opts[2].getAttribute('aria-checked'), 'false');
+        assert.strictEqual(opts[2].tabIndex, 0, 'non-selected Dark is reachable by Tab before the switch');
+        assert.strictEqual(opts[0].tabIndex, 0, 'non-selected System is reachable by Tab before the switch');
+        var enter = U.fireInline(opts[2], 'keydown', s.m, { key: 'Enter' });
+        assert.strictEqual(enter.prevented, true);
+        assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'dark');
+        assert.strictEqual(s.m.__scope.appTheme, 'dark');
+        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'false', 'true']);
+        assert.strictEqual(opts[1].tabIndex, 0, 'now non-selected Light is still reachable by Tab after the switch');
+        assert.strictEqual(opts[0].tabIndex, 0, 'non-selected System is still reachable by Tab after the switch');
+        var space = U.fireInline(opts[1], 'keydown', s.m, { key: ' ' });
+        assert.strictEqual(space.prevented, true);
+        assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'light');
+        assert.strictEqual(s.m.__scope.appTheme, 'light');
+        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'true', 'false']);
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0], 'selection never removes an option from the Tab order');
+    }, { tags: ['unit'] });
+
     test('broadcastWidgetTheme posts themeChange to every widget iframe and tolerates none', async function() {
         var s = await setup();
         s.m.broadcastWidgetTheme('dark'); // no widgets: silent no-op
@@ -287,6 +338,18 @@ describe('ui views › history page', function() {
         assert.deepStrictEqual(s.m.filterHistoryChats('ALPHA'), ['a'], 'case-insensitive');
         assert.deepStrictEqual(s.m.filterHistoryChats('zzzz'), []);
     }, { tags: ['unit'] });
+    // A7B-01: never-saved temporary chats (boot / New Chat) were listed and
+    // counted, so a fresh profile never showed the empty state.
+    test('A7B-01 History cards and stats skip temporary chats', async function() {
+        var cs = { a: chat('a', 'Alpha'), b: chat('b', 'Beta'), t: chat('t', 'New Chat', { isTemporary: true, messages: [] }) };
+        var s = await setup(cs);
+        assert.deepStrictEqual(s.m.filterHistoryChats('').sort(), ['a', 'b']);
+        s.m.renderHistoryPage();
+        assert.strictEqual(s.dom.$('#history-stats').textContent.trim(), '2 conversations');
+        delete cs.a; delete cs.b;
+        s.m.renderHistoryPage();
+        assert.ok(s.dom.$('#history-list').textContent.indexOf('No conversations yet') >= 0, 'only a temp chat: empty state');
+    }, { tags: ['unit'] });
     test('renderHistoryChatCard escapes a hostile title and exposes the chat id', async function() {
         var s = await setup({ h: chat('h', HOSTILE) });
         var html = s.m.renderHistoryChatCard('h');
@@ -391,6 +454,48 @@ describe('ui views › screenshot modal', function() {
         s.m.openScreenshotModal('x" onerror="window.__pwn=3', 't', 0, 0, '');
         assert.strictEqual(s.dom.$('#modal-body img').hasAttribute('onerror'), false, 'src must not break out of the attribute');
     }, { tags: ['unit'] });
+    // S0C12-01: a dialog that replaced the viewer body leaves no <img>; the arrow
+    // keys must neither throw nor rewrite the header / nav index.
+    test('navigateScreenshot is a no-op when #modal-body has no img', async function() {
+        var s = await setup(2);
+        s.m.openScreenshotModal(PNG(0), 'shot 0', 10, 20, '');
+        var nav = s.m.screenshotNav;
+        assert.deepStrictEqual([nav.list.length, nav.index], [2, 0]);
+        s.dom.$('#modal-body').innerHTML = '<p>Rebuild failed</p>';
+        var header = s.dom.$('#modal-header').innerHTML;
+        s.m.navigateScreenshot(1); // must not throw
+        assert.strictEqual(nav.index, 0, 'index unchanged');
+        assert.strictEqual(s.dom.$('#modal-header').innerHTML, header, 'header unchanged');
+        assert.strictEqual(s.dom.$('#modal-body').textContent, 'Rebuild failed');
+    }, { tags: ['unit'] });
+});
+
+// ─────────────────────────── Ctrl/Cmd+K ───────────────────────────
+describe('ui shell › Ctrl/Cmd+K search shortcut (core/120-init.js)', function() {
+    // A1E-03: with CapsLock on, e.key is 'K'; Ctrl+Alt (AltGr) chords are not the shortcut.
+    test("Ctrl/Cmd+K focuses chat search with CapsLock (key 'K')", async function() {
+        var src = await loadFile('src/js/core/120-init.js', WS);
+        var i = src.indexOf("getElementById('chat-search-input')");
+        var s = src.lastIndexOf('function(e) {', i);
+        assert.ok(i > 0 && s > 0, 'keydown listener found');
+        var body = src.slice(s, src.indexOf('\n    });', s) + 6);
+        var focus = 0, toggled = 0;
+        var fakeDoc = { getElementById: function(id) {
+            if (id === 'chat-search-input') return { focus: function() { focus++; } };
+            if (id === 'sidebar') return { classList: { contains: function() { return true; } } };
+            return null;
+        } };
+        var fn = new Function('document', 'toggleSidebar', 'return (' + body + ');')(fakeDoc, function() { toggled++; });
+        function press(init) { var pd = 0; fn(Object.assign({ preventDefault: function() { pd++; } }, init)); return pd; }
+        assert.strictEqual(press({ key: 'K', ctrlKey: true }), 1, 'CapsLock Ctrl+K is handled');
+        assert.strictEqual(focus, 1, 'CapsLock Ctrl+K focuses #chat-search-input');
+        assert.strictEqual(press({ key: 'k', metaKey: true }), 1);
+        assert.strictEqual(focus, 2, 'Cmd+K still focuses');
+        assert.strictEqual(press({ key: 'k', ctrlKey: true, altKey: true }), 0, 'Ctrl+Alt+K (AltGr) is left alone');
+        assert.strictEqual(press({ key: 'k' }), 0, 'plain k is left alone');
+        assert.strictEqual(focus, 2);
+        assert.strictEqual(toggled, 0, 'an expanded sidebar is not toggled');
+    }, { tags: ['unit'] });
 });
 
 // ─────────────────────────── Integrity (runs last: loads the whole bundle) ───────────────────────────
@@ -399,11 +504,7 @@ describe('ui integrity › body.html wiring', function() {
     // markup). Every call site is null-guarded, so they are dead code, not
     // crashes; kept explicit so a NEW orphan fails the test.
     var STALE_IDS = {
-        'browse-icon': 'core/120-init.js:114 — guarded icon init for a removed button',
-        'home-browse-icon': 'core/120-init.js:119 — guarded icon init for a removed button',
-        'section-icon-cache': 'core/120-init.js:160 — gear panel lost its Cache section',
         'widget-history-modal-overlay': 'core/120-init.js:251,360 — showWidgetHistory now reuses the widget modal',
-        'settings-provider-container': 'ui/010-skills-ui.js:1195 — populateProviderDropdown returns early',
         'tool-permissions-list': 'ui/140-dropdowns.js:152 — renderToolPermissions returns early (settings page uses its own list)'
     };
     async function srcFiles() { return (await buildOrder(WS)); }
@@ -447,5 +548,23 @@ describe('ui integrity › body.html wiring', function() {
         ['sidebar', 'main-area', 'messages', 'message-input', 'send-btn', 'modal-overlay', 'history-list', 'settings-panel-theme', 'chat-list'].forEach(function(id) {
             assert.ok(bodyIds[id], 'core shell id #' + id);
         });
+    }, { tags: ['unit'], timeout: 60000 });
+    test('dead toggleFileChanges helper is removed (S0-04)', async function() {
+        var files = await srcFiles(), hits = [];
+        assert.ok(files.length > 50, 'build order sanity: ' + files.length);
+        for (var i = 0; i < files.length; i++) if (/\btoggleFileChanges\b/.test(await loadFile(files[i], WS))) hits.push(files[i]);
+        assert.deepStrictEqual(hits, [], 'no caller exists, so the helper must stay deleted');
+    }, { tags: ['unit'], timeout: 60000 });
+    test('dead screenshot preview panel is removed (S0B4-01)', async function() {
+        // Nothing ever called showScreenshotPreview: panel markup, CSS, icon init and handlers are all gone.
+        var html = await loadFile('src/html/body.html', WS), css = await loadFile('src/css/19-dashboard.css', WS);
+        assert.ok(html.length > 1000 && css.length > 100, 'sources loaded');
+        assert.strictEqual(html.indexOf('screenshot-preview-'), -1, 'body.html has no screenshot preview panel');
+        assert.strictEqual(css.indexOf('screenshot-preview-'), -1, '19-dashboard.css has no screenshot preview rules');
+        var files = await srcFiles(), hits = [];
+        for (var i = 0; i < files.length; i++) {
+            if (/showScreenshotPreview|closeScreenshotPreview|downloadScreenshotPreview|screenshotEscHandler|_screenshotDataUrl|screenshot-preview-/.test(await loadFile(files[i], WS))) hits.push(files[i]);
+        }
+        assert.deepStrictEqual(hits, [], 'no JS references the removed preview panel');
     }, { tags: ['unit'], timeout: 60000 });
 });

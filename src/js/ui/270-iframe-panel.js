@@ -15,19 +15,24 @@ function openIframePanel() {
     appStorage.setItem('browserOpen', 'true');
 }
 
+// Resolves true only once Chrome confirms the tab opened (false: no chrome.tabs, lastError or a throw).
 function popOutToFullTab() {
-    if (typeof chrome === 'undefined') return;
+    if (typeof chrome === 'undefined' || !chrome.tabs) return Promise.resolve(false);
     // Open the current chat in a full tab
     var url = chrome.runtime.getURL('app.html?mode=tab');
     if (currentChatId) url += '&chat=' + encodeURIComponent(currentChatId);
-    chrome.tabs.create({ url: url });
+    return new Promise(function(r) {
+        try { chrome.tabs.create({ url: url }, function(t) { r(!chrome.runtime.lastError && !!t); }); } catch (e) { r(false); }
+    });
 }
 
 function expandSidePanel() {
-    // Open full tab and close the side panel
-    popOutToFullTab();
-    // Side panels can close themselves via window.close()
-    setTimeout(function() { window.close(); }, 300);
+    // Open full tab and close the side panel, but only once the tab really opened.
+    return popOutToFullTab().then(function(ok) {
+        // Side panels can close themselves via window.close()
+        if (ok) setTimeout(function() { window.close(); }, 300);
+        else if (typeof showSnackbar === 'function') showSnackbar('Could not open a full tab', 'error');
+    });
 }
 
 // Native Reload is single-flight in this page AND across extension panels.
@@ -196,7 +201,7 @@ function _reloadChecklist(controller) {
     }
     var overlay = node('div', 'modal-overlay show reload-preflight');
     var dialog = node('section', 'modal-dialog', '', overlay);
-    dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-labelledby', 'reload-preflight-title');
+    dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-labelledby', 'reload-preflight-title'); dialog.setAttribute('aria-modal', 'true'); overlay.tabIndex = -1; // S8D-04: clicks keep focus inside the overlay
     dialog.setAttribute('aria-describedby', 'reload-preflight-status');
     var title = node('h2', 'modal-header', 'Checking before Reload…', dialog); title.id = 'reload-preflight-title';
     var body = node('div', 'modal-body', '', dialog);
@@ -238,17 +243,32 @@ function _reloadChecklist(controller) {
     cancel.addEventListener('click', function() { choose('cancel'); });
     force.addEventListener('click', function() { if (!force.disabled) choose('force'); });
     overlay.addEventListener('keydown', function(e) {
-        // Details keep native keyboard activation; Enter must never choose Force.
-        if (e.key === 'Enter') { if (summaries.indexOf(e.target) < 0) e.preventDefault(); e.stopPropagation(); }
+        // Details and Cancel keep native keyboard activation; Enter must never choose Force.
+        if (e.key === 'Enter') { if (summaries.indexOf(e.target) < 0 && e.target !== cancel) e.preventDefault(); e.stopPropagation(); }
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); choose('cancel'); }
         // Include native summaries, but never steal focus from separate permission prompts.
         if (e.key === 'Tab') {
             var controls = summaries.concat([cancel]);
             if (!force.hidden && !force.disabled) controls.push(force);
             var active = controls.indexOf(document.activeElement);
-            if (active >= 0) { e.preventDefault(); controls[(active + (e.shiftKey ? controls.length - 1 : 1)) % controls.length].focus(); }
+            e.preventDefault(); // S8D-04: focus on the overlay/dialog itself (active < 0) enters the ring at the first control (Shift: last)
+            controls[active < 0 ? (e.shiftKey ? controls.length - 1 : 0) : (active + (e.shiftKey ? controls.length - 1 : 1)) % controls.length].focus();
         }
     });
+    // S8D-03: the global Esc sweep (core/120-init.js) replays onclick on the topmost
+    // .modal-overlay.show and then removes it - route that through a real cancel.
+    // A genuine backdrop click now cancels too, like every other overlay twin.
+    // TA4-1: only when its mousedown ALSO started on the backdrop (a drag from the
+    // dialog that ends outside must not cancel); same contract as
+    // ui/040-tools-settings.js showLlmEndpointModal. The Esc replay object and
+    // programmatic .click() are not isTrusted and still cancel.
+    var backdropPressed = false;
+    overlay.addEventListener('mousedown', function(e) { backdropPressed = (e.target === overlay); });
+    overlay.onclick = function(e) {
+        if (!e || e.target !== overlay) return;
+        if (e.isTrusted && !backdropPressed) return;
+        choose('cancel');
+    };
     function updateProgress() {
         var complete = rows.filter(function(r) { return r.complete; }).length;
         var failed = rows.filter(function(r) { return r.row.dataset.state === 'fail'; }).length;
@@ -397,8 +417,9 @@ async function _rebuildBeforeReload() {
         if (choice === 'restart') return true;
         if (choice !== 'grant') return false; // Cancel, or superseded by another modal (null)
         // Straight from the click continuation: the transient user activation lets
-        // getDeployDirHandle()'s own requestPermission() show the browser prompt.
-        dir = typeof getDeployDirHandle === 'function' ? await getDeployDirHandle() : null;
+        // getDeployDirHandle({ interactive: true })'s requestPermission() show the
+        // browser prompt (S0B3-02: the passive probe above never prompts).
+        dir = typeof getDeployDirHandle === 'function' ? await getDeployDirHandle({ interactive: true }) : null;
         _reloadMark('permission-prompt');
         if (!dir) {
             if (typeof showSnackbar === 'function') showSnackbar('Deploy folder permission still not granted — Reload cancelled', 'warning');
@@ -419,6 +440,21 @@ async function _reloadBuildBusy() {
     if (_reloadBuildInFlight) return true;
     if (!navigator.locks || !navigator.locks.request) return false;
     return navigator.locks.request(RELOAD_BUILD_LOCK, { ifAvailable: true }, function(lock) { return !lock; });
+}
+// Chat ids of in-flight agent runs. runningChatIds is a plain object keyed by chatId (core/030-config.js).
+function _runningAgentChatIds() {
+    var ids = [];
+    if (typeof runningChatIds !== 'undefined' && runningChatIds) {
+        for (var _cid in runningChatIds) { if (runningChatIds[_cid]) ids.push(_cid); }
+    }
+    return ids;
+}
+// The "Reload will stop n runs" warning; resolves true when the user accepts.
+function _confirmStopRuns(runningCount) {
+    var msg = runningCount === 1
+        ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
+        : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
+    return showConfirmModal('Reload extension?', escapeHtml(msg), 'warning');
 }
 async function _reloadExtensionLocked() {
     // M1: refuse EARLY (no preflight, build or restart) while a build still writes files.
@@ -442,17 +478,8 @@ async function _reloadExtensionLocked() {
     }
 
     // A full reload tears down in-flight agent runs. Warn before doing so.
-    // runningChatIds is a plain object keyed by chatId (core/030-config.js).
-    var runningCount = 0;
-    if (typeof runningChatIds !== 'undefined' && runningChatIds) {
-        for (var _cid in runningChatIds) { if (runningChatIds[_cid]) runningCount++; }
-    }
-    if (runningCount > 0) {
-        var msg = runningCount === 1
-            ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
-            : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
-        if (!(await showConfirmModal('Reload extension?', escapeHtml(msg), 'warning'))) return;
-    }
+    var acceptedRuns = _runningAgentChatIds();
+    if (acceptedRuns.length && !(await _confirmStopRuns(acceptedRuns.length))) return;
     _reloadMark('lock/confirm');
 
     // Fire the reload exactly once, and never let anything strand it.
@@ -466,6 +493,11 @@ async function _reloadExtensionLocked() {
             return;
         }
         _reloaded = true;
+        // RELOAD-ZOMBIE (P1): app/060 appCleanReload -> the SW closes every app tab, THEN reloads
+        // (direct chrome.runtime.reload() fallback unless acked within 1.5 s). Returned so the
+        // Reload lock/_reloadInFlight stay held during the ack wait.
+        try { if (typeof window.appCleanReload === 'function') return window.appCleanReload({ reason: 'reload' }); } catch (e) { /* direct reload below */ }
+        try { if (typeof window.keepAwakeDisarmUnload === 'function') window.keepAwakeDisarmUnload(); } catch (e) {}
         try {
             chrome.runtime.reload();
         } catch (e) {
@@ -517,7 +549,7 @@ async function _reloadExtensionLocked() {
         return Promise.race([written, fallback]).then(function() {
             clearTimeout(fallbackTimer);
             _reloadMark('restart request');
-            _doReload();
+            return _doReload();
         });
     }
 
@@ -526,8 +558,16 @@ async function _reloadExtensionLocked() {
     // redeploy the extension from the workspace FIRST, so chrome.runtime.reload()
     // picks up the freshly built files from disk. Without a connected folder (or
     // build tool) there is nothing on disk to update, so we just reload.
-    return _rebuildBeforeReload().then(function(proceed) {
+    return _rebuildBeforeReload().then(async function(proceed) {
         if (!proceed) return;
+        // The preflight + build can take minutes: a run that started meanwhile (not
+        // accepted above) gets the same warning before anything restarts. Cancel
+        // restarts nothing and leaves any deployed files on disk (like a timed-out build).
+        var nowRunning = _runningAgentChatIds();
+        if (nowRunning.some(function(id) { return acceptedRuns.indexOf(id) < 0; }) && !(await _confirmStopRuns(nowRunning.length))) {
+            if (typeof showSnackbar === 'function') showSnackbar('Reload cancelled — click Reload when the runs finish', 'warning');
+            return;
+        }
         // Cleanly close every realm's IDB connection BEFORE chrome.runtime.reload()
         // tears the contexts down. An abrupt teardown of an un-closed connection can
         // make Chrome force-close the origin's IndexedDB backing store, which then

@@ -128,7 +128,47 @@ function rtParseEvalResult(evalRes, cfg, isolation, hostDenials) {
         error: success ? undefined : (invalid ? 'Invalid/incomplete sandbox result' : 'Test failure, denied tool call or unverified isolation') };
 }
 
-var RunTestsHelpers = { rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE };
+// B2 coded-error contract (SW side: background.js): offscreen failures read
+// 'OFFSCREEN_<CODE>: sentence' and/or keep the /not available/ wording.
+var RT_SANDBOX_HINT = 'Hint: Reload the extension; if the problem persists, check chrome://extensions \u2192 AppAgent \u2192 Errors.';
+function rtSandboxErrorCode(message, existing) {
+    var msg = String(message || ''), m = msg.match(/\bOFFSCREEN_[A-Z_]+\b/);
+    if (m) return m[0];
+    if (/not available/i.test(msg) && /offscreen|sandbox/i.test(msg)) return 'OFFSCREEN_UNAVAILABLE';
+    return existing || null;
+}
+
+// Never a silent/empty green: surfaces sandbox errors and fails loudly when no
+// test body executed (passed + failed === 0; skips never count). Mutates `out`.
+function rtGuardResult(out, cfg, evalRes) {
+    var selected = (cfg && Array.isArray(cfg.files) ? cfg.files : []).length;
+    var nFiles = selected + ' test file' + (selected === 1 ? '' : 's') + ' selected';
+    var files = Array.isArray(out.files) ? out.files : [];
+    var ran = files.reduce(function(n, f) { return n + ((f && Number(f.passed)) || 0) + ((f && Number(f.failed)) || 0); }, 0);
+    var evalErr = evalRes && evalRes.success === false ? String(evalRes.error || 'js_eval failed without an error message') : '';
+    var code = evalErr ? rtSandboxErrorCode(evalErr, evalRes.error_code) : null;
+    if (code && /^OFFSCREEN_/.test(code)) {
+        var orig = evalErr.replace(/^js_eval sandbox unavailable: /, '').replace(/\s*Hint: Reload the extension[^\n]*$/, '');
+        out.success = false; out.error_code = code; out.tests_ran = 0;
+        out.error = 'run_tests could not start the sandbox: ' + orig + ' (0 tests ran; ' + nFiles + ').\n' + RT_SANDBOX_HINT;
+        return out;
+    }
+    if (ran > 0) return out;
+    var why;
+    if (!files.length) why = nFiles + ', but the sandbox returned no file results';
+    else {
+        var errored = files.filter(function(f) { return f && f.status === 'error'; });
+        var empty = files.filter(function(f) { return f && f.status === 'empty'; }).length;
+        var skipped = files.reduce(function(n, f) { return n + ((f && Number(f.skipped)) || 0); }, 0);
+        why = nFiles + ', ' + (files.length - errored.length) + ' loaded but no test ran (' + empty + ' file' + (empty === 1 ? '' : 's') + ' registered no tests, ' + skipped + ' test' + (skipped === 1 ? '' : 's') + ' skipped' +
+            (errored.length ? '; ' + errored.length + ' failed to load, first: ' + errored[0].file + ': ' + errored[0].error : '') + ')';
+    }
+    out.success = false; out.error_code = 'NO_TESTS_RAN'; out.tests_ran = 0;
+    out.error = 'NO_TESTS_RAN: 0 tests ran \u2014 ' + why + '.' + (out.error ? ' ' + out.error : '');
+    return out;
+}
+
+var RunTestsHelpers = { rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE, rtSandboxErrorCode: rtSandboxErrorCode, rtGuardResult: rtGuardResult };
 
 // ─── tool entry points (dispatched from tools/020-tool-execution.js) ─────────
 
@@ -160,7 +200,7 @@ async function executeRunJsFile(args, messageIndex, options) {
         code = 'return await runFile(' + JSON.stringify(a.path) + ', ' + JSON.stringify(a.args) + ', ' + JSON.stringify(wk) + ');';
     }
     var res = await executeTool('js_eval', { code: code }, messageIndex, _rtEvalOptions(options));
-    if (!res || res.success === false) return { success: false, path: a.path, mode: a.mode, error: (res && res.error) || 'js_eval failed' };
+    if (!res || res.success === false) return { success: false, path: a.path, mode: a.mode, error: (res && res.error) || 'js_eval failed', error_code: (res && res.error_code) || undefined };
     return { success: true, path: a.path, mode: a.mode, workspace: wk, result: res.result };
 }
 
@@ -221,8 +261,9 @@ async function executeRunTests(args, messageIndex, options) {
         if (!files.length) {
             var _noMatch = 'NO_TESTS_MATCHED: no test files matched' +
                 (a.pattern ? ' pattern ' + JSON.stringify(String(a.pattern)) : '') +
-                (Array.isArray(a.files) ? ' in files ' + JSON.stringify(a.files) : ' in test/') + '.';
-            return { success: false, error: _noMatch, code: 'NO_TESTS_MATCHED', pattern: a.pattern || null, files: [], summary: { files: 0, total: 0, passed: 0, failed: 0, skipped: 0 } };
+                (Array.isArray(a.files) ? ' in files ' + JSON.stringify(a.files) : ' in test/') + '.' +
+                ' NO_TESTS_RAN: 0 test files selected, so 0 tests ran.';
+            return { success: false, error: _noMatch, code: 'NO_TESTS_MATCHED', error_code: 'NO_TESTS_RAN', tests_ran: 0, pattern: a.pattern || null, files: [], summary: { files: 0, total: 0, passed: 0, failed: 0, skipped: 0 } };
         }
         // Complete baseline before loading any executable test code. Any failed or
         // capped snapshot aborts BEFORE dispatch; snapshots never go through tests.
@@ -255,6 +296,7 @@ async function executeRunTests(args, messageIndex, options) {
         isolation = TestRunPolicy.compare(before, after);
     } catch (error) { isolation = { ok: false, error: String(error && error.message || error), violations: [] }; }
     var out = rtParseEvalResult(evalRes, cfg || { files: [] }, isolation, context ? TestRunPolicy.registry.denials(context) : []);
+    rtGuardResult(out, cfg || { files: Array.isArray(files) ? files : [] }, evalRes);
     out.duration_ms = Date.now() - started;
     out.workspace = wk;
     return out;

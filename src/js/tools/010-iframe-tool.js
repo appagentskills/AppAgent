@@ -6,6 +6,70 @@ function describeEl(el) {
     return s;
 }
 
+// S0C4-03 mirror of content-script isSecretInput (TB-2: lowercased localName, so XHTML inputs match too)
+function _ifIsSecretInput(n) {
+    return !!n && String(n.localName || n.tagName || '').toLowerCase() === 'input' && (String(n.type).toLowerCase() === 'password' ||
+        /(^|\s)(current-password|new-password|one-time-code)(\s|$)/.test(String((n.getAttribute && n.getAttribute('autocomplete')) || '').toLowerCase()));
+}
+
+// S0C4-03 mirror of content-script safeOuterHTML: get_dom serializes an INERT DOMParser copy with
+// value="[redacted]" when el's subtree holds a secret input with a non-empty value attribute (the
+// live widget DOM is never mutated or cloned); otherwise el.outerHTML is returned unchanged.
+// TA3-6: as in content-script safeOuterHTML, every live secret still in the output is then string-redacted.
+function _ifSafeOuterHTML(el) {
+    var html = el.outerHTML;
+    var hasSecret = function(n) { return _ifIsSecretInput(n) && !!n.getAttribute('value'); };
+    var live = [el].concat(Array.prototype.slice.call(el.getElementsByTagName('input'))).filter(hasSecret);
+    if (!live.length) return html;
+    // <html>/<body> keep their own tags only when parsed as a document; any other element is
+    // parsed as <template> content (where table rows, list items, etc. round-trip).
+    var ln = String(el.localName || '').toLowerCase(), asDoc = ln === 'html' || ln === 'body';   // TB-2: XHTML-safe
+    var inert = new DOMParser().parseFromString(asDoc ? html : '<template>' + html + '</template>', 'text/html');
+    var tpl = asDoc ? null : inert.querySelector('template');
+    Array.prototype.forEach.call((tpl ? tpl.content : inert).querySelectorAll('input'), function(n) {
+        if (hasSecret(n)) n.setAttribute('value', '[redacted]');
+    });
+    var out = tpl ? tpl.innerHTML : (ln === 'html' ? inert.documentElement : inert.body).outerHTML;
+    live.forEach(function(n) { out = _ifRedactSecretText(out, n.getAttribute('value')); });
+    return out;
+}
+// TA3-6 mirror of content-script redactSecretText: s raw, attribute-escaped or text-escaped becomes [redacted].
+function _ifRedactSecretText(out, s) {
+    var a = s.replace(/&/g, '&amp;').replace(/\u00a0/g, '&nbsp;'), q = a.replace(/"/g, '&quot;');
+    [s, q, a.replace(/</g, '&lt;').replace(/>/g, '&gt;'), q.replace(/</g, '&lt;').replace(/>/g, '&gt;')].forEach(function(v, i, all) {
+        if (all.indexOf(v) === i && out.indexOf(v) !== -1) out = out.split(v).join('[redacted]');
+    });
+    return out;
+}
+
+// S0C4-02: fill/type only write into real editables; anything else is an error (no events).
+// Mirrors content-script.js isEditableTarget/setEditableValue.
+function _ifIsEditableTarget(el) {
+    var t = (el && el.nodeType === 1) ? el.tagName : '';
+    return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' ||
+        (!!t && !!(el.isContentEditable ? el : (el.closest && el.closest('[contenteditable]:not([contenteditable="false"])')))) ||
+        (t.indexOf('-') > 0 && ('value' in el));   // custom elements only; built-ins like button/li/option also expose `value`
+}
+function _ifSetEditableValue(el, value, win) {   // caller already checked _ifIsEditableTarget(el)
+    var t = el.tagName, host = (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') ? null : ((el.isContentEditable ? el : (el.closest && el.closest('[contenteditable]:not([contenteditable="false"])'))) || null);
+    if (t === 'INPUT' || t === 'TEXTAREA') {
+        try { var desc = Object.getOwnPropertyDescriptor((t === 'TEXTAREA' ? win.HTMLTextAreaElement : win.HTMLInputElement).prototype, 'value');
+              if (desc && desc.set) desc.set.call(el, value); else el.value = value; } catch(e) { el.value = value; }
+    } else if (host) {
+        var d = host.ownerDocument || document, ok = false;
+        try { var sel = d.getSelection ? d.getSelection() : null; if (sel && d.createRange) { var rg = d.createRange(); rg.selectNodeContents(host); sel.removeAllRanges(); sel.addRange(rg); ok = d.execCommand('insertText', false, String(value)) === true; } } catch(e) { ok = false; }
+        if (!ok) host.textContent = String(value);
+    } else { el.value = value; }   // SELECT and custom elements exposing `value`
+}
+// TB-3: the fill/type 'input' event is an InputEvent{inputType:'insertText',data} (composed, like a native one); an empty
+// write (the type clear) is deleteContentBackward with data null, as native never sends an empty insertText. A realm
+// without InputEvent (or a throwing init) keeps the old plain Event. Mirrors content-script.js userInputEvent.
+function _ifInputEvent(win, data) {
+    var s = data == null ? '' : String(data);
+    try { if (win && typeof win.InputEvent === 'function') return new win.InputEvent('input', s ? { bubbles: true, composed: true, inputType: 'insertText', data: s } : { bubbles: true, composed: true, inputType: 'deleteContentBackward', data: null }); } catch(e) {}
+    return new win.Event('input', { bubbles: true });
+}
+
 // Tab ids currently being adopted/navigated by a navigate call in this context.
 // Guards against two concurrent navigates (e.g. two chats) adopting the same tab.
 var _adoptionInFlight = new Set();
@@ -468,7 +532,9 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 if (action === 'get_visible_text') {
                     // Deep mode returns visibleElements array; simple mode returns text
                     if (extResult.visibleElements) {
-                        return { success: true, visibleElements: extResult.visibleElements, note: extResult.note || '' };
+                        var _vr = { success: true, visibleElements: extResult.visibleElements, note: extResult.note || '' };
+                        if (extResult.truncated) _vr.truncated = true;   // S0C6-05: the content script hit its 2 s selector budget
+                        return _vr;
                     }
                     return { success: true, text: extResult.text || '' };
                 }
@@ -550,6 +616,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     if (!doc) return queryWidgetViaPostMessage(iframe, 'get_visible_text', { deep: args.deep });
 
                     var visible = [];
+                    var _selScan = { root: doc, memo: new Map(), roots: null }, _t0 = Date.now(), _truncated = false;   // S0C6-05
                     var scanElements = function(root) {
                         if (!root) return;
                         
@@ -575,7 +642,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                         };
 
                         var walk = function(node) {
-                            if (!node) return;
+                            if (!node || visible.length >= 1000) return;   // S0C6-05: stop at the 1000 entries returned
                             
                             // Handle Document (9), Element (1), or DocumentFragment/ShadowRoot (11)
                             if (node.nodeType !== 1 && node.nodeType !== 9 && node.nodeType !== 11) return;
@@ -607,7 +674,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                     // For inputs, get value; for others get only direct text to avoid duplication
                                     var textValue = "";
                                     if (node.tagName === 'INPUT') {
-                                        textValue = node.value || node.placeholder || "";
+                                        textValue = _ifIsSecretInput(node) ? (node.value ? '[redacted password]' : (node.placeholder || "")) : (node.value || node.placeholder || "");
                                     } else if (node.tagName === 'TEXTAREA') {
                                         textValue = node.value || "";
                                     } else if (node.tagName === 'IMG') {
@@ -632,6 +699,8 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                         // Build element data based on deep flag
                                         var elemData;
                                         if (args.deep) {
+                                            var _si = Date.now() - _t0 < 2000 ? getUniqueSelectorInfo(node, root, _selScan) : null;   // S0C6-05: per-scan memo, 2 s selector budget
+                                            if (!_si) _truncated = true;
                                             elemData = {
                                                 tag: node.tagName.toLowerCase(),
                                                 type: type,
@@ -641,7 +710,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                                 ariaLabel: ariaLabel || null,
                                                 role: role || null,
                                                 inputType: node.type || null,
-                                                selector: getUniqueSelector(node, root),
+                                                selector: _si ? _si.selector : null,
                                                 rect: rect ? { 
                                                     x: Math.round(rect.x), 
                                                     y: Math.round(rect.y), 
@@ -649,6 +718,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                                     h: Math.round(rect.height) 
                                                 } : null
                                             };
+                                            if (_si && !_si.unique) elemData.selectorUnique = false;   // S0C6-02: no selector resolves only to this node
                                         } else {
                                             // Simplified output: only text
                                             elemData = {
@@ -658,6 +728,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                             };
                                         }
                                         visible.push(elemData);
+                                        if (visible.length >= 1000) return;
                                     }
                                 }
                             }
@@ -691,11 +762,13 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     scanElements(doc);
                     
                     // Limit to 1000 elements to ensure we capture enough detail on complex forms
-                    return { 
+                    var _res = { 
                         success: true, 
                         visibleElements: visible.slice(0, 1000), 
                         note: 'Returning visible elements (including shadow DOM content) for analysis.' 
                     };
+                    if (_truncated) _res.truncated = true;   // S0C6-05: selectors past the 2 s budget are null
+                    return _res;
                 } catch(e) {
                     return { success: false, error: 'Get visible text failed: ' + e.message };
                 }
@@ -721,9 +794,9 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                             domEl = doc.querySelector(args.selector);
                         }
                         if (!domEl) return { success: false, error: 'Element not found: ' + args.selector + (typeof args.match_index === 'number' ? ' (match_index=' + args.match_index + ', total matches: ' + _domMatchCount + ')' : ''), match_count: _domMatchCount };
-                        html = domEl.outerHTML;
+                        html = _ifSafeOuterHTML(domEl);
                     } else {
-                        html = doc.documentElement.outerHTML;
+                        html = _ifSafeOuterHTML(doc.documentElement);
                     }
                     var maxLen = (typeof args.max_length === 'number' ? args.max_length : 200000);
                     if (html.length > maxLen) {
@@ -746,7 +819,10 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     var el = doc.querySelector(args.selector);
                     if (!el) return { success: false, error: 'Element not found: ' + args.selector };
                     el.scrollIntoView({ block: 'center', behavior: 'instant' });
-                    el.click();
+                    // TB-1 (twin of content-script.js S0C4-01): SVG/MathML nodes have no .click(); dispatch a real
+                    // bubbling click on the node itself. A non-Window `view` throws in the init, so only a real defaultView.
+                    if (typeof el.click === 'function') el.click();
+                    else el.dispatchEvent(new (doc.defaultView || window).MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: (el.ownerDocument && el.ownerDocument.defaultView) || null }));
                     return { success: true, message: 'Clicked ' + args.selector + ' -> ' + describeEl(el) + ' in widget' };
                 } catch(e) {
                     return { success: false, error: 'Click failed: ' + e.message };
@@ -763,6 +839,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     if (!doc) return queryWidgetViaPostMessage(target.iframe, 'fill', { selector: args.selector, value: args.value });
                     var el = doc.querySelector(args.selector);
                     if (!el) return { success: false, error: 'Element not found: ' + args.selector };
+                    if (!_ifIsEditableTarget(el)) return { success: false, error: 'Target <' + el.tagName.toLowerCase() + '> is not editable (input/textarea/select/contenteditable)' };
                     el.scrollIntoView({ block: 'center', behavior: 'instant' });
                     el.focus();
                     // Full user-typing event chain so frameworks (React/Angular) that listen
@@ -771,13 +848,8 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     var lastChar = (args.value && String(args.value).length) ? String(args.value).charAt(String(args.value).length - 1) : '';
                     try { el.dispatchEvent(new win.KeyboardEvent('keydown', { bubbles: true, key: lastChar })); } catch(e) {}
                     try { el.dispatchEvent(new win.KeyboardEvent('keypress', { bubbles: true, key: lastChar })); } catch(e) {}
-                    // React-safe value setter
-                    try {
-                        var fproto = (el.tagName === 'TEXTAREA') ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
-                        var fdesc = Object.getOwnPropertyDescriptor(fproto, 'value');
-                        if (fdesc && fdesc.set) fdesc.set.call(el, args.value); else el.value = args.value;
-                    } catch(e) { el.value = args.value; }
-                    el.dispatchEvent(new win.Event('input', { bubbles: true }));
+                    _ifSetEditableValue(el, args.value, win);   // S0C4-02
+                    el.dispatchEvent(_ifInputEvent(win, args.value));   // TB-3
                     try { el.dispatchEvent(new win.KeyboardEvent('keyup', { bubbles: true, key: lastChar })); } catch(e) {}
                     el.dispatchEvent(new win.Event('change', { bubbles: true }));
                     return { success: true, message: 'Filled ' + args.selector + ' -> ' + describeEl(el) + ' in widget' };
@@ -796,17 +868,15 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     if (!tdoc) return queryWidgetViaPostMessage(ttarget.iframe, 'type', { selector: args.selector, value: args.value, delay: args.delay, append: args.append });
                     var tel = tdoc.querySelector(args.selector);
                     if (!tel) return { success: false, error: 'Element not found: ' + args.selector };
+                    if (!_ifIsEditableTarget(tel)) return { success: false, error: 'Target <' + tel.tagName.toLowerCase() + '> is not editable (input/textarea/select/contenteditable)' };
                     var tval = String(args.value);
                     var tdelay = (typeof args.delay === 'number' && args.delay >= 0) ? args.delay : 30;
                     var tappend = !!args.append;
                     tel.scrollIntoView({ block: 'center', behavior: 'instant' });
                     tel.focus();
                     var twin = tdoc.defaultView || window;
-                    var tproto = (tel.tagName === 'TEXTAREA') ? twin.HTMLTextAreaElement.prototype : twin.HTMLInputElement.prototype;
-                    var tdesc = Object.getOwnPropertyDescriptor(tproto, 'value');
-                    var tsetter = (tdesc && tdesc.set) || null;
-                    var tcurrent = tappend ? (tel.value || '') : '';
-                    if (!tappend) { try { tsetter ? tsetter.call(tel, '') : (tel.value = ''); } catch(e) { tel.value = ''; } tel.dispatchEvent(new twin.Event('input', { bubbles: true })); }
+                    var tcurrent = tappend ? String((('value' in tel) ? tel.value : tel.textContent) || '') : '';
+                    if (!tappend) { _ifSetEditableValue(tel, '', twin); tel.dispatchEvent(_ifInputEvent(twin, '')); }   // TB-3
                     return await new Promise(function(tresolve) {
                         var ti = 0;
                         function typeNext() {
@@ -819,8 +889,8 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                             try { tel.dispatchEvent(new twin.KeyboardEvent('keydown', { bubbles: true, key: ch })); } catch(e) {}
                             try { tel.dispatchEvent(new twin.KeyboardEvent('keypress', { bubbles: true, key: ch })); } catch(e) {}
                             tcurrent += ch;
-                            try { tsetter ? tsetter.call(tel, tcurrent) : (tel.value = tcurrent); } catch(e) { tel.value = tcurrent; }
-                            tel.dispatchEvent(new twin.Event('input', { bubbles: true }));
+                            _ifSetEditableValue(tel, tcurrent, twin);
+                            tel.dispatchEvent(_ifInputEvent(twin, ch));   // TB-3
                             try { tel.dispatchEvent(new twin.KeyboardEvent('keyup', { bubbles: true, key: ch })); } catch(e) {}
                             ti++;
                             if (tdelay > 0) setTimeout(typeNext, tdelay); else typeNext();
@@ -968,14 +1038,15 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                             info.styles = { display: cs.display, visibility: cs.visibility, color: cs.color, backgroundColor: cs.backgroundColor, fontSize: cs.fontSize, fontWeight: cs.fontWeight, overflow: cs.overflow, position: cs.position, opacity: cs.opacity };
                         }
                         if (include.indexOf('value') !== -1) {
-                            info.value = el.value !== undefined ? el.value : null;
+                            info.value = _ifIsSecretInput(el) ? (el.value ? '[redacted]' : '') : (el.value !== undefined ? el.value : null);
+                            if (_ifIsSecretInput(el)) info.hasValue = !!el.value;
                             info.textContent = (el.textContent || '').substring(0, 200);
                             info.checked = el.checked !== undefined ? el.checked : null;
                         }
                         if (include.indexOf('attributes') !== -1) {
                             info.attributes = {};
                             for (var a = 0; a < el.attributes.length; a++) {
-                                info.attributes[el.attributes[a].name] = el.attributes[a].value;
+                                info.attributes[el.attributes[a].name] = (el.attributes[a].name === 'value' && _ifIsSecretInput(el)) ? '[redacted]' : el.attributes[a].value;
                             }
                         }
                         results.push(info);

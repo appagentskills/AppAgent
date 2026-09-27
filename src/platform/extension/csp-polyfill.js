@@ -1,8 +1,9 @@
 // MV3 CSP Inline Handler Polyfill
 // Chrome MV3 blocks inline event handlers (onclick="...") in extension pages.
-// This polyfill intercepts innerHTML, insertAdjacentHTML, and setAttribute to
+// This polyfill intercepts innerHTML, outerHTML, insertAdjacentHTML, and setAttribute to
 // transform on* attributes into data attributes BEFORE they reach the DOM,
 // then binds them via addEventListener with a mini handler interpreter.
+// outerHTML and insertAdjacentHTML scan ONLY the inserted nodes, never the whole parent subtree.
 //
 // This handles dynamically-created HTML in JavaScript.
 // Static HTML handlers are extracted at build time separately.
@@ -79,10 +80,18 @@
 
     // --- Override insertAdjacentHTML ---
     var _origInsertAdj = Element.prototype.insertAdjacentHTML;
+    // Record the boundary siblings first, then scan ONLY the inserted nodes (S0C2-01).
+    // parentNode (not parentElement) also covers ShadowRoot/DocumentFragment parents.
     Element.prototype.insertAdjacentHTML = function(pos, html) {
-        _origInsertAdj.call(this, pos, txHTML(html));
-        var root = (pos === 'beforeend' || pos === 'afterbegin') ? this : this.parentElement;
-        if (root) _scanAll(root);
+        var p = String(pos).toLowerCase(), parent, start, end;
+        if (p === 'beforeend')        { parent = this; start = this.lastChild; end = null; }
+        else if (p === 'afterbegin')  { parent = this; start = null; end = this.firstChild; }
+        else if (p === 'beforebegin') { parent = this.parentNode; start = this.previousSibling; end = this; }
+        else                          { parent = this.parentNode; start = this; end = this.nextSibling; }
+        _origInsertAdj.call(this, pos, txHTML(html)); // throws on bad pos/null parent as before
+        if (!parent) return;
+        for (var n = start ? start.nextSibling : parent.firstChild; n && n !== end; n = n.nextSibling)
+            if (n.nodeType === 1) { _scanEl(n); _scanAll(n); }
     };
 
     // --- Override setAttribute for on* ---
@@ -125,7 +134,8 @@
     // --- Mini handler interpreter ---
     // Handles: fn(), fn('a'), fn(event), fn(this), fn(a,b), event.stopPropagation(),
     //          if(event.key==='Enter')fn(), document.getElementById('x').click(),
-    //          multi-statements separated by ;, this.property, return false
+    //          multi-statements separated by ;, this.property, return false,
+    //          if(cond){stmt;stmt} (balanced block running to the end of the statement; no else)
 
     function _exec(code, el, ev) {
         // Smart split by ; respecting brackets and strings
@@ -163,6 +173,15 @@
         var thisProp = s.match(/^this\.(\w+)\s*=\s*(.+)$/);
         if (thisProp) { el[thisProp[1]] = _val(thisProp[2].trim(), el, ev); return; }
 
+        // if(cond){stmt;stmt} - the block must close at the end of the statement (no else)
+        if (s.slice(0, 3) === 'if(') {
+            var ce = _close(s, 2);
+            if (ce > 0 && s[ce + 1] === '{' && _close(s, ce + 1) === s.length - 1) {
+                if (_cond(s.slice(3, ce), ev)) _exec(s.slice(ce + 2, -1), el, ev);
+                return;
+            }
+        }
+
         // if(cond)action
         var ifm = s.match(/^if\((.+?)\)(\w.+)$/);
         if (ifm) { if (_cond(ifm[1], ev)) _run(ifm[2], el, ev); return; }
@@ -191,6 +210,18 @@
         console.warn('[CSP polyfill] Unmatched handler statement:', s.substring(0, 120));
     }
 
+    // Quote-aware: index of the bracket closing s[o], or -1 when unbalanced.
+    function _close(s, o) {
+        for (var i = o, d = 0, q = ''; i < s.length; i++) {
+            var c = s[i];
+            if (q) { if (c === '\\') i++; else if (c === q) q = ''; continue; }
+            if (c === '\'' || c === '"') q = c;
+            else if ('([{'.indexOf(c) >= 0) d++;
+            else if (')]}'.indexOf(c) >= 0 && --d === 0) return i;
+        }
+        return -1;
+    }
+
     function _call(name, argsStr, el, ev) {
         if (_isBlockedPath(name)) {
             console.warn('[CSP polyfill] Blocked call to dangerous function:', name);
@@ -213,13 +244,17 @@
     }
 
     function _cond(c, ev) {
-        var parts = c.split('||');
+        var parts = c.split('||'), hit = false;
         for (var i = 0; i < parts.length; i++) {
             var p = parts[i].trim();
             var km = p.match(/event\.key==='([^']*)'/);
-            if (km && ev.key === km[1]) return true;
+            // R2a: only exact `event.key==='...'` terms are supported. Warn on every
+            // other term (&&, !, other properties) so it can't silently disable a
+            // handler; any key match still makes the condition true.
+            if (!km || km[0] !== p) console.warn('[CSP polyfill] Unsupported condition term:', p.substring(0, 120));
+            if (km && ev.key === km[1]) hit = true;
         }
-        return false;
+        return hit;
     }
 
     function _args(str, el, ev) {

@@ -482,14 +482,22 @@ function resolveTierAlias(tier) {
     return getTierAliasMap()[key] || null;
 }
 
+// TA-7: true while the LAST loadTierAliases read failed. The map is then left
+// as it was (null = still unhydrated, so the next call retries), never {} —
+// setTierAlias (ui/040) refuses to save over the stored overrides meanwhile.
+var subAgentTierAliasesReadFailed = false;
+
 // Hydrate the alias overrides from the IDB settings store. Called from the
 // SW port bridge's run-agent gate (so spawn-time resolution sees fresh
 // values) and lazily by the settings UI. getSetting lives in
 // core/130-indexeddb.js — shared in both bundles, called at runtime only.
 async function loadTierAliases() {
+    var readDone = false;
     try {
         if (typeof getSetting === 'function') {
-            var stored = await getSetting(TIER_ALIASES_SETTING_KEY, null);
+            var stored = await getSetting(TIER_ALIASES_SETTING_KEY, null, { strict: true });
+            readDone = true;
+            subAgentTierAliasesReadFailed = false;
             subAgentTierAliases = (stored && typeof stored === 'object') ? stored : {};
             // Recover stored aliases that still point at RENAMED default
             // provider names (e.g. 'Sonnet 5 OAuth' → 'Sonnet 5') — provider
@@ -511,12 +519,17 @@ async function loadTierAliases() {
             subAgentTierAliases = {};
         }
     } catch (e) {
-        if (subAgentTierAliases === null) subAgentTierAliases = {};
+        // TA-7: a failed read keeps the last good map (a null map stays null so
+        // the next call retries); getTierAliasMap still answers the defaults.
+        if (!readDone) {
+            subAgentTierAliasesReadFailed = true;
+            console.warn('loadTierAliases: could not read the stored tier aliases; keeping the current map:', e);
+        }
     }
     return getTierAliasMap();
 }
 
-// Persist an updated alias map (full small/medium/large map expected).
+// Persist an updated alias map (sparse overrides; getTierAliasMap fills unset tiers from DEFAULT_TIER_ALIASES).
 async function saveTierAliases(map) {
     subAgentTierAliases = map || {};
     if (typeof setSetting === 'function') {

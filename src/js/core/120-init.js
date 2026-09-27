@@ -66,6 +66,9 @@ async function init() {
     var savedTheme = appStorage.getItem('appTheme');
     if (savedTheme) appTheme = savedTheme;
     applyTheme();
+    // P1: a ?widget=…&print=1 tab always prints on the light palette. Only the attribute
+    // changes (070 loadWidget reads it); appTheme/appStorage stay untouched, so the saved theme is kept.
+    if (new URLSearchParams(location.search).get('print') === '1') { document.documentElement.setAttribute('data-theme', 'light'); }
 
     // Restore sidebar state (default collapsed) - no animation on initial load
     var savedSidebarState = appStorage.getItem('sidebarCollapsed');
@@ -111,13 +114,9 @@ async function init() {
     var floatingMenuIcon = document.getElementById('floating-menu-icon');
     var versionSidebarOpen = document.getElementById('version-sidebar-open');
     var versionSidebarClose = document.getElementById('version-sidebar-close');
-    var browseIcon = document.getElementById('browse-icon');
     if (floatingMenuIcon) floatingMenuIcon.innerHTML = UI_ICONS.menu;
     if (versionSidebarOpen) versionSidebarOpen.innerHTML = UI_ICONS.menu;
     if (versionSidebarClose) versionSidebarClose.innerHTML = UI_ICONS.close;
-    if (browseIcon) browseIcon.innerHTML = UI_ICONS.panelLeftOpen;
-    var homeBrowseIcon = document.getElementById('home-browse-icon');
-    if (homeBrowseIcon) homeBrowseIcon.innerHTML = UI_ICONS.panelLeftOpen;
     
     // Restore history section state
     var savedHistoryState = appStorage.getItem('historyExpanded');
@@ -145,11 +144,6 @@ async function init() {
     if (homeAttachIcon) homeAttachIcon.innerHTML = UI_ICONS.attach;
     if (homeSendIcon) homeSendIcon.innerHTML = UI_ICONS.send;
     
-    var ssPreviewDownloadBtn = document.getElementById('screenshot-preview-download-btn');
-    var ssPreviewCloseBtn = document.getElementById('screenshot-preview-close-btn');
-    if (ssPreviewDownloadBtn) ssPreviewDownloadBtn.innerHTML = UI_ICONS.download;
-    if (ssPreviewCloseBtn) ssPreviewCloseBtn.innerHTML = UI_ICONS.close;
-
     // Initialize header rename button icon
     var headerRenameBtn = document.getElementById('header-rename-btn');
     if (headerRenameBtn) headerRenameBtn.innerHTML = UI_ICONS.edit;
@@ -157,9 +151,7 @@ async function init() {
     // Initialize settings panel icons (gear dropdown now only has the Display
     // section — Model/Permissions/Data Management moved to the full settings page)
     var sectionIconDisplay = document.getElementById('section-icon-display');
-    var sectionIconCache = document.getElementById('section-icon-cache');
     if (sectionIconDisplay) sectionIconDisplay.innerHTML = UI_ICONS.display;
-    if (sectionIconCache) sectionIconCache.innerHTML = UI_ICONS.cache;
 
     // Gear-panel footer links: leading glyph per item + trailing external-link
     // glyph signalling the click navigates to the full settings page.
@@ -190,7 +182,7 @@ async function init() {
     
     // Setup keyboard shortcut for ⌘K to focus search
     document.addEventListener('keydown', function(e) {
-        if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === 'k' && !e.altKey) {
             e.preventDefault();
             var searchInput = document.getElementById('chat-search-input');
             var sidebar = document.getElementById('sidebar');
@@ -216,14 +208,20 @@ async function init() {
     //
     // Precedence = innermost / most-recently-opened first, following the
     // z-index ladder in css/00-tokens.css:
+    //   #widget-pin-menu          pin popover, z-index 2147483000 (css/19-dashboard.css)
     //   --z-modal (10006)        .modal-overlay.show — permanent + dynamic twins
     //   --z-widget-modal          widget overlays, .action-result-popover
     //   --z-overlay (10000)       #diff-viewer-overlay (css/16-diff.css:2)
+    //   --z-overlay (10000)       .modal-backdrop hosts (bg prompt popup, icon picker) — step 5b
     //   --z-jobs-dropdown (9000)  .header-menu pills (jobs, gear, model, ws, usage)
     //
     // Surfaces that register their OWN document-level Escape handler are
     // deliberately NOT handled here (double-close / leaked listeners):
     //   #tool-inspector-modal  ui/040-tools-settings.js:62-68 — skipped explicitly below
+    //   #chatgpt-browser-modal ui/160-notifications.js showChatGPTBrowserModal
+    //                          (_chatGPTBrowserKeyHandler) — skipped explicitly below
+    //   #chatgpt-device-modal  ui/160-notifications.js showChatGPTDeviceCodeModal
+    //                          (_chatGPTDeviceKeyHandler) — skipped explicitly below
     //   #jobs-expand-overlay   tools/120-actions.js:3468-3470 — capture phase +
     //                          stopPropagation, so the key never reaches us
     //   .sdoc-preview-overlay  tools/110-smart-documents.js:846
@@ -236,6 +234,14 @@ async function init() {
     // see the key — the handler never swallows it.
     document.addEventListener('keydown', function(e) {
         if (e.key !== 'Escape') return;
+        // 0. Widget pin popover (ui/070-dashboard-ui.js showWidgetPinMenu) — the
+        // topmost surface (z-index 2147483000), above every overlay below. It
+        // only has a click-outside once-listener, and closeWidgetFullscreen()
+        // doesn't remove it, so it must close first or it is left orphaned.
+        if (document.getElementById('widget-pin-menu')) {
+            if (typeof closeWidgetPinMenu === 'function') closeWidgetPinMenu(); else document.getElementById('widget-pin-menu').remove();
+            return;
+        }
         // 1. The generic modal (--z-modal 10006) stacks ABOVE the widget
         // overlays — confirm dialogs spawn from the widget fullscreen / editor
         // (e.g. Delete Widget) — so it closes first.
@@ -265,13 +271,17 @@ async function init() {
             // #tool-inspector-modal wires its own Escape listener at open time and
             // removes it in closeToolInspectorModal(); closing it from here would
             // both double-close and leak that listener.
-            if (ov.id === 'tool-inspector-modal') return;
+            if (ov.id === 'tool-inspector-modal' || ov.id === 'chatgpt-device-modal' || ov.id === 'chatgpt-browser-modal') return;
             if (typeof ov.onclick === 'function') {
                 try {
                     ov.onclick({ target: ov, currentTarget: ov,
                         preventDefault: function() {}, stopPropagation: function() {} });
                 } catch (err) {}
             }
+            // TA4-2: the Reload checklist (ui/270-iframe-panel.js, .reload-preflight, no id)
+            // closes itself: the replayed click starts an ASYNC cancel (abort, then
+            // ui.close() removes it and restores focus), so never drop it mid-cancel.
+            if (ov.classList && ov.classList.contains('reload-preflight')) return;
             if (ov.isConnected) ov.remove();
             return;
         }
@@ -290,9 +300,35 @@ async function init() {
         // and --z-widget-modal (10002, steps 2+4) and ABOVE the dropdowns/header
         // pills, so this is its z-order slot in the ladder.
         if (document.getElementById('diff-viewer-overlay')) { closeDiffViewer(); return; }
+        // 5b. Ad-hoc .modal-backdrop hosts (--z-overlay): the bg prompt popup
+        // (tools/100-prompt-user.js:221) and the icon picker (ui/010-skills-ui.js:1214)
+        // have no key handler. Replay the backdrop's own click so its closer runs
+        // (dismiss only; a bg prompt stays pending, same as the X), then drop the host
+        // if the closer did not (inline onclick may be uncompiled).
+        var bds = document.querySelectorAll('.modal-backdrop');
+        if (bds.length) {
+            var bd = bds[bds.length - 1];
+            if (typeof bd.onclick === 'function') {
+                try { bd.onclick({ target: bd, currentTarget: bd, preventDefault: function() {}, stopPropagation: function() {} }); } catch (err) {}
+            }
+            if (bd.isConnected) { var bdHost = bd.parentElement; (bdHost && bdHost !== document.body ? bdHost : bd).remove(); }
+            return;
+        }
         // 6. sn-dropdown menus (skills import/export/download) sit below every
         // overlay — close them only when nothing above claimed the key.
         if (document.querySelector('.sn-dropdown.open')) { closeDropdowns(); return; }
+        // 6b. T1b-2: a sidebar chat row menu (.chat-dropdown.open inside
+        // .chat-menu-wrapper, ui/180-search.js) had no Escape path. Close it with the
+        // shared closeChatDropdowns (ui/210-chat-menus.js) and return focus to that
+        // row's "···" .chat-menu-btn (menu-button pattern).
+        var chatDd = document.querySelector('.chat-dropdown.open');
+        if (chatDd && typeof closeChatDropdowns === 'function') {
+            var ddWrap = typeof chatDd.closest === 'function' ? chatDd.closest('.chat-menu-wrapper') : null;
+            var ddBtn = ddWrap ? ddWrap.querySelector('.chat-menu-btn') : null;
+            closeChatDropdowns();
+            if (ddBtn) ddBtn.focus();
+            return;
+        }
         // 7. Header pill menus — gear settings panel, jobs dropdown, model menu,
         // workspace dropdown, usage + instance pickers. They all share the
         // .header-menu chrome class (css/04-header.css:86) and are mutually
@@ -312,6 +348,16 @@ async function init() {
                 if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus();
                 return;
             }
+        }
+        // 8. T1b-1: the sidebar search box (#chat-search-input, html/body.html) had no
+        // Escape path. Last, and only while it has focus (not mid-IME-composition): Esc
+        // clears the query via clearGlobalSearch (ui/180-search.js, the clear button's
+        // handler: value, debounce, highlights, re-render; NOT handleGlobalSearch,
+        // which reads e.target.value), and Esc on the empty box blurs it.
+        var searchBox = document.activeElement;
+        if (searchBox && searchBox.id === 'chat-search-input' && !e.isComposing) {
+            if (searchBox.value) { if (typeof clearGlobalSearch === 'function') clearGlobalSearch(); }
+            else if (typeof searchBox.blur === 'function') searchBox.blur();
         }
     });
 
@@ -552,6 +598,8 @@ async function init() {
     if (typeof SubAgents !== 'undefined' && SubAgents.loadAll) {
         try { await SubAgents.loadAll(); } catch (e) { /* non-fatal */ }
     }
+    // F6 boot breadcrumb (core/015-boot-crumbs.js): typeof-guarded, fire-and-forget, never awaited.
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('post-subagents'); } catch (e) {} }
     cleanupStaleWorkspaces(); // remove old-format workspace metas with no files
     setSetting('defaultWorkspaceRepo', null); // migration: remove stale default pointer
     updateWorkspaceHeaderStatus(); // show local state immediately
@@ -567,16 +615,20 @@ async function init() {
     renderChatList();
     renderAllActionPlacements(); // render action buttons in home/header/chat/sidebar
     updateModelDisplay();
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('post-render'); } catch (e) {} }
 
     // Deep-link to a specific chat via ?chat= parameter (used by side panel expand)
     var deepLinkChatId = urlParams.get('chat');
+    // TB-5: a ?doc= tab shows a document, not a chat. Keep lastChatId in memory only
+    // (no selectChat, no lastChatId write) so the doc tab neither opens nor re-points it.
+    var isDocDeepLink = !!urlParams.get('doc');
 
     // Restore last viewed chat or start new chat
     var willShowNonChatView = savedView === 'dashboard' || savedView === 'skills' || savedView === 'home' || savedView === 'documents' || !savedView;
     var lastChatId = deepLinkChatId || appStorage.getItem('lastChatId');
     var isNewChat = false;
     if (lastChatId && chats[lastChatId]) {
-        if (willShowNonChatView) {
+        if (willShowNonChatView || isDocDeepLink) {
             currentChatId = lastChatId;
             isNewChat = !chats[lastChatId].messages || chats[lastChatId].messages.length === 0;
         } else {
@@ -586,7 +638,7 @@ async function init() {
     } else {
         currentChatId = generateId();
         chats[currentChatId] = { id: currentChatId, title: 'New Chat', messages: [], createdAt: Date.now(), isTemporary: true };
-        appStorage.setItem('lastChatId', currentChatId);
+        if (!isDocDeepLink) appStorage.setItem('lastChatId', currentChatId);
         versionHistory = [];
         clearUpdateSet();
         if (!willShowNonChatView) {
@@ -676,7 +728,9 @@ async function init() {
         openHistoryView();
     } else if (savedView === 'documents') {
         openDocumentsView();
-    } else if (savedView === 'chat') {
+    } else if (savedView === 'chat' && !isDocDeepLink) {
+        // TB-5b: not on a ?doc= tab (the doc deep link below owns its view): showChatView()
+        // would stamp lastViewedAt and clear the unseen badge of a chat the tab never shows.
         // Show browser controls for chat view
         currentView = 'chat';
         showChatView();
@@ -685,6 +739,9 @@ async function init() {
         // Default to home for first-time users
         openHomeView();
     }
+    // F6: boot-complete (ms auto-filled by core/015) sits before the widget and doc deep-link
+    // early returns below, so every page load that gets this far logs it.
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('boot-complete'); } catch (e) {} }
 
     // Deep-link to a specific widget via ?widget= parameter
     var deepLinkWidgetId = urlParams.get('widget');
@@ -759,6 +816,9 @@ async function init() {
                         ch.postMessage(_dlRenderMsg);
                         ch.close();
                     } catch (e) {}
+                    // S0C2-02: Print button (080 printWidgetFullscreen) opens ?widget=&print=1;
+                    // print the top-level page once the sandboxed widget has rendered.
+                    if (urlParams.get('print') === '1') { try { window.print(); } catch (e) {} }
                 }); });
             }
             // Live-DOM snapshot path (set by take_screenshot 060 via &snap=1): render a
@@ -825,8 +885,42 @@ async function init() {
         }
     }
 
+    // S0B4-02/03: ?doc= deep link, the persistent replacement for the blob "Open in new tab" page
+    var deepLinkDocId = urlParams.get('doc');
+    if (deepLinkDocId) {
+        (smartDocuments[deepLinkDocId] ? Promise.resolve(smartDocuments[deepLinkDocId]) : loadDocumentById(deepLinkDocId)).then(function(doc) {
+            // RC2A3-F1: build the content first (a render throw lands in the catch below);
+            // the body is only swapped once it is ready.
+            var wrap = document.createElement('div');
+            wrap.className = 'message-content';
+            if (!doc) wrap.textContent = 'Document not found';
+            else wrap.innerHTML = '<h1>' + escDisplay(doc.title) + '</h1>' + sdocRenderContent(doc); // innerHTML → polyfill binds handlers
+            document.body.innerHTML = '';
+            document.body.classList.add('sdoc-standalone');   // classList, not className: keeps theme classes
+            if (doc) document.title = doc.title || 'Document';
+            document.body.appendChild(wrap);
+        }).catch(function(e) {
+            console.error('[deep-link doc] failed:', e);
+            // Show the error instead of a blank page (textContent escapes the message).
+            var err = document.createElement('div');
+            err.className = 'message-content';
+            err.textContent = 'Could not render document: ' + ((e && e.message) || String(e));
+            document.body.innerHTML = '';
+            document.body.classList.add('sdoc-standalone');
+            document.body.appendChild(err);
+        });
+        // Like the widget deep link: stop the app boot here, so this tab never
+        // consumes the one-shot post-import notice or wires the panel-only hooks below.
+        return;
+    }
+
     // Mark initial load complete - subsequent pushHistoryState calls will use pushState instead of replaceState
     isInitialLoad = false;
+
+    // S0B-03: show the result of an import that restarted the app (one-shot;
+    // ui/130-data-management.js). Below the deep-link early return, so widget
+    // screenshot tabs never consume it.
+    if (typeof consumePostImportNotice === 'function') { try { consumePostImportNotice(); } catch (e) {} }
 
     // The jobs badge is always-on (launcher for the Active/Recent/Done chats
     // popup). Paint it now so it shows even when we boot straight to a non-chat
@@ -1074,6 +1168,7 @@ async function openSkillEditor(skillId) {
         if (assetsContainer) assetsContainer.style.display = 'none';
     }
     renderSkillBodyView();
+    if (typeof resetSkillActionsDraft === 'function') resetSkillActionsDraft();
     renderSkillActionsEditor();
     if (nameInput) nameInput.focus();
     
@@ -1206,6 +1301,8 @@ async function renderSkillAssets() {
     
     // Show attached assets
     assets.forEach(function(asset, idx) {
+        // SKILL.md is the virtual card above; skip legacy stored copies (NEW-F15-1).
+        if (String(asset.filename || '').toLowerCase() === 'skill.md') return;
         var icon = asset.type === 'xml' ? UI_ICONS.file : (asset.type === 'js' ? UI_ICONS.code : UI_ICONS.skill);
         var iconClass = asset.type === 'xml' ? 'xml' : (asset.type === 'js' ? 'js' : 'md');
         var typeLabel = asset.type === 'js' ? 'JS Tool' : asset.type.toUpperCase();

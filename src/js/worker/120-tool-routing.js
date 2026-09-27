@@ -1325,13 +1325,26 @@ executeTool = async function(name, args, messageIndex, options) {
             var dp = result._display_persist;
             if (!chats[chatId].displays) chats[chatId].displays = {};
             var dpEntry = { template: dp.template, args: dp.args };
-            // Preserve eager-render attachment: when the display was created
-            // from inside a sandbox via executeTool('display', ...), the
-            // entry carries msgIndex + eager flag so the renderer emits it
-            // alongside the parent tool's result (no placeholder-in-text needed).
+            // Preserve eager-render attachment: the entry carries the owning
+            // tool_result slot (toolCallId, + msgIndex/eager) so the renderer
+            // emits it alongside that result — the parent tool's slot for
+            // sandbox calls, the display call's own slot at top level (no
+            // placeholder-in-text needed; see executeDisplay).
+            if (dp.toolCallId) dpEntry.toolCallId = dp.toolCallId;
             if (dp.eager) {
                 dpEntry.msgIndex = dp.msgIndex;
                 dpEntry.eager = true;
+            } else if (dp.toolCallId && chats[chatId].messages) {
+                // The page mirror had not seen the seeded slot yet; this SW
+                // chat is authoritative and always has it.
+                for (var _dpi = chats[chatId].messages.length - 1; _dpi >= 0; _dpi--) {
+                    var _dpm = chats[chatId].messages[_dpi];
+                    if (_dpm && _dpm.role === 'tool' && _dpm.tool_call_id === dp.toolCallId) {
+                        dpEntry.msgIndex = _dpi;
+                        dpEntry.eager = true;
+                        break;
+                    }
+                }
             }
             chats[chatId].displays[dp.displayId] = dpEntry;
             delete result._display_persist;

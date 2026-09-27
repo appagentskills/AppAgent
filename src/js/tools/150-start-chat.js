@@ -227,8 +227,14 @@ async function executeStartChat(args, options) {
 
     // newChat() only closes skills/dashboard/home/settings-page
     // (ui/170-chat-management.js:635-643) — a view it does not know about
-    // (e.g. 'history') would stay on top of the chat. Force the switch first,
-    // exactly like editDocumentWithAgent (tools/110-smart-documents.js).
+    // (e.g. 'history') would stay on top of the chat, so the switch is forced
+    // right after newChat(), like editDocumentWithAgent (tools/110-smart-documents.js).
+    // newChat() BLANKS #message-input at its very end (ui/170-chat-management.js:719-725),
+    // so every prefill MUST happen after it. A5A3-01: it also runs BEFORE the forced
+    // switch below: showChatView() stamps lastViewedAt on (and consumes the unseen
+    // state of) the CURRENT chat, so that must be the new chat, not the user's.
+    newChat();
+
     if (typeof currentView !== 'undefined' && currentView !== 'chat') {
         var _knownCloser = (currentView === 'skills' || currentView === 'dashboard' || currentView === 'home' || currentView === 'settings-page');
         if (!_knownCloser) {
@@ -238,10 +244,6 @@ async function executeStartChat(args, options) {
             if (typeof showChatView === 'function') { try { showChatView(); } catch (e) {} }
         }
     }
-
-    // newChat() BLANKS #message-input at its very end (ui/170-chat-management.js:719-725),
-    // so every prefill MUST happen after this call.
-    newChat();
 
     var chatId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
     if (explicitTitle && chatId && chats && chats[chatId]) {

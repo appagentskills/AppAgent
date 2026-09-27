@@ -79,6 +79,7 @@ async function runJsEvalSandboxLifecycleTests(sources) {
             onMessage: { addListener: function(fn) { receiver = fn; } },
             sendMessage: function(message) {
                 var d = deferred(); d.message = message;
+                if (message.type === 'sw-exec-tool' && h.sendThrows) throw new TypeError(h.sendThrows);
                 if (message.type === 'sw-exec-tool') h.tools.push(d);
                 else if (message.type === 'sw-sleep') h.sleeps.push(d);
                 else throw new Error('unexpected helper message: ' + message.type);
@@ -188,6 +189,17 @@ async function runJsEvalSandboxLifecycleTests(sources) {
     h.emit(f, { type: 'sandboxToolCall', name: 'workspace', args: {}, id: 1 });
     a.abort(); await p; h.tools[0].reject(new Error('late tool rejection')); await flush();
     check('late inner-tool rejection cannot post to cancelled frame', f.sent.length === 0);
+    // S0C10-02: args runtime.sendMessage cannot serialize throw synchronously; the sandbox
+    // must get an immediate error result instead of an inner call that never settles.
+    h = harness(); a = new AbortController(); p = h.direct(a); await flush(); f = h.frames[0];
+    h.sendThrows = 'Could not serialize message.';
+    var cyclicArgs = { action: 'list' }; cyclicArgs.self = cyclicArgs;
+    var sentBefore = f.sent.length;
+    h.emit(f, { type: 'sandboxToolCall', name: 'workspace', args: cyclicArgs, id: 1 });
+    await flush();
+    var lastSent = f.sent[f.sent.length - 1];
+    check('unserializable inner-tool args get an immediate error result', f.sent.length === sentBefore + 1 && lastSent.type === 'sandboxToolResult' && lastSent.id === 1 && /serialize/.test(lastSent.error) && h.tools.length === 0 && h.live.size === 1);
+    a.abort(); await p;
 
     h = harness(); a = new AbortController(); p = h.direct(a); await flush(); f = h.frames[0];
     h.emit(f, { type: 'sandboxToolCall', name: '__sandbox_sleep', args: { ms: 10 * 60 * 1000 }, id: 1 });

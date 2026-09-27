@@ -184,6 +184,19 @@ function openBackgroundPromptPopup(chatId, promptId) {
     }
     if (!msg || msg.status !== 'pending') return;
 
+    // A4A5-01: the prompt's chat is on screen with its inline form painted:
+    // jump to that form instead of stacking a popup with a duplicate
+    // prompt-form-<id> over it (the inline submit/cancel clears needs_input).
+    if (currentView === 'chat' && currentChatId === chatId) {
+        var inlineForm = document.getElementById('prompt-form-' + promptId);
+        if (inlineForm && !inlineForm.closest('#bg-popup-host')) {
+            if (inlineForm.scrollIntoView) inlineForm.scrollIntoView({ block: 'nearest' });
+            var firstInline = inlineForm.querySelector('input.prompt-field-input, textarea.prompt-field-input');
+            if (firstInline) firstInline.focus();
+            return;
+        }
+    }
+
     // Only one popup host at a time: a second click on the bell (or on
     // another chat's bell) must not stack a duplicate #bg-popup-host with a
     // duplicate prompt-form-<id> — close/submit use getElementById and would
@@ -213,7 +226,8 @@ function openBackgroundPromptPopup(chatId, promptId) {
                 '</div>' +
                 '<div class="bg-popup-body">' +
                     descHtml +
-                    '<form id="prompt-form-' + promptId + '" onsubmit="event.preventDefault();submitBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">' +
+                    // A4A4-02: capture drafts like the inline form, so close + reopen keeps typed values.
+                    '<form id="prompt-form-' + promptId + '" oninput="promptCaptureDraft(this)" onchange="promptCaptureDraft(this)" onsubmit="event.preventDefault();submitBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">' +
                         fieldsHtml +
                     '</form>' +
                 '</div>' +
@@ -239,8 +253,25 @@ function closeBackgroundPromptPopup(e) {
     if (host) host.remove();
 }
 
+// TA-12: answering a prompt (submit or cancel, inline or popup) clears the bg
+// action's needs_input bell ONLY when the action waits on THAT prompt (or on
+// none we know of). An older prompt still pending in the transcript used to
+// clear the bell a newer prompt had raised, leaving the newer one unreachable.
+// clearActionNeedsInput stays single-arg (its callers' tests pin that
+// contract), so the promptId check lives here.
+function _clearActionNeedsInputFor(chat, promptId) {
+    if (!chat || !chat.actionId || typeof clearActionNeedsInput !== 'function') return;
+    var a = typeof activeActions === 'object' && activeActions ? activeActions[chat.actionId] : null;
+    if (promptId && a && a.needsInputPromptId && a.needsInputPromptId !== promptId) return;
+    clearActionNeedsInput(chat.actionId);
+}
+
 function submitBackgroundPromptPopup(chatId, promptId) {
-    var form = document.getElementById('prompt-form-' + promptId);
+    // A4A5-01: read the POPUP's form. getElementById returns the first
+    // prompt-form-<id> in document order, i.e. the inline transcript form when
+    // the same prompt is also painted inline (wrong values / validation).
+    var host = document.getElementById('bg-popup-host');
+    var form = host && host.getAttribute('data-prompt-id') === promptId ? host.querySelector('form') : null;
     if (!form) return;
     // FLUX-QW1: pass the target chat EXPLICITLY instead of swapping the
     // currentChatId global around the call. The old swap had no try/finally
@@ -248,31 +279,26 @@ function submitBackgroundPromptPopup(chatId, promptId) {
     // submitPromptUser's renderMessages() fired MID-SWAP, repainting the
     // visible pane with the BACKGROUND chat's transcript (the restore never
     // re-rendered, so the wrong transcript stayed up).
-    var ok = submitPromptUser(promptId, chatId);
+    var ok = submitPromptUser(promptId, chatId, form);
     if (ok === false) return; // validation failed — keep popup open and needs_input state intact
     // Clear needs-input flag on the action button
-    var chat = chats[chatId];
-    if (chat && chat.actionId && typeof clearActionNeedsInput === 'function') {
-        clearActionNeedsInput(chat.actionId);
-    }
+    _clearActionNeedsInputFor(chats[chatId], promptId);
     closeBackgroundPromptPopup();
 }
 
 function cancelBackgroundPromptPopup(chatId, promptId) {
     // FLUX-QW1: explicit chatId, no global swap — see submitBackgroundPromptPopup.
     cancelPromptUser(promptId, chatId);
-    var chat = chats[chatId];
-    if (chat && chat.actionId && typeof clearActionNeedsInput === 'function') {
-        clearActionNeedsInput(chat.actionId);
-    }
+    _clearActionNeedsInputFor(chats[chatId], promptId);
     closeBackgroundPromptPopup();
 }
 
 // Called when PM submits the form. `chatId` is optional: the inline
 // transcript form omits it (the prompt belongs to the chat on screen); the
 // background prompt popup passes the owning chat explicitly (FLUX-QW1).
-function submitPromptUser(promptId, chatId) {
-    var form = document.getElementById('prompt-form-' + promptId);
+function submitPromptUser(promptId, chatId, formEl) {
+    // A4A5-01: `formEl` optional; the bg popup passes its own form.
+    var form = formEl || document.getElementById('prompt-form-' + promptId);
     // Return false (not undefined) so submitBackgroundPromptPopup's
     // `ok === false` guard holds: returning undefined would clear the
     // needs_input flag and close the popup while the prompt stays pending
@@ -359,6 +385,10 @@ function submitPromptUser(promptId, chatId) {
             saveChatsToStorage();
         }
     }
+    // A4A5-01: the inline form also answers a bg action's prompt (the bell jumps
+    // to it when that chat is on screen), so clear needs_input here too.
+    // Idempotent with the popup paths. TA-12: only for the awaited prompt.
+    _clearActionNeedsInputFor(chat, promptId);
 
     // Resolve the blocking promise (live agent loop)
     if (pendingPromptResolvers[promptId]) {
@@ -410,6 +440,8 @@ function cancelPromptUser(promptId, chatId) {
             saveChatsToStorage();
         }
     }
+    // A4A5-01: same as submitPromptUser: an inline cancel also answers a bg action.
+    _clearActionNeedsInputFor(chat, promptId);
 
     // Resolve with cancelled
     if (pendingPromptResolvers[promptId]) {

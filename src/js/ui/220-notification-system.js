@@ -9,7 +9,7 @@
 // warning was lost exactly this way). Now a toast that arrives while a pinned toast is
 // on screen is QUEUED and rendered once the pinned one is dismissed.
 var snackbarTimeout = null;
-var snackbarQueue = [];        // pending toasts: { message, type, duration, pinned }
+var snackbarQueue = [];        // pending toasts: { message, type, duration, pinned, at, key }
 var currentSnackbar = null;    // the toast currently on screen (null = none)
 var snackbarDrainTimer = null; // set while waiting out the slide-out before the next toast
 var SNACKBAR_QUEUE_MAX = 20;
@@ -36,7 +36,15 @@ function _warnDroppedSnackbar(entry, why) {
     } catch (e) {}
 }
 
-function showSnackbar(message, type, duration) {
+// opts (optional): { key, transient }
+//   key       - names the context a toast belongs to (the skill editor passes
+//               'skill-editor'). A newer toast with the SAME key supersedes that
+//               key's queued toasts and its toast on screen, even a pinned one (A5A-01).
+//   transient - instant feedback for the user's own click (copy confirmations). It
+//               is shown over an unrelated pinned toast at once; the pinned toast
+//               returns when it hides (A3A-01).
+// Toasts without opts behave exactly as before.
+function showSnackbar(message, type, duration, opts) {
     var snackbar = document.getElementById('snackbar');
     if (!snackbar) return;
 
@@ -44,11 +52,39 @@ function showSnackbar(message, type, duration) {
     // (#approval-card, see getApprovalCardEl below) — toasts here can no
     // longer displace a pending approval, so no requeue logic is needed.
 
-    var entry = { message: message, type: type, duration: duration, pinned: isPinnedSnackbar(type), at: Date.now() };
+    var entry = { message: message, type: type, duration: duration, pinned: isPinnedSnackbar(type), at: Date.now(), key: (opts && opts.key) || null };
+
+    // Keyed supersede (A5A-01): the user is working in this context, so its own
+    // older (possibly pinned) toast must not hide the newer result, e.g. "Skill
+    // saved" queued behind "Save the skill first" and later dropped as stale.
+    if (entry.key) {
+        snackbarQueue = snackbarQueue.filter(function(q) { return q.key !== entry.key; });
+        if (currentSnackbar && currentSnackbar.key === entry.key && !snackbarDrainTimer) { renderSnackbar(entry); return; }
+    }
 
     // A pinned toast is on screen (or one is about to be rendered from the
     // queue): do NOT clobber it — queue this one instead.
     var pinnedShowing = !!(currentSnackbar && currentSnackbar.pinned && snackbar.classList.contains('show'));
+    // Transient (A3A-01): show it now and put the pinned toast back at the FRONT of
+    // the queue. Pinned entries are never stale-dropped, so the normal hide -> drain
+    // re-renders it when the transient toast auto-hides; it is never lost.
+    // TA-6: putting it back follows the same dedupe + MAX rules as the push below. A
+    // queued copy (same message and type) is removed so it can't show twice, and a
+    // full queue gives up its oldest auto-dismissing entry. If every queued entry is
+    // pinned there is no room: the transient toast takes the normal path below
+    // instead, and no pinned toast is evicted.
+    if (opts && opts.transient === true && pinnedShowing && !snackbarDrainTimer) {
+        var back = currentSnackbar;
+        snackbarQueue = snackbarQueue.filter(function(q) { return q.message !== back.message || q.type !== back.type; });
+        if (snackbarQueue.length >= SNACKBAR_QUEUE_MAX) {
+            for (var f = 0; f < snackbarQueue.length; f++) { if (!snackbarQueue[f].pinned) { snackbarQueue.splice(f, 1); break; } }
+        }
+        if (snackbarQueue.length < SNACKBAR_QUEUE_MAX) {
+            snackbarQueue.unshift(back);
+            renderSnackbar(entry);
+            return;
+        }
+    }
     if (pinnedShowing || snackbarDrainTimer) {
         // Collapse exact duplicates so a repeating error can't flood the queue.
         if (currentSnackbar && currentSnackbar.message === entry.message && currentSnackbar.type === entry.type) return;
@@ -85,10 +121,10 @@ function renderSnackbar(entry) {
     if (!snackbar) return;
     currentSnackbar = entry;
 
-    // Handle both string type ('error'/'success'/'warning') and legacy boolean isError
+    // String type ('error'/'success'/'warning'/'info') or legacy boolean isError; untyped/unknown types keep the success style
     var isError = entry.type === 'error' || entry.type === true;
     var isWarning = entry.type === 'warning';
-    var typeClass = isError ? ' error' : (isWarning ? ' warning' : ' success');
+    var typeClass = isError ? ' error' : (isWarning ? ' warning' : (entry.type === 'info' ? ' info' : ' success'));
 
     // Build snackbar content with close button for errors and warnings
     var closeBtn = (isError || isWarning) ? '<button class="snackbar-close" onclick="dismissSnackbar()" aria-label="Dismiss">' + UI_ICONS.close + '</button>' : '';
@@ -427,12 +463,13 @@ function rerenderCurrentNotification() {
 function toggleNotificationExpand() {
     var card = getApprovalCardEl();
     if (!card) return;
-    card.classList.toggle('notification-expanded');
+    var expanded = card.classList.toggle('notification-expanded');
     var btn = card.querySelector('.notification-expand');
-    if (btn) btn.title = card.classList.contains('notification-expanded') ? 'Collapse' : 'Expand';
-    // Auto-open params when expanding
-    if (card.classList.contains('notification-expanded')) {
-        card.querySelectorAll('.notification-params:not([open])').forEach(function(d) { d.open = true; });
+    if (btn) btn.title = expanded ? 'Collapse' : 'Expand';
+    if (expanded) { // auto-open params, remembering which ones we opened
+        card.querySelectorAll('.notification-params:not([open])').forEach(function(d) { d.open = true; d.setAttribute('data-auto-opened', '1'); });
+    } else { // A4A2-01: collapse restores the pre-expand state: close only what expand opened
+        card.querySelectorAll('.notification-params[data-auto-opened]').forEach(function(d) { d.open = false; d.removeAttribute('data-auto-opened'); });
     }
 }
 
@@ -861,6 +898,9 @@ function showModal(title, message, buttons, variant) {
         settlePendingModalResolve();
         modalResolve = resolve;
         var overlay = document.getElementById('modal-overlay');
+        // S0C12-01: a dialog opened over a content viewer (screenshot/PDF/file)
+        // must not inherit its mode class (its CSS hides .modal-actions).
+        resetModalContentMode(overlay);
         var header = document.getElementById('modal-header');
         var body = document.getElementById('modal-body');
         var actions = document.getElementById('modal-actions');
@@ -878,22 +918,30 @@ function showModal(title, message, buttons, variant) {
     });
 }
 
-function closeModal() {
-    var modal = document.getElementById('modal-overlay');
-    modal.classList.remove('show');
-    modal.classList.remove('modal-variant-warning');
-    modal.classList.remove('modal-variant-danger');
-    modal.classList.remove('skill-asset-modal');
-    modal.classList.remove('request-body-modal');
-    modal.classList.remove('screenshot-modal');
-    modal.classList.remove('pdf-modal');
-    modal.classList.remove('file-modal');
-    modal.classList.remove('worker-chat-modal');
+// S0C12-01: strip every content-mode class and the screenshot viewer's key
+// listener + nav state. Shared by closeModal, showModal and (ui/230)
+// resolveModal / showPromptModal. It never touches modalResolve: callers settle
+// the pending promise themselves.
+function resetModalContentMode(ov) {
+    ov.classList.remove('skill-asset-modal', 'screenshot-modal', 'pdf-modal', 'file-modal', 'worker-chat-modal');
     // Detach the worker chat-view modal's live-refresh listener (guarded:
     // defined in ui/175-sub-agent-ui.js, a no-op when no such modal is open).
     if (typeof _teardownWorkerChatModal === 'function') _teardownWorkerChatModal();
     document.removeEventListener('keydown', screenshotModalKeyHandler);
     screenshotNav.list = [];
     screenshotNav.index = -1;
+    // NEW-T25-1: openPdfModal (app/050-image-attachments.js) parks the PDF data
+    // URL + name on the SHARED #modal-body dataset. Drop them on every reset so
+    // the last PDF is not pinned in the DOM (openPdfModal never calls this reset).
+    var mb = document.getElementById('modal-body');
+    if (mb && mb.dataset) { delete mb.dataset.pdfSrc; delete mb.dataset.pdfName; }
+}
+
+function closeModal() {
+    var modal = document.getElementById('modal-overlay');
+    modal.classList.remove('show');
+    modal.classList.remove('modal-variant-warning');
+    modal.classList.remove('modal-variant-danger');
+    resetModalContentMode(modal);
     if (modalResolve) { modalResolve(null); modalResolve = null; }
 }

@@ -114,6 +114,26 @@ describe('H13 smart-doc actions target the clicked copy, not the first', functio
         assert.ok(!t.b.classList.contains('sdoc-diffing') && shown(t.b.querySelector('.sdoc-body')));
     }, { tags: ['unit'], timeout: 5000 });
 
+    // A7A2-01: Edit hid the diff but left the select on v1, so after Cancel
+    // picking v1 again fired no change and the diff never came back.
+    test('A7A2-01 Edit from a compare view resets the version select', async function() {
+        var m = await loadSdoc(fixture());
+        var t = await mountTwice(m, m.smartDocuments.doc_dup);
+        var sel = t.b.querySelector('.sdoc-version-select');
+        sel.value = '1';
+        U.fireInline(sel, 'change', m);
+        assert.ok(t.b.classList.contains('sdoc-diffing') && shown(t.b.querySelector('.sdoc-diff')), 'copy #2 diffing');
+        U.fireInline(t.b.querySelector('.sdoc-action-btn[title="Edit"]'), 'click', m);
+        assert.strictEqual(sel.value, '', 'Edit resets the Compare select');
+        assert.ok(t.b.classList.contains('sdoc-editing') && !t.b.classList.contains('sdoc-diffing'), 'editing, not diffing');
+        U.fireInline(t.b.querySelector('.sdoc-edit-actions .skills-action-btn:not(.primary)'), 'click', m);
+        assert.ok(shown(t.b.querySelector('.sdoc-body')) && !shown(t.b.querySelector('.sdoc-diff')), 'Cancel: body shown, diff hidden');
+        sel.value = '1';
+        U.fireInline(sel, 'change', m);
+        assert.ok(t.b.classList.contains('sdoc-diffing') && shown(t.b.querySelector('.sdoc-diff')), 'picking v1 again shows the diff');
+        assert.strictEqual(t.a.querySelector('.sdoc-version-select').value, '', 'copy #1 select untouched');
+    }, { tags: ['unit'], timeout: 5000 });
+
     test('prompt Submit from copy #2 (polyfill receiver = form) reads copy #2 fields', async function() {
         var doc = fixture();
         var m = await loadSdoc(doc);

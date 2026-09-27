@@ -342,6 +342,14 @@ describe('ui smart documents › documents page and preview modal', function() {
         assert.ok(info.stopped, 'delete does not open the card');
         assert.deepStrictEqual(m.sdocDeleteFromPage.calls[0], ['doc_b']);
     }, { tags: ['unit'] });
+    test('S0C5-02 (b): the Delete Document confirm escapes the title; cancel keeps the doc', async function() {
+        var confirm = U.recorder(function() { return Promise.resolve(false); });
+        var m = await loadSdoc({ doc_x: sdocFixture({ id: 'doc_x', title: 'notes<script>.md' }) }, { showConfirmModal: confirm });
+        await m.sdocDeleteFromPage('doc_x');
+        assert.deepStrictEqual(confirm.calls[0], ['Delete Document', 'Delete "notes&lt;script&gt;.md" and all its versions? This cannot be undone.', 'danger']);
+        assert.ok(m.smartDocuments.doc_x, 'cancel keeps the document');
+        assert.strictEqual(m.__stubs.showSnackbar.calls.length, 0, 'no Document deleted snackbar');
+    }, { tags: ['unit'] });
 
     test('card click opens the preview modal; close button, backdrop and Escape close it', async function() {
         var doc = sdocFixture();
@@ -462,6 +470,146 @@ describe('ui smart documents › documents page and preview modal', function() {
         assert.strictEqual(m.__appStorage.getItem('documentsPageLayout'), 'rows');
         assert.ok(dom.$('#documents-items').classList.contains('layout-rows'));
     }, { tags: ['unit'] });
+
+    // A7A-01: a dirty edit in the preview asks before Esc / backdrop / Close drop it.
+    function openDirtyPreview(m) {
+        m.sdocOpenPreview('doc_ui');
+        var modal = document.getElementById('sdoc-preview-modal');
+        modal.querySelector('.sdoc-editor').focus = function() {};
+        U.fireInline(modal.querySelector('.sdoc-action-btn[title="Edit"]'), 'click', m);
+        modal.querySelector('.sdoc-editor').value = 'draft';
+        return modal;
+    }
+    test('A7A-01 dirty edit: Esc, backdrop and Close ask before discarding', async function() {
+        var m = await loadSdoc({ doc_ui: sdocFixture() });
+        var confirms = [], answer = false;
+        m.__scope.showConfirmModal = async function(t, msg, v) { confirms.push([t, msg, v]); return answer; };
+        var modal = openDirtyPreview(m);
+        var acts = [['Escape', function() { U.key(document.body, 'Escape'); }], ['backdrop', function() { U.click(modal); }],
+            ['Close', function() { U.click(modal.querySelector('.sdoc-header-actions .sdoc-action-btn[title="Close"]')); }]];
+        for (var i = 0; i < acts.length; i++) {
+            var label = acts[i][0];
+            acts[i][1]();
+            await U.flush(); await U.flush(); // past the macrotask reset of the pending-confirm flag
+            assert.strictEqual(document.getElementById('sdoc-preview-modal'), modal, label + ': modal kept');
+            assert.ok(modal.querySelector('.sdoc').classList.contains('sdoc-editing'), label + ': still editing');
+            assert.strictEqual(modal.querySelector('.sdoc-editor').value, 'draft', label + ': draft kept');
+            assert.strictEqual(confirms.length, i + 1, label + ': asked once');
+            assert.strictEqual(confirms[i][2], 'warning');
+        }
+        assert.match(confirms[0][0], /Discard changes/);
+        assert.match(confirms[0][1], /"Plan"/);
+        answer = true;
+        U.key(document.body, 'Escape');
+        await U.flush();
+        assert.strictEqual(document.getElementById('sdoc-preview-modal'), null, 'confirmed discard closes the preview');
+        assert.strictEqual(confirms.length, 4);
+    }, { tags: ['unit'] });
+
+    test('A7A-01 Esc while the discard confirm is pending does not re-prompt', async function() {
+        var m = await loadSdoc({ doc_ui: sdocFixture() });
+        var confirms = [], pending = null;
+        m.__scope.showConfirmModal = function(t, msg, v) { confirms.push([t, msg, v]); return new Promise(function(r) { pending = r; }); };
+        // Stand-in for core/120-init.js's global Esc: registered first, it closes the
+        // open confirm (resolves it as cancel) before the preview's own listener runs.
+        function initEsc(e) { if (e.key === 'Escape' && pending) { var r = pending; pending = null; r(false); } }
+        document.addEventListener('keydown', initEsc);
+        try {
+            var modal = openDirtyPreview(m);
+            U.key(document.body, 'Escape'); // opens the confirm
+            U.key(document.body, 'Escape'); // INIT closes it; the preview must not ask again
+            await U.flush(); await U.flush();
+            assert.strictEqual(confirms.length, 1, 'one confirm, no re-prompt');
+            assert.strictEqual(document.getElementById('sdoc-preview-modal'), modal, 'modal kept');
+            assert.strictEqual(modal.querySelector('.sdoc-editor').value, 'draft', 'draft kept');
+        } finally {
+            document.removeEventListener('keydown', initEsc);
+            var p = document.getElementById('sdoc-preview-modal');
+            if (p && p._escHandler) document.removeEventListener('keydown', p._escHandler);
+        }
+    }, { tags: ['unit'] });
+
+    test('RF25-F1: the Discard changes confirm escapes the title; cancel keeps the doc and editor', async function() {
+        var m = await loadSdoc({ doc_ui: sdocFixture({ title: '<b>Plan</b>' }) });
+        var confirms = [];
+        m.__scope.showConfirmModal = async function(t, msg, v) { confirms.push([t, msg, v]); return false; };
+        try {
+            var modal = openDirtyPreview(m);
+            U.key(document.body, 'Escape');
+            await U.flush(); await U.flush(); // past the macrotask reset of the pending-confirm flag
+            assert.deepStrictEqual(confirms, [['Discard changes?', 'Unsaved edits to "&lt;b&gt;Plan&lt;/b&gt;" will be lost.', 'warning']]);
+            assert.strictEqual(document.getElementById('sdoc-preview-modal'), modal, 'cancel keeps the preview');
+            assert.ok(modal.querySelector('.sdoc').classList.contains('sdoc-editing'), 'still editing');
+            assert.strictEqual(modal.querySelector('.sdoc-editor').value, 'draft', 'draft kept');
+            assert.strictEqual(m.smartDocuments.doc_ui.title, '<b>Plan</b>', 'doc title unchanged');
+        } finally {
+            var p = document.getElementById('sdoc-preview-modal');
+            if (p && p._escHandler) document.removeEventListener('keydown', p._escHandler);
+        }
+    }, { tags: ['unit'] });
+
+    // A7A2-02: Create opens a never-saved blank doc in edit mode.
+    async function freshCreate() {
+        var un = U.recorder();
+        var m = await loadSdoc({}, { newFileId: function() { return 'file_t'; }, registerFile: U.recorder(), unregisterFile: un });
+        await U.mountDom({ html: '<div id="documents-list"></div>' });
+        await m.sdocCreateFromPage();
+        var id = Object.keys(m.smartDocuments)[0];
+        var pm = document.getElementById('sdoc-preview-modal');
+        assert.ok(id && pm && pm.querySelector('.sdoc.sdoc-editing'), 'Create opens the blank doc in edit mode');
+        return { m: m, id: id, pm: pm, un: un };
+    }
+    function cancelBtn() { return document.querySelector('#sdoc-preview-modal .sdoc-edit .skills-action-btn:not(.primary)'); }
+    test('A7A2-02 Cancel right after Create discards the blank doc', async function() {
+        var f = await freshCreate();
+        U.fireInline(cancelBtn(), 'click', f.m);
+        await U.flush(); await U.flush();
+        assert.strictEqual(f.m.smartDocuments[f.id], undefined, 'blank doc deleted');
+        assert.strictEqual(document.getElementById('sdoc-preview-modal'), null, 'preview closed');
+        assert.deepStrictEqual(f.un.calls, [['file_t']], 'file id unregistered');
+    }, { tags: ['unit'] });
+
+    test('A7A2-02 Esc right after Create discards the blank doc', async function() {
+        var f = await freshCreate();
+        U.key(document.body, 'Escape');
+        await U.flush(); await U.flush();
+        assert.strictEqual(f.m.smartDocuments[f.id], undefined, 'blank doc deleted');
+        assert.strictEqual(document.getElementById('sdoc-preview-modal'), null, 'preview closed');
+        assert.deepStrictEqual(f.un.calls, [['file_t']], 'file id unregistered');
+    }, { tags: ['unit'] });
+
+    test('A7A2-02 Save then Cancel keeps the doc', async function() {
+        var f = await freshCreate();
+        f.pm.querySelector('.sdoc-title-input').value = 'Named';
+        await f.m.sdocSaveEdit(f.id, f.pm.querySelector('.sdoc-edit .skills-action-btn.primary'));
+        U.fireInline(cancelBtn(), 'click', f.m);
+        U.key(document.body, 'Escape');
+        await U.flush(); await U.flush();
+        assert.strictEqual(f.m.smartDocuments[f.id].title, 'Named', 'saved doc kept');
+        // An unchanged Save (its no-change path runs sdocCancelEdit) is an explicit Save too.
+        var g = await freshCreate();
+        await g.m.sdocSaveEdit(g.id, g.pm.querySelector('.sdoc-edit .skills-action-btn.primary'));
+        U.key(document.body, 'Escape');
+        await U.flush(); await U.flush();
+        assert.ok(g.m.smartDocuments[g.id], 'unchanged Save keeps the blank doc');
+        assert.strictEqual(document.getElementById('sdoc-preview-modal'), null, 'Esc closes the preview');
+        assert.strictEqual(f.un.calls.length + g.un.calls.length, 0, 'nothing unregistered');
+    }, { tags: ['unit'] });
+
+    test('A7A2-02 a version bump before Cancel keeps the doc', async function() {
+        var f = await freshCreate();
+        var d = f.m.smartDocuments[f.id];
+        d.currentVersion = 2;
+        d.versions.push({ version: 2, content: '', title: 'Untitled Document', author: 'agent', timestamp: Date.now() });
+        U.fireInline(cancelBtn(), 'click', f.m);
+        await U.flush(); await U.flush();
+        assert.strictEqual(f.m.smartDocuments[f.id], d, 'doc kept');
+        assert.ok(document.getElementById('sdoc-preview-modal'), 'Cancel only leaves edit mode');
+        U.key(document.body, 'Escape');
+        await U.flush(); await U.flush();
+        assert.strictEqual(f.m.smartDocuments[f.id], d, 'closing afterwards keeps it too');
+        assert.strictEqual(f.un.calls.length, 0, 'nothing unregistered');
+    }, { tags: ['unit'] });
 });
 
 describe('ui html_widget › inline frame chrome', function() {
@@ -577,6 +725,98 @@ describe('ui html_widget › inline frame chrome', function() {
     }, { tags: ['unit'] });
 });
 
+// A6A3-01 / A6A2-01 — dashboard deactivate persistence + screenshot fallback cleanup.
+describe('ui html_widget › dashboard deactivate + screenshot fallback', function() {
+    afterEach(function() { U.cleanupAll(); var o = document.getElementById('widget-fullscreen-overlay'); if (o) o.remove(); });
+    test('dashboard deactivate persists + survives re-render (A6A3-01)', async function() {
+        var x = await loadWidgets({ dashboard: { widget_a: { id: 'widget_a', html: W1.html, dashboard: 'main' } } });
+        var sc = x.m.__scope, saves = [];
+        sc.WidgetStore.project = function() {};
+        sc.saveDashboardWidget = function(w, skipHistory) { saves.push({ rec: Object.assign({}, w), same: w === sc.dashboardWidgets.widget_a, skipHistory: skipHistory }); return Promise.resolve(); };
+        var dom = await U.mountDom({ html: '<div id="dashboard-widget-content-widget_a"></div>' });
+        var box = dom.$('#dashboard-widget-content-widget_a');
+        x.m.renderWidgetContent(sc.dashboardWidgets.widget_a);
+        assert.ok(box.querySelector('.widget-shadow-host'), 'live before');
+        x.m.toggleWidgetRunning('widget_a');
+        assert.strictEqual(sc.dashboardWidgets.widget_a.deactivated, true, 'dashboard record flagged');
+        assert.strictEqual(saves.length, 1, 'dashboard record persisted');
+        assert.strictEqual(saves[0].same, true);
+        assert.strictEqual(saves[0].skipHistory, true, 'no revision');
+        assert.deepStrictEqual([saves[0].rec.id, saves[0].rec.html, saves[0].rec.dashboard, saves[0].rec.deactivated], ['widget_a', W1.html, 'main', true]);
+        x.m.expandDashboardWidget('widget_a');
+        var btn = document.querySelector('#widget-fullscreen-overlay .widget-stop-btn');
+        assert.strictEqual(btn.title, 'Activate Widget');
+        document.getElementById('widget-fullscreen-overlay').remove();
+        x.m.renderWidgetContent(sc.dashboardWidgets.widget_a);
+        assert.strictEqual(box.textContent, 'Widget deactivated.', 'grid re-render honours the flag');
+        assert.strictEqual(box.querySelector('.widget-shadow-host'), null);
+        x.m.toggleWidgetRunning('widget_a');
+        assert.strictEqual(sc.dashboardWidgets.widget_a.deactivated, false);
+        assert.strictEqual(x.w.deactivated, false);
+        assert.ok(box.querySelector('.widget-shadow-host'), 'reactivated with the grid renderer');
+        assert.strictEqual(saves.length, 2);
+    }, { tags: ['unit'], timeout: 5000 });
+
+    // NEW-T23-1: the chat fullscreen (openWidgetFullscreen) and its dashboard twin
+    // (expandDashboardWidget) honour deactivation like the grid above: placeholder,
+    // no live iframe (so no bridge 'message' listener), and an 'Activate Widget' button.
+    test('NEW-T23-1: fullscreen and expanded views of a deactivated widget mount no iframe', async function() {
+        var x = await loadWidgets({ dashboard: { widget_a: { id: 'widget_a', html: W1.html, title: 'T', dashboard: 'main' } } });
+        var sc = x.m.__scope;
+        sc.WidgetStore.project = function() {};
+        sc.saveDashboardWidget = function() { return Promise.resolve(); };
+        var views = { fullscreen: [x.m.openWidgetFullscreen, x.m.closeWidgetFullscreen], expand: [x.m.expandDashboardWidget, x.m.closeExpandedWidget] };
+        function snap(name) {
+            var base = x.win.count('message');
+            views[name][0]('widget_a');
+            var ov = document.getElementById('widget-fullscreen-overlay');
+            var c = ov.querySelector('.widget-fullscreen-content');
+            var r = [c.textContent, !!c.querySelector('iframe'), ov.querySelector('.widget-stop-btn').title, x.win.count('message') > base];
+            views[name][1]();
+            return r;
+        }
+        x.m.toggleWidgetRunning('widget_a');
+        assert.strictEqual(x.m.isWidgetDeactivated('widget_a'), true);
+        var DEAD = ['Widget deactivated.', false, 'Activate Widget', false];
+        assert.deepStrictEqual(snap('fullscreen'), DEAD, 'chat fullscreen: placeholder, no iframe, no bridge listener');
+        assert.deepStrictEqual(snap('expand'), DEAD, 'dashboard expand twin');
+        x.m.toggleWidgetRunning('widget_a');
+        assert.strictEqual(x.m.isWidgetDeactivated('widget_a'), false);
+        assert.deepStrictEqual(snap('fullscreen').slice(1, 3), [true, 'Deactivate Widget'], 're-activated fullscreen mounts an iframe');
+        assert.deepStrictEqual(snap('expand').slice(1, 3), [true, 'Deactivate Widget'], 're-activated expand mounts an iframe');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('NEW-T23-1: chat fullscreen reads the merged flag (only the dashboard record is flagged)', async function() {
+        var x = await loadWidgets({ dashboard: { widget_a: { id: 'widget_a', html: W1.html, dashboard: 'main', deactivated: true } } });
+        assert.strictEqual(x.w.deactivated, undefined, 'chat copy not flagged');
+        x.m.openWidgetFullscreen('widget_a');
+        var ov = document.getElementById('widget-fullscreen-overlay');
+        var c = ov.querySelector('.widget-fullscreen-content');
+        assert.deepStrictEqual([c.textContent, c.querySelector('iframe'), ov.querySelector('.widget-stop-btn').title], ['Widget deactivated.', null, 'Activate Widget']);
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('screenshot fallback cleans up when capture fails (A6A2-01)', async function() {
+        var x = await loadWidgets();
+        var sc = x.m.__scope, ch = x.s.chrome, removed = [], sent = [];
+        sc.chats.c1.targetTabId = 5;
+        sc.getWidgetIframe = function() { return { contentDocument: null }; };
+        ch.tabs.create = function() { return Promise.resolve({ id: 77 }); };
+        ch.tabs.remove = function(id) { removed.push(id); };
+        ch.tabs.onUpdated.addListener = function(fn) { setTimeout(function() { fn(77, { status: 'complete' }); }, 0); };
+        ch.runtime.sendMessage = function(msg) { sent.push(msg); throw new Error('Extension context invalidated.'); };
+        await x.m.screenshotWidget('widget_a');
+        assert.strictEqual(sc.chats.c1.targetTabId, 5, 'viewed chat tab target untouched');
+        assert.strictEqual(sent.length, 1);
+        assert.strictEqual(sent[0].targetTabId, 77, 'temp tab targeted explicitly');
+        assert.deepStrictEqual(removed, [77], 'temp tab closed');
+        assert.deepStrictEqual(x.s.showSnackbar.calls[x.s.showSnackbar.calls.length - 1], ['Screenshot failed', 'error']);
+        ch.tabs.create = function() { return Promise.reject(new Error('no tabs')); };
+        await x.m.screenshotWidget('widget_a');
+        assert.deepStrictEqual(removed, [77]);
+        assert.deepStrictEqual(x.s.showSnackbar.calls[x.s.showSnackbar.calls.length - 1], ['Screenshot failed', 'error']);
+    }, { tags: ['unit'], timeout: 5000 });
+});
+
 describe('ui html_widget › fullscreen, pin and sidebar', function() {
     afterEach(function() { U.cleanupAll(); ['widget-fullscreen-overlay'].forEach(function(id) { var o = document.getElementById(id); if (o) o.remove(); }); });
     test('fullscreen header controls, pin state and close paths', async function() {
@@ -589,7 +829,7 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.strictEqual(hdr.querySelector('.widget-title').textContent, 'Sales <b>board</b>');
         assert.strictEqual(hdr.querySelector('.widget-title b'), null);
         var titles = Array.prototype.map.call(hdr.querySelectorAll('.widget-ctrl-btn'), function(b) { return b.title; });
-        assert.deepStrictEqual(titles, ['Deactivate Widget', 'Pin to dashboard\u2026', 'Print', 'Screenshot', 'Open in New Tab', 'Open in Side Panel', 'Edit', 'Edit code']);
+        assert.deepStrictEqual(titles, ['Deactivate Widget', 'Pin to dashboard\u2026', 'Print', 'Screenshot', 'Open in new tab', 'Edit', 'Edit code']);
         assert.strictEqual(hdr.querySelector('.widget-stop-btn').getAttribute('data-widget-id'), 'widget_a');
         assert.ok(!hdr.querySelector('.widget-dashboard-btn').classList.contains('on-dashboard'));
         var frame = ov.querySelector('.widget-fullscreen-content iframe.widget-iframe');
@@ -634,7 +874,7 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.strictEqual(items[0].querySelector('.widget-sidebar-title').textContent, 'Sales <b>board</b>');
         assert.strictEqual(items[0].querySelector('.widget-sidebar-title b'), null);
         var btns = items[0].querySelectorAll('.widget-sidebar-actions button');
-        assert.deepStrictEqual(Array.prototype.map.call(btns, function(b) { return b.title; }), ['Show in Panel', 'Pin to dashboard\u2026', 'Fullscreen']);
+        assert.deepStrictEqual(Array.prototype.map.call(btns, function(b) { return b.title; }), ['Open in new tab', 'Pin to dashboard\u2026', 'Fullscreen']);
         Array.prototype.forEach.call(btns, function(b) { assert.ok(U.a11y(b).hasName && b.querySelector('svg')); });
         x.m.showWidgetPinMenu = U.recorder(); x.m.showWidgetInPanel = U.recorder(); x.m.openWidgetFullscreen = U.recorder(); x.m.scrollToWidget = U.recorder();
         var r = U.fireInline(btns[1], 'click', x.m);
@@ -645,10 +885,33 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.deepStrictEqual(x.m.scrollToWidget.calls[0], ['widget_a']);
     }, { tags: ['unit'] });
 
+    test('A3B2-02: the tab-opening sidebar button reads "Open in new tab" with the external-link icon in both renderers', async function() {
+        var x = await loadWidgets();
+        var dom = await U.mountDom({ html: '<div id="widget-sidebar-list"></div>' });
+        x.m.renderWidgetSidebar();
+        var btn = dom.$('.widget-sidebar-item .widget-sidebar-actions button');
+        var ref = document.createElement('div'); ref.innerHTML = x.m.UI_ICONS.externalLink;
+        assert.strictEqual(btn.title, 'Open in new tab');
+        assert.strictEqual(btn.innerHTML, ref.innerHTML);
+        // 080 renderWidgetSidebar and 120 renderVersionSidebar render the same row: keep both in sync.
+        var files = ['src/js/tools/080-widget-tools.js', 'src/js/ui/120-ui-utils.js'];
+        for (var i = 0; i < files.length; i++) {
+            var src = await loadFile(files[i], WS);
+            assert.strictEqual(src.indexOf('Show in Panel'), -1, files[i] + ' still labels the tab-opening button "Show in Panel"');
+            var rows = src.split('\n').filter(function(l) { return l.indexOf('<button') >= 0 && l.indexOf('showWidgetInPanel(') >= 0; });
+            assert.strictEqual(rows.length, 1, files[i]);
+            assert.ok(rows[0].indexOf('title="Open in new tab">') >= 0 && rows[0].indexOf('UI_ICONS.externalLink') >= 0 && rows[0].indexOf('UI_ICONS.panelRight') < 0, files[i] + ': ' + rows[0].trim());
+        }
+    }, { tags: ['unit'] });
+
     test('scrollToWidget highlights an inline card, else opens the modal', async function() {
         var x = await loadWidgets();
         var dom = await U.mountDom({ html: '<div id="widget-widget_a"></div>' });
         var el = dom.$('#widget-widget_a'); el.scrollIntoView = U.recorder();
+        // NEW-V15-1: only an on-screen card is highlighted, and the sandbox has no
+        // layout, so give this card a 300x200 box (see test/rg-b6-dashboard.test.js).
+        el.getClientRects = function() { return [{ width: 300, height: 200 }]; };
+        el.getBoundingClientRect = function() { return { width: 300, height: 200, top: 0, left: 0, right: 300, bottom: 200 }; };
         x.m.scrollToWidget('widget_a');
         assert.ok(el.classList.contains('highlight')); assert.strictEqual(el.scrollIntoView.calls.length, 1);
         dom.cleanup();
@@ -677,4 +940,229 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.strictEqual((mention.match(/<style data-appagent-tokens/g) || []).length, 1, 'plain mention still injected');
         assert.strictEqual(inj(null), null);
     }, { tags: ['unit'] });
+
+    test('RC7B2-F1: no widget control claims a side panel; new-tab labels are sentence case', async function() {
+        var x = await loadWidgets({ dashboard: { widget_a: Object.assign({}, W1, { dashboard: 'main' }) } });
+        function tabBtns(root) { return Array.prototype.filter.call(root.querySelectorAll('button'), function(b) { return (b.getAttribute('onclick') || '').indexOf('openWidgetLink(') >= 0; }); }
+        // Chat fullscreen (080 openWidgetFullscreen): one tab-opening control, no "side panel" twin that opens the same tab.
+        x.m.openWidgetFullscreen('widget_a');
+        var hdr = document.querySelector('#widget-fullscreen-overlay .widget-fullscreen-header');
+        assert.strictEqual(tabBtns(hdr).length, 1, 'exactly one openWidgetLink( button');
+        // RC7B2-F1: the icon-only button also needs an accessible name (aria-label), like 070 below.
+        assert.deepStrictEqual([tabBtns(hdr)[0].title, tabBtns(hdr)[0].getAttribute('aria-label')], ['Open in new tab', 'Open in new tab']);
+        assert.strictEqual(hdr.querySelector('.widget-panel-btn'), null, 'no duplicate side-panel button');
+        assert.strictEqual(Array.prototype.filter.call(hdr.querySelectorAll('button'), function(b) { return (b.getAttribute('onclick') || '').indexOf('openWidgetInIframePanel(') >= 0; }).length, 0);
+        document.getElementById('widget-fullscreen-overlay').remove();
+        // Dashboard expanded view (070 expandDashboardWidget): same label on title and aria-label.
+        x.m.__scope.WidgetStore.project = function() {};
+        x.m.expandDashboardWidget('widget_a');
+        var ov = document.getElementById('widget-fullscreen-overlay');
+        assert.strictEqual(tabBtns(ov).length, 1);
+        assert.deepStrictEqual([tabBtns(ov)[0].title, tabBtns(ov)[0].getAttribute('aria-label')], ['Open in new tab', 'Open in new tab']);
+        var files = ['src/js/tools/080-widget-tools.js', 'src/js/ui/070-dashboard-ui.js'];
+        for (var i = 0; i < files.length; i++) {
+            var src = await loadFile(files[i], WS);
+            assert.strictEqual(src.indexOf('Open in Side Panel'), -1, files[i] + ' still has an "Open in Side Panel" control');
+            assert.strictEqual(src.indexOf('Open in New Tab'), -1, files[i] + ' still title-cases "Open in New Tab"');
+        }
+    }, { tags: ['unit'] });
+
+    test('NEW-T20-1: every icon-only widget close button has an accessible name', async function() {
+        var x = await loadWidgets({ dashboard: { widget_a: Object.assign({}, W1, { dashboard: 'main' }) } });
+        // Chat fullscreen (080 openWidgetFullscreen).
+        x.m.openWidgetFullscreen('widget_a');
+        var c1 = document.querySelector('#widget-fullscreen-overlay .widget-close-btn');
+        assert.ok(c1, 'fullscreen close button rendered');
+        assert.deepStrictEqual([c1.title, c1.getAttribute('aria-label')], ['Close', 'Close']);
+        document.getElementById('widget-fullscreen-overlay').remove();
+        // Dashboard expanded view (070 expandDashboardWidget).
+        x.m.__scope.WidgetStore.project = function() {};
+        x.m.expandDashboardWidget('widget_a');
+        var c2 = document.querySelector('#widget-fullscreen-overlay .widget-close-btn');
+        assert.ok(c2, 'expanded-view close button rendered');
+        assert.deepStrictEqual([c2.title, c2.getAttribute('aria-label')], ['Close', 'Close']);
+        document.getElementById('widget-fullscreen-overlay').remove();
+        // Source scan: every close-button tag (080: fullscreen, code editor, modal; 070: expanded view).
+        // The counts are pinned so a regex miss cannot pass silently.
+        var want = { 'src/js/tools/080-widget-tools.js': 3, 'src/js/ui/070-dashboard-ui.js': 1 };
+        for (var f in want) {
+            var tags = (await loadFile(f, WS)).match(/<button class="widget-close-btn"[^>]*>/g) || [];
+            assert.strictEqual(tags.length, want[f], f + ': close-button count');
+            tags.forEach(function(tag) {
+                assert.ok(tag.indexOf('aria-label="Close"') >= 0, f + ': no aria-label in ' + tag);
+                assert.ok(tag.indexOf('title="Close"') >= 0, f + ': no title in ' + tag);
+            });
+        }
+    }, { tags: ['unit'] });
+});
+
+// S0B-10 / S0B-15 — ui/070-dashboard-ui.js importDashboard / exportDashboard.
+// saveDashboardWidget, refreshVisibleDashboards and showConfirmModal live in
+// files outside WG_FILES, so they are free identifiers set on the scope. The
+// file <input> / <a> are captured by wrapping the real document.createElement
+// (removed again in afterEach): no real file picker or download ever opens.
+describe('S0B-10 / S0B-15 dashboard import-export', function() {
+    afterEach(function() { delete document.createElement; });
+    async function setup(dash) {
+        var x = await loadWidgets({ dashboard: dash || { widget_a: { id: 'widget_a', title: 'Old' } } });
+        var sc = x.m.__scope;
+        x.saves = []; x.fail = null; x.blobs = []; x.confirm = { answer: false, calls: [] }; x.cap = { inputs: [], anchors: [] };
+        sc.saveDashboardWidget = async function(w) { if (x.fail && x.fail(w)) throw new Error('boom'); x.saves.push(w.id); };
+        sc.refreshVisibleDashboards = U.recorder();
+        sc.showConfirmModal = async function(t, msg, v) { x.confirm.calls.push([t, msg, v]); return x.confirm.answer; };
+        sc.Blob = function(parts, o) { this.parts = parts.slice(); this.type = o && o.type; x.blobs.push(this); };
+        sc.URL = { createObjectURL: function() { return 'blob:test'; }, revokeObjectURL: function() {} };
+        document.createElement = function(t) { var el = { tagName: String(t).toUpperCase(), click: function() {} }; (t === 'input' ? x.cap.inputs : x.cap.anchors).push(el); return el; };
+        x.importData = async function(data) {
+            await x.m.importDashboard();
+            var input = x.cap.inputs[x.cap.inputs.length - 1];
+            await input.onchange({ target: { files: [{ text: async function() { return JSON.stringify(data); } }] } });
+        };
+        x.snacks = x.s.showSnackbar.calls;
+        x.refreshes = function() { return sc.refreshVisibleDashboards.calls.length; };
+        return x;
+    }
+
+    test('S0B-10 non-array widgets gives an error and 0 saves', async function() {
+        var x = await setup();
+        await x.importData({ type: 'appagent-dashboard', version: 1, widgets: { a: { id: 'w1' } } });
+        assert.deepStrictEqual(x.snacks, [['Invalid dashboard file format', 'error']], 'was "Imported 0 widget(s)"');
+        await x.importData(null);
+        assert.deepStrictEqual(x.snacks[1], ['Invalid dashboard file format', 'error']);
+        assert.deepStrictEqual(x.saves, []);
+        assert.strictEqual(x.confirm.calls.length, 0);
+        assert.strictEqual(x.refreshes(), 0, 'nothing written, nothing to refresh');
+    }, { tags: ['unit'] });
+
+    test('S0B-10 an id-less row after a valid row gives an error and 0 saves', async function() {
+        var x = await setup();
+        await x.importData({ type: 'appagent-dashboard', widgets: [{ id: 'w1', title: 'A' }, { title: 'no id' }, null, { id: 'w1' }] });
+        assert.deepStrictEqual(x.snacks, [['Invalid dashboard file: 3 widget(s) lack a valid unique id', 'error']]);
+        assert.deepStrictEqual(x.saves, [], 'the valid first row is not saved either');
+        await x.importData({ type: 'appagent-dashboard-widget', widget: { id: '__proto__', title: 'polluted' } });
+        assert.deepStrictEqual(x.snacks[1], ['Invalid dashboard file: 1 widget(s) lack a valid unique id', 'error']);
+        assert.deepStrictEqual(x.saves, []);
+        assert.strictEqual(x.confirm.calls.length, 0, '__proto__ is not an existing widget');
+        assert.strictEqual(x.refreshes(), 0);
+    }, { tags: ['unit'] });
+
+    test('S0B-10 existing ids ask first, and Cancel saves nothing', async function() {
+        var x = await setup();
+        var file = { type: 'appagent-dashboard', widgets: [{ id: 'widget_a', title: 'New' }, { id: 'w2', title: 'B' }] };
+        await x.importData(file);
+        assert.strictEqual(x.confirm.calls.length, 1);
+        assert.strictEqual(x.confirm.calls[0][0], 'Import dashboard');
+        assert.match(x.confirm.calls[0][1], /^1 widget\(s\) already exist; their title\/content will be updated \(layout kept\)/);
+        assert.strictEqual(x.confirm.calls[0][2], 'warning');
+        assert.deepStrictEqual(x.saves, [], 'Cancel writes nothing');
+        assert.deepStrictEqual(x.snacks, []);
+        assert.strictEqual(x.refreshes(), 0);
+        x.confirm.answer = true;
+        await x.importData(file);
+        assert.deepStrictEqual(x.saves, ['widget_a', 'w2']);
+        assert.deepStrictEqual(x.snacks, [['Imported 1 widget(s), updated 1', 'success']]);
+        assert.strictEqual(x.refreshes(), 1);
+        await x.importData({ type: 'appagent-dashboard-widget', widget: { id: 'w3' } });
+        assert.strictEqual(x.confirm.calls.length, 2, 'only new widgets: no confirmation');
+        assert.deepStrictEqual(x.saves, ['widget_a', 'w2', 'w3']);
+        assert.deepStrictEqual(x.snacks[1], ['Imported 1 widget(s)', 'success']);
+    }, { tags: ['unit'] });
+
+    test('S0B-10 a save rejection still refreshes and reports an error', async function() {
+        var x = await setup({});
+        x.fail = function(w) { return w.id === 'w2'; };
+        await x.importData({ type: 'appagent-dashboard', widgets: [{ id: 'w1' }, { id: 'w2' }, { id: 'w3' }] });
+        assert.deepStrictEqual(x.saves, ['w1']);
+        assert.deepStrictEqual(x.snacks, [['Failed to import (1 of 3 saved): boom', 'error']]);
+        assert.strictEqual(x.refreshes(), 1, 'refresh runs even after a failed save');
+    }, { tags: ['unit'] });
+
+    test('S0B-15 exportDashboard: a throwing widget getter → error snackbar', async function() {
+        var bad = { id: 'w_bad' };
+        Object.defineProperty(bad, 'html', { enumerable: true, get: function() { throw new Error('getter boom'); } });
+        var x = await setup({ w_bad: bad });
+        x.m.exportDashboard();
+        assert.deepStrictEqual(x.snacks, [['Download failed: getter boom', 'error']], 'was an uncaught exception');
+        assert.strictEqual(x.cap.anchors.length, 0, 'no download started');
+        var y = await setup();
+        y.m.exportDashboard();
+        assert.deepStrictEqual(y.snacks, [['Dashboard exported', 'success']]);
+        assert.strictEqual(y.cap.anchors.length, 1);
+        assert.match(y.cap.anchors[0].download, /^dashboard-\d{4}-\d{2}-\d{2}\.json$/);
+        assert.strictEqual(JSON.parse(y.blobs[0].parts.join('')).widgets[0].id, 'widget_a');
+    }, { tags: ['unit'] });
+});
+
+// A6B-01 — the dashboard expanded-modal trash button only UNPINS
+// (deleteDashboardWidget drops the dashboardWidgets row); the WidgetStore
+// record, its versions and the library item stay. deleteDashboardWidget,
+// dashboardGridEl, dashboardWidgetsFor, widgetDashboardOf (020),
+// showConfirmModal (230), renderVersionSidebar (120) and currentEditingWidget
+// (130) live outside WG_FILES, so they are free identifiers set on the scope.
+describe('A6B-01 dashboard expanded-modal remove', function() {
+    afterEach(function() { U.cleanupAll(); var o = document.getElementById('widget-fullscreen-overlay'); if (o) o.remove(); });
+    async function setup(dash, board) {
+        var x = await loadWidgets({ dashboard: dash });
+        var sc = x.m.__scope, id = Object.keys(dash)[0];
+        x.answer = true; x.confirms = []; x.dels = []; x.removes = [];
+        sc.currentEditingWidget = null;
+        sc.WidgetStore.project = function() {};
+        sc.WidgetStore.remove = function(wid) { x.removes.push(wid); return Promise.resolve(); };
+        sc.showConfirmModal = async function(t, msg, v) { x.confirms.push([t, msg, v]); return x.answer; };
+        sc.deleteDashboardWidget = async function(wid) { x.dels.push(wid); delete sc.dashboardWidgets[wid]; };
+        sc.widgetDashboardOf = function(w) { return (w && w.dashboard) || 'main'; };
+        sc.dashboardWidgetsFor = function(d) { return Object.keys(sc.dashboardWidgets).map(function(k) { return sc.dashboardWidgets[k]; }).filter(function(w) { return sc.widgetDashboardOf(w) === d; }); };
+        sc.renderVersionSidebar = U.recorder();
+        x.dom = await U.mountDom({ html: '<div id="a6b-grid"><div class="dashboard-widget" data-widget-id="' + id + '"></div></div>' +
+            '<button class="widget-dashboard-btn on-dashboard" data-widget-id="' + id + '"></button>' });
+        x.grid = x.dom.$('#a6b-grid');
+        sc.dashboardGridEl = function(d) { return d === board ? x.grid : null; };
+        x.clickRemove = async function() {
+            x.m.expandDashboardWidget(id);
+            var btn = document.querySelector('#widget-fullscreen-overlay .widget-modal-btn.danger');
+            U.fireInline(btn, 'click', x.m);
+            await U.flush(); await U.flush();
+            return btn;
+        };
+        x.lastSnack = function() { var c = x.s.showSnackbar.calls; return c[c.length - 1]; };
+        return x;
+    }
+
+    test('A6B-01 expanded-modal remove says Remove and never deletes the widget record', async function() {
+        var x = await setup({ widget_a: { id: 'widget_a', title: 'T' } }, 'main');
+        x.answer = false;
+        var btn = await x.clickRemove();
+        assert.strictEqual(btn.title, 'Remove from dashboard');
+        assert.strictEqual(btn.getAttribute('aria-label'), 'Remove from dashboard');
+        assert.strictEqual(x.confirms.length, 1);
+        assert.strictEqual(x.confirms[0][0], 'Remove from Dashboard');
+        assert.ok(!/delete/i.test(x.confirms[0][0] + ' ' + x.confirms[0][1]), x.confirms[0][1]);
+        assert.strictEqual(x.confirms[0][1], 'Remove "T" from the dashboard? The widget and its saved versions stay in your library.');
+        assert.strictEqual(x.confirms[0][2], 'danger');
+        assert.deepStrictEqual(x.dels, [], 'cancel removes nothing');
+        assert.ok(x.dom.$('.dashboard-widget'), 'card kept on cancel');
+        x.answer = true;
+        await x.clickRemove();
+        assert.deepStrictEqual(x.dels, ['widget_a'], 'deleteDashboardWidget once (unpin only)');
+        assert.deepStrictEqual(x.removes, [], 'WidgetStore.remove never called');
+        assert.deepStrictEqual(x.lastSnack(), ['Removed from dashboard', 'success']);
+        assert.ok(!x.s.showSnackbar.calls.some(function(c) { return /delete/i.test(c[0]); }), 'no "deleted" snackbar');
+        assert.strictEqual(x.dom.$('.dashboard-widget'), null, 'grid card removed');
+        assert.match(x.grid.textContent, /No widgets yet/);
+        assert.strictEqual(x.dom.$('.widget-dashboard-btn').classList.contains('on-dashboard'), false, 'chat pin button refreshed');
+        assert.strictEqual(x.m.__scope.renderVersionSidebar.calls.length, 1, 'version sidebar refreshed');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('A6B-01 removing a Home widget says Home and keeps the record', async function() {
+        var x = await setup({ widget_h: { id: 'widget_h', title: 'H', dashboard: 'home' } }, 'home');
+        await x.clickRemove();
+        assert.strictEqual(x.confirms.length, 1);
+        assert.strictEqual(x.confirms[0][0], 'Remove from Home'); // TA-8: the title names Home too
+        assert.strictEqual(x.confirms[0][1], 'Remove "H" from Home? The widget and its saved versions stay in your library.');
+        assert.deepStrictEqual(x.dels, ['widget_h']);
+        assert.deepStrictEqual(x.removes, [], 'WidgetStore.remove never called');
+        assert.deepStrictEqual(x.lastSnack(), ['Removed from Home', 'success']);
+        assert.strictEqual(x.dom.$('.dashboard-widget'), null, 'home card removed');
+        assert.strictEqual(x.grid.innerHTML, '', 'home grid emptied (no dashboard empty-state card)');
+    }, { tags: ['unit'], timeout: 5000 });
 });

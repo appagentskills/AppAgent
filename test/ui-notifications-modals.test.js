@@ -126,7 +126,7 @@ describe('ui notifications › snackbar', function() {
         t.m.showSnackbar('one', 'success', 500);
         t.m.showSnackbar('two', 'info', 800);
         assert.strictEqual(el.querySelector('.snackbar-message').textContent, 'two');
-        assert.strictEqual(el.className, 'snackbar show success', 'unknown type falls back to success styling');
+        assert.strictEqual(el.className, 'snackbar show info', "'info' gets its own neutral class (S0C17-01)");
         t.clock.tick(799); assert.ok(el.classList.contains('show'), 'old 500ms timer was cleared');
         t.clock.tick(1); assert.strictEqual(el.classList.contains('show'), false);
     }, { tags: ['unit'] });
@@ -167,6 +167,99 @@ describe('ui notifications › snackbar', function() {
         t.clock.tick(16000);
         t.m.dismissSnackbar(); t.clock.tick(320);
         assert.strictEqual(el.querySelector('.snackbar-message').textContent, 'Warn later', 'stale success skipped, pinned warning shown');
+    }, { tags: ['unit'] });
+    test('untyped and unknown types keep the success style (S0C17-01)', async function() {
+        var t = await setup(), el = sb(t);
+        t.m.showSnackbar('x');
+        assert.strictEqual(el.className, 'snackbar show success', 'untyped');
+        t.m.showSnackbar('y', 'bogus');
+        assert.strictEqual(el.className, 'snackbar show success', 'unknown type');
+    }, { tags: ['unit'] });
+    test('13-notifications.css defines a neutral .snackbar.info (S0C17-01)', async function() {
+        var css = await loadFile('src/css/13-notifications.css', WS);
+        assert.match(css, /\.snackbar\.info\s*\{[^}]*background:\s*var\(--bg-tooltip\)/);
+    }, { tags: ['unit'] });
+    test('same-key toast supersedes a pinned toast and its queued siblings (A5A-01)', async function() {
+        var t = await setup(), el = sb(t), K = { key: 'skill-editor' };
+        function msg() { return el.querySelector('.snackbar-message').textContent; }
+        t.m.showSnackbar('E1', 'error', undefined, K);
+        t.m.showSnackbar('E2', 'error', undefined, K);
+        assert.strictEqual(msg(), 'E2', 'same-key error replaces the pinned one at once');
+        t.m.showSnackbar('ok', 'success', undefined, K);
+        assert.strictEqual(msg(), 'ok'); assert.strictEqual(el.className, 'snackbar show success');
+        t.clock.tick(2999); assert.ok(el.classList.contains('show'), 'ok still visible at 2999ms');
+        t.clock.tick(1); assert.strictEqual(el.classList.contains('show'), false, 'ok hidden at 3000ms');
+        t.clock.tick(5000); assert.strictEqual(el.classList.contains('show'), false, 'nothing queued: E1/E2 were superseded, not queued');
+        // Control: a keyed toast still queues behind an UNRELATED (unkeyed) pinned toast,
+        // but only the newest same-key sibling survives in the queue.
+        t.m.showSnackbar('Other', 'error');
+        t.m.showSnackbar('K1', 'error', undefined, K);
+        t.m.showSnackbar('K2', 'success', undefined, K);
+        assert.strictEqual(msg(), 'Other', 'unkeyed pinned error is not superseded by a keyed toast');
+        t.m.dismissSnackbar(); t.clock.tick(320);
+        assert.strictEqual(msg(), 'K2', 'queued K1 was superseded by K2');
+        t.clock.tick(3000 + 320);
+        assert.strictEqual(el.classList.contains('show'), false, 'queue exhausted: K1 is gone');
+    }, { tags: ['unit'] });
+    test('transient toast shows over an unrelated pinned toast, which comes back afterwards (A3A-01)', async function() {
+        var t = await setup(), el = sb(t);
+        function msg() { return el.querySelector('.snackbar-message').textContent; }
+        t.m.showSnackbar('Endpoint saturated', 'warning');
+        t.m.showSnackbar('Copied to clipboard', 'success', undefined, { transient: true });
+        assert.strictEqual(msg(), 'Copied to clipboard', 'copy feedback is visible at once');
+        assert.strictEqual(el.className, 'snackbar show success');
+        t.clock.tick(3000); assert.strictEqual(el.classList.contains('show'), false, 'transient toast auto-hides');
+        t.clock.tick(320);
+        assert.strictEqual(msg(), 'Endpoint saturated', 'the pinned warning is back');
+        assert.ok(el.classList.contains('warning') && el.classList.contains('show'));
+        t.clock.tick(60000); assert.ok(el.classList.contains('show'), 'still pinned');
+        t.m.showSnackbar('Saved', 'success');
+        assert.strictEqual(msg(), 'Endpoint saturated', 'control: a non-transient toast still waits behind it');
+    }, { tags: ['unit'] });
+    // TA-6 (RG-F36): the transient path puts the pinned toast back through the same
+    // dedupe + MAX rules as every other enqueue (src/js/ui/220-notification-system.js).
+    test('transient path: a pinned toast that is put back twice shows only once (TA-6)', async function() {
+        var t = await setup(), el = sb(t);
+        function msg() { return el.querySelector('.snackbar-message').textContent; }
+        t.m.showSnackbar('Boom', 'error');
+        t.m.showSnackbar('Copied', 'success', undefined, { transient: true }); // Boom goes back to the queue
+        t.m.showSnackbar('Boom', 'error'); // nothing pinned on screen: the same error renders at once
+        assert.strictEqual(msg(), 'Boom');
+        t.m.showSnackbar('Copied', 'success', undefined, { transient: true }); // puts Boom back a second time
+        assert.strictEqual(msg(), 'Copied');
+        t.clock.tick(3000 + 320);
+        assert.strictEqual(msg(), 'Boom', 'the pinned error is back');
+        t.m.dismissSnackbar(); t.clock.tick(5000);
+        assert.strictEqual(el.classList.contains('show'), false, 'one dismissal is enough: no second queued copy of the error');
+    }, { tags: ['unit'] });
+    test('transient path keeps the queue at MAX and never evicts a pinned toast (TA-6)', async function() {
+        var t = await setup(), el = sb(t), E = [];
+        function msg() { return el.querySelector('.snackbar-message').textContent; }
+        function drainAll() { var seen = []; for (var n = 0; n < 40 && el.classList.contains('show'); n++) { seen.push(msg()); t.m.dismissSnackbar(); t.clock.tick(320); } return seen; }
+        for (var i = 1; i <= 20; i++) E.push('E' + i);
+        // 20 pinned toasts queued (MAX): there is no room to put E0 back, so it stays on screen.
+        t.m.showSnackbar('E0', 'error');
+        E.forEach(function(m) { t.m.showSnackbar(m, 'error'); });
+        t.m.showSnackbar('Copied', 'success', undefined, { transient: true });
+        assert.strictEqual(msg(), 'E0', 'no room in the queue: E0 is not displaced');
+        assert.deepStrictEqual(drainAll(), ['E0'].concat(E), 'E0 and the 20 queued toasts, each once');
+        assert.strictEqual(t.g.console.warn.calls.length, 0, 'no pinned toast was dropped');
+        // A full queue that holds an auto-dismissing toast: that one makes room.
+        t.m.showSnackbar('E0', 'error');
+        t.m.showSnackbar('status', 'success');
+        E.slice(0, 19).forEach(function(m) { t.m.showSnackbar(m, 'error'); });
+        t.m.showSnackbar('Copied', 'success', undefined, { transient: true });
+        assert.strictEqual(msg(), 'Copied', 'the transient toast shows at once');
+        t.clock.tick(3000 + 320);
+        assert.deepStrictEqual(drainAll(), ['E0'].concat(E.slice(0, 19)), 'the oldest auto-dismissing entry made room; E0 came back; the queue stayed at MAX');
+    }, { tags: ['unit'] });
+    test('callers pass the new opts: skill-editor key (A5A-01) and transient copy toasts (A3A-01)', async function() {
+        var sk = await loadFile('src/js/ui/010-skills-ui.js', WS), lay = await loadFile('src/js/ui/240-layout.js', WS);
+        assert.strictEqual(sk.split("undefined, { key: 'skill-editor' })").length - 1, 9, 'the 9 skill-editor toasts are keyed');
+        assert.strictEqual(/showSnackbar\('Save the skill first', 'error'\)/.test(sk), false, 'no unkeyed "Save the skill first" left');
+        ["'Message copied'", "'Response copied'"].forEach(function(m) {
+            assert.ok(lay.indexOf('showSnackbar(' + m + ", 'success', undefined, { transient: true })") >= 0, m + ' is transient');
+        });
     }, { tags: ['unit'] });
     test('queue full of pinned toasts: newcomer is logged to console.warn, never silently lost', async function() {
         var t = await setup();
@@ -287,11 +380,44 @@ describe('ui notifications › generic modal', function() {
     test('closeModal (the Escape path) resolves null and strips every modal mode class', async function() {
         var t = await setup(), o = ov(t);
         var p = t.m.showModal('t', 'm', [], 'warning');
-        ['skill-asset-modal', 'request-body-modal', 'screenshot-modal', 'pdf-modal', 'file-modal', 'worker-chat-modal'].forEach(function(c) { o.classList.add(c); });
+        ['skill-asset-modal', 'screenshot-modal', 'pdf-modal', 'file-modal', 'worker-chat-modal'].forEach(function(c) { o.classList.add(c); });
         t.m.closeModal();
         assert.strictEqual(await p, null);
         assert.strictEqual(o.className, 'modal-overlay');
         assert.deepStrictEqual([t.g.screenshotNav.list.length, t.g.screenshotNav.index], [0, -1]);
+    }, { tags: ['unit'] });
+    // S0C12-01: a dialog opened over the screenshot/PDF/file viewer must not inherit
+    // its content-mode class (its CSS hides .modal-actions) nor the viewer's nav state.
+    test('S0C12-01 showModal/showPromptModal/resolveModal strip content-mode classes', async function() {
+        var t = await setup(), o = ov(t);
+        o.classList.add('screenshot-modal', 'pdf-modal');
+        t.g.screenshotNav.list = [1, 2]; t.g.screenshotNav.index = 1;
+        var p = t.m.showModal('T', 'B', [{ label: 'OK', value: 'ok', class: 'primary' }]);
+        assert.strictEqual(o.classList.contains('screenshot-modal'), false, 'screenshot-modal stripped by showModal');
+        assert.strictEqual(o.classList.contains('pdf-modal'), false, 'pdf-modal stripped by showModal');
+        assert.ok(o.classList.contains('show'));
+        assert.strictEqual(t.$$('#modal-actions button').length, 1);
+        assert.deepStrictEqual([t.g.screenshotNav.list.length, t.g.screenshotNav.index], [0, -1], 'nav state reset');
+        o.classList.add('screenshot-modal');
+        U.fireInline(t.$('#modal-actions button'), 'click', t.m); // -> resolveModal('ok')
+        assert.strictEqual(await p, 'ok', 'resolveModal still settles the pending promise');
+        assert.strictEqual(o.classList.contains('screenshot-modal'), false, 'screenshot-modal stripped by resolveModal');
+        o.classList.add('file-modal', 'screenshot-modal');
+        var p2 = t.m.showPromptModal('Name', 'Enter a name', 'x');
+        assert.strictEqual(o.classList.contains('file-modal'), false, 'file-modal stripped by showPromptModal');
+        assert.strictEqual(o.classList.contains('screenshot-modal'), false, 'screenshot-modal stripped by showPromptModal');
+        assert.strictEqual(t.$$('#modal-actions button').length, 2);
+        t.m.resolveModal(null);
+        assert.strictEqual(await p2, null);
+    }, { tags: ['unit'] });
+    // S0B4-04: the request-body modal (showRequestBodyModal / downloadRequestBodyJson)
+    // had no caller left; its dead code and its CSS variant are removed.
+    test('request-body modal code is gone', async function() {
+        var t = await setup();
+        assert.strictEqual(typeof t.m.showRequestBodyModal, 'undefined');
+        assert.strictEqual(typeof t.m.downloadRequestBodyJson, 'undefined');
+        assert.strictEqual((await loadFile('src/js/ui/230-modals.js', WS)).indexOf('downloadRequestBodyJson'), -1);
+        assert.strictEqual((await loadFile('src/css/06-input.css', WS)).indexOf('request-body-modal'), -1);
     }, { tags: ['unit'] });
     test('opening a second modal settles the first as null (no hung await)', async function() {
         var t = await setup();
@@ -453,6 +579,27 @@ describe('ui notifications › tool approval card', function() {
         assert.ok(c.classList.contains('notification-expanded')); assert.strictEqual(ex.title, 'Collapse'); assert.strictEqual(c.querySelector('details').open, true);
         U.fireInline(ex, 'click', t.m);
         assert.strictEqual(c.classList.contains('notification-expanded'), false); assert.strictEqual(ex.title, 'Expand');
+        // A4A2-01: collapse closes (and unmarks) the params that expand opened ...
+        var det = c.querySelector('details.notification-params');
+        assert.strictEqual(det.open, false, 'collapse closes the params expand opened');
+        assert.strictEqual(det.hasAttribute('data-auto-opened'), false, 'collapse clears the auto-opened marker');
+        // ... but params the user opened before expanding stay open.
+        det.open = true;
+        U.fireInline(ex, 'click', t.m);
+        assert.strictEqual(det.hasAttribute('data-auto-opened'), false, 'expand does not mark user-opened params');
+        U.fireInline(ex, 'click', t.m);
+        assert.strictEqual(det.open, true, 'user-opened params stay open after expand + collapse');
+    }, { tags: ['unit'] });
+    test('grouped card: collapse closes every compact params popover that expand opened', async function() {
+        var t = await setup(), c = card(t);
+        ['a', 'b', 'c'].forEach(function(k, i) { promptIn(t, 'c1', 'tool_' + k, { x: i }, 't' + (i + 1)); });
+        assert.strictEqual(t.$$('#approval-card .notification-tool-item').length, 3);
+        var ex = c.querySelector('.notification-expand'); // queried after the last merge re-render
+        U.fireInline(ex, 'click', t.m);
+        assert.strictEqual(t.$$('#approval-card details.notification-params-compact[open]').length, 3, 'expand opens every row popover');
+        U.fireInline(ex, 'click', t.m);
+        assert.strictEqual(t.$$('#approval-card details.notification-params[open]').length, 0, 'no popover stays open over the rows / bulk bar');
+        assert.strictEqual(c.classList.contains('notification-expanded'), false);
     }, { tags: ['unit'] });
     test('duplicate (chatId, index) notifications are ignored; stale clicks on a resolved row are no-ops', async function() {
         var t = await setup(), c = card(t);

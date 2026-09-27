@@ -49,8 +49,26 @@ var DASHBOARD_CONTENT_FIELDS = ['html', 'title', 'error', 'chatId', 'msgIndex', 
 // prevHtml (optional): the pre-edit HTML, for callers that mutate the dashboard
 // record IN PLACE before saving — the history diff below compares against the
 // stored record, which in that case already holds the NEW html.
-async function saveDashboardWidget(widget, skipHistory, prevHtml) {
+//
+// TB-7: when IndexedDB fails, the save rolls its in-memory set back and REJECTS,
+// so an awaiting caller (importDashboard's "N of M saved") sees the failure.
+// Callers that fire and forget (ui/070 grid migration, drag end, resize end)
+// must not raise an unhandled rejection: the no-op handler below marks the
+// promise handled (the error is logged in the catch), and an awaiting caller
+// still receives the rejection.
+function saveDashboardWidget(widget, skipHistory, prevHtml) {
+    var result = saveDashboardWidgetImpl(widget, skipHistory, prevHtml);
+    result.catch(function() {});
+    return result;
+}
+
+async function saveDashboardWidgetImpl(widget, skipHistory, prevHtml) {
     try {
+        // TB-7 rollback snapshot, taken before this call changes anything.
+        var id = widget.id;
+        var hadEntry = Object.prototype.hasOwnProperty.call(dashboardWidgets, id);
+        var prevEntry = dashboardWidgets[id];
+        var prevFields = prevEntry ? Object.assign({}, prevEntry) : null;
         var existing = dashboardWidgets[widget.id];
         var basisHtml = (prevHtml === undefined || prevHtml === null)
             ? (existing ? existing.html : null)
@@ -73,6 +91,9 @@ async function saveDashboardWidget(widget, skipHistory, prevHtml) {
         target.lastPrompt = target.prompt;
         
         dashboardWidgets[target.id] = target;
+        // What this call wrote (TB-7): at rollback, a key whose value differs from
+        // this was changed by someone else meanwhile (e.g. a later save) and is kept.
+        var afterFields = prevFields ? Object.assign({}, target) : null;
         
         // Create a copy without transient state for storage
         var widgetToSave = Object.assign({}, target);
@@ -83,8 +104,9 @@ async function saveDashboardWidget(widget, skipHistory, prevHtml) {
         var transaction = database.transaction([dashboardWidgetsStoreName], 'readwrite');
         var store = transaction.objectStore(dashboardWidgetsStoreName);
 
-        // Wait for the write to complete
-        return new Promise(function(resolve, reject) {
+        // Wait for the write to complete (awaited, so an async put error also
+        // reaches the catch below)
+        await new Promise(function(resolve, reject) {
             var request = store.put(widgetToSave);
             request.onsuccess = function() {
                 resolve();
@@ -96,6 +118,20 @@ async function saveDashboardWidget(widget, skipHistory, prevHtml) {
         });
     } catch (e) {
         console.error('Failed to save dashboard widget:', e);
+        // TB-7: roll back this call's in-memory set (skipped if a later write has
+        // already replaced or deleted the entry), then rethrow.
+        if (target && dashboardWidgets[id] === target) {
+            if (prevFields) {
+                Object.keys(prevEntry).concat(Object.keys(prevFields)).forEach(function(k) {
+                    if (afterFields && !Object.is(prevEntry[k], afterFields[k])) return;
+                    if (Object.prototype.hasOwnProperty.call(prevFields, k)) prevEntry[k] = prevFields[k];
+                    else delete prevEntry[k];
+                });
+            }
+            if (hadEntry) dashboardWidgets[id] = prevEntry;
+            else delete dashboardWidgets[id];
+        }
+        throw e;
     }
 }
 

@@ -27,6 +27,9 @@ var _swBootReadyResolve = null;
 self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolve; });
 
 (function bootSwRuntime() {
+    // F6 boot breadcrumbs (worker/185-boot-crumbs-sw.js): first persisted
+    // marker of this SW boot. Guarded, fire-and-forget, never breaks boot.
+    if (typeof swBootCrumb === 'function') { try { swBootCrumb('sw-start'); } catch (eCrumb) {} }
     // Per-loader .catch so a transient IDB hiccup in any single loader
     // doesn't block the resume scan. We want resume to be best-effort:
     // a missing provider list, missing skills, etc. degrades gracefully,
@@ -124,6 +127,18 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         safe(loadSubs, 'subAgents'),
         safe(Platform.ready, 'platform')
     ]).then(function() {
+        // F6: every loader settled (possibly degraded by its deadline) —
+        // record what actually hydrated. Each count is typeof-guarded.
+        if (typeof swBootCrumb === 'function') {
+            try {
+                swBootCrumb('sw-loaders-done', {
+                    chats: (typeof chats !== 'undefined' && chats) ? Object.keys(chats).length : null,
+                    docs: (typeof smartDocuments !== 'undefined' && smartDocuments) ? Object.keys(smartDocuments).length : null,
+                    subs: (typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.listAll === 'function') ? SubAgents.listAll().length : null,
+                    hydrated: (typeof _chatsHydrated !== 'undefined') ? !!_chatsHydrated : null
+                });
+            } catch (eCrumb) {}
+        }
         // Signal that `chats` and providers are populated. Any concurrent
         // resume from background.js was waiting on this.
         if (_swBootReadyResolve) { _swBootReadyResolve(); _swBootReadyResolve = null; }
@@ -243,6 +258,10 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // Failsafe: still open the boot gate so background.js's alarm
         // path can attempt resume even after a partial loader failure.
         if (_swBootReadyResolve) { _swBootReadyResolve(); _swBootReadyResolve = null; }
+        // F6: the one failure crumb of this boot (after the gate failsafe).
+        if (typeof swBootCrumb === 'function') {
+            try { swBootCrumb('sw-boot-error', { err: String((e && e.message) || e).slice(0, 200) }); } catch (eCrumb) {}
+        }
         // ZR1-R1 (follow-up): this catch also fires when
         // listRunningAgentCheckpoints rejects AFTER loadAllSubAgents already
         // claimed pool slots for checkpoint-resumable subs — without the

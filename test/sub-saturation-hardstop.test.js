@@ -124,6 +124,18 @@ describe('#3 sub-agent saturation hard stop (app/030-agent-loop.js)', function()
         assert.ok(/FINAL WARNING/.test(txt), txt);
         assert.ok(/~60%/.test(txt), txt);
     });
+    test('(4b) sub context notices name the non-error report status (need_input) at 50/60/100%; main notices do not', async function() {
+        var m = await load(); reset(m);
+        [500, 600, 1000].forEach(function(n) {
+            var txt = JSON.stringify(m.appendContextNotice(subChat(n), 'result'));
+            assert.ok(/report_to_parent/.test(txt), n + ': ' + txt);
+            assert.ok(/status \\"need_input\\"/.test(txt), n + ': no need_input status: ' + txt);
+            assert.ok(/NOT an error/.test(txt), n + ': ' + txt);
+        });
+        var main = subChat(600); main.isSubAgent = false;
+        var mtxt = JSON.stringify(m.appendContextNotice(main, 'result'));
+        assert.ok(/FINAL WARNING/.test(mtxt) && !/need_input/.test(mtxt), mtxt);
+    });
     test('(5) loop wiring: call site sits between the progress nudge and the assistant row, breaks on reported', async function() {
         var src = await loadFile('src/js/app/030-agent-loop.js');
         var iNudge = src.indexOf('_progressNudge: true,');

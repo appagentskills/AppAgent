@@ -1848,7 +1848,25 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (typeof sandbox !== 'undefined' && sandbox && sandbox.parentNode) {
                 try { sandbox.parentNode.removeChild(sandbox); } catch (cleanupErr) {}
             }
-            return { success: false, error: e.message };
+            // B2-JS-EVAL-ERROR-SURFACE:BEGIN (sliced by test/tool-error-surfacing.test.js)
+            // Never swallow a sandbox/offscreen failure. SW errors (background.js)
+            // read 'OFFSCREEN_<CODE>: sentence' and/or keep callOffscreenHelper's
+            // /not available/ wording. error_code = first OFFSCREEN_* token, else
+            // OFFSCREEN_UNAVAILABLE for an offscreen/sandbox 'not available'
+            // message; any other error keeps the pre-B2 {success:false, error}.
+            var _jsErrMsg = (e && e.message) || (e != null ? String(e) : '');
+            var _jsErrCode = (_jsErrMsg.match(/\bOFFSCREEN_[A-Z_]+\b/) || [])[0] ||
+                (/not available/i.test(_jsErrMsg) && /offscreen|sandbox/i.test(_jsErrMsg) ? 'OFFSCREEN_UNAVAILABLE' : null);
+            var _jsErrHint = 'Hint: Reload the extension; if the problem persists, check chrome://extensions \u2192 AppAgent \u2192 Errors.';
+            if (_jsErrCode) return { success: false, error: 'js_eval sandbox unavailable: ' + _jsErrMsg + '\n' + _jsErrHint, error_code: _jsErrCode };
+            // Realm-safe (no instanceof): an Error object with an empty message,
+            // e.g. new Error('') or new TypeError(''), stringifies to its bare name.
+            var _jsErrNoMsg = e !== null && typeof e === 'object' && (e.message === '' || (!e.message && /^[A-Za-z]*Error$/.test(_jsErrMsg)));
+            if (!_jsErrMsg || _jsErrMsg === 'undefined' || _jsErrMsg === '[object Object]' || _jsErrNoMsg) {
+                return { success: false, error: 'js_eval failed without an error message (the sandbox may be unavailable).\n' + _jsErrHint };
+            }
+            return { success: false, error: (e && e.message) || _jsErrMsg };
+            // B2-JS-EVAL-ERROR-SURFACE:END
         }
     } else if (name === 'list_instances') {
         // List all connected ServiceNow instances.
@@ -3360,9 +3378,10 @@ async function wsClone(repo, branch) {
         }
     }
 
-    // Save metadata — carry pin state + fork lineage across a re-clone.
-    // Rebuilding meta from scratch silently UNPINNED a pinned workspace, so
-    // Reload/default resolution could switch to a different workspace.
+    // Save metadata — carry pin state, fork lineage and the PR tracking
+    // (meta.prs) across a re-clone. Rebuilding meta from scratch silently
+    // UNPINNED a pinned workspace, so Reload/default resolution could switch
+    // to a different workspace, and dropped the workspace's PR list (TA-2).
     var _newMeta = {
         repo: wk,
         github_repo: repo,
@@ -3377,6 +3396,7 @@ async function wsClone(repo, branch) {
         if (existing.pinned) _newMeta.pinned = true;
         if (existing.forked_from) _newMeta.forked_from = existing.forked_from;
         if (existing.base_branch) _newMeta.base_branch = existing.base_branch;
+        if (existing.prs) _newMeta.prs = existing.prs; // TA-2: keep the PR tracking
     }
     await setWorkspaceMeta(_newMeta);
 
@@ -4012,14 +4032,13 @@ async function setWorkspacePin(wk, unpin) {
         for (var i = 0; i < all.length; i++) {
             var m = all[i];
             if (m && m.repo !== wk && m.pinned && (m.github_repo || parseWsKey(m.repo).repo) === githubRepo) {
-                m.pinned = false;
-                await setWorkspaceMeta(m);
-                cleared.push(m.repo);
+                // S8B-01: patch only `pinned` on the fresh row (the `all` snapshot may be stale).
+                if (await patchWorkspaceMeta(m.repo, function(c) { if (!c.pinned) return false; c.pinned = false; })) cleared.push(m.repo);
             }
         }
     }
-    meta.pinned = !unpin;
-    await setWorkspaceMeta(meta);
+    // S8B-01: patch only `pinned` on the fresh row, never the stale `meta` snapshot.
+    await patchWorkspaceMeta(wk, function(c) { c.pinned = !unpin; });
     try { AgentEvents.emit('workspaceMutated', { action: 'pin', repo: wk, pinned: !unpin }); } catch (e) {}
     var res = { success: true, workspace: wk, pinned: !unpin };
     if (cleared.length) res.unpinned = cleared;
@@ -5809,6 +5828,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
     }
     // Re-read meta after sync (head_sha may have advanced)
     meta = await getWorkspaceMeta(wk);
+    if (!meta) return { success: false, error: 'Workspace "' + wk + '" no longer exists (removed or unreadable during sync). Re-clone before pushing.' };
 
     // Base is always the source/cloned branch unless explicitly overridden.
     // A local fork's base is the branch it was forked FROM (meta.base_branch)
@@ -6529,7 +6549,24 @@ var DEPLOY_ROOT_MANAGED = ['app.html', 'app.js', 'app.css', 'sw-bundle.js', 'the
 // count in files_skipped — callers gating on success should use the sum.
 async function wsDeploy(wk, srcPath, destSubdir) {
     var handle = await getDeployDirHandle();
-    if (!handle) return { success: false, error: 'No deploy folder connected. Go to Settings > GitHub > Connect Folder.' };
+    if (!handle) {
+        // TB-4: null means no stored folder OR a stored one whose readwrite
+        // grant lapsed ('prompt'/'denied'): name the Settings button that fixes it.
+        var _ds = null;
+        try { _ds = typeof getDeployDirStatus === 'function' ? await getDeployDirStatus() : null; } catch (e) { _ds = null; }
+        if (_ds && (_ds.state === 'prompt' || _ds.state === 'denied')) return { success: false, error: 'Deploy folder "' + (_ds.name || '?') + '" is connected, but its readwrite access lapsed. Go to Settings > GitHub > Grant access.' };
+        return { success: false, error: 'No deploy folder connected. Go to Settings > GitHub > Connect Folder.' };
+    }
+    // S0B3-01: never write into (or prune) a folder that does not look like an
+    // AppAgent build unless the user confirmed that folder when connecting it.
+    var _di = {}, _id = typeof checkDeployDirIdentity === 'function' ? await checkDeployDirIdentity(handle, _di) : 'unknown';
+    if (_id === 'foreign' && !(await getSetting('deployDirForeignOk'))) return { success: false, error: 'Deploy folder does not look like an AppAgent build (manifest "' + (_di.name || '?') + '"). Reconnect it in Settings > GitHub.' };
+    // R-C4d #1: an EMPTY folder is ours to fill — persist that consent BEFORE
+    // the first write: the build's icons/ deploy leaves it non-empty without a
+    // manifest, so the root deploy's re-check reads 'foreign'. Also covers
+    // handles connected before empty folders were consented at connect time.
+    // A failed persist fails closed (the next check refuses).
+    if (_id === 'empty') await setSetting('deployDirForeignOk', true);
 
     var files = await getAllWorkspaceFiles(wk);
     if (files.length === 0) return { success: false, error: 'No files in workspace. Clone first.' };

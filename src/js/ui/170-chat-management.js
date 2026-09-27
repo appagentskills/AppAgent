@@ -726,6 +726,13 @@ async function summarizeAndStartNewChat() {
     }
 }
 
+// A6A3-02 / TA-9: a path that hands the composer to a fresh chat drops a
+// transient hint (openAddWidgetModal sets its own after newChat()).
+function resetComposerPlaceholder(inputEl) {
+    var el = inputEl || document.getElementById('message-input');
+    if (el) el.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
+}
+
 // Called after agent completes a summary request to create the new chat
 function completeSummaryAndCreateNewChat() {
     if (!pendingSummaryRequest) return;
@@ -740,7 +747,9 @@ function completeSummaryAndCreateNewChat() {
     var summary = null;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         var msg = chat.messages[i];
-        if (msg.role === 'assistant' && msg.content && !msg.isSummary) {
+        // A2B3-01: the SW's runAgent finish may already have stamped isSummary on
+        // this reply (_stampSummaryReply), so skip only aggregate metric rows.
+        if (msg.role === 'assistant' && msg.content && !(msg.metrics && msg.metrics.isAggregate)) {
             summary = msg.content;
             // Mark as summary so it's not counted in metrics
             msg.isSummary = true;
@@ -781,6 +790,8 @@ function completeSummaryAndCreateNewChat() {
     renderMessages();
     renderVersionSidebar();
     updateChatTitleHeader();
+    // TA-9: this path bypasses newChat(), so it resets the composer hint itself.
+    if (typeof resetComposerPlaceholder === 'function') resetComposerPlaceholder();
     // Reset Workers strip for the fresh chat — the new chat owns no
     // sub-agents yet, so the strip should be empty/hidden. Without this,
     // chips from the previous chat persist until the next selectChat.
@@ -819,8 +830,6 @@ function newChat() {
     activeStreamingChatId = null;
     pendingInjection = null;
     pendingInjectionImages = null;
-    hidePauseButton();
-    hideContinueButton();
     // Clear foreground-UI globals so the previous chat's state doesn't leak
     // into the fresh new chat. Two real cases were observed:
     //   - lastApiError: drives the inline error banner. If chat A blew up
@@ -838,14 +847,16 @@ function newChat() {
     // B14: newChat must also hide the dead Retry button + the (non-auto-dismiss)
     // error snackbar left over from the previous chat, like selectChat /
     // openChatFromHistory. Clearing only lastApiError left the button visible-but-dead
-    // and the red error snackbar pinned over the empty new chat.
-    if (typeof hideRetryButton === 'function') hideRetryButton();
+    // and the red error snackbar pinned over the empty new chat. The buttons are
+    // now painted by the CHAT-CONTROLS derive right after the new chat exists.
     if (typeof hideSnackbar === 'function') hideSnackbar();
     var _newChatMessagesEl = document.getElementById('messages');
     if (_newChatMessagesEl) _newChatMessagesEl.classList.remove('is-streaming');
 
     currentChatId = generateId();
     chats[currentChatId] = { id: currentChatId, title: 'New Chat', messages: [], createdAt: Date.now(), isTemporary: true };
+    // CHAT-CONTROLS SSOT: a fresh chat always derives 'none' (all three hidden).
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(currentChatId);
 
     // Close the previous view only after switching identity and resetting the UI.
     // These helpers call showChatView(), which marks the focused chat as seen.
@@ -906,6 +917,8 @@ function newChat() {
     var inputEl = document.getElementById('message-input');
     if (inputEl) {
         inputEl.value = '';
+        // A6A3-02: drop a transient hint (openAddWidgetModal sets its own after newChat()).
+        inputEl.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
         inputEl.style.height = 'auto';
         inputEl.focus();
     }
@@ -961,15 +974,15 @@ function selectChat(chatId, options) {
     // navigateToSearchMatch re-sets it right after selectChat, so jumping to
     // a match still highlights.
     window.currentSearchHighlight = null;
-    // R-2: clear the dead Retry button + the (non-auto-dismiss) error snackbar
-    // left over from the previous chat, then re-derive Retry from THIS chat's
-    // persisted error (R-1 stores an unfocused foreground chat's error on the
-    // chat as _lastApiError) so a previously-unfocused errored chat stays
-    // recoverable when the user navigates to it.
-    if (typeof hideRetryButton === 'function') hideRetryButton();
+    // R-2: clear the (non-auto-dismiss) error snackbar left over from the
+    // previous chat, then restore the global error from THIS chat's persisted
+    // error (R-1 stores an unfocused foreground chat's error on the chat as
+    // _lastApiError) so a previously-unfocused errored chat stays recoverable
+    // when the user navigates to it. Retry itself is painted by the
+    // CHAT-CONTROLS derive below, once this chat is the displayed one.
     if (typeof hideSnackbar === 'function') hideSnackbar();
     var _selErr = chats[chatId] && chats[chatId]._lastApiError;
-    if (_selErr) { lastApiError = _selErr; if (typeof showRetryButton === 'function') showRetryButton(); }
+    if (_selErr) { lastApiError = _selErr; }
     if (runningChatIds[chatId]) {
         isRunning = true;
         activeStreamingChatId = chatId;
@@ -979,15 +992,9 @@ function selectChat(chatId, options) {
         var _selHook = typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId);
         if (_selHook) {
             if (_messagesEl) _messagesEl.classList.remove('is-streaming');
-            if (typeof hidePauseButton === 'function') hidePauseButton();
         } else {
             if (_messagesEl) _messagesEl.classList.add('is-streaming');
-            // Pass chatId explicitly — currentChatId hasn't been updated yet (line below)
-            // so showPauseButton's syncPauseButtonUI call would otherwise read the
-            // previous chat's pausedChats flag and mislabel the button.
-            showPauseButton(chatId);
         }
-        hideContinueButton();
         var stored = pendingInjectionsByChatId[chatId];
         if (stored) {
             pendingInjection = stored.text;
@@ -999,15 +1006,16 @@ function selectChat(chatId, options) {
         isRunning = false;
         activeStreamingChatId = null;
         if (_messagesEl) _messagesEl.classList.remove('is-streaming');
-        hidePauseButton();
         pendingInjection = null;
         pendingInjectionImages = null;
-        // If the chat looks interrupted (e.g. page was reloaded mid-stream), show
-        // a Continue button so the user can pick up where the agent left off.
-        refreshContinueButtonForChat(chatId);
+        // An interrupted chat (e.g. page reloaded mid-stream) gets Continue from
+        // the CHAT-CONTROLS derive below, once this chat is the displayed one.
     }
     currentChatId = chatId;
     appStorage.setItem('lastChatId', chatId);
+    // CHAT-CONTROLS SSOT: paint Pause/Resume/Retry/Continue for the chat that is
+    // now displayed (running, paused, errored or interrupted), after the writes above.
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
     // SAGF-1: tell the SW which chat is focused so its sub-agent GC paths don't
     // reclaim a transcript the user is now viewing (SW currentChatId is null).
     if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
@@ -1114,6 +1122,9 @@ function selectChat(chatId, options) {
         showChatView();
         currentView = 'chat';
         appStorage.setItem('currentView', 'chat');
+        // CHAT-CONTROLS SSOT: showChatView() derived while currentView was still
+        // the old view (all hidden); re-derive now that the chat view is active.
+        if (typeof syncChatControlsUI === 'function') syncChatControlsUI(currentChatId);
         updateAllButtonStates();
     } else if (!sidebarCollapsed && (document.body.classList.contains('sidepanel-mode') || window.innerWidth <= 480)) {
         toggleSidebar();
@@ -1392,6 +1403,10 @@ async function deleteChat(chatId, e) {
     // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
     // (the runFinished cleanup in app/045 only prunes on a NON-paused terminal event).
     try { if (typeof _pruneChatPauseTokens === 'function') _pruneChatPauseTokens(chatId); } catch (ePt) {}
+    // NEW-T15-2: drop the in-memory pause flag (pausedChats, core/030-config.js) too.
+    // A plain delete, not setChatPausedPersistent: that would dispatch a chat-meta
+    // write for the tombstoned chat.
+    try { if (typeof pausedChats !== 'undefined' && pausedChats) delete pausedChats[chatId]; } catch (ePc) {}
     // Chat-scoped approval grants ("Allow for this chat") die with the chat.
     try { _pruneChatPermissionGrants(chatId); } catch (ePg) {}
     // MEMFIX (leak prunes): drop per-chat caches that used to survive deletion.
@@ -1404,6 +1419,9 @@ async function deleteChat(chatId, e) {
     try { if (typeof stickToBottomByChatId !== 'undefined' && stickToBottomByChatId) delete stickToBottomByChatId[chatId]; } catch (eSb) {}
     try { if (typeof pendingInjectionsByChatId !== 'undefined' && pendingInjectionsByChatId) delete pendingInjectionsByChatId[chatId]; } catch (ePi) {}
     try { if (typeof pendingWidgetRegenerationByChatId !== 'undefined' && pendingWidgetRegenerationByChatId) delete pendingWidgetRegenerationByChatId[chatId]; } catch (ePw) {}
+    // NEW-T21-1: the #messages scroll listener (ui/010-skills-ui.js) persists
+    // appStorage 'scrollPos_<id>' and nothing else removes it, so drop it here.
+    try { appStorage.removeItem('scrollPos_' + chatId); } catch (eSp) {}
     // Expanded-state maps (core/030-config.js) are keyed by chatId+':'+…
     try {
         var _pfx = chatId + ':';
@@ -1429,9 +1447,34 @@ async function deleteChat(chatId, e) {
     try { _swNotified = _notifyWorkerChatDeleted(chatId); } catch (eSw) { _swNotified = false; }
     saveChatsToStorage();
     if (currentChatId === chatId) {
-        var ids = Object.keys(chats);
-        ids.length > 0 ? selectChat(ids[0]) : newChat();
+        // A2B3-02 (FO9/PM2): deleting the OPEN chat lands on a fresh chat, the
+        // same one newChat() gives. It never opens another existing chat: the
+        // old pick took the first key of the chats map (roughly the oldest chat,
+        // even a hidden chat_sub_* or 0-message one), and selectChat stamped
+        // that chat's lastViewedAt although the user never chose it.
+        newChat();
     } else renderChatList();
+    // TA3-5: the chat's composer drafts (text + images) die with it, in memory and
+    // in settings. Done after newChat(), whose pending-state save still files the
+    // open composer under the deleted id.
+    try {
+        var _textGone = false, _imagesGone = false;
+        if (typeof chatPendingTexts !== 'undefined' && chatPendingTexts
+            && Object.prototype.hasOwnProperty.call(chatPendingTexts, chatId)) {
+            delete chatPendingTexts[chatId];
+            _textGone = true;
+        }
+        if (typeof chatPendingImages !== 'undefined' && chatPendingImages
+            && Object.prototype.hasOwnProperty.call(chatPendingImages, chatId)) {
+            delete chatPendingImages[chatId];
+            _imagesGone = true;
+        }
+        if (_textGone && typeof persistPendingTextsToStorage === 'function') persistPendingTextsToStorage();
+        if (_imagesGone && typeof setSetting === 'function') {
+            var _imgSave = setSetting('chatPendingImages', Object.keys(chatPendingImages).length > 0 ? chatPendingImages : null);
+            if (_imgSave && typeof _imgSave.catch === 'function') _imgSave.catch(function() {});
+        }
+    } catch (eDr) {}
     renderHistoryPage();
     showSnackbar('Chat deleted', 'success');
     // EXPLICIT-DELETE: a tombstone that never reached the SW is a guaranteed

@@ -1,54 +1,19 @@
-// Show request body modal with JSON formatting (collapse/expand)
-var currentRequestBodyJson = null;
-function showRequestBodyModal(requestBodyId) {
-    var el = document.getElementById(requestBodyId);
-    if (!el) return;
-    
-    var requestBody;
-    try {
-        requestBody = JSON.parse(decodeURIComponent(el.getAttribute('data-json')));
-    } catch (e) {
-        showSnackbar('Failed to parse request body', 'error');
-        return;
-    }
-    
-    currentRequestBodyJson = requestBody;
-    
-    var overlay = document.getElementById('modal-overlay');
-    var header = document.getElementById('modal-header');
-    var body = document.getElementById('modal-body');
-    var actions = document.getElementById('modal-actions');
-    
-    header.innerHTML = '<span class="modal-title-text">API Request Body</span><div class="modal-header-actions">' +
-        '<button class="modal-edit-btn" onclick="downloadRequestBodyJson()" title="Download JSON">' + UI_ICONS.download + '</button>' +
-        '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
-    body.innerHTML = '<div class="json-viewer-container"><pre class="json-viewer">' + formatJsonValue(requestBody, 0) + '</pre></div>';
-    actions.innerHTML = '';
-    
-    overlay.classList.add('show');
-    overlay.classList.add('request-body-modal');
-}
-
-function downloadRequestBodyJson() {
-    if (!currentRequestBodyJson) return;
-    var blob = new Blob([JSON.stringify(currentRequestBodyJson, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'api-request-' + new Date().toISOString().slice(0, 19).replace(/[:-]/g, '') + '.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showSnackbar('Request body downloaded', 'success');
-}
-
 function resolveModal(value) {
     var overlay = document.getElementById('modal-overlay');
     overlay.classList.remove('show');
     overlay.classList.remove('modal-variant-warning');
     overlay.classList.remove('modal-variant-danger');
+    // S0C12-01: also drop any content-mode class (ui/220 resetModalContentMode).
+    if (typeof resetModalContentMode === 'function') resetModalContentMode(overlay);
     if (modalResolve) { modalResolve(value); modalResolve = null; }
+}
+
+// S0C-01: the OK button calls this instead of an inline
+// resolveModal(document.getElementById(...).value) - the CSP polyfill cannot
+// evaluate that nested expression and resolved the literal JS text instead.
+function submitPromptModal() {
+    var input = document.getElementById('modal-prompt-input');
+    resolveModal(input ? input.value : null);
 }
 
 // Helper function for confirm dialogs - returns true if confirmed.
@@ -73,6 +38,8 @@ function showPromptModal(title, message, defaultValue) {
         if (typeof settlePendingModalResolve === 'function') settlePendingModalResolve();
         modalResolve = resolve;
         var overlay = document.getElementById('modal-overlay');
+        // S0C12-01: never inherit a content viewer's mode class (hidden actions).
+        if (typeof resetModalContentMode === 'function') resetModalContentMode(overlay);
         var header = document.getElementById('modal-header');
         var body = document.getElementById('modal-body');
         var actions = document.getElementById('modal-actions');
@@ -80,7 +47,7 @@ function showPromptModal(title, message, defaultValue) {
         body.innerHTML = '<p style="margin:0 0 var(--space-6) 0;">' + escapeHtml(message) + '</p>' +
             '<input type="text" id="modal-prompt-input" class="modal-input" value="' + escapeHtml(defaultValue || '') + '" style="width:100%;padding: var(--space-4) var(--space-6);border:1px solid var(--secondary-border);border-radius:var(--radius-md);font-size:var(--text-body-lg);">';
         actions.innerHTML = '<button class="modal-btn secondary" onclick="resolveModal(null)">Cancel</button>' +
-            '<button class="modal-btn primary" onclick="resolveModal(document.getElementById(\'modal-prompt-input\').value)">OK</button>';
+            '<button class="modal-btn primary" onclick="submitPromptModal()">OK</button>';
         overlay.classList.add('show');
         setTimeout(function() {
             var input = document.getElementById('modal-prompt-input');
@@ -95,6 +62,8 @@ function showPromptModal(title, message, defaultValue) {
 // so Escape is intentionally NOT duplicated here.
 document.addEventListener('keydown', function(e) {
     if (e.key !== 'Enter' || e.isComposing) return;
+    // R3b-c: an Enter a focused control already handled (e.g. a chat row) is not a submit.
+    if (e.defaultPrevented) return;
     var overlay = document.getElementById('modal-overlay');
     if (!overlay || !overlay.classList.contains('show')) return;
     // Only generic prompt/confirm modals set modalResolve. Bug-sweep F2: the rename

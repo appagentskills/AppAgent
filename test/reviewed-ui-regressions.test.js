@@ -23,7 +23,9 @@ async function runReviewedUiAudit(sources) {
         'getCurrentPendingContext', 'savePendingImagesForContext', 'restorePendingImagesForContext',
         'savePendingTextForContext', 'restorePendingTextForContext', 'persistPendingTextsToStorage',
         'persistPendingImagesToSession', 'getEditedTurnAttachments', 'editMessage',
-        'setPendingImagesOwner', 'getPendingImagesOwnerContext'];
+        'setPendingImagesOwner', 'getPendingImagesOwnerContext',
+        '_attachmentChars', 'isFileDrag', 'resetDropOverlay', '_armDropHeartbeat',
+        'handleDragOver', 'handleDragEnter', 'handleDragLeave', 'handleDrop'];
     var code = names.map(function(n) { return declaration(attachments, n); }).join('\n') + '\n' +
         declaration(navigation, 'selectChat') + '\n' + declaration(sources['src/js/ui/030-home-view.js'], 'sendHomeMessage') + '\n' +
         declaration(sources['src/js/ui/050-history-view.js'], 'openChatFromHistory');
@@ -41,6 +43,7 @@ async function runReviewedUiAudit(sources) {
             runningChatIds: {}, pendingInjectionsByChatId: {}, sidebarCollapsed: true,
             isRunning: false, activeStreamingChatId: null, lastApiError: null,
             pendingInjection: null, pendingInjectionImages: null,
+            dragDepth: 0, _dropHb: null, DROP_OVERLAY_HEARTBEAT_MS: 1000, MAX_PENDING_ATTACHMENT_CHARS: 30 * 1024 * 1024,
             window: { innerWidth: 1024, currentSearchHighlight: null },
             appStorage: { setItem: function() {} },
             document: { getElementById: element, body: element('body'), createElement: function() {
@@ -149,6 +152,51 @@ async function runReviewedUiAudit(sources) {
         f.api.openChatFromHistory('B'); check(f.env.chatPendingImages.A.length === 2 && f.env.chatPendingImages.home.length === 1, 'drafts lost on history open');
     });
     var legacyDoc = { role: 'context', content: '[User referenced Smart Document "Legacy" (doc_id: old_doc). Use the document tool with action "read" and this doc_id to access its content.]' };
+    await test('non-file drags are ignored: no preventDefault, no overlay, no processing', function() {
+        var f = fixture(), shown = false, ov = f.element('drop-overlay');
+        ov.classList = { add: function(c) { if (c === 'visible') shown = true; }, remove: function(c) { if (c === 'visible') shown = false; }, contains: function() { return shown; } };
+        function drag(types, files) { return { prevented: 0, preventDefault: function() { this.prevented++; }, stopPropagation: function() {}, dataTransfer: { types: types, files: files || [] } }; }
+        var text = [drag(['text/plain']), drag(['text/plain']), drag(['text/plain'], [file('text/plain', 'x.txt')])];
+        f.api.handleDragEnter(text[0]); f.api.handleDragOver(text[1]); f.api.handleDrop(text[2]);
+        check(text.every(function(e) { return e.prevented === 0; }), 'text drag default prevented');
+        check(!shown && f.env.dragDepth === 0 && f.readers.length === 0, 'text drag treated as a file drag');
+        f.api.handleDragEnter(drag(['Files'])); check(shown && f.env.dragDepth === 1, 'file drag did not show the overlay');
+        var d = drag(['Files'], [file('text/plain', 'x.txt')]); f.api.handleDrop(d);
+        check(d.prevented === 1 && !shown && f.env.dragDepth === 0 && f.readers.length === 1, 'file drop not handled');
+    });
+    await test('attach on a non-chat view or with no chat is refused', function() {
+        var f = fixture('dashboard'); f.api.processImageFile(file('text/plain', 'a.txt'));
+        var last = f.errors[f.errors.length - 1] || '';
+        check(f.readers.length === 0 && !f.env.pendingImageAttachments.length && !Object.keys(f.env.chatPendingImages).length, 'dashboard attach went to a hidden draft');
+        check(/Open a chat/.test(last) && !/deleted/.test(last), 'wrong refusal message: ' + last);
+        var g = fixture(); g.env.currentChatId = null; g.api.processImageFile(file('application/pdf', 'b.pdf'));
+        last = g.errors[g.errors.length - 1] || '';
+        check(g.readers.length === 0 && /Open a chat/.test(last) && !/deleted/.test(last), 'no-chat attach not refused: ' + last);
+    });
+    await test('picker-offered .log/.yml/.yaml files are read as text', function() {
+        var f = fixture();
+        f.api.processImageFile({ type: 'application/x-yaml', name: 'c.yaml', size: 12 });
+        f.api.processImageFile({ type: '', name: 'a.log', size: 12 });
+        f.api.processImageFile({ type: '', name: 'b.yml', size: 12 });
+        check(f.readers.length === 3, 'not read as text: ' + f.readers.length + ' of 3');
+        check(!f.errors.some(function(m) { return /Unsupported/.test(m); }), 'rejected as unsupported');
+        finish(f.readers[0], 'k: v');
+        var a = f.env.pendingImageAttachments[0];
+        check(a && a.fileType === 'file' && a.name === 'c.yaml' && a.content === 'k: v', 'yaml not attached as a text file');
+    });
+    await test('aggregate pending attachments are capped at ~30 MB', function() {
+        var f = fixture(); f.env.renderPendingImages = function() {}; f.env.setSetting = function() {};
+        var big = 'x'.repeat(12 * 1024 * 1024);
+        f.api.appendPendingImageForContext('A', { name: 'n1', base64: big });
+        f.api.appendPendingImageForContext('A', { name: 'n2', base64: big });
+        check(f.env.pendingImageAttachments.length === 2 && !f.errors.length, 'attachments under the cap refused');
+        f.api.appendPendingImageForContext('A', { name: 'n3', base64: big });
+        check(f.env.pendingImageAttachments.length === 2, 'attachment over the aggregate cap kept');
+        check(/"n3" skipped: attachments would exceed ~30 MB/.test(f.errors[f.errors.length - 1] || ''), 'no cap message');
+        f.api.appendPendingImageForContext('B', { name: 'b1', content: big }); f.api.appendPendingImageForContext('B', { name: 'b2', base64: big });
+        f.api.appendPendingImageForContext('B', { name: 'b3', content: big });
+        check(f.env.chatPendingImages.B.length === 2 && f.errors.length === 2, 'background draft not capped');
+    });
     await test('edit branch preserves earlier history and all attachment metadata, isolates source draft and transcript', function() {
         var f = fixture();
         var original = [ { role: 'user', content: 'earlier' }, { role: 'assistant', content: 'answer', tool_calls: [{ id: 'kept' }] },
@@ -277,8 +325,88 @@ async function runReviewedUiAudit(sources) {
         var toggle = declaration(notifications, 'toggleModelMenu');
         check(toggle.indexOf("event.type === 'keydown') menu.querySelector") >= 0 && toggle.indexOf("if (e.key === 'Escape')") >= 0 && toggle.indexOf('anchor.focus()') >= 0, 'popup keyboard focus lifecycle missing');
     });
+    // A2A2-01: the real hideAllPanels/openDashboardView/openHomeView, evaluated only for these tests
+    // (the shared fixture stubs hideAllPanels); pending-text helpers come from the fixture api.
+    function homeNav(f) {
+        var env = f.env;
+        ['getCurrentPendingContext', 'savePendingImagesForContext', 'restorePendingImagesForContext',
+            'savePendingTextForContext', 'persistPendingTextsToStorage'].forEach(function(n) { env[n] = f.api[n]; });
+        'stopHomeTrailAnimation renderDashboard renderHome pushFocusChatToOffscreen setupDashboardResponsive triggerNavWorkspaceSync toggleSidebar'
+            .split(' ').forEach(function(n) { env[n] = function() {}; });
+        env.currentEditingWidget = null;
+        env.setTimeout = function(fn) { fn(); };
+        var navCode = declaration(sources['src/js/ui/040-tools-settings.js'], 'hideAllPanels') + '\n' +
+            declaration(sources['src/js/ui/060-docs-view.js'], 'openDashboardView') + '\n' +
+            declaration(sources['src/js/ui/030-home-view.js'], 'openHomeView');
+        return new Function('env', 'with(env){\n' + navCode + '\nreturn {hideAllPanels:hideAllPanels,openDashboardView:openDashboardView,openHomeView:openHomeView};}')(env);
+    }
+    await test('home draft survives Home → Dashboard → Home', function() {
+        var f = fixture('home'), nav = homeNav(f);
+        f.element('home-panel').style.display = 'flex';
+        f.element('home-message-input').value = 'ZZ-draft';
+        nav.openDashboardView();
+        check(f.env.currentView === 'dashboard', 'dashboard not opened');
+        check(f.env.chatPendingTexts.home === 'ZZ-draft', 'home draft not saved when leaving Home: ' + JSON.stringify(f.env.chatPendingTexts));
+        check(f.writes.some(function(w) { return w.key === 'chatPendingTexts' && w.value && w.value.home === 'ZZ-draft'; }), 'home draft not persisted');
+        f.element('home-message-input').value = '';
+        nav.openHomeView();
+        check(f.element('home-message-input').value === 'ZZ-draft', 'home draft not restored: ' + JSON.stringify(f.element('home-message-input').value));
+    });
+    await test('hideAllPanels never deletes the home draft while the composer is still empty', function() {
+        var f = fixture('home'), nav = homeNav(f);
+        f.env.chatPendingTexts.home = 'kept';
+        f.element('home-panel').style.display = 'flex';
+        f.element('home-message-input').value = '';
+        nav.hideAllPanels();
+        check(f.env.chatPendingTexts.home === 'kept', 'empty composer wiped the saved home draft');
+        check(f.element('home-panel').style.display === 'none', 'home panel not hidden');
+    });
+    await test('A3A3-01 parsed-PDF image URL is attribute-escaped', function() {
+        var search = sources['src/js/ui/180-search.js'];
+        var pdfCode = declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
+            declaration(attachments, 'findPdfAnnotations') + '\n' + declaration(attachments, 'viewPdfAnnotations');
+        var els = {}, snacks = [];
+        ['modal-overlay', 'modal-header', 'modal-body', 'modal-actions'].forEach(function(id) {
+            els[id] = { innerHTML: '', classList: { add: function() {}, remove: function() {}, contains: function() { return false; } } };
+        });
+        var env = { currentChatId: 'P',
+            chats: { P: { messages: [{ role: 'pdf', name: 'doc.pdf', annotations: [{ type: 'file', file: { name: 'doc.pdf', content: [
+                { type: 'image_url', image_url: { url: 'x" onerror="p()' } },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] } }] }] } },
+            document: { getElementById: function(id) { return els[id] || null; } },
+            UI_ICONS: { eye: '', close: '' },
+            showSnackbar: function(m) { snacks.push(m); } };
+        var view = new Function('env', 'with(env){\n' + pdfCode + '\nreturn viewPdfAnnotations;}')(env);
+        view(0);
+        var html = els['modal-body'].innerHTML;
+        check(!snacks.length, 'fixture annotations not found: ' + snacks.join(', '));
+        check(html.indexOf('<img src="x&quot; onerror=&quot;p()" alt="Parsed image" />') >= 0, 'image URL not attribute-escaped: ' + html);
+        check(html.indexOf('" onerror="') < 0, 'a raw quote in the URL breaks out of src: ' + html);
+        check(html.indexOf('<img src="data:image/png;base64,AAAA" alt="Parsed image" />') >= 0, 'a valid data: URL must render unchanged: ' + html);
+    });
+    await test('RC7A-F1 PDF preview iframe src is attribute-escaped', function() {
+        var search = sources['src/js/ui/180-search.js'];
+        var pdfCode = declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
+            declaration(attachments, 'openPdfModal');
+        var els = {};
+        ['modal-overlay', 'modal-header', 'modal-body', 'modal-actions'].forEach(function(id) {
+            els[id] = { innerHTML: '', dataset: {}, classList: { add: function() {}, remove: function() {}, contains: function() { return false; } } };
+        });
+        var env = { chats: {}, currentChatId: null,
+            document: { getElementById: function(id) { return els[id] || null; } },
+            UI_ICONS: { file: '', download: '', close: '' } };
+        var open = new Function('env', 'with(env){\n' + pdfCode + '\nreturn openPdfModal;}')(env);
+        open('x" onload="p()', 'doc.pdf');
+        var html = els['modal-body'].innerHTML;
+        check(html.indexOf('<iframe src="x&quot; onload=&quot;p()" ') >= 0, 'PDF src not attribute-escaped: ' + html);
+        check(html.indexOf('" onload="') < 0, 'a raw quote in the PDF src breaks out of the attribute: ' + html);
+        check(els['modal-body'].dataset.pdfSrc === 'x" onload="p()', 'the download source must keep the raw value');
+        open('data:application/pdf;base64,JVBERi0xLjQ=', 'doc.pdf');
+        html = els['modal-body'].innerHTML;
+        check(html.indexOf('<iframe src="data:application/pdf;base64,JVBERi0xLjQ=" ') >= 0, 'a valid data: URL must render unchanged: ' + html);
+    });
     return results;
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css"];
+var PATHS = ["src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css","src/js/ui/040-tools-settings.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js"];
 await registerRunner('reviewed-ui-regressions', async function() { return runReviewedUiAudit(await loadSources(PATHS)); });

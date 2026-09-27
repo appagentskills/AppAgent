@@ -14,7 +14,7 @@ function reloadFixture(sources) {
     function setup(opts) {
         opts = opts || {};
         var doc, calls = [], timers = [], rows = [], buttons = {}, notices = [], approvalCalls = [], serial = 0;
-        var logs = [], snacks = [], confirms = [], sets = [], held = [], removed = [], store = opts.store || null, modals = [], getHeld = [], deployCalls = 0;
+        var logs = [], snacks = [], confirms = [], sets = [], held = [], removed = [], store = opts.store || null, modals = [], getHeld = [], deployCalls = 0, deployArgs = [];
         function el(tag) {
             var x = { tag: tag, className: '', textContent: '', children: [], dataset: {}, disabled: false, hidden: false, checked: false, isConnected: true, handlers: {}, style: {},
                 appendChild: function(child) { this.children.push(child); child.parent = this; if (child.className === 'reload-preflight-row') rows.push(child); },
@@ -40,12 +40,14 @@ function reloadFixture(sources) {
             local.get = function(key, cb) { if (opts.getThrows) throw new Error('storage unavailable'); if (opts.holdGet) { getHeld.push({ key: key, cb: cb }); return; } var out = {}; if (Object.prototype.hasOwnProperty.call(store, key)) out[key] = store[key]; cb(out); };
             local.remove = function(key, cb) { removed.push(key); delete store[key]; if (cb) cb(); };
         }
-        var chromeFake = { runtime: { reload: function() { calls.push('reload'); } } };
+        var chromeFake = { runtime: { reload: function() { calls.push('reload'); }, getURL: function(p) { return 'chrome-extension://appagent/' + p; } } };
+        // opts.tabs(chrome, options, cb) fakes chrome.tabs.create (records 'tab:<url>'); without it there is no chrome.tabs.
+        if (opts.tabs) chromeFake.tabs = { create: function(o, cb) { calls.push('tab:' + o.url); return opts.tabs(chromeFake, o, cb); } };
         if (!opts.noStorage) chromeFake.storage = { local: local };
-        var api = new Function('document', 'navigator', 'window', 'chrome', 'runningChatIds', 'showConfirmModal', 'escapeHtml', 'showSnackbar', 'isSkillTool', 'getDeployDirHandle', 'executeTool', 'getAllWorkspaceMetas', 'getWorkspaceMeta', 'getAllWorkspaceFiles', 'crypto', 'TextEncoder', 'AbortController', 'setTimeout', 'clearTimeout', 'closeDatabase', 'console', 'showModal', sources['src/js/ui/270-iframe-panel.js'] + '\nreturn { reload: reloadExtension, checklist: _reloadChecklist, gate: _runReloadPreflight, normalize: _reloadSuiteResult, fingerprint: _reloadFingerprint, files: RELOAD_PREFLIGHT_FILES, busy: function() { return _reloadInFlight; }, bootReport: _reportLastReloadTimings, suiteRows: _reloadSuiteRows, passKey: RELOAD_PREFLIGHT_PASS_KEY, startBuild: typeof _startExtensionBuild === "function" ? _startExtensionBuild : null, building: function() { return typeof _reloadBuildInFlight === "undefined" ? undefined : _reloadBuildInFlight; } };')(
-            doc, opts.noLocks ? {} : { locks: locks }, { addEventListener: function() {}, location: { reload: function() { calls.push('page-reload'); } } },
-            chromeFake, opts.running ? { a: true } : {},
-            async function(title, body) { calls.push('confirm:' + title); confirms.push({ title: title, body: body }); return opts.confirm !== false; }, function(s) { return s; }, function(s, type) { notices.push(s); snacks.push([s, type]); }, function() { return !opts.noBuild; }, async function() { deployCalls++; if (opts.deployAnswers) return opts.deployAnswers.length ? opts.deployAnswers.shift() : null; return opts.noDeploy ? null : {}; },
+        var api = new Function('document', 'navigator', 'window', 'chrome', 'runningChatIds', 'showConfirmModal', 'escapeHtml', 'showSnackbar', 'isSkillTool', 'getDeployDirHandle', 'executeTool', 'getAllWorkspaceMetas', 'getWorkspaceMeta', 'getAllWorkspaceFiles', 'crypto', 'TextEncoder', 'AbortController', 'setTimeout', 'clearTimeout', 'closeDatabase', 'console', 'showModal', 'currentChatId', sources['src/js/ui/270-iframe-panel.js'] + '\nreturn { reload: reloadExtension, expand: expandSidePanel, checklist: _reloadChecklist, gate: _runReloadPreflight, normalize: _reloadSuiteResult, fingerprint: _reloadFingerprint, files: RELOAD_PREFLIGHT_FILES, busy: function() { return _reloadInFlight; }, bootReport: _reportLastReloadTimings, suiteRows: _reloadSuiteRows, passKey: RELOAD_PREFLIGHT_PASS_KEY, startBuild: typeof _startExtensionBuild === "function" ? _startExtensionBuild : null, building: function() { return typeof _reloadBuildInFlight === "undefined" ? undefined : _reloadBuildInFlight; } };')(
+            doc, opts.noLocks ? {} : { locks: locks }, { addEventListener: function() {}, close: function() { calls.push('window-close'); }, location: { reload: function() { calls.push('page-reload'); } } },
+            chromeFake, opts.runningChatIds || (opts.running ? { a: true } : {}),
+            async function(title, body) { calls.push('confirm:' + title); confirms.push({ title: title, body: body }); return opts.confirmAnswers ? !!opts.confirmAnswers.shift() : opts.confirm !== false; }, function(s) { return s; }, function(s, type) { notices.push(s); snacks.push([s, type]); }, function() { return !opts.noBuild; }, async function(o) { deployCalls++; deployArgs.push(o); if (opts.deployAnswers) return opts.deployAnswers.length ? opts.deployAnswers.shift() : null; return opts.noDeploy ? null : {}; },
             async function(name, args, index, host) {
                 calls.push(name); approvalCalls.push({ name: name, args: args, host: host });
                 if (name === 'extension_build' && opts.build) return opts.build(args, host);
@@ -56,10 +58,11 @@ function reloadFixture(sources) {
             }, async function() { return metas; }, async function() { return opts.noMeta ? null : metas[0]; }, async function() { return files; },
             { subtle: { digest: async function(_, bytes) { return bytes.buffer; } } }, TextEncoder, AbortController, timer, function(t) { if (t) t.cleared = true; }, function() { calls.push('close-db'); }, fakeConsole,
             // showModal(title, message, buttons, variant) resolves the clicked button's value; tests answer via modals[i].answer(value).
-            function(title, message, buttons, variant) { calls.push('modal:' + title); var d = deferred(); modals.push({ title: title, message: message, buttons: buttons, variant: variant, answer: d.resolve }); return d.promise; }
+            function(title, message, buttons, variant) { calls.push('modal:' + title); var d = deferred(); modals.push({ title: title, message: message, buttons: buttons, variant: variant, answer: d.resolve }); return d.promise; },
+            opts.chatId || null
         );
         return { api: api, calls: calls, rows: rows, find: find, elements: function() { return descendants(doc.body); }, doc: doc, buttons: buttons, notices: notices, approvals: approvalCalls, files: files, metas: metas, timers: timers, locks: locks,
-            logs: logs, snacks: snacks, confirms: confirms, sets: sets, held: held, removed: removed, store: store, modals: modals, getHeld: getHeld, deployCalls: function() { return deployCalls; },
+            logs: logs, snacks: snacks, confirms: confirms, sets: sets, held: held, removed: removed, store: store, modals: modals, getHeld: getHeld, deployCalls: function() { return deployCalls; }, deployArgs: deployArgs,
             byClass: function(cls) { return descendants(doc.body).filter(function(e) { return String(e.className).split(' ').indexOf(cls) >= 0; }); } };
     }
     return { good: good, deferred: deferred, until: until, setup: setup };
@@ -362,6 +365,16 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         assert.ok(h.calls.indexOf('run_tests') < h.calls.indexOf('extension_build') && h.calls.indexOf('extension_build') < h.calls.indexOf('reload'), 'preflight, then build, then reload');
         assert.strictEqual(h.deployCalls(), 2, 'no further permission requests');
     }, T);
+    test('S0B3-02 Grant access passes { interactive: true }; the first probe is passive', async function() {
+        var fx = await reloadKit(), h = fx.setup({ deployAnswers: [null, {}] });
+        var p = h.api.reload();
+        await waitFor(function() { return h.modals.length === 1; }, 'deploy permission modal');
+        answer(h.modals[0], 'Grant access');
+        await settle(p);
+        assert.strictEqual(h.deployArgs.length, 2);
+        assert.strictEqual(h.deployArgs[0], undefined, 'passive probe: never prompts');
+        assert.deepStrictEqual(h.deployArgs[1], { interactive: true }, 'the click continuation may prompt');
+    }, T);
     test('Grant access that is still denied warns and never builds or reloads', async function() {
         var fx = await reloadKit(), h = fx.setup({ deployAnswers: [null, null] });
         var p = h.api.reload();
@@ -548,5 +561,123 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         assert.strictEqual(bare.api.bootReport(), undefined);
         broken.api.bootReport(); await ticks(20);
         assert.strictEqual(bare.logs.length + broken.logs.length, 0);
+    }, T);
+    test('runs started during the build → second confirm; cancel → chrome.runtime.reload not called', async function() {
+        var running = { a: true };
+        var fx = await reloadKit(), h = fx.setup({ runningChatIds: running, confirmAnswers: [true, false], build: function() { running.b = true; return okBuild(); } });
+        await settle(h.api.reload());
+        assert.strictEqual(count(h, 'confirm:Reload extension?'), 2, 'a run started during the build is confirmed again');
+        assert.match(h.confirms[1].body, /^2 agent runs are still in progress/);
+        assert.strictEqual(count(h, 'extension_build'), 1, 'the build ran');
+        assert.strictEqual(count(h, 'reload'), 0, 'cancel never restarts');
+        assert.strictEqual(marker(h).length, 0, 'no reopenAppTab marker');
+        assert.ok(h.snacks.some(function(s) { return /Reload cancelled/.test(s[0]) && s[1] === 'warning'; }), 'cancel snackbar');
+        assert.ok(released(h), 'lock and buttons released');
+    }, T);
+    test('runs accepted before the build are not re-confirmed', async function() {
+        var fx = await reloadKit(), h = fx.setup({ runningChatIds: { a: true }, confirmAnswers: [true] });
+        await settle(h.api.reload());
+        assert.strictEqual(count(h, 'confirm:Reload extension?'), 1, 'one confirm');
+        assert.strictEqual(count(h, 'extension_build'), 1, 'the build ran');
+        assert.strictEqual(count(h, 'reload'), 1, 'one reload');
+    }, T);
+    test('Expand: a failed tab open keeps the panel open and shows an error', async function() {
+        var fx = await reloadKit(), h = fx.setup({ tabs: function(c, o, cb) { c.runtime.lastError = { message: 'No current window' }; if (cb) cb(); delete c.runtime.lastError; } });
+        await settle(h.api.expand());
+        await ticks(5);
+        assert.strictEqual(count(h, 'tab:chrome-extension://appagent/app.html?mode=tab'), 1, 'a full tab was requested');
+        assert.strictEqual(count(h, 'window-close'), 0, 'the panel stays open');
+        assert.ok(h.snacks.some(function(s) { return s[0] === 'Could not open a full tab' && s[1] === 'error'; }), 'error snackbar');
+    }, T);
+    test('Expand: an opened tab closes the panel; no chrome.tabs never closes', async function() {
+        var fx = await reloadKit(), h = fx.setup({ chatId: 'c1', tabs: function(c, o, cb) { cb({ id: 7 }); } });
+        await settle(h.api.expand());
+        await ticks(5);
+        assert.strictEqual(count(h, 'tab:chrome-extension://appagent/app.html?mode=tab&chat=c1'), 1, 'the current chat opens in a tab');
+        assert.strictEqual(count(h, 'window-close'), 1, 'the panel closes once the tab opened');
+        assert.ok(!h.snacks.some(function(s) { return s[1] === 'error'; }), 'no error snackbar');
+        var bare = fx.setup();
+        await settle(bare.api.expand());
+        await ticks(5);
+        assert.strictEqual(count(bare, 'window-close'), 0, 'no chrome.tabs: the panel stays open');
+        assert.ok(bare.snacks.some(function(s) { return s[0] === 'Could not open a full tab' && s[1] === 'error'; }), 'error snackbar without chrome.tabs');
+    }, T);
+    // S8D-03: replays the global Esc sweep (core/120-init.js, step 3) on the topmost
+    // .modal-overlay.show: a synthetic backdrop click, then remove() if still attached.
+    function escSweep(ov) {
+        if (typeof ov.onclick === 'function') {
+            try { ov.onclick({ target: ov, currentTarget: ov, preventDefault: function() {}, stopPropagation: function() {} }); } catch (err) {}
+        }
+        if (ov.isConnected) ov.remove();
+    }
+    test('S8D-03 Esc sweep on the checklist cancels the preflight (pass run)', async function() {
+        var fx = await reloadKit(), d = fx.deferred(), h = fx.setup({ run: function() { return d.promise; } });
+        var p = h.api.reload();
+        await waitFor(function() { return h.byClass('reload-preflight').length === 1 && count(h, 'run_tests') === 1; }, 'checklist open with the run pending');
+        var ov = h.byClass('reload-preflight')[0], status = h.byClass('reload-preflight-status')[0];
+        assert.strictEqual(typeof ov.onclick, 'function', 'the checklist overlay has a backdrop handler for the Esc sweep');
+        ov.onclick({ target: ov.children[0] });
+        assert.ok(ov.isConnected && !/^Cancelling/.test(status.textContent), 'a click inside the dialog does not cancel');
+        escSweep(ov);
+        assert.match(status.textContent, /^Cancelling/, 'the sweep routes through a real cancel');
+        d.resolve(fx.good(h.api.files.slice()));
+        await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 0, 'no build after the Esc sweep');
+        assert.strictEqual(count(h, 'reload'), 0, 'no reload after the Esc sweep');
+        assert.ok(released(h), 'lock and buttons released');
+    }, T);
+    test('S8D-03 Esc sweep after a failing run releases the lock', async function() {
+        var fx = await reloadKit(), h = fx.setup({ run: function(args) {
+            var r = fx.good(args.files), f = r.files[1];
+            f.status = 'fail'; f.passed = 1; f.failed = 1; f.failures = [{ name: 'x', error: 'Expected true' }];
+            r.summary.passed--; r.summary.failed++; r.success = false; return r;
+        } });
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h); }, 'failure dialog');
+        escSweep(h.byClass('reload-preflight')[0]);
+        await settle(p);
+        assert.ok(released(h), 'lock and buttons released');
+        assert.strictEqual(count(h, 'extension_build'), 0, 'no build');
+        assert.strictEqual(count(h, 'reload'), 0, 'no reload');
+        assert.strictEqual(h.byClass('reload-preflight').length, 0, 'checklist gone');
+    }, T);
+    // S8D-04: checklist keyboard - Cancel keeps native Enter, Tab from the overlay/dialog
+    // itself enters the control ring, and the dialog is aria-modal with a focusable overlay.
+    test('S8D-04 Enter on Cancel keeps native activation; Enter on Force never chooses', async function() {
+        var fx = await reloadKit(), h = fx.setup(), c = new AbortController(), ui = h.api.checklist(c), ov = h.doc.body.children[0];
+        var prevented = false, stopped = false;
+        ov.handlers.keydown({ key: 'Enter', target: h.find('Cancel'), preventDefault: function() { prevented = true; }, stopPropagation: function() { stopped = true; } });
+        assert.strictEqual(prevented, false, 'Enter on Cancel keeps its native activation');
+        assert.ok(stopped, 'Enter still stops at the checklist');
+        ui.failure('x', true);
+        assert.ok(forceShown(h) && !h.find('Force build').disabled, 'settled failure enables Force');
+        var decided = false; ui.decision.then(function() { decided = true; });
+        prevented = false;
+        ov.handlers.keydown({ key: 'Enter', target: h.find('Force build'), preventDefault: function() { prevented = true; }, stopPropagation: function() {} });
+        await ticks(3);
+        assert.ok(prevented, 'Enter on Force is prevented: never an implicit Force build');
+        assert.ok(!ui.cancelled() && !decided && !c.signal.aborted, 'Enter never chooses');
+        ui.close();
+    }, T);
+    test('S8D-04 Tab from the overlay itself enters the control ring', async function() {
+        var fx = await reloadKit(), h = fx.setup(), ui = h.api.checklist(new AbortController()), ov = h.doc.body.children[0];
+        var first = h.byClass('reload-preflight-details')[0].children[0], prevented = false;
+        ui.failure('x', true);
+        h.doc.activeElement = ov;
+        ov.handlers.keydown({ key: 'Tab', target: ov, preventDefault: function() { prevented = true; }, stopPropagation: function() {} });
+        assert.ok(prevented, 'Tab from the overlay stays in the checklist');
+        assert.strictEqual(h.doc.activeElement, first, 'Tab enters the ring at the first control');
+        h.doc.activeElement = ov; prevented = false;
+        ov.handlers.keydown({ key: 'Tab', shiftKey: true, target: ov, preventDefault: function() { prevented = true; }, stopPropagation: function() {} });
+        assert.ok(prevented, 'Shift+Tab from the overlay stays in the checklist');
+        assert.strictEqual(h.doc.activeElement, h.find('Force build'), 'Shift+Tab enters at the last control (enabled Force)');
+        ui.close();
+    }, T);
+    test('S8D-04 overlay is focusable and the dialog is aria-modal', async function() {
+        var fx = await reloadKit(), h = fx.setup(), ui = h.api.checklist(new AbortController()), ov = h.doc.body.children[0];
+        assert.strictEqual(ov.tabIndex, -1, 'the overlay takes focus on clicks inside the checklist');
+        assert.strictEqual(ov.children[0].role, 'dialog');
+        assert.strictEqual(ov.children[0]['aria-modal'], 'true', 'the dialog is aria-modal');
+        ui.close();
     }, T);
 });

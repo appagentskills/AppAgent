@@ -163,3 +163,28 @@ describe('H14 › formatContent document recursion guard', function() {
         assert.deepStrictEqual(m.formatContent._docStack, []);
     }, { tags: ['unit'] });
 });
+
+describe('S0C5-01 › attachment/widget row fade is recomputed', function() {
+    afterEach(function() { U.cleanupAll(); });
+    test('row fade recomputes on image load and window resize; binds once', async function() {
+        var m = await load(RENDER);
+        var dom = await U.mountDom({ html: '<div class="attachments-row"><img alt="t"></div>' });
+        var row = dom.$('.attachments-row'), img = row.querySelector('img'), sw = 100;
+        Object.defineProperty(img, 'complete', { value: false, configurable: true });
+        Object.defineProperty(row, 'scrollWidth', { get: function() { return sw; }, configurable: true });
+        Object.defineProperty(row, 'clientWidth', { get: function() { return 100; }, configurable: true });
+        var added = [], add = row.addEventListener;
+        row.addEventListener = function(type) { added.push(type); return add.apply(this, arguments); };
+        m._attachRowScrollShadow(row);
+        assert.strictEqual(row.classList.contains('has-right-shadow'), false, 'no overflow before the thumbnail decodes');
+        sw = 300; img.dispatchEvent(new Event('load'));
+        assert.strictEqual(row.classList.contains('has-right-shadow'), true, 'recomputed on image load');
+        sw = 100; m.__scope.window.dispatchEvent({ type: 'resize' });
+        assert.strictEqual(row.classList.contains('has-right-shadow'), true, 'resize is debounced');
+        await new Promise(function(r) { setTimeout(r, 150); });
+        assert.strictEqual(row.classList.contains('has-right-shadow'), false, 'recomputed after a panel resize');
+        m._attachRowScrollShadow(row);
+        assert.deepStrictEqual(added, ['scroll'], 'scroll listener bound once');
+        assert.strictEqual((m.__scope.window._listeners.resize || []).length, 1, 'one window resize listener');
+    }, { tags: ['unit'] });
+});

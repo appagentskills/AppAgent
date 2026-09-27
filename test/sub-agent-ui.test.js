@@ -49,6 +49,11 @@ function runSubAgentUiAudit(sources) {
         check(blocker, 'Shared modal propagation fixture missing');
         dialog.addEventListener('click', new Function('event', blocker[1]));
         el('modal-body', dialog); el('modal-header', dialog); el('modal-actions', dialog);
+        // NEW-T15-1: focus() moves doc.activeElement (the sandbox's real focus() cannot).
+        function focusable(n) { n.focus = function(opts) { doc.activeElement = n; n.focusOpts = opts; }; return n; }
+        doc.activeElement = null;
+        var closeIcon = focusable(node(elements['modal-header'], { 'class': 'modal-close-icon' }));
+        elements['modal-header'].querySelector = function(sel) { return sel === '.modal-close-icon' ? closeIcon : null; };
         el('sub-self-card-host'); el('sub-self-parent-host');
         doc.getElementById = function(id) { return elements[id] || null; };
         var report = { role: 'sub_report', subAgentId: 'sub-retired', subAgentName: 'Retired worker', subChatId: 'child',
@@ -70,7 +75,7 @@ function runSubAgentUiAudit(sources) {
             '_contextCircleHtml = function() { return ""; };' +
             'var originalCard = _workerCardHtml; _workerCardHtml = function(r, opts) { calls.cards.push(r); return originalCard(r, opts); };' +
             'return { progress: _workerProgressInner, self: updateSubAgentSelfCard, resolve: _resolveSubRec, open: openWorkerChatModal, teardown: _teardownWorkerChatModal, reconstruct: _reconstructSubsFromMessages }; }')(env);
-        return { api: api, env: env, report: report, chats: chats, elements: elements, calls: calls, doc: doc, overlay: overlay };
+        return { api: api, env: env, report: report, chats: chats, elements: elements, calls: calls, doc: doc, overlay: overlay, closeIcon: closeIcon, focusable: focusable };
     }
     function controls(html) {
         var out = [], re = /<(a|button)\b([^>]*)>([\s\S]*?)<\/\1>/g, m;
@@ -164,6 +169,36 @@ function runSubAgentUiAudit(sources) {
         f.env.closeModal();
         click(node(f.elements['modal-body'], { 'data-sub-chat-id': 'child' }));
         check(f.calls.reveal.length === 0, 'Worker handler leaked into another modal');
+    });
+    // NEW-T15-1: opening the worker modal moves focus into it (close icon) and a
+    // REAL close (.show already dropped, as closeModal / the Esc path do before the
+    // reset) hands it back to the opener once; a reset with .show kept (showModal /
+    // showPromptModal reusing the overlay) must not move focus.
+    test('worker modal focuses its close icon and restores the opener once on real close', function() {
+        var f = fixture(), opener = f.focusable(node(f.doc));
+        opener.focus();
+        f.api.open('sub-retired');
+        check(f.doc.activeElement === f.closeIcon, 'Focus stayed behind the aria-modal overlay');
+        check(!!(f.closeIcon.focusOpts && f.closeIcon.focusOpts.preventScroll), 'Close icon focus must use preventScroll');
+        f.api.open('sub-retired'); // re-open with focus inside the overlay keeps the outer opener
+        f.overlay.classList.remove('show'); f.api.teardown();
+        check(f.doc.activeElement === opener, 'Focus not restored to the opener');
+        f.closeIcon.focus(); f.api.teardown();
+        check(f.doc.activeElement === f.closeIcon, 'Opener restored twice');
+    });
+    test('worker modal teardown with .show kept leaves focus alone; a detached opener is skipped', function() {
+        var f = fixture(), opener = f.focusable(node(f.doc));
+        opener.focus();
+        f.api.open('sub-retired');
+        f.api.teardown(); // showModal/showPromptModal reset: overlay still .show
+        check(f.doc.activeElement === f.closeIcon, 'Reset with .show kept moved focus');
+        f.overlay.classList.remove('show'); f.api.teardown();
+        check(f.doc.activeElement === opener, 'Opener lost after a kept-.show reset');
+        var gone = f.focusable(node(null));
+        gone.focus();
+        f.api.open('sub-retired');
+        f.overlay.classList.remove('show'); f.api.teardown();
+        check(f.doc.activeElement === f.closeIcon, 'Focus restored to a detached opener');
     });
     return { passed: results.filter(function(r) { return r.passed; }).length, total: results.length, results: results };
 }

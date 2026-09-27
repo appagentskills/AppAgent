@@ -13,7 +13,8 @@
 //      pill and a click-through into the sub's chat.
 //
 // Listener: every render path re-derives state from SubAgents.listAll() +
-// SubAgents.poolSnapshot(). The registry calls notify on every mutation
+// SubAgents.isQueued() (pool-queue mirror of the SW's poolSnapshot().queue_ids,
+// installed by applySnapshot from the subagent-snapshot envelope). The registry calls notify on every mutation
 // (spawn/report/stop/sleep/wake), and we subscribe via SubAgents.addListener.
 
 // ---------- sub_report renderer (called from 250-message-render.js) ----------
@@ -337,8 +338,16 @@ function _subReportLiveStatus(msg) {
 // { phase, tool, icon, label } or null — callers MUST keep their existing
 // spinner / bot-icon fallback for null so old snapshots, non-running states
 // and cleared activity render exactly as before.
+// B1: a 'running' record still waiting in the pool queue (no loop yet).
+function _subIsQueued(rec) {
+    return !!(rec && rec.state === 'running' && typeof SubAgents !== 'undefined'
+        && typeof SubAgents.isQueued === 'function' && SubAgents.isQueued(rec.agent_id));
+}
+
 function _subActivityInfo(rec) {
     if (!rec || rec.state !== 'running') return null;
+    // Queued: no loop has run yet — no activity / stuck verdict to show.
+    if (_subIsQueued(rec)) return null;
     // Stuck-worker signal: the SAME pure verdict agent_status reports (core/097
     // _subStuckSignal), recomputed on the mirrored record so the label and the
     // model agree; falls back to the SW-stamped rec.stuck.
@@ -379,7 +388,8 @@ function _patchWorkerCardActivity(card, rec) {
     var iconEl = card.querySelector('.worker-card-icon');
     if (!iconEl) return;
     var act = _subActivityInfo(rec);
-    var key = act ? (act.phase + ':' + act.label) : '';
+    var queued = !act && _subIsQueued(rec);
+    var key = act ? (act.phase + ':' + act.label) : (queued ? 'queued' : '');
     if (iconEl.getAttribute('data-activity-key') !== key) {
         iconEl.setAttribute('data-activity-key', key);
         iconEl.innerHTML = act ? act.icon : ((typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '');
@@ -387,7 +397,7 @@ function _patchWorkerCardActivity(card, rec) {
         iconEl.classList.toggle('worker-activity-tool', !!act && act.phase === 'tool');
         var stEl = card.querySelector('[data-worker-state]');
         if (stEl) {
-            var txt = act ? act.label : (rec.state || '');
+            var txt = act ? act.label : (queued ? 'queued' : (rec.state || ''));
             if (stEl.textContent !== txt) stEl.textContent = txt;
             stEl.title = act ? act.label : '';
         }
@@ -1488,7 +1498,9 @@ function _subAwaitingApproval(rec) {
 // Orchestrator §6: per-sub model provenance line for worker cards and the
 // sub-report card header — 'provider (tier)'. rec.provider is the
 // resolved provider NAME pinned at spawn, rec.tier the alias it was
-// requested through. '' for legacy / reconstructed records that carry
+// requested through — EXCEPT tier:'same' (explicit, or an alias mapped to
+// __same__ in 097 _resolveSpawnProvider): provider is null, tier 'same', and
+// the followed model is resolved live from rec.same_as below. '' for legacy / reconstructed records that carry
 // neither field (no badge rendered — GC-safe).
 function _subModelLine(rec) {
     if (!rec) return '';
@@ -1700,7 +1712,7 @@ function _workerModalContentKey(msg, rec) {
     var prog = Array.isArray(msg.progress) ? msg.progress.length : 0;
     var phn = Array.isArray(msg.phases) ? msg.phases.length : 0;
     var act = (msg.actionState && msg.actionState.at) || 0;
-    var live = rec ? (rec.state + ':' + ((rec.action_state && rec.action_state.at) || 0) + ':' + (Array.isArray(rec.inbox) ? rec.inbox.length : 0)) : '';
+    var live = rec ? (rec.state + ((typeof _subIsQueued === 'function' && _subIsQueued(rec)) ? '~q' : '') + ':' + ((rec.action_state && rec.action_state.at) || 0) + ':' + (Array.isArray(rec.inbox) ? rec.inbox.length : 0)) : '';
     return st + ':' + prog + ':' + (msg.progressDropped | 0) + ':' + phn + ':' + (msg.phasesDropped | 0) + ':' + act + ':' + live + ':' + _subParentHistoryKey(msg);
 }
 
@@ -1750,6 +1762,11 @@ function openWorkerChatModal(agentId) {
     var body = document.getElementById('modal-body');
     var actions = document.getElementById('modal-actions');
     if (!overlay || !header || !body) return;
+    // NEW-T15-1: remember the element focused OUTSIDE the overlay. Read it
+    // before the header/body re-render below, which drops focus to <body>
+    // when it came from inside; a re-open from inside keeps the opener.
+    var _ae = document.activeElement;
+    if (_ae && !overlay.contains(_ae)) _workerModalOpener = _ae;
     var name = msg.subAgentName || agentId;
     header.innerHTML = '<span class="modal-title-text">' + escapeHtml(name) + '</span>' +
         '<div class="modal-header-actions">' +
@@ -1772,6 +1789,9 @@ function openWorkerChatModal(agentId) {
     _renderWorkerChatModalBody();
     overlay.classList.add('show');
     overlay.classList.add('worker-chat-modal');
+    // NEW-T15-1: move focus into the aria-modal dialog (its close icon).
+    var _closeBtn = header.querySelector('.modal-close-icon');
+    if (_closeBtn && typeof _closeBtn.focus === 'function') { try { _closeBtn.focus({ preventScroll: true }); } catch (_) {} }
     if (!_workerModalListener && typeof SubAgents !== 'undefined' && SubAgents.addListener) {
         _workerModalListener = function() {
             if (_workerModalRefreshScheduled) return;
@@ -1782,6 +1802,9 @@ function openWorkerChatModal(agentId) {
         SubAgents.addListener(_workerModalListener);
     }
 }
+// NEW-T15-1: element focused before the worker modal opened; handed back once
+// on a real close by _teardownWorkerChatModal.
+var _workerModalOpener = null;
 
 // Teardown hook — called by closeModal() (220-notification-system.js) on
 // EVERY close path (close button, backdrop click, Escape) so the live
@@ -1797,6 +1820,17 @@ function _teardownWorkerChatModal() {
     _workerModalAgentId = null;
     _workerModalKey = null;
     _workerModalRefreshScheduled = false;
+    // NEW-T15-1: restore focus only on a REAL close (.show already dropped, as
+    // closeModal does before resetModalContentMode). A showModal/showPromptModal
+    // reset keeps .show, so the opener survives for that dialog's real close.
+    var _ov = document.getElementById('modal-overlay');
+    var _op = _workerModalOpener;
+    if (_op && !(_ov && _ov.classList.contains('show'))) {
+        _workerModalOpener = null;
+        if (document.contains(_op) && typeof _op.focus === 'function') {
+            try { _op.focus({ preventScroll: true }); } catch (_) {}
+        }
+    }
 }
 
 // ---------- Self card (right sidebar of a sub-agent's OWN chat) ----------
@@ -1988,7 +2022,7 @@ function _updateSelfCardMetrics() {
 
 // Whitelist worker state for class-name interpolation (defense-in-depth,
 // same rationale as SUB_REPORT_STATUSES).
-var WORKER_CARD_STATES = { running: 1, sleeping: 1, stopped: 1, errored: 1 };
+var WORKER_CARD_STATES = { running: 1, queued: 1, sleeping: 1, stopped: 1, errored: 1 };
 
 // Context-length ring for a chat (sub-agent OR a normal top-level chat). Mirrors
 // the main chat's .context-circle. Shared by worker cards (sidebar Workers
@@ -2043,8 +2077,10 @@ function subAgentsForChatTree(chatId) {
 function _workerCardHtml(r, opts) {
     var selfCard = !!(opts && opts.selfCard);
     var label = r.name || r.agent_id;
-    var stateClass = WORKER_CARD_STATES[r.state] ? r.state : 'unknown';
-    var stateLabel = r.state;
+    // B1: pool-queued subs are 'running' records with no loop yet — own look.
+    var queued = _subIsQueued(r);
+    var stateClass = queued ? 'queued' : (WORKER_CARD_STATES[r.state] ? r.state : 'unknown');
+    var stateLabel = queued ? 'queued' : r.state;
     // Phase 5: legacy records may lack `depth` — default to 1 (direct child of
     // root). Cap the rendered depth at 3 to match the CSS rule ladder.
     var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
@@ -2093,8 +2129,8 @@ function _workerCardHtml(r, opts) {
     return '<div class="worker-card-wrap' + (selfCard ? ' worker-card-wrap-self' : '') + '" data-depth="' + renderDepth + '"' + (selfCard ? ' style="margin-top:var(--space-3,6px)"' : '') + '>' +
         '<' + wkTag + ' class="worker-card worker-' + stateClass + (wkExpandedNow ? ' worker-card-expanded' : '') + (selfCard ? ' worker-card-self' : '') + '" ' +
         wkToggleAttrs +
-        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(r.state) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(String(used)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
-        '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : '') + '" aria-hidden="true">' + cardIcon + '</span>' +
+        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(queued ? 'queued (waiting for a free pool slot)' : r.state) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(String(used)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
+        '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : (queued ? 'queued' : '')) + '" aria-hidden="true">' + cardIcon + '</span>' +
         '<span class="worker-card-main">' +
             '<span class="worker-card-row">' +
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
@@ -2306,7 +2342,8 @@ function renderWorkersStrip() {
                 return r.parent_chat_id === currentChatId
                     || (r.root_chat_id || r.parent_chat_id) === currentChatId;
             })
-            .map(function(r) { return r.agent_id + ':' + r.state + ':' + (r.depth || 1); });
+            // B1: queued flag so a dequeue (state stays 'running') repaints.
+            .map(function(r) { return r.agent_id + ':' + r.state + (_subIsQueued(r) ? '~q' : '') + ':' + (r.depth || 1); });
         rows.sort();
         return currentChatId + '|' + rows.join('|');
     }

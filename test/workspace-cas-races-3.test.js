@@ -239,4 +239,23 @@ describe('H7: wsPush write-back is CAS against the pre-push snapshot (tools/020)
         assert.strictEqual(a.content, 'pushed'); assert.strictEqual(a.last_modified_by_chat_id, null);
         assert.ok(a.pushed_pr && a.pushed_pr.number === 7);
     });
+    test('S0C13-01: workspace removed during the pre-push sync fails cleanly with no remote writes (old code: TypeError on meta.source_branch)', async function() {
+        var w = await setup();
+        await w.s.setWorkspaceFile(row('a.js', 'base'));
+        await edit(w, 'a.js', 'pushed', 1);
+        gh(w);
+        // The sync reads meta before its ref GET and returns up-to-date (sha H == head_sha H),
+        // so deleting the meta on that GET makes only wsPush's post-sync re-read see null.
+        var inner = w.m.__scope.githubApi, calls = [];
+        w.m.__scope.githubApi = async function(method, url) {
+            calls.push(method);
+            if (method === 'GET' && /git\/ref\/heads\/main$/.test(url)) delete w.metas[WK];
+            return inner.apply(this, arguments);
+        };
+        var res = await w.m.wsPush(WK, { branch_name: 'feat', commit_message: 'c', pr_title: 'T' }, 'c1', 'C1');
+        assert.strictEqual(res.success, false, JSON.stringify(res).slice(0, 400));
+        assert.match(res.error, /no longer exists/);
+        assert.ok(calls.length > 0, 'the sync ran');
+        assert.strictEqual(calls.filter(function(c) { return c !== 'GET'; }).length, 0, 'no remote writes: ' + calls.join(','));
+    }, { tags: ['unit'] });
 });

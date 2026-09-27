@@ -26,7 +26,7 @@ function _wsfScanChat(chat) {
     var pending = {};
     chat.messages.forEach(function(msg, idx) {
         if (msg.role === 'assistant' && msg.tool_calls) {
-            msg.tool_calls.forEach(function(tc) {
+            msg.tool_calls.forEach(function(tc, tcIdx) {
                 if (!tc.function || tc.function.name !== 'workspace' || !tc.id) return;
                 var a;
                 try { a = JSON.parse(tc.function.arguments); } catch (e) { return; }
@@ -35,7 +35,7 @@ function _wsfScanChat(chat) {
                 // discard we cannot attribute to a single file — skip it.
                 var path = a.action === 'copy' ? a.dest : a.path;
                 if (!path) return;
-                pending[tc.id] = { action: a.action, args: a, path: path, wsKey: a.workspace || null, msgIdx: idx };
+                pending[tc.id] = { action: a.action, args: a, path: path, wsKey: a.workspace || null, msgIdx: idx, tcIdx: tcIdx };
             });
         } else if (msg.role === 'tool' && msg.tool_call_id && pending[msg.tool_call_id]) {
             var entry = pending[msg.tool_call_id];
@@ -298,6 +298,9 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
         + '<button class="wsf-modal-close" title="Close">' + UI_ICONS.close + '</button></div>'
         + '<div class="wsf-modal-body">' + bodyHtml + '</div></div>';
     function onKey(e) {
+        // Capture phase (see addEventListener below): runs before the bubble-phase
+        // Esc ladder, so an open Restore/Discard confirm is still visible here.
+        if (document.querySelector('.modal-overlay.show')) return; // the modal owns the keys; the global ladder closes it
         // Overlays stack (viewer/diff opened from the versions modal): only the
         // TOPMOST one may react to keys, otherwise one keypress closes all.
         var all = document.querySelectorAll('.wsf-overlay');
@@ -311,10 +314,10 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
             wsfNavFile(opts.fileIndex + (e.key === 'ArrowRight' ? 1 : -1), (opts.active || 'view'));
         }
     }
-    function close() { overlay.remove(); document.removeEventListener('keydown', onKey); }
+    function close() { overlay.remove(); document.removeEventListener('keydown', onKey, true); }
     overlay.addEventListener('click', function(e) { if (e.target === overlay) close(); });
     overlay.querySelector('.wsf-modal-close').addEventListener('click', close);
-    document.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', onKey, true); // capture: runs before the Esc ladder (see onKey)
     // Expose the real closer so bulk removals (wsfGoToVersionMsg, restore)
     // detach the document keydown listener instead of leaking it.
     overlay._wsfClose = close;
@@ -322,8 +325,11 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
     return overlay;
 }
 
+function _wsfNotFoundText(f) {
+    return '"' + f.path + '" not found in any local workspace (deleted new file, synced away, or repo re-cloned)';
+}
 function _wsfNotFoundMsg(f) {
-    showSnackbar('"' + f.path + '" not found in any local workspace (deleted new file, synced away, or repo re-cloned)', 'warning');
+    showSnackbar(_wsfNotFoundText(f), 'warning');
 }
 
 // Prev/next navigation between the chat's edited files, keeping the current
@@ -350,10 +356,19 @@ function wsfHeaderAction(i, act) {
     }
     var p = act === 'diff' ? wsfOpenDiff(i) : act === 'versions' ? wsfOpenVersions(i) : wsfOpenViewer(i);
     // Close the old overlay(s) once the new one is in the DOM (the promise
-    // resolves after _wsfOverlay appended it). New overlays stack on top, so
-    // the swap is seamless. On failure (file not found) close them too —
-    // matching the previous end state (snackbar, no modal).
-    if (p && typeof p.then === 'function') p.then(closeOld, closeOld);
+    // resolves true after _wsfOverlay appended it). New overlays stack on top,
+    // so the swap is seamless. File not found (false; the open fn showed the
+    // snackbar): swap in a "not found" placeholder that keeps the prev/next nav
+    // and header icons, so navigation can step past it — unless the user closed
+    // the overlay meanwhile. On an error keep the current overlay.
+    if (p && typeof p.then === 'function') p.then(function(ok) {
+        if (ok) return closeOld();
+        var f = _wsfSectionFiles[i];
+        if (!f || !old.some(function(o) { return o.isConnected; })) return; // user closed meanwhile
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">not found</span>',
+            '<div class="wsf-empty">' + escapeHtml(_wsfNotFoundText(f)) + '</div>', { fileIndex: i, active: act });
+        closeOld();
+    }, function() { /* keep the current overlay */ });
     else closeOld();
 }
 
@@ -361,13 +376,13 @@ function wsfHeaderAction(i, act) {
 
 async function wsfOpenViewer(i) {
     var f = _wsfSectionFiles[i];
-    if (!f) return;
+    if (!f) return false;
     var res = await _wsfResolve(f);
     if (!res) {
         // Live record gone (fork auto-deleted on merge, repo re-cloned) —
         // show the merged PR's pushed content when a snapshot exists.
-        if (await _wsfOpenMergedView(f, i)) return;
-        _wsfNotFoundMsg(f); return;
+        if (await _wsfOpenMergedView(f, i)) return true;
+        _wsfNotFoundMsg(f); return false;
     }
     var rec = res.rec;
     var status = rec.deleted ? 'Deleted' : (rec.dirty ? 'Modified (uncommitted)' : 'Clean (matches base)');
@@ -378,6 +393,7 @@ async function wsfOpenViewer(i) {
         body += '<pre class="wsf-code">' + escapeHtml(rec.content || '') + '</pre>';
     }
     _wsfOverlay(escapeHtml(f.path), body, { fileIndex: i, active: 'view' });
+    return true;
 }
 
 // --- Diff --------------------------------------------------------------------
@@ -432,7 +448,7 @@ function _wsfRenderDiffHtml(oldText, newText) {
 
 async function wsfOpenDiff(i) {
     var f = _wsfSectionFiles[i];
-    if (!f) return;
+    if (!f) return false;
     var res = await _wsfResolve(f);
     // Fall back to the durable merged-PR snapshot (pre-merge base → pushed
     // content) when the live record is GONE (fork auto-deleted on merge) or
@@ -440,14 +456,15 @@ async function wsfOpenDiff(i) {
     // show "No differences"). A genuinely dirty live record still wins: those
     // are newer, uncommitted edits.
     if (!res || !(res.rec && res.rec.dirty)) {
-        if (await _wsfOpenMergedDiff(f, i)) return;
+        if (await _wsfOpenMergedDiff(f, i)) return true;
     }
-    if (!res) { _wsfNotFoundMsg(f); return; }
+    if (!res) { _wsfNotFoundMsg(f); return false; }
     var rec = res.rec;
     var oldText = rec.original_content != null ? rec.original_content : '';
     var newText = rec.deleted ? '' : (rec.content || '');
     var note = rec.dirty ? '' : '<div class="wsf-file-meta">File has no uncommitted changes \u2014 it matches its base.</div>';
     _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">base \u2192 current</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+    return true;
 }
 
 // Render the merged-PR snapshot diff for a section entry. Returns true when a
@@ -510,7 +527,7 @@ async function _wsfOpenMergedView(f, i) {
 // non-reconstructable until the next full write/discard.
 async function wsfOpenVersions(i) {
     var f = _wsfSectionFiles[i];
-    if (!f) return;
+    if (!f) return false;
     var res = await _wsfResolve(f);
 
     // Gather changes for this path across all chats.
@@ -541,7 +558,7 @@ async function wsfOpenVersions(i) {
     var cur = base;
     var reliable = base != null;
     entries.forEach(function(ch) {
-        var v = { action: ch.action, chatId: ch.chatId, chatTitle: ch.chatTitle, msgIdx: ch.msgIdx, args: ch.args };
+        var v = { action: ch.action, chatId: ch.chatId, chatTitle: ch.chatTitle, msgIdx: ch.msgIdx, tcIdx: ch.tcIdx, args: ch.args };
         if (ch.action === 'write') {
             if (typeof ch.args.content === 'string') { cur = ch.args.content; reliable = true; }
             else { cur = null; reliable = false; } // write from file_id — content not in the transcript
@@ -592,22 +609,47 @@ async function wsfOpenVersions(i) {
         if (vi > 0) {
             body += '<button class="sn-artifact-icon-btn" onclick="wsfDiffVersion(' + vi + ')" title="Diff vs previous version">' + UI_ICONS.diff + '</button>';
         }
-        if (v.content != null && v.action !== 'current') {
+        // A3C2-03: no Restore without a known target workspace (never fall back to the default one).
+        if (v.content != null && v.action !== 'current' && _wsfVersionState.wsKey) {
             body += '<button class="sn-artifact-icon-btn" onclick="wsfRestoreVersion(' + vi + ')" title="Restore this version into the workspace">' + UI_ICONS.undo + '</button>';
         }
         body += '</span>';
         body += '</div>';
     });
     body += '</div>';
-    if (!res) body += '<div class="wsf-file-meta">File no longer exists in a local workspace \u2014 base and current content unavailable.</div>';
+    if (!res) body += '<div class="wsf-file-meta">File no longer exists in a local workspace \u2014 base and current content unavailable.' + (_wsfVersionState.wsKey ? '' : ' Restore is unavailable: no local workspace is known for this file.') + '</div>';
     _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + (versions.length) + ' versions</span>', body, { fileIndex: i, active: 'versions' });
+    return true;
+}
+
+// A3C2-01: "Show in chat" must reveal the exact tool call that produced the
+// version. scrollToMessage (110) opens only the FIRST tool call of
+// #msg-<idx>, and in compact mode a run of tool-call messages renders into
+// #msg-<first> (each call as #tc-<origMsgIdx>-<tcIdx>), leaving #msg-<idx>
+// an empty placeholder. Returns false (the caller falls back to
+// scrollToMessage) when that tool-call node is not rendered.
+function _wsfRevealToolCall(msgIdx, tcIdx) {
+    if (tcIdx == null || msgIdx == null || msgIdx < 0) return false;
+    if (typeof clearToolHighlights === 'function') clearToolHighlights();
+    // MEMWIN: render the window that holds the target first (no-op when in window).
+    if (typeof ensureMessageInWindow === 'function') ensureMessageInWindow(msgIdx);
+    var tcEl = document.getElementById('tc-' + msgIdx + '-' + tcIdx);
+    if (!tcEl) return false;
+    for (var d = tcEl.parentElement; d; d = d.parentElement) if (d.tagName === 'DETAILS') d.open = true; // compact group
+    if (typeof collapseOtherTools === 'function') collapseOtherTools(tcEl);
+    tcEl.open = true;
+    tcEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    tcEl.classList.add('highlight-flash');
+    setTimeout(function() { tcEl.classList.remove('highlight-flash'); }, 2000);
+    return true;
 }
 
 function wsfGoToVersionMsg(vi) {
     var st = _wsfVersionState;
     if (!st || !st.versions[vi]) return;
     document.querySelectorAll('.wsf-overlay').forEach(function(o) { o._wsfClose ? o._wsfClose() : o.remove(); });
-    scrollToMessage(st.versions[vi].msgIdx);
+    var v = st.versions[vi];
+    if (!_wsfRevealToolCall(v.msgIdx, v.tcIdx)) scrollToMessage(v.msgIdx, v.tcIdx);
 }
 
 function wsfViewVersion(vi) {
@@ -643,7 +685,8 @@ async function wsfRestoreVersion(vi) {
     var st = _wsfVersionState;
     if (!st || !st.versions[vi] || st.versions[vi].content == null) return;
     var v = st.versions[vi];
-    if (!await showConfirmModal('Restore Version', 'Restore "' + st.file.path + '" to v' + vi + '? This overwrites the current workspace content as a new uncommitted change.')) return;
+    if (!st.wsKey) { showSnackbar('Cannot restore "' + st.file.path + '": no local workspace is known for it', 'warning'); return; }
+    if (!await showConfirmModal('Restore Version', 'Restore "' + escapeHtml(st.file.path) + '" to v' + vi + ' in ' + escapeHtml(st.wsKey) + '? This overwrites the current workspace content as a new uncommitted change.')) return;
     try {
         showSpinner('Restoring v' + vi + '...');
         var args;
@@ -652,7 +695,7 @@ async function wsfRestoreVersion(vi) {
         } else {
             args = { action: 'write', path: st.file.path, content: v.content };
         }
-        if (st.wsKey) args.workspace = st.wsKey;
+        args.workspace = st.wsKey;
         var r = await executeWorkspaceTool(args, { chatId: currentChatId });
         hideSpinner();
         if (r && r.success) {
@@ -679,7 +722,7 @@ async function wsfDiscardFile(i) {
         showSnackbar('"' + f.path + '" has no uncommitted changes', 'warning');
         return;
     }
-    if (!await showConfirmModal('Discard Changes', 'Discard uncommitted changes to "' + f.path + '"? The file is reset to its cloned base content. This cannot be undone.', 'danger')) return;
+    if (!await showConfirmModal('Discard Changes', 'Discard uncommitted changes to "' + escapeHtml(f.path) + '"? The file is reset to its cloned base content. This cannot be undone.', 'danger')) return;
     try {
         showSpinner('Discarding...');
         var args = { action: 'discard', path: f.path, workspace: res.wsKey };

@@ -1,5 +1,4 @@
 // Screenshot capture functions
-var _screenshotDataUrl = null;
 var _htiFontCache = null; // pre-cached @font-face CSS for screenshot capture
 var _SCREENSHOT_SKIP_TAGS = { SCRIPT: 1, STYLE: 1, LINK: 1, NOSCRIPT: 1, META: 1 };
 function screenshotFilter(node) {
@@ -683,49 +682,4 @@ function _htiToSvg(node, options) {
             if (options.height) clone.style.height = options.height + 'px';
             return _htiNodeToDataURL(clone, width, height);
         });
-}
-
-function showScreenshotPreview(dataUrl, title, cssWidth, cssHeight) {
-    var panel = document.getElementById('screenshot-preview-panel');
-    var img = document.getElementById('screenshot-preview-img');
-    var titleEl = document.getElementById('screenshot-preview-title');
-    var mainArea = document.getElementById('main-area');
-    img.src = dataUrl;
-    if (cssWidth && cssHeight) {
-        img.style.width = cssWidth + 'px';
-        img.style.height = cssHeight + 'px';
-    } else {
-        img.style.width = '';
-        img.style.height = '';
-    }
-    titleEl.textContent = title;
-    // Hide main chat area and show screenshot panel in its place
-    if (mainArea) mainArea.style.display = 'none';
-    panel.classList.add('visible');
-    document.addEventListener('keydown', screenshotEscHandler);
-}
-
-function closeScreenshotPreview() {
-    var panel = document.getElementById('screenshot-preview-panel');
-    var mainArea = document.getElementById('main-area');
-    var img = document.getElementById('screenshot-preview-img');
-    panel.classList.remove('visible');
-    // Restore main chat area
-    if (mainArea) mainArea.style.display = '';
-    document.removeEventListener('keydown', screenshotEscHandler);
-    // Clear image src to release memory from large data URL
-    if (img) img.src = '';
-    _screenshotDataUrl = null;
-}
-
-function screenshotEscHandler(e) {
-    if (e.key === 'Escape') closeScreenshotPreview();
-}
-
-function downloadScreenshotPreview() {
-    if (!_screenshotDataUrl) return;
-    var link = document.createElement('a');
-    link.href = _screenshotDataUrl;
-    link.download = 'screenshot-' + Date.now() + '.png';
-    link.click();
 }

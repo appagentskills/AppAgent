@@ -2,7 +2,11 @@
 // =============================================
 // Templates render as native HTML in the message content (not iframes).
 // They inherit the app's CSS variables for theme-aware styling.
-// The agent includes <!--display:ID--> in its text; formatContent replaces it.
+// A display attached to a tool_result slot (its own top-level call, or the
+// parent tool when made inside a sandbox) renders there eagerly
+// (getDisplayHtmlForMessage); one with no slot renders only via placeholder. If the agent ALSO writes <!--display:ID--> in
+// any assistant message, formatContent renders it at that spot instead and
+// the eager copy is skipped, so a display never shows twice.
 
 var _displayIdCounter = 0;
 var _displayStore = {}; // displayId -> { template, args, html }
@@ -25,28 +29,29 @@ function executeDisplay(args, messageIndex, options) {
     // Persist on chat for re-render
     var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
-    // Eager-render path: when display is called from inside a sandbox (js_eval
-    // / skill tool / widget bridge), the agent never sees a placeholder string
-    // to emit in its reply text, so the placeholder-in-text render path is
-    // unreachable. Attach the display to the PARENT tool's tool_result slot
-    // so the renderer emits it eagerly alongside that result (same shape as
-    // html_widget). For top-level display calls (no parentToolCallId) the old
-    // behavior — placeholder in agent text triggers render — is preserved.
+    // Eager-render path: attach the display to a tool_result slot so the
+    // renderer emits it alongside that result (same shape as html_widget),
+    // whether or not the agent ever writes the placeholder. Only the FINAL
+    // assistant message is shown by default, so a placeholder-only display
+    // was silently lost whenever the model forgot it there.
+    //  - inside a sandbox (js_eval / skill tool / widget bridge): the PARENT
+    //    tool's slot (parentToolCallId) — the agent never sees a placeholder;
+    //  - top level: this call's own slot (options.toolCallId = the tool_use id,
+    //    forwarded agent loop -> SW routing -> page exec-tool).
+    // toolCallId is persisted so the SW (whose authoritative chat always has
+    // the seeded slot) can resolve msgIndex when this page mirror lacks it, and
+    // so the renderer matches the slot by id rather than a bare index.
+    // No slot at all (widget-bridge and other non-agent callers, whose id the
+    // SW mints as 'ui_...'; a sandbox with no parent tool): nothing can render
+    // eagerly, so the placeholder contract below applies.
     var fromSandbox = !!(options && options.fromSandbox);
-    var parentToolCallId = options && options.parentToolCallId;
-    var eagerMsgIndex = -1;
-    if (fromSandbox && parentToolCallId && chat && chat.messages) {
-        for (var pi = chat.messages.length - 1; pi >= 0; pi--) {
-            var pm = chat.messages[pi];
-            if (pm.role === 'tool' && pm.tool_call_id === parentToolCallId) {
-                eagerMsgIndex = pi;
-                break;
-            }
-        }
-    }
+    var slotId = fromSandbox ? (options && options.parentToolCallId) : (options && options.toolCallId);
+    var attachToolCallId = _displayIsSlotId(slotId) ? slotId : null;
+    var eagerMsgIndex = _displayFindToolSlot(chat, attachToolCallId);
     if (chat) {
         if (!chat.displays) chat.displays = {};
         var entry = { template: template, args: args };
+        if (attachToolCallId) entry.toolCallId = attachToolCallId;
         if (eagerMsgIndex >= 0) {
             entry.msgIndex = eagerMsgIndex;
             entry.eager = true;
@@ -57,14 +62,18 @@ function executeDisplay(args, messageIndex, options) {
 
     var title = args.title || (template.charAt(0).toUpperCase() + template.slice(1));
     var placeholder = '<!--display:' + displayId + '-->';
-    // Suppress the "include this in your reply" hint when we'll render eagerly
-    // anyway — the agent has no way to do that from inside a sandbox, and the
-    // hint would be misleading.
-    var message = eagerMsgIndex >= 0
-        ? title + ' rendered.'
-        : title + ' ready. Include ' + placeholder + ' in your response to render it inline.';
+    // Slot: sandbox -> no hint (the agent cannot place a placeholder there);
+    // top level -> already rendered, the placeholder only MOVES it (optional).
+    // No slot: the placeholder is the only way it renders (pre-eager wording).
+    var message = !attachToolCallId
+        ? title + ' ready. Include ' + placeholder + ' in your response to render it inline.'
+        : fromSandbox
+            ? title + ' rendered.'
+            : title + ' rendered inline. Optionally include ' + placeholder + ' in your final response to position it there instead.';
+    var returnedPlaceholder = (fromSandbox && attachToolCallId) ? null : placeholder;
 
     var persistEntry = { displayId: displayId, template: template, args: args };
+    if (attachToolCallId) persistEntry.toolCallId = attachToolCallId;
     if (eagerMsgIndex >= 0) {
         persistEntry.msgIndex = eagerMsgIndex;
         persistEntry.eager = true;
@@ -77,10 +86,11 @@ function executeDisplay(args, messageIndex, options) {
         id: displayId,
         displayId: displayId,
         // Normalized: `placeholder` matches the placeholder-based render
-        // contract; null when eager-rendered (caller doesn't need to emit it).
-        placeholder: eagerMsgIndex >= 0 ? null : placeholder,
+        // contract; null for sandbox calls with a parent slot (the agent cannot
+        // place it there). Top level: optional — it only repositions the display.
+        placeholder: returnedPlaceholder,
         message: message,
-        _display_placeholder: eagerMsgIndex >= 0 ? null : placeholder,
+        _display_placeholder: returnedPlaceholder,
         // SW-side wrapper reads this to persist chat.displays on its own chat
         // object. Without it, the SW's chat snapshot (which is broadcast back
         // to the panel) wipes the page-side mutation on the next save.
@@ -88,16 +98,96 @@ function executeDisplay(args, messageIndex, options) {
     };
 }
 
+// A real tool_use / parent tool id, i.e. one that can name a chat tool_result
+// slot. Synthesized ids never do: 'ui_...' (minted by SW routing for
+// widget-bridge and other calls without a tool_use id) and 'prog_...'
+// (nested sandbox calls).
+function _displayIsSlotId(id) {
+    return typeof id === 'string' && id !== '' && !/^(ui|prog)_/.test(id);
+}
+
+// Index of the role:'tool' message whose tool_call_id is `toolCallId`, or -1.
+function _displayFindToolSlot(chat, toolCallId) {
+    if (!toolCallId || !chat || !chat.messages) return -1;
+    for (var i = chat.messages.length - 1; i >= 0; i--) {
+        var m = chat.messages[i];
+        if (m && m.role === 'tool' && m.tool_call_id === toolCallId) return i;
+    }
+    return -1;
+}
+
+// Per-render-pass index for getDisplayHtmlForMessage:
+//  - placed: ids whose <!--display:ID--> placeholder appears in an assistant
+//    message (reply text OR tool_call arguments, e.g. a `document` embedding
+//    it). Those render where they were placed, so the eager copy is skipped.
+//  - slots: tool_call_id of every tool_result message in the chat.
+// Memoized for ONE render pass: renderMessages calls
+// getDisplayHtmlForMessage.resetPass() first, so an in-place edit to an
+// earlier message is never served stale. The signature (chat + message count
+// + last-message size) guards calls made outside a pass.
+var _displayPlacedCache = null;
+function _displayRenderIndex(chatId, chat) {
+    var msgs = (chat && chat.messages) || [];
+    var last = msgs.length ? msgs[msgs.length - 1] : null;
+    var lastSize = last ? String(typeof last.content === 'string' ? last.content : JSON.stringify(last.content || '')).length
+        + JSON.stringify(last.tool_calls || '').length : 0;
+    var sig = chatId + '|' + msgs.length + '|' + lastSize;
+    if (_displayPlacedCache && _displayPlacedCache.sig === sig) return _displayPlacedCache;
+    var placed = {};
+    var slots = {};
+    var re = /<!--display:(dsp_\w+)-->/g;
+    function scan(s) {
+        if (s == null) return;
+        if (typeof s !== 'string') s = JSON.stringify(s);
+        if (s.indexOf('<!--display:') === -1) return;
+        var mm;
+        re.lastIndex = 0;
+        while ((mm = re.exec(s)) !== null) placed[mm[1]] = true;
+    }
+    msgs.forEach(function(m) {
+        if (!m) return;
+        if (m.role === 'tool') {
+            if (m.tool_call_id) slots[m.tool_call_id] = true;
+            return;
+        }
+        if (m.role !== 'assistant') return;
+        scan(m.content);
+        (m.tool_calls || []).forEach(function(tc) { scan(tc && tc.function ? tc.function.arguments : tc); });
+    });
+    _displayPlacedCache = { sig: sig, placed: placed, slots: slots };
+    return _displayPlacedCache;
+}
+
+// True when display `displayId` is attached to the tool_result at `msgIndex`.
+// Precedence: toolCallId when that slot exists in the chat (robust to index
+// shifts) > msgIndex (sandbox-era entries, or a toolCallId whose slot is not
+// in this chat) > legacy top-level result (pre-eager saved chats: the display
+// tool's own result, which names the id, never rendered when the placeholder
+// was missed).
+function _displayAttachedTo(entry, displayId, msg, msgIndex, slots) {
+    if (!entry || !msg || msg.role !== 'tool') return false;
+    if (entry.toolCallId && slots && slots[entry.toolCallId]) return msg.tool_call_id === entry.toolCallId;
+    if (entry.eager) return entry.msgIndex === msgIndex;
+    return msg.name === 'display' && typeof msg.content === 'string' && msg.content.indexOf(displayId) !== -1;
+}
+
 // Eager-render scan: returns concatenated HTML for every display attached to
-// `msgIndex` (set when the display was created from inside a sandbox — see
-// `executeDisplay`). Called by the message renderer alongside `getWidgetHtmlForMessage`.
+// the tool_result at `msgIndex` (see `executeDisplay`), minus displays placed
+// via placeholder in an assistant message. Called by the message renderer
+// alongside `getWidgetHtmlForMessage`.
 function getDisplayHtmlForMessage(msgIndex) {
     var chat = chats[currentChatId];
     if (!chat || !chat.displays) return '';
+    var msg = chat.messages && chat.messages[msgIndex];
+    if (!msg || msg.role !== 'tool') return '';
     var html = '';
+    var index = null;
     Object.keys(chat.displays).forEach(function(displayId) {
         var entry = chat.displays[displayId];
-        if (!entry || !entry.eager || entry.msgIndex !== msgIndex) return;
+        if (!entry) return;
+        if (!index) index = _displayRenderIndex(currentChatId, chat);
+        if (!_displayAttachedTo(entry, displayId, msg, msgIndex, index.slots)) return;
+        if (index.placed[displayId]) return;
         // Render via the same path placeholder-in-text uses, so cache + chart
         // generator code stays single-sourced.
         var renderedHtml = renderDisplayPlaceholder(displayId);
@@ -105,6 +195,8 @@ function getDisplayHtmlForMessage(msgIndex) {
     });
     return html;
 }
+// Start of a render pass (renderMessages): drop the memoized index.
+getDisplayHtmlForMessage.resetPass = function() { _displayPlacedCache = null; };
 
 // Called from formatContent to replace <!--display:ID--> placeholders
 function renderDisplayPlaceholder(displayId) {
@@ -154,7 +246,7 @@ var DISPLAY_COPY_ICON = '<svg width="12" height="12" viewBox="0 0 24 24" fill="n
 // ─── Table Template ───
 function generateTable(args) {
     var columns = args.columns || [];
-    var rows = args.rows || [];
+    var rows = (args.rows || []).map(function(r) { return r == null ? [] : r; });
     if (!columns.length) return null;
 
     var tableId = 'dtbl_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
@@ -184,11 +276,10 @@ function generateTable(args) {
     html += '</tr></thead><tbody>';
     rows.forEach(function(row) {
         html += '<tr>';
-        if (Array.isArray(row)) {
-            row.forEach(function(cell, i) { html += '<td' + (numericCols[i] ? ' class="num"' : '') + '>' + displayFormatCell(cell) + '</td>'; });
-        } else {
-            columns.forEach(function(col, i) { html += '<td' + (numericCols[i] ? ' class="num"' : '') + '>' + displayFormatCell(row[col]) + '</td>'; });
-        }
+        columns.forEach(function(col, i) {
+            var v = Array.isArray(row) ? row[i] : row[col];
+            html += '<td' + (numericCols[i] ? ' class="num"' : '') + '>' + displayFormatCell(v) + '</td>';
+        });
         html += '</tr>';
     });
     html += '</tbody></table><div class="display-table-empty" style="display:none">No matching rows</div></div></div>';
@@ -213,7 +304,7 @@ function displaySortTable(tableId, colIdx) {
     else { state.col = colIdx; state.asc = true; }
     wrap._sortState = state;
     rows.sort(function(a, b) {
-        var x = a.cells[colIdx].textContent, y = b.cells[colIdx].textContent;
+        var x = (a.cells[colIdx] || {}).textContent || '', y = (b.cells[colIdx] || {}).textContent || '';
         var xn = parseFloat(x), yn = parseFloat(y);
         if (!isNaN(xn) && !isNaN(yn)) return state.asc ? xn - yn : yn - xn;
         return state.asc ? x.localeCompare(y) : y.localeCompare(x);

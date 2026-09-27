@@ -52,3 +52,28 @@ describe('prompt_user lifecycle',function(){
         m.cancelPromptUser('p9','b');assert.strictEqual(injected.length,2);assert.strictEqual(injected[1][2].cancelled,true);
     });
 });
+// TA-12: real 100-prompt-user + 120-actions in one scope (DOM/chrome are fakes).
+describe('prompt_user answers vs the background action bell',function(){
+    async function load(){
+        var forms={},doc={addEventListener:function(){},removeEventListener:function(){},querySelector:function(){return null;},querySelectorAll:function(){return [];},getElementById:function(id){return forms[id]||null;},createElement:function(){return {style:{},classList:{add:function(){},remove:function(){}},setAttribute:function(){},appendChild:function(){}};},body:{appendChild:function(){},classList:{add:function(){},remove:function(){}}}};
+        var m=await loadModules(['src/js/tools/100-prompt-user.js','src/js/tools/120-actions.js'],{lenient:true,globals:{window:fakeWindow({document:doc}),chrome:fakeChrome(),document:doc,console:console}});
+        var s=m.__scope;
+        s.chats={b:{id:'b',actionId:'act1',messages:[{role:'prompt_user',promptId:'p1',status:'pending'},{role:'prompt_user',promptId:'p2',status:'pending'}]}};
+        s.currentChatId='other';s.saveChatsToStorage=function(){};s.renderMessages=function(){};s.scrollToBottomIfAllowed=function(){};
+        s.activeActions={act1:{id:'act1',chatId:'b',state:'running',icon:'spinner',label:'Working'}};
+        forms['prompt-form-p1']={querySelectorAll:function(){return [];},querySelector:function(){return null;},appendChild:function(){}};
+        m.setActionNeedsInput('act1','p2');
+        return m;
+    }
+    function bell(m){var a=m.__scope.activeActions.act1;return [a.state,a.icon,a.label,a.needsInputPromptId];}
+    test('TA-12: answering a stale prompt keeps the bell; answering the awaited one clears it',async function(){
+        var m=await load(),on=['needs_input','bell','Input needed','p2'];
+        assert.deepStrictEqual(bell(m),on);
+        assert.strictEqual(m.submitPromptUser('p1','b'),true);
+        assert.deepStrictEqual(bell(m),on,'stale inline submit keeps the bell');
+        m.cancelBackgroundPromptPopup('b','p1');
+        assert.deepStrictEqual(bell(m),on,'stale popup cancel keeps the bell');
+        m.cancelPromptUser('p2','b');
+        assert.deepStrictEqual(bell(m),['running','spinner','Working',null],'answering the awaited prompt clears it');
+    });
+});

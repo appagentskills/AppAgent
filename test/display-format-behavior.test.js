@@ -14,6 +14,14 @@ describe('display generator behavior',function(){
         var m=await displayModule(),d=displayDoc(m.generateTable({columns:['Badge','Missing'],rows:[[{badge:'<b>Open</b>',color:'blue" onmouseover="bad()'},null]]}));
         assert.strictEqual(d.querySelector('.display-badge-blue').textContent,'<b>Open</b>');assert.strictEqual(d.querySelector('[onmouseover]'),null);assert.strictEqual(d.querySelector('.display-muted').textContent,'—');
     });
+    // S0C6-01: a null row or a short array row must not break the table.
+    test('table tolerates null and ragged rows',async function(){
+        var m=await displayModule(),d=displayDoc(m.generateTable({columns:['Name'],rows:[null]}));
+        assert.strictEqual(d.querySelectorAll('tbody td').length,1);assert.strictEqual(d.querySelector('tbody td .display-muted').textContent,'\u2014');
+        d=displayDoc(m.generateTable({columns:['Name','Count','Note'],rows:[['a'],['b',2],['c',3,'x']]}));
+        assert.deepStrictEqual([].map.call(d.querySelectorAll('tbody tr'),function(tr){return tr.querySelectorAll('td').length;}),[3,3,3]);
+        assert.strictEqual(d.querySelectorAll('tbody tr')[0].querySelectorAll('.display-muted').length,2);assert.strictEqual(d.querySelectorAll('th.num').length,1);
+    },{tags:['unit']});
     test('table and card search controls obey their distinct thresholds',async function(){
         var m=await displayModule();
         assert.strictEqual(displayDoc(m.generateTable({columns:['x'],rows:Array(5).fill(['x'])})).querySelector('.display-search'),null);

@@ -116,13 +116,15 @@
             return;
         }
         if (message.type === 'helper-js-eval') {
-            runJsEvalSandbox(message.payload || {})
+            // S0C10-01: sync-start wrapper (here and below): a synchronous throw in the
+            // runner becomes an ok:false reply instead of escaping the listener.
+            new Promise(function(resolve) { resolve(runJsEvalSandbox(message.payload || {})); })
                 .then(function(result) { sendResponse({ ok: true, result: result }); })
                 .catch(function(err) { sendResponse({ ok: false, error: err && err.message ? err.message : String(err) }); });
             return true;
         }
         if (message.type === 'helper-skill-sandbox') {
-            runSkillSandbox(message.payload || {})
+            new Promise(function(resolve) { resolve(runSkillSandbox(message.payload || {})); })
                 .then(function(result) { sendResponse({ ok: true, result: result }); })
                 .catch(function(err) { sendResponse({ ok: false, error: err && err.message ? err.message : String(err) }); });
             return true;
@@ -229,18 +231,26 @@
                     //    the top. Recorded approvals are additionally bound to
                     //    the tool name + args (worker/120, ui/150).
                     var hostSeq = ++hostCallSeq;
-                    chrome.runtime.sendMessage({
-                        type: 'sw-exec-tool',
-                        payload: {
-                            name: d.name,
-                            args: d.args,
-                            sandboxRequestId: requestId,
-                            chatId: chatId,
-                            messageIndex: messageIndex,
-                            toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + hostSeq,
-                            parentToolCallId: parentToolCallId || null
-                        }
-                    }).then(function(resp) {
+                    var relay;
+                    try {
+                        relay = chrome.runtime.sendMessage({
+                            type: 'sw-exec-tool',
+                            payload: {
+                                name: d.name,
+                                args: d.args,
+                                sandboxRequestId: requestId,
+                                chatId: chatId,
+                                messageIndex: messageIndex,
+                                toolCallId: 'prog_' + (parentToolCallId || 'np') + '_' + hostSeq,
+                                parentToolCallId: parentToolCallId || null
+                            }
+                        });
+                    } catch (err) {
+                        // S0C10-02: args runtime.sendMessage cannot serialize (e.g. cyclic) throw
+                        // synchronously; answer the sandbox via the .catch below instead of never.
+                        relay = Promise.reject(err);
+                    }
+                    relay.then(function(resp) {
                         if (settled || !sandbox || !sandbox.contentWindow) return;
                         if (resp && resp.ok) {
                             sandbox.contentWindow.postMessage({ type: MSG_TOOL_RESULT, id: d.id, result: resp.result }, '*');
@@ -307,25 +317,30 @@
             // never read from a sandbox message or exposed in sandbox globals.
             var id = payload.sandboxRequestId;
             if (typeof id !== 'string' || !id || activeSandboxes[id]) return Promise.reject(new Error('Invalid test invocation'));
-            var context = TestRunPolicy.registry.open(payload.testRunPolicy);
             var controller = new AbortController();
             activeSandboxes[id] = function() { controller.abort(); };
-            return TestRunPolicy.runFrame({
-                registry: TestRunPolicy.registry, context: context,
-                code: String(payload.code || ''), document: document, window: window,
-                signal: controller.signal,
-                dispatch: function(name, args, callId) {
-                    if (name === '__sandbox_sleep') return swSleep(args.ms, payload.chatId, function() { return controller.signal.aborted; }).then(function() { return { __sleep_ok: true }; });
-                    return chrome.runtime.sendMessage({ type: 'sw-exec-tool', payload: {
-                        name: name, args: args, sandboxRequestId: id,
-                        chatId: payload.chatId, messageIndex: payload.messageIndex,
-                        toolCallId: 'prog_' + (payload.parentToolCallId || 'test') + '_' + callId,
-                        parentToolCallId: payload.parentToolCallId || null
-                    } }).then(function(r) {
-                        if (!r || !r.ok) throw new Error(r && r.error || 'Test relay failed');
-                        return r.result;
-                    });
-                }
+            // S0C10-01: synchronous executor (NOT Promise.resolve().then) keeps the
+            // frame start synchronous, while an invalid/expired descriptor (open or
+            // runFrame throwing) becomes a rejection, so `.finally` drops the entry.
+            return new Promise(function(resolve) {
+                var context = TestRunPolicy.registry.open(payload.testRunPolicy);
+                resolve(TestRunPolicy.runFrame({
+                    registry: TestRunPolicy.registry, context: context,
+                    code: String(payload.code || ''), document: document, window: window,
+                    signal: controller.signal,
+                    dispatch: function(name, args, callId) {
+                        if (name === '__sandbox_sleep') return swSleep(args.ms, payload.chatId, function() { return controller.signal.aborted; }).then(function() { return { __sleep_ok: true }; });
+                        return chrome.runtime.sendMessage({ type: 'sw-exec-tool', payload: {
+                            name: name, args: args, sandboxRequestId: id,
+                            chatId: payload.chatId, messageIndex: payload.messageIndex,
+                            toolCallId: 'prog_' + (payload.parentToolCallId || 'test') + '_' + callId,
+                            parentToolCallId: payload.parentToolCallId || null
+                        } }).then(function(r) {
+                            if (!r || !r.ok) throw new Error(r && r.error || 'Test relay failed');
+                            return r.result;
+                        });
+                    }
+                }));
             }).finally(function() { controller.abort(); delete activeSandboxes[id]; });
         }
         var code = String(payload.code || '');

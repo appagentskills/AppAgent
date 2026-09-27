@@ -93,9 +93,3 @@
 .metrics-view-request-btn svg { width: 12px; height: 12px; }
 .json-viewer-container { max-height: 70vh; overflow: auto; padding: var(--space-8); background: var(--bg-light); border-radius: var(--radius-md); }
 .json-viewer { font-family: var(--font-mono); font-size: var(--text-body); line-height: var(--leading-relaxed); white-space: pre-wrap; word-break: break-word; margin: 0; }
-.modal-overlay.request-body-modal .modal-dialog { width: 90vw; max-width: 1200px; height: 85vh; max-height: 85vh; display: flex; flex-direction: column; }
-.modal-overlay.request-body-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-8); }
-.modal-overlay.request-body-modal .modal-title-text { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); }
-.modal-overlay.request-body-modal .modal-header-actions { display: flex; align-items: center; gap: var(--space-4); }
-.modal-overlay.request-body-modal .modal-body { flex: 1; overflow: hidden; padding: 0; }
-.modal-overlay.request-body-modal .json-viewer-container { max-height: none; height: 100%; border-radius: 0; }

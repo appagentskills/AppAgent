@@ -134,7 +134,7 @@ describe('ui message cards › code blocks (formatContent)', function() {
         var dom = await U.mountDom({ html: m.formatContent('```\n<raw> & "q"\n```') });
         var clip = m.__scope.navigator.clipboard;
         U.fireInline(dom.$('.code-copy-btn'), 'click', m); await U.flush();
-        assert.deepStrictEqual(clip.writes, ['<raw> & "q"\n']); assert.deepStrictEqual(snack.calls, [['Copied to clipboard', 'success']]);
+        assert.deepStrictEqual(clip.writes, ['<raw> & "q"\n']); assert.deepStrictEqual(snack.calls, [['Copied to clipboard', 'success', undefined, { transient: true }]]);
         clip.mode = 'fail'; U.fireInline(dom.$('.code-copy-btn'), 'click', m); await U.flush();
         assert.deepStrictEqual(snack.calls[1], ['Copy failed', 'error']);
     }, { tags: ['unit'] });

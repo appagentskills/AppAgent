@@ -55,6 +55,7 @@ async function getVersionXml(versionSysId) {
     try {
         var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
         var res = await fetch('/api/now/table/sys_update_version/' + versionSysId + '?sysparm_fields=payload', { headers: headers });
+        if (!res.ok) return null;
         var data = await res.json();
         if (data.result && data.result.payload) {
             return data.result.payload;
@@ -63,6 +64,25 @@ async function getVersionXml(versionSysId) {
         console.error('Failed to get version XML:', e);
     }
     return null;
+}
+
+// TB-8: the record element(s) inside a ServiceNow XML export, or null when
+// the text is not one. Only an <unload>, <record_update> (sys_update_version
+// payload) or <xml> (.do?XML export) root that wraps an element counts: a
+// login/error page answered with HTTP 200, or the empty <xml/> that .do?XML
+// returns for a missing or unreadable record, gives null.
+// Strips only the LEADING declaration and the OUTER wrappers (anchored, \b so
+// <unload_date> etc. don't match): a CDATA field may contain '<?xml' or
+// '<unload>' literals that must survive (S0B3-06).
+function getRecordXmlBody(recXml) {
+    if (typeof recXml !== 'string') return null;
+    var content = recXml.replace(/^\s*<\?xml[^?]*\?>/i, '');
+    var wrapped = false;
+    var m = content.match(/^\s*<unload\b[^>]*>([\s\S]*)<\/unload>\s*$/i); if (m) { content = m[1]; wrapped = true; }
+    m = content.match(/^\s*<record_update\b[^>]*>([\s\S]*)<\/record_update>\s*$/i); if (m) { content = m[1]; wrapped = true; }
+    m = content.match(/^\s*<xml\b[^>]*>([\s\S]*)<\/xml>\s*$/i); if (m) { content = m[1]; wrapped = true; } // .do?XML export root (S0B3-05)
+    content = content.trim();
+    return wrapped && /^<[A-Za-z_]/.test(content) ? content : null;
 }
 
 // Latest XML for a record, for download/preview. Prefers the newest
@@ -75,10 +95,15 @@ async function getLatestRecordXml(table, sysId) {
     try {
         var latestAfterVersion = (typeof getLatestAfterVersion === 'function')
             ? getLatestAfterVersion(table, sysId) : null;
+        // TB-8: each source must be a real record export (getRecordXmlBody),
+        // else the next one is tried: .do?XML can answer 200 with a login
+        // page, or with an empty <xml/> for a missing or unreadable record.
         var xml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : null;
+        if (!getRecordXmlBody(xml)) xml = null;
         if (!xml) {
             var liveVersion = await getRecordVersion(table, sysId);
             if (liveVersion) xml = await getVersionXml(liveVersion.sys_id);
+            if (!getRecordXmlBody(xml)) xml = null;
         }
         if (!xml) {
             if (!_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
@@ -86,6 +111,7 @@ async function getLatestRecordXml(table, sysId) {
                 headers: { 'X-UserToken': window.sessionToken }
             });
             if (res.ok) xml = await res.text();
+            if (!getRecordXmlBody(xml)) xml = null;
         }
         return xml || null;
     } catch (e) {
@@ -335,24 +361,28 @@ async function downloadChangesXml() {
     showSpinner('Preparing XML download...');
     
     try {
-        // Collect all version XMLs for the latest state of each file
-        var recordXmls = [];
+        // Collect the latest XML of each file: tracked version, then live
+        // version, then the <table>.do?XML export (data tables have no
+        // sys_update_version). Records that still fail are reported below.
+        var recordXmls = [], skipped = [];
         
         for (var i = 0; i < changedFiles.length; i++) {
             var file = changedFiles[i];
-            var latestAfterVersion = getLatestAfterVersion(file.table, file.sysId);
-            
-            if (latestAfterVersion) {
-                var xml = await getVersionXml(latestAfterVersion);
-                if (xml) {
-                    recordXmls.push(xml);
-                }
-            }
+            var label = file.displayName || (file.table + ':' + file.sysId);
+            // TB-9: a sys_attachment row carries no file bytes (they live in
+            // its sys_attachment_doc chunks, which are not exported), so it
+            // would import as a broken attachment: list it as not exported.
+            if (file.table === 'sys_attachment') { skipped.push(label + ' (attachment)'); continue; }
+            var xml = await getLatestRecordXml(file.table, file.sysId);
+            if (getRecordXmlBody(xml)) recordXmls.push(xml); // TB-8: a record, not any 200 text
+            else skipped.push(label);
         }
         
+        // The records left out (first 3), for both snackbars below.
+        var notExported = skipped.length ? ' (not exported: ' + skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', …' : '') + ')' : '';
         if (recordXmls.length === 0) {
             hideSpinner();
-            showSnackbar('Could not retrieve version data for any files', 'error');
+            showSnackbar('Could not retrieve version data for any files' + notExported, 'error');
             return;
         }
         
@@ -377,6 +407,7 @@ async function downloadChangesXml() {
         URL.revokeObjectURL(url);
         
         hideSpinner();
+        if (skipped.length) showSnackbar('Exported ' + recordXmls.length + ' of ' + changedFiles.length + ' records' + notExported, 'warning');
         
     } catch (e) {
         hideSpinner();
@@ -390,25 +421,12 @@ function buildUpdateSetXml(recordXmls) {
     xml += '<unload unload_date="' + new Date().toISOString().replace('T', ' ').substring(0, 19) + '">\n';
     
     recordXmls.forEach(function(recXml) {
-        // Extract the actual record element, removing <unload> and <record_update> wrappers
-        var content = recXml;
-        
-        // Remove XML declaration
-        content = content.replace(/<\?xml[^?]*\?>/gi, '');
-        
-        // Extract content from <unload> if present
-        var unloadMatch = content.match(/<unload[^>]*>([\s\S]*)<\/unload>/i);
-        if (unloadMatch) {
-            content = unloadMatch[1];
-        }
-        
-        // Remove <record_update> wrapper if present, keeping the inner record element
-        var recordUpdateMatch = content.match(/<record_update[^>]*>([\s\S]*)<\/record_update>/i);
-        if (recordUpdateMatch) {
-            content = recordUpdateMatch[1];
-        }
-        
-        xml += content.trim() + '\n';
+        // Only the record element(s): getRecordXmlBody strips the leading
+        // declaration and the outer <unload>/<record_update>/<xml> wrappers
+        // (anchored, CDATA literals survive: S0B3-05/06). An entry with no
+        // record inside (a login page, an empty <xml/>) adds nothing (TB-8).
+        var content = getRecordXmlBody(recXml);
+        if (content) xml += content + '\n';
     });
     
     xml += '</unload>';
@@ -569,7 +587,7 @@ function renderInlineChanges(userMsgIdx) {
 
 // Revert a single inline change (only for changes in a specific user message range)
 async function revertInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Undo Changes', 'Undo changes to "' + displayName + '"? This will restore the file to its state before this AI response.')) return;
+    if (!await showConfirmModal('Undo Changes', 'Undo changes to "' + escapeHtml(displayName) + '"? This will restore the file to its state before this AI response.')) return;
     
     // Find the message range for this user message
     var chat = chats[currentChatId];
@@ -784,7 +802,7 @@ async function revertAllInlineChanges(userMsgIdx) {
 
 // Redo an inline change that was reverted
 async function redoInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + displayName + '"? This will restore the AI-made changes.')) return;
+    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + escapeHtml(displayName) + '"? This will restore the AI-made changes.')) return;
     
     // Find the message range for this user message
     var chat = chats[currentChatId];
@@ -936,7 +954,7 @@ async function redoAllInlineChanges(userMsgIdx) {
 
 // Delete a newly created record
 async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Delete Record', 'Delete "' + displayName + '"? This will permanently delete this newly created record.', 'danger')) return;
+    if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
 
     try {
         showSpinner('Deleting ' + displayName + '...');

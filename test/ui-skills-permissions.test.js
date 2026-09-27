@@ -35,6 +35,7 @@ async function load(extra) {
         pushHistoryState: rec(), replaceHistoryState: rec(), history: { state: null, length: 1, back: rec() },
         getActionId: function(s, n) { return s + '--' + String(n).toLowerCase().replace(/[^a-z0-9]+/g, '-'); },
         toggleDropdown: rec(), closeDropdowns: rec(), renderAllActionPlacements: rec(),
+        showConfirmModal: rec(function() { return Promise.resolve(true); }), // NEW-T17-1: a dirty Back asks; default = Discard
         toolPermissions: {}, instancePermissions: {}, saveToolPermissions: rec(), saveInstancePermissions: rec(),
         hasNonDefaultPermissions: function() { return false; }, resetAllPermissionsToDefaults: rec(), updateSnStatus: rec(),
         Platform: { instanceUrl: 'https://' + HOST }, TOOLS: [{ function: { name: 'web_fetch' } }],
@@ -168,7 +169,7 @@ describe('ui skills › editor open / save / cancel', function() {
         assert.strictEqual(sk.body, 'body2');
         assert.strictEqual(sk.userModified, true);
         assert.deepStrictEqual(sk.actions, [{ name: 'Run', icon: 'rocket', show: ['home', 'chat'] }], 'actions collected from rows');
-        assert.deepStrictEqual(L.snack.calls[0], ['Skill saved', 'success']);
+        assert.deepStrictEqual(L.snack.calls[0], ['Skill saved', 'success', undefined, { key: 'skill-editor' }]);
         assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none');
         assert.strictEqual(dom.$('#skills-list-panel').style.display, 'flex');
         assert.strictEqual(sc(L, 'currentEditingSkill'), null);
@@ -179,10 +180,10 @@ describe('ui skills › editor open / save / cancel', function() {
         var L = await load({ skills: {} }), dom = await body();
         await L.m.openSkillEditor(null);
         await L.m.saveCurrentSkill();
-        assert.deepStrictEqual(L.snack.calls[0], ['Name is required', 'error']);
+        assert.deepStrictEqual(L.snack.calls[0], ['Name is required', 'error', undefined, { key: 'skill-editor' }]);
         dom.$('#skill-name-input').value = 'ok';
         await L.m.saveCurrentSkill();
-        assert.deepStrictEqual(L.snack.calls[1], ['Description is required', 'error']);
+        assert.deepStrictEqual(L.snack.calls[1], ['Description is required', 'error', undefined, { key: 'skill-editor' }]);
         assert.strictEqual(L.g.saveSkill.calls.length, 0);
         assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'flex');
     }, { tags: ['unit'] });
@@ -200,6 +201,10 @@ describe('ui skills › editor open / save / cancel', function() {
         dom.$('#skill-name-input').value = 'mutated';
         var back = dom.$('.skills-back-btn');
         U.fireInline(back, 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 1, 'a dirty Back asks once (NEW-T17-1)');
+        assert.strictEqual(L.g.showConfirmModal.calls[0][0], 'Discard changes?');
+        assert.match(L.g.showConfirmModal.calls[0][1], /"alpha"/);
+        assert.strictEqual(L.g.showConfirmModal.calls[0][2], 'warning');
         assert.strictEqual(L.g.saveSkill.calls.length, 0);
         assert.strictEqual(L.g.skills.a1.name, 'alpha');
         assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none');
@@ -225,6 +230,139 @@ describe('ui skills › editor open / save / cancel', function() {
         assert.deepStrictEqual(L.snack.calls[0], ['Activated', 'success']);
         assert.match(dom.$('#skill-activate-btn').textContent, /Deactivate/);
         assert.strictEqual(dom.$('#skill-activate-btn').disabled, false);
+    }, { tags: ['unit'] });
+    test('Edit with Agent does not mark the previous chat seen (A5A3-01)', async function() {
+        var rec = U.recorder;
+        var L = await load({ skills: one(), currentChatId: 'X', chats: { X: {} }, currentView: 'skills', newChat: rec(), dispatchChatMeta: rec(),
+            clearUnseenFinishedChat: rec(), pushFocusChatToOffscreen: rec(), autoResizeTextarea: rec(), updateDashboardButtonState: rec() });
+        await body();
+        await L.m.openSkillEditor('a1');
+        L.m.editSkillWithAgent();
+        assert.strictEqual(L.g.newChat.calls.length, 1);
+        ['clearUnseenFinishedChat', 'dispatchChatMeta', 'pushFocusChatToOffscreen'].forEach(function(n) {
+            assert.ok(!L.g[n].calls.some(function(c) { return c[0] === 'X'; }), n + ' must not touch the previous chat');
+        });
+    }, { tags: ['unit'] });
+    // NEW-T17-1: Back (requestCloseSkillEditor) asks before it drops unsaved edits.
+    function backBtn(dom) { return dom.$('.skills-back-btn'); }
+    function editorRowNames(dom) { return dom.$$('.skill-action-row').map(function(r) { return r.querySelector('.skill-action-name').value; }); }
+    function denyConfirm() { return U.recorder(function() { return Promise.resolve(false); }); }
+    function assertKeptOpen(L, dom) {
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'flex', 'editor stays open');
+        assert.strictEqual(sc(L, 'currentEditingSkill'), 'a1');
+        assert.strictEqual(L.g.saveSkill.calls.length, 0, 'nothing saved');
+        assert.strictEqual(L.g.history.back.calls.length, 0, 'no history.back');
+        assert.strictEqual(L.g.replaceHistoryState.calls.length, 0, 'no history replace');
+    }
+    test('Back on a clean editor closes without asking (CRLF text, string/unordered placements) (NEW-T17-1)', async function() {
+        var sk = one();
+        sk.a1.description = 'first\r\nline';
+        sk.a1.body = '# Title\r\nhello';
+        sk.a1.actions = [{ name: 'Run', icon: 'nope', show: 'home chat' }, { name: '  Two  ', icon: 'bug', show: ['sidebar', 'home'] }];
+        var L = await load({ skills: sk }), dom = await body();
+        await L.m.openSkillEditor('a1');
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 0, 'clean Back never asks');
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none');
+        assert.strictEqual(sc(L, 'currentEditingSkill'), null);
+        assert.deepStrictEqual(L.g.replaceHistoryState.calls[0], ['skills', null, null]);
+    }, { tags: ['unit'] });
+    test('Back with an unsaved description: Cancel keeps the editor and the typed text (NEW-T17-1)', async function() {
+        var L = await load({ skills: one(), showConfirmModal: denyConfirm() }), dom = await body();
+        await L.m.openSkillEditor('a1');
+        dom.$('#skill-description-input').value = 'edited desc';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 1, 'dirty Back asks');
+        assertKeptOpen(L, dom);
+        assert.strictEqual(dom.$('#skill-description-input').value, 'edited desc', 'typed text kept');
+        assert.strictEqual(dom.$('#skill-name-input').value, 'alpha');
+        assert.strictEqual(L.g.skills.a1.description, 'first', 'skills[] untouched');
+    }, { tags: ['unit'] });
+    test('Back with a renamed action row: Cancel keeps the rows and the draft (NEW-T17-1)', async function() {
+        var L = await load({ skills: one(), showConfirmModal: denyConfirm() }), dom = await body();
+        await L.m.openSkillEditor('a1');
+        var input = dom.$('.skill-action-row[data-action-index="0"] .skill-action-name');
+        input.value = 'Renamed'; U.fireInline(input, 'input', L.m);
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 1, 'a row edit alone makes Back ask');
+        assertKeptOpen(L, dom);
+        assert.deepStrictEqual(editorRowNames(dom), ['Renamed'], 'row kept');
+        assert.strictEqual(L.m.getSkillActionsDraft()[0].name, 'Renamed', 'draft kept');
+        assert.strictEqual(L.g.skills.a1.actions[0].name, 'Run', 'skills[] untouched');
+    }, { tags: ['unit'] });
+    test('new skill: a blank form closes silently, a typed name asks first (NEW-T17-1)', async function() {
+        var L = await load({ skills: one(), showConfirmModal: denyConfirm() }), dom = await body();
+        await L.m.openSkillEditor(null);
+        dom.$('#skill-name-input').value = '   ';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 0, 'a blank (whitespace-only) form never asks');
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none');
+        await L.m.openSkillEditor(null);
+        dom.$('#skill-name-input').value = 'draft-skill';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 1, 'a typed name asks');
+        assert.match(L.g.showConfirmModal.calls[0][1], /"this new skill"/);
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'flex', 'Cancel keeps the form');
+        assert.strictEqual(dom.$('#skill-name-input').value, 'draft-skill');
+        assert.strictEqual(L.g.saveSkill.calls.length, 0);
+    }, { tags: ['unit'] });
+    test('the discard confirm names the skill HTML-escaped (NEW-T17-1)', async function() {
+        var L = await load({ skills: { zz: { id: 'zz', name: 'ZZ <b>&', description: 'd', body: 'b' } }, showConfirmModal: denyConfirm() }), dom = await body();
+        await L.m.openSkillEditor('zz');
+        dom.$('#skill-body-input').value = 'changed';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 1);
+        var c = L.g.showConfirmModal.calls[0];
+        assert.strictEqual(c[0], 'Discard changes?');
+        assert.strictEqual(c[1], 'Unsaved edits to "ZZ &lt;b&gt;&amp;" will be lost.');
+        assert.ok(c[1].indexOf('<b>') < 0, 'no raw markup');
+        assert.strictEqual(c[2], 'warning');
+    }, { tags: ['unit'] });
+    test('Save and Delete close without the discard confirm (NEW-T17-1)', async function() {
+        var g = { skills: one() };
+        g.deleteSkill = U.recorder(function(id) { delete g.skills[id]; return Promise.resolve(); });
+        var L = await load(g), dom = await body();
+        await L.m.openSkillEditor('a1');
+        dom.$('#skill-name-input').value = '  My Skill!! ';
+        var save = dom.$$('button').filter(function(b) { return b.getAttribute('onclick') === 'saveCurrentSkill()'; })[0];
+        await U.fireInline(save, 'click', L.m).result; await U.flush();
+        assert.strictEqual(L.g.saveSkill.calls.length, 1);
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none', 'Save closes');
+        assert.strictEqual(L.g.showConfirmModal.calls.length, 0, 'Save never asks to discard');
+        await L.m.openSkillEditor('a1');
+        dom.$('#skill-description-input').value = 'unsaved before delete';
+        await U.fireInline(dom.$('#skill-delete-btn'), 'click', L.m).result; await U.flush();
+        assert.deepStrictEqual(L.g.showConfirmModal.calls.map(function(c) { return c[0]; }), ['Delete Skill'], 'only the delete confirm');
+        assert.deepStrictEqual(g.deleteSkill.calls, [['a1']]);
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none', 'Delete closes');
+    }, { tags: ['unit'] });
+    test('the Back button is wired to requestCloseSkillEditor() (NEW-T17-1)', async function() {
+        var dom = await body();
+        assert.strictEqual(dom.$('.skills-back-btn').getAttribute('onclick'), 'requestCloseSkillEditor()');
+    }, { tags: ['unit'] });
+    test('a 2nd Back click while the confirm is pending asks once; a stale confirm never closes another skill (NEW-T17-1)', async function() {
+        var pending = { resolve: null }, sk = one();
+        var confirm = U.recorder(function() { return new Promise(function(r) { pending.resolve = r; }); });
+        sk.b2 = { id: 'b2', name: 'beta', description: 'second', body: '' };
+        var L = await load({ skills: sk, showConfirmModal: confirm }), dom = await body();
+        await L.m.openSkillEditor('a1');
+        dom.$('#skill-body-input').value = 'changed';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(confirm.calls.length, 1, 'one confirm while pending');
+        pending.resolve(true); await U.flush();
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'none', 'Discard closes');
+        assert.strictEqual(sc(L, 'currentEditingSkill'), null);
+        assert.strictEqual(L.g.replaceHistoryState.calls.length, 1, 'closed once');
+        await L.m.openSkillEditor('a1');
+        dom.$('#skill-body-input').value = 'changed again';
+        U.fireInline(backBtn(dom), 'click', L.m); await U.flush();
+        assert.strictEqual(confirm.calls.length, 2, 'the guard resets once the confirm settled');
+        await L.m.openSkillEditor('b2');
+        pending.resolve(true); await U.flush();
+        assert.strictEqual(sc(L, 'currentEditingSkill'), 'b2', 'the other skill stays open');
+        assert.strictEqual(dom.$('#skill-editor-panel').style.display, 'flex');
+        assert.strictEqual(L.g.replaceHistoryState.calls.length, 1, 'no second close');
     }, { tags: ['unit'] });
 });
 
@@ -253,9 +391,9 @@ describe('ui skills › action rows', function() {
         assert.ok(home.classList.contains('selected'), 'last placement cannot be deselected');
         U.fireInline(chat, 'click', L.m);
         assert.strictEqual(chat.getAttribute('aria-pressed'), 'true');
-        assert.deepStrictEqual(L.g.skills.s.actions[0].show, ['home', 'chat'], 'in-memory state synced');
+        assert.deepStrictEqual(L.m.collectSkillActionsFromEditor()[0].show, ['home', 'chat'], 'editor rows synced');
         U.fireInline(home, 'click', L.m);
-        assert.deepStrictEqual(L.g.skills.s.actions[0].show, ['chat']);
+        assert.deepStrictEqual(L.m.collectSkillActionsFromEditor()[0].show, ['chat']);
     }, { tags: ['unit'] });
     test('name input, add (+), remove (✕), and max 8 guard', async function() {
         var L = await load({ skills: withActions() }), dom = await body();
@@ -263,7 +401,7 @@ describe('ui skills › action rows', function() {
         var name1 = dom.$('.skill-action-row[data-action-index="1"] .skill-action-name');
         name1.value = 'Renamed';
         U.fireInline(name1, 'input', L.m);
-        assert.strictEqual(L.g.skills.s.actions[1].name, 'Renamed');
+        assert.strictEqual(L.m.collectSkillActionsFromEditor()[1].name, 'Renamed');
         var add = dom.$('.skill-actions-add-btn');
         U.fireInline(add, 'click', L.m);
         var rows = dom.$$('.skill-action-row');
@@ -276,13 +414,13 @@ describe('ui skills › action rows', function() {
         assert.strictEqual(dom.$$('.skill-action-row').length, 8);
         U.fireInline(dom.$('.skill-actions-add-btn'), 'click', L.m);
         assert.strictEqual(dom.$$('.skill-action-row').length, 8);
-        assert.deepStrictEqual(L.snack.calls[L.snack.calls.length - 1], ['Max 8 actions per skill', 'error']);
+        assert.deepStrictEqual(L.snack.calls[L.snack.calls.length - 1], ['Max 8 actions per skill', 'error', undefined, { key: 'skill-editor' }]);
     }, { tags: ['unit'] });
     test('add on an unsaved skill → "Save the skill first"', async function() {
         var L = await load({ skills: {} }), dom = await body();
         await L.m.openSkillEditor(null);
         U.fireInline(dom.$('.skill-actions-add-btn'), 'click', L.m);
-        assert.deepStrictEqual(L.snack.calls[0], ['Save the skill first', 'error']);
+        assert.deepStrictEqual(L.snack.calls[0], ['Save the skill first', 'error', undefined, { key: 'skill-editor' }]);
         assert.strictEqual(dom.$$('.skill-action-row').length, 0);
     }, { tags: ['unit'] });
     test('icon picker: opens with current icon selected, choosing updates hidden input + preview; backdrop closes', async function() {
@@ -297,7 +435,7 @@ describe('ui skills › action rows', function() {
         assert.strictEqual(document.getElementById('icon-picker-host'), null, 'closed after choose');
         assert.strictEqual(row0.querySelector('.skill-action-icon').value, 'rocket');
         assert.strictEqual(row0.querySelector('.skill-action-preview').innerHTML, norm(L.m.UI_ICONS.rocket));
-        assert.strictEqual(L.g.skills.s.actions[0].icon, 'rocket');
+        assert.strictEqual(L.m.collectSkillActionsFromEditor()[0].icon, 'rocket');
         U.fireInline(row0.querySelector('.skill-action-icon-btn'), 'click', L.m);
         host = document.getElementById('icon-picker-host');
         var modal = host.querySelector('.icon-picker-modal');
@@ -305,6 +443,61 @@ describe('ui skills › action rows', function() {
         assert.ok(document.getElementById('icon-picker-host'), 'click inside modal does not close');
         U.fireInline(host.querySelector('.icon-picker-backdrop'), 'click', L.m);
         assert.strictEqual(document.getElementById('icon-picker-host'), null, 'backdrop click closes');
+    }, { tags: ['unit'] });
+    function rowNames(dom) { return dom.$$('.skill-action-row').map(function(r) { return r.querySelector('.skill-action-name').value; }); }
+    function pickIcon(dom, L, index, icon) {
+        U.fireInline(dom.$('.skill-action-row[data-action-index="' + index + '"] .skill-action-icon-btn'), 'click', L.m);
+        U.fireInline(document.getElementById('icon-picker-host').querySelector('[data-icon="' + icon + '"]'), 'click', L.m);
+    }
+    function rename(dom, L, index, value) {
+        var input = dom.$('.skill-action-row[data-action-index="' + index + '"] .skill-action-name');
+        input.value = value;
+        U.fireInline(input, 'input', L.m);
+    }
+    test('unsaved action edits are discarded on Back and on reopen (A5A2-01)', async function() {
+        var L = await load({ skills: withActions() }), dom = await body();
+        await L.m.openSkillEditor('s');
+        var snap = JSON.stringify(L.g.skills.s.actions);
+        rename(dom, L, 1, 'Renamed');
+        U.fireInline(dom.$('.skill-actions-add-btn'), 'click', L.m);
+        U.fireInline(dom.$('.skill-action-row[data-action-index="0"] .skill-action-remove'), 'click', L.m);
+        pickIcon(dom, L, 0, 'rocket');
+        assert.deepStrictEqual(rowNames(dom), ['Renamed', 'New Action'], 'edits are shown in the editor');
+        assert.strictEqual(JSON.stringify(L.g.skills.s.actions), snap, 'skills[] untouched until Save');
+        U.fireInline(dom.$('.skills-back-btn'), 'click', L.m); await U.flush();
+        assert.strictEqual(JSON.stringify(L.g.skills.s.actions), snap, 'Back persists nothing');
+        await L.m.openSkillEditor('s');
+        assert.deepStrictEqual(rowNames(dom), ['A ' + HOSTILE, 'B'], 'reopen after Back shows the saved rows');
+        assert.strictEqual(dom.$('.skill-action-row[data-action-index="0"] .skill-action-icon').value, 'bug');
+        // Reopening without Back (history / list click) drops the draft too.
+        rename(dom, L, 1, 'Again');
+        await L.m.openSkillEditor('s');
+        assert.deepStrictEqual(rowNames(dom), ['A ' + HOSTILE, 'B'], 'reopen without Back shows the saved rows');
+        assert.strictEqual(JSON.stringify(L.g.skills.s.actions), snap);
+        assert.strictEqual(L.g.saveSkill.calls.length, 0, 'nothing saved');
+    }, { tags: ['unit'] });
+    test('saved action edits are committed on Save (A5A2-01)', async function() {
+        var L = await load({ skills: withActions() }), dom = await body();
+        await L.m.openSkillEditor('s');
+        rename(dom, L, 1, 'Renamed');
+        U.fireInline(dom.$('.skill-actions-add-btn'), 'click', L.m);
+        pickIcon(dom, L, 0, 'rocket');
+        await L.m.saveCurrentSkill();
+        assert.strictEqual(L.g.saveSkill.calls.length, 1);
+        var saved = L.g.saveSkill.calls[0][0].actions;
+        assert.deepStrictEqual(saved.map(function(a) { return a.name; }), ['A ' + HOSTILE, 'Renamed', 'New Action']);
+        assert.strictEqual(saved[0].icon, 'rocket');
+        await L.m.openSkillEditor('s');
+        assert.deepStrictEqual(rowNames(dom), ['A ' + HOSTILE, 'Renamed', 'New Action'], 'reopen shows the saved rows');
+    }, { tags: ['unit'] });
+    test('a just-added row can be removed before Save on a skill without saved actions (A5A2-01)', async function() {
+        var L = await load({ skills: { e: { id: 'e', name: 'e', description: 'd' } } }), dom = await body();
+        await L.m.openSkillEditor('e');
+        U.fireInline(dom.$('.skill-actions-add-btn'), 'click', L.m);
+        assert.strictEqual(dom.$$('.skill-action-row').length, 1);
+        U.fireInline(dom.$('.skill-action-row .skill-action-remove'), 'click', L.m);
+        assert.strictEqual(dom.$$('.skill-action-row').length, 0);
+        assert.strictEqual(L.g.skills.e.actions, undefined, 'nothing persisted');
     }, { tags: ['unit'] });
 });
 
@@ -349,6 +542,118 @@ describe('ui skills › SKILL.md round-trip through the editor', function() {
         assert.strictEqual(L.m._yamlScalar('Audit: "prod"\nx'), '"Audit: \\"prod\\"\\nx"');
         assert.strictEqual(L.m._yamlScalar('plain text'), 'plain text');
         assert.strictEqual(L.m._stripYamlQuotes('"a \\"b\\" \\n c \\d"'), 'a "b" \n c \\d');
+    }, { tags: ['unit'] });
+});
+
+describe('ui skills › Add file (S0B-11)', function() {
+    afterEach(function() { U.cleanupAll(); });
+    function one() { return { a1: { id: 'a1', name: 'alpha', description: 'first', body: '# Title\nhello', actions: [{ name: 'Run', icon: 'rocket', show: ['home', 'chat'] }] } }; }
+    function file(name, text) { return { name: name, text: function() { return typeof text === 'function' ? text() : Promise.resolve(text); } }; }
+    // existing = what getSkillAsset resolves for the picked name (default null = new name; A5B2-01).
+    async function setup(confirmResult, existing) {
+        var confirm = U.recorder(function() { return Promise.resolve(confirmResult); });
+        var L = await load({ skills: one(), currentEditingSkill: 'a1', showConfirmModal: confirm,
+            saveSkillAsset: U.recorder(function() { return Promise.resolve(); }),
+            getSkillAsset: U.recorder(function() { return Promise.resolve(existing || null); }) });
+        await body();
+        return { L: L, confirm: confirm };
+    }
+    // Drive the real entry point: capture the <input type=file> addSkillAsset() builds instead of opening a picker.
+    async function pick(L, files) {
+        var orig = document.createElement, picked = null;
+        document.createElement = function(tag) {
+            var el = orig.apply(document, arguments);
+            if (String(tag).toLowerCase() === 'input') el.click = function() { picked = el; };
+            return el;
+        };
+        try { await L.m.addSkillAsset(); } finally { document.createElement = orig; }
+        assert.ok(picked && typeof picked.onchange === 'function', 'addSkillAsset opened a file picker');
+        var err = null;
+        try { await picked.onchange({ target: { files: files } }); } catch (e) { err = e || 'rejected'; }
+        return err;
+    }
+    test('plain SKILL.md replaces only the body; name + actions kept (S0B-11)', async function() {
+        var S = await setup(true);
+        assert.strictEqual(await pick(S.L, [file('SKILL.md', 'brand new body')]), null);
+        var sk = S.L.g.skills.a1;
+        assert.deepStrictEqual([sk.name, sk.description, sk.body, sk.actions.length], ['alpha', 'first', 'brand new body', 1]);
+        assert.strictEqual(S.confirm.calls.length, 1, 'asked before replacing');
+        assert.deepStrictEqual(S.L.snack.calls[S.L.snack.calls.length - 1], ['Added 0 file(s); skill updated from SKILL.md', 'success']);
+    }, { tags: ['unit'] });
+    test('file.text() rejecting → error snackbar, onchange never rejects (S0B-11)', async function() {
+        var S = await setup(true);
+        var err = await pick(S.L, [file('notes.md', function() { return Promise.reject(new Error('boom')); })]);
+        assert.strictEqual(err, null, 'onchange must not reject');
+        assert.ok(S.L.snack.calls.some(function(c) { return /Add file failed: boom/.test(c[0]) && c[1] === 'error'; }), JSON.stringify(S.L.snack.calls));
+        assert.strictEqual(S.L.g.saveSkillAsset.calls.length, 0);
+    }, { tags: ['unit'] });
+    test('.txt counts as skipped: "Added 1 file(s), skipped 1" (S0B-11)', async function() {
+        var S = await setup(true);
+        assert.strictEqual(await pick(S.L, [file('a.js', 'x()'), file('b.txt', 'nope')]), null);
+        assert.deepStrictEqual(S.L.g.saveSkillAsset.calls, [['a1', 'a.js', 'js', 'x()']]);
+        assert.deepStrictEqual(S.L.snack.calls[S.L.snack.calls.length - 1], ['Added 1 file(s), skipped 1', 'success']);
+    }, { tags: ['unit'] });
+    test('SKILL.md cancel keeps the skill untouched (S0B-11)', async function() {
+        // null = the real Cancel button / Escape (resolveModal(null)); false = any other dismiss.
+        var results = [null, false];
+        for (var k = 0; k < results.length; k++) {
+            var S = await setup(results[k]);
+            assert.strictEqual(await pick(S.L, [file('SKILL.md', '---\nname: evil\ndescription: replaced\n---\nnew body')]), null);
+            var sk = S.L.g.skills.a1;
+            assert.strictEqual(S.confirm.calls.length, 1, 'asked before replacing');
+            assert.strictEqual(S.confirm.calls[0][2], 'danger');
+            assert.deepStrictEqual([sk.name, sk.description, sk.body, sk.actions.length], ['alpha', 'first', '# Title\nhello', 1]);
+            assert.strictEqual(S.L.g.saveSkill.calls.length, 0, 'nothing persisted on cancel');
+            U.cleanupAll();
+        }
+    }, { tags: ['unit'] });
+    test('same-name asset asks before overwrite (A5B2-01)', async function() {
+        // Cancel (null = Cancel button / Escape, false = any other dismiss) writes nothing.
+        var cancels = [null, false];
+        for (var k = 0; k < cancels.length; k++) {
+            var S = await setup(cancels[k], { content: 'old' });
+            assert.strictEqual(await pick(S.L, [file('my_tool.js', 'new')]), null);
+            assert.deepStrictEqual(S.L.g.getSkillAsset.calls, [['a1', 'my_tool.js']]);
+            assert.strictEqual(S.confirm.calls.length, 1, 'asked before replacing');
+            assert.deepStrictEqual([S.confirm.calls[0][0], S.confirm.calls[0][2]], ['Replace file', 'danger']);
+            assert.match(S.confirm.calls[0][1], /my_tool\.js already exists/);
+            assert.strictEqual(S.L.g.saveSkillAsset.calls.length, 0, 'nothing overwritten on cancel');
+            assert.deepStrictEqual(S.L.snack.calls[S.L.snack.calls.length - 1], ['Added 0 file(s), skipped 1', 'success']);
+            U.cleanupAll();
+        }
+        // Confirm replaces exactly once.
+        var R = await setup(true, { content: 'old' });
+        assert.strictEqual(await pick(R.L, [file('my_tool.js', 'new')]), null);
+        assert.strictEqual(R.confirm.calls.length, 1);
+        assert.deepStrictEqual(R.L.g.saveSkillAsset.calls, [['a1', 'my_tool.js', 'js', 'new']]);
+        assert.deepStrictEqual(R.L.snack.calls[R.L.snack.calls.length - 1], ['Added 1 file(s)', 'success']);
+        U.cleanupAll();
+        // A new name saves with no confirm.
+        var N = await setup(true);
+        assert.strictEqual(await pick(N.L, [file('fresh.md', 'hi')]), null);
+        assert.strictEqual(N.confirm.calls.length, 0, 'no confirm for a new name');
+        assert.deepStrictEqual(N.L.g.saveSkillAsset.calls, [['a1', 'fresh.md', 'md', 'hi']]);
+    }, { tags: ['unit'] });
+    test('S0C5-02 (b): the Remove File confirm escapes the file name; cancel deletes nothing', async function() {
+        var confirm = U.recorder(function() { return Promise.resolve(false); });
+        var L = await load({ skills: one(), currentEditingSkill: 'a1', showConfirmModal: confirm,
+            deleteSkillAsset: U.recorder(function() { return Promise.resolve(); }) });
+        await L.m.removeSkillAsset('notes<script>.md');
+        assert.deepStrictEqual(confirm.calls[0], ['Remove File', 'Remove notes&lt;script&gt;.md from this skill?', 'danger']);
+        assert.strictEqual(L.g.deleteSkillAsset.calls.length, 0, 'cancel deletes nothing');
+        assert.strictEqual(L.snack.calls.length, 0);
+    }, { tags: ['unit'] });
+    test('RF25-F1: the Replace file confirm escapes the file name; cancel replaces nothing', async function() {
+        var S = await setup(false, { content: 'old' });
+        assert.strictEqual(await pick(S.L, [file('notes<script>.md', 'new')]), null);
+        assert.deepStrictEqual(S.L.g.getSkillAsset.calls, [['a1', 'notes<script>.md']], 'lookup keeps the raw name');
+        assert.deepStrictEqual(S.confirm.calls, [['Replace file', 'notes&lt;script&gt;.md already exists in this skill. Replace it?', 'danger']]);
+        assert.strictEqual(S.L.g.saveSkillAsset.calls.length, 0, 'cancel replaces nothing');
+        U.cleanupAll();
+        // Confirm saves under the raw name.
+        var R = await setup(true, { content: 'old' });
+        assert.strictEqual(await pick(R.L, [file('notes<script>.md', 'new')]), null);
+        assert.deepStrictEqual(R.L.g.saveSkillAsset.calls, [['a1', 'notes<script>.md', 'md', 'new']]);
     }, { tags: ['unit'] });
 });
 
@@ -405,6 +710,18 @@ describe('ui permissions › radio groups', function() {
         assert.ok(a);
         assert.ok(U.fireInline(a, 'click', L.m).prevented);
         assert.strictEqual(L.g.resetAllPermissionsToDefaults.calls.length, 1);
+    }, { tags: ['unit'] });
+    test('renderToolPermissions with only #settings-tool-permissions mounted repaints the Settings list', async function() {
+        // S0-02: the header #tool-permissions-list is gone; callers (bridge, data import,
+        // reset) still call renderToolPermissions() and must refresh the Settings list.
+        var L = await load(), dom = await U.mountDom({ html: '<div id="settings-tool-permissions"></div>' });
+        L.m.renderSettingsToolPermissions();
+        assert.ok(dom.$('#settings-instance-tier-toggle .tier-opt-manual.selected'), 'initial paint: manual');
+        assert.strictEqual(dom.$('#settings-instance-tier-toggle .tier-opt-dev.selected'), null);
+        L.g.instancePermissions[HOST] = { tier: 'dev', tools: {} };
+        L.m.renderToolPermissions();
+        assert.ok(dom.$('#settings-instance-tier-toggle .tier-opt-dev.selected'), 'Settings list repainted with the new tier');
+        assert.strictEqual(dom.$('#tool-permissions-list'), null, 'no header list was created');
     }, { tags: ['unit'] });
 });
 

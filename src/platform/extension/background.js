@@ -126,8 +126,27 @@ async function injectInterceptors(tabId) {
 
                 // Console interceptor
                 var origLog = console.log, origWarn = console.warn, origError = console.error;
+                function isOurs(d) {
+                    return !!d && typeof d.type === 'string' && d.type.indexOf('appagent-') === 0;
+                }
+                // TA3-4: does one log argument carry our payload (the posted object, an event
+                // wrapping it, or its serialized form)? Duck-typed, so cross-realm objects match too.
+                function carriesOurs(a) {
+                    try {
+                        if (typeof a === 'string') return a.indexOf('appagent-') === 0 || a.indexOf('"type":"appagent-') !== -1;
+                        return !!a && typeof a === 'object' && (isOurs(a) || isOurs(a.data));
+                    } catch (e) { return false; }
+                }
                 function capture(level, args) {
-                    var msg = Array.prototype.slice.call(args).map(function(a) {
+                    // S0C4-06: a page 'message' listener that logs our own appagent-* posts
+                    // would re-enter capture and loop forever; skip logs made while one is dispatched.
+                    var ev = window.event;
+                    if (ev && ev.type === 'message' && ev.data && typeof ev.data.type === 'string' && ev.data.type.indexOf('appagent-') === 0) return;
+                    // TA3-4: window.event is unset for a later-task (setTimeout) or cross-realm log,
+                    // so also drop any log that carries our payload (private channel later).
+                    var list = Array.prototype.slice.call(args);
+                    if (list.some(carriesOurs)) return;
+                    var msg = list.map(function(a) {
                         try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
                         catch(e) { return String(a); }
                     }).join(' ');
@@ -140,13 +159,24 @@ async function injectInterceptors(tabId) {
                 // Fetch interceptor
                 var origFetch = window.fetch;
                 window.fetch = function(url, opts) {
-                    var method = (opts && opts.method) || 'GET';
+                    // S0C4-10: fetch(new Request(...)) carries its method/url on the Request itself.
+                    // All probing stays in one try: a non-callable page global Request ({}/null) or a
+                    // Proxy / Object.create(Request.prototype) input must never make fetch() throw.
+                    var isReq = false, method, reqUrl = '';
+                    try {
+                        isReq = typeof Request === 'function' && url instanceof Request;
+                        method = (opts && opts.method) || (isReq ? url.method : 'GET');
+                        reqUrl = isReq ? url.url : String(url);
+                    } catch (e) {
+                        method = (opts && opts.method) || 'GET';
+                        reqUrl = '';
+                    }
                     var start = Date.now();
                     return origFetch.apply(this, arguments).then(function(res) {
                         window.postMessage({
                             type: 'appagent-network',
                             method: method,
-                            url: String(url),
+                            url: reqUrl,
                             status: res.status,
                             duration: Date.now() - start
                         }, '*');
@@ -155,7 +185,7 @@ async function injectInterceptors(tabId) {
                         window.postMessage({
                             type: 'appagent-network',
                             method: method,
-                            url: String(url),
+                            url: reqUrl,
                             status: 0,
                             duration: Date.now() - start
                         }, '*');
@@ -172,20 +202,29 @@ async function injectInterceptors(tabId) {
                     xhr.open = function(method, url) {
                         xhrMethod = method;
                         xhrUrl = url;
-                        xhrStart = Date.now();
+                        xhrStart = null;
                         return origOpen.apply(xhr, arguments);
                     };
+                    // S0C4-10: one loadend listener per XHR posts once per send, also on
+                    // error/abort/timeout (status 0); send/loadstart only stamp the start time.
+                    // TA4-8: XMLHttpRequest.prototype.send.call(xhr) skips the send wrapper, so every
+                    // async send is also stamped on loadstart; a send with no stamp (a sync prototype
+                    // send) posts duration null, and open/each post clear the stamp (never stale).
+                    xhr.addEventListener('loadstart', function() { xhrStart = Date.now(); });
+                    xhr.addEventListener('loadend', function() {
+                        var started = xhrStart;
+                        xhrStart = null;
+                        window.postMessage({
+                            type: 'appagent-network',
+                            method: xhrMethod,
+                            url: String(xhrUrl),
+                            status: xhr.status,
+                            duration: started === null ? null : Date.now() - started
+                        }, '*');
+                    });
                     var origSend = xhr.send;
                     xhr.send = function() {
-                        xhr.addEventListener('load', function() {
-                            window.postMessage({
-                                type: 'appagent-network',
-                                method: xhrMethod,
-                                url: String(xhrUrl),
-                                status: xhr.status,
-                                duration: Date.now() - xhrStart
-                            }, '*');
-                        });
+                        xhrStart = Date.now();
                         return origSend.apply(xhr, arguments);
                     };
                     return xhr;
@@ -234,36 +273,210 @@ async function updateHeaderRules() {
 
 // --- App tab: toolbar click + reopen-after-Reload (APP-TAB-REOPEN) ---
 //
-// The in-app Reload button (ui/270-iframe-panel.js) writes `reopenAppTab`
-// (a Date.now() timestamp; legacy builds wrote `true`) and then calls
-// chrome.runtime.reload(). The fresh SW consumes the marker and reopens the
-// app as a full tab (sidePanel.open() needs a user gesture).
-//
-// Bug fixed here: the marker used to be consumed ONLY by one top-level
-// storage read in whichever SW instance started next. When that read missed
-// it (marker landed late / SW start raced), nothing reopened after Reload and
-// the marker stayed pending; the NEXT SW start was the user's toolbar click,
-// which then ran BOTH the marker reopen AND the onClicked open -> two tabs.
-// Now: the marker is timestamped and discarded when stale, consumption is
-// single-flight and re-checked (startup, onInstalled, short delayed retry),
-// and a toolbar click atomically cancels any pending marker and reuses a tab
-// that the reopen just created instead of opening a second one.
-// Also: (m1) a reopen only ever waits for / focuses / reloads the app tabs that
-// existed at this instance's FIRST attempt (id snapshot kept in memory and in
-// chrome.storage.session), never a tab of the new instance; (m2) a toolbar
-// click cancels the in-flight attempt at its next checkpoint (~one poll), so
-// it opens promptly; (nit) the legacy `true` marker is consumed on its first
-// attempt even when that attempt fails.
+// Clean reload (PR B1): the in-app Reload (app/060-keep-awake.js) sends
+// {type:'app-clean-reload'}. This SW acks {ok:true, ack} at once (synchronously,
+// before any await), then writes the reopen marker {at, attempts:0, tabId:null}
+// (bounded 1s), closes EVERY extension tab (query+remove bounded ~3s together)
+// and only then calls chrome.runtime.reload(). Without an ack within 1.5s the
+// page reloads on its own (the page first writes its own Date.now() number
+// marker, pre-timestamp builds wrote 'true'; both are still accepted). The
+// fresh SW consumes the marker and reopens the app as a full tab
+// (sidePanel.open() needs a user gesture).
+// Ready handshake: a created tab only counts once its page proves it booted:
+// app/070-app-tab-ready.js sends {type:'app-tab-ready'} (recorded even before
+// the tabs.create answer). No ready within REOPEN_APP_TAB_READY_MS: the tab is
+// closed and one more is created, at most REOPEN_APP_TAB_MAX_ATTEMPTS per Reload
+// (counted in the marker, so an SW restart mid-wait closes the unproven tab and
+// continues the count; after the final attempt it leaves that tab open and
+// gives up). The last tab is left open, never closed; a toolbar click during a
+// wait adopts the tab being verified (never closed either).
+// Survivors (old-instance app tabs still open ~2s after the reload) are closed,
+// never focused or reloaded.
+// Kept from earlier fixes: the marker is timestamped and dropped when stale;
+// consumption is single-flight and re-checked (startup, onInstalled, delayed
+// re-checks); a toolbar click atomically cancels a pending marker and reuses a
+// tab the reopen just opened (no second tab). (m1) a reopen only ever touches
+// the app tabs that existed at this instance's FIRST attempt (id snapshot kept
+// in memory and in chrome.storage.session), never a tab of the new instance;
+// (m2) a click cancels the in-flight attempt at its next checkpoint (~one poll).
+// HANG-FIX: every chrome.* call here is bounded (REOPEN_APP_TAB_CALL_MS), a
+// whole flight by a benign watchdog (REOPEN_APP_TAB_WATCHDOG_MS: it stops later
+// creates and marker writes and drops the marker, never closes a tab), and a
+// click waits at most REOPEN_APP_TAB_CLICK_WAIT_MS for it, then opens anyway.
 var APP_TAB_PATH = 'app.html?mode=tab';
 var REOPEN_APP_TAB_MAX_AGE_MS = 60 * 1000;   // marker older than this is stale
 var REOPEN_APP_TAB_REUSE_MS = 10 * 1000;     // click right after a reopen reuses that tab
 var REOPEN_APP_TAB_SETTLE_POLLS = 8;         // x250ms: wait ~2s for the OLD instance's app tabs to close
 var REOPEN_APP_TAB_POLL_MS = 250;
-var REOPEN_APP_TAB_VERIFY_MS = 500;          // an opened tab must still exist this long after
-var REOPEN_APP_TAB_SUSPECTS_KEY = 'reopenAppTabSuspects'; // chrome.storage.session: m1 snapshot
-var _appTabReopenState = { done: false, inFlight: null, tab: null, at: 0, suspectIds: null };
+var REOPEN_APP_TAB_SUSPECTS_KEY = 'reopenAppTabSuspects'; // chrome.storage.session: m1 snapshot {ids, marker, at}
+var REOPEN_APP_TAB_CALL_MS = 3000;           // max wait for any single chrome.* call below
+var REOPEN_APP_TAB_WATCHDOG_MS = 25 * 1000;  // a whole reopen flight; then it is abandoned (benign)
+var REOPEN_APP_TAB_CLICK_WAIT_MS = 1500;     // a toolbar click waits at most this for the reopen
+var REOPEN_APP_TAB_READY_MS = 8000;          // a created tab must send app-tab-ready within this
+var REOPEN_APP_TAB_MAX_ATTEMPTS = 2;         // tabs created + waited for per Reload (marker.attempts)
+var REOPEN_APP_TAB_CLEAN_REMOVE_MS = 3000;   // one bounded tabs.query + remove phase
+var REOPEN_APP_TAB_READY_TTL_MS = 60 * 1000; // readyTabs entries older than this are pruned
+var REOPEN_APP_TAB_PEEK_MS = 1000;           // MED-1: bound of the tabs.get once a ready wait ran out
+var REOPEN_APP_TAB_STALE_READY_MS = 500;     // LOW-1: a restart's unverified tab gets this for its waking ready
+var _appTabReopenState = {
+    done: false, inFlight: null, tab: null, at: 0, suspectIds: null, clickOpened: false,
+    verifying: null,    // the created tab awaiting its app-tab-ready
+    adoptedTabId: null, // a verifying tab a toolbar click took over (never closed)
+    readyTabs: {},      // tabId -> {bootId, at, nav, prevBoot, t}, recorded before any wait
+    readyWaiters: {},   // tabId -> fn of the pending _reopenWaitReady
+    verifyWaiters: []   // clicks waiting for a created tab to start verifying
+};
+var _reopenCleanReloadInFlight = false;
+// F4 (Boot OOM): ONE toolbar click at a time. A click while another is in
+// flight joins it; a click right after one that showed a tab is debounced; an
+// existing plain app tab is focused (live) or reloaded (not known alive)
+// instead of opening another app instance (_clickReuseOrCreate).
+var APP_TAB_CLICK_DEBOUNCE_MS = 2000;
+var APP_TAB_CLICK_SW_GRACE_MS = 2000;        // a live page reconnects its port ~250ms after an SW restart
+var _APP_TAB_CLICK_STUCK = { stuck: true };  // the click's reopen wait ran out
+var _appTabClick = {
+    inFlight: null, last: null, okAt: -Infinity,
+    queryHungAt: -Infinity, // last tabs.query of this slice that timed out
+    touched: {},            // tabId -> when a click created / reloaded it (boot grace)
+    swStartAt: Date.now()
+};
 
 function _reopenDelay(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+// Runs fn() (one chrome.* call) and settles with its result, or rejects with a
+// timeout error (err.reopenTimeout) after ms. A result arriving after the
+// timeout goes to onLate (e.g. a slow tabs.create) instead of being lost.
+function _reopenCall(fn, ms, onLate) {
+    ms = ms || REOPEN_APP_TAB_CALL_MS;
+    return new Promise(function(resolve, reject) {
+        var settled = false;
+        setTimeout(function() {
+            if (settled) return;
+            settled = true;
+            var err = new Error('chrome call timed out after ' + ms + 'ms');
+            err.reopenTimeout = true;
+            reject(err);
+        }, ms);
+        Promise.resolve().then(fn).then(function(v) {
+            if (!settled) { settled = true; resolve(v); return; }
+            if (onLate) { try { onLate(v); } catch (e) {} }
+        }, function(e) {
+            if (!settled) { settled = true; reject(e); }
+        });
+    });
+}
+
+// The ONLY chrome.storage.local write of the reopen code (bounded like every
+// chrome.* call here). B2 routes the persisted reopen log through it as well.
+function _reopenStorageSet(obj, ms) {
+    return _reopenCall(function() { return chrome.storage.local.set(obj); }, ms);
+}
+
+// Structured reopen log: console.info, plus (B2) the persisted ring buffer
+// below. Synchronous for callers, never throws, never awaited.
+function _reopenLog(ev, data) {
+    try { console.info('[SW][reopen] ' + ev, data || {}); } catch (e) {}
+    try { _reopenLogPersist(_reopenLogEntry(ev, data)); } catch (e) {}
+}
+
+// Persisted reopen log (B2): chrome.storage.local[REOPEN_LOG_KEY] is an array
+// of {at, event, ...data}, newest last, only the last REOPEN_LOG_MAX kept, so a
+// reopen that went wrong can be read back later. ONE module-level promise chain
+// serializes the read-modify-write appends in call order; each get and set is
+// bounded by REOPEN_LOG_STEP_MS (the setTimeout race of _reopenCall). A get
+// that throws, hangs or answers no object skips that entry (the stored log is
+// never overwritten with a partial array); a set that throws or hangs is
+// dropped; either way the chain moves on. Nothing here is awaited by a caller,
+// so it never delays the clean-reload ack -> marker -> close -> reload order.
+var REOPEN_LOG_KEY = 'appagentReopenLog';
+var REOPEN_LOG_MAX = 50;          // entries kept, newest last
+var REOPEN_LOG_DATA_MAX = 500;    // max chars of one entry's stringified data
+var REOPEN_LOG_STEP_MS = 1800;    // bound of each log get / set (matches no flow timer)
+var _reopenLogChain = Promise.resolve();
+
+// {at, event, ...data}. Data keys named at / event are kept as data_at /
+// data_event; data longer than REOPEN_LOG_DATA_MAX chars once stringified is
+// kept as the cut JSON string {data, truncated: true}.
+function _reopenLogEntry(ev, data) {
+    var entry = { at: Date.now(), event: String(ev).slice(0, 100) };
+    var json;
+    try { json = JSON.stringify(data == null ? {} : data); } catch (e) { entry.unserializable = true; return entry; }
+    if (typeof json !== 'string') return entry;
+    if (json.length > REOPEN_LOG_DATA_MAX) { entry.truncated = true; entry.data = json.slice(0, REOPEN_LOG_DATA_MAX); return entry; }
+    var copy = JSON.parse(json);
+    if (!copy || typeof copy !== 'object' || Array.isArray(copy)) { entry.data = copy; return entry; }
+    Object.keys(copy).forEach(function(k) { entry[k === 'at' || k === 'event' ? 'data_' + k : k] = copy[k]; });
+    return entry;
+}
+
+// Queues one append (get -> trim -> set) on the chain; returns at once.
+function _reopenLogPersist(entry) {
+    var local = chrome.storage && chrome.storage.local;
+    if (!local || typeof local.get !== 'function' || typeof local.set !== 'function') return;
+    var append = function() {
+        return _reopenCall(function() { return local.get(REOPEN_LOG_KEY); }, REOPEN_LOG_STEP_MS).then(function(got) {
+            if (!got || typeof got !== 'object') return; // not a real read: skip, never overwrite
+            var prev = got[REOPEN_LOG_KEY];
+            var list = (Array.isArray(prev) ? prev : []).concat([entry]).slice(-REOPEN_LOG_MAX);
+            var obj = {};
+            obj[REOPEN_LOG_KEY] = list;
+            return _reopenStorageSet(obj, REOPEN_LOG_STEP_MS).catch(function() {}); // set threw / timed out: move on
+        }, function() {}); // get threw / timed out: skip this entry
+    };
+    _reopenLogChain = (_reopenLogChain || Promise.resolve()).then(append, append);
+}
+
+function _reopenErr(e) {
+    try { return String((e && e.message) || e); } catch (x) { return 'error'; }
+}
+
+function _reopenTabInfo(t) {
+    t = t || {};
+    return { id: t.id, url: t.url || t.pendingUrl || '', title: t.title || '', status: t.status || '' };
+}
+
+function _reopenRemoveMarker() {
+    // Once a clean reload wrote the marker for the NEXT instance, nothing of
+    // this lifetime may drop it any more.
+    if (_reopenCleanReloadInFlight) return Promise.resolve();
+    return _reopenCall(function() { return chrome.storage.local.remove('reopenAppTab'); }).catch(function() {});
+}
+
+// Bounded close of tab ids: one tabs.remove per id (an id that is already gone
+// never keeps the others open), all together at most ms. Never throws;
+// resolves the number of tabs Chrome confirmed closed.
+function _reopenRemoveTabs(ids, ms) {
+    var list = (ids || []).filter(function(id) { return typeof id === 'number'; });
+    if (!list.length || !chrome.tabs || !chrome.tabs.remove) return Promise.resolve(0);
+    var all = Promise.all(list.map(function(id) {
+        return Promise.resolve().then(function() { return chrome.tabs.remove(id); }).then(function() { return 1; }, function(e) {
+            _reopenLog('remove-failed', { tabId: id, error: _reopenErr(e) });
+            return 0;
+        });
+    })).then(function(r) { return r.reduce(function(a, b) { return a + b; }, 0); });
+    return _reopenCall(function() { return all; }, ms || REOPEN_APP_TAB_CLEAN_REMOVE_MS).catch(function(e) {
+        _reopenLog('remove-timeout', { tabIds: list, error: _reopenErr(e) });
+        return 0;
+    });
+}
+
+// A reopen tab whose create answered only after we stopped waiting: keep it as
+// THE reopened tab, unless another app tab was opened meanwhile (then close it,
+// so a slow create never leaves a duplicate). Only ever touches that new tab.
+function _reopenLateTab(tab) {
+    var st = _appTabReopenState;
+    if (!tab || tab.id == null) return;
+    if (st.clickOpened || (st.tab && st.tab.id !== tab.id)) {
+        _reopenLog('late-tab-closed', { tabId: tab.id });
+        _reopenRemoveTabs([tab.id]);
+        return;
+    }
+    _reopenLog('late-tab-adopted', { tabId: tab.id });
+    st.done = true;
+    st.tab = tab;
+    st.at = Date.now();
+    _reopenRemoveMarker();
+}
 
 // Wait ~ms in poll-sized steps; returns early once a toolbar click took over
 // (st.done), so the click never waits more than ~one poll for this attempt.
@@ -273,78 +486,263 @@ function _reopenNap(ms) {
     return _reopenDelay(step).then(function() { return _reopenNap(ms - step); });
 }
 
-// true while the tab exists. Chrome closes an unloaded extension's tabs
-// asynchronously, so a tab seen right after reload() may vanish a moment later.
-function _reopenTabAlive(id) {
-    if (!chrome.tabs.get) return Promise.resolve(true);
-    return Promise.resolve().then(function() { return chrome.tabs.get(id); }).then(function(t) { return !!t; }, function() { return false; });
+// The tab (tabs.get snapshot) while it exists, else null (also when tabs.get
+// did not answer). Chrome closes an unloaded extension's tabs asynchronously,
+// so a tab seen right after reload() may vanish a moment later.
+function _reopenGetTab(id) {
+    if (!chrome.tabs.get) return Promise.resolve({ id: id });
+    return _reopenCall(function() { return chrome.tabs.get(id); }).then(function(t) { return t || null; }, function() { return null; });
 }
 
 function _appTabUrl() { return chrome.runtime.getURL(APP_TAB_PATH); }
 
 function _createAppTab() {
-    return Promise.resolve(chrome.tabs.create({ url: _appTabUrl() }));
+    return _reopenCall(function() { return chrome.tabs.create({ url: _appTabUrl() }); });
 }
 
 function _focusAppTab(tab) {
-    return Promise.resolve(chrome.tabs.update(tab.id, { active: true })).then(function(t) {
+    return _reopenCall(function() { return chrome.tabs.update(tab.id, { active: true }); }).then(function(t) {
         var winId = (t && t.windowId != null) ? t.windowId : tab.windowId;
         if (winId != null && chrome.windows && chrome.windows.update) {
-            return Promise.resolve(chrome.windows.update(winId, { focused: true })).catch(function() {}).then(function() { return t || tab; });
+            return _reopenCall(function() { return chrome.windows.update(winId, { focused: true }); }).catch(function() {}).then(function() { return t || tab; });
         }
         return t || tab;
     });
 }
 
+// Normalized reopen marker {at, attempts, tabId} (+legacy), or null. Accepts
+// the object this SW writes, a Date.now() number and the legacy 'true'.
+function _reopenMarker(v) {
+    if (v === true) return { at: Date.now(), attempts: 0, tabId: null, legacy: true };
+    if (typeof v === 'number') return isFinite(v) ? { at: v, attempts: 0, tabId: null } : null;
+    if (v && typeof v === 'object' && typeof v.at === 'number' && isFinite(v.at)) {
+        var n = (typeof v.attempts === 'number' && isFinite(v.attempts) && v.attempts > 0) ? Math.floor(v.attempts) : 0;
+        return { at: v.at, attempts: n, tabId: typeof v.tabId === 'number' ? v.tabId : null };
+    }
+    return null;
+}
+
 function _reopenMarkerIsFresh(v) {
-    if (v === true) return true; // legacy marker from a pre-timestamp page build
-    if (typeof v !== 'number' || !isFinite(v)) return false;
-    var age = Date.now() - v;
+    var m = _reopenMarker(v);
+    if (!m) return false;
+    if (m.legacy) return true; // legacy marker from a pre-timestamp page build
+    var age = Date.now() - m.at;
     return age >= -5000 && age <= REOPEN_APP_TAB_MAX_AGE_MS;
 }
 
+// true once tabId sent app-tab-ready (at once when it already did, e.g. before
+// its tabs.create answered), false after ms. The waiter is always cleaned up.
+function _reopenWaitReady(tabId, ms) {
+    var st = _appTabReopenState;
+    if (st.readyTabs[tabId]) return Promise.resolve(true);
+    return new Promise(function(resolve) {
+        var finished = false;
+        function finish(ok) {
+            if (finished) return;
+            finished = true;
+            if (st.readyWaiters[tabId] === onReady) delete st.readyWaiters[tabId];
+            resolve(ok);
+        }
+        function onReady() { finish(true); }
+        st.readyWaiters[tabId] = onReady;
+        setTimeout(function() { finish(!!st.readyTabs[tabId]); }, ms || REOPEN_APP_TAB_READY_MS);
+    });
+}
+
+// A created tab started verifying: wake the clicks waiting to adopt one.
+function _reopenFireVerify(tab) {
+    var st = _appTabReopenState, list = st.verifyWaiters;
+    st.verifyWaiters = [];
+    list.forEach(function(fn) { try { fn(tab); } catch (e) {} });
+}
+
+// Our own extension pages only (same rule as _openaiTrustedAuthSender).
+function _reopenTrustedSender(sender) {
+    try {
+        return !!(sender && sender.id === chrome.runtime.id && typeof sender.url === 'string' &&
+            sender.url.indexOf(chrome.runtime.getURL('')) === 0);
+    } catch (e) { return false; }
+}
+
+// Clean reload, close phase: every tab showing one of our pages (the sender
+// too; web tabs untouched). tabs.query + remove share ONE bound.
+function _reopenCloseExtensionTabs() {
+    var base = chrome.runtime.getURL('');
+    var work = Promise.resolve().then(function() { return chrome.tabs.query({}); }).then(function(tabs) {
+        var mine = (tabs || []).filter(function(t) { return t && t.id != null && String(t.url || t.pendingUrl || '').indexOf(base) === 0; });
+        _reopenLog('clean-reload-close', { tabs: mine.map(_reopenTabInfo) });
+        return _reopenRemoveTabs(mine.map(function(t) { return t.id; }), REOPEN_APP_TAB_CLEAN_REMOVE_MS);
+    });
+    return _reopenCall(function() { return work; }, REOPEN_APP_TAB_CLEAN_REMOVE_MS).catch(function(e) {
+        _reopenLog('clean-reload-close-failed', { error: _reopenErr(e) });
+        return 0;
+    });
+}
+
+// app-clean-reload: ack at once (synchronously, before any await) -> marker
+// (bounded 1s) -> close every extension tab (one <=3s bound) -> finally
+// runtime.reload(). The ack comes first because an SW cold start plus the 1s
+// marker write could miss the page's 1.5s fallback; the page already wrote its
+// own reopenAppTab timestamp before sending, so an early ack loses nothing.
+// Single-flight: a repeat only gets the same ack. Foreign senders: nothing.
+function _reopenOnCleanReload(msg, sender, sendResponse) {
+    if (!_reopenTrustedSender(sender)) {
+        _reopenLog('clean-reload-rejected', { senderId: sender ? sender.id : null, url: sender ? sender.url : null });
+        return false;
+    }
+    var ack = { ok: true, ack: 'app-clean-reload' };
+    if (_reopenCleanReloadInFlight) {
+        _reopenLog('clean-reload-dup', { reason: msg.reason || null });
+        try { sendResponse(ack); } catch (e) {}
+        return false;
+    }
+    _reopenCleanReloadInFlight = true;
+    _appTabReopenState.done = true; // this lifetime's reopen creates / writes nothing more
+    _reopenLog('clean-reload', { reason: msg.reason || null, at: msg.at || null, url: sender.url, tabId: sender.tab ? sender.tab.id : null });
+    try { sendResponse(ack); } catch (e) {}
+    _reopenStorageSet({ reopenAppTab: { at: Date.now(), attempts: 0, tabId: null } }, 1000).catch(function(e) {
+        _reopenLog('clean-reload-marker-failed', { error: _reopenErr(e) });
+    }).then(function() {
+        return _reopenCloseExtensionTabs();
+    }).catch(function() {}).then(function() {
+        try { chrome.runtime.reload(); } catch (e) {
+            _reopenLog('clean-reload-reload-threw', { error: _reopenErr(e) });
+            _reopenCleanReloadInFlight = false;
+        }
+    });
+    return false; // ack already sent synchronously (same as the dup path)
+}
+
+// app-tab-ready (app/070-app-tab-ready.js): recorded BEFORE any wait (it can
+// beat the tabs.create answer), then the pending wait for that tab resolves.
+// No sender.tab (side panel, offscreen) or a foreign sender: ignored, no reply.
+function _reopenOnTabReady(msg, sender, sendResponse) {
+    var tabId = sender && sender.tab ? sender.tab.id : null;
+    if (tabId == null || !_reopenTrustedSender(sender)) return false;
+    var st = _appTabReopenState, now = Date.now();
+    Object.keys(st.readyTabs).forEach(function(k) {
+        var r = st.readyTabs[k];
+        if (!r || !(now - r.t <= REOPEN_APP_TAB_READY_TTL_MS)) delete st.readyTabs[k];
+    });
+    st.readyTabs[tabId] = { bootId: msg.bootId || null, at: msg.at || null, nav: msg.nav || null, prevBoot: msg.prevBoot || null, t: now };
+    var waiter = st.readyWaiters[tabId] || null;
+    if (waiter) delete st.readyWaiters[tabId];
+    _reopenLog('ready', { tabId: tabId, bootId: msg.bootId || null, nav: msg.nav || null, prevBoot: msg.prevBoot || null, awaited: !!waiter });
+    if (waiter) { try { waiter(); } catch (e) {} }
+    try { sendResponse({ ok: true }); } catch (e) {}
+    return false;
+}
+
+// Own listener (kept inside this slice so the tests run it); every other
+// message type is left to the other listeners (no reply from here).
+if (chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+    chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'app-clean-reload') return _reopenOnCleanReload(msg, sender, sendResponse);
+        if (msg.type === 'app-tab-ready') { _reopenOnTabReady(msg, sender, sendResponse); return; }
+    });
+}
+
 // Consume the reopen marker at most once per SW lifetime. Resolves to the tab
-// opened (or focused) for the reopen, or null when there was nothing to do.
+// opened for the reopen, or null when there was nothing to do.
 function _consumeReopenAppTab() {
     var st = _appTabReopenState;
     if (st.done) return Promise.resolve(st.tab);
     if (st.inFlight) return st.inFlight;
     // Every trigger (startup, onInstalled, delayed re-checks) shares this one
-    // in-flight attempt. The marker is removed and `done` set ONLY after a
-    // verified open; on failure a NUMERIC marker stays so a later trigger
-    // retries (bounded by the REOPEN_APP_TAB_MAX_AGE_MS staleness cut-off).
-    st.inFlight = Promise.resolve(chrome.storage.local.get('reopenAppTab')).then(function(data) {
+    // in-flight attempt. The marker is removed and 'done' set after a verified
+    // (or adopted) tab or a final give-up; a create that failed without any tab
+    // keeps it so a later trigger retries (bounded by REOPEN_APP_TAB_MAX_AGE_MS).
+    var flight = null;
+    var deadline = Date.now() + REOPEN_APP_TAB_WATCHDOG_MS; // when the watchdog below fires (MED-1)
+    var run = _reopenCall(function() { return chrome.storage.local.get('reopenAppTab'); }).then(function(data) {
         var v = data && data.reopenAppTab;
         if (v === undefined || v === null || v === false) return null;
         // A toolbar click that happened while the read was in flight already
-        // opened the app and cancelled the marker — never open a second tab.
+        // opened the app and cancelled the marker - never open a second tab.
         if (st.done) return st.tab;
         function clear(result) {
             st.done = true;
-            return Promise.resolve(chrome.storage.local.remove('reopenAppTab')).catch(function() {}).then(function() { return result; });
+            return _reopenRemoveMarker().then(function() { return result; });
         }
-        if (!_reopenMarkerIsFresh(v)) return clear(null); // stale leftover: drop silently
-        // The legacy `true` marker has no age: kept on failure it would retry on
-        // every SW start forever, so consume it up front (exactly one attempt).
-        var legacy = v === true;
+        var m = _reopenMarker(v);
+        if (!m || !_reopenMarkerIsFresh(v)) {
+            // Garbage / stale leftover: drop silently. A tab it names is NOT
+            // closed (it may be a long-lived healthy tab).
+            _reopenLog('marker-dropped', { why: m ? 'stale' : 'invalid' });
+            return clear(null);
+        }
         return Promise.resolve().then(function() {
-            return legacy ? chrome.storage.local.remove('reopenAppTab') : null;
-        }).catch(function() {}).then(function() {
-            return _openAppTabForReopen();
-        }).then(function(tab) {
-            if (tab) return clear(tab);
-            // null after a toolbar click = cancelled on purpose: the click opens the app.
-            if (!st.done) console.warn(legacy ? '[SW] reopen app tab not verified; legacy marker consumed (no retry)' : '[SW] reopen app tab not verified; keeping marker for a retry');
-            return null;
+            if (m.legacy) {
+                // Legacy 'true' has no age: persist it as an aged marker, so
+                // MAX_AGE bounds its retries (else it retries on every SW start).
+                if (!st.done) return _reopenStorageSet({ reopenAppTab: { at: m.at, attempts: 0, tabId: null } }).catch(function() {});
+                return null;
+            }
+            if (m.tabId == null) return null;
+            if (st.readyTabs[m.tabId]) return 'ready';
+            // The final attempt's tab never proved it booted, but it is the
+            // last tab: leave it open (the last tab is never closed), give up
+            // below. LOW-2: whether it is still open is read (bounded tabs.get).
+            if (m.attempts >= REOPEN_APP_TAB_MAX_ATTEMPTS) {
+                return _reopenGetTab(m.tabId).then(function(t) { return t ? 'final' : 'final-gone'; });
+            }
+            // An earlier SW lifetime died while this tab awaited its ready: it
+            // never proved it booted - close it and continue the count. LOW-1:
+            // the ready that woke this SW can lose the race with the storage.get
+            // reply, so it gets REOPEN_APP_TAB_STALE_READY_MS before the close.
+            return _reopenWaitReady(m.tabId, REOPEN_APP_TAB_STALE_READY_MS).then(function(ready) {
+                if (ready) return 'ready';
+                return _reopenRemoveTabs([m.tabId]).then(function(removed) {
+                    _reopenLog('stale-verify-closed', { tabId: m.tabId, attempts: m.attempts, removed: removed });
+                    return null;
+                });
+            });
+        }).then(function(pre) {
+            if (st.done) return st.tab;
+            if (pre === 'ready') {
+                // Its ready is what woke this SW: that tab IS the reopen.
+                _reopenLog('verified', { tabId: m.tabId, attempt: m.attempts, restart: true });
+                st.tab = { id: m.tabId };
+                st.at = Date.now();
+                return clear(st.tab);
+            }
+            if (m.attempts >= REOPEN_APP_TAB_MAX_ATTEMPTS) {
+                _reopenLog('gave-up', { why: 'restart-max-attempts', attempts: m.attempts, tabId: m.tabId, leftOpen: pre === 'final' });
+                return clear(null);
+            }
+            return _openAppTabForReopen(m, deadline).then(function(tab) {
+                if (tab) return clear(tab);
+                // null after a click / give-up is handled; otherwise keep the marker.
+                if (!st.done) _reopenLog('not-verified-keep-marker', { attempts: m.attempts });
+                return null;
+            });
         });
     }).catch(function(e) {
-        console.warn('[SW] reopenAppTab check failed', e);
+        _reopenLog('check-failed', { error: _reopenErr(e) });
         return null;
-    }).then(function(tab) {
-        st.inFlight = null;
+    });
+    // Watchdog (benign): a flight still pending after REOPEN_APP_TAB_WATCHDOG_MS
+    // is abandoned for this SW lifetime. st.done stops every later tabs.create
+    // and marker write (both check it synchronously right before; storage ops
+    // are FIFO, so a write issued earlier lands before this remove), the marker
+    // is dropped so no later SW start pops a surprise tab, and st.inFlight is
+    // released. A tab still verifying is NOT closed (a click adopts it).
+    var watchdog = new Promise(function(resolve) {
+        setTimeout(function() {
+            if (st.inFlight !== flight) return; // settled already
+            st.done = true;
+            _reopenRemoveMarker();
+            _reopenLog('gave-up', { why: 'watchdog', ms: REOPEN_APP_TAB_WATCHDOG_MS, verifying: st.verifying ? st.verifying.id : null });
+            resolve(null);
+        }, REOPEN_APP_TAB_WATCHDOG_MS);
+    });
+    flight = Promise.race([run, watchdog]).then(function(tab) {
+        if (st.inFlight === flight) st.inFlight = null;
         return tab;
     });
-    return st.inFlight;
+    st.inFlight = flight;
+    return flight;
 }
 
 // New app tab in the last-focused normal window, or in a new window if none.
@@ -352,26 +750,26 @@ function _createAppTabForReopen() {
     var url = _appTabUrl();
     return Promise.resolve().then(function() {
         if (!chrome.windows || !chrome.windows.getLastFocused) return null;
-        return Promise.resolve(chrome.windows.getLastFocused({ windowTypes: ['normal'] })).catch(function() { return null; });
+        return _reopenCall(function() { return chrome.windows.getLastFocused({ windowTypes: ['normal'] }); }).catch(function() { return null; });
     }).then(function(win) {
         if (_appTabReopenState.done) return null; // m2: a toolbar click took over - open nothing
         if (win && win.id != null) {
-            return Promise.resolve(chrome.tabs.create({ url: url, windowId: win.id, active: true })).then(function(tab) {
-                if (chrome.windows.update) Promise.resolve(chrome.windows.update(win.id, { focused: true })).catch(function() {});
+            return _reopenCall(function() { return chrome.tabs.create({ url: url, windowId: win.id, active: true }); }, 0, _reopenLateTab).then(function(tab) {
+                if (chrome.windows.update) _reopenCall(function() { return chrome.windows.update(win.id, { focused: true }); }).catch(function() {});
                 return tab;
             });
         }
         if (chrome.windows && chrome.windows.create) {
-            return Promise.resolve(chrome.windows.create({ url: url, focused: true, type: 'normal' })).then(function(w) { return (w && w.tabs && w.tabs[0]) || null; });
+            return _reopenCall(function() { return chrome.windows.create({ url: url, focused: true, type: 'normal' }); }, 0, function(w) { _reopenLateTab((w && w.tabs && w.tabs[0]) || null); }).then(function(w) { return (w && w.tabs && w.tabs[0]) || null; });
         }
-        return _createAppTab();
+        return _reopenCall(function() { return chrome.tabs.create({ url: url }); }, 0, _reopenLateTab);
     });
 }
 
-// m1: the ONLY app tabs a reopen may wait for, focus or reload are the ones
-// present at this instance's FIRST reopen attempt (the old instance's tabs
-// Chrome is closing). Their ids are snapshotted once and kept on the state and
-// in chrome.storage.session (in-memory: survives SW restarts, cleared on
+// m1: the ONLY app tabs a reopen may wait for or close are the ones present at
+// this instance's FIRST reopen attempt (the old instance's tabs Chrome is
+// closing). Their ids are snapshotted once and kept on the state and in
+// chrome.storage.session (in-memory: survives SW restarts, cleared on
 // extension reload/update), so neither a retry nor a later SW lifetime of the
 // same instance mistakes a NEW tab (a pop-out, one we created) for a suspect.
 // Without a usable storage.session the module-level snapshot still covers
@@ -380,24 +778,33 @@ function _reopenSessionStore() {
     try { return (chrome.storage && chrome.storage.session) || null; } catch (e) { return null; }
 }
 
-function _reopenSuspectIds() {
+function _reopenSuspectIds(marker) {
     var st = _appTabReopenState;
     if (st.suspectIds) return Promise.resolve(st.suspectIds);
     return Promise.resolve().then(function() {
         var s = _reopenSessionStore();
-        return s && s.get ? s.get(REOPEN_APP_TAB_SUSPECTS_KEY) : null;
+        return s && s.get ? _reopenCall(function() { return s.get(REOPEN_APP_TAB_SUSPECTS_KEY); }) : null;
     }).catch(function() { return null; }).then(function(data) {
         var saved = data && data[REOPEN_APP_TAB_SUSPECTS_KEY];
-        // Taken by an earlier SW lifetime of this instance: reuse, never re-snapshot.
-        if (Array.isArray(saved)) return saved.filter(function(id) { return typeof id === 'number'; });
+        // Taken by an earlier SW lifetime for THIS Reload (same marker, fresh):
+        // reuse, never re-snapshot. TTL: a snapshot of another Reload, one older
+        // than the marker max age, or a legacy bare array is ignored, so state a
+        // killed SW left behind can never steer (or stall) a later reopen.
+        if (saved && Array.isArray(saved.ids) && saved.marker === marker && typeof saved.at === 'number' &&
+            Math.abs(Date.now() - saved.at) <= REOPEN_APP_TAB_MAX_AGE_MS) {
+            return saved.ids.filter(function(id) { return typeof id === 'number'; });
+        }
         return Promise.resolve().then(function() {
-            return chrome.tabs.query({ url: _appTabUrl().replace(/\?.*$/, '') + '*' });
-        }).catch(function() { return []; }).then(function(tabs) {
+            return _reopenCall(function() { return chrome.tabs.query({ url: _appTabUrl().replace(/\?.*$/, '') + '*' }); });
+        }).catch(function(e) {
+            if (e && e.reopenTimeout) _appTabClick.queryHungAt = Date.now(); // F4: clicks skip their finder
+            return [];
+        }).then(function(tabs) {
             var ids = (tabs || []).filter(function(t) { return t && t.id != null && t.url && t.url.indexOf(APP_TAB_PATH) >= 0; }).map(function(t) { return t.id; });
             return Promise.resolve().then(function() {
                 var s = _reopenSessionStore(), o = {};
-                o[REOPEN_APP_TAB_SUSPECTS_KEY] = ids;
-                return s && s.set ? s.set(o) : null;
+                o[REOPEN_APP_TAB_SUSPECTS_KEY] = { ids: ids, marker: marker, at: Date.now() };
+                return s && s.set ? _reopenCall(function() { return s.set(o); }) : null;
             }).catch(function() {}).then(function() { return ids; });
         });
     }).then(function(ids) {
@@ -406,79 +813,331 @@ function _reopenSuspectIds() {
     });
 }
 
-// Reopen after Reload. The suspect app tabs (m1 snapshot above) usually belong
-// to the old instance and Chrome is still closing them, so focusing one used to
-// record "success" for a tab that vanished a moment later (no page reopened).
-// Wait ~2s for them to disappear; a survivor is focused + reloaded (it runs the
-// old code), otherwise a fresh tab is created. Success only once the tab still
-// exists REOPEN_APP_TAB_VERIFY_MS later; resolves null when nothing verified.
-// m2: once a toolbar click set st.done every checkpoint below bails out with
-// null and no tabs.create/update/reload (the click opens its own tab); a tab
-// already being verified is still returned so the click can reuse it.
-function _openAppTabForReopen() {
+// Reopen after Reload (m = normalized marker). The suspect app tabs (m1
+// snapshot above) usually belong to the old instance and Chrome is still
+// closing them: wait ~2s for them to disappear, close every survivor (bounded;
+// never focus or reload one - it runs the old code), then create a fresh tab
+// and wait for its app-tab-ready. Resolves the verified (or click-adopted) tab,
+// or null. m2: once a toolbar click set st.done every checkpoint bails out with
+// no tabs.create; a tab created meanwhile becomes st.verifying so the click
+// adopts it (a click that already opened its own tab gets it closed).
+function _openAppTabForReopen(m, deadline) {
     var st = _appTabReopenState;
     function clicked() { return st.done; }
     function remember(tab) { st.tab = tab || null; st.at = Date.now(); return st.tab; }
-    function verify(tab) {
-        if (!tab || tab.id == null) return null;
-        return _reopenDelay(REOPEN_APP_TAB_VERIFY_MS).then(function() { return _reopenTabAlive(tab.id); }).then(function(alive) { return alive ? remember(tab) : null; });
-    }
-    // Resolves the suspect ids still alive after the settle window, or null
-    // once a click took over.
+    // Resolves the suspect tabs (tabs.get snapshots) still open after the
+    // settle window, or null once a click took over.
     function settle(ids, polls) {
         if (clicked()) return Promise.resolve(null);
-        return Promise.all(ids.map(function(id) { return _reopenTabAlive(id).then(function(a) { return a ? id : null; }); })).then(function(res) {
-            var alive = res.filter(function(id) { return id != null; });
+        return Promise.all(ids.map(_reopenGetTab)).then(function(res) {
+            var alive = res.filter(function(t) { return t && t.id != null; });
             if (clicked()) return null;
             if (!alive.length || polls >= REOPEN_APP_TAB_SETTLE_POLLS) return alive;
-            return _reopenDelay(REOPEN_APP_TAB_POLL_MS).then(function() { return settle(alive, polls + 1); });
+            return _reopenDelay(REOPEN_APP_TAB_POLL_MS).then(function() {
+                return settle(alive.map(function(t) { return t.id; }), polls + 1);
+            });
         });
     }
-    function create() {
-        var attempt = 0;
+    // A rejected create (no tab, e.g. "Tabs cannot be edited right now") is
+    // retried with back-off, 3 tries per flight, and uses no attempt (the marker
+    // stays for the later triggers). A create that did not answer is never
+    // repeated (it may still land: _reopenLateTab adopts it).
+    function createTab() {
+        var tries = 0;
         function tryCreate() {
             if (clicked()) return Promise.resolve(null);
-            attempt++;
-            return _createAppTabForReopen().then(verify).then(function(tab) {
-                if (tab) return tab;
-                throw new Error('created app tab disappeared');
+            tries++;
+            return _createAppTabForReopen().then(function(tab) {
+                if (tab && tab.id != null) return tab;
+                if (clicked()) return null;
+                throw new Error('create returned no tab');
             }).catch(function(e) {
                 if (clicked()) return null;
-                if (attempt >= 3) { console.warn('[SW] reopen app tab failed', e); return null; }
-                return _reopenNap(400 * attempt).then(tryCreate);
+                if (e && e.reopenTimeout) {
+                    st.done = true;
+                    _reopenRemoveMarker();
+                    _reopenLog('gave-up', { why: 'create-timeout', error: _reopenErr(e) });
+                    return null;
+                }
+                if (tries >= 3) { _reopenLog('create-failed', { tries: tries, error: _reopenErr(e) }); return null; }
+                return _reopenNap(400 * tries).then(tryCreate);
             });
         }
         return tryCreate();
     }
-    return _reopenSuspectIds().then(function(ids) {
+    // One create + ready wait per turn; n = attempts used so far (marker).
+    function attempt(n) {
+        if (clicked()) return Promise.resolve(null);
+        return createTab().then(function(tab) {
+            if (!tab) return null;
+            if (st.clickOpened) {
+                // The click already opened its own tab: never leave a duplicate.
+                _reopenLog('dup-closed', { tabId: tab.id });
+                _reopenRemoveTabs([tab.id]);
+                return null;
+            }
+            n++;
+            _reopenLog('created', { tabId: tab.id, attempt: n, windowId: tab.windowId != null ? tab.windowId : null });
+            st.verifying = tab;
+            _reopenFireVerify(tab);
+            // st.done is checked synchronously right before the write (as before
+            // every tabs.create): nothing is written after a click / watchdog.
+            if (!st.done) _reopenStorageSet({ reopenAppTab: { at: m.at, attempts: n, tabId: tab.id } }).catch(function() {});
+            var extended = false;
+            // MED-1: 070 only answers once the WHOLE app.js has evaluated, so a
+            // healthy tab can miss READY_MS on a slow boot (Chrome is busy right
+            // after a reload). A tab that tabs.get (bounded REOPEN_APP_TAB_PEEK_MS)
+            // still reports 'loading' gets ONE more READY_MS, only when that ends
+            // before this flight's watchdog (deadline), never after a click or the
+            // watchdog. A peek that fails or does not answer: the old verdict.
+            function slowBoot() {
+                if (clicked() || st.adoptedTabId === tab.id) return false;
+                if (typeof deadline === 'number' && Date.now() + REOPEN_APP_TAB_PEEK_MS + REOPEN_APP_TAB_READY_MS > deadline) return false;
+                return _reopenCall(function() { return chrome.tabs.get(tab.id); }, REOPEN_APP_TAB_PEEK_MS).then(function(t) {
+                    return !!(t && t.status === 'loading');
+                }, function() { return false; }).then(function(loading) {
+                    if (st.readyTabs[tab.id]) return true; // its ready landed during the peek
+                    if (!loading || clicked() || st.adoptedTabId === tab.id) return false;
+                    extended = true;
+                    _reopenLog('ready-slow-extended', { tabId: tab.id, attempt: n, ms: REOPEN_APP_TAB_READY_MS });
+                    return _reopenWaitReady(tab.id, REOPEN_APP_TAB_READY_MS);
+                });
+            }
+            return _reopenWaitReady(tab.id, REOPEN_APP_TAB_READY_MS).then(function(ok) {
+                return ok || slowBoot();
+            }).then(function(ok) {
+                if (st.verifying === tab) st.verifying = null;
+                if (ok) {
+                    _reopenLog('verified', extended ? { tabId: tab.id, attempt: n, extended: true } : { tabId: tab.id, attempt: n });
+                    return remember(tab);
+                }
+                if (st.adoptedTabId === tab.id) {
+                    _reopenLog('click-adopted-verify-end', { tabId: tab.id, attempt: n });
+                    return tab;
+                }
+                _reopenLog('ready-timeout', extended ? { tabId: tab.id, attempt: n, ms: 2 * REOPEN_APP_TAB_READY_MS, extended: true } : { tabId: tab.id, attempt: n, ms: REOPEN_APP_TAB_READY_MS });
+                if (st.done) {
+                    _reopenLog('verify-abandoned-left-open', { tabId: tab.id, attempt: n });
+                    return null;
+                }
+                // MED-A: a retry closes this tab BEFORE the next create's st.done
+                // check (_createAppTabForReopen), so it is only made when that close
+                // (CLEAN_REMOVE_MS) and the create (getLastFocused + tabs.create,
+                // CALL_MS each) end by this flight's watchdog (deadline): else the
+                // watchdog can land in between and leave NO app tab. No deadline: as before.
+                var retry = n < REOPEN_APP_TAB_MAX_ATTEMPTS;
+                var budget = typeof deadline !== 'number' ||
+                    Date.now() + REOPEN_APP_TAB_CLEAN_REMOVE_MS + 2 * REOPEN_APP_TAB_CALL_MS <= deadline;
+                if (retry && budget) {
+                    return _reopenRemoveTabs([tab.id]).then(function(removed) {
+                        _reopenLog('closed-unverified', { tabId: tab.id, attempt: n, removed: removed });
+                        return attempt(n);
+                    });
+                }
+                // Last attempt, or no budget left for another: leave the tab open (a
+                // slow boot or a lost message must never leave the user without an
+                // app tab) and stop here.
+                st.done = true;
+                _reopenRemoveMarker();
+                _reopenLog('gave-up', retry ? { why: 'no-budget', tabId: tab.id, attempts: n, leftOpen: true, left: deadline - Date.now() } : { why: 'max-attempts', tabId: tab.id, attempts: n });
+                return null;
+            });
+        });
+    }
+    return _reopenSuspectIds(m.at).then(function(ids) {
         return ids.length ? settle(ids, 0) : [];
     }).then(function(survivors) {
         if (!survivors || clicked()) return null;
-        if (!survivors.length) return create();
-        var id = survivors[0];
-        return _focusAppTab({ id: id }).then(function(ft) {
-            if (clicked()) return null;
-            return Promise.resolve(chrome.tabs.reload ? chrome.tabs.reload(id) : null).catch(function() {}).then(function() { return verify(ft && ft.id != null ? ft : { id: id }); });
-        }).catch(function() { return null; }).then(function(tab) { return tab || create(); });
+        if (!survivors.length) return attempt(m.attempts);
+        var infos = survivors.map(_reopenTabInfo);
+        return _reopenRemoveTabs(survivors.map(function(t) { return t.id; })).then(function(removed) {
+            _reopenLog('survivors-closed', { tabs: infos, removed: removed });
+            return attempt(m.attempts);
+        });
     });
 }
 
+// A click while a created tab awaits its ready: that tab becomes the click's
+// tab (focused now, never closed by the reopen).
+function _reopenAdoptVerifying() {
+    var st = _appTabReopenState, tab = st.verifying;
+    st.adoptedTabId = tab.id;
+    _reopenLog('click-adopted', { tabId: tab.id });
+    return _focusAppTab(tab).catch(function() { return _clickCreateAppTab(); });
+}
+
+// F4 single-flight: joins a click in flight (click-joined); within
+// APP_TAB_CLICK_DEBOUNCE_MS after a click that showed a tab it answers that
+// tab again (click-debounced); else runs the click (_onActionClickedRun) now,
+// synchronously, so st.done is set before any pending reopen read answers.
 function _onActionClicked() {
+    var c = _appTabClick, now = Date.now();
+    if (c.inFlight) { _reopenLog('click-joined', {}); return c.inFlight; }
+    if (c.last && now - c.okAt >= 0 && now - c.okAt < APP_TAB_CLICK_DEBOUNCE_MS) {
+        _reopenLog('click-debounced', { ms: now - c.okAt });
+        return c.last;
+    }
+    var run;
+    try { run = Promise.resolve(_onActionClickedRun()); } catch (e) { run = Promise.reject(e); }
+    var p = run.then(function(tab) {
+        if (c.inFlight === p) c.inFlight = null;
+        if (tab) c.okAt = Date.now();
+        return tab;
+    }, function(e) {
+        if (c.inFlight === p) c.inFlight = null;
+        _reopenLog('click-open-failed', { error: _reopenErr(e) });
+        return null;
+    });
+    c.inFlight = p;
+    c.last = p;
+    return p;
+}
+
+function _onActionClickedRun() {
     var st = _appTabReopenState;
     var pending = st.inFlight;
     // The click IS the open: cancel any pending reopen marker atomically (the
     // in-flight consumer checks st.done before opening) and drop it from storage.
     st.done = true;
-    try { Promise.resolve(chrome.storage.local.remove('reopenAppTab')).catch(function() {}); } catch (e) {}
-    return Promise.resolve(pending).then(function(reopenTab) {
+    try { _reopenRemoveMarker(); } catch (e) {}
+    if (st.verifying) return _reopenAdoptVerifying();
+    // BOUNDED: wait for an in-flight reopen at most REOPEN_APP_TAB_CLICK_WAIT_MS
+    // (it bails at its next checkpoint) or until a tab it was creating starts
+    // verifying (adopted). A stuck chrome.* call used to wedge EVERY click.
+    var signal = null;
+    var waited = pending ? Promise.race([
+        Promise.resolve(pending).catch(function() { return null; }),
+        new Promise(function(r) { signal = r; st.verifyWaiters.push(r); }),
+        _reopenDelay(REOPEN_APP_TAB_CLICK_WAIT_MS).then(function() { return _APP_TAB_CLICK_STUCK; })
+    ]) : Promise.resolve(null);
+    return waited.then(function(reopenTab) {
+        var stuck = reopenTab === _APP_TAB_CLICK_STUCK;
+        if (stuck) reopenTab = null;
+        if (signal) st.verifyWaiters = st.verifyWaiters.filter(function(f) { return f !== signal; });
+        if (st.verifying) return _reopenAdoptVerifying();
         var tab = reopenTab || st.tab;
         if (tab && tab.id != null && Date.now() - st.at <= REOPEN_APP_TAB_REUSE_MS) {
             // The reopen just opened a tab (this click raced it): show that one.
             st.tab = null;
-            return _focusAppTab(tab).catch(function() { return _createAppTab(); });
+            return _focusAppTab(tab).catch(function() { return _clickCreateAppTab(); });
         }
-        return _createAppTab();
-    }).catch(function(e) { console.warn('[SW] open app tab failed', e); });
+        return _clickReuseOrCreate(stuck);
+    }).catch(function(e) { _reopenLog('click-open-failed', { error: _reopenErr(e) }); });
+}
+
+// F4: an existing PLAIN app tab (never a widget / doc / print / standalone
+// page, never a reopen suspect of the old instance) is shown instead of a new
+// one: focused when known alive, else reloaded (bounded) and focused. Every
+// failure falls back to the create, so a tab always opens. Skipped (the plain
+// create) when the click's reopen wait ran out or a tabs.query of this slice
+// timed out lately: a hung tabs.query must never delay a click again. At most
+// ONE create per click (create below): the trailing catch (e.g. the finder
+// threw) creates only if this click has not tried one yet, so a create that
+// failed or timed out (it may still land) is never doubled.
+function _clickReuseOrCreate(stuck) {
+    var c = _appTabClick, created = false;
+    var create = function(why) { created = true; return _clickCreateAppTab(why); };
+    if (stuck) return create('reopen-stuck');
+    if (Date.now() - c.queryHungAt <= REOPEN_APP_TAB_WATCHDOG_MS) return create('query-hung');
+    return _reopenCall(function() {
+        return chrome.tabs.query({ url: _appTabUrl().replace(/\?.*$/, '') + '*' });
+    }, REOPEN_APP_TAB_CLICK_WAIT_MS).then(function(tabs) {
+        var pick = _clickPickAppTab(tabs || []);
+        if (!pick) return create('no-tab');
+        var id = pick.tab.id;
+        if (pick.why) {
+            return _focusAppTab(pick.tab).then(function(t) {
+                _reopenLog('click-focused', { tabId: id, why: pick.why });
+                return t;
+            }, function() { return create('focus-failed'); });
+        }
+        return _reopenCall(function() { return chrome.tabs.reload(id); }).then(function() {
+            _clickTouch(id);
+            return _clickFocusReloaded(pick.tab, create);
+        }, function() { return create('reload-failed'); });
+    }, function(e) {
+        if (e && e.reopenTimeout) c.queryHungAt = Date.now();
+        return create('query-failed');
+    }).catch(function(e) {
+        if (created) throw e; // this click's create failed / timed out: never a second one
+        _reopenLog('click-reuse-failed', { error: _reopenErr(e) });
+        return create('reuse-failed');
+    });
+}
+
+// The tab a click just reloaded is focused; a failed focus is retried once, at
+// once (both bounded). The reload answered, so the tab is there: only a
+// bounded tabs.get saying it is gone makes the click create (never a second
+// app instance beside it). Still there: the click shows nothing (null, so it
+// is not debounced) and the next click focuses it (its boot grace).
+function _clickFocusReloaded(tab, create) {
+    var id = tab.id;
+    return _focusAppTab(tab).catch(function() { return _focusAppTab(tab); }).then(function(t) {
+        _reopenLog('click-reloaded', { tabId: id });
+        return t;
+    }, function(e) {
+        return _reopenGetTab(id).then(function(live) {
+            if (!live) return create('reload-gone');
+            _reopenLog('click-focus-failed', { tabId: id, error: _reopenErr(e) });
+            return null;
+        });
+    });
+}
+
+// {tab, why} of the tab a click shows (why = its liveness proof, null = reload
+// it), live tabs first; null when there is no plain app tab to reuse.
+function _clickPickAppTab(tabs) {
+    var now = Date.now(), suspects = _appTabReopenState.suspectIds || [], dead = null;
+    for (var i = 0; i < tabs.length; i++) {
+        var t = tabs[i], u = t && t.id != null ? String(t.url || t.pendingUrl || '') : '';
+        if (u.indexOf(APP_TAB_PATH) < 0 || /[?&](widget|doc|standalone)=|print/i.test(u)) continue;
+        if (suspects.indexOf(t.id) >= 0) continue; // the old instance's tab: Chrome is closing it
+        var why = _clickTabLive(t, now);
+        if (why) return { tab: t, why: why };
+        if (!dead) dead = { tab: t, why: null };
+    }
+    return dead;
+}
+
+// Why tab t is known alive (a port of the SW bundle, a fresh app-tab-ready, a
+// click's own create / reload still booting, loading, or an SW too young for
+// the page to have reconnected), else null.
+function _clickTabLive(t, now) {
+    var c = _appTabClick, r = _appTabReopenState.readyTabs[t.id], port = false;
+    try {
+        if (typeof _swPanelPorts !== 'undefined' && _swPanelPorts && _swPanelPorts.forEach) {
+            _swPanelPorts.forEach(function(p) { if (p && p.sender && p.sender.tab && p.sender.tab.id === t.id) port = true; });
+        }
+    } catch (e) {}
+    if (port) return 'port';
+    if (r && now - r.t <= REOPEN_APP_TAB_READY_TTL_MS) return 'ready';
+    if (typeof c.touched[t.id] === 'number' && now - c.touched[t.id] <= REOPEN_APP_TAB_READY_MS) return 'recent';
+    if (t.status === 'loading') return 'loading';
+    if (now - c.swStartAt < APP_TAB_CLICK_SW_GRACE_MS) return 'sw-young';
+    return null;
+}
+
+// Records a click's create / reload (pruned by rebuilding the map).
+function _clickTouch(id) {
+    var c = _appTabClick, now = Date.now(), keep = {};
+    Object.keys(c.touched).forEach(function(k) { if (now - c.touched[k] <= REOPEN_APP_TAB_READY_MS) keep[k] = c.touched[k]; });
+    keep[id] = now;
+    c.touched = keep;
+}
+
+// The click's own tab (a late reopen tab is closed from now on). A failed create
+// (e.g. "Tabs cannot be edited right now") is retried once; one that did not
+// answer in time is not (it may still land).
+function _clickCreateAppTab(why) {
+    _appTabReopenState.clickOpened = true;
+    return _createAppTab().catch(function(e) {
+        if (e && e.reopenTimeout) throw e;
+        return _reopenDelay(300).then(_createAppTab);
+    }).then(function(tab) {
+        if (tab && tab.id != null) _clickTouch(tab.id);
+        _reopenLog('click-created', { tabId: tab && tab.id != null ? tab.id : null, why: why || 'create' });
+        return tab;
+    });
 }
 
 // Open AppAgent in a full page tab when the toolbar icon is clicked.
@@ -492,7 +1151,7 @@ chrome.action.onClicked.addListener(_onActionClicked);
 _consumeReopenAppTab();
 chrome.runtime.onInstalled.addListener(function() { _consumeReopenAppTab(); });
 setTimeout(function() { _consumeReopenAppTab(); }, 1500);
-// Last retry for a failed/unverified attempt (marker kept on failure).
+// Last retry for a failed attempt (marker kept when a create failed with no tab).
 setTimeout(function() { _consumeReopenAppTab(); }, 5000);
 // APP-TAB-REOPEN end
 
@@ -2027,7 +2686,14 @@ function describeChatGPTUsageLimit(bodyText) {
     return { headline: headline, plan: plan, resetsAt: resetsAt, resetsIn: resetIn, message: msg, raw: raw };
 }
 
-async function startClaudeOAuth() {
+// TA4-3: logout epoch. 'claude-oauth-logout' bumps it FIRST; every login/renew
+// carries the epoch it started under, and saveOAuthCreds drops (throws) a write
+// from an older epoch, so a token exchange that resolves after the logout can't
+// silently re-write claudeOAuth (logging the user back in).
+var claudeOAuthEpoch = 0;
+
+async function startClaudeOAuth(epoch) {
+    if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
     var sessionKey = await getClaudeCookie('sessionKey');
     if (!sessionKey) {
         throw new Error('Not signed into claude.ai. Open https://claude.ai, sign in, then retry.');
@@ -2088,7 +2754,7 @@ async function startClaudeOAuth() {
         var tErr = await tokRes.text();
         throw new Error('Token exchange failed: ' + tokRes.status + ' ' + tErr);
     }
-    return saveOAuthCreds(await tokRes.json());
+    return saveOAuthCreds(await tokRes.json(), undefined, epoch);
 }
 
 async function refreshClaudeToken(refreshToken) {
@@ -2114,21 +2780,31 @@ async function refreshClaudeToken(refreshToken) {
 // needs the user's claude.ai sessionKey cookie (long-lived). If a refresh_token
 // IS present we still try the proper refresh first — that's the standards path
 // and would work if Anthropic ever turns it on for this client.
-async function renewClaudeToken(oauth) {
+async function renewClaudeToken(oauth, epoch) {
+    if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
     if (oauth && oauth.refreshToken) {
         try {
             var tokenData = await refreshClaudeToken(oauth.refreshToken);
-            return saveOAuthCreds(tokenData, oauth.refreshToken);
+            return saveOAuthCreds(tokenData, oauth.refreshToken, epoch);
         } catch (e) {
+            // TA4-3: fenced by a logout - a cookie re-auth would be dropped too.
+            if (e && e.claudeOAuthStale) throw e;
             // fall through to silent re-auth
             console.log('[Claude OAuth] refresh failed, falling back to silent re-auth:', e.message);
         }
     }
     // Silent re-auth via the claude.ai session cookie.
-    return await startClaudeOAuth();
+    return await startClaudeOAuth(epoch);
 }
 
-function saveOAuthCreds(tokenData, existingRefresh) {
+function saveOAuthCreds(tokenData, existingRefresh, epoch) {
+    if (typeof epoch === 'number' && epoch !== claudeOAuthEpoch) {
+        // TA4-3: the user logged out after this login/renew started - drop it
+        // (no storage write, no broadcast).
+        var stale = new Error('Claude sign-in was cancelled by a logout; the new token was discarded.');
+        stale.claudeOAuthStale = true;
+        throw stale;
+    }
     var creds = {
         accessToken: tokenData.access_token,
         refreshToken: tokenData.refresh_token || existingRefresh,
@@ -2152,14 +2828,18 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
     if (message.type === 'claude-oauth-refresh') {
+        // TA4-3: capture the epoch on arrival, so a logout during the get/renew fences it.
+        var refreshEpoch = claudeOAuthEpoch;
         chrome.storage.local.get('claudeOAuth', function(data) {
-            renewClaudeToken(data.claudeOAuth).then(function(creds) {
+            renewClaudeToken(data.claudeOAuth, refreshEpoch).then(function(creds) {
                 sendResponse({ success: true, claudeOAuth: creds });
             }).catch(function(err) { sendResponse({ error: err.message }); });
         });
         return true;
     }
     if (message.type === 'claude-oauth-status') {
+        // TA4-3: captured on arrival; a logout mid-poll fences its auto-login/renew writes.
+        var statusEpoch = claudeOAuthEpoch;
         chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin'], async function(data) {
             if (!data.claudeOAuth) {
                 // AUTO-LOGIN: no token stored yet. If the user is signed into
@@ -2179,14 +2859,15 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                     try {
                         try { sk = await getClaudeCookie('sessionKey'); } catch (e) {}
                         if (sk && sk !== data.claudeAutoLoginFailedFor) {
-                            var creds = await startClaudeOAuth();
+                            var creds = await startClaudeOAuth(statusEpoch);
                             chrome.storage.local.remove('claudeAutoLoginFailedFor');
                             sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt });
                             return;
                         }
                     } catch (e) {
-                        // Remember this cookie failed so we don't retry it every poll.
-                        if (sk) chrome.storage.local.set({ claudeAutoLoginFailedFor: sk });
+                        // Remember this cookie failed so we don't retry it every poll
+                        // (not when a logout fenced the attempt: the cookie itself is fine).
+                        if (sk && !(e && e.claudeOAuthStale)) chrome.storage.local.set({ claudeAutoLoginFailedFor: sk });
                     } finally {
                         claudeAutoLoginInFlight = false;
                     }
@@ -2200,8 +2881,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             // session cookie (the Desktop OAuth client we use does not issue refresh tokens).
             if (Date.now() > oauth.expiresAt - 60000) {
                 try {
-                    oauth = await renewClaudeToken(oauth);
+                    oauth = await renewClaudeToken(oauth, statusEpoch);
                 } catch(e) {
+                    // TA4-3: a logout fenced the renew - report logged out, not expired.
+                    if (e && e.claudeOAuthStale) { sendResponse({ loggedIn: false }); return; }
                     // Renew failed — login is truly expired (claude.ai session gone too)
                     sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt });
                     return;
@@ -2216,6 +2899,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
     if (message.type === 'claude-oauth-logout') {
+        // TA4-3: bump the epoch FIRST so an in-flight login/renew can't re-write the token.
+        claudeOAuthEpoch++;
         chrome.storage.local.remove('claudeOAuth');
         // Suppress auto-login so an explicit logout sticks — otherwise the next
         // status poll would immediately re-exchange the still-present cookie.
@@ -5530,47 +6215,107 @@ var _swOffscreenCreating = null;          // Promise while creation is in flight
 var _swOffscreenKeepAlivePort = null;     // Persistent port opened by offscreen → SW
 var _swOffscreenClosing = null;           // P4 #1: Promise while an idle-close is in flight (ensureOffscreenDocument awaits it)
 var _swOffscreenHealing = null;           // P4 #1: Promise while a zombie self-heal (close → recreate) is in flight — single-flight across concurrent waitForOffscreenReady timeouts
+var _swOffscreenLastError = null;         // B2: {code, message, at} of the last failed ensure step (OFFSCREEN_* code); null after a success. Surfaced by callOffscreenHelper.
 var _swOffscreenIdleSince = 0;            // ms when last run finished; 0 = busy or unknown
 var _swOffscreenReadyResolvers = [];      // Awaiters that need offscreen up + handlers registered
 var OFFSCREEN_IDLE_GRACE_MS = 60 * 1000;  // close offscreen 60s after the last run ends
 
-async function ensureOffscreenDocument() {
+// B2 (post-Reload wedge: js_eval / run_tests silently never ran). Every await
+// below is capped at 5s (closing wait, hasDocument/getContexts probe,
+// createDocument, getContexts fallback), so a call settles within ~20s worst
+// case. Failures reject with e = Error(CODE + ': ' + sentence), e.code = CODE
+// (OFFSCREEN_CLOSE_TIMEOUT | OFFSCREEN_PROBE_TIMEOUT | OFFSCREEN_CREATE_TIMEOUT |
+// OFFSCREEN_CREATE_FAILED), recorded in _swOffscreenLastError ({code, message,
+// at}; null after a success). Helpers are INLINE so text slices of this
+// function stay self-contained.
+function ensureOffscreenDocument() {
+    var p = (async function() {
     if (typeof chrome.offscreen === 'undefined') {
         console.error('[SW] chrome.offscreen API unavailable — manifest "offscreen" permission missing?');
         return;
     }
+    var STEP_MS = 5000;
+    // Settles {ok,value} | {ok:false,error} | {timedOut:true} within STEP_MS; never rejects.
+    function within(fn) {
+        return new Promise(function(resolve) {
+            var t = setTimeout(function() { resolve({ timedOut: true }); }, STEP_MS);
+            function done(r) { clearTimeout(t); resolve(r); }
+            try { Promise.resolve(fn()).then(function(v) { done({ ok: true, value: v }); }, function(err) { done({ ok: false, error: err }); }); }
+            catch (err) { done({ ok: false, error: err }); }
+        });
+    }
+    function fail(code, sentence) {
+        var e = new Error(code + ': ' + sentence);
+        e.code = code;
+        _swOffscreenLastError = { code: code, message: e.message, at: Date.now() };
+        return e;
+    }
+    var useHas = typeof chrome.offscreen.hasDocument === 'function';
+    var canContexts = !!(chrome.runtime && typeof chrome.runtime.getContexts === 'function');
+    function contexts() { return chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }); }
     // P4 #1 (flag P4_OFFSCREEN_SELF_HEAL, read at CALL time — bg.js loads
     // BEFORE the SW bundle that defines self.getP4Flag): never race a create
     // against an in-flight idle-close. hasDocument() still reports the doc
     // being torn down, so without this we would skip creation and the next
     // waitForOffscreenReady would time out on a document that is gone.
-    if (_swOffscreenClosing && typeof self.getP4Flag === 'function' && self.getP4Flag('P4_OFFSCREEN_SELF_HEAL')) {
-        try { await _swOffscreenClosing; } catch (e) { /* close failure is non-fatal */ }
+    // B2: bounded — a wedged close is DROPPED on timeout (never awaited again
+    // by later calls); a close failure stays non-fatal.
+    var closing = _swOffscreenClosing;
+    if (closing && typeof self.getP4Flag === 'function' && self.getP4Flag('P4_OFFSCREEN_SELF_HEAL')) {
+        var cw = await within(function() { return closing; });
+        if (cw.timedOut) {
+            if (_swOffscreenClosing === closing) _swOffscreenClosing = null;
+            console.warn('[SW] ' + fail('OFFSCREEN_CLOSE_TIMEOUT', 'the in-flight offscreen close did not settle within ' + STEP_MS
+                + 'ms; dropped it and continuing').message);
+        }
     }
     var exists = false;
-    try {
-        if (typeof chrome.offscreen.hasDocument === 'function') {
-            exists = await chrome.offscreen.hasDocument();
-        } else {
-            var contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-            exists = (contexts && contexts.length > 0);
-        }
-    } catch (e) { exists = false; }
-    if (exists) return;
+    var probe = await within(useHas ? function() { return chrome.offscreen.hasDocument(); } : (canContexts ? contexts : function() { return []; }));
+    if (probe.timedOut) {
+        // Unknown state: try the create anyway — its failure/timeout path
+        // re-checks getContexts, so an existing document still counts.
+        console.warn('[SW] ' + fail('OFFSCREEN_PROBE_TIMEOUT', (useHas ? 'chrome.offscreen.hasDocument' : 'chrome.runtime.getContexts')
+            + ' did not settle within ' + STEP_MS + 'ms; trying createDocument').message);
+    } else if (probe.ok) {
+        exists = useHas ? !!probe.value : !!(probe.value && probe.value.length > 0);
+    }
+    if (exists) { _swOffscreenLastError = null; return; }
     if (_swOffscreenCreating) return _swOffscreenCreating;
-    _swOffscreenCreating = chrome.offscreen.createDocument({
-        url: 'offscreen.html',
-        reasons: ['BLOBS'],
-        justification: 'Host the JS sandbox iframe for js_eval / skill tools and provide a keep-alive anchor for the agent loop in the service worker.'
-    }).then(function() {
-        _swOffscreenCreating = null;
-        _swOffscreenIdleSince = 0;
-    }).catch(function(e) {
-        _swOffscreenCreating = null;
-        if (e && e.message && e.message.indexOf('single offscreen document') >= 0) return;
-        console.error('[SW] offscreen creation failed', e);
-    });
-    return _swOffscreenCreating;
+    var creating = (async function() {
+        var cr = await within(function() {
+            return chrome.offscreen.createDocument({
+                url: 'offscreen.html',
+                reasons: ['BLOBS'],
+                justification: 'Host the JS sandbox iframe for js_eval / skill tools and provide a keep-alive anchor for the agent loop in the service worker.'
+            });
+        });
+        if (cr.ok) { _swOffscreenIdleSince = 0; _swOffscreenLastError = null; return; }
+        var cause = cr.timedOut ? 'chrome.offscreen.createDocument did not settle within ' + STEP_MS + 'ms'
+            : 'chrome.offscreen.createDocument failed: ' + String(cr.error && cr.error.message || cr.error);
+        // Fallback: a document may exist although the create failed or hung
+        // ("Only a single offscreen document may be created", or a probe that
+        // timed out above). An existing OFFSCREEN_DOCUMENT context = success.
+        if (canContexts) {
+            var fb = await within(contexts);
+            if (fb.ok && fb.value && fb.value.length > 0) { _swOffscreenLastError = null; return; }
+            if (fb.timedOut) throw fail('OFFSCREEN_PROBE_TIMEOUT', 'chrome.runtime.getContexts did not settle within ' + STEP_MS
+                + 'ms while checking for an existing document after ' + cause);
+        } else if (!cr.timedOut && /single offscreen document/.test(cause)) {
+            _swOffscreenLastError = null; return; // pre-B2 behaviour when getContexts is unavailable
+        }
+        throw fail(cr.timedOut ? 'OFFSCREEN_CREATE_TIMEOUT' : 'OFFSCREEN_CREATE_FAILED', cause + '; no offscreen document exists');
+    })();
+    // Always settles (every step above is bounded) and ALWAYS clears, so the
+    // next call after a failure starts fresh and recreate/heal never hang on it.
+    var tracked = creating.finally(function() { if (_swOffscreenCreating === tracked) _swOffscreenCreating = null; });
+    _swOffscreenCreating = tracked;
+    tracked.catch(function(err) { console.error('[SW] offscreen creation failed: ' + (err && err.message || err)); });
+    return tracked;
+    })();
+    // Pre-handled: fire-and-forget callers (worker/130-port-bridge.js) never
+    // raise unhandledrejection; awaiting callers still receive the coded error.
+    p.catch(function() {});
+    return p;
 }
 
 // H18 — liveness ping. An open keep-alive port only proves the document
@@ -5609,27 +6354,69 @@ function pingOffscreenDocument(timeoutMs) {
     });
 }
 
+// B2 (recreate hardening): settles {ok,value} | {ok:false,error} | {timedOut:true}
+// within ms; never rejects; always clears its timer. Module-level twin of the
+// inline within() in ensureOffscreenDocument. Deliberately declared OUTSIDE the
+// waitForOffscreenReady slice (test/js-eval-sandbox-lifecycle.test.js counts
+// that slice's timers).
+function _swOffscreenWithin(fn, ms) {
+    return new Promise(function(resolve) {
+        var t = setTimeout(function() { resolve({ timedOut: true }); }, ms);
+        function done(r) { clearTimeout(t); resolve(r); }
+        try { Promise.resolve(fn()).then(function(v) { done({ ok: true, value: v }); }, function(err) { done({ ok: false, error: err }); }); }
+        catch (err) { done({ ok: false, error: err }); }
+    });
+}
+
 // Close + recreate a wedged document. Shares the _swOffscreenHealing slot with
 // the zombie self-heal in waitForOffscreenReady, so at most ONE close/recreate
 // is in flight; publishes _swOffscreenClosing like maybeCloseOffscreenIfIdle so
 // a concurrent ensureOffscreenDocument waits instead of racing the teardown.
+// B2: both close awaits (an in-flight close, then our closeDocument) are capped
+// at 5s. A wedged close is DROPPED (only if it is still the published one),
+// recorded as OFFSCREEN_CLOSE_TIMEOUT in _swOffscreenLastError, and the
+// (bounded) re-create runs anyway, so the heal ALWAYS settles (worst case ~5s +
+// 5s + ensure) and the slot is ALWAYS cleared (identity-checked). The port reset
+// is identity-checked too: a close settling late must not null the port a
+// fresh document connected meanwhile.
 function recreateOffscreenDocument(reason) {
     if (_swOffscreenHealing) return _swOffscreenHealing;
-    _swOffscreenHealing = (async function() {
-        if (_swOffscreenClosing) { try { await _swOffscreenClosing; } catch (e) { /* non-fatal */ } }
+    var CLOSE_MS = 5000;
+    function closeTimeout(sentence) {
+        var msg = 'OFFSCREEN_CLOSE_TIMEOUT: ' + sentence;
+        _swOffscreenLastError = { code: 'OFFSCREEN_CLOSE_TIMEOUT', message: msg, at: Date.now() };
+        console.warn('[SW] ' + msg);
+    }
+    var healing = (async function() {
+        var prior = _swOffscreenClosing;
+        if (prior) {
+            var pw = await _swOffscreenWithin(function() { return prior; }, CLOSE_MS); // a rejection stays non-fatal
+            if (pw.timedOut) {
+                if (_swOffscreenClosing === prior) _swOffscreenClosing = null;
+                closeTimeout('the in-flight offscreen close did not settle within ' + CLOSE_MS + 'ms; dropped it and recreating');
+            }
+        }
         console.warn('[SW] offscreen document unresponsive (' + (reason || 'ping') + '); closing and recreating');
+        var portAtClose = _swOffscreenKeepAlivePort;
         var closing = (async function() {
             try {
                 if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) await chrome.offscreen.closeDocument();
             } catch (e) { /* already gone */ }
-            _swOffscreenKeepAlivePort = null;
+            if (_swOffscreenKeepAlivePort === portAtClose) _swOffscreenKeepAlivePort = null;
         })();
         _swOffscreenClosing = closing;
-        try { await closing; } finally { if (_swOffscreenClosing === closing) _swOffscreenClosing = null; }
+        var cw = await _swOffscreenWithin(function() { return closing; }, CLOSE_MS);
+        if (_swOffscreenClosing === closing) _swOffscreenClosing = null;
+        if (cw.timedOut) {
+            if (_swOffscreenKeepAlivePort === portAtClose) _swOffscreenKeepAlivePort = null;
+            closeTimeout('chrome.offscreen.closeDocument did not settle within ' + CLOSE_MS + 'ms; dropped it and recreating');
+        }
         try { await ensureOffscreenDocument(); } catch (e) { /* creation errors are logged there */ }
         return true;
-    })().finally(function() { _swOffscreenHealing = null; });
-    return _swOffscreenHealing;
+    })();
+    var tracked = healing.finally(function() { if (_swOffscreenHealing === tracked) _swOffscreenHealing = null; });
+    _swOffscreenHealing = tracked;
+    return tracked;
 }
 
 // Resolves true when the document answers a ping (or a fresh one is ready
@@ -5681,7 +6468,13 @@ self.checkOffscreenResponsive = function(reason) {
 // port (== handlers are registered). Resolves to true if ready.
 function waitForOffscreenReady(timeoutMs) {
     if (_swOffscreenKeepAlivePort) return Promise.resolve(true);
-    ensureOffscreenDocument();
+    // B2: fire-and-forget, but never an unhandled rejection — the coded error
+    // is recorded in _swOffscreenLastError and surfaced by callOffscreenHelper.
+    // Guarded: test slices stub ensureOffscreenDocument.
+    try {
+        var _ensure = ensureOffscreenDocument();
+        if (_ensure && typeof _ensure.catch === 'function') _ensure.catch(function() { /* logged + recorded in ensure */ });
+    } catch (e) { /* stub threw synchronously */ }
     // P4 #1: cap the readiness wait (callers pass their execution timeout
     // here, sometimes minutes — a dead document should fail fast). Hard cap
     // 60s, not 20s (#923 follow-up): a long-running caller whose offscreen
@@ -5810,6 +6603,12 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
                 } catch (err) { console.warn('[SW] sandbox cancellation delivery failed', err); }
             }
         }
+        // B2: append the last coded ensure failure (OFFSCREEN_*). typeof guard:
+        // test slices of this function run without the module-level state.
+        function lastOffscreenError() {
+            var le = typeof _swOffscreenLastError !== 'undefined' ? _swOffscreenLastError : null;
+            return le && le.message ? ' (last offscreen error: ' + le.message + ')' : '';
+        }
         if (signal) {
             if (signal.aborted) { onAbort(); return; }
             signal.addEventListener('abort', onAbort, { once: true });
@@ -5823,7 +6622,7 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
                 // never connected" from a helper runtime error. The message
                 // keeps the /not available/ contract (tests + worker stub).
                 var e = new Error('Offscreen helper not available (offscreen_not_ready: keep-alive port never connected within '
-                    + Math.min(timeoutMs || 5000, 60000) + 'ms)');
+                    + Math.min(timeoutMs || 5000, 60000) + 'ms)' + lastOffscreenError());
                 e.code = 'offscreen_not_ready';
                 throw e;
             }
@@ -5842,7 +6641,7 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
             return ensureOffscreenResponsive(timeoutMs || 5000, type).then(function(alive) {
                 if (settled) return;
                 if (!alive) {
-                    var ue = new Error('Offscreen helper not available (offscreen_unresponsive: document did not answer a ping and could not be recreated)');
+                    var ue = new Error('Offscreen helper not available (offscreen_unresponsive: document did not answer a ping and could not be recreated)' + lastOffscreenError());
                     ue.code = 'offscreen_not_ready';
                     throw ue;
                 }
@@ -5867,6 +6666,7 @@ self._swOffscreenDebug = function() {
         keepAlivePort: !!_swOffscreenKeepAlivePort,
         idleSince: _swOffscreenIdleSince,
         creating: !!_swOffscreenCreating,
+        lastError: _swOffscreenLastError,
         readyWaiters: _swOffscreenReadyResolvers.length
     };
 };
@@ -5900,16 +6700,20 @@ async function maybeCloseOffscreenIfIdle() {
     // P4 #1: publish the in-flight close so ensureOffscreenDocument (flag
     // P4_OFFSCREEN_SELF_HEAL) can await it instead of racing a create against
     // a document that hasDocument() still reports.
-    _swOffscreenClosing = (async function() {
+    // B2: ensure / recreate DROP a close that hangs >5s, so this one may settle
+    // late: clear the slot and reset the port only if they are still ours.
+    var portAtClose = _swOffscreenKeepAlivePort;
+    var closing = (async function() {
         try {
             if (typeof chrome.offscreen !== 'undefined' && chrome.offscreen.closeDocument) {
                 await chrome.offscreen.closeDocument();
             }
         } catch (e) { /* ignore — already gone */ }
         _swOffscreenIdleSince = 0;
-        _swOffscreenKeepAlivePort = null;
-    })().finally(function() { _swOffscreenClosing = null; });
-    return _swOffscreenClosing;
+        if (_swOffscreenKeepAlivePort === portAtClose) _swOffscreenKeepAlivePort = null;
+    })().finally(function() { if (_swOffscreenClosing === closing) _swOffscreenClosing = null; });
+    _swOffscreenClosing = closing;
+    return closing;
 }
 self.markOffscreenMaybeIdle = function() { _swOffscreenIdleSince = Date.now(); };
 
@@ -5921,6 +6725,7 @@ chrome.runtime.onConnect.addListener(function(port) {
     if (port.name !== 'sw-keepalive') return;
     _swOffscreenKeepAlivePort = port;
     _swOffscreenIdleSince = 0;
+    _swOffscreenLastError = null; // B2: a connected document is a success signal (no stale OFFSCREEN_* suffix)
     // Drain ready-waiters now that offscreen is fully online.
     var waiters = _swOffscreenReadyResolvers.splice(0);
     waiters.forEach(function(fn) { try { fn(); } catch (e) {} });

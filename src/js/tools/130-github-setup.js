@@ -16,7 +16,7 @@ async function executeGitHubSetup(args) {
     args = args || {};
     var gh = await loadGitHubSettings();
     var connected = !!(gh.user && gh.token);
-    var instanceUrl = (args.instance_url || gh.instanceUrl || 'https://github.com').replace(/\/$/, '');
+    var instanceUrl = normalizeGitHubInstanceUrl(args.instance_url || gh.instanceUrl); // TA-1: https:// default
     var tokenPageUrl = instanceUrl + '/settings/tokens/new?scopes=repo&description=AppAgent';
 
     showGitHubSetupModal({
@@ -48,16 +48,31 @@ async function executeGitHubSetup(args) {
 
 function showGitHubSetupModal(opts) {
     var existing = document.getElementById('github-setup-modal');
+    var opener = (existing && existing._opener) || document.activeElement; // A8C-01: keep the first opener across re-renders
     if (existing) existing.remove();
 
     var overlay = document.createElement('div');
     overlay.id = 'github-setup-modal';
     overlay.className = 'modal-overlay show';
     overlay.onclick = function(e) { if (e.target === overlay) closeGitHubSetupModal(); };
+    // A8C-01: a labelled modal dialog that keeps Tab inside; Esc stays with the global
+    // INIT sweep (-> onclick -> closeGitHubSetupModal, which restores the opener's focus).
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'ghsetup-title');
+    overlay.tabIndex = -1;
+    overlay._opener = opener;
+    overlay.addEventListener('keydown', function(e) {
+        if (e.key !== 'Tab') return;
+        var n = overlay.querySelectorAll('input:not([disabled]), button:not([disabled]), a[href]'), a = document.activeElement;
+        if (!n.length) return;
+        if (e.shiftKey && (a === n[0] || a === overlay)) { e.preventDefault(); n[n.length - 1].focus(); }
+        else if (!e.shiftKey && a === n[n.length - 1]) { e.preventDefault(); n[0].focus(); }
+    });
 
     var html =
         '<div class="modal-dialog" style="max-width:520px;">' +
-            '<div class="modal-header">' + UI_ICONS.git + ' GitHub Setup</div>' +
+            '<div class="modal-header" id="ghsetup-title">' + UI_ICONS.git + ' GitHub Setup</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">';
 
     if (opts.connected) {
@@ -74,18 +89,18 @@ function showGitHubSetupModal(opts) {
         // Not connected — token form with a direct link to the token page.
         html +=
             '<div class="form-field">' +
-                '<label class="form-label">Instance URL</label>' +
+                '<label class="form-label" for="ghsetup-instance">Instance URL</label>' +
                 '<input type="text" id="ghsetup-instance" class="form-input" value="' + escapeHtml(opts.instanceUrl) + '" placeholder="https://github.com">' +
             '</div>' +
             '<div class="form-field">' +
-                '<label class="form-label">Personal Access Token <span class="required">*</span></label>' +
+                '<label class="form-label" for="ghsetup-token">Personal Access Token <span class="required">*</span></label>' +
                 '<input type="password" id="ghsetup-token" class="form-input" placeholder="ghp_..." onkeydown="if(event.key===\'Enter\')connectGitHubFromSetupModal()">' +
                 '<div class="settings-page-row-hint" style="margin-top:var(--space-2);">Requires <code>repo</code> scope. ' +
                     '<a href="#" id="ghsetup-token-link" onclick="openGitHubSetupTokenPage(event)" style="color:var(--accent);">Open GitHub token page</a>' +
                 '</div>' +
             '</div>' +
             '<div style="display:flex;justify-content:flex-end;align-items:center;gap:var(--space-4);">' +
-                '<span id="ghsetup-connect-status" style="font-size:var(--text-body-sm);flex:1;"></span>' +
+                '<span id="ghsetup-connect-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);flex:1;"></span>' +
                 '<button class="skills-action-btn" id="ghsetup-connect-btn" onclick="connectGitHubFromSetupModal()">Connect</button>' +
             '</div>';
     }
@@ -96,11 +111,11 @@ function showGitHubSetupModal(opts) {
             '<div class="settings-page-row-label" style="margin-bottom:var(--space-4);">Add a repository</div>' +
             (opts.connected ? '' : '<div class="settings-page-row-hint" style="margin-bottom:var(--space-4);">Connect your account above first, then clone.</div>') +
             '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
-                '<input type="text" id="ghsetup-repo" class="form-input" style="flex:1;" placeholder="owner/repo" value="' + escapeHtml(opts.repo || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
-                '<input type="text" id="ghsetup-branch" class="form-input" style="width:130px;" placeholder="branch (optional)" value="' + escapeHtml(opts.branch || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
+                '<input type="text" id="ghsetup-repo" class="form-input" style="flex:1;" placeholder="owner/repo" aria-label="Repository (owner/repo)" value="' + escapeHtml(opts.repo || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
+                '<input type="text" id="ghsetup-branch" class="form-input" style="width:130px;" placeholder="branch (optional)" aria-label="Branch (optional)" value="' + escapeHtml(opts.branch || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
                 '<button class="skills-action-btn" id="ghsetup-clone-btn" onclick="cloneGitHubRepoFromSetupModal()"' + (opts.connected ? '' : ' disabled') + '>Clone</button>' +
             '</div>' +
-            '<div id="ghsetup-clone-status" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
+            '<div id="ghsetup-clone-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
         '</div>';
 
     html +=
@@ -112,21 +127,28 @@ function showGitHubSetupModal(opts) {
 
     overlay.innerHTML = html;
     document.body.appendChild(overlay);
+    // A8C-01: move focus into the dialog (the token field, or the repo field once connected).
+    var f = overlay.querySelector(opts.connected ? '#ghsetup-repo' : '#ghsetup-token');
+    if (f) f.focus();
 }
 
 function closeGitHubSetupModal() {
     var modal = document.getElementById('github-setup-modal');
-    if (modal) modal.remove();
+    if (!modal) return;
+    var o = modal._opener; // A8C-01: return focus to whatever opened the dialog
+    modal.remove();
+    if (o && document.contains(o) && typeof o.focus === 'function') { try { o.focus(); } catch (e) {} }
 }
 
 function openGitHubSetupTokenPage(e) {
     if (e) e.preventDefault();
     var inst = document.getElementById('ghsetup-instance');
-    var instanceUrl = ((inst && inst.value.trim()) || 'https://github.com').replace(/\/$/, '');
+    var instanceUrl = normalizeGitHubInstanceUrl(inst && inst.value); // TA-1: https:// default
     window.open(instanceUrl + '/settings/tokens/new?scopes=repo&description=AppAgent', '_blank');
 }
 
 async function connectGitHubFromSetupModal() {
+    var b0 = document.getElementById('ghsetup-connect-btn'); if (b0 && b0.disabled) return; // S8C-02: Enter honours the disabled button
     var btn = document.getElementById('ghsetup-connect-btn');
     var status = document.getElementById('ghsetup-connect-status');
     var tokenInput = document.getElementById('ghsetup-token');
@@ -163,7 +185,11 @@ async function connectGitHubFromSetupModal() {
     }
 }
 
+// S8C-02: the RC16B-F1 confirm below runs before Clone is disabled, so a second Enter/click
+// during it (or during wsClone) must not start a parallel clone.
+var _ghSetupCloneBusy = false;
 async function cloneGitHubRepoFromSetupModal() {
+    var b0 = document.getElementById('ghsetup-clone-btn'); if (b0 && b0.disabled) return; // S8C-02: Enter honours the disabled button
     var repoInput = document.getElementById('ghsetup-repo');
     var branchInput = document.getElementById('ghsetup-branch');
     var btn = document.getElementById('ghsetup-clone-btn');
@@ -178,22 +204,31 @@ async function cloneGitHubRepoFromSetupModal() {
         return;
     }
     var branch = (branchInput && branchInput.value.trim()) || undefined;
-    if (btn) btn.disabled = true;
-    if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Cloning ' + repo + '...'; }
+    if (_ghSetupCloneBusy) return;
+    _ghSetupCloneBusy = true;
     try {
-        var result = await wsClone(repo, branch);
-        if (result.success) {
-            if (status) { status.style.color = 'var(--success)'; status.textContent = result.message; }
-            if (repoInput) repoInput.value = '';
-            if (branchInput) branchInput.value = '';
-            // Keep the rest of the UI in sync with the new workspace.
-            if (typeof renderGitHubReposList === 'function') renderGitHubReposList();
-            if (typeof updateWorkspaceHeaderStatus === 'function') updateWorkspaceHeaderStatus();
-        } else {
-            if (status) { status.style.color = 'var(--danger)'; status.textContent = result.error; }
+        // RC16B-F1: never silently replace an existing clone (ui/040 _confirmReplaceExistingClone).
+        // Asked before the button is disabled, so Cancel / Escape / backdrop leave the popup as it was.
+        if (!(await _confirmReplaceExistingClone(repo, branch))) return;
+        if (btn) btn.disabled = true;
+        if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Cloning ' + repo + '...'; }
+        try {
+            var result = await wsClone(repo, branch);
+            if (result.success) {
+                if (status) { status.style.color = 'var(--success)'; status.textContent = result.message; }
+                if (repoInput) repoInput.value = '';
+                if (branchInput) branchInput.value = '';
+                // Keep the rest of the UI in sync with the new workspace.
+                if (typeof renderGitHubReposList === 'function') renderGitHubReposList();
+                if (typeof updateWorkspaceHeaderStatus === 'function') updateWorkspaceHeaderStatus();
+            } else {
+                if (status) { status.style.color = 'var(--danger)'; status.textContent = result.error; }
+            }
+        } catch (e) {
+            if (status) { status.style.color = 'var(--danger)'; status.textContent = e.message; }
         }
-    } catch (e) {
-        if (status) { status.style.color = 'var(--danger)'; status.textContent = e.message; }
+        if (btn) btn.disabled = false;
+    } finally {
+        _ghSetupCloneBusy = false;
     }
-    if (btn) btn.disabled = false;
 }

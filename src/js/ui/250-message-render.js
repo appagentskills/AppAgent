@@ -411,14 +411,32 @@ function _sweepOrphanedParkedWidgets() {
 
 // Shared by the full render and the R1 fast path: right-edge fade shadow for
 // horizontally scrollable attachment/widget rows.
+function _updateRowShadow(row) {
+    var hasOverflow = row.scrollWidth > row.clientWidth + 1;
+    var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
+    row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
+}
+var _rowShadowResizeBound = false;
 function _attachRowScrollShadow(row) {
-    function updateShadow() {
-        var hasOverflow = row.scrollWidth > row.clientWidth + 1;
-        var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
-        row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
+    _updateRowShadow(row);
+    if (row._shadowBound) return;
+    row._shadowBound = true;
+    row.addEventListener('scroll', function() { _updateRowShadow(row); });
+    // Thumbnails are width:auto, so a row only overflows once its images decode.
+    row.querySelectorAll('img').forEach(function(i) {
+        if (!i.complete) i.addEventListener('load', function() { _updateRowShadow(row); }, { once: true });
+    });
+    // Panel resize: one lazily bound, debounced window listener recomputes every row.
+    if (!_rowShadowResizeBound) {
+        _rowShadowResizeBound = true;
+        var resizeTimer = null;
+        window.addEventListener('resize', function() {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(function() {
+                document.querySelectorAll('.attachments-row, .widgets-container').forEach(_updateRowShadow);
+            }, 100);
+        });
     }
-    updateShadow();
-    row.addEventListener('scroll', updateShadow);
 }
 
 // R1: conservative incremental fast path for renderMessages(). Applies ONLY
@@ -622,6 +640,10 @@ function renderMessages() {
 
     var container = document.getElementById('messages');
     var chat = chats[currentChatId];
+
+    // Display eager-render index is memoized per render pass
+    // (tools/090-display-templates.js): start every pass fresh.
+    if (typeof getDisplayHtmlForMessage === 'function' && getDisplayHtmlForMessage.resetPass) getDisplayHtmlForMessage.resetPass();
 
     // Update context indicator
     updateContextIndicator();
@@ -866,9 +888,12 @@ function renderMessages() {
         // Skip hidden messages (tool, approval, browser_context) when checking adjacency
         var isAttachment = isAttachmentRole(msg.role);
 
-        // If this attachment was already rendered as part of a group, return hidden placeholder
+        // If this attachment was already rendered as part of a group, return hidden placeholder.
+        // RG-B9 (NEW-T11-3): the visible copy in the group's .attachments-row owns
+        // id="msg-N"; the placeholder keeps the slot and its `message` class (120
+        // overlay nth-child / .message fallback) but must not repeat the id.
         if (isAttachment && processedAttachments[index]) {
-            return '<div class="message ' + msg.role + '" id="msg-' + index + '" style="display:none;"></div>';
+            return '<div class="message ' + msg.role + '" data-grouped-msg="' + index + '" style="display:none;"></div>';
         }
 
         var prevVisibleMsg = findAdjacentForAttachmentGroup(chat.messages, index, -1);
@@ -1162,9 +1187,10 @@ function renderMessages() {
                     block.toolCalls.forEach(function(item) {
                         if (item.hasResult && item.resultMsgIdx >= 0) {
                             blockWidgetHtml += getWidgetHtmlForMessage(item.resultMsgIdx);
-                            // Eager-render displays attached to this tool's result slot
-                            // (created via executeTool('display', ...) from inside js_eval
-                            // / skill / widget sandboxes — see executeDisplay).
+                            // Eager-render displays attached to this tool's result slot: a
+                            // top-level display call's own result, or the parent js_eval /
+                            // skill tool for one created inside a sandbox (see executeDisplay;
+                            // skipped when its placeholder is in an assistant message).
                             if (typeof getDisplayHtmlForMessage === 'function') {
                                 blockDisplayHtml += getDisplayHtmlForMessage(item.resultMsgIdx);
                             }
@@ -1403,9 +1429,10 @@ function renderMessages() {
                 var mwGroupOpen = closedWidgetGroups[index] ? '' : ' open';
                 toolHtml += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + mwGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + mwLabel + '</summary><div class="widgets-container">' + msgWidgetHtml + '</div></details>';
             }
-            // Eager-rendered displays for this tool result (created via
-            // executeTool('display', ...) from inside js_eval / skill / widget
-            // sandboxes — see executeDisplay).
+            // Eager-rendered displays for this tool result: a top-level display
+            // call's own result, or the parent js_eval / skill tool for one
+            // created inside a sandbox (see executeDisplay; skipped when its
+            // placeholder is in an assistant message).
             if (typeof getDisplayHtmlForMessage === 'function') {
                 var msgDisplayHtml = getDisplayHtmlForMessage(index);
                 if (msgDisplayHtml) {
@@ -2162,6 +2189,19 @@ function formatContent(content) {
     html = html.replace(/<!--display:(dsp_\w+)-->/g, function(match, displayId) {
         var rendered = renderDisplayPlaceholder(displayId);
         displayBlocks.push(rendered);
+        // Placed via placeholder: drop any eager copy already on screen (e.g.
+        // the placeholder just streamed in; the finalize render skips the
+        // eager copy, but until then it would show twice).
+        if (typeof document !== 'undefined' && document && typeof document.querySelectorAll === 'function') {
+            try {
+                var eagerCopies = document.querySelectorAll('.displays-container > .display-inline[data-display-id="' + displayId + '"]');
+                for (var ec = 0; ec < eagerCopies.length; ec++) {
+                    var eagerBox = eagerCopies[ec].parentNode;
+                    eagerBox.removeChild(eagerCopies[ec]);
+                    if (!eagerBox.querySelector('.display-inline') && eagerBox.parentNode) eagerBox.parentNode.removeChild(eagerBox);
+                }
+            } catch (_e) { /* rendering must never fail on DOM cleanup */ }
+        }
         return '%%DISPLAY' + (displayBlocks.length - 1) + '%%';
     });
 
@@ -2226,7 +2266,8 @@ function formatContent(content) {
     var lines = html.split('\n');
     var out = [];
     var inTable = false;
-    var inList = false;
+    var tableClose = '</table>'; // '</tbody></table>' once a <thead> was emitted
+    var listTag = ''; // '' | 'ul' | 'ol': the open list's tag
     var inBlockquote = false;
 
     for (var i = 0; i < lines.length; i++) {
@@ -2251,32 +2292,54 @@ function formatContent(content) {
         }
 
         if (ln.match(/^\|.+\|$/)) {
-            if (inList) { out.push('</ul>'); inList = false; }
+            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
             if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+            var tableOpened = false;
             if (!inTable) {
                 while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
                 inTable = true;
+                tableOpened = true;
+                tableClose = '</table>';
                 out.push('<table class="md-table">');
             }
             if (ln.match(/^\|[\s\-:|]+\|$/)) continue;
             var cells = ln.split('|').slice(1, -1);
-            out.push('<tr>' + cells.map(function(c) { return '<td>' + c.trim() + '</td>'; }).join('') + '</tr>');
+            if (tableOpened && i + 1 < lines.length && /^\|[\s\-:|]+\|$/.test(lines[i + 1])) {
+                // GFM header: the table's FIRST row followed by a delimiter row
+                // (| --- | :-: |) becomes <thead>/<th>; the body goes in <tbody>.
+                // Tables without that delimiter keep the plain <tr><td> rows.
+                out.push('<thead><tr>' + cells.map(function(c) { return '<th>' + c.trim() + '</th>'; }).join('') + '</tr></thead><tbody>');
+                tableClose = '</tbody></table>';
+            } else {
+                out.push('<tr>' + cells.map(function(c) { return '<td>' + c.trim() + '</td>'; }).join('') + '</tr>');
+            }
         } else if (isBlockquote) {
-            if (inTable) { out.push('</table>'); inTable = false; }
-            if (inList) { out.push('</ul>'); inList = false; }
+            if (inTable) { out.push(tableClose); inTable = false; }
+            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
             if (!inBlockquote) { out.push('<blockquote class="md-blockquote">'); inBlockquote = true; }
             // Strip the leading `&gt;` plus optional single space; everything after is
             // pushed as a normal line so the paragraph pass below wraps it.
             var bqContent = trimmedLn.replace(/^&gt;\s?/, '');
             out.push(bqContent);
         } else if (isListItem) {
-            if (inTable) { out.push('</table>'); inTable = false; }
+            if (inTable) { out.push(tableClose); inTable = false; }
             if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
-            if (!inList) { out.push('<ul>'); inList = true; }
+            // "1. " items render in an <ol>, "- " items in a <ul>; a change of
+            // kind closes the open list and starts a new one. An <ol> whose
+            // first number isn't 1 keeps it via start= (e.g. steps split by a
+            // code block continue at 2.). Numbers over 9 digits are ignored.
+            var itemNum = /^(\d+)\. /.exec(trimmedLn);
+            var itemTag = itemNum ? 'ol' : 'ul';
+            if (listTag && listTag !== itemTag) { out.push('</' + listTag + '>'); listTag = ''; }
+            if (!listTag) {
+                var startNum = (itemNum && itemNum[1].length <= 9) ? parseInt(itemNum[1], 10) : 1;
+                out.push(startNum !== 1 ? '<ol start="' + startNum + '">' : '<' + itemTag + '>');
+                listTag = itemTag;
+            }
             // Convert to li tag
             var liContent = trimmedLn.replace(/^- /, '').replace(/^\d+\. /, '');
             out.push('<li>' + liContent + '</li>');
-        } else if (trimmedLn === '' && inList && nextIsListItem) {
+        } else if (trimmedLn === '' && listTag && nextIsListItem) {
             // Empty line between list items - keep list open
             continue;
         } else if (trimmedLn === '' && inBlockquote && nextIsBlockquote) {
@@ -2295,14 +2358,14 @@ function formatContent(content) {
             // elements are swallowed by the cleanup regexes further down.
             out.push('');
         } else {
-            if (inTable) { out.push('</table>'); inTable = false; }
-            if (inList) { out.push('</ul>'); inList = false; }
+            if (inTable) { out.push(tableClose); inTable = false; }
+            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
             if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
             out.push(ln);
         }
     }
-    if (inTable) out.push('</table>');
-    if (inList) out.push('</ul>');
+    if (inTable) out.push(tableClose);
+    if (listTag) out.push('</' + listTag + '>');
     if (inBlockquote) out.push('</blockquote>');
     
     // Join and clean up - remove newlines between list items
@@ -2466,7 +2529,10 @@ function decorateIdMentions(html) {
     html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>|<code\b[^>]*>[\s\S]*?<\/code>/g, stash);
     html = html.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<\u0000]+/gi, stash);
 
-    html = html.replace(/\bwidget_\d{10,}_[a-z0-9]{1,9}\b/g, function(id) {
+    // A6B2-01: BOTH widget-id formats — generateWidgetId's legacy
+    // widget_<ms>_<rand> and the current widget_<64-hex SHA-256 digest>
+    // (lowercase; the trailing \b rejects a 65+ hex run).
+    html = html.replace(/\bwidget_(?:\d{10,}_[a-z0-9]{1,9}|[0-9a-f]{64})\b/g, function(id) {
         // Resolve a friendly name when we can. getWidgetById lives in the TOOLS tier
         // (loaded after this ui file) and walks the `chats` map, so it is both
         // typeof-guarded and try/catch-wrapped: a rendering pass must never throw

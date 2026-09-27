@@ -26,7 +26,10 @@ function openHomeView() {
     // sub-agent GC doesn't keep the previously-viewed chat pinned (port-keyed).
     if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(null);
     hideAllPanels();
-    hidePauseButton();
+    // CHAT-CONTROLS SSOT: the view is already 'home' (set above), so the derive
+    // hides Pause, Continue and Retry together; the old Pause-only hide left the
+    // other two painted. closeHomeView -> showChatView re-derives on the way back.
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI();
     var homePanel = document.getElementById('home-panel');
     if (homePanel) { homePanel.style.display = 'flex'; renderHome(); }
     // Browse button visibility is handled by setBrowserControlsVisibility in init

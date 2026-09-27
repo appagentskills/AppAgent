@@ -1767,7 +1767,13 @@ function removeSubAgentListener(fn) {
 // envelope (see src/js/worker/105-subagent-broadcast.js) on every notify,
 // and the page bridge (src/js/app/045-agent-port-bridge-page.js) routes it
 // here. Full-replace is correct because no page-side mutation paths exist.
-function applySubAgentSnapshot(records) {
+// `pool` (B1) is the envelope's poolSnapshot(); its queue_ids is mirrored so
+// the page can tell a pool-QUEUED sub (state 'running', no loop yet) from a
+// running one. Replaced on every snapshot — null/absent clears the mirror so
+// a stale queue never sticks (falls back to the plain running look).
+var _subPoolMirror = null;
+function applySubAgentSnapshot(records, pool) {
+    _subPoolMirror = (pool && Array.isArray(pool.queue_ids)) ? { queue_ids: pool.queue_ids.slice() } : null;
     var next = Object.create(null);
     if (records && records.length) {
         for (var i = 0; i < records.length; i++) {
@@ -1777,6 +1783,15 @@ function applySubAgentSnapshot(records) {
     }
     _subAgents = next;
     _notifyListeners();
+}
+
+// B1: true while `agentId` waits in the pool queue. The local _subPool.queue
+// is authoritative in the SW (the page never enqueues: boot requeue is
+// worker-gated); the page falls back to the snapshot mirror above.
+function isSubAgentQueued(agentId) {
+    if (!agentId) return false;
+    if (_subPool.queue.indexOf(agentId) >= 0) return true;
+    return !!(_subPoolMirror && _subPoolMirror.queue_ids.indexOf(agentId) >= 0);
 }
 
 // ---------- ID helpers ----------
@@ -5797,6 +5812,9 @@ function agentStatus(args, ctx) {
         if (rec.crash_cause) e.crash_cause = rec.crash_cause;
         if ((rec.workspace_force_taken || []).length) e.workspace_force_taken = rec.workspace_force_taken;
         if (rec.revisions_requested) e.revisions_requested = rec.revisions_requested;
+        // B2: waiting for a pool slot (state is already 'running') — same
+        // truth as the verbose in_pool_queue, only emitted when true.
+        if (_subPool.queue.indexOf(rec.agent_id) >= 0) e.in_pool_queue = true;
         var esc = _escalationSuggestion(rec);
         if (esc) e.escalation_suggestion = esc;
         if ((rec.state === 'errored' || rec.state === 'stopped')
@@ -6439,6 +6457,8 @@ var SubAgents = {
     // SW registry. Called by the page-side port bridge on `hello` and on
     // every `subagent-snapshot` envelope.
     applySnapshot: applySubAgentSnapshot,
+    // B1: pool-queue membership (local queue, then the page's mirror).
+    isQueued: isSubAgentQueued,
     // SAGF-1: page→SW focus tracking. The page posts a `focus-chat` envelope
     // whenever the user selects/opens a chat; the SW port bridge calls this so
     // the GC paths (_idleSweepTick / loadAllSubAgents) can skip a transcript
@@ -6514,6 +6534,9 @@ var SubAgents = {
         return {
             running: Object.keys(_subPool.running).length,
             queued:  _subPool.queue.length,
+            // B1: WHICH subs wait for a slot (state 'running', no loop yet) —
+            // mirrored page-side by applySubAgentSnapshot for isQueued().
+            queue_ids: _subPool.queue.slice(),
             size:    SUBAGENT_POOL_SIZE,
             // Orchestrator §5: per-connection-group pool limits.
             global_max: SUBAGENT_POOL_GLOBAL_MAX,

@@ -75,17 +75,6 @@
 #chat-header.widget-mode .widget-back-btn { display: flex; }
 
 
-/* Screenshot side panel (left of iframe) */
-.screenshot-preview-panel { display: none; flex: 1; flex-direction: column; background: var(--bg-white); border-right: 1px solid var(--secondary-border); min-width: 0; }
-.screenshot-preview-panel.visible { display: flex; }
-.screenshot-preview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-4) var(--space-8); border-bottom: 1px solid var(--border); }
-.screenshot-preview-title { flex: 1; font-size: var(--text-body-lg); font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.screenshot-preview-actions { display: flex; align-items: center; gap: var(--space-3); }
-.screenshot-preview-actions .modal-close-icon { width: 26px; height: 26px; }
-.screenshot-preview-actions .modal-close-icon svg { width: 13px; height: 13px; }
-.screenshot-preview-image-wrap { flex: 1; overflow: auto; }
-.screenshot-preview-image-wrap img { display: block; max-width: none; }
-
 /* Home dashboard (pinned widgets above Active chats on the home page).
    Sized IDENTICALLY to .home-active-chats (23-actions.css) so the two panels
    align: width 100%, max-width 1200px, margin var(--space-8) auto 0. */

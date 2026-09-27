@@ -468,6 +468,7 @@ function togglePause() {
     // Per-chat ONLY. Do NOT read the legacy global `paused` here — if another chat
     // was paused earlier, this chat would inherit that flag and Resume would fire
     // a fresh runAgent() the user never asked for (B-2).
+    if (typeof _dismissHaltChats !== 'undefined' && _dismissHaltChats) delete _dismissHaltChats[chatId];
     var wasPaused = pausedChats[chatId] === true;
     var nowPaused = !wasPaused;
     // Persist the user-pause on the chat record too (chat.pausedByUser) so the
@@ -480,6 +481,8 @@ function togglePause() {
     // consult `pausedChats[chatId]` via `isChatPaused`.
     paused = nowPaused;
     syncPauseButtonUI(chatId);
+    // CHAT-CONTROLS SSOT: repaint visibility from state (an idle paused chat shows Resume).
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
 
     if (nowPaused) {
         // Stop the in-flight stream / tool immediately so Pause feels responsive.
@@ -512,8 +515,10 @@ function togglePause() {
         // parked on the resolver promise, and Resume can't re-enter because the
         // original loop never exited (early-return in runAgent on runningChatIds).
         // Resolve with `false` (denied) so the loop falls through to its next pause
-        // check and exits cleanly. Inline approval messages remain `pending` in the
-        // transcript so the user can re-approve after Resume.
+        // check and exits cleanly. The still-pending inline approval rows are then
+        // flipped to `denied` + `deniedByPause` by the rejector below (intended,
+        // 642bfe8; pinned by test/ui-composer-sidebar.test.js). deniedByPause is
+        // write-only today — a marker for telling pause denials from user ones.
         rejectPendingApprovalsForChat(chatId);
         return;
     }
@@ -531,17 +536,23 @@ function togglePause() {
     if (wasPaused && !nowPaused && !runningChatIds[chatId]) {
         runAgent();
     }
+    // The runAgent shim marks runningChatIds synchronously, so this paints Pause with no
+    // flash. Resume while the old loop is still exiting: the chat is still running and
+    // unpaused, so Pause stays; runFinished re-derives (Continue/none), never a dead Pause.
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
 }
 
 function showPauseButton(chatId) {
+    // RC4: a raw primitive must never paint ANOTHER chat's Pause onto the displayed
+    // chat (a background chat's run event used to do exactly that). State-driven
+    // callers use syncChatControlsUI(chatId) instead; this stays for direct callers.
+    if (chatId && typeof currentChatId !== 'undefined' && currentChatId && chatId !== currentChatId) return;
     var pauseBtn = document.getElementById('pause-btn');
     if (pauseBtn) pauseBtn.classList.add('visible');
     // Always sync the label when revealing — prevents stale "Pause" leaking in when
     // the chat is actually paused (e.g. cross-tab navigation back to a paused chat).
-    // Forward the explicit chatId so callers that haven't yet updated `currentChatId`
-    // (e.g. selectChat reveals the new chat's pause state BEFORE assigning currentChatId)
-    // get the correct label. Without this, syncPauseButtonUI's `chatId || currentChatId`
-    // fallback reads the stale-previous chat's pausedChats flag and mislabels the button.
+    // Forward the explicit chatId so the label reads THIS chat's pausedChats flag
+    // (only reachable here when it is the displayed chat or no chat is displayed yet).
     syncPauseButtonUI(chatId);
     // Pause and Continue are mutually exclusive — only one can be shown at a time.
     hideContinueButton();
@@ -589,19 +600,20 @@ function hideContinueButton() {
 }
 
 function retryLastCall() {
-    if (!lastApiError) return;
+    if (!lastApiError) {
+        // CHAT-CONTROLS SSOT: the derive also shows Retry for the displayed chat's persisted
+        // chats[id]._lastApiError; route that to retryChat so Retry is never a dead button.
+        var _shownId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
+        if (_shownId && chats[_shownId] && chats[_shownId]._lastApiError) retryChat(_shownId);
+        return;
+    }
     // Target the chat that actually errored, not whatever the user is
     // currently looking at. Without this, retrying a 429 after the user
     // switched chats kicks runAgent on the wrong chat (no-op for the
     // error context, surprise loop on the other).
     var targetChatId = lastApiError.chatId || currentChatId;
-    hideRetryButton();
-    // Continue and Retry can both be visible after an errored runFinished
-    // (the handler shows Continue when the chat is interrupted). If Retry
-    // doesn't dismiss Continue, the user clicks Retry, sees nothing change
-    // (Continue still sitting there, no spinner), and clicks Continue
-    // assuming Retry was broken. Mirror continueAgent: hide both.
-    hideContinueButton();
+    // CHAT-CONTROLS SSOT: no direct hide*Button() here. The derive after runAgent()
+    // below repaints Retry/Continue away (the shim marks the run running synchronously).
     // RETRY-F2-SNACK: hide the non-auto-dismiss error snackbar (selectChat/newChat do this too).
     if (typeof hideSnackbar === 'function') hideSnackbar();
     lastApiError = null;
@@ -634,6 +646,8 @@ function retryLastCall() {
         try { var _jdRetryLast = _getOpenJobsDropdown(); if (_jdRetryLast) renderJobsDropdown(_jdRetryLast); } catch (e2) {}
     }
     runAgent(targetChatId);
+    // No arg: repaint the DISPLAYED chat even if the error belonged to another one.
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI();
 }
 
 // R-3 (partial): chat-targeted retry primitive for an UNFOCUSED chat's
@@ -659,8 +673,7 @@ function retryChat(chatId) {
         // Retry + error snackbar AND this used to RE-ARM the global lastApiError toward the chat
         // being retried. Consume it and hide the toolbar surface, mirroring retryLastCall/selectChat.
         lastApiError = null;
-        if (typeof hideRetryButton === 'function') hideRetryButton();
-        if (typeof hideContinueButton === 'function') hideContinueButton();
+        // CHAT-CONTROLS SSOT: the derive after runAgent() below hides Retry/Continue.
         // RETRY-F2-SNACK: also hide the non-auto-dismiss error snackbar (selectChat/newChat do this too).
         if (typeof hideSnackbar === 'function') hideSnackbar();
     }
@@ -674,6 +687,8 @@ function retryChat(chatId) {
         try { var _jdRetry = _getOpenJobsDropdown(); if (_jdRetry) renderJobsDropdown(_jdRetry); } catch (e2) {}
     }
     runAgent(chatId);
+    // Non-displayed chatId is a no-op (the toolbar belongs to the displayed chat).
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
 }
 
 // Continue an interrupted run (e.g. after a page reload mid-stream).
@@ -681,8 +696,7 @@ function retryChat(chatId) {
 // the agent loop's own interrupted-tool-call logic stitches the conversation
 // back together.
 function continueAgent() {
-    hideContinueButton();
-    hideRetryButton();
+    // CHAT-CONTROLS SSOT: no direct hide*Button() — the derive after runAgent() repaints.
     // RETRY-F1: hide the non-auto-dismiss error snackbar (mirrors retryLastCall @:267,
     // retryChat @:324, selectChat/newChat). Without this, Continue resumes the run but
     // leaves the pinned API-error snackbar sitting on screen.
@@ -691,7 +705,7 @@ function continueAgent() {
     paused = false;
     // Defensive: skip if no chat is selected. (`pausedChats` is module-level and
     // always defined — the previous `&& pausedChats` guard was dead code.)
-    if (!currentChatId) return;
+    if (!currentChatId) { if (typeof syncChatControlsUI === 'function') syncChatControlsUI(); return; }
     // Clears the persisted pausedByUser flag too (survives-reload pause state).
     setChatPausedPersistent(currentChatId, false);
     // Use the single source of truth for the label rather than a manual innerHTML
@@ -699,6 +713,7 @@ function continueAgent() {
     // ever extended with extra state, continueAgent picks it up for free).
     syncPauseButtonUI(currentChatId);
     runAgent();
+    if (typeof syncChatControlsUI === 'function') syncChatControlsUI(currentChatId);
 }
 
 // B-A2: resolve any pending approval promise for the given chat with `false` so
@@ -803,23 +818,87 @@ function isChatInterrupted(chat) {
 
 // Show the Continue button if the chat is interrupted, otherwise hide it.
 // Call this when entering a chat or after init to surface the Continue affordance.
+// CHAT-CONTROLS SSOT: now a thin alias of syncChatControlsUI. RC4: a non-displayed
+// chatId is a no-op (it used to repaint the displayed chat's Continue from another
+// chat's state); the displayed chat gets the full one-control derive below.
 function refreshContinueButtonForChat(chatId) {
-    if (!chatId || typeof chats === 'undefined' || !chats[chatId]) {
-        hideContinueButton();
-        return;
+    return syncChatControlsUI(chatId);
+}
+
+// CHAT-CONTROLS SSOT (fix for Continue/Pause "randomly shown"): the ONLY writer of
+// #pause-btn / #continue-btn / #retry-btn visibility and the Pause/Resume label.
+// State changes (click handlers, run events, chat/view switches) call
+// syncChatControlsUI(chatId) instead of poking the show/hide*Button() primitives.
+// Exactly one control, first match wins:
+//   none     paused chat whose action is stopped (_isStoppedActionChat), running or idle.
+//   pause    running (runningChatIds, or the isChatControlsHeld hook) and not a silent
+//            after-response hook run; labelled Resume when pausedChats says paused.
+//   none     idle sub-agent: parked subs are not mirrored in the page's pausedChats; the parent resumes subs.
+//   resume   paused, idle, not a sub-agent (a parked sub is resumed by its parent, so
+//            it gets no toolbar control at all).
+//   retry    an API error is recorded for the chat AND it is not running. Intentional
+//            behaviour change: an error mid-run keeps Pause up and Retry appears at run
+//            end (runFinished re-derives), so Pause and Retry are never shown together.
+//   continue interrupted tail (isChatInterrupted). Retry beats Continue (PR-PAUSE R6).
+//   none
+// 020 is SW-bundled (build.js WORKER_SHARED_FILES): every page-only global is typeof-guarded.
+// Stopped action (tools/120 stopAction): the chat stays paused only to halt the loop (the SW
+// while-gate and the M4 update_action_state guard read it); it is not a pause the toolbar can
+// resume. A send or a Resume clears the pause, so the normal rules apply again. The chatId
+// match keeps a re-run (same actionId, new chat) off the old chat. activeActions is page-only.
+function _isStoppedActionChat(chatId, chat) {
+    // Transient 5s dismiss/delete halt (tools/120 _dismissHaltChats): not resumable either.
+    if (typeof _dismissHaltChats !== 'undefined' && _dismissHaltChats && _dismissHaltChats[chatId]) return true;
+    if (chat === undefined) chat = (chatId && typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+    var a = (chat && chat.actionId && typeof activeActions !== 'undefined' && activeActions) ? activeActions[chat.actionId] : null;
+    return !!(a && a.chatId === chatId && a.state === 'stopped');
+}
+
+function _chatControlsState(chatId) {
+    if (!chatId || typeof chats === 'undefined' || !chats || !chats[chatId]) return 'none';
+    var chat = chats[chatId];
+    var running = !!((typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]) ||
+        (typeof isChatControlsHeld === 'function' && isChatControlsHeld(chatId)));
+    var paused = typeof pausedChats !== 'undefined' && !!pausedChats && pausedChats[chatId] === true;
+    if (paused && _isStoppedActionChat(chatId, chat)) return 'none';
+    if (running) {
+        if (typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(chatId)) return 'none';
+        return paused ? 'resume' : 'pause';
     }
-    // PR-PAUSE (R6): Retry and Continue are now mutually exclusive. When the
-    // chat has a recorded API error, Retry owns the affordance (it re-issues
-    // the failed request and clears the error); Continue is only offered for a
-    // clean interruption. Previously both could be visible at once and both
-    // simply called runAgent(chatId), which read as one of them being broken.
-    var _errForChat = (typeof lastApiError !== 'undefined' && lastApiError && lastApiError.chatId === chatId)
-        || !!(chats[chatId] && chats[chatId]._lastApiError);
-    if (_errForChat) {
-        hideContinueButton();
-    } else if (isChatInterrupted(chats[chatId])) {
-        showContinueButton();
-    } else {
-        hideContinueButton();
-    }
+    if (chat.isSubAgent) return 'none';
+    if (paused) return 'resume';
+    var errored = (typeof lastApiError !== 'undefined' && lastApiError && lastApiError.chatId === chatId) ||
+        !!chat._lastApiError;
+    if (errored) return 'retry';
+    return isChatInterrupted(chat) ? 'continue' : 'none';
+}
+
+function _setChatControlVisible(el, on) {
+    if (!el || !el.classList) return;
+    // add/remove, not toggle(force): the test fake DOMs implement only add/remove/contains.
+    if (on) el.classList.add('visible'); else el.classList.remove('visible');
+}
+
+// Contract: not on the chat view → hide all three. Else a chatId that is not the
+// displayed chat → no-op (returns null). Else derive for the displayed chat.
+// Returns the painted state: 'pause' | 'resume' | 'retry' | 'continue' | 'none'.
+function syncChatControlsUI(chatId) {
+    if (typeof document === 'undefined' || !document || typeof document.getElementById !== 'function') return null;
+    var shown = (typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
+    // currentView is declared in core/130-indexeddb.js with a 'chat' default.
+    var inChatView = typeof currentView === 'undefined' || currentView === 'chat';
+    var state;
+    if (!inChatView) state = 'none';
+    else if (chatId && chatId !== shown) return null;
+    else state = shown ? _chatControlsState(shown) : 'none';
+    var pb = document.getElementById('pause-btn');
+    var cb = document.getElementById('continue-btn');
+    var rb = document.getElementById('retry-btn');
+    _setChatControlVisible(pb, state === 'pause' || state === 'resume');
+    _setChatControlVisible(cb, state === 'continue');
+    _setChatControlVisible(rb, state === 'retry');
+    if (cb && state === 'continue') cb.title = 'Resume the interrupted run';   // PR-PAUSE R6 titles
+    if (rb && state === 'retry') rb.title = 'Retry the failed request';
+    if (shown && pb) syncPauseButtonUI(shown);
+    return state;
 }

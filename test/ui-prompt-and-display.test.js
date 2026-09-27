@@ -421,6 +421,58 @@ describe('ui prompt_user › live lifecycle (executePromptUser, reload path, bac
         assert.strictEqual((await guard(p, 'bg executePromptUser after popup cancel')).cancelled, true); assert.strictEqual(document.getElementById('bg-popup-host'), null);
         assert.deepStrictEqual(env.rec.clearActionNeedsInput.calls[0], ['act2']);
     }, { tags: ['unit'] });
+    test('bg popup captures drafts; reopen restores (A4A4-02)', async function() {
+        var bg = { id: 'b1', isBackground: true, actionId: 'act1', messages: [] };
+        var env = promptEnv({ b1: bg }); var m = await loadPrompt(env); await mountTranscript(env);
+        m.executePromptUser({ fields: [{ name: 'why', type: 'text' }] }, { chatId: 'b1' });
+        var pid = bg.messages[0].promptId;
+        m.openBackgroundPromptPopup('b1', pid);
+        var f = document.querySelector('#bg-popup-host form');
+        assert.strictEqual(f.getAttribute('oninput'), 'promptCaptureDraft(this)'); assert.strictEqual(f.getAttribute('onchange'), 'promptCaptureDraft(this)');
+        U.input(f.querySelector('input'), 'draft'); U.fireInline(f, 'input', m);
+        assert.strictEqual(bg.messages[0].fields[0].value, 'draft', 'popup typing captured into msg.fields');
+        U.fireInline(document.querySelector('#bg-popup-host .bg-popup-backdrop'), 'click', m);
+        assert.strictEqual(document.getElementById('bg-popup-host'), null);
+        m.openBackgroundPromptPopup('b1', pid);
+        assert.strictEqual(document.querySelector('#bg-popup-host input').value, 'draft', 'reopen restores the draft');
+    }, { tags: ['unit'] });
+    test('bg popup submit uses the popup form when the same prompt is inline (A4A5-01)', async function() {
+        var bg = { id: 'b1', isBackground: true, actionId: 'act1', messages: [] };
+        var env = promptEnv({ b1: bg }); var m = await loadPrompt(env); await mountTranscript(env);
+        var p = m.executePromptUser({ fields: [{ name: 'why', type: 'text', required: true }] }, { chatId: 'b1' });
+        var pid = bg.messages[0].promptId;
+        env.dom.$('#messages').innerHTML = m.renderPromptUserMessage(bg.messages[0], 0);
+        m.openBackgroundPromptPopup('b1', pid); // currentChatId is c1, so the popup opens
+        var host = document.getElementById('bg-popup-host');
+        assert.ok(host, 'popup opens for an off-screen chat');
+        U.input(env.dom.$('#messages input'), 'inline'); // inline filled, popup field left empty
+        var submit = host.querySelectorAll('.bg-popup-footer button')[1];
+        U.fireInline(submit, 'click', m);
+        assert.strictEqual(host.querySelectorAll('.prompt-field.invalid').length, 1, 'the popup form is validated');
+        assert.strictEqual(env.dom.$$('#messages .prompt-field.invalid').length, 0, 'the inline form is untouched');
+        assert.ok(document.getElementById('bg-popup-host'), 'invalid popup stays open');
+        U.input(host.querySelector('input'), 'popup'); U.fireInline(submit, 'click', m);
+        assert.deepStrictEqual((await guard(p, 'bg executePromptUser after popup submit')).values, { why: 'popup' });
+    }, { tags: ['unit'] });
+    test('bg popup is not opened when its chat is on screen; inline field focused (A4A5-01)', async function() {
+        var bg = { id: 'b1', isBackground: true, actionId: 'act1', messages: [] };
+        var env = promptEnv({ b1: bg }, { currentChatId: 'b1' }); var m = await loadPrompt(env);
+        env.dom = await U.mountDom({ html: '<div id="messages"></div>', css: CSS });
+        var p = m.executePromptUser({ fields: [{ name: 'why', type: 'text', required: true }] }, { chatId: 'b1' });
+        var pid = bg.messages[0].promptId;
+        env.dom.$('#messages').innerHTML = m.renderPromptUserMessage(bg.messages[0], 0);
+        var form = env.dom.$('#messages form'), inp = form.querySelector('input'), focused = 0, scrolled = 0;
+        // sandbox focus() does not move activeElement (ui-helpers), so spy on the calls
+        inp.focus = function() { focused++; }; form.scrollIntoView = function() { scrolled++; };
+        m.openBackgroundPromptPopup('b1', pid);
+        assert.strictEqual(document.getElementById('bg-popup-host'), null, 'no popup over the on-screen chat');
+        assert.strictEqual(focused, 1, 'inline field focused'); assert.strictEqual(scrolled, 1, 'inline form scrolled into view');
+        U.input(inp, 'inline');
+        var btn = env.dom.$$('.tool-approval-actions button').filter(function(b) { return b.textContent.trim() === 'Submit'; })[0];
+        U.fireInline(btn, 'click', m);
+        assert.deepStrictEqual(env.rec.clearActionNeedsInput.calls[0], ['act1'], 'inline submit clears needs_input');
+        assert.deepStrictEqual((await guard(p, 'executePromptUser after inline submit')).values, { why: 'inline' });
+    }, { tags: ['unit'] });
 });
 
 // ---------------------------------------------------------------- display
@@ -453,6 +505,22 @@ describe('ui display templates › table sort + filter', function() {
         assert.ok(th[0].classList.contains('sorted')); assert.strictEqual(th[1].classList.contains('sorted'), false);
         assert.strictEqual(th[1].querySelector('.display-sort-arrow').textContent, '▲', 'arrow reset on old column');
         assert.strictEqual(dom.$('tbody img, tbody script'), null);
+    }, { tags: ['unit'] });
+    // S0C6-01: short rows used to render fewer cells and the comparator threw on them.
+    test('sorting a column that short rows lack does not throw', async function() {
+        var e = await loadDisplay(), m = e.m;
+        var dom = await mountDisplay(m.generateTable({ columns: ['Name', 'Count', 'Note'], rows: [['b', '2', 'zeta'], ['a'], ['c', '3', 'alpha']] }));
+        var th = dom.$$('th');
+        function col(i) { return dom.$$('tbody tr').map(function(r) { return r.cells[i] ? r.cells[i].textContent : null; }); }
+        function named(v) { return v && v !== '\u2014'; }
+        assert.deepStrictEqual(col(0), ['b', 'a', 'c']);
+        U.fireInline(th[2], 'click', m);
+        assert.ok(th[2].classList.contains('sorted'));
+        assert.deepStrictEqual(col(2).filter(named), ['alpha', 'zeta'], 'rows reordered by the 3rd column');
+        assert.ok(col(0).indexOf('c') < col(0).indexOf('b'));
+        dom.$$('tbody tr').filter(function(r) { return r.cells[0].textContent === 'a'; })[0].deleteCell(-1); // a row with no 3rd cell at all
+        U.fireInline(th[2], 'click', m);
+        assert.deepStrictEqual(col(2).filter(named), ['zeta', 'alpha'], 'desc sort still runs');
     }, { tags: ['unit'] });
     test('filter: search + row count for >5 rows, case-insensitive hide, empty state, reset', async function() {
         var e = await loadDisplay(), m = e.m;

@@ -1,5 +1,5 @@
 async function addSampleTool() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error'); return; }
+    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
 
     var sampleToolContent = `// Sample Tool: my_tool
 // Runs in isolated sandbox - only executeTool() is available
@@ -65,60 +65,80 @@ async function my_tool(args) {
 }
 
 async function addSkillAsset() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error'); return; }
+    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
     var input = document.createElement('input');
     input.type = 'file';
     input.accept = '.xml,.md,.js';
     input.multiple = true;
-    input.onchange = async function(e) {
-        var files = e.target.files;
-        var skillUpdated = false;
+    input.onchange = function(e) { return addSkillAssetFiles(e.target.files); };
+    input.click();
+}
+
+// S0B-11: never rejects; confirms before SKILL.md replaces content; honest count.
+async function addSkillAssetFiles(files) {
+    var added = 0, skipped = 0, skillUpdated = false;
+    try {
         for (var i = 0; i < files.length; i++) {
             var file = files[i];
             var ext = file.name.split('.').pop().toLowerCase();
-            if (ext === 'xml' || ext === 'md' || ext === 'js') {
-                var content = await file.text();
-                
-                // If importing SKILL.md, update the skill's parsed content (don't save as asset)
-                if (file.name === 'SKILL.md' || file.name.toLowerCase() === 'skill.md') {
-                    var parsed = parseSkillMarkdown(content, currentEditingSkill);
-                    var skill = skills[currentEditingSkill];
-                    if (skill) {
-                        skill.name = parsed.name || skill.name;
-                        skill.description = parsed.description || skill.description;
-                        skill.body = parsed.body;
-                        skill.actions = dedupeActionsByActionId(skill.name, parsed.actions || []);
-                        skill.updatedAt = Date.now();
-                        skill.userModified = true;
-                        await saveSkill(skill);
-                        skillUpdated = true;
-                        // Update editor fields
-                        var nameInput = document.getElementById('skill-name-input');
-                        var descInput = document.getElementById('skill-description-input');
-                        var bodyInput = document.getElementById('skill-body-input');
-                        if (nameInput) nameInput.value = skill.name || '';
-                        if (descInput) descInput.value = skill.description || '';
-                        if (bodyInput) bodyInput.value = skill.body || '';
-                        // Re-render body view
-                        renderSkillBodyView();
-                        renderSkillActionsEditor();
-                    }
-                    continue; // Don't save SKILL.md as a separate asset
-                }
-                
-                await saveSkillAsset(currentEditingSkill, file.name, ext, content);
+            if (ext !== 'xml' && ext !== 'md' && ext !== 'js') { skipped++; continue; }
+            var content = await file.text();
+            // If importing SKILL.md, update the skill's parsed content (don't save as asset)
+            if (file.name.toLowerCase() === 'skill.md') {
+                var skill = skills[currentEditingSkill];
+                if (!skill) { showSnackbar('Add file failed: skill not found (save it first)', 'error'); return; }
+                var fm = content.match(/^---\s*\n([\s\S]*?)\n---/);
+                // TB-10: the mini parser reads block lists only, so a flow list (`actions: [a, b]`)
+                // parses to []. Replace the actions only when the parse is non-empty (never wipe them).
+                var parsed = parseSkillMarkdown(content, file.name);
+                var hasActions = !!fm && /^actions\s*:/m.test(fm[1]) && Array.isArray(parsed.actions) && parsed.actions.length > 0;
+                var ok = await showConfirmModal('Replace skill content', 'SKILL.md will replace this skill\'s ' +
+                    (fm ? 'name, description, body' + (hasActions ? ' and actions' : '') : 'body') +
+                    '. Unsaved editor changes are lost. Continue?', 'danger');
+                if (!ok) { skipped++; continue; }
+                if (fm) { skill.name = parsed.name || skill.name; skill.description = parsed.description || skill.description; }
+                skill.body = parsed.body;
+                if (hasActions) skill.actions = dedupeActionsByActionId(skill.name, parsed.actions || []);
+                skill.updatedAt = Date.now();
+                skill.userModified = true;
+                await saveSkill(skill);
+                skillUpdated = true;
+                // Update editor fields
+                var nameInput = document.getElementById('skill-name-input');
+                var descInput = document.getElementById('skill-description-input');
+                var bodyInput = document.getElementById('skill-body-input');
+                if (nameInput) nameInput.value = skill.name || '';
+                if (descInput) descInput.value = skill.description || '';
+                if (bodyInput) bodyInput.value = skill.body || '';
+                // Re-render body view
+                renderSkillBodyView();
+                resetSkillActionsDraft();
+                renderSkillActionsEditor();
+                continue; // Don't save SKILL.md as a separate asset
             }
+            // A5B2-01: a same-name asset is replaced only after an explicit confirm; Cancel skips it.
+            var existing = await getSkillAsset(currentEditingSkill, file.name);
+            if (existing) {
+                var rep = await showConfirmModal('Replace file', escapeHtml(file.name) + ' already exists in this skill. Replace it?', 'danger');
+                if (!rep) { skipped++; continue; }
+            }
+            await saveSkillAsset(currentEditingSkill, file.name, ext, content);
+            added++;
         }
-        await renderSkillAssets();
-        var msg = skillUpdated ? 'Skill updated from SKILL.md' : 'Added ' + files.length + ' file(s)';
-        showSnackbar(msg, 'success');
-    };
-    input.click();
+    } catch (e) {
+        console.error('[addSkillAsset] failed:', e);
+        showSnackbar('Add file failed: ' + ((e && e.message) || e), 'error');
+        return;
+    } finally {
+        try { await renderSkillAssets(); } catch (e2) { console.error('[addSkillAsset] render failed:', e2); }
+    }
+    showSnackbar('Added ' + added + ' file(s)' + (skipped ? ', skipped ' + skipped : '') +
+        (skillUpdated ? '; skill updated from SKILL.md' : ''), 'success');
 }
 
 async function removeSkillAsset(filename) {
     if (!currentEditingSkill) return;
-    var confirmed = await showConfirmModal('Remove File', 'Remove ' + filename + ' from this skill?', 'danger');
+    var confirmed = await showConfirmModal('Remove File', 'Remove ' + escapeHtml(filename) + ' from this skill?', 'danger');
     if (!confirmed) return;
     await deleteSkillAsset(currentEditingSkill, filename);
     await renderSkillAssets();
@@ -278,8 +298,18 @@ async function saveAssetEdit() {
             if (nameInput) nameInput.value = skill.name || '';
             if (descInput) descInput.value = skill.description || '';
             if (bodyInput) bodyInput.value = skill.body || '';
+            resetSkillActionsDraft();
             renderSkillActionsEditor();
         }
+        // SKILL.md is virtual (skillToMarkdown of the live skill): never store it as
+        // an asset. A stored copy is a frozen snapshot that renders as a 2nd card
+        // and replays stale name/description/body/actions when saved (NEW-F15-1).
+        if (!skill) { showSnackbar('Skill not found', 'error'); return; }
+        currentViewingAsset.content = skillToMarkdown(skill);
+        assetEditMode = false;
+        renderAssetModal();
+        showSnackbar('Skill updated', 'success');
+        return;
     }
     
     await saveSkillAsset(currentEditingSkill, filename, ext, newContent);
@@ -294,10 +324,9 @@ function editSkillWithAgent() {
     var skill = skills[currentEditingSkill];
     if (!skill) return;
 
-    // Close skills panel and go to chat
-    closeSkillsView();
-
-    // Create a new chat with just the skill name
+    // Create a new chat with just the skill name. newChat() closes the skills view
+    // itself AFTER switching identity (ui/170-chat-management.js newChat), so the
+    // previous chat's unread state is not consumed here (A5A3-01).
     newChat();
 
     // Pre-fill the message input with just the skill name
@@ -311,6 +340,7 @@ function editSkillWithAgent() {
 }
 
 function closeSkillEditor() {
+    resetSkillActionsDraft();
     currentEditingSkill = null;
     appStorage.removeItem('currentEditingSkill');
     appStorage.setItem('currentView', 'skills');
@@ -342,6 +372,61 @@ function closeSkillEditor() {
     replaceHistoryState('skills', null, null);
 }
 
+// NEW-T17-1: Back used to drop unsaved edits without a word. The Back button now
+// calls requestCloseSkillEditor(), which asks first when the form differs from
+// the saved skill. Save and Delete still call closeSkillEditor() directly.
+function _skillEditorIsDirty() {
+    var panel = document.getElementById('skill-editor-panel');
+    if (!panel || panel.style.display === 'none') return false;
+    var nameInput = document.getElementById('skill-name-input');
+    var descInput = document.getElementById('skill-description-input');
+    var bodyInput = document.getElementById('skill-body-input');
+    var name = nameInput ? String(nameInput.value || '') : '';
+    var desc = descInput ? String(descInput.value || '') : '';
+    var body = bodyInput ? String(bodyInput.value || '') : '';
+    var s = currentEditingSkill ? skills[currentEditingSkill] : null;
+    if (!s) return !!(name.trim() || desc.trim() || body.trim()); // new skill
+    // A textarea value folds CRLF (and a lone CR) to LF, so compare folded text.
+    var nl = function(v) { return String(v || '').replace(/\r\n?/g, '\n'); };
+    if (name !== String(s.name || s.id || '')) return true;
+    if (nl(desc) !== nl(s.description) || nl(body) !== nl(s.body)) return true;
+    // Normalize the saved actions the way render -> collect does (sanitized, pills
+    // in ACTION_PLACEMENTS order), so an untouched list never counts as dirty.
+    var saved = Array.isArray(s.actions) ? s.actions : [];
+    var savedNorm = saved.map(function(a) {
+        var showList = Array.isArray(a.show) ? a.show : [a.show || 'home'];
+        return sanitizeAction({
+            name: String(a.name || ''),
+            icon: String(a.icon || 'play'),
+            show: ACTION_PLACEMENTS.filter(function(p) { return showList.indexOf(p) >= 0; })
+        });
+    }).filter(Boolean);
+    return JSON.stringify(collectSkillActionsFromEditor()) !== JSON.stringify(savedNorm);
+}
+
+var _skillCloseConfirmPending = false;
+async function requestCloseSkillEditor() {
+    if (_skillCloseConfirmPending) return; // a 2nd Back click while the confirm is open
+    var dirty = false;
+    try { dirty = _skillEditorIsDirty(); } catch (e) { dirty = false; }
+    if (!dirty || typeof showConfirmModal !== 'function') { closeSkillEditor(); return; }
+    var id = currentEditingSkill;
+    var s = id ? skills[id] : null;
+    var label = (s && (s.name || s.id)) || 'this new skill';
+    var ok = false;
+    _skillCloseConfirmPending = true;
+    try {
+        ok = await showConfirmModal('Discard changes?', 'Unsaved edits to "' + escapeHtml(label) + '" will be lost.', 'warning');
+    } finally {
+        _skillCloseConfirmPending = false;
+    }
+    if (!ok) return;
+    // A stale confirm must not close a skill opened while it was showing.
+    var panelNow = document.getElementById('skill-editor-panel');
+    if (currentEditingSkill !== id || !panelNow || panelNow.style.display === 'none') return;
+    closeSkillEditor();
+}
+
 async function saveCurrentSkill() {
     var nameInput = document.getElementById('skill-name-input');
     var descInput = document.getElementById('skill-description-input');
@@ -350,9 +435,9 @@ async function saveCurrentSkill() {
     var description = (descInput ? descInput.value : '').trim();
     var body = (bodyInput ? bodyInput.value : '').trim();
     var actions = collectSkillActionsFromEditor();
-    if (!name) { showSnackbar('Name is required', 'error'); return; }
-    if (name.length > 64) { showSnackbar('Name must be 64 characters or less', 'error'); return; }
-    if (!description) { showSnackbar('Description is required', 'error'); return; }
+    if (!name) { showSnackbar('Name is required', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (name.length > 64) { showSnackbar('Name must be 64 characters or less', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!description) { showSnackbar('Description is required', 'error', undefined, { key: 'skill-editor' }); return; }
     // Reject collisions on the normalized actionId. getActionId lowercases and
     // slugifies, so "Run audit" and "RUN-AUDIT" hash to the same id — the
     // engine then can't distinguish them and only one button effectively works.
@@ -361,7 +446,7 @@ async function saveCurrentSkill() {
         for (var ai = 0; ai < actions.length; ai++) {
             var aid = getActionId(name || 'skill', actions[ai].name);
             if (seenActionIds[aid]) {
-                showSnackbar('Two actions normalize to the same id: "' + seenActionIds[aid] + '" and "' + actions[ai].name + '". Rename one.', 'error');
+                showSnackbar('Two actions normalize to the same id: "' + seenActionIds[aid] + '" and "' + actions[ai].name + '". Rename one.', 'error', undefined, { key: 'skill-editor' });
                 return;
             }
             seenActionIds[aid] = actions[ai].name;
@@ -381,13 +466,17 @@ async function saveCurrentSkill() {
         skill = { id: id, name: name, description: description, body: body, actions: actions, userModified: true, createdAt: Date.now(), updatedAt: Date.now() };
     }
     await saveSkill(skill);
-    showSnackbar('Skill saved', 'success');
+    showSnackbar('Skill saved', 'success', undefined, { key: 'skill-editor' });
+    resetSkillActionsDraft();
     closeSkillEditor();
 }
 
 async function deleteCurrentSkill() {
     if (!currentEditingSkill) return;
-    var confirmed = await showConfirmModal('Delete Skill', 'Delete this skill? This cannot be undone.', 'danger');
+    // NEW-T16-1: name the skill. The modal parses the message as HTML, so escape it.
+    var s = skills[currentEditingSkill];
+    var n = (s && s.name) || currentEditingSkill;
+    var confirmed = await showConfirmModal('Delete Skill', 'Delete "' + escapeHtml(n) + '"? This cannot be undone.', 'danger');
     if (!confirmed) return;
     await deleteSkill(currentEditingSkill);
     showSnackbar('Skill deleted', 'success');
@@ -617,6 +706,8 @@ async function _writeSkillToDir(skill, parentDirHandle) {
     var assets = await getSkillAssets(skill.id);
     for (var j = 0; j < assets.length; j++) {
         var asset = assets[j];
+        // SKILL.md was written above from the live skill; a stored copy is stale.
+        if (String(asset.filename || '').toLowerCase() === 'skill.md') continue;
         var assetHandle = await skillDirHandle.getFileHandle(asset.filename, { create: true });
         var assetWritable = await assetHandle.createWritable();
         await assetWritable.write(asset.content);
@@ -731,54 +822,95 @@ async function exportAllSkills() {
     return exportAllSkillsToFolder();
 }
 
-async function importSkillFromFolder(dirHandle, folderName) {
-    // Helper to import a single skill folder
+// S0B-08: read + parse a folder's SKILL.md (read-only). The import pre-scan uses it
+// to learn the id BEFORE anything is written, then passes it on, so the id the user
+// confirmed is the one committed.
+async function _readSkillFolderManifest(dirHandle, folderName) {
     var skillFile = await dirHandle.getFileHandle('SKILL.md');
     var file = await skillFile.getFile();
-    var content = await file.text();
-    var parsed = parseSkillMarkdown(content, folderName);
-    
-    var id = parsed.name || folderName;
-    
-    // If skill with same name exists, deactivate and delete its assets first (overwrite).
-    // Remember active state so we can re-activate after re-import.
-    var wasActive = !!activeSkills[id];
-    if (skills[id]) {
-        if (wasActive) {
-            await deactivateSkill(id);
-        }
-        await deleteSkillAssets(id);
-    }
-    
-    await saveSkill({
-        id: id,
-        name: parsed.name || folderName,
-        description: parsed.description || '',
-        body: parsed.body,
-        actions: dedupeActionsByActionId(parsed.name || folderName, parsed.actions || []),
-        userModified: true,
-        createdAt: skills[id] ? skills[id].createdAt : Date.now(),
-        updatedAt: Date.now()
+    var parsed = parseSkillMarkdown(await file.text(), folderName);
+    return { parsed: parsed, id: parsed.name || folderName };
+}
+
+// S0B-08: ONE confirmation before an import overwrites existing skills (content and
+// actions replaced, assets missing from the import deleted; an ACTIVE skill's
+// ServiceNow XML is reverted and re-applied). Read-only. Resolves true when no id
+// exists yet or the user confirms; the spinner is hidden while the dialog is open.
+async function _confirmSkillImportOverwrite(ids) {
+    var seen = Object.create(null), items = [];
+    ids.forEach(function(id) {
+        if (!id || seen[id] || !skills[id]) return;
+        seen[id] = true;
+        items.push('<li><code>' + escapeHtml(id) + '</code>' + (activeSkills[id]
+            ? ' <strong>(active: will be reverted and re-applied on ServiceNow)</strong>' : '') + '</li>');
     });
+    if (!items.length) return true;
+    hideOverlaySpinner();
+    var ok = await showConfirmModal('Overwrite existing skills?', items.length + ' skill(s) already exist. ' +
+        'Importing replaces their content and actions and deletes their assets that are not in the import:' +
+        '<ul>' + items.join('') + '</ul>This cannot be undone.', 'warning');
+    if (ok) showOverlaySpinner('Importing skills...');
+    return ok;
+}
+
+async function importSkillFromFolder(dirHandle, folderName, manifest) {
+    // Helper to import a single skill folder (manifest: the pre-scanned SKILL.md; read here when omitted)
+    manifest = manifest || await _readSkillFolderManifest(dirHandle, folderName);
+    var parsed = manifest.parsed;
     
-    // Import all other files as assets (XML, MD, JS files, excluding SKILL.md)
+    var id = manifest.id;
+    
+    // S0B-08 write-then-swap: stage every file read in memory first (touching nothing),
+    // commit the skill row + assets in ONE transaction, and only then cycle activation.
+    // Any failure before the commit leaves the old skill, its assets and its active
+    // state (and the remote XML it applied) intact, and the error propagates.
+    var existed = !!skills[id];
+    var wasActive = !!activeSkills[id];
+    var staged = [];
+    // Stage all other files as assets (XML, MD, JS files, excluding SKILL.md)
     for await (var fileEntry of dirHandle.values()) {
         if (fileEntry.kind === 'file' && fileEntry.name !== 'SKILL.md') {
             var ext = fileEntry.name.split('.').pop().toLowerCase();
             if (ext === 'xml' || ext === 'md' || ext === 'js') {
                 var assetFile = await dirHandle.getFileHandle(fileEntry.name);
                 var assetData = await assetFile.getFile();
-                var assetContent = await assetData.text();
-                await saveSkillAsset(id, fileEntry.name, ext, assetContent);
+                staged.push({ filename: fileEntry.name, type: ext, content: await assetData.text() });
             }
         }
     }
     
-    // Re-activate if it was active before
-    if (wasActive) {
-        try { await activateSkill(id); } catch (e) { /* leave inactive on failure */ }
+    await commitSkillImport({
+        id: id,
+        name: parsed.name || folderName,
+        description: parsed.description || '',
+        body: parsed.body,
+        actions: dedupeActionsByActionId(parsed.name || folderName, parsed.actions || []),
+        userModified: true,
+        createdAt: existed ? skills[id].createdAt : Date.now(),
+        updatedAt: Date.now()
+    }, staged);
+    
+    return { id: id, existed: existed, wasActive: wasActive,
+        activationError: wasActive ? await _cycleImportedSkillActivation(id) : '' };
+}
+
+// S0B-08: re-apply a re-imported skill that was active, only AFTER its new content
+// is committed (deactivate reverts the old remote XML, activate applies the new
+// assets). Returns '' on success, else the problem(s) to show to the user - incl. a
+// partial remote revert, which deactivateSkill resolves as success:true with
+// 'Skill deactivated with errors: ...' (core/140 deactivateSkill).
+async function _cycleImportedSkillActivation(id) {
+    var problems = [];
+    try {
+        var dres = await deactivateSkill(id);
+        if (dres && dres.success === false) problems.push(dres.error || 'deactivation failed');
+        else if (dres && /with errors/i.test(dres.message || '')) problems.push(dres.message);
+        var res = await activateSkill(id);
+        if (res && res.success === false) problems.push(res.error || 'activation failed');
+    } catch (e) {
+        problems.push((e && e.message) || String(e));
     }
-    return id;
+    return problems.join('; ');
 }
 
 async function importSkillsFromFolder() {
@@ -792,6 +924,24 @@ async function importSkillsFromFolder() {
         showOverlaySpinner('Importing skills...');
         var imported = 0;
         var updated = 0;
+        var errors = []; // S0B-08: real per-folder failures are collected and shown, never swallowed
+        var activationErrors = [];
+        var tally = function(res) {
+            imported++;
+            if (res.existed) updated++; // counted only after a successful import
+            if (res.activationError) activationErrors.push(res.id + ': ' + res.activationError);
+        };
+        
+        // S0B-08: read-only pre-scan - read + parse every SKILL.md first (writes nothing)
+        // so ONE confirmation can list the existing skills this import would overwrite.
+        var found = [];
+        var scan = async function(dir, name) {
+            try {
+                found.push({ dir: dir, name: name, manifest: await _readSkillFolderManifest(dir, name) });
+            } catch (e) {
+                errors.push(name + ': ' + ((e && e.message) || e));
+            }
+        };
         
         // First check if the selected folder is a single skill folder (has SKILL.md)
         var isSingleSkill = false;
@@ -802,37 +952,50 @@ async function importSkillsFromFolder() {
         
         if (isSingleSkill) {
             // Import single skill folder directly
-            var parsed = parseSkillMarkdown(await (await (await dirHandle.getFileHandle('SKILL.md')).getFile()).text(), dirHandle.name);
-            var skillId = parsed.name || dirHandle.name;
-            if (skills[skillId]) updated++;
-            await importSkillFromFolder(dirHandle, dirHandle.name);
-            imported = 1;
+            await scan(dirHandle, dirHandle.name);
         } else {
             // Import folder containing multiple skill folders
             for await (var entry of dirHandle.values()) {
                 if (entry.kind === 'directory') {
                     try {
                         var skillDir = await dirHandle.getDirectoryHandle(entry.name);
-                        var skillFile = await skillDir.getFileHandle('SKILL.md');
-                        var content = await (await skillFile.getFile()).text();
-                        var parsed = parseSkillMarkdown(content, entry.name);
-                        var skillId = parsed.name || entry.name;
-                        if (skills[skillId]) updated++;
-                        await importSkillFromFolder(skillDir, entry.name);
-                        imported++;
-                    } catch (e) { /* Skip folders without SKILL.md */ }
+                        try {
+                            await skillDir.getFileHandle('SKILL.md');
+                        } catch (e) {
+                            if (e && e.name === 'NotFoundError') continue; // Skip folders without SKILL.md
+                            throw e;
+                        }
+                        await scan(skillDir, entry.name);
+                    } catch (e) {
+                        errors.push(entry.name + ': ' + ((e && e.message) || e));
+                    }
                 }
+            }
+        }
+        
+        if (!(await _confirmSkillImportOverwrite(found.map(function(c) { return c.manifest.id; })))) {
+            showSnackbar('Import cancelled', 'info'); // nothing written, no remote call
+            return;
+        }
+        for (var c = 0; c < found.length; c++) {
+            try {
+                tally(await importSkillFromFolder(found[c].dir, found[c].name, found[c].manifest));
+            } catch (e) {
+                errors.push(found[c].name + ': ' + ((e && e.message) || e));
             }
         }
         
         hideOverlaySpinner();
         if (imported === 0) {
-            showSnackbar('No valid skills found. Folder should contain SKILL.md or subfolders with SKILL.md', 'error');
+            showSnackbar(errors.length ? 'Import failed: ' + errors.join('; ')
+                : 'No valid skills found. Folder should contain SKILL.md or subfolders with SKILL.md', 'error');
         } else {
             renderSkillsList();
             var msg = 'Imported ' + imported + ' skill(s)';
             if (updated > 0) msg += ' (' + updated + ' updated)';
-            showSnackbar(msg, 'success');
+            if (errors.length) msg += ' — ' + errors.length + ' failed: ' + errors.join('; ');
+            if (activationErrors.length) msg += ' — re-activation issues: ' + activationErrors.join('; ');
+            showSnackbar(msg, (errors.length || activationErrors.length) ? 'warning' : 'success');
         }
     } catch (err) {
         hideOverlaySpinner();
@@ -846,6 +1009,11 @@ function _normalizeSkillId(raw) {
     return String(raw).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-|-$/g, '').substring(0, 64);
 }
 
+// Id a JSON skill object imports under (shared by the S0B-08 pre-scan and the import)
+function _jsonSkillId(skillObj) {
+    return _normalizeSkillId(skillObj.id || skillObj.name) || 'untitled';
+}
+
 // Import a skill from a parsed JSON object. Handles bare-skill, single-wrapped, and bundle formats.
 // Returns { id, existed } where `existed` reflects whether a skill with that id was already present
 // BEFORE the import (so callers can count updates vs creates).
@@ -853,25 +1021,33 @@ async function importSkillFromJsonObject(skillObj) {
     if (!skillObj || typeof skillObj !== 'object') {
         throw new Error('Invalid skill object');
     }
-    var id = _normalizeSkillId(skillObj.id || skillObj.name) || 'untitled';
+    var id = _jsonSkillId(skillObj);
     var existed = !!skills[id];
     var existingCreatedAt = existed ? skills[id].createdAt : Date.now();
     var wasActive = !!activeSkills[id];
     
-    // If skill with same id exists, deactivate and delete its assets first (overwrite).
-    // We remember `wasActive` so we can re-activate after the new content is in place.
-    if (existed) {
-        if (wasActive) {
-            await deactivateSkill(id);
-        }
-        await deleteSkillAssets(id);
-    }
-    
+    // S0B-08 write-then-swap: validate + stage everything in memory first (touching
+    // nothing), commit the skill row + assets in ONE transaction, and only then cycle
+    // activation. A bad asset or an IDB error leaves the old skill, its assets and its
+    // active state (and the remote XML it applied) intact, and the error propagates.
     var actions = Array.isArray(skillObj.actions)
         ? skillObj.actions.map(sanitizeAction).filter(function(a){ return a; })
         : [];
     
-    await saveSkill({
+    // Stage inlined assets
+    var assets = Array.isArray(skillObj.assets) ? skillObj.assets : [];
+    var staged = [];
+    for (var i = 0; i < assets.length; i++) {
+        var a = assets[i];
+        if (!a || !a.filename || typeof a.content !== 'string') continue;
+        if (typeof a.filename !== 'string') throw new Error('Invalid asset filename in skill "' + id + '"');
+        var ext = (a.type || a.filename.split('.').pop() || '').toLowerCase();
+        if (ext !== 'xml' && ext !== 'md' && ext !== 'js') continue;
+        if (a.filename === 'SKILL.md' || a.filename.toLowerCase() === 'skill.md') continue;
+        staged.push({ filename: a.filename, type: ext, content: a.content });
+    }
+    
+    await commitSkillImport({
         id: id,
         name: skillObj.name || id,
         description: skillObj.description || '',
@@ -880,24 +1056,10 @@ async function importSkillFromJsonObject(skillObj) {
         userModified: true,
         createdAt: existingCreatedAt,
         updatedAt: Date.now()
-    });
+    }, staged);
     
-    // Import inlined assets
-    var assets = Array.isArray(skillObj.assets) ? skillObj.assets : [];
-    for (var i = 0; i < assets.length; i++) {
-        var a = assets[i];
-        if (!a || !a.filename || typeof a.content !== 'string') continue;
-        var ext = (a.type || a.filename.split('.').pop() || '').toLowerCase();
-        if (ext !== 'xml' && ext !== 'md' && ext !== 'js') continue;
-        if (a.filename === 'SKILL.md' || a.filename.toLowerCase() === 'skill.md') continue;
-        await saveSkillAsset(id, a.filename, ext, a.content);
-    }
-    
-    // Re-activate if it was active before
-    if (wasActive) {
-        try { await activateSkill(id); } catch (e) { /* leave inactive on failure */ }
-    }
-    return { id: id, existed: existed, wasActive: wasActive };
+    return { id: id, existed: existed, wasActive: wasActive,
+        activationError: wasActive ? await _cycleImportedSkillActivation(id) : '' };
 }
 
 async function importSkillsFromJsonFile() {
@@ -912,7 +1074,10 @@ async function importSkillsFromJsonFile() {
         var imported = 0;
         var updated = 0;
         var errors = [];
+        var activationErrors = [];
+        var cancelled = false;
         try {
+            var parsedFiles = []; // S0B-08: parse ALL files first (read-only), confirm once, then import
             for (var f = 0; f < files.length; f++) {
                 var file = files[f];
                 try {
@@ -936,19 +1101,33 @@ async function importSkillsFromJsonFile() {
                     } else {
                         throw new Error('Unrecognized JSON shape (expected skill, skill-bundle, or array)');
                     }
-                    
-                    for (var i = 0; i < skillObjs.length; i++) {
-                        var res = await importSkillFromJsonObject(skillObjs[i]);
-                        imported++;
-                        if (res && res.existed) updated++;
-                    }
+                    parsedFiles.push({ name: file.name, skillObjs: skillObjs });
                 } catch (perFileErr) {
                     errors.push(file.name + ': ' + perFileErr.message);
+                }
+            }
+            
+            var ids = [];
+            parsedFiles.forEach(function(pf) {
+                pf.skillObjs.forEach(function(o) { if (o && typeof o === 'object') ids.push(_jsonSkillId(o)); });
+            });
+            cancelled = !(await _confirmSkillImportOverwrite(ids));
+            for (var p = 0; !cancelled && p < parsedFiles.length; p++) {
+                try {
+                    for (var i = 0; i < parsedFiles[p].skillObjs.length; i++) {
+                        var res = await importSkillFromJsonObject(parsedFiles[p].skillObjs[i]);
+                        imported++;
+                        if (res && res.existed) updated++;
+                        if (res && res.activationError) activationErrors.push(res.id + ': ' + res.activationError);
+                    }
+                } catch (perFileErr) {
+                    errors.push(parsedFiles[p].name + ': ' + perFileErr.message);
                 }
             }
         } finally {
             hideOverlaySpinner();
         }
+        if (cancelled) { showSnackbar('Import cancelled', 'info'); return; } // nothing written, no remote call
         
         var msg;
         if (imported === 0) {
@@ -959,8 +1138,9 @@ async function importSkillsFromJsonFile() {
             renderSkillsList();
             msg = 'Imported ' + imported + ' skill(s)';
             if (updated > 0) msg += ' (' + updated + ' updated)';
-            if (errors.length) msg += ' — ' + errors.length + ' file(s) failed';
-            showSnackbar(msg, errors.length ? 'warning' : 'success');
+            if (errors.length) msg += ' — ' + errors.length + ' file(s) failed: ' + errors.join('; ');
+            if (activationErrors.length) msg += ' — re-activation issues: ' + activationErrors.join('; ');
+            showSnackbar(msg, (errors.length || activationErrors.length) ? 'warning' : 'success');
         }
     };
     input.click();
@@ -992,18 +1172,33 @@ async function importSkills() {
 })();
 
 // Save pending input as user types (per-chat, persisted to IndexedDB)
+// TA3-3: the draft's context is taken from the composer that was typed in, at
+// input time. Reading getCurrentPendingContext() when the 300 ms timer fired
+// filed a chat draft under 'home' (or another chat) after a quick view switch.
+// One timer per context, so typing in one composer never cancels another's save.
 (function() {
-    var saveInputTimeout = null;
+    var saveInputTimeouts = {};
+    function composerContext(el) {
+        return el.id === 'home-message-input' ? 'home' : (currentChatId || 'none');
+    }
     document.addEventListener('input', function(e) {
-        if (e.target && (e.target.id === 'message-input' || e.target.id === 'home-message-input')) {
-            clearTimeout(saveInputTimeout);
-            saveInputTimeout = setTimeout(function() {
-                var ctx = getCurrentPendingContext();
-                var value = e.target.value;
-                if (value) {
-                    chatPendingTexts[ctx] = value;
-                } else {
-                    delete chatPendingTexts[ctx];
+        var el = e.target;
+        if (el && (el.id === 'message-input' || el.id === 'home-message-input')) {
+            var ctx = composerContext(el);
+            clearTimeout(saveInputTimeouts[ctx]);
+            saveInputTimeouts[ctx] = setTimeout(function() {
+                delete saveInputTimeouts[ctx];
+                // Write the live value only while this composer still belongs to
+                // ctx. After a switch the switch path already snapshotted the draft
+                // (savePendingTextForContext); a value captured at input time would
+                // bring back a sent draft or a deleted chat's key.
+                if (composerContext(el) === ctx) {
+                    var value = el.value;
+                    if (value) {
+                        chatPendingTexts[ctx] = value;
+                    } else {
+                        delete chatPendingTexts[ctx];
+                    }
                 }
                 persistPendingTextsToStorage();
             }, 300);
@@ -1017,11 +1212,27 @@ async function importSkills() {
 // Renders the rows in the skill editor under "Actions". Each row is one
 // { name, icon, show } action button the skill contributes.
 
+// A5A2-01: unsaved action-row edits live in a draft, never in skills[]. Only
+// saveCurrentSkill() persists them; Back, reopen and SKILL.md replace discard it.
+var _skillActionsDraft = null; // { skillId, actions }
+function resetSkillActionsDraft() { _skillActionsDraft = null; }
+function getSkillActionsDraft() {
+    var id = currentEditingSkill;
+    if (!_skillActionsDraft || _skillActionsDraft.skillId !== id) {
+        var saved = (id && skills[id] && Array.isArray(skills[id].actions)) ? skills[id].actions : [];
+        _skillActionsDraft = { skillId: id, actions: saved.map(function(a) {
+            var c = Object.assign({}, a);
+            if (Array.isArray(a.show)) c.show = a.show.slice();
+            return c;
+        }) };
+    }
+    return _skillActionsDraft.actions;
+}
+
 function renderSkillActionsEditor() {
     var list = document.getElementById('skill-actions-list');
     if (!list) return;
-    var skill = currentEditingSkill ? skills[currentEditingSkill] : null;
-    var actions = (skill && Array.isArray(skill.actions)) ? skill.actions : [];
+    var actions = getSkillActionsDraft();
     if (!actions.length) {
         list.innerHTML = '<div class="skill-actions-empty">No actions yet. Click + to add a button.</div>';
         return;
@@ -1067,7 +1278,7 @@ function renderSkillActionRow(action, index) {
 function onSkillActionFieldChange(index) {
     var actions = collectSkillActionsFromEditor();
     if (currentEditingSkill && skills[currentEditingSkill]) {
-        skills[currentEditingSkill].actions = actions;
+        _skillActionsDraft = { skillId: currentEditingSkill, actions: actions };
     }
     // Update preview icon for this row only (avoid re-render to preserve focus)
     var row = document.querySelector('.skill-action-row[data-action-index="' + index + '"]');
@@ -1152,8 +1363,7 @@ function collectSkillActionsFromEditor() {
     var list = document.getElementById('skill-actions-list');
     if (!list) {
         // Editor not visible — preserve whatever is in memory
-        var s = currentEditingSkill ? skills[currentEditingSkill] : null;
-        return (s && Array.isArray(s.actions)) ? s.actions.slice() : [];
+        return getSkillActionsDraft().slice();
     }
     var rows = list.querySelectorAll('.skill-action-row');
     var actions = [];
@@ -1173,32 +1383,23 @@ function collectSkillActionsFromEditor() {
 }
 
 function addSkillAction() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error'); return; }
+    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
     var skill = skills[currentEditingSkill];
     if (!skill) return;
-    skill.actions = collectSkillActionsFromEditor();
-    if (skill.actions.length >= 8) { showSnackbar('Max 8 actions per skill', 'error'); return; }
-    skill.actions.push({ name: 'New Action', icon: 'play', show: ['home'] });
+    var actions = collectSkillActionsFromEditor();
+    _skillActionsDraft = { skillId: currentEditingSkill, actions: actions };
+    if (actions.length >= 8) { showSnackbar('Max 8 actions per skill', 'error', undefined, { key: 'skill-editor' }); return; }
+    actions.push({ name: 'New Action', icon: 'play', show: ['home'] });
     renderSkillActionsEditor();
 }
 
 function removeSkillAction(index) {
     if (!currentEditingSkill) return;
     var skill = skills[currentEditingSkill];
-    if (!skill || !Array.isArray(skill.actions)) return;
-    skill.actions = collectSkillActionsFromEditor();
-    skill.actions.splice(index, 1);
+    if (!skill) return; // the draft may hold rows the saved skill does not (A5A2-01)
+    var actions = collectSkillActionsFromEditor();
+    _skillActionsDraft = { skillId: currentEditingSkill, actions: actions };
+    actions.splice(index, 1);
     renderSkillActionsEditor();
 }
 
-// Populate provider dropdown from all providers
-function populateProviderDropdown() {
-    var container = document.getElementById('settings-provider-container');
-    if (!container) return;
-    
-    var options = getAllProviders().map(function(p) {
-        return { value: p.name, label: p.name };
-    });
-    
-    renderCustomSelect('settings-provider-container', options, currentProvider, changeProvider, 'Select model...');
-}

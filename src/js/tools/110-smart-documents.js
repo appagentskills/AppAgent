@@ -603,6 +603,7 @@ function sdocToggleEdit(docId, fromEl) {
         edit.style.display = '';
         c.classList.add('sdoc-editing');
         c.classList.remove('sdoc-diffing');
+        var vsel = c.querySelector('.sdoc-version-select'); if (vsel) vsel.value = ''; // A7A2-01
         var doc = smartDocuments[docId];
         var titleInput = c.querySelector('.sdoc-title-input');
         if (titleInput && doc) titleInput.value = doc.title;
@@ -621,6 +622,7 @@ async function sdocSaveEdit(docId, fromEl) {
     if (!editor) return;
     var doc = smartDocuments[docId];
     if (!doc) return;
+    var pmS = c.closest && c.closest('#sdoc-preview-modal'); if (pmS) pmS._sdocFreshId = null; // A7A2-02: an explicit Save keeps the doc
 
     var titleInput = c.querySelector('.sdoc-title-input');
     var newTitle = titleInput ? titleInput.value.trim() : '';
@@ -649,7 +651,27 @@ function sdocCancelEdit(docId, fromEl) {
     if (body) body.style.display = '';
     if (edit) edit.style.display = 'none';
     if (c) c.classList.remove('sdoc-editing');
+    var pmC = c.closest && c.closest('#sdoc-preview-modal');
+    if (pmC && pmC._sdocFreshId === docId) _sdocDiscardFreshBlank(pmC, docId).then(function(g) { if (g) _sdocRemovePreview(pmC); });
 }
+
+// A7A2-02: Cancel/close right after Create drops the never-saved blank doc. The
+// marker lives on the preview element, so it dies with it (New chat / Edit with
+// agent remove the preview and keep the doc); the pristine check keeps any doc
+// that a Save or an agent edit changed meanwhile.
+async function _sdocDiscardFreshBlank(pm, docId) {
+    if (!pm || pm._sdocFreshId !== docId) return false;
+    pm._sdocFreshId = null;
+    var d = smartDocuments[docId];
+    if (!d || d.currentVersion !== 1 || !Array.isArray(d.versions) || d.versions.length !== 1
+        || d.currentContent || d.title !== 'Untitled Document') return false;
+    if (typeof unregisterFile === 'function') unregisterFile(d.file_id);
+    await deleteDocumentById(docId);
+    renderDocumentsPage();
+    if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
+    return true;
+}
+function _sdocRemovePreview(pm) { if (!pm) return; if (pm._escHandler) document.removeEventListener('keydown', pm._escHandler); pm.remove(); }
 
 function sdocCompare(docId, versionStr, fromEl) {
     var c = sdocGetContainer(docId, _sdocEl(fromEl) || _sdocEl(this));
@@ -715,44 +737,40 @@ function sdocSimpleDiff(oldLines, newLines) {
 function sdocExportMd(docId) {
     var doc = smartDocuments[docId];
     if (!doc) return;
-    var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
-    navigator.clipboard.writeText(md).then(function() { showSnackbar('Markdown copied to clipboard', 'success'); }).catch(function() { sdocDownloadMd(docId); });
+    // S0B-15: a synchronous throw (non-string content, no clipboard API) gives an
+    // error snackbar instead of an uncaught exception with no feedback.
+    try {
+        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
+        navigator.clipboard.writeText(md).then(function() { showSnackbar('Markdown copied to clipboard', 'success'); }).catch(function() { sdocDownloadMd(docId); });
+    } catch (e) {
+        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+    }
 }
 
 function sdocDownloadMd(docId) {
     var doc = smartDocuments[docId];
     if (!doc) return;
-    var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
-    var blob = new Blob([md], { type: 'text/markdown' });
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = (doc.title || 'document').replace(/[^a-zA-Z0-9_-]/g, '_') + '.md';
-    a.click();
-    URL.revokeObjectURL(a.href);
+    // S0B-15: any throw (non-string content, Blob/URL) gives an error snackbar
+    // instead of an uncaught exception with no feedback.
+    try {
+        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
+        var blob = new Blob([md], { type: 'text/markdown' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = (doc.title || 'document').replace(/[^a-zA-Z0-9_-]/g, '_') + '.md';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch (e) {
+        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+    }
 }
 
 function sdocOpenNewTab(docId) {
     var doc = smartDocuments[docId];
     if (!doc) return;
-    var rendered = sdocRenderContent(doc);
-    // Collect all CSS from current page for proper template rendering
-    var allCss = '';
-    try {
-        var sheets = document.styleSheets;
-        for (var si = 0; si < sheets.length; si++) {
-            try {
-                var rules = sheets[si].cssRules || sheets[si].rules;
-                for (var ri = 0; ri < rules.length; ri++) allCss += rules[ri].cssText + '\n';
-            } catch(e) {}
-        }
-    } catch(e) {}
-    var page = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + escDisplay(doc.title) + '</title>' +
-        '<style>' + allCss + 'body{max-width:900px;margin:40px auto;padding:20px;line-height:1.6;}@media print{body{margin:0;padding:20px;}}</style></head><body class="message-content">' +
-        '<h1>' + escDisplay(doc.title) + '</h1>' + rendered + '</body></html>';
-    var blob = new Blob([page], { type: 'text/html' });
-    var url = URL.createObjectURL(blob);
-    window.open(url, '_blank');
-    setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+    // S0B4-02/03: open the persistent app.html?doc= deep link (core/120-init.js) instead of
+    // an inert blob page (dead inline handlers, collapsed content) that died on reload/restore.
+    chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?doc=' + encodeURIComponent(docId) });
 }
 
 function sdocStartChat(docId) {
@@ -767,13 +785,16 @@ function sdocStartChat(docId) {
     }
 
     // Switch to chat view if needed
+    // A5A3-01: newChat() FIRST. showChatView() stamps lastViewedAt on (and consumes
+    // the unseen state of) the CURRENT chat, so that must be the new chat, not the
+    // one the user left (newChat() has no closer for the Documents panel).
+    newChat();
     if (currentView !== 'chat') {
         currentView = 'chat';
         appStorage.setItem('currentView', 'chat');
         hideAllPanels();
         showChatView();
     }
-    newChat();
     var chat = chats[currentChatId];
     if (chat) {
         chat.title = 'Re: ' + doc.title;
@@ -809,17 +830,20 @@ function editDocumentWithAgent(docId, event) {
         modal.remove();
     }
 
-    // The doc can also be open from the Documents panel, so switch to the chat
-    // view first — same pattern as sdocStartChat above.
+    // newChat() clears #message-input at the end, so the prefill MUST come after it.
+    // A5A3-01: it also runs BEFORE the view switch below: showChatView() stamps
+    // lastViewedAt on (and consumes the unseen state of) the CURRENT chat, so that
+    // must be the new chat, not the one the user left.
+    newChat();
+
+    // The doc can also be open from the Documents panel (newChat() has no closer
+    // for it), so switch to the chat view — same pattern as sdocStartChat above.
     if (currentView !== 'chat') {
         currentView = 'chat';
         appStorage.setItem('currentView', 'chat');
         hideAllPanels();
         showChatView();
     }
-
-    // newChat() clears #message-input at the end, so the prefill MUST come after it.
-    newChat();
 
     var input = document.getElementById('message-input');
     if (input) {
@@ -897,7 +921,7 @@ function sdocOpenPreview(docId) {
     var modal = document.createElement('div');
     modal.id = 'sdoc-preview-modal';
     modal.className = 'sdoc-preview-overlay';
-    modal.onclick = function(e) { if (e.target === modal) closePreview(); };
+    modal.onclick = function(e) { if (e.target === modal) requestClose(); };
 
     // Reuse full sdocRender for all features (edit, versions, diff, prompts)
     var html = '<div class="sdoc-preview-container">' + sdocRender(doc) + '</div>';
@@ -910,7 +934,7 @@ function sdocOpenPreview(docId) {
         closeBtn.className = 'sdoc-action-btn';
         closeBtn.title = 'Close';
         closeBtn.innerHTML = UI_ICONS.close;
-        closeBtn.onclick = function(e) { e.stopPropagation(); closePreview(); };
+        closeBtn.onclick = function(e) { e.stopPropagation(); requestClose(); };
         headerActions.appendChild(closeBtn);
     }
 
@@ -925,11 +949,32 @@ function sdocOpenPreview(docId) {
         if (e.key !== 'Escape') return;
         var m = document.getElementById('modal-overlay');
         if (m && m.classList.contains('show')) return;
-        closePreview();
+        requestClose();
     }
     function closePreview() {
         document.removeEventListener('keydown', onEsc);
         modal.remove();
+        _sdocDiscardFreshBlank(modal, docId).catch(function() {}); // A7A2-02: after the sync remove, not awaited
+    }
+    var _confirming = false; // A7A-01
+    function isDirty() {
+        var c = modal.querySelector('.sdoc.sdoc-editing'), d = smartDocuments[docId];
+        if (!c || !d) return false;
+        var ed = c.querySelector('.sdoc-editor'), ti = c.querySelector('.sdoc-title-input');
+        return !!((ed && ed.value !== d.currentContent) || (ti && ti.value.trim() && ti.value.trim() !== d.title));
+    }
+    async function requestClose() {
+        if (_confirming || !modal.isConnected) return;
+        if (isDirty()) {
+            _confirming = true;
+            var ok = false;
+            try { ok = await showConfirmModal('Discard changes?', 'Unsaved edits to "' + escapeHtml((smartDocuments[docId] || {}).title || 'this document') + '" will be lost.', 'warning'); }
+            // Reset in a MACROtask: core/120-init.js's Esc closes the confirm first and the
+            // microtasks drain before this onEsc runs. A sync reset would re-prompt on the same press.
+            finally { setTimeout(function() { _confirming = false; }, 0); }
+            if (!ok) return;
+        }
+        closePreview();
     }
     modal._escHandler = onEsc;
     document.addEventListener('keydown', onEsc);
@@ -1218,7 +1263,7 @@ function buildDocumentsPageItem(doc) {
 async function sdocDeleteFromPage(docId) {
     var doc = smartDocuments[docId];
     var title = doc ? doc.title : 'this document';
-    if (!await showConfirmModal('Delete Document', 'Delete "' + title + '" and all its versions? This cannot be undone.', 'danger')) return;
+    if (!await showConfirmModal('Delete Document', 'Delete "' + escapeHtml(title) + '" and all its versions? This cannot be undone.', 'danger')) return;
     await deleteDocumentById(docId);
     renderDocumentsPage();
     renderVersionSidebar();
@@ -1247,6 +1292,8 @@ async function sdocCreateFromPage() {
     // Open in preview modal and immediately enter edit mode
     sdocOpenPreview(docId);
     sdocToggleEdit(docId);
+    var pm = document.getElementById('sdoc-preview-modal');
+    if (pm) pm._sdocFreshId = docId; // A7A2-02: this preview holds a never-saved blank doc
     // Focus the title input
     setTimeout(function() {
         var c = sdocGetContainer(docId);
@@ -1260,27 +1307,33 @@ async function sdocCreateFromPage() {
 // ─── Import / Export ───
 
 function exportAllDocuments() {
-    // Exclude chat-scoped (private) docs from "export all" — they belong to their chat only.
-    var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
-    if (docs.length === 0) { showSnackbar('No documents to export', 'error'); return; }
+    // S0B-15: any throw (a doc getter, serialisation, Blob/URL) gives an error
+    // snackbar instead of an uncaught exception with no feedback.
+    try {
+        // Exclude chat-scoped (private) docs from "export all" — they belong to their chat only.
+        var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
+        if (docs.length === 0) { showSnackbar('No documents to export', 'error'); return; }
 
-    var exportData = docs.map(function(doc) {
-        return {
-            id: doc.id, title: doc.title, currentContent: doc.currentContent,
-            currentVersion: doc.currentVersion, versions: doc.versions,
-            displays: doc.displays, prompts: doc.prompts,
-            createdAt: doc.createdAt, updatedAt: doc.updatedAt
-        };
-    });
+        var exportData = docs.map(function(doc) {
+            return {
+                id: doc.id, title: doc.title, currentContent: doc.currentContent,
+                currentVersion: doc.currentVersion, versions: doc.versions,
+                displays: doc.displays, prompts: doc.prompts,
+                createdAt: doc.createdAt, updatedAt: doc.updatedAt
+            };
+        });
 
-    var json = JSON.stringify({ type: 'appagent-documents', version: 1, documents: exportData }, null, 2);
-    var blob = new Blob([json], { type: 'application/json' });
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'appagent-documents-' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    URL.revokeObjectURL(a.href);
-    showSnackbar('Exported ' + docs.length + ' document(s)', 'success');
+        var json = JSON.stringify({ type: 'appagent-documents', version: 1, documents: exportData }, null, 2);
+        var blob = new Blob([json], { type: 'application/json' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'appagent-documents-' + new Date().toISOString().slice(0, 10) + '.json';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showSnackbar('Exported ' + docs.length + ' document(s)', 'success');
+    } catch (e) {
+        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+    }
 }
 
 function importDocuments() {
@@ -1297,12 +1350,19 @@ function importDocuments() {
                 showSnackbar('Invalid document export file', 'error');
                 return;
             }
-            var imported = 0;
-            var updated = 0;
+            // S0B-09: validate every row first (no write yet), confirm before replacing
+            // any shared same-id doc (Cancel writes nothing), then write once, atomically.
+            // RC2A3-F4: null-prototype maps + own-property lookups, so ids naming
+            // Object.prototype members (constructor, toString, ...) import as themselves
+            // instead of posing as in-file duplicates or existing docs; '__proto__' is
+            // skipped and counted (smartDocuments['__proto__'] = doc would re-parent the cache).
+            var rows = [], skipped = 0, seen = Object.create(null), shared = [];
+            var ownDoc = function(id) { return Object.prototype.hasOwnProperty.call(smartDocuments, id) ? smartDocuments[id] : null; };
             for (var i = 0; i < data.documents.length; i++) {
                 var doc = data.documents[i];
-                if (!doc.id || !doc.title) continue;
-                if (smartDocuments[doc.id]) updated++;
+                if (!doc || typeof doc !== 'object' || typeof doc.id !== 'string' || !doc.id || doc.id === '__proto__' || typeof doc.title !== 'string' || !doc.title
+                    || (doc.versions != null && !Array.isArray(doc.versions))
+                    || (doc.currentContent != null && typeof doc.currentContent !== 'string')) { skipped++; continue; }
                 // Ensure required fields
                 doc.versions = doc.versions || [];
                 doc.displays = doc.displays || {};
@@ -1311,14 +1371,75 @@ function importDocuments() {
                 doc.updatedAt = doc.updatedAt || Date.now();
                 doc.currentVersion = doc.currentVersion || 1;
                 doc.currentContent = doc.currentContent || '';
-                await saveDocument(doc);
-                imported++;
+                // A repeated id within the file is always imported as a copy.
+                var dup = !!seen[doc.id]; seen[doc.id] = true;
+                var cur = dup ? null : (ownDoc(doc.id) || await loadDocumentById(doc.id));
+                rows.push({ doc: doc, cur: cur, dup: dup });
+                if (cur && cur.scope !== 'chat') shared.push(cur);
             }
-            renderDocumentsPage();
-            renderVersionSidebar();
-            var msg = 'Imported ' + imported + ' document(s)';
-            if (updated > 0) msg += ' (' + updated + ' updated)';
-            showSnackbar(msg, 'success');
+            if (!rows.length) { showSnackbar('No valid documents to import (' + skipped + ' skipped)', 'error'); return; }
+            var choice = 'keep';
+            if (shared.length) {
+                var names = shared.slice(0, 10).map(function(c) { return escDisplay(c.title || c.id); }).join('<br>');
+                if (shared.length > 10) names += '<br>+' + (shared.length - 10) + ' more';
+                choice = await showModal('Import documents', shared.length + ' document(s) in this file already exist:<br>' + names +
+                    '<br><br><strong>Replace</strong> overwrites their content <strong>and version history</strong>. <strong>Keep both</strong> imports them as copies.', [
+                    { label: 'Cancel', value: 'cancel', class: 'secondary' },
+                    { label: 'Keep both', value: 'keep', class: 'primary' },
+                    { label: 'Replace', value: 'replace', class: 'danger' }
+                ], 'warning');
+                if (choice !== 'keep' && choice !== 'replace') return; // Cancel / dismiss: nothing written
+            }
+            // Never trust the file's scope/ownerChatId/file_id; a chat-private clash is never replaced.
+            var taken = Object.create(null), replaced = 0, copied = 0;
+            rows.forEach(function(r) { r.copy = r.dup || !!(r.cur && (r.cur.scope === 'chat' || choice !== 'replace')); if (!r.copy) taken[r.doc.id] = true; });
+            for (var j = 0; j < rows.length; j++) {
+                var r = rows[j], d = r.doc;
+                if (r.copy) {
+                    var base = await _sdocNewId(d.title), nid = base, n = 2;
+                    while (taken[nid] || ownDoc(nid) || await loadDocumentById(nid)) { nid = base + '_' + n; n++; }
+                    d.id = nid; taken[nid] = true; copied++;
+                }
+                d.scope = 'shared';
+                if (r.cur && !r.copy) { d.ownerChatId = r.cur.ownerChatId; d.file_id = r.cur.file_id || newFileId(); replaced++; }
+                else { delete d.ownerChatId; d.file_id = newFileId(); }
+            }
+            // TA4-7: a SLOW-tx TimeoutError (core/130 rejectSlow, flagged _dbTxSlow) means the
+            // backend answered its probe and the write was left queued to commit in the
+            // background, NOT aborted. Reporting "Import failed" hid docs that reappeared after a
+            // reload, and a retry re-imported every one of them as a copy. So cache + register
+            // them and warn instead. A wedged-tx TimeoutError (_dbTxTimeout: aborted, retried once
+            // by withStore) or any other rejection is still a failure that leaves the cache untouched.
+            var writeTx = null, stillSaving = false;
+            try {
+                try {
+                    await withStore([documentsStoreName], 'readwrite', function(tx) {
+                        writeTx = tx;
+                        var store = tx.objectStore(documentsStoreName);
+                        rows.forEach(function(r) { store.put(r.doc); });
+                    });
+                } catch (writeErr) {
+                    if (!(writeErr && writeErr.name === 'TimeoutError' && writeErr._dbTxSlow)) throw writeErr;
+                    stillSaving = true;
+                    console.warn('[SmartDocs] import: IndexedDB is busy; the write was left to commit in the background', writeErr);
+                    // A late abort (e.g. quota) of the queued write must not stay silent.
+                    try {
+                        var queuedTx = writeTx;
+                        queuedTx.addEventListener('abort', function() {
+                            showSnackbar('Import did not finish saving: ' + ((queuedTx.error && queuedTx.error.message) || 'transaction aborted') + '. The imported documents will not survive a reload.', 'error');
+                        });
+                    } catch (listenErr) { /* best-effort */ }
+                }
+                rows.forEach(function(r) { smartDocuments[r.doc.id] = r.doc; registerFile(r.doc.file_id, { type: 'document', docId: r.doc.id }); });
+            } finally {
+                // RC2A3-F5: a render throw must neither turn a committed import into
+                // "Import failed" nor mask a withStore rejection (the only error path).
+                try { renderDocumentsPage(); } catch (renderErr) { console.warn('[SmartDocs] import: documents page render failed', renderErr); }
+                try { renderVersionSidebar(); } catch (renderErr) { console.warn('[SmartDocs] import: version sidebar render failed', renderErr); }
+            }
+            var importedMsg = 'Imported ' + rows.length + ' document(s) (' + replaced + ' replaced, ' + copied + ' copied, ' + skipped + ' skipped)';
+            if (stillSaving) showSnackbar(importedMsg + '. Storage is busy, so they are still saving in the background.', 'warning');
+            else showSnackbar(importedMsg, 'success');
         } catch (err) {
             showSnackbar('Import failed: ' + err.message, 'error');
         }

@@ -49,6 +49,19 @@ var _workerSaveWaiters = [];
 // without this gate a broken boot silently wipes the store on first save).
 var _chatsHydrated = false;
 
+// TA-3 (Delete All save lock): set by the page's Delete All right before it
+// clears the stores (the 'delete-all-save-lock' listener at the end of this
+// file), so a late SW save cannot re-write a chat row into the emptied store.
+// Lifted again only when the clear did not commit; after a commit the
+// extension restarts. Asserted INSIDE the save's try (never in the hydration
+// guard above the waiter push: a return there would leave the waiters of a
+// pending-again re-run unresolved), so a locked save reports {ok:false}
+// through the catch and its finally still resolves every parked waiter.
+var _chatsWipeLocked = false;
+function _assertNotWipeLocked() {
+    if (_chatsWipeLocked) throw new Error('chat saves are locked by Delete All');
+}
+
 // SAVE-DROP RESCUE (runaway-spawn incident): single-flight per chat. When the
 // evicted-put guard below skips a chat that was MUTATED while evicted
 // (chat._dirtyWhileEvicted — stamped by recordToolResult in
@@ -180,6 +193,7 @@ async function saveChatsToStorage() {
         // live inside the transaction, so it captures their mutations too.
         var _boWait = _workerSaveBackoffUntil - Date.now();
         if (_boWait > 0) await new Promise(function(r) { setTimeout(r, _boWait); });
+        _assertNotWipeLocked();
         var _saveT0 = Date.now();
         var _putRecords = 0, _putBlobs = 0;
         // withStore (core/130-indexeddb.js, shared into this bundle): retries
@@ -191,6 +205,8 @@ async function saveChatsToStorage() {
         // its new payloads become blob rows in the same atomic transaction,
         // so a record never commits without its payloads being durable.
         await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
+        // TA-3: a lock set while this save waited for its transaction: no put.
+        _assertNotWipeLocked();
         var store = transaction.objectStore(chatStoreName);
         // UPSERT-ONLY (RFC addendum Invariant D, PR 3): the save NEVER deletes.
         // The absence-diff delete-pass that used to live here — "stored key ∉
@@ -479,6 +495,13 @@ function _attemptPendingChatDelete(chatId, chatSnapshot) {
                     delete chats[chatId];
                 }
             } catch (eDrop) {}
+            // DELETE-RACE (F2 review): a batched boot load in flight may
+            // already hold this row from an earlier batch read, and the
+            // tombstone that would have kept it out at its commit is gone
+            // now. Record the id so that single commit skips the stale row
+            // (see _swChatsLoadDeletedIds). Recorded whether or not a
+            // tombstone was dropped: the row itself is verified gone.
+            if (typeof _swChatsLoadDeletedIds === 'object' && _swChatsLoadDeletedIds) _swChatsLoadDeletedIds[chatId] = true;
             return true;
         }
         if (entry.tries >= PENDING_CHAT_DELETE_MAX_TRIES) {
@@ -551,173 +574,258 @@ function persistenceBusyReason() {
     return null;
 }
 
+// =============================================================
+// F2 (Boot OOM fix): BATCHED boot load of the chats store. The old
+// loader read the whole store with ONE getAll(), materializing every
+// record (and all of its legacy inline base64) at once on every SW
+// start. It now runs a key-only getAllKeys() pass, then reads the rows
+// in batches of SW_CHATS_LOAD_BATCH_SIZE, each in its OWN readonly
+// transaction, and strips each batch before reading the next, so peak
+// memory is ~one batch of payloads plus the already-stripped records.
+// The final chats map, the legacy migration queue, the error handling
+// and the _chatsLoadP contract (worker/190-entry.js) are unchanged.
+// Deliberately NO body eviction here: strip is called with ONE arg.
+// =============================================================
+var SW_CHATS_LOAD_BATCH_SIZE = 25;
+// Single-flight, same shape as the page loader (ui/070): concurrent
+// callers share ONE in-flight load; the slot clears when it settles.
+var _swChatsLoadInFlight = null;
+// DELETE-RACE (F2 review): ids whose row the delete lane VERIFIED gone
+// (_attemptPendingChatDelete -> _finish(true), which also drops the parked
+// tombstone) while a batched load sits between its start and its single
+// commit. An earlier batch may already hold such a row, and with the
+// tombstone gone the FLUX-H2 branch can no longer keep it out, so the
+// commit skips every id in this set instead of resurrecting the chat.
+// Per load: opened at load start, closed (null) at the commit and on
+// failure. null = no load in flight, so a post-commit delete records nothing.
+var _swChatsLoadDeletedIds = null;
+
 async function loadChatsFromStorage() {
+    if (_swChatsLoadInFlight) return _swChatsLoadInFlight;
+    _swChatsLoadInFlight = _swLoadChatsFromStorageBatched().finally(function() {
+        _swChatsLoadInFlight = null;
+    });
+    return _swChatsLoadInFlight;
+}
+
+async function _swLoadChatsFromStorageBatched() {
     try {
+        // DELETE-RACE: open this load's verified-deleted set (see
+        // _swChatsLoadDeletedIds); the delete lane records into it.
+        _swChatsLoadDeletedIds = Object.create(null);
         // withStore (core/130-indexeddb.js, shared into this bundle): retries
         // ONCE on a fresh connection if the cached one was force-closed.
+        // Every read below is its own readonly transaction and the withStore
+        // fn only READS (it resolves the raw result); rows are processed after
+        // it resolves, so a retried read can never double-process a row.
+        // range null = the key-only pass. A range-less getAll() is never issued.
         var _loadT0 = Date.now();
-        return await withStore([chatStoreName], 'readonly', function(transaction) {
-        var store = transaction.objectStore(chatStoreName);
-        var request = store.getAll();
-        return new Promise(function(resolve, reject) {
-            request.onsuccess = function() {
-                var results = request.result || [];
-                // FLUX-H2 (boot-adopt preservation): do NOT wholesale-replace
-                // `chats`. This loader runs once per SW life (worker/190-entry.js)
-                // and `chats` starts {}, so any entry present here is a panel
-                // snapshot adopted while this getAll was in flight (the pre-gate
-                // run-agent adopt, the ungated update-chat put, or a parked
-                // tombstone — worker/130-port-bridge.js). The old `chats = {}`
-                // replace dropped those adopts, losing the freshly-typed user
-                // turn the snapshot carried. Disk rows fill in around them below;
-                // on id collision the adopted record wins and disk-only meta is
-                // pulled forward via _swOverlayChatMeta (same prev=SW-copy
-                // semantics as a post-boot adopt overlay).
-                _legacyPayloadMigrationQueue = [];
-                // STORE-ACCT: one line per boot sizing the store — record count,
-                // read duration, and how much inline base64 is still riding in
-                // records (the legacy tail the trickle migrator is burning down).
-                // This is the number that decides whether slowness is data-size
-                // or transaction-queue congestion.
-                var _acctB64 = 0, _acctTopB64 = 0, _acctTopId = null;
-                results.forEach(function(chat) {
-                    if (chat.messages && chat.messages.length > 0) {
-                        // MEMFIX: the SW strips inline base64 payloads from EVERY
-                        // chat at load (K=0 — the SW has no UI; run entry points
-                        // rehydrate via ensureChatPayloads in core/130-indexeddb.js
-                        // before a chat is run/persisted). Evicted chats stay in
-                        // `chats` (they are live chats; saves are upsert-only) and are skipped by the
-                        // put-loop in saveChatsToStorage above (put safety).
-                        // LEGACY-MIGRATE: strip returning true means the RECORD
-                        // itself still held inline base64 — a legacy-inline row
-                        // (pre-v16 or an imported backup). Queue it for the
-                        // heartbeat trickle migrator below so the store converges
-                        // to the v16 shape instead of re-materializing these
-                        // payloads in this getAll on every SW boot.
-                        if (typeof stripChatPayloadsInPlace === 'function') {
-                            try {
-                                var _cb64 = 0;
-                                for (var _ai = 0; _ai < chat.messages.length; _ai++) {
-                                    var _am = chat.messages[_ai];
-                                    if (_am && _am.base64) _cb64 += _am.base64.length;
-                                }
-                                if (chat.screenshots) {
-                                    for (var _ak in chat.screenshots) {
-                                        var _as = chat.screenshots[_ak];
-                                        if (_as && _as.base64) _cb64 += _as.base64.length;
-                                    }
-                                }
-                                if (_cb64) {
-                                    _acctB64 += _cb64;
-                                    if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
-                                }
-                                if (stripChatPayloadsInPlace(chat)) _legacyPayloadMigrationQueue.push(chat.id);
-                                // WRITE-AMP root fix: strip only sets
-                                // _payloadsEvicted when it stripped base64, so a
-                                // pure-TEXT chat (most of the store) never got the
-                                // flag and the save put-loop re-wrote its UNCHANGED
-                                // record on EVERY save — with hundreds of chats,
-                                // tens of MB per tool boundary, the engine of the
-                                // chronic [chats, chat_payloads] congestion. At
-                                // load the in-memory copy is identical to the disk
-                                // record by definition, so mark EVERY chat evicted
-                                // ("nothing new to persist"). Every mutation path
-                                // (run gate, send, wake drain, resume, migration)
-                                // already calls ensureChatPayloads first, which
-                                // clears the flag (single cheap get for text-only
-                                // chats) and re-admits the chat to the put set.
-                                chat._payloadsEvicted = true;
-                            } catch (e) {}
+        var _readChats = function(range) {
+            return withStore([chatStoreName], 'readonly', function(transaction) {
+                var store = transaction.objectStore(chatStoreName);
+                var request = range ? store.getAll(range) : store.getAllKeys();
+                return new Promise(function(resolve, reject) {
+                    request.onsuccess = function() { resolve(request.result || []); };
+                    request.onerror = function() {
+                        // SLEEP-WEDGE: REJECT (do not resolve-empty) so withStore's
+                        // connection-error retry engages on a fresh connection. The
+                        // outer catch below logs only after the retry has also failed.
+                        reject(request.error || new Error(range ? 'chats getAll batch failed' : 'chats getAllKeys failed'));
+                    };
+                });
+            });
+        };
+        // Phase 1: key-only pass (ascending key order, no record values).
+        var _keys = await _readChats(null);
+        // STORE-ACCT: one line per boot sizing the store — record count,
+        // read duration, and how much inline base64 is still riding in
+        // records (the legacy tail the trickle migrator is burning down).
+        // This is the number that decides whether slowness is data-size
+        // or transaction-queue congestion.
+        var _acctB64 = 0, _acctTopB64 = 0, _acctTopId = null;
+        // Phase 2: batched row reads. Rows are collected LOCALLY: nothing
+        // touches the chats map or the migration queue until the single
+        // commit after the loop, so a read that fails (post-retry) merges
+        // NOTHING, exactly like the old single getAll whose onerror
+        // rejected before any row was processed.
+        var _localMigrationQueue = [];
+        var _loadedRows = [];
+        var chat;
+        for (var _bs = 0; _bs < _keys.length; _bs += SW_CHATS_LOAD_BATCH_SIZE) {
+            // Deliberate divergence from ui/070 (closed bound(first,last) batches): gap-free ranges.
+            // Batch i reads [k[s], k[s+B]) and the LAST batch is open-ended
+            // [k[s], +inf), so the batches tile [k[0], +inf) with no holes: a
+            // row written between the key pass and a batch read can never
+            // fall into a gap between two batches or past the last key.
+            var _bEnd = _bs + SW_CHATS_LOAD_BATCH_SIZE;
+            var _rows = await _readChats(_bEnd < _keys.length
+                ? IDBKeyRange.bound(_keys[_bs], _keys[_bEnd], false, true)
+                : IDBKeyRange.lowerBound(_keys[_bs]));
+            for (var _ri = 0; _ri < _rows.length; _ri++) {
+                chat = _rows[_ri];
+                if (!(chat && chat.messages && chat.messages.length > 0)) continue;
+                // MEMFIX: the SW strips inline base64 payloads from EVERY
+                // chat at load (K=0 — the SW has no UI; run entry points
+                // rehydrate via ensureChatPayloads in core/130-indexeddb.js
+                // before a chat is run/persisted). Evicted chats stay in
+                // `chats` (they are live chats; saves are upsert-only) and are skipped by the
+                // put-loop in saveChatsToStorage above (put safety).
+                // LEGACY-MIGRATE: strip returning true means the RECORD
+                // itself still held inline base64 — a legacy-inline row
+                // (pre-v16 or an imported backup). Queue it for the
+                // heartbeat trickle migrator below so the store converges
+                // to the v16 shape instead of re-materializing these
+                // payloads in the boot load on every SW boot.
+                if (typeof stripChatPayloadsInPlace === 'function') {
+                    try {
+                        var _cb64 = 0;
+                        for (var _ai = 0; _ai < chat.messages.length; _ai++) {
+                            var _am = chat.messages[_ai];
+                            if (_am && _am.base64) _cb64 += _am.base64.length;
                         }
-                        var _rowId = chat.id;
-                        var _adoptedPreBoot = chats[_rowId];
-                        if (_adoptedPreBoot) {
-                            // FLUX-H2: keep the fresher adopted record and replay
-                            // the post-boot adopt ordering — overlay the DISK
-                            // copy as `prev` (timestamps max-wins, disk DEFINED
-                            // flags win; boot-window dispatches are re-asserted
-                            // by the pending fold below, keeping last-dispatch-
-                            // wins intact). A parked tombstone is kept untouched:
-                            // the delete lane owns it and its meta must never be
-                            // resurrected from the doomed disk row.
-                            if (!_adoptedPreBoot._deleted && typeof _swOverlayChatMeta === 'function') {
-                                try { _swOverlayChatMeta(chat, _adoptedPreBoot); } catch (eOv) { /* best-effort — adopt stays */ }
+                        if (chat.screenshots) {
+                            for (var _ak in chat.screenshots) {
+                                var _as = chat.screenshots[_ak];
+                                if (_as && _as.base64) _cb64 += _as.base64.length;
                             }
-                            chat = _adoptedPreBoot;
                         }
-                        chats[_rowId] = chat;
+                        if (_cb64) {
+                            _acctB64 += _cb64;
+                            if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
+                        }
+                        if (stripChatPayloadsInPlace(chat)) _localMigrationQueue.push(chat.id);
+                        // WRITE-AMP root fix: strip only sets
+                        // _payloadsEvicted when it stripped base64, so a
+                        // pure-TEXT chat (most of the store) never got the
+                        // flag and the save put-loop re-wrote its UNCHANGED
+                        // record on EVERY save — with hundreds of chats,
+                        // tens of MB per tool boundary, the engine of the
+                        // chronic [chats, chat_payloads] congestion. At
+                        // load the in-memory copy is identical to the disk
+                        // record by definition, so mark EVERY chat evicted
+                        // ("nothing new to persist"). Every mutation path
+                        // (run gate, send, wake drain, resume, migration)
+                        // already calls ensureChatPayloads first, which
+                        // clears the flag (single cheap get for text-only
+                        // chats) and re-admits the chat to the put set.
+                        chat._payloadsEvicted = true;
+                    } catch (e) {}
+                }
+                _loadedRows.push(chat);
+            }
+            // Drop the raw batch before the next read: its records live on
+            // (stripped) in _loadedRows and the stripped base64 is garbage.
+            _rows = null;
+        }
+        _keys = null;
+        // ONE synchronous commit (no await from here on): swap in the
+        // migration queue, then merge the rows into the chats map in key
+        // order, then the fold / pause / file-index / hydrated steps.
+        _legacyPayloadMigrationQueue = _localMigrationQueue;
+        // FLUX-H2 (boot-adopt preservation): do NOT wholesale-replace
+        // `chats`. This loader runs once per SW life (worker/190-entry.js)
+        // and `chats` starts {}, so any entry present here is a panel
+        // snapshot adopted while this load was in flight (the pre-gate
+        // run-agent adopt, the ungated update-chat put, or a parked
+        // tombstone — worker/130-port-bridge.js). The old `chats = {}`
+        // replace dropped those adopts, losing the freshly-typed user
+        // turn the snapshot carried. Disk rows fill in around them below;
+        // on id collision the adopted record wins and disk-only meta is
+        // pulled forward via _swOverlayChatMeta (same prev=SW-copy
+        // semantics as a post-boot adopt overlay).
+        // DELETE-RACE: take and close this load's verified-deleted set. The
+        // commit is synchronous, so no delete can finish between this capture
+        // and the end of the loop; a later one finds null and records nothing,
+        // and a delete not finished yet still has its tombstone parked, which
+        // the FLUX-H2 branch below keeps untouched.
+        var _deletedMidLoad = _swChatsLoadDeletedIds || Object.create(null);
+        _swChatsLoadDeletedIds = null;
+        for (var _li = 0; _li < _loadedRows.length; _li++) {
+            chat = _loadedRows[_li];
+            var _rowId = chat.id;
+            // DELETE-RACE: verified gone after its batch was read (tombstone
+            // already dropped) - never re-insert the stale row.
+            if (_deletedMidLoad[_rowId]) continue;
+            var _adoptedPreBoot = chats[_rowId];
+            if (_adoptedPreBoot) {
+                // FLUX-H2: keep the fresher adopted record and replay
+                // the post-boot adopt ordering — overlay the DISK
+                // copy as `prev` (timestamps max-wins, disk DEFINED
+                // flags win; boot-window dispatches are re-asserted
+                // by the pending fold below, keeping last-dispatch-
+                // wins intact). A parked tombstone is kept untouched:
+                // the delete lane owns it and its meta must never be
+                // resurrected from the doomed disk row.
+                if (!_adoptedPreBoot._deleted && typeof _swOverlayChatMeta === 'function') {
+                    try { _swOverlayChatMeta(chat, _adoptedPreBoot); } catch (eOv) { /* best-effort — adopt stays */ }
+                }
+                chat = _adoptedPreBoot;
+            }
+            chats[_rowId] = chat;
+        }
+        _loadedRows = null;
+        // FLUX-H3 (boot-window lane fold): fold chat-meta dispatches
+        // buffered in _swChatMetaPendingByChatId into the hydrated
+        // records, with the lane's own merge (_swApplyChatMetaFields:
+        // ts max-wins, flags last-wins). getAll is a SNAPSHOT — a
+        // 'chat-meta-update' landing mid-window RMWed the STORED row
+        // (durable) and buffered its fields, but the rows read above
+        // can predate that RMW; without this fold the stale disk value
+        // wins in memory, a later adopt's `chats[id] || pending` prefers
+        // the stale held record and deletes the pending entry unfolded,
+        // and the next save writes the stale flag back over the RMWed
+        // row (_preservePageChatFields lets a DEFINED record flag beat
+        // disk). Entries are NOT deleted here: adopt sites still
+        // consume them for never-held chats, and the serialized RMW
+        // chain reads the map at execution time — re-folding is
+        // idempotent (same values, max-wins/last-wins).
+        try {
+            if (typeof _swChatMetaPendingByChatId === 'object' && _swChatMetaPendingByChatId
+                && typeof _swApplyChatMetaFields === 'function') {
+                Object.keys(_swChatMetaPendingByChatId).forEach(function(_pmCid) {
+                    if (chats[_pmCid] && !chats[_pmCid]._deleted) {
+                        _swApplyChatMetaFields(chats[_pmCid], _swChatMetaPendingByChatId[_pmCid]);
                     }
                 });
-                // FLUX-H3 (boot-window lane fold): fold chat-meta dispatches
-                // buffered in _swChatMetaPendingByChatId into the hydrated
-                // records, with the lane's own merge (_swApplyChatMetaFields:
-                // ts max-wins, flags last-wins). getAll is a SNAPSHOT — a
-                // 'chat-meta-update' landing mid-window RMWed the STORED row
-                // (durable) and buffered its fields, but the rows read above
-                // can predate that RMW; without this fold the stale disk value
-                // wins in memory, a later adopt's `chats[id] || pending` prefers
-                // the stale held record and deletes the pending entry unfolded,
-                // and the next save writes the stale flag back over the RMWed
-                // row (_preservePageChatFields lets a DEFINED record flag beat
-                // disk). Entries are NOT deleted here: adopt sites still
-                // consume them for never-held chats, and the serialized RMW
-                // chain reads the map at execution time — re-folding is
-                // idempotent (same values, max-wins/last-wins).
-                try {
-                    if (typeof _swChatMetaPendingByChatId === 'object' && _swChatMetaPendingByChatId
-                        && typeof _swApplyChatMetaFields === 'function') {
-                        Object.keys(_swChatMetaPendingByChatId).forEach(function(_pmCid) {
-                            if (chats[_pmCid] && !chats[_pmCid]._deleted) {
-                                _swApplyChatMetaFields(chats[_pmCid], _swChatMetaPendingByChatId[_pmCid]);
-                            }
-                        });
+            }
+        } catch (eFold) { /* fold is best-effort — the RMW already persisted the fields */ }
+        // Rehydrate per-chat pause flags from the persisted record field
+        // (chat.pausedByUser — see setChatPausedPersistent in
+        // core/030-config.js) so a user-paused chat stays paused across an
+        // SW restart: the loop's `while (!isChatPaused)` gate reads THIS
+        // realm's pausedChats copy. Cleared on resume/toggle-pause(false),
+        // on run-agent for an idle chat, and on a fresh user send.
+        try {
+            if (typeof pausedChats !== 'undefined') {
+                Object.keys(chats).forEach(function(_pcid) {
+                    if (chats[_pcid] && chats[_pcid].pausedByUser === true) {
+                        pausedChats[_pcid] = true;
+                        // FLUX-P1: pausedChatIds is a derived cache of the
+                        // lane's pausedByUser flag — fold it here too so the
+                        // worker/020-page-stubs.js isChatPaused fallback
+                        // agrees after an SW restart.
+                        if (typeof pausedChatIds !== 'undefined') pausedChatIds[_pcid] = true;
                     }
-                } catch (eFold) { /* fold is best-effort — the RMW already persisted the fields */ }
-                // Rehydrate per-chat pause flags from the persisted record field
-                // (chat.pausedByUser — see setChatPausedPersistent in
-                // core/030-config.js) so a user-paused chat stays paused across an
-                // SW restart: the loop's `while (!isChatPaused)` gate reads THIS
-                // realm's pausedChats copy. Cleared on resume/toggle-pause(false),
-                // on run-agent for an idle chat, and on a fresh user send.
-                try {
-                    if (typeof pausedChats !== 'undefined') {
-                        Object.keys(chats).forEach(function(_pcid) {
-                            if (chats[_pcid] && chats[_pcid].pausedByUser === true) {
-                                pausedChats[_pcid] = true;
-                                // FLUX-P1: pausedChatIds is a derived cache of the
-                                // lane's pausedByUser flag — fold it here too so the
-                                // worker/020-page-stubs.js isChatPaused fallback
-                                // agrees after an SW restart.
-                                if (typeof pausedChatIds !== 'undefined') pausedChatIds[_pcid] = true;
-                            }
-                        });
-                    }
-                } catch (e) { /* rehydration is best-effort */ }
-                if (typeof rebuildFileIndexAll === 'function') {
-                    // WS-T1: surface a boot file-index rebuild failure instead of
-                    // swallowing it — a silent failure here leaves file_id lookups
-                    // (attachments, screenshots) broken with no diagnostic.
-                    try { rebuildFileIndexAll(); } catch (e) { console.error('[worker-storage] rebuildFileIndexAll failed', e); }
-                }
-                _chatsHydrated = true;
-                console.log('[worker-storage] loaded ' + Object.keys(chats).length + ' chats in '
-                    + (Date.now() - _loadT0) + 'ms — '
-                    + (_acctB64
-                        ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records ('
-                            + _legacyPayloadMigrationQueue.length + ' queued for migration, largest '
-                            + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
-                        : 'records are v16-clean (no inline base64)'));
-                resolve();
-            };
-            request.onerror = function() {
-                // SLEEP-WEDGE: REJECT (do not resolve-empty) so withStore's
-                // connection-error retry engages on a fresh connection. The
-                // outer catch below logs only after the retry has also failed.
-                reject(request.error || new Error('chats getAll failed'));
-            };
-        });
-        }); // end withStore fn
+                });
+            }
+        } catch (e) { /* rehydration is best-effort */ }
+        if (typeof rebuildFileIndexAll === 'function') {
+            // WS-T1: surface a boot file-index rebuild failure instead of
+            // swallowing it — a silent failure here leaves file_id lookups
+            // (attachments, screenshots) broken with no diagnostic.
+            try { rebuildFileIndexAll(); } catch (e) { console.error('[worker-storage] rebuildFileIndexAll failed', e); }
+        }
+        _chatsHydrated = true;
+        console.log('[worker-storage] loaded ' + Object.keys(chats).length + ' chats in '
+            + (Date.now() - _loadT0) + 'ms — '
+            + (_acctB64
+                ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records ('
+                    + _legacyPayloadMigrationQueue.length + ' queued for migration, largest '
+                    + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
+                : 'records are v16-clean (no inline base64)'));
     } catch (e) {
+        // DELETE-RACE: a failed load merges nothing - close its set.
+        _swChatsLoadDeletedIds = null;
         // Post-retry failure — no DOM in this realm, so log loudly; the page
         // realm surfaces its own user-visible notice, and the wipe-guard
         // (_chatsHydrated stays false) keeps saves blocked so nothing is lost.
@@ -814,4 +922,21 @@ async function migrateNextLegacyChatPayloads() {
     } finally {
         _legacyPayloadMigrationBusy = false;
     }
+}
+
+// TA-3: the page's Delete All sends {type:'delete-all-save-lock', locked} right
+// before its clear (locked:true) and again when the clear failed (locked:false).
+// Only our own extension pages may set it. The reply is synchronous; the page
+// bounds its wait and fails open, so a missed reply never blocks Delete All.
+function _onDeleteAllSaveLockMessage(msg, sender, sendResponse) {
+    if (!msg || msg.type !== 'delete-all-save-lock') return;
+    var base = chrome.runtime.getURL('');
+    if (!sender || typeof sender.url !== 'string' || sender.url.indexOf(base) !== 0) return;
+    _chatsWipeLocked = msg.locked === true;
+    console.warn('[worker-storage] Delete All save lock ' + (_chatsWipeLocked ? 'ON' : 'OFF'));
+    if (typeof sendResponse === 'function') sendResponse({ ok: true });
+}
+if (typeof chrome !== 'undefined' && chrome && chrome.runtime && chrome.runtime.onMessage
+    && typeof chrome.runtime.onMessage.addListener === 'function') {
+    chrome.runtime.onMessage.addListener(_onDeleteAllSaveLockMessage);
 }

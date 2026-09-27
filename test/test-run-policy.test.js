@@ -180,6 +180,31 @@ async function runTestRunPolicyTests(sources) {
     check('offscreen safe read carries trusted host id', relayed.length === 1 && relayed[0].payload.sandboxRequestId === 'off-test');
     receiver({ type: 'helper-cancel-sandbox', payload: { sandboxRequestId: 'off-test' } }, { id: 'test' }, function() {}); await flush();
     check('offscreen cancel destroys exact test frame', h.removed() === 1 && response && response.ok === false);
+    // S0C10-01: an expired or invalid descriptor replies ok:false (no synchronous
+    // throw out of the listener) and leaves no activeSandboxes registration.
+    var framesBefore = h.frames.length, ingressThrew = null, expiredReply, invalidReply, pingReply;
+    var trustedSender = { id: 'test', url: chrome.runtime.getURL('background.js') };
+    try {
+        // deadline 1000 === the fake clock's now, so descriptor() already throws 'expired'.
+        receiver({ type: 'helper-js-eval', payload: { sandboxRequestId: 'off-expired', testRunPolicy: { workspace: 'owner/repo::main', deadline: 1000 }, code: '' } }, trustedSender, function(r) { expiredReply = r; });
+        await flush();
+        receiver({ type: 'helper-js-eval', payload: { sandboxRequestId: 'off-invalid', testRunPolicy: { workspace: '', deadline: 11000 }, code: '' } }, trustedSender, function(r) { invalidReply = r; });
+        await flush();
+    } catch (e) { ingressThrew = e; }
+    receiver({ type: 'helper-ping' }, trustedSender, function(r) { pingReply = r; });
+    check('offscreen ingress: expired test descriptor replies ok:false and leaks no sandbox', !ingressThrew && !!expiredReply && expiredReply.ok === false && /expired/.test(expiredReply.error) && h.frames.length === framesBefore && !!pingReply && pingReply.result.active === 0);
+    check('offscreen ingress: invalid test config (empty workspace) replies ok:false instead of throwing', !ingressThrew && !!invalidReply && invalidReply.ok === false && /Invalid host test configuration/.test(invalidReply.error));
+    // Dispatcher defence in depth: a synchronous throw inside either runner
+    // (here a throwing TestRunPolicy.registry getter) still replies ok:false.
+    var h2 = realm(), throwingReceiver, syncReplies = [], syncThrew = null;
+    var throwingPolicy = { runFrame: function() {} };
+    Object.defineProperty(throwingPolicy, 'registry', { get: function() { throw new Error('sync runner failure'); } });
+    new Function('chrome', 'window', 'document', 'TestRunPolicy', 'AbortController', 'setTimeout', 'clearTimeout', 'Date', sources['src/platform/extension/offscreen-helper.js'])({ runtime: Object.assign({}, offChrome.runtime, { onMessage: { addListener: function(fn) { throwingReceiver = fn; } } }) }, h2.window, h2.document, throwingPolicy, AbortController, h2.setTimer, h2.clearTimer, h2.clock);
+    try {
+        for (var syncType of ['helper-js-eval', 'helper-skill-sandbox']) throwingReceiver({ type: syncType, payload: { code: '' } }, trustedSender, function(r) { syncReplies.push(r); });
+        await flush();
+    } catch (e) { syncThrew = e; }
+    check('offscreen dispatcher: a synchronous runner throw replies ok:false (js-eval + skill-sandbox)', !syncThrew && syncReplies.length === 2 && syncReplies.every(function(r) { return r && r.ok === false && /sync runner failure/.test(r.error); }));
 
     P = realm().P;
     var validStatus = function() { return Promise.resolve({ success: true, dirty_files: [{ path: 'src/a' }] }); };

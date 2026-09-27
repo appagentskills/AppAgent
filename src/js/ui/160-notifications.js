@@ -546,6 +546,8 @@ function saveProviderToStorage() {
 function changeProvider(providerId) {
     if (getProviderById(providerId)) {
         var previousProviderObj = getProviderById(currentProvider);
+        // A8A-01: re-selecting the active model is not a switch: never abort the running chat.
+        var providerUnchanged = providerId === currentProvider;
         if (typeof invalidateCreditsRequests === 'function') invalidateCreditsRequests();
         currentProvider = providerId;
         // ALWAYS tell the authoritative worker about the new global selection.
@@ -564,7 +566,7 @@ function changeProvider(providerId) {
         var foregroundChatId = (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
             ? activeStreamingChatId : ((typeof currentChatId !== 'undefined') ? currentChatId : null);
         var foregroundChat = (foregroundChatId && typeof chats !== 'undefined') ? chats[foregroundChatId] : null;
-        var abortChatId = (previousProviderObj && previousProviderObj.isChatGPTOAuth
+        var abortChatId = (!providerUnchanged && previousProviderObj && previousProviderObj.isChatGPTOAuth
             && foregroundChatId && (!foregroundChat || !foregroundChat.isSubAgent)
             && typeof runningChatIds !== 'undefined' && runningChatIds[foregroundChatId])
             ? foregroundChatId : null;
@@ -1080,9 +1082,12 @@ function addModelFromMenu(event) {
 function modelMenuOAuthToggle() {
     _closeModelMenu();
     if (llmConnectionStatus === 'connected') {
-        chrome.runtime.sendMessage({ type: 'claude-oauth-logout' }, function() {
+        chrome.runtime.sendMessage({ type: 'claude-oauth-logout' }, function(response) {
+            // A8A-02: an unreachable SW (lastError) or a handler error is a failed logout, not a success.
+            var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : (response && response.error);
             updateClaudeOAuthStatus();
-            showSnackbar('Logged out from Claude', 'info');
+            if (err) showSnackbar('Log out failed: ' + err, 'error');
+            else showSnackbar('Logged out from Claude', 'info');
         });
     } else {
         startClaudeOAuthLogin();
@@ -1120,10 +1125,13 @@ function modelMenuChatGPTOAuthToggle() {
     var returnFocus = document.activeElement;
     _closeModelMenu();
     if (llmConnectionStatus === 'connected') {
-        chrome.runtime.sendMessage({ type: 'openai-oauth-logout' }, function() {
+        chrome.runtime.sendMessage({ type: 'openai-oauth-logout' }, function(response) {
+            // A8A-02: same as the Claude logout above.
+            var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : (response && response.error);
             closeChatGPTDeviceCodeModal();
             updateChatGPTOAuthStatus();
-            showSnackbar('Logged out from ChatGPT', 'info');
+            if (err) showSnackbar('Log out failed: ' + err, 'error');
+            else showSnackbar('Logged out from ChatGPT', 'info');
         });
     } else {
         startChatGPTOAuthLogin(returnFocus);
@@ -1197,9 +1205,10 @@ function submitChatGPTBrowserCallback() {
     input.value = '';
     var button = document.getElementById('chatgpt-browser-submit');
     if (button) button.disabled = true;
+    if (feedback) feedback.textContent = '';
     chrome.runtime.sendMessage({ type: 'openai-oauth-browser-callback', url: url }, function(response) {
         if (!document.contains(feedback)) return;
-        if (button) button.disabled = false;
+        if (button) button.disabled = !!input.disabled;
         if (chrome.runtime.lastError || !response || response.error) feedback.textContent = 'Callback not accepted. Check the address or choose device-code login.';
         else closeChatGPTBrowserModal();
         updateChatGPTOAuthStatus();
@@ -1221,6 +1230,7 @@ function showChatGPTBrowserModal(info) {
         '<label for="chatgpt-browser-callback">Local callback address (optional fallback)</label>' +
         '<input id="chatgpt-browser-callback" class="form-input" type="password" autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?…">' +
         '<button type="button" class="modal-btn secondary" id="chatgpt-browser-submit">Finish with pasted address</button>' +
+        '<p id="chatgpt-browser-expiry" class="chatgpt-device-expiry" aria-live="off"></p>' +
         '<p id="chatgpt-browser-feedback" role="status" aria-live="polite"></p></div>' +
         '<div class="modal-actions"><button type="button" class="modal-btn secondary" id="chatgpt-browser-device">Use device code instead</button><button type="button" class="modal-btn primary" id="chatgpt-browser-cancel">Cancel sign-in</button></div></div>';
     document.body.appendChild(overlay);
@@ -1240,10 +1250,16 @@ function showChatGPTBrowserModal(info) {
     var expiresAt = info && info.expiresAt;
     function expiry() {
         var expired = !expiresAt || expiresAt <= Date.now();
-        overlay.querySelector('#chatgpt-browser-feedback').textContent = expired ? 'Sign-in is unavailable or expired. Cancel and retry, or use device code.' : 'Waiting for approval. Sign-in expires in ' + Math.ceil((expiresAt - Date.now()) / 60000) + ' minutes.';
-        overlay.querySelector('#chatgpt-browser-submit').disabled = expired;
-        overlay.querySelector('#chatgpt-browser-callback').disabled = expired;
-        if (expired && _chatGPTBrowserTimer) { clearInterval(_chatGPTBrowserTimer); _chatGPTBrowserTimer = null; }
+        var text = expired ? 'Sign-in is unavailable or expired. Cancel and retry, or use device code.'
+            : 'Waiting for approval. Sign-in expires in ' + Math.ceil((expiresAt - Date.now()) / 60000) + ' minutes.';
+        var line = overlay.querySelector('#chatgpt-browser-expiry');
+        if (line.textContent !== text) line.textContent = text;
+        if (expired) {
+            overlay.querySelector('#chatgpt-browser-feedback').textContent = text; // announced once
+            overlay.querySelector('#chatgpt-browser-submit').disabled = true;
+            overlay.querySelector('#chatgpt-browser-callback').disabled = true;
+            if (_chatGPTBrowserTimer) { clearInterval(_chatGPTBrowserTimer); _chatGPTBrowserTimer = null; }
+        }
     }
     _chatGPTBrowserTimer = setInterval(expiry, 10000);
     expiry();
@@ -1320,7 +1336,7 @@ function showChatGPTDeviceCodeModal(info) {
             '<div class="chatgpt-device-url" aria-label="Approval page address">' + escapeHtml(url) + '</div>' +
             '<div class="chatgpt-device-code-row"><code id="chatgpt-device-code" class="chatgpt-device-code" aria-label="One-time device code">' + escapeHtml(code) + '</code><button type="button" class="modal-btn secondary chatgpt-device-copy" onclick="copyChatGPTDeviceCode()" aria-describedby="chatgpt-device-code">Copy code</button></div>' +
             '<div id="chatgpt-device-copy-feedback" class="chatgpt-device-feedback" role="status" aria-live="polite"></div>' +
-            '<p id="chatgpt-device-expiry" class="chatgpt-device-expiry" role="status" aria-live="polite"></p>' +
+            '<p id="chatgpt-device-expiry" class="chatgpt-device-expiry" role="timer" aria-live="off"></p>' +
             '<p>Waiting for approval. You may close this dialog; login continues in the background.</p>' +
         '</div>' +
         '<div class="modal-actions"><button type="button" class="modal-btn secondary chatgpt-device-open" onclick="openChatGPTDevicePage()">Open approval page</button><button type="button" class="modal-btn primary" onclick="closeChatGPTDeviceCodeModal()">Close</button></div>' +
@@ -1336,6 +1352,8 @@ function showChatGPTDeviceCodeModal(info) {
             overlay.querySelectorAll('.chatgpt-device-copy, .chatgpt-device-open').forEach(function(button) { button.disabled = true; });
             var codeNode = document.getElementById('chatgpt-device-code');
             if (codeNode) codeNode.setAttribute('aria-label', 'Expired one-time device code');
+            var fb = document.getElementById('chatgpt-device-copy-feedback'); // polite line: announced once
+            if (fb && fb.textContent !== 'This code has expired.') fb.textContent = 'This code has expired.';
             clearInterval(_chatGPTDeviceExpiryTimer);
             _chatGPTDeviceExpiryTimer = null;
         } else {
@@ -1346,7 +1364,7 @@ function showChatGPTDeviceCodeModal(info) {
     _chatGPTDeviceExpiryTimer = setInterval(updateExpiry, 1000);
     overlay.addEventListener('click', function(event) { if (event.target === overlay) closeChatGPTDeviceCodeModal(); });
     _chatGPTDeviceKeyHandler = function(event) {
-        if (!document.getElementById('chatgpt-device-modal')) return;
+        if (!document.getElementById('chatgpt-device-modal')) { closeChatGPTDeviceCodeModal({ restoreFocus: false }); return; }
         if (event.key === 'Escape') { event.preventDefault(); closeChatGPTDeviceCodeModal(); return; }
         if (event.key !== 'Tab') return;
         var focusable = Array.prototype.slice.call(overlay.querySelectorAll('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'));

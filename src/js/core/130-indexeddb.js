@@ -849,6 +849,16 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
     if (!chat) return false;
     var stripped = false;
     var newBodyMsgs = null; // COPY-ON-EVICT (PR #805 review, Issue 1): lazily-cloned messages array
+    // PR-CHIP (PR-1): tool_call ids of `workspace` push calls seen so far.
+    // A push call's arguments (pr_title/branch_name/pr_body) and its result
+    // (pr_url + the per-file list, always > the 512-char floor) are the ONLY
+    // source getPushedPRsForChat (ui/120-ui-utils.js) and _wsPrChatLookup
+    // (ui/040-tools-settings.js) read, and a cold chat is never hydrated for
+    // the sidebar roll-up (retired sub-agent chats hold no keep slot) — so
+    // evicting those rows silently dropped the chat's PR chip. They stay
+    // resident (a few KB per push). Local on purpose: test/sw-chat-load
+    // cuts this function's text out and evaluates it standalone.
+    var prPushIds = null;
     if (Array.isArray(chat.messages)) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
@@ -881,7 +891,9 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
             if (evictBodies && msg) {
                 var bodyClone = null;
                 if (msg.role === 'tool' && typeof msg.content === 'string'
-                    && msg.content.length > CHAT_BODY_EVICT_MIN_CHARS) {
+                    && msg.content.length > CHAT_BODY_EVICT_MIN_CHARS
+                    && !(prPushIds && msg.tool_call_id && prPushIds[msg.tool_call_id]
+                        && msg.content.indexOf('"pr_url"') !== -1)) {
                     bodyClone = bodyClone || Object.assign({}, msg);
                     delete bodyClone.content;
                 }
@@ -892,6 +904,15 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
                 if (Array.isArray(msg.tool_calls)) {
                     for (var bt = 0; bt < msg.tool_calls.length; bt++) {
                         var btc = msg.tool_calls[bt];
+                        // PR-CHIP (PR-1): a workspace push call keeps its
+                        // arguments whatever their length, and registers its
+                        // id so the matching pr_url result row is kept too.
+                        if (btc && btc.id && btc.function && btc.function.name === 'workspace'
+                            && typeof btc.function.arguments === 'string'
+                            && /"action"\s*:\s*"push"/.test(btc.function.arguments)) {
+                            (prPushIds || (prPushIds = {}))[btc.id] = true;
+                            continue;
+                        }
                         if (btc && btc.function && typeof btc.function.arguments === 'string'
                             && btc.function.arguments.length > CHAT_BODY_EVICT_MIN_CHARS) {
                             // Keep the array + names (history stats read
@@ -1000,16 +1021,25 @@ var _coldSweepTimer = null;
 // in stripChatPayloadsInPlace's bodies leg exactly.
 function chatHasEvictableBodies(chat) {
     if (!chat || !Array.isArray(chat.messages)) return false;
+    var prPushIds = null; // PR-CHIP (PR-1): same push-row exemption as the strip
     for (var i = 0; i < chat.messages.length; i++) {
         var m = chat.messages[i];
         if (!m) continue;
         if (m.role === 'tool' && typeof m.content === 'string'
-            && m.content.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
+            && m.content.length > CHAT_BODY_EVICT_MIN_CHARS
+            && !(prPushIds && m.tool_call_id && prPushIds[m.tool_call_id]
+                && m.content.indexOf('"pr_url"') !== -1)) return true;
         if (typeof m.thinking === 'string' && m.thinking.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
         if (Array.isArray(m.reasoning_details) && m.reasoning_details.length) return true;
         if (Array.isArray(m.tool_calls)) {
             for (var t = 0; t < m.tool_calls.length; t++) {
                 var tc = m.tool_calls[t];
+                if (tc && tc.id && tc.function && tc.function.name === 'workspace'
+                    && typeof tc.function.arguments === 'string'
+                    && /"action"\s*:\s*"push"/.test(tc.function.arguments)) {
+                    (prPushIds || (prPushIds = {}))[tc.id] = true;
+                    continue;
+                }
                 if (tc && tc.function && typeof tc.function.arguments === 'string'
                     && tc.function.arguments.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
             }
@@ -1025,10 +1055,17 @@ function sweepColdChatPayloads(keepHydrated, evictBodies) {
     try {
         var ids = Object.keys(chats);
         ids.sort(function(a, b) { return chatPayloadRecencyTs(chats[b]) - chatPayloadRecencyTs(chats[a]); });
+        // F3 keep-set (aligned with F1's page keep-set): the newest K
+        // NON-retired chats keep their payloads. A retired sub-agent row no
+        // longer burns a keep slot (it falls through to the eviction guards
+        // below), and the current / running / cleanup-window guards still
+        // protect those chats whatever their recency rank.
+        var kept = 0;
+        var keepK = keepHydrated || 0;
         for (var i = 0; i < ids.length; i++) {
-            if (i < (keepHydrated || 0)) continue;
             var c = chats[ids[i]];
             if (!c) continue;
+            if (kept < keepK && c.retiredSubAgent !== true) { kept++; continue; }
             // MEMFIX-RD guard relax: `_payloadsEvicted` used to settle a chat
             // for good, which made the runtime sweep a permanent no-op for
             // it — but the flag RIDES on full-body chat snapshots the page
@@ -1783,35 +1820,88 @@ function deleteChatRow(chatId, reason, evidence) {
 // cannot turn boot into a mass-delete. Expect a one-off count drop at the
 // first boot after PR 3 ships (RFC addendum §5) — the [chat-delete] log lines
 // name every reaped id.
+//
+// F3 (Boot OOM fix): the candidate scan is a KEY-DIFF, never a value
+// openCursor()/getAll() over the store (that materialised every transcript
+// at boot: the OOM). Candidates = getAllKeys() MINUS the ids held by the
+// in-memory `chats` map (the SW loader hydrates only messages.length > 0
+// rows, so an empty disk row shows up as ABSENCE from the map), each re-read
+// BY KEY in small readonly batches and kept only if it passes today's exact
+// 'empty-row' precondition. Gated on _chatsHydrated === true: on a partial
+// map the diff is meaningless, so the pass skips with zero IDB reads and the
+// rows drain on a later boot.
 var CHAT_EMPTY_ROW_GC_MAX_PER_BOOT = 200;
+var CHAT_EMPTY_ROW_GC_READ_BATCH = 25;
 function gcEmptyChatRows() {
     if (typeof deleteChatRow !== 'function') return Promise.resolve(0);
-    // Phase 1 (readonly): cursor the chats store and collect candidate ids.
-    // The age/running checks here only cut REFUSED-log noise for fresh rows;
-    // the delete tx re-checks everything authoritatively.
+    if (!(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) {
+        console.log('[chat-delete] empty-row GC: skipped (chats map not hydrated), rows drain on a later boot');
+        return Promise.resolve(0);
+    }
+    if (typeof chats === 'undefined' || !chats) return Promise.resolve(0);
+    // Phase 1a (readonly, KEYS ONLY).
     return withStore([chatStoreName], 'readonly', function(transaction) {
         return new Promise(function(resolve) {
-            var candidates = [];
-            var cursorReq;
-            try { cursorReq = transaction.objectStore(chatStoreName).openCursor(); }
-            catch (e) { resolve(candidates); return; }
-            cursorReq.onsuccess = function(ev) {
-                var cur = ev.target.result;
-                if (!cur) { resolve(candidates); return; }
-                var rec = cur.value;
-                if (rec && !(rec.messages && rec.messages.length > 0)
-                    && !_chatRowIsRunning(cur.primaryKey)) {
-                    var _ts = (typeof chatPayloadRecencyTs === 'function')
-                        ? chatPayloadRecencyTs(rec)
-                        : (rec.updatedAt || rec.createdAt || 0);
-                    var _age = Date.now() - Math.max(_ts, rec.lastResponseAt || 0, rec.lastActivityAt || 0);
-                    if (_age > CHAT_EMPTY_ROW_GC_MIN_AGE_MS) candidates.push(cur.primaryKey);
-                }
-                if (candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT) { resolve(candidates); return; }
-                cur.continue();
-            };
-            cursorReq.onerror = function() { resolve(candidates); };
+            var keysReq;
+            try { keysReq = transaction.objectStore(chatStoreName).getAllKeys(); }
+            catch (e) { resolve([]); return; }
+            keysReq.onsuccess = function() { resolve(keysReq.result || []); };
+            keysReq.onerror = function() { resolve([]); };
         });
+    }).then(function(keys) {
+        // Memory owns every id it holds (hydrated, stripped stub or brand-new
+        // empty chat), so only ids ABSENT from the map are candidates.
+        var absent = [];
+        for (var k = 0; k < keys.length; k++) {
+            if (!Object.prototype.hasOwnProperty.call(chats, keys[k])) absent.push(keys[k]);
+        }
+        // Phase 1b (readonly, BY KEY): judge each absent row with the SAME
+        // 'empty-row' precondition deleteChatRow runs (empty on disk, past the
+        // 24h floor, not running). Still only a pre-filter that cuts
+        // REFUSED-log noise; the delete tx re-verifies authoritatively. Each
+        // record is judged in its onsuccess and dropped, so at most one batch
+        // of records is alive at a time.
+        // The empty evidence object passed below is fine: 'empty-row' reads
+        // only the stored record and the chat id, and deleteChatRow re-reads
+        // the row by key in its own readwrite tx and re-runs this same
+        // precondition authoritatively before anything is deleted.
+        var emptyRowPre = CHAT_ROW_DELETE_PRECONDITIONS['empty-row'];
+        var candidates = [];
+        var pos = 0;
+        function readBatch() {
+            if (pos >= absent.length || candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT) {
+                return Promise.resolve(candidates);
+            }
+            var batch = absent.slice(pos, pos + CHAT_EMPTY_ROW_GC_READ_BATCH);
+            pos += batch.length;
+            return withStore([chatStoreName], 'readonly', function(transaction) {
+                // Per-call locals: withStore may re-run fn on a connection retry.
+                return new Promise(function(resolve) {
+                    var verdicts = [];
+                    var pending = batch.length;
+                    function settle() { if (--pending === 0) resolve(verdicts); }
+                    var store;
+                    try { store = transaction.objectStore(chatStoreName); }
+                    catch (e) { resolve([]); return; }
+                    batch.forEach(function(id, idx) {
+                        var req;
+                        try { req = store.get(id); } catch (e) { settle(); return; }
+                        req.onsuccess = function() {
+                            var rec = req.result;
+                            try { if (rec && emptyRowPre(rec, {}, id) === null) verdicts[idx] = id; } catch (e) {}
+                            settle();
+                        };
+                        req.onerror = function() { settle(); };
+                    });
+                });
+            }).then(function(verdicts) {
+                for (var j = 0; j < verdicts.length && candidates.length < CHAT_EMPTY_ROW_GC_MAX_PER_BOOT; j++) {
+                    if (verdicts[j] !== undefined) candidates.push(verdicts[j]);
+                }
+                return readBatch();
+            });
+        }
+        return readBatch();
     }).then(function(candidates) {
         if (!candidates.length) return 0;
         // Phase 2: one explicit, precondition-checked deleteChatRow per
@@ -2111,19 +2201,27 @@ async function ensureChatPayloads(chatId) {
 }
 
 // Generic settings get/set for IndexedDB
-async function getSetting(key, defaultValue) {
+// TA-7: opts.strict makes a FAILED read reject instead of answering defaultValue,
+// so a caller that writes back a merged value (loadTierAliases) can tell "nothing
+// stored" (a missing key still answers defaultValue) from "could not read".
+async function getSetting(key, defaultValue, opts) {
+    var strict = !!(opts && opts.strict);
     try {
         return await withStore([settingsStoreName], 'readonly', function(transaction) {
             var store = transaction.objectStore(settingsStoreName);
             var request = store.get(key);
-            return new Promise(function(resolve) {
+            return new Promise(function(resolve, reject) {
                 request.onsuccess = function() {
                     resolve(request.result ? request.result.value : defaultValue);
                 };
-                request.onerror = function() { resolve(defaultValue); };
+                request.onerror = function() {
+                    if (strict) reject(request.error || new Error('getSetting request failed: ' + key));
+                    else resolve(defaultValue);
+                };
             });
         });
     } catch (e) {
+        if (strict) throw e;
         // Post-retry failure — log loudly instead of silently defaulting so a
         // storage outage is diagnosable from the console.
         console.error('getSetting failed (returning default):', key, e);
@@ -2915,6 +3013,9 @@ async function saveSkill(skill) {
         skills[skill.id] = skill;
     } catch (e) {
         console.error('Failed to save skill:', e);
+        // TB-7b (like TB-7): rethrow so callers see the failed save instead of a
+        // silent success. Nothing to roll back: the memory copy is set only after put.
+        throw e;
     }
 }
 
@@ -2995,19 +3096,38 @@ async function resolveWorkspace(workspace) {
 }
 
 // Clean up old-format workspace entries (no :: in key) — stale from pre-refactor code
+// TA-5: only EMPTY ones (no file rows), as the boot call site (core/120-init.js)
+// says: a legacy workspace that still holds files may carry uncommitted edits,
+// so it is kept, and so is one whose row count fails (_countWorkspaceFileRows).
 async function cleanupStaleWorkspaces() {
     try {
         var all = await getAllWorkspaceMetas();
         for (var i = 0; i < all.length; i++) {
             var m = all[i];
             if (m.repo && m.repo.indexOf('::') === -1) {
+                var rows;
+                try { rows = await _countWorkspaceFileRows(m.repo); } catch (e) { continue; }
+                if (rows !== 0) continue;
                 console.log('Cleaning up old-format workspace:', m.repo);
                 await deleteWorkspaceFiles(m.repo);
                 await deleteWorkspaceMeta(m.repo);
-
             }
         }
     } catch (e) {}
+}
+
+// TA-5: file-row count of one workspace (the 'repo' index). REJECTS on any
+// IDB error, unlike getAllWorkspaceFiles (which reads a failure as []), so a
+// failed read can never look like an empty workspace.
+function _countWorkspaceFileRows(repo) {
+    return openDatabase().then(function(database) {
+        return new Promise(function(resolve, reject) {
+            var req = database.transaction([workspaceFilesStoreName], 'readonly')
+                .objectStore(workspaceFilesStoreName).index('repo').count(repo);
+            req.onsuccess = function() { resolve(req.result); };
+            req.onerror = function() { reject(req.error || new Error('workspace file count failed')); };
+        });
+    });
 }
 
 // Get all workspace metas
@@ -3026,11 +3146,17 @@ async function getAllWorkspaceMetas() {
 // case variants: trim, strip trailing slashes, lowercase protocol+host (URL
 // parsing does the lowercasing; path case is preserved for GHE instances
 // served under a path). Empty/missing input yields the cloud default.
-// Kept in sync with the inline copies in platform/extension/background.js
-// (separate script, not part of this bundle).
+// A scheme-less value ('ghe.example.com', 'localhost:8080', '//ghe.example.com')
+// defaults to https:// (TA-1): kept scheme-less, every link or API URL built
+// from it was RELATIVE to the extension page. Only '<scheme>://' counts as a
+// scheme, so 'host:port' is not mistaken for one.
+// The inline copies in platform/extension/background.js (separate script, not
+// part of this bundle) do NOT mirror this scheme default yet (follow-up); they
+// read the stored value, which the panel normalizes here before saving.
 function normalizeGitHubInstanceUrl(u) {
     var s = String(u || '').trim().replace(/\/+$/, '');
     if (!s) return 'https://github.com';
+    if (!/^[a-z][a-z0-9+.\-]*:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
     try {
         var p = new URL(s);
         s = p.protocol + '//' + p.host + p.pathname.replace(/\/+$/, '');
@@ -3168,6 +3294,34 @@ async function touchWorkspaceLastUsed(repo, usedAt) {
             tx.oncomplete = function() { resolve(found); };
             tx.onerror = function() { reject(tx.error || new Error('Failed to update workspace recency')); };
             tx.onabort = function() { reject(tx.error || new Error('Failed to update workspace recency')); };
+        } catch (e) { reject(e); }
+    });
+}
+
+// S8B-01: targeted read-modify-write of ONE workspace_meta row inside a single
+// readwrite tx - fields written concurrently by other callers survive.
+// mutator(current) may return false to skip the put. Resolves true iff written.
+async function patchWorkspaceMeta(repo, mutator) {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx, written = false;
+        try {
+            tx = database.transaction([workspaceMetaStoreName], 'readwrite');
+            var store = tx.objectStore(workspaceMetaStoreName);
+            var getReq = store.get(repo);
+            getReq.onsuccess = function() {
+                var current = getReq.result;
+                if (!current) return;
+                var r;
+                try { r = mutator(current); } catch (e) { try { tx.abort(); } catch (e2) {} return; }
+                if (r === false) return;
+                written = true;
+                store.put(current);
+            };
+            getReq.onerror = function() { try { tx.abort(); } catch (e) {} };
+            tx.oncomplete = function() { resolve(written); };
+            tx.onerror = function() { reject(tx.error || new Error('Failed to patch workspace meta')); };
+            tx.onabort = function() { reject(tx.error || new Error('Failed to patch workspace meta')); };
         } catch (e) { reject(e); }
     });
 }
@@ -3648,33 +3802,128 @@ function validateGitHubToken(token, instanceUrl) {
 // Deploy directory handle (File System Access API, extension only)
 var _deployDirHandle = null;
 
-async function getDeployDirHandle() {
-    if (_deployDirHandle) return _deployDirHandle;
-    try {
-        var database = await openDatabase();
-        var tx = database.transaction([settingsStoreName], 'readonly');
-        var store = tx.objectStore(settingsStoreName);
-        var request = store.get('deployDirHandle');
-        var result = await new Promise(function(r) { request.onsuccess = function() { r(request.result); }; request.onerror = function() { r(null); }; });
-        if (result && result.value) {
-            var perm = await result.value.requestPermission({ mode: 'readwrite' });
-            if (perm === 'granted') { _deployDirHandle = result.value; return _deployDirHandle; }
-        }
-    } catch (e) {}
-    return null;
+// S0B3-02: the persisted row, re-read on every call so a folder cleared or
+// replaced from another realm is noticed. Rejects on an IDB error.
+async function _readDeployDirRow() {
+    var database = await openDatabase();
+    var request = database.transaction([settingsStoreName], 'readonly').objectStore(settingsStoreName).get('deployDirHandle');
+    var result = await new Promise(function(resolve, reject) {
+        request.onsuccess = function() { resolve(request.result); };
+        request.onerror = function() { reject(request.error || new Error('deployDirHandle read failed')); };
+    });
+    return (result && result.value) || null;
 }
 
-async function setDeployDirHandle(handle) {
+// S0B3-02: readwrite permission of a stored handle, queried on EVERY call.
+// requestPermission (rejected without a user gesture) only when interactive.
+async function _deployDirPermissionOf(h, interactive) {
+    var p;
+    try { p = await h.queryPermission({ mode: 'readwrite' }); } catch (e) { p = 'denied'; }
+    if (p === 'prompt' && interactive && typeof h.requestPermission === 'function') {
+        try { p = await h.requestPermission({ mode: 'readwrite' }); } catch (e) { p = 'denied'; }
+    }
+    return p;
+}
+
+// S0B3-02: the connected handle, or null without a stored handle or a
+// readwrite grant (a grant revoked mid-session reads as disconnected).
+// TB-4: null does not say which; callers that must tell "no folder" from
+// "grant lapsed" (wsDeploy, the Settings button) ask getDeployDirStatus().
+// Passive by default — never prompts; { interactive: true } (only from a
+// user-gesture continuation) may show the browser permission prompt.
+async function getDeployDirHandle(opts) {
+    var h;
+    try { h = await _readDeployDirRow(); } catch (e) { h = _deployDirHandle; }
+    if (!h || typeof h.queryPermission !== 'function') { _deployDirHandle = null; return null; }
+    if ((await _deployDirPermissionOf(h, !!(opts && opts.interactive))) !== 'granted') { _deployDirHandle = null; return null; }
+    return (_deployDirHandle = h);
+}
+
+// S0B3-02: passive status for Settings (never prompts): { state: 'none' }
+// without a stored handle, else { state: 'granted'|'prompt'|'denied', name }.
+async function getDeployDirStatus() {
+    var h;
+    try { h = await _readDeployDirRow(); } catch (e) { h = _deployDirHandle; }
+    if (!h || typeof h.queryPermission !== 'function') return { state: 'none' };
+    return { state: await _deployDirPermissionOf(h, false), name: h.name };
+}
+
+// S0B-14: persist FIRST (withStore rejects on a failed/aborted commit —
+// setSetting would swallow it) and only then cache, so a failed persist
+// never looks connected. S0B3-01 (R-C4d #4): a boolean foreignOk writes the
+// consent row in the SAME transaction.
+async function setDeployDirHandle(handle, foreignOk) {
+    await withStore([settingsStoreName], 'readwrite', function(tx) {
+        tx.objectStore(settingsStoreName).put({ key: 'deployDirHandle', value: handle });
+        if (typeof foreignOk === 'boolean') tx.objectStore(settingsStoreName).put({ key: 'deployDirForeignOk', value: foreignOk });
+    });
     _deployDirHandle = handle;
-    await setSetting('deployDirHandle', handle);
 }
 
+// S0B3-04: explicit user Disconnect — deletes ONLY the extension's own
+// stored folder reference (the folder on disk is untouched), then drops the
+// cache. Other realms re-read the row (S0B3-02), so it propagates.
+// S0B3-01: the foreign-folder consent row goes with it.
+async function clearDeployDirHandle() {
+    await withStore([settingsStoreName], 'readwrite', function(tx) {
+        tx.objectStore(settingsStoreName).delete('deployDirHandle');
+        tx.objectStore(settingsStoreName).delete('deployDirForeignOk');
+    });
+    _deployDirHandle = null;
+}
+
+// S0B-14: only a user cancel (AbortError) returns null; any other picker or
+// persist error propagates so the caller can report it.
 async function pickDeployDir() {
+    var handle;
     try {
-        var handle = await window.showDirectoryPicker({ id: 'appagent-deploy-dir', mode: 'readwrite' });
-        await setDeployDirHandle(handle);
-        return handle;
-    } catch (e) { return null; }
+        handle = await window.showDirectoryPicker({ id: 'appagent-deploy-dir', mode: 'readwrite' });
+    } catch (e) {
+        if (e && e.name === 'AbortError') return null;
+        throw e;
+    }
+    // S0B3-01: deploy overwrites the folder's root files and prunes stale
+    // ones (icons/), so a folder that does not look like an AppAgent build
+    // needs an explicit confirm; cancel stores nothing.
+    var info = {};
+    var ident = await checkDeployDirIdentity(handle, info);
+    // R-C4d #3: both names are untrusted text inside the confirm's HTML.
+    var esc = function(s) { s = String(s); return typeof escapeHtml === 'function' ? escapeHtml(s) : s.replace(/[&<>"']/g, function(c) { return '&#' + c.charCodeAt(0) + ';'; }); };
+    if (ident === 'foreign' && !(await showConfirmModal('Use this folder?',
+        'The folder "' + esc(handle.name || '?') + '" does not look like an AppAgent build (manifest: "' + esc(info.name || 'none') + '"). ' +
+        'Deploy and Reload overwrite its root files (manifest.json, app.html, ...) and delete files in its icons/ folder that are not part of the build. Use it anyway?',
+        'danger'))) return null;
+    // R-C4d #1: an EMPTY folder is consented too — the build's icons/ deploy
+    // makes it non-empty (still no manifest) before the root deploy re-checks.
+    await setDeployDirHandle(handle, ident === 'foreign' || ident === 'empty');
+    return handle;
+}
+
+// S0B3-01: read-only identity probe of a deploy folder (never writes; reads
+// only manifest.json). 'unknown' = no API to tell (callers proceed), 'empty',
+// 'match' (same manifest key, else same name, else — only when manifest.json
+// is missing, unparseable or nameless — the sw-bundle.js + app.html build
+// markers) or 'foreign'. info.name = the folder manifest name.
+async function checkDeployDirIdentity(handle, info) {
+    info = info || {};
+    if (!handle || typeof handle.entries !== 'function' || typeof handle.getFileHandle !== 'function') return 'unknown';
+    if (typeof chrome === 'undefined' || !chrome || !chrome.runtime || typeof chrome.runtime.getManifest !== 'function') return 'unknown';
+    var any = false;
+    for await (var _entry of handle.entries()) { any = true; break; }
+    if (!any) return 'empty';
+    var own = chrome.runtime.getManifest() || {}, theirs = null;
+    try {
+        var mf = await (await handle.getFileHandle('manifest.json')).getFile();
+        theirs = JSON.parse(await mf.text());
+    } catch (e) { theirs = null; }
+    if (theirs && typeof theirs.name === 'string') info.name = theirs.name;
+    if (theirs && own.key && theirs.key) return own.key === theirs.key ? 'match' : 'foreign';
+    if (theirs && own.name && theirs.name === own.name) return 'match';
+    // R-C4d #2: an explicit manifest-name mismatch stays 'foreign'.
+    if (theirs && typeof theirs.name === 'string' && theirs.name) return 'foreign';
+    async function has(n) { try { await handle.getFileHandle(n); return true; } catch (e) { return false; } }
+    if ((await has('sw-bundle.js')) && (await has('app.html'))) return 'match';
+    return 'foreign';
 }
 
 // ═══ FLUX-6 (dual-realm persister): chat-row field ownership ═══════════

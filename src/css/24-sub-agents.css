@@ -488,6 +488,8 @@
 .worker-dot-sleeping { background: var(--text-muted, #8a93a6); }
 .worker-dot-stopped  { background: var(--text-muted, #6b7280); }
 .worker-dot-errored  { background: var(--danger, #cf222e); }
+/* B1: waiting for a pool slot — hollow, no pulse (not running yet). */
+.worker-dot-queued   { background: transparent; border: 1px dashed var(--text-muted, #8a93a6); box-sizing: border-box; }
 @keyframes worker-pulse {
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.45; }
@@ -555,6 +557,8 @@
 .worker-card.worker-running .worker-state { color: var(--success, #2da44e); }
 .worker-card.worker-errored { border-color: var(--danger, #cf222e); }
 .worker-card.worker-errored .worker-state { color: var(--danger, #cf222e); }
+.worker-card.worker-queued { border-style: dashed; border-color: var(--text-muted, #8a93a6); }
+.worker-card.worker-queued .worker-state { color: var(--text-muted, #8a93a6); font-style: italic; }
 .worker-card-wrap[data-depth="2"] { margin-left: 10px; }
 .worker-card-wrap[data-depth="3"] { margin-left: 20px; }
 .worker-card-icon {
@@ -682,7 +686,7 @@
 
 /* ---------- Worker chat-view modal ----------
    Variant class on the global #modal-overlay (same pattern as
-   .skill-asset-modal / .request-body-modal in 14-modals.css). The body
+   .skill-asset-modal in 14-modals.css). The body
    hosts the renderSubReport card, so give it room and its own scrollbar. */
 .modal-overlay.worker-chat-modal .modal-dialog { max-width: 760px; width: 92%; max-height: 85vh; display: flex; flex-direction: column; }
 .modal-overlay.worker-chat-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6, 12px); }
@@ -1140,12 +1144,17 @@
     background: var(--bg-hover, #e7e9ee);
     color: var(--text-muted, #6b7280);
 }
-.sub-notice-final.sub-report-done       .sub-notice-badge { background: var(--success, #2da44e); color: #fff; }
-.sub-notice-final.sub-report-error      .sub-notice-badge { background: var(--danger, #cf222e);  color: #fff; }
+/* Filled status pills: theme tokens only, >= 4.5:1 text contrast in BOTH
+   themes (test/sub-notice-dark-contrast.test.js). White text on the
+   light-theme fills; the dark theme's fills are light tints, so the text
+   flips to the dark surface token there. */
+.sub-notice-final.sub-report-done       .sub-notice-badge { background: var(--success-hover); color: #fff; }
+.sub-notice-final.sub-report-error      .sub-notice-badge { background: var(--danger);  color: #fff; }
 .sub-notice-final.sub-report-need_input .sub-notice-badge,
-.sub-notice-final.sub-report-waiting    .sub-notice-badge { background: var(--warning, #bf8700); color: #fff; }
+.sub-notice-final.sub-report-waiting    .sub-notice-badge { background: var(--warning-dark); color: #fff; }
 .sub-notice-final.sub-report-cancelled  .sub-notice-badge,
-.sub-notice-final.sub-report-partial    .sub-notice-badge { background: var(--text-muted, #8a93a6); color: #fff; }
+.sub-notice-final.sub-report-partial    .sub-notice-badge { background: var(--text-secondary); color: #fff; }
+:root[data-theme="dark"] .sub-notice-final .sub-notice-badge { color: var(--bg-white); }
 .sub-notice-mid .sub-notice-badge,
 .sub-notice-inbound .sub-notice-badge {
     background: transparent;
@@ -1221,7 +1230,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--text, #24292f);
+    /* Was var(--text, #24292f): --text is not a defined token, so the
+       near-black fallback applied in the DARK theme too (dark-on-dark). */
+    color: var(--text-primary);
+}
+/* <summary> is focusable: no ring after a mouse click, a themed ring for
+   keyboard focus (was the UA default ring hugging the preview line). */
+.sub-notice-collapse summary:focus:not(:focus-visible) { outline: none; }
+.sub-notice-collapse summary:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm, 4px);
 }
 .sub-notice-collapse-more {
     flex-shrink: 0;
@@ -1238,7 +1257,10 @@
     padding: var(--space-3, 6px) var(--space-4, 8px);
     max-height: 240px;
     overflow-y: auto;
-    background: var(--bg, #fff);
+    /* Was var(--bg, #fff): --bg is not a defined token, so the box stayed
+       WHITE in the dark theme under inherited light text. */
+    background: var(--bg-white);
+    color: var(--text-primary);
     border: 1px dashed var(--border, #e1e4ea);
     border-radius: var(--radius-sm, 4px);
     font-family: var(--font-mono, ui-monospace, monospace);

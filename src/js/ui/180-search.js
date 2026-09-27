@@ -31,6 +31,9 @@ function chatMatchesSearch(chat, query) {
 
 var chatSearchDebounceTimer = null;
 var lastSearchQuery = ''; // Cache to avoid redundant searches
+// A1C-01: cancel a pending debounced search so a clear (or retyping back to the
+// committed query) can't be overwritten by a stale timer firing afterwards.
+function _cancelSearchDebounce() { if (chatSearchDebounceTimer) { clearTimeout(chatSearchDebounceTimer); chatSearchDebounceTimer = null; } }
 
 // Global search - searches chats, skills, tools, widgets
 function handleGlobalSearch(e) {
@@ -46,15 +49,14 @@ function handleGlobalSearch(e) {
         }
     }
     
+    // Debounce the actual search: cancel any pending timer BEFORE the unchanged-
+    // query early return, so a/ab/a within 250 ms doesn't commit the stale 'ab'.
+    _cancelSearchDebounce();
     // Skip if query hasn't changed
     if (value === lastSearchQuery) return;
     
-    // Debounce the actual search
-    if (chatSearchDebounceTimer) {
-        clearTimeout(chatSearchDebounceTimer);
-    }
-    
     chatSearchDebounceTimer = setTimeout(function() {
+        chatSearchDebounceTimer = null;
         // Query emptied by typing (not via the clear button) while message
         // highlights are showing — route through clearGlobalSearch, the ONE
         // render site in this file that drops the stale highlights (write-site
@@ -72,6 +74,7 @@ function handleGlobalSearch(e) {
 }
 
 function clearGlobalSearch() {
+    _cancelSearchDebounce();
     chatSearchQuery = '';
     lastSearchQuery = ''; // Reset cache
     var input = document.getElementById('chat-search-input');
@@ -419,6 +422,13 @@ function renderChatItem(c) {
     var pinIcon = c.pinned ? '<span class="pin-icon" title="Pinned">' + UI_ICONS.pinFilled + '</span>' : '';
     var pinLabel = c.pinned ? 'Unpin Chat' : 'Pin Chat';
     var dropdownId = 'chat-dropdown-' + c.id;
+    // R3b-b: a data id so chatItemKeydown can refocus this chat's row after
+    // selectChat() re-renders the list. R3b-a: the role="button" row is named by
+    // its title (otherwise its name is all of its text: snippets, count, menu).
+    var rowAttrs = ' data-chat-id="' + escapeAttr(c.id) + '"';
+    // '=' is entity-encoded too, so a title ending in " onclick=" cannot make the CSP
+    // polyfill's inline-handler rewrite match inside this attribute (R3b-a fixup).
+    rowAttrs += ' aria-label="' + escapeAttr(c.title).replace(/=/g,'&#61;') + '"';
     
     // Show all snippets when searching, otherwise show title.
     // NOTE: search-mode rendering deliberately omits the streaming/pending/attention
@@ -430,6 +440,9 @@ function renderChatItem(c) {
     if (chatSearchQuery) {
         var matches = findAllSearchMatches(c, chatSearchQuery);
         searchMatchesCache[c.id] = matches; // Cache for click handling
+        // A chat admitted by its title alone has 0 message hits: label it
+        // "(title match)" instead of a misleading "(0 matches)".
+        var titleHit = !matches.length && !!c.title && c.title.toLowerCase().indexOf(chatSearchQuery.toLowerCase()) !== -1;
         
         var snippetsHtml = '';
         matches.forEach(function(match, idx) {
@@ -447,7 +460,7 @@ function renderChatItem(c) {
         // Title row with menu button
         var titleRow = '<div class="chat-result-title-row">' +
             pinIcon +
-            '<div class="chat-result-title">' + escapeHtml(c.title) + ' <span class="match-count">(' + matches.length + ' match' + (matches.length !== 1 ? 'es' : '') + ')</span></div>' +
+            '<div class="chat-result-title">' + escapeHtml(c.title) + ' <span class="match-count">' + (matches.length ? '(' + matches.length + ' match' + (matches.length !== 1 ? 'es' : '') + ')' : (titleHit ? '(title match)' : '')) + '</span></div>' +
             '<div class="chat-menu-wrapper">' +
             '<button class="chat-menu-btn" onclick="event.stopPropagation(); toggleChatDropdown(\'' + dropdownId + '\')" title="More options">···</button>' +
             '<div class="chat-dropdown" id="' + dropdownId + '">' +
@@ -472,7 +485,9 @@ function renderChatItem(c) {
             '<div class="chat-result-snippets">' + snippetsHtml + '</div>' +
         '</div>';
         
-        return '<div class="chat-item ' + active + ' searching">' + displayContent + '</div>';
+        // The whole row opens the chat (title-only matches have no snippet to
+        // click); snippet/menu clicks stopPropagation so they don't also fire it.
+        return '<div class="chat-item ' + active + ' searching" role="button" tabindex="0"' + rowAttrs + (active ? ' aria-current="true"' : '') + ' onclick="selectChat(\'' + c.id + '\')" onkeydown="chatItemKeydown(event,this,\'' + c.id + '\')">' + displayContent + '</div>';
     } else {
         var hasApproval = chatHasPendingApproval(c.id);
         var attentionIndicator = hasApproval ? '<span class="chat-attention-dot" title="Requires permission"></span>' : '';
@@ -499,7 +514,7 @@ function renderChatItem(c) {
         displayContent = attentionIndicator + streamingIndicator + pendingIndicator + actionBadge + '<span class="chat-title">' + escapeHtml(c.title) + '</span>' + subAgentBreadcrumb;
     }
 
-    return '<div class="chat-item ' + active + '" onclick="selectChat(\'' + c.id + '\')">'+
+    return '<div class="chat-item ' + active + '" role="button" tabindex="0"' + rowAttrs + (active ? ' aria-current="true"' : '') + ' onclick="selectChat(\'' + c.id + '\')" onkeydown="chatItemKeydown(event,this,\'' + c.id + '\')">'+
         pinIcon +
         displayContent +
         '<div class="chat-menu-wrapper">' +
@@ -513,6 +528,27 @@ function renderChatItem(c) {
         '</div>' +
         '</div>' +
     '</div>';
+}
+
+// Keyboard activation for chat rows (role="button" tabindex="0"): Enter/Space
+// open the chat. Keys from focusable children (the menu button) are ignored and
+// other keys (Tab) pass through untouched. Wired as a single inline call, which
+// the CSP polyfill supports (no inline if-block, no unconditional preventDefault).
+function chatItemKeydown(e, row, id) {
+    if (e.target !== row) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    selectChat(id);
+    // R3b-b: selectChat() rebuilds #chat-list (innerHTML), detaching this row and
+    // dropping focus to BODY. Refocus the re-rendered row for this chat unless focus
+    // moved elsewhere (focus() is a no-op while the list is display:none).
+    var ae = document.activeElement;
+    if (ae && ae !== document.body) return;
+    var list = document.getElementById('chat-list');
+    var rows = list ? list.querySelectorAll('.chat-item[data-chat-id]') : [];
+    for (var i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-chat-id') === id) { rows[i].focus(); return; }
+    }
 }
 
 // Handle click on search snippet

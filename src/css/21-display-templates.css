@@ -139,3 +139,12 @@ th.sorted .display-sort-arrow { opacity: 1; }
 .display-diff-del { background: var(--danger-lighter); }
 .display-diff-del .display-diff-content { color: var(--danger); }
 .display-diff-ctx .display-diff-content { color: var(--text-muted); }
+
+/* S0B4-02: standalone ?doc= tab */
+body.sdoc-standalone { max-width: 900px; margin: 40px auto; padding: 20px; line-height: 1.6; height: auto; overflow: auto; }
+@media print {
+  body.sdoc-standalone { margin: 0; padding: 0; max-width: none; }
+  .sdoc-standalone .code-block.collapsed { max-height: none; overflow: visible; }
+  .sdoc-standalone .display-card-detail, .sdoc-standalone .display-tl-detail { display: block; }
+  .sdoc-standalone .code-block-expand-btn, .sdoc-standalone .code-copy-btn, .sdoc-standalone .display-code-copy { display: none; }
+}

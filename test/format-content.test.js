@@ -17,6 +17,10 @@ var stubs = [
   "var UI_ICONS = { copy: 'C' };",
   "function renderDisplayPlaceholder(id){ return '[DSP]'; }",
   "function renderDocumentPlaceholder(id){ return '[DOC]'; }",
+  // decorateIdMentions (A6B2-01 checks below) emits chips via escapeAttr and
+  // resolves a friendly name through getWidgetById (TOOLS tier, not loaded).
+  'function escapeAttr(t){ return escapeHtml(t); }',
+  'function getWidgetById(){ return null; }',
   'var window = { currentSearchHighlight: null };'
 ].join('\n');
 var api = new Function(stubs + '\n' + emojiSrc + '\n' + fcSrc + '\nreturn { formatContent: formatContent, replaceEmojiShortcodes: replaceEmojiShortcodes };')();
@@ -66,4 +70,40 @@ describe('format-content', function() {
   // 12. shortcode inside markdown link text/url untouched
   var r12 = fc('[x :bug: y](https://ex.com/:bug:/z)');
   check('link href protected', r12.indexOf('https://ex.com/:bug:/z') >= 0, r12);
+
+  // 13. A6B2-01 — widget-id mentions chip for current ids (widget_ + the
+  // lowercase SHA-256 hex of the op id) as well as legacy generateWidgetId ids.
+  // Every check also needs a 64-hex chip, so each one fails on the legacy-only regex.
+  var H64 = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+  function widgetChips(h) { return (h.match(/class="id-mention id-mention-widget"/g) || []).length; }
+  function opens(h, id) { return h.indexOf("openWidgetMention('" + id + "', event)") >= 0; }
+  test('A6B2-01 64-hex widget id becomes a chip', function() {
+    assert.strictEqual(H64.length, 64);
+    var h = fc('open widget_' + H64);
+    assert.strictEqual(widgetChips(h), 1, h.slice(0, 400));
+    assert.ok(opens(h, 'widget_' + H64), h.slice(0, 400));
+  }, { tags: ['unit'] });
+  test('A6B2-01 legacy and 64-hex widget ids both chip', function() {
+    var h = fc('old widget_1788610000000_abc and new widget_' + H64);
+    assert.strictEqual(widgetChips(h), 2, h.slice(0, 600));
+    assert.ok(opens(h, 'widget_1788610000000_abc') && opens(h, 'widget_' + H64), h.slice(0, 600));
+  }, { tags: ['unit'] });
+  test('A6B2-01 63/65-hex runs never chip (the 64-hex one does)', function() {
+    var h = fc('short widget_' + H64.slice(1) + ' long widget_' + H64 + 'f ok widget_' + H64);
+    assert.strictEqual(widgetChips(h), 1, h.slice(0, 600));
+    assert.ok(opens(h, 'widget_' + H64), h.slice(0, 600));
+    assert.ok(h.indexOf('widget_' + H64 + 'f') >= 0 && !opens(h, 'widget_' + H64 + 'f'), 'the 65-hex run stays plain text');
+    assert.ok(!opens(h, 'widget_' + H64.slice(1)), 'the 63-hex run stays plain text');
+  }, { tags: ['unit'] });
+  test('A6B2-01 a backticked 64-hex id stays inline code (the bare one chips)', function() {
+    var h = fc('code `widget_' + H64 + '` vs bare widget_' + H64);
+    assert.strictEqual(widgetChips(h), 1, h.slice(0, 600));
+    assert.ok(h.indexOf('<code class="inline-code">widget_' + H64 + '</code>') >= 0, h.slice(0, 600));
+  }, { tags: ['unit'] });
+  test('A6B2-01 a 64-hex id inside a chrome-extension URL never chips (the bare one does)', function() {
+    var url = 'chrome-extension://x/app.html?w=widget_' + H64;
+    var h = fc('link ' + url + ' and widget_' + H64);
+    assert.strictEqual(widgetChips(h), 1, h.slice(0, 600));
+    assert.ok(h.indexOf(url + ' and ') >= 0, 'URL restored verbatim, no chip spliced in: ' + h.slice(0, 600));
+  }, { tags: ['unit'] });
 });

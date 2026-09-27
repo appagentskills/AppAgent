@@ -303,8 +303,16 @@ async function executeGetFile(args) {
             '<script>' +
             'function doDownload(){' +
             'var b=document.querySelector(".dl-b");b.textContent="Opening...";b.disabled=true;' +
-            'window.parent.postMessage({type:"widgetDownload",fileId:"' + _dlIdEsc + '",name:"' + _dlFnEsc + '"},"*");' +
-            'setTimeout(function(){b.textContent="\u2705 Sent";},300);' +
+            // The parent (ui/070-dashboard-ui.js) acks {type:"widgetDownloadResult",
+            // reqId,ok,error}: show the real outcome, and re-enable the button on
+            // failure or when no ack arrives within 5 s.
+            'var rq="d"+Date.now(),done=false,t;' +
+            'function fin(){done=true;clearTimeout(t);window.removeEventListener("message",onAck);}' +
+            'function onAck(e){if(done||!e.data||e.data.type!=="widgetDownloadResult"||e.data.reqId!==rq)return;fin();' +
+            'if(e.data.ok){b.textContent="\u2705 Opened";}else{b.textContent="\u26A0 Failed, retry";b.disabled=false;}}' +
+            'window.addEventListener("message",onAck);' +
+            't=setTimeout(function(){if(done)return;fin();b.textContent="\u2B07 Download";b.disabled=false;},5000);' +
+            'window.parent.postMessage({type:"widgetDownload",reqId:rq,fileId:"' + _dlIdEsc + '",name:"' + _dlFnEsc + '"},"*");' +
             '}' +
             '<\/script>';
 

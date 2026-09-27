@@ -59,6 +59,33 @@ function _settleAllPendingRunAgents() {
     });
 }
 
+// CHAT-CONTROLS HOLD (RC1): the bus disconnect wipes runningChatIds with no terminal
+// event, and the hello down-reconcile drops ids the SW may re-add within the REG-F1
+// grace. A held chat keeps deriving as running (app/020 _chatControlsState reads
+// isChatControlsHeld) so its Pause button neither vanishes nor flips to Continue
+// until one of: its own runStarted/runFinished/runCrashed, a hello listing it, the
+// hello grace decision, or the no-hello safety timer (BUS_HELLO_SAFETY_MS). No timer
+// of its own: the grace and no-hello timers bound every hold. Idempotent.
+var _chatControlsHeld = {};
+function isChatControlsHeld(chatId) { return !!(chatId && _chatControlsHeld[chatId] === true); }
+function _holdChatControls(chatId) { if (chatId) _chatControlsHeld[chatId] = true; }
+function _repaintDisplayedChatControls() {
+    if (typeof syncChatControlsUI !== 'function') return;
+    try { syncChatControlsUI(typeof currentChatId !== 'undefined' ? currentChatId : null); } catch (e) {}
+}
+function _releaseChatControlsHold(chatId, noRepaint) {
+    if (!chatId || _chatControlsHeld[chatId] !== true) return false;
+    delete _chatControlsHeld[chatId];
+    if (!noRepaint) _repaintDisplayedChatControls();
+    return true;
+}
+function _releaseAllChatControlsHolds() {
+    var ids = Object.keys(_chatControlsHeld);
+    ids.forEach(function(cid) { delete _chatControlsHeld[cid]; });
+    if (ids.length) _repaintDisplayedChatControls();
+    return ids.length > 0;
+}
+
 // REG-F1: deferred hello orphan reconcile. The SW's hello is posted
 // synchronously at port connect — BEFORE resumeRunningCheckpoints re-arms
 // checkpointed runs (gated on _swResumeGate ≈1.5s after the first panel-hello)
@@ -76,7 +103,7 @@ function _settleAllPendingRunAgents() {
 // reconciling, covering slow cold boots where the unbounded resume gate chain
 // outlives the first grace window.
 var _helloGraceTimer = null;
-var _helloGraceState = null; // { orphans: { cid: pendingEntry }, cleanups: { cid: true }, rearms?: number }
+var _helloGraceState = null; // { orphans: { cid: pendingEntry }, cleanups: { cid: true }, holds: { cid: true }, rearms?: number }
 var HELLO_SETTLE_GRACE_MS = 3000;
 // REG-AUDIT-2: extra grace when the SW hasn't reported its resume scan as
 // settled by the time the first window expires. The SW's
@@ -101,12 +128,13 @@ function _cancelHelloGraceReconcile() {
     _helloGraceState = null;
 }
 
-function _armHelloGraceReconcile(orphans, cleanups) {
+function _armHelloGraceReconcile(orphans, cleanups, holds) {
     // One timer only — a fresh hello supersedes any pending reconcile (its
     // candidate sets are stale relative to the newer authoritative snapshot).
     _cancelHelloGraceReconcile();
-    if (!Object.keys(orphans).length && !Object.keys(cleanups).length) return;
-    _helloGraceState = { orphans: orphans, cleanups: cleanups };
+    holds = holds || {};
+    if (!Object.keys(orphans).length && !Object.keys(cleanups).length && !Object.keys(holds).length) return;
+    _helloGraceState = { orphans: orphans, cleanups: cleanups, holds: holds };
     // REG-AUDIT-2/REG376-3: named so the callback can re-arm itself (up to
     // HELLO_SETTLE_RESUME_MAX_REARMS times) when the SW's resume scan hasn't
     // settled yet (slow cold boot). The one-timer invariant holds: re-arm
@@ -127,6 +155,13 @@ function _armHelloGraceReconcile(orphans, cleanups) {
             _helloGraceTimer = setTimeout(_helloGraceFire, HELLO_SETTLE_RESUME_EXTRA_MS);
             return;
         }
+        // CHAT-CONTROLS HOLD: the grace decision ends the hold of every chat the
+        // hello did not list. Released BEFORE the orphan/cleanup loops so the
+        // _cleanupStaleForegroundRun repaint derives from the final state.
+        var _holdsReleased = false;
+        Object.keys(st.holds || {}).forEach(function(cid) {
+            if (_releaseChatControlsHold(cid, true)) _holdsReleased = true;
+        });
         Object.keys(st.orphans).forEach(function(cid) {
             // Re-check 1: the run came back — the SW resumed it from checkpoint
             // (runStarted re-added the id) or processed a gap-posted run-agent.
@@ -154,6 +189,7 @@ function _armHelloGraceReconcile(orphans, cleanups) {
             if (runningChatIds[cid]) return;
             _cleanupStaleForegroundRun(cid);
         });
+        if (_holdsReleased) _repaintDisplayedChatControls();
     }
     _helloGraceTimer = setTimeout(_helloGraceFire, HELLO_SETTLE_GRACE_MS);
 }
@@ -166,6 +202,8 @@ function _armHelloGraceReconcile(orphans, cleanups) {
 // stale isRunning/activeStreamingChatId).
 function _cleanupStaleForegroundRun(chatId) {
     if (!chatId) return;
+    // CHAT-CONTROLS HOLD: the run is declared gone; the derive below repaints.
+    _releaseChatControlsHold(chatId, true);
     try {
         // The run evaporated WITHOUT a terminal runFinished event (SW restart /
         // reconnect flap). The grace reconcile already re-checked that the chat is
@@ -185,8 +223,12 @@ function _cleanupStaleForegroundRun(chatId) {
         if (typeof currentChatId !== 'undefined' && chatId === currentChatId) {
             var _staleMsgsEl = document.getElementById('messages');
             if (_staleMsgsEl) _staleMsgsEl.classList.remove('is-streaming');
-            if (typeof hidePauseButton === 'function') { try { hidePauseButton(); } catch (e) {} }
-            if (typeof refreshContinueButtonForChat === 'function') { try { refreshContinueButtonForChat(chatId); } catch (e) {} }
+            // CHAT-CONTROLS SSOT: one derive (app/020) instead of raw hide + refresh.
+            if (typeof syncChatControlsUI === 'function') { try { syncChatControlsUI(chatId); } catch (e) {} }
+            else {
+                if (typeof hidePauseButton === 'function') { try { hidePauseButton(); } catch (e) {} }
+                if (typeof refreshContinueButtonForChat === 'function') { try { refreshContinueButtonForChat(chatId); } catch (e) {} }
+            }
             if (typeof renderMessages === 'function') { try { renderMessages(); } catch (e) {} }
         }
         if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
@@ -324,9 +366,13 @@ function _openAgentBus() {
         // SW-side run-agent handler is idempotent (guards on its own runningChatIds @:222)
         // so a Retry that re-posts during the gap can't double-run a still-live SW loop.
         try {
-            Object.keys(runningChatIds).forEach(function(cid) { delete runningChatIds[cid]; });
+            // CHAT-CONTROLS HOLD: no terminal event arrived, so each wiped chat keeps
+            // its Pause button until a hello / its own run event / the grace or
+            // no-hello timer decides (see _chatControlsHeld).
+            Object.keys(runningChatIds).forEach(function(cid) { _holdChatControls(cid); delete runningChatIds[cid]; });
         } catch (e) {}
         if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
+        _repaintDisplayedChatControls();
         // SWM-S2: do NOT settle _pendingRunAgents here. On a transient flap the SW
         // keeps streaming, and resolving now returns `await runAgent()` callers
         // mid-run (widget spinners die, summarize finalizes early). The promises
@@ -340,6 +386,9 @@ function _openAgentBus() {
         if (_busHelloSafetyTimer) { try { clearTimeout(_busHelloSafetyTimer); } catch (e) {} }
         _busHelloSafetyTimer = setTimeout(function() {
             _busHelloSafetyTimer = null;
+            // CHAT-CONTROLS HOLD: the SW never came back — end every hold (and
+            // repaint) BEFORE the foreground cleanup below re-derives.
+            _releaseAllChatControlsHolds();
             // DRLM-B2: the SW never came back — no hello, no runFinished. Clear
             // the stale foreground streaming UI (same cleanup the hello
             // reconcile performs) before settling, or the pause button /
@@ -812,10 +861,14 @@ function _handleAgentBusMessage(msg) {
             // to do the same so renderChatList sees the cleared state.
             if (msg.eventType === 'runStarted' && msg.detail && msg.detail.chatId) {
                 runningChatIds[msg.detail.chatId] = true;
+                // CHAT-CONTROLS HOLD: the chat's own run event ends its hold (before
+                // the AgentEvents.emit below, where app/036 paints).
+                _releaseChatControlsHold(msg.detail.chatId);
             }
             if ((msg.eventType === 'runFinished' || msg.eventType === 'runCrashed') &&
                 msg.detail && msg.detail.chatId) {
                 delete runningChatIds[msg.detail.chatId];
+                _releaseChatControlsHold(msg.detail.chatId);
                 // SWM14-F5 cleanup: prune the per-chat pause/interrupt latest-wins token
                 // maps on terminal run end so they don't grow unbounded across many chats.
                 // Skip a pause-induced finish (reason 'paused') — a pushPauseToggleToOffscreen
@@ -944,6 +997,9 @@ function _handleAgentBusMessage(msg) {
                 msg.runningChatIds.forEach(function(cid) { _helloRunning[cid] = true; });
                 Object.keys(runningChatIds).forEach(function(cid) {
                     if (!_helloRunning[cid]) {
+                        // CHAT-CONTROLS HOLD: no Continue flash while REG-F1 grace
+                        // decides whether the SW resumes it.
+                        _holdChatControls(cid);
                         delete runningChatIds[cid];
                         // SWM-S3/REG-F1: no runFinished may ever come for this chat —
                         // but the SW may equally be about to resume it from checkpoint
@@ -955,7 +1011,11 @@ function _handleAgentBusMessage(msg) {
                 });
                 msg.runningChatIds.forEach(function(cid) {
                     runningChatIds[cid] = true;
+                    _releaseChatControlsHold(cid, true);
                 });
+                // CHAT-CONTROLS (RC1): repaint the displayed chat against the
+                // reconciled running set (a chat selected before this hello).
+                _repaintDisplayedChatControls();
                 if (typeof _syncKeepAwakeRuns === 'function') _syncKeepAwakeRuns();
                 if (typeof renderChatList === 'function') renderChatList();
                 // Reopening the panel while a background chat runs must also
@@ -994,7 +1054,12 @@ function _handleAgentBusMessage(msg) {
                        typeof currentChatId !== 'undefined' && currentChatId && !_helloLive[currentChatId]) {
                 _helloCleanups[currentChatId] = true;
             }
-            _armHelloGraceReconcile(_helloOrphans, _helloCleanups);
+            // CHAT-CONTROLS HOLD: chats still held (wiped at disconnect, or dropped
+            // by the down-loop above) that this hello does not list: the grace
+            // decision releases them.
+            var _helloHolds = {};
+            Object.keys(_chatControlsHeld).forEach(function(cid) { if (!_helloLive[cid]) _helloHolds[cid] = true; });
+            _armHelloGraceReconcile(_helloOrphans, _helloCleanups, _helloHolds);
             // Install initial sub-agent snapshot. The page's own
             // loadAllSubAgents at boot rehydrates from IDB so the strip
             // can paint before the SW connects, but the SW is the
@@ -1126,7 +1191,8 @@ function _handleAgentBusMessage(msg) {
             // registry helper, which fires the page's _notifyListeners
             // so the workers strip + chat list re-render.
             if (typeof SubAgents !== 'undefined' && SubAgents.applySnapshot) {
-                SubAgents.applySnapshot(msg.records || []);
+                // B1: pass the pool so queued subs render as queued.
+                SubAgents.applySnapshot(msg.records || [], msg.pool || null);
             }
             return;
 
@@ -1891,7 +1957,10 @@ function _applyChatMetaChangedFromSW(chatId, fields) {
     // apply (echo, cross-panel change, reconnect snapshot — where a null
     // flag means "no opinion recorded" and reads as unpaused).
     if (fields.pausedByUser !== undefined && typeof pausedChats !== 'undefined') pausedChats[chatId] = fields.pausedByUser === true;
-    return _applyChatMetaFields(chats[chatId], fields);
+    var _metaChanged = _applyChatMetaFields(chats[chatId], fields);
+    // CHAT-CONTROLS (RC3): relabel Pause/Resume after the apply (the derive also reads the lane's _lastApiError).
+    if (fields.pausedByUser !== undefined && typeof currentChatId !== 'undefined' && chatId === currentChatId) _repaintDisplayedChatControls();
+    return _metaChanged;
 }
 // FLUX-H4: shared repaint half (chat list + jobs badge + open jobs dropdown)
 // — the exact surfaces the seven lane fields feed.
@@ -1936,6 +2005,8 @@ function dispatchChatMeta(chatId, fields) {
     // chats[chatId]: the pre-lane helper updated the cache even for a record
     // this panel doesn't hold.
     if (clean.pausedByUser !== undefined && typeof pausedChats !== 'undefined') pausedChats[chatId] = clean.pausedByUser === true;
+    // CHAT-CONTROLS (RC3): relabel Pause/Resume for the displayed chat.
+    if (clean.pausedByUser !== undefined && typeof currentChatId !== 'undefined' && chatId === currentChatId) _repaintDisplayedChatControls();
     if (!_agentBusPort) { _queueChatMetaPatch(chatId, clean); return; }
     try {
         _agentBusPort.postMessage({ type: 'chat-meta-update', chatId: chatId, fields: clean });

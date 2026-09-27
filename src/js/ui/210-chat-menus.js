@@ -103,6 +103,9 @@ function confirmRenameChat(chatId) {
         }
         renderChatList();
         if (chatId === currentChatId) updateChatTitleHeader();
+        if (typeof currentView !== 'undefined' && currentView === 'history' && typeof renderHistoryPage === 'function') {
+            try { renderHistoryPage(); } catch (e) {} // A7B-02
+        }
         showSnackbar('Chat renamed', 'success');
     }
     
@@ -113,28 +116,42 @@ function confirmRenameChat(chatId) {
 async function downloadChat(chatId) {
     var chat = chats[chatId];
     if (!chat) return;
-    // MEMFIX: rehydrate evicted base64 payloads so the export is complete.
-    if (typeof ensureChatPayloads === 'function') {
-        try { await ensureChatPayloads(chatId); } catch (e) {}
+    // S0B-15: report any failure (non-string title, serialisation, Blob/URL) as an
+    // error snackbar instead of an unhandled rejection with no feedback, warn when
+    // payloads could not be restored, and export the chat without its transient
+    // '_' fields (the record shape a put would persist).
+    try {
+        var payloadsOk = true;
+        // MEMFIX: rehydrate evicted base64 payloads so the export is complete.
+        if (typeof ensureChatPayloads === 'function') {
+            try { await ensureChatPayloads(chatId); } catch (e) { payloadsOk = false; }
+        }
+        // TB-6: the await can swap in a fresh record for this id, so export the
+        // object in the map now, not the one captured before the await.
+        chat = chats[chatId] || chat;
+        if (chat._payloadsEvicted) payloadsOk = false;
+
+        var exportData = {
+            exportType: 'single_chat',
+            exportDate: new Date().toISOString(),
+            chat: typeof stripTransientChatFieldsForPut === 'function' ? stripTransientChatFieldsForPut(chat) : chat
+        };
+
+        var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'chat_' + String(chat.title || 'chat').replace(/[^a-z0-9]/gi, '_').substring(0, 30) + '_' + new Date().toISOString().slice(0, 10) + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        if (payloadsOk) showSnackbar('Chat downloaded', 'success');
+        else showSnackbar('Chat downloaded (some attachments could not be restored)', 'warning');
+    } catch (e) {
+        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
     }
-    
-    var exportData = {
-        exportType: 'single_chat',
-        exportDate: new Date().toISOString(),
-        chat: chat
-    };
-    
-    var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'chat_' + chat.title.replace(/[^a-z0-9]/gi, '_').substring(0, 30) + '_' + new Date().toISOString().slice(0, 10) + '.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    
-    showSnackbar('Chat downloaded', 'success');
 }
 
 // Import a single chat from JSON file

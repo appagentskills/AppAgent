@@ -134,8 +134,6 @@ AgentEvents.on('runStarted', function(e) {
     if (chatId === currentChatId) {
         isRunning = true;
         lastApiError = null;
-        hideRetryButton();
-        hideContinueButton();
         // Silent-hook runs (auto title/tldr/links) are invisible work: the
         // user-facing answer already landed, so don't re-show the Pause
         // button or re-add .is-streaming for them — the chat would look
@@ -145,11 +143,14 @@ AgentEvents.on('runStarted', function(e) {
         // already set when this runStarted arrives (port preserves order).
         var _rsHook = (typeof _isChatInSilentHook === 'function') && _isChatInSilentHook(chatId);
         if (!_rsHook) {
-            showPauseButton();
             var messagesEl = document.getElementById('messages');
             if (messagesEl) messagesEl.classList.add('is-streaming');
         }
         activeStreamingChatId = chatId;
+        // CHAT-CONTROLS SSOT: derive Pause/Continue/Retry AFTER the state writes
+        // above (runningChatIds is set by the 045 mirror before this re-emit;
+        // lastApiError was just nulled). The derive hides Pause for silent hooks.
+        if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
     } else {
         // R-1 (B11): an UNFOCUSED chat starting a run must NOT mutate the GLOBAL
         // lastApiError (it belongs to the focused chat — the toolbar Retry reads it).
@@ -363,7 +364,8 @@ AgentEvents.on('paused', function(e) {
         // tells the user what happened.
         var _subChat = (typeof chats !== 'undefined') ? chats[e.chatId] : null;
         var _isSubAgentChat = !!(_subChat && _subChat.isSubAgent);
-        if (!_isSubAgentChat) {
+        // A stopped action chat shows no Resume (app/020 _isStoppedActionChat): no snackbar either.
+        if (!_isSubAgentChat && !(typeof _isStoppedActionChat === 'function' && _isStoppedActionChat(e.chatId, _subChat))) {
             showSnackbar('Agent paused. Click Resume to continue.');
         }
         // (Scroll-follow intent is tracked continuously by handleChatScroll —
@@ -544,7 +546,9 @@ AgentEvents.on('error', function(e) {
             // has no persistent home and the re-derive reads undefined.
             if (chat && typeof dispatchChatMeta === 'function') dispatchChatMeta(e.chatId, { _lastApiError: lastApiError }); // FLUX-4C lane
             showSnackbar('API Error: ' + msg, 'error');
-            showRetryButton();
+            // CHAT-CONTROLS SSOT: the run is usually still active here, so the
+            // derive keeps Pause; Retry is painted by the runFinished derive.
+            if (typeof syncChatControlsUI === 'function') syncChatControlsUI(e.chatId);
         } else if (chat && typeof dispatchChatMeta === 'function') {
             dispatchChatMeta(e.chatId, { _lastApiError: { message: msg, chatId: e.chatId, timestamp: Date.now() } }); // FLUX-4C lane
         }
@@ -676,10 +680,12 @@ AgentEvents.on('runFinished', function(e) {
             // in the parent is the legitimate control surface.
             var _fchat = (typeof chats !== 'undefined') ? chats[chatId] : null;
             var _fIsSub = !!(_fchat && _fchat.isSubAgent);
-            if (_fIsSub) {
-                hidePauseButton();
-            } else {
-                if (typeof syncPauseButtonUI === 'function') syncPauseButtonUI(chatId);
+            // CHAT-CONTROLS SSOT: one derive for both arms. An idle (parked) sub
+            // chat derives 'none' (no Resume, no Continue); a user-paused chat
+            // derives 'resume'. Only the non-sub arm gets the snackbar.
+            if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
+            // A stopped action chat derives 'none' (no Resume to click): no snackbar either.
+            if (!_fIsSub && !(typeof _isStoppedActionChat === 'function' && _isStoppedActionChat(chatId, _fchat))) {
                 showSnackbar('Agent paused. Click Resume to continue.');
             }
         }
@@ -691,8 +697,9 @@ AgentEvents.on('runFinished', function(e) {
         // from under the user.
         var _fgElse = (typeof currentChatId !== 'undefined') ? currentChatId : null;
         if (chatId === _fgElse) {
-            hidePauseButton();
-            refreshContinueButtonForChat(chatId);
+            // CHAT-CONTROLS SSOT: runningChatIds was cleared by the 045 mirror
+            // before this re-emit, so the derive paints Retry / Continue / none.
+            if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
         }
     }
 });
@@ -711,8 +718,9 @@ AgentEvents.on('runCrashed', function(e) {
         if (e.chatId === currentChatId) {
             var _crMsgsEl = document.getElementById('messages');
             if (_crMsgsEl) _crMsgsEl.classList.remove('is-streaming');
-            hidePauseButton();
-            if (typeof refreshContinueButtonForChat === 'function') { try { refreshContinueButtonForChat(e.chatId); } catch (err) {} }
+            // CHAT-CONTROLS SSOT: the crashed run is no longer in runningChatIds
+            // (045 mirror deletes it before the re-emit), so Pause goes away.
+            if (typeof syncChatControlsUI === 'function') { try { syncChatControlsUI(e.chatId); } catch (err) {} }
             renderMessages();
         }
     }

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.30
+
+### Fixes
+- Sub-agent status chips and report notices are fixed.
+- Continue/Pause/Retry buttons no longer appear at random.
+- `display` results show up right away and are used only for structured data.
+- Many UI fixes from a full UI test sweep.
+
+---
+
 ## v1.1.29
 
 ### Features

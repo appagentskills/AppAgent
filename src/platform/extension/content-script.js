@@ -25,6 +25,9 @@
             try { doc = gsftMain.contentDocument || doc; } catch(e) { /* cross-origin */ }
         }
 
+        // S0C4-08: a synchronous throw in a handler (bad args) answers with an error instead of
+        // leaving the caller waiting for a reply that never comes.
+        try {
         switch(msg.action) {
             case 'viewport_emulate':
                 handleViewportEmulate(msg.args || {}, sendResponse);
@@ -58,12 +61,12 @@
                     if (!domEl) {
                         sendResponse({ success: false, error: 'Element not found: ' + domSelector + (matchIdx >= 0 ? ' (match_index=' + matchIdx + ', total matches: ' + domMatchCount + ')' : ''), match_count: domMatchCount });
                     } else {
-                        var elHtml = domEl.outerHTML;
+                        var elHtml = safeOuterHTML(domEl);
                         if (elHtml.length > maxLen) elHtml = elHtml.substring(0, maxLen) + '\n... [truncated]';
                         sendResponse({ success: true, html: elHtml, match_count: domMatchCount });
                     }
                 } else {
-                    sendResponse({ success: true, html: doc.documentElement.outerHTML.substring(0, maxLen) });
+                    sendResponse({ success: true, html: safeOuterHTML(doc.documentElement).substring(0, maxLen) });
                 }
                 break;
 
@@ -133,6 +136,9 @@
             default:
                 sendResponse({ error: 'Unknown action: ' + msg.action });
         }
+        } catch(e) {
+            sendResponse({ success: false, error: msg.action + ' failed: ' + (e && e.message ? e.message : String(e)) });
+        }
 
         return true; // Keep channel open for async
     });
@@ -146,6 +152,12 @@
         if (!args.enable) {
             // Remove emulation
             if (existing) existing.remove();
+            // Also remove the copy the enable branch applied to gsft_main (S0C4-05)
+            try {
+                var g = document.getElementById('gsft_main');
+                var gs = g && g.contentDocument && g.contentDocument.getElementById(styleId);
+                if (gs) gs.remove();
+            } catch(e) { /* cross-origin */ }
             sendResponse({ success: true, message: 'Viewport emulation removed' });
             return;
         }
@@ -207,6 +219,11 @@
             }
         } catch(e) {}
         return null;
+    }
+
+    // S0C4-08: a malformed CSS selector is reported as such (callers used to say "Element not found").
+    function validateSelector(doc, s) {
+        try { doc.querySelector(s); return null; } catch(e) { return 'Invalid selector: ' + s + ' (' + e.message + ')'; }
     }
 
     function findElement(doc, selector) {
@@ -278,6 +295,48 @@
         return results;
     }
 
+    // S0C4-03: password / OTP inputs never leave the page in clear text.
+    // TB-2: compare the lowercased localName: tagName is upper-cased only for HTML elements in an HTML document,
+    // so an XHTML page's <input> reports tagName 'input'.
+    function isSecretInput(n) {
+        return !!n && String(n.localName || n.tagName || '').toLowerCase() === 'input' && (String(n.type).toLowerCase() === 'password' ||
+            /(^|\s)(current-password|new-password|one-time-code)(\s|$)/.test(String((n.getAttribute && n.getAttribute('autocomplete')) || '').toLowerCase()));
+    }
+
+    // S0C4-03: get_dom serializes markup, and controlled inputs (React etc.) mirror the typed
+    // secret into the value attribute. If el's subtree holds a secret input with a non-empty value
+    // attribute, serialize an INERT DOMParser copy (the live page is never mutated or cloned) with
+    // value="[redacted]"; otherwise el.outerHTML is returned unchanged (byte-identical).
+    // TA3-6: the re-parse is not faithful everywhere (an input under <textarea>/<style> comes back as text, one under
+    // <svg>/<math> as a foreign element), so every live secret value still in the output is then string-redacted.
+    function safeOuterHTML(el) {
+        var html = el.outerHTML;
+        var hasSecret = function(n) { return isSecretInput(n) && !!n.getAttribute('value'); };
+        var live = [el].concat(Array.prototype.slice.call(el.getElementsByTagName('input'))).filter(hasSecret);
+        if (!live.length) return html;
+        // <html>/<body> keep their own tags only when parsed as a document; any other element is
+        // parsed as <template> content (where table rows, list items, etc. round-trip).
+        var ln = String(el.localName || '').toLowerCase(), asDoc = ln === 'html' || ln === 'body';   // TB-2: XHTML-safe
+        var inert = new DOMParser().parseFromString(asDoc ? html : '<template>' + html + '</template>', 'text/html');
+        var tpl = asDoc ? null : inert.querySelector('template');
+        Array.prototype.forEach.call((tpl ? tpl.content : inert).querySelectorAll('input'), function(n) {
+            if (hasSecret(n)) n.setAttribute('value', '[redacted]');
+        });
+        var out = tpl ? tpl.innerHTML : (ln === 'html' ? inert.documentElement : inert.body).outerHTML;
+        live.forEach(function(n) { out = redactSecretText(out, n.getAttribute('value')); });
+        return out;
+    }
+
+    // TA3-6: replace every occurrence of secret s in the serialized markup, raw and in each form the HTML serializer
+    // emits it: attribute-escaped (&, NBSP, " and, in newer Chrome, < >) or text-escaped (&, NBSP, < >).
+    function redactSecretText(out, s) {
+        var a = s.replace(/&/g, '&amp;').replace(/\u00a0/g, '&nbsp;'), q = a.replace(/"/g, '&quot;');
+        [s, q, a.replace(/</g, '&lt;').replace(/>/g, '&gt;'), q.replace(/</g, '&lt;').replace(/>/g, '&gt;')].forEach(function(v, i, all) {
+            if (all.indexOf(v) === i && out.indexOf(v) !== -1) out = out.split(v).join('[redacted]');
+        });
+        return out;
+    }
+
     // Shadow- and iframe-piercing plain-text extraction for get_visible_text (simple mode) and
     // wait_for(text). element/body.innerText stop at shadow boundaries, so on a Seismic / Now
     // Experience page (content nested in open shadow roots) they return ''. Honors display:none,
@@ -301,7 +360,7 @@
                 if (cs && cs.display === 'none') return;
             } catch(e) {}
             if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-                var v = node.value;
+                var v = isSecretInput(node) ? (node.value ? '[password]' : '') : node.value;
                 if (!v && tag !== 'SELECT') { try { v = node.getAttribute('placeholder'); } catch(e) {} }
                 if (v && String(v).trim()) parts.push(String(v).trim());
             }
@@ -377,6 +436,7 @@
 
     function handleClick(doc, args, sendResponse) {
         var hasCoords = args.x !== undefined && args.y !== undefined;
+        if (!hasCoords) { var selErr = validateSelector(doc, args.selector); if (selErr) { sendResponse({ success: false, error: selErr }); return; } }   // S0C4-08
         var el = hasCoords ? elementFromPointDeep(document, args.x, args.y) : findElement(doc, args.selector);
         var label = hasCoords ? '(' + args.x + ', ' + args.y + ')' : args.selector;
         if (!el) { sendResponse({ error: 'Element not found: ' + label }); return; }
@@ -388,7 +448,10 @@
             if (target.snapped) snappedInfo = { dist: target.dist };
         }
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
-        el.click();
+        // S0C4-01: SVG/MathML nodes have no .click(); dispatch a real bubbling click on the node itself
+        // (never snap to an ancestor, or listeners on the child would be skipped).
+        if (typeof el.click === 'function') el.click();
+        else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: (el.ownerDocument && el.ownerDocument.defaultView) || window }));
         var clickedTag = el.tagName.toLowerCase();
         var clickedId = el.id ? '#' + el.id : '';
         var clickedText = (el.textContent || '').trim().substring(0, 80);
@@ -410,6 +473,37 @@
         });
     }
 
+    // S0C4-02: fill/type only write into real editables; anything else is an error (no events).
+    function editableHost(el) {
+        if (!el || el.nodeType !== 1) return null;
+        return el.isContentEditable ? el : ((el.closest && el.closest('[contenteditable]:not([contenteditable="false"])')) || null);
+    }
+    function isEditableTarget(el) {
+        var t = (el && el.nodeType === 1) ? el.tagName : '';
+        // `value` hosts: custom elements only (hyphenated tag, e.g. now-*). Built-ins such as
+        // button/li/option/output/meter/progress/data/param also expose `value` but are not editable.
+        return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || !!editableHost(el) || (t.indexOf('-') > 0 && ('value' in el));
+    }
+    function setEditableValue(el, value) {   // caller already checked isEditableTarget(el)
+        var t = el.tagName, host = (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') ? null : editableHost(el);
+        if (t === 'INPUT' || t === 'TEXTAREA') {
+            try { var desc = Object.getOwnPropertyDescriptor((t === 'TEXTAREA' ? window.HTMLTextAreaElement : window.HTMLInputElement).prototype, 'value');
+                  if (desc && desc.set) desc.set.call(el, value); else el.value = value; } catch(e) { el.value = value; }
+        } else if (host) {
+            var d = host.ownerDocument || document, ok = false;
+            try { var sel = d.getSelection ? d.getSelection() : null; if (sel && d.createRange) { var rg = d.createRange(); rg.selectNodeContents(host); sel.removeAllRanges(); sel.addRange(rg); ok = d.execCommand('insertText', false, String(value)) === true; } } catch(e) { ok = false; }
+            if (!ok) host.textContent = String(value);
+        } else { el.value = value; }   // SELECT and custom elements exposing `value`
+    }
+    // TB-3: the fill/type 'input' event is an InputEvent{inputType:'insertText',data} (composed, like a native one); an empty
+    // write (the type clear) is deleteContentBackward with data null, as native never sends an empty insertText. A realm
+    // without InputEvent (or a throwing init) keeps the old plain Event. Mirrors 010-iframe-tool.js _ifInputEvent.
+    function userInputEvent(data) {
+        var s = data == null ? '' : String(data);
+        try { if (typeof InputEvent === 'function') return new InputEvent('input', s ? { bubbles: true, composed: true, inputType: 'insertText', data: s } : { bubbles: true, composed: true, inputType: 'deleteContentBackward', data: null }); } catch(e) {}
+        return new Event('input', { bubbles: true });
+    }
+
     // Fire the full user-typing event chain so frameworks (React/Angular) and
     // ServiceNow client scripts that listen for keydown/keyup/input/change/blur
     // see the change as if a real user typed it.
@@ -417,22 +511,20 @@
         var lastChar = (value && value.length) ? String(value).charAt(String(value).length - 1) : '';
         try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: lastChar })); } catch(e) {}
         try { el.dispatchEvent(new KeyboardEvent('keypress', { bubbles: true, key: lastChar })); } catch(e) {}
-        // React-safe value setter: bypass framework property trackers
-        try {
-            var proto = (el.tagName === 'TEXTAREA') ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-            var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (desc && desc.set) desc.set.call(el, value); else el.value = value;
-        } catch(e) { el.value = value; }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        // React-safe value setter (INPUT/TEXTAREA), contenteditable, SELECT/custom value hosts (S0C4-02)
+        setEditableValue(el, value);
+        el.dispatchEvent(userInputEvent(value));   // TB-3
         try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: lastChar })); } catch(e) {}
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     function handleFill(doc, args, sendResponse) {
         var hasCoords = args.x !== undefined && args.y !== undefined;
+        if (!hasCoords) { var selErr = validateSelector(doc, args.selector); if (selErr) { sendResponse({ success: false, error: selErr }); return; } }   // S0C4-08
         var el = hasCoords ? elementFromPointDeep(document, args.x, args.y) : findElement(doc, args.selector);
         var label = hasCoords ? '(' + args.x + ', ' + args.y + ')' : args.selector;
         if (!el) { sendResponse({ error: 'Element not found: ' + label }); return; }
+        if (!isEditableTarget(el)) { sendResponse({ success: false, error: 'Target <' + el.tagName.toLowerCase() + '> is not editable (input/textarea/select/contenteditable)' }); return; }
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
         el.focus();
         fireUserInput(el, args.value);
@@ -443,19 +535,18 @@
     // debounced/throttled handlers (autocomplete dropdowns, search-as-you-type).
     function handleType(doc, args, sendResponse) {
         var hasCoords = args.x !== undefined && args.y !== undefined;
+        if (!hasCoords) { var selErr = validateSelector(doc, args.selector); if (selErr) { sendResponse({ success: false, error: selErr }); return; } }   // S0C4-08
         var el = hasCoords ? elementFromPointDeep(document, args.x, args.y) : findElement(doc, args.selector);
         var label = hasCoords ? '(' + args.x + ', ' + args.y + ')' : args.selector;
         if (!el) { sendResponse({ error: 'Element not found: ' + label }); return; }
+        if (!isEditableTarget(el)) { sendResponse({ success: false, error: 'Target <' + el.tagName.toLowerCase() + '> is not editable (input/textarea/select/contenteditable)' }); return; }
         var value = String(args.value == null ? '' : args.value);
         var delay = (typeof args.delay === 'number' && args.delay >= 0) ? args.delay : 30;
         var append = !!args.append;
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
         el.focus();
-        var proto = (el.tagName === 'TEXTAREA') ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-        var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        var setter = (desc && desc.set) || null;
-        var current = append ? (el.value || '') : '';
-        if (!append) { try { setter ? setter.call(el, '') : (el.value = ''); } catch(e) { el.value = ''; } el.dispatchEvent(new Event('input', { bubbles: true })); }
+        var current = append ? String((('value' in el) ? el.value : el.textContent) || '') : '';
+        if (!append) { setEditableValue(el, ''); el.dispatchEvent(userInputEvent('')); }   // TB-3
         var i = 0;
         function typeNext() {
             if (i >= value.length) {
@@ -467,13 +558,26 @@
             try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch })); } catch(e) {}
             try { el.dispatchEvent(new KeyboardEvent('keypress', { bubbles: true, key: ch })); } catch(e) {}
             current += ch;
-            try { setter ? setter.call(el, current) : (el.value = current); } catch(e) { el.value = current; }
-            el.dispatchEvent(new Event('input', { bubbles: true }));
+            setEditableValue(el, current);
+            el.dispatchEvent(userInputEvent(ch));   // TB-3
             try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch })); } catch(e) {}
             i++;
             if (delay > 0) setTimeout(typeNext, delay); else typeNext();
         }
         typeNext();
+    }
+
+    // S0C4-04: re-resolve gsft_main on every wait_for poll (an in-frame navigation replaces its
+    // document) and read the frame URL for url_matches. Polaris (no top-level gsft_main) -> document.
+    function resolveDoc() {
+        var g = document.getElementById('gsft_main');
+        if (g) { try { if (g.contentDocument) return g.contentDocument; } catch(e) { /* cross-origin */ } }
+        return document;
+    }
+    function frameHref() {
+        var g = document.getElementById('gsft_main');
+        if (g) { try { return String(g.contentWindow.location.href || ''); } catch(e) { /* cross-origin */ } }
+        return '';
     }
 
     // Wait for a condition to be met. Pure timing primitive — doesn't bypass anything.
@@ -487,6 +591,7 @@
             else sendResponse({ success: false, error: 'Timed out after ' + timeout + 'ms waiting for: ' + detail, waited_ms: Date.now() - start });
         }
         function check() {
+            var doc = resolveDoc();   // S0C4-04: never poll a stale gsft_main document
             try {
                 if (args.selector_visible) {
                     var v = findElement(doc, args.selector_visible);
@@ -505,7 +610,7 @@
                     deepText(doc.body || doc.documentElement || doc, _wtParts, 0);
                     if (_wtParts.join(' ').indexOf(args.text) !== -1) return done(true, 'text: ' + args.text);
                 } else if (args.url_matches) {
-                    if (location.href.indexOf(args.url_matches) !== -1) return done(true, 'url_matches: ' + args.url_matches);
+                    if (frameHref().indexOf(args.url_matches) !== -1 || String(window.location.href || '').indexOf(args.url_matches) !== -1) return done(true, 'url_matches: ' + args.url_matches);
                 } else {
                     return done(false, 'no condition specified (selector_visible, selector_gone, text, or url_matches)');
                 }
@@ -515,6 +620,10 @@
             }
             setTimeout(check, pollMs);
         }
+        // S0C4-08: a malformed selector can never match: fail now instead of polling until the timeout.
+        var _wfSel = args.selector_visible || args.selector_gone;
+        var _wfErr = _wfSel ? validateSelector(doc, _wfSel) : null;
+        if (_wfErr) { sendResponse({ success: false, error: _wfErr }); return; }
         check();
     }
 
@@ -607,6 +716,8 @@
             sendResponse({ error: 'Event "' + args.event + '" not allowed. Allowed: ' + ALLOWED_EVENTS.join(', ') });
             return;
         }
+        var selErr = validateSelector(doc, args.selector);   // S0C4-08
+        if (selErr) { sendResponse({ success: false, error: selErr }); return; }
         var el = findElement(doc, args.selector);
         if (!el) {
             sendResponse({ error: 'Element not found: ' + args.selector });
@@ -665,21 +776,6 @@
                     docNode.dispatchEvent(new KeyboardEvent(args.event, { key: args.key || '', keyCode: kc, which: kc, code: code, bubbles: true, cancelable: true }));
                 }
             } catch(e) {}
-            // Also dispatch in main world via injected script to reach framework handlers
-            // (Angular $document, jQuery .on() etc. that listen in the page's JS world)
-            try {
-                var _mwScript = document.createElement('script');
-                // Sanitize strings to prevent script injection via crafted key/event names
-                var _safeEvent = args.event.replace(/[\\"]/g, '');
-                var _safeKey = (args.key || '').replace(/[\\"]/g, '');
-                var _safeCode = code.replace(/[\\"]/g, '');
-                _mwScript.textContent = '(function(){try{' +
-                    'var e=new KeyboardEvent("' + _safeEvent + '",{key:"' + _safeKey + '",keyCode:' + kc + ',which:' + kc + ',code:"' + _safeCode + '",bubbles:true,cancelable:true});' +
-                    'document.dispatchEvent(e);' +
-                    '}catch(x){}})();';
-                (document.head || document.documentElement).appendChild(_mwScript);
-                _mwScript.remove();
-            } catch(e) { /* CSP may block inline scripts */ }
         }
         var _dispMsg = 'Dispatched ' + args.event + ' on ' + (el.tagName ? el.tagName.toLowerCase() : args.selector);
         if (args.key) _dispMsg += ' (key=' + args.key + ')';
@@ -687,6 +783,8 @@
     }
 
     function handleSelectOption(doc, args, sendResponse) {
+        var selErr = validateSelector(doc, args.selector);   // S0C4-08
+        if (selErr) { sendResponse({ success: false, error: selErr }); return; }
         var el = findElement(doc, args.selector);
         if (!el || el.tagName !== 'SELECT') {
             sendResponse({ error: 'Select element not found: ' + args.selector });
@@ -770,15 +868,19 @@
             className: _classStr,
             classList: _classStr ? _classStr.trim().split(/\s+/).filter(Boolean) : [],
             textContent: (el.textContent || '').substring(0, 500),
-            value: el.value,
+            value: isSecretInput(el) ? (el.value ? '[redacted]' : '') : el.value,
             checked: el.checked,
             disabled: el.disabled,
             visible: rect.width > 0 && rect.height > 0,
             rect: rect
         };
+        if (isSecretInput(el)) props.hasValue = !!el.value;
         if (args.properties) {
+            // S0C4-08: a single property name is accepted; any other non-array is an error, not a throw.
+            var propList = (typeof args.properties === 'string') ? [args.properties] : args.properties;
+            if (!Array.isArray(propList)) { sendResponse({ success: false, error: 'properties must be an array of CSS property names (or a single name)' }); return; }
             props.computedStyle = {};
-            args.properties.forEach(function(p) {
+            propList.forEach(function(p) {
                 props.computedStyle[p] = computed.getPropertyValue(p);
             });
         }
@@ -796,11 +898,22 @@
                 opacity: computed.opacity
             };
         }
+        // S0C4-09: honour include 'attributes' like the in-page twin (values capped; a secret value is redacted).
+        if (include.indexOf('attributes') !== -1 && el.attributes) {
+            props.attributes = {};
+            for (var ai = 0; ai < el.attributes.length; ai++) {
+                var an = el.attributes[ai].name;
+                props.attributes[an] = (an === 'value' && isSecretInput(el)) ? '[redacted]' : String(el.attributes[ai].value).substring(0, 500);
+            }
+        }
         sendResponse({ success: true, properties: props, match_count: matchCount });
     }
 
     function handleSetStyle(doc, args, sendResponse) {
         if (!args.selector) { sendResponse({ error: 'selector is required for set_style action' }); return; }
+        if (args.className !== undefined && args.className !== null && typeof args.className !== 'string') {   // S0C4-08
+            sendResponse({ success: false, error: 'className must be a string: "add:<cls>", "remove:<cls>" or "toggle:<cls>"' }); return;
+        }
         var els;
         try {
             doc.querySelectorAll(args.selector);
@@ -824,51 +937,95 @@
         sendResponse({ success: true, message: 'Styled ' + els.length + ' element(s)' });
     }
 
-    // Generate a unique CSS selector for an element
-    function getUniqueSelector(el, root) {
-        if (!el || el.nodeType !== 1) return '';
+    // S0C6-05: per-scan uniqueness for deep get_visible_text: the roots queryAllDeep visits (document,
+    // same-origin iframe docs, open shadow roots) are collected once per scan, and each selector's
+    // first 2 deep matches are memoized (shadow duplicates share selectors).
+    var _uniqScan = null;
+    function _scanRoots(r, out) {
+        out.push(r);
+        try { var fr = r.querySelectorAll('iframe'); for (var f = 0; f < fr.length; f++) { try { if (fr[f].contentDocument) _scanRoots(fr[f].contentDocument, out); } catch(e) {} } } catch(e) {}
+        try { var hs = r.querySelectorAll('*'); for (var h = 0; h < hs.length; h++) { if (hs[h].shadowRoot) _scanRoots(hs[h].shadowRoot, out); } } catch(e) {}
+        return out;
+    }
+    function _scanUniq(c, sel, el) {
+        var m = c.memo.get(sel);
+        if (!m) {
+            if (!c.roots) c.roots = _scanRoots(c.root, []);
+            m = [];
+            for (var i = 0; i < c.roots.length && m.length < 2; i++) {
+                var d = c.roots[i].querySelectorAll(sel);   // bad CSS throws -> _uniq catch -> false
+                for (var k = 0; k < d.length && m.length < 2; k++) m.push(d[k]);
+            }
+            c.memo.set(sel, m);
+        }
+        return m.length === 1 && m[0] === el;
+    }
+
+    // S0C6-02: a selector counts as unique only if it resolves (shadow/iframe-piercing, the same
+    // traversal as findElement) to exactly this element. The light pre-check is a cheap early exit:
+    // deep matches always include the light ones.
+    function _uniq(sel, el, root) {
+        try {
+            var s = root || document;
+            if (_uniqScan && _uniqScan.root === s) return _scanUniq(_uniqScan, sel, el);   // S0C6-05
+            if (s.querySelectorAll(sel).length > 1) return false;
+            var m = queryAllDeep(s, sel);
+            return m.length === 1 && m[0] === el;
+        } catch(e) { return false; }
+    }
+
+    // S0C6-04: is sel valid CSS? (a raw tag such as Word's <o:p> is not)
+    function _parses(sel) {
+        try { document.createDocumentFragment().querySelector(sel); return true; } catch(e) { return false; }
+    }
+
+    // Generate a unique CSS selector for an element.
+    // S0C6-02: returns {selector, unique}; unique:false = no selector that resolves only to el was found.
+    function getUniqueSelectorInfo(el, root) {
+        if (!el || el.nodeType !== 1) return { selector: '', unique: false };
         // 1) ID-based (best case)
         if (el.id && !/\s/.test(el.id)) {
             try {
-                if ((root || document).querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
-                    return '#' + CSS.escape(el.id);
+                if (_uniq('#' + CSS.escape(el.id), el, root)) {   // S0C6-03: deep count, so a shadow/iframe twin is not unique
+                    return { selector: '#' + CSS.escape(el.id), unique: true };
                 }
             } catch(e) {}
         }
-        // 2) Try aria-label
+        // 2) Try aria-label (S0C6-04: attribute values and classes are CSS.escape'd)
         var ariaLabel = el.getAttribute('aria-label');
         if (ariaLabel) {
-            var sel = el.tagName.toLowerCase() + '[aria-label="' + ariaLabel.replace(/"/g, '\\"') + '"]';
-            try { if ((root || document).querySelectorAll(sel).length === 1) return sel; } catch(e) {}
+            var sel = el.tagName.toLowerCase() + '[aria-label="' + CSS.escape(ariaLabel) + '"]';
+            try { if (_uniq(sel, el, root)) return { selector: sel, unique: true }; } catch(e) {}
         }
         // 3) Try data-* attributes
         var attrs = el.attributes;
         for (var i = 0; i < attrs.length; i++) {
             if (attrs[i].name.indexOf('data-') === 0 && attrs[i].value) {
-                var sel = el.tagName.toLowerCase() + '[' + attrs[i].name + '="' + attrs[i].value.replace(/"/g, '\\"') + '"]';
-                try { if ((root || document).querySelectorAll(sel).length === 1) return sel; } catch(e) {}
+                var sel = el.tagName.toLowerCase() + '[' + attrs[i].name + '="' + CSS.escape(attrs[i].value) + '"]';
+                try { if (_uniq(sel, el, root)) return { selector: sel, unique: true }; } catch(e) {}
             }
         }
         // 4) Try name attribute (for form elements)
         var name = el.getAttribute('name');
         if (name) {
-            var sel = el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]';
-            try { if ((root || document).querySelectorAll(sel).length === 1) return sel; } catch(e) {}
+            var sel = el.tagName.toLowerCase() + '[name="' + CSS.escape(name) + '"]';
+            try { if (_uniq(sel, el, root)) return { selector: sel, unique: true }; } catch(e) {}
         }
         // 5) Build nth-child path from closest identifiable ancestor
         var parts = [];
         var current = el;
-        var maxDepth = 4;
-        while (current && current.nodeType === 1 && maxDepth-- > 0) {
+        var depth = 0, unique = false;   // S0C6-02: climb until the path is unique (cap 15)
+        while (current && current.nodeType === 1 && depth++ < 15) {
             var tag = current.tagName.toLowerCase();
             if (tag === 'html' || tag === 'body') break;
-            // Check if this ancestor has an ID
-            if (current.id && !/\s/.test(current.id)) {
+            // Check if this ancestor has an ID (S0C6-02: only a unique one may anchor the path)
+            if (current.id && !/\s/.test(current.id) && _uniq('#' + CSS.escape(current.id), current, root)) {
                 parts.unshift('#' + CSS.escape(current.id));
                 break;
             }
             // Use class + nth-child for specificity
-            var parent = current.parentElement;
+            // S0C6-03: a shadow root's top-level child is positioned among the root's children (climb stops there)
+            var parent = current.parentElement || (current.parentNode && current.parentNode.nodeType === 11 ? current.parentNode : null);
             if (parent) {
                 var siblings = parent.children;
                 var sameTag = [];
@@ -880,7 +1037,7 @@
                     var cls = current.className && typeof current.className === 'string' ? current.className.trim().split(/\s+/).filter(function(c) {
                         return c.length > 1 && !/^ng-|^x-|^ui-/.test(c) && !/^active$|^focus$|^hover$/.test(c);
                     })[0] : '';
-                    parts.unshift(cls ? tag + '.' + cls : tag);
+                    parts.unshift(cls ? tag + '.' + CSS.escape(cls) : tag);
                 } else {
                     var idx = sameTag.indexOf(current) + 1;
                     parts.unshift(tag + ':nth-of-type(' + idx + ')');
@@ -889,15 +1046,28 @@
                 parts.unshift(tag);
             }
             current = parent;
+            if ((unique = _uniq(parts.join(' > '), el, root))) break;
         }
         var finalSel = parts.join(' > ');
-        // Verify uniqueness
-        try {
-            if ((root || document).querySelectorAll(finalSel).length === 1) return finalSel;
-        } catch(e) {}
-        // Fallback: return the path anyway (still better than just tag name)
-        return finalSel || el.tagName.toLowerCase();
+        // S0C6-04: an unparseable path (raw tag such as Word's <o:p>) -> escaped tag:nth-of-type parts only
+        if (finalSel && !_parses(finalSel)) {
+            parts = [];
+            for (var rc = el, rd = 0; rc && rc.nodeType === 1 && rd++ < 15; rc = rc.parentElement) {
+                var rt = rc.tagName.toLowerCase();
+                if (rt === 'html' || rt === 'body') break;
+                var rn = 1;
+                for (var rp = rc.previousElementSibling; rp; rp = rp.previousElementSibling) { if (rp.tagName === rc.tagName) rn++; }
+                parts.unshift(CSS.escape(rt) + ':nth-of-type(' + rn + ')');
+                if ((unique = _uniq(parts.join(' > '), el, root))) break;
+            }
+            finalSel = parts.join(' > ');
+        }
+        // Fallback: return the path anyway (still better than just tag name); unique:false flags it
+        var result = finalSel || el.tagName.toLowerCase();
+        return { selector: result, unique: unique || _uniq(result, el, root) };
     }
+
+    function getUniqueSelector(el, root) { return getUniqueSelectorInfo(el, root).selector; }
 
     // --- get_visible_text with deep mode support ---
     function handleGetVisibleText(doc, args, sendResponse) {
@@ -914,9 +1084,10 @@
 
             // Deep mode: walk the DOM tree collecting element data with rects/selectors
             var visible = [];
+            var _t0 = Date.now(), _truncated = false; _uniqScan = { root: doc, memo: new Map(), roots: null };   // S0C6-05
             var scanElements = function(root) {
                 var walk = function(node) {
-                    if (!node) return;
+                    if (!node || visible.length >= 1000) return;   // S0C6-05: stop at the 1000 entries returned
                     // Skip hidden, script, style, noscript
                     if (node.nodeType === 1) {
                         var tag = node.tagName.toLowerCase();
@@ -948,7 +1119,7 @@
                         if (_recordable && (directText.length > 0 || isInteractive || isHeading)) {
                             var textValue = '';
                             if (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA') {
-                                textValue = node.value || node.placeholder || '';
+                                textValue = isSecretInput(node) ? (node.value ? '[redacted password]' : (node.placeholder || '')) : (node.value || node.placeholder || '');
                             } else if (node.tagName === 'SELECT') {
                                 textValue = node.options[node.selectedIndex] ? node.options[node.selectedIndex].text : '';
                             } else if (node.tagName === 'IMG') {
@@ -959,7 +1130,9 @@
 
                             if (textValue.length > 0 || isInteractive) {
                                 var type = isHeading ? 'heading' : isInteractive ? 'interactive' : 'text';
-                                visible.push({
+                                var _si = Date.now() - _t0 < 2000 ? getUniqueSelectorInfo(node, doc) : null;   // S0C6-03: unique vs the top doc findElement searches, also in iframes; S0C6-05: 2 s selector budget
+                                if (!_si) _truncated = true;
+                                var _entry = {
                                     tag: tag,
                                     type: type,
                                     text: textValue.trim().substring(0, 500),
@@ -967,9 +1140,12 @@
                                     ariaLabel: ariaLabel || null,
                                     role: role || null,
                                     inputType: node.type || null,
-                                    selector: getUniqueSelector(node, root),
+                                    selector: _si ? _si.selector : null,
                                     rect: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) }
-                                });
+                                };
+                                if (_si && !_si.unique) _entry.selectorUnique = false;   // S0C6-02: no selector resolves only to this node
+                                visible.push(_entry);
+                                if (visible.length >= 1000) return;
                             }
                         }
                     }
@@ -990,8 +1166,12 @@
             };
 
             scanElements(doc);
-            sendResponse({ success: true, visibleElements: visible.slice(0, 1000) });
+            _uniqScan = null;
+            var _res = { success: true, visibleElements: visible.slice(0, 1000) };
+            if (_truncated) _res.truncated = true;   // S0C6-05: selectors past the 2 s budget are null
+            sendResponse(_res);
         } catch(e) {
+            _uniqScan = null;
             sendResponse({ success: false, error: 'get_visible_text failed: ' + e.message });
         }
     }

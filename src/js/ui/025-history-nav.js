@@ -149,6 +149,10 @@ function handlePopState(event) {
             appStorage.setItem('currentView', 'chat');
             currentChatId = targetChatId;
             appStorage.setItem('lastChatId', targetChatId);
+            // Mirror selectChat (170): drop the previous chat's global lastApiError, then
+            // restore the target's saved one, so Retry (retryLastCall) targets THIS chat.
+            lastApiError = null;
+            if (chats[targetChatId]._lastApiError) { lastApiError = chats[targetChatId]._lastApiError; }
             showChatView();
             // Viewing the chat via Back/Forward consumes its finished-chat bell
             // entry (ui/165-finished-chat-badge.js) — this entry point bypasses
@@ -177,22 +181,20 @@ function handlePopState(event) {
             }
             document.title = getHistoryTitle('chat', targetChatId, null);
 
-            // Sync streaming UI state for the target chat. Mirror selectChat: if THAT
-            // chat actually has a live agent loop (per-tab `runningChatIds`), show Pause;
-            // otherwise reset Pause and surface the Continue button if the chat looks
-            // interrupted. Without the symmetric reset, navigating back/forward from a
-            // streaming chat to a non-streaming one left Pause visible.
+            // Sync the streaming state for the target chat (mirrors selectChat: THAT
+            // chat's live loop per the per-tab `runningChatIds`), then let the
+            // CHAT-CONTROLS SSOT (syncChatControlsUI, app/020-api-messages.js) paint
+            // exactly one of Pause/Resume, Retry or Continue for it. The view and the
+            // displayed chat already point at the target (set above), so back/forward
+            // from a streaming chat to an idle one can no longer leave Pause visible.
             if (typeof runningChatIds !== 'undefined' && runningChatIds[targetChatId]) {
                 isRunning = true;
                 activeStreamingChatId = targetChatId;
-                showPauseButton(targetChatId);
-                if (typeof hideContinueButton === 'function') hideContinueButton();
             } else {
                 isRunning = false;
                 activeStreamingChatId = null;
-                hidePauseButton();
-                if (typeof refreshContinueButtonForChat === 'function') refreshContinueButtonForChat(targetChatId);
             }
+            if (typeof syncChatControlsUI === 'function') syncChatControlsUI(targetChatId);
             // B-D1: surface pending approvals on browser back/forward, same as selectChat.
             if (typeof showPendingApprovalNotifications === 'function') {
                 showPendingApprovalNotifications(targetChatId);
@@ -246,6 +248,9 @@ function handlePopState(event) {
             currentView = 'home';
             appStorage.setItem('currentView', 'home');
             hideAllPanels();
+            // CHAT-CONTROLS SSOT: the view is 'home' now, so the derive hides Pause,
+            // Continue and Retry (same as openHomeView in ui/030-home-view.js).
+            if (typeof syncChatControlsUI === 'function') syncChatControlsUI();
             var homePanel = document.getElementById('home-panel');
             if (homePanel) { homePanel.style.display = 'flex'; renderHome(); }
             updateAllButtonStates();
