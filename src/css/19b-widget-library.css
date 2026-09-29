@@ -1,7 +1,7 @@
 /* Widget Library — dashboard page "All widgets" view (ui/065-widget-library.js) */
 .segmented-toggle { display: inline-flex; align-items: stretch; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); overflow: hidden; background: var(--secondary-light); flex-shrink: 0; }
 .segmented-toggle button { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-6); background: none; border: none; font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-secondary); cursor: pointer; white-space: nowrap; transition: all var(--transition-fast); }
-.segmented-toggle button + button { border-left: 1px solid var(--secondary-border); }
+.segmented-toggle button + button { border-inline-start: 1px solid var(--secondary-border); }
 .segmented-toggle button:hover { color: var(--text-primary); background: var(--secondary-border); }
 .segmented-toggle button.active { background: var(--bg-white); color: var(--primary); }
 .segmented-toggle button .ui-icon { width: 14px; height: 14px; }

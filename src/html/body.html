@@ -1,129 +1,135 @@
 <body>
-<a href="#main-area" class="skip-link" style="position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden;z-index:9999;">Skip to main content</a>
+<a href="#main-area" class="skip-link" data-i18n style="position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden;z-index:9999;">Skip to main content</a>
 <div class="container" id="container">
-    <button class="floating-sidebar-toggle" id="floating-sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar"><span id="floating-menu-icon" aria-hidden="true"></span></button>
-    <nav class="sidebar expanded no-transition" id="sidebar" aria-label="Main navigation">
+    <button class="floating-sidebar-toggle" id="floating-sidebar-toggle" data-i18n-attr="title,aria-label" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar"><span id="floating-menu-icon" aria-hidden="true"></span></button>
+    <nav class="sidebar expanded no-transition" id="sidebar" data-i18n-attr="aria-label" aria-label="Main navigation">
         <div class="sidebar-header">
             <div class="sidebar-toggle-row">
                 <div class="sidebar-search-wrapper">
                     <span class="sidebar-search-icon" id="sidebar-search-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></span>
-                    <input type="text" id="chat-search-input" class="sidebar-search-input" placeholder="Search" oninput="handleGlobalSearch(event)" aria-label="Search chats" />
-                    <button class="sidebar-search-clear" id="chat-search-clear" onclick="clearGlobalSearch()" title="Clear search" aria-label="Clear search"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                    <input type="text" id="chat-search-input" data-i18n-attr="placeholder,aria-label" class="sidebar-search-input" placeholder="Search" oninput="handleGlobalSearch(event)" aria-label="Search chats" />
+                    <button class="sidebar-search-clear" id="chat-search-clear" data-i18n-attr="title,aria-label" onclick="clearGlobalSearch()" title="Clear search" aria-label="Clear search"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
                 </div>
-                <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" onclick="toggleSidebar()" title="Collapse sidebar" aria-label="Toggle sidebar">
+                <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" data-i18n-attr="aria-label" onclick="toggleSidebar()" title="Collapse sidebar" aria-label="Toggle sidebar">
                 </button>
             </div>
             <div class="sidebar-actions-row" id="sidebar-actions-row"></div>
-            <button class="sidebar-nav-btn" id="new-chat-nav-btn" onclick="startNewChat()" data-tooltip="New Chat" aria-label="New Chat">
+            <button class="sidebar-nav-btn" id="new-chat-nav-btn" data-i18n-attr="data-tooltip,aria-label" onclick="startNewChat()" data-tooltip="New Chat" aria-label="New Chat">
                 <span class="sidebar-nav-icon" id="new-chat-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.375-9.375z"/></svg></span>
-                <span>New Chat</span>
-                <span class="chat-pending-dot" id="home-pending-dot" style="display:none" title="Has pending draft"></span>
+                <span data-i18n>New Chat</span>
+                <span class="chat-pending-dot" id="home-pending-dot" data-i18n-attr="title" style="display:none" title="Has pending draft"></span>
             </button>
-            <button class="sidebar-nav-btn" id="dashboard-btn" onclick="toggleDashboardView()" data-tooltip="Dashboard">
+            <button class="sidebar-nav-btn" id="dashboard-btn" data-i18n-attr="data-tooltip" onclick="toggleDashboardView()" data-tooltip="Dashboard">
                 <span class="sidebar-nav-icon" id="dashboard-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/><circle cx="6" cy="6" r="1" fill="currentColor"/></svg></span>
-                <span>Dashboard</span>
+                <span data-i18n>Dashboard</span>
             </button>
-            <button class="sidebar-nav-btn" id="documents-btn" onclick="toggleDocumentsView()" data-tooltip="Documents">
+            <button class="sidebar-nav-btn" id="documents-btn" data-i18n-attr="data-tooltip" onclick="toggleDocumentsView()" data-tooltip="Documents">
                 <span class="sidebar-nav-icon" id="documents-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
-                <span>Documents</span>
+                <span data-i18n>Documents</span>
             </button>
-            <button class="sidebar-nav-btn" id="skills-btn" onclick="toggleSkillsView()" data-tooltip="Skills">
+            <button class="sidebar-nav-btn" id="skills-btn" data-i18n-attr="data-tooltip" onclick="toggleSkillsView()" data-tooltip="Skills">
                 <span class="sidebar-nav-icon" id="skills-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></span>
-                <span>Skills</span>
+                <span data-i18n>Skills</span>
             </button>
-            <button class="sidebar-nav-btn" id="settings-page-btn" onclick="toggleSettingsView()" data-tooltip="Settings">
+            <button class="sidebar-nav-btn" id="settings-page-btn" data-i18n-attr="data-tooltip" onclick="toggleSettingsView()" data-tooltip="Settings">
                 <span class="sidebar-nav-icon" id="settings-page-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></span>
-                <span>Settings</span>
+                <span data-i18n>Settings</span>
             </button>
-            <button class="sidebar-nav-btn" id="docs-btn" onclick="toggleDocsView()" data-tooltip="Help">
+            <button class="sidebar-nav-btn" id="docs-btn" data-i18n-attr="data-tooltip" onclick="toggleDocsView()" data-tooltip="Help">
                 <span class="sidebar-nav-icon" id="docs-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>
-                <span>Help</span>
+                <span data-i18n>Help</span>
             </button>
             <div class="sidebar-history-row" id="history-toggle-btn">
-                <button class="sidebar-nav-btn sidebar-history-btn" onclick="toggleHistoryView()" data-tooltip="History">
+                <button class="sidebar-nav-btn sidebar-history-btn" data-i18n-attr="data-tooltip" onclick="toggleHistoryView()" data-tooltip="History">
                     <span class="sidebar-nav-icon" id="history-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
-                    <span>History</span>
+                    <span data-i18n>History</span>
                 </button>
-                <button class="sidebar-history-toggle" id="history-chevron-btn" onclick="event.stopPropagation(); toggleHistorySection()" title="Expand/Collapse" aria-label="Expand or collapse history" aria-expanded="true">
+                <button class="sidebar-history-toggle" id="history-chevron-btn" data-i18n-attr="title,aria-label" onclick="event.stopPropagation(); toggleHistorySection()" title="Expand/Collapse" aria-label="Expand or collapse history" aria-expanded="true">
                     <span class="sidebar-history-chevron" id="history-chevron" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
                 </button>
             </div>
         </div>
         <div class="chat-list" id="chat-list"></div>
         <div class="sidebar-footer" style="padding: var(--space-6) var(--space-8);border-top:1px solid var(--secondary-border);font-size:var(--text-sm);color:var(--text-muted);text-align:center;">
-            <div><strong>v__VERSION__</strong> · Commercial no distribute</div>
+            <div><strong>v__VERSION__</strong> · <span data-i18n>Commercial no distribute</span></div>
         </div>
     </nav>
     <div class="settings-panel header-menu" id="settings-panel">
-        <div class="settings-section-title menu-section-title"><span class="section-icon" id="section-icon-display"></span>Display</div>
+        <div class="settings-section-title menu-section-title" data-i18n><span class="section-icon" id="section-icon-display"></span>Display</div>
         <div class="settings-section">
             <div class="settings-theme-row">
-                <span class="settings-theme-row-label">Theme</span>
-                <div class="radio-group radio-group-small" id="settings-panel-theme" role="radiogroup" aria-label="Theme">
-                    <div class="radio-option" data-value="system" role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('system');}">System</div>
-                    <div class="radio-option" data-value="light" role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('light')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('light');}">Light</div>
-                    <div class="radio-option" data-value="dark" role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('dark')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('dark');}">Dark</div>
+                <span class="settings-theme-row-label" data-i18n>Theme</span>
+                <div class="radio-group radio-group-small" id="settings-panel-theme" data-i18n-attr="aria-label" role="radiogroup" aria-label="Theme" onkeydown="settingsPanelThemeKeydown(event)">
+                    <div class="radio-option" data-value="system" data-i18n role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('system');}">System</div>
+                    <div class="radio-option" data-value="light" data-i18n role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('light')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('light');}">Light</div>
+                    <div class="radio-option" data-value="dark" data-i18n role="radio" aria-checked="false" tabindex="0" onclick="setAppThemeFromPanel('dark')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setAppThemeFromPanel('dark');}">Dark</div>
                 </div>
+            </div>
+            <div class="settings-theme-row">
+                <label class="settings-theme-row-label" for="settings-panel-language" data-i18n>Language</label>
+                <!-- Options come from i18nLanguageOptionsHtml() (ui/245), filled by syncSettingsPanelLanguage() on panel open and after every language switch. -->
+                <select id="settings-panel-language" class="settings-panel-language-select" onchange="setAppLanguage(this.value)"><option value="auto" selected="selected" data-i18n>Auto (browser language)</option></select>
             </div>
             <label class="settings-checkbox">
                 <input type="checkbox" id="show-api-stats" onchange="toggleApiStats(this.checked)"/>
-                <span>Show API call statistics</span>
+                <span data-i18n>Show API call statistics</span>
             </label>
-            <label class="settings-checkbox" title="Keep the display awake during active tasks and after 5 minutes of inactivity">
+            <label class="settings-checkbox" data-i18n-attr="title" title="Keep the display awake during active tasks and after 5 minutes of inactivity">
                 <input type="checkbox" id="keep-awake-checkbox" checked="checked" onchange="toggleKeepAwake(this.checked)"/>
-                <span>Keep screen awake</span>
+                <span data-i18n>Keep screen awake</span>
             </label>
         </div>
         <div class="settings-panel-footer">
-            <button class="settings-link-item" id="settings-github-connect" style="display:none" onclick="closeSettingsPanel(); openSettingsPageView('github-settings-container')"><span class="settings-link-icon" id="settings-link-icon-github"></span><span class="settings-link-label">Connect GitHub</span><span class="settings-link-external"></span></button>
-            <button class="settings-link-item" onclick="closeSettingsPanel(); openSettingsPageView('settings-tool-permissions')"><span class="settings-link-icon" id="settings-link-icon-permissions"></span><span class="settings-link-label">Tool Permissions</span><span class="settings-link-external"></span></button>
-            <button class="settings-link-item" onclick="closeSettingsPanel(); openSettingsPageView('system-prompt-editor-container')"><span class="settings-link-icon" id="settings-link-icon-sysprompt"></span><span class="settings-link-label">System Prompt</span><span class="settings-link-external"></span></button>
-            <button class="settings-link-item settings-all-link" onclick="closeSettingsPanel(); openSettingsPageView()"><span class="settings-link-icon" id="settings-link-icon-all"></span><span class="settings-link-label">All settings</span><span class="settings-link-external"></span></button>
+            <button class="settings-link-item" id="settings-github-connect" style="display:none" onclick="closeSettingsPanel(); openSettingsPageView('github-settings-container')"><span class="settings-link-icon" id="settings-link-icon-github"></span><span class="settings-link-label" data-i18n>Connect GitHub</span><span class="settings-link-external"></span></button>
+            <button class="settings-link-item" onclick="closeSettingsPanel(); openSettingsPageView('settings-tool-permissions')"><span class="settings-link-icon" id="settings-link-icon-permissions"></span><span class="settings-link-label" data-i18n>Tool Permissions</span><span class="settings-link-external"></span></button>
+            <button class="settings-link-item" onclick="closeSettingsPanel(); openSettingsPageView('system-prompt-editor-container')"><span class="settings-link-icon" id="settings-link-icon-sysprompt"></span><span class="settings-link-label" data-i18n>System Prompt</span><span class="settings-link-external"></span></button>
+            <button class="settings-link-item" id="settings-keyboard-shortcuts" aria-haspopup="dialog" aria-keyshortcuts="Control+/ Meta+/" onclick="closeSettingsPanel(); openShortcutsModal()"><span class="settings-link-icon" id="settings-link-icon-keyboard"></span><span class="settings-link-label" data-i18n>Keyboard shortcuts</span><span class="settings-link-kbd" id="settings-link-kbd-shortcuts" aria-hidden="true"></span></button>
+            <button class="settings-link-item settings-all-link" onclick="closeSettingsPanel(); openSettingsPageView()"><span class="settings-link-icon" id="settings-link-icon-all"></span><span class="settings-link-label" data-i18n>All settings</span><span class="settings-link-external"></span></button>
         </div>
     </div>
     <div class="main-wrapper">
         <main class="main" id="main-area" role="main" style="display:none;">
             <div class="main-header">
-                <button class="toggle-sidebar-btn" id="toggle-sidebar-btn" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Expand sidebar"></button>
+                <button class="toggle-sidebar-btn" id="toggle-sidebar-btn" data-i18n-attr="title,aria-label" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Expand sidebar"></button>
                 <div class="header-title-group">
                     <span class="header-chat-title" id="header-chat-title"></span>
-                    <button class="header-rename-btn" id="header-rename-btn" onclick="renameCurrentChat()" title="Rename chat" aria-label="Rename chat"></button>
+                    <button class="header-rename-btn" id="header-rename-btn" data-i18n-attr="title,aria-label" onclick="renameCurrentChat()" title="Rename chat" aria-label="Rename chat"></button>
                     <button class="header-pin-btn" id="header-pin-btn" onclick="togglePinCurrentChat()" title="Pin chat" aria-label="Pin chat" aria-pressed="false"></button>
                 </div>
                 <div class="header-controls">
                     <div class="header-actions" id="header-actions"></div>
-                    <span class="ext-status ext-sn-status" id="ext-sn-status" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
-                    <span class="ext-status ext-active-tab" id="active-tab-indicator" style="display:none" title="Active tab"><span class="ext-status-dot"></span><span id="active-tab-url">No active tab</span></span>
-                    <button class="ext-panel-btn ext-expand-btn" id="ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+                    <span class="ext-status ext-sn-status" id="ext-sn-status" data-i18n-attr="aria-label" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
+                    <span class="ext-status ext-active-tab" id="active-tab-indicator" data-i18n-attr="title" style="display:none" title="Active tab"><span class="ext-status-dot"></span><span id="active-tab-url">No active tab</span></span>
+                    <button class="ext-panel-btn ext-expand-btn" id="ext-expand-btn" data-i18n-attr="title,aria-label" aria-label="Expand to full page" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
                     <div class="browser-controls" id="browser-controls" style="display:none">
-                        <input type="text" id="browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl()" aria-label="Enter URL path" />
+                        <input type="text" id="browser-url-input" data-i18n-attr="placeholder,aria-label" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl()" aria-label="Enter URL path" />
                     </div>
-                    <span class="ws-header-status" id="ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
-                    <span class="credits-display" id="credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" aria-hidden="true"></span>...</span>
-                    <span class="storage-display" id="storage-display" onclick="updateStorageIndicator()" onkeydown="if(event.key==='Enter'||event.key===' ')updateStorageIndicator()" title="Local storage remaining" style="display:none" role="button" tabindex="0" aria-label="Storage remaining, click to refresh"><span class="storage-icon" aria-hidden="true"></span>...</span>
-                    <div class="model-name" id="model-name" style="display:none" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><button type="button" class="model-login-btn" id="model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
+                    <span class="ws-header-status" id="ws-header-status" data-i18n-attr="title,aria-label" aria-label="Workspace status" aria-haspopup="menu" aria-expanded="false" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="credits-display" id="credits-display" data-i18n-attr="aria-label" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" aria-hidden="true"></span>...</span>
+                    <span class="storage-display" id="storage-display" data-i18n-attr="aria-label" onclick="updateStorageIndicator()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();updateStorageIndicator()}" title="Local storage remaining" style="display:none" role="button" tabindex="0" aria-label="Storage remaining, click to refresh"><span class="storage-icon" aria-hidden="true"></span>...</span>
+                    <div class="model-name" id="model-name" style="display:none" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false"><span class="model-status-dot" id="model-status-dot"></span><span class="model-name-text" id="model-name-text"></span><button type="button" class="model-login-btn" id="model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
                     <div class="jobs-badge-wrapper" id="jobs-badge-wrapper">
-                        <button type="button" class="jobs-badge" id="jobs-badge" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
+                        <button type="button" class="jobs-badge" id="jobs-badge" data-i18n-attr="aria-label" aria-haspopup="menu" aria-expanded="false" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
                         <div class="jobs-dropdown header-menu" id="jobs-dropdown" style="display:none"></div>
                     </div>
-                    <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" aria-label="Open settings"></button>
-                    <button class="ext-panel-btn ext-reload-btn" id="ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+                    <button type="button" onclick="toggleSettingsPanel(event)" data-i18n-attr="title,aria-label" title="Settings" class="settings-btn" aria-label="Open settings" aria-haspopup="menu" aria-expanded="false"></button>
+                    <button class="ext-panel-btn ext-reload-btn" id="ext-reload-btn" data-i18n-attr="title,aria-label" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                 </div>
             </div>
             <div class="chat-content-wrapper">
-                <div class="messages" id="messages" role="log" aria-label="Chat messages" aria-live="polite"></div>
+                <div class="messages" id="messages" data-i18n-attr="aria-label" role="log" aria-label="Chat messages" aria-live="polite"></div>
                 <!-- Floating open button for sidebar -->
-                <button class="version-sidebar-open" id="version-sidebar-open" onclick="openVersionSidebar()" title="Open panel" aria-label="Open version history panel"></button>
+                <button class="version-sidebar-open" id="version-sidebar-open" data-i18n-attr="title,aria-label" onclick="openVersionSidebar()" title="Open panel" aria-label="Open version history panel"></button>
                 <!-- Version History Sidebar (inline with messages) -->
                 <div class="version-sidebar" id="version-sidebar">
-                    <button class="version-sidebar-close" id="version-sidebar-close" onclick="closeVersionSidebar()" title="Close panel" aria-label="Close version history panel"></button>
+                    <button class="version-sidebar-close" id="version-sidebar-close" data-i18n-attr="title,aria-label" onclick="closeVersionSidebar()" title="Close panel" aria-label="Close version history panel"></button>
                     <!-- Live sub-agent "Workers" cards live INSIDE the
                          scrolling sidebar content now (placeholder emitted by
                          renderVersionSidebar() in 120-ui-utils.js, populated by
                          renderWorkersStrip() in src/js/ui/175-sub-agent-ui.js)
                          so PRs / progress / workers share one scrollbar. -->
-                    <div class="version-history-list" id="version-history-list" role="list" aria-label="Version history">
-                        <div class="version-empty">No changes tracked yet</div>
+                    <div class="version-history-list" id="version-history-list" data-i18n-attr="aria-label" role="list" aria-label="Version history">
+                        <div class="version-empty" data-i18n>No changes tracked yet</div>
                     </div>
                 </div>
             </div>
@@ -133,96 +139,96 @@
                      rendered by renderWorkersStrip() in 175-sub-agent-ui.js. -->
                 <div class="chat-actions-row" id="chat-actions-row"></div>
                 <div class="input-container">
-                    <textarea id="message-input" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>
-                    <div class="context-indicator" id="context-indicator" title="Summarize and start a new chat" onclick="summarizeAndStartNewChat()" onkeydown="if(event.key==='Enter'||event.key===' ')summarizeAndStartNewChat()" style="cursor:pointer;" role="button" tabindex="0" aria-label="Summarize and start new chat">
+                    <textarea id="message-input" data-i18n-attr="aria-label" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>
+                    <div class="context-indicator" id="context-indicator" data-i18n-attr="aria-label" title="Summarize and start a new chat" onclick="summarizeAndStartNewChat()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();summarizeAndStartNewChat()}" style="cursor:pointer;" role="button" tabindex="0" aria-label="Summarize and start new chat">
                         <svg class="context-circle" viewBox="0 0 36 36">
                             <path class="context-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                             <path class="context-fill" id="context-fill" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                         </svg>
                     </div>
-                    <button id="pause-btn" onclick="togglePause()" aria-label="Pause or resume"><span class="btn-icon" id="pause-icon" aria-hidden="true"></span>Pause</button>
-                    <button id="continue-btn" onclick="continueAgent()" aria-label="Continue interrupted run"><span class="btn-icon" id="continue-icon" aria-hidden="true"></span>Continue</button>
-                    <button id="retry-btn" onclick="retryLastCall()" aria-label="Retry last action"><span class="btn-icon" id="retry-icon" aria-hidden="true"></span>Retry</button>
-                    <button id="attach-btn" onclick="document.getElementById('image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span id="attach-icon" aria-hidden="true"></span></button>
+                    <button id="pause-btn" data-i18n-attr="aria-label" onclick="togglePause()" aria-label="Pause or resume"><span class="btn-icon" id="pause-icon" aria-hidden="true"></span>Pause</button>
+                    <button id="continue-btn" data-i18n data-i18n-attr="aria-label" onclick="continueAgent()" aria-label="Continue interrupted run"><span class="btn-icon" id="continue-icon" aria-hidden="true"></span>Continue</button>
+                    <button id="retry-btn" data-i18n data-i18n-attr="aria-label" onclick="retryLastCall()" aria-label="Retry last action"><span class="btn-icon" id="retry-icon" aria-hidden="true"></span>Retry</button>
+                    <button id="attach-btn" data-i18n-attr="title,aria-label" onclick="document.getElementById('image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span id="attach-icon" aria-hidden="true"></span></button>
                     <input type="file" id="image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />
-                    <button id="send-btn" onclick="sendMessage()" aria-label="Send message"><span id="send-icon" aria-hidden="true"></span></button>
+                    <button id="send-btn" data-i18n-attr="aria-label" onclick="sendMessage()" aria-label="Send message"><span id="send-icon" aria-hidden="true"></span></button>
                 </div>
             </div>
         </main>
         <div class="skills-panel" id="skills-panel" style="display:none;">
             <div class="skills-list-panel" id="skills-list-panel">
                 <div class="skills-header page-toolbar">
-                    <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="skills-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                    <span class="skills-title page-toolbar-title">Agent Skills</span>
+                    <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="skills-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                    <span class="skills-title page-toolbar-title" data-i18n>Agent Skills</span>
                     <div class="page-toolbar-slot" id="skills-toolbar-slot"></div>
                     <div class="skills-actions page-toolbar-actions">
                         <span class="skills-action-wrapper">
-                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-import-dropdown')" title="Import Skills" aria-haspopup="true"><span class="action-icon"></span>Import<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-import-dropdown')" data-i18n data-i18n-attr="title" title="Import Skills" aria-haspopup="true"><span class="action-icon"></span>Import<span class="dropdown-caret" aria-hidden="true">▾</span></button>
                             <div class="sn-dropdown" id="skills-import-dropdown">
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>From Folder…</button>
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromJsonFile()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>From JSON File…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromFolder()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>From Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); importSkillsFromJsonFile()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>From JSON File…</button>
                             </div>
                         </span>
                         <span class="skills-action-wrapper">
-                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-export-dropdown')" title="Export All Skills" aria-haspopup="true"><span class="action-icon"></span>Export<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skills-export-dropdown')" data-i18n data-i18n-attr="title" title="Export All Skills" aria-haspopup="true"><span class="action-icon"></span>Export<span class="dropdown-caret" aria-hidden="true">▾</span></button>
                             <div class="sn-dropdown" id="skills-export-dropdown">
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>To Folder…</button>
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToJson()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>To JSON File</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToFolder()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>To Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportAllSkillsToJson()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>To JSON File</button>
                             </div>
                         </span>
-                        <button class="skills-action-btn primary" onclick="openSkillEditor()" title="Add New Skill"><span class="action-icon"></span>New Skill</button>
+                        <button class="skills-action-btn primary" onclick="openSkillEditor()" data-i18n data-i18n-attr="title" title="Add New Skill"><span class="action-icon"></span>New Skill</button>
                     </div>
                 </div>
                 <div class="skills-list" id="skills-list"></div>
             </div>
             <div class="skill-editor-panel" id="skill-editor-panel" style="display:none;">
                 <div class="skills-header">
-                    <button class="skills-back-btn" onclick="requestCloseSkillEditor()" title="Back to Skills" aria-label="Back to Skills"><span class="back-icon" aria-hidden="true"></span></button>
+                    <button class="skills-back-btn" onclick="requestCloseSkillEditor()" data-i18n-attr="title,aria-label" title="Back to Skills" aria-label="Back to Skills"><span class="back-icon" aria-hidden="true"></span></button>
                     <span class="skills-title" id="skill-editor-title">New Skill</span>
                     <div class="skills-actions">
-                        <button class="skills-action-btn" id="skill-edit-ai-btn" onclick="editSkillWithAgent()" title="Edit with Agent" style="display:none;"><span class="action-icon" id="skill-ai-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 1l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7z"/><circle cx="20" cy="5" r="2" fill="currentColor" stroke="none"/><circle cx="21" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="16" cy="21" r="2" fill="currentColor" stroke="none"/></svg></span>Edit with Agent</button>
-                        <button class="skills-action-btn success" id="skill-activate-btn" onclick="toggleSkillActivation()" title="Activate/Deactivate Skill" style="display:none;"><span class="action-icon"></span>Activate</button>
+                        <button class="skills-action-btn" id="skill-edit-ai-btn" data-i18n data-i18n-attr="title" onclick="editSkillWithAgent()" title="Edit with Agent" style="display:none;"><span class="action-icon" id="skill-ai-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 1l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7z"/><circle cx="20" cy="5" r="2" fill="currentColor" stroke="none"/><circle cx="21" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="16" cy="21" r="2" fill="currentColor" stroke="none"/></svg></span>Edit with Agent</button>
+                        <button class="skills-action-btn success" id="skill-activate-btn" data-i18n-attr="title" onclick="toggleSkillActivation()" title="Activate/Deactivate Skill" style="display:none;"><span class="action-icon"></span>Activate</button>
                         <span class="skills-action-wrapper" id="skill-download-btn" style="display:none;">
-                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skill-download-dropdown')" title="Download Skill" aria-haspopup="true"><span class="action-icon"></span>Download<span class="dropdown-caret" aria-hidden="true">▾</span></button>
+                            <button class="skills-action-btn" onclick="event.stopPropagation(); toggleDropdown('skill-download-dropdown')" data-i18n data-i18n-attr="title" title="Download Skill" aria-haspopup="true"><span class="action-icon"></span>Download<span class="dropdown-caret" aria-hidden="true">▾</span></button>
                             <div class="sn-dropdown" id="skill-download-dropdown">
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToFolder()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>As Folder…</button>
-                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToJson()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>As JSON File</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToFolder()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>As Folder…</button>
+                                <button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); exportCurrentSkillToJson()" data-i18n><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>As JSON File</button>
                             </div>
                         </span>
-                        <button class="skills-action-btn danger" id="skill-delete-btn" onclick="deleteCurrentSkill()" title="Delete Skill" style="display:none;"><span class="action-icon"></span>Delete</button>
-                        <button class="skills-action-btn primary" onclick="saveCurrentSkill()" title="Save Skill"><span class="action-icon"></span>Save</button>
+                        <button class="skills-action-btn danger" id="skill-delete-btn" data-i18n data-i18n-attr="title" onclick="deleteCurrentSkill()" title="Delete Skill" style="display:none;"><span class="action-icon"></span>Delete</button>
+                        <button class="skills-action-btn primary" onclick="saveCurrentSkill()" data-i18n data-i18n-attr="title" title="Save Skill"><span class="action-icon"></span>Save</button>
                     </div>
                 </div>
                 <div class="skill-editor-layout">
                     <div class="skill-editor-main">
                         <div class="skill-editor-field">
-                            <label for="skill-name-input">Name <span class="field-hint">(lowercase, hyphens only)</span></label>
-                            <input type="text" id="skill-name-input" placeholder="e.g. my-skill-name" aria-describedby="skill-name-hint" />
+                            <label for="skill-name-input" data-i18n>Name <span class="field-hint" data-i18n>(lowercase, hyphens only)</span></label>
+                            <input type="text" id="skill-name-input" data-i18n-attr="placeholder" placeholder="e.g. my-skill-name" aria-describedby="skill-name-hint" />
                         </div>
                         <div class="skill-editor-field skill-desc-field">
-                            <label for="skill-description-input">Description</label>
-                            <textarea id="skill-description-input" rows="2" placeholder="What this skill does and when to use it..." aria-label="Skill description"></textarea>
+                            <label for="skill-description-input" data-i18n>Description</label>
+                            <textarea id="skill-description-input" data-i18n-attr="placeholder,aria-label" rows="2" placeholder="What this skill does and when to use it..." aria-label="Skill description"></textarea>
                         </div>
                         <div class="skill-editor-field skill-actions-field">
                             <div class="skill-actions-header">
-                                <label>Actions <span class="field-hint">(one-click buttons that trigger this skill)</span></label>
-                                <button type="button" class="skill-actions-add-btn" onclick="addSkillAction()" title="Add Action" aria-label="Add action">+</button>
+                                <label data-i18n>Actions <span class="field-hint" data-i18n>(one-click buttons that trigger this skill)</span></label>
+                                <button type="button" class="skill-actions-add-btn" onclick="addSkillAction()" data-i18n-attr="title,aria-label" title="Add Action" aria-label="Add action">+</button>
                             </div>
                             <div class="skill-actions-list" id="skill-actions-list"></div>
                         </div>
                         <div class="skill-editor-field skill-body-field">
                             <div class="skill-body-header">
-                                <label>Content</label>
-                                <button class="skill-body-edit-btn" id="skill-body-edit-btn" onclick="toggleSkillBodyEdit()" title="Edit" aria-label="Edit skill content"></button>
+                                <label data-i18n>Content</label>
+                                <button class="skill-body-edit-btn" id="skill-body-edit-btn" data-i18n-attr="aria-label" onclick="toggleSkillBodyEdit()" title="Edit" aria-label="Edit skill content"></button>
                             </div>
                             <div class="skill-body-view" id="skill-body-view"></div>
-                            <textarea id="skill-body-input" placeholder="Enter skill instructions and knowledge..." style="display:none;" aria-label="Skill content"></textarea>
+                            <textarea id="skill-body-input" data-i18n-attr="placeholder,aria-label" placeholder="Enter skill instructions and knowledge..." style="display:none;" aria-label="Skill content"></textarea>
                         </div>
                     </div>
                     <div class="skill-editor-sidebar" id="skill-assets-container" style="display:none;">
                         <div class="skill-sidebar-header">
-                            <span class="skill-sidebar-title">Artifacts</span>
-                            <button class="skill-sidebar-add-btn" onclick="addSkillAsset()" title="Add Files" aria-label="Add files">+</button>
+                            <span class="skill-sidebar-title" data-i18n>Artifacts</span>
+                            <button class="skill-sidebar-add-btn" onclick="addSkillAsset()" data-i18n-attr="title,aria-label" title="Add Files" aria-label="Add files">+</button>
                         </div>
                         <div class="skill-artifacts-list" id="skill-assets-list"></div>
                     </div>
@@ -231,26 +237,26 @@
         </div>
         <div class="dashboard-panel" id="dashboard-panel" style="display:none;">
             <div class="dashboard-header page-toolbar">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="dashboard-title page-toolbar-title">Dashboard</span>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="dashboard-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                <span class="dashboard-title page-toolbar-title" data-i18n>Dashboard</span>
                 <div class="page-toolbar-slot" id="dashboard-toolbar-slot"></div>
                 <div class="dashboard-actions" id="dashboard-actions">
-                    <div class="segmented-toggle dashboard-mode-toggle" role="group" aria-label="Dashboard page mode">
-                        <button type="button" class="dashboard-mode-btn active" data-mode="dashboard" aria-pressed="true" onclick="setDashboardPageMode('dashboard')" title="Pinned widgets grid">Dashboard</button>
-                        <button type="button" class="dashboard-mode-btn" data-mode="library" aria-pressed="false" onclick="setDashboardPageMode('library')" title="Every saved widget">All widgets</button>
+                    <div class="segmented-toggle dashboard-mode-toggle" role="group" data-i18n-attr="aria-label" aria-label="Dashboard page mode">
+                        <button type="button" class="dashboard-mode-btn active" data-mode="dashboard" aria-pressed="true" onclick="setDashboardPageMode('dashboard')" data-i18n data-i18n-attr="title" title="Pinned widgets grid">Dashboard</button>
+                        <button type="button" class="dashboard-mode-btn" data-mode="library" aria-pressed="false" onclick="setDashboardPageMode('library')" data-i18n data-i18n-attr="title" title="Every saved widget">All widgets</button>
                     </div>
-                    <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
-                    <button class="skills-action-btn dashboard-action-collapsible" onclick="importDashboard()" title="Import"><span class="action-icon"></span>Import</button>
-                    <button class="skills-action-btn dashboard-action-collapsible" onclick="exportDashboard()" title="Export"><span class="action-icon"></span>Export</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="openDashboardInNewTab()" data-i18n data-i18n-attr="title" title="Open Standalone"><span class="action-icon" id="newtab-icon"></span>Open Standalone</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="importDashboard()" data-i18n data-i18n-attr="title" title="Import"><span class="action-icon"></span>Import</button>
+                    <button class="skills-action-btn dashboard-action-collapsible" onclick="exportDashboard()" data-i18n data-i18n-attr="title" title="Export"><span class="action-icon"></span>Export</button>
                     <div class="dashboard-more-btn">
-                        <button class="skills-action-btn" onclick="toggleDashboardMoreMenu(event)"><span class="action-icon"></span>More</button>
+                        <button class="skills-action-btn" onclick="toggleDashboardMoreMenu(event)" data-i18n><span class="action-icon"></span>More</button>
                         <div class="dashboard-more-dropdown" id="dashboard-more-dropdown">
-                            <button onclick="openDashboardInNewTab(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-standalone-icon"></span>Open Standalone</button>
-                            <button onclick="importDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-import-icon"></span>Import</button>
-                            <button onclick="exportDashboard(); closeDashboardMoreMenu();"><span class="dropdown-icon" id="more-export-icon"></span>Export</button>
+                            <button onclick="openDashboardInNewTab(); closeDashboardMoreMenu();" data-i18n><span class="dropdown-icon" id="more-standalone-icon"></span>Open Standalone</button>
+                            <button onclick="importDashboard(); closeDashboardMoreMenu();" data-i18n><span class="dropdown-icon" id="more-import-icon"></span>Import</button>
+                            <button onclick="exportDashboard(); closeDashboardMoreMenu();" data-i18n><span class="dropdown-icon" id="more-export-icon"></span>Export</button>
                         </div>
                     </div>
-                    <button class="skills-action-btn primary" onclick="openAddWidgetModal()" title="Add Widget"><span class="action-icon"></span>Add Widget</button>
+                    <button class="skills-action-btn primary" onclick="openAddWidgetModal()" data-i18n data-i18n-attr="title" title="Add Widget"><span class="action-icon"></span>Add Widget</button>
                 </div>
             </div>
             <div class="dashboard-grid" id="dashboard-grid" ondragover="handleWidgetDragOver(event)" ondrop="handleWidgetDrop(event)"></div>
@@ -259,24 +265,24 @@
         <div class="home-panel" id="home-panel" style="display:none;">
             <canvas class="home-trail-canvas" id="home-trail-canvas"></canvas>
             <div class="home-header">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="home-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="home-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
                 <span class="home-title" aria-hidden="true"></span>
                 <div class="header-controls">
                     <div class="header-actions" id="home-header-actions"></div>
-                    <span class="ext-status ext-sn-status" id="home-ext-sn-status" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
-                    <button class="ext-panel-btn ext-expand-btn" id="home-ext-expand-btn" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+                    <span class="ext-status ext-sn-status" id="home-ext-sn-status" data-i18n-attr="aria-label" style="display:none" role="button" tabindex="0" aria-label="Choose ServiceNow instance" title="ServiceNow connection"></span>
+                    <button class="ext-panel-btn ext-expand-btn" id="home-ext-expand-btn" data-i18n-attr="title,aria-label" aria-label="Expand to full page" style="display:none" onclick="expandSidePanel()" title="Expand to full page"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
                     <div class="browser-controls" id="home-browser-controls" style="display:none">
-                        <input type="text" id="home-browser-url-input" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl('home')" aria-label="Enter URL path" />
+                        <input type="text" id="home-browser-url-input" data-i18n-attr="placeholder,aria-label" class="browser-url-input" value="/" placeholder="Enter URL path..." onkeydown="if(event.key==='Enter')openBrowserWithUrl('home')" aria-label="Enter URL path" />
                     </div>
-                    <span class="ws-header-status" id="home-ws-header-status" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
-                    <span class="credits-display" id="home-credits-display" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" id="home-credits-icon" aria-hidden="true"></span>...</span>
-                    <div class="model-name" id="home-model-name" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><button type="button" class="model-login-btn" id="home-model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
+                    <span class="ws-header-status" id="home-ws-header-status" data-i18n-attr="title,aria-label" aria-label="Workspace status" aria-haspopup="menu" aria-expanded="false" style="display:none" onclick="toggleWorkspaceDropdown()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();if(!event.repeat)this.click();}" title="Workspace status" role="button" tabindex="0"></span>
+                    <span class="credits-display" id="home-credits-display" data-i18n-attr="aria-label" title="Click to refresh" role="button" tabindex="0" aria-label="Credits balance, click to refresh" style="display:none"><span class="credits-icon" id="home-credits-icon" aria-hidden="true"></span>...</span>
+                    <div class="model-name" id="home-model-name" onclick="toggleModelMenu(event)" onkeydown="toggleModelMenu(event)" role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false"><span class="model-status-dot" id="home-model-status-dot"></span><span class="model-name-text" id="home-model-name-text"></span><button type="button" class="model-login-btn" id="home-model-login-btn" style="display:none" onclick="event.stopPropagation();modelPillLoginClick()" aria-label="Connect subscription">Connect</button></div>
                     <div class="jobs-badge-wrapper" id="home-jobs-badge-wrapper">
-                        <button type="button" class="jobs-badge" id="home-jobs-badge" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
+                        <button type="button" class="jobs-badge" id="home-jobs-badge" data-i18n-attr="aria-label" aria-haspopup="menu" aria-expanded="false" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
                         <div class="jobs-dropdown header-menu" id="home-jobs-dropdown" style="display:none"></div>
                     </div>
-                    <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" id="home-settings-btn" aria-label="Open settings"></button>
-                    <button class="ext-panel-btn ext-reload-btn" id="home-ext-reload-btn" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+                    <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" id="home-settings-btn" data-i18n-attr="title,aria-label" aria-label="Open settings" aria-haspopup="menu" aria-expanded="false"></button>
+                    <button class="ext-panel-btn ext-reload-btn" id="home-ext-reload-btn" data-i18n-attr="title,aria-label" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                 </div>
             </div>
             <div class="home-content" id="home-content" style="display:none;">
@@ -296,55 +302,55 @@
         </div>
         <div class="settings-page-panel" id="settings-page-panel" style="display:none;">
             <div class="settings-page-header page-toolbar">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="settings-page-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="settings-page-title page-toolbar-title">Settings</span>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="settings-page-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                <span class="settings-page-title page-toolbar-title" data-i18n>Settings</span>
                 <div class="page-toolbar-slot" id="settings-toolbar-slot"></div>
                 <div class="skills-actions page-toolbar-actions">
-                    <button class="skills-action-btn" onclick="importAllData()" title="Import Data"><span class="action-icon" id="settings-import-icon"></span>Import Data</button>
-                    <button class="skills-action-btn" onclick="exportAllData()" title="Export Data"><span class="action-icon" id="settings-export-icon"></span>Export Data</button>
+                    <button class="skills-action-btn" onclick="importAllData()" data-i18n data-i18n-attr="title" title="Import Data"><span class="action-icon" id="settings-import-icon"></span>Import Data</button>
+                    <button class="skills-action-btn" onclick="exportAllData()" data-i18n data-i18n-attr="title" title="Export Data"><span class="action-icon" id="settings-export-icon"></span>Export Data</button>
                 </div>
             </div>
             <div class="settings-page-content" id="settings-page-content"></div>
         </div>
         <div class="docs-panel" id="docs-panel" style="display:none;">
             <div class="docs-header page-toolbar">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="docs-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="docs-title page-toolbar-title">Help &amp; Documentation</span>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="docs-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                <span class="docs-title page-toolbar-title" data-i18n>Help &amp; Documentation</span>
                 <div class="page-toolbar-slot" id="docs-toolbar-slot"></div>
                 <div class="skills-actions page-toolbar-actions">
-                    <button class="skills-action-btn" onclick="downloadDocsAsMarkdown()" title="Download as Markdown"><span class="action-icon" id="docs-download-icon"></span>Download</button>
+                    <button class="skills-action-btn" onclick="downloadDocsAsMarkdown()" data-i18n data-i18n-attr="title" title="Download as Markdown"><span class="action-icon" id="docs-download-icon"></span>Download</button>
                 </div>
             </div>
             <div class="docs-content" id="docs-content"></div>
         </div>
         <div class="documents-panel" id="documents-panel" style="display:none;">
             <div class="documents-header page-toolbar">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="documents-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="documents-title page-toolbar-title">Smart Documents</span>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="documents-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                <span class="documents-title page-toolbar-title" data-i18n>Smart Documents</span>
                 <div class="page-toolbar-slot" id="documents-toolbar-slot"></div>
                 <div class="skills-actions page-toolbar-actions">
-                    <button class="skills-action-btn" onclick="importDocuments()" title="Import Documents"><span class="action-icon" id="docs-import-icon"></span>Import</button>
-                    <button class="skills-action-btn" onclick="exportAllDocuments()" title="Export All Documents"><span class="action-icon" id="docs-export-icon"></span>Export</button>
-                    <button class="skills-action-btn primary" onclick="sdocCreateFromPage()" title="Create New Document"><span class="action-icon" id="docs-create-icon"></span>New Document</button>
+                    <button class="skills-action-btn" onclick="importDocuments()" data-i18n data-i18n-attr="title" title="Import Documents"><span class="action-icon" id="docs-import-icon"></span>Import</button>
+                    <button class="skills-action-btn" onclick="exportAllDocuments()" data-i18n data-i18n-attr="title" title="Export All Documents"><span class="action-icon" id="docs-export-icon"></span>Export</button>
+                    <button class="skills-action-btn primary" onclick="sdocCreateFromPage()" data-i18n data-i18n-attr="title" title="Create New Document"><span class="action-icon" id="docs-create-icon"></span>New Document</button>
                 </div>
             </div>
             <div class="documents-list" id="documents-list"></div>
         </div>
         <div class="history-panel" id="history-panel" style="display:none;">
             <div class="history-header page-toolbar">
-                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="history-toggle-sidebar-btn" aria-label="Expand sidebar"></button>
-                <span class="history-title page-toolbar-title">Chat History</span>
+                <button class="toggle-sidebar-btn" onclick="toggleSidebar()" title="Expand sidebar" id="history-toggle-sidebar-btn" data-i18n-attr="title,aria-label" aria-label="Expand sidebar"></button>
+                <span class="history-title page-toolbar-title" data-i18n>Chat History</span>
                 <div class="page-toolbar-slot">
                     <div class="sidebar-search-wrapper history-search-lg">
                         <span class="sidebar-search-icon" id="history-search-icon" aria-hidden="true"></span>
-                        <input type="text" id="history-search-input" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
-<button class="sidebar-search-clear" id="history-search-clear" onclick="clearHistorySearch()" title="Clear search" aria-label="Clear search">×</button>
+                        <input type="text" id="history-search-input" data-i18n-attr="placeholder,aria-label" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
+<button class="sidebar-search-clear" id="history-search-clear" data-i18n-attr="title,aria-label" onclick="clearHistorySearch()" title="Clear search" aria-label="Clear search">×</button>
                     </div>
                     <span class="history-stats widget-library-count" id="history-stats"></span>
                     <span class="page-toolbar-layout" id="history-layout-toggle"></span>
                 </div>
                 <div class="page-toolbar-actions">
-                    <button class="skills-action-btn" onclick="downloadChatHistory()" title="Download all chats"><span class="action-icon" id="history-download-icon"></span>Download All</button>
+                    <button class="skills-action-btn" onclick="downloadChatHistory()" data-i18n data-i18n-attr="title" title="Download all chats"><span class="action-icon" id="history-download-icon"></span>Download All</button>
                 </div>
             </div>
             <div class="history-list" id="history-list"></div>
@@ -374,7 +380,7 @@
 <div class="drop-overlay" id="drop-overlay">
     <div class="drop-overlay-content">
         <svg class="drop-overlay-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
-        <span>Drop image, PDF or text file here</span>
+        <span data-i18n>Drop image, PDF or text file here</span>
     </div>
 </div>
 
@@ -393,17 +399,17 @@
 </div>
 
 <!-- iOS Add to Home Screen Banner -->
-<div class="ios-install-banner" id="ios-install-banner" role="banner" aria-label="Install app">
+<div class="ios-install-banner" id="ios-install-banner" data-i18n-attr="aria-label" role="banner" aria-label="Install app">
     <div class="ios-install-icon">
         <svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
     </div>
     <div class="ios-install-text">
-        <div class="ios-install-title">Add AppAgent to Home Screen</div>
+        <div class="ios-install-title" data-i18n>Add AppAgent to Home Screen</div>
         <div class="ios-install-desc">
             Tap <svg class="ios-share-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg> then <strong>"Add to Home Screen"</strong>
         </div>
     </div>
-    <button class="ios-install-close" id="ios-install-close" aria-label="Dismiss">
+    <button class="ios-install-close" id="ios-install-close" data-i18n-attr="aria-label" aria-label="Dismiss">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
 </div>

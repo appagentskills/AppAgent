@@ -189,7 +189,7 @@ async function sendMessage() {
                 else if ((_reopens || 0) < 1) { if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} } setTimeout(function() { _sendMessageToOffscreen(_chatId, _text, _images, 0, (_reopens || 0) + 1); }, 250); }
                 else {
                     _restoreUnsentInput();
-                    showSnackbar('Could not deliver message — agent connection unavailable. Your message was restored to the input; please try again.', 'error');
+                    showSnackbar(t('Could not deliver message — agent connection unavailable. Your message was restored to the input; please try again.'), 'error');
                 }
             }
             if (typeof _agentBusPort === 'undefined' || !_agentBusPort) {
@@ -240,12 +240,12 @@ async function sendMessage() {
             delete _silentHookChats[currentChatId];
         }
         // Update spinner immediately so the user sees instant acknowledgement.
-        showSpinner(_ansViaChat ? 'Answer sent to the pending question…'
-            : (_cancelViaChat ? 'Cancelling the pending question…' : 'Interrupting…'), currentChatId);
+        showSpinner(_ansViaChat ? t('Answer sent to the pending question…')
+            : (_cancelViaChat ? t('Cancelling the pending question…') : t('Interrupting…')), currentChatId);
         // Re-render so the queued bubble appears immediately under the chat.
         renderMessages();
-        showSnackbar(_ansViaChat ? 'Message sent as the answer to the pending question.'
-            : (_cancelViaChat ? 'Pending question cancelled — interrupting current step.' : 'Message sent — interrupting current step.'));
+        showSnackbar(_ansViaChat ? t('Message sent as the answer to the pending question.')
+            : (_cancelViaChat ? t('Pending question cancelled — interrupting current step.') : t('Message sent — interrupting current step.')));
         return;
     }
 
@@ -403,7 +403,7 @@ async function sendWidgetMessage(message) {
         widget.title = message.substring(0, 50) + (message.length > 50 ? '...' : '');
         var headerTitle = document.getElementById('header-chat-title');
         if (headerTitle) {
-            headerTitle.innerHTML = '<span class="widget-mode-badge">Widget</span> ' + escapeHtml(widget.title);
+            headerTitle.innerHTML = '<span class="widget-mode-badge">' + escapeHtml(t('Widget')) + '</span> ' + escapeHtml(widget.title);
         }
     }
     

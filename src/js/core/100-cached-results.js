@@ -975,6 +975,29 @@ async function executeCachedContentRead(chatId, args) {
     };
 }
 
+// Append the reply-language instruction (i18nResponseLanguageInstruction,
+// core/025-i18n.js) on top of a CUSTOM system prompt that does not contain
+// the {{RESPONSE_LANGUAGE}} placeholder, so non-English UI users get replies
+// in their language whatever template they saved. Mirrors
+// _maybeAppendOrchestratorPolicy (core/110-system-prompt.js): custom prompts
+// only (the DEFAULT template carries the placeholder next to CURRENT DATE),
+// a no-op for English (the instruction is ''), and idempotent — the
+// instruction text doubles as the dedupe marker, so a custom prompt that kept
+// the placeholder (already expanded) or a second pass is left unchanged.
+function _maybeAppendResponseLanguage(expanded) {
+    try {
+        if (typeof expanded !== 'string') return expanded;
+        if (typeof hasCustomSystemPrompt !== 'function' || !hasCustomSystemPrompt()) return expanded;
+        if (typeof i18nResponseLanguageInstruction !== 'function') return expanded;
+        var instruction = i18nResponseLanguageInstruction();
+        if (!instruction) return expanded;
+        if (expanded.indexOf(instruction) !== -1) return expanded;
+        return expanded + '\n\n' + instruction;
+    } catch (e) {
+        return expanded;
+    }
+}
+
 function getSystemPromptWithContext(chatId) {
     // Use custom template if available, otherwise use default template.
     // chatId is optional — when provided AND the chat is a sub-agent, the
@@ -997,6 +1020,12 @@ function getSystemPromptWithContext(chatId) {
     // preamble so a sub's ROLE PRECEDENCE note still lands last.
     if (typeof _maybeAppendToolCatalog === 'function') {
         expanded = _maybeAppendToolCatalog(expanded, chatId);
+    }
+    // Custom-prompt fallback for the reply-language instruction (no-op for
+    // English, the default template, or a prompt that already carries it) —
+    // before the sub preamble so a sub's ROLE PRECEDENCE note still lands last.
+    if (typeof _maybeAppendResponseLanguage === 'function') {
+        expanded = _maybeAppendResponseLanguage(expanded);
     }
     if (typeof _maybeAppendSubAgentPreamble === 'function') {
         expanded = _maybeAppendSubAgentPreamble(expanded, chatId);

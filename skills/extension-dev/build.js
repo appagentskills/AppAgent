@@ -342,7 +342,55 @@ function applyDocsPlaceholders(docsMd, version, changelogMd) {
     var changelog = formatChangelogForDocs(changelogMd) || CHANGELOG_FALLBACK;
     return md.split('__CHANGELOG__').join(changelog);
 }
+
+// Translated Help page files (docs/locales/<code>/ -> docs-locales/<code>/).
+// KEEP IN SYNC with build/docs-placeholders.js buildDocsLocaleFiles.
+var DOCS_LOCALES_DIR = 'docs-locales';
+function buildDocsLocaleFiles(sources, version, changelogMd) {
+    var out = {};
+    Object.keys(sources || {}).sort().forEach(function(code) {
+        if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/.test(code)) return;
+        var src = sources[code] || {};
+        if (typeof src.documentation === 'string' && src.documentation.trim()) {
+            out[DOCS_LOCALES_DIR + '/' + code + '/documentation.md'] = applyDocsPlaceholders(src.documentation, version, changelogMd);
+        }
+        if (typeof src.readme === 'string' && src.readme.trim()) {
+            out[DOCS_LOCALES_DIR + '/' + code + '/README.md'] = src.readme;
+        }
+    });
+    return out;
+}
 // ─── End docs placeholders ────────────────────────────────────────────
+
+// ─── Bounded fan-out (Reload "Aw, Snap!" code 5) ──────────────────────
+// Every sandbox->host workspace call structured-clones its args into the
+// panel renderer, and every successful write emits workspaceMutated (twice
+// in the origin tab) plus an IDB put. With #1039's ~48 docs-locales files the
+// dist write set grew from ~17 to ~65 files, all fired at once via
+// Promise.all: every bundle copy (app.js / sw-bundle.js, multi-MB each) and
+// every translated doc was in flight at the same time, which can exhaust the
+// renderer heap before any IDB transaction commits (no dist written, tab
+// crashed) — the same failure class #1019 fixed for header scans. _mapLimit keeps at most `limit` calls in flight and preserves
+// input order in the result (same contract as Promise.all over fn).
+var BUILD_WRITE_CONCURRENCY = 4;
+var BUILD_READ_CONCURRENCY = 8;
+async function _mapLimit(items, limit, fn) {
+    var list = Array.isArray(items) ? items : [];
+    var n = Math.max(1, Math.floor(limit) || 1);
+    var out = new Array(list.length);
+    var next = 0;
+    async function worker() {
+        while (next < list.length) {
+            var i = next++;
+            out[i] = await fn(list[i], i);
+        }
+    }
+    var workers = [];
+    for (var w = 0; w < Math.min(n, list.length); w++) workers.push(worker());
+    await Promise.all(workers);
+    return out;
+}
+// ─── End bounded fan-out ──────────────────────────────────────────────
 
 // ─── Self-load from the workspace ─────────────────────────────────────
 // This tool's code is the copy EMBEDDED in the installed extension (seeded
@@ -486,7 +534,9 @@ async function extension_build(args) {
     // (each one is a sandbox->host message round-trip, so a sequential loop
     // over ~200 files costs seconds); Promise.all preserves input order.
     async function concatFiles(filePaths) {
-        var contents = await Promise.all(filePaths.map(readFile));
+        // Bounded (BUILD_READ_CONCURRENCY): ~200 source reads fired at once
+        // held every content copy in the panel renderer simultaneously.
+        var contents = await _mapLimit(filePaths, BUILD_READ_CONCURRENCY, function(p) { return readFile(p); });
         return contents.filter(function(c) { return c !== null; }).join('\n');
     }
 
@@ -516,6 +566,9 @@ async function extension_build(args) {
     // tool routing, entry point).
     // KEEP IN SYNC with build/build.js WORKER_SHARED_FILES.
     var WORKER_SHARED_FILES = [
+        // 025-i18n — t()/tn()/N_() + i18nFormat* (DOM-free, page AND SW).
+        // First, so it precedes every shared file that calls t().
+        'src/js/core/025-i18n.js',
         'src/js/core/030-config.js',
         // emoji shortcode map + replaceEmojiShortcodes (formatContent calls it unconditionally)
         'src/js/core/055-emoji-shortcodes.js',
@@ -736,8 +789,9 @@ async function extension_build(args) {
     // documentation.md first (applyDocsPlaceholders) so the runtime never sees
     // the placeholders. Both get merged at runtime via mergeReadmeIntoDocs.
     var docsMd = await readFile('docs/documentation.md');
+    var changelogMd = (await readFile('changelog.md')) || '';
     if (docsMd) {
-        docsMd = applyDocsPlaceholders(docsMd, version, (await readFile('changelog.md')) || '');
+        docsMd = applyDocsPlaceholders(docsMd, version, changelogMd);
         var docsB64 = btoa(unescape(encodeURIComponent(docsMd)));
         appJS = appJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
         workerJS = workerJS.split('__DOCS_MARKDOWN_B64__').join(docsB64);
@@ -770,7 +824,7 @@ async function extension_build(args) {
         });
     }
     ratchetScanFiles = ratchetScanFiles.slice().sort();
-    var ratchetContents = await Promise.all(ratchetScanFiles.map(readFile));
+    var ratchetContents = await _mapLimit(ratchetScanFiles, BUILD_READ_CONCURRENCY, function(p) { return readFile(p); });
     var ratchetFileMap = {};
     for (var rfi = 0; rfi < ratchetScanFiles.length; rfi++) {
         if (ratchetContents[rfi] !== null) ratchetFileMap[ratchetScanFiles[rfi]] = ratchetContents[rfi];
@@ -852,6 +906,21 @@ async function extension_build(args) {
 
     var testRunPolicySource = await readFile('src/js/core/075-test-run-policy.js');
     outputFiles.push({ path: 'dist/extension/test-run-policy.js', content: testRunPolicySource });
+
+    // 8b. Translated Help page (same set as build/build.js): one folder per
+    // src/locales/<code>.json catalog; missing docs/locales/<code>/ files are
+    // skipped (the runtime falls back to English per file). Written under
+    // dist/extension/docs-locales/, which the root deploy below recurses into.
+    var docsLocaleSources = {};
+    var docsLocaleLs = await ws("ls", { path: 'src/locales' });
+    var docsLocaleCodes = (docsLocaleLs.success ? docsLocaleLs.entries : []).map(function(e) { return String(e).split(' ')[0]; })
+        .filter(function(n) { return n.endsWith('.json'); }).map(function(n) { return n.slice(0, -5); });
+    var docsLocaleReads = await _mapLimit(docsLocaleCodes, BUILD_READ_CONCURRENCY, function(code) {
+        return Promise.all([readFile('docs/locales/' + code + '/documentation.md'), readFile('docs/locales/' + code + '/README.md')]);
+    });
+    docsLocaleCodes.forEach(function(code, i) { docsLocaleSources[code] = { documentation: docsLocaleReads[i][0], readme: docsLocaleReads[i][1] }; });
+    var docsLocaleFiles = buildDocsLocaleFiles(docsLocaleSources, version, changelogMd);
+    Object.keys(docsLocaleFiles).forEach(function(p) { outputFiles.push({ path: 'dist/extension/' + p, content: docsLocaleFiles[p] }); });
     var policyArtifacts = {};
     outputFiles.forEach(function(f) { policyArtifacts[f.path.substring('dist/extension/'.length)] = f.content; });
     var policyArtifactFailures = checkTestPolicyArtifacts(policyArtifacts, testRunPolicySource);
@@ -882,14 +951,20 @@ async function extension_build(args) {
         ? ('Icons deploy produced 0 files' + (iconsDeploy && iconsDeploy.error ? ' (' + iconsDeploy.error + ')' : '') + ' — extension icons may be missing or stale.')
         : null;
 
+    var localesCopied = 0; // 9b runs after the write-failure abort below
+
     // Write all output files. dist/* is gitignored, so the workspace cross-chat
     // conflict guard skips them automatically — we still check per-file success in
     // case some other failure mode (IDB write error, validation, etc.) trips.
     var fileNames = [];
     var writeFailures = [];
-    var writeResults = await Promise.all(outputFiles.map(function(f) {
-        return ws("write", { path: f.path, content: f.content });
-    }));
+    // Bounded (BUILD_WRITE_CONCURRENCY), NOT Promise.all: see _mapLimit. A
+    // write that throws becomes a per-file failure (build aborts before deploy)
+    // instead of rejecting the whole build with a stale dist.
+    var writeResults = await _mapLimit(outputFiles, BUILD_WRITE_CONCURRENCY, function(f) {
+        return Promise.resolve().then(function() { return ws("write", { path: f.path, content: f.content }); })
+            .catch(function(e) { return { success: false, error: (e && e.message) ? e.message : String(e) }; });
+    });
     for (var wi = 0; wi < outputFiles.length; wi++) {
         if (writeResults[wi] && writeResults[wi].success) {
             fileNames.push(outputFiles[wi].path);
@@ -911,12 +986,40 @@ async function extension_build(args) {
                 cssFiles: cssFiles.length,
                 skills: embeddedSkills.length,
                 iconsCopied: iconsCopied,
+                localesCopied: localesCopied,
                 writesAttempted: outputFiles.length,
                 writesSucceeded: fileNames.length,
                 writesFailed: writeFailures.length
             }
         };
     }
+
+    // 9b. i18n catalogs: deploy src/locales/*.json to locales/ (fetched at
+    // runtime by i18nInit via chrome.runtime.getURL). AFTER the write-failure
+    // abort above, so an aborted build never deploys catalogs. ext + flat:
+    // only top-level *.json, the same set build/build.js copies (readdirSync
+    // + endsWith('.json')). English needs no catalog: a missing/empty
+    // src/locales/ makes the deploy return success:false ("No deployable files
+    // found"), a NON-fatal warning. locales/ is a managed dest subdir (stale
+    // catalogs are removed) and survives the root deploy below (root GC only
+    // touches top-level files).
+    var localesDeploy = null;
+    try {
+        localesDeploy = await executeTool("workspace", {
+            action: "deploy",
+            path: "src/locales",
+            dest: "locales",
+            ext: ".json",
+            flat: true,
+            workspace: defaultWorkspace
+        });
+    } catch (e) {
+        localesDeploy = { success: false, error: e && e.message ? e.message : String(e) };
+    }
+    localesCopied = localesDeploy && localesDeploy.success ? (localesDeploy.files_written || 0) + (localesDeploy.files_skipped || 0) : 0;
+    var localesWarning = localesCopied === 0
+        ? ('Locales deploy produced 0 files' + (localesDeploy && localesDeploy.error ? ' (' + localesDeploy.error + ')' : '') + ' — UI falls back to English.')
+        : null;
 
     // 10. Deploy dist/extension/ to the connected folder
     var deployResult = null;
@@ -940,7 +1043,7 @@ async function extension_build(args) {
     return {
         success: !deployError,
         message: 'Built ' + fileNames.length + ' files to dist/extension/; ' + deployedSummary,
-        warning: iconsWarning || undefined,
+        warning: [iconsWarning, localesWarning].filter(Boolean).join(' ') || undefined,
         ratchet_tighten: ratchetCheck.tightenable.length ? ratchetCheck.tightenable : undefined,
         built_from: defaultWorkspace || null,
         files: fileNames,
@@ -952,6 +1055,7 @@ async function extension_build(args) {
             skills: embeddedSkills.length,
             eventBindings: (headResult.bindingJS.match(/_bindEv/g) || []).length - 1 + (bodyResult.bindingJS.match(/_bindEv/g) || []).length - 1,
             iconsCopied: iconsCopied,
+            localesCopied: localesCopied,
             filesDeployed: filesDeployed
         }
     };

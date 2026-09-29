@@ -62,6 +62,11 @@ async function init() {
     var savedScreenshotMethod = appStorage.getItem('screenshotMethod');
     if (savedScreenshotMethod) screenshotMethod = savedScreenshotMethod;
 
+    // i18n (core/025-i18n.js): start loading the UI language now (IDB 'uiLanguage' + locales/<code>.json)
+    // so the I/O overlaps Phase 1; awaited (bounded) by i18nBootApply before PHASE 2.
+    var _i18nBootP = null;
+    try { _i18nBootP = (typeof i18nInit === 'function') ? i18nInit() : null; } catch (e) {}
+
     // Load and apply theme (before any rendering to avoid flash)
     var savedTheme = appStorage.getItem('appTheme');
     if (savedTheme) appTheme = savedTheme;
@@ -159,6 +164,7 @@ async function init() {
         'settings-link-icon-github': 'git',
         'settings-link-icon-permissions': 'shield',
         'settings-link-icon-sysprompt': 'code',
+        'settings-link-icon-keyboard': 'keyboard',
         'settings-link-icon-all': 'settings'
     };
     Object.keys(gearLinkIcons).forEach(function(id) {
@@ -180,9 +186,18 @@ async function init() {
     // Setup and update storage indicator
     updateStorageIndicator();
     
+    // Central keyboard-shortcut registry + dispatcher (ui/320-keyboard-shortcuts.js):
+    // Mod+/, ?, /, Mod+Shift+O/S, Alt+Shift+C, Mod+comma,
+    // Alt+Up/Down, Esc-to-pause, and
+    // the shortcuts modal. Cmd/Ctrl+K (below) and Alt+Left (NAV-H7) stay here as
+    // their own listeners; the registry lists them as display-only rows.
+    if (typeof initKeyboardShortcuts === 'function') initKeyboardShortcuts();
+
     // Setup keyboard shortcut for ⌘K to focus search
     document.addEventListener('keydown', function(e) {
         if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === 'k' && !e.altKey) {
+            // Never move focus out from under the shortcuts dialog (ui/320-keyboard-shortcuts.js).
+            if (document.getElementById('keyboard-shortcuts-modal')) return;
             e.preventDefault();
             var searchInput = document.getElementById('chat-search-input');
             var sidebar = document.getElementById('sidebar');
@@ -329,6 +344,18 @@ async function init() {
             if (ddBtn) ddBtn.focus();
             return;
         }
+        // 6c. Settings custom dropdowns (.custom-dropdown.open, ui/140-dropdowns.js)
+        // had no Escape path. Close the topmost one, resync every trigger's
+        // aria-expanded and return focus to that dropdown's trigger.
+        var openCds = document.querySelectorAll('.custom-dropdown.open');
+        if (openCds.length) {
+            var cd = openCds[openCds.length - 1];
+            cd.classList.remove('open');
+            if (typeof syncCustomDropdownExpanded === 'function') syncCustomDropdownExpanded();
+            var cdTrig = cd.querySelector('.custom-dropdown-trigger');
+            if (cdTrig && typeof cdTrig.focus === 'function') cdTrig.focus();
+            return;
+        }
         // 7. Header pill menus — gear settings panel, jobs dropdown, model menu,
         // workspace dropdown, usage + instance pickers. They all share the
         // .header-menu chrome class (css/04-header.css:86) and are mutually
@@ -460,6 +487,11 @@ async function init() {
     if (inputArea) inputArea.style.visibility = 'visible';
     // Panel visibility is handled by inline script after panels are defined
 
+    // i18n (ui/245-i18n-dom.js): bounded wait for the language load kicked off above, then
+    // <html lang dir> + the appStorage mirror + applyI18n(document). Runs AFTER the English-text
+    // icon pass above (it matches btn.textContent). A late load (wedged IDB) re-applies and re-renders.
+    if (typeof i18nBootApply === 'function') { try { await i18nBootApply(_i18nBootP); } catch (e) {} }
+
     // ===========================================
     // PHASE 2: IndexedDB async loading
     // ===========================================
@@ -480,9 +512,7 @@ async function init() {
             navigator.storage.persist().then(function(granted) {
                 if (granted) return;
                 var isExtensionOrigin = typeof location !== 'undefined' && location.protocol === 'chrome-extension:';
-                if (isExtensionOrigin) {
-                    console.info('[init] storage.persist() not granted — expected for chrome-extension:// origins; data remains eviction-exempt via the manifest unlimitedStorage permission');
-                } else {
+                if (isExtensionOrigin) {} else {
                     console.warn('[init] storage.persist() not granted — origin data remains best-effort evictable');
                 }
             }).catch(function() {});
@@ -893,18 +923,18 @@ async function init() {
             // the body is only swapped once it is ready.
             var wrap = document.createElement('div');
             wrap.className = 'message-content';
-            if (!doc) wrap.textContent = 'Document not found';
+            if (!doc) wrap.textContent = t('Document not found');
             else wrap.innerHTML = '<h1>' + escDisplay(doc.title) + '</h1>' + sdocRenderContent(doc); // innerHTML → polyfill binds handlers
             document.body.innerHTML = '';
             document.body.classList.add('sdoc-standalone');   // classList, not className: keeps theme classes
-            if (doc) document.title = doc.title || 'Document';
+            if (doc) document.title = doc.title || t('Document');
             document.body.appendChild(wrap);
         }).catch(function(e) {
             console.error('[deep-link doc] failed:', e);
             // Show the error instead of a blank page (textContent escapes the message).
             var err = document.createElement('div');
             err.className = 'message-content';
-            err.textContent = 'Could not render document: ' + ((e && e.message) || String(e));
+            err.textContent = t('Could not render document: {error}', { error: (e && e.message) || String(e) });
             document.body.innerHTML = '';
             document.body.classList.add('sdoc-standalone');
             document.body.appendChild(err);
@@ -1051,7 +1081,7 @@ async function renderSkillsList() {
     var gen = ++skillsPageState.gen;
     var slot = document.getElementById('skills-toolbar-slot');
     if (slot && !slot.firstChild && typeof pageToolbarControlsHtml === 'function') {
-        slot.innerHTML = pageToolbarControlsHtml({ placeholder: 'Search skills\u2026', inputClass: 'skills-search-input', onInput: 'skillsOnSearchInput', countId: 'skills-count', layoutFn: 'skillsSetPageLayout' });
+        slot.innerHTML = pageToolbarControlsHtml({ placeholder: t('Search skills\u2026'), inputClass: 'skills-search-input', onInput: 'skillsOnSearchInput', countId: 'skills-count', layoutFn: 'skillsSetPageLayout' });
     }
     var layout = typeof pageLayoutGet === 'function' ? pageLayoutGet(SKILLS_PAGE_LAYOUT_KEY) : 'rows';
     if (typeof pageLayoutSyncButtons === 'function') pageLayoutSyncButtons(slot, layout);
@@ -1064,13 +1094,13 @@ async function renderSkillsList() {
     });
     var skillList = allSkills.filter(function(s) { return skillMatchesQuery(s, q); });
     var countEl = slot ? slot.querySelector('.widget-library-count') : null;
-    if (countEl) countEl.textContent = q ? skillList.length + ' of ' + allSkills.length : allSkills.length + (allSkills.length === 1 ? ' skill' : ' skills');
+    if (countEl) countEl.textContent = q ? t('{shown} of {total}', { shown: skillList.length, total: allSkills.length }) : tn(allSkills.length, '{count} skill', '{count} skills');
     if (allSkills.length > 0 && skillList.length === 0) {
-        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.search + '</span><p>No skills match \u201c' + escapeHtml(q) + '\u201d</p><p class="skills-empty-hint">Search looks at skill names, ids, descriptions and tags.</p></div>';
+        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.search + '</span><p>' + t('No skills match \u201c{query}\u201d', { query: escapeHtml(q) }) + '</p><p class="skills-empty-hint">' + t('Search looks at skill names, ids, descriptions and tags.') + '</p></div>';
         return;
     }
     if (skillList.length === 0) {
-        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>No skills yet</p><p class="skills-empty-hint">Create skills to give your AI agent specialized knowledge.</p></div>';
+        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>' + t('No skills yet') + '</p><p class="skills-empty-hint">' + t('Create skills to give your AI agent specialized knowledge.') + '</p></div>';
         return;
     }
     var html = '';
@@ -1091,12 +1121,12 @@ async function renderSkillsList() {
         // is set and its content no longer matches the shipped version.
         var isOob = !!skill.embeddedHash;
         var isEdited = isOob && !!skill.userModified;
-        var oobBadge = isOob ? '<span class="skill-oob-badge" title="Bundled with the extension (out-of-box)">Built-in</span>' : '';
-        var editedBadge = isEdited ? '<span class="skill-edited-badge" title="Modified — no longer matches the built-in version">Edited</span>' : '';
-        var activeBadge = isActive ? '<span class="skill-active-badge">Active</span>' : '';
+        var oobBadge = isOob ? '<span class="skill-oob-badge" title="' + escapeHtml(t('Bundled with the extension (out-of-box)')) + '">' + t('Built-in') + '</span>' : '';
+        var editedBadge = isEdited ? '<span class="skill-edited-badge" title="' + escapeHtml(t('Modified — no longer matches the built-in version')) + '">' + t('Edited') + '</span>' : '';
+        var activeBadge = isActive ? '<span class="skill-active-badge">' + t('Active') + '</span>' : '';
         var badgesInner = oobBadge + editedBadge + activeBadge;
         var badgesHtml = badgesInner ? '<span class="skill-item-badges">' + badgesInner + '</span>' : '';
-        var displayName = skill.name || skill.id || 'Untitled';
+        var displayName = skill.name || skill.id || t('Untitled');
         var descSnippet = skill.description ? '<div class="skill-item-desc">' + escapeHtml(skill.description) + '</div>' : '';
         
         // Show attachments
@@ -1112,7 +1142,7 @@ async function renderSkillsList() {
             attachmentsHtml += '</div>';
         }
         
-        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeJsString(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openSkillEditor(\'' + escapeJsString(skill.id) + '\')" role="button" tabindex="0" aria-label="Edit skill: ' + escapeHtml(displayName) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + badgesHtml + '</div>' + descSnippet + attachmentsHtml + '</div>';
+        html += '<div class="skill-item' + activeClass + '" onclick="openSkillEditor(\'' + escapeJsString(skill.id) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openSkillEditor(\'' + escapeJsString(skill.id) + '\')}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Edit skill: {name}', { name: displayName })) + '"><div class="skill-item-header"><span class="skill-item-icon" aria-hidden="true">' + UI_ICONS.skill + '</span><span class="skill-item-title">' + escapeHtml(displayName) + '</span>' + badgesHtml + '</div>' + descSnippet + attachmentsHtml + '</div>';
     });
     container.innerHTML = html;
 }
@@ -1145,7 +1175,7 @@ async function openSkillEditor(skillId) {
     var editAiBtn = document.getElementById('skill-edit-ai-btn');
     
     if (skill) {
-        if (editorTitle) editorTitle.textContent = 'Edit Skill';
+        if (editorTitle) editorTitle.textContent = t('Edit Skill');
         if (nameInput) nameInput.value = skill.name || skill.id || '';
         if (descInput) descInput.value = skill.description || '';
         if (bodyInput) bodyInput.value = skill.body || '';
@@ -1157,7 +1187,7 @@ async function openSkillEditor(skillId) {
         updateActivateButton();
         await renderSkillAssets();
     } else {
-        if (editorTitle) editorTitle.textContent = 'New Skill';
+        if (editorTitle) editorTitle.textContent = t('New Skill');
         if (nameInput) nameInput.value = '';
         if (descInput) descInput.value = '';
         if (bodyInput) bodyInput.value = '';
@@ -1193,17 +1223,17 @@ function renderSkillBodyView() {
         bodyView.style.display = 'none';
         bodyInput.style.display = 'block';
         bodyEditBtn.innerHTML = UI_ICONS.eye;
-        bodyEditBtn.title = 'View';
+        bodyEditBtn.title = t('View');
     } else {
         bodyInput.style.display = 'none';
         bodyView.style.display = 'block';
         bodyEditBtn.innerHTML = UI_ICONS.edit;
-        bodyEditBtn.title = 'Edit';
+        bodyEditBtn.title = t('Edit');
         
         if (content.trim()) {
             bodyView.innerHTML = '<div class="markdown-body">' + formatContent(content) + '</div>';
         } else {
-            bodyView.innerHTML = '<div class="skill-body-empty">No content yet. Click Edit to add instructions.</div>';
+            bodyView.innerHTML = '<div class="skill-body-empty">' + t('No content yet. Click Edit to add instructions.') + '</div>';
         }
     }
 }
@@ -1229,7 +1259,7 @@ function updateActivateButton() {
     var btn = document.getElementById('skill-activate-btn');
     if (!btn || !currentEditingSkill) return;
     var isActive = !!activeSkills[currentEditingSkill];
-    btn.innerHTML = isActive ? '<span class="action-icon">' + UI_ICONS.close + '</span>Deactivate' : '<span class="action-icon">' + UI_ICONS.play + '</span>Activate';
+    btn.innerHTML = isActive ? '<span class="action-icon">' + UI_ICONS.close + '</span>' + t('Deactivate') : '<span class="action-icon">' + UI_ICONS.play + '</span>' + t('Activate');
     btn.className = isActive ? 'skills-action-btn' : 'skills-action-btn success';
 }
 
@@ -1241,15 +1271,15 @@ async function toggleSkillActivation() {
     // Show spinner inside button
     if (btn) {
         btn.disabled = true;
-        btn.innerHTML = '<span class="action-icon">' + UI_ICONS.spinner + '</span>' + (isActive ? 'Deactivating...' : 'Activating...');
+        btn.innerHTML = '<span class="action-icon">' + UI_ICONS.spinner + '</span>' + (isActive ? t('Deactivating...') : t('Activating...'));
     }
     
     try {
         var result = isActive ? await deactivateSkill(currentEditingSkill) : await activateSkill(currentEditingSkill);
-        showSnackbar(result.message || (result.success ? 'Done' : result.error), result.success ? 'success' : 'error');
+        showSnackbar(result.message || (result.success ? t('Done') : result.error), result.success ? 'success' : 'error');
     } catch (e) {
         console.error('Skill activation error:', e);
-        showSnackbar('Error: ' + e.message, 'error');
+        showSnackbar(t('Error: {message}', { message: e.message }), 'error');
     } finally {
         if (btn) btn.disabled = false;
         updateActivateButton();
@@ -1262,7 +1292,7 @@ function showOverlaySpinner(text) {
     var overlay = document.createElement('div');
     overlay.id = 'overlay-spinner';
     overlay.className = 'overlay-spinner';
-    overlay.innerHTML = '<div class="overlay-spinner-content"><div class="spinner"></div><span>' + escapeHtml(text || 'Loading...') + '</span></div>';
+    overlay.innerHTML = '<div class="overlay-spinner-content"><div class="spinner"></div><span>' + escapeHtml(text || t('Loading...')) + '</span></div>';
     document.body.appendChild(overlay);
 }
 
@@ -1283,17 +1313,17 @@ async function renderSkillAssets() {
     if (skill) {
         var skillMdContent = skillToMarkdown(skill);
         var dropdownId = 'artifact-dropdown-skillmd';
-        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillMd()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')viewSkillMd()" role="button" tabindex="0" aria-label="View skill definition">';
+        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillMd()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();viewSkillMd()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('View skill definition')) + '">';
         html += '<div class="sn-artifact-icon sn-icon-md">' + UI_ICONS.skill + '</div>';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">SKILL.md</div>';
-        html += '<div class="sn-artifact-meta">Skill Definition</div>';
+        html += '<div class="sn-artifact-meta">' + t('Skill Definition') + '</div>';
         html += '</div>';
         html += '<div class="sn-artifact-actions">';
-        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="More options" aria-haspopup="true">···</button>';
+        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="' + escapeHtml(t('More options')) + '" aria-haspopup="true">···</button>';
         html += '<div class="sn-dropdown" id="' + dropdownId + '">';
-        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View</button>';
-        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' + t('View') + '</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillMd()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' + t('Download') + '</button>';
         html += '</div>';
         html += '</div>';
         html += '</div>';
@@ -1305,44 +1335,44 @@ async function renderSkillAssets() {
         if (String(asset.filename || '').toLowerCase() === 'skill.md') return;
         var icon = asset.type === 'xml' ? UI_ICONS.file : (asset.type === 'js' ? UI_ICONS.code : UI_ICONS.skill);
         var iconClass = asset.type === 'xml' ? 'xml' : (asset.type === 'js' ? 'js' : 'md');
-        var typeLabel = asset.type === 'js' ? 'JS Tool' : asset.type.toUpperCase();
+        var typeLabel = asset.type === 'js' ? t('JS Tool') : asset.type.toUpperCase();
         var dropdownId = 'artifact-dropdown-' + idx;
         // Escape for JS-string-in-onclick context (handles \ ' " < > & — a
         // user-renamable filename containing " must not break out of the attribute)
         var jsFilename = escapeJsString(asset.filename);
         
-        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillAsset(\'' + jsFilename + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')viewSkillAsset(\'' + jsFilename + '\')" role="button" tabindex="0" aria-label="View asset: ' + escapeHtml(asset.filename) + '">';
+        html += '<div class="sn-artifact-card sidebar-card skill-artifact" onclick="viewSkillAsset(\'' + jsFilename + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();viewSkillAsset(\'' + jsFilename + '\')}" role="button" tabindex="0" aria-label="' + escapeHtml(t('View asset: {name}', { name: asset.filename })) + '">';
         html += '<div class="sn-artifact-icon sn-icon-' + iconClass + '">' + icon + '</div>';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">' + escapeHtml(asset.filename) + '</div>';
         html += '<div class="sn-artifact-meta">' + typeLabel + '</div>';
         html += '</div>';
         html += '<div class="sn-artifact-actions">';
-        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="More options" aria-haspopup="true">···</button>';
+        html += '<button class="sn-artifact-menu" onclick="event.stopPropagation(); toggleDropdown(\'' + dropdownId + '\')" aria-label="' + escapeHtml(t('More options')) + '" aria-haspopup="true">···</button>';
         html += '<div class="sn-dropdown" id="' + dropdownId + '">';
-        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>View</button>';
-        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); renameSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>Rename</button>';
-        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); viewSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>' + t('View') + '</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); renameSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>' + t('Rename') + '</button>';
+        html += '<button class="sn-dropdown-item" onclick="event.stopPropagation(); closeDropdowns(); downloadSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' + t('Download') + '</button>';
         html += '<div class="sn-dropdown-divider"></div>';
-        html += '<button class="sn-dropdown-item danger" onclick="event.stopPropagation(); closeDropdowns(); removeSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>Remove</button>';
+        html += '<button class="sn-dropdown-item danger" onclick="event.stopPropagation(); closeDropdowns(); removeSkillAsset(\'' + jsFilename + '\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>' + t('Remove') + '</button>';
         html += '</div>';
         html += '</div>';
         html += '</div>';
     });
     
     if (!html) {
-        html = '<div class="skill-artifacts-empty">No artifacts yet</div>';
+        html = '<div class="skill-artifacts-empty">' + t('No artifacts yet') + '</div>';
     }
     
     // Add description text under the artifacts list
     html += '<div class="skill-artifacts-help">';
-    html += '<p>Artifacts you can add:</p>';
+    html += '<p>' + t('Artifacts you can add:') + '</p>';
     html += '<ul>';
-    html += '<li><strong>XML files (.xml)</strong> – Deployed when skill is activated</li>';
-    html += '<li><strong>JS files (.js)</strong> – Custom tools the agent can use</li>';
-    html += '<li><strong>Markdown files (.md)</strong> – Context for the AI</li>';
+    html += '<li><strong>' + t('XML files (.xml)') + '</strong> – ' + t('Deployed when skill is activated') + '</li>';
+    html += '<li><strong>' + t('JS files (.js)') + '</strong> – ' + t('Custom tools the agent can use') + '</li>';
+    html += '<li><strong>' + t('Markdown files (.md)') + '</strong> – ' + t('Context for the AI') + '</li>';
     html += '</ul>';
-    html += '<a href="#" onclick="event.preventDefault(); addSampleTool()">Add a sample tool</a>';
+    html += '<a href="#" onclick="event.preventDefault(); addSampleTool()">' + t('Add a sample tool') + '</a>';
     html += '</div>';
     
     container.innerHTML = html;

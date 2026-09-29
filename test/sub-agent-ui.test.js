@@ -4,6 +4,9 @@
 function runSubAgentUiAudit(sources) {
     var results = [];
     var source = sources['src/js/ui/175-sub-agent-ui.js'];
+    // ui/175 calls t()/tn()/N_() (incl. its top-level N_() label maps): the whole-file eval below
+    // prepends the REAL i18n core (no catalog set = English identity, like the harness auto-include).
+    var i18nCore = sources['src/js/core/025-i18n.js'];
     var css = sources['src/css/24-sub-agents.css'];
     var bodySource = sources['src/html/body.html'];
     function check(ok, message) { if (!ok) throw new Error(message); }
@@ -66,7 +69,8 @@ function runSubAgentUiAudit(sources) {
             toggleJsonCollapse: function() { calls.collapse++; }, selectChat: function(id) { calls.reveal.push(id); } };
         // Whole-file syntax/boot check, with only leaf renderers/navigation replaced.
         // Production resolution, reconstruction, modal lifecycle and event router run unchanged.
-        var api = new Function('env', 'with (env) {\n' + source + '\n' +
+        check(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
+        var api = new Function('env', 'with (env) {\n' + i18nCore + '\n' + source + '\n' +
             'revealSubAgentChat = function(id) { calls.reveal.push(id); };' +
             'renderSubReport = function() { return "report"; };' +
             '_subContextInfo = function() { return { pct: 0, tokens: 0 }; };' +
@@ -203,5 +207,5 @@ function runSubAgentUiAudit(sources) {
     return { passed: results.filter(function(r) { return r.passed; }).length, total: results.length, results: results };
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/ui/175-sub-agent-ui.js","src/css/24-sub-agents.css","src/html/body.html"];
+var PATHS = ["src/js/core/025-i18n.js","src/js/ui/175-sub-agent-ui.js","src/css/24-sub-agents.css","src/html/body.html"];
 await registerRunner('sub-agent-ui', async function() { return runSubAgentUiAudit(await loadSources(PATHS)); });

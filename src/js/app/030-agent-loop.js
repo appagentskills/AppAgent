@@ -455,9 +455,6 @@ function seedPlaceholderToolResults(chat, toolCalls) {
         });
         seeded.push(tc.id);
     }
-    if (seeded.length) {
-        console.log('[seed] placeholders for', seeded.join(','), '— chat now has', chat.messages.length, 'messages');
-    }
 }
 
 // Migration helper for chats created before the atomic-placeholder design,
@@ -720,8 +717,30 @@ function _pushEmptyResponseNudge(chat) {
     return true;
 }
 
+// HOOK-MERGE: chats whose CURRENT run is an after-response hook run (the run
+// started on the synthetic isHookMessage row pushed by
+// executeAfterResponseHooks, worker/020-page-stubs.js). While set, queued
+// injections (user text sent mid-hook, sub notices) are NOT flushed into the
+// hook turn: an injected row right after the hook row was merged by
+// buildAPIMessages' consecutive-user-row join into ONE "…say nothing else:
+// …\n\n<user text>" prompt (the user's request got ignored), and it became
+// the last non-hook user row, so findHookAnswerSpan anchored on it and
+// set_tldr / set_links / set_caveat failed with "No answer message found".
+// The entry is kept and delivered as its own turn by the end-of-run follow-up
+// drain once the hook run ends. Set/cleared by runAgent (start / cleanup).
+var _hookRunDeferInjectionByChat = {};
+// True when the run about to start is a hook run: the last user row is a hook
+// row AND nothing follows it yet (a later run on the same row — e.g. the
+// follow-up that delivers the deferred user text — is not a hook run).
+function _isHookRunStart(chat, lastUserMsgIndex) {
+    var msgs = (chat && chat.messages) || [];
+    return lastUserMsgIndex >= 0 && lastUserMsgIndex === msgs.length - 1
+        && !!msgs[lastUserMsgIndex] && msgs[lastUserMsgIndex].isHookMessage === true;
+}
+
 function flushPendingInjection(chat) {
     var chatId = chat && chat.id;
+    if (chatId && _hookRunDeferInjectionByChat[chatId]) return false; // HOOK-MERGE: defer past the hook run
     var entry = chatId ? pendingInjectionsByChatId[chatId] : null;
     var text, images;
     if (entry) {
@@ -1083,6 +1102,9 @@ async function runAgent(overrideChatId) {
             break;
         }
     }
+    // HOOK-MERGE: hook runs defer queued injections (see flushPendingInjection).
+    if (_isHookRunStart(chat, lastUserMsgIndex)) _hookRunDeferInjectionByChat[streamingChatId] = true;
+    else delete _hookRunDeferInjectionByChat[streamingChatId];
     // #9: one empty-response nudge per run.
     chat._emptyRetries = 0;
     // #16: the progress-card stamp (chat._progressCardAt, set by
@@ -2098,6 +2120,14 @@ async function runAgent(overrideChatId) {
     // re-queues the sub when it sees a pendingInjection — wiping it here
     // would lose the parent's message. Keep the entry around for sub-agent
     // chats so the backstop can act on it.
+    // HOOK-MERGE: end of a hook run — lift the deferral; an entry queued
+    // during it must survive the delete below so the follow-up drain
+    // delivers it as its own user turn.
+    var _hookRunDeferred = !!_hookRunDeferInjectionByChat[streamingChatId];
+    delete _hookRunDeferInjectionByChat[streamingChatId];
+    var _hookDeferredPending = _hookRunDeferred && !!(pendingInjectionsByChatId[streamingChatId]
+        && (pendingInjectionsByChatId[streamingChatId].text
+            || (pendingInjectionsByChatId[streamingChatId].images && pendingInjectionsByChatId[streamingChatId].images.length)));
     if (!isChatPaused(streamingChatId)) {
         pendingInjection = null;
         pendingInjectionImages = null;
@@ -2120,7 +2150,7 @@ async function runAgent(overrideChatId) {
                 });
             }
         } catch (e) { /* best-effort — fall back to legacy delete */ }
-        if (!(chat && chat.isSubAgent) && !_hasOwnSubs) {
+        if (!(chat && chat.isSubAgent) && !_hasOwnSubs && !_hookDeferredPending) {
             delete pendingInjectionsByChatId[streamingChatId];
         }
     }
@@ -2190,7 +2220,10 @@ async function runAgent(overrideChatId) {
     // chat that just finished.
     // Sub-agent chats are invisible to the human and run in service of a parent;
     // PM-facing hooks (auto-title, etc.) would burn tokens and surface nothing.
-    if (!isChatPaused(streamingChatId) && !_runApiError && !(chat && chat.isSubAgent)) {
+    // HOOK-MERGE: skip re-firing hooks when user input was deferred past this
+    // hook run — the follow-up drain below must run the user's turn now (the
+    // hooks fire again after THAT answer).
+    if (!isChatPaused(streamingChatId) && !_runApiError && !(chat && chat.isSubAgent) && !_hookDeferredPending) {
         // typeof guard: the page bundle no longer carries a (dead) copy of
         // executeAfterResponseHooks — only the SW bundle defines it
         // (worker/020-page-stubs.js), and only the SW runs this loop.

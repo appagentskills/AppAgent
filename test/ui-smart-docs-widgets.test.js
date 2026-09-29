@@ -636,7 +636,7 @@ describe('ui html_widget › inline frame chrome', function() {
         var iframe = x.m.renderWidgetInContainer(x.w, box);
         assert.strictEqual(iframe.className, 'widget-iframe');
         assert.strictEqual(iframe.getAttribute('src'), 'widget-sandbox.html');
-        assert.strictEqual(iframe.getAttribute('allow'), 'fullscreen *'); assert.ok(iframe.hasAttribute('allowfullscreen'));
+        assert.strictEqual(iframe.getAttribute('allow'), 'fullscreen *'); assert.ok(!iframe.hasAttribute('allowfullscreen'), 'legacy allowfullscreen must not be set alongside allow (Chrome precedence warning)');
         assert.strictEqual(iframe.hasAttribute('scrolling'), false, 'inline frames can scroll');
         assert.strictEqual(iframe.style.height, '122px', 'lastHeight + 2 slack');
         assert.strictEqual(iframe.dataset.savedWidgetId, 'widget_a');
@@ -900,7 +900,7 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
             assert.strictEqual(src.indexOf('Show in Panel'), -1, files[i] + ' still labels the tab-opening button "Show in Panel"');
             var rows = src.split('\n').filter(function(l) { return l.indexOf('<button') >= 0 && l.indexOf('showWidgetInPanel(') >= 0; });
             assert.strictEqual(rows.length, 1, files[i]);
-            assert.ok(rows[0].indexOf('title="Open in new tab">') >= 0 && rows[0].indexOf('UI_ICONS.externalLink') >= 0 && rows[0].indexOf('UI_ICONS.panelRight') < 0, files[i] + ': ' + rows[0].trim());
+            assert.ok((rows[0].indexOf('title="Open in new tab">') >= 0 || rows[0].indexOf("title=\"' + t('Open in new tab') + '\">") >= 0) && rows[0].indexOf('UI_ICONS.externalLink') >= 0 && rows[0].indexOf('UI_ICONS.panelRight') < 0, files[i] + ': ' + rows[0].trim());
         }
     }, { tags: ['unit'] });
 
@@ -988,9 +988,11 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         for (var f in want) {
             var tags = (await loadFile(f, WS)).match(/<button class="widget-close-btn"[^>]*>/g) || [];
             assert.strictEqual(tags.length, want[f], f + ': close-button count');
+            // i18n: the label is either the literal or the t()-wrapped key; the
+            // rendered English value is asserted above (c1/c2).
             tags.forEach(function(tag) {
-                assert.ok(tag.indexOf('aria-label="Close"') >= 0, f + ': no aria-label in ' + tag);
-                assert.ok(tag.indexOf('title="Close"') >= 0, f + ': no title in ' + tag);
+                assert.ok(/aria-label="(?:Close|' \+ escapeHtml\(t\('Close'\)\) \+ ')"/.test(tag), f + ': no aria-label in ' + tag);
+                assert.ok(/title="(?:Close|' \+ escapeHtml\(t\('Close'\)\) \+ ')"/.test(tag), f + ': no title in ' + tag);
             });
         }
     }, { tags: ['unit'] });

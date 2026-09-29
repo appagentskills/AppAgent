@@ -84,6 +84,7 @@ function rtBuildSandboxCode(cfg) {
         'var out = { files: [], summary: { files: 0, total: 0, passed: 0, failed: 0, skipped: 0, no_assertions: 0 }, denied_calls: guard.denied_calls, ran_in: "js_eval-sandbox", unsupported_layers: ["contract", "runtime"] };',
         'for (var i = 0; i < cfg.files.length; i++) {',
         '  var file = cfg.files[i], t0 = Date.now(), entry = { file: file, status: "pass", passed: 0, failed: 0, skipped: 0, failures: [] };',
+        '  try { parent.postMessage({ type: "sandboxTestProgress", index: i, file: file, phase: "start" }, "*"); } catch (_) {}',
         '  H.reset(file);',
         '  try {',
         '    await evalModule(cfg.sources[i], file, { workspace: cfg.workspace });',
@@ -95,10 +96,26 @@ function rtBuildSandboxCode(cfg) {
         '    if (r.failed) entry.status = "fail"; else if (!r.tests.length) entry.status = "empty";',
         '  } catch (e) { entry.status = "error"; entry.error = String(e && e.message || e); }',
         '  entry.duration_ms = Date.now() - t0; out.files.push(entry);',
+        '  try { parent.postMessage({ type: "sandboxTestProgress", index: i, file: file, phase: "done", status: entry.status, passed: entry.passed, failed: entry.failed, skipped: entry.skipped }, "*"); } catch (_) {}',
         '  if (entry.aborted) { out.aborted = true; break; }',
         '}',
         'return out;'
     ].join('\n');
+}
+
+// Live per-file progress (display only, never authority or verdict). The
+// sandbox is untrusted: accept only a known file at its exact index, a known
+// phase/status and non-negative integer counts; anything else is dropped.
+function rtProgressEvent(raw, cfg) {
+    if (!raw || typeof raw !== 'object' || !cfg || !Array.isArray(cfg.files)) return null;
+    var i = raw.index;
+    if (!Number.isSafeInteger(i) || i < 0 || i >= cfg.files.length || raw.file !== cfg.files[i]) return null;
+    var ev = { index: i, file: cfg.files[i], total: cfg.files.length, phase: raw.phase };
+    if (raw.phase === 'start') return ev;
+    if (raw.phase !== 'done' || ['pass', 'fail', 'error', 'empty'].indexOf(raw.status) < 0) return null;
+    if (!['passed', 'failed', 'skipped'].every(function(k) { return Number.isSafeInteger(raw[k]) && raw[k] >= 0; })) return null;
+    ev.status = raw.status; ev.passed = raw.passed; ev.failed = raw.failed; ev.skipped = raw.skipped;
+    return ev;
 }
 
 // Sandbox data cannot erase host denials or isolation findings. Recompute the
@@ -168,7 +185,7 @@ function rtGuardResult(out, cfg, evalRes) {
     return out;
 }
 
-var RunTestsHelpers = { rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE, rtSandboxErrorCode: rtSandboxErrorCode, rtGuardResult: rtGuardResult };
+var RunTestsHelpers = { rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtProgressEvent: rtProgressEvent, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE, rtSandboxErrorCode: rtSandboxErrorCode, rtGuardResult: rtGuardResult };
 
 // ─── tool entry points (dispatched from tools/020-tool-execution.js) ─────────
 
@@ -281,6 +298,16 @@ async function executeRunTests(args, messageIndex, options) {
         var evalOptions = _rtEvalOptions(options);
         evalOptions._testRunContext = context;
         evalOptions._testRunSignal = controller.signal;
+        // Host-only live progress hook (e.g. the Reload checklist); model args cannot supply it.
+        var onProgress = options && typeof options._runTestsOnProgress === 'function' ? options._runTestsOnProgress : null;
+        if (onProgress) {
+            var progressCfg = cfg;
+            evalOptions._testRunOnProgress = function(raw) {
+                if (controller.signal.aborted) return;
+                var ev = rtProgressEvent(raw, progressCfg);
+                if (ev) { try { onProgress(ev); } catch (e) { /* display only */ } }
+            };
+        }
         active();
         evalRes = await budget(executeTool('js_eval', { code: rtBuildSandboxCode(cfg) }, messageIndex, evalOptions));
     } catch (error) {

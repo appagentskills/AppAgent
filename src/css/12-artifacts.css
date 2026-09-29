@@ -61,7 +61,7 @@
 .sn-status-modified { background: var(--warning-light); color: var(--warning); }
 .sn-status-reverted { background: var(--secondary-light); color: var(--text-secondary); }
 .sn-status-merged { background: var(--success-light); color: var(--success); }
-.sn-changes-badge { display: inline-block; font-size: var(--text-sm); font-weight: var(--font-medium); padding: var(--space-1) var(--space-3); border-radius: var(--radius-xl); background: var(--secondary-light); color: var(--text-secondary); margin-left: var(--space-2); }
+.sn-changes-badge { display: inline-block; font-size: var(--text-sm); font-weight: var(--font-medium); padding: var(--space-1) var(--space-3); border-radius: var(--radius-xl); background: var(--secondary-light); color: var(--text-secondary); margin-inline-start: var(--space-2); }
 
 /* Artifact Actions */
 .sn-artifact-actions { flex-shrink: 0; position: relative; }
@@ -69,10 +69,10 @@
 .sn-artifact-menu:hover { background: var(--secondary-light); color: var(--text-secondary); }
 
 /* Dropdown Menu */
-.sn-dropdown { position: absolute; top: 100%; right: 0; min-width: 140px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: var(--z-overlay-base); overflow: hidden; display: none; cursor: pointer; }
+.sn-dropdown { position: absolute; top: 100%; inset-inline-end: 0; min-width: 140px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: var(--z-overlay-base); overflow: hidden; display: none; cursor: pointer; }
 .sn-dropdown.open { display: block; }
 .sn-dropdown, .sn-dropdown * { cursor: pointer !important; }
-.sn-dropdown-item { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-7); font-size: var(--text-body); color: var(--text-primary); transition: background var(--transition-fast); border: none; background: none; width: 100%; text-align: left; }
+.sn-dropdown-item { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-7); font-size: var(--text-body); color: var(--text-primary); transition: background var(--transition-fast); border: none; background: none; width: 100%; text-align: start; }
 .sn-dropdown-item:hover { background: var(--secondary-light); }
 .sn-dropdown-item svg { width: 16px; height: 16px; flex-shrink: 0; }
 .sn-dropdown-item.danger { color: var(--danger); }

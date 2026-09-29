@@ -15,11 +15,13 @@ var TB_CHIP_TINTS = ['violet', 'green', 'amber', 'sky', 'rose'];
 // white-on-blue chip (no tint modifier). Returns '' for "primary/neutral".
 function tbChipTintFor(label, isPrimary) {
     if (isPrimary) return '';
-    var t = String(label || '');
-    if (t.indexOf('Import') !== -1) return 'green';
-    if (t.indexOf('Export') !== -1 || t.indexOf('Download') !== -1) return 'amber';
-    if (t.indexOf('Standalone') !== -1 || t.indexOf('Open') !== -1) return 'violet';
-    if (t.indexOf('Delete') !== -1 || t.indexOf('Revert') !== -1) return 'rose';
+    // i18n: `lbl`, not `t`, so the global t() is never shadowed here. These
+    // keyword matches are logic on the English label (contract rule 3).
+    var lbl = String(label || '');
+    if (lbl.indexOf('Import') !== -1) return 'green';
+    if (lbl.indexOf('Export') !== -1 || lbl.indexOf('Download') !== -1) return 'amber';
+    if (lbl.indexOf('Standalone') !== -1 || lbl.indexOf('Open') !== -1) return 'violet';
+    if (lbl.indexOf('Delete') !== -1 || lbl.indexOf('Revert') !== -1) return 'rose';
     return 'sky'; // More, Refresh, and any other secondary action
 }
 

@@ -135,7 +135,20 @@
                 var name = rows[i] && rows[i]['role.name'];
                 if (name && roles.indexOf(name) === -1) roles.push(name);
             }
-            if (!roles.length) return;
+            if (!roles.length) {
+                // No direct roles: maybe the `maint` login (not a sys_user, no roles,
+                // more access than admin).
+                // Shared snMaintEligible/snDetectMaint (core/150-record-helpers.js): the roles
+                // probe succeeded with 0 roles; probe only without a (non-maint) user name.
+                if (typeof snMaintEligible !== 'function' || !snMaintEligible(roles, true, inst.userName)) return;
+                return snDetectMaint(inst.url, window.sessionToken, function(u, o) { return _origFetch.call(window, u, o); }).then(function(isMaint) {
+                    if (!isMaint) return;
+                    var mRoles = ['maint', 'admin'];
+                    (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url) { p.roles = mRoles; p.isMaint = true; if (!p.userName) p.userName = 'maint'; } });
+                    inst.roles = mRoles; inst.isMaint = true; if (!inst.userName) inst.userName = 'maint';
+                    if (_instanceDropdown) renderInstanceDropdown(instances);
+                });
+            }
             (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url) p.roles = roles; });
             inst.roles = roles;
             if (_instanceDropdown) renderInstanceDropdown(instances);
@@ -160,6 +173,7 @@
                         token: inst.token || '',
                         userName: inst.userName || '',
                         roles: inst.roles || [],
+                        isMaint: !!inst.isMaint || (inst.roles || []).indexOf('maint') !== -1,
                         tabs: inst.tabs || [],
                         isActive: inst.url === Platform.instanceUrl
                     };
@@ -300,8 +314,8 @@
             els.forEach(function(el) {
                 if (!el) return;
                 el.className = 'ext-status ext-sn-status disconnected';
-                el.innerHTML = '<span class="ext-status-dot"></span>Not connected';
-                el.title = 'No ServiceNow instance. Open a ServiceNow page in another tab.';
+                el.innerHTML = '<span class="ext-status-dot"></span>' + escapeHtml(t('Not connected'));
+                el.title = t('No ServiceNow instance. Open a ServiceNow page in another tab.');
                 el.style.display = '';
             });
             return;
@@ -311,7 +325,7 @@
         var shortName = host.split('.')[0];
         var isOk = _snStatusState === 'connected';
         var instPerms = (typeof instancePermissions !== 'undefined' && instancePermissions[host]) || { tier: 'manual' };
-        var tierLabel = instPerms.tier === 'auto' ? 'Auto' : (instPerms.tier === 'dev' ? 'Dev' : 'Manual');
+        var tierLabel = instPerms.tier === 'auto' ? t('Auto') : (instPerms.tier === 'dev' ? t('Dev') : t('Manual'));
         // Dev = approvals OFF for this instance: amber pill (04-header.css .tier-dev).
         var tierClass = (isOk && instPerms.tier === 'dev') ? ' tier-dev' : '';
 
@@ -320,7 +334,11 @@
             el.className = 'ext-status ext-sn-status' + (isOk ? '' : ' disconnected') + tierClass;
             el.innerHTML = '<span class="ext-status-dot"></span>' + escapeHtml(shortName) +
                 (isOk ? ' <span class="ext-status-tier">' + escapeHtml(tierLabel) + '</span>' : '');
-            el.title = isOk ? 'Connected to ' + host + ' (' + tierLabel + ' mode' + (instPerms.tier === 'dev' ? ' — no tool approvals' : '') + ')' : 'Disconnected from ' + host;
+            el.title = isOk
+                ? (instPerms.tier === 'dev'
+                    ? t('Connected to {host} ({tier} mode — no tool approvals)', { host: host, tier: tierLabel })
+                    : t('Connected to {host} ({tier} mode)', { host: host, tier: tierLabel }))
+                : t('Disconnected from {host}', { host: host });
             el.style.display = '';
         });
     }
@@ -403,7 +421,7 @@
             el.textContent = label;
             el.title = info.url || '';
         } else {
-            el.textContent = 'No active tab';
+            el.textContent = t('No active tab');
             el.title = '';
         }
     }
@@ -412,6 +430,12 @@
         var d = document.createElement('div');
         d.textContent = s;
         return d.innerHTML;
+    }
+
+    // Attribute-safe variant for translated text placed inside a double-quoted
+    // HTML attribute (a catalog value may contain a literal quote).
+    function _escAttr(s) {
+        return escapeHtml(s).replace(/"/g, '&quot;');
     }
 
     // Listen for active tab changes from background
@@ -628,9 +652,9 @@
     var _recentlyRemoved = {};
     var _REMOVED_TOMBSTONE_MS = 10000;
     function _isRecentlyRemoved(u) {
-        var t = _recentlyRemoved[u];
-        if (!t) return false;
-        if (Date.now() - t > _REMOVED_TOMBSTONE_MS) { delete _recentlyRemoved[u]; return false; }
+        var ts = _recentlyRemoved[u];
+        if (!ts) return false;
+        if (Date.now() - ts > _REMOVED_TOMBSTONE_MS) { delete _recentlyRemoved[u]; return false; }
         return true;
     }
 
@@ -981,12 +1005,12 @@
         // Shared banded section title (round-5 unification): same band + icon
         // pattern as every other header pill dropdown.
         var _instTitleIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.globe) ? UI_ICONS.globe : '';
-        dd.innerHTML = '<div class="menu-section-title"><span class="section-icon">' + _instTitleIcon + '</span>Instances</div>';
+        dd.innerHTML = '<div class="menu-section-title"><span class="section-icon">' + _instTitleIcon + '</span>' + escapeHtml(t('Instances')) + '</div>';
 
         if (instances.length === 0) {
             dd.innerHTML += isLoading
-                ? '<div class="ext-instance-empty">Checking ServiceNow connections…</div>'
-                : '<div class="ext-instance-empty">No ServiceNow tabs open.<br>Open a ServiceNow page to connect.</div>';
+                ? '<div class="ext-instance-empty">' + escapeHtml(t('Checking ServiceNow connections…')) + '</div>'
+                : '<div class="ext-instance-empty">' + escapeHtml(t('No ServiceNow tabs open.')) + '<br>' + escapeHtml(t('Open a ServiceNow page to connect.')) + '</div>';
         } else {
             instances.forEach(function(inst) {
                 var isActive = inst.url === Platform.instanceUrl;
@@ -1013,19 +1037,23 @@
                 var roles = signedOut ? [] : (inst.roles || []);  // signed-out rows show no privilege badge
                 // Privilege badge replaces username when present. Priority: security_admin > admin > snc_external.
                 var badgeHtml = '';
+                var rolesTitle = _escAttr(t('Click to view all roles'));
                 var shieldIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.shield) ? UI_ICONS.shield : '&#x1F6E1;';
                 var lockIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.lock) ? UI_ICONS.lock : '&#x1F512;';
-                if (roles.indexOf('security_admin') !== -1) {
-                    badgeHtml = '<span class="ext-instance-role-badge danger" title="Click to view all roles">' + shieldIcon + 'security_admin</span>';
+                if (roles.indexOf('maint') !== -1) {
+                    // maint: not a sys_user, no roles, but more access than admin (see snDetectMaint).
+                    badgeHtml = '<span class="ext-instance-role-badge danger" title="' + rolesTitle + '">' + shieldIcon + 'maint</span>';
+                } else if (roles.indexOf('security_admin') !== -1) {
+                    badgeHtml = '<span class="ext-instance-role-badge danger" title="' + rolesTitle + '">' + shieldIcon + 'security_admin</span>';
                 } else if (roles.indexOf('admin') !== -1) {
-                    badgeHtml = '<span class="ext-instance-role-badge warn" title="Click to view all roles">' + shieldIcon + 'admin</span>';
+                    badgeHtml = '<span class="ext-instance-role-badge warn" title="' + rolesTitle + '">' + shieldIcon + 'admin</span>';
                 } else if (roles.indexOf('snc_external') !== -1) {
-                    badgeHtml = '<span class="ext-instance-role-badge muted" title="Click to view all roles">' + lockIcon + 'snc_external</span>';
+                    badgeHtml = '<span class="ext-instance-role-badge muted" title="' + rolesTitle + '">' + lockIcon + 'snc_external</span>';
                 }
                 var userSuffix = signedOut
-                    ? ' <span class="ext-instance-signedout" title="No live session — click to open and sign in">· signed out</span>'
+                    ? ' <span class="ext-instance-signedout" title="' + _escAttr(t('No live session — click to open and sign in')) + '">· ' + escapeHtml(t('signed out')) + '</span>'
                     : (!badgeHtml && userName)
-                        ? ' <span class="ext-instance-user" title="Click to view all roles">· ' + escapeHtml(userName) + '</span>'
+                        ? ' <span class="ext-instance-user" title="' + rolesTitle + '">· ' + escapeHtml(userName) + '</span>'
                         : '';
                 // Per-row agent control: rows WITH a live tab get a Disable/Enable
                 // toggle (agent must never use a disabled instance); rows with NO
@@ -1035,7 +1063,7 @@
                 // the user.
                 var closeIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.close) ? UI_ICONS.close : '&#x2715;';
                 var disabledPill = agentDisabled
-                    ? '<span class="ext-instance-disabled-pill" title="The agent will not use this instance">disabled</span>'
+                    ? '<span class="ext-instance-disabled-pill" title="' + _escAttr(t('The agent will not use this instance')) + '">' + escapeHtml(t('disabled')) + '</span>'
                     : '';
                 var controlHtml = '';
                 if (hasTab || isActive) {
@@ -1044,19 +1072,21 @@
                     // heartbeat token) get the Disable toggle; Remove stays
                     // suppressed for the active instance.
                     controlHtml = '<button class="ext-instance-disable' + (agentDisabled ? ' on' : '') + '" title="' +
-                        (agentDisabled ? 'Agent is blocked from ' + escapeHtml(host) + ' \u2014 click to re-enable' : 'Prevent the agent from using ' + escapeHtml(host)) + '">' +
-                        (agentDisabled ? 'Enable' : 'Disable') + '</button>';
+                        (agentDisabled
+                            ? _escAttr(t('Agent is blocked from {host} — click to re-enable', { host: host }))
+                            : _escAttr(t('Prevent the agent from using {host}', { host: host }))) + '">' +
+                        escapeHtml(agentDisabled ? t('Enable') : t('Disable')) + '</button>';
                 } else {
-                    controlHtml = '<button class="ext-instance-remove" title="Remove ' + escapeHtml(host) + ' from this list">' + closeIcon + '</button>';
+                    controlHtml = '<button class="ext-instance-remove" title="' + _escAttr(t('Remove {host} from this list', { host: host })) + '">' + closeIcon + '</button>';
                 }
                 row.innerHTML = '<span class="ext-instance-dot' + (isConnected ? ' ok' : '') + '"></span>' +
                     '<span class="ext-instance-name" title="' + escapeHtml(host) + '">' + escapeHtml(shortName) + userSuffix + '</span>' +
                     badgeHtml +
                     disabledPill +
-                    '<a class="ext-instance-open" href="' + escapeHtml(inst.url) + '" target="_blank" title="Open ' + escapeHtml(host) + '">' + openIcon + '</a>' +
+                    '<a class="ext-instance-open" href="' + escapeHtml(inst.url) + '" target="_blank" title="' + _escAttr(t('Open {host}', { host: host })) + '">' + openIcon + '</a>' +
                     _tierSegmentsHtml(currentTier) +
                     controlHtml +
-                    '<button class="ext-instance-test" style="display:none;">Test</button>';
+                    '<button class="ext-instance-test" style="display:none;">' + escapeHtml(t('Test')) + '</button>';
 
                 // Wrap row + collapsible roles panel together so the panel sits directly below.
                 var item = document.createElement('div');
@@ -1157,10 +1187,9 @@
                         // Captured now \u2014 `inst`/`row` may be detached by a re-render
                         // while the dialog is up, so only this plain string is used after.
                         var url = inst.url;
-                        var title = 'Remove ' + host + '?';
-                        var msg = 'AppAgent forgets its cached session for <strong>' + escapeHtml(host) +
-                            '</strong> and drops it from this list. Nothing changes on the instance itself \u2014 ' +
-                            'it reappears here as soon as a ServiceNow tab for it is opened again.';
+                        var title = t('Remove {host}?', { host: host });
+                        var msg = t('AppAgent forgets its cached session for {host} and drops it from this list. Nothing changes on the instance itself — it reappears here as soon as a ServiceNow tab for it is opened again.',
+                            { host: '<strong>' + escapeHtml(host) + '</strong>' });
                         // Resolved LAZILY at click time. platform-bridge.js is an IIFE
                         // concatenated AFTER the page bundle (build/build.js:485,
                         // skills/extension-dev/build.js:176), so the top-level
@@ -1303,7 +1332,7 @@
         }
 
         // Render loading state
-        panel.innerHTML = '<div class="ext-roles-loading">Loading roles…</div>';
+        panel.innerHTML = '<div class="ext-roles-loading">' + escapeHtml(t('Loading roles…')) + '</div>';
 
         var _loadRoles = function(token) {
             var url = inst.url + '/api/now/table/sys_user_has_role'
@@ -1336,9 +1365,9 @@
                 // Friendly message; keep technical detail (e.g. "HTTP 401") in the
                 // tooltip only so non-technical users aren't shown raw status codes.
                 var detail = String((err && err.message) || err || '');
-                var msg = /401/.test(detail) ? 'Session expired — open the instance and sign in again.'
-                        : 'Could not load roles. Open the instance and try again.';
-                panel.innerHTML = '<div class="ext-roles-empty" title="' + escapeHtml(detail) + '">' + msg + '</div>';
+                var msg = /401/.test(detail) ? t('Session expired — open the instance and sign in again.')
+                        : t('Could not load roles. Open the instance and try again.');
+                panel.innerHTML = '<div class="ext-roles-empty" title="' + escapeHtml(detail) + '">' + escapeHtml(msg) + '</div>';
             });
         };
 
@@ -1356,14 +1385,14 @@
                 if (cached.userName && !inst.userName) inst.userName = cached.userName;
                 _loadRoles(cached.token);
             } else {
-                panel.innerHTML = '<div class="ext-roles-empty">Open the instance and sign in to view roles.</div>';
+                panel.innerHTML = '<div class="ext-roles-empty">' + escapeHtml(t('Open the instance and sign in to view roles.')) + '</div>';
             }
         });
     }
 
     function renderRolesPanel(panel, all, userName) {
         if (!all || !all.length) {
-            panel.innerHTML = '<div class="ext-roles-empty">No roles assigned.</div>';
+            panel.innerHTML = '<div class="ext-roles-empty">' + escapeHtml(t('No roles assigned.')) + '</div>';
             return;
         }
         var directCount = 0;
@@ -1371,17 +1400,18 @@
         var inheritedCount = all.length - directCount;
 
         var header = '<div class="ext-roles-header">'
-            + '<span class="ext-roles-title">' + escapeHtml(userName || 'Roles') + '</span>'
-            + '<span class="ext-roles-count">' + directCount + ' direct'
-            + (inheritedCount ? ' · ' + inheritedCount + ' inherited' : '')
+            + '<span class="ext-roles-title">' + escapeHtml(userName || t('Roles')) + '</span>'
+            + '<span class="ext-roles-count">' + escapeHtml(tn(directCount, '{count} direct', '{count} direct'))
+            + (inheritedCount ? ' · ' + escapeHtml(tn(inheritedCount, '{count} inherited', '{count} inherited')) : '')
             + '</span>'
             + '</div>';
 
+        var inheritedTag = '<span class="ext-roles-tag">' + escapeHtml(t('inherited')) + '</span>';
         var listItems = all.map(function(r) {
             return '<li class="ext-roles-item' + (r.inherited ? ' inherited' : ' direct') + '">'
                 + '<span class="ext-roles-dot"></span>'
                 + '<span class="ext-roles-name">' + escapeHtml(r.name) + '</span>'
-                + (r.inherited ? '<span class="ext-roles-tag">inherited</span>' : '')
+                + (r.inherited ? inheritedTag : '')
                 + '</li>';
         }).join('');
 
@@ -1392,9 +1422,9 @@
     // stays in the tooltip (title) only — non-technical users should never see
     // bare numbers like "401".
     function _friendlyConnError(status) {
-        if (status === 401) return { label: 'Signed out', title: 'Session expired (HTTP 401). Open the instance and sign in again, then retry.' };
-        if (status === 403) return { label: 'No access',  title: 'Access denied (HTTP 403). Your account lacks permission on this instance.' };
-        return { label: 'Unavailable', title: 'Connection failed (HTTP ' + status + '). Click to retry.' };
+        if (status === 401) return { label: t('Signed out'), title: t('Session expired (HTTP 401). Open the instance and sign in again, then retry.') };
+        if (status === 403) return { label: t('No access'),  title: t('Access denied (HTTP 403). Your account lacks permission on this instance.') };
+        return { label: t('Unavailable'), title: t('Connection failed (HTTP {status}). Click to retry.', { status: status }) };
     }
 
     // Per-row tier control in the instance picker: three icon segments
@@ -1404,16 +1434,16 @@
     function _tierSegmentsHtml(currentTier) {
         var ic = typeof UI_ICONS !== 'undefined' ? UI_ICONS : {};
         var defs = [
-            { v: 'manual', label: 'Manual', icon: ic.lock || '&#x1F512;', title: 'Manual: You control each permission' },
-            { v: 'auto', label: 'Auto', icon: ic.sparkle || '&#x2728;', title: 'Auto: Agent decides for write operations' },
-            { v: 'dev', label: 'Dev', icon: ic.zap || '&#x26A1;', title: 'Dev: NO approvals — every tool call on this instance runs without asking' }
+            { v: 'manual', label: t('Manual'), icon: ic.lock || '&#x1F512;', title: t('Manual: You control each permission') },
+            { v: 'auto', label: t('Auto'), icon: ic.sparkle || '&#x2728;', title: t('Auto: Agent decides for write operations') },
+            { v: 'dev', label: t('Dev'), icon: ic.zap || '&#x26A1;', title: t('Dev: NO approvals — every tool call on this instance runs without asking') }
         ];
         var tier = TIER_ORDER.indexOf(currentTier) !== -1 ? currentTier : 'manual';
-        var html = '<span class="ext-instance-tier tier-' + tier + '" title="Permission tier for this instance">';
+        var html = '<span class="ext-instance-tier tier-' + tier + '" title="' + _escAttr(t('Permission tier for this instance')) + '">';
         defs.forEach(function(d) {
             var sel = d.v === tier;
-            html += '<span class="ext-tier-opt ' + d.v + (sel ? ' selected' : '') + '" data-tier="' + d.v + '" title="' + d.title + '">' +
-                d.icon + (sel ? ' ' + d.label : '') + '</span>';
+            html += '<span class="ext-tier-opt ' + d.v + (sel ? ' selected' : '') + '" data-tier="' + d.v + '" title="' + _escAttr(d.title) + '">' +
+                d.icon + (sel ? ' ' + escapeHtml(d.label) : '') + '</span>';
         });
         return html + '</span>';
     }
@@ -1440,10 +1470,10 @@
             // Failed: hide tier, show the status pill (doubles as a retry button).
             if (tier) tier.style.display = 'none';
             btn.style.display = '';
-            btn.textContent = label || 'Test';
+            btn.textContent = label || t('Test');
             // Keep technical detail (e.g. HTTP 401) in the tooltip only — never
             // surface raw status codes to non-technical users.
-            btn.title = title || 'Click to retry';
+            btn.title = title || t('Click to retry');
             btn.className = 'ext-instance-test fail';
             dot.className = 'ext-instance-dot fail';
             btn.disabled = false;
@@ -1451,7 +1481,7 @@
 
         var doTest = function(token) {
             if (!token) {
-                _showFailed('Signed out', 'Not signed in to this instance. Open it and sign in, then retry.');
+                _showFailed(t('Signed out'), t('Not signed in to this instance. Open it and sign in, then retry.'));
                 return;
             }
             _origFetch.call(window, inst.url + '/api/now/uisession/touch-session', {
@@ -1476,7 +1506,7 @@
                     updateSnStatus();
                 }
             }).catch(function() {
-                _showFailed('Offline', 'Could not reach the instance. Check your connection and retry.');
+                _showFailed(t('Offline'), t('Could not reach the instance. Check your connection and retry.'));
             });
         };
 

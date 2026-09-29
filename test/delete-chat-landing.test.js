@@ -7,7 +7,10 @@
 'use strict';
 
 var DCL_NAV = 'src/js/ui/170-chat-management.js';
-var DCL_PATHS = [DCL_NAV, 'src/js/ui/030-home-view.js', 'src/js/ui/040-tools-settings.js',
+// The excerpts call t()/tn()/N_(): every with (env) sandbox below gets the REAL i18n core first
+// (no catalog set = English identity, like the harness auto-include in test/harness.js).
+var DCL_I18N = 'src/js/core/025-i18n.js';
+var DCL_PATHS = [DCL_I18N, DCL_NAV, 'src/js/ui/030-home-view.js', 'src/js/ui/040-tools-settings.js',
     'src/js/core/120-init.js', 'src/js/ui/060-docs-view.js'];
 var DCL_EXISTING = ['a_oldest', 'chat_sub_x', 'cur'];
 var _dclSrc = null;
@@ -31,6 +34,12 @@ function dclDeclaration(source, header) {
 }
 
 function dclIsExisting(id) { return DCL_EXISTING.indexOf(id) >= 0; }
+
+function dclI18n(src) {
+    var core = src[DCL_I18N];
+    if (typeof core !== 'string' || core.indexOf('function t(') < 0) throw new Error('missing i18n core source: ' + DCL_I18N);
+    return core;
+}
 
 function dclFixture(src, openChatId) {
     var calls = { newChat: 0, selectChat: [], renderChatList: 0, saves: 0, notified: [],
@@ -101,6 +110,7 @@ function dclFixture(src, openChatId) {
     // Real newChat / selectChat (plus the view helpers they may call), wrapped as spies,
     // so the old first-key pick would really stamp the chat it opens.
     var real = new Function('env', 'with (env) {\n' + [
+        dclI18n(src),
         dclDeclaration(src[DCL_NAV], 'function newChat'),
         dclDeclaration(src[DCL_NAV], 'function selectChat'),
         dclDeclaration(src['src/js/ui/030-home-view.js'], 'function closeHomeView'),
@@ -111,7 +121,7 @@ function dclFixture(src, openChatId) {
     ].join('\n') + '\nreturn { newChat: newChat, selectChat: selectChat };\n}')(env);
     env.newChat = function() { calls.newChat++; return real.newChat.apply(null, arguments); };
     env.selectChat = function(id) { calls.selectChat.push(id); return real.selectChat.apply(null, arguments); };
-    var deleteChat = new Function('env', 'with (env) {\n' +
+    var deleteChat = new Function('env', 'with (env) {\n' + dclI18n(src) + '\n' +
         dclDeclaration(src[DCL_NAV], 'async function deleteChat') + '\nreturn deleteChat;\n}')(env);
     return { env: env, calls: calls, deleteChat: deleteChat };
 }
@@ -211,7 +221,7 @@ test('NEW-T15-2/NEW-T21-1: a cancelled deleteChat keeps the pausedChats flag and
 }, { tags: ['unit'], timeout: 2000 });
 
 test('TA-9: continue-from-summary resets a stale composer hint (A6A3-02)', async function() {
-    var src = (await dclSources())[DCL_NAV];
+    var all = await dclSources(), src = all[DCL_NAV];
     var input = { value: '', placeholder: 'Describe the widget you want to create...' };
     function noop() {}
     var env = {
@@ -226,7 +236,7 @@ test('TA-9: continue-from-summary resets a stale composer hint (A6A3-02)', async
         setChatPausedPersistent: noop, pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop,
         runAgent: function() { return Promise.resolve(); }
     };
-    var fn = new Function('env', 'with (env) {\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
+    var fn = new Function('env', 'with (env) {\n' + dclI18n(all) + '\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
         dclDeclaration(src, 'function completeSummaryAndCreateNewChat') + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
     fn();
     await Promise.resolve();

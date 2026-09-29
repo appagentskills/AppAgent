@@ -95,25 +95,25 @@ async function exportAllData() {
     try {
         // Use File System Access API for streaming large exports
         if (!window.showSaveFilePicker) {
-            showSnackbar('Your browser does not support large exports. Use Chrome or Edge.', 'error');
+            showSnackbar(t('Your browser does not support large exports. Use Chrome or Edge.'), 'error');
             return;
         }
 
         // S0B-06: ask first; the safe default leaves the keys out. The modal click
         // keeps the user activation the file picker needs. Cancel/dismiss: nothing
         // is written.
-        var keyChoice = await showModal('Export Data',
-            'API keys are stored in <b>plaintext</b>: anyone who gets a backup that includes them can use them.<br><br>' +
-            '<b>Export without API keys</b> (recommended): importing this backup later keeps the API keys already on that device.',
-            [{ label: 'Cancel', value: 'cancel', class: 'secondary' },
-                { label: 'Export without API keys', value: 'nokeys', class: 'primary' },
-                { label: 'Include API keys (plaintext)', value: 'keys', class: 'warning' }], 'warning');
+        var keyChoice = await showModal(t('Export Data'),
+            t('API keys are stored in <b>plaintext</b>: anyone who gets a backup that includes them can use them.') + '<br><br>' +
+            t('<b>Export without API keys</b> (recommended): importing this backup later keeps the API keys already on that device.'),
+            [{ label: t('Cancel'), value: 'cancel', class: 'secondary' },
+                { label: t('Export without API keys'), value: 'nokeys', class: 'primary' },
+                { label: t('Include API keys (plaintext)'), value: 'keys', class: 'warning' }], 'warning');
         if (keyChoice !== 'nokeys' && keyChoice !== 'keys') return;
         var redactKeys = keyChoice !== 'keys';
 
         var fileHandle = await window.showSaveFilePicker({
             suggestedName: 'appagent-backup-' + new Date().toISOString().split('T')[0] + '.json',
-            types: [{ description: 'JSON Files', accept: { 'application/json': ['.json'] } }]
+            types: [{ description: t('JSON Files'), accept: { 'application/json': ['.json'] } }]
         });
 
         writable = await fileHandle.createWritable();
@@ -222,14 +222,16 @@ async function exportAllData() {
         await writable.close();
 
         // S0B-07: payloads that could not be re-inlined are reported, not hidden.
-        if (exportStats.missing) showSnackbar('Exported ' + chatCount + ' chats; ' + exportStats.missing + ' attachments could not be included', 'warning');
-        else showSnackbar('Data exported successfully! (' + chatCount + ' chats)', 'success');
+        // i18n: one sentence, pluralized on the attachment count; English keeps "chats" (test anchor).
+        if (exportStats.missing) showSnackbar(tn(exportStats.missing, 'Exported {chats} chats; {count} attachment could not be included',
+            'Exported {chats} chats; {count} attachments could not be included', { chats: i18nFormatNumber(chatCount) }), 'warning');
+        else showSnackbar(tn(chatCount, 'Data exported successfully! ({count} chat)', 'Data exported successfully! ({count} chats)'), 'success');
     } catch (e) {
         // S0B-07: a failed write must not leave a (swap) file behind.
         if (writable) try { await writable.abort(); } catch (_) {}
         if (e.name === 'AbortError') return; // User cancelled file picker
         console.error('Export failed:', e);
-        showSnackbar('Export failed: ' + e.message, 'error');
+        showSnackbar(t('Export failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -344,7 +346,7 @@ async function importAllData() {
                 adoptChatRow(importedChat, { chatId: newId, force: true });
                 await saveChatsToStorage();
                 renderChatList();
-                showSnackbar('Chat imported successfully', 'success');
+                showSnackbar(t('Chat imported successfully'), 'success');
                 return;
             }
             
@@ -514,29 +516,41 @@ async function importAllData() {
             var _cProvBackup = _cProviders.filter(function(p) { return !_provFlagged[p.name]; });
             var _cProvCleared = _cProviders.filter(function(p) { return _provCleared[p.name]; });
             var _cProvReplaced = _cProviders.filter(function(p) { return _provReplaced[p.name]; });
-            var _provNames = function(list) { return _importConflictNames(list.map(function(p) { return p.name; })).slice(1); };
+            // i18n: {names} = the escaped list without its ': ' lead (_importConflictNames).
+            var _provNames = function(list) { return _importConflictNames(list.map(function(p) { return p.name; })).slice(2); };
             var _provKeyNotes = [];
-            if (_cProvBackup.length + _cProvCleared.length + _cProvReplaced.length < _cProviders.length) _provKeyNotes.push('local API keys kept' + (_cProvBackup.length ? ', except the backup value for' + _provNames(_cProvBackup) : ''));
-            else if (_cProvBackup.length) _provKeyNotes.push('API keys revert to the backup value for' + _provNames(_cProvBackup));
-            if (_cProvCleared.length) _provKeyNotes.push('key cleared for' + _provNames(_cProvCleared) + ' (different or invalid endpoint)');
-            if (_cProvReplaced.length) _provKeyNotes.push('local key replaced for' + _provNames(_cProvReplaced) + ' (endpoint key)');
+            if (_cProvBackup.length + _cProvCleared.length + _cProvReplaced.length < _cProviders.length) _provKeyNotes.push(_cProvBackup.length ? t('local API keys kept, except the backup value for {names}', { names: _provNames(_cProvBackup) }) : t('local API keys kept'));
+            else if (_cProvBackup.length) _provKeyNotes.push(t('API keys revert to the backup value for {names}', { names: _provNames(_cProvBackup) }));
+            if (_cProvCleared.length) _provKeyNotes.push(t('key cleared for {names} (different or invalid endpoint)', { names: _provNames(_cProvCleared) }));
+            if (_cProvReplaced.length) _provKeyNotes.push(t('local key replaced for {names} (endpoint key)', { names: _provNames(_cProvReplaced) }));
             // R1g: no provider conflicts = no key note (not "0 providers (API keys revert ...)").
-            var _provKeyNote = !_cProviders.length ? '' : _cProvBackup.length === _cProviders.length ? 'API keys revert to the backup value' : _provKeyNotes.join('; ');
-            var _impLines = ['<b>Rows with the same id are REPLACED by the backup version:</b>',
-                _cChats.length + ' of ' + _impChats.length + ' chats' + _importConflictNames(_cChats.map(function(c) { return (typeof c.title === 'string' && c.title) || c.id; })),
-                _cSettings.length + ' settings' + (_epCleared.length ? ' (key cleared for' + _importConflictNames(_epCleared).slice(1) + ' (different or invalid endpoint))' : '') + _importConflictNames(_cSettings.map(function(s) { return s.key; })),
-                _cProviders.length + ' providers' + (_provKeyNote ? ' (' + _provKeyNote + ')' : '') + _importConflictNames(_cProviders.map(function(p) { return p.name; })),
-                _cDash.length + ' dashboard widgets; ' + ((_impWidgets && _impWidgets.length) || 0) + ' widget histories (newest kept)',
-                'Everything else is added. This cannot be undone.'];
-            if (_impSkipped) _impLines.push(_impSkipped + ' invalid row(s) will be skipped.');
+            var _provKeyNote = !_cProviders.length ? '' : _cProvBackup.length === _cProviders.length ? t('API keys revert to the backup value') : _provKeyNotes.join('; ');
+            // i18n: the counts keep their plural-neutral English (test anchors); tn() gives
+            // translators the plural categories. The escaped name lists stay appended data.
+            var _histCount = i18nFormatNumber((_impWidgets && _impWidgets.length) || 0);
+            var _impLines = ['<b>' + t('Rows with the same id are REPLACED by the backup version:') + '</b>',
+                tn(_impChats.length, '{replaced} of {count} chats', '{replaced} of {count} chats', { replaced: i18nFormatNumber(_cChats.length) }) +
+                    _importConflictNames(_cChats.map(function(c) { return (typeof c.title === 'string' && c.title) || c.id; })),
+                (_epCleared.length
+                    ? tn(_cSettings.length, '{count} settings ({note})', '{count} settings ({note})',
+                        { note: t('key cleared for {names} (different or invalid endpoint)', { names: _importConflictNames(_epCleared).slice(2) }) })
+                    : tn(_cSettings.length, '{count} settings', '{count} settings')) + _importConflictNames(_cSettings.map(function(s) { return s.key; })),
+                (_provKeyNote
+                    ? tn(_cProviders.length, '{count} providers ({note})', '{count} providers ({note})', { note: _provKeyNote })
+                    : tn(_cProviders.length, '{count} providers', '{count} providers')) + _importConflictNames(_cProviders.map(function(p) { return p.name; })),
+                tn(_cDash.length, '{count} dashboard widgets; {histories} widget histories (newest kept)',
+                    '{count} dashboard widgets; {histories} widget histories (newest kept)', { histories: _histCount }),
+                t('Everything else is added. This cannot be undone.')];
+            if (_impSkipped) _impLines.push(tn(_impSkipped, '{count} invalid row(s) will be skipped.', '{count} invalid row(s) will be skipped.'));
             // S0B-02: the import restarts the extension (below), which stops every
             // in-flight agent run - warn in this SAME confirm (Reload's count loop).
             var _impRunning = 0;
             if (typeof runningChatIds !== 'undefined' && runningChatIds) {
                 for (var _rcid in runningChatIds) { if (runningChatIds[_rcid]) _impRunning++; }
             }
-            if (_impRunning) _impLines.unshift('<b>' + _impRunning + ' agent run(s) in progress; importing restarts the extension and stops them.</b>');
-            if (!await showConfirmModal('Import Data – replace existing?', _impLines.join('<br>'), 'warning')) {
+            if (_impRunning) _impLines.unshift('<b>' + tn(_impRunning, '{count} agent run(s) in progress; importing restarts the extension and stops them.',
+                '{count} agent run(s) in progress; importing restarts the extension and stops them.') + '</b>');
+            if (!await showConfirmModal(t('Import Data – replace existing?'), _impLines.join('<br>'), 'warning')) {
                 return;
             }
 
@@ -566,9 +580,15 @@ async function importAllData() {
                 }
             }
 
-            var _impResult = 'Data imported successfully! (' + _impChats.length + ' chats, ' + _impSettings.length + ' settings' +
-                (_impSkipped ? '; ' + _impSkipped + ' invalid row(s) skipped' : '') + ')';
-            showSnackbar(_impResult + ' Reloading...', 'success');
+            // i18n: translated now - the one-shot notice below is shown after the restart as-is.
+            var _impSetCount = i18nFormatNumber(_impSettings.length);
+            var _impResult = _impSkipped
+                ? tn(_impChats.length, 'Data imported successfully! ({count} chat, {settings} settings; {skipped} invalid row(s) skipped)',
+                    'Data imported successfully! ({count} chats, {settings} settings; {skipped} invalid row(s) skipped)',
+                    { settings: _impSetCount, skipped: i18nFormatNumber(_impSkipped) })
+                : tn(_impChats.length, 'Data imported successfully! ({count} chat, {settings} settings)',
+                    'Data imported successfully! ({count} chats, {settings} settings)', { settings: _impSetCount });
+            showSnackbar(t('{result} Reloading...', { result: _impResult }), 'success');
             // S0B-03: the restart below wipes that snackbar at once - hand the result
             // to the next boot. appStorage (localStorage), not sessionStorage:
             // chrome.runtime.reload() closes this page and a NEW tab is reopened.
@@ -578,7 +598,7 @@ async function importAllData() {
             await _restartAfterImport();
         } catch (e) {
             console.error('Import failed:', e);
-            showSnackbar('Import failed: ' + e.message, 'error');
+            showSnackbar(t('Import failed: {error}', { error: e.message }), 'error');
         }
     };
     input.click();
@@ -645,11 +665,14 @@ async function deleteAllData() {
     if (typeof runningChatIds !== 'undefined' && runningChatIds) {
         for (var _drcid in runningChatIds) { if (runningChatIds[_drcid]) _delRunning++; }
     }
-    var _delWarn = _delRunning ? '<b>' + _delRunning + ' agent run(s) in progress; deleting restarts the extension and stops them.</b><br><br>' : '';
-    if (!await showConfirmModal('Delete All Data', _delWarn + 'This permanently deletes <strong>all chats and their agent runs, skills (built-in skills are restored), widgets, documents, settings and permissions, saved API keys and sign-ins (GitHub, ServiceNow, Claude, ChatGPT) and the cached ServiceNow instance list</strong>.<br><br><strong>Kept:</strong> local repository clones, including unpushed edits. This cannot be undone.', 'danger')) {
+    var _delWarn = _delRunning ? '<b>' + tn(_delRunning, '{count} agent run(s) in progress; deleting restarts the extension and stops them.',
+        '{count} agent run(s) in progress; deleting restarts the extension and stops them.') + '</b><br><br>' : '';
+    if (!await showConfirmModal(t('Delete All Data'), _delWarn +
+            t('This permanently deletes <strong>all chats and their agent runs, skills (built-in skills are restored), widgets, documents, settings and permissions, saved API keys and sign-ins (GitHub, ServiceNow, Claude, ChatGPT) and the cached ServiceNow instance list</strong>.') + '<br><br>' +
+            t('<strong>Kept:</strong> local repository clones, including unpushed edits. This cannot be undone.'), 'danger')) {
         return;
     }
-    if (!await showConfirmModal('Confirm Delete', 'All chats, skills, widgets, documents, settings, saved API keys and sign-ins will be deleted. Local repository clones are kept. Then the extension restarts, which closes every open AppAgent panel. Are you REALLY sure?', 'danger')) {
+    if (!await showConfirmModal(t('Confirm Delete'), t('All chats, skills, widgets, documents, settings, saved API keys and sign-ins will be deleted. Local repository clones are kept. Then the extension restarts, which closes every open AppAgent panel. Are you REALLY sure?'), 'danger')) {
         return;
     }
 
@@ -699,9 +722,10 @@ async function deleteAllData() {
         if (typeof pushPermissionsToOffscreen === 'function') {
             try { pushPermissionsToOffscreen({ toolPermissions: {}, instancePermissions: {} }); } catch (ePerm) { /* the restart below re-reads IDB */ }
         }
-        var _delResult = secretsRemoved ? 'All data deleted' : 'All data deleted, but some saved sign-ins could not be removed';
+        // Translated here: the next boot shows the stored notice text as-is (S0B-03).
+        var _delResult = secretsRemoved ? t('All data deleted') : t('All data deleted, but some saved sign-ins could not be removed');
         var _delKind = secretsRemoved ? 'success' : 'error';
-        showSnackbar(_delResult + '. Restarting...', _delKind);
+        showSnackbar(t('{result}. Restarting...', { result: _delResult }), _delKind);
         // The restart wipes that snackbar: hand the result to the next boot (S0B-03).
         try {
             if (typeof appStorage !== 'undefined') appStorage.setItem(POST_IMPORT_NOTICE_KEY, JSON.stringify({ msg: _delResult, type: _delKind, at: Date.now() }));
@@ -717,7 +741,7 @@ async function deleteAllData() {
             if (_delLockSent) await _deleteAllCall(function(done) { _delRt.sendMessage({ type: 'delete-all-save-lock', locked: false }, done); });
         }
         console.error('Delete failed:', e);
-        showSnackbar('Delete failed: ' + e.message, 'error');
+        showSnackbar(t('Delete failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -757,12 +781,23 @@ function toggleSettingsPanel(e) {
         if (btn) {
             var rect = btn.getBoundingClientRect();
             panel.style.top = (rect.bottom + 4) + 'px';
-            panel.style.right = (window.innerWidth - rect.right) + 'px';
+            // Rule 10: align the panel's END edge with the button's (right in LTR,
+            // left in RTL); clear the other side, left over from a language switch.
+            if (typeof i18nDir === 'function' && i18nDir() === 'rtl') {
+                panel.style.right = '';
+                panel.style.left = rect.left + 'px';
+            } else {
+                panel.style.left = '';
+                panel.style.right = (window.innerWidth - rect.right) + 'px';
+            }
         }
         panel.classList.add('visible');
         // Sync the theme segmented control with the persisted pref (same
         // mechanism as the settings page: appTheme + setAppTheme).
         if (typeof syncSettingsPanelTheme === 'function') syncSettingsPanelTheme();
+        // Same for the Language picker (ui/245: shared option list + preference
+        // with Settings > Language; onchange = setAppLanguage).
+        if (typeof syncSettingsPanelLanguage === 'function') syncSettingsPanelLanguage();
         // "Connect GitHub" item: only shown when GitHub is NOT connected — same
         // connected test as the settings page GitHub section (user + token).
         var ghItem = document.getElementById('settings-github-connect');
@@ -779,6 +814,7 @@ function toggleSettingsPanel(e) {
         panel.classList.remove('visible');
         document.removeEventListener('click', closeSettingsPanelOnOutsideClick);
     }
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
 function closeSettingsPanelOnOutsideClick(e) {
@@ -800,6 +836,7 @@ function closeSettingsPanel() {
     var refocus = !!(panel && ae && panel.contains(ae));
     if (panel) panel.classList.remove('visible');
     document.removeEventListener('click', closeSettingsPanelOnOutsideClick);
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
     if (refocus) {
         var gears = document.querySelectorAll('.settings-btn');
         for (var i = 0; i < gears.length; i++) {

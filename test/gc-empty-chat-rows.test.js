@@ -92,7 +92,9 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
         var t = Date.now() - 3 * DAY;
         return Object.assign({ id: id, title: id, messages: [], createdAt: t, updatedAt: t }, extra || {});
     }
-    function gcLines(logs) { return logs.filter(function(l) { return l.indexOf('empty-row GC: reaped') !== -1; }); }
+    // Last phase-2 outcome exposed by the module (null when no pass reached it).
+    function gcRun(r) { var s = r.m.getEmptyRowGcLastRun(); return s && { reaped: s.reaped, candidates: s.candidates, capped: s.capped }; }
+    function debugLines(logs) { return logs.filter(function(l) { return /^(log|info|debug|table): /.test(l); }); }
 
     test('reaps only rows absent from memory AND empty on disk AND past 24h AND not running; keys-only scan, no value cursor', async function() {
         var r = await load({
@@ -124,7 +126,8 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
         assert.deepStrictEqual(r.idb.calls.gets.slice().sort(), ['e_active', 'e_fresh', 'e_old', 'e_old', 'e_run', 'full']);
         var rw = r.idb.calls.txs.filter(function(t) { return t.mode === 'readwrite'; });
         assert.strictEqual(rw.length, 1, 'one readwrite tx: the deleteChatRow for e_old');
-        assert.deepStrictEqual(gcLines(r.logs), ['log: [chat-delete] empty-row GC: reaped 1 of 1 empty candidate row(s)']);
+        assert.deepStrictEqual(gcRun(r), { reaped: 1, candidates: 1, capped: false });
+        assert.deepStrictEqual(debugLines(r.logs), [], 'no debug console output');
     }, U);
 
     test('a candidate absent from memory but NON-empty on disk survives (no delete issued)', async function() {
@@ -135,7 +138,7 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
         assert.deepStrictEqual(r.idb.calls.dels, []);
         assert.deepStrictEqual(r.idb.calls.gets, ['full']);
         assert.strictEqual(r.idb.calls.txs.every(function(t) { return t.mode === 'readonly'; }), true);
-        assert.deepStrictEqual(gcLines(r.logs), []);
+        assert.strictEqual(gcRun(r), null, 'no candidates: phase 2 never ran');
     }, U);
 
     test('a row that gains messages after the by-key pre-filter is refused by the delete tx and survives', async function() {
@@ -146,7 +149,7 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
         assert.strictEqual(await r.m.gcEmptyChatRows(), 0);
         assert.strictEqual(r.idb.has('race'), true);
         assert.deepStrictEqual(r.idb.calls.dels, []);
-        assert.deepStrictEqual(gcLines(r.logs), ['log: [chat-delete] empty-row GC: reaped 0 of 1 empty candidate row(s)']);
+        assert.deepStrictEqual(gcRun(r), { reaped: 0, candidates: 1, capped: false });
     }, U);
 
     test('unhydrated map (false or undeclared): returns 0 with zero IDB access', async function() {
@@ -159,7 +162,8 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
             assert.strictEqual(r.idb.calls.txs.length, 0, 'no transaction');
             assert.strictEqual(r.idb.calls.getAllKeys + r.idb.calls.gets.length + r.idb.calls.openCursor + r.idb.calls.getAll, 0);
             assert.strictEqual(r.idb.has('e_old'), true);
-            assert.deepStrictEqual(gcLines(r.logs), []);
+            assert.strictEqual(gcRun(r), null);
+            assert.deepStrictEqual(debugLines(r.logs), []);
         }
     }, U);
 
@@ -173,9 +177,7 @@ describe('F3 gcEmptyChatRows key-diff + sweep keep-set', function() {
         var ro = r.idb.calls.txs.filter(function(t) { return t.mode === 'readonly'; });
         assert.strictEqual(ro.reduce(function(s, t) { return s + t.gets; }, 0), 200, 'by-key reading stops at the cap');
         assert.strictEqual(ro.every(function(t) { return t.gets <= 25; }), true, 'batches of <= 25');
-        var lines = gcLines(r.logs);
-        assert.strictEqual(lines.length, 1);
-        assert.match(lines[0], /reaped 200 of 200 empty candidate row\(s\) \(per-boot cap hit/);
+        assert.deepStrictEqual(gcRun(r), { reaped: 200, candidates: 200, capped: true });
     }, U);
 
     test('store failure keeps the contract: resolves 0 and warns', async function() {

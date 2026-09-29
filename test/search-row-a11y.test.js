@@ -49,7 +49,7 @@ describe('search-mode chat rows open the chat (A1-01)', function() {
     test('A1-01: snippet clicks never bubble to the row', async function() {
         var t = await loadSearchRows('qzx7');
         var html = t.m.renderChatItem({ id: 'c1', title: 'Plain', messages: [{ role: 'user', content: 'has qzx7 inside' }] });
-        var snip = html.match(/<div class="chat-result-snippet-item" onclick="([^"]*)"/);
+        var snip = html.match(/<div class="chat-result-snippet-item"[^>]*? onclick="([^"]*)"/);
         assert.ok(snip, 'snippet rendered: ' + html.slice(0, 200));
         assert.match(snip[1], /^event\.stopPropagation\(\);/);
         assert.ok(html.indexOf('<span class="match-count">(1 match)</span>') !== -1, 'hit count kept');

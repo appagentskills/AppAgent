@@ -208,6 +208,7 @@ describe('chat boot load: per-batch payload strip (F1)', function() {
             _coldSweepTimer: null,
             rebuildFileIndexAll: function() { rec.fileIndex++; },
             _chatsHydrated: false,
+            window: rec.win = {},
             enterStorageDegradedMode: function(e) { rec.degraded.push(String((e && e.message) || e)); },
             console: {
                 log: function() { rec.logs.push(Array.prototype.map.call(arguments, String).join(' ')); },
@@ -266,7 +267,10 @@ describe('chat boot load: per-batch payload strip (F1)', function() {
             assert.strictEqual(r.rec.strip[id][0].evictBodies, true, 'evictBodies on ' + id);
         });
         // The tally read base64 BEFORE the strip removed it.
-        assert.match(r.rec.logs.join('\n'), /inline base64 still in records/);
+        var st = r.rec.win.pageChatLoadStats;
+        assert.ok(st && st.chats === 62, 'STORE-ACCT stats recorded: ' + JSON.stringify(st));
+        assert.ok(st.inlineB64Chars > 0 && st.largestB64Chars > 0 && typeof st.largestId === 'string', 'inline base64 still in records was tallied');
+        assert.deepStrictEqual(r.rec.logs, [], 'no debug console output');
         assert.deepStrictEqual(r.rec.crumbs, [
             { phase: 'pre-chats', extra: { n: 63 } },
             { phase: 'post-strip', extra: { n: 62, kept: 8 } }

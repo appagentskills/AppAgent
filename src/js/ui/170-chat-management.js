@@ -106,8 +106,15 @@ async function fetchCredits() {
                 if (!orl) throw new Error('No usage data');
                 var cu = codexUsageModelFromRl(orl);
                 if (!cu) throw new Error('No usable x-codex-* usage headers');
-                var cgText = Math.round(cu.pill.percent) + '%' + (cu.pill.resetStr ? ' for ' + cu.pill.resetStr : '');
-                var cgTitle = cu.pill.percent.toFixed(1) + '% used' + (cu.pill.resetStr ? ' \u00b7 resets in ' + cu.pill.resetStr : '') + (cu.weeklyTip ? ' \u00b7 ' + cu.weeklyTip : '') + ' | Click to refresh';
+                // The model's resetStr/weeklyTip stay English (unit-tested model
+                // data); the pill text and title are localized from its raw fields.
+                var cgReset = cu.pill.resetMs ? fmtUsagePillReset(Math.ceil((cu.pill.resetMs - Date.now()) / 60000)) : '';
+                var cgText = cgReset ? t('{percent}% for {time}', { percent: Math.round(cu.pill.percent), time: cgReset }) : Math.round(cu.pill.percent) + '%';
+                var cgWeekly = cu.weeklyTip ? cu.limits[1] : null;
+                var cgTitle = t('{percent}% used', { percent: cu.pill.percent.toFixed(1) }) +
+                    (cgReset ? ' \u00b7 ' + t('resets in {time}', { time: cgReset }) : '') +
+                    (cgWeekly ? ' \u00b7 ' + t('{label}: {percent}%', { label: usageLimitLabelText(cgWeekly.label, true), percent: cgWeekly.percent.toFixed(1) }) : '') +
+                    ' | ' + t('Click to refresh');
                 var cgClass = 'credits-display';
                 if (cu.pill.percent > 80) cgClass += ' error';
                 _writeCreditsCache(providerName, cgText);
@@ -128,10 +135,7 @@ async function fetchCredits() {
                 return;
             } catch (e) {
                 if (!_creditsRequestStillCurrent(generation, providerName)) return;
-                console.log('ChatGPT OAuth usage error:', e.message);
             }
-        } else {
-            console.log('ChatGPT OAuth usage: chrome.runtime unavailable');
         }
         if (!_creditsRequestStillCurrent(generation, providerName)) return;
         // No cached usage yet (first run before any Codex response) or an error:
@@ -170,19 +174,16 @@ async function fetchCredits() {
                     if (diffMs > 0) {
                         // Ceil to match fmtUsageResetIn in the popover (floor here
                         // made the pill say 3h41mn while the popover said 3 hr 42 min)
-                        var diffMin = Math.ceil(diffMs / 60000);
-                        var h = Math.floor(diffMin / 60);
-                        var m = diffMin % 60;
-                        resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
+                        resetStr = fmtUsagePillReset(Math.ceil(diffMs / 60000));
                     }
                 }
-                displayText = Math.round(util) + '%' + (resetStr ? ' for ' + resetStr : '');
+                displayText = resetStr ? t('{percent}% for {time}', { percent: Math.round(util), time: resetStr }) : Math.round(util) + '%';
                 // Surface extra usage in the tooltip too, even when 5h/7d is the
                 // pill's primary value, so it's visible without waiting for the
                 // plan buckets to go null.
                 var euTip = parseClaudeExtraUsage(rl);
-                var euTipStr = euTip ? ' \u00b7 extra usage: ' + euTip.pct.toFixed(1) + '% (' + euTip.usedStr + ' / ' + euTip.limitStr + ')' : '';
-                creditTitle = util.toFixed(1) + '% used' + (resetStr ? ' \u00b7 resets in ' + resetStr : '') + euTipStr + ' | Click to refresh';
+                var euTipStr = euTip ? ' \u00b7 ' + t('extra usage: {percent}% ({used} / {limit})', { percent: euTip.pct.toFixed(1), used: euTip.usedStr, limit: euTip.limitStr }) : '';
+                creditTitle = t('{percent}% used', { percent: util.toFixed(1) }) + (resetStr ? ' \u00b7 ' + t('resets in {time}', { time: resetStr }) : '') + euTipStr + ' | ' + t('Click to refresh');
                 if (util > 80) cssClass += ' error';
             } else {
                 // Subscription on extra-usage only: five_hour/seven_day come back
@@ -191,7 +192,7 @@ async function fetchCredits() {
                 var eu = parseClaudeExtraUsage(rl);
                 if (!eu) throw new Error('No utilization');
                 displayText = Math.round(eu.pct) + '%';
-                creditTitle = 'Extra usage: ' + eu.pct.toFixed(1) + '% used \u00b7 ' + eu.usedStr + ' / ' + eu.limitStr + ' | Click to refresh';
+                creditTitle = t('Extra usage: {percent}% used', { percent: eu.pct.toFixed(1) }) + ' \u00b7 ' + eu.usedStr + ' / ' + eu.limitStr + ' | ' + t('Click to refresh');
                 if (eu.pct > 80) cssClass += ' error';
             }
             if (displayText) {
@@ -211,7 +212,6 @@ async function fetchCredits() {
             }
         } catch(e) {
             if (!_creditsRequestStillCurrent(generation, providerName)) return;
-            console.log('Claude OAuth usage error:', e.message);
             // Keep cached value visible, don't flash error
         }
         return;
@@ -233,14 +233,14 @@ async function fetchCredits() {
         var data = await res.json();
         if (!_creditsRequestStillCurrent(generation, providerName)) return;
         var displayText = '';
-        var creditTitle = 'Click to refresh';
+        var creditTitle = t('Click to refresh');
         var cssClass = 'credits-display';
 
         if (data.data && data.data.total_credits !== undefined) {
             // OpenRouter format
             var remaining = (data.data.total_credits - data.data.total_usage).toFixed(2);
             displayText = '$' + remaining;
-            creditTitle = 'Credits: $' + data.data.total_credits.toFixed(2) + ' | Used: $' + data.data.total_usage.toFixed(2) + ' | Click to refresh';
+            creditTitle = t('Credits: {amount}', { amount: '$' + data.data.total_credits.toFixed(2) }) + ' | ' + t('Used: {amount}', { amount: '$' + data.data.total_usage.toFixed(2) }) + ' | ' + t('Click to refresh');
         } else if (data.five_hour) {
             // Claude usage format
             var fiveHour = data.five_hour.utilization;
@@ -250,14 +250,11 @@ async function fetchCredits() {
                 var diffMs = resetTime - Date.now();
                 if (diffMs > 0) {
                     // Ceil to match fmtUsageResetIn in the popover
-                    var diffMin = Math.ceil(diffMs / 60000);
-                    var h = Math.floor(diffMin / 60);
-                    var m = diffMin % 60;
-                    resetStr = h > 0 ? h + 'h' + (m > 0 ? m + 'mn' : '') : m + 'mn';
+                    resetStr = fmtUsagePillReset(Math.ceil(diffMs / 60000));
                 }
             }
-            displayText = Math.round(fiveHour) + '%' + (resetStr ? ' for ' + resetStr : '');
-            creditTitle = fiveHour.toFixed(1) + '% used' + (resetStr ? ' \u00b7 resets in ' + resetStr : '') + ' | Click to refresh';
+            displayText = resetStr ? t('{percent}% for {time}', { percent: Math.round(fiveHour), time: resetStr }) : Math.round(fiveHour) + '%';
+            creditTitle = t('{percent}% used', { percent: fiveHour.toFixed(1) }) + (resetStr ? ' \u00b7 ' + t('resets in {time}', { time: resetStr }) : '') + ' | ' + t('Click to refresh');
             if (fiveHour > 80) cssClass += ' error';
             // Same rich tooltip for the direct claude-usage-format endpoint —
             // its limits array is raw (ISO resets_at, scope.model.display_name),
@@ -296,11 +293,11 @@ async function fetchCredits() {
         if (!_creditsRequestStillCurrent(generation, providerName)) return;
         console.error('Failed to fetch credits:', e);
         if (creditsEl) {
-            creditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>Error';
+            creditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + t('Error');
             creditsEl.className = 'credits-display error';
         }
         if (homeCreditsEl) {
-            homeCreditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>Error';
+            homeCreditsEl.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + t('Error');
             homeCreditsEl.className = 'credits-display error';
         }
     }
@@ -327,8 +324,8 @@ function claudeUsageModelFromRl(rl) {
             var n = parseFloat(v);
             return n > 9999999999 ? n : n * 1000;
         }
-        var t = Date.parse(v);
-        return isNaN(t) ? null : t;
+        var ts = Date.parse(v);
+        return isNaN(ts) ? null : ts;
     }
     var limits = null;
     try { limits = JSON.parse(rl['appagent-usage-limits'] || 'null'); } catch(e) {}
@@ -363,7 +360,7 @@ function claudeUsageModelFromRl(rl) {
 // SECONDS; reset-after-seconds is relative to a bucket-specific capture time
 // (new snapshots), falling back to appagent-codex-captured-at for compatibility
 // with old snapshots. Every header is optional — parse defensively. Returns
-// { pill: {percent, resetStr}, weeklyTip, limits } or
+// { pill: {percent, resetStr, resetMs}, weeklyTip, limits } or
 // null when no usable bucket exists.
 function codexUsageModelFromRl(rl) {
     if (!rl) return null;
@@ -415,7 +412,7 @@ function codexUsageModelFromRl(rl) {
         limits.push({ kind: 'weekly_all', label: weeklyLabel(secondary), percent: secondary.percent, resets_at: secondary.resetMs ? Math.round(secondary.resetMs / 1000) : null });
         if (primary) weeklyTip = weeklyLabel(secondary).toLowerCase() + ': ' + secondary.percent.toFixed(1) + '%';
     }
-    return { pill: { percent: main.percent, resetStr: resetStr }, weeklyTip: weeklyTip, limits: limits };
+    return { pill: { percent: main.percent, resetStr: resetStr, resetMs: main.resetMs || null }, weeklyTip: weeklyTip, limits: limits };
 }
 
 function fmtUsageResetIn(ms) { // "4 hr 34 min"
@@ -423,15 +420,41 @@ function fmtUsageResetIn(ms) { // "4 hr 34 min"
     if (diff <= 0) return '';
     var min = Math.ceil(diff / 60000);
     var d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
-    if (d > 0) return d + ' d ' + h + ' hr';
-    if (h > 0) return h + ' hr' + (m > 0 ? ' ' + m + ' min' : '');
-    return m + ' min';
+    if (d > 0) return t('{days} d {hours} hr', { days: d, hours: h });
+    if (h > 0) return m > 0 ? t('{hours} hr {minutes} min', { hours: h, minutes: m }) : t('{hours} hr', { hours: h });
+    return t('{minutes} min', { minutes: m });
+}
+
+// Compact pill countdown ("3h41mn"); callers pass minutes already ceiled to
+// match fmtUsageResetIn in the dropdown.
+function fmtUsagePillReset(diffMin) {
+    var h = Math.floor(diffMin / 60);
+    var m = diffMin % 60;
+    if (h > 0) return m > 0 ? t('{hours}h{minutes}mn', { hours: h, minutes: m }) : t('{hours}h', { hours: h });
+    return t('{minutes}mn', { minutes: m });
+}
+
+// Display text for the English usage-limit labels built by claudeUsageModelFromRl
+// and codexUsageModelFromRl. The models stay English (they are data, unit-tested
+// standalone without the i18n core). Other labels (claude.ai model display
+// names) are shown as-is. lower=true is the mid-sentence form used in the pill
+// title ("weekly limit: 12.0%").
+function usageLimitLabelText(label, lower) {
+    var s = String(label == null ? '' : label);
+    var m = /^(\d+(?:\.\d+)?)-(day|hour|minute) limit$/.exec(s);
+    if (m && m[2] === 'day') return t('{count}-day limit', { count: m[1] });
+    if (m && m[2] === 'hour') return t('{count}-hour limit', { count: m[1] });
+    if (m) return t('{count}-minute limit', { count: m[1] });
+    if (s === 'Weekly limit') return lower ? t('weekly limit') : t('Weekly limit');
+    if (s === 'Secondary limit') return lower ? t('secondary limit') : t('Secondary limit');
+    if (s === 'All models') return t('All models');
+    return lower ? s.toLowerCase() : s;
 }
 
 function fmtUsageResetAt(ms) { // "Sun 5:59 AM"
     var d = new Date(ms);
-    try { return d.toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }); }
-    catch(e) { return d.toLocaleString(); }
+    try { return i18nFormatDateTime(d, { weekday: 'short', hour: 'numeric', minute: '2-digit' }); }
+    catch(e) { return i18nFormatDateTime(d); }
 }
 
 function buildUsageTooltipHtml(model) {
@@ -442,7 +465,7 @@ function buildUsageTooltipHtml(model) {
     }
     function row(label, sub, pct) {
         return '<div class="usage-tt-row">' +
-            '<div class="usage-tt-row-head"><span class="usage-tt-label">' + escapeHtml(label) + '</span><span class="usage-tt-pct">' + Math.round(pct) + '% used</span></div>' +
+            '<div class="usage-tt-row-head"><span class="usage-tt-label">' + escapeHtml(label) + '</span><span class="usage-tt-pct">' + t('{percent}% used', { percent: Math.round(pct) }) + '</span></div>' +
             bar(pct) +
             (sub ? '<div class="usage-tt-sub">' + escapeHtml(sub) + '</div>' : '') +
             '</div>';
@@ -452,17 +475,17 @@ function buildUsageTooltipHtml(model) {
         var inStr = model.session.resetsAt ? fmtUsageResetIn(model.session.resetsAt) : '';
         // Titled like the Weekly limits / Extra usage sections below, so all
         // three sections of the dropdown read as parallel groups.
-        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>Session</div>';
-        html += row('Current session', inStr ? 'Resets in ' + inStr : '', model.session.percent);
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>' + t('Session') + '</div>';
+        html += row(t('Current session'), inStr ? t('Resets in {time}', { time: inStr }) : '', model.session.percent);
     }
     if (model.weekly.length) {
-        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.stats + '</span>Weekly limits</div>';
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.stats + '</span>' + t('Weekly limits') + '</div>';
         model.weekly.forEach(function(w) {
-            html += row(w.label, w.resetsAt ? 'Resets ' + fmtUsageResetAt(w.resetsAt) : '', w.percent);
+            html += row(usageLimitLabelText(w.label), w.resetsAt ? t('Resets {time}', { time: fmtUsageResetAt(w.resetsAt) }) : '', w.percent);
         });
     }
     if (model.extra) {
-        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.money + '</span>Extra usage</div>';
+        html += '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.money + '</span>' + t('Extra usage') + '</div>';
         html += row(model.extra.usedStr + ' / ' + model.extra.limitStr, '', model.extra.pct);
     }
     return html;
@@ -529,9 +552,17 @@ function showUsageTooltip(el) {
     // aligned to the pill's right edge (clamped 8px from the viewport edge).
     var r = el.getBoundingClientRect();
     _usageTooltipEl.style.display = 'block';
-    _usageTooltipEl.style.left = 'auto';
     _usageTooltipEl.style.top = (r.bottom + 4) + 'px';
-    _usageTooltipEl.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    // Rule 10 (i18n): the dropdown is end-aligned under the pill, so mirror the
+    // edge in RTL (the pill's left edge instead of its right edge). The element
+    // is reused, so reset the opposite edge on every open.
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') {
+        _usageTooltipEl.style.right = 'auto';
+        _usageTooltipEl.style.left = Math.max(8, r.left) + 'px';
+    } else {
+        _usageTooltipEl.style.left = 'auto';
+        _usageTooltipEl.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    }
 }
 
 function hideUsageTooltipNow() {
@@ -591,7 +622,7 @@ function refreshClaudeOAuthUsage(force) {
         chrome.runtime.sendMessage({ type: 'claude-oauth-usage-refresh' }, function(response) {
             _claudeUsageRefreshInFlight = false;
             if (chrome.runtime.lastError) return;
-            if (response && response.error) { console.log('Claude usage refresh error:', response.error); return; }
+            if (response && response.error) { return; }
             // On a value change, storage.onChanged already re-rendered; call fetchCredits
             // anyway for the no-change case (onChanged does not fire on identical values).
             try { fetchCredits(); } catch(e) {}
@@ -618,7 +649,7 @@ async function updateStorageIndicator() {
             }
             
             storageEl.style.display = '';
-            var displayText = remainingMB.toFixed(1) + 'MB left';
+            var displayText = t('{size}MB left', { size: remainingMB.toFixed(1) });
             var className;
             
             if (remainingMB < 1) {
@@ -631,7 +662,7 @@ async function updateStorageIndicator() {
             
             storageEl.innerHTML = '<span class="storage-icon">' + UI_ICONS.storage + '</span>' + displayText;
             storageEl.className = className;
-            storageEl.title = 'IndexedDB Storage: ' + usedMB.toFixed(1) + 'MB used / ' + quotaMB.toFixed(0) + 'MB quota';
+            storageEl.title = t('IndexedDB Storage: {used}MB used / {quota}MB quota', { used: usedMB.toFixed(1), quota: quotaMB.toFixed(0) });
         } else {
             // Can't estimate - hide indicator
             storageEl.style.display = 'none';
@@ -652,7 +683,7 @@ var pendingSummaryRequest = null; // { chatId, chatTitle }
 async function summarizeAndStartNewChat() {
     var chat = chats[currentChatId];
     if (!chat || !chat.messages || chat.messages.length < 3) {
-        showSnackbar('Not enough conversation to summarize', 'warning');
+        showSnackbar(t('Not enough conversation to summarize'), 'warning');
         return;
     }
     
@@ -667,7 +698,7 @@ async function summarizeAndStartNewChat() {
     // check and summarize would inject its prompt mid-run.
     if (runningChatIds[currentChatId] ||
         (isRunning && typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId === currentChatId)) {
-        showSnackbar('Please wait for the current request to complete', 'warning');
+        showSnackbar(t('Please wait for the current request to complete'), 'warning');
         return;
     }
     
@@ -730,7 +761,7 @@ async function summarizeAndStartNewChat() {
 // transient hint (openAddWidgetModal sets its own after newChat()).
 function resetComposerPlaceholder(inputEl) {
     var el = inputEl || document.getElementById('message-input');
-    if (el) el.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
+    if (el) el.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? t(DEFAULT_COMPOSER_PLACEHOLDER) : t('Send a message...');
 }
 
 // Called after agent completes a summary request to create the new chat
@@ -759,7 +790,7 @@ function completeSummaryAndCreateNewChat() {
     }
     
     if (!summary) {
-        showSnackbar('Failed to generate summary', 'error');
+        showSnackbar(t('Failed to generate summary'), 'error');
         pendingSummaryRequest = null;
         return;
     }
@@ -799,7 +830,7 @@ function completeSummaryAndCreateNewChat() {
         try { renderWorkersStrip(); } catch (e) {}
     }
     
-    showSnackbar('New chat created with summary', 'success');
+    showSnackbar(t('New chat created with summary'), 'success');
     
     // Auto-start agent to get AI response
     stickToBottom = true;
@@ -918,7 +949,7 @@ function newChat() {
     if (inputEl) {
         inputEl.value = '';
         // A6A3-02: drop a transient hint (openAddWidgetModal sets its own after newChat()).
-        inputEl.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
+        inputEl.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? t(DEFAULT_COMPOSER_PLACEHOLDER) : t('Send a message...');
         inputEl.style.height = 'auto';
         inputEl.focus();
     }
@@ -1175,9 +1206,9 @@ function updateChatTitleHeader(includeToolCallId) {
     if (chat && chat.isSubAgent) {
         var iconHtml = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
         // Identity segment — plain badge, not a button.
-        var badgeSeg = '<span class="chat-title-subagent-badge" title="Delegated worker chat">'
+        var badgeSeg = '<span class="chat-title-subagent-badge" title="' + escapeHtml(t('Delegated worker chat')) + '">'
             + '<span class="chat-title-subagent-icon">' + iconHtml + '</span>'
-            + '<span class="chat-title-subagent-label">Sub-agent</span>'
+            + '<span class="chat-title-subagent-label">' + escapeHtml(t('Sub-agent')) + '</span>'
             + '</span>';
         subAgentBadgeHtml = ' <span class="chat-title-subagent-pill">'
             + badgeSeg
@@ -1222,12 +1253,13 @@ function updateChatTitleHeader(includeToolCallId) {
                 var _pillMeta = (typeof progressStateMeta === 'function') ? progressStateMeta(s) : null;
                 var icon = _pillMeta ? _pillMeta.icon : UI_ICONS.spinner;
                 var pillLabel = _pillMeta ? _pillMeta.label : s;
+                var pillTip = t('Progress: {label} — click for details', { label: pillLabel });
                 pillHtml = ' <span class="chat-title-state-pill state-' + s + '" ' +
-                    'title="Progress: ' + escapeHtml(pillLabel) + ' — click for details" ' +
-                    'aria-label="Progress: ' + escapeHtml(pillLabel) + ' — click for details" ' +
+                    'title="' + escapeHtml(pillTip) + '" ' +
+                    'aria-label="' + escapeHtml(pillTip) + '" ' +
                     'role="button" tabindex="0" ' +
                     'onclick="onChatTitleStatePillClick(this, event)" ' +
-                    'onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027)onChatTitleStatePillClick(this, event)">' +
+                    'onkeydown="if(event.key===\u0027Enter\u0027||event.key===\u0027 \u0027){event.preventDefault();onChatTitleStatePillClick(this, event)}">' +
                     '<span class="chat-title-state-icon">' + icon + '</span>' +
                     '<span class="chat-title-state-label">' + escapeHtml(pillLabel) + '</span>' +
                 '</span>';
@@ -1251,7 +1283,7 @@ function updateChatTitleHeader(includeToolCallId) {
             pinBtn.style.display = '';
             pinBtn.innerHTML = chat.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin;
             pinBtn.classList.toggle('pinned', !!chat.pinned);
-            var pinTip = chat.pinned ? 'Unpin chat' : 'Pin chat';
+            var pinTip = chat.pinned ? t('Unpin chat') : t('Pin chat');
             pinBtn.title = pinTip;
             pinBtn.setAttribute('aria-label', pinTip);
             pinBtn.setAttribute('aria-pressed', chat.pinned ? 'true' : 'false');
@@ -1358,28 +1390,29 @@ function _pruneChatPermissionGrants(chatId) {
 async function deleteChat(chatId, e) {
     e.stopPropagation();
     var chat = chats[chatId];
-    var title = chat ? chat.title : 'this chat';
+    var title = chat ? (chat.title === 'New Chat' ? t('New Chat') : chat.title) : t('this chat');
 
     // Check if any dashboard widgets are linked to this chat
     var linkedWidgets = [];
     for (var widgetId in dashboardWidgets) {
         var widget = dashboardWidgets[widgetId];
         if (widget.chatId === chatId) {
-            linkedWidgets.push(widget.title || 'Untitled Widget');
+            linkedWidgets.push(widget.title || t('Untitled Widget'));
         }
     }
 
-    var message = 'Delete "' + escapeHtml(title) + '"? This action cannot be undone.';
+    var message = t('Delete "{title}"? This action cannot be undone.', { title: escapeHtml(title) });
     if (linkedWidgets.length > 0) {
         var escapedWidgets = linkedWidgets.map(function(w) { return escapeHtml(w); });
-        message = 'Delete "' + escapeHtml(title) + '"?<br><br>⚠️ <strong>Warning:</strong> This chat is linked to ' + linkedWidgets.length +
-            ' dashboard widget' + (linkedWidgets.length > 1 ? 's' : '') + ':<br>• ' + escapedWidgets.join('<br>• ') +
-            '<br><br>Deleting this chat will prevent these widgets from being regenerated with their original context.';
+        message = t('Delete "{title}"?', { title: escapeHtml(title) }) + '<br><br>⚠️ <strong>' + t('Warning:') + '</strong> ' +
+            tn(linkedWidgets.length, 'This chat is linked to {count} dashboard widget:', 'This chat is linked to {count} dashboard widgets:') +
+            '<br>• ' + escapedWidgets.join('<br>• ') +
+            '<br><br>' + t('Deleting this chat will prevent these widgets from being regenerated with their original context.');
     }
 
-    var result = await showModal('Delete Chat', message, [
-        { label: 'Cancel', value: 'cancel', class: 'secondary' },
-        { label: 'Delete', value: 'delete', class: 'danger' }
+    var result = await showModal(t('Delete Chat'), message, [
+        { label: t('Cancel'), value: 'cancel', class: 'secondary' },
+        { label: t('Delete'), value: 'delete', class: 'danger' }
     ], 'danger');
     if (result !== 'delete') return;
     // EXPLICIT-DELETE: stop the run first. This is no longer what makes the
@@ -1476,14 +1509,14 @@ async function deleteChat(chatId, e) {
         }
     } catch (eDr) {}
     renderHistoryPage();
-    showSnackbar('Chat deleted', 'success');
+    showSnackbar(t('Chat deleted'), 'success');
     // EXPLICIT-DELETE: a tombstone that never reached the SW is a guaranteed
     // resurrection (its authoritative copy re-puts the row at the next tool
     // boundary), so it gets the SAME visible treatment as a failed IDB delete
     // below instead of being discarded silently. The 3s retry may still
     // recover it — that outcome is reported too.
     if (!_swNotified) {
-        showSnackbar('Chat deleted, but the background worker could not be reached — it may come back after a reload', 'error');
+        showSnackbar(t('Chat deleted, but the background worker could not be reached — it may come back after a reload'), 'error');
     }
     // EXPLICIT-DELETE: durable, targeted removal of the row (and this chat's
     // now-unreferenced payload blobs) from IndexedDB. saveChatsToStorage above
@@ -1494,7 +1527,7 @@ async function deleteChat(chatId, e) {
     // feedback.
     if (typeof deleteChatFromDB === 'function') {
         var _delOk = await deleteChatFromDB(chatId, _deletedRecord);
-        if (!_delOk) showSnackbar('Chat removed from the list, but the stored copy could not be deleted', 'error');
+        if (!_delOk) showSnackbar(t('Chat removed from the list, but the stored copy could not be deleted'), 'error');
     }
     // One bounded re-run: covers an SW save that was already in flight when we
     // deleted (it re-puts the row before our tombstone is applied), a run whose
@@ -1507,8 +1540,8 @@ async function deleteChat(chatId, e) {
         // saw the error above — silence otherwise (the happy path is routine).
         if (!_swNotified) {
             showSnackbar(_reNotified
-                ? 'Background worker reached — the chat deletion is durable'
-                : 'The background worker is still unreachable — the deleted chat may come back after a reload',
+                ? t('Background worker reached — the chat deletion is durable')
+                : t('The background worker is still unreachable — the deleted chat may come back after a reload'),
                 _reNotified ? 'success' : 'error');
         }
         // deleteChatFromDB is async: a plain try/catch around the call can only

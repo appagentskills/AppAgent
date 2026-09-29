@@ -1,358 +1,303 @@
 # Getting Started {#getting-started}
 
-AppAgent is an AI Agent for your ServiceNow instance. It helps you query data, edit records, browse pages, and automate tasks using natural language.
-
-AppAgent **auto-detects every ServiceNow instance** you have open in the same Chrome profile — no setup or connection string needed. Open a tab on an instance and the Agent can target it; ask it to *list instances* to see them all (with your roles and connection status).
+AppAgent is an AI Agent for ServiceNow that runs as a Chrome extension. Describe what you need in plain language and the Agent queries data, edits records, builds apps and widgets, tests pages in your browser, and reports back.
 
 :::tip
-**Quick Start:** Type a message in the chat and press Enter. The Agent will understand your request and use the right tools automatically.
+**Quick start:** Set up a model, open a tab on your ServiceNow instance, then type a request in the chat and press <kbd>Enter</kbd>.
 :::
 
-# Quick Guides {#guides}
+## Set Up a Model {#guide-setup}
 
-## Starting a Chat {#guide-chat}
+1. Open [Settings](app:openSettingsPageView) and go to **API Providers**
+2. Add a provider (Anthropic, OpenRouter or a custom OpenAI-compatible API) with your API key — or enable **OAuth** on an Anthropic provider to sign in with your Claude account
+3. Pick the model to use under **Agent Model**
 
-1. Click **+ New Chat** in the sidebar
-2. Type your request (e.g., "Show me all incidents created today")
-3. Press **Enter** to send
-4. The Agent will respond and may use tools to complete your task
+Your API key is stored only in your browser. AI calls go directly from your browser to the provider.
 
-## Browse with Agent {#guide-browse}
+## Connect Your Instances {#guide-instances}
 
-1. Navigate to any page on your ServiceNow instance
-2. Click the AppAgent icon and open the side panel
-3. Ask the Agent about what you see: "What errors are on this page?"
-4. The Agent can take screenshots, click elements, and fill forms
+AppAgent **auto-detects every ServiceNow instance** you have open in the same Chrome profile — there is no connection string to enter. Log in to an instance in a normal tab and the Agent can work on it with your user's roles and access rights. Ask *"list instances"* to see every detected instance, your roles and the connection status.
 
-## Edit Records {#guide-edit}
+Each instance has a **permission level**, chosen from the instance dropdown:
 
-1. Ask: "Update the script include MyUtils to add error logging"
-2. Review the changes shown in the chat
-3. Use the **Undo** button if needed
-4. All changes are tracked in the version sidebar (right panel)
+- **Manual** — You approve each write operation (create, update, delete, form fills)
+- **Auto** — The Agent decides on write operations without asking
+- **Dev** — No approvals at all: every tool call on this instance runs without asking. Use it only on development instances
 
-## Using Skills {#guide-skills}
+Reads are always allowed. See [Tool Permissions](#feature-permissions) for finer control.
 
-1. Go to [Skills](app:openSkillsView) page from sidebar
-2. Click **Activate** on a skill to enable it
-3. Active skills give the Agent new abilities and knowledge
-4. Deactivate skills you don't need to keep responses focused
+## Start a Chat {#guide-chat}
 
-## Create Widgets {#guide-dashboard}
+1. Click **New Chat** in the sidebar [Start New Chat →](app:startNewChat)
+2. Type your request, for example *"Show me all incidents created today"*
+3. Press <kbd>Enter</kbd> to send
+4. Follow along as the Agent works: each tool call appears in the chat, and approval prompts appear when a step needs your OK
 
-1. Go to [Dashboard](app:openDashboardView) page
-2. Click **Add Widget**
-3. Describe what you want: "A chart showing incidents by priority"
-4. The Agent generates an interactive widget
+You can keep typing while the Agent works: sending a new message interrupts the current step, and **Pause** stops the run.
 
-## Attach Images {#guide-images}
+## Attach Images and Files {#guide-images}
 
-1. Click the **Image** button in the input area
-2. Select an image file or paste from clipboard
-3. Type your question about the image
-4. The Agent can analyze screenshots, diagrams, and UI elements
+1. Click the **Attach file** button in the input area to add an image, PDF, CSV or text file
+2. Or paste an image from the clipboard, or drag and drop it onto the chat
+3. Type your question about the attachment
 
 :::tip
-Use image attachments to show the Agent error screenshots, UI mockups, or any visual content you need help with.
+Attach error screenshots, UI mockups or exported data so the Agent can see exactly what you see.
 :::
 
-# Pages {#pages}
+# Key Features {#features}
 
 ## Chat {#page-chat}
 
-The main conversation interface where you interact with the Agent. [Start New Chat →](app:startNewChat)
+The main conversation view. [Start New Chat →](app:startNewChat)
 
-- **Message Area** — Shows conversation history
-- **Input Box** — Type your messages here
-- **Pause Button** — Stop Agent execution if needed
-- **Context Indicator** — Shows how full the context is (click to summarize)
-- **Chat Sidebar** — Version history plus pushed PRs, workspace files, and sub-agent workers (right panel)
+- **Message area** — The conversation, including tool calls and their results
+- **Input box** — Type messages; attach files; send while the Agent is working to interrupt it
+- **Pause / Continue / Retry** — Stop the Agent, resume it, or retry the last step
+- **Context indicator** — Shows how full the conversation is; click it to summarize into a new chat
+- **Answer cards** — A **TL;DR** summary and a **Links** card (records, PRs, docs) can appear below an answer
+- **Chat header** — Rename or pin the chat, or open AppAgent in a full browser tab with **Expand to full page**
 
-## Dashboard {#page-dashboard}
+## Browser Control {#feature-browser}
 
-A **dynamic, smart dashboard** with Agent-generated widgets. [Open Dashboard →](app:openDashboardView)
+The Agent can open and control browser tabs on your instance to see and test pages:
 
-Unlike traditional dashboards, widgets are generated through natural language prompts. Describe what you want and the Agent creates it instantly. Need changes? Just regenerate with a new prompt.
+- **Navigate, click, fill and select** — Realistic events, so forms and autocomplete fields behave as if you typed
+- **Wait for** — Wait for an element, a text or a URL instead of guessing delays
+- **Screenshots** — Capture the page, a widget or a single element for visual checks
+- **Inspect** — Read element properties, styles, console errors and network requests
+- **Impersonate** — Test as another user, then switch back
 
-- **Add Widget** — Describe what you want in plain language
-- **Drag & Drop** — Rearrange widgets
-- **Resize** — Adjust widget sizes
-- **Regenerate** — Instantly update any widget with a new prompt
-- **Import/Export** — Save and share dashboards
+## Edit Records & Version History {#feature-history}
 
-Widgets are also **dynamic at runtime** — they have access to your ServiceNow instance and can fetch live data, making your dashboard always up-to-date.
+Every change the Agent makes to your instance is tracked in the chat sidebar:
 
-## Documents {#page-documents}
-
-**Smart Documents** — persistent, versioned Markdown documents the Agent builds and updates — are listed here. In the sidebar, **Documents** is grouped under **Dashboard**.
-
-## Skills {#page-skills}
-
-Manage Agent skills that extend its capabilities. [Open Skills →](app:openSkillsView)
-
-- **Activate/Deactivate** — Toggle skills on or off
-- **New Skill** — Create custom skills
-- **Import/Export** — Share skills between instances
-- **Edit with Agent** — Modify skills using Agent assistance
-
-Skills can provide **knowledge** (instructions, best practices) and **custom tools** (executable JavaScript functions the Agent can call). Custom tools run in isolated sandboxes with `executeTool()` access.
-
-## Tools {#page-tools}
-
-Per-tool permissions and source/schema viewers are available in [Settings → Tool Permissions](app:toggleSettingsView).
-
-- **Browser Code** — Run JavaScript in an isolated sandbox
-- **ServiceNow API** — Query and modify records
-- **Run Background Script** — Execute server-side scripts on the connected instance
-- **Edit Code/Scripts** — Make changes to scripts using search-and-replace
-- **Browser Control** — Navigate, interact with pages, impersonate users
-- **Display Widget** — Render interactive HTML widgets
-- **Display Cards** — Render structured cards, tables, and timelines
-- **Take Screenshot** — Capture screenshots of the browser, widgets, or elements
-- **Manage Skills** — Create and manage Agent skills
-- **Workspace** — Read, write, and edit files in the per-chat workspace
-- **Smart Documents** — Build and query structured documents
-- **Prompt User** — Ask the user for structured input via inline forms
-- **Web Fetch** — Fetch and read pages from the public web
-- **GitHub Setup** — Open a popup to connect a GitHub account or clone a repo into a workspace
-- **Action Updates** — Show live progress pills and one-click action buttons
-- **Read Attached File** — Read text files attached by the user
-
-## Settings {#page-settings}
-
-Configure AppAgent preferences. [Open Settings →](app:openSettingsPageView)
-
-- **Agent Model** — Choose which LLM to use
-- **API Providers** — Add or edit providers (Anthropic, OpenRouter, custom). Supports API-key and OAuth (Claude Code sign-in) providers
-- **LLM Endpoints** — Named `URL + API key` pairs; point the extension at any OpenAI-compatible LLM API
-- **Sub-Agent Model Tiers** — Map the small / medium / large tiers to concrete models, or pick **Same** to make a tier dynamically follow the spawning agent's current model (same behavior as spawning with `tier: "same"`)
-- **Reasoning Effort** — Per-provider effort selector: `(default)`, `low`, `medium`, `high`, `xhigh`, `max`. `xhigh` is accepted on Opus 4.7/4.8 and Fable/Mythos 5 on Anthropic directly (other models top out at `high`/`max`); OpenRouter maps unsupported values to the nearest supported level
-- **Max Tokens & Thinking Budget** — Global caps on response length (64k default) and extended-thinking budget (32k default)
-- **Context Window** — Set the assumed context-window size that drives the context indicator and saturation warnings
-- **Display** — Toggle API stats, compact mode, and keep-display-awake
-- **Hooks** — Enable auto-title generation, "Agent finished" notifications, and other automation
-- **Large Content Caching** — Set when large results get cached (1K to 100K tokens)
-- **Tool Permissions** — Control which tools run automatically
-- **System Prompt** — Customize the AI's system instructions
-- **Data Management** — Export, import, or delete data
-
-## History {#page-history}
-
-View and manage all your conversations. [Open History →](app:openHistoryView)
-
-- **Search** — Find chats by title, content, tools used, or widgets
-- **Pin** — Pin important conversations for quick access
-- **Export** — Download individual chats or all history
-- **Stats** — View total conversations, pinned count, and accumulated cost
-- **Preview** — See chat previews with user/agent messages
-
-## Help {#page-docs}
-
-This page! Browse the full documentation for AppAgent. The sidebar nav item is labeled **Help** (❓ icon). [Open Docs →](app:openDocsView)
-
-- **Table of Contents** — Navigate sections via the right sidebar
-- **Download** — Export the documentation as a Markdown file
-
-# Features {#features}
-
-## Agent Tools {#feature-tools}
-
-The Agent has access to powerful tools:
-
-| Tool | What it does |
-|------|--------------|
-| **Browser Code** | Execute JavaScript in an isolated sandbox with `executeTool()` access |
-| **ServiceNow API** | Read, create, update, delete records |
-| **Run Background Script** | Execute server-side scripts on the connected instance |
-| **Edit Code/Scripts** | Modify scripts using search-and-replace |
-| **Browser Control** | Navigate pages, click, fill forms, type per-character, wait for selectors/text/URL, select options, dispatch events, scroll, resize, inspect, impersonate, debug widgets |
-| **Display Widget** | Display interactive HTML widgets inline in chat |
-| **Display Cards** | Render structured cards, tables, lists, and timelines without writing HTML |
-| **Take Screenshot** | Capture screenshots of the browser, widgets, or specific elements for visual analysis |
-| **Screenshot by ID** | Retrieve a previously captured screenshot by ID without re-taking it |
-| **Manage Skills** | Create, update, activate, and manage Agent skills (supports surgical search-and-replace edits) |
-| **Workspace** | Per-chat scratchpad for files: read, write, edit, list. Cross-chat conflicts are surfaced before overwriting |
-| **Smart Documents** | Build and query structured documents that the Agent can navigate without flooding the context |
-| **Prompt User** | Show inline forms (text, select, multi-select, confirm) to collect structured input or confirm plans |
-| **Web Fetch** | Fetch and read pages from the public web |
-| **GitHub Setup** | Open a popup to connect a GitHub account or clone a repo into a workspace |
-| **Action Updates** | Render live progress pills (running / stuck / done / error) and one-click action buttons in the chat |
-| **Read Attached File** | Read text files attached by the user in the conversation |
-
-## Tool Permissions {#feature-permissions}
-
-Control how tools execute. Configure in [Settings](app:openSettingsPageView):
-
-- **Auto** — Tool runs without asking
-- **Ask First** — Shows approval prompt before running
-- **Disabled** — Tool cannot be used
-
-**Per-instance mode:** Each connected instance has a permission tier that sets its write defaults:
-
-- **Manual** — You approve each write operation (create / update / delete, form fills). Writes default to *Ask First*
-- **Auto** — The Agent runs write operations without asking
-
-Switch modes from the instance dropdown or [Settings](app:openSettingsPageView). Reads are always allowed; the per-tool controls below override the tier.
-
-**Granular Controls:**
-
-- **ServiceNow API** — Separate permissions per HTTP method (GET, POST, PUT, PATCH, DELETE)
-- **Browser Control** — Separate permissions per action (navigate, click, fill, select option, dispatch event, scroll, resize, impersonate, and more)
-- **Manage Skills** — Separate permissions per action (create, update, add/update/delete files, activate, deactivate)
-
-Confirmation dialogs are color-coded by severity — **blue** (routine), **orange** (caution), **red** (destructive).
-
-:::tip
-Set destructive tools (DELETE, PUT) to "Ask First" for safety. Skill activation is disabled by default.
-:::
-
-## Version History {#feature-history}
-
-All changes are tracked automatically:
-
-- **Undo** — Revert individual changes
-- **Redo** — Restore reverted changes
-- **Download XML** — Export all changes to XML
-
-Access version history from the panel on the right side of the chat.
-
-## Browser Panel {#feature-browser}
-
-The Agent can control browser tabs to see and interact with pages:
-
-- **Navigate** — Open pages in a browser tab for the Agent to interact with
-- **Screenshots** — Agent can see the page content
-- **Click/Fill** — Agent can interact with elements (fires the full keydown→input→keyup→change chain with a React-safe value setter)
-- **Type** — Send per-character realistic key events so debounced / autocomplete handlers fire reliably
-- **Wait For** — Wait for a selector to appear or disappear, for text to be present, or for the URL to match a pattern — instead of blind `setTimeout`
-- **Interact** — Click elements, fill forms, select options, dispatch events
-- **Scroll/Resize** — Scroll pages and resize the viewport
-- **Inspect** — Get element properties, computed styles, and dimensions
-- **Console/Network** — View errors, logs, and network requests
-- **Impersonate** — Switch to another user session
-- **Full Page Mode** — Open AppAgent in a full browser tab
-
-**Widget Debugging:** The browser panel can also open and debug HTML widgets. The Agent can take screenshots, inspect DOM, and edit widget HTML directly.
-
-## Actions & Live Progress {#feature-actions}
-
-Long-running agent workflows surface live state in the chat instead of going silent between tool calls:
-
-- **Progress pills** — A single mutating card with a color-coded state pill (running / stuck / done / error) next to the chat title. Previous distinct steps are tucked into a "Previous steps" trail
-- **Action buttons** — The Agent can render one-click buttons in the chat to trigger follow-up workflows
-- **Header action pills** — The header auto-renders any active actions, with icon-only responsive collapse
-- **Streaming dot** — The chat list shows a per-chat agent-running indicator (suppressed when paused)
-- **"Agent finished" notification** — If you tab away or switch Chrome windows mid-run, a desktop notification fires when the Agent finishes
-- **Answer cards** — After a response the Agent can attach a **TL;DR** summary card and a **Links** card of relevant links (records, PRs, docs) below the answer
-
-## Active Chats & Jobs {#feature-jobs}
-
-A header pill opens the **jobs dropdown** — a live view of your chats and background work:
-
-- **Active chats** — Running or unread-finished chats, each with a **context-usage ring**; unread chats are emphasized in **bold** (email-style) after any activity while you're away
-- **Sub-agent cards** — Worker sub-agents nest under their parent chat, with a chat-view modal to read their transcript
-- **Expand modal** — Pop the list out to a full modal with a **columns / sections** layout toggle
-- **New Chat page** — The expanded Active Chats panel is also embedded on the New Chat page for an at-a-glance overview
-
-## Usage & Limits {#feature-usage}
-
-A **usage pill** in the header tracks your API usage and remaining limits. Hover for a native tooltip, or click to open a dropdown with a rich breakdown of usage limits and remaining credits. Credit balances refresh automatically when you return to the tab.
-
-## Rate-Limit Handling {#feature-ratelimit}
-
-When a provider returns a **429 / 529** (rate limit or overload), AppAgent retries automatically instead of failing:
-
-- **Automatic backoff** — Transport-level jittered backoff with escalating retries; sub-agents throttle back under a shared stream semaphore
-- **Live status** — The chat shows an inline rate-limit status with a **retry countdown** instead of a stuck *Thinking…*, and distinguishes provider saturation from waiting on sibling agents
-- **Credit exhaustion** — Ambiguous 429s that actually mean "out of credits" are detected via the usage API and surfaced clearly
+- **Undo** — Revert an individual change
+- **Redo** — Restore a reverted change
+- **Download XML** — Export all changes, for example to move them to another instance
 
 ## Sub-Agents {#feature-subagents}
 
-The Agent can spawn **background worker agents** to handle heavy or parallel work without cluttering the main chat. Each sub runs in its own chat and context, then reports a distilled result back to the parent.
+For heavy or parallel work, the Agent can start **sub-agents**: background workers that run in their own chat and context, then report a short result back to the main chat.
 
-- **Spawn** — Delegate searches, audits, bulk edits, or deep investigations to a sub-agent
-- **Model tiers** — Each sub runs on a **small / medium / large** tier, or `same` to match the parent's model. Map tiers to models in [Settings → Sub-Agent Model Tiers](app:openSettingsPageView)
-- **Workers strip** — Running subs appear as live chips above the chat input; open one to watch its progress or transcript
-- **Manage** — The Agent can check a sub's status, wake it with follow-up work, or stop it
-- **Pool** — Concurrent subs are capped by a shared worker pool; extras queue automatically
+- **Model tiers** — Each sub-agent runs on a **small**, **medium** or **large** tier, or **same** to use the parent's model. Map tiers to models in [Settings](app:openSettingsPageView) → **Sub-Agent Model Tiers**
+- **Workers strip** — Running sub-agents appear as live chips above the chat input; open one to watch its progress or read its transcript
+- **Pool** — The number of concurrent sub-agents is capped; extra ones wait in a queue
 
-## Workspace {#feature-workspace}
+## Dashboard & Widgets {#page-dashboard}
 
-Each chat has its own **workspace** — a per-chat file scratchpad the Agent can read, write, and edit. Useful for staging plans, notes, generated artifacts, or multi-step task state.
+A dashboard of Agent-generated, interactive widgets. [Open Dashboard →](app:openDashboardView)
 
-**Cross-chat ownership:** every workspace mutation stamps the file with the chat ID, title, and timestamp. If a different chat tries to mutate the same file:
+1. Click **Add Widget**
+2. Describe what you want, for example *"A chart showing open incidents by priority"*
+3. The Agent builds the widget; ask for changes or click **Regenerate** at any time
 
-- If the owning chat is **active**, the write is blocked
-- If the owning chat is **dormant**, the Agent gets a `cross_chat_warning` and can pass `force: true` to override
-- `read` and `status` surface the owner and a human-readable "X minutes ago" timestamp
+Widgets can fetch live data from your instance, so they stay up to date. Drag, resize, import and export them (see [Advanced](#advanced)). Widgets the Agent shows inline in a chat can be saved with **Add to Dashboard**.
 
-This prevents two parallel chats from silently clobbering each other's work.
+## Smart Documents {#page-documents}
 
-**GitHub sync:** Cloned workspaces auto-sync with GitHub on page navigation, chat switch, and tab focus, so merged or updated branches stay current.
+**Smart Documents** are persistent, versioned Markdown documents that the Agent writes and updates — plans, reports, specifications, findings. They render inline in chat, keep every version, and can be edited by you directly. Open them from **Documents** in the sidebar. [Open Documents →](app:openDocumentsView)
+
+## Skills {#page-skills}
+
+Skills give the Agent extra knowledge and tools. [Open Skills →](app:openSkillsView)
+
+- **Activate / Deactivate** — Turn skills on or off; deactivate the ones you don't need to keep answers focused
+- **New Skill** — Write your own skill in Markdown, or use **Edit with Agent**
+- **Import / Export** — Share skills as folders
+- **Skill actions** — Some skills add one-click buttons on the home page that start a preset workflow
+
+A skill can provide **knowledge** (instructions, best practices) and **custom tools** (JavaScript functions that run in an isolated sandbox).
+
+## Workspace & GitHub {#feature-workspace}
+
+Each chat has a **workspace** — a file area where the Agent can read, write, edit and diff files.
+
+- **GitHub** — Connect a GitHub account in [Settings](app:openSettingsPageView) to clone repositories into a workspace. The Agent can create branches, push commits and open pull requests from the chat
+- **Pull requests** — PRs opened from a chat are listed in the chat sidebar, with a **Merge** button
+- **Protection between chats** — Each file remembers which chat changed it, so two chats working in parallel do not silently overwrite each other's work
+- **Auto-sync** — Cloned workspaces sync with GitHub when you navigate, switch chats or return to the tab
 
 ## Chat Sidebar {#feature-sidebar}
 
-The right-hand chat sidebar gathers the artifacts of the current chat in a single scroll — **pushed PRs**, **workspace files**, **version history**, and **sub-agent workers**:
+The right-hand sidebar collects everything the current chat produced:
 
-- **Pushed PRs** — Each PR the Agent opens from this chat shows as a row with its title and **target branch**. Click **Merge** to squash-merge it (the PR title becomes the commit title) and auto-sync the affected workspace
-- **Workspace files** — Files the Agent created or changed appear as rows; open one to **view** it, see a **diff** (diff-first, with file-nav arrows), or browse prior **versions**. A color-coded chip marks the owning chat, and pushed rows link to their PR
-- **Workers** — Running and finished sub-agents appear as cards; open one to watch its live progress or read its chat in a modal. Collapsed cards show tool-call, files-edited, and PRs-opened counters
+- **Pull requests** — Title, target branch and a **Merge** button
+- **Workspace files** — Open a file to view it, see its diff or browse earlier versions
+- **Version history** — Instance changes with **Undo**, **Redo** and **Download XML**
+- **Workers** — Running and finished sub-agents, with counters for tool calls, edited files and opened PRs
 
-## Pause & Send-During-Stream {#feature-streaming}
+## Actions & Live Progress {#feature-actions}
 
-You don't have to wait for the Agent to finish before reacting:
+Long tasks show live progress instead of going silent:
 
-- **Pause** aborts the in-flight LLM call immediately via `AbortController` (not at the next agent-loop iteration)
-- **Send mid-stream** aborts the current call and races any running tools via an event-driven interrupt resolver. A translucent *Queued* bubble renders the moment you press send, and the spinner switches to *Interrupting…*
-- **Per-chat scope** — Pause only affects the current chat. Background chats and parallel runs keep going
-- **Concatenating queue** — Sending two messages during the abort/restart window concatenates them instead of dropping the first
+- **Progress card** — A single card with a colored state (running, stuck, done, error) and a list of steps
+- **Action buttons** — One-click buttons that start follow-up workflows
+- **Running indicator** — The chat list marks chats where the Agent is working
+- **"Agent finished" notification** — If you switch tabs or windows during a run, a desktop notification tells you when the Agent is done
+
+## Active Chats & Jobs {#feature-jobs}
+
+The jobs pill in the header opens a live view of your chats and background work:
+
+- **Active chats** — Running chats and chats with unread results (shown in **bold**), each with a context-usage ring
+- **Sub-agents** — Listed under their parent chat; open one to read its transcript
+- **Expand** — Open the list as a larger panel with a columns or sections layout
+
+## Tool Permissions {#feature-permissions}
+
+Besides the per-instance permission level (**Manual**, **Auto**, **Dev**), each tool has its own setting in [Settings](app:openSettingsPageView) → **Tool Permissions**:
+
+- **Allow** — The tool always runs without asking
+- **Auto** — The tool runs without asking, unless the Agent flags a call as needing your confirmation
+- **Ask** — You get an approval prompt before every call
+- **Off** — The Agent cannot use the tool
+
+Some tools have finer controls: the ServiceNow API per HTTP method (GET, POST, PUT, PATCH, DELETE), browser control per action (navigate, click, fill, impersonate…), and skill management per action. Confirmation dialogs are color-coded by risk: **blue** (routine), **orange** (caution), **red** (destructive).
+
+:::tip
+Keep DELETE and other destructive operations on **Ask**, and use **Dev** only on development instances.
+:::
+
+## Agent Tools {#feature-tools}
+
+The main tools the Agent uses:
+
+| Tool | What it does |
+|------|--------------|
+| **ServiceNow API** (`servicenow_api`) | Read, create, update and delete records |
+| **Background script** (`servicenow_run_script`) | Run a server-side script on the instance (requires the admin role) |
+| **Script edits** (`servicenow_diff_edit`) | Change scripts with precise search-and-replace edits |
+| **Browser control** (`iframe_tool`) | Navigate, click, fill, inspect and impersonate in browser tabs |
+| **Browser code** (`js_eval`) | Run JavaScript in an isolated sandbox that can call other tools |
+| **Screenshots** (`take_screenshot`) | Capture the page, a widget or an element |
+| **Widgets and cards** (`html_widget`, `display`) | Show interactive widgets, tables, cards and timelines in the chat |
+| **Smart Documents** (`document`) | Create and update persistent Markdown documents |
+| **Prompt user** (`prompt_user`) | Ask you for input with an inline form |
+| **Sub-agents** (`spawn_sub_agent`) | Delegate work to background workers |
+| **Workspace** (`workspace`) | Work with files and GitHub repositories |
+| **Web fetch** (`web_fetch`) | Read pages from the public web |
+| **Skills** (`get_skill`, `manage_skill`) | Read and manage skills |
+
+Open [Settings](app:openSettingsPageView) → **Tool Permissions** to see every tool, its source and its permission.
 
 ## Large Content Caching {#feature-caching}
 
-When data is too large to fit in the conversation (over 4K tokens by default), it gets automatically cached. Instead of overwhelming the context, the Agent receives a smart outline and can explore the content piece by piece.
+When a tool result is too large for the conversation (more than 4K tokens by default), AppAgent caches it. The Agent receives an outline and then reads, searches or browses only the parts it needs. This keeps chats fast and focused. Change the threshold (1K to 100K tokens) in [Settings](app:openSettingsPageView) → **Large Content Caching**.
 
-**How it works:**
+## Context Indicator {#feature-saturation}
 
-1. A tool returns a large result (e.g., a big API response or long script)
-2. The content is automatically cached
-3. The Agent sees a summary showing the structure and contents
-4. The Agent can browse, search, and read specific parts as needed
+The **context indicator** next to the chat input shows how full the conversation is. Past 50% the Agent is asked to wrap up and hand remaining heavy work to sub-agents; at 100% it stops and reports. Click the indicator at any time to summarize the conversation into a fresh chat.
 
-**What the Agent can do with cached content:**
+## Usage & Rate Limits {#feature-usage}
 
-- **Browse the outline** — See the structure at different detail levels, from a quick overview to a deep dive
-- **Search** — Find specific text or patterns within the cached content
-- **Read sections** — Access specific parts of the data without loading everything
+- **Usage pill** — The header shows your API usage and remaining limits; click it for details
+- **Automatic retries** — When the provider is rate-limited or overloaded (HTTP 429 / 529), AppAgent waits and retries automatically and shows a countdown in the chat
+- **Out of credits** — When a 429 actually means your credits are exhausted, the chat says so clearly
 
-**Settings:** You can adjust the cache threshold in [Settings](app:openSettingsPageView) (1K to 100K tokens). Lower values cache more aggressively, higher values let more data through directly.
+## Languages {#feature-languages}
 
-:::tip
-**Why this matters:** Caching keeps conversations fast and focused. The Agent works smarter by only pulling in the specific data it needs, rather than flooding the context with huge responses.
-:::
+The interface is available in English plus 24 languages: Arabic, Chinese (Simplified, Traditional), Czech, Danish, Dutch, Finnish, French (France, Canada), German, Hebrew, Hungarian, Italian, Japanese, Korean, Norwegian, Polish, Portuguese (Brazil, Portugal), Russian, Spanish, Swedish, Thai and Turkish.
 
-## Context Saturation {#feature-saturation}
+Choose one in [Settings](app:openSettingsPageView) → **Language**, or from the quick-settings menu in the header. **Auto** follows your browser's language and falls back to English. The change applies immediately, without a reload.
 
-The **context indicator** by the chat input tracks how full the conversation is. As it fills, the Agent receives escalating nudges:
+- **Right-to-left** — Arabic and Hebrew use a right-to-left layout
+- **Local formats** — Dates, times and numbers follow your language
+- **Agent replies** — The Agent replies in the chosen language unless you write in another one. Code, table and field names stay unchanged
+- **This help page** — Shown in your language; the changelog stays in English
 
-- **Past 50%** — A warning to wrap up the current step and delegate remaining heavy work to fresh sub-agents (model quality degrades as context grows)
-- **Full (100%)** — A stop-now prompt to report conclusions immediately and hand off unfinished work to a new chat or sub-agent
+# Pages & Settings {#pages}
 
-Click the context indicator to summarize the conversation into a fresh chat.
+## Settings {#page-settings}
 
-# Tips & Shortcuts {#tips}
+[Open Settings →](app:openSettingsPageView)
+
+- **Agent Model** — The model the Agent uses
+- **API Providers** — Anthropic, OpenRouter or custom providers, with an API key or OAuth
+- **LLM Endpoints** — Named `URL + API key` pairs for any OpenAI-compatible API
+- **Sub-Agent Model Tiers** — Map the small, medium and large tiers to models, or **Same**
+- **Reasoning Effort, Max Tokens & Thinking Budget** — Tune answer depth and length
+- **Context Window** — The context size used by the context indicator
+- **Display** — API statistics, compact mode, keep the display awake
+- **Language** — Interface language, or **Auto**
+- **Hooks** — Automatic chat titles, "Agent finished" notifications and other automation
+- **Large Content Caching** — When large results are cached
+- **Tool Permissions** — What runs automatically, asks first or is disabled
+- **GitHub** — Connect a GitHub account and manage cloned repositories
+- **System Prompt** — Customize the Agent's instructions
+- **Data Management** — Export, import or delete your data
+
+## History {#page-history}
+
+All your conversations. [Open History →](app:openHistoryView)
+
+- **Search** — Find chats by title, content, tools used or widgets
+- **Pin** — Keep important chats at the top
+- **Export** — Download one chat or your whole history
+- **Stats** — Number of chats, pinned chats and total cost
+
+## Help {#page-docs}
+
+This page. [Open Help →](app:openDocsView)
+
+- **Search** — Filter the help topics from the search box in the toolbar
+- **Contents** — Jump to a section from the outline
+- **Download** — Save the documentation as a Markdown file
+
+# Tips & Keyboard Shortcuts {#tips}
 
 | Action | How |
 |--------|-----|
 | Send message | <kbd>Enter</kbd> |
-| New line | <kbd>Shift + Enter</kbd> |
-| New chat | Click **+ New Chat** |
-| Search chats | Use search box in sidebar |
-| Pause Agent | Click **Pause** button |
-| Summarize context | Click the context percentage circle |
+| New line | <kbd>Shift</kbd> + <kbd>Enter</kbd> |
+| Search chats | <kbd>Ctrl</kbd> + <kbd>K</kbd> (<kbd>⌘</kbd> + <kbd>K</kbd> on Mac) |
+| Close a dialog or menu | <kbd>Esc</kbd> |
+| Go back | <kbd>Alt</kbd> + <kbd>←</kbd> |
+| Attach an image | Paste it, or drag and drop it onto the chat |
+| Start fresh with a summary | Click the context indicator |
+| Interrupt the Agent | Send a new message, or click **Pause** |
 
 :::tip
-**Pro tip:** Be specific in your requests. Instead of "fix this", say "fix the null reference error on line 42".
+**Be specific.** Instead of *"fix this"*, say *"fix the null reference error on line 42 of the MyUtils script include"*. Name the table, record or page when you can.
 :::
+
+- **One goal per chat** — Start a new chat for an unrelated task; the Agent stays faster and more accurate
+- **Let it test** — Ask the Agent to open the page and verify its own change with a screenshot
+- **Use skills** — Activate a skill that matches your task (for example testing or auditing) before you start
+
+# Troubleshooting & FAQ {#faq}
+
+### The Agent does not see my instance
+
+Open the instance in a tab of the same Chrome profile and make sure you are logged in, then ask *"list instances"*. If it still does not appear, reload the instance tab.
+
+### I get an API or authentication error
+
+Check your provider in [Settings](app:openSettingsPageView) → **API Providers**: the API key, the selected endpoint and the model name. For OAuth, sign in to claude.ai again in the same Chrome profile.
+
+### The Agent says it is rate-limited
+
+AppAgent retries automatically and shows a countdown. If it keeps happening, check the usage pill for remaining credits, or use a smaller model tier for sub-agents.
+
+### Too many approval prompts, or not enough
+
+Change the instance's permission level (**Manual**, **Auto**, **Dev**) from the instance dropdown, and adjust individual tools in [Settings](app:openSettingsPageView) → **Tool Permissions**.
+
+### Answers get slower or less accurate in a long chat
+
+The conversation is filling up its context. Click the context indicator to continue in a fresh chat with a summary.
+
+### How do I undo a change?
+
+Open the chat sidebar and click **Undo** on the change in the version history. **Download XML** exports all changes.
+
+### Where is my data stored?
+
+Locally in your browser (IndexedDB). Chats never go to an AppAgent server — only to your AI provider and your ServiceNow instance. See [Data Storage](#adv-data-storage).
+
+### The interface or this page is in the wrong language
+
+Choose the language in [Settings](app:openSettingsPageView) → **Language**. **Auto** follows your browser's language.
 
 # Advanced {#advanced}
 
@@ -569,7 +514,7 @@ The system prompt defines the Agent's behavior and capabilities. You can customi
 | Placeholder | Description |
 |-------------|-------------|
 | `{{CURRENT_DATE}}` | Today's date (weekday, month, day, year) |
-| `{{ORCHESTRATOR_POLICY}}` | Sub-agent delegation & orchestration policy — rendered for main (parent) chats, empty (`''`) for sub-agent chats, which get their worker role via the sub-agent preamble instead |
+| `{{ORCHESTRATOR_POLICY}}` | Sub-agent delegation policy — included in main chats, left empty in sub-agent chats |
 | `{{DISABLED_TOOLS}}` | List of disabled tools |
 | `{{TOOL_CATALOG}}` | Deferred-tool catalog (empty when deferred tool loading is off) |
 | `{{SKILLS_SUMMARY}}` | Active skills content |
@@ -582,10 +527,10 @@ Click **Revert to Default** to restore the original system prompt if needed.
 
 ## Agent API Calls {#adv-agent-api}
 
-AppAgent runs as a **Chrome extension**. AI API calls go directly from your browser to the AI provider:
+AppAgent runs as a **Chrome extension**:
 
 - AI API calls go **directly from your browser to the AI provider** (e.g., Anthropic, OpenRouter)
-- AI calls do **not** route through your instance, and do **not** route through any AppAgent server — there is no proxy in the middle
+- They do **not** pass through your instance or any AppAgent server
 - Your API key (or OAuth token) is stored locally in your browser
 - Conversation data is sent to the AI provider for processing
 
@@ -593,12 +538,12 @@ AppAgent runs as a **Chrome extension**. AI API calls go directly from your brow
 
 1. You type a message in the chat
 2. AppAgent builds a prompt with system instructions, tools, and conversation history
-3. The prompt is sent directly from your browser to the AI provider's API endpoint
+3. The prompt is sent to the AI provider's API
 4. The Agent's response streams back to your browser
 5. Tool calls are executed in your browser, using your instance session for API calls
 
 :::tip
-**Privacy:** Your API key and conversation data are handled client-side. AI API calls go directly to the provider from your browser. Tool calls that interact with your instance use your existing session credentials.
+**Privacy:** Your API key and conversation data are handled client-side. Tool calls that interact with your instance use your existing session credentials.
 :::
 
 ## LLM Endpoints {#adv-endpoints}
@@ -618,14 +563,13 @@ Claude **OAuth** providers don't use endpoints — they talk to `api.anthropic.c
 Instead of pasting an API key, you can sign in to Anthropic providers using your existing claude.ai session:
 
 1. In [Settings → API Providers](app:openSettingsPageView), add or edit an Anthropic provider and enable **OAuth**
-2. The extension reads the claude.ai session cookie from your Chrome profile and performs a PKCE exchange against `api.anthropic.com` directly
-3. No consent tab, no fetch interceptor, no AppAgent server in the loop
+2. The extension uses your claude.ai sign-in from the same Chrome profile to connect to Anthropic directly
+3. No extra sign-in window, and no AppAgent server in between
 
 **Requirements:**
 
 - You must be signed in to `claude.ai` in the same Chrome profile
-- The extension manifest requires the `cookies` permission
-- OAuth works under SSO setups where the old `/oauth/authorize` page would return 403
+- Works with single sign-on (SSO) accounts
 
 :::tip
 OAuth tokens are refreshed automatically. If sign-in fails, open `claude.ai` in the same profile and sign in again.

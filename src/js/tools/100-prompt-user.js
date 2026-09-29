@@ -38,6 +38,24 @@ function sanitizePromptOptions(options) {
     return out;
 }
 
+// i18n: the default title 'Input needed' is stored in English on the row (a
+// marker, like 'New Chat'); translate it only at display time. Agent-supplied
+// titles are shown as given.
+function promptTitleText(title) {
+    return (!title || title === 'Input needed') ? t('Input needed') : String(title);
+}
+
+// i18n: executePromptUser appends the free-text field with an English label and
+// placeholder that are stored on the row (compared here, like the title
+// marker); translate them only at display time. Agent-supplied labels and
+// placeholders are shown as given.
+function promptFreeTextDisplay(field, text) {
+    if (!field || field.name !== 'free_text_response') return text;
+    if (text === 'Your answer (free text)') return t('Your answer (free text)');
+    if (text === 'Type your own answer here if none of the options above fit…') return t('Type your own answer here if none of the options above fit…');
+    return text;
+}
+
 // Fields → array of plain objects with array options (non-objects dropped).
 // Returns copies so the caller's args are not mutated.
 function sanitizePromptFields(fields) {
@@ -78,8 +96,8 @@ async function executePromptUser(args, options) {
         fields = fields.concat([{
             name: 'free_text_response',
             type: 'textarea',
-            label: 'Your answer (free text)',
-            placeholder: 'Type your own answer here if none of the options above fit…',
+            label: N_('Your answer (free text)'),
+            placeholder: N_('Type your own answer here if none of the options above fit…'),
             required: false
         }]);
     }
@@ -221,8 +239,8 @@ function openBackgroundPromptPopup(chatId, promptId) {
         '<div class="modal-backdrop bg-popup-backdrop" onclick="closeBackgroundPromptPopup(event)">' +
             '<div class="modal bg-popup-modal" onclick="event.stopPropagation()">' +
                 '<div class="modal-header">' +
-                    '<span class="modal-title-text">' + escapeHtml(msg.title || 'Input needed') + '</span>' +
-                    '<button class="modal-close-icon" onclick="closeBackgroundPromptPopup()" aria-label="Close">' + UI_ICONS.close + '</button>' +
+                    '<span class="modal-title-text">' + escapeHtml(promptTitleText(msg.title)) + '</span>' +
+                    '<button class="modal-close-icon" onclick="closeBackgroundPromptPopup()" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
                 '</div>' +
                 '<div class="bg-popup-body">' +
                     descHtml +
@@ -232,8 +250,8 @@ function openBackgroundPromptPopup(chatId, promptId) {
                     '</form>' +
                 '</div>' +
                 '<div class="bg-popup-footer">' +
-                    '<button class="bg-popup-btn secondary" onclick="cancelBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">Cancel</button>' +
-                    '<button class="bg-popup-btn primary" onclick="submitBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">Submit</button>' +
+                    '<button class="bg-popup-btn secondary" onclick="cancelBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">' + escapeHtml(t('Cancel')) + '</button>' +
+                    '<button class="bg-popup-btn primary" onclick="submitBackgroundPromptPopup(\'' + chatId + '\',\'' + promptId + '\')">' + escapeHtml(t('Submit')) + '</button>' +
                 '</div>' +
             '</div>' +
         '</div>';
@@ -354,7 +372,7 @@ function submitPromptUser(promptId, chatId, formEl) {
             form.appendChild(notice);
         }
         var nInv = form.querySelectorAll('.prompt-field.invalid').length;
-        notice.textContent = nInv === 1 ? '1 required field needs a value' : nInv + ' required fields need a value';
+        notice.textContent = tn(nInv, '{count} required field needs a value', '{count} required fields need a value');
         if (firstInvalid.scrollIntoView) firstInvalid.scrollIntoView({ block: 'nearest' });
         return false;
     }
@@ -545,11 +563,11 @@ function renderPromptUserMessage(msg, index) {
     // Title: INLINE markdown only (code spans + bold) — block markdown would
     // break the one-line <summary> row. Escaped first, same regexes as
     // formatContent's inline passes.
-    html += escapeHtml(msg.title || 'Input needed')
+    html += escapeHtml(promptTitleText(msg.title))
         .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    if (isSubmitted) html += ' <span class="tool-approval-status allowed">Submitted</span>';
-    if (isCancelled) html += ' <span class="tool-approval-status denied">' + (msg.abandoned ? 'Abandoned' : 'Cancelled') + '</span>';
+    if (isSubmitted) html += ' <span class="tool-approval-status allowed">' + escapeHtml(t('Submitted')) + '</span>';
+    if (isCancelled) html += ' <span class="tool-approval-status denied">' + escapeHtml(msg.abandoned ? t('Abandoned') : t('Cancelled')) + '</span>';
     html += '</summary>';
 
     // Body
@@ -573,7 +591,7 @@ function renderPromptUserMessage(msg, index) {
         html += '<div class="prompt-submitted-values">';
         sanitizePromptFields(msg.fields).forEach(function(field) {
             html += '<div class="prompt-value-row">';
-            html += '<div class="prompt-value-label">' + escapeHtml(field.label || field.name) + '</div>';
+            html += '<div class="prompt-value-label">' + escapeHtml(promptFreeTextDisplay(field, field.label || field.name)) + '</div>';
             html += promptSubmittedValueHtml(field, msg.values[field.name]);
             html += '</div>';
         });
@@ -584,8 +602,8 @@ function renderPromptUserMessage(msg, index) {
     // Actions (only when pending)
     if (isPending) {
         html += '<div class="tool-approval-actions">';
-        html += '<button class="tool-approval-btn deny" onclick="cancelPromptUser(\'' + promptId + '\')">' + UI_ICONS.close + ' Cancel</button>';
-        html += '<button class="tool-approval-btn allow" onclick="submitPromptUser(\'' + promptId + '\')">' + UI_ICONS.check + ' Submit</button>';
+        html += '<button class="tool-approval-btn deny" onclick="cancelPromptUser(\'' + promptId + '\')">' + UI_ICONS.close + ' ' + escapeHtml(t('Cancel')) + '</button>';
+        html += '<button class="tool-approval-btn allow" onclick="submitPromptUser(\'' + promptId + '\')">' + UI_ICONS.check + ' ' + escapeHtml(t('Submit')) + '</button>';
         html += '</div>';
     }
 
@@ -623,7 +641,7 @@ function promptSubmittedValueHtml(field, val) {
         return '<div class="prompt-value-chips">' + chips + '</div>';
     }
     if (typeof val === 'boolean') {
-        return '<div class="prompt-value-text">' + (val ? 'Yes' : 'No') + '</div>';
+        return '<div class="prompt-value-text">' + escapeHtml(val ? t('Yes') : t('No')) + '</div>';
     }
     var text = (field && field.type === 'select') ? promptOptionLabel(field, val) : String(val);
     return '<div class="prompt-value-text">' + escapeHtml(text) + '</div>';
@@ -633,14 +651,14 @@ function renderPromptField(field, promptId) {
     // H1: defensive — legacy persisted rows can hand us null / non-object fields.
     if (!field || typeof field !== 'object') return '';
     var name = field.name != null ? String(field.name) : '';
-    var label = field.label != null && field.label !== '' ? String(field.label) : name;
+    var label = promptFreeTextDisplay(field, field.label != null && field.label !== '' ? String(field.label) : name);
     var type = typeof field.type === 'string' && field.type ? field.type : 'text';
     var value = field.value != null ? field.value : '';
     var required = field.required ? ' required' : '';
     var reqAttr = field.required ? ' data-required="1"' : '';
-    var reqMark = field.required ? '<span class="prompt-field-required" title="Required">*</span>' : '';
+    var reqMark = field.required ? '<span class="prompt-field-required" title="' + escapeHtml(t('Required')) + '">*</span>' : '';
     var clearInvalid = ' oninput="promptClearInvalid(this)"';
-    var placeholder = field.placeholder ? ' placeholder="' + escapeHtml(field.placeholder) + '"' : '';
+    var placeholder = field.placeholder ? ' placeholder="' + escapeHtml(promptFreeTextDisplay(field, field.placeholder)) + '"' : '';
     var options = sanitizePromptOptions(field.options);
     // FOCUS-KEEP: stable identity for focusable controls so a transcript
     // rebuild (renderMessages / _tryIncrementalRender, ui/250-message-render)
@@ -684,7 +702,7 @@ function renderPromptField(field, promptId) {
             });
             html += '<select class="prompt-field-input"' + ctlIdAttr + ' data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="' + type + '"' + required + (options.length ? reqAttr : '') + ' onchange="promptClearInvalid(this)">';
             // Required + no default: placeholder option so the browser can't silently submit the first option
-            if (field.required && !hasDefault) html += '<option value="" disabled selected hidden>Select…</option>';
+            if (field.required && !hasDefault) html += '<option value="" disabled selected hidden>' + escapeHtml(t('Select…')) + '</option>';
             options.forEach(function(opt) {
                 var optVal = typeof opt === 'object' ? opt.value : opt;
                 var optLabel = typeof opt === 'object' ? (opt.label || opt.value) : opt;
@@ -730,7 +748,7 @@ function renderPromptField(field, promptId) {
         html += '<input type="text" class="prompt-field-input"' + ctlIdAttr + ' data-field-name="' + escapeHtml(name) + '"' + fieldKey + ' data-field-type="text" value="' + escapeHtml(String(value)) + '"' + required + reqAttr + clearInvalid + placeholder + '>';
     }
 
-    html += '<div class="prompt-field-error">This field is required</div></div>';
+    html += '<div class="prompt-field-error">' + escapeHtml(t('This field is required')) + '</div></div>';
     return html;
 }
 

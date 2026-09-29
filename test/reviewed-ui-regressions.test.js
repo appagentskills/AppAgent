@@ -19,6 +19,10 @@ async function runReviewedUiAudit(sources) {
     var attachments = sources['src/js/app/050-image-attachments.js'];
     var navigation = sources['src/js/ui/170-chat-management.js'];
     var notifications = sources['src/js/ui/160-notifications.js'];
+    // The excerpts call t()/tn()/N_(): the with(env) fixture gets the REAL i18n core first
+    // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+    var i18nCore = sources['src/js/core/025-i18n.js'];
+    check(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
     var names = ['processImageFile', 'appendPendingImageForContext', 'clearPendingImages',
         'getCurrentPendingContext', 'savePendingImagesForContext', 'restorePendingImagesForContext',
         'savePendingTextForContext', 'restorePendingTextForContext', 'persistPendingTextsToStorage',
@@ -26,7 +30,7 @@ async function runReviewedUiAudit(sources) {
         'setPendingImagesOwner', 'getPendingImagesOwnerContext',
         '_attachmentChars', 'isFileDrag', 'resetDropOverlay', '_armDropHeartbeat',
         'handleDragOver', 'handleDragEnter', 'handleDragLeave', 'handleDrop'];
-    var code = names.map(function(n) { return declaration(attachments, n); }).join('\n') + '\n' +
+    var code = i18nCore + '\n' + names.map(function(n) { return declaration(attachments, n); }).join('\n') + '\n' +
         declaration(navigation, 'selectChat') + '\n' + declaration(sources['src/js/ui/030-home-view.js'], 'sendHomeMessage') + '\n' +
         declaration(sources['src/js/ui/050-history-view.js'], 'openChatFromHistory');
     function fixture(view) {
@@ -245,7 +249,7 @@ async function runReviewedUiAudit(sources) {
     var renderEnv = { escapeHtml: escapeHtml, highlightJS: escapeHtml, storeRawCopy: function() { return 'copy'; },
         UI_ICONS: { copy: 'C' }, window: { currentSearchHighlight: null }, decorateIdMentions: function(s) { return s; },
         renderDisplayPlaceholder: function() { return '<div>DISPLAY</div>'; }, renderDocumentPlaceholder: function() { return '<div>DOCUMENT</div>'; } };
-    var fc = new Function('env', 'with(env){\n' + sources['src/js/core/055-emoji-shortcodes.js'] + '\n' + declaration(renderer, 'formatContent') + '\nreturn formatContent;}')(renderEnv);
+    var fc = new Function('env', 'with(env){\n' + i18nCore + '\n' + sources['src/js/core/055-emoji-shortcodes.js'] + '\n' + declaration(renderer, 'formatContent') + '\nreturn formatContent;}')(renderEnv);
     await test('inline bold, markdown links, bare URLs, IDs, emoji, table pipes and HTML all remain literal', function() {
         var literals = ['**bold**', '[x](https://example.com)', 'https://example.com', ':bug:', 'widget_1788610000000_abc', '<img src=x onerror=bad()>', 'a | b', '# heading', '<!--document:doc_x-->', '<!--display:dsp_x-->', '$& $$'];
         literals.forEach(function(literal) { var html = fc('`' + literal + '`'); check(html.indexOf('<code class="inline-code">' + escapeHtml(literal) + '</code>') >= 0, 'inline transformed: ' + literal + ' => ' + html); });
@@ -363,7 +367,7 @@ async function runReviewedUiAudit(sources) {
     });
     await test('A3A3-01 parsed-PDF image URL is attribute-escaped', function() {
         var search = sources['src/js/ui/180-search.js'];
-        var pdfCode = declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
+        var pdfCode = i18nCore + '\n' + declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
             declaration(attachments, 'findPdfAnnotations') + '\n' + declaration(attachments, 'viewPdfAnnotations');
         var els = {}, snacks = [];
         ['modal-overlay', 'modal-header', 'modal-body', 'modal-actions'].forEach(function(id) {
@@ -386,7 +390,7 @@ async function runReviewedUiAudit(sources) {
     });
     await test('RC7A-F1 PDF preview iframe src is attribute-escaped', function() {
         var search = sources['src/js/ui/180-search.js'];
-        var pdfCode = declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
+        var pdfCode = i18nCore + '\n' + declaration(search, 'escapeHtml') + '\n' + declaration(search, 'escapeAttr') + '\n' +
             declaration(attachments, 'openPdfModal');
         var els = {};
         ['modal-overlay', 'modal-header', 'modal-body', 'modal-actions'].forEach(function(id) {
@@ -408,5 +412,5 @@ async function runReviewedUiAudit(sources) {
     return results;
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css","src/js/ui/040-tools-settings.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js"];
+var PATHS = ["src/js/core/025-i18n.js","src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css","src/js/ui/040-tools-settings.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js"];
 await registerRunner('reviewed-ui-regressions', async function() { return runReviewedUiAudit(await loadSources(PATHS)); });

@@ -54,6 +54,7 @@ function showGitHubSetupModal(opts) {
     var overlay = document.createElement('div');
     overlay.id = 'github-setup-modal';
     overlay.className = 'modal-overlay show';
+    overlay.setAttribute('data-kbd-self-focus', ''); // traps + restores focus itself (ui/320 manager skips it)
     overlay.onclick = function(e) { if (e.target === overlay) closeGitHubSetupModal(); };
     // A8C-01: a labelled modal dialog that keeps Tab inside; Esc stays with the global
     // INIT sweep (-> onclick -> closeGitHubSetupModal, which restores the opener's focus).
@@ -72,7 +73,7 @@ function showGitHubSetupModal(opts) {
 
     var html =
         '<div class="modal-dialog" style="max-width:520px;">' +
-            '<div class="modal-header" id="ghsetup-title">' + UI_ICONS.git + ' GitHub Setup</div>' +
+            '<div class="modal-header" id="ghsetup-title">' + UI_ICONS.git + ' ' + t('GitHub Setup') + '</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">';
 
     if (opts.connected) {
@@ -81,7 +82,7 @@ function showGitHubSetupModal(opts) {
             '<div style="display:flex;align-items:center;gap:var(--space-4);">' +
                 (opts.user && opts.user.avatar_url ? '<img src="' + escapeHtml(opts.user.avatar_url + (opts.user.avatar_url.indexOf('?') >= 0 ? '&' : '?') + 's=32') + '" style="width:32px;height:32px;border-radius:50%;" />' : '') +
                 '<div>' +
-                    '<div class="settings-page-row-label">Connected as ' + escapeHtml((opts.user && opts.user.login) || '') + '</div>' +
+                    '<div class="settings-page-row-label">' + t('Connected as {login}', {login: escapeHtml((opts.user && opts.user.login) || '')}) + '</div>' +
                     '<div class="settings-page-row-hint">' + escapeHtml(opts.instanceUrl) + '</div>' +
                 '</div>' +
             '</div>';
@@ -89,31 +90,31 @@ function showGitHubSetupModal(opts) {
         // Not connected — token form with a direct link to the token page.
         html +=
             '<div class="form-field">' +
-                '<label class="form-label" for="ghsetup-instance">Instance URL</label>' +
+                '<label class="form-label" for="ghsetup-instance">' + t('Instance URL') + '</label>' +
                 '<input type="text" id="ghsetup-instance" class="form-input" value="' + escapeHtml(opts.instanceUrl) + '" placeholder="https://github.com">' +
             '</div>' +
             '<div class="form-field">' +
-                '<label class="form-label" for="ghsetup-token">Personal Access Token <span class="required">*</span></label>' +
+                '<label class="form-label" for="ghsetup-token">' + t('Personal Access Token') + ' <span class="required">*</span></label>' +
                 '<input type="password" id="ghsetup-token" class="form-input" placeholder="ghp_..." onkeydown="if(event.key===\'Enter\')connectGitHubFromSetupModal()">' +
-                '<div class="settings-page-row-hint" style="margin-top:var(--space-2);">Requires <code>repo</code> scope. ' +
-                    '<a href="#" id="ghsetup-token-link" onclick="openGitHubSetupTokenPage(event)" style="color:var(--accent);">Open GitHub token page</a>' +
+                '<div class="settings-page-row-hint" style="margin-top:var(--space-2);">' + t('Requires {scope} scope.', {scope: '<code>repo</code>'}) + ' ' +
+                    '<a href="#" id="ghsetup-token-link" onclick="openGitHubSetupTokenPage(event)" style="color:var(--accent);">' + t('Open GitHub token page') + '</a>' +
                 '</div>' +
             '</div>' +
             '<div style="display:flex;justify-content:flex-end;align-items:center;gap:var(--space-4);">' +
                 '<span id="ghsetup-connect-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);flex:1;"></span>' +
-                '<button class="skills-action-btn" id="ghsetup-connect-btn" onclick="connectGitHubFromSetupModal()">Connect</button>' +
+                '<button class="skills-action-btn" id="ghsetup-connect-btn" onclick="connectGitHubFromSetupModal()">' + t('Connect') + '</button>' +
             '</div>';
     }
 
     // Clone section — always present; disabled until connected.
     html +=
         '<div style="border-top:1px solid var(--border);padding-top:var(--space-6);">' +
-            '<div class="settings-page-row-label" style="margin-bottom:var(--space-4);">Add a repository</div>' +
-            (opts.connected ? '' : '<div class="settings-page-row-hint" style="margin-bottom:var(--space-4);">Connect your account above first, then clone.</div>') +
+            '<div class="settings-page-row-label" style="margin-bottom:var(--space-4);">' + t('Add a repository') + '</div>' +
+            (opts.connected ? '' : '<div class="settings-page-row-hint" style="margin-bottom:var(--space-4);">' + t('Connect your account above first, then clone.') + '</div>') +
             '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
-                '<input type="text" id="ghsetup-repo" class="form-input" style="flex:1;" placeholder="owner/repo" aria-label="Repository (owner/repo)" value="' + escapeHtml(opts.repo || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
-                '<input type="text" id="ghsetup-branch" class="form-input" style="width:130px;" placeholder="branch (optional)" aria-label="Branch (optional)" value="' + escapeHtml(opts.branch || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
-                '<button class="skills-action-btn" id="ghsetup-clone-btn" onclick="cloneGitHubRepoFromSetupModal()"' + (opts.connected ? '' : ' disabled') + '>Clone</button>' +
+                '<input type="text" id="ghsetup-repo" class="form-input" style="flex:1;" placeholder="owner/repo" aria-label="' + escapeHtml(t('Repository (owner/repo)')) + '" value="' + escapeHtml(opts.repo || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
+                '<input type="text" id="ghsetup-branch" class="form-input" style="width:130px;" placeholder="' + escapeHtml(t('branch (optional)')) + '" aria-label="' + escapeHtml(t('Branch (optional)')) + '" value="' + escapeHtml(opts.branch || '') + '" onkeydown="if(event.key===\'Enter\')cloneGitHubRepoFromSetupModal()">' +
+                '<button class="skills-action-btn" id="ghsetup-clone-btn" onclick="cloneGitHubRepoFromSetupModal()"' + (opts.connected ? '' : ' disabled') + '>' + t('Clone') + '</button>' +
             '</div>' +
             '<div id="ghsetup-clone-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
         '</div>';
@@ -121,7 +122,7 @@ function showGitHubSetupModal(opts) {
     html +=
             '</div>' +
             '<div class="modal-actions">' +
-                '<button class="modal-btn secondary" onclick="closeGitHubSetupModal()">Close</button>' +
+                '<button class="modal-btn secondary" onclick="closeGitHubSetupModal()">' + t('Close') + '</button>' +
             '</div>' +
         '</div>';
 
@@ -154,7 +155,7 @@ async function connectGitHubFromSetupModal() {
     var tokenInput = document.getElementById('ghsetup-token');
     var instInput = document.getElementById('ghsetup-instance');
     if (!tokenInput || !tokenInput.value.trim()) {
-        if (status) { status.style.color = 'var(--danger)'; status.textContent = 'Please enter a token'; }
+        if (status) { status.style.color = 'var(--danger)'; status.textContent = t('Please enter a token'); }
         return;
     }
     var token = tokenInput.value.trim();
@@ -163,7 +164,7 @@ async function connectGitHubFromSetupModal() {
     // base derivations (normalizeGitHubInstanceUrl: core/130-indexeddb.js).
     var instanceUrl = normalizeGitHubInstanceUrl(instInput && instInput.value);
     if (btn) btn.disabled = true;
-    if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Validating...'; }
+    if (status) { status.style.color = 'var(--text-muted)'; status.textContent = t('Validating...'); }
     var result = await validateGitHubToken(token, instanceUrl);
     if (result.ok) {
         await saveGitHubSettings(token, instanceUrl, { login: result.login, avatar_url: result.avatar_url, name: result.name });
@@ -181,7 +182,7 @@ async function connectGitHubFromSetupModal() {
         });
     } else {
         if (btn) btn.disabled = false;
-        if (status) { status.style.color = 'var(--danger)'; status.textContent = result.error || 'Connection failed'; }
+        if (status) { status.style.color = 'var(--danger)'; status.textContent = result.error || t('Connection failed'); }
     }
 }
 
@@ -196,11 +197,11 @@ async function cloneGitHubRepoFromSetupModal() {
     var status = document.getElementById('ghsetup-clone-status');
     var repo = repoInput ? repoInput.value.trim() : '';
     if (!repo) {
-        if (status) { status.style.color = 'var(--danger)'; status.textContent = 'Enter a repo (owner/repo)'; }
+        if (status) { status.style.color = 'var(--danger)'; status.textContent = t('Enter a repo (owner/repo)'); }
         return;
     }
     if (repo.indexOf('/') === -1) {
-        if (status) { status.style.color = 'var(--danger)'; status.textContent = 'Format: owner/repo'; }
+        if (status) { status.style.color = 'var(--danger)'; status.textContent = t('Format: owner/repo'); }
         return;
     }
     var branch = (branchInput && branchInput.value.trim()) || undefined;
@@ -211,7 +212,7 @@ async function cloneGitHubRepoFromSetupModal() {
         // Asked before the button is disabled, so Cancel / Escape / backdrop leave the popup as it was.
         if (!(await _confirmReplaceExistingClone(repo, branch))) return;
         if (btn) btn.disabled = true;
-        if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Cloning ' + repo + '...'; }
+        if (status) { status.style.color = 'var(--text-muted)'; status.textContent = t('Cloning {repo}...', {repo: repo}); }
         try {
             var result = await wsClone(repo, branch);
             if (result.success) {

@@ -372,10 +372,10 @@ function _reopenStorageSet(obj, ms) {
     return _reopenCall(function() { return chrome.storage.local.set(obj); }, ms);
 }
 
-// Structured reopen log: console.info, plus (B2) the persisted ring buffer
-// below. Synchronous for callers, never throws, never awaited.
+// Structured reopen log: the persisted ring buffer below (B2) — read it back
+// from chrome.storage.local[REOPEN_LOG_KEY]. Synchronous for callers, never
+// throws, never awaited.
 function _reopenLog(ev, data) {
-    try { console.info('[SW][reopen] ' + ev, data || {}); } catch (e) {}
     try { _reopenLogPersist(_reopenLogEntry(ev, data)); } catch (e) {}
 }
 
@@ -605,12 +605,49 @@ function _reopenOnCleanReload(msg, sender, sendResponse) {
     }).then(function() {
         return _reopenCloseExtensionTabs();
     }).catch(function() {}).then(function() {
+        return _reopenArmWakeAlarms();
+    }).catch(function() {}).then(function() {
         try { chrome.runtime.reload(); } catch (e) {
             _reopenLog('clean-reload-reload-threw', { error: _reopenErr(e) });
             _reopenCleanReloadInFlight = false;
         }
     });
     return false; // ack already sent synchronously (same as the dup path)
+}
+
+// WAKE-AFTER-RELOAD: Chrome does NOT reliably start the new SW after
+// chrome.runtime.reload() (boot crumbs showed no sw-start for 33s until the
+// user clicked the toolbar icon), so the marker sat unread and nothing
+// reopened. chrome.alarms persist across an unload/load (AlarmManager
+// re-reads them from the StateStore on OnExtensionLoaded, only uninstall
+// clears them), and a firing alarm starts the SW. So right before reload()
+// arm a few one-shot wake alarms; their handler (bottom of this slice) runs
+// the single-flight _consumeReopenAppTab(). Bounded; never blocks the reload.
+var REOPEN_WAKE_ALARM_PREFIX = 'appagent-reopen-wake-';
+var REOPEN_WAKE_DELAYS_MS = [1000, 3000, 8000, 20000]; // all well inside REOPEN_APP_TAB_MAX_AGE_MS
+function _reopenArmWakeAlarms() {
+    if (!chrome.alarms || typeof chrome.alarms.create !== 'function') return Promise.resolve(0);
+    var now = Date.now();
+    return Promise.all(REOPEN_WAKE_DELAYS_MS.map(function(ms, i) {
+        return _reopenCall(function() { return chrome.alarms.create(REOPEN_WAKE_ALARM_PREFIX + i, { when: now + ms }); }, 1000)
+            .then(function() { return 1; }, function(e) { _reopenLog('wake-alarm-failed', { i: i, error: _reopenErr(e) }); return 0; });
+    })).then(function(r) { return r.reduce(function(a, b) { return a + b; }, 0); });
+}
+function _reopenClearWakeAlarms() {
+    if (!chrome.alarms || typeof chrome.alarms.clear !== 'function') return;
+    REOPEN_WAKE_DELAYS_MS.forEach(function(ms, i) {
+        try { Promise.resolve(chrome.alarms.clear(REOPEN_WAKE_ALARM_PREFIX + i)).catch(function() {}); } catch (e) {}
+    });
+}
+// A wake alarm started (or found running) this SW: consume the marker. In the
+// OLD instance mid clean-reload it does nothing (never clears the others).
+function _reopenOnWakeAlarm(alarm) {
+    if (!alarm || typeof alarm.name !== 'string' || alarm.name.indexOf(REOPEN_WAKE_ALARM_PREFIX) !== 0) return;
+    if (_reopenCleanReloadInFlight) return;
+    _reopenLog('wake-alarm', { name: alarm.name, done: !!_appTabReopenState.done });
+    return Promise.resolve(_consumeReopenAppTab()).catch(function() {}).then(function() {
+        if (_appTabReopenState.done) _reopenClearWakeAlarms();
+    });
 }
 
 // app-tab-ready (app/070-app-tab-ready.js): recorded BEFORE any wait (it can
@@ -1153,6 +1190,11 @@ chrome.runtime.onInstalled.addListener(function() { _consumeReopenAppTab(); });
 setTimeout(function() { _consumeReopenAppTab(); }, 1500);
 // Last retry for a failed attempt (marker kept when a create failed with no tab).
 setTimeout(function() { _consumeReopenAppTab(); }, 5000);
+// WAKE-AFTER-RELOAD: registered synchronously at top level so the persisted
+// wake alarm armed before reload() is delivered to the new SW.
+if (chrome.alarms && chrome.alarms.onAlarm && chrome.alarms.onAlarm.addListener) {
+    chrome.alarms.onAlarm.addListener(_reopenOnWakeAlarm);
+}
 // APP-TAB-REOPEN end
 
 // Strip Origin header from extension-initiated requests only (web_fetch tool)
@@ -1331,8 +1373,9 @@ async function snGetInstancesDetailed() {
             if (_nm.status === 401) authRejected = true;
         }
         var roles = [];
+        var _rr = null;
         if (token) {
-            var _rr = await snFetchUserRoles(inst.url, token);
+            _rr = await snFetchUserRoles(inst.url, token);
             roles = _rr.roles;
             if (_rr.status === 401) authRejected = true;
         }
@@ -1348,7 +1391,19 @@ async function snGetInstancesDetailed() {
         if (token && !userName && roles.length === 0 && authRejected) {
             token = '';
         }
-        result.push({ url: inst.url, tabs: inst.tabs, token: token, userName: userName, roles: roles });
+        // maint: no roles + no user name (maint is not a sys_user) + admin-level read
+        // of the roles table. Synthetic roles ['maint','admin'] so the badge, the
+        // list_instances admin check and the servicenow_run_script gate treat it as admin.
+        // maint: probe ONLY when the roles probe SUCCEEDED (2xx) with 0 roles and no
+        // user name (maint is not a sys_user) — shared snDetectMaint/snMaintEligible in
+        // core/150-record-helpers.js (via sw-bundle), one request, cached per URL+token.
+        var isMaint = false;
+        var _rolesOk = !!(_rr && _rr.responded && _rr.status >= 200 && _rr.status < 300);
+        if (token && !authRejected && typeof snMaintEligible === 'function' && snMaintEligible(roles, _rolesOk, userName)) {
+            isMaint = await snDetectMaint(inst.url, token);
+            if (isMaint) { roles = ['maint', 'admin']; if (!userName) userName = 'maint'; }
+        }
+        result.push({ url: inst.url, tabs: inst.tabs, token: token, userName: userName, roles: roles, isMaint: isMaint });
     }
     return result;
 }
@@ -2790,7 +2845,7 @@ async function renewClaudeToken(oauth, epoch) {
             // TA4-3: fenced by a logout - a cookie re-auth would be dropped too.
             if (e && e.claudeOAuthStale) throw e;
             // fall through to silent re-auth
-            console.log('[Claude OAuth] refresh failed, falling back to silent re-auth:', e.message);
+            console.warn('[Claude OAuth] refresh failed, falling back to silent re-auth:', e && e.message);
         }
     }
     // Silent re-auth via the claude.ai session cookie.
@@ -5613,7 +5668,7 @@ function convertContentPart(part) {
 //       https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
 //
 // FABLE_5_1_PLUS_RE / isFable51Plus and the wider THINKING_BINDING_RE /
-// isThinkingBindingModel (Fable/Mythos 5.1+ OR Opus 5.5+ — the set this file
+// isThinkingBindingModel (Fable/Mythos 5.1+ OR Opus 5.5+ OR Sonnet 5.5+ — the set this file
 // actually gates on) are DEFINED in src/js/core/030-config.js (single source
 // of truth, shared with buildAPIMessages in the page + SW bundles) and reach
 // this file through importScripts('sw-bundle.js') at the top. Do not
@@ -5622,7 +5677,7 @@ function convertContentPart(part) {
 
 // Beta flags for the OAuth /v1/messages call. The base trio is unconditional
 // (OAuth access, interleaved thinking, cache scope); the bound-thinking models
-// (Fable/Mythos 5.1+ AND Opus 5.5+ — THINKING_BINDING_RE / isThinkingBindingModel
+// (Fable/Mythos 5.1+, Opus 5.5+ AND Sonnet 5.5+ — THINKING_BINDING_RE / isThinkingBindingModel
 // in src/js/core/030-config.js) additionally need the two thinking betas that
 // back the block_binding / display fields transformToAnthropic emits for them —
 // sending those fields WITHOUT the betas is a 400, and sending the betas to
@@ -5726,7 +5781,7 @@ function transformToAnthropic(body) {
         // (callOpenRouterStreaming in src/js/app/010-llm-streaming.js, from
         // the global Max Tokens setting) — this is a last-resort fallback.
         // getDefaultMaxTokensForModel (src/js/core/030-config.js, shared into
-        // the SW bundle) gives 128000 for Opus 5.5+ / 64000 otherwise; the
+        // the SW bundle) gives 128000 for Opus 5.5+ / Sonnet 5.5+ / 64000 otherwise; the
         // literal 64000 = DEFAULT_MAX_TOKENS guards a realm without it.
         max_tokens: body.max_tokens || (typeof getDefaultMaxTokensForModel === 'function' ? getDefaultMaxTokensForModel(body.model) : 64000),
         stream: true,
@@ -5755,7 +5810,7 @@ function transformToAnthropic(body) {
         result.tool_choice = { type: 'auto' };
     }
 
-    // Bound-thinking models (Fable/Mythos 5.1+, Opus 5.5+ — isThinkingBindingModel):
+    // Bound-thinking models (Fable/Mythos 5.1+, Opus 5.5+, Sonnet 5.5+ — isThinkingBindingModel):
     // thinking is always-on adaptive (type 'enabled'/'disabled' → 400), so the
     // thinking object is sent UNCONDITIONALLY for them — even when the
     // provider has no effort/budget configured (effort then stays at the model
@@ -5772,12 +5827,13 @@ function transformToAnthropic(body) {
     // Both betas are added by getAnthropicBetas for the same THINKING_BINDING_RE match.
     //   thinkingOff — the request builder's explicit off switch (global Thinking
     //                 Budget = 0, no provider effort → reasoning:{enabled:false},
-    //                 see callOpenRouterStreaming). Bound-thinking models IGNORE
-    //                 it: their thinking is always-on and there is no accepted
-    //                 'disabled' shape (on Opus 5.5 an omitted `thinking` is
-    //                 equivalent to adaptive anyway), so the forced branch below
-    //                 stays unconditional (the Settings hint says "not for
-    //                 Fable 5.1+").
+    //                 see callOpenRouterStreaming). Fable/Mythos 5.1+ and Opus
+    //                 5.5+ never receive it (the builder's offSignalOk gate) and
+    //                 have no accepted 'disabled' shape, so they get the forced
+    //                 adaptive object below. Sonnet 5.5+ on this OAuth path DOES
+    //                 receive it and maps it to {type:'between_tools'} via
+    //                 thinkingOffShapeFor — the only bound model with an off-ish
+    //                 mode. Never 'disabled' for any bound model.
     var thinkingBound = isThinkingBindingModel(body.model);
     var thinkingOff = !!(body.reasoning && body.reasoning.enabled === false);
     var effort = (body.reasoning && !thinkingOff) ? body.reasoning.effort : null;
@@ -5785,7 +5841,20 @@ function transformToAnthropic(body) {
     var modelLower = String(body.model || '').toLowerCase();
     var adaptiveOnly = isAdaptiveOnlyClaude(modelLower);
     var adaptiveCapable = adaptiveOnly || ADAPTIVE_CAPABLE_CLAUDE_RE.test(modelLower);
-    if (thinkingBound) {
+    // Sonnet 5.5+ exception (thinkingOffShapeFor, core/030-config.js): the
+    // off switch maps to {type:'between_tools'} (no other fields allowed).
+    // The builder REPLACES reasoning with exactly {enabled:false}, so
+    // body.reasoning.effort is undefined here in practice; the xhigh/max →
+    // adaptive result of thinkingOffShapeFor is a defensive guard only (a
+    // provider effort always wins over the off switch upstream, so xhigh/max
+    // arrive as {effort} and take the forced-adaptive branch instead).
+    // Never 'disabled'.
+    var offShape = (thinkingOff && typeof thinkingOffShapeFor === 'function')
+        ? thinkingOffShapeFor(modelLower, body.reasoning.effort) : null;
+    if (thinkingBound && offShape && offShape.type === 'between_tools') {
+        result.thinking = offShape;
+        stripReplayedThinkingBeforeLastUserTurn(merged);
+    } else if (thinkingBound) {
         result.thinking = { type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
     } else if (!thinkingOff) {
         if (adaptiveCapable) {
@@ -5945,6 +6014,44 @@ function buildOrderedAnthropicAssistantBlocks(msg) {
         out[lastTextOut].cache_control = cc;
     }
     return out.length > 0 ? out : null;
+}
+
+// between_tools (Sonnet 5.5+ thinking OFF): the model only thinks between
+// tool calls, so thinking blocks replayed from EARLIER turns are dead weight
+// (and, bound to a prefix, may be dropped server-side anyway). Strip
+// `thinking` / `redacted_thinking` blocks IN PLACE from assistant messages
+// that come BEFORE the last genuine user turn — a user message with no
+// tool_result block (a user message carrying any tool_result is part of the
+// running tool loop). Blocks of the in-flight tool loop (assistant messages
+// after that boundary) are KEPT: the API requires the final assistant
+// tool-use turn to start with its thinking block, else 400. The boundary is
+// identical for every request of one turn, so the stripped prefix stays
+// byte-stable across that turn's tool loop (prompt cache friendly). An
+// assistant message that would become empty is left unchanged.
+// NOT covered: a system-prompt edit or a context compaction in the MIDDLE of
+// a turn rewrites the prefix under the in-flight loop's kept thinking blocks;
+// between_tools carries no block_binding field, so that case still depends
+// on the API accepting (or the caller retrying) the replayed blocks.
+function stripReplayedThinkingBeforeLastUserTurn(messages) {
+    if (!Array.isArray(messages)) return messages;
+    var boundary = -1;
+    for (var i = messages.length - 1; i >= 0; i--) {
+        var m = messages[i];
+        if (!m || m.role !== 'user') continue;
+        var hasToolResult = Array.isArray(m.content) && m.content.some(function(b) {
+            return b && b.type === 'tool_result';
+        });
+        if (!hasToolResult) { boundary = i; break; }
+    }
+    for (var j = 0; j < boundary; j++) {
+        var a = messages[j];
+        if (!a || a.role !== 'assistant' || !Array.isArray(a.content)) continue;
+        var kept = a.content.filter(function(b) {
+            return !(b && (b.type === 'thinking' || b.type === 'redacted_thinking'));
+        });
+        if (kept.length > 0 && kept.length !== a.content.length) a.content = kept;
+    }
+    return messages;
 }
 
 function transformMessageToAnthropic(msg) {
@@ -6692,10 +6799,7 @@ async function maybeCloseOffscreenIfIdle() {
     // 30s heartbeat re-checks and closes once the save channel is quiet.
     if (typeof persistenceBusyReason === 'function') {
         var _pbr = persistenceBusyReason();
-        if (_pbr) {
-            console.log('[sw] offscreen idle-close deferred: ' + _pbr);
-            return;
-        }
+        if (_pbr) return;
     }
     // P4 #1: publish the in-flight close so ensureOffscreenDocument (flag
     // P4_OFFSCREEN_SELF_HEAL) can await it instead of racing a create against

@@ -188,6 +188,9 @@ var TestRunPolicy = (function() {
                         if (!check.ok) throw new Error(check.reason);
                         return config.dispatch(d.name, check.args, d.id);
                     }).then(function(result) { reply(d.id, result); }, function(error) { reply(d.id, { success: false, error: String(error && error.message || error) }); });
+                } else if (d.type === 'sandboxTestProgress') {
+                    // Display-only progress: no authority, never settles the frame.
+                    if (typeof config.onProgress === 'function') { try { config.onProgress(d); } catch (_) { /* display only */ } }
                 } else if (d.type === 'sandboxTestTimeout') {
                     finish(new Error('Per-test timeout: aborted remaining tests and destroyed sandbox'));
                 } else if (d.type === 'sandboxDone') {

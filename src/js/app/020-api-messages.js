@@ -56,9 +56,9 @@ function _hasLegacySubNoticeShape(text, pre) {
 }
 function _isInjectedSubNoticeRow(msg) {
     if (!msg || !msg.injected || typeof msg.content !== 'string') return false;
-    var t = msg.content;
+    var txt = msg.content;
     if (Array.isArray(msg.subNotices) && msg.subNotices.length > 0) {
-        var rest = t, found = 0;
+        var rest = txt, found = 0;
         for (var i = 0; i < msg.subNotices.length; i++) {
             var sn = msg.subNotices[i];
             var mt = (sn && typeof sn.text === 'string') ? sn.text : '';
@@ -76,9 +76,9 @@ function _isInjectedSubNoticeRow(msg) {
         }
     }
     if (msg.hasUserText === true) return false;
-    var pre = _subNoticePrechecks(t);
-    if (pre.inbox && _SUB_INBOX_ANY_RE.test(t)) return false;
-    return _hasLegacySubNoticeShape(t, pre);
+    var pre = _subNoticePrechecks(txt);
+    if (pre.inbox && _SUB_INBOX_ANY_RE.test(txt)) return false;
+    return _hasLegacySubNoticeShape(txt, pre);
 }
 
 // C2 UPDATE LEDGER (request-time only, never persisted). On a WAKE run —
@@ -239,10 +239,10 @@ function _collapseWakeReminders(content, line) {
     var changed = false;
     var parts = content.map(function(p) {
         if (!p || p.type !== 'text' || typeof p.text !== 'string') return p;
-        var t = _collapseReminderText(p.text, line);
-        if (t === p.text) return p;
+        var collapsed = _collapseReminderText(p.text, line);
+        if (collapsed === p.text) return p;
         changed = true;
-        return Object.assign({}, p, { text: t }); // keeps cache_control etc.
+        return Object.assign({}, p, { text: collapsed }); // keeps cache_control etc.
     });
     return changed ? parts : content;
 }
@@ -454,9 +454,12 @@ function syncPauseButtonUI(chatId) {
     // Per-chat: do NOT consult global `paused` — it would mislabel the button on a
     // chat that was never paused, just because some other chat was paused earlier.
     var isPaused = !!(id && pausedChats[id] === true);
+    // i18n: JS owns this label (body.html #pause-btn has no text data-i18n).
+    // escapeHtml is page-only (ui/180) and this file is also SW-bundled: guard it.
+    var esc = function(s) { return typeof escapeHtml === 'function' ? escapeHtml(s) : s; };
     pauseBtn.innerHTML = isPaused
-        ? '<span class="btn-icon">' + UI_ICONS.play + '</span>Resume'
-        : '<span class="btn-icon">' + UI_ICONS.pause + '</span>Pause';
+        ? '<span class="btn-icon">' + UI_ICONS.play + '</span>' + esc(t('Resume'))
+        : '<span class="btn-icon">' + UI_ICONS.pause + '</span>' + esc(t('Pause'));
 }
 
 function togglePause() {
@@ -569,7 +572,7 @@ function showRetryButton() {
         retryBtn.classList.add('visible');
         // PR-PAUSE (R6): see showContinueButton — Retry re-issues the FAILED
         // request; it is never shown alongside Continue.
-        retryBtn.title = 'Retry the failed request';
+        retryBtn.title = t('Retry the failed request');
     }
     hideContinueButton();
 }
@@ -586,7 +589,7 @@ function showContinueButton() {
         // PR-PAUSE (R6): self-explanatory affordance — Continue resumes an
         // interrupted run, Retry re-issues a FAILED request. They used to be
         // shown together after an errored run and both just called runAgent.
-        btn.title = 'Resume the interrupted run';
+        btn.title = t('Resume the interrupted run');
     }
     // Pause and Continue are mutually exclusive.
     hidePauseButton();
@@ -897,8 +900,15 @@ function syncChatControlsUI(chatId) {
     _setChatControlVisible(pb, state === 'pause' || state === 'resume');
     _setChatControlVisible(cb, state === 'continue');
     _setChatControlVisible(rb, state === 'retry');
-    if (cb && state === 'continue') cb.title = 'Resume the interrupted run';   // PR-PAUSE R6 titles
-    if (rb && state === 'retry') rb.title = 'Retry the failed request';
+    if (cb && state === 'continue') cb.title = t('Resume the interrupted run');   // PR-PAUSE R6 titles
+    if (rb && state === 'retry') rb.title = t('Retry the failed request');
     if (shown && pb) syncPauseButtonUI(shown);
+    // A11y: #messages is busy while the displayed chat's run streams ('pause' =
+    // the Pause control is live), so screen readers wait for the settled reply.
+    var msgs = document.getElementById('messages');
+    if (msgs && typeof msgs.setAttribute === 'function') {
+        if (state === 'pause') msgs.setAttribute('aria-busy', 'true');
+        else if (typeof msgs.removeAttribute === 'function') msgs.removeAttribute('aria-busy');
+    }
     return state;
 }

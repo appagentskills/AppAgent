@@ -77,12 +77,12 @@ function toggleCodeBlockExpand(btn, event) {
         pre.classList.remove('collapsed');
         wrapper.classList.add('expanded');
         btn.textContent = '⤡';
-        btn.title = 'Collapse';
+        btn.title = t('Collapse');
     } else {
         pre.classList.add('collapsed');
         wrapper.classList.remove('expanded');
         btn.textContent = '⤢';
-        btn.title = 'Expand';
+        btn.title = t('Expand');
     }
 }
 
@@ -165,9 +165,9 @@ function copyCodeBlock(btn, event) {
     }
     
     navigator.clipboard.writeText(text).then(function() {
-        showSnackbar('Copied to clipboard', 'success', undefined, { transient: true });
+        showSnackbar(t('Copied to clipboard'), 'success', undefined, { transient: true });
     }).catch(function() {
         // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
-        showSnackbar('Copy failed', 'error');
+        showSnackbar(t('Copy failed'), 'error');
     });
 }

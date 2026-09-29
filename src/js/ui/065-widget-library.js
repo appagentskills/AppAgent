@@ -66,7 +66,7 @@ function widgetLibraryEntry(id) {
     var placement = (typeof dashboardWidgets !== 'undefined') ? dashboardWidgets[id] : null;
     return {
         id: id,
-        title: v.title || 'Widget',
+        title: v.title || t('Widget'),
         chatId: v.chatId || null,
         latestVersion: v.latestVersion || (last ? last.version : 1),
         versionCount: versions.length,
@@ -85,12 +85,11 @@ function widgetLibraryEntries() {
 
 function widgetLibraryRelativeTime(ts) {
     if (!ts) return '';
-    var diff = Date.now() - ts;
-    if (diff < 60000) return 'just now';
-    if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
-    if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
-    if (diff < 7 * 86400000) return Math.floor(diff / 86400000) + 'd ago';
-    return new Date(ts).toLocaleDateString();
+    var now = Date.now();
+    // Under a week: locale relative text ("now", "5 min. ago"); a future stamp
+    // (clock skew) is clamped to now like the old "just now". Older: the date.
+    if (now - ts < 7 * 86400000) return i18nFormatRelative(Math.min(ts, now), { now: now });
+    return i18nFormatDate(ts);
 }
 
 function onWidgetLibraryKeydown(e) {
@@ -112,7 +111,7 @@ function renderWidgetLibrary() {
         widgetLibraryState.bound = null;
         slot.innerHTML = '<div class="widget-library-header">' +
             '<label class="widget-library-search">' + UI_ICONS.search +
-                '<input type="search" class="widget-library-search-input" placeholder="Search widgets\u2026" aria-label="Search widgets">' +
+                '<input type="search" class="widget-library-search-input" placeholder="' + escapeHtml(t('Search widgets\u2026')) + '" aria-label="' + escapeHtml(t('Search widgets')) + '">' +
             '</label>' +
             '<span class="widget-library-count" id="widget-library-count"></span>' +
             pageLayoutToggleHtml('setWidgetLibraryLayout') +
@@ -123,14 +122,15 @@ function renderWidgetLibrary() {
     }
     if (!host.querySelector('.widget-library-header')) {
         widgetLibraryState.bound = null; // header rebuilt → child listeners must be re-bound
+        var rowsLabel = escapeHtml(t('Rows')), galleryLabel = escapeHtml(t('Gallery'));
         lib.innerHTML = '<div class="widget-library-header">' +
             '<label class="widget-library-search">' + UI_ICONS.search +
-                '<input type="search" class="widget-library-search-input" placeholder="Search widgets\u2026" aria-label="Search widgets">' +
+                '<input type="search" class="widget-library-search-input" placeholder="' + escapeHtml(t('Search widgets\u2026')) + '" aria-label="' + escapeHtml(t('Search widgets')) + '">' +
             '</label>' +
             '<span class="widget-library-count" id="widget-library-count"></span>' +
-            '<div class="segmented-toggle widget-library-layout" role="group" aria-label="Layout">' +
-                '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="Rows">' + UI_ICONS.list + '<span>Rows</span></button>' +
-                '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="Gallery">' + WIDGET_LIBRARY_GRID_ICON + '<span>Gallery</span></button>' +
+            '<div class="segmented-toggle widget-library-layout" role="group" aria-label="' + escapeHtml(t('Layout')) + '">' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="' + rowsLabel + '">' + UI_ICONS.list + '<span>' + rowsLabel + '</span></button>' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="' + galleryLabel + '">' + WIDGET_LIBRARY_GRID_ICON + '<span>' + galleryLabel + '</span></button>' +
             '</div>' +
         '</div>' +
         '<div class="widget-library-items" id="widget-library-items"></div>';
@@ -180,12 +180,14 @@ function renderWidgetLibraryItems() {
     var entries = widgetLibraryEntries();
     var total = WidgetStore.list().length;
     var count = document.getElementById('widget-library-count');
-    if (count) count.textContent = widgetLibraryState.query ? entries.length + ' of ' + total : total + (total === 1 ? ' widget' : ' widgets');
+    if (count) count.textContent = widgetLibraryState.query
+        ? t('{shown} of {total}', { shown: i18nFormatNumber(entries.length), total: i18nFormatNumber(total) })
+        : tn(total, '{count} widget', '{count} widgets');
     if (!entries.length) {
         list.innerHTML = '<div class="widget-library-empty">' + UI_ICONS.widget +
             (total === 0
-                ? '<p>No saved widgets yet</p><p class="widget-library-empty-hint">Widgets created in any chat show up here, pinned or not.</p>'
-                : '<p>No widgets match \u201c' + escapeHtml(widgetLibraryState.query) + '\u201d</p>') +
+                ? '<p>' + escapeHtml(t('No saved widgets yet')) + '</p><p class="widget-library-empty-hint">' + escapeHtml(t('Widgets created in any chat show up here, pinned or not.')) + '</p>'
+                : '<p>' + escapeHtml(t('No widgets match \u201c{query}\u201d', { query: widgetLibraryState.query })) + '</p>') +
             '</div>';
         return;
     }
@@ -198,46 +200,48 @@ function renderWidgetLibraryItems() {
             renderWidgetLibraryThumb(hit.target);
         });
     }, { root: list, rootMargin: '200px' });
-    list.querySelectorAll('.widget-library-thumb').forEach(function(t) { observer.observe(t); });
+    list.querySelectorAll('.widget-library-thumb').forEach(function(thumb) { observer.observe(thumb); });
 }
 
 function widgetLibraryPinBadgeHtml(e) {
-    var label = e.pinned === 'home' ? 'Home' : (e.pinned === 'main' ? 'Main' : 'Not pinned');
-    return '<span class="widget-library-badge pin-badge' + (e.pinned ? ' pinned' : '') + '">' + (e.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + label + '</span>';
+    var label = e.pinned === 'home' ? t('Home') : (e.pinned === 'main' ? t('Main') : t('Not pinned'));
+    return '<span class="widget-library-badge pin-badge' + (e.pinned ? ' pinned' : '') + '">' + (e.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + escapeHtml(label) + '</span>';
 }
 function widgetLibraryPinBtnHtml(e) {
-    return '<button type="button" class="widget-library-btn widget-library-pin-btn' + (e.pinned ? ' on-dashboard' : '') + '" data-action="pin" title="' + (e.pinned ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026') + '">' + (e.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '<span>Pin \u25be</span></button>';
+    return '<button type="button" class="widget-library-btn widget-library-pin-btn' + (e.pinned ? ' on-dashboard' : '') + '" data-action="pin" title="' + escapeHtml(e.pinned ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026')) + '">' + (e.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '<span>' + escapeHtml(t('Pin')) + ' \u25be</span></button>';
 }
 
 function buildWidgetLibraryItem(e) {
     var chat = e.chatId && typeof chats !== 'undefined' ? chats[e.chatId] : null;
-    var chatTitle = chat ? (chat.title || 'Untitled Chat') : 'Unknown chat';
-    var when = e.createdAt ? new Date(e.createdAt).toLocaleString() : '';
+    // 'New Chat' is the stored default-title marker: compare in English, show translated.
+    var chatTitle = chat ? (chat.title ? (chat.title === 'New Chat' ? t('New Chat') : chat.title) : t('Untitled Chat')) : t('Unknown chat');
+    var when = e.createdAt ? i18nFormatDateTime(e.createdAt) : '';
+    var openLabel = escapeHtml(t('Open'));
     return '<div class="widget-library-item" data-widget-id="' + escapeHtml(e.id) + '">' +
-        '<div class="widget-library-thumb" data-action="open" role="button" tabindex="0" title="Open ' + escapeHtml(e.title) + '">' +
+        '<div class="widget-library-thumb" data-action="open" role="button" tabindex="0" title="' + escapeHtml(t('Open {title}', { title: e.title })) + '">' +
             '<div class="widget-library-thumb-placeholder">' + UI_ICONS.widget + '</div>' +
             '<div class="widget-library-overlay">' +
-                '<button type="button" class="widget-library-btn" data-action="open">' + UI_ICONS.maximize + '<span>Open</span></button>' +
+                '<button type="button" class="widget-library-btn" data-action="open">' + UI_ICONS.maximize + '<span>' + openLabel + '</span></button>' +
                 widgetLibraryPinBtnHtml(e) +
             '</div>' +
         '</div>' +
         '<div class="widget-library-info">' +
             '<div class="widget-library-title" title="' + escapeHtml(e.title) + '">' + escapeHtml(e.title) + '</div>' +
             '<div class="widget-library-meta">' + widgetLibraryPinBadgeHtml(e) +
-                '<span class="widget-library-badge version-badge">v' + e.latestVersion + '</span>' +
+                '<span class="widget-library-badge version-badge">' + escapeHtml(t('v{version}', { version: e.latestVersion })) + '</span>' +
                 '<span class="widget-library-date" title="' + escapeHtml(when) + '">' + widgetLibraryRelativeTime(e.createdAt) + '</span>' +
             '</div>' +
             '<div class="widget-library-chat" title="' + escapeHtml(chatTitle) + '">' + UI_ICONS.chat + '<span>' + escapeHtml(chatTitle) + '</span></div>' +
         '</div>' +
         '<div class="widget-library-actions">' +
-            '<button type="button" class="widget-library-btn" data-action="open" title="Open fullscreen">' + UI_ICONS.maximize + '<span>Open</span></button>' +
-            '<button type="button" class="widget-library-btn" data-action="newtab" title="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
+            '<button type="button" class="widget-library-btn" data-action="open" title="' + escapeHtml(t('Open fullscreen')) + '">' + UI_ICONS.maximize + '<span>' + openLabel + '</span></button>' +
+            '<button type="button" class="widget-library-btn" data-action="newtab" title="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
             widgetLibraryPinBtnHtml(e) +
-            '<button type="button" class="widget-library-btn" data-action="chat" title="Go to source chat"' + (chat ? '' : ' disabled') + '>' + UI_ICONS.chat + '<span>Chat</span></button>' +
-            '<button type="button" class="widget-library-btn" data-action="agent" title="Edit with agent">' + UI_ICONS.edit + '<span>Edit</span></button>' +
-            '<button type="button" class="widget-library-btn" data-action="code" title="Edit code">' + UI_ICONS.code + '</button>' +
-            '<button type="button" class="widget-library-btn version-count" data-action="versions" title="Versions (opens fullscreen with the version picker)">' + UI_ICONS.history + '<span>' + e.versionCount + '</span></button>' +
-            '<button type="button" class="widget-library-btn danger" data-action="delete" title="Delete widget">' + UI_ICONS.trash + '</button>' +
+            '<button type="button" class="widget-library-btn" data-action="chat" title="' + escapeHtml(t('Go to source chat')) + '"' + (chat ? '' : ' disabled') + '>' + UI_ICONS.chat + '<span>' + escapeHtml(t('Chat')) + '</span></button>' +
+            '<button type="button" class="widget-library-btn" data-action="agent" title="' + escapeHtml(t('Edit with agent')) + '">' + UI_ICONS.edit + '<span>' + escapeHtml(t('Edit')) + '</span></button>' +
+            '<button type="button" class="widget-library-btn" data-action="code" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
+            '<button type="button" class="widget-library-btn version-count" data-action="versions" title="' + escapeHtml(t('Versions (opens fullscreen with the version picker)')) + '">' + UI_ICONS.history + '<span>' + e.versionCount + '</span></button>' +
+            '<button type="button" class="widget-library-btn danger" data-action="delete" title="' + escapeHtml(t('Delete widget')) + '">' + UI_ICONS.trash + '</button>' +
         '</div>' +
     '</div>';
 }
@@ -285,7 +289,7 @@ function refreshWidgetLibraryEntry(widgetId) {
     var title = item.querySelector('.widget-library-title');
     if (title) { title.textContent = e.title; title.title = e.title; }
     var ver = item.querySelector('.version-badge');
-    if (ver) ver.textContent = 'v' + e.latestVersion;
+    if (ver) ver.textContent = t('v{version}', { version: e.latestVersion });
     var cnt = item.querySelector('.version-count span');
     if (cnt) cnt.textContent = String(e.versionCount);
 }
@@ -314,7 +318,7 @@ function onWidgetLibraryClick(e) {
 function widgetLibraryGoToChat(widgetId) {
     var w = WidgetStore.view(widgetId);
     var chatId = w && w.chatId;
-    if (!chatId || typeof chats === 'undefined' || !chats[chatId]) { showSnackbar('Source chat not found', 'error'); return; }
+    if (!chatId || typeof chats === 'undefined' || !chats[chatId]) { showSnackbar(t('Source chat not found'), 'error'); return; }
     selectChat(chatId);
     // selectChat renders messages synchronously but inline widgets mount on
     // the next frame; scrollToWidget falls back to the modal if not found.
@@ -328,19 +332,20 @@ async function confirmDeleteLibraryWidget(widgetId) {
     var w = WidgetStore.view(widgetId);
     if (!w) return;
     var n = WidgetStore.versions(widgetId).length;
-    var ok = await showConfirmModal('Delete Widget',
-        'Permanently delete \u201c' + escapeHtml(w.title) + '\u201d and its ' + n + ' saved version' + (n === 1 ? '' : 's') + '? It will also be unpinned from any dashboard. This cannot be undone.',
+    var ok = await showConfirmModal(t('Delete Widget'),
+        escapeHtml(tn(n, 'Permanently delete \u201c{title}\u201d and its {count} saved version?', 'Permanently delete \u201c{title}\u201d and its {count} saved versions?', { title: w.title })) + ' ' +
+            escapeHtml(t('It will also be unpinned from any dashboard.')) + ' ' + escapeHtml(t('This cannot be undone.')),
         'danger');
     if (!ok) return;
     try {
         await WidgetStore.remove(widgetId);
     } catch (err) {
         console.error('Widget delete failed', err);
-        showSnackbar('Failed to delete widget: ' + (err && err.message || err), 'error');
+        showSnackbar(t('Failed to delete widget: {error}', { error: String(err && err.message || err) }), 'error');
         return;
     }
     if (typeof currentEditingWidget !== 'undefined' && currentEditingWidget === widgetId) currentEditingWidget = null;
     if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
     renderWidgetLibraryItems();
-    showSnackbar('Widget deleted', 'success');
+    showSnackbar(t('Widget deleted'), 'success');
 }

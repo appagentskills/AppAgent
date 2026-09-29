@@ -250,7 +250,7 @@ function toggleWidgetRunning(widgetId, event) {
                 iframe.srcdoc = '';
                 iframe.remove();
             }
-            container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+            container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
         });
     }
 
@@ -264,7 +264,7 @@ function toggleWidgetRunning(widgetId, event) {
     var buttons = document.querySelectorAll('.widget-stop-btn[data-widget-id="' + widgetId + '"]');
     buttons.forEach(function(btn) {
         btn.innerHTML = isDeactivated ? UI_ICONS.stop : UI_ICONS.play;
-        btn.title = isDeactivated ? 'Deactivate Widget' : 'Activate Widget';
+        btn.title = isDeactivated ? t('Deactivate Widget') : t('Activate Widget');
     });
 }
 
@@ -438,7 +438,7 @@ function openWidgetFullscreen(widgetId, event) {
     var header = document.createElement('div');
     header.className = 'widget-fullscreen-header';
     var isOnDash = dashboardWidgets[widget.id] ? true : false;
-    var dashBtn = '<button class="widget-ctrl-btn widget-dashboard-btn' + (isOnDash ? ' on-dashboard' : '') + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + (isOnDash ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026') + '">' + (isOnDash ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
+    var dashBtn = '<button class="widget-ctrl-btn widget-dashboard-btn' + (isOnDash ? ' on-dashboard' : '') + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + escapeHtml(isOnDash ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026')) + '">' + (isOnDash ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
         '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
         '<div class="widget-modal-controls">' +
@@ -447,20 +447,20 @@ function openWidgetFullscreen(widgetId, event) {
             // fullscreen twin was the only .widget-stop-btn in the app the loop could
             // not find - the dashboard expand-modal twin (ui/070-dashboard-ui.js:97)
             // has always carried it.
-            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + (isWidgetDeactivated(widget.id) ? 'Activate Widget' : 'Deactivate Widget') + '">' + (isWidgetDeactivated(widget.id) ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + escapeHtml(isWidgetDeactivated(widget.id) ? t('Activate Widget') : t('Deactivate Widget')) + '">' + (isWidgetDeactivated(widget.id) ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
             dashBtn +
-            '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen()" title="Print">' + UI_ICONS.printer + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="Open in new tab" aria-label="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
-            '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen()" title="' + escapeHtml(t('Print')) + '">' + UI_ICONS.printer + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="' + escapeHtml(t('Open in new tab')) + '" aria-label="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
+            '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>' +
             // Manual code editor (editWidgetCode -> saveWidgetCodeEdit), alongside the
             // agent-edit button. closeWidgetFullscreen() FIRST is load-bearing, not
             // cosmetic: the editor overlay is a .widget-modal-overlay at
             // --z-widget-modal (10002) while this one sits at --z-fullscreen (10003)
             // (css/00-tokens.css:174-175), so leaving it open would bury the editor
             // behind this backdrop and desync the Escape order (core/120-init.js:209-211).
-            '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="Edit code">' + UI_ICONS.code + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetFullscreen()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetFullscreen()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     // Content
@@ -477,7 +477,7 @@ function openWidgetFullscreen(widgetId, event) {
         // NEW-T23-1: a deactivated widget (chat copy OR dashboard record - the
         // merged flag) must not mount or run its iframe in fullscreen either; show
         // the same placeholder toggleWidgetRunning (:253) and the chat re-render use.
-        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
     } else {
         renderWidgetInContainer(widget, content, { fullscreen: true });
     }
@@ -515,9 +515,9 @@ function printWidgetFullscreen() {
 
 async function screenshotWidget(widgetId) {
     var widget = getWidgetById(widgetId);
-    if (!widget || !widget.html) { showSnackbar('Widget not found', 'error'); return; }
+    if (!widget || !widget.html) { showSnackbar(t('Widget not found'), 'error'); return; }
     var iframe = getWidgetIframe(widgetId);
-    if (!iframe) { showSnackbar('Widget not visible', 'error'); return; }
+    if (!iframe) { showSnackbar(t('Widget not visible'), 'error'); return; }
 
     var base64Data;
     var canAccessDOM = false;
@@ -539,7 +539,7 @@ async function screenshotWidget(widgetId) {
         // unhandled rejection from the inline onclick.
         var tab = null;
         try { tab = await chrome.tabs.create({ url: url, active: false }); } catch (eCreate) { tab = null; }
-        if (!tab) { showSnackbar('Screenshot failed', 'error'); return; }
+        if (!tab) { showSnackbar(t('Screenshot failed'), 'error'); return; }
         await new Promise(function(resolve) {
             function onUpdated(tabId, info) {
                 if (tabId === tab.id && info.status === 'complete') {
@@ -563,7 +563,7 @@ async function screenshotWidget(widgetId) {
             });
         } catch (e) { result = { error: (e && e.message) || String(e) }; }
         finally { try { chrome.tabs.remove(tab.id); } catch (e2) {} }
-        if (result.error) { showSnackbar('Screenshot failed', 'error'); return; }
+        if (result.error) { showSnackbar(t('Screenshot failed'), 'error'); return; }
         base64Data = result.base64;
     }
 
@@ -578,7 +578,7 @@ async function screenshotWidget(widgetId) {
 // Edit widget code manually
 function editWidgetCode(widgetId) {
     var widget = getWidgetById(widgetId);
-    if (!widget) { showSnackbar('Widget not found', 'error'); return; }
+    if (!widget) { showSnackbar(t('Widget not found'), 'error'); return; }
     
     // Create modal for editing
     var overlay = document.createElement('div');
@@ -593,10 +593,10 @@ function editWidgetCode(widgetId) {
     var header = document.createElement('div');
     header.className = 'widget-modal-header';
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.edit + '</span>' +
-        '<span class="widget-title">Edit Widget: ' + escapeHtml(widget.title) + '</span>' +
+        '<span class="widget-title">' + escapeHtml(t('Edit Widget: {title}', { title: widget.title })) + '</span>' +
         '<div class="widget-modal-controls">' +
-            '<button class="widget-ctrl-btn primary" onclick="saveWidgetCodeEdit(\'' + widget.id + '\')" title="Save">' + UI_ICONS.save + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetCodeEdit()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-ctrl-btn primary" onclick="saveWidgetCodeEdit(\'' + widget.id + '\')" title="' + escapeHtml(t('Save')) + '">' + UI_ICONS.save + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetCodeEdit()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     var content = document.createElement('div');
@@ -634,16 +634,16 @@ async function saveWidgetCodeEdit(widgetId) {
     if (!editor) return;
     
     var widget = getWidgetById(widgetId);
-    if (!widget) { showSnackbar('Widget not found', 'error'); return; }
+    if (!widget) { showSnackbar(t('Widget not found'), 'error'); return; }
     
     var result;
     try { result = await saveWidgetRevision(widget, editor.value, Number(editor.dataset.widgetBaseVersion), editor.dataset.widgetOperationId); }
-    catch (e) { showSnackbar('Widget save failed: ' + e.message, 'error'); return; }
+    catch (e) { showSnackbar(t('Widget save failed: {error}', { error: e.message }), 'error'); return; }
     if (!result.success) { showSnackbar(result.error, 'error'); return; }
     closeWidgetCodeEdit();
     renderMessages();
     refreshVisibleDashboards();
-    showSnackbar('Widget saved as version ' + result.version, 'success');
+    showSnackbar(t('Widget saved as version {version}', { version: result.version }), 'success');
 }
 
 function openWidgetModal(widgetId) {
@@ -665,9 +665,9 @@ function openWidgetModal(widgetId) {
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
         '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
         '<div class="widget-modal-controls">' +
-            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="closeWidgetModal();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetModal()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="closeWidgetModal();openWidgetFullscreen(\'' + widget.id + '\')" title="' + escapeHtml(t('Fullscreen')) + '">' + UI_ICONS.maximize + '</button>' +
+            '<button class="widget-close-btn" onclick="closeWidgetModal()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     // Content
@@ -704,7 +704,7 @@ function renderWidgetSidebar() {
     if (!container) return;
     
     if (widgets.length === 0) {
-        container.innerHTML = '<div class="widget-sidebar-empty">No widgets yet</div>';
+        container.innerHTML = '<div class="widget-sidebar-empty">' + escapeHtml(t('No widgets yet')) + '</div>';
         return;
     }
     
@@ -712,15 +712,15 @@ function renderWidgetSidebar() {
     widgets.forEach(function(widget) {
         var isOnDashboard = dashboardWidgets && dashboardWidgets[widget.id];
         var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn widget-dashboard-btn on-dashboard' : 'widget-sidebar-btn widget-dashboard-btn';
-        var dashboardBtnTitle = isOnDashboard ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026';
+        var dashboardBtnTitle = isOnDashboard ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026');
         var dashboardBtnIcon = isOnDashboard ? UI_ICONS.pinFilled : UI_ICONS.pin;
-        html += '<div class="widget-sidebar-item" onclick="scrollToWidget(\'' + widget.id + '\')">' +
+        html += '<div class="widget-sidebar-item" role="button" tabindex="0" data-kbd-click onclick="scrollToWidget(\'' + widget.id + '\')">' +
             '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
             '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
             '<div class="widget-sidebar-actions">' +
-            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
+            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="' + t('Open in new tab') + '">' + UI_ICONS.externalLink + '</button>' +
             '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
-            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
+            '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="' + t('Fullscreen') + '">' + UI_ICONS.maximize + '</button>' +
             '</div>' +
         '</div>';
     });
@@ -777,7 +777,7 @@ function openWidgetMention(widgetId, event) {
     // unknown id, which would look like a dead chip. Toast instead.
     var widget = getWidgetById(widgetId);
     if (!widget) {
-        if (typeof showSnackbar === 'function') showSnackbar('Widget ' + widgetId + ' not found', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Widget {id} not found', { id: widgetId }), 'error');
         else console.warn('[openWidgetMention] widget not found: ' + widgetId);
         return;
     }
@@ -834,7 +834,7 @@ function getWidgetHtmlForMessage(msgIndex) {
                 '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-controls">' +
-                    '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="Expand">' +
+                    '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Expand')) + '">' +
                         UI_ICONS.maximize +
                     '</button>' +
                 '</div>' +
@@ -852,7 +852,7 @@ function initializeWidgetsInView() {
         var container = document.getElementById('widget-content-' + widget.id);
         if (container && !container.hasChildNodes()) {
             if (widget.deactivated) {
-                container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+                container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
             } else {
                 renderWidgetInContainer(widget, container);
             }

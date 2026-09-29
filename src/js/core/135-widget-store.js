@@ -469,20 +469,20 @@ function attachWidgetVersionPicker(iframe, widgetId) {
         if (!slot) return;
         picker = document.createElement('select');
         picker.className = 'widget-version-picker';
-        picker.setAttribute('aria-label', 'Widget version');
-        picker.title = 'Widget version';
+        picker.setAttribute('aria-label', t('Widget version'));
+        picker.title = t('Widget version');
         slot.insertBefore(picker, slot.firstChild);
         iframe.__versionPicker = picker;
         picker.addEventListener('change', function() { selectWidgetRenderVersion(iframe, picker.value); });
         // Header clicks/drags (dashboard card drag, thumbnail open) must not fire.
-        ['click', 'mousedown'].forEach(function(t) { picker.addEventListener(t, function(e) { if (e && e.stopPropagation) e.stopPropagation(); }); });
+        ['click', 'mousedown'].forEach(function(type) { picker.addEventListener(type, function(e) { if (e && e.stopPropagation) e.stopPropagation(); }); });
     }
     picker.replaceChildren();
     var latest = document.createElement('option');
-    latest.value = ''; latest.textContent = 'Latest (v' + versions[versions.length - 1].version + ')'; picker.appendChild(latest);
+    latest.value = ''; latest.textContent = t('Latest (v{version})', { version: versions[versions.length - 1].version }); picker.appendChild(latest);
     versions.slice().reverse().forEach(function(v) {
         var option = document.createElement('option'); option.value = String(v.version);
-        option.textContent = 'v' + v.version + ' · ' + new Date(v.createdAt).toLocaleString(); picker.appendChild(option);
+        option.textContent = t('v{version} · {date}', { version: v.version, date: i18nFormatDateTime(new Date(v.createdAt)) }); picker.appendChild(option);
     });
     picker.value = iframe.dataset.selectedWidgetVersion || '';
 }

@@ -36,7 +36,9 @@ function startApprovalTitleFlash() {
             return;
         }
         flashOn = !flashOn;
-        document.title = flashOn ? '⚠ Approval needed' : _approvalTitleFlashOriginal;
+        // The ⚠ glyph stays outside the key so it reuses 'Approval needed'
+        // (tools/120 action label); English output is byte-identical.
+        document.title = flashOn ? '⚠ ' + t('Approval needed') : _approvalTitleFlashOriginal;
     }, 1000);
 }
 
@@ -92,7 +94,7 @@ function resurfacePendingApprovals() {
         var row = chat.messages[entry.approvalIndex];
         if (!row || row.role !== 'approval' || row.status !== 'pending') continue;
         showApprovalNotification(
-            chat.title || 'A chat',
+            chat.title || t('A chat'),   // display-only fallback, same key as ui/160
             row.toolName,
             entry.chatId,
             (row.args && row.args.status_message) ? row.args.status_message : null,

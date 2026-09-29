@@ -608,6 +608,8 @@ async function loadChatsFromStorage() {
     return _swChatsLoadInFlight;
 }
 
+// Last boot load's store accounting (null until a load commits).
+var swChatLoadStats = null;
 async function _swLoadChatsFromStorageBatched() {
     try {
         // DELETE-RACE: open this load's verified-deleted set (see
@@ -637,7 +639,7 @@ async function _swLoadChatsFromStorageBatched() {
         };
         // Phase 1: key-only pass (ascending key order, no record values).
         var _keys = await _readChats(null);
-        // STORE-ACCT: one line per boot sizing the store — record count,
+        // STORE-ACCT: sizes the store per boot (swChatLoadStats) — record count,
         // read duration, and how much inline base64 is still riding in
         // records (the legacy tail the trickle migrator is burning down).
         // This is the number that decides whether slowness is data-size
@@ -816,13 +818,11 @@ async function _swLoadChatsFromStorageBatched() {
             try { rebuildFileIndexAll(); } catch (e) { console.error('[worker-storage] rebuildFileIndexAll failed', e); }
         }
         _chatsHydrated = true;
-        console.log('[worker-storage] loaded ' + Object.keys(chats).length + ' chats in '
-            + (Date.now() - _loadT0) + 'ms — '
-            + (_acctB64
-                ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records ('
-                    + _legacyPayloadMigrationQueue.length + ' queued for migration, largest '
-                    + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
-                : 'records are v16-clean (no inline base64)'));
+        // STORE-ACCT: kept as inspectable state (swChatLoadStats in the SW
+        // console) instead of a boot log line.
+        swChatLoadStats = { chats: Object.keys(chats).length, ms: Date.now() - _loadT0,
+            inlineB64Chars: _acctB64, largestId: _acctTopId, largestB64Chars: _acctTopB64,
+            queued: _legacyPayloadMigrationQueue.length };
     } catch (e) {
         // DELETE-RACE: a failed load merges nothing - close its set.
         _swChatsLoadDeletedIds = null;
@@ -915,8 +915,6 @@ async function migrateNextLegacyChatPayloads() {
               || (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[chatId]))) {
             try { stripChatPayloadsInPlace(chats[chatId]); } catch (e) {}
         }
-        console.log('[worker-storage] migrated legacy inline payloads for chat ' + chatId
-            + ' (' + _legacyPayloadMigrationQueue.length + ' left)');
     } catch (e) {
         console.warn('[worker-storage] legacy payload migration tick failed', e);
     } finally {

@@ -17,11 +17,11 @@ function showToolInspector(toolName, skillId) {
         displayName = toolName;
         description = (info.definition && info.definition.function && info.definition.function.description) || '';
     } else {
-        var tool = TOOLS.find(function(t) { return t.function.name === toolName; });
+        var tool = TOOLS.find(function(tdef) { return tdef.function.name === toolName; });
         if (!tool) return;
         schema = tool;
         source = getToolFunctionSource(toolName);
-        displayName = TOOL_DISPLAY_NAMES[toolName] || toolName;
+        displayName = TOOL_DISPLAY_NAMES[toolName] ? t(TOOL_DISPLAY_NAMES[toolName]) : toolName;
         description = tool.function.description || '';
     }
 
@@ -30,6 +30,7 @@ function showToolInspector(toolName, skillId) {
     var overlay = document.createElement('div');
     overlay.id = 'tool-inspector-modal';
     overlay.className = 'modal-overlay show';
+    overlay.setAttribute('data-kbd-self-focus', ''); // own Esc + focus restore (ui/320 manager skips it)
     overlay.onclick = function(e) { if (e.target === overlay) closeToolInspectorModal(); };
     // A8B3-01: dialog semantics, labelled by the header.
     overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true');
@@ -42,21 +43,21 @@ function showToolInspector(toolName, skillId) {
                 (description ? '<div style="font-size:var(--text-body-sm);color:var(--text-muted);">' + escapeHtml(description) + '</div>' : '') +
                 '<div class="tool-code-section">' +
                     '<div class="tool-code-header">' +
-                        '<strong style="font-size:var(--text-caption);color:var(--text-muted);">Tool Definition (JSON Schema)</strong>' +
-                        '<button class="tool-code-copy-btn" onclick="copyInspectorContent(\'schema\')" title="Copy Schema">' + UI_ICONS.copy + '</button>' +
+                        '<strong style="font-size:var(--text-caption);color:var(--text-muted);">' + t('Tool Definition (JSON Schema)') + '</strong>' +
+                        '<button class="tool-code-copy-btn" onclick="copyInspectorContent(\'schema\')" title="' + t('Copy Schema') + '">' + UI_ICONS.copy + '</button>' +
                     '</div>' +
                     '<pre class="tool-code-content" id="tool-inspector-schema">' + escapeHtml(schemaJson) + '</pre>' +
                 '</div>' +
                 (source ? '<div class="tool-code-section">' +
                     '<div class="tool-code-header">' +
-                        '<strong style="font-size:var(--text-caption);color:var(--text-muted);">Implementation Source</strong>' +
-                        '<button class="tool-code-copy-btn" onclick="copyInspectorContent(\'source\')" title="Copy Source">' + UI_ICONS.copy + '</button>' +
+                        '<strong style="font-size:var(--text-caption);color:var(--text-muted);">' + t('Implementation Source') + '</strong>' +
+                        '<button class="tool-code-copy-btn" onclick="copyInspectorContent(\'source\')" title="' + t('Copy Source') + '">' + UI_ICONS.copy + '</button>' +
                     '</div>' +
                     '<pre class="tool-code-content" id="tool-inspector-source" style="max-height:400px;">' + escapeHtml(source) + '</pre>' +
                 '</div>' : '') +
             '</div>' +
             '<div class="modal-actions">' +
-                '<button class="modal-btn primary" onclick="closeToolInspectorModal()">Close</button>' +
+                '<button class="modal-btn primary" onclick="closeToolInspectorModal()">' + t('Close') + '</button>' +
             '</div>' +
         '</div>';
 
@@ -100,9 +101,9 @@ function copyInspectorContent(type) {
     var el = document.getElementById('tool-inspector-' + type);
     if (!el) return;
     navigator.clipboard.writeText(el.textContent).then(function() {
-        showSnackbar((type === 'source' ? 'Source' : 'Schema') + ' copied!', 'success');
+        showSnackbar(type === 'source' ? t('Source copied!') : t('Schema copied!'), 'success');
     }).catch(function() {
-        showSnackbar('Failed to copy', 'error');
+        showSnackbar(t('Failed to copy'), 'error');
     });
 }
 
@@ -110,8 +111,8 @@ function copyInspectorContent(type) {
 function _toolSourceBtn(toolName, skillId) {
     var skillArg = skillId ? ', \'' + escapeJsString(skillId) + '\'' : '';
     return '<button class="tool-source-btn" onclick="event.stopPropagation(); showToolInspector(\'' +
-        escapeJsString(toolName) + '\'' + skillArg + ')" title="View source: ' +
-        escapeHtml(toolName) + '">' + UI_ICONS.code + '</button>';
+        escapeJsString(toolName) + '\'' + skillArg + ')" title="' +
+        t('View source: {name}', { name: escapeHtml(toolName) }) + '">' + UI_ICONS.code + '</button>';
 }
 
 function getToolFunctionSource(toolName) {
@@ -135,7 +136,7 @@ function getToolFunctionSource(toolName) {
         return fn.toString();
     } else if (typeof fn === 'string') {
         // For inline implementations, show the executeTool function
-        return 'Implementation is inline in executeTool function.\nSee: ' + fn;
+        return t('Implementation is inline in executeTool function.') + '\n' + t('See: {fn}', { fn: fn });
     }
     return null;
 }
@@ -186,175 +187,184 @@ function closeSettingsPageView() {
 function renderSettingsPage() {
     var container = document.getElementById('settings-page-content');
     if (!container) return;
+    // The innerHTML write below drops #system-prompt-textarea, so an unsaved system-prompt draft
+    // (value, selection, scroll, focus) is captured first and handed to renderSystemPromptEditor().
+    var systemPromptDraft = systemPromptEditMode ? _systemPromptDraftState(getSystemPromptTemplate()) : null;
     
     container.innerHTML =
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title">' + UI_ICONS.git + ' GitHub</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Connect a GitHub account to clone repos, edit files, and push PRs from the workspace tool.</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Connect a GitHub account to clone repos, edit files, and push PRs from the workspace tool.') + '</div>' +
             '<div id="github-settings-container"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
-                '<span>' + UI_ICONS.api + ' LLM Endpoints</span>' +
-                '<button class="skills-action-btn" onclick="showLlmEndpointModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' Add Endpoint</button>' +
+                '<span>' + UI_ICONS.api + ' ' + t('LLM Endpoints') + '</span>' +
+                '<button class="skills-action-btn" onclick="showLlmEndpointModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' ' + t('Add Endpoint') + '</button>' +
             '</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Named endpoint URL + API key pairs. Each endpoint-backed model below picks one — update a key here once and every model using it follows. The same URL can appear under different names with different keys.</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Named endpoint URL + API key pairs. Each endpoint-backed model below picks one — update a key here once and every model using it follows. The same URL can appear under different names with different keys.') + '</div>' +
             '<div id="llm-endpoints-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
-                '<span>' + UI_ICONS.api + ' API Providers</span>' +
-                '<button class="skills-action-btn" onclick="showAddApiProviderModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' Add</button>' +
+                '<span>' + UI_ICONS.api + ' ' + t('API Providers') + '</span>' +
+                '<button class="skills-action-btn" onclick="showAddApiProviderModal()" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + UI_ICONS.plus + ' ' + t('Add') + '</button>' +
             '</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Configure API providers. These are persisted and exported with your data.</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Configure API providers. These are persisted and exported with your data.') + '</div>' +
             '<div id="custom-api-providers-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
             '<div class="settings-page-section-title" style="display:flex;align-items:center;justify-content:space-between;">' +
-                '<span>' + UI_ICONS.api + ' Sub-Agent Model Tiers</span>' +
-                '<button class="skills-action-btn" onclick="resetTierAliases()" title="Clear your tier overrides and go back to the built-in defaults" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">Reset to defaults</button>' +
+                '<span>' + UI_ICONS.api + ' ' + t('Sub-Agent Model Tiers') + '</span>' +
+                '<button class="skills-action-btn" onclick="resetTierAliases()" title="' + t('Clear your tier overrides and go back to the built-in defaults') + '" style="padding: var(--space-2) var(--space-5);font-size:var(--text-body-sm);">' + t('Reset to defaults') + '</button>' +
             '</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Map the abstract <code>small</code> / <code>medium</code> / <code>large</code> tiers to providers above, or pick <code>Same</code> to make a tier dynamically follow the spawning agent&#39;s current model. The agent uses these when spawning sub-agents with <code>tier</code> (e.g. small for cheap search fan-outs, large for heavy implementation work).</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Map the abstract {small} / {medium} / {large} tiers to providers above, or pick {same} to make a tier dynamically follow the spawning agent\'s current model. The agent uses these when spawning sub-agents with {tier} (e.g. small for cheap search fan-outs, large for heavy implementation work).', { small: '<code>small</code>', medium: '<code>medium</code>', large: '<code>large</code>', same: '<code>Same</code>', tier: '<code>tier</code>' }) + '</div>' +
             '<div id="tier-aliases-list"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.display + ' Display</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.display + ' ' + t('Display') + '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Theme</div><div class="settings-page-row-hint">Choose light, dark, or follow your system preference</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Theme') + '</div><div class="settings-page-row-hint">' + t('Choose light, dark, or follow your system preference') + '</div></div>' +
                 '<select onchange="setAppTheme(this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
-                    '<option value="system"' + (appTheme === 'system' ? ' selected' : '') + '>System</option>' +
-                    '<option value="light"' + (appTheme === 'light' ? ' selected' : '') + '>Light</option>' +
-                    '<option value="dark"' + (appTheme === 'dark' ? ' selected' : '') + '>Dark</option>' +
+                    '<option value="system"' + (appTheme === 'system' ? ' selected' : '') + '>' + t('System') + '</option>' +
+                    '<option value="light"' + (appTheme === 'light' ? ' selected' : '') + '>' + t('Light') + '</option>' +
+                    '<option value="dark"' + (appTheme === 'dark' ? ' selected' : '') + '>' + t('Dark') + '</option>' +
                 '</select>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Show API Statistics</div><div class="settings-page-row-hint">Display token usage and cost after API calls</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Language') + '</div><div class="settings-page-row-hint">' + t('Choose the interface language, or follow your browser language') + '</div></div>' +
+                '<select id="settings-language-select" onchange="setAppLanguage(this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
+                    (typeof i18nLanguageOptionsHtml === 'function' ? i18nLanguageOptionsHtml() : '<option value="auto" selected>' + t('Auto (browser language)') + '</option>') +
+                '</select>' +
+            '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">' + t('Show API Statistics') + '</div><div class="settings-page-row-hint">' + t('Display token usage and cost after API calls') + '</div></div>' +
                 '<input type="checkbox" id="settings-show-api-stats" ' + (showApiStats ? 'checked' : '') + ' onchange="toggleApiStats(this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Compact Tool Calls</div><div class="settings-page-row-hint">Collapse all tool calls in a single area</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Compact Tool Calls') + '</div><div class="settings-page-row-hint">' + t('Collapse all tool calls in a single area') + '</div></div>' +
                 '<input type="checkbox" ' + (compactToolCalls ? 'checked' : '') + ' onchange="toggleCompactToolCalls()">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Keep Display Awake</div><div class="settings-page-row-hint">Prevent the screen from sleeping while the agent is actively running a task, and after 5 minutes of inactivity in AppAgent. Released when the task ends or the page is closed.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Keep Display Awake') + '</div><div class="settings-page-row-hint">' + t('Prevent the screen from sleeping while the agent is actively running a task, and after 5 minutes of inactivity in AppAgent. Released when the task ends or the page is closed.') + '</div></div>' +
                 '<input type="checkbox" id="settings-keep-awake" ' + ((typeof window.getKeepAwakeForeverDisabled === 'function' && window.getKeepAwakeForeverDisabled()) ? '' : 'checked') + ' onchange="toggleKeepAwake(this.checked)">' +
             '</div>' +
 
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Deferred tool loading (experimental)</div><div class="settings-page-row-hint">Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Deferred tool loading (experimental)') + '</div><div class="settings-page-row-hint">' + t('Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.') + '</div></div>' +
                 '<input type="checkbox" ' + (typeof isDeferredToolsActive === 'function' && isDeferredToolsActive() ? 'checked' : '') + ' onchange="toggleDeferredTools(this.checked)">' +
             '</div>' +
 
             // P4 kill-switches (core/030-config.js P4_FLAG_DEFAULTS). Default off.
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">P4: offscreen self-heal (experimental)</div><div class="settings-page-row-hint">When the offscreen sandbox document exists but its keep-alive port never connects, close and recreate it once instead of waiting minutes. Default off.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('P4: offscreen self-heal (experimental)') + '</div><div class="settings-page-row-hint">' + t('When the offscreen sandbox document exists but its keep-alive port never connects, close and recreate it once instead of waiting minutes. Default off.') + '</div></div>' +
                 '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_OFFSCREEN_SELF_HEAL') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_OFFSCREEN_SELF_HEAL\', this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">P4: sub-agent saturation hard-stop (experimental)</div><div class="settings-page-row-hint">At ~60% context a sub-agent gets a mandatory hand-over notice; after two more turns it is auto-reported to its parent as need_input. Default off.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('P4: sub-agent saturation hard-stop (experimental)') + '</div><div class="settings-page-row-hint">' + t('At ~60% context a sub-agent gets a mandatory hand-over notice; after two more turns it is auto-reported to its parent as need_input. Default off.') + '</div></div>' +
                 '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_SUB_SATURATION_HARDSTOP') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_SUB_SATURATION_HARDSTOP\', this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">P4: boot placeholder sweep (experimental)</div><div class="settings-page-row-hint">On service-worker boot, finalize tool-result placeholders stranded by a crashed run so the chat can continue. Default off.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('P4: boot placeholder sweep (experimental)') + '</div><div class="settings-page-row-hint">' + t('On service-worker boot, finalize tool-result placeholders stranded by a crashed run so the chat can continue. Default off.') + '</div></div>' +
                 '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_BOOT_PLACEHOLDER_SWEEP') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_BOOT_PLACEHOLDER_SWEEP\', this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">P4: action watchdog re-kick (experimental)</div><div class="settings-page-row-hint">On page boot, re-start background actions whose agent run never began (interrupted before the first assistant turn). When off, such actions are marked as an error instead. Default off.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('P4: action watchdog re-kick (experimental)') + '</div><div class="settings-page-row-hint">' + t('On page boot, re-start background actions whose agent run never began (interrupted before the first assistant turn). When off, such actions are marked as an error instead. Default off.') + '</div></div>' +
                 '<input type="checkbox" ' + (typeof getP4Flag === 'function' && getP4Flag('P4_ACTION_WATCHDOG') ? 'checked' : '') + ' onchange="toggleP4Flag(\'P4_ACTION_WATCHDOG\', this.checked)">' +
             '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.hook + ' Hooks</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Hooks run automatically after certain events.</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.hook + ' ' + t('Hooks') + '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Hooks run automatically after certain events.') + '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Auto-generate Chat Title</div><div class="settings-page-row-hint">Automatically generate a title after agent completes</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Auto-generate Chat Title') + '</div><div class="settings-page-row-hint">' + t('Automatically generate a title after agent completes') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoTitle ? 'checked' : '') + ' onchange="toggleHook(\'autoTitle\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Answer TL;DR Card</div><div class="settings-page-row-hint">Ask the agent for a short TL;DR after each answer, shown as a card at the end of the answer</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Answer TL;DR Card') + '</div><div class="settings-page-row-hint">' + t('Ask the agent for a short TL;DR after each answer, shown as a card at the end of the answer') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoTldr ? 'checked' : '') + ' onchange="toggleHook(\'autoTldr\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Answer Links Card</div><div class="settings-page-row-hint">Ask the agent for relevant links (PRs, diffs, records, docs) after each answer, shown as a card below the TL;DR</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Answer Links Card') + '</div><div class="settings-page-row-hint">' + t('Ask the agent for relevant links (PRs, diffs, records, docs) after each answer, shown as a card below the TL;DR') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoLinks ? 'checked' : '') + ' onchange="toggleHook(\'autoLinks\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Caveat Warning</div><div class="settings-page-row-hint">Agent flags anything you must not miss (off-plan changes, assumptions, questions at the end) as a warning card. Optional per answer — only shown when there is something to flag.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Caveat Warning') + '</div><div class="settings-page-row-hint">' + t('Agent flags anything you must not miss (off-plan changes, assumptions, questions at the end) as a warning card. Optional per answer — only shown when there is something to flag.') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoCaveat ? 'checked' : '') + ' onchange="toggleHook(\'autoCaveat\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Auto chat progress</div><div class="settings-page-row-hint">Ask the agent to finalize the chat progress card after each answer with a terminal state (finished, PR opened, finished with caveat, or failed), shown as a badge on chat cards and the header pill. Skipped for purely conversational answers.</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Auto chat progress') + '</div><div class="settings-page-row-hint">' + t('Ask the agent to finalize the chat progress card after each answer with a terminal state (finished, PR opened, finished with caveat, or failed), shown as a badge on chat cards and the header pill. Skipped for purely conversational answers.') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.autoProgress ? 'checked' : '') + ' onchange="toggleHook(\'autoProgress\')">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Show Hook Messages</div><div class="settings-page-row-hint">Display hook messages and responses in chat</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Show Hook Messages') + '</div><div class="settings-page-row-hint">' + t('Display hook messages and responses in chat') + '</div></div>' +
                 '<input type="checkbox" ' + (hooksEnabled.showHookMessages ? 'checked' : '') + ' onchange="toggleHook(\'showHookMessages\')">' +
             '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.cache + ' Large Content Caching</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Large results are automatically cached so the Agent can browse them without overwhelming the conversation. Default: 4K tokens.</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.cache + ' ' + t('Large Content Caching') + '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Large results are automatically cached so the Agent can browse them without overwhelming the conversation. Default: 4K tokens.') + '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Cache Threshold</div><div class="settings-page-row-hint">Results larger than this are cached</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Cache Threshold') + '</div><div class="settings-page-row-hint">' + t('Results larger than this are cached') + '</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-cache-limit" class="settings-number-input" min="1" max="100" value="' + Math.round(cacheTokenLimit / 1000) + '" onchange="updateCacheTokenLimitFromK(this.value)" />' +
-                    '<span class="settings-input-suffix">K tokens</span>' +
+                    '<span class="settings-input-suffix">' + t('K tokens') + '</span>' +
                 '</div>' +
             '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.stats + ' Context Window & Token Budgets</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Assumed context window for all models. At 50% usage, agents get a warning with every tool result \u2014 the main agent is nudged to delegate to sub-agents; sub-agents are nudged to wrap up and report to their parent suggesting a handoff. At 100% there is no hard stop, but the agent is urged to stop and report to the user (main agent) or to its parent (sub-agent).</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.stats + ' ' + t('Context Window & Token Budgets') + '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Assumed context window for all models. At 50% usage, agents get a warning with every tool result \u2014 the main agent is nudged to delegate to sub-agents; sub-agents are nudged to wrap up and report to their parent suggesting a handoff. At 100% there is no hard stop, but the agent is urged to stop and report to the user (main agent) or to its parent (sub-agent).') + '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Context Window (tokens)</div><div class="settings-page-row-hint">Default: 200000</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Context Window (tokens)') + '</div><div class="settings-page-row-hint">' + t('Default: 200000') + '</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-context-window" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.contextWindow.min + '" max="' + SETTINGS_NUMBER_LIMITS.contextWindow.max + '" step="1000" value="' + getAssumedContextTokens() + '" onchange="updateAssumedContextTokensFromSettings(this.value)" />' +
-                    '<span class="settings-input-suffix">tokens</span>' +
+                    '<span class="settings-input-suffix">' + t('tokens') + '</span>' +
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Max Tokens</div><div class="settings-page-row-hint">Max output tokens per request, for all providers. Default: 64000 (128000 for Opus 5.5+ until you set a value)</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Max Tokens') + '</div><div class="settings-page-row-hint">' + t('Max output tokens per request, for all providers. Default: 64000 (128000 for Opus 5.5+ until you set a value)') + '</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-max-tokens" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.maxTokens.min + '" max="' + SETTINGS_NUMBER_LIMITS.maxTokens.max + '" step="1000" value="' + getGlobalMaxTokens() + '" onchange="updateGlobalMaxTokens(this.value)" />' +
-                    '<span class="settings-input-suffix">tokens</span>' +
+                    '<span class="settings-input-suffix">' + t('tokens') + '</span>' +
                 '</div>' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Thinking Budget</div><div class="settings-page-row-hint">Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). 0 = thinking off (not for Fable 5.1+ or Opus 5.5+, whose thinking is always on; a model with an Effort set still thinks). Default: 32000</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Thinking Budget') + '</div><div class="settings-page-row-hint">' + t('Reasoning token budget. Ignored by adaptive-thinking Claude models (they use Effort). 0 = thinking off (not for Fable 5.1+ or Opus 5.5+, whose thinking is always on; a model with an Effort set still thinks). Default: 32000') + '</div></div>' +
                 '<div class="settings-input-group">' +
                     '<input type="number" id="settings-page-thinking-budget" class="settings-number-input" min="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.min + '" max="' + SETTINGS_NUMBER_LIMITS.thinkingBudget.max + '" step="1000" value="' + getGlobalThinkingBudget() + '" onchange="updateGlobalThinkingBudget(this.value)" />' +
-                    '<span class="settings-input-suffix">tokens</span>' +
+                    '<span class="settings-input-suffix">' + t('tokens') + '</span>' +
                 '</div>' +
             '</div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.chat + ' System Prompt</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Customize the system prompt sent to the AI. Use placeholders like <code>{{DISABLED_TOOLS}}</code>, <code>{{SKILLS_SUMMARY}}</code> which get replaced with actual values.</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.chat + ' ' + t('System Prompt') + '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Customize the system prompt sent to the AI. Use placeholders like {disabledTools}, {skillsSummary} which get replaced with actual values.', { disabledTools: '<code>{{DISABLED_TOOLS}}</code>', skillsSummary: '<code>{{SKILLS_SUMMARY}}</code>' }) + '</div>' +
             '<div id="system-prompt-editor-container"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.tool + ' Tool Permissions</div>' +
-            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">Control which tools can run automatically, require approval, or are disabled. Instance tools are per-instance, global tools apply everywhere.</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.tool + ' ' + t('Tool Permissions') + '</div>' +
+            '<div class="settings-page-row-hint" style="margin-bottom: var(--space-6);">' + t('Control which tools can run automatically, require approval, or are disabled. Instance tools are per-instance, global tools apply everywhere.') + '</div>' +
             '<div id="settings-tool-permissions"></div>' +
         '</div>' +
         '<div class="settings-page-section">' +
-            '<div class="settings-page-section-title">' + UI_ICONS.database + ' Data Management</div>' +
+            '<div class="settings-page-section-title">' + UI_ICONS.database + ' ' + t('Data Management') + '</div>' +
             // Export / Import live in the page toolbar (body.html #settings-page-panel).
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">Export, import or delete data</div><div class="settings-page-row-hint">Export Data and Import Data are in the toolbar above. Delete All permanently removes chats, skills, widgets, documents, settings, saved API keys and sign-ins. Local repository clones are kept.</div></div>' +
-                '<button class="skills-action-btn danger" onclick="deleteAllData()">' + UI_ICONS.trash + ' Delete All</button>' +
+                '<div><div class="settings-page-row-label">' + t('Export, import or delete data') + '</div><div class="settings-page-row-hint">' + t('Export Data and Import Data are in the toolbar above. Delete All permanently removes chats, skills, widgets, documents, settings, saved API keys and sign-ins. Local repository clones are kept.') + '</div></div>' +
+                '<button class="skills-action-btn danger" onclick="deleteAllData()">' + UI_ICONS.trash + ' ' + t('Delete All') + '</button>' +
             '</div>' +
         '</div>' +
         '<div class="settings-page-section" style="text-align:center;color:var(--text-muted);font-size:var(--text-body-sm);">' +
-            '<div><strong>Version:</strong> v__VERSION__</div>' +
-            '<div style="margin-top: var(--space-2);"><strong>License:</strong> Private and Commercial use. Internal modification permitted. Distribution and resale prohibited. All rights reserved.</div>' +
+            '<div><strong>' + t('Version:') + '</strong> v__VERSION__</div>' +
+            '<div style="margin-top: var(--space-2);"><strong>' + t('License:') + '</strong> ' + t('Private and Commercial use. Internal modification permitted. Distribution and resale prohibited. All rights reserved.') + '</div>' +
         '</div>';
     
     // Render tool permissions in settings
     renderSettingsToolPermissions();
 
-    // Render system prompt editor
-    renderSystemPromptEditor();
+    // Render system prompt editor (keeps the draft captured above)
+    renderSystemPromptEditor(systemPromptDraft);
 
     // Render LLM endpoints + API providers lists
     renderLlmEndpointsList();
@@ -369,7 +379,7 @@ function renderSettingsPage() {
     // Toolbar search (ui/046-settings-help-search.js): fill the slot once and
     // re-apply any active query to the freshly rendered sections.
     if (typeof ensurePageSearchToolbar === 'function') {
-        ensurePageSearchToolbar('settings-toolbar-slot', { placeholder: 'Search settings\u2026', label: 'Search settings', inputClass: 'settings-search-input', onInput: 'settingsOnSearchInput', countId: 'settings-search-count' });
+        ensurePageSearchToolbar('settings-toolbar-slot', { placeholder: t('Search settings\u2026'), label: t('Search settings'), inputClass: 'settings-search-input', onInput: 'settingsOnSearchInput', countId: 'settings-search-count' });
         applySettingsPageSearch();
     }
 }
@@ -460,9 +470,9 @@ async function updateAssumedContextTokensFromSettings(value) {
 // core/030-config.js); the SW re-hydrates it on every run-agent gate so
 // spawn-time tier resolution picks changes up on the next run.
 var TIER_ALIAS_HINTS = {
-    small: 'Cheap + fast — search fan-outs, summaries, doc lookups',
-    medium: 'Balanced — general delegated work',
-    large: 'Strongest — heavy implementation / debugging subs'
+    small: N_('Cheap + fast — search fan-outs, summaries, doc lookups'),
+    medium: N_('Balanced — general delegated work'),
+    large: N_('Strongest — heavy implementation / debugging subs')
 };
 function renderTierAliasSettings() {
     var container = document.getElementById('tier-aliases-list');
@@ -476,7 +486,7 @@ function renderTierAliasSettings() {
             // the tier follows the spawning agent's current model dynamically
             // — identical behavior to an explicit tier:'same' spawn.
             var isSame = (typeof TIER_ALIAS_SAME !== 'undefined' && current === TIER_ALIAS_SAME);
-            var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>Same</option>';
+            var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>' + t('Same') + '</option>';
             var found = isSame;
             (apiProviders || []).forEach(function(p) {
                 if (p.name === current) found = true;
@@ -485,16 +495,16 @@ function renderTierAliasSettings() {
             // Mapped provider no longer exists (deleted/renamed) — keep it
             // visible + selected so the user sees the stale mapping.
             if (!found && current) {
-                options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + ' (missing)</option>' + options;
+                options = '<option value="' + escapeHtml(current) + '" selected>' + t('{name} (missing)', {name: escapeHtml(current)}) + '</option>' + options;
             }
             // Show the built-in default explicitly so the user can tell an
             // override apart from the fallback (DEFAULT_TIER_ALIASES,
             // core/030-config.js; `large` defaults to Same).
             var _def = (typeof DEFAULT_TIER_ALIASES !== 'undefined') ? DEFAULT_TIER_ALIASES[tier] : '';
-            var _defLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && _def === TIER_ALIAS_SAME) ? 'Same' : (_def || '');
+            var _defLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && _def === TIER_ALIAS_SAME) ? t('Same') : (_def || '');
             html += '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label" style="text-transform:capitalize;">' + tier + '</div>' +
-                '<div class="settings-page-row-hint">' + (TIER_ALIAS_HINTS[tier] || '') + (_defLabel ? ' · default: ' + escapeHtml(_defLabel) : '') + '</div></div>' +
+                '<div class="settings-page-row-hint">' + (TIER_ALIAS_HINTS[tier] ? t(TIER_ALIAS_HINTS[tier]) : '') + (_defLabel ? ' · ' + t('default: {name}', {name: escapeHtml(_defLabel)}) : '') + '</div></div>' +
                 '<select onchange="setTierAlias(\'' + tier + '\', this.value)" style="padding: var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);">' +
                     options +
                 '</select>' +
@@ -519,7 +529,7 @@ async function setTierAlias(tier, providerName) {
     // promise) and let the next change retry the read. A map that an earlier
     // good read hydrated still merges below.
     if (subAgentTierAliases === null && typeof subAgentTierAliasesReadFailed !== 'undefined' && subAgentTierAliasesReadFailed) {
-        if (typeof showSnackbar === 'function') showSnackbar('Could not read the saved sub-agent tiers, so this change was not saved. Try again.', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Could not read the saved sub-agent tiers, so this change was not saved. Try again.'), 'error');
         return false;
     }
     var map = Object.assign({}, subAgentTierAliases || {});
@@ -532,16 +542,16 @@ async function setTierAlias(tier, providerName) {
 // re-run loadTierAliases, which reads the same IDB key). Then repaints.
 async function resetTierAliases() {
     // A8B2-02: one click used to wipe every tier override with no undo; ask first.
-    var ok = await showConfirmModal('Reset Sub-Agent Tiers', 'Clear your tier overrides? small, medium and large will go back to the built-in defaults for every new sub-agent.', 'warning');
+    var ok = await showConfirmModal(t('Reset Sub-Agent Tiers'), t('Clear your tier overrides? small, medium and large will go back to the built-in defaults for every new sub-agent.'), 'warning');
     if (!ok) return;
     try {
         await saveTierAliases({});
     } catch (e) {
-        if (typeof showSnackbar === 'function') showSnackbar('Could not reset sub-agent tiers: ' + (e && e.message), 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Could not reset sub-agent tiers: {error}', {error: String(e && e.message)}), 'error');
         return;
     }
     renderTierAliasSettings();
-    if (typeof showSnackbar === 'function') showSnackbar('Sub-agent tiers reset to defaults', 'info');
+    if (typeof showSnackbar === 'function') showSnackbar(t('Sub-agent tiers reset to defaults'), 'info');
 }
 
 // GitHub settings UI
@@ -550,10 +560,10 @@ async function resetTierAliases() {
 // Disconnect, shown only while a folder is stored.
 function _deployDirRowHtml() {
     return '<div class="settings-page-row" style="margin-top:var(--space-8);align-items:center;">' +
-        '<div><div class="settings-page-row-label">Extension Deploy Folder</div><div class="settings-page-row-hint">Point to your unpacked extension directory. Find it at <code>chrome://extensions</code> → your extension → the path shown under "ID".</div></div>' +
+        '<div><div class="settings-page-row-label">' + t('Extension Deploy Folder') + '</div><div class="settings-page-row-hint">' + t('Point to your unpacked extension directory. Find it at {url} → your extension → the path shown under "ID".', {url: '<code>chrome://extensions</code>'}) + '</div></div>' +
         '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
-            '<button class="skills-action-btn" id="deploy-dir-btn" onclick="connectDeployDir()">Connect Folder</button>' +
-            '<button class="skills-action-btn danger" id="deploy-dir-disconnect-btn" onclick="disconnectDeployDir()" style="display:none">Disconnect</button>' +
+            '<button class="skills-action-btn" id="deploy-dir-btn" onclick="connectDeployDir()">' + t('Connect Folder') + '</button>' +
+            '<button class="skills-action-btn danger" id="deploy-dir-disconnect-btn" onclick="disconnectDeployDir()" style="display:none">' + t('Disconnect') + '</button>' +
         '</div>' +
     '</div>';
 }
@@ -573,17 +583,17 @@ async function renderGitHubSettings() {
                         '<div class="settings-page-row-hint">' + escapeHtml(gh.instanceUrl || 'https://github.com') + '</div>' +
                     '</div>' +
                 '</div>' +
-                '<button class="skills-action-btn danger" onclick="disconnectGitHub()">Disconnect</button>' +
+                '<button class="skills-action-btn danger" onclick="disconnectGitHub()">' + t('Disconnect') + '</button>' +
             '</div>' +
             '<div style="margin-top:var(--space-8);">' +
                 '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-4);">' +
-                    '<div class="settings-page-row-label">Repositories</div>' +
+                    '<div class="settings-page-row-label">' + t('Repositories') + '</div>' +
                 '</div>' +
                 '<div id="github-repos-list" style="margin-bottom:var(--space-4);"></div>' +
                 '<div style="display:flex;gap:var(--space-4);align-items:center;">' +
-                    '<input type="text" id="github-add-repo-input" placeholder="owner/repo" aria-label="Repository (owner/repo)" style="flex:1;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
-                    '<input type="text" id="github-add-branch-input" placeholder="branch (optional)" aria-label="Branch (optional)" style="width:130px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
-                    '<button class="skills-action-btn" onclick="cloneGitHubRepo()">Clone</button>' +
+                    '<input type="text" id="github-add-repo-input" placeholder="owner/repo" aria-label="' + t('Repository (owner/repo)') + '" style="flex:1;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
+                    '<input type="text" id="github-add-branch-input" placeholder="' + t('branch (optional)') + '" aria-label="' + t('Branch (optional)') + '" style="width:130px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')cloneGitHubRepo()" />' +
+                    '<button class="skills-action-btn" onclick="cloneGitHubRepo()">' + t('Clone') + '</button>' +
                 '</div>' +
                 '<div id="github-clone-status" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
             '</div>' +
@@ -595,16 +605,16 @@ async function renderGitHubSettings() {
         var instanceVal = gh.instanceUrl || 'https://github.com';
         container.innerHTML =
             '<div class="settings-page-row">' +
-                '<div><label class="settings-page-row-label" for="github-instance-url" style="display:block;">Instance URL</label><div class="settings-page-row-hint">Use https://github.com for public GitHub</div></div>' +
+                '<div><label class="settings-page-row-label" for="github-instance-url" style="display:block;">' + t('Instance URL') + '</label><div class="settings-page-row-hint">' + t('Use https://github.com for public GitHub') + '</div></div>' +
                 '<input type="text" id="github-instance-url" value="' + escapeHtml(instanceVal) + '" placeholder="https://github.com" style="width:260px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" />' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><label class="settings-page-row-label" for="github-pat-input" style="display:block;">Personal Access Token</label><div class="settings-page-row-hint">Requires <code>repo</code> scope</div></div>' +
+                '<div><label class="settings-page-row-label" for="github-pat-input" style="display:block;">' + t('Personal Access Token') + '</label><div class="settings-page-row-hint">' + t('Requires {scope} scope', {scope: '<code>repo</code>'}) + '</div></div>' +
                 '<input type="password" id="github-pat-input" placeholder="ghp_..." style="width:260px;padding:var(--space-2) var(--space-4);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:var(--text-body-sm);background:var(--bg-secondary);color:var(--text-primary);" onkeydown="if(event.key===\'Enter\')connectGitHub()" />' +
             '</div>' +
             '<div class="settings-page-row" style="justify-content:flex-end;gap:var(--space-4);">' +
-                '<a id="github-generate-link" href="#" target="_blank" onclick="openGitHubTokenPage(event)" style="font-size:var(--text-body-sm);color:var(--accent);">Generate token</a>' +
-                '<button class="skills-action-btn" id="github-connect-btn" onclick="connectGitHub()">Connect</button>' +
+                '<a id="github-generate-link" href="#" target="_blank" onclick="openGitHubTokenPage(event)" style="font-size:var(--text-body-sm);color:var(--accent);">' + t('Generate token') + '</a>' +
+                '<button class="skills-action-btn" id="github-connect-btn" onclick="connectGitHub()">' + t('Connect') + '</button>' +
             '</div>' +
             '<div id="github-status-msg" role="status" aria-live="polite" style="font-size:var(--text-body-sm);margin-top:var(--space-2);"></div>' +
             _deployDirRowHtml();
@@ -627,7 +637,7 @@ async function connectGitHub() {
     var tokenInput = document.getElementById('github-pat-input');
     var instanceInput = document.getElementById('github-instance-url');
     if (!tokenInput || !tokenInput.value.trim()) {
-        if (statusMsg) { statusMsg.style.color = 'var(--danger)'; statusMsg.textContent = 'Please enter a token'; }
+        if (statusMsg) { statusMsg.style.color = 'var(--danger)'; statusMsg.textContent = t('Please enter a token'); }
         return;
     }
     var token = tokenInput.value.trim();
@@ -636,27 +646,26 @@ async function connectGitHub() {
     // base derivations (normalizeGitHubInstanceUrl: core/130-indexeddb.js).
     var instanceUrl = normalizeGitHubInstanceUrl(instanceInput && instanceInput.value);
     if (btn) btn.disabled = true;
-    if (statusMsg) { statusMsg.style.color = 'var(--text-muted)'; statusMsg.textContent = 'Validating...'; }
+    if (statusMsg) { statusMsg.style.color = 'var(--text-muted)'; statusMsg.textContent = t('Validating...'); }
     var result = await validateGitHubToken(token, instanceUrl);
     if (result.ok) {
         await saveGitHubSettings(token, instanceUrl, { login: result.login, avatar_url: result.avatar_url, name: result.name });
         renderGitHubSettings();
     } else {
         if (btn) btn.disabled = false;
-        if (statusMsg) { statusMsg.style.color = 'var(--danger)'; statusMsg.textContent = result.error || 'Connection failed'; }
+        if (statusMsg) { statusMsg.style.color = 'var(--danger)'; statusMsg.textContent = result.error || t('Connection failed'); }
     }
 }
 
 async function disconnectGitHub() {
     // S8C-03: one click removed the only copy of the token - confirm first (Cancel keeps it).
     var gh = await loadGitHubSettings();
-    var who = escapeHtml((gh.user && gh.user.login) || 'your GitHub account');
-    if (!await showConfirmModal('Disconnect GitHub', 'Disconnect <strong>' + who + '</strong>? The stored access token is removed from this browser ' +
-        '(GitHub shows a token only once, so you may need a new one). Local clones are kept.', 'danger')) return;
+    var who = escapeHtml((gh.user && gh.user.login) || t('your GitHub account'));
+    if (!await showConfirmModal(t('Disconnect GitHub'), t('Disconnect {account}? The stored access token is removed from this browser (GitHub shows a token only once, so you may need a new one). Local clones are kept.', {account: '<strong>' + who + '</strong>'}), 'danger')) return;
     try { await clearGitHubSettings(); }
-    catch (e) { showSnackbar('Could not disconnect GitHub: ' + ((e && e.message) || e), 'error'); return; }
+    catch (e) { showSnackbar(t('Could not disconnect GitHub: {error}', {error: String((e && e.message) || e)}), 'error'); return; }
     await renderGitHubSettings();
-    showSnackbar('GitHub disconnected', 'info');
+    showSnackbar(t('GitHub disconnected'), 'info');
 }
 
 async function connectDeployDir() {
@@ -677,7 +686,7 @@ async function connectDeployDir() {
         }
     } catch (e) {
         // S0B-14: picker/persist failures (not a cancel) are reported, never silent.
-        showSnackbar('Could not connect folder: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Could not connect folder: {error}', {error: String((e && e.message) || e)}), 'error');
         updateDeployDirButton();
     }
 }
@@ -688,7 +697,7 @@ async function disconnectDeployDir() {
     try {
         await clearDeployDirHandle();
     } catch (e) {
-        showSnackbar('Could not disconnect folder: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Could not disconnect folder: {error}', {error: String((e && e.message) || e)}), 'error');
     }
     await updateDeployDirButton();
     if (typeof updateReloadBtnVisibility === 'function') updateReloadBtnVisibility();
@@ -710,7 +719,7 @@ async function updateDeployDirButton() {
             btn.textContent = st.name;
             btn.classList.add('connected');
         } else {
-            btn.textContent = st.state === 'none' ? 'Connect Folder' : 'Grant access';
+            btn.textContent = st.state === 'none' ? t('Connect Folder') : t('Grant access');
             btn.classList.remove('connected');
         }
         return;
@@ -721,7 +730,7 @@ async function updateDeployDirButton() {
         btn.textContent = handle.name;
         btn.classList.add('connected');
     } else {
-        btn.textContent = 'Connect Folder';
+        btn.textContent = t('Connect Folder');
         btn.classList.remove('connected');
     }
 }
@@ -784,7 +793,9 @@ function _wsSyncOnce(wk) {
     if (_wsRemoteSyncInFlight[wk]) return _wsRemoteSyncInFlight[wk];
     var scheduled = new Promise(function(resolve, reject) {
         _wsRemoteSyncQueue.push({
-            run: function() { return wsSyncWithRemote(wk); },
+            // autoPull: fast-forward clean behind files so ↻ actually brings
+            // the workspace up to date (dirty rows are never touched).
+            run: function() { return wsSyncWithRemote(wk, { autoPull: true }); },
             resolve: resolve,
             reject: reject
         });
@@ -795,14 +806,14 @@ function _wsSyncOnce(wk) {
 }
 
 function _wsLoadingHtml(label) {
-    return '<span class="ws-refresh-indicator"><span class="dropdown-loading-spinner" aria-hidden="true"></span>' + escapeHtml(label || 'Refreshing…') + '</span>';
+    return '<span class="ws-refresh-indicator"><span class="dropdown-loading-spinner" aria-hidden="true"></span>' + escapeHtml(label || t('Refreshing…')) + '</span>';
 }
 
 // GitHub repos list in settings
 async function renderGitHubReposList() {
     var container = document.getElementById('github-repos-list');
     if (!container) return;
-    container.innerHTML = '<div class="ws-settings-loading">' + _wsLoadingHtml('Loading local workspaces…') + '</div>';
+    container.innerHTML = '<div class="ws-settings-loading">' + _wsLoadingHtml(t('Loading local workspaces…')) + '</div>';
     try {
         var database = await openDatabase();
         var tx = database.transaction([workspaceMetaStoreName], 'readonly');
@@ -811,7 +822,7 @@ async function renderGitHubReposList() {
         var repos = await new Promise(function(r) { request.onsuccess = function() { r(request.result || []); }; request.onerror = function() { r([]); }; });
 
         if (repos.length === 0) {
-            container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">No repositories cloned yet.</div>';
+            container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">' + t('No repositories cloned yet.') + '</div>';
             return;
         }
 
@@ -854,7 +865,7 @@ async function renderGitHubReposList() {
             var syncSpanId = 'repo-sync-' + ri;
 
             // Dirty count for header line
-            var dirtyLabel = rd.dirtyCount > 0 ? '<span style="color:var(--warning);">' + rd.dirtyCount + ' modified</span>' : '';
+            var dirtyLabel = rd.dirtyCount > 0 ? '<span style="color:var(--warning);">' + tn(rd.dirtyCount, '{count} modified', '{count} modified') + '</span>' : '';
 
             // File rows (same style as header dropdown)
             var detailHtml = '<div id="repo-detail-' + ri + '" style="margin-top:var(--space-2);">';
@@ -870,17 +881,17 @@ async function renderGitHubReposList() {
                         '<span style="font-size:var(--text-caption);color:var(--text-muted);background:var(--bg-tertiary);padding:1px var(--space-3);border-radius:var(--radius-sm);">' + escapeHtml(rd.meta.branch) + '</span>' +
                     '</div>' +
                     '<div style="font-size:var(--text-caption);color:var(--text-muted);margin-top:var(--space-2);display:flex;gap:var(--space-6);flex-wrap:wrap;">' +
-                        '<span>' + rd.totalFiles + ' files</span>' +
+                        '<span>' + tn(rd.totalFiles, '{count} file', '{count} files') + '</span>' +
                         '<span>' + rd.sizeStr + '</span>' +
-                        '<span id="' + syncSpanId + '" style="color:var(--text-muted);">' + (rd.eager ? _wsLoadingHtml('Refreshing…') : 'Refreshes when workspace pill opens') + '</span>' +
+                        '<span id="' + syncSpanId + '" style="color:var(--text-muted);">' + (rd.eager ? _wsLoadingHtml(t('Refreshing…')) : t('Refreshes when workspace pill opens')) + '</span>' +
                         '<span id="repo-dirty-' + ri + '">' + dirtyLabel + '</span>' +
                     '</div>' +
                     detailHtml +
                 '</div>' +
                 '<div style="display:flex;gap:var(--space-3);align-items:center;flex-shrink:0;">' +
-                    '<button class="skills-action-btn" onclick="_toggleWorkspacePinFromUi(\'' + escapeJsString(rd.wk) + '\')" title="' + (rd.meta.pinned ? 'Pinned — Reload and default resolution use this workspace. Click to unpin.' : 'Pin this workspace (Reload + default resolution will use it)') + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);' + (rd.meta.pinned ? '' : 'opacity:0.4;filter:grayscale(1);') + '">\uD83D\uDCCC</button>' +
-                    '<button class="skills-action-btn" onclick="_recloneWorkspaceFromDropdown(\'' + escapeJsString(rd.githubRepo) + '\', \'' + escapeJsString(rd.meta.branch) + '\')" title="Re-clone (fetch latest)" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
-                    '<button class="skills-action-btn danger" onclick="_deleteWorkspaceFromDropdown(\'' + escapeJsString(rd.wk) + '\')" title="Delete local clone" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
+                    '<button class="skills-action-btn" onclick="_toggleWorkspacePinFromUi(\'' + escapeJsString(rd.wk) + '\')" title="' + (rd.meta.pinned ? t('Pinned — Reload and default resolution use this workspace. Click to unpin.') : t('Pin this workspace (Reload + default resolution will use it)')) + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);' + (rd.meta.pinned ? '' : 'opacity:0.4;filter:grayscale(1);') + '">\uD83D\uDCCC</button>' +
+                    '<button class="skills-action-btn" onclick="_recloneWorkspaceFromDropdown(\'' + escapeJsString(rd.githubRepo) + '\', \'' + escapeJsString(rd.meta.branch) + '\')" title="' + t('Re-clone (fetch latest)') + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.refresh + '</button>' +
+                    '<button class="skills-action-btn danger" onclick="_deleteWorkspaceFromDropdown(\'' + escapeJsString(rd.wk) + '\')" title="' + t('Delete local clone') + '" style="padding:var(--space-1) var(--space-4);font-size:var(--text-caption);">' + UI_ICONS.trash + '</button>' +
                 '</div>' +
             '</div>';
         }
@@ -918,20 +929,20 @@ async function renderGitHubReposList() {
                         return;
                     }
                     if (!syncResult) {
-                        el.style.color = 'var(--text-muted)'; el.textContent = 'offline';
+                        el.style.color = 'var(--text-muted)'; el.textContent = t('offline');
                         return;
                     }
                     var parts = [];
                     if (syncResult.behind) {
                         el.style.color = 'var(--warning)';
                         if (syncResult.behindFiles && syncResult.behindFiles.length > 0)
-                            parts.push(syncResult.behindFiles.length + ' behind');
+                            parts.push(tn(syncResult.behindFiles.length, '{count} behind', '{count} behind'));
                         if (syncResult.conflictFiles && syncResult.conflictFiles.length > 0)
-                            parts.push(syncResult.conflictFiles.length + ' conflict');
-                        el.textContent = parts.length > 0 ? parts.join(' · ') : 'behind remote';
+                            parts.push(tn(syncResult.conflictFiles.length, '{count} conflict', '{count} conflicts'));
+                        el.textContent = parts.length > 0 ? parts.join(' · ') : t('behind remote');
                     } else {
                         el.style.color = 'var(--success)';
-                        el.textContent = 'up to date';
+                        el.textContent = t('up to date');
                     }
                     // Re-render file list after sync
                     wsGetIgnoreFilterLocal(rd.wk).then(function(isIgnored) {
@@ -939,7 +950,7 @@ async function renderGitHubReposList() {
                             var freshDirty = freshFiles.filter(function(f) { return f.dirty && !isIgnored(f.path); });
                             var countEl = document.getElementById('repo-dirty-' + idx);
                             if (countEl) {
-                                countEl.innerHTML = freshDirty.length > 0 ? '<span style="color:var(--warning);">' + freshDirty.length + ' modified</span>' : '';
+                                countEl.innerHTML = freshDirty.length > 0 ? '<span style="color:var(--warning);">' + tn(freshDirty.length, '{count} modified', '{count} modified') + '</span>' : '';
                             }
                             var detailEl = document.getElementById('repo-detail-' + idx);
                             if (detailEl) {
@@ -951,13 +962,13 @@ async function renderGitHubReposList() {
                                 // Add behind/conflict files
                                 if (syncResult.behindFiles) {
                                     rows += syncResult.behindFiles.map(function(bf) {
-                                        var label = bf.remoteDeleted ? 'deleted on remote' : bf.isNew ? 'new on remote' : 'behind';
+                                        var label = bf.remoteDeleted ? t('deleted on remote') : bf.isNew ? t('new on remote') : t('behind');
                                         return '<div class="ws-file-row"><span class="ws-file-path" title="' + escapeHtml(bf.path) + '">' + escapeHtml(bf.path) + '</span><span class="ws-file-badge behind">' + label + '</span></div>';
                                     }).join('');
                                 }
                                 if (syncResult.conflictFiles) {
                                     rows += syncResult.conflictFiles.map(function(cf) {
-                                        return '<div class="ws-file-row"><span class="ws-file-path" title="' + escapeHtml(cf.path) + '">' + escapeHtml(cf.path) + '</span><span class="ws-file-badge conflict">conflict</span></div>';
+                                        return '<div class="ws-file-row"><span class="ws-file-path" title="' + escapeHtml(cf.path) + '">' + escapeHtml(cf.path) + '</span><span class="ws-file-badge conflict">' + t('conflict') + '</span></div>';
                                     }).join('');
                                 }
                                 detailEl.insertAdjacentHTML('beforeend', rows);
@@ -965,11 +976,11 @@ async function renderGitHubReposList() {
                         });
                     });
                 }).catch(function() {
-                    if (el && el.parentNode) { el.style.color = 'var(--text-muted)'; el.textContent = 'offline'; }
+                    if (el && el.parentNode) { el.style.color = 'var(--text-muted)'; el.textContent = t('offline'); }
                 });
         }).catch(function() {});
     } catch (e) {
-        container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-body-sm);">Error loading repos: ' + escapeHtml(e.message) + '</div>';
+        container.innerHTML = '<div style="color:var(--danger);font-size:var(--text-body-sm);">' + t('Error loading repos: {error}', {error: escapeHtml(e.message)}) + '</div>';
     }
 }
 
@@ -981,7 +992,7 @@ function _refreshBaseRowAfterAutoDelete(syncResult, repoData) {
     for (var bi = 0; bi < repoData.length; bi++) {
         if (repoData[bi].wk !== syncResult.base_workspace) continue;
         var bEl = document.getElementById('repo-sync-' + bi);
-        if (bEl) { bEl.style.color = 'var(--success)'; bEl.textContent = 'up to date'; }
+        if (bEl) { bEl.style.color = 'var(--success)'; bEl.textContent = t('up to date'); }
         var bDetail = document.getElementById('repo-detail-' + bi);
         if (bDetail) {
             var staleBadges = bDetail.querySelectorAll('.ws-file-badge.behind');
@@ -1000,13 +1011,13 @@ async function cloneGitHubRepo() {
     var branchInput = document.getElementById('github-add-branch-input');
     var statusEl = document.getElementById('github-clone-status');
     if (!repoInput || !repoInput.value.trim()) {
-        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Enter a repo (owner/repo)'; }
+        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = t('Enter a repo (owner/repo)'); }
         return;
     }
     var repo = repoInput.value.trim();
     var branch = (branchInput && branchInput.value.trim()) || undefined;
     if (repo.indexOf('/') === -1) {
-        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Format: owner/repo'; }
+        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = t('Format: owner/repo'); }
         return;
     }
     if (_ghSettingsCloneBusy) return;
@@ -1014,7 +1025,7 @@ async function cloneGitHubRepo() {
     try {
         // RC16B-F1: never silently replace an existing (possibly dirty) clone.
         if (!(await _confirmReplaceExistingClone(repo, branch))) return;
-        if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Cloning ' + repo + '...'; }
+        if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = t('Cloning {repo}...', {repo: repo}); }
         try {
             var result = await wsClone(repo, branch);
             if (result.success) {
@@ -1053,7 +1064,7 @@ async function deleteGitHubRepo(repo) {
             if (rows[i].getAttribute('data-wk') === repo) { rows[i].remove(); break; }
         }
         if (!container.querySelector('.settings-page-row[data-wk]')) {
-            container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">No repositories cloned yet.</div>';
+            container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body-sm);padding:var(--space-4) 0;">' + t('No repositories cloned yet.') + '</div>';
         }
     }
 
@@ -1160,19 +1171,19 @@ function _renderWsHeaderBadge() {
         if (!el) return;
         if (anyRefreshing) {
             el.className = 'ws-header-status modified';
-            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + _wsLoadingHtml('Refreshing…');
+            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + _wsLoadingHtml(t('Refreshing…'));
         } else if (anyBehind) {
             el.className = 'ws-header-status modified';
-            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>behind';
+            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + t('behind');
         } else if (totalDirty > 0) {
             el.className = 'ws-header-status modified';
             var label = reposWithChanges > 1
-                ? reposWithChanges + ' repos · ' + totalDirty + ' modified'
-                : totalDirty + ' modified';
+                ? tn(reposWithChanges, '{count} repo', '{count} repos') + ' · ' + tn(totalDirty, '{count} modified', '{count} modified')
+                : tn(totalDirty, '{count} modified', '{count} modified');
             el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + label;
         } else {
             el.className = 'ws-header-status synced';
-            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>clean';
+            el.innerHTML = '<span class="ws-icon">' + gitBranch + '</span>' + t('clean');
         }
         el.style.display = '';
     });
@@ -1527,6 +1538,7 @@ function hideWorkspaceDropdown() {
         _wsDropdown = null;
         document.removeEventListener('click', _onClickOutsideWsDropdown, true);
     }
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
 function _onClickOutsideWsDropdown(e) {
@@ -1536,12 +1548,12 @@ function _onClickOutsideWsDropdown(e) {
 }
 
 function _getSyncLabel(syncStatus) {
-    return syncStatus === 'up-to-date' ? '<span class="ws-sync up-to-date">✓ synced</span>' :
-        syncStatus === 'behind' ? '<span class="ws-sync behind">behind remote</span>' :
-        syncStatus === 'modified' ? '<span class="ws-sync behind">local changes</span>' :
-        syncStatus === 'offline' ? '<span class="ws-sync">offline</span>' :
-        syncStatus === 'deferred' ? '<span class="ws-sync">opens to refresh</span>' :
-        '<span class="ws-sync">' + _wsLoadingHtml('Refreshing…') + '</span>';
+    return syncStatus === 'up-to-date' ? '<span class="ws-sync up-to-date">✓ ' + t('synced') + '</span>' :
+        syncStatus === 'behind' ? '<span class="ws-sync behind">' + t('behind remote') + '</span>' :
+        syncStatus === 'modified' ? '<span class="ws-sync behind">' + t('local changes') + '</span>' :
+        syncStatus === 'offline' ? '<span class="ws-sync">' + t('offline') + '</span>' :
+        syncStatus === 'deferred' ? '<span class="ws-sync">' + t('opens to refresh') + '</span>' :
+        '<span class="ws-sync">' + _wsLoadingHtml(t('Refreshing…')) + '</span>';
 }
 
 // Pin button HTML — filled (full opacity) for the pinned workspace, dimmed
@@ -1549,7 +1561,7 @@ function _getSyncLabel(syncStatus) {
 // (showWorkspaceDropdown) via the data-pin-ws attribute.
 function _wsPinBtnHtml(wk, pinned) {
     return '<button class="ws-pin-btn" data-pin-ws="' + escapeHtml(wk) + '" title="' +
-        (pinned ? 'Pinned — Reload and default workspace resolution use this workspace. Click to unpin.' : 'Pin this workspace — Reload and default workspace resolution will use it.') +
+        (pinned ? t('Pinned — Reload and default workspace resolution use this workspace. Click to unpin.') : t('Pin this workspace — Reload and default workspace resolution will use it.')) +
         '" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);font-size:12px;line-height:1;vertical-align:middle;' +
         (pinned ? '' : 'opacity:0.3;filter:grayscale(1);') + '">\uD83D\uDCCC</button>';
 }
@@ -1559,13 +1571,13 @@ function _wsPinBtnHtml(wk, pinned) {
 function _wsCloneBtnHtml(repo, branch) {
     var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.refresh) ? UI_ICONS.refresh : '\u21BB';
     return '<button class="ws-clone-btn" data-clone-repo="' + escapeHtml(repo) + '" data-clone-branch="' + escapeHtml(branch) +
-        '" title="Re-clone this repo (fetch the latest from remote)" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);line-height:1;vertical-align:middle;color:var(--text-secondary);">' + icon + '</button>';
+        '" title="' + t('Re-clone this repo (fetch the latest from remote)') + '" style="background:none;border:none;cursor:pointer;padding:0 var(--space-2);line-height:1;vertical-align:middle;color:var(--text-secondary);">' + icon + '</button>';
 }
 
 function _wsDeleteBtnHtml(wk) {
     var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.trash) ? UI_ICONS.trash : '\u00d7';
     return '<button class="ws-delete-btn" data-delete-ws="' + escapeHtml(wk) +
-        '" title="Delete this local workspace" aria-label="Delete local workspace ' + escapeHtml(wk) + '">' + icon + '</button>';
+        '" title="' + t('Delete this local workspace') + '" aria-label="' + t('Delete local workspace {name}', {name: escapeHtml(wk)}) + '">' + icon + '</button>';
 }
 
 // Fresh dirty count for the re-clone / delete confirms (S8C-01): the Settings repo rows also
@@ -1587,19 +1599,21 @@ async function _deleteWorkspaceFromDropdown(wk) {
     var fresh = await _wsDirtyCountFresh(wk);
     var dirtyCount = Math.max(cache ? (cache.dirtyCount || 0) : 0, fresh || 0);
     var dirtyWarning = dirtyCount > 0
-        ? '<br><br><strong>This permanently discards ' + dirtyCount + ' uncommitted local change' + (dirtyCount === 1 ? '' : 's') +
-            (fresh === null ? ' (last known count; the current state could not be checked)' : '') + '.</strong>'
+        ? '<br><br><strong>' + (fresh === null
+            ? tn(dirtyCount, 'This permanently discards {count} uncommitted local change (last known count; the current state could not be checked).', 'This permanently discards {count} uncommitted local changes (last known count; the current state could not be checked).')
+            : tn(dirtyCount, 'This permanently discards {count} uncommitted local change.', 'This permanently discards {count} uncommitted local changes.')) +
+            '</strong>'
         : '';
-    if (fresh === null && dirtyCount === 0) dirtyWarning += '<br><br><strong>Any uncommitted local changes will be permanently discarded (they could not be checked).</strong>';
-    var confirmed = await showConfirmModal('Delete local workspace?',
-        'Delete <strong>' + escapeHtml(parsed.repo) + ' (' + escapeHtml(parsed.branch) + ')</strong> from this browser?' + dirtyWarning +
-        '<br><br>Gitignored files' + (dirtyCount > 0 ? ' (not counted above)' : '') + ' and the workspace\u2019s PR tracking are deleted too. The GitHub repository and remote branch will not be deleted.', 'danger');
+    if (fresh === null && dirtyCount === 0) dirtyWarning += '<br><br><strong>' + t('Any uncommitted local changes will be permanently discarded (they could not be checked).') + '</strong>';
+    var confirmed = await showConfirmModal(t('Delete local workspace?'),
+        t('Delete {workspace} from this browser?', {workspace: '<strong>' + escapeHtml(parsed.repo) + ' (' + escapeHtml(parsed.branch) + ')</strong>'}) + dirtyWarning +
+        '<br><br>' + (dirtyCount > 0 ? t('Gitignored files (not counted above) and the workspace\u2019s PR tracking are deleted too. The GitHub repository and remote branch will not be deleted.') : t('Gitignored files and the workspace\u2019s PR tracking are deleted too. The GitHub repository and remote branch will not be deleted.')), 'danger');
     if (!confirmed) return;
 
     var result = await deleteGitHubRepo(wk);
     if (typeof showSnackbar === 'function') {
-        if (result && result.success) showSnackbar('Deleted local workspace ' + parsed.repo + ' (' + parsed.branch + ')');
-        else showSnackbar('Delete failed: ' + ((result && result.error) || 'unknown error'), 'error');
+        if (result && result.success) showSnackbar(t('Deleted local workspace {repo} ({branch})', {repo: parsed.repo, branch: parsed.branch}));
+        else showSnackbar(t('Delete failed: {error}', {error: (result && result.error) || t('unknown error')}), 'error');
     }
 }
 
@@ -1612,24 +1626,25 @@ async function _recloneWorkspaceFromDropdown(repo, branch) {
     var fresh = await _wsDirtyCountFresh(wk);
     var n = Math.max(c ? (c.dirtyCount || 0) : 0, fresh || 0);
     if (n > 0 || fresh === null) {
-        var ok = await showConfirmModal('Re-clone ' + repo + '?',
-            'Re-cloning ' + escapeHtml(repo) + ' (' + escapeHtml(branch) + ') fetches the latest from remote and <strong>' +
-            (n > 0 ? 'discards ' + n + ' local change' + (n > 1 ? 's' : '') : 'may discard local changes (they could not be checked)') +
-            '</strong>. Gitignored files (not counted) are replaced too; the workspace\u2019s PR tracking is kept. Continue?', 'danger');
+        var rcP = {repo: escapeHtml(repo), branch: escapeHtml(branch)};
+        var ok = await showConfirmModal(t('Re-clone {repo}?', {repo: repo}),
+            (n > 0 ? tn(n, 'Re-cloning {repo} ({branch}) fetches the latest from remote and <strong>discards {count} local change</strong>.', 'Re-cloning {repo} ({branch}) fetches the latest from remote and <strong>discards {count} local changes</strong>.', rcP)
+                : t('Re-cloning {repo} ({branch}) fetches the latest from remote and <strong>may discard local changes (they could not be checked)</strong>.', rcP)) +
+            ' ' + t('Gitignored files (not counted) are replaced too; the workspace\u2019s PR tracking is kept. Continue?'), 'danger');
         if (!ok) return;
     }
-    if (typeof showSnackbar === 'function') showSnackbar('Re-cloning ' + repo + '\u2026');
+    if (typeof showSnackbar === 'function') showSnackbar(t('Re-cloning {repo}\u2026', {repo: repo}));
     try {
         var result = await wsClone(repo, branch);
         if (result && result.success) {
-            if (typeof showSnackbar === 'function') showSnackbar('Re-cloned ' + repo + ' (' + branch + ')');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Re-cloned {repo} ({branch})', {repo: repo, branch: branch}));
             if (typeof renderGitHubReposList === 'function') renderGitHubReposList();
             if (typeof updateWorkspaceHeaderStatus === 'function') await updateWorkspaceHeaderStatus();
         } else if (typeof showSnackbar === 'function') {
-            showSnackbar('Re-clone failed: ' + ((result && result.error) || 'unknown error'), 'error');
+            showSnackbar(t('Re-clone failed: {error}', {error: (result && result.error) || t('unknown error')}), 'error');
         }
     } catch (e) {
-        if (typeof showSnackbar === 'function') showSnackbar('Re-clone failed: ' + (e && e.message ? e.message : String(e)), 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Re-clone failed: {error}', {error: e && e.message ? e.message : String(e)}), 'error');
     }
 }
 
@@ -1651,16 +1666,16 @@ async function _confirmReplaceExistingClone(repo, branch) {
         if (!c && !(await getWorkspaceMeta(wk))) continue;
         var fresh = await _wsDirtyCountFresh(wk);
         var n = Math.max(c ? (c.dirtyCount || 0) : 0, fresh || 0);
-        lines.push('<strong>' + escapeHtml(repo) + ' (' + escapeHtml(branches[i]) + ')</strong>: ' +
-            (n > 0 ? '<strong>permanently discards ' + n + ' uncommitted local change' + (n === 1 ? '' : 's') + '</strong>'
-                : fresh === null ? '<strong>may discard uncommitted local changes (they could not be checked)</strong>'
-                : 'no uncommitted local changes found'));
+        var rpP = {workspace: '<strong>' + escapeHtml(repo) + ' (' + escapeHtml(branches[i]) + ')</strong>'};
+        lines.push(n > 0 ? tn(n, '{workspace}: <strong>permanently discards {count} uncommitted local change</strong>', '{workspace}: <strong>permanently discards {count} uncommitted local changes</strong>', rpP)
+            : fresh === null ? t('{workspace}: <strong>may discard uncommitted local changes (they could not be checked)</strong>', rpP)
+            : t('{workspace}: no uncommitted local changes found', rpP));
     }
     if (!lines.length) return true;
-    return await showConfirmModal('Replace existing clone?',
-        'Already cloned in this browser. Cloning again replaces the local clone.<br><br>' + lines.join('<br>') +
-        (fb ? '<br><br>' + (branch ? '' : 'No branch entered: ') + 'main is cloned, or master if the remote has no main.' : '') +
-        '<br><br>Gitignored files (not counted) are lost too; the workspace\u2019s PR tracking is kept. Continue?', 'danger');
+    return await showConfirmModal(t('Replace existing clone?'),
+        t('Already cloned in this browser. Cloning again replaces the local clone.') + '<br><br>' + lines.join('<br>') +
+        (fb ? '<br><br>' + (branch ? t('main is cloned, or master if the remote has no main.') : t('No branch entered: main is cloned, or master if the remote has no main.')) : '') +
+        '<br><br>' + t('Gitignored files (not counted) are lost too; the workspace\u2019s PR tracking is kept. Continue?'), 'danger');
 }
 
 // Toggle a workspace pin from the UI — shared logic lives in setWorkspacePin
@@ -1673,12 +1688,12 @@ async function _toggleWorkspacePinFromUi(wk) {
     try {
         var meta = await getWorkspaceMeta(wk);
         if (!meta) {
-            if (typeof showSnackbar === 'function') showSnackbar('Pin failed: no local workspace metadata for ' + wk, 'error');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Pin failed: no local workspace metadata for {workspace}', {workspace: wk}), 'error');
             return;
         }
         await setWorkspacePin(wk, !!meta.pinned); // toggle
     } catch (e) {
-        if (typeof showSnackbar === 'function') showSnackbar('Pin update failed: ' + (e && e.message ? e.message : String(e)), 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Pin update failed: {error}', {error: e && e.message ? e.message : String(e)}), 'error');
         return;
     }
     // Refresh cached metas + re-render every open dropdown section (a pin
@@ -1836,7 +1851,7 @@ function _wsChatChip(f) {
     var ref = _wsResolveChatRef(cid);
     var known = !!ref;
     var isWorker = !!(ref && ref.isSub);
-    var title = stampTitle || (ref && ref.title) || 'Untitled chat';
+    var title = stampTitle || (ref && ref.title) || t('Untitled chat');
     var chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'ws-file-chat' + (!known ? ' gone' : '');
@@ -1845,17 +1860,20 @@ function _wsChatChip(f) {
     // chat pushed the PR (pushed_pr.chatId is the actual pusher, stamped in
     // prInfo at push time), say "Edited … · pushed in PR #N" instead of the
     // misleading "Pushed by" (the editor never pushed anything).
-    var who = (isWorker ? 'worker' : 'chat') + ' \u201c' + title + '\u201d';
-    var prNumLabel = (f.pushed_pr && f.pushed_pr.number) ? 'PR #' + f.pushed_pr.number : '';
+    var whoP = {title: title, number: (f.pushed_pr && f.pushed_pr.number) ? f.pushed_pr.number : ''};
+    var hasPrNum = !!whoP.number;
     var head;
     if (!pushed) {
-        head = 'Edited by ' + who;
+        head = isWorker ? t('Edited by worker \u201c{title}\u201d', whoP) : t('Edited by chat \u201c{title}\u201d', whoP);
     } else if (f.pushed_pr && f.pushed_pr.chatId && f.pushed_pr.chatId !== cid) {
-        head = 'Edited by ' + who + (prNumLabel ? ' \u00b7 pushed in ' + prNumLabel : ' \u00b7 pushed by another chat');
+        head = (isWorker ? t('Edited by worker \u201c{title}\u201d', whoP) : t('Edited by chat \u201c{title}\u201d', whoP)) +
+            ' \u00b7 ' + (hasPrNum ? t('pushed in PR #{number}', whoP) : t('pushed by another chat'));
+    } else if (hasPrNum) {
+        head = isWorker ? t('Pushed (PR #{number}) by worker \u201c{title}\u201d', whoP) : t('Pushed (PR #{number}) by chat \u201c{title}\u201d', whoP);
     } else {
-        head = 'Pushed' + (prNumLabel ? ' (' + prNumLabel + ')' : '') + ' by ' + who;
+        head = isWorker ? t('Pushed by worker \u201c{title}\u201d', whoP) : t('Pushed by chat \u201c{title}\u201d', whoP);
     }
-    chip.title = head + (!known ? ' \u2014 chat not loaded (may be deleted or a background worker)' : ' \u2014 click to open');
+    chip.title = head + ' \u2014 ' + (!known ? t('chat not loaded (may be deleted or a background worker)') : t('click to open'));
     chip.innerHTML = (typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '\ud83d\udcac';
     chip.addEventListener('click', function(ev) {
         ev.stopPropagation();
@@ -1869,9 +1887,9 @@ function _wsChatChip(f) {
 // Shared row builder for a dirty file (status badge + optional PR link +
 // color-coded owning-chat chip).
 function _dirtyFileRow(f) {
-    var badge = f.deleted ? '<span class="ws-file-badge deleted">deleted</span>' :
-        (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">new</span>' :
-        '<span class="ws-file-badge modified">modified</span>';
+    var badge = f.deleted ? '<span class="ws-file-badge deleted">' + t('deleted') + '</span>' :
+        (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">' + t('new') + '</span>' :
+        '<span class="ws-file-badge modified">' + t('modified') + '</span>';
     var prLink = '';
     if (f.pushed_pr && f.pushed_pr.url) {
         prLink = '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank" onclick="event.stopPropagation()">PR #' + f.pushed_pr.number + '</a>';
@@ -1935,10 +1953,10 @@ function _reconcileThisChatSection() {
     var total = 0;
     groups.forEach(function(g) { total += g.files.length; });
     var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
-    var countChip = '<span class="ws-change-count" title="' + total + ' uncommitted change' + (total > 1 ? 's' : '') + ' by this chat">' + total + '</span>';
+    var countChip = '<span class="ws-change-count" title="' + tn(total, '{count} uncommitted change by this chat', '{count} uncommitted changes by this chat') + '">' + total + '</span>';
     var header = sec.querySelector('.ws-dropdown-header');
     var chatIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '') + '</span>';
-    header.innerHTML = '<span class="ws-dd-title">' + chevron + chatIcon + 'This chat' + countChip + '</span><span class="ws-sync">uncommitted</span>';
+    header.innerHTML = '<span class="ws-dd-title">' + chevron + chatIcon + t('This chat') + countChip + '</span><span class="ws-sync">' + t('uncommitted') + '</span>';
     var body = sec.querySelector('.ws-dropdown-body');
     body.innerHTML = '';
     groups.forEach(function(g) {
@@ -1959,7 +1977,7 @@ function _renderDropdownSection(section, cache) {
         var pinBtn = _wsExtDevMode ? _wsPinBtnHtml(cache.wk, !!(cache.meta && cache.meta.pinned)) : '';
         var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
         var changeCount = _wsSectionChangeCount(cache);
-        var countChip = changeCount > 0 ? '<span class="ws-change-count" title="' + changeCount + ' change' + (changeCount > 1 ? 's' : '') + '">' + changeCount + '</span>' : '';
+        var countChip = changeCount > 0 ? '<span class="ws-change-count" title="' + tn(changeCount, '{count} change', '{count} changes') + '">' + changeCount + '</span>' : '';
         var repoIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>';
         header.innerHTML = '<span class="ws-dd-title">' + chevron + repoIcon + escapeHtml(parsed.repo) + ' <span class="ws-branch">' + escapeHtml(parsed.branch) + '</span>' + countChip + cloneBtn + pinBtn + deleteBtn + '</span>' + _getSyncLabel(cache.syncStatus);
     }
@@ -1977,7 +1995,7 @@ function _renderDropdownSection(section, cache) {
         cache.conflictFiles.forEach(function(cf) {
             var row = document.createElement('div');
             row.className = 'ws-file-row';
-            row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(cf.path) + '">' + escapeHtml(cf.path) + '</span><span class="ws-file-badge conflict">conflict</span>';
+            row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(cf.path) + '">' + escapeHtml(cf.path) + '</span><span class="ws-file-badge conflict">' + t('conflict') + '</span>';
             body.appendChild(row);
         });
     }
@@ -1985,7 +2003,7 @@ function _renderDropdownSection(section, cache) {
     // Behind files
     if (cache.behindFiles && cache.behindFiles.length > 0) {
         cache.behindFiles.forEach(function(bf) {
-            var label = bf.remoteDeleted ? 'deleted on remote' : bf.isNew ? 'new on remote' : 'behind';
+            var label = bf.remoteDeleted ? t('deleted on remote') : bf.isNew ? t('new on remote') : t('behind');
             var row = document.createElement('div');
             row.className = 'ws-file-row';
             row.innerHTML = '<span class="ws-file-path" title="' + escapeHtml(bf.path) + '">' + escapeHtml(bf.path) + '</span><span class="ws-file-badge behind">' + label + '</span>';
@@ -1993,14 +2011,14 @@ function _renderDropdownSection(section, cache) {
         });
 
         var pullRow = document.createElement('div');
-        pullRow.style.cssText = 'padding:var(--space-3) var(--space-5);text-align:right;';
+        pullRow.style.cssText = 'padding:var(--space-3) var(--space-5);text-align:end;';
         var pullBtn = document.createElement('button');
         pullBtn.className = 'skills-action-btn';
         pullBtn.style.cssText = 'font-size:var(--text-caption);padding:var(--space-2) var(--space-5);';
-        pullBtn.textContent = 'Pull ' + cache.behindFiles.length + ' file' + (cache.behindFiles.length > 1 ? 's' : '') + ' from remote';
+        pullBtn.textContent = tn(cache.behindFiles.length, 'Pull {count} file from remote', 'Pull {count} files from remote');
         pullBtn.addEventListener('click', async function() {
             pullBtn.disabled = true;
-            pullBtn.textContent = 'Pulling...';
+            pullBtn.textContent = t('Pulling...');
             await wsPull(cache.wk);
             hideWorkspaceDropdown();
             await syncAndUpdateWorkspaceHeader();
@@ -2015,7 +2033,7 @@ function _renderDropdownSection(section, cache) {
         (!cache.conflictFiles || cache.conflictFiles.length === 0)) {
         var empty = document.createElement('div');
         empty.className = 'ws-dropdown-empty';
-        empty.textContent = 'All files match remote';
+        empty.textContent = t('All files match remote');
         body.appendChild(empty);
     }
 }
@@ -2092,7 +2110,7 @@ async function showWorkspaceDropdown() {
     // — the pill already says "workspace", the menu lists cloned repositories.
     var titleBand = document.createElement('div');
     titleBand.className = 'menu-section-title ws-menu-title';
-    titleBand.innerHTML = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>Repositories';
+    titleBand.innerHTML = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.git) ? UI_ICONS.git : '') + '</span>' + t('Repositories');
     dd.appendChild(titleBand);
 
     keys.forEach(function(wk, idx) {
@@ -2133,9 +2151,12 @@ async function showWorkspaceDropdown() {
 
     var rect = anchor.getBoundingClientRect();
     dd.style.top = (rect.bottom + 4) + 'px';
-    dd.style.right = (window.innerWidth - rect.right) + 'px';
+    // Rule 10 (i18n): pin the menu to the pill's inline-end edge (right in LTR, left in RTL).
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') dd.style.left = rect.left + 'px';
+    else dd.style.right = (window.innerWidth - rect.right) + 'px';
     document.body.appendChild(dd);
     _wsDropdown = dd;
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
     _reconcileThisChatSection();
 
     setTimeout(function() {
@@ -2153,7 +2174,7 @@ function renderLlmEndpointsList() {
     if (!container) return;
 
     if (llmEndpoints.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">No endpoints configured. Add one to use endpoint-backed models (subscription models don\'t need one).</div>';
+        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">' + t('No endpoints configured. Add one to use endpoint-backed models (subscription models don\'t need one).') + '</div>';
         return;
     }
 
@@ -2161,17 +2182,17 @@ function renderLlmEndpointsList() {
     llmEndpoints.forEach(function(ep) {
         var domain = getEndpointDomain(ep.url);
         var domainTag = domain ? '<span class="provider-tag">' + escapeHtml(domain) + '</span>' : '';
-        var keyTag = (ep.apiKey || '') ? '<span class="provider-tag">key set</span>' : '<span class="provider-tag">no key</span>';
+        var keyTag = (ep.apiKey || '') ? '<span class="provider-tag">' + t('key set') + '</span>' : '<span class="provider-tag">' + t('no key') + '</span>';
         var useCount = apiProviders.filter(function(p) { return findEndpointForProvider(p) === ep; }).length;
-        var usageTag = '<span class="provider-tag">' + useCount + ' model' + (useCount === 1 ? '' : 's') + '</span>';
+        var usageTag = '<span class="provider-tag">' + tn(useCount, '{count} model', '{count} models') + '</span>';
 
         html += '<div class="api-provider-row">' +
             '<span class="api-provider-endpoint-icon">' + getEndpointIcon(ep.url) + '</span>' +
             '<span class="api-provider-name">' + escapeHtml(ep.name) + '</span>' +
             '<div class="api-provider-tags">' + domainTag + keyTag + usageTag + '</div>' +
             '<div class="api-provider-actions">' +
-                '<button class="api-provider-btn" onclick="editLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
-                '<button class="api-provider-btn danger" onclick="confirmDeleteLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
+                '<button class="api-provider-btn" onclick="editLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="' + t('Edit') + '">' + UI_ICONS.edit + '</button>' +
+                '<button class="api-provider-btn danger" onclick="confirmDeleteLlmEndpoint(\'' + escapeJsString(ep.id) + '\')" title="' + t('Delete') + '">' + UI_ICONS.trash + '</button>' +
             '</div>' +
         '</div>';
     });
@@ -2206,24 +2227,24 @@ function showLlmEndpointModal(editingEndpoint) {
 
     overlay.innerHTML =
         '<div class="modal-dialog" style="max-width:480px;">' +
-            '<div class="modal-header">' + (isEditing ? 'Edit' : 'Add') + ' LLM Endpoint</div>' +
+            '<div class="modal-header">' + (isEditing ? t('Edit LLM Endpoint') : t('Add LLM Endpoint')) + '</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Name <span class="required">*</span></label>' +
-                    '<input type="text" id="llm-endpoint-name" class="form-input" value="' + escapeHtml(ep.name) + '" placeholder="e.g. OpenRouter (work key)">' +
+                    '<label class="form-label">' + t('Name') + ' <span class="required">*</span></label>' +
+                    '<input type="text" id="llm-endpoint-name" class="form-input" value="' + escapeHtml(ep.name) + '" placeholder="' + t('e.g. OpenRouter (work key)') + '">' +
                 '</div>' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Endpoint URL <span class="required">*</span></label>' +
+                    '<label class="form-label">' + t('Endpoint URL') + ' <span class="required">*</span></label>' +
                     '<input type="text" id="llm-endpoint-url" class="form-input" value="' + escapeHtml(ep.url) + '" placeholder="https://openrouter.ai/api/v1/chat/completions">' +
                 '</div>' +
                 '<div class="form-field">' +
-                    '<label class="form-label">API Key</label>' +
+                    '<label class="form-label">' + t('API Key') + '</label>' +
                     '<input type="password" id="llm-endpoint-apikey" class="form-input" value="' + escapeHtml(ep.apiKey || '') + '" placeholder="sk-or-...">' +
                 '</div>' +
             '</div>' +
             '<div class="modal-actions">' +
-                '<button class="modal-btn secondary" onclick="closeLlmEndpointModal()">Cancel</button>' +
-                '<button class="modal-btn primary" onclick="saveLlmEndpointFromModal(\'' + escapeJsString(isEditing ? ep.id : '') + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
+                '<button class="modal-btn secondary" onclick="closeLlmEndpointModal()">' + t('Cancel') + '</button>' +
+                '<button class="modal-btn primary" onclick="saveLlmEndpointFromModal(\'' + escapeJsString(isEditing ? ep.id : '') + '\')">' + (isEditing ? t('Save') : t('Add')) + '</button>' +
             '</div>' +
         '</div>';
 
@@ -2241,12 +2262,12 @@ async function saveLlmEndpointFromModal(editingId) {
     var apiKey = document.getElementById('llm-endpoint-apikey').value.trim();
 
     if (!name || !url) {
-        showSnackbar('Please fill in Name and Endpoint URL', 'error');
+        showSnackbar(t('Please fill in Name and Endpoint URL'), 'error');
         return;
     }
     var nameClash = llmEndpoints.some(function(ep) { return ep.name === name && ep.id !== editingId; });
     if (nameClash) {
-        showSnackbar('An endpoint with that name already exists', 'error');
+        showSnackbar(t('An endpoint with that name already exists'), 'error');
         return;
     }
 
@@ -2283,7 +2304,7 @@ async function saveLlmEndpointFromModal(editingId) {
         await persistLlmEndpointState(nextEndpoints, affectedProviders);
     } catch (e) {
         console.error('Failed to save LLM endpoint:', e);
-        showSnackbar('Could not save endpoint: ' + (e && e.message), 'error');
+        showSnackbar(t('Could not save endpoint: {error}', {error: String(e && e.message)}), 'error');
         return;
     }
     llmEndpoints = nextEndpoints;
@@ -2291,27 +2312,27 @@ async function saveLlmEndpointFromModal(editingId) {
     closeLlmEndpointModal();
     renderLlmEndpointsList();
     renderApiProvidersList();
-    showSnackbar(editingId ? 'Endpoint updated' + (touched ? ' (' + touched + ' model' + (touched === 1 ? '' : 's') + ' re-synced)' : '') : 'Endpoint added', 'success');
+    showSnackbar(editingId ? (touched ? tn(touched, 'Endpoint updated ({count} model re-synced)', 'Endpoint updated ({count} models re-synced)') : t('Endpoint updated')) : t('Endpoint added'), 'success');
 }
 
 async function confirmDeleteLlmEndpoint(endpointId) {
     var ep = getLlmEndpointById(endpointId);
     if (!ep) return;
     var useCount = apiProviders.filter(function(p) { return findEndpointForProvider(p) === ep; }).length;
-    var msg = 'Delete endpoint "' + escapeHtml(ep.name) + '"?' + (useCount ? ' ' + useCount + (useCount === 1 ? ' model references' : ' models reference') + ' it and will keep the current URL/key until re-saved.' : '') + ' This cannot be undone.';
-    if (await showConfirmModal('Delete Endpoint', msg, 'danger')) {
+    var msg = useCount ? tn(useCount, 'Delete endpoint "{name}"? {count} model references it and will keep the current URL/key until re-saved. This cannot be undone.', 'Delete endpoint "{name}"? {count} models reference it and will keep the current URL/key until re-saved. This cannot be undone.', { name: escapeHtml(ep.name) }) : t('Delete endpoint "{name}"? This cannot be undone.', { name: escapeHtml(ep.name) });
+    if (await showConfirmModal(t('Delete Endpoint'), msg, 'danger')) {
         var nextEndpoints = llmEndpoints.filter(function(e) { return e.id !== endpointId; }).map(function(e) { return Object.assign({}, e); });
         try {
             await persistLlmEndpointState(nextEndpoints, []);
         } catch (e) {
             console.error('Failed to delete LLM endpoint:', e);
-            showSnackbar('Could not delete endpoint: ' + (e && e.message), 'error');
+            showSnackbar(t('Could not delete endpoint: {error}', {error: String(e && e.message)}), 'error');
             return;
         }
         llmEndpoints = nextEndpoints;
         renderLlmEndpointsList();
         renderApiProvidersList(); // A8A3-02: the deleted endpoint's models regroup (same as the save path)
-        showSnackbar('Endpoint deleted', 'success');
+        showSnackbar(t('Endpoint deleted'), 'success');
     }
 }
 
@@ -2439,6 +2460,13 @@ function selectModelEndpoint(endpointId) {
     if (hidden) hidden.value = endpointId;
 }
 
+// i18n: _MODAL_EFFORT_LEVELS and _modalEffortLabelHtml stay free of direct
+// t()/N_() calls (test/chatgpt-astra.test.js:40 evaluates that slice without
+// the i18n core); _modalEffortLabelHtml translates through a typeof-guarded
+// t(), so the displayed labels/badges are registered for extraction here.
+var _MODAL_EFFORT_I18N_KEYS = [N_('Low'), N_('Medium'), N_('High'), N_('X-High'), N_('Max'), N_('Default'),
+    N_('high on Astra'), N_('server decides'), N_('sent as high on ChatGPT')];
+
 // Reasoning-effort slider in the model modal: the pill-menu control
 // (_EFFORT_LEVELS, ui/160-notifications.js) plus a TRAILING 'Default' stop at
 // the high end — same semantics as the old select's empty option
@@ -2469,9 +2497,11 @@ function _modalEffortLabelHtml(idx, authKind, model) {
     var astra = kind === 'chatgpt' && isChatGPTAstraModel(model);
     // GPT-6 Astra/Sol/Luna take xhigh/max natively (chatGPTSupportsExtendedEffort).
     var clampedOnChatGPT = kind === 'chatgpt' && !chatGPTSupportsExtendedEffort(model) && (e.v === 'xhigh' || e.v === 'max');
-    return '<span class="model-menu-effort-name">' + e.label + '</span>' +
-        (e.v === '' ? '<span class="model-row-badge">' + (astra ? 'high on Astra' : 'server decides') + '</span>' : '') +
-        (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
+    // typeof-guarded t(): this slice also runs without the i18n core (see above).
+    var tr = typeof t === 'function' ? t : String;
+    return '<span class="model-menu-effort-name">' + tr(e.label) + '</span>' +
+        (e.v === '' ? '<span class="model-row-badge">' + (astra ? tr('high on Astra') : tr('server decides')) + '</span>' : '') +
+        (clampedOnChatGPT ? '<span class="model-row-badge">' + tr('sent as high on ChatGPT') + '</span>' : '');
 }
 // keepValue (F3): refresh the slider visuals only, leaving #provider-effort.
 function onModalEffortSliderInput(v, keepValue) {
@@ -2500,12 +2530,13 @@ function onModalEffortSliderInput(v, keepValue) {
 // (resets on reload; default expanded), keyed by section key.
 var _modelSectionCollapsed = {};
 function _modelSectionFor(provider) {
-    if (provider.isChatGPTOAuth) return { key: 'chatgpt', label: 'ChatGPT Subscription', icon: UI_ICONS.brandOpenAI };
-    if (provider.isClaudeOAuth) return { key: 'claude', label: 'Claude Subscription', icon: UI_ICONS.brandClaude };
+    if (provider.isChatGPTOAuth) return { key: 'chatgpt', label: t('ChatGPT Subscription'), icon: UI_ICONS.brandOpenAI };
+    if (provider.isClaudeOAuth) return { key: 'claude', label: t('Claude Subscription'), icon: UI_ICONS.brandClaude };
     var ep = findEndpointForProvider(provider);
     if (ep) return { key: 'ep:' + ep.id, label: ep.name, icon: getEndpointIcon(ep.url) };
-    var domain = getEndpointDomain(provider.endpoint) || 'Other';
-    return { key: 'url:' + domain, label: domain, icon: getEndpointIcon(provider.endpoint || '') };
+    // The section key stays English ('Other'); only the displayed label is translated.
+    var domain = getEndpointDomain(provider.endpoint);
+    return { key: 'url:' + (domain || 'Other'), label: domain || t('Other'), icon: getEndpointIcon(provider.endpoint || '') };
 }
 function toggleModelSection(key) {
     _modelSectionCollapsed[key] = !_modelSectionCollapsed[key];
@@ -2540,7 +2571,7 @@ function renderApiProvidersList() {
     if (!container) return;
     
     if (apiProviders.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">No providers configured.</div>';
+        container.innerHTML = '<div style="color:var(--text-muted);font-size:var(--text-body);padding: var(--space-4) 0;">' + t('No providers configured.') + '</div>';
         return;
     }
     
@@ -2556,8 +2587,8 @@ function renderApiProvidersList() {
         var isCustomized = isProviderCustomized(provider);
         var isNew = !DEFAULT_API_PROVIDERS.find(function(d) { return d.name === provider.name; });
         var isActive = provider.name === currentProvider;
-        var statusBadge = isNew ? '<span class="provider-badge new">custom</span>' : (isCustomized ? '<span class="provider-badge">modified</span>' : '');
-        var activeTag = isActive ? '<span class="provider-tag active">Active</span>' : '';
+        var statusBadge = isNew ? '<span class="provider-badge new">' + t('custom') + '</span>' : (isCustomized ? '<span class="provider-badge">' + t('modified') + '</span>' : '');
+        var activeTag = isActive ? '<span class="provider-tag active">' + t('Active') + '</span>' : '';
         var endpointLabel = getEndpointDomain(provider.endpoint);
         var domainTag = endpointLabel ? '<span class="provider-tag">' + escapeHtml(endpointLabel) + '</span>' : '';
         var providerTag = provider.provider ? '<span class="provider-tag">' + escapeHtml(provider.provider) + '</span>' : '';
@@ -2567,9 +2598,9 @@ function renderApiProvidersList() {
             statusBadge +
             '<div class="api-provider-tags">' + activeTag + domainTag + providerTag + '</div>' +
             '<div class="api-provider-actions">' +
-                '<button class="api-provider-btn' + (isActive ? ' selected' : '') + '" onclick="selectApiProvider(\'' + escapeJsString(provider.name) + '\')" title="' + (isActive ? 'Active' : 'Use this model') + '">' + UI_ICONS.check + '</button>' +
-                '<button class="api-provider-btn" onclick="editApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Edit">' + UI_ICONS.edit + '</button>' +
-                '<button class="api-provider-btn danger" onclick="confirmDeleteApiProvider(\'' + escapeJsString(provider.name) + '\')" title="Delete">' + UI_ICONS.trash + '</button>' +
+                '<button class="api-provider-btn' + (isActive ? ' selected' : '') + '" onclick="selectApiProvider(\'' + escapeJsString(provider.name) + '\')" title="' + (isActive ? t('Active') : t('Use this model')) + '">' + UI_ICONS.check + '</button>' +
+                '<button class="api-provider-btn" onclick="editApiProvider(\'' + escapeJsString(provider.name) + '\')" title="' + t('Edit') + '">' + UI_ICONS.edit + '</button>' +
+                '<button class="api-provider-btn danger" onclick="confirmDeleteApiProvider(\'' + escapeJsString(provider.name) + '\')" title="' + t('Delete') + '">' + UI_ICONS.trash + '</button>' +
             '</div>' +
         '</div>';
         });
@@ -2624,7 +2655,7 @@ function showAddApiProviderModal(editingProvider) {
     var selectedEndpointId = _providerEp ? _providerEp.id
         : (getLlmEndpointById('openrouter') ? 'openrouter' : (llmEndpoints.length > 0 ? llmEndpoints[0].id : ''));
     var endpointFieldInner = llmEndpoints.length > 0
-        ? '<div class="radio-group radio-group-vertical" id="provider-endpoint-group" role="radiogroup" aria-label="Endpoint">' +
+        ? '<div class="radio-group radio-group-vertical" id="provider-endpoint-group" role="radiogroup" aria-label="' + t('Endpoint') + '">' +
             llmEndpoints.map(function(ep) {
                 var on = ep.id === selectedEndpointId;
                 var epDomain = getEndpointDomain(ep.url);
@@ -2638,7 +2669,7 @@ function showAddApiProviderModal(editingProvider) {
             }).join('') +
           '</div>' +
           '<input type="hidden" id="provider-endpoint-select" value="' + escapeHtml(selectedEndpointId) + '">'
-        : '<div class="settings-page-row-hint">No LLM endpoints configured — add one in the LLM Endpoints section of Settings first (subscription models don\'t need one).</div>';
+        : '<div class="settings-page-row-hint">' + t('No LLM endpoints configured — add one in the LLM Endpoints section of Settings first (subscription models don\'t need one).') + '</div>';
 
     // Reasoning-effort slider (same control as the model pill menu, plus a
     // trailing 'Default' stop at the high end = the old select's empty option).
@@ -2677,12 +2708,12 @@ function showAddApiProviderModal(editingProvider) {
     
     overlay.innerHTML = 
         '<div class="modal-dialog">' +
-            '<div class="modal-header">' + (isEditing ? 'Edit' : 'Add') + ' Model</div>' +
+            '<div class="modal-header">' + (isEditing ? t('Edit Model') : t('Add Model')) + '</div>' +
             '<div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-8);">' +
                 '<div class="form-field">' +
-                    '<label class="form-label">API Access</label>' +
-                    '<div class="radio-group" id="provider-auth-kind" role="radiogroup" aria-label="API access">' +
-                        [['chatgpt', 'ChatGPT Subscription', UI_ICONS.brandOpenAI], ['claude', 'Claude Subscription', UI_ICONS.brandClaude], ['endpoint', 'Endpoint', UI_ICONS.brandEndpoint]].map(function(opt) {
+                    '<label class="form-label">' + t('API Access') + '</label>' +
+                    '<div class="radio-group" id="provider-auth-kind" role="radiogroup" aria-label="' + t('API access') + '">' +
+                        [['chatgpt', t('ChatGPT Subscription'), UI_ICONS.brandOpenAI], ['claude', t('Claude Subscription'), UI_ICONS.brandClaude], ['endpoint', t('Endpoint'), UI_ICONS.brandEndpoint]].map(function(opt) {
                             var on = authKind === opt[0];
                             return '<div class="radio-option' + (on ? ' selected' : '') + '" data-value="' + opt[0] + '" role="radio" aria-checked="' + on + '" tabindex="0"' +
                                 ' onclick="selectModelAuthKind(\'' + opt[0] + '\')"' +
@@ -2692,31 +2723,31 @@ function showAddApiProviderModal(editingProvider) {
                     '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Model ID <span class="required">*</span></label>' +
-                    '<input type="text" id="provider-model" class="form-input" list="provider-model-datalist" value="' + escapeHtml(provider.model) + '" placeholder="e.g. anthropic/claude-sonnet-4" oninput="onModelIdInput(this.value)">' +
+                    '<label class="form-label">' + t('Model ID') + ' <span class="required">*</span></label>' +
+                    '<input type="text" id="provider-model" class="form-input" list="provider-model-datalist" value="' + escapeHtml(provider.model) + '" placeholder="' + t('e.g. anthropic/claude-sonnet-4') + '" oninput="onModelIdInput(this.value)">' +
                     '<datalist id="provider-model-datalist"></datalist>' +
                     '<div class="settings-page-row-hint" id="provider-model-catalog-hint" style="display:none"></div>' +
                 '</div>' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Display Name <span class="required">*</span></label>' +
-                    '<input type="text" id="provider-name" class="form-input" value="' + escapeHtml(provider.name) + '" placeholder="Auto-filled from Model ID" oninput="onModelNameInput(this.value)">' +
+                    '<label class="form-label">' + t('Display Name') + ' <span class="required">*</span></label>' +
+                    '<input type="text" id="provider-name" class="form-input" value="' + escapeHtml(provider.name) + '" placeholder="' + t('Auto-filled from Model ID') + '" oninput="onModelNameInput(this.value)">' +
                 '</div>' +
                 '<div id="provider-custom-fields" style="' + (authKind === 'endpoint' ? 'display:flex;flex-direction:column;gap:var(--space-8)' : 'display:none') + '">' +
                     '<div class="form-field">' +
-                        '<label class="form-label">Endpoint <span class="required">*</span></label>' +
+                        '<label class="form-label">' + t('Endpoint') + ' <span class="required">*</span></label>' +
                         endpointFieldInner +
                     '</div>' +
                     '<div class="form-field" id="provider-provider-field">' +
-                        '<label class="form-label">Provider (Optional)</label>' +
-                        '<input type="text" id="provider-provider" class="form-input" value="' + escapeHtml(provider.provider || '') + '" placeholder="e.g. anthropic or novita/bf16">' +
+                        '<label class="form-label">' + t('Provider (Optional)') + '</label>' +
+                        '<input type="text" id="provider-provider" class="form-input" value="' + escapeHtml(provider.provider || '') + '" placeholder="' + t('e.g. anthropic or novita/bf16') + '">' +
                     '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
-                    '<label class="form-label">Reasoning Effort</label>' +
+                    '<label class="form-label">' + t('Reasoning Effort') + '</label>' +
                     '<div class="model-menu-effort modal-effort">' +
                         '<div class="model-menu-effort-track" id="modal-effort-track" style="--pos: ' + (effortIdx / 5) + '">' + effortDots +
                             '<span class="effort-track-fill"></span>' +
-                            '<input type="range" class="model-menu-effort-slider" id="modal-effort-slider" min="0" max="5" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onModalEffortSliderInput(this.value)">' +
+                            '<input type="range" class="model-menu-effort-slider" id="modal-effort-slider" min="0" max="5" step="1" value="' + effortIdx + '" aria-label="' + t('Reasoning effort') + '" oninput="onModalEffortSliderInput(this.value)">' +
                             '<span class="effort-disc" id="modal-effort-disc"></span>' +
                         '</div>' +
                         '<div class="model-menu-effort-label" id="modal-effort-label">' + _modalEffortLabelHtml(effortIdx, authKind, provider.model) + '</div>' +
@@ -2725,9 +2756,9 @@ function showAddApiProviderModal(editingProvider) {
                 '</div>' +
             '</div>' +
             '<div class="modal-actions">' +
-                (isEditing ? '<button class="modal-btn danger" style="margin-right:auto" onclick="deleteApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">Delete</button>' : '') +
-                '<button class="modal-btn secondary" onclick="closeApiProviderModal()">Cancel</button>' +
-                '<button class="modal-btn primary" onclick="saveApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">' + (isEditing ? 'Save' : 'Add') + '</button>' +
+                (isEditing ? '<button class="modal-btn danger" style="margin-inline-end:auto" onclick="deleteApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">' + t('Delete') + '</button>' : '') +
+                '<button class="modal-btn secondary" onclick="closeApiProviderModal()">' + t('Cancel') + '</button>' +
+                '<button class="modal-btn primary" onclick="saveApiProviderFromModal(\'' + escapeJsString(originalName) + '\')">' + (isEditing ? t('Save') : t('Add')) + '</button>' +
             '</div>' +
         '</div>';
     
@@ -2772,8 +2803,8 @@ function refreshCodexModelOptions() {
             if (!hintNow) return;
             if (!models.length) { hintNow.style.display = 'none'; return; }
             hintNow.textContent = (response.success && response.live)
-                ? (models.length + ' model' + (models.length === 1 ? '' : 's') + ' available on your ChatGPT subscription')
-                : 'Live catalog unavailable — showing known Codex models';
+                ? tn(models.length, '{count} model available on your ChatGPT subscription', '{count} models available on your ChatGPT subscription')
+                : t('Live catalog unavailable — showing known Codex models');
             hintNow.style.display = '';
         });
     } catch (e) { /* catalog is best-effort — never block the modal */ }
@@ -2828,11 +2859,11 @@ async function saveApiProviderFromModal(originalName) {
     var effort = effortField ? effortField.value : '';
 
     if (!name || !model) {
-        showSnackbar('Please fill in all required fields (Name, Model ID)', 'error');
+        showSnackbar(t('Please fill in all required fields (Name, Model ID)'), 'error');
         return;
     }
     if (!isOAuth && !selectedEp) {
-        showSnackbar('Please select an Endpoint — add one in Settings → LLM Endpoints first', 'error');
+        showSnackbar(t('Please select an Endpoint — add one in Settings → LLM Endpoints first'), 'error');
         return;
     }
     
@@ -2841,7 +2872,7 @@ async function saveApiProviderFromModal(originalName) {
     // saveLlmEndpointFromModal; editing a model without renaming is fine.
     var nameClash = apiProviders.some(function(p) { return p.name === name && p.name !== originalName; });
     if (nameClash) {
-        showSnackbar('A model with that name already exists', 'error');
+        showSnackbar(t('A model with that name already exists'), 'error');
         return; // keep modal open with the user's input intact
     }
     var renamingCurrent = !!(originalName && originalName !== name && currentProvider === originalName);
@@ -2876,7 +2907,7 @@ async function saveApiProviderFromModal(originalName) {
         await saveApiProvider(provider, originalName || null);
     } catch (e) {
         console.error('Failed to save API provider:', e);
-        showSnackbar('Could not save provider: ' + (e && e.message), 'error');
+        showSnackbar(t('Could not save provider: {error}', {error: String(e && e.message)}), 'error');
         return; // keep modal open with the user's input intact
     }
     if (renamingCurrent) {
@@ -2887,7 +2918,7 @@ async function saveApiProviderFromModal(originalName) {
     closeApiProviderModal();
     renderLlmEndpointsList(); // S8A-04: refresh the endpoints' "N models" tags
     renderApiProvidersList();
-    showSnackbar(originalName ? 'Provider updated' : 'Provider added', 'success');
+    showSnackbar(originalName ? t('Provider updated') : t('Provider added'), 'success');
 }
 
 function editApiProvider(providerName) {
@@ -2903,7 +2934,7 @@ function editApiProvider(providerName) {
 async function deleteApiProviderFromModal(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
-    if (await showConfirmModal('Delete Model', 'Delete model "' + escapeHtml(provider.name) + '"? This cannot be undone.', 'danger')) {
+    if (await showConfirmModal(t('Delete Model'), t('Delete model "{name}"? This cannot be undone.', { name: escapeHtml(provider.name) }), 'danger')) {
         closeApiProviderModal();
         await deleteApiProviderAndRefresh(providerName);
     }
@@ -2913,7 +2944,7 @@ async function confirmDeleteApiProvider(providerName) {
     var provider = apiProviders.find(function(p) { return p.name === providerName; });
     if (!provider) return;
     
-    if (await showConfirmModal('Delete Provider', 'Delete provider "' + escapeHtml(provider.name) + '"? This cannot be undone.', 'danger')) {
+    if (await showConfirmModal(t('Delete Provider'), t('Delete provider "{name}"? This cannot be undone.', { name: escapeHtml(provider.name) }), 'danger')) {
         await deleteApiProviderAndRefresh(providerName);
     }
 }
@@ -2927,7 +2958,7 @@ async function deleteApiProviderAndRefresh(providerName) {
         await deleteApiProvider(providerName);
     } catch (e) {
         console.error('Failed to delete API provider:', e);
-        showSnackbar('Could not delete provider: ' + ((e && e.message) || 'storage transaction failed'), 'error');
+        showSnackbar(t('Could not delete provider: {error}', {error: (e && e.message) || t('storage transaction failed')}), 'error');
         return;
     }
     // Only publish selection/UI changes after deleteApiProvider confirms commit.
@@ -2938,17 +2969,23 @@ async function deleteApiProviderAndRefresh(providerName) {
     renderLlmEndpointsList(); // S8A-04: refresh the endpoints' "N models" tags
     renderApiProvidersList();
     updateModelDisplay();
-    showSnackbar('Provider deleted', 'success');
+    showSnackbar(t('Provider deleted'), 'success');
 }
 
 // System Prompt Editor Functions
-function renderSystemPromptEditor() {
+// savedDraft: optional _systemPromptDraftState() result captured by a caller that has already
+// replaced the textarea (renderSettingsPage); without it the live textarea is read.
+function renderSystemPromptEditor(savedDraft) {
     var container = document.getElementById('system-prompt-editor-container');
     if (!container) return;
     
     var isEditing = systemPromptEditMode;
     var isCustom = hasCustomSystemPrompt();
     var template = getSystemPromptTemplate();
+    // A re-render while editing (a direct call, or a language switch -> refreshI18nViews ->
+    // renderSettingsPage) keeps the unsaved draft, its selection, scroll and focus instead of the saved template.
+    var draft = isEditing ? ((savedDraft && typeof savedDraft.value === 'string') ? savedDraft : _systemPromptDraftState(template)) : null;
+    if (draft) template = draft.value;
     var expandedPrompt = expandSystemPromptPlaceholders(template);
     var tokenCount = estimateTokens(expandedPrompt);
     
@@ -2964,16 +3001,16 @@ function renderSystemPromptEditor() {
         '<div class="system-prompt-toolbar">' +
             '<div class="system-prompt-toolbar-left">' +
                 (isEditing ? 
-                    '<span class="system-prompt-mode-badge editing">Editing Template</span>' :
-                    '<span class="system-prompt-mode-badge preview">Preview Mode</span>') +
-                (isCustom ? '<span class="system-prompt-custom-badge">Custom</span>' : '') +
+                    '<span class="system-prompt-mode-badge editing">' + t('Editing Template') + '</span>' :
+                    '<span class="system-prompt-mode-badge preview">' + t('Preview Mode') + '</span>') +
+                (isCustom ? '<span class="system-prompt-custom-badge">' + t('Custom') + '</span>' : '') +
             '</div>' +
             '<div class="system-prompt-toolbar-right">' +
                 (isEditing ?
-                    '<button class="skills-action-btn" onclick="cancelSystemPromptEdit()">' + UI_ICONS.close + ' Cancel</button>' +
-                    '<button class="skills-action-btn primary" onclick="saveSystemPromptEdit()">' + UI_ICONS.save + ' Save</button>' :
-                    (isCustom ? '<button class="skills-action-btn" onclick="revertSystemPromptToDefault()">' + UI_ICONS.refresh + ' Revert to Default</button>' : '') +
-                    '<button class="skills-action-btn primary" onclick="startSystemPromptEdit()">' + UI_ICONS.edit + ' Edit</button>') +
+                    '<button class="skills-action-btn" onclick="cancelSystemPromptEdit()">' + UI_ICONS.close + ' ' + t('Cancel') + '</button>' +
+                    '<button class="skills-action-btn primary" onclick="saveSystemPromptEdit()">' + UI_ICONS.save + ' ' + t('Save') + '</button>' :
+                    (isCustom ? '<button class="skills-action-btn" onclick="revertSystemPromptToDefault()">' + UI_ICONS.refresh + ' ' + t('Revert to Default') + '</button>' : '') +
+                    '<button class="skills-action-btn primary" onclick="startSystemPromptEdit()">' + UI_ICONS.edit + ' ' + t('Edit') + '</button>') +
             '</div>' +
         '</div>' +
         '<div class="system-prompt-content-wrapper">' +
@@ -2981,21 +3018,42 @@ function renderSystemPromptEditor() {
                 '<textarea id="system-prompt-textarea" class="system-prompt-textarea" oninput="updateSystemPromptTokenCount()">' + escapeHtml(template) + '</textarea>' :
                 '<pre class="system-prompt-preview">' + content + '</pre>') +
             '<div class="system-prompt-token-count">' +
-                '<span id="system-prompt-token-display">' + totalTokenCount.toLocaleString() + ' tokens</span>' +
-                '<span class="system-prompt-token-detail">(prompt: ' + tokenCount.toLocaleString() + ' + tools: ' + toolsTokenCount.toLocaleString() + ')</span>' +
+                '<span id="system-prompt-token-display">' + tn(totalTokenCount, '{count} token', '{count} tokens') + '</span>' +
+                '<span class="system-prompt-token-detail">' + t('(prompt: {prompt} + tools: {tools})', {prompt: i18nFormatNumber(tokenCount), tools: i18nFormatNumber(toolsTokenCount)}) + '</span>' +
             '</div>' +
         '</div>' +
         '<div class="system-prompt-placeholders-help">' +
-            '<strong>Available Placeholders:</strong> ' +
-            '<code>{{CURRENT_DATE}}</code> - Today\'s date, ' +
-            '<code>{{ORCHESTRATOR_POLICY}}</code> - Delegation policy (main chats only; empty for sub-agents), ' +
-            '<code>{{DISABLED_TOOLS}}</code> - List of disabled tools, ' +
-            '<code>{{SKILLS_SUMMARY}}</code> - Available skills list, ' +
-            '<code>{{TOOL_CATALOG}}</code> - Deferred-tool catalog (empty when deferred tool loading is off)' +
+            '<strong>' + t('Available Placeholders:') + '</strong> ' +
+            '<code>{{CURRENT_DATE}}</code> - ' + t("Today's date") + ', ' +
+            '<code>{{ORCHESTRATOR_POLICY}}</code> - ' + t('Delegation policy (main chats only; empty for sub-agents)') + ', ' +
+            '<code>{{DISABLED_TOOLS}}</code> - ' + t('List of disabled tools') + ', ' +
+            '<code>{{SKILLS_SUMMARY}}</code> - ' + t('Available skills list') + ', ' +
+            '<code>{{TOOL_CATALOG}}</code> - ' + t('Deferred-tool catalog (empty when deferred tool loading is off)') +
         '</div>' +
     '</div>';
     
     container.innerHTML = html;
+    if (draft) _restoreSystemPromptDraft(draft);
+}
+
+// Live #system-prompt-textarea state (value, selection, scroll, focus), or null when there is
+// no textarea yet or its value is still the saved template.
+function _systemPromptDraftState(savedTemplate) {
+    var ta = document.getElementById('system-prompt-textarea');
+    if (!ta || typeof ta.value !== 'string' || ta.value === savedTemplate) return null;
+    return { value: ta.value, start: ta.selectionStart, end: ta.selectionEnd, direction: ta.selectionDirection,
+        scrollTop: ta.scrollTop, focused: document.activeElement === ta };
+}
+
+function _restoreSystemPromptDraft(d) {
+    var ta = document.getElementById('system-prompt-textarea');
+    if (!ta || !d) return false;
+    try {
+        if (d.focused && typeof ta.focus === 'function') ta.focus();
+        if (typeof ta.setSelectionRange === 'function' && typeof d.start === 'number') ta.setSelectionRange(d.start, typeof d.end === 'number' ? d.end : d.start, d.direction || 'none');
+        if (typeof d.scrollTop === 'number') ta.scrollTop = d.scrollTop;
+    } catch (e) {}
+    return true;
 }
 
 function startSystemPromptEdit() {
@@ -3019,7 +3077,7 @@ async function saveSystemPromptEdit() {
     
     // Validate that the template is not empty
     if (!newTemplate.trim()) {
-        showSnackbar('System prompt cannot be empty', 'error');
+        showSnackbar(t('System prompt cannot be empty'), 'error');
         return;
     }
     
@@ -3027,17 +3085,17 @@ async function saveSystemPromptEdit() {
     await saveCustomSystemPrompt(newTemplate);
     systemPromptEditMode = false;
     renderSystemPromptEditor();
-    showSnackbar('System prompt saved', 'success');
+    showSnackbar(t('System prompt saved'), 'success');
 }
 
 async function revertSystemPromptToDefault() {
-    var confirmed = await showConfirmModal('Revert to Default', 'Are you sure you want to revert to the default system prompt? Your custom prompt will be deleted.');
+    var confirmed = await showConfirmModal(t('Revert to Default'), t('Are you sure you want to revert to the default system prompt? Your custom prompt will be deleted.'));
     if (!confirmed) return;
     
     await clearCustomSystemPrompt();
     systemPromptEditMode = false;
     renderSystemPromptEditor();
-    showSnackbar('Reverted to default system prompt', 'success');
+    showSnackbar(t('Reverted to default system prompt'), 'success');
 }
 
 // Settings toggle for deferred tool loading (core/030-config.js). Persists
@@ -3049,7 +3107,7 @@ async function toggleDeferredTools(enabled) {
         pushDeferredToolsSettingToOffscreen(!!enabled);
     }
     if (typeof showSnackbar === 'function') {
-        showSnackbar('Deferred tool loading ' + (enabled ? 'enabled' : 'disabled'), 'success');
+        showSnackbar(enabled ? t('Deferred tool loading enabled') : t('Deferred tool loading disabled'), 'success');
     }
 }
 
@@ -3061,7 +3119,7 @@ async function toggleP4Flag(name, enabled) {
         await saveP4Flag(name, !!enabled);
     }
     if (typeof showSnackbar === 'function') {
-        showSnackbar(String(name) + ' ' + (enabled ? 'enabled' : 'disabled'), 'success');
+        showSnackbar(enabled ? t('{name} enabled', {name: String(name)}) : t('{name} disabled', {name: String(name)}), 'success');
     }
 }
 
@@ -3080,9 +3138,9 @@ function updateSystemPromptTokenCount() {
     var toolsTokenCount = estimateTokens(toolsJson);
     var totalTokenCount = tokenCount + toolsTokenCount;
     
-    tokenDisplay.textContent = totalTokenCount.toLocaleString() + ' tokens';
+    tokenDisplay.textContent = tn(totalTokenCount, '{count} token', '{count} tokens');
     if (detailDisplay) {
-        detailDisplay.textContent = '(prompt: ' + tokenCount.toLocaleString() + ' + tools: ' + toolsTokenCount.toLocaleString() + ')';
+        detailDisplay.textContent = t('(prompt: {prompt} + tools: {tools})', {prompt: i18nFormatNumber(tokenCount), tools: i18nFormatNumber(toolsTokenCount)});
     }
 }
 
@@ -3112,13 +3170,13 @@ function renderSettingsToolPermissions() {
 
     // Reset link (only when non-default)
     if (hasNonDefaultPermissions()) {
-        html += '<div style="text-align:right;margin-bottom:var(--space-4);">';
-        html += '<a href="#" onclick="event.preventDefault(); resetAllPermissionsToDefaults()" style="font-size:var(--text-caption);color:var(--text-muted);text-decoration:underline;">Reset to defaults</a>';
+        html += '<div style="text-align:end;margin-bottom:var(--space-4);">';
+        html += '<a href="#" onclick="event.preventDefault(); resetAllPermissionsToDefaults()" style="font-size:var(--text-caption);color:var(--text-muted);text-decoration:underline;">' + t('Reset to defaults') + '</a>';
         html += '</div>';
     }
 
     // --- Instance section ---
-    var instanceTitle = host ? host.split('.')[0] : 'No instance connected';
+    var instanceTitle = host ? host.split('.')[0] : t('No instance connected');
     var disabledClass = host ? '' : ' disabled';
 
     html += '<div class="tool-permission-section' + disabledClass + '">';
@@ -3131,9 +3189,9 @@ function renderSettingsToolPermissions() {
 
     if (host) {
         html += '<div class="tool-permission-group">';
-        html += '<div class="tool-permission-group-title">ServiceNow API ' + _toolSourceBtn('servicenow_api') + ' ' + _toolSourceBtn('servicenow_diff_edit') + ' ' + _toolSourceBtn('servicenow_run_script') + '</div>';
+        html += '<div class="tool-permission-group-title">' + t('ServiceNow API') + ' ' + _toolSourceBtn('servicenow_api') + ' ' + _toolSourceBtn('servicenow_diff_edit') + ' ' + _toolSourceBtn('servicenow_run_script') + '</div>';
         _snPermissionKeys().forEach(function(key) {
-            var displayName = TOOL_DISPLAY_NAMES[key] || key;
+            var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
             var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
             html += '<div class="tool-permission-item tool-permission-subitem' + (isAutoTier ? ' tier-auto' : '') + '">' +
                 '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -3143,9 +3201,9 @@ function renderSettingsToolPermissions() {
         html += '</div>';
 
         html += '<div class="tool-permission-group">';
-        html += '<div class="tool-permission-group-title">Browser ' + _toolSourceBtn('iframe_tool') + '</div>';
+        html += '<div class="tool-permission-group-title">' + t('Browser') + ' ' + _toolSourceBtn('iframe_tool') + '</div>';
         INSTANCE_PERMISSION_KEYS.filter(function(k) { return k.startsWith('browser:'); }).forEach(function(key) {
-            var displayName = TOOL_DISPLAY_NAMES[key] || key;
+            var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
             var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
             html += '<div class="tool-permission-item tool-permission-subitem' + (isAutoTier ? ' tier-auto' : '') + '">' +
                 '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -3159,7 +3217,7 @@ function renderSettingsToolPermissions() {
     // --- Global section ---
     html += '<div class="tool-permission-section">';
     html += '<div class="tool-permission-section-header">';
-    html += '<span class="tool-permission-section-title">' + UI_ICONS.tool + ' Global Tools</span>';
+    html += '<span class="tool-permission-section-title">' + UI_ICONS.tool + ' ' + t('Global Tools') + '</span>';
     html += '</div>';
 
     var manageSkillKeys = GLOBAL_PERMISSION_KEYS.filter(function(k) { return k.startsWith('manage_skill:'); });
@@ -3170,10 +3228,10 @@ function renderSettingsToolPermissions() {
     });
 
     otherGlobalKeys.forEach(function(key) {
-        var displayName = TOOL_DISPLAY_NAMES[key] || key;
+        var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
         // For ungrouped global keys, the permission key IS the tool name, so we can show a source link.
-        var hasTool = TOOLS.some(function(t) { return t.function.name === key; });
+        var hasTool = TOOLS.some(function(tool) { return tool.function.name === key; });
         html += '<div class="tool-permission-item">' +
             '<span class="tool-permission-name">' + displayName + (hasTool ? ' ' + _toolSourceBtn(key) : '') + '</span>' +
             '<div class="tool-permission-control" id="' + containerId + '"></div>' +
@@ -3181,9 +3239,9 @@ function renderSettingsToolPermissions() {
     });
 
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Manage Agent Skill ' + _toolSourceBtn('manage_skill') + '</div>';
+    html += '<div class="tool-permission-group-title">' + t('Manage Agent Skill') + ' ' + _toolSourceBtn('manage_skill') + '</div>';
     manageSkillKeys.forEach(function(key) {
-        var displayName = TOOL_DISPLAY_NAMES[key] || key;
+        var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
         html += '<div class="tool-permission-item tool-permission-subitem">' +
             '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -3193,9 +3251,9 @@ function renderSettingsToolPermissions() {
     html += '</div>';
 
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Workspace ' + _toolSourceBtn('workspace') + '</div>';
+    html += '<div class="tool-permission-group-title">' + t('Workspace') + ' ' + _toolSourceBtn('workspace') + '</div>';
     workspaceKeys.forEach(function(key) {
-        var displayName = TOOL_DISPLAY_NAMES[key] || key;
+        var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
         html += '<div class="tool-permission-item tool-permission-subitem">' +
             '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -3205,9 +3263,9 @@ function renderSettingsToolPermissions() {
     html += '</div>';
 
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Smart Document ' + _toolSourceBtn('document') + '</div>';
+    html += '<div class="tool-permission-group-title">' + t('Smart Document') + ' ' + _toolSourceBtn('document') + '</div>';
     documentKeys.forEach(function(key) {
-        var displayName = TOOL_DISPLAY_NAMES[key] || key;
+        var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
         html += '<div class="tool-permission-item tool-permission-subitem">' +
             '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -3226,7 +3284,7 @@ function renderSettingsToolPermissions() {
         if (toolNames.length > 0) {
             var skillName = skill ? (skill.name || skill.id) : skillId;
             html += '<div class="tool-permission-group">';
-            html += '<div class="tool-permission-group-title">Skill: ' + escapeHtml(skillName) + '</div>';
+            html += '<div class="tool-permission-group-title">' + t('Skill: {name}', {name: escapeHtml(skillName)}) + '</div>';
             toolNames.forEach(function(toolName) {
                 var permKey = 'skill:' + toolName;
                 var containerId = 'settings-perm-' + permKey.replace(/[^a-zA-Z0-9]/g, '-');

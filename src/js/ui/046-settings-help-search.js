@@ -23,7 +23,7 @@ function _pageSearchEmptyState(host, show, q, hint) {
     }
     var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.search) ? UI_ICONS.search : '';
     var safe = typeof escapeHtml === 'function' ? escapeHtml(q) : String(q).replace(/[&<>"']/g, '');
-    el.innerHTML = '<span class="skills-empty-icon">' + icon + '</span><p>Nothing matches \u201c' + safe + '\u201d</p><p class="skills-empty-hint">' + hint + '</p>';
+    el.innerHTML = '<span class="skills-empty-icon">' + icon + '</span><p>' + t('Nothing matches \u201c{query}\u201d', { query: safe }) + '</p><p class="skills-empty-hint">' + hint + '</p>';
 }
 
 function _pageSearchSetCount(slot, text) {
@@ -51,7 +51,7 @@ function filterSettingsPage(root, query) {
         _pageSearchHide(sec, !visible);
         if (visible) shown++;
     });
-    _pageSearchEmptyState(root, !!q && sections.length > 0 && shown === 0, q, 'Search looks at section titles, setting names and descriptions.');
+    _pageSearchEmptyState(root, !!q && sections.length > 0 && shown === 0, q, t('Search looks at section titles, setting names and descriptions.'));
     return { shown: shown, total: sections.length };
 }
 
@@ -59,7 +59,7 @@ function applySettingsPageSearch() {
     var root = document.getElementById('settings-page-content');
     var res = filterSettingsPage(root, settingsPageSearchState.query);
     _pageSearchSetCount(document.getElementById('settings-toolbar-slot'),
-        settingsPageSearchState.query ? res.shown + ' of ' + res.total : res.total + (res.total === 1 ? ' section' : ' sections'));
+        settingsPageSearchState.query ? t('{shown} of {total}', { shown: res.shown, total: res.total }) : tn(res.total, '{count} section', '{count} sections'));
     return res;
 }
 
@@ -103,14 +103,14 @@ function filterDocsPage(root, query) {
         var id = a.getAttribute('data-docs-anchor');
         _pageSearchHide(a, !!q && id in vis && !vis[id]);
     });
-    _pageSearchEmptyState(main, !!q && sections.length > 0 && shown === 0, q, 'Search looks at help topic titles and text.');
+    _pageSearchEmptyState(main, !!q && sections.length > 0 && shown === 0, q, t('Search looks at help topic titles and text.'));
     return { shown: shown, total: sections.length };
 }
 
 function applyDocsPageSearch() {
     var res = filterDocsPage(document.getElementById('docs-content'), docsPageSearchState.query);
     _pageSearchSetCount(document.getElementById('docs-toolbar-slot'),
-        docsPageSearchState.query ? res.shown + ' of ' + res.total : res.total + (res.total === 1 ? ' topic' : ' topics'));
+        docsPageSearchState.query ? t('{shown} of {total}', { shown: res.shown, total: res.total }) : tn(res.total, '{count} topic', '{count} topics'));
     return res;
 }
 
@@ -123,11 +123,22 @@ function docsOnSearchInput(value) {
     }, PAGE_SEARCH_DEBOUNCE_MS);
 }
 
-// Fill a page's toolbar slot once (search + count), like Skills/Documents.
+// Fill a page's toolbar slot once (search + count), like Skills/Documents. Later calls
+// (re-render, language switch) only relabel it in place: placeholder, aria-label and the
+// Rows/Gallery labels follow the language; the typed query, focus and count are kept.
 function ensurePageSearchToolbar(slotId, opts) {
     var slot = document.getElementById(slotId);
-    if (slot && !slot.firstChild && typeof pageToolbarControlsHtml === 'function') {
-        slot.innerHTML = pageToolbarControlsHtml(opts);
+    if (!slot) return slot;
+    if (!slot.firstChild) {
+        if (typeof pageToolbarControlsHtml === 'function') slot.innerHTML = pageToolbarControlsHtml(opts);
+        return slot;
     }
+    var o = opts || {}, input = slot.querySelector('input[type=search]');
+    if (input) {
+        if (o.placeholder !== null && o.placeholder !== undefined) input.setAttribute('placeholder', String(o.placeholder));
+        var label = o.label || o.placeholder;
+        if (label !== null && label !== undefined) input.setAttribute('aria-label', String(label));
+    }
+    if (typeof pageLayoutRelabel === 'function') pageLayoutRelabel(slot);
     return slot;
 }

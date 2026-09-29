@@ -58,12 +58,10 @@ function formatJsonValue(value, indent) {
             var firstLine = valueLines[0];
             if (firstLine.length > 80) firstLine = firstLine.substring(0, 77) + '...';
             var preview = escapeHtml(firstLine);
-            if (lineCount > 2) {
-                preview += '<span class="json-preview"> +' + (lineCount - 1) + ' lines</span>';
-            } else if (lineCount === 2) {
-                preview += '<span class="json-preview"> +1 line</span>';
+            if (lineCount >= 2) {
+                preview += '<span class="json-preview"> ' + tn(lineCount - 1, '+{count} line', '+{count} lines') + '</span>';
             }
-            return '<span class="json-collapse" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
+            return '<span class="json-collapse" role="button" tabindex="0" data-kbd-click aria-expanded="true" aria-controls="' + collapseId + '" aria-label="' + escapeHtml(t('Expand/Collapse')) + '" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
                 '<span id="' + collapseId + '" class="json-collapsible json-str">' + escaped + '</span>' +
                 '<span id="' + collapseId + '-collapsed" class="json-collapsed json-str" style="display:none">' + preview + '</span>';
         }
@@ -76,9 +74,9 @@ function formatJsonValue(value, indent) {
         var items = value.map(function(item, idx) {
             return nextIndent + formatJsonValue(item, indent + 1) + (idx < value.length - 1 ? ',' : '');
         }).join('\n');
-        return '<span class="json-collapse" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
+        return '<span class="json-collapse" role="button" tabindex="0" data-kbd-click aria-expanded="true" aria-controls="' + collapseId + '" aria-label="' + escapeHtml(t('Expand/Collapse')) + '" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
             '<span id="' + collapseId + '" class="json-collapsible">[\n' + items + '\n' + indentStr + ']</span>' +
-            '<span id="' + collapseId + '-collapsed" class="json-collapsed" style="display:none">[<span class="json-preview">' + value.length + ' items</span>]</span>';
+            '<span id="' + collapseId + '-collapsed" class="json-collapsed" style="display:none">[<span class="json-preview">' + tn(value.length, '{count} item', '{count} items') + '</span>]</span>';
     }
     
     if (typeof value === 'object') {
@@ -89,9 +87,9 @@ function formatJsonValue(value, indent) {
         }).join('\n');
         // Add collapse button for all objects
         var collapseId = 'json-obj-' + Math.random().toString(36).substr(2, 9);
-        return '<span class="json-collapse" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
+        return '<span class="json-collapse" role="button" tabindex="0" data-kbd-click aria-expanded="true" aria-controls="' + collapseId + '" aria-label="' + escapeHtml(t('Expand/Collapse')) + '" onclick="toggleJsonCollapse(\'' + collapseId + '\', event)">−</span>' +
             '<span id="' + collapseId + '" class="json-collapsible">{\n' + entries + '\n' + indentStr + '}</span>' +
-            '<span id="' + collapseId + '-collapsed" class="json-collapsed" style="display:none">{<span class="json-preview">' + keys.length + ' keys</span>}</span>';
+            '<span id="' + collapseId + '-collapsed" class="json-collapsed" style="display:none">{<span class="json-preview">' + tn(keys.length, '{count} key', '{count} keys') + '</span>}</span>';
     }
     
     return String(value);
@@ -105,14 +103,17 @@ function toggleJsonCollapse(id, event) {
     var btn = event.target;
     if (!expanded || !collapsed) return;
     
+    var canAria = !!(btn && typeof btn.setAttribute === 'function');
     if (expanded.style.display === 'none') {
         expanded.style.display = 'inline';
         collapsed.style.display = 'none';
-        btn.textContent = '−';
+        if (btn) btn.textContent = '−';
+        if (canAria) btn.setAttribute('aria-expanded', 'true');
     } else {
         expanded.style.display = 'none';
         collapsed.style.display = 'inline';
-        btn.textContent = '+';
+        if (btn) btn.textContent = '+';
+        if (canAria) btn.setAttribute('aria-expanded', 'false');
     }
 }
 
@@ -155,7 +156,7 @@ function toggleToolExpand(btn, event) {
             }
         }
         btn.textContent = '⤢';
-        btn.title = 'Expand';
+        btn.title = t('Expand');
     } else {
         pre.classList.add('expanded');
         if (details) {
@@ -164,7 +165,7 @@ function toggleToolExpand(btn, event) {
             setupStickyObserver(details);
         }
         btn.textContent = '⤡';
-        btn.title = 'Collapse';
+        btn.title = t('Collapse');
     }
     
     // Save expanded state to message data

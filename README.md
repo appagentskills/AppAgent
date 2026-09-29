@@ -36,7 +36,9 @@ Please fill this form and we will reach out: [Contact Us Form](https://forms.gle
 | **Workspaces** | Per-chat file scratchpad — clone GitHub repos, read, write, edit, diff, and switch branches. Multi-repo per chat, with cross-chat ownership protection |
 | **Integrated Git & GitHub Push** | The Agent can pull from / push to GitHub, raise branches, and open pull requests directly from the chat — no terminal, no IDE |
 | **Smart Documents** | Persistent, versioned markdown the Agent can edit and reference across chats |
-| **Multi-Instance** | Connect multiple ServiceNow instances; the Agent can see and act on all of them from one chat |
+| **Multi-Instance** | Auto-detects every ServiceNow instance open in your browser; the Agent can see and act on all of them from one chat |
+| **Sub-Agents** | Delegates heavy or parallel work to background worker agents that report back to the main chat |
+| **25 Languages** | Interface and help in English plus 24 languages, including right-to-left Arabic and Hebrew |
 | **Pause & Interrupt** | Pause or send a new message mid-stream — the in-flight call aborts immediately |
 | **Web Search** | Free, keyless web lookups via Google and DuckDuckGo |
 | **Mechanical Undo** | Every change tracked, one-click rollback |
@@ -74,7 +76,7 @@ AppAgent is a Chrome extension with a built-in agent loop. You describe what you
 | **Browser control for testing** | ✓ | ✗ | ✗ | ✗ |
 | **Takes screenshots** | ✓ | ✗ | ✗ | ✗ |
 | **Background tasks** | ✓ (via Skill Actions) | ✗ | ✓ | ✗ |
-| **Parallel agents** | Roadmap | ✗ | ✓ | ✗ |
+| **Parallel agents** | ✓ (Sub-Agents) | ✗ | ✓ | ✗ |
 | **Mechanical undo** | ✓ | ✗ | ✗ | ✗ |
 | **Images & PDFs** | ✓ | ✓ | ✓ | Limited |
 | **Smart Dashboards** | ✓ | ✗ | ✗ | ✓ |
@@ -101,8 +103,8 @@ AppAgent is a Chrome extension with a built-in agent loop. You describe what you
 
 1. **Install** — Install the AppAgent extension from the Chrome Web Store (or load unpacked for development)
 2. **Get an API Key** — Sign up at [OpenRouter](https://openrouter.ai), use Anthropic/OpenAI directly, or connect your Claude Code subscription (Enterprise or Personal)
-3. **Configure** — Open the extension, paste your API key in Settings
-4. **Start Building** — Navigate to your ServiceNow instance and start chatting
+3. **Configure** — Open the extension and add your API key (or sign in with Claude) in Settings → API Providers
+4. **Start Building** — Open your ServiceNow instance in a tab (it is detected automatically) and start chatting
 
 ## Examples
 
@@ -149,7 +151,6 @@ Opus 4.7 => ... (we are still testing)
 
 ## Roadmap
 
-- Parallel agents
 - RAG
 - Specs and test cases
 

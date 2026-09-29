@@ -29,14 +29,14 @@ function appendPendingImageForContext(contextKey, attachment) {
     if (contextKey !== 'home' && (!chats[contextKey] || chats[contextKey]._deleted)) {
         // The origin chat vanished while the file was being read: the upload
         // has nowhere to land. Say so instead of silently dropping it.
-        if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" was dropped: its chat was deleted', 'warning');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Attachment "{name}" was dropped: its chat was deleted', { name: (attachment && attachment.name) || t('file') }), 'warning');
         return;
     }
     var list = getPendingImagesOwnerContext() === contextKey ? pendingImageAttachments : (chatPendingImages[contextKey] || []);
     var total = _attachmentChars(attachment);
     for (var i = 0; i < list.length; i++) total += _attachmentChars(list[i]);
     if (total > MAX_PENDING_ATTACHMENT_CHARS) {
-        if (typeof showSnackbar === 'function') showSnackbar('Attachment "' + ((attachment && attachment.name) || 'file') + '" skipped: attachments would exceed ~30 MB', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Attachment "{name}" skipped: attachments would exceed ~30 MB', { name: (attachment && attachment.name) || t('file') }), 'error');
         return;
     }
     // Compare against the context that OWNS the live list, not the visible view:
@@ -60,7 +60,7 @@ function processImageFile(file) {
     // views (dashboard, skills, settings, docs, history, documents) the file
     // would land in a hidden draft, and with no chat it was reported as "deleted".
     if ((currentView !== 'chat' && currentView !== 'home') || originContext === 'none') {
-        if (typeof showSnackbar === 'function') showSnackbar('Open a chat or Home to attach "' + ((file && file.name) || 'file') + '"', 'info');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Open a chat or Home to attach "{name}"', { name: (file && file.name) || t('file') }), 'info');
         return;
     }
     // Handle PDF files
@@ -70,7 +70,7 @@ function processImageFile(file) {
         // (unlike images), and the old 25MB cap let a ~33MB payload through —
         // over the provider's ~32MB request limit, so it failed at send time.
         if (file.size > 10 * 1024 * 1024) {
-            showSnackbar('PDF too large (max 10MB)', 'error');
+            showSnackbar(t('PDF too large (max 10MB)'), 'error');
             return;
         }
 
@@ -78,7 +78,7 @@ function processImageFile(file) {
         // A read failure (permission revoked, file moved, I/O error) never
         // fires onload — surface it instead of silently dropping the attachment.
         reader.onerror = function() {
-            showSnackbar('Could not read PDF', 'error');
+            showSnackbar(t('Could not read PDF'), 'error');
         };
         reader.onload = function(e) {
             var name = file.name || 'document.pdf';
@@ -103,13 +103,13 @@ function processImageFile(file) {
 
     if (isTextFile) {
         if (file.size > 10 * 1024 * 1024) {
-            showSnackbar('File too large (max 10MB)', 'error');
+            showSnackbar(t('File too large (max 10MB)'), 'error');
             return;
         }
 
         var reader = new FileReader();
         reader.onerror = function() {
-            showSnackbar('Could not read file', 'error');
+            showSnackbar(t('Could not read file'), 'error');
         };
         reader.onload = function(e) {
             var name = file.name || 'file';
@@ -130,13 +130,13 @@ function processImageFile(file) {
 
     // Handle image files
     if (!file.type.startsWith('image/')) {
-        showSnackbar('Unsupported file type. Use image, PDF, or text files.', 'error');
+        showSnackbar(t('Unsupported file type. Use image, PDF, or text files.'), 'error');
         return;
     }
 
     // Limit file size to 10MB
     if (file.size > 10 * 1024 * 1024) {
-        showSnackbar('Image too large (max 10MB)', 'error');
+        showSnackbar(t('Image too large (max 10MB)'), 'error');
         return;
     }
 
@@ -182,19 +182,19 @@ function processImageFile(file) {
                 });
             }).catch(function() {
                 // Bug-sweep F8: surface compression failures instead of dropping silently.
-                showSnackbar('Could not read image', 'error');
+                showSnackbar(t('Could not read image'), 'error');
             });
         };
         // Bug-sweep F8: a corrupt / unsupported image never fires onload.
         img.onerror = function() {
-            showSnackbar('Could not read image', 'error');
+            showSnackbar(t('Could not read image'), 'error');
         };
         img.src = e.target.result;
     };
     // Same as the PDF/text readers: a FileReader failure never reaches
     // img.onerror, so it needs its own handler.
     reader.onerror = function() {
-        showSnackbar('Could not read image', 'error');
+        showSnackbar(t('Could not read image'), 'error');
     };
     reader.readAsDataURL(file);
 }
@@ -234,8 +234,8 @@ var DROP_OVERLAY_HEARTBEAT_MS = 1000, _dropHb = null;
 // (e.g. dashboard) drags keep their native behavior: no preventDefault,
 // no overlay, no depth change.
 function isFileDrag(e) {
-    var t = e && e.dataTransfer && e.dataTransfer.types;
-    return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
+    var types = e && e.dataTransfer && e.dataTransfer.types;
+    return !!types && Array.prototype.indexOf.call(types, 'Files') >= 0;
 }
 
 function resetDropOverlay() {
@@ -312,31 +312,32 @@ function renderPendingImages() {
 
     // Build the HTML once
     var html = '';
+    var removeLabel = escapeHtml(t('Remove'));
     if (pendingImageAttachments.length > 0) {
         pendingImageAttachments.forEach(function(img, idx) {
             if (img.fileType === 'document') {
-                html += '<div class="pending-image-item pending-file-item" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">DOC</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'pdf') {
-                html += '<div class="pending-image-item pending-pdf-item" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-pdf-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-pdf-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-pdf-label">PDF</span></div>';
                 html += '<div class="pending-pdf-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'file') {
                 var fileExt = (img.name || '').split('.').pop().toUpperCase();
-                html += '<div class="pending-image-item pending-file-item" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">' + escapeHtml(fileExt) + '</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else {
-                html += '<div class="pending-image-item" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
                 html += '<img src="' + escapeHtml(img.base64) + '" alt="' + escapeHtml(img.name) + '" />';
-                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="Remove" aria-label="Remove">×</button>';
+                html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             }
         });
@@ -345,11 +346,11 @@ function renderPendingImages() {
         var fileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
         var docCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; }).length; // Bug-sweep F6
         var parts = [];
-        if (imageCount > 0) parts.push(imageCount + ' image' + (imageCount > 1 ? 's' : ''));
-        if (pdfCount > 0) parts.push(pdfCount + ' PDF' + (pdfCount > 1 ? 's' : ''));
-        if (fileCount > 0) parts.push(fileCount + ' file' + (fileCount > 1 ? 's' : ''));
-        if (docCount > 0) parts.push(docCount + ' document' + (docCount > 1 ? 's' : ''));
-        html += '<div class="pending-images-hint">' + parts.join(', ') + ' attached. Click to preview, or × to remove.</div>';
+        if (imageCount > 0) parts.push(tn(imageCount, '{count} image', '{count} images'));
+        if (pdfCount > 0) parts.push(tn(pdfCount, '{count} PDF', '{count} PDFs'));
+        if (fileCount > 0) parts.push(tn(fileCount, '{count} file', '{count} files'));
+        if (docCount > 0) parts.push(tn(docCount, '{count} document', '{count} documents'));
+        html += '<div class="pending-images-hint">' + t('{items} attached. Click to preview, or × to remove.', { items: parts.join(', ') }) + '</div>';
     }
 
     // Update both containers
@@ -390,7 +391,7 @@ function viewPendingImage(index) {
         if (img.sdocId && typeof sdocOpenPreview === 'function' && typeof smartDocuments !== 'undefined' && smartDocuments[img.sdocId]) {
             sdocOpenPreview(img.sdocId);
         } else {
-            showSnackbar('Document is no longer available', 'warning');
+            showSnackbar(t('Document is no longer available'), 'warning');
         }
     } else if (img.fileType === 'pdf') {
         openPdfModal(img.base64, img.name);
@@ -416,14 +417,14 @@ function openPdfModal(base64, title, msgIndex) {
         if (chat && chat.messages) {
             var annotations = findPdfAnnotations(chat.messages, msgIndex);
             if (annotations) {
-                headerHtml += '<button class="modal-close-icon" onclick="viewPdfAnnotations(' + msgIndex + ')" title="View parsed content">' + UI_ICONS.file + '</button>';
+                headerHtml += '<button class="modal-close-icon" onclick="viewPdfAnnotations(' + msgIndex + ')" title="' + escapeHtml(t('View parsed content')) + '">' + UI_ICONS.file + '</button>';
             }
         }
     }
-    headerHtml += '<button class="modal-close-icon" onclick="downloadPdfFromModal()" title="Download">' + UI_ICONS.download + '</button>';
-    headerHtml += '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    headerHtml += '<button class="modal-close-icon" onclick="downloadPdfFromModal()" title="' + escapeHtml(t('Download')) + '">' + UI_ICONS.download + '</button>';
+    headerHtml += '<button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
     header.innerHTML = headerHtml;
-    body.innerHTML = '<iframe src="' + escapeAttr(base64) + '" style="width:100%;height:100%;border:none;" title="PDF Preview"></iframe>';
+    body.innerHTML = '<iframe src="' + escapeAttr(base64) + '" style="width:100%;height:100%;border:none;" title="' + escapeHtml(t('PDF Preview')) + '"></iframe>';
     actions.innerHTML = '';
 
     // Store base64 for download
@@ -462,7 +463,7 @@ function viewPdfAnnotations(msgIndex) {
     if (!chat || !chat.messages) return;
     var annotations = findPdfAnnotations(chat.messages, msgIndex);
     if (!annotations) {
-        showSnackbar('No parsed content available for this PDF', 'info');
+        showSnackbar(t('No parsed content available for this PDF'), 'info');
         return;
     }
 
@@ -471,11 +472,11 @@ function viewPdfAnnotations(msgIndex) {
     var body = document.getElementById('modal-body');
     var actions = document.getElementById('modal-actions');
     var pdfMsg = chat.messages[msgIndex];
-    var pdfTitle = pdfMsg.name || pdfMsg.description || 'Document';
+    var pdfTitle = pdfMsg.name || pdfMsg.description || t('Document');
 
     overlay.classList.remove('pdf-modal');
     overlay.classList.add('screenshot-modal');
-    header.innerHTML = '<span class="modal-title-text">Parsed: ' + escapeHtml(pdfTitle) + '</span><div class="modal-header-actions"><button class="modal-close-icon" onclick="openPdfFromMessage(' + msgIndex + ')" title="Back to PDF">' + UI_ICONS.eye + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    header.innerHTML = '<span class="modal-title-text">' + t('Parsed: {title}', { title: escapeHtml(pdfTitle) }) + '</span><div class="modal-header-actions"><button class="modal-close-icon" onclick="openPdfFromMessage(' + msgIndex + ')" title="' + escapeHtml(t('Back to PDF')) + '">' + UI_ICONS.eye + '</button><button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
 
     var contentHtml = '<div class="pdf-annotations-content">';
     annotations.forEach(function(ann) {
@@ -484,14 +485,14 @@ function viewPdfAnnotations(msgIndex) {
                 contentHtml += '<div class="pdf-ann-filename">' + escapeHtml(ann.file.name) + '</div>';
             }
             if (ann.file.hash) {
-                contentHtml += '<div class="pdf-ann-hash">Hash: <code>' + escapeHtml(ann.file.hash) + '</code></div>';
+                contentHtml += '<div class="pdf-ann-hash">' + escapeHtml(t('Hash:')) + ' <code>' + escapeHtml(ann.file.hash) + '</code></div>';
             }
             if (ann.file.content && ann.file.content.length > 0) {
                 ann.file.content.forEach(function(part) {
                     if (part.type === 'text') {
                         contentHtml += '<div class="pdf-ann-text">' + escapeHtml(part.text).replace(/\n/g, '<br>') + '</div>';
                     } else if (part.type === 'image_url' && part.image_url) {
-                        contentHtml += '<div class="pdf-ann-image"><img src="' + escapeAttr(part.image_url.url || '') + '" alt="Parsed image" /></div>';
+                        contentHtml += '<div class="pdf-ann-image"><img src="' + escapeAttr(part.image_url.url || '') + '" alt="' + escapeHtml(t('Parsed image')) + '" /></div>';
                     }
                 });
             }
@@ -524,7 +525,7 @@ function openFileModal(content, title, mimeType) {
     var actions = document.getElementById('modal-actions');
 
     overlay.classList.add('file-modal');
-    header.innerHTML = '<span class="modal-title-text">' + escapeHtml(title || 'File') + '</span><div class="modal-header-actions"><button class="modal-close-icon" onclick="downloadTextFile()" title="Download">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    header.innerHTML = '<span class="modal-title-text">' + escapeHtml(title || t('File')) + '</span><div class="modal-header-actions"><button class="modal-close-icon" onclick="downloadTextFile()" title="' + escapeHtml(t('Download')) + '">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
     body.innerHTML = '<pre style="white-space:pre-wrap;word-wrap:break-word;margin:0;padding: var(--space-8);font-family:var(--font-mono);font-size:var(--text-body-sm);line-height:var(--leading-relaxed);overflow:auto;height:100%;background:var(--secondary-lighter);">' + escapeHtml(content) + '</pre>';
     actions.innerHTML = '';
 
@@ -555,7 +556,7 @@ function openFileFromMessage(msgIndex) {
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     if (msg.role !== 'file' || !msg.content) return;
-    openFileModal(msg.content, msg.name || 'File', msg.mimeType);
+    openFileModal(msg.content, msg.name || t('File'), msg.mimeType);
 }
 
 // Open PDF preview from a chat message by index
@@ -564,7 +565,7 @@ function openPdfFromMessage(msgIndex) {
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     if (msg.role !== 'pdf' || !msg.base64) return;
-    openPdfModal(msg.base64, msg.name || msg.description || 'Document', msgIndex);
+    openPdfModal(msg.base64, msg.name || msg.description || t('Document'), msgIndex);
 }
 
 // Clear all pending images
@@ -635,14 +636,14 @@ function savePendingTextForContext(contextKey) {
 
 // A6A3-02: the static #message-input placeholder (= src/html/body.html:136). A transient hint
 // (e.g. openAddWidgetModal's) must not stick as every chat's placeholder.
-var DEFAULT_COMPOSER_PLACEHOLDER = 'Send a message...';
+var DEFAULT_COMPOSER_PLACEHOLDER = N_('Send a message...');
 
 function restorePendingTextForContext(contextKey) {
     var inputId = contextKey === 'home' ? 'home-message-input' : 'message-input';
     var input = document.getElementById(inputId);
     if (input) {
         input.value = chatPendingTexts[contextKey] || '';
-        if (inputId === 'message-input') input.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? DEFAULT_COMPOSER_PLACEHOLDER : 'Send a message...';
+        if (inputId === 'message-input') input.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? t(DEFAULT_COMPOSER_PLACEHOLDER) : t('Send a message...');
         autoResizeTextarea(input);
     }
 }
@@ -798,7 +799,7 @@ function editMessage(msgIndex) {
     persistPendingTextsToStorage();
     document.getElementById('message-input').focus();
 
-    showSnackbar('Editing message - modify and send to branch', 'success');
+    showSnackbar(t('Editing message - modify and send to branch'), 'success');
 }
 
 window.onload = init;

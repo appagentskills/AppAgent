@@ -33,7 +33,7 @@
     font-weight: var(--font-normal);
     color: var(--text-muted);
     font-size: var(--text-caption);
-    margin-left: var(--space-2);
+    margin-inline-start: var(--space-2);
 }
 
 .skill-actions-add-btn {
@@ -418,7 +418,7 @@
 .action-btn-badge {
     position: absolute;
     top: -3px;
-    right: -3px;
+    inset-inline-end: -3px;
     width: 12px;
     height: 12px;
     display: inline-flex;
@@ -719,14 +719,14 @@
 .action-updates-list {
     list-style: none;
     margin: 0;
-    padding: var(--space-5) var(--space-5) var(--space-5) var(--space-8);
+    padding-block: var(--space-5); padding-inline: var(--space-8) var(--space-5);
     position: relative;
 }
 /* Connecting vertical track between dots */
 .action-updates-list::before {
     content: "";
     position: absolute;
-    left: calc(var(--space-8) + 4px);
+    inset-inline-start: calc(var(--space-8) + 4px);
     top: var(--space-6);
     bottom: var(--space-6);
     width: 1px;
@@ -735,12 +735,12 @@
 
 .action-update {
     position: relative;
-    padding: var(--space-3) 0 var(--space-3) var(--space-6);
+    padding-block: var(--space-3); padding-inline: var(--space-6) 0;
     min-height: 28px;
 }
 .action-update-dot {
     position: absolute;
-    left: -3px;
+    inset-inline-start: -3px;
     top: var(--space-4);
     width: 11px;
     height: 11px;
@@ -771,7 +771,7 @@
 .action-update-icon .ui-icon { width: 13px; height: 13px; }
 .action-update-label { font-weight: var(--font-semibold); color: var(--text-primary); }
 .action-update-state {
-    margin-left: auto;
+    margin-inline-start: auto;
     font-size: var(--text-caption);
     padding: 1px var(--space-3);
     border-radius: var(--radius-sm);
@@ -907,13 +907,13 @@
 .action-update-history-list {
     list-style: none;
     margin: 0;
-    padding: 0 var(--space-7) var(--space-4) var(--space-8);
+    padding-block: 0 var(--space-4); padding-inline: var(--space-8) var(--space-7);
     position: relative;
 }
 .action-update-history-list::before {
     content: "";
     position: absolute;
-    left: calc(var(--space-8) + 4px);
+    inset-inline-start: calc(var(--space-8) + 4px);
     top: 4px;
     bottom: 4px;
     width: 1px;
@@ -921,7 +921,7 @@
 }
 .action-update-history-item {
     position: relative;
-    padding: var(--space-2) 0 var(--space-2) var(--space-5);
+    padding-block: var(--space-2); padding-inline: var(--space-5) 0;
     font-size: var(--text-caption);
     color: var(--text-muted);
     display: flex;
@@ -930,7 +930,7 @@
 }
 .action-update-history-dot {
     position: absolute;
-    left: -3px;
+    inset-inline-start: -3px;
     top: 50%;
     transform: translateY(-50%);
     width: 9px;
@@ -1009,7 +1009,7 @@
     overflow: visible;
     flex-wrap: nowrap;
     flex-shrink: 0;
-    margin-right: var(--space-2);
+    margin-inline-end: var(--space-2);
 }
 
 /* Force-shrink protection on the title so the icons never overlap it.
@@ -1159,14 +1159,14 @@
     display: inline-flex;
     align-items: center;
     gap: 2px;
-    margin-left: var(--space-1);
+    margin-inline-start: var(--space-1);
     color: var(--warning, #f59e0b);
 }
 .jobs-badge .jobs-badge-bell svg { width: 13px; height: 13px; }
 /* When the bell is the leading element (finished-chat state, where it stands in
    for the icon next to the "Active chats" label) it must sit flush left like the
    normal icon, not carry the appended-segment left margin. */
-.jobs-badge .jobs-badge-bell:first-child { margin-left: 0; }
+.jobs-badge .jobs-badge-bell:first-child { margin-inline-start: 0; }
 .jobs-badge .jobs-badge-bell-count { font-variant-numeric: tabular-nums; }
 
 /* At least one of the finished chats ended with an error. */
@@ -1268,7 +1268,7 @@
     /* 4px gap below the pill — same offset as every other header menu
        (model menu, settings panel, ws dropdown, usage dropdown, instance picker). */
     top: calc(100% + 4px);
-    right: 0;
+    inset-inline-end: 0;
     z-index: var(--z-jobs-dropdown);
     /* Fixed footprint: at least 40% of the viewport, clamped so it can't
        overflow. Stays constant across tab switches (no content-driven resize). */
@@ -1479,7 +1479,7 @@
 }
 .jobs-history-search-icon {
     position: absolute;
-    left: calc(var(--space-3) + 9px);
+    inset-inline-start: calc(var(--space-3) + 9px);
     display: inline-flex;
     align-items: center;
     color: var(--text-muted);
@@ -1489,7 +1489,7 @@
 .jobs-history-search-input {
     flex: 1;
     min-width: 0;
-    padding: 6px 28px 6px 30px;
+    padding-block: 6px; padding-inline: 30px 28px;
     border: 1px solid var(--secondary-border);
     border-radius: var(--radius-md);
     background: var(--bg-white);
@@ -1503,7 +1503,7 @@
 }
 .jobs-history-search-clear {
     position: absolute;
-    right: calc(var(--space-3) + 6px);
+    inset-inline-end: calc(var(--space-3) + 6px);
     border: none;
     background: transparent;
     color: var(--text-muted);
@@ -1592,7 +1592,7 @@
     font-variant-numeric: tabular-nums;
     /* Right-align; the column WIDTH is set inline per section (max time width in
        that section) so the icons to its left line up within each section. */
-    text-align: right;
+    text-align: end;
 }
 .jobs-chat-row .jobs-row-btn,
 .jobs-today-row .jobs-row-btn { opacity: 0; transition: opacity 0.12s; }
@@ -1790,11 +1790,11 @@
 .jobs-acc-workers-list .worker-card-wrap[data-depth="3"]::before {
     content: '';
     position: absolute;
-    left: -7px; top: -4px; bottom: 50%;
+    inset-inline-start: -7px; top: -4px; bottom: 50%;
     width: 7px;
-    border-left: 1px solid var(--secondary-border);
+    border-inline-start: 1px solid var(--secondary-border);
     border-bottom: 1px solid var(--secondary-border);
-    border-bottom-left-radius: 4px;
+    border-end-start-radius: 4px;
 }
 /* Compact context ring for the (non-expanded) jobs chat rows — smaller than
    the sidebar worker ring so it fits the dense row beside the action buttons. */
@@ -1846,7 +1846,7 @@
     font-size: var(--text-caption); font-weight: var(--font-semibold);
 }
 .jobs-expand-close {
-    margin-left: auto;
+    margin-inline-start: auto;
     width: 32px; height: 32px;
     border: 1px solid transparent; background: transparent;
     color: var(--text-muted); cursor: pointer;
@@ -1930,9 +1930,9 @@
 .jobs-expand-card::before {
     content: '';
     position: absolute;
-    left: 0; top: 0; bottom: 0;
+    inset-inline-start: 0; top: 0; bottom: 0;
     width: 3px;
-    border-radius: var(--radius-md) 0 0 var(--radius-md);
+    border-start-start-radius: var(--radius-md); border-start-end-radius: 0; border-end-end-radius: 0; border-end-start-radius: var(--radius-md);
     background: transparent;
     pointer-events: none;
 }
@@ -2050,7 +2050,7 @@
     width: 100%;
     max-width: 1200px;
     margin: var(--space-8) auto 0;
-    text-align: left;
+    text-align: start;
 }
 .home-active-chats-inner {
     border: 1px solid var(--secondary-border);
@@ -2088,7 +2088,7 @@
    columns/sections layout toggle. Uppercase caption-sized chips; the active
    pill takes the state palette used elsewhere (.action-btn.state-*, dots). */
 .home-chats-filters {
-    margin-left: auto;
+    margin-inline-start: auto;
     display: inline-flex; align-items: center;
     gap: var(--space-1);
     flex-wrap: wrap;

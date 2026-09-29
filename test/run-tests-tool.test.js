@@ -90,8 +90,27 @@ async function runRunTestsToolSafetyTests(sources) {
     cfg.files = ['test/a.test.js', 'test/b.test.js']; cfg.sources = ['', ''];
     var program = new (Object.getPrototypeOf(async function() {}).constructor)('evalModule', 'window', 'parent', RT.rtBuildSandboxCode(cfg));
     var fileArgs = [];
-    var programResult = await program(async function(_, path, args) { if (path === 'test/harness.js') return H; fileArgs.push(args); return {}; }, fakeWindow, { postMessage: function(m) { timeoutMessage = m; } });
-    check('per-test timeout signals trusted host and aborts remaining files', timeoutMessage.type === 'sandboxTestTimeout' && programResult.aborted && filesVisited.length === 1);
+    var posted = [];
+    var programResult = await program(async function(_, path, args) { if (path === 'test/harness.js') return H; fileArgs.push(args); return {}; }, fakeWindow, { postMessage: function(m) { posted.push(m); } });
+    timeoutMessage = posted.filter(function(m) { return m.type === 'sandboxTestTimeout'; })[0];
+    check('per-test timeout signals trusted host and aborts remaining files', timeoutMessage && timeoutMessage.type === 'sandboxTestTimeout' && programResult.aborted && filesVisited.length === 1);
+    var prog = posted.filter(function(m) { return m.type === 'sandboxTestProgress'; });
+    check('sandbox streams per-file start/done progress', prog.length === 2 && prog[0].phase === 'start' && prog[0].index === 0 && prog[1].phase === 'done' && prog[1].file === 'test/a.test.js' && prog[1].failed === 1);
+    var pcfg = { files: ['test/a.test.js', 'test/b.test.js'] };
+    check('progress sanitizer accepts exact index/file', RT.rtProgressEvent({ index: 1, file: 'test/b.test.js', phase: 'done', status: 'pass', passed: 2, failed: 0, skipped: 0 }, pcfg).total === 2);
+    for (var badEv of [null, { index: 1, file: 'test/a.test.js', phase: 'start' }, { index: 5, file: 'x', phase: 'start' }, { index: 0, file: 'test/a.test.js', phase: 'done', status: 'ok', passed: 0, failed: 0, skipped: 0 }, { index: 0, file: 'test/a.test.js', phase: 'done', status: 'pass', passed: -1, failed: 0, skipped: 0 }]) check('progress sanitizer rejects ' + JSON.stringify(badEv), RT.rtProgressEvent(badEv, pcfg) === null);
+    var seen = []; h = setup();
+    await h.entry.run({ files: ['test/a.test.js'] }, 0, { _runTestsOnProgress: function(ev) { seen.push(ev); } });
+    check('host forwards only sanitized progress while live', typeof h.opts()._testRunOnProgress === 'function' && (h.opts()._testRunOnProgress({ index: 0, file: 'test/a.test.js', phase: 'start' }), seen.length === 0));
+    h = setup({ hung: true }); seen = [];
+    var progRun = h.entry.run({ files: ['test/a.test.js'], timeout_ms: 50 }, 0, { _runTestsOnProgress: function(ev) { seen.push(ev); } });
+    for (var w = 0; w < 100 && !h.opts(); w++) await Promise.resolve();
+    h.opts()._testRunOnProgress({ index: 0, file: 'test/a.test.js', phase: 'start' });
+    h.opts()._testRunOnProgress({ index: 0, file: 'test/forged.test.js', phase: 'start' });
+    check('live progress forwarded once; forged file dropped', seen.length === 1 && seen[0].phase === 'start' && seen[0].total === 1);
+    await progRun;
+    h = setup(); await h.entry.run({ files: ['test/a.test.js'], _runTestsOnProgress: function() {} }, 0, {});
+    check('model args cannot inject a progress hook', h.opts()._testRunOnProgress === undefined);
     check('test files receive the resolved workspace as args.workspace', fileArgs.length === 1 && fileArgs[0].workspace === 'owner/repo::main');
     // The actual cleanup snapshot callbacks must stop after their independent
     // deadline even when an already-started read settles late. All clocks/effects fake.

@@ -72,24 +72,24 @@ function expandDashboardWidget(widgetId) {
     // A6A3-01: same merged flag toggleWidgetRunning reads (chat copy OR dashboard record).
     var isDeact = (typeof isWidgetDeactivated === 'function') ? isWidgetDeactivated(widgetId) : !!widget.deactivated;
     header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
-        '<span class="widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>' +
+        '<span class="widget-title">' + escapeHtml(widget.title || t('Untitled')) + '</span>' +
         '<div class="widget-modal-controls">' +
-        '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + (isDeact ? 'Activate Widget' : 'Deactivate Widget') + '">' + (isDeact ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+        '<button class="widget-modal-btn widget-stop-btn" data-widget-id="' + widgetId + '" onclick="toggleWidgetRunning(\'' + widgetId + '\', event);closeExpandedWidget()" title="' + escapeHtml(isDeact ? t('Activate Widget') : t('Deactivate Widget')) + '">' + (isDeact ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
         // Saved revisions live in WidgetStore (widget.history is no longer written).
         // The button opens the version picker attachWidgetVersionPicker mounted
         // in this header's controls; it only shows when there is history to pick.
-        (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="History (' + WidgetStore.versions(widgetId).length + ' versions)">' + UI_ICONS.history + '</button>' : '') +
-        '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>' +
-        '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="Open in new tab" aria-label="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
-        '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="Edit">' + UI_ICONS.edit + '</button>' +
+        (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="' + escapeHtml(tn(WidgetStore.versions(widgetId).length, 'History ({count} version)', 'History ({count} versions)')) + '">' + UI_ICONS.history + '</button>' : '') +
+        '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+        '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="' + escapeHtml(t('Open in new tab')) + '" aria-label="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
+        '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>' +
         // Dashboard twin of the chat toolbar's manual code editor
         // (tools/080-widget-tools.js:429). Distinct from the "Edit" button above:
         // that one hands the widget to the agent in a fresh chat, this one opens
         // the raw HTML editor. Same title/icon pair the chat fullscreen uses, so
         // the two surfaces stay learnable.
-        '<button class="widget-modal-btn widget-code-btn" data-widget-id="' + widgetId + '" onclick="editDashboardWidgetCode(\'' + widgetId + '\', event)" title="Edit code">' + UI_ICONS.code + '</button>' +
-        '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="Remove from dashboard" aria-label="Remove from dashboard">' + UI_ICONS.trash + '</button>' +
-        '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="Close" aria-label="Close">' + UI_ICONS.close + '</button>' +
+        '<button class="widget-modal-btn widget-code-btn" data-widget-id="' + widgetId + '" onclick="editDashboardWidgetCode(\'' + widgetId + '\', event)" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
+        '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="' + escapeHtml(t('Remove from dashboard')) + '" aria-label="' + escapeHtml(t('Remove from dashboard')) + '">' + UI_ICONS.trash + '</button>' +
+        '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
     
     var content = document.createElement('div');
@@ -104,7 +104,7 @@ function expandDashboardWidget(widgetId) {
     // Render widget in fullscreen. TA-10: a stopped widget gets the same
     // placeholder as its grid card (renderWidgetContent) and no live iframe.
     if (isDeact) {
-        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+        content.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
     } else if (widget.html) {
         var iframe = document.createElement('iframe');
         iframe.className = 'widget-iframe';
@@ -142,8 +142,8 @@ function closeExpandedWidget() {
 // therefore a pure route — close, then hand off. No dashboard-side save fork.
 function editDashboardWidgetCode(widgetId, event) {
     if (event) { event.stopPropagation(); event.preventDefault(); }
-    if (!dashboardWidgets[widgetId]) { showSnackbar('Widget not found', 'error'); return; }
-    if (typeof editWidgetCode !== 'function') { showSnackbar('Code editor unavailable', 'error'); return; }
+    if (!dashboardWidgets[widgetId]) { showSnackbar(t('Widget not found'), 'error'); return; }
+    if (typeof editWidgetCode !== 'function') { showSnackbar(t('Code editor unavailable'), 'error'); return; }
     // Close the dashboard fullscreen FIRST — load-bearing, not cosmetic: it is a
     // .widget-fullscreen-overlay at --z-fullscreen (10003) while the editor is a
     // .widget-modal-overlay at --z-widget-modal (10002) (css/00-tokens.css:174-175),
@@ -290,10 +290,10 @@ function gridPaddingOf(grid) {
     if (!cs) return pad;
     var l = parseFloat(cs.paddingLeft);
     var r = parseFloat(cs.paddingRight);
-    var t = parseFloat(cs.paddingTop);
+    var tp = parseFloat(cs.paddingTop);
     if (!isNaN(l)) pad.left = l;
     if (!isNaN(r)) pad.right = r;
-    if (!isNaN(t)) pad.top = t;
+    if (!isNaN(tp)) pad.top = tp;
     return pad;
 }
 
@@ -390,8 +390,8 @@ function buildWidgetHtml(widget, dashboard) {
 
     var errorClass = widget.error ? ' widget-error' : '';
     var loadingClass = widget.isLoading ? ' widget-loading' : '';
-    var errorBadge = widget.error ? '<span class="widget-error-badge" title="' + escapeHtml(widget.error) + '">Error</span>' : '';
-    var loadingOverlay = widget.isLoading ? '<div class="widget-loading-overlay"><div class="widget-spinner"></div><span>Generating...</span></div>' : '';
+    var errorBadge = widget.error ? '<span class="widget-error-badge" title="' + escapeHtml(widget.error) + '">' + escapeHtml(t('Error')) + '</span>' : '';
+    var loadingOverlay = widget.isLoading ? '<div class="widget-loading-overlay"><div class="widget-spinner"></div><span>' + escapeHtml(t('Generating...')) + '</span></div>' : '';
 
     var html = '<div class="dashboard-widget' + errorClass + loadingClass + '" data-widget-id="' + widget.id + '" draggable="true" ';
     html += 'ondragstart="handleWidgetDragStart(event, \'' + widget.id + '\')" ';
@@ -402,10 +402,10 @@ function buildWidgetHtml(widget, dashboard) {
     if (!isHome) {
     html += '<div class="dashboard-widget-header">';
     html += '<span class="dashboard-widget-icon drag-handle">' + UI_ICONS.widget + '</span>';
-    html += '<span class="dashboard-widget-title">' + escapeHtml(widget.title || 'Untitled') + '</span>';
+    html += '<span class="dashboard-widget-title">' + escapeHtml(widget.title || t('Untitled')) + '</span>';
     html += errorBadge;
     html += '<div class="dashboard-widget-controls">';
-    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" title="Expand">' + UI_ICONS.maximize + '</button>';
+    html += '<button class="dashboard-widget-btn" onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Expand')) + '">' + UI_ICONS.maximize + '</button>';
     html += '</div>';
     html += '</div>';
     }
@@ -421,7 +421,7 @@ function buildWidgetHtml(widget, dashboard) {
     html += '<button class="dashboard-widget-hover-btn" draggable="true" ';
     html += 'ondragstart="event.stopPropagation();handleWidgetDragStart(event, \'' + widget.id + '\')" ';
     html += 'onclick="event.stopPropagation();expandDashboardWidget(\'' + widget.id + '\')" ';
-    html += 'title="Expand · drag to move">' + UI_ICONS.maximize + '</button>';
+    html += 'title="' + escapeHtml(t('Expand · drag to move')) + '">' + UI_ICONS.maximize + '</button>';
     html += '<div class="dashboard-widget-content" id="dashboard-widget-content-' + widget.id + '">' + loadingOverlay + '</div>';
     html += '<div class="dashboard-widget-resize-handle" onmousedown="startWidgetResize(event, \'' + widget.id + '\')"></div>';
     html += '</div>';
@@ -784,8 +784,11 @@ function writeWidgetHtml(iframe, html, widgetId, options) {
     attachWidgetVersionPicker(iframe, widgetId);
     // Shared by chat, dashboard and fullscreen; native fullscreen still needs
     // a user gesture in the widget. No top-page overlay or privileged eval.
+    // `allow="fullscreen *"` alone grants fullscreen; also setting the legacy
+    // `allowfullscreen` attribute makes Chrome warn "Allow attribute will take
+    // precedence over 'allowfullscreen'" on every widget mount.
     iframe.setAttribute('allow', "fullscreen *");
-    iframe.setAttribute('allowfullscreen', '');
+    iframe.removeAttribute('allowfullscreen');
     var _liveWidget = registerWidgetInstance(iframe, options.preview ? null : widgetId);
     // Inject once, before the handshake, so the same string is posted no matter
     // how many ready messages arrive.
@@ -995,12 +998,12 @@ function renderWidgetContent(widget) {
     }
     // A6A3-01: honour the persisted deactivated flag on every grid (re-)render.
     if (widget.deactivated || (typeof isWidgetDeactivated === 'function' ? isWidgetDeactivated(widget.id) : (dashboardWidgets[widget.id] || {}).deactivated)) {
-        container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">Widget deactivated.</div>';
+        container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
         return;
     }
     if (!widget.html) {
         console.warn('Widget has no HTML:', widget);
-        container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-muted);text-align:center;">No content available. Try regenerating.</div>';
+        container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-muted);text-align:center;">' + escapeHtml(t('No content available. Try regenerating.')) + '</div>';
         return;
     }
     
@@ -1035,12 +1038,12 @@ async function addWidgetToDashboard(widgetId, event, dashboard) {
     }
 
     if (!chatWidget) {
-        showSnackbar('Widget not found', 'error');
+        showSnackbar(t('Widget not found'), 'error');
         return;
     }
 
     if (!chatWidget.html) {
-        showSnackbar('Widget has no content', 'error');
+        showSnackbar(t('Widget has no content'), 'error');
         return;
     }
 
@@ -1095,7 +1098,7 @@ async function addWidgetToDashboard(widgetId, event, dashboard) {
     // Update sidebar to reflect dashboard state
     renderVersionSidebar();
 
-    showSnackbar(dashboard === 'home' ? 'Widget pinned to Home' : 'Widget pinned to Dashboard', 'success');
+    showSnackbar(dashboard === 'home' ? t('Widget pinned to Home') : t('Widget pinned to Dashboard'), 'success');
     return dashWidget;
 }
 
@@ -1106,7 +1109,7 @@ function updateWidgetPinButtons(widgetId) {
     document.querySelectorAll('.widget-dashboard-btn[data-widget-id="' + widgetId + '"]').forEach(function(btn) {
         btn.classList.toggle('on-dashboard', pinned);
         btn.innerHTML = pinned ? UI_ICONS.pinFilled : UI_ICONS.pin;
-        btn.title = pinned ? 'Pinned — click to change' : 'Pin to dashboard…';
+        btn.title = pinned ? t('Pinned — click to change') : t('Pin to dashboard…');
     });
     // Widget Library rows/cards carry their own pin badge + labelled button.
     if (typeof refreshWidgetLibraryEntry === 'function') refreshWidgetLibraryEntry(widgetId);
@@ -1120,16 +1123,22 @@ function showWidgetPinMenu(widgetId, event) {
     var menu = document.createElement('div');
     menu.className = 'widget-pin-menu';
     menu.id = 'widget-pin-menu';
-    var html = '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'home\')"' + (current === 'home' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>Pin to Home</span></button>';
-    html += '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'main\')"' + (current === 'main' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>Pin to Dashboard</span></button>';
+    var html = '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'home\')"' + (current === 'home' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>' + escapeHtml(t('Pin to Home')) + '</span></button>';
+    html += '<button onclick="pinWidgetTo(\'' + widgetId + '\', \'main\')"' + (current === 'main' ? ' class="active"' : '') + '>' + UI_ICONS.pin + '<span>' + escapeHtml(t('Pin to Dashboard')) + '</span></button>';
     if (current) {
-        html += '<button class="danger" onclick="pinWidgetTo(\'' + widgetId + '\', \'none\')">' + UI_ICONS.close + '<span>Unpin</span></button>';
+        html += '<button class="danger" onclick="pinWidgetTo(\'' + widgetId + '\', \'none\')">' + UI_ICONS.close + '<span>' + escapeHtml(t('Unpin')) + '</span></button>';
     }
     menu.innerHTML = html;
     document.body.appendChild(menu);
     var x = event ? event.clientX : window.innerWidth / 2;
     var y = event ? event.clientY : window.innerHeight / 2;
-    menu.style.left = Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    // Rule 10 (i18n): the menu opens toward the inline end of the pointer, so
+    // in RTL anchor its RIGHT edge at the pointer (same 8px viewport clamp).
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') {
+        menu.style.right = Math.max(8, Math.min(window.innerWidth - x, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    } else {
+        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    }
     menu.style.top = Math.max(8, Math.min(y + 6, window.innerHeight - menu.offsetHeight - 8)) + 'px';
     setTimeout(function() {
         document.addEventListener('click', closeWidgetPinMenu, { once: true });
@@ -1150,7 +1159,7 @@ async function pinWidgetTo(widgetId, target) {
         // not in removeWidgetFromDashboard (Remove toasts itself, agent path stays silent).
         var from = dashboardWidgets[widgetId] ? widgetDashboardOf(dashboardWidgets[widgetId]) : null;
         await removeWidgetFromDashboard(widgetId);
-        if (from) showSnackbar(from === 'home' ? 'Removed from Home' : 'Removed from dashboard', 'success');
+        if (from) showSnackbar(from === 'home' ? t('Removed from Home') : t('Removed from dashboard'), 'success');
         return;
     }
     if (target !== 'home' && target !== 'main') {
@@ -1158,7 +1167,7 @@ async function pinWidgetTo(widgetId, target) {
         // Known callers pass literals only: the pin menu (:1007-1010) and
         // executePinWidget (tools/080-widget-tools.js:165, pre-validated).
         console.warn('pinWidgetTo: unknown target "' + target + '"');
-        if (typeof showSnackbar === 'function') showSnackbar('Unknown pin target: ' + String(target), 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Unknown pin target: {target}', { target: String(target) }), 'error');
         return null;
     }
     var existing = dashboardWidgets[widgetId];
@@ -1172,7 +1181,7 @@ async function pinWidgetTo(widgetId, target) {
             existing.gridY = pos.gridY;
             await saveDashboardWidget(existing);
             refreshVisibleDashboards();
-            showSnackbar(target === 'home' ? 'Widget moved to Home' : 'Widget moved to Dashboard', 'success');
+            showSnackbar(target === 'home' ? t('Widget moved to Home') : t('Widget moved to Dashboard'), 'success');
         }
         updateWidgetPinButtons(widgetId);
         renderVersionSidebar();
@@ -1201,7 +1210,7 @@ async function removeWidgetFromDashboard(widgetId, event) {
         // Show empty state if no widgets left on the dashboard it was removed from
         var container = dashboardGridEl(removedFrom);
         if (container && dashboardWidgetsFor(removedFrom).length === 0) {
-            container.innerHTML = removedFrom === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
+            container.innerHTML = removedFrom === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>' + escapeHtml(t('No widgets yet')) + '</p><p class="dashboard-empty-hint">' + escapeHtml(t('Add widgets to your dashboard using prompts.')) + '</p></div>';
         }
     }
     // Hide the home section entirely when its last widget is unpinned
@@ -1243,13 +1252,13 @@ function updateHomeDashboardExpandBtn(expanded) {
     if (!btn) return;
     btn.innerHTML = UI_ICONS.chevronDown || '';
     btn.classList.toggle('expanded', expanded);
-    btn.title = expanded ? 'Collapse' : 'Expand';
+    btn.title = expanded ? t('Collapse') : t('Expand');
 }
 
 // Sidebar/version-row "Open in new tab": opens the app.html?widget= deep link in a new tab (openWidgetInIframePanel, ui/270-iframe-panel.js)
 function showWidgetInPanel(widgetId) {
     var widget = getWidgetById(widgetId);
-    if (!widget) { showSnackbar('Widget not found', 'error'); return; }
+    if (!widget) { showSnackbar(t('Widget not found'), 'error'); return; }
     openWidgetInIframePanel(widgetId);
 }
 
@@ -1266,7 +1275,7 @@ function openAddWidgetModal() {
     // Set a hint in the input
     var input = document.getElementById('message-input');
     if (input) {
-        input.placeholder = 'Describe the widget you want to create...';
+        input.placeholder = t('Describe the widget you want to create...');
         input.focus();
     }
 }
@@ -1291,7 +1300,7 @@ function openWidgetInChatMode(widget, isNew) {
     // Update header title to show widget name
     var headerTitle = document.getElementById('header-chat-title');
     if (headerTitle) {
-        headerTitle.innerHTML = '<span class="widget-mode-badge">Widget</span> ' + escapeHtml(widget.title || 'New Widget');
+        headerTitle.innerHTML = '<span class="widget-mode-badge">' + escapeHtml(t('Widget')) + '</span> ' + escapeHtml(widget.title || t('New Widget'));
     }
     
     // Show back to dashboard button
@@ -1300,7 +1309,7 @@ function openWidgetInChatMode(widget, isNew) {
         backBtn = document.createElement('button');
         backBtn.id = 'widget-back-btn';
         backBtn.className = 'skills-back-btn widget-back-btn';
-        backBtn.title = 'Back to Dashboard';
+        backBtn.title = t('Back to Dashboard');
         backBtn.innerHTML = '<span class="back-icon"></span>';
         backBtn.onclick = closeWidgetChatMode;
         mainHeader.insertBefore(backBtn, mainHeader.firstChild);
@@ -1384,7 +1393,7 @@ function renderWidgetInChat(widget) {
     var conversation = widget ? (widget.conversation || []) : [];
     
     if (conversation.length === 0) {
-        container.innerHTML = '<div class="widget-chat-empty">Describe the widget you want to create...</div>';
+        container.innerHTML = '<div class="widget-chat-empty">' + escapeHtml(t('Describe the widget you want to create...')) + '</div>';
         return;
     }
     
@@ -1552,7 +1561,12 @@ async function confirmDeleteDashboardWidget(widgetId) {
     // 065-widget-library.js), so the modal says "Remove", never "delete".
     var where = widgetDashboardOf(widget) === 'home' ? 'Home' : 'the dashboard';
     // TA-8: the title names Home too; the main dashboard keeps "Remove from Dashboard".
-    var confirmed = await showConfirmModal('Remove from ' + (where === 'Home' ? where : 'Dashboard'), 'Remove "' + escapeHtml(widget.title) + '" from ' + where + '? The widget and its saved versions stay in your library.', 'danger');
+    // i18n: one whole sentence per target (contract rule 4); `where` stays an English marker.
+    var confirmed = await showConfirmModal(where === 'Home' ? t('Remove from Home') : t('Remove from Dashboard'),
+        where === 'Home'
+            ? t('Remove "{title}" from Home? The widget and its saved versions stay in your library.', { title: escapeHtml(widget.title) })
+            : t('Remove "{title}" from the dashboard? The widget and its saved versions stay in your library.', { title: escapeHtml(widget.title) }),
+        'danger');
     if (!confirmed) return;
     
     // Close widget editor if open for this widget
@@ -1567,14 +1581,14 @@ async function confirmDeleteDashboardWidget(widgetId) {
     // pin buttons + version sidebar, which this path used to leave "pinned".
     await removeWidgetFromDashboard(widgetId);
     
-    showSnackbar(where === 'Home' ? 'Removed from Home' : 'Removed from dashboard', 'success');
+    showSnackbar(where === 'Home' ? t('Removed from Home') : t('Removed from dashboard'), 'success');
 }
 
 function openDashboardInNewTab() {
     // Open AppAgent in standalone dashboard mode (same page, no sidebar/header)
     var widgetList = Object.values(dashboardWidgets);
     if (widgetList.length === 0) {
-        showSnackbar('No widgets to display', 'error');
+        showSnackbar(t('No widgets to display'), 'error');
         return;
     }
     chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?standalone=dashboard' });
@@ -1586,7 +1600,7 @@ function exportDashboard() {
     try {
         var widgetList = Object.values(dashboardWidgets);
         if (widgetList.length === 0) {
-            showSnackbar('No widgets to export', 'error');
+            showSnackbar(t('No widgets to export'), 'error');
             return;
         }
 
@@ -1603,9 +1617,9 @@ function exportDashboard() {
         a.download = 'dashboard-' + new Date().toISOString().slice(0, 10) + '.json';
         a.click();
         URL.revokeObjectURL(url);
-        showSnackbar('Dashboard exported', 'success');
+        showSnackbar(t('Dashboard exported'), 'success');
     } catch (e) {
-        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -1630,7 +1644,7 @@ async function importDashboard() {
             var rows = data && data.type === 'appagent-dashboard-widget' && data.widget ? [data.widget]
                 : data && data.type === 'appagent-dashboard' && Array.isArray(data.widgets) ? data.widgets : null;
             if (!rows) {
-                showSnackbar('Invalid dashboard file format', 'error');
+                showSnackbar(t('Invalid dashboard file format'), 'error');
                 return;
             }
             var seen = {};
@@ -1640,25 +1654,27 @@ async function importDashboard() {
                 return !ok;
             });
             if (bad.length) {
-                showSnackbar('Invalid dashboard file: ' + bad.length + ' widget(s) lack a valid unique id', 'error');
+                showSnackbar(tn(bad.length, 'Invalid dashboard file: {count} widget(s) lack a valid unique id', 'Invalid dashboard file: {count} widget(s) lack a valid unique id'), 'error');
                 return;
             }
             var existing = rows.filter(function(w) { return dashboardWidgets[w.id]; }).length;
-            if (existing && !(await showConfirmModal('Import dashboard', existing + ' widget(s) already exist; their title/content will be updated (layout kept). Continue?', 'warning'))) return;
+            if (existing && !(await showConfirmModal(t('Import dashboard'), tn(existing, '{count} widget(s) already exist; their title/content will be updated (layout kept). Continue?', '{count} widget(s) already exist; their title/content will be updated (layout kept). Continue?'), 'warning'))) return;
             var done = 0;
             try {
                 for (var i = 0; i < rows.length; i++) {
                     await saveDashboardWidget(rows[i]);
                     done++;
                 }
-                showSnackbar('Imported ' + (rows.length - existing) + ' widget(s)' + (existing ? ', updated ' + existing : ''), 'success');
+                showSnackbar(existing
+                    ? tn(rows.length - existing, 'Imported {count} widget(s), updated {updated}', 'Imported {count} widget(s), updated {updated}', { updated: i18nFormatNumber(existing) })
+                    : tn(rows.length - existing, 'Imported {count} widget(s)', 'Imported {count} widget(s)'), 'success');
             } catch (err) {
-                showSnackbar('Failed to import (' + done + ' of ' + rows.length + ' saved): ' + ((err && err.message) || err), 'error');
+                showSnackbar(t('Failed to import ({done} of {total} saved): {error}', { done: i18nFormatNumber(done), total: i18nFormatNumber(rows.length), error: String((err && err.message) || err) }), 'error');
             } finally {
                 refreshVisibleDashboards();
             }
         } catch (e) {
-            showSnackbar('Failed to import: ' + e.message, 'error');
+            showSnackbar(t('Failed to import: {error}', { error: String(e.message) }), 'error');
         }
     };
     input.click();
@@ -1708,7 +1724,7 @@ function showStorageUnavailableNotice(err) {
     console.error('Chat storage unavailable:', err);
     try {
         if (typeof showSnackbar === 'function') {
-            showSnackbar('Storage unavailable — chat history could not be loaded. Try restarting Chrome.', 'error');
+            showSnackbar(t('Storage unavailable — chat history could not be loaded. Try restarting Chrome.'), 'error');
         }
     } catch (e) { /* notice must never break init */ }
 }
@@ -1806,7 +1822,7 @@ function exitStorageDegradedMode() {
     _storageDegraded = false;
     _degradedChatIndex = null;
     if (_storageRetryTimer) { try { clearTimeout(_storageRetryTimer); } catch (e) {} _storageRetryTimer = null; }
-    try { if (typeof showSnackbar === 'function') showSnackbar('Storage recovered — chat history restored.', 'success'); } catch (e) {}
+    try { if (typeof showSnackbar === 'function') showSnackbar(t('Storage recovered — chat history restored.'), 'success'); } catch (e) {}
     try { renderChatList(); } catch (e) {}
     try { if (typeof renderAllActionPlacements === 'function') renderAllActionPlacements(); } catch (e) {}
     try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
@@ -1819,8 +1835,8 @@ function exitStorageDegradedMode() {
 function buildDegradedChatListHtml() {
     var banner =
         '<div class="storage-degraded-banner" style="padding:12px;margin:8px;border-radius:8px;background:rgba(230,150,30,0.12);border:1px solid rgba(230,150,30,0.4);color:var(--text-primary,inherit);font-size:var(--text-sm,13px);line-height:1.4;">' +
-            '<div style="font-weight:600;margin-bottom:4px;">Storage unavailable — your history is safe, retrying…</div>' +
-            '<div style="color:var(--text-muted,#999);">Your chats are shown read-only below. If this persists, restart Chrome to clear the storage wedge.</div>' +
+            '<div style="font-weight:600;margin-bottom:4px;">' + escapeHtml(t('Storage unavailable — your history is safe, retrying…')) + '</div>' +
+            '<div style="color:var(--text-muted,#999);">' + escapeHtml(t('Your chats are shown read-only below. If this persists, restart Chrome to clear the storage wedge.')) + '</div>' +
         '</div>';
     var rows = '';
     var items = (_degradedChatIndex || []).slice().sort(function(a, b) {
@@ -1829,11 +1845,13 @@ function buildDegradedChatListHtml() {
         return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
     if (items.length === 0) {
-        rows = '<div class="empty-state" style="padding:16px;color:var(--text-muted,#999);">Checking storage…</div>';
+        rows = '<div class="empty-state" style="padding:16px;color:var(--text-muted,#999);">' + escapeHtml(t('Checking storage…')) + '</div>';
     } else {
         items.forEach(function(it) {
-            rows += '<div class="chat-item chat-item-degraded" style="opacity:0.6;cursor:default;padding:8px 12px;border-radius:6px;" title="Read-only until storage recovers">' +
-                escapeHtml(it.title || 'Untitled') +
+            // The mirror stores the English 'Untitled' fallback (mirrorChatIndexToLocal);
+            // translate that marker only here, at display (contract rule 3).
+            rows += '<div class="chat-item chat-item-degraded" style="opacity:0.6;cursor:default;padding:8px 12px;border-radius:6px;" title="' + escapeHtml(t('Read-only until storage recovers')) + '">' +
+                escapeHtml(!it.title || it.title === 'Untitled' ? t('Untitled') : it.title) +
             '</div>';
         });
     }
@@ -1983,12 +2001,11 @@ async function _loadChatsFromStorageImpl() {
             adoptChatRow(c, { chatId: id, map: loaded });
         });
         chats = loaded;
-        console.log('[storage] loaded ' + Object.keys(loaded).length + ' chats in '
-            + (Date.now() - _loadT0) + 'ms — '
-            + (_acctB64
-                ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records (largest '
-                    + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
-                : 'records are v16-clean (no inline base64)'));
+        // STORE-ACCT: inspectable state (pageChatLoadStats) instead of a log line.
+        try {
+            window.pageChatLoadStats = { chats: Object.keys(loaded).length, ms: Date.now() - _loadT0,
+                inlineB64Chars: _acctB64, largestId: _acctTopId, largestB64Chars: _acctTopB64 };
+        } catch (e) { /* diagnostics only */ }
 
         // Rehydrate per-chat pause flags from the persisted record field
         // (chat.pausedByUser, stamped by setChatPausedPersistent) so a
@@ -2613,10 +2630,12 @@ async function resetAllPermissionsToDefaults() {
     // S8B-02: one click wiped every tool permission, the instance tier and this
     // session's grants with no way back - ask first (Cancel = nothing changes).
     var host0 = getConnectedInstanceHost();
-    var ok = await showConfirmModal('Reset all permissions?',
-        'Every tool permission returns to its default' +
-        (host0 ? ', <strong>' + escapeHtml(host0) + '</strong> goes back to the <strong>Manual</strong> tier' : '') +
-        ', and this session\'s grants are cleared. This cannot be undone.', 'danger');
+    // i18n: one whole sentence per variant (contract rule 4); the host stays escaped.
+    var ok = await showConfirmModal(t('Reset all permissions?'),
+        host0
+            ? t('Every tool permission returns to its default, <strong>{host}</strong> goes back to the <strong>Manual</strong> tier, and this session\'s grants are cleared. This cannot be undone.', { host: escapeHtml(host0) })
+            : t('Every tool permission returns to its default, and this session\'s grants are cleared. This cannot be undone.'),
+        'danger');
     if (!ok) return;
     // Reset global permissions
     toolPermissions = {};
@@ -2667,5 +2686,5 @@ async function resetAllPermissionsToDefaults() {
     renderToolPermissions();
     if (typeof renderSettingsToolPermissions === 'function') renderSettingsToolPermissions();
     if (typeof updateSnStatus === 'function') updateSnStatus();
-    showSnackbar('All permissions reset to defaults', 'success');
+    showSnackbar(t('All permissions reset to defaults'), 'success');
 }

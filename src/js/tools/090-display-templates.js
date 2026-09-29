@@ -216,7 +216,7 @@ function renderDisplayPlaceholder(displayId) {
             return html;
         }
     }
-    return '<div class="display-error">Display not found: ' + escDisplay(displayId) + '</div>';
+    return '<div class="display-error">' + escDisplay(t('Display not found: {id}', { id: displayId })) + '</div>';
 }
 
 // ─── Helper ───
@@ -266,12 +266,12 @@ function generateTable(args) {
 
     var html = '<div class="display-template display-table" id="' + tableId + '">';
     if (rows.length > 5) {
-        html += '<input class="display-search" placeholder="Search..." oninput="displayFilterTable(\'' + tableId + '\', this.value)">';
-        html += '<div class="display-row-count" id="' + tableId + '-count">' + rows.length + ' rows</div>';
+        html += '<input class="display-search" placeholder="' + escDisplay(t('Search...')) + '" oninput="displayFilterTable(\'' + tableId + '\', this.value)">';
+        html += '<div class="display-row-count" id="' + tableId + '-count">' + escDisplay(tn(rows.length, '{count} row', '{count} rows')) + '</div>';
     }
     html += '<div class="display-table-wrap"><table><thead><tr>';
     columns.forEach(function(col, i) {
-        html += '<th' + (numericCols[i] ? ' class="num"' : '') + ' tabindex="0" onclick="displaySortTable(\'' + tableId + '\', ' + i + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displaySortTable(\'' + tableId + '\', ' + i + ')">' + escDisplay(col) + '<span class="display-sort-arrow">&#9650;</span></th>';
+        html += '<th' + (numericCols[i] ? ' class="num"' : '') + ' tabindex="0" onclick="displaySortTable(\'' + tableId + '\', ' + i + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();displaySortTable(\'' + tableId + '\', ' + i + ')}">' + escDisplay(col) + '<span class="display-sort-arrow">&#9650;</span></th>';
     });
     html += '</tr></thead><tbody>';
     rows.forEach(function(row) {
@@ -282,13 +282,13 @@ function generateTable(args) {
         });
         html += '</tr>';
     });
-    html += '</tbody></table><div class="display-table-empty" style="display:none">No matching rows</div></div></div>';
+    html += '</tbody></table><div class="display-table-empty" style="display:none">' + escDisplay(t('No matching rows')) + '</div></div></div>';
     return html;
 }
 
 function displayFormatCell(val) {
     if (val == null) return '<span class="display-muted">&mdash;</span>';
-    if (typeof val === 'boolean') return val ? '<span class="display-badge display-badge-green">Yes</span>' : '<span class="display-badge display-badge-red">No</span>';
+    if (typeof val === 'boolean') return val ? '<span class="display-badge display-badge-green">' + escDisplay(t('Yes')) + '</span>' : '<span class="display-badge display-badge-red">' + escDisplay(t('No')) + '</span>';
     if (typeof val === 'object' && val.badge) return '<span class="display-badge display-badge-' + displaySafeToken(val.color, 'blue') + '">' + escDisplay(val.badge) + '</span>';
     return escDisplay(val);
 }
@@ -328,7 +328,7 @@ function displayFilterTable(tableId, query) {
         if (match) count++;
     });
     var countEl = document.getElementById(tableId + '-count');
-    if (countEl) countEl.textContent = count + ' of ' + rows.length + ' rows';
+    if (countEl) countEl.textContent = tn(rows.length, '{shown} of {count} row', '{shown} of {count} rows', { shown: i18nFormatNumber(count) });
     var emptyEl = wrap.querySelector('.display-table-empty');
     if (emptyEl) emptyEl.style.display = count === 0 ? '' : 'none';
 }
@@ -340,12 +340,12 @@ function generateCardList(args) {
 
     var html = '<div class="display-template display-card-list">';
     if (cards.length > 6) {
-        html += '<input class="display-search" placeholder="Search cards..." oninput="displayFilterCards(this)">';
+        html += '<input class="display-search" placeholder="' + escDisplay(t('Search cards...')) + '" oninput="displayFilterCards(this)">';
     }
     html += '<div class="display-cards">';
     cards.forEach(function(card) {
         var hasDetail = !!card.detail;
-        html += '<div class="display-card' + (hasDetail ? ' has-detail' : '') + '"' + (hasDetail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleExpand(this)"' : '') + '>';
+        html += '<div class="display-card' + (hasDetail ? ' has-detail' : '') + '"' + (hasDetail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();displayToggleExpand(this)}"' : '') + '>';
         html += '<div class="display-card-header">';
         html += '<div class="display-card-header-content">';
         if (card.icon) html += '<div class="display-card-icon">' + escDisplay(card.icon) + '</div>';
@@ -389,7 +389,7 @@ function generateChecklist(args, displayId) {
         var label = typeof item === 'string' ? item : (item.label || item.text || '');
         var desc = typeof item === 'object' ? (item.description || '') : '';
         var checked = typeof item === 'object' && item.checked;
-        html += '<div class="display-check-item' + (checked ? ' checked' : '') + '" role="checkbox" aria-checked="' + (checked ? 'true' : 'false') + '" tabindex="0" onclick="displayToggleCheck(\'' + listId + '\', this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleCheck(\'' + listId + '\', this)">';
+        html += '<div class="display-check-item' + (checked ? ' checked' : '') + '" role="checkbox" aria-checked="' + (checked ? 'true' : 'false') + '" tabindex="0" onclick="displayToggleCheck(\'' + listId + '\', this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();displayToggleCheck(\'' + listId + '\', this)}">';
         html += '<div class="display-check-box"></div>';
         html += '<div class="display-check-content"><div class="display-check-label">' + escDisplay(label) + '</div>';
         if (desc) html += '<div class="display-check-desc">' + escDisplay(desc) + '</div>';
@@ -439,7 +439,7 @@ function displayUpdateCheckSummary(listId) {
     var items = wrap.querySelectorAll('.display-check-item');
     var done = [].filter.call(items, function(i) { return i.classList.contains('checked'); }).length;
     var text = document.getElementById(listId + '-text');
-    if (text) text.textContent = done + ' of ' + items.length + ' completed';
+    if (text) text.textContent = t('{done} of {total} completed', { done: i18nFormatNumber(done), total: i18nFormatNumber(items.length) });
     var bar = document.getElementById(listId + '-bar');
     if (bar) bar.style.width = (items.length ? Math.round(done / items.length * 100) : 0) + '%';
     var summary = document.getElementById(listId + '-summary');
@@ -475,7 +475,7 @@ function generateCode(args) {
     var codeId = 'dcode_' + Date.now() + '_' + (++_displayCodeSeq);
 
     var html = '<div class="display-template display-code-wrap">';
-    html += '<div class="display-code-header"><span class="display-code-lang">' + escDisplay(language) + '</span><button class="display-code-copy" onclick="displayCopyCode(\'' + codeId + '\', this)">' + DISPLAY_COPY_ICON + '<span>Copy</span></button></div>';
+    html += '<div class="display-code-header"><span class="display-code-lang">' + escDisplay(language) + '</span><button class="display-code-copy" onclick="displayCopyCode(\'' + codeId + '\', this)">' + DISPLAY_COPY_ICON + '<span>' + escDisplay(t('Copy')) + '</span></button></div>';
     html += '<pre class="display-code-pre" id="' + codeId + '">';
     code.split('\n').forEach(function(line, i) {
         html += '<span class="display-line-num">' + (i + 1) + '</span>' + escDisplay(line) + '\n';
@@ -496,14 +496,14 @@ function displayCopyCode(codeId, btn) {
     navigator.clipboard.writeText(text).then(function() {
         var span = btn.querySelector('span');
         btn.classList.add('copied');
-        if (span) span.textContent = 'Copied!';
+        if (span) span.textContent = t('Copied!');
         setTimeout(function() {
             btn.classList.remove('copied');
-            if (span) span.textContent = 'Copy';
+            if (span) span.textContent = t('Copy');
         }, 1500);
     }).catch(function() {
         // Clipboard write can reject (no focus / permission denied) — same feedback as copyCodeBlock.
-        if (typeof showSnackbar === 'function') showSnackbar('Copy failed', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Copy failed'), 'error');
     });
 }
 
@@ -517,7 +517,7 @@ function generateTimeline(args) {
         var tlColor = displaySafeToken(evt.color, '');
         var colorClass = tlColor ? ' display-tl-' + tlColor : '';
         var detail = evt.detail || evt.description;
-        html += '<div class="display-tl-event' + colorClass + (detail ? ' has-detail' : '') + '"' + (detail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')displayToggleExpand(this)"' : '') + '>';
+        html += '<div class="display-tl-event' + colorClass + (detail ? ' has-detail' : '') + '"' + (detail ? ' role="button" tabindex="0" onclick="displayToggleExpand(this)" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();displayToggleExpand(this)}"' : '') + '>';
         if (evt.time || evt.date || evt.timestamp) html += '<div class="display-tl-time">' + escDisplay(evt.time || evt.date || evt.timestamp) + '</div>';
         html += '<div class="display-tl-title">' + escDisplay(evt.title || evt.label || '') + (detail ? '<span class="display-tl-chevron">&#9662;</span>' : '') + '</div>';
         if (detail) html += '<div class="display-tl-detail">' + escDisplay(detail) + '</div>';
@@ -561,7 +561,7 @@ function generateChart(args) {
         });
         html += '<div class="display-pie-wrap">';
         html += '<div class="display-pie" style="background:conic-gradient(' + gradientParts.join(',') + ')">';
-        html += '<div class="display-pie-hole"><div class="display-pie-total">' + escDisplay(total) + '</div><div class="display-pie-total-label">total</div></div></div>';
+        html += '<div class="display-pie-hole"><div class="display-pie-total">' + escDisplay(total) + '</div><div class="display-pie-total-label">' + escDisplay(t('total')) + '</div></div></div>';
         html += '<ul class="display-pie-legend">';
         labels.forEach(function(label, i) {
             var pct = total > 0 ? (values[i] / total * 100).toFixed(1) : 0;
@@ -625,7 +625,7 @@ function generateDiff(args) {
     }
 
     var html = '<div class="display-template display-diff">';
-    html += '<div class="display-diff-header"><span class="display-diff-file">' + escDisplay(args.file || args.header || 'Changes') + '</span>';
+    html += '<div class="display-diff-header"><span class="display-diff-file">' + escDisplay(args.file || args.header || t('Changes')) + '</span>';
     html += '<span class="display-diff-stats"><span class="display-diff-stat-add">+' + addCount + '</span><span class="display-diff-stat-del">&minus;' + delCount + '</span></span></div>';
     html += body + '</div>';
     return html;

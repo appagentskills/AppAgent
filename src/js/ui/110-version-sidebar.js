@@ -1,13 +1,13 @@
 // Download single file from sidebar
 async function downloadSingleFile(table, sysId, displayName) {
-    showSpinner('Downloading...');
+    showSpinner(t('Downloading...'));
     try {
         // getLatestRecordXml (ui/090-version-history.js) falls back to the
         // <table>.do?XML export for data tables with no sys_update_version rows.
         var xml = await getLatestRecordXml(table, sysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('No version to download', 'warning');
+            showSnackbar(t('No version to download'), 'warning');
             return;
         }
         if (xml) {
@@ -21,10 +21,10 @@ async function downloadSingleFile(table, sysId, displayName) {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            showSnackbar('Downloaded ' + displayName, 'success');
+            showSnackbar(t('Downloaded {name}', { name: displayName }), 'success');
         }
     } catch (e) {
-        showSnackbar('Download failed: ' + e.message, 'error');
+        showSnackbar(t('Download failed: {error}', { error: e.message }), 'error');
     }
     hideSpinner();
 }
@@ -35,10 +35,10 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
     // returns name || number || short_description straight off the ServiceNow Table API),
     // and showModal renders the confirm message as HTML. Escape it here — the same
     // pattern already used by ui/070-dashboard-ui.js:1492 and ui/170-chat-management.js.
-    if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
+    if (!await showConfirmModal(t('Delete Record'), t('Delete "{name}"? This will permanently delete this newly created record.', { name: escapeHtml(displayName) }), 'danger')) return;
 
     try {
-        showSpinner('Deleting ' + displayName + '...');
+        showSpinner(t('Deleting {name}...', { name: displayName }));
 
         var recordScope = await getRecordScope(table, sysId);
         var deleteUrl = '/api/now/table/' + table + '/' + sysId;
@@ -80,19 +80,19 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
             renderVersionSidebar();
             renderMessages();
 
-            showSnackbar('Successfully deleted "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully deleted "{name}"', { name: displayName }), 'success');
         } else {
-            showSnackbar('Delete failed: ' + res.status, 'error');
+            showSnackbar(t('Delete failed: {error}', { error: res.status }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Delete failed: ' + e.message, 'error');
+        showSnackbar(t('Delete failed: {error}', { error: e.message }), 'error');
     }
 }
 
 async function revertToVersion(versionSysId, historyIndex, revertType) {
     if (!versionSysId) {
-        showSnackbar('No version available to revert to', 'warning');
+        showSnackbar(t('No version available to revert to'), 'warning');
         return;
     }
     
@@ -101,21 +101,23 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
     
     // entry.displayName originates from the ServiceNow record (see comment in
     // deleteNewRecordFromSidebar above) and lands in an HTML sink — escape it.
-    var confirmMsg = 'Revert ' + escapeHtml(entry.displayName) + ' to ' + (revertType === 'before' ? 'before' : 'after') + ' this change?';
-    if (!await showConfirmModal('Revert Change', confirmMsg)) return;
+    var confirmMsg = revertType === 'before'
+        ? t('Revert {name} to before this change?', { name: escapeHtml(entry.displayName) })
+        : t('Revert {name} to after this change?', { name: escapeHtml(entry.displayName) });
+    if (!await showConfirmModal(t('Revert Change'), confirmMsg)) return;
     
     try {
-        showSpinner('Fetching version XML...');
+        showSpinner(t('Fetching version XML...'));
         
         // Get the XML payload from sys_update_version
         var xml = await getVersionXml(versionSysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('Failed to get version XML', 'error');
+            showSnackbar(t('Failed to get version XML'), 'error');
             return;
         }
         
-        showSpinner('Importing XML to revert...');
+        showSpinner(t('Importing XML to revert...'));
         
         var result = await uploadXml(xml, entry.table, entry.sysId);
         hideSpinner();
@@ -146,14 +148,14 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
             saveVersionHistory();
             renderVersionSidebar();
             updateVersionSidebarVisibility();
-            showSnackbar('Successfully reverted ' + entry.displayName, 'success');
+            showSnackbar(t('Successfully reverted {name}', { name: entry.displayName }), 'success');
         } else {
-            showSnackbar('Failed to import XML: ' + result.error, 'error');
+            showSnackbar(t('Failed to import XML: {error}', { error: result.error }), 'error');
         }
     } catch (e) {
         hideSpinner();
         console.error('Revert failed:', e);
-        showSnackbar('Revert failed: ' + e.message, 'error');
+        showSnackbar(t('Revert failed: {error}', { error: e.message }), 'error');
     }
 }
 

@@ -6,9 +6,9 @@
 .dashboard-actions.collapsed .dashboard-action-collapsible { display: none; }
 .dashboard-actions.collapsed .dashboard-more-btn { display: flex; }
 .dashboard-more-btn { display: none; position: relative; }
-.dashboard-more-dropdown { display: none; position: absolute; top: 100%; right: 0; margin-top: var(--space-2); background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 160px; z-index: 100; padding: var(--space-2); }
+.dashboard-more-dropdown { display: none; position: absolute; top: 100%; inset-inline-end: 0; margin-top: var(--space-2); background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 160px; z-index: 100; padding: var(--space-2); }
 .dashboard-more-dropdown.show { display: block; }
-.dashboard-more-dropdown button { width: 100%; display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: none; border: none; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--text-primary); cursor: pointer; text-align: left; }
+.dashboard-more-dropdown button { width: 100%; display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: none; border: none; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--text-primary); cursor: pointer; text-align: start; }
 .dashboard-more-dropdown button:hover { background: var(--secondary-light); }
 .dashboard-more-dropdown .dropdown-icon { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); }
 .dashboard-more-dropdown .dropdown-icon svg { width: 14px; height: 14px; }
@@ -44,7 +44,7 @@
 /* Floating hover-only card control (headers are never shown): carries the
    Expand click and a drag grip, since the content iframe eats mouse events.
    z-index 11 clears the .widget-loading-overlay (z-index 10 above). */
-.dashboard-widget-hover-btn { position: absolute; top: var(--space-3); right: var(--space-3); z-index: 11; width: 26px; height: 26px; border: 1px solid var(--secondary-border); background: var(--bg-white); border-radius: var(--radius-sm); cursor: grab; display: flex; align-items: center; justify-content: center; color: var(--text-muted); box-shadow: var(--shadow-sm); opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast); }
+.dashboard-widget-hover-btn { position: absolute; top: var(--space-3); inset-inline-end: var(--space-3); z-index: 11; width: 26px; height: 26px; border: 1px solid var(--secondary-border); background: var(--bg-white); border-radius: var(--radius-sm); cursor: grab; display: flex; align-items: center; justify-content: center; color: var(--text-muted); box-shadow: var(--shadow-sm); opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast); }
 .dashboard-widget:hover .dashboard-widget-hover-btn { opacity: 1; }
 .dashboard-widget-hover-btn:hover { background: var(--primary-lighter); color: var(--primary); }
 .dashboard-widget-hover-btn svg { width: 14px; height: 14px; }
@@ -58,20 +58,20 @@
 .widget-loading-overlay span { font-size: var(--text-body); color: var(--text-muted); }
 
 /* Widget Resize Handle */
-.dashboard-widget-resize-handle { position: absolute; bottom: 0; right: 0; width: 20px; height: 20px; cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, var(--secondary-border) 50%); border-bottom-right-radius: 10px; opacity: 0; transition: opacity var(--transition-normal); }
+.dashboard-widget-resize-handle { position: absolute; bottom: 0; inset-inline-end: 0; width: 20px; height: 20px; cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, var(--secondary-border) 50%); border-end-end-radius: 10px; opacity: 0; transition: opacity var(--transition-normal); }
 .dashboard-widget:hover .dashboard-widget-resize-handle { opacity: 1; }
 .dashboard-widget-resize-handle:hover { background: linear-gradient(135deg, transparent 50%, var(--primary-light) 50%); }
 
 /* Streaming cursor animation */
-.streaming-cursor { display: inline-block; width: 8px; height: 16px; background: var(--primary); margin-left: var(--space-1); animation: blink 1s infinite; vertical-align: text-bottom; }
+.streaming-cursor { display: inline-block; width: 8px; height: 16px; background: var(--primary); margin-inline-start: var(--space-1); animation: blink 1s infinite; vertical-align: text-bottom; }
 @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 
 /* Widget chat empty state */
 .widget-chat-empty { color: var(--text-muted); font-size: var(--text-body-lg); text-align: center; padding: var(--space-12) var(--space-9); }
 
 /* Widget mode in chat */
-.widget-mode-badge { display: inline-block; background: var(--primary); color: var(--text-inverse); font-size: var(--text-sm); font-weight: var(--font-semibold); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); margin-right: var(--space-3); vertical-align: middle; }
-.widget-back-btn { display: none; margin-right: var(--space-4); }
+.widget-mode-badge { display: inline-block; background: var(--primary); color: var(--text-inverse); font-size: var(--text-sm); font-weight: var(--font-semibold); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); margin-inline-end: var(--space-3); vertical-align: middle; }
+.widget-back-btn { display: none; margin-inline-end: var(--space-4); }
 #chat-header.widget-mode .widget-back-btn { display: flex; }
 
 
@@ -80,7 +80,7 @@
    align: width 100%, max-width 1200px, margin var(--space-8) auto 0. */
 .home-dashboard-section { width: 100%; max-width: 1200px; margin: var(--space-8) auto 0; }
 .home-dashboard-bar { display: flex; align-items: center; gap: var(--space-4); padding: 0 var(--space-4); }
-.home-dashboard-bar .home-section-label { flex: 1; text-align: left; }
+.home-dashboard-bar .home-section-label { flex: 1; text-align: start; }
 .home-dashboard-expand-btn { width: 24px; height: 24px; border: none; background: none; border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
 .home-dashboard-expand-btn:hover { background: var(--secondary-light); color: var(--text-primary); }
 .home-dashboard-expand-btn svg { width: 16px; height: 16px; transition: transform var(--transition-fast); }
@@ -100,7 +100,7 @@
 
 /* Widget pin-target popover (Pin to Home / Pin to Dashboard / Unpin) */
 .widget-pin-menu { position: fixed; z-index: 2147483000; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); min-width: 170px; padding: var(--space-2); }
-.widget-pin-menu button { width: 100%; display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: none; border: none; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--text-primary); cursor: pointer; text-align: left; }
+.widget-pin-menu button { width: 100%; display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: none; border: none; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--text-primary); cursor: pointer; text-align: start; }
 .widget-pin-menu button:hover { background: var(--secondary-light); }
 .widget-pin-menu button.active { color: var(--primary); font-weight: var(--font-semibold); }
 .widget-pin-menu button.danger:hover { background: var(--danger-light); color: var(--danger); }
@@ -111,7 +111,15 @@
     .home-dashboard-section { max-width: 100%; padding: 0 8px; }
 }
 
-/* Skip link accessibility */
+/* Skip link accessibility.
+   Unfocused: visually hidden IN PLACE (clip), never parked off-canvas. The
+   inline `left:-9999px` in src/html/body.html is overridden here because in
+   RTL (<html dir="rtl">) the root scroller's scrollable overflow extends to
+   the LEFT, so a box 9999px past the left edge added a ~10000px horizontal
+   scrollbar (documentElement.scrollWidth 11553 vs clientWidth 1554).
+   left:auto keeps it at its static position (the inline-start edge in both
+   directions), so this is direction-agnostic and LTR looks identical. */
+.skip-link:not(:focus) { left: auto !important; clip-path: inset(50%); white-space: nowrap; }
 .skip-link:focus { position: fixed !important; left: 50% !important; top: 10px !important; transform: translateX(-50%); width: auto !important; height: auto !important; overflow: visible !important; padding: var(--space-5) var(--space-9); background: var(--primary); color: var(--text-inverse); text-decoration: none; border-radius: var(--radius-sm); font-weight: var(--font-semibold); z-index: var(--z-overlay); box-shadow: var(--shadow-md); }
 
 /* ==================== RESPONSIVE DESIGN ==================== */

@@ -16,7 +16,7 @@ function navigateDiffChange(direction) {
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
         // Update counter
         var counter = document.getElementById('diff-nav-counter');
-        if (counter) counter.textContent = (currentDiffChangeIndex + 1) + ' / ' + diffChangeElements.length;
+        if (counter) counter.textContent = t('{current} / {total}', { current: currentDiffChangeIndex + 1, total: diffChangeElements.length });
     }
 }
 
@@ -83,19 +83,19 @@ async function openDiffViewer(table, sysId, displayName) {
 
     var revertBtnHtml = '';
     if (isNew) {
-        revertBtnHtml = '<button class="diff-action-btn danger" onclick="revertFromDiffViewer()" title="Delete this new record">' + UI_ICONS.trash + '<span>Delete</span></button>';
+        revertBtnHtml = '<button class="diff-action-btn danger" onclick="revertFromDiffViewer()" title="' + escapeHtml(t('Delete this new record')) + '">' + UI_ICONS.trash + '<span>' + escapeHtml(t('Delete')) + '</span></button>';
     } else if (firstBeforeVersion) {
-        revertBtnHtml = '<button class="diff-action-btn" onclick="revertFromDiffViewer()" title="Revert to before chat">' + UI_ICONS.undo + '<span>Revert</span></button>';
+        revertBtnHtml = '<button class="diff-action-btn" onclick="revertFromDiffViewer()" title="' + escapeHtml(t('Revert to before chat')) + '">' + UI_ICONS.undo + '<span>' + escapeHtml(t('Revert')) + '</span></button>';
     }
 
     // Build compare section - either dropdown or "no earlier version" message
     var compareHtml = '';
     if (hasComparableVersions) {
-        compareHtml = '<span class="diff-compare-label">Compare with:</span>' +
+        compareHtml = '<span class="diff-compare-label">' + escapeHtml(t('Compare with:')) + '</span>' +
             '<select id="diff-compare-version" class="diff-version-select" onchange="updateDiffView()">' +
-            '<option value="">Loading...</option></select>';
+            '<option value="">' + escapeHtml(t('Loading...')) + '</option></select>';
     } else {
-        compareHtml = '<span class="diff-no-compare">No earlier version to compare against</span>';
+        compareHtml = '<span class="diff-no-compare">' + escapeHtml(t('No earlier version to compare against')) + '</span>';
     }
 
     // Open on instance URL
@@ -107,18 +107,18 @@ async function openDiffViewer(table, sysId, displayName) {
         '</div>' +
         '<div class="diff-header-center" id="diff-header-stats"></div>' +
         '<div class="diff-header-right">' +
-        '<a class="diff-action-btn" href="' + instanceUrl + '" target="_blank" title="Open on instance">' + UI_ICONS.externalLink + '<span>Open</span></a>' +
-        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + escapeJsString(displayName) + '\')" title="Screenshot">' + UI_ICONS.camera + '<span>Screenshot</span></button>' : '') +
-        '<button class="diff-action-btn" onclick="downloadFromDiffViewer()" title="Download XML">' + UI_ICONS.download + '<span>Download</span></button>' +
+        '<a class="diff-action-btn" href="' + instanceUrl + '" target="_blank" title="' + escapeHtml(t('Open on instance')) + '">' + UI_ICONS.externalLink + '<span>' + escapeHtml(t('Open')) + '</span></a>' +
+        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + escapeJsString(displayName) + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '<span>' + escapeHtml(t('Screenshot')) + '</span></button>' : '') +
+        '<button class="diff-action-btn" onclick="downloadFromDiffViewer()" title="' + escapeHtml(t('Download XML')) + '">' + UI_ICONS.download + '<span>' + escapeHtml(t('Download')) + '</span></button>' +
         revertBtnHtml +
-        '<button class="diff-close-btn" onclick="closeDiffViewer()" title="Close">' + UI_ICONS.close + '</button>' +
+        '<button class="diff-close-btn" onclick="closeDiffViewer()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
 
     // Content area
     var content = document.createElement('div');
     content.className = 'diff-viewer-content';
     content.id = 'diff-viewer-content';
-    content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>Loading...</div>';
+    content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>' + escapeHtml(t('Loading...')) + '</div>';
 
     modal.appendChild(header);
     modal.appendChild(content);
@@ -152,12 +152,12 @@ async function openDiffViewer(table, sysId, displayName) {
 
             // Current version first (disabled)
             if (currentVersion) {
-                dropdownHtml += '<option value="' + currentVersion.versionId + '" disabled class="diff-option-current">' + escapeHtml(currentVersion.label) + ' (Current)</option>';
+                dropdownHtml += '<option value="' + currentVersion.versionId + '" disabled class="diff-option-current">' + t('{label} (Current)', { label: escapeHtml(currentVersion.label) }) + '</option>';
             }
 
             // Chat versions (excluding current)
             if (chatVersions.length > 0) {
-                dropdownHtml += '<optgroup label="This Chat">';
+                dropdownHtml += '<optgroup label="' + escapeHtml(t('This Chat')) + '">';
                 chatVersions.forEach(function(ver, idx) {
                     var selected = idx === 0 ? ' selected' : '';
                     dropdownHtml += '<option value="' + ver.versionId + '"' + selected + '>' + escapeHtml(ver.label) + '</option>';
@@ -167,7 +167,7 @@ async function openDiffViewer(table, sysId, displayName) {
 
             // Historical versions
             if (histVersions.length > 0) {
-                dropdownHtml += '<optgroup label="Earlier History">';
+                dropdownHtml += '<optgroup label="' + escapeHtml(t('Earlier History')) + '">';
                 var firstInGroup = chatVersions.length === 0;
                 histVersions.forEach(function(ver, idx) {
                     var selected = firstInGroup && idx === 0 ? ' selected' : '';
@@ -195,7 +195,7 @@ async function updateDiffView() {
     var seq = ++_diffViewSeq, file = currentDiffFile;
     function stale() { return seq !== _diffViewSeq || currentDiffFile !== file || !content.isConnected; }
 
-    content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>Loading...</div>';
+    content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>' + escapeHtml(t('Loading...')) + '</div>';
     if (headerStats) headerStats.innerHTML = '';
 
     var latestAfterVersion = getLatestAfterVersion(currentDiffFile.table, currentDiffFile.sysId);
@@ -216,7 +216,7 @@ async function updateDiffView() {
             var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
             if (stale()) return;
             if (!xml) {
-                content.innerHTML = '<div class="diff-error">Could not load record data.</div>';
+                content.innerHTML = '<div class="diff-error">' + escapeHtml(t('Could not load record data.')) + '</div>';
                 return;
             }
             var formattedXml = formatXmlForDiff(xml);
@@ -233,17 +233,17 @@ async function updateDiffView() {
             html += '</div></div>';
             content.innerHTML = html;
 
-            if (headerStats) headerStats.innerHTML = '<span class="diff-preview-label">' + lines.length + ' lines</span>';
+            if (headerStats) headerStats.innerHTML = '<span class="diff-preview-label">' + escapeHtml(tn(lines.length, '{count} line', '{count} lines')) + '</span>';
         } catch (e) {
             if (stale()) return;
-            content.innerHTML = '<div class="diff-error">Failed to load version data: ' + escapeHtml(e.message) + '</div>';
+            content.innerHTML = '<div class="diff-error">' + t('Failed to load version data: {error}', { error: escapeHtml(e.message) }) + '</div>';
         }
         return;
     }
 
     // If comparing the same version, show a message
     if (compareVersionId === latestAfterVersion) {
-        content.innerHTML = '<div class="diff-no-changes"><div class="diff-no-changes-icon">' + UI_ICONS.info + '</div><div class="diff-no-changes-text">This is the current version. Select an earlier version to compare.</div></div>';
+        content.innerHTML = '<div class="diff-no-changes"><div class="diff-no-changes-icon">' + UI_ICONS.info + '</div><div class="diff-no-changes-text">' + escapeHtml(t('This is the current version. Select an earlier version to compare.')) + '</div></div>';
         if (headerStats) headerStats.innerHTML = '';
         return;
     }
@@ -254,7 +254,7 @@ async function updateDiffView() {
         if (stale()) return;
 
         if (!oldXml) {
-            content.innerHTML = '<div class="diff-error">Could not load version data. The version may have been deleted.</div>';
+            content.innerHTML = '<div class="diff-error">' + escapeHtml(t('Could not load version data. The version may have been deleted.')) + '</div>';
             return;
         }
 
@@ -262,7 +262,6 @@ async function updateDiffView() {
         var oldContent = formatXmlForDiff(oldXml);
         var newContent = formatXmlForDiff(newXml);
 
-        console.log('Diff comparison:', { compareVersionId: compareVersionId, latestAfterVersion: latestAfterVersion, oldLength: oldContent ? oldContent.length : 0, newLength: newContent ? newContent.length : 0 });
 
         var diff = computeDiff(oldContent, newContent);
 
@@ -351,10 +350,10 @@ async function updateDiffView() {
             statsHtml += '<span class="diff-stat remove">-' + removeCount + '</span>';
             if (totalHunks > 0) {
                 statsHtml += '<div class="diff-nav">';
-                statsHtml += '<button class="diff-nav-btn" onclick="navigateDiffChange(-1)" title="Previous change">' + UI_ICONS.arrowUp + '</button>';
-                statsHtml += '<span id="diff-nav-counter" class="diff-nav-counter">1 / ' + totalHunks + '</span>';
-                statsHtml += '<button class="diff-nav-btn" onclick="navigateDiffChange(1)" title="Next change">' + UI_ICONS.arrowDown + '</button>';
-                statsHtml += '<button id="diff-focus-toggle" class="diff-nav-btn active" onclick="toggleDiffFocus()" title="Show changes only">' + UI_ICONS.collapse + '</button>';
+                statsHtml += '<button class="diff-nav-btn" onclick="navigateDiffChange(-1)" title="' + escapeHtml(t('Previous change')) + '">' + UI_ICONS.arrowUp + '</button>';
+                statsHtml += '<span id="diff-nav-counter" class="diff-nav-counter">' + escapeHtml(t('{current} / {total}', { current: 1, total: totalHunks })) + '</span>';
+                statsHtml += '<button class="diff-nav-btn" onclick="navigateDiffChange(1)" title="' + escapeHtml(t('Next change')) + '">' + UI_ICONS.arrowDown + '</button>';
+                statsHtml += '<button id="diff-focus-toggle" class="diff-nav-btn active" onclick="toggleDiffFocus()" title="' + escapeHtml(t('Show changes only')) + '">' + UI_ICONS.collapse + '</button>';
                 statsHtml += '</div>';
             }
             headerStats.innerHTML = statsHtml;
@@ -371,7 +370,7 @@ async function updateDiffView() {
 
     } catch (e) {
         if (stale()) return;
-        content.innerHTML = '<div class="diff-error">Failed to load version data: ' + escapeHtml(e.message) + '</div>';
+        content.innerHTML = '<div class="diff-error">' + t('Failed to load version data: {error}', { error: escapeHtml(e.message) }) + '</div>';
     }
 }
 
@@ -390,7 +389,7 @@ async function downloadFromDiffViewer() {
     // swaps it) while the fetch below is in flight.
     var file = currentDiffFile;
 
-    showSpinner('Downloading...');
+    showSpinner(t('Downloading...'));
     try {
         // getLatestRecordXml falls back to the <table>.do?XML export for data
         // tables (no sys_update_version rows) — the old getLatestAfterVersion
@@ -398,7 +397,7 @@ async function downloadFromDiffViewer() {
         var xml = await getLatestRecordXml(file.table, file.sysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('No version to download', 'warning');
+            showSnackbar(t('No version to download'), 'warning');
             return;
         }
         if (xml) {
@@ -412,10 +411,10 @@ async function downloadFromDiffViewer() {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            showSnackbar('Downloaded ' + file.displayName, 'success');
+            showSnackbar(t('Downloaded {name}', { name: file.displayName }), 'success');
         }
     } catch (e) {
-        showSnackbar('Download failed: ' + e.message, 'error');
+        showSnackbar(t('Download failed: {error}', { error: e.message }), 'error');
     }
     hideSpinner();
 }
@@ -426,9 +425,9 @@ async function revertFromDiffViewer() {
 
     if (currentDiffFile.isNew) {
         // Delete new record
-        if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(currentDiffFile.displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
+        if (!await showConfirmModal(t('Delete Record'), t('Delete "{name}"? This will permanently delete this newly created record.', { name: escapeHtml(currentDiffFile.displayName) }), 'danger')) return;
 
-        showSpinner('Deleting...');
+        showSpinner(t('Deleting...'));
         try {
             var recordScope = await getRecordScope(currentDiffFile.table, currentDiffFile.sysId);
             var deleteUrl = '/api/now/table/' + currentDiffFile.table + '/' + currentDiffFile.sysId;
@@ -455,20 +454,20 @@ async function revertFromDiffViewer() {
                     action: 'USER_DELETE',
                     messageIndex: -1
                 });
-                showSnackbar('Deleted "' + currentDiffFile.displayName + '"', 'success');
+                showSnackbar(t('Deleted "{name}"', { name: currentDiffFile.displayName }), 'success');
                 closeDiffViewer();
             } else {
-                showSnackbar('Delete failed', 'error');
+                showSnackbar(t('Delete failed'), 'error');
             }
         } catch (e) {
-            showSnackbar('Delete failed: ' + e.message, 'error');
+            showSnackbar(t('Delete failed: {error}', { error: e.message }), 'error');
         }
         hideSpinner();
     } else if (currentDiffFile.firstBeforeVersion) {
         // Revert to before chat
-        if (!await showConfirmModal('Revert Changes', 'Revert "' + escapeHtml(currentDiffFile.displayName) + '" to its state before this chat? You can redo this later.')) return;
+        if (!await showConfirmModal(t('Revert Changes'), t('Revert "{name}" to its state before this chat? You can redo this later.', { name: escapeHtml(currentDiffFile.displayName) }))) return;
 
-        showSpinner('Reverting...');
+        showSpinner(t('Reverting...'));
         try {
             var xml = await getVersionXml(currentDiffFile.firstBeforeVersion);
             if (xml) {
@@ -488,14 +487,14 @@ async function revertFromDiffViewer() {
                         messageIndex: -1,
                         afterVersion: currentDiffFile.firstBeforeVersion
                     });
-                    showSnackbar('Reverted "' + currentDiffFile.displayName + '"', 'success');
+                    showSnackbar(t('Reverted "{name}"', { name: currentDiffFile.displayName }), 'success');
                     closeDiffViewer();
                 } else {
-                    showSnackbar('Revert failed: ' + result.error, 'error');
+                    showSnackbar(t('Revert failed: {error}', { error: result.error }), 'error');
                 }
             }
         } catch (e) {
-            showSnackbar('Revert failed: ' + e.message, 'error');
+            showSnackbar(t('Revert failed: {error}', { error: e.message }), 'error');
         }
         hideSpinner();
     }

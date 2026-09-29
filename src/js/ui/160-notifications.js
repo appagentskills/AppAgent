@@ -74,7 +74,7 @@ function showPendingApprovalNotifications(chatId) {
     // Now add notifications for each pending approval
     for (var j = 0; j < pendingApprovals.length; j++) {
         var approval = pendingApprovals[j];
-        var chatTitle = chat.title || 'A chat';
+        var chatTitle = chat.title || t('A chat');
         var statusMessage = (approval.msg.args && approval.msg.args.status_message) ? approval.msg.args.status_message : null;
         showApprovalNotification(chatTitle, approval.msg.toolName, chatId, statusMessage, approval.index, approval.msg.args);
     }
@@ -177,8 +177,8 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             }
             if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
             var reuseTitle = (toolCallId && toolCallId.startsWith('prog_'))
-                ? (options.widgetName || chat.title || 'Background task')
-                : (chat.title || 'A chat');
+                ? (options.widgetName || chat.title || t('Background task'))
+                : (chat.title || t('A chat'));
             var reuseStatusMessage = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(reuseTitle, displayName, chatId, reuseStatusMessage, existingRow.index, args, options);
             renderChatList();
@@ -218,19 +218,19 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             // calls also come from js_eval chains and other chats routed via the
             // worker, so fall back to the originating chat's title before the
             // generic label — "Widget" was misleading for non-widget callers.
-            var notificationTitle = options.widgetName || chat.title || 'Background task';
+            var notificationTitle = options.widgetName || chat.title || t('Background task');
             var statusMessage = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
         } else if (currentChatId === chatId && currentView === 'chat') {
             // For agent tool calls on current chat, show notification popup instead of inline
-            var chatTitle = chat.title || 'A chat';
+            var chatTitle = chat.title || t('A chat');
             var statusMessage = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
             renderMessages(); // Still render to update chat but notification handles approval
             scrollToBottomIfAllowed();
         } else {
             // Show notification when user is on a different chat or different view
-            var chatTitle = chat.title || 'A chat';
+            var chatTitle = chat.title || t('A chat');
             var statusMessage = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(chatTitle, displayName, chatId, statusMessage, approvalIndex, args, options);
         }
@@ -271,7 +271,7 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
             var reuseKeyB = chatId + ':' + existingRowB.index;
             pendingToolApprovals[reuseKeyB] = { resolve: resolve, approvalIndex: existingRowB.index, chatId: chatId, toolCallId: toolCallId };
             var isProgB = toolCallId && toolCallId.startsWith('prog_');
-            var reuseTitleB = isProgB ? (options.widgetName || chat.title || 'Background task') : (chat.title || 'A chat');
+            var reuseTitleB = isProgB ? (options.widgetName || chat.title || t('Background task')) : (chat.title || t('A chat'));
             var reuseStatusMessageB = (args && args.status_message) ? args.status_message : null;
             showApprovalNotification(reuseTitleB, displayName, chatId, reuseStatusMessageB, existingRowB.index, args);
             return;
@@ -300,7 +300,7 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
         // Queue notification (will be shown after all approvals are added)
         // Always show notification popup (not just when on different chat/view)
         var isProgrammaticCall = toolCallId && toolCallId.startsWith('prog_');
-        var notificationTitle = isProgrammaticCall ? (options.widgetName || chat.title || 'Background task') : (chat.title || 'A chat');
+        var notificationTitle = isProgrammaticCall ? (options.widgetName || chat.title || t('Background task')) : (chat.title || t('A chat'));
         var statusMessage = (args && args.status_message) ? args.status_message : null;
         showApprovalNotification(notificationTitle, displayName, chatId, statusMessage, approvalIndex, args);
     });
@@ -636,12 +636,12 @@ function initChatGPTOAuth() {
                 _chatGPTLoginGeneration++;
                 closeChatGPTBrowserModal();
                 closeChatGPTDeviceCodeModal();
-                try { showSnackbar('ChatGPT login failed: ' + msg.error, 'error'); } catch (e) {}
+                try { showSnackbar(t('ChatGPT login failed: {error}', { error: msg.error }), 'error'); } catch (e) {}
             } else if (msg.openaiOAuth) {
                 _chatGPTLoginGeneration++;
                 closeChatGPTBrowserModal();
                 closeChatGPTDeviceCodeModal();
-                try { showSnackbar('Logged in to ChatGPT', 'success'); } catch (e) {}
+                try { showSnackbar(t('Logged in to ChatGPT'), 'success'); } catch (e) {}
             } else {
                 // Logout/credential removal: no pending code remains valid.
                 _chatGPTLoginGeneration++;
@@ -727,9 +727,9 @@ function updateModelConnectionDot() {
             // Clicking the pill opens the model menu (reasoning effort + model picker +
             // optional OAuth login/logout row) — it does NOT log out on a single click,
             // so don't advertise "Click to logout" here.
-            el.title = name + ' — Connected';
+            el.title = t('{name} — Connected', { name: name });
         } else if (isOAuth && isDisconnected) {
-            el.title = name + ' — Click to login';
+            el.title = t('{name} — Click to login', { name: name });
         } else {
             el.title = name;
         }
@@ -746,8 +746,19 @@ function updateModelConnectionDot() {
             if (showButton) {
                 loginButton.classList.toggle('pending', llmConnectionStatus === 'pending');
                 loginButton.disabled = llmConnectionStatus === 'pending';
-                loginButton.textContent = llmConnectionStatus === 'pending' ? 'Waiting…' : (llmConnectionStatus === 'error' ? 'Retry' : 'Connect');
-                loginButton.setAttribute('aria-label', loginButton.textContent + ' ' + (provider.isClaudeOAuth ? 'Claude' : 'ChatGPT') + ' subscription');
+                // Whole-sentence keys per state (contract rule 4): the aria
+                // label is NOT built from the translated button text.
+                var loginProviderName = provider.isClaudeOAuth ? 'Claude' : 'ChatGPT';
+                if (llmConnectionStatus === 'pending') {
+                    loginButton.textContent = t('Waiting…');
+                    loginButton.setAttribute('aria-label', t('Waiting… {provider} subscription', { provider: loginProviderName }));
+                } else if (llmConnectionStatus === 'error') {
+                    loginButton.textContent = t('Retry');
+                    loginButton.setAttribute('aria-label', t('Retry {provider} subscription', { provider: loginProviderName }));
+                } else {
+                    loginButton.textContent = t('Connect');
+                    loginButton.setAttribute('aria-label', t('Connect {provider} subscription', { provider: loginProviderName }));
+                }
             }
         }
     });
@@ -757,6 +768,10 @@ function updateModelConnectionDot() {
 // is intentionally a single consistent glyph (the same `model` icon shown in
 // the header pill) rather than a per-vendor guess — guessed vendor icons read
 // as arbitrary and inconsistent.
+// i18n: _modelRowMeta/_modelMenuRowHtml translate through a typeof-guarded
+// t() (test/reviewed-ui-regressions.test.js evaluates both declarations
+// without the i18n core), so their display keys are registered here.
+var _MODEL_ROW_I18N_KEYS = [N_('Proxy'), N_('Subscription'), N_('Select model {name}'), N_('Edit model'), N_('Edit model {name}')];
 function _modelRowMeta(p) {
     var ep = (p && p.endpoint ? p.endpoint : '').toLowerCase();
     var conn = '';
@@ -767,12 +782,14 @@ function _modelRowMeta(p) {
 }
 
 function _modelMenuRowHtml(p) {
+    // typeof-guarded t() with {placeholder} fill (see _MODEL_ROW_I18N_KEYS).
+    var tr = typeof t === 'function' ? t : function(s, params) { return String(s).replace(/\{(\w+)\}/g, function(m, k) { return params && params[k] != null ? String(params[k]) : m; }); };
     var meta = _modelRowMeta(p);
     var sel = p.name === currentProvider;
-    var badges = (p.isClaudeOAuth || p.isChatGPTOAuth) ? '<span class="model-row-badge oauth">Subscription</span>' : '';
+    var badges = (p.isClaudeOAuth || p.isChatGPTOAuth) ? '<span class="model-row-badge oauth">' + escapeHtml(tr('Subscription')) + '</span>' : '';
     var subBits = [];
     if (p.model) subBits.push(escapeHtml(p.model));
-    if (meta.conn) subBits.push(escapeHtml(meta.conn));
+    if (meta.conn) subBits.push(escapeHtml(tr(meta.conn)));
     var sub = subBits.join(' \u00b7 ');
     var check = sel
         ? '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>'
@@ -780,14 +797,14 @@ function _modelMenuRowHtml(p) {
     // Separate native buttons: Enter/Space work without a keydown shim, and
     // activating Edit can never bubble into model selection. Keep row styling.
     return '<div class="model-menu-row' + (sel ? ' selected' : '') + '">' +
-        '<button type="button" class="model-row-main model-row-select" aria-pressed="' + sel + '" aria-label="Select model ' + escapeHtml(p.name) + '" onclick="selectModelFromMenu(\'' + escapeJsString(p.name) + '\')">' +
+        '<button type="button" class="model-row-main model-row-select" aria-pressed="' + sel + '" aria-label="' + escapeHtml(tr('Select model {name}', { name: p.name })) + '" onclick="selectModelFromMenu(\'' + escapeJsString(p.name) + '\')">' +
             '<span class="model-row-icon">' + UI_ICONS.model + '</span>' +
             '<span class="model-row-main">' +
                 '<span class="model-row-title"><span class="model-row-name" title="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + '</span>' + badges + '</span>' +
                 (sub ? '<span class="model-row-sub">' + sub + '</span>' : '') +
             '</span>' + check +
         '</button>' +
-        '<button type="button" class="model-row-edit" title="Edit model" aria-label="Edit model ' + escapeHtml(p.name) + '" onclick="event.stopPropagation();editModelFromMenu(\'' + escapeJsString(p.name) + '\')">' + UI_ICONS.edit + '</button>' +
+        '<button type="button" class="model-row-edit" title="' + escapeHtml(tr('Edit model')) + '" aria-label="' + escapeHtml(tr('Edit model {name}', { name: p.name })) + '" onclick="event.stopPropagation();editModelFromMenu(\'' + escapeJsString(p.name) + '\')">' + UI_ICONS.edit + '</button>' +
     '</div>';
 }
 
@@ -806,12 +823,16 @@ function _providerDefaultEffort(p) {
 // Discrete reasoning-effort levels — same values the settings page's provider
 // modal writes (provider.effort via saveApiProvider); slider index = position.
 var _EFFORT_LEVELS = [
-    { v: 'low', label: 'Low' },
-    { v: 'medium', label: 'Medium' },
-    { v: 'high', label: 'High' },
-    { v: 'xhigh', label: 'X-High' },
-    { v: 'max', label: 'Max' }
+    { v: 'low', label: N_('Low') },
+    { v: 'medium', label: N_('Medium') },
+    { v: 'high', label: N_('High') },
+    { v: 'xhigh', label: N_('X-High') },
+    { v: 'max', label: N_('Max') }
 ];
+// i18n: _effortSliderLabelHtml translates through a typeof-guarded t()
+// (test/chatgpt-astra.test.js evaluates it without the i18n core), so its
+// badge keys are registered for extraction here.
+var _EFFORT_I18N_KEYS = [N_('default'), N_('sent as high on ChatGPT')];
 
 // Dynamic label under the effort slider: level name + 'default' badge when
 // the level equals the provider's seed default.
@@ -823,9 +844,11 @@ function _effortSliderLabelHtml(idx) {
     // 'high' (the Responses API rejects them) — say so instead of silently lying.
     // GPT-6 Astra/Sol/Luna take xhigh/max natively (chatGPTSupportsExtendedEffort).
     var clampedOnChatGPT = !!(provider && provider.isChatGPTOAuth && !chatGPTSupportsExtendedEffort(provider.model) && (e.v === 'xhigh' || e.v === 'max'));
-    return '<span class="model-menu-effort-name">' + e.label + '</span>' +
-        (isDef ? '<span class="model-row-badge">default</span>' : '') +
-        (clampedOnChatGPT ? '<span class="model-row-badge">sent as high on ChatGPT</span>' : '');
+    // typeof-guarded t() (see _EFFORT_I18N_KEYS).
+    var tr = typeof t === 'function' ? t : String;
+    return '<span class="model-menu-effort-name">' + tr(e.label) + '</span>' +
+        (isDef ? '<span class="model-row-badge">' + tr('default') + '</span>' : '') +
+        (clampedOnChatGPT ? '<span class="model-row-badge">' + tr('sent as high on ChatGPT') + '</span>' : '');
 }
 
 // Live refresh while dragging (does not persist): label text, level circles
@@ -865,12 +888,12 @@ async function commitEffortSlider(v) {
     try {
         await saveApiProvider(updated);
         onEffortSliderInput(idx);
-        showSnackbar('Reasoning effort: ' + e.label, 'info');
+        showSnackbar(t('Reasoning effort: {level}', { level: t(e.label) }), 'info');
     } catch (err) {
         provider.effort = previousEffort;
         var restored = _EFFORT_LEVELS.map(function(level) { return level.v; }).indexOf(previousEffort || _providerDefaultEffort(provider));
         onEffortSliderInput(restored < 0 ? 2 : restored);
-        showSnackbar('Could not save reasoning effort: ' + (err && err.message), 'error');
+        showSnackbar(t('Could not save reasoning effort: {error}', { error: String(err && err.message) }), 'error');
     }
 }
 
@@ -888,7 +911,7 @@ function _tierMenuRowsHtml() {
         // follows the spawning agent's current model dynamically — identical
         // behavior to an explicit tier:'same' spawn. Mirrors the Settings page.
         var isSame = (typeof TIER_ALIAS_SAME !== 'undefined' && current === TIER_ALIAS_SAME);
-        var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>Same</option>';
+        var options = '<option value="' + TIER_ALIAS_SAME + '"' + (isSame ? ' selected' : '') + '>' + escapeHtml(t('Same')) + '</option>';
         var found = isSame;
         (apiProviders || []).forEach(function(p) {
             if (p.name === current) found = true;
@@ -897,7 +920,7 @@ function _tierMenuRowsHtml() {
         // Mapped provider no longer exists (deleted/renamed) — keep it
         // visible + selected so the user sees the stale mapping.
         if (!found && current) {
-            options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + ' (missing)</option>' + options;
+            options = '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(t('{name} (missing)', { name: current })) + '</option>' + options;
         }
         html += '<div class="model-menu-tier-row">' +
             '<span class="model-menu-tier-label">' + tier + '</span>' +
@@ -913,8 +936,8 @@ function _tierMenuRowsHtml() {
 function setTierAliasFromMenu(tier, providerName) {
     if (typeof setTierAlias === 'function') setTierAlias(tier, providerName);
     var _tierLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && providerName === TIER_ALIAS_SAME)
-        ? 'Same (follows current model)' : providerName;
-    showSnackbar('Sub-agent ' + tier + ' tier: ' + _tierLabel, 'info');
+        ? t('Same (follows current model)') : providerName;
+    showSnackbar(t('Sub-agent {tier} tier: {model}', { tier: tier, model: _tierLabel }), 'info');
 }
 
 // Session-scoped collapse state for the pill menu's model sections — kept
@@ -938,7 +961,7 @@ function toggleModelMenu(event) {
     if (event && event.target && event.target.closest && event.target.closest('.model-login-btn')) return;
     if (event) { event.stopPropagation(); event.preventDefault(); }
     var existing = document.getElementById('model-menu');
-    if (existing) { existing.remove(); document.removeEventListener('click', _closeModelMenuOnOutside); return; }
+    if (existing) { existing.remove(); document.removeEventListener('click', _closeModelMenuOnOutside); if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded(); return; }
     // Only one header dropdown open at a time
     if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('model');
 
@@ -948,7 +971,7 @@ function toggleModelMenu(event) {
     menu.id = 'model-menu';
     menu.className = 'header-menu model-menu';
 
-    var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>Reasoning effort</div>';
+    var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>' + escapeHtml(t('Reasoning effort')) + '</div>';
     var defEffort = _providerDefaultEffort(provider);
     var curEffort = (provider && provider.effort) || defEffort;
     if (provider && provider.isChatGPTOAuth && isChatGPTAstraModel(provider.model) && /^(none|minimal)$/i.test(curEffort)) curEffort = 'low';
@@ -961,13 +984,13 @@ function toggleModelMenu(event) {
     html += '<div class="model-menu-effort">' +
         '<div class="model-menu-effort-track" style="--pos: ' + (effortIdx / 4) + '">' + effortDots +
             '<span class="effort-track-fill"></span>' +
-            '<input type="range" class="model-menu-effort-slider" id="model-menu-effort-slider" min="0" max="4" step="1" value="' + effortIdx + '" aria-label="Reasoning effort" oninput="onEffortSliderInput(this.value)" onchange="commitEffortSlider(this.value)">' +
+            '<input type="range" class="model-menu-effort-slider" id="model-menu-effort-slider" min="0" max="4" step="1" value="' + effortIdx + '" aria-label="' + escapeHtml(t('Reasoning effort')) + '" oninput="onEffortSliderInput(this.value)" onchange="commitEffortSlider(this.value)">' +
             '<span class="effort-disc" id="model-menu-effort-disc"></span>' +
         '</div>' +
         '<div class="model-menu-effort-label" id="model-menu-effort-label">' + _effortSliderLabelHtml(effortIdx) + '</div>' +
     '</div>';
-    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.model + '</span><span>Model</span>' +
-        '<button class="menu-title-btn" title="Add model" aria-label="Add model" onclick="addModelFromMenu(event)">' + UI_ICONS.plus + '</button></div>';
+    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.model + '</span><span>' + escapeHtml(t('Model')) + '</span>' +
+        '<button class="menu-title-btn" title="' + escapeHtml(t('Add model')) + '" aria-label="' + escapeHtml(t('Add model')) + '" onclick="addModelFromMenu(event)">' + UI_ICONS.plus + '</button></div>';
     // Folded per-source sections — same grouping as the Settings model list
     // (groupProvidersIntoSections, ui/040-tools-settings.js). Sections start
     // collapsed except the one holding the current model; manual toggles are
@@ -989,19 +1012,20 @@ function toggleModelMenu(event) {
             '<div class="model-section-body">' + sec.rows.map(function(p) { return _modelMenuRowHtml(p); }).join('') + '</div>' +
         '</div>';
     });
-    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.bot + '</span>Sub-Agent Tiers</div>';
+    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.bot + '</span>' + escapeHtml(t('Sub-Agent Tiers')) + '</div>';
     html += _tierMenuRowsHtml();
     if (provider && provider.isClaudeOAuth) {
-        html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>Claude Subscription</div>';
-        var oauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
+        html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>' + escapeHtml(t('Claude Subscription')) + '</div>';
+        var oauthLabel = llmConnectionStatus === 'connected' ? escapeHtml(t('Log out')) : escapeHtml(t('Log in'));
         html += '<button type="button" class="custom-dropdown-option" onclick="modelMenuOAuthToggle()">' + oauthLabel + '</button>';
     } else if (provider && provider.isChatGPTOAuth) {
-        html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>ChatGPT Subscription</div>';
-        var gptOauthLabel = llmConnectionStatus === 'connected' ? 'Log out' : 'Log in';
+        html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.lock + '</span>' + escapeHtml(t('ChatGPT Subscription')) + '</div>';
+        var gptOauthLabel = llmConnectionStatus === 'connected' ? escapeHtml(t('Log out')) : escapeHtml(t('Log in'));
         html += '<button type="button" class="custom-dropdown-option" onclick="modelMenuChatGPTOAuthToggle()">' + gptOauthLabel + '</button>';
     }
     menu.innerHTML = html;
     document.body.appendChild(menu);
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
     menu.addEventListener('keydown', function(e) {
         if (e.key === 'Escape') {
             e.preventDefault();
@@ -1022,15 +1046,15 @@ function toggleModelMenu(event) {
             var m = document.getElementById('model-menu');
             if (!m || !map) return;
             m.querySelectorAll('.model-menu-tier-select').forEach(function(sel) {
-                var t = sel.getAttribute('data-tier');
-                var v = map[t];
+                var tierName = sel.getAttribute('data-tier');
+                var v = map[tierName];
                 if (!v) return;
                 sel.value = v;
                 if (sel.value !== v) {
                     // Stored alias not in the provider list — surface it as missing.
                     var opt = document.createElement('option');
                     opt.value = v;
-                    opt.textContent = v + ' (missing)';
+                    opt.textContent = t('{name} (missing)', { name: v });
                     sel.insertBefore(opt, sel.firstChild);
                     sel.value = v;
                 }
@@ -1041,7 +1065,13 @@ function toggleModelMenu(event) {
     var r = anchor.getBoundingClientRect();
     menu.style.position = 'fixed';
     menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    // Rule 10 (i18n): the menu is end-aligned under its anchor, so mirror
+    // the edge in RTL (the anchor's left edge instead of its right edge).
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') {
+        menu.style.left = Math.max(8, r.left) + 'px';
+    } else {
+        menu.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    }
     setTimeout(function() { document.addEventListener('click', _closeModelMenuOnOutside); }, 0);
 }
 
@@ -1050,6 +1080,7 @@ function _closeModelMenuOnOutside(e) {
     if (menu && !menu.contains(e.target) && !e.target.closest('.model-name')) {
         menu.remove();
         document.removeEventListener('click', _closeModelMenuOnOutside);
+        if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
     }
 }
 
@@ -1057,6 +1088,7 @@ function _closeModelMenu() {
     var menu = document.getElementById('model-menu');
     if (menu) menu.remove();
     document.removeEventListener('click', _closeModelMenuOnOutside);
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
 function selectModelFromMenu(name) {
@@ -1086,8 +1118,8 @@ function modelMenuOAuthToggle() {
             // A8A-02: an unreachable SW (lastError) or a handler error is a failed logout, not a success.
             var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : (response && response.error);
             updateClaudeOAuthStatus();
-            if (err) showSnackbar('Log out failed: ' + err, 'error');
-            else showSnackbar('Logged out from Claude', 'info');
+            if (err) showSnackbar(t('Log out failed: {error}', { error: err }), 'error');
+            else showSnackbar(t('Logged out from Claude'), 'info');
         });
     } else {
         startClaudeOAuthLogin();
@@ -1099,11 +1131,11 @@ function modelMenuOAuthToggle() {
 // toast's Log in action (snackbarLoginClick, ui/220-notification-system.js).
 // The pill dot refreshes via updateClaudeOAuthStatus in the callback.
 function startClaudeOAuthLogin() {
-    showSnackbar('Logging in to Claude...', 'info');
+    showSnackbar(t('Logging in to Claude...'), 'info');
     chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
-        if (chrome.runtime.lastError) { showSnackbar('Sign-in error: ' + chrome.runtime.lastError.message, 'error'); }
-        else if (response && response.error) { showSnackbar('Sign-in error: ' + response.error, 'error'); }
-        else { showSnackbar('Logged in to Claude Subscription', 'success'); }
+        if (chrome.runtime.lastError) { showSnackbar(t('Sign-in error: {error}', { error: chrome.runtime.lastError.message }), 'error'); }
+        else if (response && response.error) { showSnackbar(t('Sign-in error: {error}', { error: response.error }), 'error'); }
+        else { showSnackbar(t('Logged in to Claude Subscription'), 'success'); }
         updateClaudeOAuthStatus();
     });
 }
@@ -1130,13 +1162,21 @@ function modelMenuChatGPTOAuthToggle() {
             var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : (response && response.error);
             closeChatGPTDeviceCodeModal();
             updateChatGPTOAuthStatus();
-            if (err) showSnackbar('Log out failed: ' + err, 'error');
-            else showSnackbar('Logged out from ChatGPT', 'info');
+            if (err) showSnackbar(t('Log out failed: {error}', { error: err }), 'error');
+            else showSnackbar(t('Logged out from ChatGPT'), 'info');
         });
     } else {
         startChatGPTOAuthLogin(returnFocus);
     }
 }
+
+// Catalog keys of the typeof-guarded tr() calls in startChatGPTOAuthLogin and
+// submitChatGPTBrowserCallback: test/chatgpt-login-ui.test.js evaluates those
+// two functions without the i18n core (same pattern as _MODEL_ROW_I18N_KEYS).
+var _CHATGPT_LOGIN_I18N_KEYS = [
+    N_('Sign-in did not start or was cancelled. Choose a login method to try again.'),
+    N_('Callback not accepted. Check the address or choose device-code login.')
+];
 
 // Login-only ChatGPT OAuth flow — used by the model menu's "Log in" row, the
 // pill's Connect button (modelPillLoginClick) and the not-logged-in error
@@ -1144,6 +1184,7 @@ function modelMenuChatGPTOAuthToggle() {
 // The pill dot refreshes via updateChatGPTOAuthStatus / the
 // 'openai-oauth-updated' broadcast once the device code is approved.
 function startChatGPTOAuthLogin(returnFocusEl, method) {
+    var tr = typeof t === 'function' ? t : String; // typeof-guarded t() (see _CHATGPT_LOGIN_I18N_KEYS)
     var loginGeneration = ++_chatGPTLoginGeneration;
     method = method === 'device' ? 'device' : 'browser';
     _chatGPTDeviceReturnFocus = returnFocusEl || document.activeElement;
@@ -1155,7 +1196,7 @@ function startChatGPTOAuthLogin(returnFocusEl, method) {
         if (loginGeneration !== _chatGPTLoginGeneration) return;
         if (chrome.runtime.lastError || !response || response.error) {
             closeChatGPTDeviceCodeModal();
-            showSnackbar('Sign-in did not start or was cancelled. Choose a login method to try again.', 'error');
+            showSnackbar(tr('Sign-in did not start or was cancelled. Choose a login method to try again.'), 'error');
             showChatGPTBrowserModal({});
         } else if (response.userCode) { closeChatGPTBrowserModal(); showChatGPTDeviceCodeModal(response); }
         else if (response.method === 'browser') { closeChatGPTDeviceCodeModal(); showChatGPTBrowserModal(response); }
@@ -1188,7 +1229,7 @@ function cancelChatGPTBrowserLogin() {
     _oauthStatusGeneration++;
     closeChatGPTBrowserModal();
     chrome.runtime.sendMessage({ type: 'openai-oauth-cancel' }, function(response) {
-        if (chrome.runtime.lastError || !response || response.error) showSnackbar('Could not cancel sign-in. Close the OpenAI tab and try again.', 'error');
+        if (chrome.runtime.lastError || !response || response.error) showSnackbar(t('Could not cancel sign-in. Close the OpenAI tab and try again.'), 'error');
         updateChatGPTOAuthStatus();
     });
 }
@@ -1198,6 +1239,7 @@ function useChatGPTDeviceLogin() {
     startChatGPTOAuthLogin(null, 'device');
 }
 function submitChatGPTBrowserCallback() {
+    var tr = typeof t === 'function' ? t : String; // typeof-guarded t() (see _CHATGPT_LOGIN_I18N_KEYS)
     var input = document.getElementById('chatgpt-browser-callback');
     var feedback = document.getElementById('chatgpt-browser-feedback');
     if (!input || !input.value.trim()) return;
@@ -1209,7 +1251,7 @@ function submitChatGPTBrowserCallback() {
     chrome.runtime.sendMessage({ type: 'openai-oauth-browser-callback', url: url }, function(response) {
         if (!document.contains(feedback)) return;
         if (button) button.disabled = !!input.disabled;
-        if (chrome.runtime.lastError || !response || response.error) feedback.textContent = 'Callback not accepted. Check the address or choose device-code login.';
+        if (chrome.runtime.lastError || !response || response.error) feedback.textContent = tr('Callback not accepted. Check the address or choose device-code login.');
         else closeChatGPTBrowserModal();
         updateChatGPTOAuthStatus();
     });
@@ -1221,18 +1263,19 @@ function showChatGPTBrowserModal(info) {
     var overlay = document.createElement('div');
     overlay.id = 'chatgpt-browser-modal';
     overlay.className = 'modal-overlay show chatgpt-device-modal';
+    overlay.setAttribute('data-kbd-self-focus', ''); // manages its own focus (ui/320 manager skips it)
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
     overlay.setAttribute('aria-labelledby', 'chatgpt-browser-title');
-    overlay.innerHTML = '<div class="modal-dialog"><div class="modal-header" id="chatgpt-browser-title">Sign in to ChatGPT</div>' +
-        '<div class="modal-body"><p>Approve sign-in in the OpenAI tab. AppAgent will try to finish automatically.</p>' +
-        '<p>If localhost shows a connection error, copy the full address from that tab and paste it here only — never into chat. Automatic capture is not guaranteed.</p>' +
-        '<label for="chatgpt-browser-callback">Local callback address (optional fallback)</label>' +
+    overlay.innerHTML = '<div class="modal-dialog"><div class="modal-header" id="chatgpt-browser-title">' + escapeHtml(t('Sign in to ChatGPT')) + '</div>' +
+        '<div class="modal-body"><p>' + escapeHtml(t('Approve sign-in in the OpenAI tab. AppAgent will try to finish automatically.')) + '</p>' +
+        '<p>' + escapeHtml(t('If localhost shows a connection error, copy the full address from that tab and paste it here only — never into chat. Automatic capture is not guaranteed.')) + '</p>' +
+        '<label for="chatgpt-browser-callback">' + escapeHtml(t('Local callback address (optional fallback)')) + '</label>' +
         '<input id="chatgpt-browser-callback" class="form-input" type="password" autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?…">' +
-        '<button type="button" class="modal-btn secondary" id="chatgpt-browser-submit">Finish with pasted address</button>' +
+        '<button type="button" class="modal-btn secondary" id="chatgpt-browser-submit">' + escapeHtml(t('Finish with pasted address')) + '</button>' +
         '<p id="chatgpt-browser-expiry" class="chatgpt-device-expiry" aria-live="off"></p>' +
         '<p id="chatgpt-browser-feedback" role="status" aria-live="polite"></p></div>' +
-        '<div class="modal-actions"><button type="button" class="modal-btn secondary" id="chatgpt-browser-device">Use device code instead</button><button type="button" class="modal-btn primary" id="chatgpt-browser-cancel">Cancel sign-in</button></div></div>';
+        '<div class="modal-actions"><button type="button" class="modal-btn secondary" id="chatgpt-browser-device">' + escapeHtml(t('Use device code instead')) + '</button><button type="button" class="modal-btn primary" id="chatgpt-browser-cancel">' + escapeHtml(t('Cancel sign-in')) + '</button></div></div>';
     document.body.appendChild(overlay);
     overlay.querySelector('#chatgpt-browser-submit').addEventListener('click', submitChatGPTBrowserCallback);
     overlay.querySelector('#chatgpt-browser-device').addEventListener('click', useChatGPTDeviceLogin);
@@ -1250,8 +1293,8 @@ function showChatGPTBrowserModal(info) {
     var expiresAt = info && info.expiresAt;
     function expiry() {
         var expired = !expiresAt || expiresAt <= Date.now();
-        var text = expired ? 'Sign-in is unavailable or expired. Cancel and retry, or use device code.'
-            : 'Waiting for approval. Sign-in expires in ' + Math.ceil((expiresAt - Date.now()) / 60000) + ' minutes.';
+        var text = expired ? t('Sign-in is unavailable or expired. Cancel and retry, or use device code.')
+            : tn(Math.ceil((expiresAt - Date.now()) / 60000), 'Waiting for approval. Sign-in expires in {count} minute.', 'Waiting for approval. Sign-in expires in {count} minutes.');
         var line = overlay.querySelector('#chatgpt-browser-expiry');
         if (line.textContent !== text) line.textContent = text;
         if (expired) {
@@ -1287,7 +1330,7 @@ function copyChatGPTDeviceCode() {
     var code = codeEl ? codeEl.textContent : '';
     function done(ok) {
         if (!feedback) return;
-        feedback.textContent = ok ? 'Copied' : 'Copy failed — select the code manually';
+        feedback.textContent = ok ? t('Copied') : t('Copy failed — select the code manually');
         feedback.classList.toggle('error', !ok);
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1306,7 +1349,7 @@ function copyChatGPTDeviceCode() {
 
 function openChatGPTDevicePage() {
     chrome.runtime.sendMessage({ type: 'openai-oauth-open-verify' }, function(res) {
-        if (chrome.runtime.lastError || !res || !res.tabOpened) showSnackbar('Could not open the approval page — use the link shown in the dialog', 'error');
+        if (chrome.runtime.lastError || !res || !res.tabOpened) showSnackbar(t('Could not open the approval page — use the link shown in the dialog'), 'error');
     });
 }
 
@@ -1325,21 +1368,22 @@ function showChatGPTDeviceCodeModal(info) {
     var overlay = document.createElement('div');
     overlay.id = 'chatgpt-device-modal';
     overlay.className = 'modal-overlay show chatgpt-device-modal';
+    overlay.setAttribute('data-kbd-self-focus', ''); // manages its own focus (ui/320 manager skips it)
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
     overlay.setAttribute('aria-labelledby', 'chatgpt-device-title');
     overlay.setAttribute('aria-describedby', 'chatgpt-device-description chatgpt-device-expiry');
     overlay.innerHTML = '<div class="modal-dialog">' +
-        '<div class="modal-header" id="chatgpt-device-title">Finish the ChatGPT login</div>' +
+        '<div class="modal-header" id="chatgpt-device-title">' + escapeHtml(t('Finish the ChatGPT login')) + '</div>' +
         '<div class="modal-body">' +
-            '<p class="chatgpt-device-intro" id="chatgpt-device-description">' + (opened ? 'The OpenAI approval page is open in another tab.' : 'Open the OpenAI approval page to continue.') + '</p>' +
-            '<div class="chatgpt-device-url" aria-label="Approval page address">' + escapeHtml(url) + '</div>' +
-            '<div class="chatgpt-device-code-row"><code id="chatgpt-device-code" class="chatgpt-device-code" aria-label="One-time device code">' + escapeHtml(code) + '</code><button type="button" class="modal-btn secondary chatgpt-device-copy" onclick="copyChatGPTDeviceCode()" aria-describedby="chatgpt-device-code">Copy code</button></div>' +
+            '<p class="chatgpt-device-intro" id="chatgpt-device-description">' + escapeHtml(opened ? t('The OpenAI approval page is open in another tab.') : t('Open the OpenAI approval page to continue.')) + '</p>' +
+            '<div class="chatgpt-device-url" aria-label="' + escapeHtml(t('Approval page address')) + '">' + escapeHtml(url) + '</div>' +
+            '<div class="chatgpt-device-code-row"><code id="chatgpt-device-code" class="chatgpt-device-code" aria-label="' + escapeHtml(t('One-time device code')) + '">' + escapeHtml(code) + '</code><button type="button" class="modal-btn secondary chatgpt-device-copy" onclick="copyChatGPTDeviceCode()" aria-describedby="chatgpt-device-code">' + escapeHtml(t('Copy code')) + '</button></div>' +
             '<div id="chatgpt-device-copy-feedback" class="chatgpt-device-feedback" role="status" aria-live="polite"></div>' +
             '<p id="chatgpt-device-expiry" class="chatgpt-device-expiry" role="timer" aria-live="off"></p>' +
-            '<p>Waiting for approval. You may close this dialog; login continues in the background.</p>' +
+            '<p>' + escapeHtml(t('Waiting for approval. You may close this dialog; login continues in the background.')) + '</p>' +
         '</div>' +
-        '<div class="modal-actions"><button type="button" class="modal-btn secondary chatgpt-device-open" onclick="openChatGPTDevicePage()">Open approval page</button><button type="button" class="modal-btn primary" onclick="closeChatGPTDeviceCodeModal()">Close</button></div>' +
+        '<div class="modal-actions"><button type="button" class="modal-btn secondary chatgpt-device-open" onclick="openChatGPTDevicePage()">' + escapeHtml(t('Open approval page')) + '</button><button type="button" class="modal-btn primary" onclick="closeChatGPTDeviceCodeModal()">' + escapeHtml(t('Close')) + '</button></div>' +
     '</div>';
     document.body.appendChild(overlay);
     function updateExpiry() {
@@ -1347,17 +1391,19 @@ function showChatGPTDeviceCodeModal(info) {
         if (!el) return;
         var seconds = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
         if (!seconds) {
-            el.textContent = 'This code has expired. Close this dialog and choose Retry.';
+            el.textContent = t('This code has expired. Close this dialog and choose Retry.');
             el.classList.add('expired');
             overlay.querySelectorAll('.chatgpt-device-copy, .chatgpt-device-open').forEach(function(button) { button.disabled = true; });
             var codeNode = document.getElementById('chatgpt-device-code');
-            if (codeNode) codeNode.setAttribute('aria-label', 'Expired one-time device code');
+            if (codeNode) codeNode.setAttribute('aria-label', t('Expired one-time device code'));
             var fb = document.getElementById('chatgpt-device-copy-feedback'); // polite line: announced once
-            if (fb && fb.textContent !== 'This code has expired.') fb.textContent = 'This code has expired.';
+            // Compare with the same translated text that is displayed, so the line is written once in every language.
+            var expiredNotice = t('This code has expired.');
+            if (fb && fb.textContent !== expiredNotice) fb.textContent = expiredNotice;
             clearInterval(_chatGPTDeviceExpiryTimer);
             _chatGPTDeviceExpiryTimer = null;
         } else {
-            el.textContent = 'Code expires in ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') + '.';
+            el.textContent = t('Code expires in {time}.', { time: Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') });
         }
     }
     updateExpiry();

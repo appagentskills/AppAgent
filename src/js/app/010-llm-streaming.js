@@ -169,15 +169,30 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         if (!requestBody.reasoning) requestBody.reasoning = {};
         requestBody.reasoning.effort = provider.effort;
     }
-    if (thinkingOff && !isThinkingBindingModel(modelLower)) {
+    // ONE predicate for "this request goes to the SW Claude OAuth proxy
+    // (transformToAnthropic)": used both for the off-signal gate below and
+    // for the routing branch further down, so the two can never drift. Only
+    // the explicit isClaudeOAuth flag routes there (Settings sets it); an
+    // apiKey of 'oauth' alone does not.
+    var routesToClaudeOAuth = !!provider.isClaudeOAuth;
+    // Sonnet 5.5+ (isSonnet55Plus, core/030-config.js) is thinking-bound but
+    // HAS an off-ish mode: on the Claude OAuth path the flag is kept so
+    // transformToAnthropic (background.js) can send {type:'between_tools'}.
+    // On OpenRouter it is NOT sent ('disabled' is a 400 on Sonnet 5.5), so
+    // reasoning stays absent (model default adaptive).
+    var offSignalOk = !isThinkingBindingModel(modelLower)
+        || (routesToClaudeOAuth && typeof isSonnet55Plus === 'function' && isSonnet55Plus(modelLower));
+    if (thinkingOff && offSignalOk) {
         // OpenRouter's documented off switch (reasoning.enabled:false). The
         // OAuth transforms in background.js read the same flag:
         // transformToAnthropic sends no `thinking` object and
         // transformToResponses drops `reasoning` entirely.
-        // NOT for thinking-bound models (Fable/Mythos 5.1+, Opus 5.5+ —
-        // isThinkingBindingModel, core/030-config.js): their thinking is
-        // always-on and 'disabled' is a 400, so the off switch is a no-op
-        // there and reasoning stays absent (model default adaptive).
+        // Skipped (offSignalOk false) for thinking-bound models
+        // (Fable/Mythos 5.1+, Opus 5.5+, and Sonnet 5.5+ off the OAuth path —
+        // isThinkingBindingModel, core/030-config.js): 'disabled' is a 400
+        // there, so reasoning stays absent (model default adaptive). The one
+        // exception is Sonnet 5.5+ via Claude OAuth, where the flag is kept
+        // and transformToAnthropic maps it to thinking:{type:'between_tools'}.
         requestBody.reasoning = { enabled: false };
     }
     if (isAdaptiveOnly && provider.thinkingBudget && !requestBody.reasoning && !thinkingOff) {
@@ -238,7 +253,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     //     named 'claude-oauth-stream' from inside the SW would fire
     //     onConnect in every OTHER extension context, never our own.
     //   • Page context: connect to the SW port (legacy path).
-    if ((provider.isClaudeOAuth || provider.isChatGPTOAuth) && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.connect) {
+    if ((routesToClaudeOAuth || provider.isChatGPTOAuth) && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.connect) {
         reader = await (function() {
             return new Promise(function(resolve) {
                 var chunks = [];

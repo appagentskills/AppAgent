@@ -131,8 +131,10 @@ describe('PR #938 genuine fixes (roll-forward)', function() {
         function slice(from, to) { var a = src.indexOf(from), b = src.indexOf(to, a); assert.ok(a >= 0 && b > a, 'source anchors present: ' + from); return src.slice(a, b); }
         var body = slice('var widgetLibraryState =', '\n') + '\n' + slice('function onWidgetLibraryKeydown(', '\n// ---- rendering ----') + slice('function renderWidgetLibrary() {', '\nfunction renderWidgetLibraryItems()') +
             '\nreturn { render: renderWidgetLibrary, state: widgetLibraryState };';
-        return new Function('document', 'UI_ICONS', 'WIDGET_LIBRARY_GRID_ICON', 'getWidgetLibraryLayout', 'renderWidgetLibraryItems', 'onWidgetLibraryClick', 'setWidgetLibraryLayout', body)(
-            doc, { search: '', list: '' }, '', function() { return 'rows'; }, function() {}, function() {}, function() {});
+        // t/escapeHtml: the header markup is i18n-wrapped (English identity + plain escape suffice here).
+        return new Function('document', 'UI_ICONS', 'WIDGET_LIBRARY_GRID_ICON', 'getWidgetLibraryLayout', 'renderWidgetLibraryItems', 'onWidgetLibraryClick', 'setWidgetLibraryLayout', 't', 'escapeHtml', body)(
+            doc, { search: '', list: '' }, '', function() { return 'rows'; }, function() {}, function() {}, function() {},
+            function(s) { return s; }, function(s) { return String(s); });
     }
     test('re-created #widget-library gets its listeners; re-render on the same element never doubles them', async function() {
         var libA = fakeLib(), current = libA;

@@ -6,21 +6,21 @@
 
 /* Main area */
 .main { flex: 1; display: flex; flex-direction: column; transition: width 0.3s ease; position: relative; min-width: 0; overflow: hidden; }
-.floating-sidebar-toggle { display: none; position: fixed; top: var(--space-4); left: var(--space-4); z-index: 100; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-3) var(--space-5); cursor: pointer; font-size: var(--text-xl); box-shadow: var(--shadow-sm); }
+.floating-sidebar-toggle { display: none; position: fixed; top: var(--space-4); inset-inline-start: var(--space-4); z-index: 100; background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-3) var(--space-5); cursor: pointer; font-size: var(--text-xl); box-shadow: var(--shadow-sm); }
 .floating-sidebar-toggle:hover { background: var(--bg-hover); }
 .main-wrapper { display: flex; flex: 1; overflow: hidden; }
 
 /* TL;DR card — rendered at the end of an answer by the autoTldr hook */
-.tldr-card { position: relative; margin: var(--space-6) 20% var(--space-2) 0; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
-.tldr-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.tldr-card { position: relative; margin-block: var(--space-6) var(--space-2); margin-inline: 0 20%; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.tldr-card-label { position: absolute; top: -11px; inset-inline-start: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
 .tldr-card-text { font-size: var(--text-body-sm); color: var(--text-primary); line-height: var(--leading-normal); }
 .tldr-card-text .md-paragraph { margin: 0; }
-@media (max-width: 768px) { .tldr-card { margin-right: 0; } }
+@media (max-width: 768px) { .tldr-card { margin-inline-end: 0; } }
 
 /* Links card — relevant links (PRs, diffs, records, docs) rendered just below
    the TL;DR by the autoLinks hook via the set_links tool */
-.links-card { position: relative; margin: var(--space-8) 20% var(--space-2) 0; padding: var(--space-7) var(--space-6) var(--space-5); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
-.links-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.links-card { position: relative; margin-block: var(--space-8) var(--space-2); margin-inline: 0 20%; padding: var(--space-7) var(--space-6) var(--space-5); background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius-md); }
+.links-card-label { position: absolute; top: -11px; inset-inline-start: 14px; display: inline-block; background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
 .links-card-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .links-card-item { margin: 0; padding: 0; }
 .links-card-link { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); color: var(--accent); text-decoration: none; font-size: var(--text-body-sm); line-height: var(--leading-normal); transition: background 0.15s ease; }
@@ -30,15 +30,15 @@
 .links-card-icon .ui-icon { width: 14px; height: 14px; }
 .links-card-link:hover .links-card-icon { color: var(--accent); }
 .links-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 768px) { .links-card { margin-right: 0; } }
+@media (max-width: 768px) { .links-card { margin-inline-end: 0; } }
 
 /* Caveat card — a MUST-READ warning rendered ABOVE the TL;DR by the autoCaveat
    hook via the set_caveat tool (executeSetCaveat). Warning-styled (amber) so it
    stands out from the neutral tldr/links cards; uses --warning* tokens so it
    stays readable in both light and dark themes. */
-.caveat-card { position: relative; margin: var(--space-6) 20% var(--space-2) 0; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--warning-bg); border: 1px solid var(--warning-light); border-left: 3px solid var(--warning); border-radius: var(--radius-md); }
-.caveat-card-label { position: absolute; top: -11px; left: 14px; display: inline-block; background: var(--warning-bg); color: var(--warning-text); border: 1px solid var(--warning); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
+.caveat-card { position: relative; margin-block: var(--space-6) var(--space-2); margin-inline: 0 20%; padding: var(--space-8) var(--space-8) var(--space-7); background: var(--warning-bg); border: 1px solid var(--warning-light); border-inline-start: 3px solid var(--warning); border-radius: var(--radius-md); }
+.caveat-card-label { position: absolute; top: -11px; inset-inline-start: 14px; display: inline-block; background: var(--warning-bg); color: var(--warning-text); border: 1px solid var(--warning); border-radius: 999px; padding: 3px 11px; font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.05em; line-height: 1.4; }
 .caveat-card-text { font-size: var(--text-body-sm); color: var(--text-primary); line-height: var(--leading-normal); }
 .caveat-card-text .md-paragraph { margin: 0; }
-@media (max-width: 768px) { .caveat-card { margin-right: 0; } }
+@media (max-width: 768px) { .caveat-card { margin-inline-end: 0; } }
 

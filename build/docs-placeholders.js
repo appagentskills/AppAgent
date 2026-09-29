@@ -53,11 +53,39 @@ function applyDocsPlaceholders(docsMd, version, changelogMd) {
     return md.split('__CHANGELOG__').join(changelog);
 }
 
+// Translated Help page sources: docs/locales/<code>/documentation.md and
+// docs/locales/<code>/README.md (one folder per src/locales/<code>.json
+// catalog). They are NOT base64-embedded: the build writes them as plain files
+// to dist/extension/docs-locales/<code>/ and the Help page fetches them at
+// runtime (src/js/ui/060-docs-view.js), falling back to English per file.
+// sources: { <code>: { documentation: string|null, readme: string|null } }.
+// documentation.md gets the same __VERSION__/__CHANGELOG__ substitution as
+// English (the changelog stays English); README.md is copied verbatim, like
+// the English README embed. Missing/empty sources and malformed codes are
+// skipped silently. Returns { '<dist-relative path>': content }.
+var DOCS_LOCALES_DIR = 'docs-locales';
+function buildDocsLocaleFiles(sources, version, changelogMd) {
+    var out = {};
+    Object.keys(sources || {}).sort().forEach(function(code) {
+        if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/.test(code)) return;
+        var src = sources[code] || {};
+        if (typeof src.documentation === 'string' && src.documentation.trim()) {
+            out[DOCS_LOCALES_DIR + '/' + code + '/documentation.md'] = applyDocsPlaceholders(src.documentation, version, changelogMd);
+        }
+        if (typeof src.readme === 'string' && src.readme.trim()) {
+            out[DOCS_LOCALES_DIR + '/' + code + '/README.md'] = src.readme;
+        }
+    });
+    return out;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         CHANGELOG_FALLBACK: CHANGELOG_FALLBACK,
+        DOCS_LOCALES_DIR: DOCS_LOCALES_DIR,
         formatChangelogForDocs: formatChangelogForDocs,
         applyDocsPlaceholders: applyDocsPlaceholders,
+        buildDocsLocaleFiles: buildDocsLocaleFiles,
     };
 }
 

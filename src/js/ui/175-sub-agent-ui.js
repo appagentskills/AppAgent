@@ -33,10 +33,10 @@ var SUB_REPORT_STATUSES = { done: 1, error: 1, partial: 1, need_input: 1, cancel
 // missing values render no badge. Inline styles keep the badge
 // self-contained (no companion CSS edit needed).
 var SUB_REVIEW_BADGES = {
-    pending:            { label: 'review pending',     bg: 'var(--warning-bg, #5c4d10)', fg: 'var(--warning-text, #ffe289)' },
-    accepted:           { label: 'accepted',           bg: '#1d5c2e', fg: '#a9f5c1' },
-    revision_requested: { label: 'revision requested', bg: '#6b271d', fg: '#ffbfae' },
-    cross_checked:      { label: 'cross-checked',      bg: '#1d3f6b', fg: '#aecdf5' }
+    pending:            { label: N_('review pending'),     bg: 'var(--warning-bg, #5c4d10)', fg: 'var(--warning-text, #ffe289)' },
+    accepted:           { label: N_('accepted'),           bg: '#1d5c2e', fg: '#a9f5c1' },
+    revision_requested: { label: N_('revision requested'), bg: '#6b271d', fg: '#ffbfae' },
+    cross_checked:      { label: N_('cross-checked'),      bg: '#1d3f6b', fg: '#aecdf5' }
 };
 
 // User open/collapse choices for sub-report cards, keyed by a stable
@@ -87,7 +87,7 @@ function _renderSubCollapsibleText(text, prefKey, domId) {
     if (firstLine.length > 80) firstLine = firstLine.substring(0, 77) + '...';
     var preview = escapeHtml(firstLine);
     if (lineCount > 1) {
-        preview += '<span class="json-preview"> +' + (lineCount - 1) + ' line' + (lineCount > 2 ? 's' : '') + '</span>';
+        preview += '<span class="json-preview"> ' + tn(lineCount - 1, '+{count} line', '+{count} lines') + '</span>';
     }
     var collapsed = !!_subPanelPref['str:' + prefKey];
     return '<span class="json-collapse" data-sub-collapse="' + escapeHtml(prefKey) + '" data-sub-collapse-id="' + escapeHtml(domId) + '">' + (collapsed ? '+' : '−') + '</span>' +
@@ -244,7 +244,7 @@ function _renderSubCollapsibleMarkdown(text, prefKey, domId) {
     if (firstLine.length > 80) firstLine = firstLine.substring(0, 77) + '...';
     var preview = escapeHtml(firstLine);
     if (lineCount > 1) {
-        preview += '<span class="json-preview"> +' + (lineCount - 1) + ' line' + (lineCount > 2 ? 's' : '') + '</span>';
+        preview += '<span class="json-preview"> ' + tn(lineCount - 1, '+{count} line', '+{count} lines') + '</span>';
     }
     var collapsed = !!_subPanelPref['str:' + prefKey];
     // NOTE: the expanded element renders display:block (CSS) so the markdown
@@ -290,20 +290,23 @@ function _subActionStateHtml(st) {
     var stClass = Object.prototype.hasOwnProperty.call(SUB_ACTION_STATES, st.state) ? st.state : 'running';
     var head = '';
     if (st.label) {
+        // Display words for the state pill (the sub-action-* class keeps the raw state).
+        var stateLabels = { running: t('running'), waiting: t('waiting'), stuck: t('stuck'), done: t('done'), error: t('error'),
+            finished: t('finished'), pr_opened: t('PR opened'), finished_with_caveat: t('finished with caveat') };
         head = '<div class="sub-report-action-head">' +
-            '<span class="sub-report-action-pill">' + escapeHtml(stClass) + '</span>' +
+            '<span class="sub-report-action-pill">' + escapeHtml(stateLabels[stClass] || stClass) + '</span>' +
             '<span class="sub-report-action-label">' + escapeHtml(String(st.label)) + '</span>' +
         '</div>';
     }
-    var rows = tasks.map(function(t) {
-        var ts = (t && Object.prototype.hasOwnProperty.call(SUB_ACTION_TASK_STATUSES, t.status)) ? t.status : 'pending';
+    var rows = tasks.map(function(task) {
+        var ts = (task && Object.prototype.hasOwnProperty.call(SUB_ACTION_TASK_STATUSES, task.status)) ? task.status : 'pending';
         var glyph = (ts === 'done') ? '\u2713'
                   : (ts === 'error') ? '\u2715'
                   : (ts === 'running') ? '<span class="sub-report-spinner sub-report-task-spinner" aria-hidden="true"></span>'
                   : '\u25cb';
         return '<div class="sub-report-task sub-task-' + ts + '">' +
             '<span class="sub-report-task-icon" aria-hidden="true">' + glyph + '</span>' +
-            '<span class="sub-report-task-label">' + escapeHtml(String((t && t.label) || '')) + '</span>' +
+            '<span class="sub-report-task-label">' + escapeHtml(String((task && task.label) || '')) + '</span>' +
         '</div>';
     }).join('');
     var outHtml = output ? '<div class="sub-notice-body markdown-body">' + renderSubMarkdown(output) + '</div>' : '';
@@ -344,6 +347,13 @@ function _subIsQueued(rec) {
         && typeof SubAgents.isQueued === 'function' && SubAgents.isQueued(rec.agent_id));
 }
 
+// Display word for a registry state (logic and change keys keep rec.state English).
+var SUB_STATE_LABELS = { running: N_('running'), sleeping: N_('sleeping'), stopped: N_('stopped'), errored: N_('errored') };
+function _subStateLabel(state) {
+    var k = String(state || '');
+    return Object.prototype.hasOwnProperty.call(SUB_STATE_LABELS, k) ? t(SUB_STATE_LABELS[k]) : k;
+}
+
 function _subActivityInfo(rec) {
     if (!rec || rec.state !== 'running') return null;
     // Queued: no loop has run yet — no activity / stuck verdict to show.
@@ -356,19 +366,20 @@ function _subActivityInfo(rec) {
     catch (_) { st = rec.stuck || null; }
     if (st && st.reason) {
         var sIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS && (UI_ICONS.alert || UI_ICONS.warning || UI_ICONS.thinking)) || '';
-        return { phase: 'stuck', tool: null, reason: st.reason, icon: sIcon, label: 'stuck: ' + st.reason };
+        return { phase: 'stuck', tool: null, reason: st.reason, icon: sIcon, label: t('stuck: {reason}', { reason: st.reason }) };
     }
     if (!rec.activity || !rec.activity.phase) return null;
     var act = rec.activity;
     if (act.phase === 'tool' && act.tool) {
         var icon = (typeof getToolIcon === 'function') ? getToolIcon(act.tool) : '';
         if (!icon) return null;
-        var label = act.tool_label
-            || ((typeof TOOL_DISPLAY_NAMES !== 'undefined' && TOOL_DISPLAY_NAMES[act.tool]) || String(act.tool));
+        // D1: tool_label / TOOL_DISPLAY_NAMES values are English N_() markers; translate for display.
+        var label = t(act.tool_label
+            || ((typeof TOOL_DISPLAY_NAMES !== 'undefined' && TOOL_DISPLAY_NAMES[act.tool]) || String(act.tool)));
         return { phase: 'tool', tool: act.tool, icon: icon, label: label };
     }
     if (act.phase === 'thinking' && typeof UI_ICONS !== 'undefined' && UI_ICONS.thinking) {
-        return { phase: 'thinking', tool: null, icon: UI_ICONS.thinking, label: 'thinking' };
+        return { phase: 'thinking', tool: null, icon: UI_ICONS.thinking, label: t('thinking') };
     }
     return null;
 }
@@ -397,7 +408,7 @@ function _patchWorkerCardActivity(card, rec) {
         iconEl.classList.toggle('worker-activity-tool', !!act && act.phase === 'tool');
         var stEl = card.querySelector('[data-worker-state]');
         if (stEl) {
-            var txt = act ? act.label : (queued ? 'queued' : (rec.state || ''));
+            var txt = act ? act.label : (queued ? t('queued') : _subStateLabel(rec.state));
             if (stEl.textContent !== txt) stEl.textContent = txt;
             stEl.title = act ? act.label : '';
         }
@@ -491,7 +502,7 @@ function _subThreadEntries(msg, liveRec) {
     }
     function pushParentHistory(phase) {
         var history = Array.isArray(phase.parentMessages) ? phase.parentMessages : [];
-        if (phase.parentMessagesDropped) push('parent', 'notice', '[' + phase.parentMessagesDropped + ' earlier parent messages truncated]', null);
+        if (phase.parentMessagesDropped) push('parent', 'notice', tn(phase.parentMessagesDropped, '[{count} earlier parent message truncated]', '[{count} earlier parent messages truncated]'), null);
         history.forEach(function(item) {
             push(item.from === 'parent' ? 'parent' : 'worker',
                 (item.kind === 'instruction' ? 'wake · ' : 'message · ') + _subParentMessageState(item, msg), item.text, item.at);
@@ -511,7 +522,7 @@ function _subThreadEntries(msg, liveRec) {
         pushProgress(ph.progress);
         pushParentHistory(ph);
         if (ph.report) {
-            push('worker', 'report \u00b7 ' + (ph.report.status || 'done'), ph.report.summary || '(no summary)', ph.report.at);
+            push('worker', 'report \u00b7 ' + (ph.report.status || 'done'), ph.report.summary || t('(no summary)'), ph.report.at);
             if (typeof ph.report.at === 'number') prevAt = ph.report.at;
         }
     }
@@ -525,7 +536,7 @@ function _subThreadEntries(msg, liveRec) {
     pushParentHistory(msg);
     var rep = msg.report;
     if (rep && rep.status && rep.status !== 'running' && rep.status !== 'partial') {
-        push('worker', 'report \u00b7 ' + rep.status, rep.summary || '(no summary)', rep.at);
+        push('worker', 'report \u00b7 ' + rep.status, rep.summary || t('(no summary)'), rep.at);
     }
     // Queued inbox (live record only): parent→ messages waiting for the next
     // wake/drain. Sub→sub senders keep their agent_id as the role label
@@ -567,6 +578,17 @@ function _subThreadPreview(text) {
     return s.length > 220 ? (s.slice(0, 220) + '\u2026') : s;
 }
 
+// Thread-row kind pill: e.kind stays the English logic value (callers and
+// tests compare it); each ' \u00b7 '-separated word is translated for display.
+var SUB_THREAD_KIND_WORDS = { notice: N_('notice'), update: N_('update'), spawn: N_('spawn'), wake: N_('wake'),
+    message: N_('message'), report: N_('report'), queued: N_('queued'), pending: N_('pending'), injected: N_('injected'),
+    instruction: N_('instruction'), done: N_('done'), error: N_('error'), cancelled: N_('cancelled') };
+function _subThreadKindLabel(kind) {
+    return String(kind).split(' \u00b7 ').map(function(w) {
+        return Object.prototype.hasOwnProperty.call(SUB_THREAD_KIND_WORDS, w) ? t(SUB_THREAD_KIND_WORDS[w]) : w;
+    }).join(' \u00b7 ');
+}
+
 function _subThreadHtml(msg, liveRec, cardKey) {
     var entries;
     try { entries = _subThreadEntries(msg, liveRec); } catch (_) { entries = []; }
@@ -577,8 +599,8 @@ function _subThreadHtml(msg, liveRec, cardKey) {
         var isParent = (e.role === 'parent');
         var time = e.at ? _subThreadTime(e.at) : '';
         rows += '<div class="sub-thread-row sub-thread-' + (isParent ? 'parent' : 'worker') + '">' +
-            '<span class="sub-thread-role">' + (isParent ? 'parent \u2192' : 'worker \u2192') + '</span>' +
-            (e.kind ? '<span class="sub-thread-kind">' + escapeHtml(e.kind) + '</span>' : '') +
+            '<span class="sub-thread-role">' + escapeHtml(isParent ? t('parent') : t('worker')) + ' \u2192</span>' +
+            (e.kind ? '<span class="sub-thread-kind">' + escapeHtml(_subThreadKindLabel(e.kind)) + '</span>' : '') +
             '<span class="sub-thread-text">' + escapeHtml(_subThreadPreview(e.text)) + '</span>' +
             (time ? '<span class="sub-thread-time">' + escapeHtml(time) + '</span>' : '') +
         '</div>';
@@ -590,7 +612,7 @@ function _subThreadHtml(msg, liveRec, cardKey) {
     var pref = _subReportOpenPref[prefKey];
     var open = (pref != null) ? pref : false;
     return '<details' + (open ? ' open' : '') + ' class="sub-thread" data-sub-report-toggle="' + escapeHtml(prefKey) + '" data-rendered-open="' + (open ? '1' : '0') + '">' +
-        '<summary class="sub-thread-summary">dialogue (' + entries.length + ')</summary>' +
+        '<summary class="sub-thread-summary">' + escapeHtml(t('dialogue ({count})', { count: entries.length })) + '</summary>' +
         '<div class="sub-thread-body">' + rows + '</div>' +
     '</details>';
 }
@@ -603,8 +625,8 @@ function renderSubReport(msg, index) {
     var isRunning = (status === 'running');
     var isWaiting = (status === 'waiting');
     var isLive = isRunning || isWaiting;
-    var statusLabelMap = { running: 'working', waiting: 'waiting', partial: 'working',
-        done: 'done', error: 'error', need_input: 'needs input', cancelled: 'cancelled' };
+    var statusLabelMap = { running: t('working'), waiting: t('waiting'), partial: t('working'),
+        done: t('done'), error: t('error'), need_input: t('needs input'), cancelled: t('cancelled') };
     var statusLabel = statusLabelMap[status] || status;
     var iconChar = (status === 'done') ? '✓'
              : (status === 'error') ? '✕'
@@ -633,10 +655,10 @@ function renderSubReport(msg, index) {
         var _rvRec = SubAgents.getById(msg.subAgentId);
         var _rvBadge = (_rvRec && _rvRec.review_state) ? SUB_REVIEW_BADGES[_rvRec.review_state] : null;
         if (_rvBadge) {
-            reviewHtml = '<span class="sub-report-review" title="deliverable review state"'
+            reviewHtml = '<span class="sub-report-review" title="' + escapeHtml(t('deliverable review state')) + '"'
                 + ' style="margin-left:6px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
                 + 'background:' + _rvBadge.bg + ';color:' + _rvBadge.fg + ';">'
-                + escapeHtml(_rvBadge.label) + '</span>';
+                + escapeHtml(t(_rvBadge.label)) + '</span>';
         }
         // Orchestrator §6: model-provenance badge — which provider/tier
         // this worker runs on. Live-record read only (same GC
@@ -644,7 +666,7 @@ function renderSubReport(msg, index) {
         // record exists; the archived report itself never claimed it).
         var _mdlLine = _subModelLine(_rvRec);
         if (_mdlLine) {
-            reviewHtml += '<span class="sub-report-model" title="model this worker runs on \u2014 provider (tier)">'
+            reviewHtml += '<span class="sub-report-model" title="' + escapeHtml(t('model this worker runs on — provider (tier)')) + '">'
                 + escapeHtml(_mdlLine) + '</span>';
         }
         // Orchestrator §5: awaiting-approval badge — a tool call in the sub's
@@ -652,14 +674,18 @@ function renderSubReport(msg, index) {
         // by onSubApprovalEvent). The card repaints on the same lifecycle
         // notice that announces the park, so the badge appears immediately.
         if (_subAwaitingApproval(_rvRec)) {
-            var _apTool = (_rvRec.awaiting_approval && _rvRec.awaiting_approval.tool) || 'a tool call';
-            reviewHtml += '<span class="sub-report-approval" title="' + escapeHtml(_apTool) + ' is awaiting user approval in the sub\u2019s chat"'
+            var _apTool = _rvRec.awaiting_approval && _rvRec.awaiting_approval.tool;
+            // One whole sentence per case (no translated fragment spliced in).
+            var _apTitle = _apTool
+                ? t('{tool} is awaiting user approval in the sub’s chat', { tool: String(_apTool) })
+                : t('a tool call is awaiting user approval in the sub’s chat');
+            reviewHtml += '<span class="sub-report-approval" title="' + escapeHtml(_apTitle) + '"'
                 + ' style="margin-left:6px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
-                + 'background:var(--warning-bg, #5c4d10);color:var(--warning-text, #ffe289);">awaiting approval</span>';
+                + 'background:var(--warning-bg, #5c4d10);color:var(--warning-text, #ffe289);">' + escapeHtml(t('awaiting approval')) + '</span>';
         }
     }
     var summary = report.summary || '';
-    var name = msg.subAgentName || report.from_name || msg.subAgentId || 'sub-agent';
+    var name = msg.subAgentName || report.from_name || msg.subAgentId || t('sub-agent');
     // Stable per-card key — drives the open/collapse pref maps and the
     // stable ids/keys for the input/output panels below. Computed up here
     // so inputsHtml/outputHtml can derive stable child keys from it.
@@ -699,9 +725,9 @@ function renderSubReport(msg, index) {
         // key off them. sub-md (only when markdown rendered) resets the
         // pre's white-space/font so markdown reads naturally (24-sub-agents.css).
         return '<div class="tool-args-wrapper" data-copy-id="' + escapeHtml(argsCopyId) + '" data-sub-expand-key="' + escapeHtml(cardKey + prefSuffix) + '">' +
-            '<button class="tool-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + (inExpanded ? 'Collapse' : 'Expand') + '">' + (inExpanded ? '⤡' : '⤢') + '</button>' +
+            '<button class="tool-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + escapeHtml(inExpanded ? t('Collapse') : t('Expand')) + '">' + (inExpanded ? '⤡' : '⤢') + '</button>' +
             '<pre class="tool-args' + (mdOk ? ' sub-md markdown-body' : '') + (inExpanded ? ' expanded' : '') + '">' + taskHtml + '</pre>' +
-            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
     }
     function _subOutputPanel(text, prefSuffix, domSuffix, labelHtml) {
         var summaryText = String(text);
@@ -721,16 +747,16 @@ function renderSubReport(msg, index) {
         // actually rendered (white-space reset would mangle plain text).
         return '<div class="tool-result-section">' + (labelHtml || '') +
             '<div class="tool-result-wrapper" data-copy-id="' + escapeHtml(resultCopyId) + '" data-sub-expand-key="' + escapeHtml(cardKey + prefSuffix) + '">' +
-            '<button class="tool-result-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + (outExpanded ? 'Collapse' : 'Expand') + '">' + (outExpanded ? '⤡' : '⤢') + '</button>' +
+            '<button class="tool-result-expand-btn" onclick="toggleSubReportExpand(this, event)" title="' + escapeHtml(outExpanded ? t('Collapse') : t('Expand')) + '">' + (outExpanded ? '⤡' : '⤢') + '</button>' +
             '<pre class="' + (mdOk ? 'sub-md markdown-body' : '') + (outExpanded ? ' expanded' : '') + '">' + summaryHtml + '</pre>' +
-            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></div>';
+            '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div></div>';
     }
     function _subProgressHtml(progArr, dropped) {
         if (!progArr.length && !dropped) return '';
         var items = progArr.map(function(p) {
-            var t = (p && p.text) ? String(p.text) : '';
+            var ptext = (p && p.text) ? String(p.text) : '';
             // F1: shared renderer (try/catch + section icons).
-            var rendered = t ? renderSubMarkdown(t) : '<span class="md-paragraph"></span>';
+            var rendered = ptext ? renderSubMarkdown(ptext) : '<span class="md-paragraph"></span>';
             return '<div class="sub-report-progress-item">' +
                 '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
                 '<div class="sub-report-progress-text markdown-body">' + rendered + '</div>' +
@@ -742,7 +768,7 @@ function renderSubReport(msg, index) {
         if (dropped) {
             items = '<div class="sub-report-progress-item">' +
                 '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
-                '<div class="sub-report-progress-text">[' + (dropped | 0) + ' earlier update' + (dropped > 1 ? 's' : '') + ' truncated]</div>' +
+                '<div class="sub-report-progress-text">' + escapeHtml(tn(dropped | 0, '[{count} earlier update truncated]', '[{count} earlier updates truncated]')) + '</div>' +
             '</div>' + items;
         }
         return '<div class="sub-report-progress">' + items + '</div>';
@@ -763,7 +789,7 @@ function renderSubReport(msg, index) {
         // treatment as the progressDropped stub).
         phasesHtml += '<div class="sub-report-progress"><div class="sub-report-progress-item">' +
             '<span class="sub-report-progress-dot" aria-hidden="true"></span>' +
-            '<div class="sub-report-progress-text">[' + (msg.phasesDropped | 0) + ' earlier phase' + (msg.phasesDropped > 1 ? 's' : '') + ' truncated]</div>' +
+            '<div class="sub-report-progress-text">' + escapeHtml(tn(msg.phasesDropped | 0, '[{count} earlier phase truncated]', '[{count} earlier phases truncated]')) + '</div>' +
         '</div></div>';
     }
     for (var pi = 0; pi < phases.length; pi++) {
@@ -874,9 +900,9 @@ function renderSubReport(msg, index) {
         // white-space:nowrap on the button (CSS) keep it on one line even
         // when the preview text would otherwise push it to wrap.
         var chatIconSvg = '<svg class="sub-report-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
-        openLink = '<button type="button" class="sub-report-open" data-sub-chat-id="' + escapeHtml(targetChatId) + '" title="Open this sub-agent\u2019s chat">' + chatIconSvg + '<span class="sub-report-open-label">Open chat</span></button>';
+        openLink = '<button type="button" class="sub-report-open" data-sub-chat-id="' + escapeHtml(targetChatId) + '" title="' + escapeHtml(t('Open this sub-agent’s chat')) + '">' + chatIconSvg + '<span class="sub-report-open-label">' + escapeHtml(t('Open chat')) + '</span></button>';
     }
-    var synth = report._synthesized ? '<span class="sub-report-synth" title="No explicit report_to_parent — fallback summary from last assistant message">auto</span>' : '';
+    var synth = report._synthesized ? '<span class="sub-report-synth" title="' + escapeHtml(t('No explicit report_to_parent — fallback summary from last assistant message')) + '">' + escapeHtml(t('auto')) + '</span>' : '';
     // Phase-5 follow-up: the sub_report panel is now COLLAPSED by default —
     // a long markdown report from a sub used to dominate the scrollback the
     // moment it landed. The <summary> row stays visible (icon + name +
@@ -981,8 +1007,9 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
     // the LABEL may show the raw — escaped — status so an unknown value is
     // still readable. The regex restricts status to [a-z_]{1,24} anyway.
     var st = SUB_REPORT_STATUSES[status] ? status : 'partial';
-    var labelMap = { done: 'done', error: 'error', need_input: 'needs input',
-        cancelled: 'cancelled', running: 'working', waiting: 'waiting', partial: 'partial' };
+    // Display-only labels (translated here); st/status stay English in logic.
+    var labelMap = { done: t('done'), error: t('error'), need_input: t('needs input'),
+        cancelled: t('cancelled'), running: t('working'), waiting: t('waiting'), partial: t('partial') };
     var label = SUB_REPORT_STATUSES[status] ? labelMap[status] : status;
     var iconChar = (st === 'done') ? '✓'
              : (st === 'error') ? '✕'
@@ -1006,7 +1033,7 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
             body = '<div class="sub-notice-body markdown-body">'
                 + '<details class="sub-notice-collapse">'
                 + '<summary><span class="sub-notice-err-preview">' + escapeHtml(preview) + '\u2026</span>'
-                + '<span class="sub-notice-collapse-more">show full error</span></summary>'
+                + '<span class="sub-notice-collapse-more">' + escapeHtml(t('show full error')) + '</span></summary>'
                 + (rawErr ? '<div class="sub-notice-collapse-full">' + escapeHtml(summary) + '</div>'
                           : '<div class="sub-notice-collapse-full markdown-body" style="white-space:normal">' + rendered + '</div>')
                 + '</details></div>';
@@ -1021,12 +1048,12 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
         : '';
     var isMid = (kind === 'mid');
     // A mid-flight ERROR is not a 'progress update' — badge it honestly.
-    var midLabel = (st === 'error') ? 'Errored' : 'Progress update';
+    var midLabel = (st === 'error') ? t('Errored') : t('Progress update');
     var badge = isMid
-        ? '<span class="sub-notice-badge">' + midLabel + '</span>'
-        : '<span class="sub-notice-badge">Final report · ' + escapeHtml(label) + '</span>';
+        ? '<span class="sub-notice-badge">' + escapeHtml(midLabel) + '</span>'
+        : '<span class="sub-notice-badge">' + escapeHtml(t('Final report · {status}', { status: label })) + '</span>';
     var viewBtn = agentId
-        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="' + escapeHtml(t('View this sub-agent’s instructions, progress and report')) + '">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">' + escapeHtml(t('View agent')) + '</span></button>'
         : '';
     // opts.rowIndex: rendered as a top-level transcript row (the passive
     // report sub_msg row) — same `message` class + msg-N id as
@@ -1053,8 +1080,8 @@ function _parentMsgCardHtml(count, bodyText, fmt) {
     return '<div class="sub-notice sub-notice-inbound">' +
         '<div class="sub-notice-header">' +
             '<span class="sub-report-icon" aria-hidden="true">\u2192</span>' +
-            '<span class="sub-report-name">From parent</span>' +
-            '<span class="sub-notice-badge">' + (count > 1 ? count + ' messages' : 'Message') + '</span>' +
+            '<span class="sub-report-name">' + escapeHtml(t('From parent')) + '</span>' +
+            '<span class="sub-notice-badge">' + escapeHtml(count > 1 ? tn(count, '{count} message', '{count} messages') : t('Message')) + '</span>' +
         '</div>' + body + '</div>';
 }
 
@@ -1065,7 +1092,7 @@ function _parentMsgCardHtml(count, bodyText, fmt) {
 // full history stays in the sub_report card's progress stream — this row is
 // the at-a-glance transcript surface. Called from 250-message-render.js.
 function renderSubAgentMessage(msg, index) {
-    var name = msg.subAgentName || msg.subAgentId || 'sub-agent';
+    var name = msg.subAgentName || msg.subAgentId || t('sub-agent');
     // PASSIVE-NOTICE: kind:'passive_report' rows come from
     // _postPassiveReportNotice (core/097) — a wake_parent:false sub reported
     // and the parent was NOT woken. Render the same final-report card as the
@@ -1073,7 +1100,7 @@ function renderSubAgentMessage(msg, index) {
     // View agent), headline only, with a muted "not woken" hint.
     if (msg.kind === 'passive_report') {
         return _subNoticeCardHtml(name, msg.subAgentId, String(msg.status || 'done'), String(msg.text || ''), 'final',
-            { hint: 'Parent not woken (wake_parent:false) \u2014 open the agent for the full report', rowIndex: index });
+            { hint: t('Parent not woken (wake_parent:false) \u2014 open the agent for the full report'), rowIndex: index });
     }
     var text = String(msg.text || '');
     var body = '';
@@ -1084,13 +1111,13 @@ function renderSubAgentMessage(msg, index) {
     // Same delegated-click "View agent" affordance as _subNoticeCardHtml —
     // data-worker-modal is handled by _wireSubAgentUi → openWorkerChatModal.
     var viewBtn = msg.subAgentId
-        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(msg.subAgentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(msg.subAgentId) + '" title="' + escapeHtml(t('View this sub-agent\u2019s instructions, progress and report')) + '">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">' + escapeHtml(t('View agent')) + '</span></button>'
         : '';
     return '<div class="message sub-notice sub-notice-mid sub-notice-outbound" id="msg-' + index + '" data-sub-agent-id="' + escapeHtml(msg.subAgentId || '') + '">' +
         '<div class="sub-notice-header">' +
             '<span class="sub-report-icon" aria-hidden="true">\u2190</span>' +
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
-            '<span class="sub-notice-badge">Message to parent</span>' +
+            '<span class="sub-notice-badge">' + escapeHtml(t('Message to parent')) + '</span>' +
             viewBtn +
         '</div>' + body + '</div>';
 }
@@ -1175,7 +1202,7 @@ function renderSubReportNotices(text, messages, usedSubMessages, subNotices) {
             if (lst === 'error') {
                 var hm = hl.match(/\s*(?:[\u2014\u2013-]\s*|\()resurrectable via wake_sub_agent[^)\n]*\)?\s*$/i);
                 if (hm) {
-                    lopts = { hint: 'Resurrectable via wake_sub_agent' };
+                    lopts = { hint: t('Resurrectable via wake_sub_agent') };
                     hl = hl.slice(0, hm.index).trim();
                 }
                 hl = hl.replace(/^errored\s*[\u2014\u2013-]\s*/i, '');
@@ -1278,7 +1305,7 @@ function _subNoticeLeftoverHtml(seg, messages, used) {
 
 function _subNoticeMetaCardHtml(meta, messages, used) {
     var agentId = meta.agentId ? String(meta.agentId) : '';
-    var name = String(meta.name || agentId || 'sub-agent');
+    var name = String(meta.name || agentId || t('sub-agent'));
     var summary = String(meta.summary == null ? '' : meta.summary);
     if (meta.kind === 'final' || meta.kind === 'mid') {
         var rst = String(meta.status || 'done');
@@ -1299,7 +1326,7 @@ function _subNoticeMetaCardHtml(meta, messages, used) {
         if (lst === 'error') {
             var hm = hl.match(/\s*(?:[\u2014\u2013-]\s*|\()resurrectable via wake_sub_agent[^)\n]*\)?\s*$/i);
             if (hm) {
-                lopts = { hint: 'Resurrectable via wake_sub_agent' };
+                lopts = { hint: t('Resurrectable via wake_sub_agent') };
                 hl = hl.slice(0, hm.index).trim();
             }
             hl = hl.replace(/^errored\s*[\u2014\u2013-]\s*/i, '');
@@ -1327,13 +1354,13 @@ function _subNoticeMetaCardHtml(meta, messages, used) {
 function _subMessageNoticeCardHtml(name, agentId, text) {
     var body = text ? '<div class="sub-notice-body markdown-body">' + renderSubMarkdown(text) + '</div>' : '';
     var viewBtn = agentId
-        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="View this sub-agent\u2019s instructions, progress and report">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">View agent</span></button>'
+        ? '<button type="button" class="sub-report-open sub-notice-view" data-worker-modal="' + escapeHtml(agentId) + '" title="' + escapeHtml(t('View this sub-agent\u2019s instructions, progress and report')) + '">' + SUB_NOTICE_VIEW_ICON + '<span class="sub-report-open-label">' + escapeHtml(t('View agent')) + '</span></button>'
         : '';
     return '<div class="sub-notice sub-notice-mid sub-notice-outbound" data-sub-agent-id="' + escapeHtml(agentId) + '">' +
         '<div class="sub-notice-header">' +
             '<span class="sub-report-icon" aria-hidden="true">\u2190</span>' +
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
-            '<span class="sub-notice-badge">Message to parent</span>' +
+            '<span class="sub-notice-badge">' + escapeHtml(t('Message to parent')) + '</span>' +
             viewBtn +
         '</div>' + body + '</div>';
 }
@@ -1393,10 +1420,10 @@ function renderSubAgentBreadcrumb(chat) {
         if (!parent) {
             // Unknown / GC'd ancestor — keep a placeholder so depth still
             // reflects the real chain length.
-            chain.unshift({ id: cur.parentChatId, title: 'parent', missing: true });
+            chain.unshift({ id: cur.parentChatId, title: t('parent'), missing: true });
             break;
         }
-        chain.unshift({ id: cur.parentChatId, title: parent.title || 'parent' });
+        chain.unshift({ id: cur.parentChatId, title: parent.title ? (parent.title === 'New Chat' ? t('New Chat') : parent.title) : t('parent') });
         cur = parent;
         guard++;
     }
@@ -1414,7 +1441,7 @@ function renderSubAgentBreadcrumb(chat) {
     var tip = chain.map(function(n) { return n.title; }).join(' \u203a ');
     // `--depth` drives the CSS indent (attr() inside calc() is not portable
     // cross-browser, so we stamp the value as a custom property too).
-    return '<div class="sub-agent-breadcrumb" data-depth="' + depth + '" style="--depth:' + depth + '" title="Sub-agent of: ' + escapeHtml(tip) + '">\u21b3 ' + parts.join(' \u203a ') + '</div>';
+    return '<div class="sub-agent-breadcrumb" data-depth="' + depth + '" style="--depth:' + depth + '" title="' + escapeHtml(t('Sub-agent of: {chain}', { chain: tip })) + '">\u21b3 ' + parts.join(' \u203a ') + '</div>';
 }
 
 // ---------- Workers panel (in the version sidebar, like artifacts) ----------
@@ -1457,9 +1484,9 @@ function _subContextInfo(chatId) {
     return { tokens: tokens, pct: pct };
 }
 
-function _fmtTokens(t) {
-    t = t || 0;
-    return t >= 1000 ? (Math.round(t / 1000) + 'k') : String(t);
+function _fmtTokens(n) {
+    n = n || 0;
+    return n >= 1000 ? (Math.round(n / 1000) + 'k') : String(n);
 }
 
 // Collapsed-card work counters: files edited + PRs opened by the sub's chat.
@@ -1481,11 +1508,6 @@ function _subWorkStats(chatId) {
     var out = { n: c.messages.length, files: files, prs: prs };
     _subWorkStatsCache[chatId] = out;
     return out;
-}
-
-// Singular/plural label for the collapsed-card work counters.
-function _subCountLabel(n, singular, plural) {
-    return n + ' ' + (n === 1 ? singular : plural);
 }
 
 // Orchestrator §5: true while the sub is parked on a permission modal
@@ -1511,7 +1533,7 @@ function _subModelLine(rec) {
         try { prov = resolveChatProviderName(rec.same_as); } catch (_) { /* leave null */ }
     }
     if (!prov && !rec.tier) return '';
-    var line = prov || 'inherit';
+    var line = prov || t('inherit');
     if (rec.tier) line += ' (' + rec.tier + ')';
     return line;
 }
@@ -1545,7 +1567,7 @@ function updateSidebarWorkerMetrics() {
             var rec = _resolveSubRec(aid);
             if (rec) {
                 var used = rec.tool_calls_used || 0;
-                toolsEl.textContent = String(used) + ' tool calls';
+                toolsEl.textContent = tn(used, '{count} tool call', '{count} tool calls');
                 // Orchestrator §5: live approval badge refresh.
                 var apEl = card.querySelector('[data-worker-approval]');
                 if (apEl) apEl.hidden = !_subAwaitingApproval(rec);
@@ -1556,13 +1578,13 @@ function updateSidebarWorkerMetrics() {
         var work = _subWorkStats(card.getAttribute('data-worker-chat'));
         var filesEl = card.querySelector('[data-worker-files]');
         if (filesEl) {
-            var filesTxt = _subCountLabel(work.files, 'file', 'files');
+            var filesTxt = tn(work.files, '{count} file', '{count} files');
             if (filesEl.textContent !== filesTxt) filesEl.textContent = filesTxt;
             filesEl.hidden = !work.files;
         }
         var prsEl = card.querySelector('[data-worker-prs]');
         if (prsEl) {
-            var prsTxt = _subCountLabel(work.prs, 'PR', 'PRs');
+            var prsTxt = tn(work.prs, '{count} PR', '{count} PRs');
             if (prsEl.textContent !== prsTxt) prsEl.textContent = prsTxt;
             prsEl.hidden = !work.prs;
         }
@@ -1600,7 +1622,7 @@ var _workerExpanded = Object.create(null);
 // transcript" link (data-sub-agent-reveal -> revealSubAgentChat).
 function _workerProgressInner(rec, opts) {
     var inner = rec ? _subActionStateHtml(rec.action_state) : '';
-    if (!inner) inner = '<div class="worker-progress-empty">No progress reported yet.</div>';
+    if (!inner) inner = '<div class="worker-progress-empty">' + escapeHtml(t('No progress reported yet.')) + '</div>';
     // Self-card variant (the sub-agent's OWN chat sidebar) skips the "Open chat"
     // affordance below ("you're already in this chat") but KEEPS "View more":
     // the self card no longer renders the input/output card inline, so "View more"
@@ -1618,18 +1640,18 @@ function _workerProgressInner(rec, opts) {
         openAttr = 'data-sub-agent-reveal="' + escapeHtml(rec.agent_id) + '"';
     }
     if (openAttr && !selfCard) {
-        inner += '<button type="button" class="worker-progress-open" ' + openAttr + ' title="Open chat">' +
+        inner += '<button type="button" class="worker-progress-open" ' + openAttr + ' title="' + escapeHtml(t('Open chat')) + '">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
-            '<span>Open chat</span></button>';
+            '<span>' + escapeHtml(t('Open chat')) + '</span></button>';
     }
     // "Chat view" affordance — opens the sub's inline chat card (the SAME
     // renderSubReport card shown in the parent chat: inputs + progress +
     // outputs) inside the global modal overlay. Only offered when a
     // persisted sub_report card for this agent can actually be located.
     if (rec && rec.agent_id && _findSubReportMsg(rec.agent_id)) {
-        inner += '<button type="button" class="worker-progress-open worker-progress-chat-view" data-worker-modal="' + escapeHtml(rec.agent_id) + '" title="View this sub-agent\'s inputs and outputs in a modal">' +
+        inner += '<button type="button" class="worker-progress-open worker-progress-chat-view" data-worker-modal="' + escapeHtml(rec.agent_id) + '" title="' + escapeHtml(t("View this sub-agent's inputs and outputs in a modal")) + '">' +
             '<svg class="ui-icon worker-progress-open-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>' +
-            '<span>View more</span></button>';
+            '<span>' + escapeHtml(t('View more')) + '</span></button>';
     }
     return inner;
 }
@@ -1734,7 +1756,7 @@ function _renderWorkerChatModalBody() {
     _workerModalKey = key;
     var html;
     try { html = renderSubReport(msg, 'wkmodal'); }
-    catch (_) { html = '<div class="worker-progress-empty">Failed to render chat view.</div>'; }
+    catch (_) { html = '<div class="worker-progress-empty">' + escapeHtml(t('Failed to render chat view.')) + '</div>'; }
     body.innerHTML = html;
     // Force the card open inside the modal (a modal showing a collapsed
     // header is useless). Pre-stamp data-rendered-open='1' BEFORE flipping
@@ -1754,7 +1776,7 @@ function _renderWorkerChatModalBody() {
 function openWorkerChatModal(agentId) {
     var msg = _findSubReportMsg(agentId);
     if (!msg) {
-        if (typeof showSnackbar === 'function') showSnackbar('No chat card found for this sub-agent', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('No chat card found for this sub-agent'), 'error');
         return;
     }
     var overlay = document.getElementById('modal-overlay');
@@ -1770,7 +1792,7 @@ function openWorkerChatModal(agentId) {
     var name = msg.subAgentName || agentId;
     header.innerHTML = '<span class="modal-title-text">' + escapeHtml(name) + '</span>' +
         '<div class="modal-header-actions">' +
-        '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+        '<button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
     if (actions) actions.innerHTML = '';
     // The shared .modal-dialog stops click bubbling before document. Route
     // report controls from the body instead, after their own target handlers.
@@ -1928,7 +1950,7 @@ function updateSubAgentSelfCard() {
     // <button>, so Enter/Space activation is native — no inline onkeydown.
     var linkHtml = '';
     if (parentChatId && chats[parentChatId]) {
-        var navTip = parentTitle ? 'Back to parent: ' + parentTitle : 'Back to the chat that spawned this sub-agent';
+        var navTip = parentTitle ? t('Back to parent: {title}', { title: parentTitle === 'New Chat' ? t('New Chat') : parentTitle }) : t('Back to the chat that spawned this sub-agent');
         // Corner-up-left "return to parent" arrow (UI_ICONS.backToParent) —
         // clearer than the old plain left arrow; falls back to the generic
         // back arrow, then a literal ↰, if the constant is ever missing.
@@ -1937,7 +1959,7 @@ function updateSubAgentSelfCard() {
             + ' data-open-parent-chat-id="' + escapeHtml(parentChatId) + '"'
             + ' title="' + escapeHtml(navTip) + '">'
             + '<span class="action-icon" aria-hidden="true">' + backIcon + '</span>'
-            + '<span class="sub-self-parent-label">Back to parent</span>'
+            + '<span class="sub-self-parent-label">' + escapeHtml(t('Back to parent')) + '</span>'
             + '</button>';
     }
     // Input/output report card removed from this view: its full detail is now
@@ -2001,20 +2023,20 @@ function _updateSelfCardMetrics() {
     _patchWorkerCardActivity(card, rec);
     if (rec) {
         var toolsEl = card.querySelector('[data-worker-tools]');
-        if (toolsEl) toolsEl.textContent = String(rec.tool_calls_used || 0) + ' tool calls';
+        if (toolsEl) toolsEl.textContent = tn(rec.tool_calls_used || 0, '{count} tool call', '{count} tool calls');
         var apEl = card.querySelector('[data-worker-approval]');
         if (apEl) apEl.hidden = !_subAwaitingApproval(rec);
     }
     var work = _subWorkStats(chatId);
     var filesEl = card.querySelector('[data-worker-files]');
     if (filesEl) {
-        var filesTxt = _subCountLabel(work.files, 'file', 'files');
+        var filesTxt = tn(work.files, '{count} file', '{count} files');
         if (filesEl.textContent !== filesTxt) filesEl.textContent = filesTxt;
         filesEl.hidden = !work.files;
     }
     var prsEl = card.querySelector('[data-worker-prs]');
     if (prsEl) {
-        var prsTxt = _subCountLabel(work.prs, 'PR', 'PRs');
+        var prsTxt = tn(work.prs, '{count} PR', '{count} PRs');
         if (prsEl.textContent !== prsTxt) prsEl.textContent = prsTxt;
         prsEl.hidden = !work.prs;
     }
@@ -2034,7 +2056,7 @@ function _contextCircleHtml(chatId, extraClass, withTitle) {
     var ctxClass = ctx.pct >= 90 ? ' worker-ctx-danger' : (ctx.pct >= 70 ? ' worker-ctx-warning' : '');
     var titleAttr = '';
     if (withTitle) {
-        var tip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
+        var tip = ctx.tokens ? t('{tokens} ctx tokens \u2014 {pct}%', { tokens: _fmtTokens(ctx.tokens), pct: ctx.pct }) : t('context not started');
         titleAttr = ' title="' + escapeHtml(tip) + '"';
     }
     return '<span class="worker-ctx' + ctxClass + (extraClass ? ' ' + extraClass : '') + '" data-worker-ctx' + titleAttr + '>' +
@@ -2080,14 +2102,14 @@ function _workerCardHtml(r, opts) {
     // B1: pool-queued subs are 'running' records with no loop yet — own look.
     var queued = _subIsQueued(r);
     var stateClass = queued ? 'queued' : (WORKER_CARD_STATES[r.state] ? r.state : 'unknown');
-    var stateLabel = queued ? 'queued' : r.state;
+    var stateLabel = queued ? t('queued') : _subStateLabel(r.state);
     // Phase 5: legacy records may lack `depth` — default to 1 (direct child of
     // root). Cap the rendered depth at 3 to match the CSS rule ladder.
     var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
     var renderDepth = Math.min(depth, 3);
     var used = (r.tool_calls_used || 0);
     var ctx = _subContextInfo(r.chat_id);
-    var tokTip = ctx.tokens ? (_fmtTokens(ctx.tokens) + ' ctx tokens \u2014 ' + ctx.pct + '%') : 'context not started';
+    var tokTip = ctx.tokens ? t('{tokens} ctx tokens \u2014 {pct}%', { tokens: _fmtTokens(ctx.tokens), pct: ctx.pct }) : t('context not started');
     var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
     // ACTIVITY: live thinking/tool glyph replaces the static bot icon while
     // running; the tool's display name replaces the state word in the sub
@@ -2129,30 +2151,30 @@ function _workerCardHtml(r, opts) {
     return '<div class="worker-card-wrap' + (selfCard ? ' worker-card-wrap-self' : '') + '" data-depth="' + renderDepth + '"' + (selfCard ? ' style="margin-top:var(--space-3,6px)"' : '') + '>' +
         '<' + wkTag + ' class="worker-card worker-' + stateClass + (wkExpandedNow ? ' worker-card-expanded' : '') + (selfCard ? ' worker-card-self' : '') + '" ' +
         wkToggleAttrs +
-        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(queued ? 'queued (waiting for a free pool slot)' : r.state) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(String(used)) + ' tool calls \u2014 ' + escapeHtml(tokTip) + ' \u2014 depth ' + escapeHtml(String(depth)) + '">' +
+        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(queued ? t('queued (waiting for a free pool slot)') : _subStateLabel(r.state)) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(tn(used, '{count} tool call', '{count} tool calls')) + ' \u2014 ' + escapeHtml(tokTip) + ' \u2014 ' + escapeHtml(t('depth {depth}', { depth: depth })) + '">' +
         '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : (queued ? 'queued' : '')) + '" aria-hidden="true">' + cardIcon + '</span>' +
         '<span class="worker-card-main">' +
             '<span class="worker-card-row">' +
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
                 '<span class="worker-name">' + escapeHtml(label) + '</span>' +
-                '<span class="worker-approval-badge" data-worker-approval title="a tool call is awaiting user approval in this sub\u2019s chat"' +
+                '<span class="worker-approval-badge" data-worker-approval title="' + escapeHtml(t('a tool call is awaiting user approval in this sub\u2019s chat')) + '"' +
                 ' style="margin-left:4px;padding:0 5px;border-radius:8px;font-size:9px;font-weight:600;white-space:nowrap;background:var(--warning-bg, #5c4d10);color:var(--warning-text, #ffe289);"' +
-                (awaitingAp ? '' : ' hidden') + '>approval</span>' +
+                (awaitingAp ? '' : ' hidden') + '>' + escapeHtml(t('approval')) + '</span>' +
             '</span>' +
             '<span class="worker-card-row worker-card-sub">' +
                 '<span class="worker-state" data-worker-state' + (act ? ' title="' + escapeHtml(act.label) + '"' : '') + '>' + escapeHtml(stateText) + '</span>' +
-                '<span class="worker-tools" data-worker-tools>' + escapeHtml(String(used)) + ' tool calls</span>' +
-                '<span class="worker-files" data-worker-files title="workspace files edited by this sub"' + (work.files ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.files, 'file', 'files')) + '</span>' +
-                '<span class="worker-prs" data-worker-prs title="PRs opened by this sub"' + (work.prs ? '' : ' hidden') + '>' + escapeHtml(_subCountLabel(work.prs, 'PR', 'PRs')) + '</span>' +
+                '<span class="worker-tools" data-worker-tools>' + escapeHtml(tn(used, '{count} tool call', '{count} tool calls')) + '</span>' +
+                '<span class="worker-files" data-worker-files title="' + escapeHtml(t('workspace files edited by this sub')) + '"' + (work.files ? '' : ' hidden') + '>' + escapeHtml(tn(work.files, '{count} file', '{count} files')) + '</span>' +
+                '<span class="worker-prs" data-worker-prs title="' + escapeHtml(t('PRs opened by this sub')) + '"' + (work.prs ? '' : ' hidden') + '>' + escapeHtml(tn(work.prs, '{count} PR', '{count} PRs')) + '</span>' +
             '</span>' +
             // Orchestrator §6: own row — the provider/tier string is long
             // and would crush the state/tools row into ellipsis.
             (modelLine
-                ? '<span class="worker-card-row worker-card-sub"><span class="worker-model" data-worker-model title="model this worker runs on \u2014 provider (tier)">' + escapeHtml(modelLine) + '</span></span>'
+                ? '<span class="worker-card-row worker-card-sub"><span class="worker-model" data-worker-model title="' + escapeHtml(t('model this worker runs on \u2014 provider (tier)')) + '">' + escapeHtml(modelLine) + '</span></span>'
                 : '') +
             // Tool-profile chips — own row (same rationale as the model line).
             (profileTags.length
-                ? '<span class="worker-card-row worker-card-sub worker-profiles" title="tool profiles this worker was spawned with">' +
+                ? '<span class="worker-card-row worker-card-sub worker-profiles" title="' + escapeHtml(t('tool profiles this worker was spawned with')) + '">' +
                     profileTags.map(function(p) { return '<span class="worker-profile-tag">' + escapeHtml(p) + '</span>'; }).join('') +
                   '</span>'
                 : '') +
@@ -2289,7 +2311,7 @@ function renderWorkersStrip() {
         return (b.last_activity_at || 0) - (a.last_activity_at || 0);
     });
     var chips = mine.map(_workerCardHtml).join('');
-    stripEl.innerHTML = '<div class="sidebar-workers-header">Workers (' + mine.length + ')</div>' +
+    stripEl.innerHTML = '<div class="sidebar-workers-header">' + escapeHtml(t('Workers ({count})', { count: mine.length })) + '</div>' +
         '<div class="sidebar-workers-list">' + chips + '</div>';
     stripEl.style.display = '';
 }
@@ -2471,22 +2493,22 @@ function renderWorkersStrip() {
                 }
                 return;
             }
-            var t = evt.target;
-            while (t && t !== document) {
-                if (t.getAttribute) {
+            var hitEl = evt.target;
+            while (hitEl && hitEl !== document) {
+                if (hitEl.getAttribute) {
                     // Worker card click -> toggle its inline progress panel
                     // (update_action_state tasks). Checked before the reveal
                     // branch; the "open chat" link inside the panel carries
                     // data-sub-agent-reveal and falls through to it.
-                    var wkToggle = t.getAttribute('data-worker-toggle');
+                    var wkToggle = hitEl.getAttribute('data-worker-toggle');
                     if (wkToggle) {
-                        toggleWorkerProgress(wkToggle, t);
+                        toggleWorkerProgress(wkToggle, hitEl);
                         evt.preventDefault();
                         return;
                     }
                     // "Chat view" link inside an expanded worker card —
                     // opens the sub's inline chat card in the global modal.
-                    var wkModal = t.getAttribute('data-worker-modal');
+                    var wkModal = hitEl.getAttribute('data-worker-modal');
                     if (wkModal) {
                         openWorkerChatModal(wkModal);
                         evt.preventDefault();
@@ -2496,8 +2518,8 @@ function renderWorkersStrip() {
                     // via registry); data-sub-chat-id carries a direct
                     // chat id (used for sub_report links so they keep
                     // working after the registry GCs the settled record).
-                    var aid = t.getAttribute('data-sub-agent-reveal');
-                    var cid = t.getAttribute('data-sub-chat-id');
+                    var aid = hitEl.getAttribute('data-sub-agent-reveal');
+                    var cid = hitEl.getAttribute('data-sub-chat-id');
                     if (aid || cid) {
                         revealSubAgentChat(aid || cid);
                         // A reveal clicked INSIDE the worker chat-view modal
@@ -2505,7 +2527,7 @@ function renderWorkersStrip() {
                         // chat BEHIND the overlay — close the modal so the
                         // user actually sees the chat they asked for.
                         var _ovl = document.getElementById('modal-overlay');
-                        if (_ovl && _ovl.classList.contains('worker-chat-modal') && _ovl.contains(t) && typeof closeModal === 'function') {
+                        if (_ovl && _ovl.classList.contains('worker-chat-modal') && _ovl.contains(hitEl) && typeof closeModal === 'function') {
                             closeModal();
                         }
                         evt.preventDefault();
@@ -2515,7 +2537,7 @@ function renderWorkersStrip() {
                     // in the right sidebar (see updateSubAgentSelfCard above).
                     // Routes via selectChat so the chat list expands / scrolls
                     // / etc. just like a normal click on the sidebar row.
-                    var openParent = t.getAttribute('data-open-parent-chat-id');
+                    var openParent = hitEl.getAttribute('data-open-parent-chat-id');
                     if (openParent) {
                         if (typeof selectChat === 'function') {
                             try { selectChat(openParent); } catch (_) { /* ignore */ }
@@ -2524,7 +2546,7 @@ function renderWorkersStrip() {
                         return;
                     }
                 }
-                t = t.parentNode;
+                hitEl = hitEl.parentNode;
             }
         };
         document.addEventListener('click', _handleSubAgentUiClick);

@@ -4,10 +4,10 @@ function copyMessageText(msgIndex) {
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     navigator.clipboard.writeText(msg.content).then(function() {
-        showSnackbar('Message copied', 'success', undefined, { transient: true });
+        showSnackbar(t('Message copied'), 'success', undefined, { transient: true });
     }).catch(function() {
         // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
-        showSnackbar('Copy failed', 'error');
+        showSnackbar(t('Copy failed'), 'error');
     });
 }
 
@@ -40,10 +40,10 @@ function copyAiMessage(userMsgIdx) {
     }
     
     navigator.clipboard.writeText(content.join('\n\n')).then(function() {
-        showSnackbar('Response copied', 'success', undefined, { transient: true });
+        showSnackbar(t('Response copied'), 'success', undefined, { transient: true });
     }).catch(function() {
         // Bug-sweep F3: clipboard write can reject (no focus / permission denied).
-        showSnackbar('Copy failed', 'error');
+        showSnackbar(t('Copy failed'), 'error');
     });
 }
 
@@ -135,6 +135,26 @@ function closeAllHeaderMenus(except) {
     if (except !== 'workspace' && typeof hideWorkspaceDropdown === 'function') hideWorkspaceDropdown();
     if (except !== 'usage' && typeof hideUsageTooltipNow === 'function') hideUsageTooltipNow();
     if (except !== 'instances' && typeof window.hideInstancePicker === 'function') window.hideInstancePicker();
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
+}
+
+// A11y: mirror each header menu's open state onto its trigger(s) as
+// aria-expanded (the triggers carry aria-haspopup in body.html). Reads the DOM,
+// so any open/close path can call it: gear panel (.visible), model menu
+// (#model-menu exists), workspace dropdown (_wsDropdown), jobs (display:block).
+function syncHeaderMenuExpanded() {
+    function set(sel, open) {
+        document.querySelectorAll(sel).forEach(function(el) { el.setAttribute('aria-expanded', open ? 'true' : 'false'); });
+    }
+    var panel = document.getElementById('settings-panel');
+    set('.settings-btn', !!(panel && panel.classList.contains('visible')));
+    set('#model-name, #home-model-name', !!document.getElementById('model-menu'));
+    set('#ws-header-status, #home-ws-header-status', typeof _wsDropdown !== 'undefined' && !!_wsDropdown);
+    document.querySelectorAll('.jobs-badge').forEach(function(b) {
+        var w = b.closest('.jobs-badge-wrapper');
+        var dd = w && w.querySelector('.jobs-dropdown');
+        b.setAttribute('aria-expanded', dd && dd.style.display === 'block' ? 'true' : 'false');
+    });
 }
 
 // Gear-dropdown theme toggle — same mechanism as the settings page
@@ -155,6 +175,28 @@ function syncSettingsPanelTheme() {
         o.classList.toggle('selected', on);
         o.setAttribute('aria-checked', on ? 'true' : 'false');
     });
+    // APG radiogroup: roving tabindex, so Tab stops only on the checked radio
+    // (the first one when nothing is checked); arrows move between them.
+    var opts = group.querySelectorAll('.radio-option');
+    var sel = group.querySelector('.radio-option.selected') || opts[0];
+    opts.forEach(function(o) { o.setAttribute('tabindex', o === sel ? '0' : '-1'); });
+}
+
+// Arrow keys on #settings-panel-theme move focus AND selection (APG radiogroup);
+// Enter/Space stay on each radio's own onkeydown. kbdRadioNextIndex: ui/320.
+function settingsPanelThemeKeydown(e) {
+    if (!e || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    var group = document.getElementById('settings-panel-theme');
+    if (!group || typeof kbdRadioNextIndex !== 'function') return;
+    var opts = Array.prototype.slice.call(group.querySelectorAll('.radio-option'));
+    var cur = opts.indexOf(e.target && e.target.closest ? e.target.closest('.radio-option') : null);
+    if (cur < 0) return;
+    var rtl = typeof i18nDir === 'function' && i18nDir() === 'rtl';
+    var next = kbdRadioNextIndex(opts.length, cur, e.key, rtl);
+    if (next < 0) return;
+    e.preventDefault();
+    setAppThemeFromPanel(opts[next].getAttribute('data-value'));
+    opts[next].focus();
 }
 
 // Listen for OS theme changes (only matters when set to 'system')
@@ -229,7 +271,7 @@ function updateContextIndicator() {
 
     // Show percentage and token count in tooltip
     var tokenDisplay = totalTokens >= 1000 ? Math.round(totalTokens / 1000) + 'k' : totalTokens;
-    indicator.title = percentage + '% context used (' + tokenDisplay + ' tokens)';
+    indicator.title = t('{percent}% context used ({tokens} tokens)', { percent: percentage, tokens: tokenDisplay });
 }
 
 // Auto-resize textarea
@@ -292,10 +334,10 @@ function updateSidebarToggleIcon() {
     if (btn) {
         if (sidebarCollapsed) {
             btn.innerHTML = UI_ICONS.panelLeftOpen;
-            btn.title = 'Expand sidebar';
+            btn.title = t('Expand sidebar') + (typeof kbdHintSuffix === 'function' ? kbdHintSuffix('sidebar') : '');
         } else {
             btn.innerHTML = UI_ICONS.panelLeftClose;
-            btn.title = 'Collapse sidebar';
+            btn.title = t('Collapse sidebar') + (typeof kbdHintSuffix === 'function' ? kbdHintSuffix('sidebar') : '');
         }
     }
 }
@@ -367,7 +409,7 @@ function showSpinner(text, chatId, opts) {
     }
     var spinnerHtml = '<div class="spinner-container" id="loading-spinner">' +
         glyph +
-        '<span class="spinner-text">' + escapeHtml(text || 'Thinking...') + '</span>' +
+        '<span class="spinner-text">' + escapeHtml(text || t('Thinking...')) + '</span>' +
         '</div>';
     hideSpinner();
     container.insertAdjacentHTML('beforeend', spinnerHtml);

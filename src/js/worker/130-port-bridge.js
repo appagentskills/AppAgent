@@ -305,7 +305,6 @@ function _swLateHydrationResync() {
         try { p.postMessage({ type: 'chat-meta-snapshot', chatMeta: snap }); n++; }
         catch (e) { /* dead port — disconnect handler cleans up */ }
     });
-    console.log('[sw-runtime] late hydration: re-synced chat-meta snapshot to ' + n + ' panel(s)');
 }
 self._swLateHydrationResync = _swLateHydrationResync;
 
@@ -920,6 +919,10 @@ function _handlePanelMessage(port, msg) {
                     // so a Settings change reaches an already-booted SW before
                     // the next run's context warnings / saturation gauges.
                     .then(function() { return (typeof loadAssumedContextTokens === 'function') ? loadAssumedContextTokens() : null; })
+                    // i18n: re-read the UI-language preference (IDB 'uiLanguage') + catalog so this run's
+                    // system prompt resolves {{RESPONSE_LANGUAGE}} from the latest Settings > Language.
+                    // A failed load never blocks the run (English fallback).
+                    .then(function() { return (typeof i18nInit === 'function') ? Promise.resolve(i18nInit()).catch(function() {}) : null; })
                     // MEMFIX: the SW loader evicts inline base64 payloads from
                     // every chat (worker/115-storage.js) and a panel snapshot
                     // adopted above may itself be payload-evicted (the page
@@ -1586,6 +1589,16 @@ function _handlePanelMessage(port, msg) {
             deferredToolsEnabled = !!msg.enabled;
             return;
 
+        case 'ui-language':
+            // Posted by ui/245 setAppLanguage AFTER its IDB write (setSetting('uiLanguage', pref)):
+            // re-run i18nInit so SW-side t() and the next run's {{RESPONSE_LANGUAGE}} follow the switch.
+            // The message carries the preference, so no IDB re-read can race the page's write.
+            if (typeof i18nInit === 'function') {
+                var uiLangOpts = (typeof msg.uiLanguage === 'string' && msg.uiLanguage) ? { language: msg.uiLanguage } : undefined;
+                try { Promise.resolve(i18nInit(uiLangOpts)).catch(function() {}); } catch (e) {}
+            }
+            return;
+
         case 'skills-refresh':
             // Panel finished importEmbeddedSkills() (or activated/deactivated a
             // skill). Re-run loadActiveSkills so the SW's `skillTools` registry
@@ -2148,6 +2161,11 @@ async function _handlePanelSendMessage(msg) {
         // including when the text is a STOP PHRASE ("stop"/"no"/"cancel"): the
         // helper then settles the prompt as cancelled and returns false so the
         // interrupt lane below still runs.
+        // HOOK-MERGE: during an after-response hook run the message is only
+        // QUEUED — don't abort the (short) hook call or cancel its answer-card
+        // tools; the loop defers the flush and the end-of-run drain delivers
+        // it as a separate user turn (app/030-agent-loop.js).
+        if (typeof _hookRunDeferInjectionByChat !== 'undefined' && _hookRunDeferInjectionByChat[chatId]) return;
         if (typeof _swAnswerPendingPromptViaChat === 'function' && _swAnswerPendingPromptViaChat(chatId, msg.text)) return;
         userInterruptedChats[chatId] = true;
         if (interruptResolversByChatId[chatId]) {

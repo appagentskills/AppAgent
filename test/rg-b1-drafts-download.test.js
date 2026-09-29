@@ -51,6 +51,10 @@ describe('TA3-3 draft debounce files the draft under the composer it was typed i
 describe('TB-6 downloadChat exports the record present after payload hydration', function() {
     test('ensureChatPayloads swaps in a restored record mid-await -> that record is exported', async function() {
         var src = await loadFile('src/js/ui/210-chat-menus.js');
+        // downloadChat calls t(): the with (env) fixture gets the REAL i18n core first
+        // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+        var i18nCore = await loadFile('src/js/core/025-i18n.js');
+        assert.ok(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
         var start = src.indexOf('async function downloadChat(');
         var end = src.indexOf('\n}', start);
         assert.ok(start >= 0 && end > start, 'downloadChat declaration not found');
@@ -69,7 +73,7 @@ describe('TB-6 downloadChat exports the record present after payload hydration',
                 body: { appendChild: function() {}, removeChild: function() {} } },
             showSnackbar: function(m, t) { snacks.push(t + ':' + m); }
         };
-        var fn = new Function('env', 'with (env) {\n' + src.slice(start, end + 2) + '\nreturn downloadChat;\n}')(env);
+        var fn = new Function('env', 'with (env) {\n' + i18nCore + '\n' + src.slice(start, end + 2) + '\nreturn downloadChat;\n}')(env);
         await fn('c1');
         assert.strictEqual(blobs.length, 1, 'nothing exported');
         var exported = JSON.parse(blobs[0].parts.join('')).chat;

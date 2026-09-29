@@ -23,13 +23,13 @@
 
     /* User messages - wider on tablet */
     .message.user .message-content { max-width: 75%; }
-    .message.assistant .message-content { margin-right: 10%; }
-    .message.assistant .message-content .code-block-wrapper.expanded { margin-right: -10%; width: 110%; }
+    .message.assistant .message-content { margin-inline-end: 10%; }
+    .message.assistant .message-content .code-block-wrapper.expanded { margin-inline-end: -10%; width: 110%; }
 
     /* Input area adjustments */
     .input-area { padding: var(--space-6) var(--space-8) var(--space-8); }
     .input-area.centered { padding: 0 16px; max-width: 100%; }
-    .input-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-8); }
+    .input-container { border-radius: var(--radius-pill); padding-block: var(--space-3); padding-inline: var(--space-8) var(--space-3); }
 
     /* Header adjustments */
     .main-header { padding: var(--space-5) var(--space-6); }
@@ -38,10 +38,10 @@
     .credits-display, .storage-display { font-size: var(--text-caption); padding: var(--space-2) var(--space-4); }
 
     /* Settings panel - full width */
-    .settings-panel { width: 100%; max-width: 360px; right: 0; left: auto; }
+    .settings-panel { width: 100%; max-width: 360px; inset-inline-end: 0; inset-inline-start: auto; }
 
     /* Version sidebar - overlay on tablet */
-    .version-sidebar { position: fixed; right: 0; top: 0; bottom: 0; z-index: var(--z-drawer); width: 300px; }
+    .version-sidebar { position: fixed; inset-inline-end: 0; top: 0; bottom: 0; z-index: var(--z-drawer); width: 300px; }
 
     /* Dashboard grid - 6 columns on tablet */
     .dashboard-grid { grid-template-columns: repeat(6, 1fr); gap: var(--space-6); padding: var(--space-6); }
@@ -52,7 +52,7 @@
 
     /* Docs layout - stack on tablet */
     .docs-layout { flex-direction: column; }
-    .docs-outline { width: 100%; max-height: none; position: relative; border-left: none; border-bottom: 1px solid var(--secondary-border); }
+    .docs-outline { width: 100%; max-height: none; position: relative; border-inline-start: none; border-bottom: 1px solid var(--secondary-border); }
     .docs-main { padding: var(--space-8); }
 
     /* Home panel */
@@ -69,7 +69,7 @@
 
     /* Skill editor layout */
     .skill-editor-layout { flex-direction: column; }
-    .skill-editor-layout .skill-sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--secondary-border); max-height: 200px; }
+    .skill-editor-layout .skill-sidebar { width: 100%; border-inline-end: none; border-bottom: 1px solid var(--secondary-border); max-height: 200px; }
 }
 
 /* Mobile breakpoint (480px and below) */
@@ -81,8 +81,8 @@
     .main-wrapper { height: 100%; overflow: hidden; }
 
     /* Sidebar - use transform for smooth slide animation on mobile */
-    .sidebar { position: fixed !important; left: 0; top: 0; bottom: 0; width: 280px !important; min-width: 280px !important; border: none !important; overflow: hidden; z-index: var(--z-overlay-base); transform: translateX(-100%); transition: transform 0.3s ease !important; }
-    .sidebar.expanded { transform: translateX(0); border-right: 1px solid var(--secondary-border) !important; overflow: visible; }
+    .sidebar { position: fixed !important; inset-inline-start: 0; top: 0; bottom: 0; width: 280px !important; min-width: 280px !important; border: none !important; overflow: hidden; z-index: var(--z-overlay-base); transform: translateX(-100%); transition: transform 0.3s ease !important; }
+    .sidebar.expanded { transform: translateX(0); border-inline-end: 1px solid var(--secondary-border) !important; overflow: visible; }
     .sidebar.no-transition { transition: none !important; }
 
     /* Overlay is handled by JS (sidebar-overlay div) for click-to-close support */
@@ -105,13 +105,13 @@
     .chat-content-wrapper { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
     .message { margin-bottom: var(--space-6); }
     .message.user .message-content { max-width: 85%; padding: var(--space-5) var(--space-7); border-radius: var(--radius-bubble); }
-    .message.assistant .message-content { margin-right: 5%; padding: var(--space-3) 0; }
-    .message.assistant .message-content .code-block-wrapper.expanded { margin-right: 0; width: 100%; }
+    .message.assistant .message-content { margin-inline-end: 5%; padding: var(--space-3) 0; }
+    .message.assistant .message-content .code-block-wrapper.expanded { margin-inline-end: 0; width: 100%; }
 
     /* Input area - fixed at bottom */
     .input-area { padding: var(--space-5) var(--space-6) var(--space-7); padding-bottom: calc(14px + env(safe-area-inset-bottom)); flex-shrink: 0; }
     .input-area.centered { padding: 0 12px; position: relative; }
-    .input-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-7); gap: var(--space-3); }
+    .input-container { border-radius: var(--radius-pill); padding-block: var(--space-3); padding-inline: var(--space-7) var(--space-3); gap: var(--space-3); }
     .input-container textarea { font-size: var(--text-xl); padding: var(--space-4) 0; min-height: 20px; }
     #send-btn { width: 40px; height: 40px; }
     #send-btn svg { width: 16px; height: 16px; }
@@ -157,7 +157,7 @@
     /* Home panel - proper scrolling */
     .home-panel { padding: var(--space-8) var(--space-6); height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .home-search-section { padding: 0 8px; }
-    .home-search-container { border-radius: var(--radius-pill); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-7); }
+    .home-search-container { border-radius: var(--radius-pill); padding-block: var(--space-3); padding-inline: var(--space-7) var(--space-3); }
     .home-search-container textarea { font-size: var(--text-xl); }
     #home-send-btn { width: 40px; height: 40px; }
     .home-stats { gap: var(--space-4); padding: 0 8px; }
@@ -201,7 +201,7 @@
     .message-content { line-height: var(--leading-relaxed); }
     .message-content h2 { font-size: 1.15em; }
     .message-content h3 { font-size: 1.05em; }
-    .message-content ul, .message-content ol { padding-left: var(--space-9); }
+    .message-content ul, .message-content ol { padding-inline-start: var(--space-9); }
 
     /* Attachments */
     .screenshot-container { max-width: 160px; padding: var(--space-4); }
@@ -228,7 +228,7 @@
     .docs-outline { padding: var(--space-4) 0; }
     .docs-outline-title { padding: var(--space-5) var(--space-8) var(--space-3); font-size: var(--text-sm); }
     .docs-nav-item { padding: var(--space-3) var(--space-8); font-size: var(--text-body-sm); }
-    .docs-nav-subitem { padding: var(--space-2) var(--space-8) var(--space-2) var(--space-10); font-size: var(--text-caption); }
+    .docs-nav-subitem { padding-block: var(--space-2); padding-inline: var(--space-10) var(--space-8); font-size: var(--text-caption); }
     .docs-section h1 { font-size: var(--text-2xl); }
     .docs-section h2 { font-size: var(--text-lg); }
     .docs-section p, .docs-section li { font-size: var(--text-body); }
@@ -254,7 +254,7 @@
     .messages { padding: var(--space-5); }
     .message.user .message-content { max-width: 90%; padding: var(--space-4) var(--space-6); }
 
-    .input-container { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-6); }
+    .input-container { padding-block: var(--space-2); padding-inline: var(--space-6) var(--space-2); }
     .input-container textarea { font-size: var(--text-body); }
     #send-btn { width: 36px; height: 36px; }
 

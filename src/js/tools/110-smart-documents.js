@@ -400,7 +400,7 @@ function renderDocumentPlaceholder(docId) {
                 if (loaded && typeof sdocReRenderAll === 'function') sdocReRenderAll(docId);
             });
         }
-        return '<div class="sdoc-error" data-doc-id="' + escDisplay(docId) + '">Loading document ' + escDisplay(docId) + '\u2026</div>';
+        return '<div class="sdoc-error" data-doc-id="' + escDisplay(docId) + '">' + escDisplay(t('Loading document {id}\u2026', { id: docId })) + '</div>';
     }
     return sdocRender(doc);
 }
@@ -420,11 +420,11 @@ function sdocRender(doc) {
     html += '<div class="sdoc-header-left">';
     html += '<span class="sdoc-icon">' + UI_ICONS.file + '</span>';
     html += '<span class="sdoc-title">' + escDisplay(doc.title) + '</span>';
-    html += '<input type="text" class="sdoc-title-input" value="' + escDisplay(doc.title) + '" placeholder="Document title..." />';
+    html += '<input type="text" class="sdoc-title-input" value="' + escDisplay(doc.title) + '" placeholder="' + escDisplay(t('Document title...')) + '" />';
     html += '<span class="sdoc-version-badge">v' + escDisplay(doc.currentVersion) + '</span>';
     html += '</div>';
     html += '<div class="sdoc-header-actions">';
-    html += '<select class="sdoc-version-select" onchange="sdocCompare(\'' + sdocJsArg(docId) + '\', this.value, this)" title="Compare with version">';
+    html += '<select class="sdoc-version-select" onchange="sdocCompare(\'' + sdocJsArg(docId) + '\', this.value, this)" title="' + escDisplay(t('Compare with version')) + '">';
     html += '<option value="">v' + escDisplay(doc.currentVersion) + '</option>';
     for (var i = doc.versions.length - 1; i >= 0; i--) {
         var v = doc.versions[i];
@@ -433,11 +433,11 @@ function sdocRender(doc) {
         html += '<option value="' + escDisplay(v.version) + '">v' + escDisplay(v.version) + ' ' + icon + ' ' + sdocTimeAgo(v.timestamp) + '</option>';
     }
     html += '</select>';
-    html += '<button class="sdoc-action-btn" onclick="sdocToggleEdit(\'' + sdocJsArg(docId) + '\', this)" title="Edit">' + UI_ICONS.edit + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="editDocumentWithAgent(\'' + sdocJsArg(docId) + '\', event)" title="Edit with agent">' + UI_ICONS.agentEdit + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocExportMd(\'' + sdocJsArg(docId) + '\')" title="Copy Markdown">' + UI_ICONS.copy + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocOpenNewTab(\'' + sdocJsArg(docId) + '\')" title="Open in new tab">' + UI_ICONS.expand + '</button>';
-    html += '<button class="sdoc-action-btn" onclick="sdocStartChat(\'' + sdocJsArg(docId) + '\')" title="New chat">' + UI_ICONS.chat + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocToggleEdit(\'' + sdocJsArg(docId) + '\', this)" title="' + escDisplay(t('Edit')) + '">' + UI_ICONS.edit + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="editDocumentWithAgent(\'' + sdocJsArg(docId) + '\', event)" title="' + escDisplay(t('Edit with agent')) + '">' + UI_ICONS.agentEdit + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocExportMd(\'' + sdocJsArg(docId) + '\')" title="' + escDisplay(t('Copy Markdown')) + '">' + UI_ICONS.copy + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocOpenNewTab(\'' + sdocJsArg(docId) + '\')" title="' + escDisplay(t('Open in new tab')) + '">' + UI_ICONS.expand + '</button>';
+    html += '<button class="sdoc-action-btn" onclick="sdocStartChat(\'' + sdocJsArg(docId) + '\')" title="' + escDisplay(t('New chat')) + '">' + UI_ICONS.chat + '</button>';
     html += '</div></div>';
 
     // Diff (hidden)
@@ -450,14 +450,14 @@ function sdocRender(doc) {
     html += '<div class="sdoc-edit" id="' + cid + '-edit" style="display:none;">';
     html += '<textarea class="sdoc-editor" id="' + cid + '-editor">' + escDisplay(doc.currentContent) + '</textarea>';
     html += '<div class="sdoc-edit-actions">';
-    html += '<button class="skills-action-btn primary" onclick="sdocSaveEdit(\'' + sdocJsArg(docId) + '\', this)">Save</button>';
-    html += '<button class="skills-action-btn" onclick="sdocCancelEdit(\'' + sdocJsArg(docId) + '\', this)">Cancel</button>';
+    html += '<button class="skills-action-btn primary" onclick="sdocSaveEdit(\'' + sdocJsArg(docId) + '\', this)">' + escDisplay(t('Save')) + '</button>';
+    html += '<button class="skills-action-btn" onclick="sdocCancelEdit(\'' + sdocJsArg(docId) + '\', this)">' + escDisplay(t('Cancel')) + '</button>';
     html += '</div></div>';
 
     // Prompts
     if (doc.prompts && doc.prompts.length > 0) {
         html += '<div class="sdoc-prompts">';
-        html += '<div class="sdoc-prompts-title">Questions</div>';
+        html += '<div class="sdoc-prompts-title">' + escDisplay(t('Questions')) + '</div>';
         doc.prompts.forEach(function(prompt) { html += sdocRenderPrompt(doc, prompt); });
         html += '</div>';
     }
@@ -533,10 +533,10 @@ function sdocRenderPrompt(doc, prompt) {
         }
         html += '</div>';
     });
-    var btnLabel = answered ? 'Update' : 'Submit';
+    var btnLabel = answered ? t('Update') : t('Submit');
     html += '<div class="sdoc-prompt-submit-row">';
-    html += '<button type="submit" class="skills-action-btn primary" style="align-self:flex-start">' + btnLabel + '</button>';
-    if (answered) html += '<span class="sdoc-prompt-answered">✓ Saved</span>';
+    html += '<button type="submit" class="skills-action-btn primary" style="align-self:flex-start">' + escDisplay(btnLabel) + '</button>';
+    if (answered) html += '<span class="sdoc-prompt-answered">✓ ' + escDisplay(t('Saved')) + '</span>';
     html += '</div>';
     html += '</form></div>';
     return html;
@@ -693,8 +693,12 @@ function sdocCompare(docId, versionStr, fromEl) {
     diff.style.display = '';
     c.classList.add('sdoc-diffing');
     c.classList.remove('sdoc-editing');
+    // Whole-label keys per known author (stored values stay 'user'/'agent'); an unknown author shows as-is.
+    var oldLabel = oldVer.author === 'user' ? t('v{version} (user)', { version: oldVer.version })
+        : oldVer.author === 'agent' ? t('v{version} (agent)', { version: oldVer.version })
+        : 'v' + oldVer.version + ' (' + oldVer.author + ')';
     diff.innerHTML = sdocRenderDiff(oldVer.content.split('\n'), doc.currentContent.split('\n'),
-        'v' + oldVer.version + ' (' + oldVer.author + ')', 'v' + doc.currentVersion + ' (current)');
+        oldLabel, t('v{version} (current)', { version: doc.currentVersion }));
 }
 
 function sdocRenderDiff(oldLines, newLines, oldLabel, newLabel) {
@@ -740,10 +744,11 @@ function sdocExportMd(docId) {
     // S0B-15: a synchronous throw (non-string content, no clipboard API) gives an
     // error snackbar instead of an uncaught exception with no feedback.
     try {
-        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
-        navigator.clipboard.writeText(md).then(function() { showSnackbar('Markdown copied to clipboard', 'success'); }).catch(function() { sdocDownloadMd(docId); });
+        var embedLabel = t('[embedded display]');
+        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, function() { return embedLabel; });
+        navigator.clipboard.writeText(md).then(function() { showSnackbar(t('Markdown copied to clipboard'), 'success'); }).catch(function() { sdocDownloadMd(docId); });
     } catch (e) {
-        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -753,7 +758,8 @@ function sdocDownloadMd(docId) {
     // S0B-15: any throw (non-string content, Blob/URL) gives an error snackbar
     // instead of an uncaught exception with no feedback.
     try {
-        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, '[embedded display]');
+        var embedLabel = t('[embedded display]');
+        var md = doc.currentContent.replace(/<!--display:dsp_\w+-->/g, function() { return embedLabel; });
         var blob = new Blob([md], { type: 'text/markdown' });
         var a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -761,7 +767,7 @@ function sdocDownloadMd(docId) {
         a.click();
         URL.revokeObjectURL(a.href);
     } catch (e) {
-        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -851,7 +857,7 @@ function editDocumentWithAgent(docId, event) {
         // starts on line 2. autoResizeTextarea runs AFTER the value is set so the
         // textarea grows to 2 rows, and setSelectionRange puts the caret there.
         // NOT auto-sent — the user types what they want changed.
-        input.value = 'Edit document ' + docId + ':\n';
+        input.value = t('Edit document {id}:', { id: docId }) + '\n';
         if (typeof autoResizeTextarea === 'function') autoResizeTextarea(input);
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
@@ -903,7 +909,7 @@ function sdocSubmitPrompt(docId, promptId, fromEl) {
     doc.updatedAt = Date.now();
     saveDocument(doc);
     sdocReRenderAll(docId);
-    showSnackbar('Response saved', 'success');
+    showSnackbar(t('Response saved'), 'success');
 }
 
 // ─── Document Preview Modal ───
@@ -932,7 +938,7 @@ function sdocOpenPreview(docId) {
     if (headerActions) {
         var closeBtn = document.createElement('button');
         closeBtn.className = 'sdoc-action-btn';
-        closeBtn.title = 'Close';
+        closeBtn.title = t('Close');
         closeBtn.innerHTML = UI_ICONS.close;
         closeBtn.onclick = function(e) { e.stopPropagation(); requestClose(); };
         headerActions.appendChild(closeBtn);
@@ -968,7 +974,8 @@ function sdocOpenPreview(docId) {
         if (isDirty()) {
             _confirming = true;
             var ok = false;
-            try { ok = await showConfirmModal('Discard changes?', 'Unsaved edits to "' + escapeHtml((smartDocuments[docId] || {}).title || 'this document') + '" will be lost.', 'warning'); }
+            var docTitle = (smartDocuments[docId] || {}).title;
+            try { ok = await showConfirmModal(t('Discard changes?'), docTitle ? t('Unsaved edits to "{title}" will be lost.', { title: escapeHtml(docTitle) }) : t('Unsaved edits to this document will be lost.'), 'warning'); }
             // Reset in a MACROtask: core/120-init.js's Esc closes the confirm first and the
             // microtasks drain before this onEsc runs. A sync reset would re-prompt on the same press.
             finally { setTimeout(function() { _confirming = false; }, 0); }
@@ -995,7 +1002,7 @@ function openDocumentMention(docId, event) {
     if (smartDocuments[docId]) { sdocOpenPreview(docId); return; }
     loadDocumentById(docId).then(function(doc) {
         if (doc) { sdocOpenPreview(docId); return; }
-        if (typeof showSnackbar === 'function') showSnackbar('Document ' + docId + ' not found', 'error');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Document {id} not found', { id: docId }), 'error');
         else console.warn('[openDocumentMention] document not found: ' + docId);
     });
 }
@@ -1071,15 +1078,11 @@ function _sdocCarryPromptDrafts(oldRoot, newRoot) {
 // ─── Time formatting ───
 
 function sdocTimeAgo(ts) {
-    var d = Date.now() - ts;
-    var m = Math.floor(d / 60000);
-    if (m < 1) return 'just now';
-    if (m < 60) return m + 'm ago';
-    var h = Math.floor(m / 60);
-    if (h < 24) return h + 'h ago';
-    var days = Math.floor(h / 24);
-    if (days < 30) return days + 'd ago';
-    return new Date(ts).toLocaleDateString();
+    // Locale-aware relative text under 30 days, narrow like the old compact '5m ago'
+    // (a future stamp from clock skew reads as now, like the old 'just now'), then a locale date.
+    var now = Date.now();
+    if (Math.floor((now - ts) / 86400000) < 30) return i18nFormatRelative(Math.min(ts, now), { now: now, style: 'narrow' });
+    return i18nFormatDate(ts);
 }
 
 // ─── Documents Page ───
@@ -1167,7 +1170,7 @@ function renderDocumentsPage() {
     var slot = document.getElementById('documents-toolbar-slot');
     var host = slot || list;
     if (slot && !slot.querySelector('.sdoc-page-toolbar') && typeof pageToolbarControlsHtml === 'function') {
-        slot.innerHTML = pageToolbarControlsHtml({ extraClass: 'sdoc-page-toolbar', placeholder: 'Search documents\u2026', inputClass: 'sdoc-page-search-input', onInput: 'sdocOnPageSearchInput', countId: 'documents-count', layoutFn: 'sdocSetPageLayout' });
+        slot.innerHTML = pageToolbarControlsHtml({ extraClass: 'sdoc-page-toolbar', placeholder: t('Search documents\u2026'), inputClass: 'sdoc-page-search-input', onInput: 'sdocOnPageSearchInput', countId: 'documents-count', layoutFn: 'sdocSetPageLayout' });
     }
     if (slot && !document.getElementById('documents-items')) {
         list.innerHTML = '<div class="widget-library-items page-list" id="documents-items"></div>';
@@ -1175,12 +1178,12 @@ function renderDocumentsPage() {
     if (!host.querySelector('.sdoc-page-toolbar')) {
         list.innerHTML = '<div class="widget-library-header sdoc-page-toolbar">' +
             '<label class="widget-library-search">' + UI_ICONS.search +
-                '<input type="search" class="widget-library-search-input sdoc-page-search-input" placeholder="Search documents\u2026" aria-label="Search documents" oninput="sdocOnPageSearchInput(this.value)">' +
+                '<input type="search" class="widget-library-search-input sdoc-page-search-input" placeholder="' + escDisplay(t('Search documents\u2026')) + '" aria-label="' + escDisplay(t('Search documents')) + '" oninput="sdocOnPageSearchInput(this.value)">' +
             '</label>' +
             '<span class="widget-library-count" id="documents-count"></span>' +
-            '<div class="segmented-toggle widget-library-layout" role="group" aria-label="Layout">' +
-                '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="Rows" onclick="sdocSetPageLayout(\'rows\')">' + UI_ICONS.list + '<span>Rows</span></button>' +
-                '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="Gallery" onclick="sdocSetPageLayout(\'gallery\')">' + SDOC_GRID_ICON + '<span>Gallery</span></button>' +
+            '<div class="segmented-toggle widget-library-layout" role="group" aria-label="' + escDisplay(t('Layout')) + '">' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="' + escDisplay(t('Rows')) + '" onclick="sdocSetPageLayout(\'rows\')">' + UI_ICONS.list + '<span>' + escDisplay(t('Rows')) + '</span></button>' +
+                '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="' + escDisplay(t('Gallery')) + '" onclick="sdocSetPageLayout(\'gallery\')">' + SDOC_GRID_ICON + '<span>' + escDisplay(t('Gallery')) + '</span></button>' +
             '</div>' +
         '</div>' +
         '<div class="widget-library-items" id="documents-items"></div>';
@@ -1208,20 +1211,20 @@ function renderDocumentsPageItems() {
     docs.sort(function(a, b) { return b.updatedAt - a.updatedAt; });
 
     var count = document.getElementById('documents-count');
-    if (count) count.textContent = q ? docs.length + ' of ' + all.length : all.length + (all.length === 1 ? ' document' : ' documents');
+    if (count) count.textContent = q ? t('{shown} of {total}', { shown: i18nFormatNumber(docs.length), total: i18nFormatNumber(all.length) }) : tn(all.length, '{count} document', '{count} documents');
 
     if (all.length === 0) {
         items.innerHTML = '<div class="widget-library-empty sdoc-page-empty">' + UI_ICONS.file +
-            '<p class="sdoc-page-empty-title">No documents yet</p>' +
-            '<p class="widget-library-empty-hint">Create a document or ask the agent to create one for you.</p>' +
-            '<button class="skills-action-btn primary" onclick="sdocCreateFromPage()" style="margin-top:12px">' + UI_ICONS.plus + ' New Document</button>' +
+            '<p class="sdoc-page-empty-title">' + escDisplay(t('No documents yet')) + '</p>' +
+            '<p class="widget-library-empty-hint">' + escDisplay(t('Create a document or ask the agent to create one for you.')) + '</p>' +
+            '<button class="skills-action-btn primary" onclick="sdocCreateFromPage()" style="margin-top:12px">' + UI_ICONS.plus + ' ' + escDisplay(t('New Document')) + '</button>' +
             '</div>';
         return;
     }
     if (docs.length === 0) {
         items.innerHTML = '<div class="widget-library-empty sdoc-page-empty">' + UI_ICONS.search +
-            '<p class="sdoc-page-empty-title">No documents match \u201c' + escDisplay(q) + '\u201d</p>' +
-            '<p class="widget-library-empty-hint">Search looks at document titles and content.</p>' +
+            '<p class="sdoc-page-empty-title">' + escDisplay(t('No documents match \u201c{query}\u201d', { query: q })) + '</p>' +
+            '<p class="widget-library-empty-hint">' + escDisplay(t('Search looks at document titles and content.')) + '</p>' +
             '</div>';
         return;
     }
@@ -1235,26 +1238,27 @@ function buildDocumentsPageItem(doc) {
     var preview = sdocPagePreview(doc);
     var versionCount = doc.versions.length;
     var scope = doc.scope === 'chat' ? 'chat' : 'shared';
-    var when = doc.updatedAt ? new Date(doc.updatedAt).toLocaleString() : '';
+    var when = doc.updatedAt ? i18nFormatDateTime(doc.updatedAt) : '';
 
     var html = '<div class="widget-library-item sdoc-lib-item" data-doc-id="' + escDisplay(doc.id) + '" role="button" tabindex="0"' +
-        ' title="Open ' + escDisplay(doc.title) + '" onclick="sdocOpenPreview(\'' + id + '\')" onkeydown="sdocPageItemKey(event, \'' + id + '\')">';
+        ' title="' + escDisplay(t('Open {title}', { title: doc.title })) + '" onclick="sdocOpenPreview(\'' + id + '\')" onkeydown="sdocPageItemKey(event, \'' + id + '\')">';
     html += '<div class="sdoc-lib-icon">' + UI_ICONS.file + '</div>';
     html += '<div class="sdoc-lib-info">';
     html += '<div class="widget-library-title sdoc-lib-title">' + escDisplay(doc.title) + '</div>';
-    html += '<div class="sdoc-lib-preview' + (preview ? '' : ' empty') + '">' + (preview ? escDisplay(preview) + (preview.length >= 200 ? '...' : '') : 'Empty document') + '</div>';
+    html += '<div class="sdoc-lib-preview' + (preview ? '' : ' empty') + '">' + (preview ? escDisplay(preview) + (preview.length >= 200 ? '...' : '') : escDisplay(t('Empty document'))) + '</div>';
     html += '<div class="widget-library-meta sdoc-lib-meta">';
-    html += '<span class="widget-library-badge sdoc-scope-badge scope-' + scope + '">' + (scope === 'chat' ? 'Chat' : 'Shared') + '</span>';
+    html += '<span class="widget-library-badge sdoc-scope-badge scope-' + scope + '">' + escDisplay(scope === 'chat' ? t('Chat') : t('Shared')) + '</span>';
     html += '<span class="widget-library-badge sdoc-version-badge">v' + escDisplay(doc.currentVersion) + '</span>';
     html += '<span class="sdoc-lib-stat sdoc-lib-date" title="' + escDisplay(when) + '">' + UI_ICONS.clock + sdocTimeAgo(doc.updatedAt) + '</span>';
-    html += '<span class="sdoc-lib-stat sdoc-lib-versions">' + versionCount + ' version' + (versionCount > 1 ? 's' : '') + '</span>';
-    if (lastVer) html += '<span class="sdoc-lib-stat sdoc-lib-author">' + authorIcon + ' ' + escDisplay(lastVer.author) + '</span>';
+    html += '<span class="sdoc-lib-stat sdoc-lib-versions">' + escDisplay(tn(versionCount, '{count} version', '{count} versions')) + '</span>';
+    if (lastVer) html += '<span class="sdoc-lib-stat sdoc-lib-author">' + authorIcon + ' ' + escDisplay(lastVer.author === 'user' ? t('user') : lastVer.author === 'agent' ? t('agent') : lastVer.author) + '</span>';
     html += '</div>';
     html += '</div>';
+    var lblChat = escDisplay(t('New chat')), lblExport = escDisplay(t('Export')), lblDelete = escDisplay(t('Delete'));
     html += '<div class="sdoc-lib-actions">';
-    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocStartChat(\'' + id + '\')" title="New chat" aria-label="New chat">' + UI_ICONS.chat + '</button>';
-    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocDownloadMd(\'' + id + '\')" title="Export" aria-label="Export">' + UI_ICONS.download + '</button>';
-    html += '<button type="button" class="widget-library-btn danger" onclick="event.stopPropagation(); sdocDeleteFromPage(\'' + id + '\')" title="Delete" aria-label="Delete">' + UI_ICONS.trash + '</button>';
+    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocStartChat(\'' + id + '\')" title="' + lblChat + '" aria-label="' + lblChat + '">' + UI_ICONS.chat + '</button>';
+    html += '<button type="button" class="widget-library-btn" onclick="event.stopPropagation(); sdocDownloadMd(\'' + id + '\')" title="' + lblExport + '" aria-label="' + lblExport + '">' + UI_ICONS.download + '</button>';
+    html += '<button type="button" class="widget-library-btn danger" onclick="event.stopPropagation(); sdocDeleteFromPage(\'' + id + '\')" title="' + lblDelete + '" aria-label="' + lblDelete + '">' + UI_ICONS.trash + '</button>';
     html += '</div>';
     html += '</div>';
     return html;
@@ -1262,12 +1266,13 @@ function buildDocumentsPageItem(doc) {
 
 async function sdocDeleteFromPage(docId) {
     var doc = smartDocuments[docId];
-    var title = doc ? doc.title : 'this document';
-    if (!await showConfirmModal('Delete Document', 'Delete "' + escapeHtml(title) + '" and all its versions? This cannot be undone.', 'danger')) return;
+    var msg = doc ? t('Delete "{title}" and all its versions? This cannot be undone.', { title: escapeHtml(doc.title) })
+        : t('Delete this document and all its versions? This cannot be undone.');
+    if (!await showConfirmModal(t('Delete Document'), msg, 'danger')) return;
     await deleteDocumentById(docId);
     renderDocumentsPage();
     renderVersionSidebar();
-    showSnackbar('Document deleted', 'success');
+    showSnackbar(t('Document deleted'), 'success');
 }
 
 // ─── Create from Page ───
@@ -1312,7 +1317,7 @@ function exportAllDocuments() {
     try {
         // Exclude chat-scoped (private) docs from "export all" — they belong to their chat only.
         var docs = Object.values(smartDocuments).filter(function(doc) { return doc.scope !== 'chat'; });
-        if (docs.length === 0) { showSnackbar('No documents to export', 'error'); return; }
+        if (docs.length === 0) { showSnackbar(t('No documents to export'), 'error'); return; }
 
         var exportData = docs.map(function(doc) {
             return {
@@ -1330,9 +1335,9 @@ function exportAllDocuments() {
         a.download = 'appagent-documents-' + new Date().toISOString().slice(0, 10) + '.json';
         a.click();
         URL.revokeObjectURL(a.href);
-        showSnackbar('Exported ' + docs.length + ' document(s)', 'success');
+        showSnackbar(tn(docs.length, 'Exported {count} document(s)', 'Exported {count} document(s)'), 'success');
     } catch (e) {
-        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -1347,7 +1352,7 @@ function importDocuments() {
             var text = await file.text();
             var data = JSON.parse(text);
             if (!data.documents || !Array.isArray(data.documents)) {
-                showSnackbar('Invalid document export file', 'error');
+                showSnackbar(t('Invalid document export file'), 'error');
                 return;
             }
             // S0B-09: validate every row first (no write yet), confirm before replacing
@@ -1377,16 +1382,16 @@ function importDocuments() {
                 rows.push({ doc: doc, cur: cur, dup: dup });
                 if (cur && cur.scope !== 'chat') shared.push(cur);
             }
-            if (!rows.length) { showSnackbar('No valid documents to import (' + skipped + ' skipped)', 'error'); return; }
+            if (!rows.length) { showSnackbar(tn(skipped, 'No valid documents to import ({count} skipped)', 'No valid documents to import ({count} skipped)'), 'error'); return; }
             var choice = 'keep';
             if (shared.length) {
                 var names = shared.slice(0, 10).map(function(c) { return escDisplay(c.title || c.id); }).join('<br>');
-                if (shared.length > 10) names += '<br>+' + (shared.length - 10) + ' more';
-                choice = await showModal('Import documents', shared.length + ' document(s) in this file already exist:<br>' + names +
-                    '<br><br><strong>Replace</strong> overwrites their content <strong>and version history</strong>. <strong>Keep both</strong> imports them as copies.', [
-                    { label: 'Cancel', value: 'cancel', class: 'secondary' },
-                    { label: 'Keep both', value: 'keep', class: 'primary' },
-                    { label: 'Replace', value: 'replace', class: 'danger' }
+                if (shared.length > 10) names += '<br>' + escDisplay(tn(shared.length - 10, '+{count} more', '+{count} more'));
+                choice = await showModal(t('Import documents'), escDisplay(tn(shared.length, '{count} document(s) in this file already exist:', '{count} document(s) in this file already exist:')) + '<br>' + names +
+                    '<br><br>' + t('<strong>Replace</strong> overwrites their content <strong>and version history</strong>. <strong>Keep both</strong> imports them as copies.'), [
+                    { label: t('Cancel'), value: 'cancel', class: 'secondary' },
+                    { label: t('Keep both'), value: 'keep', class: 'primary' },
+                    { label: t('Replace'), value: 'replace', class: 'danger' }
                 ], 'warning');
                 if (choice !== 'keep' && choice !== 'replace') return; // Cancel / dismiss: nothing written
             }
@@ -1426,7 +1431,7 @@ function importDocuments() {
                     try {
                         var queuedTx = writeTx;
                         queuedTx.addEventListener('abort', function() {
-                            showSnackbar('Import did not finish saving: ' + ((queuedTx.error && queuedTx.error.message) || 'transaction aborted') + '. The imported documents will not survive a reload.', 'error');
+                            showSnackbar(t('Import did not finish saving: {error}. The imported documents will not survive a reload.', { error: (queuedTx.error && queuedTx.error.message) || t('transaction aborted') }), 'error');
                         });
                     } catch (listenErr) { /* best-effort */ }
                 }
@@ -1437,11 +1442,11 @@ function importDocuments() {
                 try { renderDocumentsPage(); } catch (renderErr) { console.warn('[SmartDocs] import: documents page render failed', renderErr); }
                 try { renderVersionSidebar(); } catch (renderErr) { console.warn('[SmartDocs] import: version sidebar render failed', renderErr); }
             }
-            var importedMsg = 'Imported ' + rows.length + ' document(s) (' + replaced + ' replaced, ' + copied + ' copied, ' + skipped + ' skipped)';
-            if (stillSaving) showSnackbar(importedMsg + '. Storage is busy, so they are still saving in the background.', 'warning');
+            var importedMsg = tn(rows.length, 'Imported {count} document(s) ({replaced} replaced, {copied} copied, {skipped} skipped)', 'Imported {count} document(s) ({replaced} replaced, {copied} copied, {skipped} skipped)', { replaced: i18nFormatNumber(replaced), copied: i18nFormatNumber(copied), skipped: i18nFormatNumber(skipped) });
+            if (stillSaving) showSnackbar(t('{summary}. Storage is busy, so they are still saving in the background.', { summary: importedMsg }), 'warning');
             else showSnackbar(importedMsg, 'success');
         } catch (err) {
-            showSnackbar('Import failed: ' + err.message, 'error');
+            showSnackbar(t('Import failed: {error}', { error: String((err && err.message) || err) }), 'error');
         }
     };
     input.click();

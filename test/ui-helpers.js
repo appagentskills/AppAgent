@@ -12,7 +12,9 @@
 //   U.DOM_PASSTHROUGH                   DOM ctor/fn names forwarded by loadUi
 //   await U.loadUi(paths, opts?) -> m   loadModules(paths) with workspace +
 //       DOM globals preset. opts: {globals, passthrough:[...], allowUnstubbed:[...],
-//       lenient, window}. Default globals: document, DOMParser, navigator
+//       lenient, window, i18n}. i18n:false skips the harness auto-included
+//       i18n core (src/js/core/025-i18n.js; default: included, English identity).
+//       Default globals: document, DOMParser, navigator
 //       (clipboard recorder), window (= fakeWindow({document, _rawCopyStore:{}})
 //       — NOT the real window). Throws if m.__unstubbed has a name outside
 //       opts.allowUnstubbed. m.__scope = raw scope (stubs + implicit globals).
@@ -66,7 +68,7 @@ async function loadUi(paths, opts) {
         : { document: document, _rawCopyStore: {}, currentSearchHighlight: null, isRunning: false });
     var globals = Object.assign({ document: document, DOMParser: DOMParser, window: win, navigator: { userAgent: 'ui-test', clipboard: _uiClipboard() } }, opts.globals || {});
     var m = await loadModules(paths, { workspace: opts.workspace || UI_DEFAULT_WORKSPACE, globals: globals, lenient: opts.lenient === true,
-        passthrough: UI_DOM_PASSTHROUGH.concat(opts.passthrough || []) });
+        passthrough: UI_DOM_PASSTHROUGH.concat(opts.passthrough || []), i18n: opts.i18n });
     assertUnstubbed(m, opts.allowUnstubbed || []);
     return m;
 }

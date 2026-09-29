@@ -4,7 +4,7 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
     var container = document.getElementById(containerId);
     if (!container) return;
     
-    placeholder = placeholder || 'Select...';
+    placeholder = placeholder || t('Select...');
     
     // If 3 or fewer options, render as radio group
     if (options.length <= 3) {
@@ -30,7 +30,7 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
     var dropdownId = containerId + '-dropdown';
     
     var html = '<div class="custom-dropdown" id="' + dropdownId + '">';
-    html += '<div class="custom-dropdown-trigger" onclick="toggleCustomDropdown(\'' + dropdownId + '\')" tabindex="0">';
+    html += '<div class="custom-dropdown-trigger" role="button" aria-haspopup="listbox" aria-expanded="false" data-kbd-click onclick="toggleCustomDropdown(\'' + dropdownId + '\')" tabindex="0">';
     html += '<span class="dropdown-label">' + escapeHtml(selectedLabel) + '</span>';
     html += '<span class="dropdown-arrow">' + UI_ICONS.chevronDown + '</span>';
     html += '</div>';
@@ -38,14 +38,14 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
     
     if (showSearch) {
         html += '<div class="custom-dropdown-search">';
-        html += '<input type="text" placeholder="Search..." oninput="filterCustomDropdown(\'' + dropdownId + '\', this.value)" onclick="event.stopPropagation()">';
+        html += '<input type="text" placeholder="' + escapeHtml(t('Search...')) + '" oninput="filterCustomDropdown(\'' + dropdownId + '\', this.value)" onclick="event.stopPropagation()">';
         html += '</div>';
     }
     
-    html += '<div class="custom-dropdown-options">';
+    html += '<div class="custom-dropdown-options" role="listbox">';
     options.forEach(function(opt) {
         var isSelected = opt.value === selectedValue;
-        html += '<div class="custom-dropdown-option' + (isSelected ? ' selected' : '') + '" ' +
+        html += '<div class="custom-dropdown-option' + (isSelected ? ' selected' : '') + '" role="option" tabindex="-1" data-kbd-click aria-selected="' + (isSelected ? 'true' : 'false') + '" ' +
             'data-value="' + escapeHtml(opt.value) + '" data-label="' + escapeHtml(opt.label) + '" ' +
             'onclick="selectCustomDropdownOption(\'' + containerId + '\', \'' + dropdownId + '\', \'' + escapeJsString(opt.value) + '\', ' + onChangeCallback + ', event)">' +
             escapeHtml(opt.label) + '</div>';
@@ -53,6 +53,18 @@ function renderCustomSelect(containerId, options, selectedValue, onChangeCallbac
     html += '</div></div></div>';
     
     container.innerHTML = html;
+}
+
+// Keep every custom-dropdown trigger's aria-expanded in step with its
+// dropdown's .open class. Called from every open/close path (toggle, option
+// select, outside click, Esc ladder) so AT never sees a stale "expanded".
+function syncCustomDropdownExpanded() {
+    if (typeof document === 'undefined' || !document.querySelectorAll) return;
+    document.querySelectorAll('.custom-dropdown-trigger').forEach(function(trig) {
+        var dd = trig.closest ? trig.closest('.custom-dropdown') : null;
+        var open = !!(dd && dd.classList.contains('open'));
+        trig.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
 }
 
 function toggleCustomDropdown(dropdownId) {
@@ -65,11 +77,18 @@ function toggleCustomDropdown(dropdownId) {
     });
     
     dropdown.classList.toggle('open');
+    var isOpen = dropdown.classList.contains('open');
+    var trig = dropdown.querySelector('.custom-dropdown-trigger');
+    syncCustomDropdownExpanded();
     
-    // Focus search input if exists
-    if (dropdown.classList.contains('open')) {
+    // Focus search input if exists, else the selected (or first) option so ↑/↓ work.
+    if (isOpen) {
         var searchInput = dropdown.querySelector('.custom-dropdown-search input');
         if (searchInput) setTimeout(function() { searchInput.focus(); }, 50);
+        else {
+            var firstOpt = dropdown.querySelector('.custom-dropdown-option.selected') || dropdown.querySelector('.custom-dropdown-option');
+            if (firstOpt && document.activeElement === trig) setTimeout(function() { firstOpt.focus(); }, 0);
+        }
     }
 }
 
@@ -92,7 +111,7 @@ function filterCustomDropdown(dropdownId, query) {
     var optionsContainer = dropdown.querySelector('.custom-dropdown-options');
     var emptyMsg = dropdown.querySelector('.custom-dropdown-empty');
     if (!hasVisible && !emptyMsg) {
-        optionsContainer.insertAdjacentHTML('beforeend', '<div class="custom-dropdown-empty">No matches found</div>');
+        optionsContainer.insertAdjacentHTML('beforeend', '<div class="custom-dropdown-empty">' + escapeHtml(t('No matches found')) + '</div>');
     } else if (hasVisible && emptyMsg) {
         emptyMsg.remove();
     }
@@ -116,8 +135,11 @@ function selectCustomDropdownOption(containerId, dropdownId, value, callback, ev
         if (labelEl) labelEl.textContent = label;
         // Update selected state
         dropdown.querySelectorAll('.custom-dropdown-option').forEach(function(o) {
-            o.classList.toggle('selected', o.getAttribute('data-value') === value);
+            var sel = o.getAttribute('data-value') === value;
+            o.classList.toggle('selected', sel);
+            o.setAttribute('aria-selected', sel ? 'true' : 'false');
         });
+        syncCustomDropdownExpanded();
     }
     if (callback) callback(value);
 }
@@ -142,9 +164,12 @@ function selectRadioOption(containerId, value, callback) {
 // Close custom dropdowns when clicking outside
 document.addEventListener('click', function(e) {
     if (!e.target.closest('.custom-dropdown')) {
+        var closed = false;
         document.querySelectorAll('.custom-dropdown.open').forEach(function(d) {
             d.classList.remove('open');
+            closed = true;
         });
+        if (closed) syncCustomDropdownExpanded();
     }
 });
 
@@ -165,12 +190,12 @@ function renderToolPermissions() {
     // Reset link (only when non-default)
     if (hasNonDefaultPermissions()) {
         html += '<div style="text-align:right;margin-bottom:var(--space-4);">';
-        html += '<a href="#" onclick="event.preventDefault(); resetAllPermissionsToDefaults()" style="font-size:var(--text-caption);color:var(--text-muted);text-decoration:underline;">Reset to defaults</a>';
+        html += '<a href="#" onclick="event.preventDefault(); resetAllPermissionsToDefaults()" style="font-size:var(--text-caption);color:var(--text-muted);text-decoration:underline;">' + escapeHtml(t('Reset to defaults')) + '</a>';
         html += '</div>';
     }
 
     // --- Instance section (top) ---
-    var instanceTitle = host ? host.split('.')[0] : 'No instance connected';
+    var instanceTitle = host ? host.split('.')[0] : t('No instance connected');
     var disabledClass = host ? '' : ' disabled';
 
     html += '<div class="tool-permission-section' + disabledClass + '">';
@@ -187,7 +212,7 @@ function renderToolPermissions() {
         // core/070-permissions.js, see ui/040-tools-settings.js) rather than a
         // hardcoded array, which is what silently dropped 'sn:run_script'.
         html += '<div class="tool-permission-group">';
-        html += '<div class="tool-permission-group-title">ServiceNow API</div>';
+        html += '<div class="tool-permission-group-title">' + escapeHtml(t('ServiceNow API')) + '</div>';
         _snPermissionKeys().forEach(function(key) {
             html += _renderInstancePermItem(key, isAutoTier);
         });
@@ -195,7 +220,7 @@ function renderToolPermissions() {
 
         // Browser (write actions)
         html += '<div class="tool-permission-group">';
-        html += '<div class="tool-permission-group-title">Browser</div>';
+        html += '<div class="tool-permission-group-title">' + escapeHtml(t('Browser')) + '</div>';
         INSTANCE_PERMISSION_KEYS.filter(function(k) { return k.startsWith('browser:'); }).forEach(function(key) {
             html += _renderInstancePermItem(key, isAutoTier);
         });
@@ -206,7 +231,7 @@ function renderToolPermissions() {
     // --- Global section (bottom) ---
     html += '<div class="tool-permission-section">';
     html += '<div class="tool-permission-section-header">';
-    html += '<span class="tool-permission-section-title">' + UI_ICONS.tool + ' Global Tools</span>';
+    html += '<span class="tool-permission-section-title">' + UI_ICONS.tool + ' ' + escapeHtml(t('Global Tools')) + '</span>';
     html += '</div>';
 
     // Group: Manage Skills
@@ -224,19 +249,19 @@ function renderToolPermissions() {
 
     // Manage Skill group
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Manage Agent Skill</div>';
+    html += '<div class="tool-permission-group-title">' + escapeHtml(t('Manage Agent Skill')) + '</div>';
     manageSkillKeys.forEach(function(key) { html += _renderGlobalPermItem(key, true); });
     html += '</div>';
 
     // Workspace group
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Workspace</div>';
+    html += '<div class="tool-permission-group-title">' + escapeHtml(t('Workspace')) + '</div>';
     workspaceKeys.forEach(function(key) { html += _renderGlobalPermItem(key, true); });
     html += '</div>';
 
     // Document group
     html += '<div class="tool-permission-group">';
-    html += '<div class="tool-permission-group-title">Smart Document</div>';
+    html += '<div class="tool-permission-group-title">' + escapeHtml(t('Smart Document')) + '</div>';
     documentKeys.forEach(function(key) { html += _renderGlobalPermItem(key, true); });
     html += '</div>';
 
@@ -250,7 +275,7 @@ function renderToolPermissions() {
         if (toolNames.length > 0) {
             var skillName = skill ? (skill.name || skill.id) : skillId;
             html += '<div class="tool-permission-group">';
-            html += '<div class="tool-permission-group-title">Skill: ' + escapeHtml(skillName) + '</div>';
+            html += '<div class="tool-permission-group-title">' + escapeHtml(t('Skill: {name}', { name: skillName })) + '</div>';
             toolNames.forEach(function(toolName) {
                 var permKey = 'skill:' + toolName;
                 skillToolKeys.push(permKey);
@@ -289,7 +314,7 @@ function renderToolPermissions() {
 }
 
 function _renderInstancePermItem(key, isAutoTier) {
-    var displayName = TOOL_DISPLAY_NAMES[key] || key;
+    var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
     var containerId = 'perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
     return '<div class="tool-permission-item tool-permission-subitem' + (isAutoTier ? ' tier-auto' : '') + '">' +
         '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -298,7 +323,7 @@ function _renderInstancePermItem(key, isAutoTier) {
 }
 
 function _renderGlobalPermItem(key, isSubitem) {
-    var displayName = TOOL_DISPLAY_NAMES[key] || key;
+    var displayName = TOOL_DISPLAY_NAMES[key] ? t(TOOL_DISPLAY_NAMES[key]) : key;
     var containerId = 'perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
     return '<div class="tool-permission-item' + (isSubitem ? ' tool-permission-subitem' : '') + '">' +
         '<span class="tool-permission-name">' + displayName + '</span>' +
@@ -311,10 +336,10 @@ function _renderPermRadio(containerId, selectedValue, permKey, isInstance, isAut
     if (!container) return;
 
     var options = [
-        { value: 'allow', label: 'Allow' },
-        { value: 'auto', label: 'Auto' },
-        { value: 'ask', label: 'Ask' },
-        { value: 'disabled', label: 'Off' }
+        { value: 'allow', label: t('Allow') },
+        { value: 'auto', label: t('Auto') },
+        { value: 'ask', label: t('Ask') },
+        { value: 'disabled', label: t('Off') }
     ];
 
     var html = '<div class="radio-group radio-group-small' + (isAutoTier ? ' radio-group-disabled' : '') + '">';
@@ -343,14 +368,14 @@ var INSTANCE_TIERS = ['manual', 'auto', 'dev'];
 function _instanceTierToggleHtml(currentTier, extraOnClick) {
     var tier = INSTANCE_TIERS.indexOf(currentTier) !== -1 ? currentTier : 'manual';
     var opts = [
-        { v: 'manual', label: 'Manual', icon: UI_ICONS.lock, title: 'Manual: You control each permission' },
-        { v: 'auto', label: 'Auto', icon: UI_ICONS.sparkle, title: 'Auto: Agent decides for write operations' },
-        { v: 'dev', label: 'Dev', icon: UI_ICONS.zap, title: 'Dev: NO approvals — every tool call on this instance runs without asking' }
+        { v: 'manual', label: t('Manual'), icon: UI_ICONS.lock, title: t('Manual: You control each permission') },
+        { v: 'auto', label: t('Auto'), icon: UI_ICONS.sparkle, title: t('Auto: Agent decides for write operations') },
+        { v: 'dev', label: t('Dev'), icon: UI_ICONS.zap, title: t('Dev: NO approvals — every tool call on this instance runs without asking') }
     ];
     var html = '<div class="radio-group radio-group-small">';
     opts.forEach(function(o) {
         html += '<div class="radio-option tier-opt-' + o.v + (tier === o.v ? ' selected' : '') + '" title="' + escapeHtml(o.title) + '" ' +
-            'onclick="event.stopPropagation(); setInstanceTier(\'' + o.v + '\', this);' + (extraOnClick || '') + '">' + o.icon + ' ' + o.label + '</div>';
+            'onclick="event.stopPropagation(); setInstanceTier(\'' + o.v + '\', this);' + (extraOnClick || '') + '">' + o.icon + ' ' + escapeHtml(o.label) + '</div>';
     });
     return html + '</div>';
 }
@@ -459,9 +484,9 @@ function getEnabledTools(chatId, opts) {
     // tool shadowing a built-in name (e.g. stale IDB asset after a tool was
     // promoted to core) would otherwise cause "Tool names must be unique".
     var seenToolNames = {};
-    baseTools.forEach(function(t) { seenToolNames[t.function.name] = true; });
-    skillToolDefs = skillToolDefs.filter(function(t) {
-        var n = t && t.function && t.function.name;
+    baseTools.forEach(function(tool) { seenToolNames[tool.function.name] = true; });
+    skillToolDefs = skillToolDefs.filter(function(tool) {
+        var n = tool && tool.function && tool.function.name;
         if (!n || seenToolNames[n]) return false;
         seenToolNames[n] = true;
         return true;
@@ -490,8 +515,8 @@ function getEnabledTools(chatId, opts) {
             if (_rec && Array.isArray(_rec.tool_roster)) {
                 var _rosterSet = Object.create(null);
                 for (var _ri = 0; _ri < _rec.tool_roster.length; _ri++) _rosterSet[_rec.tool_roster[_ri]] = true;
-                allTools = allTools.filter(function(t) {
-                    return _rosterSet[t.function && t.function.name];
+                allTools = allTools.filter(function(tool) {
+                    return _rosterSet[tool.function && tool.function.name];
                 });
             }
         } else {
@@ -502,14 +527,14 @@ function getEnabledTools(chatId, opts) {
             // skill actions (run_audit, web_search, …) keep working. Keep in
             // sync with the worker twin in src/js/worker/025-permissions-helpers.js.
             var _regSet = Object.create(null);
-            baseTools.forEach(function(t) { _regSet[t.function.name] = true; });
+            baseTools.forEach(function(tool) { _regSet[tool.function.name] = true; });
             var _mainSet = null;
             if (typeof getToolNamesForProfiles === 'function') {
                 _mainSet = Object.create(null);
                 getToolNamesForProfiles(['orchestrator', 'code', 'servicenow']).forEach(function(n) { _mainSet[n] = true; });
             }
-            allTools = allTools.filter(function(t) {
-                var n = t.function && t.function.name;
+            allTools = allTools.filter(function(tool) {
+                var n = tool.function && tool.function.name;
                 if (n === 'report_to_parent' || n === 'sleep_self') return false;
                 if (_mainSet && _regSet[n] && !_mainSet[n]) return false;
                 return true;

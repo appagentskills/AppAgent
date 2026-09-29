@@ -6,7 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { applyDocsPlaceholders } = require('./docs-placeholders');
+const { applyDocsPlaceholders, buildDocsLocaleFiles } = require('./docs-placeholders');
 
 const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'src');
@@ -132,6 +132,10 @@ const JS_TIERS = ['core', 'ui', 'tools', 'app'];
 const WORKER_JS_TIERS = ['worker'];
 const WORKER_SHARED_FILES = [
     // core (declarations + utilities)
+    // 025-i18n: t()/tn()/N_() + i18nFormat* + language resolution. DOM-free
+    // (page AND SW); listed first so it precedes every shared file that
+    // calls t(). The page bundle picks it up via the numeric prefix sort.
+    'js/core/025-i18n.js',
     'js/core/030-config.js',
     // 055-emoji-shortcodes: SECTION_ICON_SHORTCODES map + replaceEmojiShortcodes,
     // called unconditionally by formatContent — DOM-free, safe in the SW.
@@ -345,6 +349,27 @@ function scanSwBundleGaps(raw) {
     for (var di = 0; di < declPatterns.length; di++) {
         var dm;
         while ((dm = declPatterns[di].exec(src)) !== null) declared.add(dm[1]);
+    }
+    // Multi-declarator lists — `var a = f(x, y), b, c = {p: 1};` declares
+    // b and c too. Walk each var/let/const statement bracket-depth-aware
+    // (strings are already stripped) and take the leading identifier of
+    // every top-level comma segment, stopping at `;` or an unbalanced close.
+    var multiDeclRe = /\b(?:var|let|const)\s+/g;
+    var mdm;
+    while ((mdm = multiDeclRe.exec(src)) !== null) {
+        var depth = 0, segStart = mdm.index + mdm[0].length;
+        var limit = Math.min(src.length, segStart + 4000);
+        for (var ci = segStart; ci <= limit; ci++) {
+            var ch = ci < limit ? src[ci] : ';';
+            if (ch === '(' || ch === '[' || ch === '{') depth++;
+            else if ((ch === ')' || ch === ']' || ch === '}') && depth > 0) depth--;
+            else if (depth === 0 && (ch === ',' || ch === ';' || ch === ')' || ch === ']' || ch === '}')) {
+                var seg = src.substring(segStart, ci).match(/^\s*([a-zA-Z_$][a-zA-Z0-9_$]*)/);
+                if (seg) declared.add(seg[1]);
+                if (ch !== ',') break;
+                segStart = ci + 1;
+            }
+        }
     }
 
     // Guarded references: identifiers that appear inside `typeof X === 'function'`
@@ -1099,6 +1124,38 @@ ${processedBody}
             outputFiles['icons/' + icon] = fs.readFileSync(path.join(iconsDir, icon));
         }
     }
+    // i18n catalogs: src/locales/<code>.json -> locales/<code>.json, fetched at
+    // runtime by i18nInit() via chrome.runtime.getURL. Optional folder (English
+    // needs no catalog), so a missing src/locales/ is not an error.
+    const localesDir = path.join(SRC, 'locales');
+    let localesCopied = 0;
+    if (fs.existsSync(localesDir)) {
+        for (const locale of fs.readdirSync(localesDir)) {
+            if (!locale.endsWith('.json')) continue;
+            outputFiles['locales/' + locale] = fs.readFileSync(path.join(localesDir, locale), 'utf-8');
+            localesCopied++;
+        }
+    }
+    console.log(`  Locales: ${localesCopied} catalog(s) -> locales/` + (fs.existsSync(localesDir) ? '' : ' (src/locales/ absent; English only)'));
+    // Translated Help page: docs/locales/<code>/{documentation.md,README.md}
+    // -> docs-locales/<code>/..., one folder per catalog code. Plain files (not
+    // base64-embedded), fetched at runtime by 060-docs-view.js with a per-file
+    // English fallback, so a missing translation is skipped silently.
+    const docsLocaleSources = {};
+    if (fs.existsSync(localesDir)) {
+        for (const locale of fs.readdirSync(localesDir)) {
+            if (!locale.endsWith('.json')) continue;
+            const code = locale.slice(0, -5);
+            const readOpt = (name) => {
+                const p = path.join(ROOT, 'docs', 'locales', code, name);
+                return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : null;
+            };
+            docsLocaleSources[code] = { documentation: readOpt('documentation.md'), readme: readOpt('README.md') };
+        }
+    }
+    const docsLocaleFiles = buildDocsLocaleFiles(docsLocaleSources, version, changelogMd);
+    Object.keys(docsLocaleFiles).forEach((p) => { outputFiles[p] = docsLocaleFiles[p]; });
+    console.log(`  Help docs: ${Object.keys(docsLocaleFiles).length} translated file(s) -> docs-locales/`);
     const policyArtifactFailures = checkTestPolicyArtifacts(outputFiles, testRunPolicySource);
     if (policyArtifactFailures.length) throw new Error('Build aborted — host policy artifacts: ' + policyArtifactFailures.join(' || ') + ' (dist/ untouched).');
     // POLICY_ARTIFACT_STAGE_END

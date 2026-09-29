@@ -44,7 +44,7 @@ function reloadFixture(sources) {
         // opts.tabs(chrome, options, cb) fakes chrome.tabs.create (records 'tab:<url>'); without it there is no chrome.tabs.
         if (opts.tabs) chromeFake.tabs = { create: function(o, cb) { calls.push('tab:' + o.url); return opts.tabs(chromeFake, o, cb); } };
         if (!opts.noStorage) chromeFake.storage = { local: local };
-        var api = new Function('document', 'navigator', 'window', 'chrome', 'runningChatIds', 'showConfirmModal', 'escapeHtml', 'showSnackbar', 'isSkillTool', 'getDeployDirHandle', 'executeTool', 'getAllWorkspaceMetas', 'getWorkspaceMeta', 'getAllWorkspaceFiles', 'crypto', 'TextEncoder', 'AbortController', 'setTimeout', 'clearTimeout', 'closeDatabase', 'console', 'showModal', 'currentChatId', sources['src/js/ui/270-iframe-panel.js'] + '\nreturn { reload: reloadExtension, expand: expandSidePanel, checklist: _reloadChecklist, gate: _runReloadPreflight, normalize: _reloadSuiteResult, fingerprint: _reloadFingerprint, files: RELOAD_PREFLIGHT_FILES, busy: function() { return _reloadInFlight; }, bootReport: _reportLastReloadTimings, suiteRows: _reloadSuiteRows, passKey: RELOAD_PREFLIGHT_PASS_KEY, startBuild: typeof _startExtensionBuild === "function" ? _startExtensionBuild : null, building: function() { return typeof _reloadBuildInFlight === "undefined" ? undefined : _reloadBuildInFlight; } };')(
+        var api = new Function('document', 'navigator', 'window', 'chrome', 'runningChatIds', 'showConfirmModal', 'escapeHtml', 'showSnackbar', 'isSkillTool', 'getDeployDirHandle', 'executeTool', 'getAllWorkspaceMetas', 'getWorkspaceMeta', 'getAllWorkspaceFiles', 'crypto', 'TextEncoder', 'AbortController', 'setTimeout', 'clearTimeout', 'closeDatabase', 'console', 'showModal', 'currentChatId', sources['src/js/core/025-i18n.js'] + '\n' + sources['src/js/ui/270-iframe-panel.js'] + '\nreturn { reload: reloadExtension, expand: expandSidePanel, checklist: _reloadChecklist, gate: _runReloadPreflight, normalize: _reloadSuiteResult, fingerprint: _reloadFingerprint, files: RELOAD_PREFLIGHT_FILES, busy: function() { return _reloadInFlight; }, bootReport: _reportLastReloadTimings, previousTimings: function() { return _previousReloadTimings; }, suiteRows: _reloadSuiteRows, passKey: RELOAD_PREFLIGHT_PASS_KEY, startBuild: typeof _startExtensionBuild === "function" ? _startExtensionBuild : null, building: function() { return typeof _reloadBuildInFlight === "undefined" ? undefined : _reloadBuildInFlight; } };')(
             doc, opts.noLocks ? {} : { locks: locks }, { addEventListener: function() {}, close: function() { calls.push('window-close'); }, location: { reload: function() { calls.push('page-reload'); } } },
             chromeFake, opts.runningChatIds || (opts.running ? { a: true } : {}),
             async function(title, body) { calls.push('confirm:' + title); confirms.push({ title: title, body: body }); return opts.confirmAnswers ? !!opts.confirmAnswers.shift() : opts.confirm !== false; }, function(s) { return s; }, function(s, type) { notices.push(s); snacks.push([s, type]); }, function() { return !opts.noBuild; }, async function(o) { deployCalls++; deployArgs.push(o); if (opts.deployAnswers) return opts.deployAnswers.length ? opts.deployAnswers.shift() : null; return opts.noDeploy ? null : {}; },
@@ -230,7 +230,7 @@ async function runReloadPreflightTests(sources) {
     check('checked and running indicators scoped with theme tokens', css.includes('.reload-preflight .reload-preflight-check:checked { background: var(--success)') && css.includes('.reload-preflight .reload-preflight-row[data-state="running"] .reload-preflight-spinner { display: block; }'));
     return passed;
 }
-var PATHS = ['src/js/ui/270-iframe-panel.js', 'src/css/14-modals.css'], _reloadSources = null;
+var PATHS = ['src/js/core/025-i18n.js', 'src/js/ui/270-iframe-panel.js', 'src/css/14-modals.css'], _reloadSources = null;
 async function reloadSources() { return _reloadSources || (_reloadSources = await loadSources(PATHS)); }
 await registerRunner('reload-preflight', async function() { return runReloadPreflightTests(await reloadSources()); });
 
@@ -275,7 +275,11 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         assert.strictEqual(count(second, 'run_tests'), 0);
         assert.deepStrictEqual(second.calls, ['extension_build', 'close-db', 'storage', 'reload']);
         assert.deepStrictEqual(rowStates(second), ['skipped', 'skipped', 'skipped', 'skipped', 'skipped']);
-        assert.ok(second.logs.indexOf('info:[reload] preflight skipped (unchanged since last pass)') >= 0, 'skip line logged');
+        function texts(el) { return [String(el.textContent || '')].concat((el.children || []).reduce(function(a, c) { return a.concat(texts(c)); }, [])); }
+        second.rows.forEach(function(r, i) {
+            assert.ok(texts(r).indexOf('Preflight skipped (unchanged since last pass)') >= 0, 'row ' + i + ' shows the skip reason');
+        });
+        assert.ok(!second.logs.some(function(l) { return l.indexOf('info:') === 0 || l.indexOf('log:') === 0; }), 'no debug console output');
         var edited = fx.setup({ store: store });
         edited.files[0].content = 'edited';
         await settle(edited.api.reload());
@@ -293,6 +297,26 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         var waits = h.timers.filter(function(t) { return t.ms === 615000; });
         assert.ok(waits.length === 1 && waits[0].cleared, 'one bounded page-side wait, cleared after the result');
         assert.deepStrictEqual(rowStates(h), ['pass', 'pass', 'pass', 'pass', 'pass']);
+    }, T);
+    test('live progress: suites complete one by one while the single run_tests call is in flight', async function() {
+        var fx = await reloadKit(), gate = fx.deferred(), host = null, argsSeen = null;
+        var h = fx.setup({ run: function(args, hostOpts) { host = hostOpts; argsSeen = args; return gate.promise; } });
+        var p = h.api.reload();
+        await waitFor(function() { return !!host; }, 'run_tests dispatched');
+        assert.strictEqual(typeof host._runTestsOnProgress, 'function', 'host-only progress hook passed');
+        var bar = h.byClass('reload-preflight-progress')[0], text = h.byClass('reload-preflight-progress-text')[0];
+        assert.strictEqual(bar.value, 0);
+        host._runTestsOnProgress({ index: 0, file: argsSeen.files[0], phase: 'start' });
+        assert.ok(h.byClass('reload-preflight-status')[0].textContent.indexOf(argsSeen.files[0]) >= 0, 'status names the current suite');
+        host._runTestsOnProgress({ index: 0, file: argsSeen.files[0], phase: 'done', status: 'pass', passed: 3, failed: 0, skipped: 0 });
+        host._runTestsOnProgress({ index: 1, file: argsSeen.files[1], phase: 'done', status: 'fail', passed: 1, failed: 2, skipped: 0 });
+        host._runTestsOnProgress({ index: 2, file: 'test/forged.test.js', phase: 'done', status: 'pass', passed: 1, failed: 0, skipped: 0 });
+        assert.strictEqual(bar.value, 2, 'bar advances mid-run');
+        assert.ok(/^2 of 5 suites complete/.test(text.textContent) && text.textContent.indexOf('1 failed') >= 0, text.textContent);
+        assert.deepStrictEqual(rowStates(h), ['pass', 'fail', 'running', 'running', 'running']);
+        gate.resolve(fx.good(argsSeen.files));
+        await settle(p);
+        assert.deepStrictEqual(rowStates(h), ['pass', 'pass', 'pass', 'pass', 'pass'], 'final envelope re-judges every row');
     }, T);
     test('one failing file fails only its row; reload blocked unless Force', async function() {
         var fx = await reloadKit();
@@ -547,16 +571,20 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         await ticks(20);
         assert.strictEqual(count(h, 'reload'), 1, 'a late callback never reloads twice');
     }, T);
-    test('boot report logs and removes stored timings; never throws without storage', async function() {
+    test('boot report adopts and removes stored timings; never throws without storage', async function() {
         var fx = await reloadKit();
         var store = { appagentLastReloadTimings: { requestedAt: Date.now() - 1500, total_ms: 42, phases: { preflight: 7 } } };
         var h = fx.setup({ store: store });
-        await waitFor(function() { return h.logs.some(function(l) { return l.indexOf('info:[reload] previous reload:') === 0; }); }, 'boot report logged');
-        assert.match(h.logs.find(function(l) { return l.indexOf('info:[reload] previous reload:') === 0; }), /^info:\[reload\] previous reload: restart \d+ms, total before restart 42ms, phases \{"preflight":7\}$/);
+        await waitFor(function() { return h.api.previousTimings() !== null; }, 'boot report adopted');
+        var prev = h.api.previousTimings();
+        assert.ok(typeof prev.restart_ms === 'number' && prev.restart_ms >= 1500, 'restart duration derived from requestedAt');
+        assert.strictEqual(prev.total_ms, 42);
+        assert.deepStrictEqual(prev.phases, { preflight: 7 });
         assert.deepStrictEqual(h.removed, ['appagentLastReloadTimings']);
         assert.ok(!('appagentLastReloadTimings' in store), 'entry cleared');
         h.api.bootReport(); await ticks(20);
-        assert.strictEqual(h.logs.filter(function(l) { return l.indexOf('previous reload') >= 0; }).length, 1, 'logged once');
+        assert.strictEqual(h.api.previousTimings(), prev, 'adopted once (entry already cleared, second pass is a no-op)');
+        assert.deepStrictEqual(h.removed, ['appagentLastReloadTimings'], 'removed once');
         var bare = fx.setup({ noStorage: true }), broken = fx.setup({ store: {}, getThrows: true });
         assert.strictEqual(bare.api.bootReport(), undefined);
         broken.api.bootReport(); await ticks(20);

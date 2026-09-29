@@ -96,7 +96,7 @@ describe('F4 icon click: single-flight + reuse of an existing app tab (backgroun
         var fakeDate = { now: function() { return e.now; } };
         var fakeSetTimeout = function(fn, ms) { e.queue.push({ fn: fn, due: e.clock + (ms || 0), seq: ++e.seq }); return e.seq; };
         var fakeConsole = {
-            info: function(msg, data) { var m = /^\[SW\]\[reopen\] (.+)$/.exec(String(msg)); if (m) e.logs.push({ ev: m[1], data: data || {}, clock: e.clock }); },
+            info: function() {},
             warn: function() {}, log: function() {}, error: function() {}
         };
         e.ev = function(name) { return e.logs.filter(function(l) { return l.ev === name; }); };
@@ -105,7 +105,12 @@ describe('F4 icon click: single-flight + reuse of an existing app tab (backgroun
                 fn({ type: 'app-tab-ready', bootId: 'b' + id, at: e.now, nav: 'navigate', prevBoot: null }, { id: 'ext', url: APP, tab: { id: id, windowId: 1 } }, function() {});
             });
         };
-        new Function('chrome', 'Date', 'setTimeout', 'console', '_swPanelPorts', await slice())(chrome, fakeDate, fakeSetTimeout, fakeConsole, ports);
+        // Observe each structured reopen event where it is built for the
+        // persisted log (_reopenLogEntry, called synchronously by _reopenLog).
+        // Prepended: declarations are hoisted, so the wrap precedes any event.
+        var reopenHook = function(ev, data) { e.logs.push({ ev: String(ev), data: data || {}, clock: e.clock }); };
+        var hookSrc = 'var __reopenEntry = _reopenLogEntry; _reopenLogEntry = function(ev, data) { __reopenHook(ev, data); return __reopenEntry(ev, data); };\n';
+        new Function('chrome', 'Date', 'setTimeout', 'console', '_swPanelPorts', '__reopenHook', hookSrc + await slice())(chrome, fakeDate, fakeSetTimeout, fakeConsole, ports, reopenHook);
         // Run, in due order, every timer due within the next `ms` of fake time.
         e.advance = async function(ms) {
             var target = e.clock + ms;

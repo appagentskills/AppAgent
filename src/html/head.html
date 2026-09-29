@@ -9,5 +9,5 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
     <meta name="apple-mobile-web-app-title" content="AppAgent"/>
     <script>
-    (function(){var p=(function(){try{return window.self!==window.top}catch(e){return true}})()? 'iframe_':'';var t=localStorage.getItem(p+'appTheme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);})();
+    (function(){var p=(function(){try{return window.self!==window.top}catch(e){return true}})()? 'iframe_':'';var t=localStorage.getItem(p+'appTheme')||'system';if(t==='system')t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t);try{var l=localStorage.getItem(p+'uiLanguage'),d=localStorage.getItem(p+'uiLanguageDir');document.documentElement.setAttribute('lang',l||'en');document.documentElement.setAttribute('dir',d==='rtl'?'rtl':'ltr');}catch(e){}})();
     </script>

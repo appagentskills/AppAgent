@@ -35,9 +35,9 @@ function pageLayoutSet(key, layout) {
 
 // Rows/Gallery segmented toggle. `fnName` is a global taking 'rows'|'gallery'.
 function pageLayoutToggleHtml(fnName) {
-    return '<div class="segmented-toggle widget-library-layout" role="group" aria-label="Layout">' +
-        '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="Rows" onclick="' + fnName + '(\'rows\')">' + UI_ICONS.list + '<span>Rows</span></button>' +
-        '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="Gallery" onclick="' + fnName + '(\'gallery\')">' + PAGE_LAYOUT_GRID_ICON + '<span>Gallery</span></button>' +
+    return '<div class="segmented-toggle widget-library-layout" role="group" aria-label="' + escapeHtml(t('Layout')) + '">' +
+        '<button type="button" class="widget-library-layout-btn" data-layout="rows" title="' + escapeHtml(t('Rows')) + '" onclick="' + fnName + '(\'rows\')">' + UI_ICONS.list + '<span>' + escapeHtml(t('Rows')) + '</span></button>' +
+        '<button type="button" class="widget-library-layout-btn" data-layout="gallery" title="' + escapeHtml(t('Gallery')) + '" onclick="' + fnName + '(\'gallery\')">' + PAGE_LAYOUT_GRID_ICON + '<span>' + escapeHtml(t('Gallery')) + '</span></button>' +
     '</div>';
 }
 
@@ -47,11 +47,26 @@ function pageLayoutToggleHtml(fnName) {
 function pageToolbarControlsHtml(opts) {
     return '<div class="widget-library-header ' + (opts.extraClass || '') + '">' +
         '<label class="widget-library-search">' + UI_ICONS.search +
-            '<input type="search" class="widget-library-search-input ' + (opts.inputClass || '') + '" placeholder="' + opts.placeholder + '" aria-label="' + (opts.label || opts.placeholder) + '" oninput="' + opts.onInput + '(this.value)">' +
+            '<input type="search" class="widget-library-search-input ' + (opts.inputClass || '') + '" placeholder="' + escapeHtml(opts.placeholder) + '" aria-label="' + escapeHtml(opts.label || opts.placeholder) + '" oninput="' + opts.onInput + '(this.value)">' +
         '</label>' +
         '<span class="widget-library-count" id="' + opts.countId + '"></span>' +
         (opts.layoutFn ? pageLayoutToggleHtml(opts.layoutFn) : '') +
     '</div>';
+}
+
+// Re-translate a Rows/Gallery toggle rendered once by pageLayoutToggleHtml (language switch):
+// group aria-label, button titles and labels. Returns the number of buttons relabelled.
+function pageLayoutRelabel(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return 0;
+    Array.prototype.forEach.call(root.querySelectorAll('.widget-library-layout'), function(g) { g.setAttribute('aria-label', t('Layout')); });
+    var btns = root.querySelectorAll('.widget-library-layout-btn');
+    Array.prototype.forEach.call(btns, function(btn) {
+        var label = btn.getAttribute('data-layout') === 'gallery' ? t('Gallery') : t('Rows');
+        btn.setAttribute('title', label);
+        var span = btn.querySelector('span');
+        if (span) span.textContent = label;
+    });
+    return btns.length;
 }
 
 function pageLayoutSyncButtons(root, layout) {

@@ -29,12 +29,12 @@ function navigateScreenshot(delta) {
     if (!img) return;
     screenshotNav.index = newIndex;
     var header = document.getElementById('modal-header');
-    var titleText = escapeHtml(s.name || s.description || 'Screenshot');
+    var titleText = escapeHtml(s.name || s.description || t('Screenshot'));
     var sizeText = (s.width && s.height) ? ' <span class="screenshot-modal-size">' + s.width + ' × ' + s.height + 'px</span>' : '';
     var url = s.url || '';
-    var urlBtn = /^https?:\/\//i.test(url) ? '<button class="modal-close-icon" onclick="openScreenshotSourceUrl(\'' + escapeJsString(url) + '\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
+    var urlBtn = /^https?:\/\//i.test(url) ? '<button class="modal-close-icon" onclick="openScreenshotSourceUrl(\'' + escapeJsString(url) + '\')" title="' + escapeHtml(t('Open URL')) + '">' + UI_ICONS.externalLink + '</button>' : '';
     var counterText = '<span class="screenshot-modal-counter">' + (newIndex + 1) + ' / ' + screenshotNav.list.length + '</span>';
-    header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="Download">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="' + escapeHtml(t('Download')) + '">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
     img.src = s.base64;
     img.dataset.fullSrc = s.base64;
     updateNavArrows();
@@ -71,15 +71,15 @@ function openScreenshotModal(src, title, width, height, url) {
     }
     var hasNav = screenshotNav.list.length > 1 && screenshotNav.index >= 0;
 
-    var titleText = escapeHtml(title || 'Screenshot');
+    var titleText = escapeHtml(title || t('Screenshot'));
     var sizeText = (width && height) ? ' <span class="screenshot-modal-size">' + width + ' × ' + height + 'px</span>' : '';
     var counterText = hasNav ? '<span class="screenshot-modal-counter">' + (screenshotNav.index + 1) + ' / ' + screenshotNav.list.length + '</span>' : '';
-    var urlBtn = /^https?:\/\//i.test(url) ? '<button class="modal-close-icon" onclick="openScreenshotSourceUrl(\'' + escapeJsString(url) + '\')" title="Open URL">' + UI_ICONS.externalLink + '</button>' : '';
+    var urlBtn = /^https?:\/\//i.test(url) ? '<button class="modal-close-icon" onclick="openScreenshotSourceUrl(\'' + escapeJsString(url) + '\')" title="' + escapeHtml(t('Open URL')) + '">' + UI_ICONS.externalLink + '</button>' : '';
 
-    header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="Download">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    header.innerHTML = '<div class="screenshot-modal-title">' + titleText + sizeText + counterText + '</div><div class="modal-header-actions">' + urlBtn + '<button class="modal-close-icon" onclick="downloadScreenshot()" title="' + escapeHtml(t('Download')) + '">' + UI_ICONS.download + '</button><button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
 
-    var navPrev = hasNav ? '<button class="screenshot-nav-prev" onclick="event.stopPropagation();navigateScreenshot(-1)" title="Previous (Left Arrow)"' + (screenshotNav.index <= 0 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronLeft + '</button>' : '';
-    var navNext = hasNav ? '<button class="screenshot-nav-next" onclick="event.stopPropagation();navigateScreenshot(1)" title="Next (Right Arrow)"' + (screenshotNav.index >= screenshotNav.list.length - 1 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronRight + '</button>' : '';
+    var navPrev = hasNav ? '<button class="screenshot-nav-prev" onclick="event.stopPropagation();navigateScreenshot(-1)" title="' + escapeHtml(t('Previous (Left Arrow)')) + '"' + (screenshotNav.index <= 0 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronLeft + '</button>' : '';
+    var navNext = hasNav ? '<button class="screenshot-nav-next" onclick="event.stopPropagation();navigateScreenshot(1)" title="' + escapeHtml(t('Next (Right Arrow)')) + '"' + (screenshotNav.index >= screenshotNav.list.length - 1 ? ' style="display:none"' : '') + '>' + UI_ICONS.chevronRight + '</button>' : '';
 
     body.innerHTML = navPrev + '<img src="' + escapeHtml(src) + '" />' + navNext;
     actions.innerHTML = '';
@@ -112,14 +112,14 @@ async function _sidebarPayload(role, index, field) {
         m = pick();
     }
     if (!m || missing(m)) {
-        if (typeof showSnackbar === 'function') showSnackbar('Attachment not available (still loading or removed)', 'warning');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Attachment not available (still loading or removed)'), 'warning');
         return null;
     }
     return m;
 }
 
 // S0B2-08: download extension from an image data URL (jpeg -> jpg), png otherwise.
-function _imgExt(d) { var t = /^data:image\/(\w+)/.exec(d || ''); return t ? (t[1] === 'jpeg' ? 'jpg' : t[1]) : 'png'; }
+function _imgExt(d) { var m = /^data:image\/(\w+)/.exec(d || ''); return m ? (m[1] === 'jpeg' ? 'jpg' : m[1]) : 'png'; }
 
 function downloadScreenshot() {
     var img = document.querySelector('#modal-body img');

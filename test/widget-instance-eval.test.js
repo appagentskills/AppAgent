@@ -620,7 +620,7 @@ async function runWidgetEvalTests(sources) {
     check('approved and pending direct eval replay request recovery only', (loop.match(/widgetEvalRecoverOnly: toolName === 'widget_eval'/g) || []).length === 2);
 
     var dashboard = sources['src/js/ui/070-dashboard-ui.js'];
-    check('shared mount delegates native fullscreen', dashboard.includes("iframe.setAttribute('allow', \"fullscreen *\")") && dashboard.includes("iframe.setAttribute('allowfullscreen', '')"));
+    check('shared mount delegates native fullscreen', dashboard.includes("iframe.setAttribute('allow', \"fullscreen *\")") && !dashboard.includes("iframe.setAttribute('allowfullscreen'"));
     check('inline mount retains autosize cleanup while chaining lifecycle', sources['src/js/tools/080-widget-tools.js'].includes("if (typeof _mountCleanup === 'function') _mountCleanup();"));
     var dispatcher = sources['src/js/tools/020-tool-execution.js'];
     var deny = new Function('requestProgrammaticToolApproval', 'chats', dispatcher + '\nreturn executeTool;')(async function() { return { allowed: false, error: 'Denied by user' }; }, identityChats);

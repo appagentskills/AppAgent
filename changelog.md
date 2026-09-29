@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.31
+
+### Features
+- The UI is available in 24 languages, with a language picker and right-to-left support. The Help docs are translated too.
+- Keyboard shortcuts and full keyboard-only navigation.
+- Claude Sonnet 5.5 is now supported and replaces Sonnet 5.
+
+### Fixes
+- Workspaces stay in sync after a PR is merged.
+
+---
+
 ## v1.1.30
 
 ### Fixes

@@ -11,8 +11,8 @@
    Dashboard actions onto a second row at mid widths for nothing. */
 .page-toolbar-slot.slot-idle { flex: 1 1 0; }
 .page-toolbar-slot .widget-library-search { flex: 1 1 220px; max-width: 480px; }
-.page-toolbar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-4); margin-left: auto; }
-.page-toolbar .dashboard-actions { margin-left: auto; }
+.page-toolbar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-4); margin-inline-start: auto; }
+.page-toolbar .dashboard-actions { margin-inline-start: auto; }
 .page-toolbar-layout { display: inline-flex; }
 
 /* History search (sidebar-style input with clear button) sized like the other toolbars */
@@ -26,7 +26,7 @@
 /* Skills gallery cards */
 .layout-gallery .skill-item { display: flex; flex-direction: column; min-height: 140px; box-sizing: border-box; }
 .layout-gallery .skill-item-header { flex-wrap: wrap; }
-.layout-gallery .skill-item-desc, .layout-gallery .skill-item-attachments { margin-left: 0; }
+.layout-gallery .skill-item-desc, .layout-gallery .skill-item-attachments { margin-inline-start: 0; }
 .layout-gallery .skill-item-desc { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* History gallery cards */

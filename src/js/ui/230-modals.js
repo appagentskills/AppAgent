@@ -25,8 +25,8 @@ async function showConfirmModal(title, message, variant) {
     var v = normalizeModalVariant(variant);
     var confirmClass = v === 'danger' ? 'danger' : (v === 'warning' ? 'warning' : 'primary');
     var result = await showModal(title, message, [
-        { label: 'Cancel', value: 'cancel', class: 'secondary' },
-        { label: 'Confirm', value: 'confirm', class: confirmClass }
+        { label: t('Cancel'), value: 'cancel', class: 'secondary' },
+        { label: t('Confirm'), value: 'confirm', class: confirmClass }
     ], variant);
     return result === 'confirm';
 }
@@ -46,8 +46,8 @@ function showPromptModal(title, message, defaultValue) {
         header.textContent = title;
         body.innerHTML = '<p style="margin:0 0 var(--space-6) 0;">' + escapeHtml(message) + '</p>' +
             '<input type="text" id="modal-prompt-input" class="modal-input" value="' + escapeHtml(defaultValue || '') + '" style="width:100%;padding: var(--space-4) var(--space-6);border:1px solid var(--secondary-border);border-radius:var(--radius-md);font-size:var(--text-body-lg);">';
-        actions.innerHTML = '<button class="modal-btn secondary" onclick="resolveModal(null)">Cancel</button>' +
-            '<button class="modal-btn primary" onclick="submitPromptModal()">OK</button>';
+        actions.innerHTML = '<button class="modal-btn secondary" onclick="resolveModal(null)">' + escapeHtml(t('Cancel')) + '</button>' +
+            '<button class="modal-btn primary" onclick="submitPromptModal()">' + escapeHtml(t('OK')) + '</button>';
         overlay.classList.add('show');
         setTimeout(function() {
             var input = document.getElementById('modal-prompt-input');

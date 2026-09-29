@@ -7,7 +7,7 @@ describe('servicenow_run_script admin gate', function() {
             fetch: async function(url, opts) { calls.push(url); return fetchImpl(url, opts); },
             console: console
         };
-        var m = await loadModules(['src/js/tools/020-tool-execution.js'], { globals: g });
+        var m = await loadModules(['src/js/core/150-record-helpers.js', 'src/js/tools/020-tool-execution.js'], { globals: g });
         return { m: m, calls: calls };
     }
     function jsonRes(status, body) {

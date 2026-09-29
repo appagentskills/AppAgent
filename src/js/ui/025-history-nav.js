@@ -14,23 +14,24 @@ function getHistoryTitle(view, chatId, skillId) {
     var baseTitle = 'AppAgent';
     if (view === 'chat' && chatId && chats[chatId]) {
         var chat = chats[chatId];
-        return (chat.title && chat.title !== 'New Chat') ? chat.title + ' - ' + baseTitle : 'New Chat - ' + baseTitle;
+        // 'New Chat' is the stored default-title marker: the comparison stays English, only the display is translated.
+        return (chat.title && chat.title !== 'New Chat') ? t('{title} - AppAgent', { title: chat.title }) : t('New Chat - AppAgent');
     } else if (view === 'skill-editor' && skillId && skills[skillId]) {
-        return skills[skillId].name + ' - Skills - ' + baseTitle;
+        return t('{name} - Skills - AppAgent', { name: skills[skillId].name });
     } else if (view === 'skills') {
-        return 'Skills - ' + baseTitle;
+        return t('Skills - AppAgent');
     } else if (view === 'dashboard') {
-        return 'Dashboard - ' + baseTitle;
+        return t('Dashboard - AppAgent');
     } else if (view === 'home') {
         return baseTitle;
     } else if (view === 'settings-page') {
-        return 'Settings - ' + baseTitle;
+        return t('Settings - AppAgent');
     } else if (view === 'docs') {
-        return 'Documentation - ' + baseTitle;
+        return t('Documentation - AppAgent');
     } else if (view === 'history') {
-        return 'Chat History - ' + baseTitle;
+        return t('Chat History - AppAgent');
     } else if (view === 'documents') {
-        return 'Documents - ' + baseTitle;
+        return t('Documents - AppAgent');
     }
     return baseTitle;
 }

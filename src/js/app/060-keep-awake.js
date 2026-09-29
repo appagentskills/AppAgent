@@ -33,25 +33,13 @@
     var CLEAN_RELOAD_ACK_MAX_MS = 60000; // appCleanReload: opts.timeoutMs is capped here
     var CLEAN_RELOAD_POST_ACK_MS = 10000; // appCleanReload post-ack watchdog: still alive this long after the ack -> the SW never reloaded
     var cleanReloadPromise = null;     // appCleanReload is single-shot per page
-    var DEBUG = false;                 // ship with logging off (window.keepAwakeStatus() still works for diagnostics)
-    function log() {
-        if (!DEBUG) return;
-        try {
-            var args = ['[keep-awake]'].concat(Array.prototype.slice.call(arguments));
-            console.log.apply(console, args);
-        } catch (e) {}
-    }
 
     function sendKeepAwake(enabled) {
         try {
             chrome.runtime.sendMessage({ type: 'keep-awake-set', enabled: !!enabled }, function (resp) {
-                if (chrome.runtime.lastError) {
-                    log('sendMessage error:', chrome.runtime.lastError.message);
-                } else {
-                    log('SW responded:', resp);
-                }
+                if (chrome.runtime.lastError) { /* ignore */ }
             });
-        } catch (e) { log('sendMessage threw:', e); }
+        } catch (e) {}
     }
 
     // The MV3 service worker dies after ~30s of inactivity, which releases the
@@ -65,7 +53,6 @@
             // reconcile, stale-join cleanup) can't pin the lock forever.
             reconcileRuns();
             if (!lockActive) return;
-            log('heartbeat — re-asserting lock');
             sendKeepAwake(true);
         }, HEARTBEAT_MS);
     }
@@ -113,12 +100,10 @@
         var want = computeDesired();
         if (want && !lockActive) {
             lockActive = true;
-            log('LOCK ON — ' + (anyRunActive() ? 'agent run active' : 'idle threshold'));
             sendKeepAwake(true);
             startHeartbeat();
         } else if (!want && lockActive) {
             lockActive = false;
-            log('LOCK OFF — no run + idle cleared/disabled');
             sendKeepAwake(false);
             stopHeartbeat();
         }
@@ -132,7 +117,6 @@
         if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
         var hadRunLock = anyRunActive();
         idleActivated = true;
-        log('idle threshold hit');
         syncLock();
         if (!noticeDismissed && !hadRunLock) showNotice();
     }
@@ -141,7 +125,7 @@
     // preserved by syncLock(). `immediate` hides the notice now vs. after a grace period.
     function clearIdle(immediate) {
         if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-        if (idleActivated) { idleActivated = false; log('idle cleared'); }
+        if (idleActivated) { idleActivated = false; }
         syncLock();
         if (immediate) {
             if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
@@ -178,16 +162,14 @@
     // ---------- Agent-run tracking (primary keep-awake trigger) ----------
     function attachRunListeners() {
         if (typeof AgentEvents === 'undefined' || !AgentEvents.on) {
-            log('AgentEvents unavailable — run-based keep-awake disabled');
             return;
         }
         AgentEvents.on('runStarted', function (e) {
-            if (e && e.chatId) { runningChats[e.chatId] = true; log('runStarted ' + e.chatId); syncLock(); }
+            if (e && e.chatId) { runningChats[e.chatId] = true; syncLock(); }
         });
         function runEnded(e) {
             if (e && e.chatId && runningChats[e.chatId]) {
                 delete runningChats[e.chatId];
-                log('runEnded ' + e.chatId);
                 syncLock();
             }
         }
@@ -222,10 +204,10 @@
         var el = document.createElement('div');
         el.className = 'keep-awake-notice';
         el.innerHTML =
-            '<span class="ka-msg">\u2600\ufe0f AppAgent is keeping your display awake.</span>' +
-            '<button class="ka-session" type="button">Disable this session</button>' +
-            '<button class="ka-forever" type="button">Disable forever</button>' +
-            '<button class="ka-close" type="button" title="Dismiss">\u00d7</button>';
+            '<span class="ka-msg">\u2600\ufe0f ' + t('AppAgent is keeping your display awake.') + '</span>' +
+            '<button class="ka-session" type="button">' + t('Disable this session') + '</button>' +
+            '<button class="ka-forever" type="button">' + t('Disable forever') + '</button>' +
+            '<button class="ka-close" type="button" title="' + t('Dismiss') + '">\u00d7</button>';
         document.body.appendChild(el);
         // Force reflow so the transition kicks in.
         void el.offsetWidth;
@@ -307,7 +289,6 @@
         } catch (e) { /* getSetting not ready yet; default to enabled */ }
         // Disarmed (a reload started) while awaiting: attach nothing, never re-acquire the lock.
         if (disarmed) return;
-        log('init — foreverDisabled=' + foreverDisabled + ' idleMs=' + IDLE_MS);
         // Sync any checkbox in the UI now that the saved setting is loaded.
         syncKeepAwakeCheckboxes();
         attachListeners();
@@ -446,12 +427,10 @@
             heartbeatMs: HEARTBEAT_MS,
             documentHidden: document.hidden
         };
-        console.table(s);
         return s;
     };
     // Manual force-on for testing — bypasses the 5-min wait.
     window.keepAwakeForceOn = function () {
-        log('FORCE ON (testing)');
         if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
         activateLock();
     };

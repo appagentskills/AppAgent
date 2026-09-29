@@ -585,6 +585,17 @@ async function loadAllSubAgents() {
                 // read records — but it has a live spawn deferred / pool presence
                 // and must NOT be rewritten as orphaned.
                 // N1: a sub touched/reported this session also counts as live.
+                // #1038 self-heal: un-park a sub a pre-fix boot parked on the
+                // parent card's 'running' placeholder (it never reported) and
+                // run it through the normal decision (→ re-queued when its
+                // episode never started).
+                if (_subBootIsPlaceholderPark(r) && !_isLiveThisSession(r)) {
+                    r.state = 'running';
+                    delete r.last_report;
+                    delete r.report_collected;
+                    if (typeof pausedChats !== 'undefined' && r.chat_id) delete pausedChats[r.chat_id];
+                    _subAgentsPersist(r);
+                }
                 if (r.state === 'running' && !_isLiveThisSession(r)) {
                     _bootDecisions.push(_resumeOrOrphanSubAtBoot(r));
                 }
@@ -830,20 +841,43 @@ function _subBootRecoverableReport(rec) {
     // report — a persisted last_report / card report is the previous one.
     var staleEpisode = !rec.woken_at && _subBootTranscriptEpisode(rec).reportBeforeLastUser;
     var lr = rec.last_report;
-    if (!staleEpisode && lr && !lr._orphaned && !lr._synthesized && lr.status !== 'error' && (lr.at || 0) >= since) return lr;
+    if (!staleEpisode && _subBootIsRealReport(lr) && (lr.at || 0) >= since) return lr;
     var tr = _subRecoverReportFromTranscript(rec);
     if (tr) return tr;
     if (staleEpisode) return null;
     var card = null;
     try { card = rec.parent_chat_id ? _findSubAgentCard(rec.parent_chat_id, rec.agent_id) : null; } catch (_) { card = null; }
     var cr = card && card.report;
-    if (cr && typeof cr === 'object' && cr.status && cr.status !== 'error' && !cr._orphaned && !cr._synthesized && (cr.at || 0) >= since) {
+    if (_subBootIsRealReport(cr) && (cr.at || 0) >= since) {
         var out = {};
         for (var k in cr) out[k] = cr[k];
         out.from = rec.agent_id; out.from_name = rec.name; out._recovered = true; out._recovered_from = 'card';
         return out;
     }
     return null;
+}
+
+// #1038: a report A1 may park with. report_to_parent only produces
+// done|error|need_input (validated in reportToParent); 'error' never parks.
+// Every spawn / wake seeds the parent card with a placeholder
+// {status:'running', summary:''} — accepting it parked still-QUEUED subs as
+// 'sleeping' at boot and pre-settled their handle 'done' with an empty summary.
+function _subBootIsRealReport(r) {
+    return !!(r && typeof r === 'object' && (r.status === 'done' || r.status === 'need_input')
+        && !r._orphaned && !r._synthesized);
+}
+
+// #1038 self-heal: a record a pre-fix boot parked on the card placeholder
+// (state 'sleeping', last_report.status 'running' recovered from the card).
+// No real report ever has status 'running', so this cannot match a sub that
+// actually reported. A record woken AFTER the placeholder (woken_at >
+// placeholder at) ran a later episode and is legitimately sleeping — not
+// healed. A queued wake that was bug-parked still heals: wake stamps
+// woken_at BEFORE re-arming the card placeholder, so its at >= woken_at.
+function _subBootIsPlaceholderPark(r) {
+    var lr = r && r.last_report;
+    return !!(r && r.state === 'sleeping' && lr && lr.status === 'running' && lr._recovered_from === 'card'
+        && !((r.woken_at || 0) > (lr.at || 0)));
 }
 
 // Tool rows are {role:'tool', tool_call_id, name, content} (030
@@ -4441,7 +4475,9 @@ function sleepSelf(args, ctx) {
     // indefinitely while the sub sits dormant.
     if (_spawnDeferreds[rec.spawn_handle_id]) {
         var _reason = (args.reason ? String(args.reason).slice(0, 200) : 'sub-agent parked via sleep_self without report_to_parent');
-        rec.last_report = rec.last_report || {
+        // #1038: never keep a pre-fix boot's card placeholder ('running') as
+        // this settle's report — replace it with the synthetic sleep report.
+        rec.last_report = (rec.last_report && rec.last_report.status !== 'running') ? rec.last_report : {
             status: 'need_input',
             summary: _reason,
             from: rec.agent_id,
@@ -6401,7 +6437,61 @@ function onSubAgentRunFinished(chatId, finishCtx) {
 
 // ---------- Exported API ----------
 
+// Generic chat notice (background tool results — tools/020 _sfNotifyCompletion).
+// Same delivery as _wakeParentOnReport: live run -> queued injection flushed
+// at the next safe point (+ durable pending wake); idle top-level chat ->
+// notice row + new run (respects user pause); idle sub-agent -> inbox
+// (drained on its next wake; never auto-wakes a sleeping/reported sub).
+function notifyChatOfBackgroundResult(chatId, text, sourceId) {
+    try {
+        if (!chatId || typeof chats === 'undefined' || !chats[chatId] || chats[chatId]._deleted) return false;
+        var chat = chats[chatId];
+        var notice = _withWakeFinalReminder(String(text == null ? '' : text), chatId);
+        var live = !!(typeof runningChatIds !== 'undefined' && runningChatIds[chatId]);
+        var subRec = (chat.isSubAgent && chat.subAgentId) ? (_subAgents[chat.subAgentId] || null) : null;
+        if (!live && subRec) live = !!_subPool.running[subRec.agent_id];
+        if (live) {
+            if (typeof pendingInjectionsByChatId === 'undefined') return false;
+            _queueNoticeInjection(chatId, notice, []);
+            persistPendingWake(chatId, notice, null, null);
+            return true;
+        }
+        if (subRec) {
+            subRec.inbox = subRec.inbox || [];
+            subRec.inbox.push({ kind: 'message', from: 'system', content: notice, at: Date.now(), source: sourceId || null });
+            _subAgentsPersist(subRec);
+            return true;
+        }
+        var paused = false;
+        try {
+            if (typeof isChatPaused === 'function' && isChatPaused(chatId)) paused = true;
+            if (typeof pausedChats !== 'undefined' && pausedChats[chatId] === true) paused = true;
+            if (typeof pausedChatIds !== 'undefined' && pausedChatIds[chatId] === true) paused = true;
+        } catch (_) {}
+        if (!paused) _cancelAgentMessageWake(chatId);
+        var deliver = function() {
+            var c = chats[chatId];
+            if (!c) return;
+            // Sanctioned push + persist (write-site ratchet).
+            _pushPendingWakeRows(c, [notice]);
+            persistPendingWake(chatId, notice, null, null);
+            if (paused || typeof runAgent !== 'function') return;
+            Promise.resolve().then(function() { return runAgent(chatId); }).catch(function(err) {
+                console.warn('[sub-agents] notifyChat run failed for', chatId, err);
+            });
+        };
+        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') ensureChatPayloads(chatId).then(deliver, deliver);
+        else deliver();
+        return !paused;
+    } catch (e) {
+        console.warn('[sub-agents] notifyChatOfBackgroundResult failed for', chatId, e);
+        return false;
+    }
+}
+
 var SubAgents = {
+    // Background tool-result notice (tools/020 slow-fetch handles)
+    notifyChat: notifyChatOfBackgroundResult,
     // Tool implementations (called from tools/020-tool-execution.js dispatch arms)
     spawn:   spawnSubAgent,
     report:  reportToParent,

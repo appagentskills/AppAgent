@@ -195,7 +195,7 @@ function renderWorkspaceFilesSection(chat) {
     if (files.length === 0) return '';
 
     var html = '<div class="version-wsfiles-section">';
-    html += '<div class="version-section-title">Workspace Files (' + files.length + ')</div>';
+    html += '<div class="version-section-title">' + t('Workspace Files ({count})', { count: files.length }) + '</div>';
     html += '<div class="version-files-list">';
     files.forEach(function(f, i) {
         var name = f.path.split('/').pop();
@@ -205,19 +205,19 @@ function renderWorkspaceFilesSection(chat) {
         // is the more useful state), but never DELETED/DISCARDED which reflect
         // an explicit later local action.
         var mergedSnap = (!f.isDeleted && !f.isDiscarded) ? _wsfMergedSnapFor(f.path, f.wsKey) : null;
-        if (f.isDeleted) badge = '<span class="sn-status-badge sn-status-deleted">DELETED</span>';
-        else if (f.isDiscarded) badge = '<span class="sn-status-badge sn-status-reverted">DISCARDED</span>';
-        else if (mergedSnap) badge = '<span class="sn-status-badge sn-status-merged" title="Merged in PR #' + mergedSnap.pr.number + '">MERGED</span>';
-        else if (f.isNew) badge = '<span class="sn-status-badge sn-status-new">NEW</span>';
-        else badge = '<span class="sn-status-badge sn-status-modified">MODIFIED</span>';
-        var changesBadge = f.changes.length > 1 ? '<span class="sn-changes-badge">' + f.changes.length + ' changes</span>' : '';
+        if (f.isDeleted) badge = '<span class="sn-status-badge sn-status-deleted">' + t('DELETED') + '</span>';
+        else if (f.isDiscarded) badge = '<span class="sn-status-badge sn-status-reverted">' + t('DISCARDED') + '</span>';
+        else if (mergedSnap) badge = '<span class="sn-status-badge sn-status-merged" title="' + escapeHtml(t('Merged in PR #{number}', { number: mergedSnap.pr.number })) + '">' + t('MERGED') + '</span>';
+        else if (f.isNew) badge = '<span class="sn-status-badge sn-status-new">' + t('NEW') + '</span>';
+        else badge = '<span class="sn-status-badge sn-status-modified">' + t('MODIFIED') + '</span>';
+        var changesBadge = f.changes.length > 1 ? '<span class="sn-changes-badge">' + tn(f.changes.length, '{count} change', '{count} changes') + '</span>' : '';
         var wsLabel = f.wsKey ? escapeHtml(f.wsKey.split('/').pop()) : '';
         var workerChips = (f.workers && f.workers.length)
-            ? f.workers.map(function(w) { return '<span class="wsf-ws" title="Edited by worker ' + escapeHtml(w) + '">' + escapeHtml(w) + '</span>'; }).join('')
+            ? f.workers.map(function(w) { return '<span class="wsf-ws" title="' + escapeHtml(t('Edited by worker {name}', { name: w })) + '">' + escapeHtml(w) + '</span>'; }).join('')
             : '';
 
         // Diff-first: the most useful view of an edited file is what changed.
-        html += '<div class="sn-artifact-card sidebar-card wsf-card" onclick="wsfOpenDiff(' + i + ')" title="' + escapeHtml(f.path) + '">';
+        html += '<div class="sn-artifact-card sidebar-card wsf-card" role="button" tabindex="0" data-kbd-click onclick="wsfOpenDiff(' + i + ')" title="' + escapeHtml(f.path) + '">';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">' + escapeHtml(name) + '</div>';
         html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + workerChips + badge + changesBadge + '</div>';
@@ -254,8 +254,8 @@ async function _wsfResolve(f) {
 
 function _wsfFmtSize(s) {
     var n = (s || '').length;
-    if (n < 1024) return n + ' B';
-    return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024) return t('{size} B', { size: i18nFormatNumber(n, { useGrouping: false }) });
+    return t('{size} KB', { size: i18nFormatNumber(n / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false }) });
 }
 
 // --- Overlay helper ----------------------------------------------------------
@@ -273,20 +273,20 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
             var fi = opts.fileIndex;
             var act = opts.active || 'view';
             navHtml = '<div class="wsf-modal-nav">'
-                + '<button class="sn-artifact-icon-btn" onclick="wsfNavFile(' + (fi - 1) + ',\'' + act + '\')" title="Previous file (\u2190)"' + (fi <= 0 ? ' disabled' : '') + '>' + UI_ICONS.chevronLeft + '</button>'
+                + '<button class="sn-artifact-icon-btn" onclick="wsfNavFile(' + (fi - 1) + ',\'' + act + '\')" title="' + escapeHtml(t('Previous file (\u2190)')) + '"' + (fi <= 0 ? ' disabled' : '') + '>' + UI_ICONS.chevronLeft + '</button>'
                 + '<span class="wsf-nav-counter">' + (fi + 1) + ' / ' + _wsfSectionFiles.length + '</span>'
-                + '<button class="sn-artifact-icon-btn" onclick="wsfNavFile(' + (fi + 1) + ',\'' + act + '\')" title="Next file (\u2192)"' + (fi >= _wsfSectionFiles.length - 1 ? ' disabled' : '') + '>' + UI_ICONS.chevronRight + '</button>'
+                + '<button class="sn-artifact-icon-btn" onclick="wsfNavFile(' + (fi + 1) + ',\'' + act + '\')" title="' + escapeHtml(t('Next file (\u2192)')) + '"' + (fi >= _wsfSectionFiles.length - 1 ? ' disabled' : '') + '>' + UI_ICONS.chevronRight + '</button>'
                 + '</div>';
         }
         var acts = [
-            { id: 'view', icon: UI_ICONS.eye, title: 'View file' },
-            { id: 'diff', icon: UI_ICONS.diff, title: 'Diff vs base' },
-            { id: 'versions', icon: UI_ICONS.history, title: 'Version history' },
-            { id: 'discard', icon: UI_ICONS.undo, title: 'Discard uncommitted changes', danger: true }
+            { id: 'view', icon: UI_ICONS.eye, title: t('View file') },
+            { id: 'diff', icon: UI_ICONS.diff, title: t('Diff vs base') },
+            { id: 'versions', icon: UI_ICONS.history, title: t('Version history') },
+            { id: 'discard', icon: UI_ICONS.undo, title: t('Discard uncommitted changes'), danger: true }
         ];
         actionsHtml = '<div class="wsf-modal-actions">' + acts.map(function(a) {
             var cls = 'sn-artifact-icon-btn' + (a.danger ? ' danger' : '') + (opts.active === a.id ? ' active' : '');
-            return '<button class="' + cls + '" onclick="wsfHeaderAction(' + opts.fileIndex + ',\'' + a.id + '\')" title="' + a.title + '">' + a.icon + '</button>';
+            return '<button class="' + cls + '" onclick="wsfHeaderAction(' + opts.fileIndex + ',\'' + a.id + '\')" title="' + escapeHtml(a.title) + '">' + a.icon + '</button>';
         }).join('') + '</div>';
     }
     var overlay = document.createElement('div');
@@ -295,7 +295,7 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
         + '<div class="wsf-modal-header"><div class="wsf-modal-title">' + titleHtml + '</div>'
         + navHtml
         + actionsHtml
-        + '<button class="wsf-modal-close" title="Close">' + UI_ICONS.close + '</button></div>'
+        + '<button class="wsf-modal-close" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>'
         + '<div class="wsf-modal-body">' + bodyHtml + '</div></div>';
     function onKey(e) {
         // Capture phase (see addEventListener below): runs before the bubble-phase
@@ -308,8 +308,8 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
         if (e.key === 'Escape') { close(); return; }
         // Left/right arrows switch files (like the screenshot modal).
         if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && opts && opts.fileIndex != null && opts.fileIndex >= 0 && _wsfSectionFiles.length > 1) {
-            var t = e.target;
-            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+            var tgt = e.target;
+            if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA')) return;
             e.preventDefault();
             wsfNavFile(opts.fileIndex + (e.key === 'ArrowRight' ? 1 : -1), (opts.active || 'view'));
         }
@@ -326,7 +326,7 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
 }
 
 function _wsfNotFoundText(f) {
-    return '"' + f.path + '" not found in any local workspace (deleted new file, synced away, or repo re-cloned)';
+    return t('"{path}" not found in any local workspace (deleted new file, synced away, or repo re-cloned)', { path: f.path });
 }
 function _wsfNotFoundMsg(f) {
     showSnackbar(_wsfNotFoundText(f), 'warning');
@@ -365,7 +365,7 @@ function wsfHeaderAction(i, act) {
         if (ok) return closeOld();
         var f = _wsfSectionFiles[i];
         if (!f || !old.some(function(o) { return o.isConnected; })) return; // user closed meanwhile
-        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">not found</span>',
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('not found') + '</span>',
             '<div class="wsf-empty">' + escapeHtml(_wsfNotFoundText(f)) + '</div>', { fileIndex: i, active: act });
         closeOld();
     }, function() { /* keep the current overlay */ });
@@ -385,10 +385,10 @@ async function wsfOpenViewer(i) {
         _wsfNotFoundMsg(f); return false;
     }
     var rec = res.rec;
-    var status = rec.deleted ? 'Deleted' : (rec.dirty ? 'Modified (uncommitted)' : 'Clean (matches base)');
+    var status = rec.deleted ? t('Deleted') : (rec.dirty ? t('Modified (uncommitted)') : t('Clean (matches base)'));
     var body = '<div class="wsf-file-meta">' + escapeHtml(res.wsKey) + ' \u00b7 ' + status + ' \u00b7 ' + _wsfFmtSize(rec.content) + '</div>';
     if (rec.stub && rec.content == null) {
-        body += '<div class="wsf-empty">Content not loaded locally (lazy clone stub).</div>';
+        body += '<div class="wsf-empty">' + t('Content not loaded locally (lazy clone stub).') + '</div>';
     } else {
         body += '<pre class="wsf-code">' + escapeHtml(rec.content || '') + '</pre>';
     }
@@ -411,7 +411,7 @@ function _wsfRenderDiffHtml(oldText, newText) {
         else if (d.type === 'remove') dels++;
     });
     if (adds === 0 && dels === 0) {
-        return '<div class="wsf-empty">No differences</div>';
+        return '<div class="wsf-empty">' + t('No differences') + '</div>';
     }
     // Visibility: keep 3 context lines around every change, collapse the rest.
     var CONTEXT = 3;
@@ -425,7 +425,7 @@ function _wsfRenderDiffHtml(oldText, newText) {
     var hiddenRun = 0;
     function flushHidden() {
         if (hiddenRun > 0) {
-            html += '<div class="diff-separator"><span class="diff-separator-text">\u22ef ' + hiddenRun + ' unchanged line' + (hiddenRun === 1 ? '' : 's') + '</span></div>';
+            html += '<div class="diff-separator"><span class="diff-separator-text">\u22ef ' + tn(hiddenRun, '{count} unchanged line', '{count} unchanged lines') + '</span></div>';
             hiddenRun = 0;
         }
     }
@@ -462,8 +462,8 @@ async function wsfOpenDiff(i) {
     var rec = res.rec;
     var oldText = rec.original_content != null ? rec.original_content : '';
     var newText = rec.deleted ? '' : (rec.content || '');
-    var note = rec.dirty ? '' : '<div class="wsf-file-meta">File has no uncommitted changes \u2014 it matches its base.</div>';
-    _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">base \u2192 current</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+    var note = rec.dirty ? '' : '<div class="wsf-file-meta">' + t('File has no uncommitted changes \u2014 it matches its base.') + '</div>';
+    _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('base \u2192 current') + '</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
     return true;
 }
 
@@ -487,10 +487,13 @@ async function _wsfOpenMergedDiff(f, i) {
         if (snap.file.new_sha && blobs[snap.file.new_sha] == null) return false;
         var oldText = snap.file.old_sha ? blobs[snap.file.old_sha] : '';
         var newText = snap.file.new_sha ? blobs[snap.file.new_sha] : '';
-        var note = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">MERGED</span> Merged in <a href="' + escapeHtml(snap.pr.url || '#') + '" target="_blank" rel="noopener">PR #' + snap.pr.number + '</a>'
-            + (snap.pr.merged_at ? ' \u00b7 ' + escapeHtml(String(snap.pr.merged_at).slice(0, 10)) : '')
-            + ' \u2014 original edited diff (pre-merge base \u2192 pushed content).</div>';
-        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">merged \u00b7 PR #' + snap.pr.number + '</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+        var prLink = '<a href="' + escapeHtml(snap.pr.url || '#') + '" target="_blank" rel="noopener">' + t('PR #{number}', { number: snap.pr.number }) + '</a>';
+        var note = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">' + t('MERGED') + '</span> '
+            + (snap.pr.merged_at
+                ? t('Merged in {pr} \u00b7 {date} \u2014 original edited diff (pre-merge base \u2192 pushed content).', { pr: prLink, date: escapeHtml(String(snap.pr.merged_at).slice(0, 10)) })
+                : t('Merged in {pr} \u2014 original edited diff (pre-merge base \u2192 pushed content).', { pr: prLink }))
+            + '</div>';
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('merged \u00b7 PR #{number}', { number: snap.pr.number }) + '</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
         return true;
     } catch (e) {
         console.error('wsf merged snapshot diff failed', e);
@@ -509,9 +512,9 @@ async function _wsfOpenMergedView(f, i) {
         var blobs = await getWorkspaceBlobsBySha([snap.file.new_sha]);
         var content = blobs[snap.file.new_sha];
         if (content == null) return false;
-        var body = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">MERGED</span> PR #' + snap.pr.number + ' \u00b7 pushed content \u00b7 ' + _wsfFmtSize(content) + '</div>'
+        var body = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">' + t('MERGED') + '</span> ' + t('PR #{number} \u00b7 pushed content \u00b7 {size}', { number: snap.pr.number, size: _wsfFmtSize(content) }) + '</div>'
             + '<pre class="wsf-code">' + escapeHtml(content) + '</pre>';
-        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">merged \u00b7 PR #' + snap.pr.number + '</span>', body, { fileIndex: i, active: 'view' });
+        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('merged \u00b7 PR #{number}', { number: snap.pr.number }) + '</span>', body, { fileIndex: i, active: 'view' });
         return true;
     } catch (e) { return false; }
 }
@@ -537,7 +540,8 @@ async function wsfOpenVersions(i) {
             if (ch.path !== f.path) return;
             if (ch.wsKey && f.wsKey && ch.wsKey !== f.wsKey) return;
             ch.chatId = cid;
-            ch.chatTitle = chats[cid].title || 'Untitled chat';
+            var ttl = chats[cid].title;
+            ch.chatTitle = ttl ? (ttl === 'New Chat' ? t('New Chat') : ttl) : t('Untitled chat');
             entries.push(ch);
         });
     });
@@ -554,7 +558,7 @@ async function wsfOpenVersions(i) {
 
     var base = res && res.rec && res.rec.original_content != null ? res.rec.original_content : null;
     var versions = [];
-    versions.push({ action: 'base', label: 'Base (clone)', content: base, ok: base != null });
+    versions.push({ action: 'base', label: t('Base (clone)'), content: base, ok: base != null });
     var cur = base;
     var reliable = base != null;
     entries.forEach(function(ch) {
@@ -583,42 +587,43 @@ async function wsfOpenVersions(i) {
         versions.push(v);
     });
     if (res && res.rec) {
-        versions.push({ action: 'current', label: 'Current', content: res.rec.deleted ? '' : res.rec.content, ok: res.rec.content != null });
+        versions.push({ action: 'current', label: t('Current'), content: res.rec.deleted ? '' : res.rec.content, ok: res.rec.content != null });
     }
 
     _wsfVersionState = { file: f, fileIndex: i, wsKey: res ? res.wsKey : f.wsKey, versions: versions };
 
     var icons = { base: UI_ICONS.gitBranch, write: UI_ICONS.edit, edit: UI_ICONS.edit, 'delete': UI_ICONS.trash, discard: UI_ICONS.undo, copy: UI_ICONS.copy, current: UI_ICONS.check };
+    var actionLabels = { write: t('Write'), edit: t('Edit'), 'delete': t('Delete'), copy: t('Copy'), discard: t('Discard') };
     var body = '<div class="wsf-versions-list">';
     versions.forEach(function(v, vi) {
-        var label = v.label || (v.action.charAt(0).toUpperCase() + v.action.slice(1));
+        var label = v.label || actionLabels[v.action] || (v.action.charAt(0).toUpperCase() + v.action.slice(1));
         var isThisChat = v.chatId && v.chatId === currentChatId;
         var chatChip = v.chatId
-            ? '<span class="wsf-ver-chat' + (isThisChat ? ' this-chat' : '') + '"' + (isThisChat ? ' onclick="wsfGoToVersionMsg(' + vi + ')" title="Show in chat"' : ' title="' + escapeHtml(v.chatTitle) + '"') + '>' + UI_ICONS.chat + ' ' + escapeHtml(isThisChat ? 'this chat' : (v.chatTitle.length > 28 ? v.chatTitle.slice(0, 28) + '\u2026' : v.chatTitle)) + '</span>'
+            ? '<span class="wsf-ver-chat' + (isThisChat ? ' this-chat' : '') + '"' + (isThisChat ? ' role="button" tabindex="0" data-kbd-click onclick="wsfGoToVersionMsg(' + vi + ')" title="' + escapeHtml(t('Show in chat')) + '"' : ' title="' + escapeHtml(v.chatTitle) + '"') + '>' + UI_ICONS.chat + ' ' + escapeHtml(isThisChat ? t('this chat') : (v.chatTitle.length > 28 ? v.chatTitle.slice(0, 28) + '\u2026' : v.chatTitle)) + '</span>'
             : '';
         body += '<div class="wsf-ver-row' + (v.ok ? '' : ' unreliable') + '">';
         body += '<span class="wsf-ver-num">v' + vi + '</span>';
         body += '<span class="wsf-ver-icon">' + (icons[v.action] || UI_ICONS.file) + '</span>';
         body += '<span class="wsf-ver-label">' + escapeHtml(label) + '</span>';
         body += chatChip;
-        if (!v.ok && v.action !== 'base') body += '<span class="wsf-ver-note" title="Content could not be rebuilt from the recorded tool calls">not reconstructable</span>';
+        if (!v.ok && v.action !== 'base') body += '<span class="wsf-ver-note" title="' + escapeHtml(t('Content could not be rebuilt from the recorded tool calls')) + '">' + t('not reconstructable') + '</span>';
         body += '<span class="wsf-ver-actions">';
         if (v.content != null) {
-            body += '<button class="sn-artifact-icon-btn" onclick="wsfViewVersion(' + vi + ')" title="View this version">' + UI_ICONS.eye + '</button>';
+            body += '<button class="sn-artifact-icon-btn" onclick="wsfViewVersion(' + vi + ')" title="' + escapeHtml(t('View this version')) + '">' + UI_ICONS.eye + '</button>';
         }
         if (vi > 0) {
-            body += '<button class="sn-artifact-icon-btn" onclick="wsfDiffVersion(' + vi + ')" title="Diff vs previous version">' + UI_ICONS.diff + '</button>';
+            body += '<button class="sn-artifact-icon-btn" onclick="wsfDiffVersion(' + vi + ')" title="' + escapeHtml(t('Diff vs previous version')) + '">' + UI_ICONS.diff + '</button>';
         }
         // A3C2-03: no Restore without a known target workspace (never fall back to the default one).
         if (v.content != null && v.action !== 'current' && _wsfVersionState.wsKey) {
-            body += '<button class="sn-artifact-icon-btn" onclick="wsfRestoreVersion(' + vi + ')" title="Restore this version into the workspace">' + UI_ICONS.undo + '</button>';
+            body += '<button class="sn-artifact-icon-btn" onclick="wsfRestoreVersion(' + vi + ')" title="' + escapeHtml(t('Restore this version into the workspace')) + '">' + UI_ICONS.undo + '</button>';
         }
         body += '</span>';
         body += '</div>';
     });
     body += '</div>';
-    if (!res) body += '<div class="wsf-file-meta">File no longer exists in a local workspace \u2014 base and current content unavailable.' + (_wsfVersionState.wsKey ? '' : ' Restore is unavailable: no local workspace is known for this file.') + '</div>';
-    _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + (versions.length) + ' versions</span>', body, { fileIndex: i, active: 'versions' });
+    if (!res) body += '<div class="wsf-file-meta">' + t('File no longer exists in a local workspace \u2014 base and current content unavailable.') + (_wsfVersionState.wsKey ? '' : ' ' + t('Restore is unavailable: no local workspace is known for this file.')) + '</div>';
+    _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + tn(versions.length, '{count} version', '{count} versions') + '</span>', body, { fileIndex: i, active: 'versions' });
     return true;
 }
 
@@ -671,12 +676,12 @@ function wsfDiffVersion(vi) {
         body = _wsfRenderDiffHtml(prev.content, v.content);
     } else if (v.action === 'edit' && v.args && Array.isArray(v.args.edits)) {
         // Fallback when replay failed: show the recorded find/replace hunks.
-        body = '<div class="wsf-file-meta">Exact version content could not be rebuilt \u2014 showing the recorded search &amp; replace operations of this change.</div>';
+        body = '<div class="wsf-file-meta">' + escapeHtml(t('Exact version content could not be rebuilt \u2014 showing the recorded search & replace operations of this change.')) + '</div>';
         v.args.edits.forEach(function(e, k) {
-            body += '<div class="wsf-edit-hunk-title">Edit ' + (k + 1) + '</div>' + _wsfRenderDiffHtml(e.find, e.replace);
+            body += '<div class="wsf-edit-hunk-title">' + t('Edit {number}', { number: k + 1 }) + '</div>' + _wsfRenderDiffHtml(e.find, e.replace);
         });
     } else {
-        body = '<div class="wsf-empty">Not enough recorded data to build this diff.</div>';
+        body = '<div class="wsf-empty">' + t('Not enough recorded data to build this diff.') + '</div>';
     }
     _wsfOverlay(escapeHtml(st.file.path) + ' <span class="wsf-title-sub">v' + (vi - 1) + ' \u2192 v' + vi + '</span>', body, { fileIndex: st.fileIndex, active: 'versions' });
 }
@@ -685,10 +690,10 @@ async function wsfRestoreVersion(vi) {
     var st = _wsfVersionState;
     if (!st || !st.versions[vi] || st.versions[vi].content == null) return;
     var v = st.versions[vi];
-    if (!st.wsKey) { showSnackbar('Cannot restore "' + st.file.path + '": no local workspace is known for it', 'warning'); return; }
-    if (!await showConfirmModal('Restore Version', 'Restore "' + escapeHtml(st.file.path) + '" to v' + vi + ' in ' + escapeHtml(st.wsKey) + '? This overwrites the current workspace content as a new uncommitted change.')) return;
+    if (!st.wsKey) { showSnackbar(t('Cannot restore "{path}": no local workspace is known for it', { path: st.file.path }), 'warning'); return; }
+    if (!await showConfirmModal(t('Restore Version'), t('Restore "{path}" to v{version} in {workspace}? This overwrites the current workspace content as a new uncommitted change.', { path: escapeHtml(st.file.path), version: vi, workspace: escapeHtml(st.wsKey) }))) return;
     try {
-        showSpinner('Restoring v' + vi + '...');
+        showSpinner(t('Restoring v{version}...', { version: vi }));
         var args;
         if (v.action === 'base') {
             args = { action: 'discard', path: st.file.path };
@@ -699,15 +704,15 @@ async function wsfRestoreVersion(vi) {
         var r = await executeWorkspaceTool(args, { chatId: currentChatId });
         hideSpinner();
         if (r && r.success) {
-            showSnackbar('Restored "' + st.file.path + '" to v' + vi, 'success');
+            showSnackbar(t('Restored "{path}" to v{version}', { path: st.file.path, version: vi }), 'success');
             document.querySelectorAll('.wsf-overlay').forEach(function(o) { o._wsfClose ? o._wsfClose() : o.remove(); });
             renderVersionSidebar();
         } else {
-            showSnackbar('Restore failed: ' + ((r && r.error) || 'unknown error'), 'error');
+            showSnackbar(t('Restore failed: {error}', { error: (r && r.error) || t('unknown error') }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Restore failed: ' + e.message, 'error');
+        showSnackbar(t('Restore failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -719,24 +724,24 @@ async function wsfDiscardFile(i) {
     var res = await _wsfResolve(f);
     if (!res) { _wsfNotFoundMsg(f); return; }
     if (!res.rec.dirty) {
-        showSnackbar('"' + f.path + '" has no uncommitted changes', 'warning');
+        showSnackbar(t('"{path}" has no uncommitted changes', { path: f.path }), 'warning');
         return;
     }
-    if (!await showConfirmModal('Discard Changes', 'Discard uncommitted changes to "' + escapeHtml(f.path) + '"? The file is reset to its cloned base content. This cannot be undone.', 'danger')) return;
+    if (!await showConfirmModal(t('Discard Changes'), t('Discard uncommitted changes to "{path}"? The file is reset to its cloned base content. This cannot be undone.', { path: escapeHtml(f.path) }), 'danger')) return;
     try {
-        showSpinner('Discarding...');
+        showSpinner(t('Discarding...'));
         var args = { action: 'discard', path: f.path, workspace: res.wsKey };
         var r = await executeWorkspaceTool(args, { chatId: currentChatId });
         hideSpinner();
         if (r && r.success) {
-            showSnackbar('Discarded changes to "' + f.path + '"', 'success');
+            showSnackbar(t('Discarded changes to "{path}"', { path: f.path }), 'success');
             renderVersionSidebar();
         } else {
-            showSnackbar('Discard failed: ' + ((r && r.error) || 'unknown error'), 'error');
+            showSnackbar(t('Discard failed: {error}', { error: (r && r.error) || t('unknown error') }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Discard failed: ' + e.message, 'error');
+        showSnackbar(t('Discard failed: {error}', { error: e.message }), 'error');
     }
 }
 

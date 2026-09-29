@@ -1,5 +1,5 @@
 async function addSampleTool() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!currentEditingSkill) { showSnackbar(t('Save the skill first'), 'error', undefined, { key: 'skill-editor' }); return; }
 
     var sampleToolContent = `// Sample Tool: my_tool
 // Runs in isolated sandbox - only executeTool() is available
@@ -61,11 +61,11 @@ async function my_tool(args) {
     
     await saveSkillAsset(currentEditingSkill, 'my_tool.js', 'js', sampleToolContent);
     await renderSkillAssets();
-    showSnackbar('Sample tool added', 'success');
+    showSnackbar(t('Sample tool added'), 'success');
 }
 
 async function addSkillAsset() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!currentEditingSkill) { showSnackbar(t('Save the skill first'), 'error', undefined, { key: 'skill-editor' }); return; }
     var input = document.createElement('input');
     input.type = 'file';
     input.accept = '.xml,.md,.js';
@@ -86,15 +86,16 @@ async function addSkillAssetFiles(files) {
             // If importing SKILL.md, update the skill's parsed content (don't save as asset)
             if (file.name.toLowerCase() === 'skill.md') {
                 var skill = skills[currentEditingSkill];
-                if (!skill) { showSnackbar('Add file failed: skill not found (save it first)', 'error'); return; }
+                if (!skill) { showSnackbar(t('Add file failed: skill not found (save it first)'), 'error'); return; }
                 var fm = content.match(/^---\s*\n([\s\S]*?)\n---/);
                 // TB-10: the mini parser reads block lists only, so a flow list (`actions: [a, b]`)
                 // parses to []. Replace the actions only when the parse is non-empty (never wipe them).
                 var parsed = parseSkillMarkdown(content, file.name);
                 var hasActions = !!fm && /^actions\s*:/m.test(fm[1]) && Array.isArray(parsed.actions) && parsed.actions.length > 0;
-                var ok = await showConfirmModal('Replace skill content', 'SKILL.md will replace this skill\'s ' +
-                    (fm ? 'name, description, body' + (hasActions ? ' and actions' : '') : 'body') +
-                    '. Unsaved editor changes are lost. Continue?', 'danger');
+                var ok = await showConfirmModal(t('Replace skill content'),
+                    !fm ? t("SKILL.md will replace this skill's body. Unsaved editor changes are lost. Continue?")
+                        : hasActions ? t("SKILL.md will replace this skill's name, description, body and actions. Unsaved editor changes are lost. Continue?")
+                        : t("SKILL.md will replace this skill's name, description, body. Unsaved editor changes are lost. Continue?"), 'danger');
                 if (!ok) { skipped++; continue; }
                 if (fm) { skill.name = parsed.name || skill.name; skill.description = parsed.description || skill.description; }
                 skill.body = parsed.body;
@@ -119,7 +120,7 @@ async function addSkillAssetFiles(files) {
             // A5B2-01: a same-name asset is replaced only after an explicit confirm; Cancel skips it.
             var existing = await getSkillAsset(currentEditingSkill, file.name);
             if (existing) {
-                var rep = await showConfirmModal('Replace file', escapeHtml(file.name) + ' already exists in this skill. Replace it?', 'danger');
+                var rep = await showConfirmModal(t('Replace file'), t('{name} already exists in this skill. Replace it?', { name: escapeHtml(file.name) }), 'danger');
                 if (!rep) { skipped++; continue; }
             }
             await saveSkillAsset(currentEditingSkill, file.name, ext, content);
@@ -127,22 +128,27 @@ async function addSkillAssetFiles(files) {
         }
     } catch (e) {
         console.error('[addSkillAsset] failed:', e);
-        showSnackbar('Add file failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Add file failed: {error}', { error: String((e && e.message) || e) }), 'error');
         return;
     } finally {
         try { await renderSkillAssets(); } catch (e2) { console.error('[addSkillAsset] render failed:', e2); }
     }
-    showSnackbar('Added ' + added + ' file(s)' + (skipped ? ', skipped ' + skipped : '') +
-        (skillUpdated ? '; skill updated from SKILL.md' : ''), 'success');
+    // One whole sentence per variant (contract rule 4). English keeps the pinned 'file(s)'
+    // wording in both forms (English identity); tn() lets catalogs supply real plural forms.
+    var skippedP = { skipped: i18nFormatNumber(skipped) };
+    showSnackbar(skipped && skillUpdated ? tn(added, 'Added {count} file(s), skipped {skipped}; skill updated from SKILL.md', 'Added {count} file(s), skipped {skipped}; skill updated from SKILL.md', skippedP)
+        : skipped ? tn(added, 'Added {count} file(s), skipped {skipped}', 'Added {count} file(s), skipped {skipped}', skippedP)
+        : skillUpdated ? tn(added, 'Added {count} file(s); skill updated from SKILL.md', 'Added {count} file(s); skill updated from SKILL.md')
+        : tn(added, 'Added {count} file(s)', 'Added {count} file(s)'), 'success');
 }
 
 async function removeSkillAsset(filename) {
     if (!currentEditingSkill) return;
-    var confirmed = await showConfirmModal('Remove File', 'Remove ' + escapeHtml(filename) + ' from this skill?', 'danger');
+    var confirmed = await showConfirmModal(t('Remove File'), t('Remove {name} from this skill?', { name: escapeHtml(filename) }), 'danger');
     if (!confirmed) return;
     await deleteSkillAsset(currentEditingSkill, filename);
     await renderSkillAssets();
-    showSnackbar('File removed', 'success');
+    showSnackbar(t('File removed'), 'success');
 }
 
 function viewSkillMd() {
@@ -166,7 +172,7 @@ function downloadSkillMd() {
 async function downloadSkillAsset(filename) {
     if (!currentEditingSkill) return;
     var asset = await getSkillAsset(currentEditingSkill, filename);
-    if (!asset) { showSnackbar('File not found', 'error'); return; }
+    if (!asset) { showSnackbar(t('File not found'), 'error'); return; }
     var mimeType = asset.type === 'xml' ? 'application/xml' : (asset.type === 'js' ? 'application/javascript' : 'text/markdown');
     downloadFile(filename, asset.content, mimeType);
 }
@@ -178,7 +184,7 @@ async function renameSkillAsset(oldFilename) {
     var ext = oldFilename.substring(oldFilename.lastIndexOf('.'));
     var baseName = oldFilename.substring(0, oldFilename.lastIndexOf('.'));
     
-    var newName = await showPromptModal('Rename File', 'Enter new filename:', baseName);
+    var newName = await showPromptModal(t('Rename File'), t('Enter new filename:'), baseName);
     if (!newName || newName === baseName) return;
     
     // Ensure proper extension
@@ -190,20 +196,20 @@ async function renameSkillAsset(oldFilename) {
     // Check if new filename already exists
     var existingAsset = await getSkillAsset(currentEditingSkill, newFilename);
     if (existingAsset) {
-        showSnackbar('A file with that name already exists', 'error');
+        showSnackbar(t('A file with that name already exists'), 'error');
         return;
     }
     
     // Get old asset content
     var asset = await getSkillAsset(currentEditingSkill, oldFilename);
-    if (!asset) { showSnackbar('File not found', 'error'); return; }
+    if (!asset) { showSnackbar(t('File not found'), 'error'); return; }
     
     // Save with new name and remove old
     await saveSkillAsset(currentEditingSkill, newFilename, asset.type, asset.content);
     await deleteSkillAsset(currentEditingSkill, oldFilename);
     
     await renderSkillAssets();
-    showSnackbar('File renamed to ' + newFilename, 'success');
+    showSnackbar(t('File renamed to {name}', { name: newFilename }), 'success');
 }
 
 function downloadFile(filename, content, mimeType) {
@@ -224,7 +230,7 @@ var assetEditMode = false;
 async function viewSkillAsset(filename) {
     if (!currentEditingSkill) return;
     var asset = await getSkillAsset(currentEditingSkill, filename);
-    if (!asset) { showSnackbar('File not found', 'error'); return; }
+    if (!asset) { showSnackbar(t('File not found'), 'error'); return; }
     
     currentViewingAsset = { filename: filename, content: asset.content, type: asset.type };
     assetEditMode = false;
@@ -242,14 +248,14 @@ function renderAssetModal() {
     modal.classList.add('skill-asset-modal');
     
     var editBtn = assetEditMode 
-        ? '<button class="modal-edit-btn active" onclick="toggleAssetEditMode()" title="View">' + UI_ICONS.eye + '</button>'
-        : '<button class="modal-edit-btn" onclick="toggleAssetEditMode()" title="Edit">' + UI_ICONS.edit + '</button>';
+        ? '<button class="modal-edit-btn active" onclick="toggleAssetEditMode()" title="' + escapeHtml(t('View')) + '">' + UI_ICONS.eye + '</button>'
+        : '<button class="modal-edit-btn" onclick="toggleAssetEditMode()" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>';
     
-    header.innerHTML = '<span class="modal-title-text">' + escapeHtml(asset.filename) + '</span><div class="modal-header-actions">' + editBtn + '<button class="modal-close-icon" onclick="closeModal()" title="Close">' + UI_ICONS.close + '</button></div>';
+    header.innerHTML = '<span class="modal-title-text">' + escapeHtml(asset.filename) + '</span><div class="modal-header-actions">' + editBtn + '<button class="modal-close-icon" onclick="closeModal()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button></div>';
     
     if (assetEditMode) {
         body.innerHTML = '<textarea class="skill-asset-editor" id="asset-edit-textarea">' + escapeHtml(asset.content) + '</textarea>';
-        actions.innerHTML = '<button class="modal-btn secondary" onclick="closeModal()">Cancel</button><button class="modal-btn primary" onclick="saveAssetEdit()">Save</button>';
+        actions.innerHTML = '<button class="modal-btn secondary" onclick="closeModal()">' + escapeHtml(t('Cancel')) + '</button><button class="modal-btn primary" onclick="saveAssetEdit()">' + escapeHtml(t('Save')) + '</button>';
     } else {
         var contentHtml = '';
         if (asset.type === 'js') {
@@ -304,11 +310,11 @@ async function saveAssetEdit() {
         // SKILL.md is virtual (skillToMarkdown of the live skill): never store it as
         // an asset. A stored copy is a frozen snapshot that renders as a 2nd card
         // and replays stale name/description/body/actions when saved (NEW-F15-1).
-        if (!skill) { showSnackbar('Skill not found', 'error'); return; }
+        if (!skill) { showSnackbar(t('Skill not found'), 'error'); return; }
         currentViewingAsset.content = skillToMarkdown(skill);
         assetEditMode = false;
         renderAssetModal();
-        showSnackbar('Skill updated', 'success');
+        showSnackbar(t('Skill updated'), 'success');
         return;
     }
     
@@ -316,7 +322,7 @@ async function saveAssetEdit() {
     currentViewingAsset.content = newContent;
     assetEditMode = false;
     renderAssetModal();
-    showSnackbar('File saved', 'success');
+    showSnackbar(t('File saved'), 'success');
 }
 
 function editSkillWithAgent() {
@@ -332,7 +338,7 @@ function editSkillWithAgent() {
     // Pre-fill the message input with just the skill name
     var input = document.getElementById('message-input');
     if (input) {
-        input.value = 'I want to edit the skill: ' + (skill.name || skill.id) + '\n\nWhat changes would you like to make?';
+        input.value = t('I want to edit the skill: {name}', { name: skill.name || skill.id }) + '\n\n' + t('What changes would you like to make?');
         autoResizeTextarea(input);
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
@@ -412,11 +418,13 @@ async function requestCloseSkillEditor() {
     if (!dirty || typeof showConfirmModal !== 'function') { closeSkillEditor(); return; }
     var id = currentEditingSkill;
     var s = id ? skills[id] : null;
-    var label = (s && (s.name || s.id)) || 'this new skill';
+    var label = (s && (s.name || s.id)) || '';
     var ok = false;
     _skillCloseConfirmPending = true;
     try {
-        ok = await showConfirmModal('Discard changes?', 'Unsaved edits to "' + escapeHtml(label) + '" will be lost.', 'warning');
+        ok = await showConfirmModal(t('Discard changes?'), label
+            ? t('Unsaved edits to "{name}" will be lost.', { name: escapeHtml(label) })
+            : t('Unsaved edits to "this new skill" will be lost.'), 'warning');
     } finally {
         _skillCloseConfirmPending = false;
     }
@@ -435,9 +443,9 @@ async function saveCurrentSkill() {
     var description = (descInput ? descInput.value : '').trim();
     var body = (bodyInput ? bodyInput.value : '').trim();
     var actions = collectSkillActionsFromEditor();
-    if (!name) { showSnackbar('Name is required', 'error', undefined, { key: 'skill-editor' }); return; }
-    if (name.length > 64) { showSnackbar('Name must be 64 characters or less', 'error', undefined, { key: 'skill-editor' }); return; }
-    if (!description) { showSnackbar('Description is required', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!name) { showSnackbar(t('Name is required'), 'error', undefined, { key: 'skill-editor' }); return; }
+    if (name.length > 64) { showSnackbar(t('Name must be 64 characters or less'), 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!description) { showSnackbar(t('Description is required'), 'error', undefined, { key: 'skill-editor' }); return; }
     // Reject collisions on the normalized actionId. getActionId lowercases and
     // slugifies, so "Run audit" and "RUN-AUDIT" hash to the same id — the
     // engine then can't distinguish them and only one button effectively works.
@@ -446,7 +454,7 @@ async function saveCurrentSkill() {
         for (var ai = 0; ai < actions.length; ai++) {
             var aid = getActionId(name || 'skill', actions[ai].name);
             if (seenActionIds[aid]) {
-                showSnackbar('Two actions normalize to the same id: "' + seenActionIds[aid] + '" and "' + actions[ai].name + '". Rename one.', 'error', undefined, { key: 'skill-editor' });
+                showSnackbar(t('Two actions normalize to the same id: "{first}" and "{second}". Rename one.', { first: seenActionIds[aid], second: actions[ai].name }), 'error', undefined, { key: 'skill-editor' });
                 return;
             }
             seenActionIds[aid] = actions[ai].name;
@@ -466,7 +474,7 @@ async function saveCurrentSkill() {
         skill = { id: id, name: name, description: description, body: body, actions: actions, userModified: true, createdAt: Date.now(), updatedAt: Date.now() };
     }
     await saveSkill(skill);
-    showSnackbar('Skill saved', 'success', undefined, { key: 'skill-editor' });
+    showSnackbar(t('Skill saved'), 'success', undefined, { key: 'skill-editor' });
     resetSkillActionsDraft();
     closeSkillEditor();
 }
@@ -476,10 +484,10 @@ async function deleteCurrentSkill() {
     // NEW-T16-1: name the skill. The modal parses the message as HTML, so escape it.
     var s = skills[currentEditingSkill];
     var n = (s && s.name) || currentEditingSkill;
-    var confirmed = await showConfirmModal('Delete Skill', 'Delete "' + escapeHtml(n) + '"? This cannot be undone.', 'danger');
+    var confirmed = await showConfirmModal(t('Delete Skill'), t('Delete "{name}"? This cannot be undone.', { name: escapeHtml(n) }), 'danger');
     if (!confirmed) return;
     await deleteSkill(currentEditingSkill);
-    showSnackbar('Skill deleted', 'success');
+    showSnackbar(t('Skill deleted'), 'success');
     closeSkillEditor();
 }
 
@@ -721,33 +729,33 @@ async function _writeSkillToDir(skill, parentDirHandle) {
 
 async function exportSkillToFolder(skillId) {
     var skill = skills[skillId];
-    if (!skill) { showSnackbar('Skill not found', 'error'); return; }
+    if (!skill) { showSnackbar(t('Skill not found'), 'error'); return; }
     
     if (!window.showDirectoryPicker) {
-        showSnackbar('Your browser does not support folder export. Use Chrome or Edge.', 'error');
+        showSnackbar(t('Your browser does not support folder export. Use Chrome or Edge.'), 'error');
         return;
     }
     
     try {
         var dirHandle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'downloads' });
         await _writeSkillToDir(skill, dirHandle);
-        showSnackbar('Exported skill "' + (skill.name || skill.id) + '" to folder', 'success');
+        showSnackbar(t('Exported skill "{name}" to folder', { name: skill.name || skill.id }), 'success');
     } catch (err) {
-        if (err.name !== 'AbortError') showSnackbar('Export failed: ' + err.message, 'error');
+        if (err.name !== 'AbortError') showSnackbar(t('Export failed: {error}', { error: err.message }), 'error');
     }
 }
 
 async function exportSkillToJson(skillId) {
     var skill = skills[skillId];
-    if (!skill) { showSnackbar('Skill not found', 'error'); return; }
+    if (!skill) { showSnackbar(t('Skill not found'), 'error'); return; }
     try {
         var skillObj = await skillToJsonObject(skill);
         var bundle = { version: 1, type: 'skill', exportedAt: new Date().toISOString(), skill: skillObj };
         var filename = _skillFolderName(skill) + '.skill.json';
         downloadFile(filename, JSON.stringify(bundle, null, 2), 'application/json');
-        showSnackbar('Exported skill "' + (skill.name || skill.id) + '" as JSON', 'success');
+        showSnackbar(t('Exported skill "{name}" as JSON', { name: skill.name || skill.id }), 'success');
     } catch (err) {
-        showSnackbar('Export failed: ' + err.message, 'error');
+        showSnackbar(t('Export failed: {error}', { error: err.message }), 'error');
     }
 }
 
@@ -775,10 +783,10 @@ async function exportCurrentSkill() {
 
 async function exportAllSkillsToFolder() {
     var skillList = Object.values(skills);
-    if (skillList.length === 0) { showSnackbar('No skills to export', 'error'); return; }
+    if (skillList.length === 0) { showSnackbar(t('No skills to export'), 'error'); return; }
     
     if (!window.showDirectoryPicker) {
-        showSnackbar('Your browser does not support folder export. Use Chrome or Edge.', 'error');
+        showSnackbar(t('Your browser does not support folder export. Use Chrome or Edge.'), 'error');
         return;
     }
     
@@ -789,15 +797,15 @@ async function exportAllSkillsToFolder() {
             await _writeSkillToDir(skillList[i], dirHandle);
             exported++;
         }
-        showSnackbar('Exported ' + exported + ' skill(s) to folder', 'success');
+        showSnackbar(tn(exported, 'Exported {count} skill(s) to folder', 'Exported {count} skill(s) to folder'), 'success');
     } catch (err) {
-        if (err.name !== 'AbortError') showSnackbar('Export failed: ' + err.message, 'error');
+        if (err.name !== 'AbortError') showSnackbar(t('Export failed: {error}', { error: err.message }), 'error');
     }
 }
 
 async function exportAllSkillsToJson() {
     var skillList = Object.values(skills);
-    if (skillList.length === 0) { showSnackbar('No skills to export', 'error'); return; }
+    if (skillList.length === 0) { showSnackbar(t('No skills to export'), 'error'); return; }
     try {
         var skillObjs = [];
         for (var i = 0; i < skillList.length; i++) {
@@ -811,9 +819,9 @@ async function exportAllSkillsToJson() {
         };
         var filename = 'skills-' + new Date().toISOString().slice(0, 10) + '.json';
         downloadFile(filename, JSON.stringify(bundle, null, 2), 'application/json');
-        showSnackbar('Exported ' + skillObjs.length + ' skill(s) as JSON', 'success');
+        showSnackbar(tn(skillObjs.length, 'Exported {count} skill(s) as JSON', 'Exported {count} skill(s) as JSON'), 'success');
     } catch (err) {
-        showSnackbar('Export failed: ' + err.message, 'error');
+        showSnackbar(t('Export failed: {error}', { error: err.message }), 'error');
     }
 }
 
@@ -842,14 +850,15 @@ async function _confirmSkillImportOverwrite(ids) {
         if (!id || seen[id] || !skills[id]) return;
         seen[id] = true;
         items.push('<li><code>' + escapeHtml(id) + '</code>' + (activeSkills[id]
-            ? ' <strong>(active: will be reverted and re-applied on ServiceNow)</strong>' : '') + '</li>');
+            ? ' <strong>' + escapeHtml(t('(active: will be reverted and re-applied on ServiceNow)')) + '</strong>' : '') + '</li>');
     });
     if (!items.length) return true;
     hideOverlaySpinner();
-    var ok = await showConfirmModal('Overwrite existing skills?', items.length + ' skill(s) already exist. ' +
-        'Importing replaces their content and actions and deletes their assets that are not in the import:' +
-        '<ul>' + items.join('') + '</ul>This cannot be undone.', 'warning');
-    if (ok) showOverlaySpinner('Importing skills...');
+    var ok = await showConfirmModal(t('Overwrite existing skills?'),
+        escapeHtml(tn(items.length, '{count} skill(s) already exist.', '{count} skill(s) already exist.')) + ' ' +
+        escapeHtml(t('Importing replaces their content and actions and deletes their assets that are not in the import:')) +
+        '<ul>' + items.join('') + '</ul>' + escapeHtml(t('This cannot be undone.')), 'warning');
+    if (ok) showOverlaySpinner(t('Importing skills...'));
     return ok;
 }
 
@@ -903,10 +912,10 @@ async function _cycleImportedSkillActivation(id) {
     var problems = [];
     try {
         var dres = await deactivateSkill(id);
-        if (dres && dres.success === false) problems.push(dres.error || 'deactivation failed');
+        if (dres && dres.success === false) problems.push(dres.error || t('deactivation failed'));
         else if (dres && /with errors/i.test(dres.message || '')) problems.push(dres.message);
         var res = await activateSkill(id);
-        if (res && res.success === false) problems.push(res.error || 'activation failed');
+        if (res && res.success === false) problems.push(res.error || t('activation failed'));
     } catch (e) {
         problems.push((e && e.message) || String(e));
     }
@@ -915,13 +924,13 @@ async function _cycleImportedSkillActivation(id) {
 
 async function importSkillsFromFolder() {
     if (!window.showDirectoryPicker) {
-        showSnackbar('Your browser does not support folder import. Use Chrome or Edge.', 'error');
+        showSnackbar(t('Your browser does not support folder import. Use Chrome or Edge.'), 'error');
         return;
     }
     
     try {
         var dirHandle = await window.showDirectoryPicker({ mode: 'read', startIn: 'downloads' });
-        showOverlaySpinner('Importing skills...');
+        showOverlaySpinner(t('Importing skills...'));
         var imported = 0;
         var updated = 0;
         var errors = []; // S0B-08: real per-folder failures are collected and shown, never swallowed
@@ -974,7 +983,7 @@ async function importSkillsFromFolder() {
         }
         
         if (!(await _confirmSkillImportOverwrite(found.map(function(c) { return c.manifest.id; })))) {
-            showSnackbar('Import cancelled', 'info'); // nothing written, no remote call
+            showSnackbar(t('Import cancelled'), 'info'); // nothing written, no remote call
             return;
         }
         for (var c = 0; c < found.length; c++) {
@@ -987,19 +996,20 @@ async function importSkillsFromFolder() {
         
         hideOverlaySpinner();
         if (imported === 0) {
-            showSnackbar(errors.length ? 'Import failed: ' + errors.join('; ')
-                : 'No valid skills found. Folder should contain SKILL.md or subfolders with SKILL.md', 'error');
+            showSnackbar(errors.length ? t('Import failed: {error}', { error: errors.join('; ') })
+                : t('No valid skills found. Folder should contain SKILL.md or subfolders with SKILL.md'), 'error');
         } else {
             renderSkillsList();
-            var msg = 'Imported ' + imported + ' skill(s)';
-            if (updated > 0) msg += ' (' + updated + ' updated)';
-            if (errors.length) msg += ' — ' + errors.length + ' failed: ' + errors.join('; ');
-            if (activationErrors.length) msg += ' — re-activation issues: ' + activationErrors.join('; ');
+            var msg = updated > 0
+                ? tn(imported, 'Imported {count} skill(s) ({updated} updated)', 'Imported {count} skill(s) ({updated} updated)', { updated: i18nFormatNumber(updated) })
+                : tn(imported, 'Imported {count} skill(s)', 'Imported {count} skill(s)');
+            if (errors.length) msg += ' — ' + tn(errors.length, '{count} failed: {errors}', '{count} failed: {errors}', { errors: errors.join('; ') });
+            if (activationErrors.length) msg += ' — ' + t('re-activation issues: {issues}', { issues: activationErrors.join('; ') });
             showSnackbar(msg, (errors.length || activationErrors.length) ? 'warning' : 'success');
         }
     } catch (err) {
         hideOverlaySpinner();
-        if (err.name !== 'AbortError') showSnackbar('Import failed: ' + err.message, 'error');
+        if (err.name !== 'AbortError') showSnackbar(t('Import failed: {error}', { error: err.message }), 'error');
     }
 }
 
@@ -1070,7 +1080,7 @@ async function importSkillsFromJsonFile() {
     input.onchange = async function(e) {
         var files = e.target.files;
         if (!files || !files.length) return;
-        showOverlaySpinner('Importing skills...');
+        showOverlaySpinner(t('Importing skills...'));
         var imported = 0;
         var updated = 0;
         var errors = [];
@@ -1127,19 +1137,19 @@ async function importSkillsFromJsonFile() {
         } finally {
             hideOverlaySpinner();
         }
-        if (cancelled) { showSnackbar('Import cancelled', 'info'); return; } // nothing written, no remote call
+        if (cancelled) { showSnackbar(t('Import cancelled'), 'info'); return; } // nothing written, no remote call
         
         var msg;
         if (imported === 0) {
-            msg = 'No valid skills found in JSON';
-            if (errors.length) msg += ' (' + errors[0] + ')';
+            msg = errors.length ? t('No valid skills found in JSON ({error})', { error: errors[0] }) : t('No valid skills found in JSON');
             showSnackbar(msg, 'error');
         } else {
             renderSkillsList();
-            msg = 'Imported ' + imported + ' skill(s)';
-            if (updated > 0) msg += ' (' + updated + ' updated)';
-            if (errors.length) msg += ' — ' + errors.length + ' file(s) failed: ' + errors.join('; ');
-            if (activationErrors.length) msg += ' — re-activation issues: ' + activationErrors.join('; ');
+            msg = updated > 0
+                ? tn(imported, 'Imported {count} skill(s) ({updated} updated)', 'Imported {count} skill(s) ({updated} updated)', { updated: i18nFormatNumber(updated) })
+                : tn(imported, 'Imported {count} skill(s)', 'Imported {count} skill(s)');
+            if (errors.length) msg += ' — ' + tn(errors.length, '{count} file(s) failed: {errors}', '{count} file(s) failed: {errors}', { errors: errors.join('; ') });
+            if (activationErrors.length) msg += ' — ' + t('re-activation issues: {issues}', { issues: activationErrors.join('; ') });
             showSnackbar(msg, (errors.length || activationErrors.length) ? 'warning' : 'success');
         }
     };
@@ -1234,7 +1244,7 @@ function renderSkillActionsEditor() {
     if (!list) return;
     var actions = getSkillActionsDraft();
     if (!actions.length) {
-        list.innerHTML = '<div class="skill-actions-empty">No actions yet. Click + to add a button.</div>';
+        list.innerHTML = '<div class="skill-actions-empty">' + escapeHtml(t('No actions yet. Click + to add a button.')) + '</div>';
         return;
     }
     list.innerHTML = actions.map(function(a, i) { return renderSkillActionRow(a, i); }).join('');
@@ -1242,9 +1252,9 @@ function renderSkillActionsEditor() {
 
 // Placement metadata — label + representative mini-icon for radio buttons
 var ACTION_PLACEMENT_META = {
-    home:       { label: 'Home',       icon: 'widget' },
-    chat:       { label: 'Chat',       icon: 'send' },
-    sidebar:    { label: 'Sidebar',    icon: 'panelLeftOpen' }
+    home:       { label: N_('Home'),       icon: 'widget' },
+    chat:       { label: N_('Chat'),       icon: 'send' },
+    sidebar:    { label: N_('Sidebar'),    icon: 'panelLeftOpen' }
 };
 
 function renderSkillActionRow(action, index) {
@@ -1253,24 +1263,25 @@ function renderSkillActionRow(action, index) {
     var placementBtns = ACTION_PLACEMENTS.map(function(p) {
         var meta = ACTION_PLACEMENT_META[p] || { label: p, icon: 'play' };
         var iconHtml = UI_ICONS[meta.icon] || '';
+        var label = escapeHtml(t(meta.label));
         var sel = showList.indexOf(p) >= 0 ? ' selected' : '';
         return '<button type="button" class="skill-action-place-btn' + sel + '" data-placement="' + p + '" ' +
             'onclick="toggleSkillActionPlacement(' + index + ',\'' + p + '\')" ' +
-            'title="' + meta.label + '" aria-pressed="' + (sel ? 'true' : 'false') + '">' +
+            'title="' + label + '" aria-pressed="' + (sel ? 'true' : 'false') + '">' +
             '<span class="skill-action-place-icon" aria-hidden="true">' + iconHtml + '</span>' +
-            '<span class="skill-action-place-label">' + meta.label + '</span>' +
+            '<span class="skill-action-place-label">' + label + '</span>' +
             '</button>';
     }).join('');
     // Single-row layout: icon btn | name | placement pills | remove btn
     return '' +
         '<div class="skill-action-row" data-action-index="' + index + '">' +
-            '<button type="button" class="skill-action-icon-btn" title="Choose icon" aria-label="Choose icon" onclick="openIconPicker(' + index + ')">' +
+            '<button type="button" class="skill-action-icon-btn" title="' + escapeHtml(t('Choose icon')) + '" aria-label="' + escapeHtml(t('Choose icon')) + '" onclick="openIconPicker(' + index + ')">' +
                 '<span class="skill-action-preview" aria-hidden="true">' + iconSvg + '</span>' +
             '</button>' +
             '<input type="hidden" class="skill-action-icon" value="' + escapeHtml(action.icon || 'play') + '" />' +
-            '<input type="text" class="skill-action-name" value="' + escapeHtml(action.name || '') + '" placeholder="Button label" maxlength="48" oninput="onSkillActionFieldChange(' + index + ')" />' +
-            '<div class="skill-action-placement" role="group" aria-label="Placements (multi-select)">' + placementBtns + '</div>' +
-            '<button type="button" class="skill-action-remove" title="Remove" aria-label="Remove action" onclick="removeSkillAction(' + index + ')">' + UI_ICONS.close + '</button>' +
+            '<input type="text" class="skill-action-name" value="' + escapeHtml(action.name || '') + '" placeholder="' + escapeHtml(t('Button label')) + '" maxlength="48" oninput="onSkillActionFieldChange(' + index + ')" />' +
+            '<div class="skill-action-placement" role="group" aria-label="' + escapeHtml(t('Placements (multi-select)')) + '">' + placementBtns + '</div>' +
+            '<button type="button" class="skill-action-remove" title="' + escapeHtml(t('Remove')) + '" aria-label="' + escapeHtml(t('Remove action')) + '" onclick="removeSkillAction(' + index + ')">' + UI_ICONS.close + '</button>' +
         '</div>';
 }
 
@@ -1324,8 +1335,8 @@ function openIconPicker(index) {
     }).join('');
     var html = '<div class="modal-backdrop icon-picker-backdrop" onclick="closeIconPicker(event)">' +
         '<div class="modal icon-picker-modal" onclick="event.stopPropagation()">' +
-            '<div class="modal-header"><span class="modal-title-text">Choose icon</span>' +
-                '<button class="modal-close-icon" onclick="closeIconPicker()" aria-label="Close">' + UI_ICONS.close + '</button>' +
+            '<div class="modal-header"><span class="modal-title-text">' + escapeHtml(t('Choose icon')) + '</span>' +
+                '<button class="modal-close-icon" onclick="closeIconPicker()" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
             '</div>' +
             '<div class="icon-picker-grid">' + gridHtml + '</div>' +
         '</div>' +
@@ -1383,12 +1394,12 @@ function collectSkillActionsFromEditor() {
 }
 
 function addSkillAction() {
-    if (!currentEditingSkill) { showSnackbar('Save the skill first', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (!currentEditingSkill) { showSnackbar(t('Save the skill first'), 'error', undefined, { key: 'skill-editor' }); return; }
     var skill = skills[currentEditingSkill];
     if (!skill) return;
     var actions = collectSkillActionsFromEditor();
     _skillActionsDraft = { skillId: currentEditingSkill, actions: actions };
-    if (actions.length >= 8) { showSnackbar('Max 8 actions per skill', 'error', undefined, { key: 'skill-editor' }); return; }
+    if (actions.length >= 8) { showSnackbar(t('Max 8 actions per skill'), 'error', undefined, { key: 'skill-editor' }); return; }
     actions.push({ name: 'New Action', icon: 'play', show: ['home'] });
     renderSkillActionsEditor();
 }

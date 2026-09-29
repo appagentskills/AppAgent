@@ -5,7 +5,7 @@
 /* ─── Document Container (full width in chat) ─── */
 .sdoc { background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); overflow: hidden; margin: var(--space-6) 0; width: 100%; }
 /* Documents in chat: remove assistant margin-right constraint so doc takes full width */
-.message.assistant .message-content:has(.sdoc) { margin-right: 0; }
+.message.assistant .message-content:has(.sdoc) { margin-inline-end: 0; }
 
 /* ─── Header ─── */
 .sdoc-header { display: flex; align-items: center; justify-content: space-between; padding: var(--space-4) var(--space-6); background: var(--bg-secondary); border-bottom: 1px solid var(--secondary-border); gap: var(--space-4); flex-wrap: wrap; }
@@ -62,7 +62,7 @@
 .sdoc-prompts { border-top: 1px solid var(--secondary-border); padding: var(--space-6) var(--space-7); }
 .sdoc-prompts-title { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--space-5); }
 .sdoc-prompt-item { background: var(--bg-secondary); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); padding: var(--space-6); margin-bottom: var(--space-4); }
-.sdoc-prompt-item.answered { border-left: 3px solid var(--success); }
+.sdoc-prompt-item.answered { border-inline-start: 3px solid var(--success); }
 .sdoc-prompt-item-title { font-weight: var(--font-semibold); color: var(--text-primary); margin-bottom: var(--space-3); }
 /* Prompt description renders MARKDOWN (formatContent) inside a .markdown-body
    container — block rules (paragraph margins, lists, blockquotes) come from

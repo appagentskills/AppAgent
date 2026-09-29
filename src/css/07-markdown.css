@@ -27,9 +27,9 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .id-mention { display: inline; margin: 0 0.25em; padding: var(--space-1) var(--space-3); background: var(--bg-hover); color: var(--text-heading); border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.85em; cursor: pointer; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast); }
 .id-mention:hover { text-decoration: underline; }
 /* Per-type accent so a widget chip and a document chip are distinguishable. */
-.id-mention-widget { border-left: 2px solid var(--accent); }
+.id-mention-widget { border-inline-start: 2px solid var(--accent); }
 .id-mention-widget:hover { background: var(--accent-lighter); border-color: var(--accent); color: var(--accent-hover); }
-.id-mention-doc { border-left: 2px solid var(--primary); }
+.id-mention-doc { border-inline-start: 2px solid var(--primary); }
 .id-mention-doc:hover { background: var(--primary-lighter); border-color: var(--primary); color: var(--primary); }
 .message-content { line-height: var(--leading-loose); }
 .message-content h2 { font-size: 1.25em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }
@@ -52,12 +52,12 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .markdown-body .md-paragraph:last-child { margin-bottom: 0; }
 .message-content .md-paragraph + .md-table { margin-top: var(--space-1); }
 .message-content .md-table + .md-paragraph { margin-top: var(--space-1); }
-.message-content ul, .message-content ol { margin: var(--space-2) 0; padding-left: var(--space-10); list-style-position: outside; }
+.message-content ul, .message-content ol { margin: var(--space-2) 0; padding-inline-start: var(--space-10); list-style-position: outside; }
 .message-content li { margin: 0; padding: 0; line-height: var(--leading-normal); }
 /* Generic list indent for any markdown-rendered container (popovers, action update outputs, etc.).
    Needed because the universal `* { padding: 0 }` reset in 01-dark-theme.css zeros browser default
    ul/ol padding — without this, bullets fall outside the container and get clipped. */
-.markdown-body ul, .markdown-body ol { margin: var(--space-2) 0; padding-left: var(--space-10); list-style-position: outside; }
+.markdown-body ul, .markdown-body ol { margin: var(--space-2) 0; padding-inline-start: var(--space-10); list-style-position: outside; }
 .markdown-body li { margin: 0; padding: 0; line-height: var(--leading-normal); }
 
 /* JSON formatting styles */
@@ -66,14 +66,14 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .json-num { color: var(--sh-keyword); }
 .json-bool { color: var(--sh-bool); }
 .json-null { color: var(--text-muted); font-style: italic; }
-.json-collapse { display: inline-block; width: 14px; height: 14px; line-height: 12px; text-align: center; background: var(--bg-hover); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-sm); font-weight: bold; color: var(--text-secondary); margin-right: var(--space-1); user-select: none; vertical-align: middle; }
+.json-collapse { display: inline-block; width: 14px; height: 14px; line-height: 12px; text-align: center; background: var(--bg-hover); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-sm); font-weight: bold; color: var(--text-secondary); margin-inline-end: var(--space-1); user-select: none; vertical-align: middle; }
 .json-collapse:hover { background: var(--border); color: var(--text-primary); }
 .json-preview { color: var(--text-muted); font-style: italic; font-size: 0.9em; }
 .json-collapsible, .json-collapsed { }
 .md-table { border-collapse: separate; border-spacing: 0; margin: var(--space-1) 0; width: auto; max-width: 100%; display: table; border: 1px solid var(--border-dark); border-radius: var(--radius-md); }
 .message-content .md-table:first-child { margin-top: 0; }
-.md-table td, .md-table th { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: var(--space-5) var(--space-7); text-align: left; }
-.md-table td:last-child, .md-table th:last-child { border-right: none; }
+.md-table td, .md-table th { border-bottom: 1px solid var(--border); border-inline-end: 1px solid var(--border); padding: var(--space-5) var(--space-7); text-align: start; }
+.md-table td:last-child, .md-table th:last-child { border-inline-end: none; }
 .md-table tr:last-child td { border-bottom: none; }
 .md-table tr:nth-child(even) { background: var(--bg-light); }
 .md-table th, .md-table tbody:first-child tr:first-child td { font-weight: var(--font-semibold); background: var(--bg-code); color: var(--text-primary); }
@@ -84,7 +84,7 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .markdown-body .md-blockquote {
     margin: var(--space-4) 0;
     padding: var(--space-1) var(--space-6);
-    border-left: 3px solid var(--border-dark);
+    border-inline-start: 3px solid var(--border-dark);
     color: var(--text-secondary);
     background: var(--bg-light);
     border-radius: var(--radius-sm);

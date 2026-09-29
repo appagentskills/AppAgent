@@ -162,7 +162,7 @@ AgentEvents.on('runStarted', function(e) {
 });
 
 AgentEvents.on('turnStarted', function(e) {
-    showSpinner('Waiting for response...', e.chatId, { phase: 'thinking' });
+    showSpinner(t('Waiting for response...'), e.chatId, { phase: 'thinking' });
 });
 
 AgentEvents.on('assistantMessageStarted', function(e) {
@@ -281,7 +281,7 @@ AgentEvents.on('toolCallStarted', function(e) {
     // fresh assistantMessage event in this panel's lifetime (SW restart /
     // pending-tool resume in 030-agent-loop.js).
     _flushFinalizedStreamingText(e.chatId);
-    showSpinner('Executing ' + e.displayName + '...', e.chatId, { phase: 'tool', tool: e.name });
+    showSpinner(t('Executing {tool}...', { tool: t(String(e.displayName)) }), e.chatId, { phase: 'tool', tool: e.name });
 });
 
 AgentEvents.on('toolCallResult', function(e) {
@@ -366,7 +366,7 @@ AgentEvents.on('paused', function(e) {
         var _isSubAgentChat = !!(_subChat && _subChat.isSubAgent);
         // A stopped action chat shows no Resume (app/020 _isStoppedActionChat): no snackbar either.
         if (!_isSubAgentChat && !(typeof _isStoppedActionChat === 'function' && _isStoppedActionChat(e.chatId, _subChat))) {
-            showSnackbar('Agent paused. Click Resume to continue.');
+            showSnackbar(t('Agent paused. Click Resume to continue.'));
         }
         // (Scroll-follow intent is tracked continuously by handleChatScroll —
         // see 050-streaming.js — nothing to derive here.)
@@ -492,10 +492,10 @@ AgentEvents.on('llmTransportStatus', function(e) {
                     setInline(doneText, 15000);
                     return;
                 }
-                var t = withRemaining();
+                var _cdText = withRemaining();
                 var msgEl2 = ours();
-                if (msgEl2) msgEl2.textContent = t;
-                setInline(t, e.waitMs + 15000);
+                if (msgEl2) msgEl2.textContent = _cdText;
+                setInline(_cdText, e.waitMs + 15000);
             }, 1000);
             if (_tChat) _transportCountdownTimers[_tChat] = _tTimer;
         } else {
@@ -545,7 +545,7 @@ AgentEvents.on('error', function(e) {
             // focused-but-errored chat and back. Without this a focused-origin error
             // has no persistent home and the re-derive reads undefined.
             if (chat && typeof dispatchChatMeta === 'function') dispatchChatMeta(e.chatId, { _lastApiError: lastApiError }); // FLUX-4C lane
-            showSnackbar('API Error: ' + msg, 'error');
+            showSnackbar(t('API Error: {message}', { message: msg }), 'error');
             // CHAT-CONTROLS SSOT: the run is usually still active here, so the
             // derive keeps Pause; Retry is painted by the runFinished derive.
             if (typeof syncChatControlsUI === 'function') syncChatControlsUI(e.chatId);
@@ -686,7 +686,7 @@ AgentEvents.on('runFinished', function(e) {
             if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);
             // A stopped action chat derives 'none' (no Resume to click): no snackbar either.
             if (!_fIsSub && !(typeof _isStoppedActionChat === 'function' && _isStoppedActionChat(chatId, _fchat))) {
-                showSnackbar('Agent paused. Click Resume to continue.');
+                showSnackbar(t('Agent paused. Click Resume to continue.'));
             }
         }
     } else {
@@ -742,7 +742,7 @@ AgentEvents.on('runCrashed', function(e) {
         if (_crAct.state === 'running' && !_crPaused) {
             _crAct.state = 'error';
             _crAct.icon = 'alert';
-            if (!_crAct.label || _crAct.label === 'Starting…') _crAct.label = 'Crashed';
+            if (!_crAct.label || _crAct.label === 'Starting…') _crAct.label = N_('Crashed');
             if (!_crAct.output) _crAct.output = 'The run crashed with an uncaught error before reporting a result. Open the chat for details.';
             _crAct.updatedAt = Date.now();
             if (typeof persistActionState === 'function') { try { persistActionState(chats[e.chatId].actionId); } catch (err) {} }
@@ -794,9 +794,9 @@ AgentEvents.on('notifyFinish', function(e) {
     var nc = chats[chatId];
     if (nc && nc.isSubAgent) return;
     if (!e.isPaused && !e.wasSilentHook && (awayNow || wasHidden)) {
-        var title = nc && nc.title ? nc.title : 'Chat';
+        var title = nc && nc.title ? (nc.title === 'New Chat' ? t('New Chat') : nc.title) : t('Chat');
         Platform.sendNotification({
-            title: e.hasError ? 'Agent stopped — error' : 'Agent finished',
+            title: e.hasError ? t('Agent stopped — error') : t('Agent finished'),
             message: title,
             chatId: chatId
         });
@@ -849,7 +849,7 @@ function _showParkedToolMessage(chatId, toolCallId, name) {
         role: 'parked_tool',
         toolCallId: toolCallId,
         name: name,
-        content: '📌 Tool waiting for a panel — auto-resumes when you open one.',
+        content: t('📌 Tool waiting for a panel — auto-resumes when you open one.'),
         timestamp: Date.now()
     });
     if (chatId === currentChatId) renderMessages();

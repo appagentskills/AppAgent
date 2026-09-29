@@ -63,6 +63,52 @@ async function getRecordVersion(table, sysId) {
     return null;
 }
 
+// ---- maint detection (single source of truth: page + SW; used by
+// background.js snGetInstancesDetailed, platform-bridge _ensureActiveRoles,
+// tools/020 _rsCheckAdmin + list_instances). The `maint` login is not a
+// sys_user and has no roles, yet has MORE access than admin.
+// snMaintEligible: probe ONLY when the roles probe SUCCEEDED with 0 roles and
+// no user name is known (or it is literally 'maint') — users with roles, a
+// known name, or a failed roles probe never trigger a request.
+// snDetectMaint: ONE request to an admin-only-OOB table (sys_properties read
+// ACL requires admin; user_admin/ESS get 403 or ACL-filtered 0 rows): maint iff
+// HTTP 200 with >= 1 row. 401/403/empty/error body/network => false.
+// Cached per instance URL + session token (a token/user switch re-probes);
+// network errors are not cached.
+var SN_MAINT_PROBE_PATH = '/api/now/table/sys_properties?sysparm_limit=1&sysparm_fields=sys_id';
+var _snMaintCache = {};
+function snMaintEligible(roles, rolesProbeOk, userName) {
+    return !!rolesProbeOk && Array.isArray(roles) && roles.length === 0 && (!userName || userName === 'maint');
+}
+function _snMaintKey(instanceUrl, token) {
+    return String(instanceUrl || '').replace(/\/+$/, '') + '|' + String(token || '');
+}
+function snMaintCached(instanceUrl, token) {
+    var k = _snMaintKey(instanceUrl, token);
+    return Object.prototype.hasOwnProperty.call(_snMaintCache, k) ? _snMaintCache[k] : undefined;
+}
+async function snDetectMaint(instanceUrl, token, fetchFn) {
+    var k = _snMaintKey(instanceUrl, token);
+    if (Object.prototype.hasOwnProperty.call(_snMaintCache, k)) return _snMaintCache[k];
+    var f = fetchFn || function(u, o) { return fetch(u, o); };
+    var res;
+    try {
+        res = await f(String(instanceUrl || '').replace(/\/+$/, '') + SN_MAINT_PROBE_PATH, {
+            method: 'GET', credentials: 'include',
+            headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
+        });
+    } catch (e) { return false; } // transient: not cached
+    var ok = false;
+    try {
+        if (res && res.ok) {
+            var data = await res.json();
+            ok = !!(data && Array.isArray(data.result) && data.result.length >= 1);
+        }
+    } catch (e2) { ok = false; }
+    _snMaintCache[k] = ok;
+    return ok;
+}
+
 async function getRecordDisplayValue(table, sysId) {
     if (!sysId || !_recValidTable.test(table) || !_recValidSysId.test(sysId)) {
         return sysId ? sysId.substring(0, 8) : '';

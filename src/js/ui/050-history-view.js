@@ -47,6 +47,8 @@ function renderHistoryPage() {
     var layoutSlot = document.getElementById('history-layout-toggle');
     if (layoutSlot && typeof pageLayoutToggleHtml === 'function' && !layoutSlot.firstChild) {
         layoutSlot.innerHTML = pageLayoutToggleHtml('historySetPageLayout');
+    } else if (layoutSlot && typeof pageLayoutRelabel === 'function') {
+        pageLayoutRelabel(layoutSlot); // language switch: relabel in place
     }
     var historyLayout = typeof pageLayoutGet === 'function' ? pageLayoutGet(HISTORY_PAGE_LAYOUT_KEY) : 'rows';
     if (typeof pageLayoutSyncButtons === 'function') pageLayoutSyncButtons(layoutSlot, historyLayout);
@@ -93,11 +95,11 @@ function renderHistoryPage() {
     // Update stats
     if (historyStats) {
         if (isSearching) {
-            historyStats.innerHTML = '<strong>' + filteredCount + '</strong> result' + (filteredCount !== 1 ? 's' : '') + ' for "' + escapeHtml(q) + '"';
+            historyStats.innerHTML = tn(filteredCount, '<strong>{count}</strong> result for "{query}"', '<strong>{count}</strong> results for "{query}"', { query: escapeHtml(q) });
         } else {
-            var statsHtml = '<strong>' + totalChats + '</strong> conversation' + (totalChats !== 1 ? 's' : '');
-            if (pinnedCount > 0) statsHtml += ' · <strong>' + pinnedCount + '</strong> pinned';
-            if (totalCost > 0) statsHtml += ' · Total cost: <strong>$' + totalCost.toFixed(2) + '</strong>';
+            var statsHtml = tn(totalChats, '<strong>{count}</strong> conversation', '<strong>{count}</strong> conversations');
+            if (pinnedCount > 0) statsHtml += ' · ' + tn(pinnedCount, '<strong>{count}</strong> pinned', '<strong>{count}</strong> pinned');
+            if (totalCost > 0) statsHtml += ' · ' + t('Total cost: <strong>{cost}</strong>', { cost: '$' + totalCost.toFixed(2) });
             historyStats.innerHTML = statsHtml;
         }
     }
@@ -105,8 +107,8 @@ function renderHistoryPage() {
     if (totalChats === 0 && !q) {
         historyList.innerHTML = '<div class="history-empty">' +
             '<div class="history-empty-icon">' + UI_ICONS.chat + '</div>' +
-            '<div class="history-empty-title">No conversations yet</div>' +
-            '<div class="history-empty-text">Start a new chat to begin</div>' +
+            '<div class="history-empty-title">' + escapeHtml(t('No conversations yet')) + '</div>' +
+            '<div class="history-empty-text">' + escapeHtml(t('Start a new chat to begin')) + '</div>' +
             '</div>';
         return;
     }
@@ -114,8 +116,8 @@ function renderHistoryPage() {
     if (filteredCount === 0 && isSearching) {
         historyList.innerHTML = '<div class="history-empty">' +
             '<div class="history-empty-icon">' + UI_ICONS.search + '</div>' +
-            '<div class="history-empty-title">No matching chats</div>' +
-            '<div class="history-empty-text">Try a different search term</div>' +
+            '<div class="history-empty-title">' + escapeHtml(t('No matching chats')) + '</div>' +
+            '<div class="history-empty-text">' + escapeHtml(t('Try a different search term')) + '</div>' +
             '</div>';
         return;
     }
@@ -152,7 +154,7 @@ function getChatStats(chatId) {
     
     // Get widgets from chat.widgets (persisted) or getWidgetsForChat
     var widgetList = getWidgetsForChat(chatId);
-    stats.widgetNames = widgetList.map(function(w) { return w.title || w.name || 'Widget'; });
+    stats.widgetNames = widgetList.map(function(w) { return w.title || w.name || t('Widget'); });
     
     // Check if any widget from this chat is on dashboard
     Object.keys(dashboardWidgets || {}).forEach(function(dwId) {
@@ -202,7 +204,8 @@ function renderHistoryChatCard(chatId) {
     var chat = chats[chatId];
     if (!chat) return '';
     
-    var title = chat.title || 'Untitled Chat';
+    // 'New Chat' is the stored English marker; translate it only for display.
+    var title = chat.title ? (chat.title === 'New Chat' ? t('New Chat') : chat.title) : t('Untitled Chat');
     var preview = getHistoryChatPreview(chat);
     var messageCount = chat.messages ? chat.messages.length : 0;
     var dateStr = formatHistoryDate(chatActivityTs(chat));
@@ -212,8 +215,8 @@ function renderHistoryChatCard(chatId) {
     
     // Badges
     var badgesHtml = '';
-    if (chat.pinned) badgesHtml += '<span class="history-chat-badge pinned">' + UI_ICONS.pinFilled + 'Pinned</span>';
-    if (stats.hasDashboardWidget) badgesHtml += '<span class="history-chat-badge dashboard">' + UI_ICONS.widget + 'Dashboard</span>';
+    if (chat.pinned) badgesHtml += '<span class="history-chat-badge pinned">' + UI_ICONS.pinFilled + escapeHtml(t('Pinned')) + '</span>';
+    if (stats.hasDashboardWidget) badgesHtml += '<span class="history-chat-badge dashboard">' + UI_ICONS.widget + escapeHtml(t('Dashboard')) + '</span>';
     // Sub-agent badge — history cards previously rendered sub-agent transcripts
     // identically to top-level chats, so a user scanning the history page could
     // not tell at a glance which chats were delegated workers vs. real
@@ -221,21 +224,21 @@ function renderHistoryChatCard(chatId) {
     // `renderSubAgentBreadcrumb` for a while; this brings the history view to
     // parity. `chat.isSubAgent` is stamped at sub-agent chat creation in
     // 097-sub-agent-registry.js.
-    if (chat.isSubAgent) badgesHtml += '<span class="history-chat-badge subagent" title="Delegated worker chat">' + UI_ICONS.bot + 'Sub-agent</span>';
+    if (chat.isSubAgent) badgesHtml += '<span class="history-chat-badge subagent" title="' + escapeHtml(t('Delegated worker chat')) + '">' + UI_ICONS.bot + escapeHtml(t('Sub-agent')) + '</span>';
     
     // Action buttons - pin button is bold when pinned
     var pinBtnClass = chat.pinned ? 'history-chat-action-btn pinned' : 'history-chat-action-btn';
     var actionsHtml = '<div class="history-chat-actions">' +
-        '<button class="history-chat-action-btn" onclick="event.stopPropagation(); openRenameModal(\'' + chatId + '\')" title="Rename">' + UI_ICONS.edit + '</button>' +
-        '<button class="' + pinBtnClass + '" onclick="event.stopPropagation(); togglePinChat(\'' + chatId + '\'); renderHistoryPage();" title="' + (chat.pinned ? 'Unpin' : 'Pin') + '">' + (chat.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>' +
-        '<button class="history-chat-action-btn" onclick="event.stopPropagation(); exportChatFromHistory(\'' + chatId + '\')" title="Export">' + UI_ICONS.download + '</button>' +
-        '<button class="history-chat-action-btn danger" onclick="event.stopPropagation(); deleteChat(\'' + chatId + '\', event)" title="Delete">' + UI_ICONS.trash + '</button>' +
+        '<button class="history-chat-action-btn" onclick="event.stopPropagation(); openRenameModal(\'' + chatId + '\')" title="' + escapeHtml(t('Rename')) + '">' + UI_ICONS.edit + '</button>' +
+        '<button class="' + pinBtnClass + '" onclick="event.stopPropagation(); togglePinChat(\'' + chatId + '\'); renderHistoryPage();" title="' + escapeHtml(chat.pinned ? t('Unpin') : t('Pin')) + '">' + (chat.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>' +
+        '<button class="history-chat-action-btn" onclick="event.stopPropagation(); exportChatFromHistory(\'' + chatId + '\')" title="' + escapeHtml(t('Export')) + '">' + UI_ICONS.download + '</button>' +
+        '<button class="history-chat-action-btn danger" onclick="event.stopPropagation(); deleteChat(\'' + chatId + '\', event)" title="' + escapeHtml(t('Delete')) + '">' + UI_ICONS.trash + '</button>' +
         '</div>';
     
     // Stats row with message count and tools
     var statsHtml = '<div class="history-chat-stats">';
-    statsHtml += '<span class="history-chat-stat">' + UI_ICONS.chat + messageCount + ' msg</span>';
-    if (stats.toolCalls > 0) statsHtml += '<span class="history-chat-stat">' + UI_ICONS.tool + stats.toolCalls + ' tools</span>';
+    statsHtml += '<span class="history-chat-stat">' + UI_ICONS.chat + escapeHtml(tn(messageCount, '{count} msg', '{count} msg')) + '</span>';
+    if (stats.toolCalls > 0) statsHtml += '<span class="history-chat-stat">' + UI_ICONS.tool + escapeHtml(tn(stats.toolCalls, '{count} tool', '{count} tools')) + '</span>';
     // Widget tags inline
     stats.widgetNames.slice(0, 3).forEach(function(name) {
         statsHtml += '<span class="history-chat-stat widgets">' + UI_ICONS.widget + escapeHtml(name) + '</span>';
@@ -252,17 +255,17 @@ function renderHistoryChatCard(chatId) {
     // Preview with user message and Agent answer
     var previewHtml = '<div class="history-chat-preview-area">';
     if (preview.user) {
-        previewHtml += '<div class="history-preview-msg user"><span class="history-preview-label">' + UI_ICONS.user + 'You:</span><span class="history-preview-text">' + escapeHtml(preview.user) + '</span></div>';
+        previewHtml += '<div class="history-preview-msg user"><span class="history-preview-label">' + UI_ICONS.user + escapeHtml(t('You:')) + '</span><span class="history-preview-text">' + escapeHtml(preview.user) + '</span></div>';
     }
     if (preview.assistant) {
-        previewHtml += '<div class="history-preview-msg assistant"><span class="history-preview-label">' + UI_ICONS.bot + 'Agent:</span><span class="history-preview-text">' + escapeHtml(preview.assistant) + '</span></div>';
+        previewHtml += '<div class="history-preview-msg assistant"><span class="history-preview-label">' + UI_ICONS.bot + escapeHtml(t('Agent:')) + '</span><span class="history-preview-text">' + escapeHtml(preview.assistant) + '</span></div>';
     }
     previewHtml += '</div>';
     
     // Meta row with date, context, cost, then model (inside card at bottom)
     var metaHtml = '<div class="history-chat-meta">';
-    metaHtml += '<span>' + UI_ICONS.clock + dateStr + '</span>';
-    if (contextLength > 0) metaHtml += '<span>' + formatContextLength(contextLength) + '</span>';
+    metaHtml += '<span>' + UI_ICONS.clock + escapeHtml(dateStr) + '</span>';
+    if (contextLength > 0) metaHtml += '<span>' + escapeHtml(formatContextLength(contextLength)) + '</span>';
     if (stats.cost > 0) {
         var costStr = stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2);
         metaHtml += '<span class="history-meta-cost">' + UI_ICONS.money + '$' + costStr + '</span>';
@@ -282,7 +285,7 @@ function renderHistoryChatCard(chatId) {
     // The WHOLE card is the click target (it already hover-highlights as one
     // clickable unit) — openChatCardFromHistory guards against clicks on inner
     // interactive controls (action buttons, breadcrumb links).
-    return '<div class="history-chat-card' + (isActive ? ' active' : '') + subAgentCardClass + '" onclick="openChatCardFromHistory(\'' + chatId + '\', event)" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openChatCardFromHistory(\'' + chatId + '\', event)" role="button" tabindex="0" aria-label="Open chat: ' + escapeHtml(title) + '">' +
+    return '<div class="history-chat-card' + (isActive ? ' active' : '') + subAgentCardClass + '" onclick="openChatCardFromHistory(\'' + chatId + '\', event)" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openChatCardFromHistory(\'' + chatId + '\', event)}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open chat: {title}', { title: title })) + '">' +
         '<div class="history-chat-header">' +
         '<div class="history-chat-title-row">' +
         '<span class="history-chat-title">' + escapeHtml(title) + '</span>' +
@@ -337,25 +340,23 @@ function getContextLength(chat) {
 }
 
 function formatContextLength(tokens) {
-    if (tokens < 1000) return tokens + ' tokens';
-    if (tokens < 1000000) return (tokens / 1000).toFixed(1) + 'K tokens';
-    return (tokens / 1000000).toFixed(2) + 'M tokens';
+    if (tokens < 1000) return tn(tokens, '{count} token', '{count} tokens');
+    if (tokens < 1000000) return t('{value}K tokens', { value: i18nFormatNumber(tokens / 1000, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) });
+    return t('{value}M tokens', { value: i18nFormatNumber(tokens / 1000000, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) });
 }
 
 function formatHistoryDate(timestamp) {
-    if (!timestamp) return 'Unknown';
+    if (!timestamp) return t('Unknown');
     var date = new Date(timestamp);
     var now = new Date();
     var diffMs = now - date;
-    var diffMins = Math.floor(diffMs / 60000);
-    var diffHours = Math.floor(diffMs / 3600000);
     var diffDays = Math.floor(diffMs / 86400000);
     
-    if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return diffMins + 'm ago';
-    if (diffHours < 24) return diffHours + 'h ago';
-    if (diffDays < 7) return diffDays + 'd ago';
-    return date.toLocaleDateString();
+    // Under a week: locale relative text (narrow: "now", "5m ago", "2h ago",
+    // "3d ago" in English). A future stamp from clock skew reads as now, like
+    // the old 'Just now'. Older: a locale date.
+    if (diffDays < 7) return i18nFormatRelative(Math.min(date.getTime(), now.getTime()), { now: now.getTime(), style: 'narrow' });
+    return i18nFormatDate(date);
 }
 
 // Whole-card click target for history cards (see renderHistoryChatCard). The
@@ -546,10 +547,10 @@ async function exportChatFromHistory(chatId) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        if (payloadsOk) showSnackbar('Chat exported', 'success');
-        else showSnackbar('Chat exported (some attachments could not be restored)', 'warning');
+        if (payloadsOk) showSnackbar(t('Chat exported'), 'success');
+        else showSnackbar(t('Chat exported (some attachments could not be restored)'), 'warning');
     } catch (e) {
-        showSnackbar('Chat export failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Chat export failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -596,8 +597,10 @@ async function downloadChatHistory() {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        showSnackbar('Chat history exported (' + n + ' chats' + (bad ? ', ' + bad + ' incomplete' : '') + ')', bad ? 'warning' : 'success');
+        showSnackbar(bad
+            ? tn(n, 'Chat history exported ({count} chat, {bad} incomplete)', 'Chat history exported ({count} chats, {bad} incomplete)', { bad: i18nFormatNumber(bad) })
+            : tn(n, 'Chat history exported ({count} chat)', 'Chat history exported ({count} chats)'), bad ? 'warning' : 'success');
     } catch (e) {
-        showSnackbar('Chat history export failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Chat history export failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }

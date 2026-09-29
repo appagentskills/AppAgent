@@ -20,11 +20,11 @@
 .wsf-modal-header { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-5) var(--space-7); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; }
 .wsf-modal-title { flex: 1; display: flex; align-items: center; gap: var(--space-3); font-size: var(--text-body-lg); font-weight: var(--font-semibold); color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wsf-modal-title .ui-icon { flex-shrink: 0; }
-.wsf-title-sub { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-muted); margin-left: var(--space-2); }
+.wsf-title-sub { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-muted); margin-inline-start: var(--space-2); }
 .wsf-modal-close { border: none; background: transparent; color: var(--text-muted); cursor: pointer; border-radius: var(--radius-md); width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .wsf-modal-close:hover { background: var(--secondary-light); color: var(--text-primary); }
 /* Prev/next file navigation in the modal header (arrow keys work too). */
-.wsf-modal-nav { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; margin-right: var(--space-3); }
+.wsf-modal-nav { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; margin-inline-end: var(--space-3); }
 .wsf-modal-nav .sn-artifact-icon-btn[disabled] { opacity: 0.35; cursor: default; pointer-events: none; }
 .wsf-nav-counter { font-size: var(--text-xs); color: var(--text-muted); font-variant-numeric: tabular-nums; padding: 0 var(--space-1); white-space: nowrap; }
 /* Header action icons — identical on every wsf modal; active = current modal. */
@@ -58,4 +58,4 @@
 .wsf-ver-chat.this-chat { cursor: pointer; background: var(--secondary-light); color: var(--primary, var(--text-primary)); }
 .wsf-ver-chat.this-chat:hover { filter: brightness(0.95); }
 .wsf-ver-note { font-size: var(--text-xs); color: var(--warning); }
-.wsf-ver-actions { margin-left: auto; display: flex; gap: var(--space-1); }
+.wsf-ver-actions { margin-inline-start: auto; display: flex; gap: var(--space-1); }

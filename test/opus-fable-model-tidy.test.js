@@ -132,10 +132,10 @@ describe('Model list tidy-up: selections, tiers and chat pins follow the redirec
     test('resolveChatProviderName: retired pin redirects; surviving customized pin stays; unknown falls back', async function() {
         var s = await _sources(), cfg = _config(s);
         var chats = { a: { provider: 'Opus 5' }, b: { provider: 'Fable 5' }, c: { provider: 'Nope' }, d: { provider: 'Opus-4-8' } };
-        var resolve = _resolveChat(s, cfg, [{ name: 'Opus 5.5' }, { name: 'Fable 5.1' }, { name: 'Opus-4-8' }], chats, 'Sonnet 5');
+        var resolve = _resolveChat(s, cfg, [{ name: 'Opus 5.5' }, { name: 'Fable 5.1' }, { name: 'Opus-4-8' }], chats, 'Sonnet 5.5');
         assert.strictEqual(resolve('a'), 'Opus 5.5');
         assert.strictEqual(resolve('b'), 'Fable 5.1');
-        assert.strictEqual(resolve('c'), 'Sonnet 5');
+        assert.strictEqual(resolve('c'), 'Sonnet 5.5');
         assert.strictEqual(resolve('d'), 'Opus-4-8');
     }, { tags: ['unit'] });
     test('applyOpus5DefaultRepoint lands on Opus 5.5 and never clobbers a surviving customized Opus-4-8', async function() {
@@ -147,7 +147,7 @@ describe('Model list tidy-up: selections, tiers and chat pins follow the redirec
         assert.strictEqual(alias.stored, 'Opus 5.5');
         var custom = _repoint(s, cfg, [{ name: 'Opus 5.5' }, { name: 'Opus-4-8' }], 'Opus-4-8');
         assert.strictEqual(custom.stored, 'Opus-4-8');
-        var other = _repoint(s, cfg, [{ name: 'Opus 5.5' }, { name: 'Sonnet 5' }], 'Sonnet 5');
-        assert.strictEqual(other.stored, 'Sonnet 5');
+        var other = _repoint(s, cfg, [{ name: 'Opus 5.5' }, { name: 'Sonnet 5.5' }], 'Sonnet 5.5');
+        assert.strictEqual(other.stored, 'Sonnet 5.5');
     }, { tags: ['unit'] });
 });

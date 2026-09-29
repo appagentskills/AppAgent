@@ -1,11 +1,20 @@
 // =============================================================
 // deroulement.js: executable checks for the feature-deroulement skill.
-// A plain helper module. It is NOT a skill tool (it deliberately declares no
-// tool definition), so the skills engine skips it and the agent loads it itself.
-// Dependency-free. Needs only what the js_eval sandbox has: RegExp, Function,
-// DOMParser and CSSStyleSheet. Optional: executeTool / loadFile for live lookups.
+// It is BOTH a skill tool and a plain helper module:
+//   * skill tool `deroulement_check` (TOOL_DEFINITION below, entry point
+//     deroulement_check(args) near the end). The skills engine
+//     (core/140-skills-engine.js loadSkillTools) only regex-parses the
+//     definition in the page AND the service worker; the file body runs only
+//     when the tool is called, inside the skill sandbox iframe (sandbox.html:
+//     page realm directly, SW realm via the offscreen helper), which has a DOM.
+//   * helper module for runFile / run_js_file / get_skill read_file (below).
+// Dependency-free. Needs only what the sandbox has: RegExp, Function, and
+// (optionally) DOMParser and CSSStyleSheet: without them the HTML / CSS / DOM
+// checks degrade to "unverified" rows with a reason, never a throw.
+// Optional: executeTool / loadFile for live lookups.
 //
 // LOAD IT (see SKILL.md for the full copy-paste snippets):
+//   tool call       : deroulement_check {files:[...], prose:'...', workspace:'owner/repo::branch'}
 //   in-repo js_eval : var D = await runFile('skills/feature-deroulement/deroulement.js');
 //   run_js_file     : {path:'skills/feature-deroulement/deroulement.js', args:{run:true, files:[...], prose:'...'}}
 //                     (module mode returns the JSON report directly)
@@ -29,6 +38,42 @@
 // lexical mask (drMask). What that cannot see is listed in DR_LIMITATIONS,
 // and the list is copied into every report.
 // =============================================================
+
+var TOOL_DEFINITION = {
+  type: "function",
+  function: {
+    name: "deroulement_check",
+    description: "Executable phase of the feature-deroulement skill: runs the deroulement.js checks over changed files and your walkthrough prose and returns a JSON claims report (summary, gate {pass, refuted, unverified}, markdown ledger). Checks: (a) parse gate for JS/HTML/CSS, (b) backticked prose symbols and file:line citations exist, ids/classes/message types cross-reference, (c) every changed function is wired (referenced by real code), (d) branch inventory + matrix, (e) branch probes with stubs, (f) edge inputs + DOM post-conditions, (g) mutation-lite, (h) ledger + done-gate (pass = 0 refuted). Lookups go live through the workspace (grep/read/diff/ls) unless `corpus` is given (offline, deterministic). Read-only: never edits files.",
+    parameters: {
+      type: "object",
+      properties: {
+        files: { type: "array", items: { type: "string" }, description: "Workspace paths of the changed files to analyse (.js/.html/.css). An unreadable file is a refuted row. Test files are only parse-gated (see exclude)." },
+        sources: { type: "object", additionalProperties: { type: "string" }, description: "Offline alternative to files: {path: sourceText} analysed as the targets (same as D.run({files:{...}})). Combine with corpus for deterministic lookups." },
+        prose: { type: "string", description: "Your deroulement draft. Only single-backticked tokens are checked: `fn()`, `fn:123`, `.class`, `#id`, `path/file.js:10`." },
+        workspace: { type: "string", description: "Workspace key for live lookups, e.g. owner/AppAgent::main. Default: the current workspace." },
+        corpus: { type: "object", additionalProperties: { type: "string" }, description: "{path: sourceText}: when given it is the ONLY code base searched (offline, deterministic). Put test files here, not in files." },
+        diff: { type: "string", description: "Unified diff limiting the changed-function analysis. Default: the live workspace diff of each file." },
+        functions: { type: "array", items: { type: "string" }, description: "Names of the functions you changed (union with the diff). Without a diff, functions with more than 5 branches otherwise collapse into one summary row." },
+        functionsOnly: { type: "boolean", description: "Analyse only the named functions." },
+        exclude: { type: "array", items: { type: "string" }, description: "Regex sources of paths that get only the parse gate. Default [\"^test/\"]." },
+        entryPoints: { type: "array", items: { type: "string" }, description: "Dynamic-dispatch entry points: downgrades their 'defined but not referenced' wiring rows to unverified (never to verified)." },
+        waive: { type: "object", additionalProperties: { type: "string" }, description: "{functionName: reason} for 'defined but not referenced' wiring rows only (a non-empty reason is required)." },
+        cssDir: { type: "string", description: "Directory whose .css files back the class cross-ref. Default src/css." },
+        cssFiles: { type: "array", items: { type: "string" }, description: "Explicit CSS files for the class cross-ref (overrides cssDir)." },
+        grepPath: { type: "string", description: "Limit live greps to this path prefix." },
+        maxSymbols: { type: "number", description: "Max prose symbols checked. Default 40." },
+        maxMaskReads: { type: "number", description: "Max files read to mask grep hits. Default 400." },
+        maskBudgetMs: { type: "number", description: "Time budget for masking grep hits. Default 30000." },
+        timeoutMs: { type: "number", description: "Per-probe async timeout. Default 5000." },
+        probes: { type: "array", description: "Branch probes: [{file, fn, inputs: [[arg0, arg1], ...], edge: true to add the edge inputs, only, baseArgs, domCheck, stubs: {name: 'JS source of the stub, e.g. function (s) { return String(s); }'}}].", items: { type: "object" } },
+        mutation: { type: "array", description: "Mutation-lite: [{file, fn, cases: [{args: [...], expect: value}], stubs: {name: 'JS source'}, max}].", items: { type: "object" } },
+        claims: { type: "array", description: "Your own assertions: [{claim, check: true|false, evidence, subject}]. Anything but true/false is unverified.", items: { type: "object" } },
+        output: { type: "string", enum: ["summary", "ledger", "full"], description: "summary = summary + gate; ledger (default) = also the markdown claims ledger; full = also the complete JSON report." }
+      },
+      required: []
+    }
+  }
+};
 
 var DR_VERSION = '1.4.0';
 var DR_LIMITATIONS = [
@@ -457,9 +502,18 @@ function drIO(opts) {
             if (local) return Object.keys(local).filter(function (p) { return p.indexOf(dir + '/') === 0; }).map(function (p) { return p.slice(dir.length + 1); });
             if (!ex) return [];
             var r = await ex('workspace', { action: 'ls', path: dir, workspace: ws });
-            return (r && r.entries) || [];
+            return lsEntryNames((r && r.entries) || []);
         }
     };
+}
+
+// workspace ls decorates entries: 'a.css *' (dirty), 'sub/ (3 files)' (dir), or {name|path}
+// objects. Strip the markers so name filters like /\.css$/ see every file.
+function lsEntryNames(entries) {
+    return (Array.isArray(entries) ? entries : []).map(function (e) {
+        var s = (e && typeof e === 'object') ? (e.name || e.path || '') : String(e == null ? '' : e);
+        return s.replace(/\s+\(\d+ files?\)\s*$/, '').replace(/\s+\*+\s*$/, '').trim();
+    }).filter(Boolean);
 }
 
 // Every IO call goes through this: a throw (or a wrong return type) becomes an ioErrors[] entry and the
@@ -529,7 +583,10 @@ function drAllEls(root) {
     (function walk(r) { Array.prototype.forEach.call(r.querySelectorAll('*'), function (el) { out.push(el); if (el.tagName === 'TEMPLATE' && el.content) walk(el.content); }); })(root);
     return out;
 }
+// '' when DOMParser exists, else the reason DOM-only checks degrade to "unverified" (e.g. a service-worker realm).
+function drNoDom() { return typeof DOMParser === 'function' ? '' : 'DOMParser unavailable in this realm (no DOM, e.g. a service worker): check not run'; }
 function drParseGateHtml(file, html, known) {
+    if (drNoDom()) return { file: file, ok: null, noDom: drNoDom(), ids: [], handlerCalls: [], issues: [], unverified: [] };
     var doc = new DOMParser().parseFromString(String(html), 'text/html'), all = drAllEls(doc), issues = [], count = Object.create(null), calls = [], unknown = [];
     all.forEach(function (el) { if (el.hasAttribute('id')) count[el.id] = (count[el.id] || 0) + 1; });
     Object.keys(count).forEach(function (id) { if (count[id] > 1) issues.push({ kind: 'duplicate-id', subject: id, detail: 'id "' + id + '" appears ' + count[id] + ' times' }); });
@@ -684,10 +741,11 @@ function drSenderRe(t) { return new RegExp('\\b' + DR_TYPE_KEY + '\\s*:\\s*["\'`
 async function drCrossRefs(files, io, opts, mk, testish) {
     if (!files || typeof files !== 'object') return { error: 'crossRefs(files): files must be an object {path: text}, got ' + (files === null ? 'null' : typeof files), ids: { used: 0, missing: [] }, classes: { used: 0, cssFiles: 0, cssRules: 0, parser: null, noCss: [] }, messages: { sent: [], handled: [], unhandled: [], noSender: [] } };
     opts = opts || {}; mk = mk || drMasker(io, files, opts); testish = testish || drExcluder(opts).testish;
-    var usedIds = [], definedIds = Object.create(null), usedClasses = [], sent = [], handled = [], x;
+    var usedIds = [], definedIds = Object.create(null), usedClasses = [], sent = [], handled = [], x, htmlNoDom = false;
     function push(list, name, file, line, extra) { list.push(Object.assign({ name: name, file: file, line: line }, extra || {})); }
     Object.keys(files).forEach(function (f) {
         var src = String(files[f]), line = drLines(src);
+        if (/\.html?$/.test(f) && drNoDom()) { htmlNoDom = true; return; }
         if (/\.html?$/.test(f)) { var d = new DOMParser().parseFromString(src, 'text/html'); drAllEls(d).forEach(function (el) { if (el.hasAttribute('id')) definedIds[el.id] = f; }); return; }
         if (!/\.m?js$/.test(f)) return;
         var c = drMask(src, true), cm = drMask(src), re;
@@ -731,7 +789,8 @@ async function drCrossRefs(files, io, opts, mk, testish) {
         var u = usedIds[i]; if (definedIds[u.name]) continue;
         if (!(u.name in idCache)) { var hits = await io.grep(drEsc(u.name)); idCache[u.name] = hits == null ? null : Object.assign(await onCmt(hits, drIdDefRe(u.name)), { truncated: !!hits.truncated }); }
         var ce = idCache[u.name]; // truncated is cached WITH the entry: a later cache hit must not read another grep's flag
-        if (ce == null) missingIds.push(Object.assign({ unverifiable: true }, u));
+        if (htmlNoDom) missingIds.push(Object.assign({ unverifiable: true, noDom: true }, u)); // ids in the unparsed HTML may define it
+        else if (ce == null) missingIds.push(Object.assign({ unverifiable: true }, u));
         else if (!ce.yes) missingIds.push(ce.unreadable ? Object.assign({ unverifiable: true, unreadable: ce.unreadable }, u) : ce.truncated ? Object.assign({ unverifiable: true, capped: true }, u) : u);
     }
     // classes: every JS-used class needs a CSS rule (CSSStyleSheet-parsed)
@@ -939,7 +998,7 @@ async function drProbe(fnSrc, opts) {
     runs.forEach(function (r) { r.trace.forEach(function (h) { seen[h] = true; }); });
     var missing = runs.map(function (r) { var q = /ReferenceError: ([\w$]+) is not defined/.exec(r.threw || ''); return q && q[1]; }).filter(Boolean);
     var table = '| run | input | trace | result |\n|---|---|---|---|\n' + runs.map(function (r) {
-        return '| ' + r.label + ' | ' + r.input.replace(/\|/g, '\\|').slice(0, 60) + ' | ' + (r.trace.join(' ') || '(no branch)') + ' | ' + (r.threw ? 'THREW ' + r.threw : r.result).replace(/\|/g, '\\|').slice(0, 60) + (r.post && !r.post.ok ? ' POST FAIL' : '') + ' |';
+        return '| ' + r.label + ' | ' + r.input.replace(/\|/g, '\\|').slice(0, 60) + ' | ' + (r.trace.join(' ') || '(no branch)') + ' | ' + (r.threw ? 'THREW ' + r.threw : r.result).replace(/\|/g, '\\|').slice(0, 60) + (r.post && r.post.ok === false ? ' POST FAIL' : r.post && r.post.ok === null ? ' POST UNVERIFIED' : '') + ' |';
     }).join('\n');
     return { ok: true, branches: inst.rows, runs: runs, coverage: { arms: arms.length, hit: arms.filter(function (x) { return seen[x]; }), missed: arms.filter(function (x) { return !seen[x]; }) }, missingStubs: missing.filter(function (n, i) { return missing.indexOf(n) === i; }), table: table };
 }
@@ -963,6 +1022,8 @@ function drEdgeInputs(baseArgs, opts) {
     return out;
 }
 function drDomPostconditions(target) {
+    if (typeof target === 'string' && drNoDom()) return { ok: null, unverified: true, reason: drNoDom(), issues: [] };
+    if (typeof target !== 'string' && (!target || typeof target !== 'object')) return { ok: null, unverified: true, reason: 'not a DOM node or HTML string: ' + typeof target, issues: [] };
     var root = typeof target === 'string' ? new DOMParser().parseFromString(target, 'text/html').body : target, issues = [], ids = {};
     var bad = /\bundefined\b|\bNaN\b|\[object Object\]/, text = root.textContent || '', m = bad.exec(text);
     if (m) issues.push({ kind: 'bad-text', detail: '"' + m[0] + '" in text: ' + JSON.stringify(text.slice(Math.max(0, m.index - 30), m.index + 30)) });
@@ -1067,6 +1128,7 @@ function drLedger(rep, opts) {
             add(p.file + ' CSS parses', 'parse', p.file, cst, p.parser + ', ' + p.rules + ' rules' + (p.balanced === false ? ', UNBALANCED braces (comments and strings stripped)' : '') + (p.dropped ? ', ' + p.dropped + ' of ' + p.braces + ' blocks dropped by the parser' : '') + (!p.rules && p.empty === false ? ', 0 rules from non-empty CSS' : ''));
             return;
         }
+        if (p.noDom) { add(p.file + ' HTML is well-formed', 'parse', p.file, 'unverified', p.noDom); return; }
         if (p.issues) {
             if (!p.issues.length) add(p.file + ' HTML is well-formed', 'parse', p.file, 'verified', 'DOMParser: ' + p.ids.length + ' unique ids, ' + p.handlerCalls.length + ' inline handler calls');
             p.issues.forEach(function (i) { add(p.file + ': ' + i.detail, 'parse', i.subject, 'refuted', i.kind); });
@@ -1079,7 +1141,7 @@ function drLedger(rep, opts) {
     if (x && x.error) add('cross-refs ran on the analysed files', 'config', null, 'refuted', x.error);
     if (rep.excludedAll) add('opts.exclude leaves at least one file for cross-ref and wiring analysis', 'config', null, 'unverified', 'every file matched opts.exclude (' + rep.excluded.length + ' excluded): only the parse gate ran, cross-refs and wiring checked nothing');
     if (x) {
-        x.ids.missing.forEach(function (u) { add('#' + u.name + ' (' + u.file + ':' + u.line + ') has a static id definition', 'cross-ref', u.name, u.unverifiable ? 'unverified' : 'refuted', u.unverifiable ? (u.capped ? 'grep capped at 100 hits with no definition among them: absence unproven' : 'grep unavailable') : 'looked up via getElementById/querySelector, no id="' + u.name + '" found'); });
+        x.ids.missing.forEach(function (u) { add('#' + u.name + ' (' + u.file + ':' + u.line + ') has a static id definition', 'cross-ref', u.name, u.unverifiable ? 'unverified' : 'refuted', u.unverifiable ? (u.noDom ? 'HTML files not parsed (' + drNoDom() + '): absence unproven' : u.capped ? 'grep capped at 100 hits with no definition among them: absence unproven' : 'grep unavailable') : 'looked up via getElementById/querySelector, no id="' + u.name + '" found'); });
         x.classes.noCss.forEach(function (u) { add('.' + u.name + ' (' + u.file + ':' + u.line + ') has a CSS rule', 'cross-ref', u.name, 'unverified', 'no selector in ' + x.classes.cssFiles + ' CSS files (' + x.classes.cssRules + ' rules). JS-only hook, or a missing style?'); });
         x.messages.unhandled.forEach(function (u) { add('message type "' + u.name + '" (sent ' + u.file + ':' + u.line + ') has a handler', 'cross-ref', u.name, u.unverifiable ? 'unverified' : 'refuted', u.unverifiable ? (u.capped ? 'grep capped at 100 hits, no handler among them: absence unproven' : 'grep unavailable') : 'no case/=== handler found'); });
         x.messages.noSender.forEach(function (u) { add('handled type "' + u.name + '" (' + u.file + ':' + u.line + ') has a sender', 'cross-ref', u.name, 'unverified', u.capped ? 'grep capped at 100 hits, no sender among them: absence unproven' : 'no `type: "' + u.name + '"` sender found (dead handler, or sent dynamically?)'); });
@@ -1115,7 +1177,8 @@ function drLedger(rep, opts) {
         // missed arms always reach the ledger, even when fn is not in the analysed (changed) set
         if (!branchRow[p.fn] && p.coverage && p.coverage.missed.length) add(p.fn + ': every probed branch arm exercised', 'probe', p.fn, 'unverified', 'probe hit ' + p.coverage.hit.length + '/' + p.coverage.arms + ' arms; missed ' + p.coverage.missed.join(' '));
         p.runs.forEach(function (r) {
-            if (r.post && !r.post.ok) add(p.fn + '(' + r.label + ') output passes DOM post-conditions', 'probe', p.fn, 'refuted', r.post.issues.map(function (i) { return i.kind + ': ' + i.detail; }).join('; '));
+            if (r.post && r.post.ok === null) add(p.fn + '(' + r.label + ') output passes DOM post-conditions', 'probe', p.fn, 'unverified', r.post.reason);
+            else if (r.post && !r.post.ok) add(p.fn + '(' + r.label + ') output passes DOM post-conditions', 'probe', p.fn, 'refuted', r.post.issues.map(function (i) { return i.kind + ': ' + i.detail; }).join('; '));
             if (r.threw && !/ReferenceError: [\w$]+ is not defined/.test(r.threw)) add(p.fn + '(' + r.label + ') does not throw', 'probe', p.fn, 'unverified', r.threw + ': intended validation, or a crash?');
         });
     });
@@ -1296,6 +1359,50 @@ async function drRunInner(opts, errs) {
     return rep;
 }
 
+// ---------- skill tool entry point (TOOL_DEFINITION at the top) ----------
+// Called by the skills engine as `<file body>;\nreturn await deroulement_check(<JSON args>)` inside the
+// skill sandbox iframe. Tool args are JSON only, so function-valued run() options arrive as JS source
+// strings (probes[].stubs / post, mutation[].check / stubs) and exclude entries as regex sources.
+function drCompileFn(src, where) {
+    if (typeof src === 'function') return src;
+    if (typeof src !== 'string') throw new Error(where + ' must be JS source text (a string), got ' + (src === null ? 'null' : typeof src));
+    try { return new Function('return (' + src + '\n);')(); } catch (e) { throw new Error(where + ' does not compile: ' + e.message); }
+}
+function drCompileStubs(stubs, where) {
+    if (stubs == null) return stubs;
+    if (typeof stubs !== 'object' || Array.isArray(stubs)) throw new Error(where + ' must be an object {name: source}');
+    var out = {};
+    Object.keys(stubs).forEach(function (k) { var v = stubs[k]; out[k] = typeof v === 'string' ? drCompileFn(v, where + '.' + k) : v; });
+    return out;
+}
+function drToolArgs(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('arguments must be an object');
+    var a = Object.assign({}, input);
+    delete a.output; delete a.sources; delete a.run; delete a.io;
+    if (input.sources != null) {
+        if (typeof input.sources !== 'object' || Array.isArray(input.sources)) throw new Error('sources must be an object {path: sourceText}');
+        if (Array.isArray(input.files) && input.files.length) throw new Error('pass either files (workspace paths) or sources ({path: text}), not both');
+        a.files = input.sources;
+    }
+    if (a.files == null) throw new Error('files (workspace paths) or sources ({path: text}) is required');
+    a.probes = (input.probes || []).map(function (p, i) { var q = Object.assign({}, p); q.stubs = drCompileStubs(p.stubs, 'probes[' + i + '].stubs'); if (p.post != null) q.post = drCompileFn(p.post, 'probes[' + i + '].post'); return q; });
+    a.mutation = (input.mutation || []).map(function (m, i) { var q = Object.assign({}, m); q.stubs = drCompileStubs(m.stubs, 'mutation[' + i + '].stubs'); if (m.check != null) q.check = drCompileFn(m.check, 'mutation[' + i + '].check'); return q; });
+    return a;
+}
+async function deroulement_check(input) {
+    var mode = input && input.output ? String(input.output) : 'ledger';
+    if (['summary', 'ledger', 'full'].indexOf(mode) < 0) return { success: false, error: 'deroulement_check: output must be summary, ledger or full, got ' + JSON.stringify(mode) };
+    var opts;
+    try { opts = drToolArgs(input); } catch (e) { return { success: false, error: 'deroulement_check: ' + e.message }; }
+    var rep = await drRun(opts); // never throws: an internal error is a refuted row
+    var out = { success: true, version: DR_VERSION, summary: rep.summary, gate: rep.gate };
+    if (rep.error) out.error = rep.error;
+    if (drNoDom()) out.environment = drNoDom() + ' (HTML/CSS/DOM rows are unverified)';
+    if (mode !== 'summary') { try { out.ledger = drFormat(rep); } catch (e) { out.ledger = null; out.ledgerError = e.message; } }
+    if (mode === 'full') out.report = rep;
+    return JSON.parse(JSON.stringify(out)); // plain JSON across the sandbox postMessage boundary
+}
+
 var DEROULEMENT = {
     version: DR_VERSION, limitations: DR_LIMITATIONS, run: drRun, mask: drMask,
     parseGateJs: drParseGateJs, parseGateHtml: drParseGateHtml,
@@ -1304,7 +1411,8 @@ var DEROULEMENT = {
     parseDiff: drParseDiff, findFunctions: drFindFunctions, changedFunctions: drChangedFunctions, fnSource: drFnSource, listeners: drListeners,
     branches: drBranches, matrix: drMatrix, instrument: drInstrument, probe: drProbe,
     edgeValues: drEdgeValues, edgeInputs: drEdgeInputs, domPostconditions: drDomPostconditions,
-    mutants: drMutants, mutationTest: drMutationTest, ledger: drLedger, format: drFormat
+    mutants: drMutants, mutationTest: drMutationTest, ledger: drLedger, format: drFormat,
+    tool: deroulement_check, toolDefinition: TOOL_DEFINITION
 };
 if (typeof module !== 'undefined' && module) module.exports = DEROULEMENT;
 // run_js_file module mode: {args:{run:true, ...}} returns the JSON report instead of the API.

@@ -101,8 +101,9 @@ describe('ui shell › theme switching (real CSS tokens)', function() {
         assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'light');
     }, { tags: ['unit'] });
 
-    // A1E-02: the gear-panel options are real keyboard radios (Enter/Space; every option tabindex 0, like the settings-page radios).
-    test('gear theme options are keyboard radios (role, aria-checked, tabindex 0 on every option, Enter/Space)', async function() {
+    // A1E-02: the gear-panel options are real keyboard radios (Enter/Space). Phase B: APG roving
+    // tabindex, so only the checked option is in the Tab order (arrows move between them, below).
+    test('gear theme options are keyboard radios (role, aria-checked, roving tabindex, Enter/Space)', async function() {
         var s = await setup();
         var group = s.dom.$('#settings-panel-theme');
         assert.strictEqual(group.getAttribute('role'), 'radiogroup');
@@ -111,12 +112,12 @@ describe('ui shell › theme switching (real CSS tokens)', function() {
         assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('role'); }), ['radio', 'radio', 'radio']);
         s.m.syncSettingsPanelTheme(); // appTheme is 'light'
         assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'true', 'false']);
-        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0]);
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [-1, 0, -1]);
         var space = U.fireInline(opts[2], 'keydown', s.m, { key: ' ' });
         assert.strictEqual(space.prevented, true, 'Space does not scroll the panel');
         assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'dark');
         assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'false', 'true']);
-        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0]);
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [-1, -1, 0]);
         var enter = U.fireInline(opts[0], 'keydown', s.m, { key: 'Enter' });
         assert.strictEqual(enter.prevented, true);
         assert.strictEqual(s.m.__scope.appTheme, 'system');
@@ -126,30 +127,44 @@ describe('ui shell › theme switching (real CSS tokens)', function() {
         assert.strictEqual(s.m.__scope.appTheme, 'system');
     }, { tags: ['unit'] });
 
-    // A1E-02 (R-C1 point 9): with a roving tabindex and no Arrow keys only the selected option was
-    // Tab-reachable, so keyboard users could never switch theme. A NON-selected option must stay
-    // reachable (tabIndex 0) before and after a switch, and Enter/Space on it must switch the theme.
-    test('gear theme: a non-selected option stays Tab-reachable (tabIndex 0) before and after a switch, and Enter/Space on it switches theme', async function() {
-        var s = await setup();
-        var opts = Array.prototype.slice.call(s.dom.$('#settings-panel-theme').querySelectorAll('.radio-option'));
-        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0], 'markup: every option is in the Tab order');
-        s.m.syncSettingsPanelTheme(); // appTheme is 'light': System and Dark are the non-selected options
-        assert.strictEqual(opts[2].getAttribute('aria-checked'), 'false');
-        assert.strictEqual(opts[2].tabIndex, 0, 'non-selected Dark is reachable by Tab before the switch');
-        assert.strictEqual(opts[0].tabIndex, 0, 'non-selected System is reachable by Tab before the switch');
-        var enter = U.fireInline(opts[2], 'keydown', s.m, { key: 'Enter' });
-        assert.strictEqual(enter.prevented, true);
-        assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'dark');
-        assert.strictEqual(s.m.__scope.appTheme, 'dark');
+    // A1E-02 (R-C1 point 9) + phase B: the roving tabindex is only safe because Arrow keys now move
+    // focus AND selection (APG radiogroup), so keyboard users can still reach every theme.
+    test('gear theme: Arrow keys move focus and selection with a roving tabindex (wraps; modifiers ignored)', async function() {
+        var st = appStorageStub(), win = winStub();
+        var m = await loadLenient(ICONS.concat(['src/js/ui/320-keyboard-shortcuts.js', 'src/js/ui/240-layout.js']), { window: win, appStorage: st, appTheme: 'light', sidebarCollapsed: true, historyExpanded: true });
+        var dom = await U.mountDom({ body: true, css: ALL_CSS });
+        var group = dom.$('#settings-panel-theme');
+        assert.strictEqual(group.getAttribute('onkeydown'), 'settingsPanelThemeKeydown(event)');
+        var opts = Array.prototype.slice.call(group.querySelectorAll('.radio-option'));
+        m.syncSettingsPanelTheme(); // appTheme is 'light'
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [-1, 0, -1], 'only the checked radio is a Tab stop');
+        // The gear panel is hidden in the mounted DOM (focus() is a no-op there), so record calls.
+        var focused = null;
+        opts.forEach(function(o) { o.focus = function() { focused = o; }; });
+        function arrow(el, key, mods) {
+            var e = Object.assign({ key: key, target: el, defaultPrevented: false }, mods || {});
+            e.preventDefault = function() { e.defaultPrevented = true; };
+            m.settingsPanelThemeKeydown(e);
+            return e;
+        }
+        var e1 = arrow(opts[1], 'ArrowRight');
+        assert.strictEqual(e1.defaultPrevented, true);
+        assert.strictEqual(m.__scope.appTheme, 'dark');
+        assert.strictEqual(focused, opts[2], 'focus follows selection');
         assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'false', 'true']);
-        assert.strictEqual(opts[1].tabIndex, 0, 'now non-selected Light is still reachable by Tab after the switch');
-        assert.strictEqual(opts[0].tabIndex, 0, 'non-selected System is still reachable by Tab after the switch');
-        var space = U.fireInline(opts[1], 'keydown', s.m, { key: ' ' });
-        assert.strictEqual(space.prevented, true);
-        assert.strictEqual(document.documentElement.getAttribute('data-theme'), 'light');
-        assert.strictEqual(s.m.__scope.appTheme, 'light');
-        assert.deepStrictEqual(opts.map(function(o) { return o.getAttribute('aria-checked'); }), ['false', 'true', 'false']);
-        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [0, 0, 0], 'selection never removes an option from the Tab order');
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [-1, -1, 0]);
+        arrow(opts[2], 'ArrowDown');
+        assert.strictEqual(m.__scope.appTheme, 'system', 'wraps from last to first');
+        arrow(opts[0], 'ArrowUp');
+        assert.strictEqual(m.__scope.appTheme, 'dark', 'wraps from first to last');
+        var alt = arrow(opts[2], 'ArrowLeft', { altKey: true });
+        assert.strictEqual(alt.defaultPrevented, false, 'Alt+Arrow is left for the chat-switch shortcut');
+        assert.strictEqual(m.__scope.appTheme, 'dark');
+        var tab = arrow(opts[2], 'Tab');
+        assert.strictEqual(tab.defaultPrevented, false);
+        arrow(opts[2], 'ArrowLeft');
+        assert.strictEqual(m.__scope.appTheme, 'light');
+        assert.deepStrictEqual(opts.map(function(o) { return o.tabIndex; }), [-1, 0, -1]);
     }, { tags: ['unit'] });
 
     test('broadcastWidgetTheme posts themeChange to every widget iframe and tolerates none', async function() {

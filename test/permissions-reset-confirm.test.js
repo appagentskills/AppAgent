@@ -23,6 +23,11 @@ async function makeReset(opts) {
     opts = opts || {};
     var decl = await realDecl('src/js/ui/070-dashboard-ui.js', 'resetAllPermissionsToDefaults');
     var escDecl = await realDecl('src/js/ui/180-search.js', 'escapeHtml');
+    // resetAllPermissionsToDefaults calls t(): the fixture gets the REAL i18n core first
+    // (no catalog set = English identity, like the harness auto-include in test/harness.js),
+    // so the file passes when it runs alone, not only after a test that leaked a global t().
+    var i18nCore = await loadFile('src/js/core/025-i18n.js');
+    assert.ok(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
     var host = opts.host === undefined ? 'dev1.service-now.com' : opts.host;
     var rec = { saveTool: 0, saveInst: 0, push: [], render: 0, snack: [], confirm: [] };
     var initial = {
@@ -58,7 +63,7 @@ async function makeReset(opts) {
         '    renderSettingsToolPermissions = stubs.renderSettingsToolPermissions, updateSnStatus = stubs.updateSnStatus,\n' +
         '    showSnackbar = stubs.showSnackbar, getConnectedInstanceHost = stubs.getConnectedInstanceHost,\n' +
         '    showConfirmModal = stubs.showConfirmModal;\n' +
-        escDecl + '\n' + decl + '\n' +
+        i18nCore + '\n' + escDecl + '\n' + decl + '\n' +
         'return { run: resetAllPermissionsToDefaults, state: function() { return { toolPermissions: toolPermissions,\n' +
         '    instancePermissions: instancePermissions, sessionPermissions: sessionPermissions }; } };';
     var api = new Function('stubs', body)(stubs);

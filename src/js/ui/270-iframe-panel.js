@@ -22,7 +22,7 @@ function popOutToFullTab() {
     var url = chrome.runtime.getURL('app.html?mode=tab');
     if (currentChatId) url += '&chat=' + encodeURIComponent(currentChatId);
     return new Promise(function(r) {
-        try { chrome.tabs.create({ url: url }, function(t) { r(!chrome.runtime.lastError && !!t); }); } catch (e) { r(false); }
+        try { chrome.tabs.create({ url: url }, function(tab) { r(!chrome.runtime.lastError && !!tab); }); } catch (e) { r(false); }
     });
 }
 
@@ -31,7 +31,7 @@ function expandSidePanel() {
     return popOutToFullTab().then(function(ok) {
         // Side panels can close themselves via window.close()
         if (ok) setTimeout(function() { window.close(); }, 300);
-        else if (typeof showSnackbar === 'function') showSnackbar('Could not open a full tab', 'error');
+        else if (typeof showSnackbar === 'function') showSnackbar(t('Could not open a full tab'), 'error');
     });
 }
 
@@ -70,7 +70,7 @@ function reloadExtension() {
             return _reloadExtensionLocked();
         });
     }).catch(function(e) {
-        if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: ' + e.message);
+        if (typeof showSnackbar === 'function') showSnackbar(t('Reload stopped: {message}', { message: String(e.message) }));
     }).finally(function() {
         buttons.forEach(function(b, i) { if (b) b.disabled = disabled[i]; });
         _reloadInFlight = null;
@@ -100,7 +100,7 @@ async function _reloadFingerprint(workspace) {
     var bytes = new TextEncoder().encode(JSON.stringify([meta.head_sha, meta.branch, rows]));
     return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))).map(function(n) { return n.toString(16).padStart(2, '0'); }).join('');
 }
-// Phase timings: console.info per phase plus a summary persisted with the reopen
+// Phase timings: per-phase durations, persisted as a summary with the reopen
 // marker. Diagnostics only: every use is guarded and can never break Reload.
 function _reloadPhaseClock() {
     var start = Date.now(), last = start, phases = {};
@@ -108,7 +108,6 @@ function _reloadPhaseClock() {
         mark: function(name) {
             var now = Date.now(), ms = now - last; last = now;
             phases[name] = (phases[name] || 0) + ms;
-            console.info('[reload] ' + name + ' ' + ms + 'ms');
         },
         summary: function(requestedAt) { return { requestedAt: requestedAt, total_ms: requestedAt - start, phases: Object.assign({}, phases) }; }
     };
@@ -158,6 +157,13 @@ function _reloadSuiteResult(result, file) {
     if (f && f.skips && f.skips.length) detail += '\n' + JSON.stringify(f.skips);
     return { state: state, detail: detail.slice(0, 6000) };
 }
+// Display only: these English detail lines are built above and compared/parsed
+// by _reloadChecklist; the logic keeps them English and only the shown text is translated.
+function _reloadDetailLine(line) {
+    var markers = [N_('Malformed or incomplete test result'), N_('Required supported assertions or verified isolation missing'),
+        N_('Suite reported more than once'), N_('Not reported by the test run (it stopped before this suite)'), N_('Not run')];
+    return markers.indexOf(line) >= 0 ? t(line) : line;
+}
 // One run_tests call covers every suite. Each row gets a one-file view of that
 // envelope (its own entry + the shared isolation/denial/abort/error fields) and
 // is judged by the unchanged single-file _reloadSuiteResult. A missing entry or an
@@ -203,41 +209,41 @@ function _reloadChecklist(controller) {
     var dialog = node('section', 'modal-dialog', '', overlay);
     dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-labelledby', 'reload-preflight-title'); dialog.setAttribute('aria-modal', 'true'); overlay.tabIndex = -1; // S8D-04: clicks keep focus inside the overlay
     dialog.setAttribute('aria-describedby', 'reload-preflight-status');
-    var title = node('h2', 'modal-header', 'Checking before Reload…', dialog); title.id = 'reload-preflight-title';
+    var title = node('h2', 'modal-header', t('Checking before Reload…'), dialog); title.id = 'reload-preflight-title';
     var body = node('div', 'modal-body', '', dialog);
-    var status = node('p', 'reload-preflight-status', 'Preparing workspace…', body); status.id = 'reload-preflight-status'; status.setAttribute('aria-live', 'polite');
-    var progressText = node('p', 'reload-preflight-progress-text', '0 of 5 suites complete', body); progressText.setAttribute('aria-live', 'polite'); progressText.setAttribute('aria-atomic', 'true');
-    var progress = node('progress', 'reload-preflight-progress', '', body); progress.max = RELOAD_PREFLIGHT_FILES.length; progress.value = 0; progress.setAttribute('aria-label', 'Suites complete');
-    var labels = ['Policy checks', 'Test runner', 'Sandbox lifecycle', 'Test harness', 'Reload checks'];
+    var status = node('p', 'reload-preflight-status', t('Preparing workspace…'), body); status.id = 'reload-preflight-status'; status.setAttribute('aria-live', 'polite');
+    var progressText = node('p', 'reload-preflight-progress-text', tn(RELOAD_PREFLIGHT_FILES.length, '{complete} of {count} suite complete', '{complete} of {count} suites complete', { complete: i18nFormatNumber(0) }), body); progressText.setAttribute('aria-live', 'polite'); progressText.setAttribute('aria-atomic', 'true');
+    var progress = node('progress', 'reload-preflight-progress', '', body); progress.max = RELOAD_PREFLIGHT_FILES.length; progress.value = 0; progress.setAttribute('aria-label', t('Suites complete'));
+    var labels = [t('Policy checks'), t('Test runner'), t('Sandbox lifecycle'), t('Test harness'), t('Reload checks')];
     var summaries = [];
     var rows = RELOAD_PREFLIGHT_FILES.map(function(file, index) {
         var row = node('div', 'reload-preflight-row', '', body);
         var label = node('label', 'reload-preflight-label', '', row), box = node('input', 'reload-preflight-check', '', label);
-        box.type = 'checkbox'; box.disabled = true; box.setAttribute('aria-label', labels[index] + ': Pending');
+        box.type = 'checkbox'; box.disabled = true; box.setAttribute('aria-label', t('{label}: {state}', { label: labels[index], state: t('Pending') }));
         var spinner = node('span', 'reload-preflight-spinner', '', label); spinner.setAttribute('aria-hidden', 'true');
         node('span', '', labels[index], label);
         var result = node('div', 'reload-preflight-result', '', row);
-        var state = node('span', 'reload-preflight-state', 'Pending', result);
+        var state = node('span', 'reload-preflight-state', t('Pending'), result);
         var counts = node('span', 'reload-preflight-counts', '', result); counts.hidden = true;
         var message = node('p', 'reload-preflight-message', '', row); message.hidden = true;
         var details = node('details', 'reload-preflight-details', '', row);
-        var summary = node('summary', '', 'Details', details); summary.setAttribute('aria-label', 'Details for ' + labels[index]); summaries.push(summary);
+        var summary = node('summary', '', t('Details'), details); summary.setAttribute('aria-label', t('Details for {label}', { label: labels[index] })); summaries.push(summary);
         node('code', 'reload-preflight-file', file, details);
         var detail = node('pre', 'reload-preflight-detail', '', details); detail.hidden = true;
         row.dataset.state = 'pending';
         return { row: row, box: box, state: state, counts: counts, message: message, detail: detail, complete: false };
     });
     var technical = node('details', 'reload-preflight-details reload-preflight-technical', '', body);
-    summaries.push(node('summary', '', 'Coverage and workspace', technical));
-    var workspace = node('p', 'reload-preflight-workspace', 'Workspace: preparing…', technical);
-    node('p', '', 'Unit and canary checks use workspace sources in the installed runtime, not the new build. Contract and runtime layers are unsupported; skipped checks are not passes. Permission prompts remain separate.', technical);
+    summaries.push(node('summary', '', t('Coverage and workspace'), technical));
+    var workspace = node('p', 'reload-preflight-workspace', t('Workspace: preparing…'), technical);
+    node('p', '', t('Unit and canary checks use workspace sources in the installed runtime, not the new build. Contract and runtime layers are unsupported; skipped checks are not passes. Permission prompts remain separate.'), technical);
     var actions = node('div', 'modal-actions', '', dialog);
-    var cancel = node('button', 'modal-btn secondary', 'Cancel', actions); cancel.type = 'button';
-    var force = node('button', 'modal-btn warning', 'Force build', actions); force.type = 'button'; force.hidden = true; force.disabled = true;
+    var cancel = node('button', 'modal-btn secondary', t('Cancel'), actions); cancel.type = 'button';
+    var force = node('button', 'modal-btn warning', t('Force build'), actions); force.type = 'button'; force.hidden = true; force.disabled = true;
     function choose(value) {
         if (choice) return;
         choice = value;
-        if (value === 'cancel') { controller.abort(); status.textContent = 'Cancelling — revoking test authority…'; }
+        if (value === 'cancel') { controller.abort(); status.textContent = t('Cancelling — revoking test authority…'); }
         resolveChoice(value);
     }
     cancel.addEventListener('click', function() { choose('cancel'); });
@@ -274,7 +280,8 @@ function _reloadChecklist(controller) {
         var failed = rows.filter(function(r) { return r.row.dataset.state === 'fail'; }).length;
         var errors = rows.filter(function(r) { return r.row.dataset.state === 'error'; }).length;
         progress.value = complete;
-        progressText.textContent = complete + ' of ' + rows.length + ' suites complete' + (failed ? ' · ' + failed + ' failed' : '') + (errors ? ' · ' + errors + (errors === 1 ? ' error' : ' errors') : '');
+        progressText.textContent = tn(rows.length, '{complete} of {count} suite complete', '{complete} of {count} suites complete', { complete: i18nFormatNumber(complete) }) +
+            (failed ? ' · ' + tn(failed, '{count} failed', '{count} failed') : '') + (errors ? ' · ' + tn(errors, '{count} error', '{count} errors') : '');
         progress.setAttribute('aria-valuetext', progressText.textContent);
     }
     document.body.appendChild(overlay); cancel.focus();
@@ -284,32 +291,33 @@ function _reloadChecklist(controller) {
         update: function(index, state, detail) {
             var r = rows[index];
             r.row.dataset.state = state; r.box.checked = state === 'pass';
-            var stateLabels = { pending: 'Pending', running: 'Running', pass: 'Passed', fail: 'Failed', skipped: 'Skipped', error: 'Error' };
-            r.state.textContent = state === 'skipped' && detail === 'Not run' ? 'Not run' : (stateLabels[state] || state);
-            r.box.setAttribute('aria-label', labels[index] + ': ' + r.state.textContent);
+            var stateLabels = { pending: t('Pending'), running: t('Running'), pass: t('Passed'), fail: t('Failed'), skipped: t('Skipped'), error: t('Error') };
+            r.state.textContent = state === 'skipped' && detail === 'Not run' ? t('Not run') : (stateLabels[state] || state);
+            r.box.setAttribute('aria-label', t('{label}: {state}', { label: labels[index], state: r.state.textContent }));
             r.complete = ['pass', 'fail', 'skipped', 'error'].indexOf(state) >= 0 && detail !== 'Not run';
             // Format the existing gate diagnostic without changing eligibility or inventing counts.
             var lines = String(detail || '').split('\n');
             var counts = /^(\d+) passed; (\d+) failed; (\d+) skipped(?: \(unchecked\))?$/.exec(lines[0]);
-            r.counts.textContent = counts ? counts[1] + ' passed · ' + counts[2] + ' failed · ' + counts[3] + ' skipped' : '';
+            r.counts.textContent = counts ? [tn(+counts[1], '{count} passed', '{count} passed'), tn(+counts[2], '{count} failed', '{count} failed'),
+                tn(+counts[3], '{count} skipped', '{count} skipped')].join(' · ') : '';
             r.counts.hidden = !counts;
             if (counts) lines.shift();
             lines = lines.filter(function(line) { return line.trim() && line.trim() !== '[]'; });
-            var text = lines.map(function(line) { try { return JSON.stringify(JSON.parse(line), null, 2); } catch (_) { return line; } }).join('\n');
+            var text = lines.map(function(line) { try { return JSON.stringify(JSON.parse(line), null, 2); } catch (_) { return _reloadDetailLine(line); } }).join('\n');
             r.detail.textContent = text; r.detail.hidden = !text;
             var needsAttention = state === 'fail' || state === 'error' || state === 'skipped';
             var headline = lines.find(function(line) { return line !== 'Malformed or incomplete test result' && line !== 'Required supported assertions or verified isolation missing'; }) || lines[0];
-            headline = headline || 'This suite did not pass.';
+            headline = headline ? _reloadDetailLine(headline) : t('This suite did not pass.');
             r.message.textContent = needsAttention ? (headline.length > 240 ? headline.slice(0, 240) + '…' : headline) : '';
             r.message.hidden = !needsAttention;
             updateProgress();
         },
         status: function(text) {
-            if (text.indexOf('Workspace: ') === 0) { workspace.textContent = text; status.textContent = 'Checking supported assertions before building.'; }
-            else if (text.indexOf('All five supported suites passed') === 0) { title.textContent = 'All checks passed'; status.textContent = 'Building the checked workspace…'; }
+            if (text.indexOf('Workspace: ') === 0) { workspace.textContent = t('Workspace: {workspace}', { workspace: text.slice('Workspace: '.length) }); status.textContent = t('Checking supported assertions before building.'); }
+            else if (text.indexOf('All five supported suites passed') === 0) { title.textContent = t('All checks passed'); status.textContent = t('Building the checked workspace…'); }
             else status.textContent = text;
         },
-        failure: function(text, settled) { title.textContent = 'Checks need attention'; status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
+        failure: function(text, settled) { title.textContent = t('Checks need attention'); status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
         close: function() { overlay.remove(); if (previous && previous.isConnected) previous.focus(); }
     };
 }
@@ -326,6 +334,16 @@ async function _reloadWait(promise, signal, ms) {
             timer = setTimeout(function() { reject(new Error('Reload preflight timed out')); }, ms);
         })]);
     } finally { clearTimeout(timer); if (abort) signal.removeEventListener('abort', abort); }
+}
+// Applies one run_tests progress event ({index, file, phase, status, counts}) to
+// the checklist. Display only; never decides pass/fail for the Reload gate.
+function _reloadApplyProgress(ev, files, states, set, ui, live) {
+    if (!live || !ev || !Number.isSafeInteger(ev.index) || files[ev.index] !== ev.file || states[ev.index] !== 'running') return false;
+    if (ev.phase === 'start') { ui.status(t('Running supported assertions…') + ' ' + ev.file); return true; }
+    if (ev.phase !== 'done') return false;
+    var state = ev.status === 'pass' ? 'pass' : ev.status === 'fail' ? 'fail' : 'error';
+    set(ev.index, state, ev.passed + ' passed; ' + ev.failed + ' failed; ' + ev.skipped + ' skipped (unchecked)');
+    return true;
 }
 async function _runReloadPreflight() {
     var controller = new AbortController(), ui = _reloadChecklist(controller);
@@ -346,18 +364,24 @@ async function _runReloadPreflight() {
             console.warn('[reload] pass record unavailable (' + (e && e.message || e) + '); running the suites');
         }
         if (_reloadPassMatches(lastPass, workspace, fingerprint)) {
-            console.info('[reload] preflight skipped (unchanged since last pass)');
-            files.forEach(function(_, i) { set(i, 'skipped', 'Preflight skipped (unchanged since last pass)'); });
-            ui.status('Preflight skipped (unchanged since last pass) — building ' + workspace);
+            files.forEach(function(_, i) { set(i, 'skipped', t('Preflight skipped (unchanged since last pass)')); });
+            ui.status(t('Preflight skipped (unchanged since last pass) — building {workspace}', { workspace: workspace }));
             return { proceed: true, workspace: workspace, skipped: true };
         }
         if (controller.signal.aborted) throw new Error('Reload cancelled');
         // ONE run_tests call for every suite (was one per file); rows map from its entries.
-        files.forEach(function(_, i) { set(i, 'running', 'Running supported assertions…'); });
+        files.forEach(function(_, i) { set(i, 'running', t('Running supported assertions…')); });
         running = true; settled = false;
+        // Live progress: the single run_tests call streams per-suite events, so the
+        // counter/bar advance as each suite finishes instead of jumping from 0 to
+        // N at the end. Provisional only: the envelope below re-judges every row.
+        var provisional = files.map(function() { return false; });
+        var onSuiteProgress = function(ev) {
+            _reloadApplyProgress(ev, files, states, function(i, st, detail) { provisional[i] = true; set(i, st, detail); }, ui, running && !settled && !controller.signal.aborted);
+        };
         pending = Promise.resolve().then(function() {
             if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
-            return executeTool('run_tests', { files: files.slice(), tags: ['unit', 'canary'], workspace: workspace, timeout_ms: RELOAD_PREFLIGHT_TIMEOUT_MS }, null, { _runTestsAbortSignal: controller.signal });
+            return executeTool('run_tests', { files: files.slice(), tags: ['unit', 'canary'], workspace: workspace, timeout_ms: RELOAD_PREFLIGHT_TIMEOUT_MS }, null, { _runTestsAbortSignal: controller.signal, _runTestsOnProgress: onSuiteProgress });
         }).finally(function() { settled = true; });
         var result = await _reloadWait(pending, controller.signal, RELOAD_PREFLIGHT_WAIT_MS);
         running = false;
@@ -365,13 +389,13 @@ async function _runReloadPreflight() {
         failed = states.some(function(st) { return st !== 'pass'; });
         // Rows can all pass only on a consistent envelope; still require the run's own verdict.
         if (!failed && !(result && result.success === true)) {
-            files.forEach(function(_, i) { set(i, 'error', 'Test run did not report success\n' + (result && result.error || '')); });
+            files.forEach(function(_, i) { set(i, 'error', t('Test run did not report success') + '\n' + (result && result.error || '')); });
             failed = true;
         }
         if (!failed) {
             var current = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
             if (current !== fingerprint || await _reloadWait(_reloadWorkspace(), controller.signal, 15000) !== workspace) {
-                files.forEach(function(_, i) { set(i, 'error', 'Workspace changed — previous results are stale.'); });
+                files.forEach(function(_, i) { set(i, 'error', t('Workspace changed — previous results are stale.')); });
                 throw new Error('Workspace changed during tests. Run Reload again, or explicitly force this workspace build.');
             }
             // Remember this pass: an unchanged workspace skips the preflight next time.
@@ -385,8 +409,9 @@ async function _runReloadPreflight() {
         // Any caught error is a failure. An empty/undefined message used to leave
         // `failed` falsy: the finally below closed the checklist and then
         // `await ui.decision` hung forever with the Reload buttons disabled.
-        var reason = String(e && (e.message || (typeof e === 'string' ? e : '')) || '').trim() || 'Preflight failed (unknown error)';
-        if (running) files.forEach(function(_, i) { if (states[i] === 'running') set(i, 'error', reason); });
+        var reason = String(e && (e.message || (typeof e === 'string' ? e : '')) || '').trim() || t('Preflight failed (unknown error)');
+        // Fail closed: provisional (streamed, unverified) rows are errors too.
+        if (running) files.forEach(function(_, i) { if (states[i] === 'running' || (provisional && provisional[i])) set(i, 'error', reason); });
         failed = reason;
     } finally {
         // Do not offer Force while the host invocation is still settling.
@@ -398,7 +423,8 @@ async function _runReloadPreflight() {
     }
     if (ui.cancelled()) { ui.close(); return { proceed: false }; }
     files.forEach(function(_, i) { if (states[i] === 'pending') set(i, 'skipped', 'Not run'); });
-    ui.failure((typeof failed === 'string' ? failed : 'Required checks did not pass.') + (settled ? ' Cancel or explicitly Force build (tests only; artifact/security checks still apply).' : ' Host cleanup did not settle; Force is unavailable.'), settled && !!workspace);
+    ui.failure((typeof failed === 'string' ? failed : t('Required checks did not pass.')) + ' ' +
+        (settled ? t('Cancel or explicitly Force build (tests only; artifact/security checks still apply).') : t('Host cleanup did not settle; Force is unavailable.')), settled && !!workspace);
     try { return { proceed: (await ui.decision) === 'force', workspace: workspace }; }
     finally { ui.close(); }
 }
@@ -411,9 +437,10 @@ async function _rebuildBeforeReload() {
         // getDeployDirHandle() quietly returns null without readwrite permission.
         // Ask instead of silently restarting on the old files (m4).
         console.warn('[reload] deploy folder permission not granted; asking before any restart');
-        var choice = await showModal('Deploy folder access needed',
-            'Reload cannot rebuild the extension: readwrite permission for the connected deploy folder is not granted.<br><br>Grant access to rebuild and deploy your workspace changes, Restart anyway to restart on the previously built files, or Cancel.',
-            [{ label: 'Cancel', value: 'cancel', class: 'secondary' }, { label: 'Restart anyway', value: 'restart', class: 'secondary' }, { label: 'Grant access', value: 'grant', class: 'primary' }], 'warning');
+        var choice = await showModal(t('Deploy folder access needed'),
+            t('Reload cannot rebuild the extension: readwrite permission for the connected deploy folder is not granted.') + '<br><br>' +
+            t('Grant access to rebuild and deploy your workspace changes, Restart anyway to restart on the previously built files, or Cancel.'),
+            [{ label: t('Cancel'), value: 'cancel', class: 'secondary' }, { label: t('Restart anyway'), value: 'restart', class: 'secondary' }, { label: t('Grant access'), value: 'grant', class: 'primary' }], 'warning');
         if (choice === 'restart') return true;
         if (choice !== 'grant') return false; // Cancel, or superseded by another modal (null)
         // Straight from the click continuation: the transient user activation lets
@@ -422,7 +449,7 @@ async function _rebuildBeforeReload() {
         dir = typeof getDeployDirHandle === 'function' ? await getDeployDirHandle({ interactive: true }) : null;
         _reloadMark('permission-prompt');
         if (!dir) {
-            if (typeof showSnackbar === 'function') showSnackbar('Deploy folder permission still not granted — Reload cancelled', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Deploy folder permission still not granted — Reload cancelled'), 'warning');
             return false;
         }
     }
@@ -451,10 +478,9 @@ function _runningAgentChatIds() {
 }
 // The "Reload will stop n runs" warning; resolves true when the user accepts.
 function _confirmStopRuns(runningCount) {
-    var msg = runningCount === 1
-        ? 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?'
-        : runningCount + ' agent runs are still in progress. Reloading the extension will stop them. Reload anyway?';
-    return showConfirmModal('Reload extension?', escapeHtml(msg), 'warning');
+    var msg = tn(runningCount, 'An agent run is still in progress. Reloading the extension will stop it. Reload anyway?',
+        '{count} agent runs are still in progress. Reloading the extension will stop them. Reload anyway?');
+    return showConfirmModal(t('Reload extension?'), escapeHtml(msg), 'warning');
 }
 async function _reloadExtensionLocked() {
     // M1: refuse EARLY (no preflight, build or restart) while a build still writes files.
@@ -489,7 +515,7 @@ async function _reloadExtensionLocked() {
         // Belt and braces (M1): never restart onto a half-written build.
         if (_reloadBuildInFlight) {
             console.warn('[reload] extension build still in flight; restart refused');
-            if (typeof showSnackbar === 'function') showSnackbar('Reload blocked: the extension build is still running', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Reload blocked: the extension build is still running'), 'warning');
             return;
         }
         _reloaded = true;
@@ -513,10 +539,10 @@ async function _reloadExtensionLocked() {
     // chrome.runtime.reload() unreached and the old SW running. The write is
     // raced against a bounded RELOAD_RESTART_FALLBACK_MS timer, so the reload
     // always fires. The same write carries the phase timings, which the next
-    // boot logs once (_reportLastReloadTimings).
+    // boot adopts once (_reportLastReloadTimings -> _previousReloadTimings).
     function _startReloadSequence() {
         // Immediate feedback — the reload tears the page down a moment later.
-        if (typeof showSnackbar === 'function') showSnackbar('Reloading extension…');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Reloading extension…'));
         // Timestamp (not `true`): background.js discards a stale marker
         // instead of consuming it on a much later SW start (the next
         // toolbar click), which used to open TWO app tabs.
@@ -565,7 +591,7 @@ async function _reloadExtensionLocked() {
         // restarts nothing and leaves any deployed files on disk (like a timed-out build).
         var nowRunning = _runningAgentChatIds();
         if (nowRunning.some(function(id) { return acceptedRuns.indexOf(id) < 0; }) && !(await _confirmStopRuns(nowRunning.length))) {
-            if (typeof showSnackbar === 'function') showSnackbar('Reload cancelled — click Reload when the runs finish', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Reload cancelled — click Reload when the runs finish'), 'warning');
             return;
         }
         // Cleanly close every realm's IDB connection BEFORE chrome.runtime.reload()
@@ -608,17 +634,20 @@ if (typeof window !== 'undefined' && window.addEventListener) {
 
 // Boot report: _startReloadSequence stores the phase timings under
 // RELOAD_TIMINGS_KEY right before chrome.runtime.reload(); the restarted page
-// logs them once and clears the entry. Diagnostics only: never throws at boot.
+// adopts them once into _previousReloadTimings (inspect it from the console:
+// restart_ms, total_ms, phases) and clears the entry. Diagnostics only: never
+// throws at boot.
+var _previousReloadTimings = null;
 function _reportLastReloadTimings() {
     try {
         if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local || typeof chrome.storage.local.get !== 'function') return;
-        _reloadStorageGet(RELOAD_TIMINGS_KEY).then(function(t) {
+        _reloadStorageGet(RELOAD_TIMINGS_KEY).then(function(rec) {
             try {
-                if (!t) return;
+                if (!rec) return;
                 if (typeof chrome.storage.local.remove === 'function') {
                     chrome.storage.local.remove(RELOAD_TIMINGS_KEY, function() { if (chrome.runtime && chrome.runtime.lastError) { /* ignore */ } });
                 }
-                console.info('[reload] previous reload: restart ' + (Date.now() - t.requestedAt) + 'ms, total before restart ' + t.total_ms + 'ms, phases ' + JSON.stringify(t.phases));
+                _previousReloadTimings = { restart_ms: Date.now() - rec.requestedAt, total_ms: rec.total_ms, phases: rec.phases || {} };
             } catch (e) { /* diagnostics only */ }
         });
     } catch (e) { /* diagnostics only */ }
@@ -662,16 +691,18 @@ async function _awaitExtensionBuild(build) {
         try { res = await Promise.race([build, windowEnd]); } finally { clearTimeout(timer); }
         if (res !== TIMED_OUT) return { result: res };
         console.warn('[reload] extension build still running after ' + minutes + ' min');
-        var choice = await showModal('Extension build still running',
-            'The extension build has not finished within ' + minutes + ' minutes and is still writing the deploy folder.<br><br>Reloading now could load a half-written build, so Reload will not restart until it finishes. Keep waiting, or Cancel (Reload stays blocked until the build finishes).',
-            [{ label: 'Cancel', value: 'cancel', class: 'secondary' }, { label: 'Keep waiting', value: 'wait', class: 'primary' }], 'warning');
+        var choice = await showModal(t('Extension build still running'),
+            tn(minutes, 'The extension build has not finished within {count} minute and is still writing the deploy folder.',
+                'The extension build has not finished within {count} minutes and is still writing the deploy folder.') + '<br><br>' +
+            t('Reloading now could load a half-written build, so Reload will not restart until it finishes. Keep waiting, or Cancel (Reload stays blocked until the build finishes).'),
+            [{ label: t('Cancel'), value: 'cancel', class: 'secondary' }, { label: t('Keep waiting'), value: 'wait', class: 'primary' }], 'warning');
         if (choice !== 'wait') return null;
     }
 }
 async function _buildFrozenWorkspace(workspace) {
     try {
 
-        if (typeof showSnackbar === 'function') showSnackbar('Rebuilding extension…');
+        if (typeof showSnackbar === 'function') showSnackbar(t('Rebuilding extension…'));
         // _startExtensionBuild passes fromSandbox to bypass the skill-tool truncation in
         // executeSkillTool (core/140-skills-engine.js) — results over
         // LARGE_RESPONSE_LINE_LIMIT (50) pretty-printed lines are otherwise
@@ -687,12 +718,12 @@ async function _buildFrozenWorkspace(workspace) {
         // re-enables the buttons). A build that settles by rejecting lands in the catch.
         var start = await _startExtensionBuild(workspace), build = start && start.build;
         if (!build) {
-            if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: another extension build is still running — Reload is blocked until it finishes', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Reload stopped: another extension build is still running — Reload is blocked until it finishes'), 'warning');
             return false;
         }
         var waited = await _awaitExtensionBuild(build);
         if (!waited) {
-            if (typeof showSnackbar === 'function') showSnackbar(_reloadBuildInFlight === build ? 'Reload cancelled — the extension build is still running; Reload is blocked until it finishes' : 'Reload cancelled', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(_reloadBuildInFlight === build ? t('Reload cancelled — the extension build is still running; Reload is blocked until it finishes') : t('Reload cancelled'), 'warning');
             return false;
         }
         var res = waited.result;
@@ -700,21 +731,21 @@ async function _buildFrozenWorkspace(workspace) {
         if (ok) {
             // Surface WHICH workspace was built — with pinning + forks the
             // build may come from a non-trunk workspace.
-            if (typeof showSnackbar === 'function' && res.built_from) showSnackbar('Rebuilt extension from ' + res.built_from);
+            if (typeof showSnackbar === 'function' && res.built_from) showSnackbar(t('Rebuilt extension from {workspace}', { workspace: res.built_from }));
             return true;
         }
 
         // Build/deploy failed — let the user decide whether to reload the
         // previously built files instead of silently shipping a broken build.
-        var err = (res && (res.error || (res.deploy && res.deploy.error))) || 'no files were built/deployed (is the repo cloned?)';
-        return await showConfirmModal('Extension rebuild failed', 'Extension rebuild failed:<br>' + escapeHtml(err) + '<br><br>Reload with the previously built files anyway?', 'danger');
+        var err = (res && (res.error || (res.deploy && res.deploy.error))) || t('no files were built/deployed (is the repo cloned?)');
+        return await showConfirmModal(t('Extension rebuild failed'), t('Extension rebuild failed:') + '<br>' + escapeHtml(err) + '<br><br>' + t('Reload with the previously built files anyway?'), 'danger');
     } catch (e) {
         // Only a SETTLED build may offer the previous files; never while one still writes.
         if (_reloadBuildInFlight) {
-            if (typeof showSnackbar === 'function') showSnackbar('Reload stopped: ' + (e && e.message ? e.message : String(e)) + ' — the extension build is still running', 'warning');
+            if (typeof showSnackbar === 'function') showSnackbar(t('Reload stopped: {message} — the extension build is still running', { message: e && e.message ? e.message : String(e) }), 'warning');
             return false;
         }
-        return await showConfirmModal('Extension rebuild error', 'Extension rebuild error:<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>Reload with the previously built files anyway?', 'danger');
+        return await showConfirmModal(t('Extension rebuild error'), t('Extension rebuild error:') + '<br>' + escapeHtml(e && e.message ? e.message : String(e)) + '<br><br>' + t('Reload with the previously built files anyway?'), 'danger');
     }
 }
 
@@ -779,7 +810,7 @@ function openBrowserWithUrl(source, openedByAI) {
     if (!document.body.classList.contains('sidepanel-mode')) {
         var snUrl = Platform.instanceUrl;
         if (!snUrl) {
-            showSnackbar('No ServiceNow instance connected. Open a ServiceNow page first.', 'error');
+            showSnackbar(t('No ServiceNow instance connected. Open a ServiceNow page first.'), 'error');
             return;
         }
         // Honour the typed path: resolveUrl prefixes the instance for a
@@ -841,7 +872,7 @@ async function screenshotUIPage(pageName) {
     var result = await Platform.sendBrowserAction('take_screenshot', {});
     if (chat) chat.targetTabId = origTabId;
     try { chrome.tabs.remove(tab.id); } catch(e) {}
-    if (result.error) { showSnackbar('Screenshot failed', 'error'); return; }
+    if (result.error) { showSnackbar(t('Screenshot failed'), 'error'); return; }
     var link = document.createElement('a');
     link.href = result.base64;
     link.download = pageName + '.png';

@@ -41,6 +41,7 @@ var TOOLS = [
                     attachment_table_name: { type: 'string', description: 'Attachment upload: table of the target record, e.g. "incident".' },
                     attachment_table_sys_id: { type: 'string', description: 'Attachment upload: sys_id of the target record.' },
                     attachment_content_type: { type: 'string', description: 'Attachment upload: MIME type, e.g. "image/png". Auto-detected from the file name if omitted.' },
+                    timeout_ms: { type: 'number', description: 'Hard request timeout in ms (default 30000) → {success:false, timed_out:true}. Still running after 5s: returns {pending:true, handle}; the request continues and you are notified on completion — await_handle({handle}) to wait, await_handle({handle, cancel:true}) to abort.' },
                     instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name (e.g. "dev12345") or URL. See list_instances.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -53,7 +54,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'servicenow_run_script',
-            description: 'Execute a server-side JavaScript snippet on a ServiceNow instance. Runs synchronously, captures gs.print/gs.info output and returns it; each run is logged in sys_script_execution_history.\nUse ONLY for what the Table API genuinely cannot do: server-only globals (gs.*), GlideRecord-only APIs, transactions, system operations, or logic that must run server-side. It is not a replacement for multiple Table API calls — for "fetch N records, update each", chain servicenow_api calls in js_eval.\nRequires the admin role: it runs via /sys.scripts.do, which is admin-only, so the call fails for non-admin users. BEFORE calling, check the target instance\'s roles in list_instances (instances[].roles; reuse a result from earlier in this chat for the same instance). If `admin` is not listed, do NOT call this tool — use servicenow_api instead or tell the user admin is required. Enforced in code: the call is refused (success:false) unless the user has effective admin (direct or inherited) on the target instance. Empty roles = unknown (probe failed): verify with servicenow_api GET sys_user_has_role, query user=javascript:gs.getUserID()^role.name=admin.',
+            description: 'Execute a server-side JavaScript snippet on a ServiceNow instance. Runs synchronously, captures gs.print/gs.info output and returns it; each run is logged in sys_script_execution_history.\nUse ONLY for what the Table API genuinely cannot do: server-only globals (gs.*), GlideRecord-only APIs, transactions, system operations, or logic that must run server-side. It is not a replacement for multiple Table API calls — for "fetch N records, update each", chain servicenow_api calls in js_eval.\nRequires the admin role: it runs via /sys.scripts.do, which is admin-only, so the call fails for non-admin users. BEFORE calling, check the target instance\'s roles in list_instances (instances[].roles; reuse a result from earlier in this chat for the same instance). If `admin` is not listed, do NOT call this tool — use servicenow_api instead or tell the user admin is required. Enforced in code: the call is refused (success:false) unless the user has effective admin (direct or inherited) on the target instance, or is the `maint` login (not a sys_user, no roles, but more access than admin — listed with isMaint:true and roles ["maint","admin"]; counts as admin). Empty roles = unknown (probe failed): verify with servicenow_api GET sys_user_has_role, query user=javascript:gs.getUserID()^role.name=admin.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -61,6 +62,7 @@ var TOOLS = [
                     scope: { type: 'string', description: 'Application scope to run in, e.g. "global" or "x_snc_myapp". Default: global.' },
                     record_for_rollback: { type: 'boolean', description: 'If true (default), records changes for rollback via sys_script_execution_history.' },
                     sandbox: { type: 'boolean', description: 'If true, runs in sandboxed mode (limits some operations). Default: false.' },
+                    timeout_ms: { type: 'number', description: 'Hard timeout in ms (default 120000). After 5s returns a pending handle and keeps running (see servicenow_api timeout_ms).' },
                     instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name. See list_instances.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Often appropriate for this tool.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -94,6 +96,7 @@ var TOOLS = [
                             required: ['find', 'replace']
                         }
                     },
+                    timeout_ms: { type: 'number', description: 'Hard timeout per request in ms (default 30000). After 5s returns a pending handle and keeps running (see servicenow_api timeout_ms).' },
                     instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name (e.g. "dev12345") or URL. See list_instances.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -610,6 +613,7 @@ var TOOLS = [
                     headers: { type: 'object', description: 'Extra HTTP headers (key-value pairs).' },
                     body: { type: 'string', description: 'Request body (POST/PUT).' },
                     save_file: { type: 'boolean', description: 'If true, saves the response as a file and returns a file_id instead of the body — for binary content (images, PDFs, archives) or files to reference later, copy into a workspace, or offer as a download.' },
+                    timeout_ms: { type: 'number', description: 'Hard timeout in ms (default 30000). After 5s returns {pending:true, handle} and keeps running; await_handle to wait or cancel.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Note: web_fetch normally prompts on every call EXCEPT requests to the connected GitHub REST API base, which this flag governs — reads run silently; set confirm:true for writes such as merging a PR or posting a comment.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
@@ -776,7 +780,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'list_instances',
-            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Instances the user DISABLED for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled.',
+            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed; the `maint` login — no sys_user, no roles, admin-level read of the roles table — is reported as isMaint:true with roles ["maint","admin"] and counts as admin) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Instances the user DISABLED for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -796,12 +800,13 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'await_handle',
-            description: 'Block (on the scheduler, not the model) until an async handle settles. Handles come from spawn_sub_agent, wake_sub_agent and agent_message and settle when the sub reports. Returns {status: done|error|cancelled|pending, result?, error?}. Sub-agent handles: done → result is the full report {status (done|need_input), summary, data, artifacts, from, from_name, at}; error → error is the headline (report summary) AND result is the full report; cancelled → error is the stop reason (no result). Still pending after timeout_ms → left in flight; await it again. Handles are per-chat and do not survive a page reload.',
+            description: 'Block (on the scheduler, not the model) until an async handle settles. Handles come from spawn_sub_agent, wake_sub_agent and agent_message and settle when the sub reports. Returns {status: done|error|cancelled|pending, result?, error?}. Sub-agent handles: done → result is the full report {status (done|need_input), summary, data, artifacts, from, from_name, at}; error → error is the headline (report summary) AND result is the full report; cancelled → error is the stop reason (no result). Still pending after timeout_ms → left in flight; await it again. Also accepts pending request handles from slow servicenow_api / servicenow_run_script / servicenow_diff_edit / web_fetch calls (result = the tool result). Handles are per-chat and do not survive a page reload.',
             parameters: {
                 type: 'object',
                 properties: {
                     handle: { type: 'string', description: 'Handle id from a previous async call (e.g. "h_xxx").' },
                     timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    cancel: { type: 'boolean', description: 'Abort a pending background request handle (slow HTTP tool call) instead of waiting. Not for sub-agents (use stop_sub_agent).' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['handle']

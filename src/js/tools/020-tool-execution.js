@@ -861,7 +861,7 @@ async function executeDiffEdit(args, messageIndex, options) {
                 'X-UserToken': _diffApiToken
             }
         };
-        var getRes = await fetch(getUrl, getOpts);
+        var getRes = await _toolFetch(getUrl, getOpts, options && options._sfCtx, 30000);
 
         if (!getRes.ok) {
             var errText = await getRes.text();
@@ -921,7 +921,7 @@ async function executeDiffEdit(args, messageIndex, options) {
             },
             body: JSON.stringify(putData)
         };
-        var putRes = await fetch(putUrl, putOpts);
+        var putRes = await _toolFetch(putUrl, putOpts, options && options._sfCtx, 30000);
 
         if (!putRes.ok) {
             var errText = await putRes.text();
@@ -1074,24 +1074,38 @@ function _sandboxEvalCleanup(chatId) {
 // Table API lookup (any inherited value). Lookup failure => refuse (fail-safe).
 // Positive results are cached per instance URL for the session.
 var _rsAdminOk = {};
-async function _rsCheckAdmin(instanceUrl, token) {
+// Keyed by URL + userName + token so a pass never survives a user/session switch.
+// maint (not a sys_user, no roles, more than admin) uses the shared
+// snMaintEligible/snDetectMaint from core/150-record-helpers.js.
+async function _rsCheckAdmin(instanceUrl, token, ctx) {
     var key = String(instanceUrl || '').replace(/\/+$/, '');
     var inst = ((typeof Platform !== 'undefined' && Platform.instances) || []).filter(function(i) {
         return i && String(i.url || '').replace(/\/+$/, '') === key;
     })[0] || null;
     var who = (inst && inst.userName) || 'current user';
     var where = (inst && inst.shortName) || key.replace(/^https?:\/\//, '').split('.')[0] || 'this instance';
-    if (_rsAdminOk[key]) return { ok: true };
-    if (inst && Array.isArray(inst.roles) && inst.roles.indexOf('admin') !== -1) { _rsAdminOk[key] = true; return { ok: true }; }
+    var okKey = key + '|' + ((inst && inst.userName) || '') + '|' + String(token || '');
+    if (_rsAdminOk[okKey]) return { ok: true };
+    if (inst && Array.isArray(inst.roles) && (inst.roles.indexOf('admin') !== -1 || inst.roles.indexOf('maint') !== -1)) { _rsAdminOk[okKey] = true; return { ok: true }; }
     var denied = 'User ' + who + ' lacks the admin role on ' + where + '; server scripts require admin — use servicenow_api (Table API) instead.';
     try {
-        var res = await fetch(key + '/api/now/table/sys_user_has_role?sysparm_query=' + encodeURIComponent('user=javascript:gs.getUserID()^role.name=admin') + '&sysparm_fields=sys_id&sysparm_limit=1', {
+        var res = await _toolFetch(key + '/api/now/table/sys_user_has_role?sysparm_query=' + encodeURIComponent('user=javascript:gs.getUserID()^role.name=admin') + '&sysparm_fields=sys_id&sysparm_limit=1', {
             method: 'GET', credentials: 'include',
             headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
-        });
+        }, ctx, 30000);
         if (!res.ok) return { ok: false, error: 'Admin-role check failed on ' + where + ' (HTTP ' + res.status + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
         var data = await res.json();
-        if (data && Array.isArray(data.result) && data.result.length) { _rsAdminOk[key] = true; return { ok: true }; }
+        if (data && Array.isArray(data.result) && data.result.length) { _rsAdminOk[okKey] = true; return { ok: true }; }
+        // No admin grant for gs.getUserID(): may be the `maint` login (no sys_user,
+        // no roles, more access than admin) — only when no user name is known.
+        // The lookup above succeeded (a roles probe) — probe maint only with no cached
+        // roles and no (non-maint) user name: ONE request, cached per URL+token.
+        if (typeof snMaintEligible === 'function' && snMaintEligible((inst && inst.roles) || [], true, inst && inst.userName)) {
+            if (await snDetectMaint(key, token, function(u, o) { return _toolFetch(u, o, ctx, 30000); })) {
+                _rsAdminOk[okKey] = true;
+                return { ok: true };
+            }
+        }
         return { ok: false, error: denied };
     } catch (e) {
         return { ok: false, error: 'Admin-role check failed on ' + where + ' (' + (e && e.message) + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
@@ -1121,6 +1135,185 @@ function _enqueueSysScripts(instanceKey, fn) {
     // chain for subsequent callers; `next` itself still propagates the result.
     _sysScriptsQueues[instanceKey] = next.catch(function() {});
     return next;
+}
+
+// ---------- Tool HTTP hard timeout + 5s slow-request notice ----------
+// Every agent-facing HTTP tool (below) runs through _slowFetchDispatch:
+//   • each fetch goes through _toolFetch — AbortController hard timeout
+//     (per fetch, covers the body read; args.timeout_ms overrides the default)
+//     and registration on the call's ctx so await_handle({cancel:true}) can
+//     abort it;
+//   • a TOP-LEVEL call still running SLOW_FETCH_NOTICE_MS after its approval
+//     settled returns early with a pending handle (Handles registry); the
+//     request keeps running and settles the handle with the full normal
+//     result (+ elapsed_ms). On settle the chat is notified via
+//     SubAgents.notifyChat (same injection/wake path sub-agent reports use)
+//     unless it was blocked awaiting that handle or cancelled it.
+//   • nested calls (js_eval / widget / skill tools) never background — the
+//     script needs the data — they only get the hard timeout.
+var SLOW_FETCH_NOTICE_MS = 5000;
+var TOOL_FETCH_DEFAULT_TIMEOUT_MS = {
+    servicenow_api: 30000,
+    servicenow_diff_edit: 30000,
+    web_fetch: 30000,
+    servicenow_run_script: 120000
+};
+var _sfCtxByHandle = {};
+// Test hook: shorten the notice threshold (unit tests only).
+function _sfSetNoticeMs(ms) { SLOW_FETCH_NOTICE_MS = ms; }
+
+async function _toolFetch(url, opts, ctx, fallbackMs) {
+    var ms = (ctx && typeof ctx.timeoutMs === 'number' && ctx.timeoutMs > 0) ? ctx.timeoutMs : (fallbackMs || 30000);
+    if (ctx && ctx.cancelled) throw new Error('Cancelled by agent');
+    var ac = new AbortController();
+    var rec = { ac: ac, timer: null, timedOut: false };
+    if (ctx) ctx.controllers.push(rec);
+    rec.timer = setTimeout(function() {
+        rec.timedOut = true;
+        if (ctx) { ctx.timedOut = true; ctx.timedOutMs = ms; }
+        try { ac.abort(); } catch (_) {}
+    }, ms);
+    try {
+        return await fetch(url, Object.assign({}, opts || {}, { signal: ac.signal }));
+    } catch (e) {
+        if (rec.timedOut) throw new Error('Timed out after ' + ms + 'ms');
+        if (ctx && ctx.cancelled) throw new Error('Cancelled by agent');
+        throw e;
+    } finally {
+        // With a ctx the timer stays armed until the tool finishes so a hung
+        // BODY read (res.text()/json()) is also bounded; _sfClearTimers
+        // disarms it. Without a ctx only the headers phase is bounded.
+        if (!ctx) clearTimeout(rec.timer);
+    }
+}
+
+function _sfClearTimers(ctx) {
+    (ctx.controllers || []).forEach(function(r) { try { clearTimeout(r.timer); } catch (_) {} });
+}
+
+function _sfAbort(ctx) {
+    ctx.cancelled = true;
+    (ctx.controllers || []).forEach(function(r) {
+        try { clearTimeout(r.timer); } catch (_) {}
+        try { r.ac.abort(); } catch (_) {}
+    });
+}
+
+function _sfTarget(name, args) {
+    args = args || {};
+    if (name === 'web_fetch') return String(args.url || '').slice(0, 120);
+    if (name === 'servicenow_run_script') return '/sys.scripts.do';
+    return String(args.table || '') + (args.sys_id ? '/' + args.sys_id : '');
+}
+
+function _sfFinalize(ctx, result) {
+    var elapsed = Date.now() - ctx.startedAt;
+    var failed = !result || result.success === false;
+    // Only override FAILED results: a best-effort inner fetch that timed out
+    // but was swallowed (display-name lookup) must not flip a success.
+    if (failed && ctx.cancelled) {
+        return { success: false, cancelled: true, error: 'Cancelled by agent', elapsed_ms: elapsed };
+    }
+    if (failed && ctx.timedOut) {
+        var out = { success: false, error: 'Timed out after ' + ctx.timedOutMs + 'ms', timed_out: true, elapsed_ms: elapsed };
+        if (result && result.error && result.error !== out.error) out.detail = result.error;
+        return out;
+    }
+    // Fast calls stay byte-identical; slow ones carry elapsed_ms.
+    if (result && typeof result === 'object' && !Array.isArray(result)
+        && elapsed >= SLOW_FETCH_NOTICE_MS && result.elapsed_ms == null) {
+        result.elapsed_ms = elapsed;
+    }
+    return result;
+}
+
+function _sfNotifyCompletion(ctx, handleId, result) {
+    try {
+        if (typeof SubAgents === 'undefined' || typeof SubAgents.notifyChat !== 'function') return false;
+        var r = result || {};
+        var state = r.timed_out ? ('timed out after ' + Math.round((r.elapsed_ms || 0) / 1000) + 's')
+            : (r.success === false ? 'failed' : 'completed') + ' after ' + Math.round((r.elapsed_ms || (Date.now() - ctx.startedAt)) / 1000) + 's';
+        var body = '';
+        try { body = JSON.stringify(r); } catch (_) { body = ''; }
+        var text = 'Background request ' + state + ': ' + ctx.name + ' ' + ctx.target + ' (handle "' + handleId + '").'
+            + (body && body.length <= 2000 ? '\nResult: ' + body : (r.error ? '\nError: ' + r.error : ''))
+            + '\nFull result via await_handle("' + handleId + '").';
+        return SubAgents.notifyChat(ctx.chatId, text, handleId);
+    } catch (e) { return false; }
+}
+
+function _slowFetchDispatch(name, args, messageIndex, options) {
+    args = args || {};
+    var chatId = (options && options.chatId)
+        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var ctx = {
+        name: name, target: _sfTarget(name, args), chatId: chatId, controllers: [],
+        startedAt: Date.now(), cancelled: false, timedOut: false, hadAwaiters: false,
+        timeoutMs: (args.timeout_ms != null && Number(args.timeout_ms) > 0) ? Number(args.timeout_ms) : TOOL_FETCH_DEFAULT_TIMEOUT_MS[name]
+    };
+    var nested = !!(options && (options.fromSandbox || options.fromWidget));
+    var canBackground = !nested && SLOW_FETCH_NOTICE_MS > 0
+        && typeof Handles !== 'undefined' && typeof Handles.start === 'function';
+    var timer = null, early = false, armed = false, resolveOuter;
+    var outer = new Promise(function(r) { resolveOuter = r; });
+    function goBackground() {
+        timer = null;
+        if (early) return;
+        early = true;
+        var hid = null;
+        var started = Handles.start(chatId, name, args, name + ' ' + ctx.target, function() {
+            return inner.then(function(r) {
+                // Read BEFORE the registry drains awaiters: a caller blocked in
+                // await_handle/any/all gets the settle directly — no notice.
+                var e = Handles.get(chatId, hid);
+                ctx.hadAwaiters = !!(e && Array.isArray(e.awaiters) && e.awaiters.length);
+                return r;
+            });
+        });
+        hid = started.handleId;
+        // The registry resolves a null chatId to its default bucket — keep
+        // ctx in sync so the await_handle cancel ownership check matches.
+        if (started.entry && started.entry.chatId) ctx.chatId = started.entry.chatId;
+        _sfCtxByHandle[hid] = ctx;
+        Promise.resolve(started.entry.promise).then(function() {
+            delete _sfCtxByHandle[hid];
+            var e = started.entry;
+            if (e.cancelled || e.status === 'cancelled' || ctx.cancelled || ctx.hadAwaiters) return;
+            _sfNotifyCompletion(ctx, hid, e.result);
+        });
+        resolveOuter({
+            success: true, pending: true, handle: hid, elapsed_ms: Date.now() - ctx.startedAt,
+            message: name + ' request to ' + ctx.target + ' still running after ' + Math.round(SLOW_FETCH_NOTICE_MS / 1000) + 's. It continues in the background (hard timeout ' + ctx.timeoutMs + 'ms); you will be notified when it finishes. Call await_handle({handle:"' + hid + '"}) to wait for the result, or await_handle({handle:"' + hid + '", cancel:true}) to abort it.'
+        });
+    }
+    function arm() {
+        if (armed) return;
+        armed = true;
+        ctx.startedAt = Date.now(); // approval wait is not request time
+        if (canBackground) timer = setTimeout(goBackground, SLOW_FETCH_NOTICE_MS);
+    }
+    var prevHook = options && options._onApprovalSettled;
+    var innerOpts = Object.assign({}, options || {}, {
+        _sfCtx: ctx,
+        _onApprovalSettled: function(ap) {
+            if (typeof prevHook === 'function') { try { prevHook(ap); } catch (_) {} }
+            if (ap && ap.allowed) arm();
+        }
+    });
+    var inner = Promise.resolve().then(function() {
+        return _executeToolInner(name, args, messageIndex, innerOpts);
+    }).then(function(r) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        _sfClearTimers(ctx);
+        return _sfFinalize(ctx, r);
+    }, function(err) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        _sfClearTimers(ctx);
+        return _sfFinalize(ctx, { success: false, error: (err && err.message) ? err.message : String(err) });
+    });
+    inner.then(function(r) { if (!early) { early = true; resolveOuter(r); } });
+    return outer;
 }
 
 async function executeTool(name, args, messageIndex, options) {
@@ -1186,6 +1379,12 @@ function _widgetEvalCallerError(options) {
 }
 
 async function _executeToolInner(name, args, messageIndex, options) {
+    // HTTP tools: hard timeout + 5s pending-handle notice (see _slowFetchDispatch).
+    // The dispatcher re-enters here with options._sfCtx set, so every gate
+    // below (approval, roster, counter) still runs exactly once.
+    if (TOOL_FETCH_DEFAULT_TIMEOUT_MS[name] && !(options && options._sfCtx)) {
+        return _slowFetchDispatch(name, args, messageIndex, options);
+    }
     if (name === 'widget_eval' && args && args.action === 'eval') {
         var callerError = _widgetEvalCallerError(options);
         if (callerError) return callerError;
@@ -1387,6 +1586,18 @@ async function _executeToolInner(name, args, messageIndex, options) {
         };
         if (name === 'await_handle') {
             if (!args || !args.handle) return { success: false, error: 'await_handle requires `handle`.' };
+            if (args.cancel === true) {
+                var _sfc = _sfCtxByHandle[args.handle];
+                if (!_sfc || _sfc.chatId !== chatIdH) {
+                    var _cEntry = Handles.get(chatIdH, args.handle);
+                    return { success: false, error: _cEntry
+                        ? 'cancel:true only applies to pending background request handles (servicenow_api / servicenow_run_script / servicenow_diff_edit / web_fetch). Use stop_sub_agent for sub-agents.'
+                        : 'unknown handle: ' + args.handle, snapshot: _cEntry ? Handles.snapshot(_cEntry) : undefined };
+                }
+                _sfAbort(_sfc);
+                var _cRes = Handles.cancel(chatIdH, args.handle, 'cancelled by agent (await_handle cancel:true)');
+                return { success: !!_cRes.ok, cancelled: !!_cRes.ok, error: _cRes.ok ? undefined : _cRes.error, snapshot: Handles.poll(chatIdH, args.handle) };
+            }
             var timeoutMsAH = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
             // Pool-deadlock prevention (Phase 5): if the caller is a sub-agent
             // and the target handle is a spawn handle (i.e. waiting on a
@@ -1488,6 +1699,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     registry: TestRunPolicy.registry, context: _testKey,
                     code: args.code, document: document, window: window,
                     signal: options._testRunSignal,
+                    onProgress: options._testRunOnProgress,
                     dispatch: function(tool, toolArgs, id) {
                         if (tool === '__sandbox_sleep') return new Promise(function(resolve) { setTimeout(function() { resolve({ __sleep_ok: true }); }, toolArgs.ms); });
                         return executeTool(tool, toolArgs, messageIndex, {
@@ -1906,7 +2118,14 @@ async function _executeToolInner(name, args, messageIndex, options) {
             await Promise.all(Platform.instances.filter(function(inst) { return inst.token && !_liDisabledMap[_liNorm(inst.url)]; }).map(async function(inst) {
                 try {
                     var _tok = (Platform.getTokenForInstance && await Platform.getTokenForInstance(inst.url)) || inst.token;
-                    _liFresh[inst.url] = { roles: await _liFetchDirectRoles(inst.url, _tok) };
+                    var _dr = await _liFetchDirectRoles(inst.url, _tok);
+                    var _mt = false;
+                    // maint: no direct roles + no user name + admin-level roles-table read.
+                    if (typeof snMaintEligible === 'function' && snMaintEligible(_dr, true, inst.userName)) {
+                        _mt = await snDetectMaint(inst.url, _tok);
+                        if (_mt) _dr = ['maint', 'admin'];
+                    }
+                    _liFresh[inst.url] = { roles: _dr, isMaint: _mt };
                 } catch (e) { _liFresh[inst.url] = { error: 'roles lookup failed: ' + (e && e.message) }; }
             }));
         }
@@ -1919,6 +2138,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     activeTabs: (inst.tabs || []).map(function(t) { return { id: t.id, title: t.title, url: t.url }; }),
                     connected: !!inst.token, userName: inst.userName || '',
                     roles: _fr.roles || [], rolesSource: 'direct', rolesError: _fr.error,
+                    isMaint: !!_fr.isMaint,
                     tabCount: (inst.tabs || []).length
                 };
                 return {
@@ -1928,6 +2148,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     connected: !!inst.token,
                     userName: inst.userName || '',
                     roles: inst.roles || [],
+                    isMaint: !!inst.isMaint || (inst.roles || []).indexOf('maint') !== -1,
                     tabCount: (inst.tabs || []).length
                 };
             }),
@@ -1992,7 +2213,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 },
                 body: bytes.buffer
             };
-            var res = await fetch(attachUrl, attachOpts);
+            var res = await _toolFetch(attachUrl, attachOpts, options && options._sfCtx, 30000);
             var _attachRespText = await res.text();
             var data;
             try { data = JSON.parse(_attachRespText); } catch(e) { data = { error: { message: 'Non-JSON response (HTTP ' + res.status + ')' } }; }
@@ -2049,9 +2270,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             var _atDeleteName = null;
             if (args.method === 'DELETE' && !_atCrossInstance) {
                 try {
-                    var _atMetaRes = await fetch('/api/now/attachment/' + args.sys_id, {
+                    var _atMetaRes = await _toolFetch('/api/now/attachment/' + args.sys_id, {
                         headers: { 'Accept': 'application/json', 'X-UserToken': _atToken || Platform.getSessionToken() || '' }
-                    });
+                    }, options && options._sfCtx, 30000);
                     if (_atMetaRes.ok) {
                         var _atMeta = await _atMetaRes.json();
                         _atDeleteName = _atMeta && _atMeta.result && _atMeta.result.file_name;
@@ -2088,10 +2309,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (_atInstanceUrl) atUrl = _atInstanceUrl + atUrl;
 
             var _atApiToken = _atToken || Platform.getSessionToken() || '';
-            var atRes = await fetch(atUrl, {
+            var atRes = await _toolFetch(atUrl, {
                 method: args.method,
                 headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-UserToken': _atApiToken }
-            });
+            }, options && options._sfCtx, 30000);
             var atData;
             if (atRes.status === 204) {
                 atData = {};
@@ -2192,7 +2413,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (args.data && ['POST', 'PUT', 'PATCH'].includes(args.method)) {
                 opts.body = JSON.stringify(args.data);
             }
-            var res = await fetch(url, opts);
+            var res = await _toolFetch(url, opts, options && options._sfCtx, 30000);
             var data;
             if (res.status === 204) {
                 data = {};
@@ -2248,7 +2469,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
         }
         // Hard admin gate (see _rsCheckAdmin) — never POST as a non-admin.
-        var _rsGate = await _rsCheckAdmin(_rsTargetUrl || Platform.resolveInstanceUrl(null) || '', _rsTargetToken || Platform.getSessionToken() || '');
+        var _rsGate = await _rsCheckAdmin(_rsTargetUrl || Platform.resolveInstanceUrl(null) || '', _rsTargetToken || Platform.getSessionToken() || '', options && options._sfCtx);
         if (!_rsGate.ok) return { success: false, error: _rsGate.error };
         var _rsScope = args.scope || 'global';
         var _rsParams = [
@@ -2278,22 +2499,13 @@ async function _executeToolInner(name, args, messageIndex, options) {
             var _rsApiToken = _rsTargetToken || Platform.getSessionToken() || '';
             // FIX (RS-2): a wedged/hanging sys.scripts.do POST had no timeout,
             // so a single stuck request could park the whole per-instance
-            // queue (_enqueueSysScripts) forever. Abort after ~120s with a
-            // clear timeout error; always clear the timer.
-            var _rsAbort = new AbortController();
-            var _rsTimedOut = false;
-            var _rsTimer = setTimeout(function() { _rsTimedOut = true; _rsAbort.abort(); }, 120000);
-            var _rsRes;
-            try {
-                _rsRes = await fetch(_rsUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'X-UserToken': _rsApiToken },
-                    body: _rsBody,
-                    signal: _rsAbort.signal
-                });
-            } finally {
-                clearTimeout(_rsTimer);
-            }
+            // queue (_enqueueSysScripts) forever. _toolFetch aborts after the
+            // hard timeout (default 120s, args.timeout_ms overrides).
+            var _rsRes = await _toolFetch(_rsUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'X-UserToken': _rsApiToken },
+                body: _rsBody
+            }, options && options._sfCtx, 120000);
             var _rsText = await _rsRes.text();
             // Parse the response: extract output between <PRE>...</PRE> and execution history sys_id
             var _rsOutput = '';
@@ -2341,9 +2553,6 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (_rsTargetUrl) _rsResult.instance = args.instance;
             return _rsResult;
         } catch (e) {
-            if (_rsTimedOut) {
-                return { success: false, error: 'servicenow_run_script timed out after 120s waiting for /sys.scripts.do' };
-            }
             return { success: false, error: e.message };
         }
         });
@@ -2464,7 +2673,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 }
             } catch (_wfGhErr) { /* malformed URL or storage read error: fall through unauthenticated (safe no-op) */ }
             // ------------------------------------------------------------------
-            var _wfRes = await fetch(args.url, _wfOpts);
+            var _wfRes = await _toolFetch(args.url, _wfOpts, options && options._sfCtx, 30000);
             var _wfCT = _wfRes.headers.get('content-type') || '';
             var _wfBody;
             if (_wfSaveFile) {
@@ -3173,11 +3382,11 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'push') {
             result = await wsPush(wk, args, chatId, chatTitle);
         } else if (action === 'deploy') {
-            result = await wsDeploy(wk, args.path, args.dest);
+            result = await wsDeploy(wk, args.path, args.dest, { ext: args.ext, flat: args.flat });
         } else if (action === 'discard') {
             // files/dest are not supported selectors; do not turn them into discard-all.
             if (args.files != null || args.dest != null) return { success: false, error: 'workspace discard accepts only path, not files or dest' };
-            result = await wsDiscard(wk, args.path, chatId, chatTitle, force);
+            result = await wsDiscard(wk, args.path, chatId, chatTitle, force, { remoteCheck: true });
         } else if (action === 'pin') {
             // Pin (or unpin) a workspace. At most one pinned workspace per
             // owner/repo — setWorkspacePin clears any sibling pin. The pinned
@@ -3948,6 +4157,36 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
 
     var discarded = [];
     var _dRaced = [];
+    // opts.remoteCheck (the user-facing discard): never restore a base that the
+    // remote has already moved past (e.g. our PR merged) — restore to the
+    // remote blob instead. The remote tree is fetched lazily, once.
+    // Fail-closed: when the remote cannot be verified (ref/tree fetch failed,
+    // tree truncated) the discard is REFUSED — it never falls back to the
+    // possibly-stale original_content.
+    var _dRemote; // undefined = not fetched, null = unavailable (unverified)
+    var _dRemoteAhead = [];
+    var _dUnverified = [];
+    var _dRemoteDeleted = [];
+    // Agents have no sync/pull action — the ↻ sync button is the user's.
+    var _dHint = 'ask the user to click \u21bb sync on the workspace, then discard again';
+    async function _dGetRemoteTree() {
+        if (_dRemote !== undefined) return _dRemote;
+        _dRemote = null;
+        try {
+            var _dRepo = meta.github_repo || parseWsKey(wk).repo;
+            var _dRef = await githubApi('GET', '/repos/' + _dRepo + '/git/ref/heads/' + encodeURIComponent(meta.branch));
+            if (!_dRef || !_dRef.ok || !_dRef.body || !_dRef.body.object || !_dRef.body.object.sha) return null;
+            // No up-to-date shortcut: even at our own head the path may be gone
+            // upstream (a pre-fix sync moved HEAD past the deletion), so the
+            // deleted-path check below always runs against the real tree.
+            var _dTree = await githubApi('GET', '/repos/' + _dRepo + '/git/trees/' + _dRef.body.object.sha + '?recursive=1');
+            if (!_dTree || !_dTree.ok || !_dTree.body || _dTree.body.truncated || !Array.isArray(_dTree.body.tree)) return null;
+            var _dMap = {};
+            _dTree.body.tree.forEach(function(e) { if (e.type === 'blob') _dMap[e.path] = e.sha; });
+            _dRemote = { tree: _dMap, repo: _dRepo };
+        } catch (e) { _dRemote = null; }
+        return _dRemote;
+    }
     for (var i = 0; i < proceedable.length; i++) {
         var f = proceedable[i];
         // CAS expected: the caller's snapshot (single-file) or the row as read
@@ -3976,7 +4215,36 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
             // tracked-but-never-hydrated stub (original_content null, stub +
             // sha set) this restores the stub itself: content goes back to
             // null and the blob is re-fetched on demand.
-            f.content = f.original_content;
+            var _dRestore = f.original_content, _dNewSha = null;
+            if (opts && opts.remoteCheck && f.sha) {
+                var _dRt = await _dGetRemoteTree();
+                if (!_dRt) {
+                    if (filePath) return { success: false, unverified: true, path: f.path, error: "Discard refused — couldn't verify remote (GitHub API error or truncated tree), so the possibly-stale base was NOT restored — " + _dHint + ': ' + f.path };
+                    _dUnverified.push(f.path);
+                    continue;
+                }
+                var _dRs = _dRt.tree[f.path] || null;
+                if (!_dRs) {
+                    if (filePath) return { success: false, remote_deleted: true, path: f.path, error: 'Discard refused — ' + f.path + ' no longer exists on the remote branch (deleted upstream), so its stale base was NOT restored. To drop your local copy use workspace delete on it; to keep your edits, leave it (sync reports it as a remote_deleted conflict).' };
+                    _dRemoteDeleted.push(f.path);
+                    continue;
+                }
+                if (_dRs && _dRs !== f.sha) {
+                    var _dBlob = null;
+                    try { _dBlob = await githubApi('GET', '/repos/' + _dRt.repo + '/git/blobs/' + _dRs); } catch (e) { _dBlob = null; }
+                    if (_dBlob && _dBlob.ok && _dBlob.body && _dBlob.body.content != null) {
+                        _dRestore = _wsDecodeBlobBody(_dBlob.body);
+                        _dNewSha = _dRs;
+                    } else {
+                        var _dAheadMsg = 'remote ahead: ' + f.path + ' changed on the remote (' + String(_dRs).slice(0, 7) + ') and its content could not be fetched, so the stale local base was NOT restored — ' + _dHint + '.';
+                        if (filePath) return { success: false, remote_ahead: true, path: f.path, error: 'Discard refused — ' + _dAheadMsg };
+                        _dRemoteAhead.push(f.path);
+                        continue;
+                    }
+                }
+            }
+            if (_dNewSha) { f.original_content = _dRestore; f.sha = _dNewSha; f.stub = false; }
+            f.content = _dRestore;
             f.dirty = false;
             f.deleted = false;
             f.pushed_pr = null;
@@ -3996,10 +4264,22 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
                 continue;
             }
             if (typeof invalidateWorkspaceFilePointer === 'function') invalidateWorkspaceFilePointer(f.file_id);
-            discarded.push({ path: f.path, action: 'restored' });
+            discarded.push(_dNewSha ? { path: f.path, action: 'restored_to_remote', sha: _dNewSha } : { path: f.path, action: 'restored' });
         }
     }
     var resp = { success: true, message: 'Discarded changes to ' + discarded.length + ' file(s)', discarded: discarded.length, files: discarded };
+    if (_dRemoteAhead.length > 0) {
+        resp.remote_ahead = _dRemoteAhead;
+        resp.message += ' (' + _dRemoteAhead.length + ' file(s) NOT discarded — remote ahead, ' + _dHint + ': ' + _dRemoteAhead.join(', ') + ')';
+    }
+    if (_dUnverified.length > 0) {
+        resp.unverified = _dUnverified;
+        resp.message += ' (' + _dUnverified.length + " file(s) NOT discarded — couldn't verify remote, " + _dHint + ': ' + _dUnverified.join(', ') + ')';
+    }
+    if (_dRemoteDeleted.length > 0) {
+        resp.remote_deleted = _dRemoteDeleted;
+        resp.message += ' (' + _dRemoteDeleted.length + ' file(s) NOT discarded — no longer on the remote (use workspace delete to drop them): ' + _dRemoteDeleted.join(', ') + ')';
+    }
     if (_dRaced.length > 0) {
         resp.changed_concurrently = _dRaced;
         resp.message += ' (' + _dRaced.length + ' file(s) changed concurrently and were kept: ' + _dRaced.join(', ') + ')';
@@ -4643,11 +4923,12 @@ async function wsStatus(wk, includeIgnored, chatId, includePrs) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
-    // Sync with remote first — cleans up merged PRs, auto-deletes a merged
-    // head-branch workspace whose base is cloned locally, and detects behind/
-    // conflict files.
+    // READ-ONLY sync: detects behind / conflict / pending-rebase files but
+    // writes nothing (no auto-pull, no rebase, no clean-marking, no merged-fork
+    // auto-delete). `status` is a safe action (run_tests snapshots with it);
+    // the ↻ / auto-sync UI path, pull and push perform the actual sync.
     var syncResult = null;
-    try { syncResult = await wsSyncWithRemote(wk); } catch(e) {}
+    try { syncResult = await wsSyncWithRemote(wk, { readOnly: true }); } catch(e) {}
 
     // wsSyncWithRemote auto-deleted this workspace (branch merged into a locally
     // cloned base) — report that instead of normal status.
@@ -4743,6 +5024,7 @@ async function wsStatus(wk, includeIgnored, chatId, includePrs) {
         if (syncResult.behindFiles && syncResult.behindFiles.length > 0) result.behind_files = syncResult.behindFiles;
         if (syncResult.conflictFiles && syncResult.conflictFiles.length > 0) result.conflict_files = syncResult.conflictFiles;
         if (syncResult.merge_warning) result.merge_warning = syncResult.merge_warning;
+        if (syncResult.pending_rebase && syncResult.pending_rebase.length > 0) result.pending_rebase = syncResult.pending_rebase;
     }
     // Pin state: expose this workspace's pin, and a short notice when a
     // SIBLING workspace of the same repo holds the pin (it — not this one —
@@ -4893,10 +5175,11 @@ async function wsDiff(repo, filePath, includeIgnored, chatId) {
     var meta = await getWorkspaceMeta(repo);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
 
-    // Sync with remote first — updates original_content for dirty files whose base changed
+    // Read-only sync (like wsStatus): diff is a run_tests safe action, so it
+    // never writes rows/meta — pending rebases are reported, not applied.
     var _syncErr = null;
     var _diffSync = null;
-    try { _diffSync = await wsSyncWithRemote(repo); } catch(e) { _syncErr = e; }
+    try { _diffSync = await wsSyncWithRemote(repo, { readOnly: true }); } catch(e) { _syncErr = e; }
     if (_diffSync && _diffSync.deleted) {
         return { success: true, deleted: true, message: 'Workspace auto-deleted — branch "' + _diffSync.branch + '" was merged into the locally-cloned base "' + _diffSync.base_branch + '".' };
     }
@@ -4939,6 +5222,8 @@ async function wsDiff(repo, filePath, includeIgnored, chatId) {
             : _dForeign.length + ' diffed file(s) have uncommitted changes from other (now dormant) chats \u2014 mutating them silently takes over ownership.';
     }
     if (_syncErr) result.sync_warning = 'Remote sync failed — diffs may be against stale base';
+    if (_diffSync && _diffSync.pending_rebase && _diffSync.pending_rebase.length) result.pending_rebase = _diffSync.pending_rebase;
+    if (_diffSync && _diffSync.conflictFiles && _diffSync.conflictFiles.length) result.conflict_files = _diffSync.conflictFiles;
     return result;
 }
 
@@ -5271,7 +5556,128 @@ function _wsChatProgressState(chat) {
     return last;
 }
 
-async function wsSyncWithRemote(wk) {
+// Line hunks turning `a` into `b` (arrays of lines) via Myers O(ND) diff:
+// [{bs, be, os, oe}] = a[bs,be) replaced by b[os,oe). Returns null when the
+// edit distance exceeds `maxD` (caller treats that as "cannot merge").
+function _wsLineHunks(a, b, maxD) {
+    var n = a.length, m = b.length, pre = 0, suf = 0;
+    while (pre < n && pre < m && a[pre] === b[pre]) pre++;
+    while (suf < n - pre && suf < m - pre && a[n - 1 - suf] === b[m - 1 - suf]) suf++;
+    var A = a.slice(pre, n - suf), B = b.slice(pre, m - suf), N = A.length, M = B.length;
+    if (!N && !M) return [];
+    if (!N || !M) return [{ bs: pre, be: pre + N, os: pre, oe: pre + M }];
+    // Two passes: pass 1 finds the edit distance D in O(N+M) space and gives
+    // up past the cap (a large rewrite → null → caller's conflict fallback)
+    // WITHOUT recording anything; pass 2 re-runs to D with the trace, whose
+    // size is O(D²) ≤ cap² (2000 → ≤4M ints) only when a diff exists.
+    var max = N + M, cap = Math.min(max, maxD || 2000), off = max + 1;
+    function run(limit, trace) {
+        var V = new Int32Array(2 * max + 3);
+        for (var d = 0; d <= limit; d++) {
+            for (var k = -d; k <= d; k += 2) {
+                var x = (k === -d || (k !== d && V[off + k - 1] < V[off + k + 1])) ? V[off + k + 1] : V[off + k - 1] + 1;
+                var y = x - k;
+                while (x < N && y < M && A[x] === B[y]) { x++; y++; }
+                V[off + k] = x;
+                if (x >= N && y >= M) { if (trace) trace.push(V.slice(off - d, off + d + 1)); return d; }
+            }
+            if (trace) trace.push(V.slice(off - d, off + d + 1));
+        }
+        return -1;
+    }
+    var D = run(cap, null);
+    if (D < 0) return null;
+    var trace = [];
+    run(D, trace);
+    var delA = new Uint8Array(N), insB = new Uint8Array(M), cx = N, cy = M;
+    for (var dd = D; dd > 0; dd--) {
+        var Vp = trace[dd - 1], kk = cx - cy;
+        var gv = function(q) { return Vp[q + dd - 1]; };
+        var pk = (kk === -dd || (kk !== dd && gv(kk - 1) < gv(kk + 1))) ? kk + 1 : kk - 1;
+        var px = gv(pk), py = px - pk;
+        while (cx > px && cy > py) { cx--; cy--; }
+        if (pk === kk + 1) insB[py] = 1; else delA[px] = 1;
+        cx = px; cy = py;
+    }
+    var hunks = [], i = 0, j = 0;
+    while (i < N || j < M) {
+        if (i < N && j < M && !delA[i] && !insB[j]) { i++; j++; continue; }
+        var si = i, sj = j;
+        while ((i < N && delA[i]) || (j < M && insB[j])) {
+            while (i < N && delA[i]) i++;
+            while (j < M && insB[j]) j++;
+        }
+        if (i === si && j === sj) break; // defensive: never loop forever
+        hunks.push({ bs: pre + si, be: pre + i, os: pre + sj, oe: pre + j });
+    }
+    return hunks;
+}
+
+// Line-based 3-way merge (diff3 style). Returns {clean, content, shared}:
+// clean=false on any overlapping/touching hunks whose results differ (or when
+// the diff is too large); shared = number of regions BOTH sides changed
+// identically (evidence that the local change already landed in `theirs`).
+function _wsMerge3(base, ours, theirs) {
+    if (typeof base !== 'string' || typeof ours !== 'string' || typeof theirs !== 'string') return { clean: false };
+    if (ours === theirs) return { clean: true, content: theirs, shared: ours === base ? 0 : 1 };
+    if (base === ours) return { clean: true, content: theirs, shared: 0 };
+    if (base === theirs) return { clean: true, content: ours, shared: 0 };
+    var b = base.split('\n'), o = ours.split('\n'), t = theirs.split('\n');
+    var hA = _wsLineHunks(b, o), hB = _wsLineHunks(b, t);
+    if (!hA || !hB) return { clean: false };
+    var all = hA.map(function(h) { return { h: h, s: 0 }; }).concat(hB.map(function(h) { return { h: h, s: 1 }; }));
+    all.sort(function(x, y) { return (x.h.bs - y.h.bs) || (x.h.be - y.h.be); });
+    var groups = [];
+    all.forEach(function(it) {
+        var g = groups[groups.length - 1];
+        if (g && it.h.bs <= g.hi) { g.items.push(it); if (it.h.be > g.hi) g.hi = it.h.be; }
+        else groups.push({ lo: it.h.bs, hi: it.h.be, items: [it] });
+    });
+    var out = [], pos = 0, delta = [0, 0], sides = [o, t], shared = 0;
+    for (var gi = 0; gi < groups.length; gi++) {
+        var g = groups[gi];
+        for (var p = pos; p < g.lo; p++) out.push(b[p]);
+        var has = [false, false], inDelta = [0, 0];
+        g.items.forEach(function(it) { has[it.s] = true; inDelta[it.s] += (it.h.oe - it.h.os) - (it.h.be - it.h.bs); });
+        var txt = [0, 1].map(function(s) { return sides[s].slice(g.lo + delta[s], g.hi + delta[s] + inDelta[s]); });
+        if (has[0] && has[1]) {
+            if (txt[0].join('\n') !== txt[1].join('\n')) return { clean: false };
+            shared++;
+            Array.prototype.push.apply(out, txt[0]);
+        } else {
+            Array.prototype.push.apply(out, has[0] ? txt[0] : txt[1]);
+        }
+        delta[0] += inDelta[0]; delta[1] += inDelta[1];
+        pos = g.hi;
+    }
+    for (var q = pos; q < b.length; q++) out.push(b[q]);
+    return { clean: true, content: out.join('\n'), shared: shared };
+}
+
+// GitHub-confirmed merge state of a pushed_pr ref ({number|url}). Fail-closed:
+// any API failure / unknown number reads as NOT merged. `cache` (optional,
+// per sync) keys by PR number so one sync costs at most one GET per PR.
+async function _wsPrConfirmedMerged(githubRepo, prRef, cache) {
+    var num = prRef && (prRef.number || (String(prRef.url || '').match(/\/pulls?\/(\d+)/) || [])[1]);
+    if (!num || !githubRepo) return false;
+    if (cache && cache[num] !== undefined) return cache[num];
+    var merged = false;
+    try {
+        var r = await githubApi('GET', '/repos/' + githubRepo + '/pulls/' + num);
+        merged = !!(r && r.ok && r.body && (r.body.merged === true || r.body.merged_at));
+    } catch (e) { merged = false; }
+    if (cache) cache[num] = merged;
+    return merged;
+}
+
+// opts.autoPull: after syncing, fast-forward clean behind files via wsPull
+// (per-row CAS, skips dirty rows) followed by ONE re-sync. opts.noAutoPull
+// always wins. opts.readOnly (wsStatus): detect only — no row/meta writes, no
+// merged-fork auto-delete, no auto-pull; rebases/landings that a normal sync
+// would apply are reported in `pending_rebase` (and keep `behind` true).
+async function wsSyncWithRemote(wk, opts) {
+    opts = opts || {};
+    var _ro = !!opts.readOnly;
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return null;
     var githubRepo = meta.github_repo || parseWsKey(wk).repo;
@@ -5283,7 +5689,7 @@ async function wsSyncWithRemote(wk) {
     // PR lands on the base. Dirty edits are moved to the base workspace first
     // (a blocked move keeps the workspace and surfaces merge_warning). No-op
     // for open PRs / non-local base / default branch (see wsMaybeAutoDeleteMerged).
-    var _autoDel = await wsMaybeAutoDeleteMerged(wk, meta);
+    var _autoDel = _ro ? null : await wsMaybeAutoDeleteMerged(wk, meta);
     if (_autoDel && _autoDel.deleted) {
         return {
             synced: 0, behind: false, deleted: true, remoteHead: null, dirty_remaining: 0,
@@ -5352,6 +5758,13 @@ async function wsSyncWithRemote(wk) {
     var _racedPaths = {};
     var _racedList = [];
     function _markRaced(p) { if (!_racedPaths[p]) { _racedPaths[p] = true; _racedList.push(p); } }
+    // Dirty files rebased onto a changed remote base by the step-4 3-way merge.
+    var _rebasedList = [];
+    // readOnly: rows a normal sync would write (clean-mark / rebase), keyed
+    // so step 4 does not re-classify them; reported as pending_rebase.
+    var _roInSync = {};
+    var _roPending = [];
+    var _prMergedCache = {};
 
     for (var i = 0; i < files.length; i++) {
         var f = files[i];
@@ -5359,7 +5772,7 @@ async function wsSyncWithRemote(wk) {
 
         if (f.deleted) {
             // Deleted locally — if also gone from remote, sync it
-            if (!remoteTree[f.path]) {
+            if (!remoteTree[f.path] && !_ro) {
                 // H6: CAS delete against the snapshot row — a concurrent
                 // un-delete / re-create since getAllWorkspaceFiles keeps it.
                 var _dCas;
@@ -5378,6 +5791,7 @@ async function wsSyncWithRemote(wk) {
         if (f.content == null) continue; // stub safety — dirty files are always hydrated
         var localSha = await computeGitBlobSha(f.content);
         if (remoteTree[f.path] && remoteTree[f.path] === localSha) {
+            if (_ro) { _roInSync[f.path] = true; _roPending.push({ path: f.path, remoteSha: localSha, reason: 'matches_remote' }); continue; }
             // File content matches remote — mark as clean, update original_content and sha,
             // and clear cross-chat ownership (no longer dirty, so no claim).
             // If this file was pushed to a PR, the remote now matching our local
@@ -5417,6 +5831,7 @@ async function wsSyncWithRemote(wk) {
         var cf = files[j];
         if (isIgnored(cf.path)) continue;
         if (_racedPaths[cf.path]) continue; // H6: stale in-memory row — re-evaluated next sync
+        if (_roInSync[cf.path]) continue; // readOnly: already reported as pending_rebase
         if (cf.dirty && cf.deleted) {
             // Deleted locally — if remote also changed, that's a conflict (unless we pushed the delete)
             if (remoteTree[cf.path] && cf.sha && remoteTree[cf.path] !== cf.sha) {
@@ -5426,10 +5841,18 @@ async function wsSyncWithRemote(wk) {
         } else if (cf.dirty && !cf.deleted) {
             // Dirty file — check if remote base also changed
             var _remoteSha = remoteTree[cf.path];
-            if (_remoteSha && (!cf.sha || _remoteSha !== cf.sha)) {
+            if (!_remoteSha && cf.sha) {
+                // Tracked (non-new) dirty file DELETED upstream: never move HEAD
+                // past the deletion silently — a later discard would restore the
+                // stale original_content and a push would re-create the file.
+                // Flag it (a report only: no row writes, readOnly alike).
+                conflictFiles.push({ path: cf.path, remoteSha: null, reason: 'remote_deleted' });
+            } else if (_remoteSha && (!cf.sha || _remoteSha !== cf.sha)) {
                 // Check if this remote sha matches one of our pushed shas (our PR was merged)
                 var _isOurWork = cf.pushed_shas && cf.pushed_shas.indexOf(_remoteSha) !== -1;
-                if (_isOurWork) {
+                if (_isOurWork && _ro) {
+                    _roPending.push({ path: cf.path, remoteSha: _remoteSha, reason: 'pushed_work_landed' });
+                } else if (_isOurWork) {
                     // Capture before pushed_pr is cleared below — needed to stamp
                     // the tracked meta.prs entry as merged.
                     var _mergedPrRef = cf.pushed_pr || null;
@@ -5470,14 +5893,77 @@ async function wsSyncWithRemote(wk) {
                                 _markRaced(cf.path);
                             }
                         } else {
-                            conflictFiles.push({ path: cf.path, remoteSha: _remoteSha });
+                            conflictFiles.push({ path: cf.path, remoteSha: _remoteSha, blobFetchFailed: true });
                         }
                     } catch(_e) {
-                        conflictFiles.push({ path: cf.path, remoteSha: _remoteSha });
+                        conflictFiles.push({ path: cf.path, remoteSha: _remoteSha, blobFetchFailed: true });
                     }
                 } else {
+                    // Remote sha is neither our base nor something we pushed (e.g.
+                    // our PR merged together with other upstream edits, or the
+                    // pushed_shas stamp was lost). Try a line-based 3-way merge
+                    // base=original_content / ours=local / theirs=remote and adopt
+                    // the remote as the new base ONLY on landing evidence: the
+                    // merge result equals the remote exactly (all our changes are
+                    // already there), or the file's pushed_pr is confirmed merged
+                    // via the GitHub API. A partial shared hunk alone is NOT
+                    // evidence (conflict reason pr_not_merged / not_ours). The PR
+                    // is stamped merged / pushed_pr cleared ONLY on API confirmation.
+                    var _m3Done = false, _m3Fail = null;
+                    if (cf.sha && cf.original_content != null && typeof cf.content === 'string' && cf.content.indexOf('::binary::') !== 0) {
+                        try {
+                            var _m3Blob = await githubApi('GET', '/repos/' + githubRepo + '/git/blobs/' + _remoteSha);
+                            if (_m3Blob && _m3Blob.ok && _m3Blob.body && _m3Blob.body.content != null) {
+                                var _m3Remote = _wsDecodeBlobBody(_m3Blob.body);
+                                var _m3 = _wsMerge3(cf.original_content, cf.content, _m3Remote);
+                                var _m3Clean = !!(_m3.clean && _m3.content === _m3Remote);
+                                var _m3PrMerged = false;
+                                // Partial merge: the lookup IS the landing evidence. Exact
+                                // match: it only gates the stamp / pushed_pr clear (the same
+                                // upstream change can land while our PR is still open).
+                                // readOnly never stamps, so it skips the exact-match lookup.
+                                if (_m3.clean && cf.pushed_pr && !(_m3Clean && _ro)) _m3PrMerged = await _wsPrConfirmedMerged(githubRepo, cf.pushed_pr, _prMergedCache);
+                                if (_m3.clean && (_m3Clean || _m3PrMerged) && _ro) {
+                                    _roPending.push({ path: cf.path, remoteSha: _remoteSha, reason: 'rebase_available' });
+                                    _m3Done = true;
+                                } else if (_m3.clean && (_m3Clean || _m3PrMerged)) {
+                                    var _m3PrRef = cf.pushed_pr || null;
+                                    var _m3Snap = Object.assign({}, cf);
+                                    cf.original_content = _m3Remote;
+                                    cf.sha = _remoteSha;
+                                    cf.content = _m3.content;
+                                    cf.stub = false;
+                                    // Unconfirmed exact match: base adopted, PR link kept.
+                                    if (_m3PrMerged || !_m3PrRef) { cf.pushed_pr = null; cf.pushed_shas = null; }
+                                    if (_m3Clean) {
+                                        cf.dirty = false;
+                                        cf.last_modified_by_chat_id = null;
+                                        cf.last_modified_by_chat_title = null;
+                                        cf.last_modified_at = null;
+                                    }
+                                    var _m3Cas;
+                                    try { _m3Cas = await _wsCasWrite(wk, cf.path, _m3Snap, cf); } catch (e) { _m3Cas = { ok: false, error: e && e.message }; }
+                                    if (_m3Cas && _m3Cas.ok) {
+                                        _m3Done = true;
+                                        if (typeof invalidateWorkspaceFilePointer === 'function') { try { invalidateWorkspaceFilePointer(cf.file_id); } catch (e) {} }
+                                        // Stamp merged ONLY when the GitHub API confirmed it.
+                                        if (_m3PrRef && _m3PrMerged && _mergedPrRefs.indexOf(_m3PrRef) === -1) _mergedPrRefs.push(_m3PrRef);
+                                        _rebasedList.push({ path: cf.path, remoteSha: _remoteSha, dirty: !_m3Clean });
+                                        synced++;
+                                    } else {
+                                        _m3Done = true;
+                                        _markRaced(cf.path);
+                                    }
+                                } else {
+                                    _m3Fail = !_m3.clean ? 'merge_conflict' : (cf.pushed_pr ? 'pr_not_merged' : 'not_ours');
+                                }
+                            } else {
+                                _m3Fail = 'blob_fetch_failed';
+                            }
+                        } catch (_m3e) { _m3Fail = 'blob_fetch_failed'; }
+                    }
                     // Someone else changed the file — real conflict
-                    conflictFiles.push({ path: cf.path, remoteSha: _remoteSha });
+                    if (!_m3Done) conflictFiles.push(_m3Fail ? { path: cf.path, remoteSha: _remoteSha, reason: _m3Fail } : { path: cf.path, remoteSha: _remoteSha });
                 }
             }
         } else if (!cf.dirty && !cf.deleted) {
@@ -5507,7 +5993,7 @@ async function wsSyncWithRemote(wk) {
         }
     }
 
-    var behind = behindFiles.length > 0 || conflictFiles.length > 0;
+    var behind = behindFiles.length > 0 || conflictFiles.length > 0 || _roPending.length > 0;
 
     // Late re-check: a CONCURRENT operation (e.g. a sibling fork's merge auto-
     // delete pulling this base workspace, or a parallel UI sync) may have
@@ -5517,14 +6003,14 @@ async function wsSyncWithRemote(wk) {
     var _metaNow = await getWorkspaceMeta(wk);
     if (!_metaNow) {
         // Workspace removed mid-sync — clean any rows our step-3 writes may
-        // have resurrected and report as gone.
-        try { await deleteWorkspaceFiles(wk); } catch (e) {}
+        // have resurrected and report as gone (readOnly wrote nothing).
+        if (!_ro) { try { await deleteWorkspaceFiles(wk); } catch (e) {} }
         return null;
     }
     if (behind && _metaNow.head_sha === remoteHead) {
         // Already pulled to the remote head concurrently — our behind/conflict
         // lists were computed from a stale snapshot.
-        behind = false; behindFiles = []; conflictFiles = [];
+        behind = false; behindFiles = []; conflictFiles = []; _roPending = [];
     }
     meta = _metaNow;
 
@@ -5553,7 +6039,9 @@ async function wsSyncWithRemote(wk) {
     }
 
     // Only advance HEAD if fully in sync (H6: and no row write lost a race)
-    if (!behind && _racedList.length === 0) {
+    if (_ro) {
+        // readOnly: never advance HEAD / persist stamps.
+    } else if (!behind && _racedList.length === 0) {
         meta.head_sha = remoteHead;
         meta.tree_sha = treeRes.body.sha;
         await setWorkspaceMeta(meta);
@@ -5566,18 +6054,52 @@ async function wsSyncWithRemote(wk) {
 
     var _syncRet = { synced: synced, behind: behind, remoteHead: remoteHead, dirty_remaining: remaining, behindFiles: behindFiles, conflictFiles: conflictFiles, _remoteTree: remoteTree, _treeSha: treeRes.body.sha };
     if (_racedList.length) _syncRet.raced = _racedList;
+    if (_rebasedList.length) _syncRet.rebased = _rebasedList;
     if (_mergeWarning) _syncRet.merge_warning = _mergeWarning;
+    if (_roPending.length) _syncRet.pending_rebase = _roPending;
+    // Fast-forward clean behind files (opt-in; the ↻/auto-sync UI path only).
+    // wsPull reuses THIS sync's result (no extra sync of its own) and only
+    // ever writes rows that are still clean (per-row CAS); then exactly ONE
+    // follow-up re-sync reports the final state.
+    if (opts.autoPull && !opts.noAutoPull && !_ro && behindFiles.length > 0) {
+        try {
+            var _ap = await wsPull(wk, { syncResult: _syncRet });
+            var _after = await wsSyncWithRemote(wk, { noAutoPull: true });
+            // The re-sync auto-deleted the workspace — report THAT, never the
+            // stale pre-pull result.
+            if (_after && _after.deleted) return _after;
+            if (_after) {
+                _after.auto_pulled = (_ap && _ap.pulled) || 0;
+                if (_ap && _ap.failed) _after.auto_pull_failed = _ap.failed;
+                if (_rebasedList.length && !_after.rebased) _after.rebased = _rebasedList;
+                _after.synced = (_after.synced || 0) + synced;
+                return _after;
+            }
+            // Re-sync returned null (ref fetch failed / workspace removed mid-
+            // sync): the pre-pull _syncRet is stale once wsPull wrote rows or
+            // advanced HEAD — return an explicit unverified state instead (no
+            // conflictFiles array: callers must treat it as not checked).
+            var _rsFail = { synced: synced, behind: true, remoteHead: remoteHead, dirty_remaining: -1, resync_failed: true,
+                auto_pulled: (_ap && _ap.pulled) || 0,
+                sync_warning: 'Auto-pull ran but the follow-up re-sync failed — workspace state is unverified; sync again.' };
+            if (_ap && _ap.failed) _rsFail.auto_pull_failed = _ap.failed;
+            if (_rebasedList.length) _rsFail.rebased = _rebasedList;
+            if (_mergeWarning) _rsFail.merge_warning = _mergeWarning;
+            return _rsFail;
+        } catch (e) { _syncRet.auto_pull_error = (e && e.message) || String(e); }
+    }
     return _syncRet;
 }
 
 // Pull remote changes for behind files (download new content from remote)
-async function wsPull(wk) {
+async function wsPull(wk, opts) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned' };
     var githubRepo = meta.github_repo || parseWsKey(wk).repo;
 
-    // Re-sync to get fresh behind files list
-    var syncResult = await wsSyncWithRemote(wk);
+    // Re-sync to get fresh behind files list (never auto-pull from here — we ARE the pull).
+    // opts.syncResult: the caller (wsSyncWithRemote autoPull) just synced — reuse it.
+    var syncResult = (opts && opts.syncResult) || await wsSyncWithRemote(wk, { noAutoPull: true });
     if (syncResult && syncResult.deleted) {
         return { success: true, deleted: true, pulled: 0, message: 'Workspace auto-deleted — branch "' + syncResult.branch + '" was merged into the locally-cloned base "' + syncResult.base_branch + '".' };
     }
@@ -5784,8 +6306,17 @@ async function wsPush(wk, args, chatId, chatTitle) {
 
     // Sync with remote first — advance HEAD if PRs were merged
     var syncResult = await wsSyncWithRemote(wk);
-    if (syncResult && syncResult.conflictFiles && syncResult.conflictFiles.length > 0) {
-        return { success: false, error: 'Cannot push — ' + syncResult.conflictFiles.length + ' file(s) have conflicting remote changes. Pull or discard first.', conflict_files: syncResult.conflictFiles };
+    // A scoped push (args.files) is only blocked by conflicts on the files it
+    // actually commits — an unrelated stale dirty file must not wedge it. (The
+    // pre-commit fresh-tree re-check below still guards every committed path.)
+    var _syncConflicts = (syncResult && Array.isArray(syncResult.conflictFiles)) ? syncResult.conflictFiles : [];
+    if (_syncConflicts.length && Array.isArray(args.files) && args.files.length) {
+        var _allow = {};
+        args.files.forEach(function(p) { _allow[String(p).replace(/^\/+/, '')] = true; });
+        _syncConflicts = _syncConflicts.filter(function(c) { return c && _allow[c.path]; });
+    }
+    if (_syncConflicts.length > 0) {
+        return { success: false, error: 'Cannot push — ' + _syncConflicts.length + ' file(s) have conflicting remote changes (see conflict_files). Leave them out of this push (files: [...]), or discard them and re-apply your edits on the new remote base.', conflict_files: _syncConflicts };
     }
     // FAIL CLOSED: pushing is only safe when conflict detection actually RAN.
     // wsSyncWithRemote returns null when the remote ref fetch failed, and a
@@ -6402,7 +6933,10 @@ async function wsPush(wk, args, chatId, chatTitle) {
             if (!(_pwCas && _pwCas.ok)) {
                 var _cur = _pwCas && _pwCas.conflict ? _pwCas.current : null;
                 var _chg = { path: dirtyFiles[k].path, reason: !_pwCas || !_pwCas.conflict ? 'write_failed' : (!_cur ? 'removed' : (_cur.dirty ? 'edited' : 'discarded')), stamped: false };
-                if (_cur && _cur.dirty) {
+                // Bounded retry: a single lost CAS used to drop the pushed_shas
+                // stamp for good, so a later sync could no longer recognise the
+                // merged blob as our work (stale base + false conflict).
+                for (var _try = 0; _try < 3 && _cur && _cur.dirty && !_chg.stamped; _try++) {
                     var _curSnap = Object.assign({}, _cur);
                     var _stamped = Object.assign({}, _cur);
                     _stamped.pushed_pr = prInfo;
@@ -6413,6 +6947,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
                     var _rc;
                     try { _rc = await _wsCasWrite(wk, dirtyFiles[k].path, _curSnap, _stamped); } catch (e) { _rc = null; }
                     _chg.stamped = !!(_rc && _rc.ok);
+                    if (!_chg.stamped) _cur = (_rc && _rc.conflict) ? _rc.current : null;
                 }
                 _changedDuringPush.push(_chg);
             }
@@ -6547,7 +7082,36 @@ var DEPLOY_ROOT_MANAGED = ['app.html', 'app.js', 'app.css', 'sw-bundle.js', 'the
 // matches are SKIPPED (cheap getFile()+compare), and the remaining writes
 // run in PARALLEL. A no-op deploy returns files_written: 0 with the skip
 // count in files_skipped — callers gating on success should use the sum.
-async function wsDeploy(wk, srcPath, destSubdir) {
+function wsDeployIncludes(rel, opts) {
+    var o = opts || {}, ext = typeof o.ext === 'string' ? o.ext : '';
+    if (o.flat && rel.indexOf('/') >= 0) return false;
+    return !ext || (rel.length > ext.length && rel.slice(-ext.length) === ext);
+}
+
+// Order-preserving Promise.allSettled over fn(items[i]) with at most `limit`
+// calls in flight (a throwing fn yields a 'rejected' outcome, never aborts).
+var WS_DEPLOY_CONCURRENCY = 4;
+async function _wsDeployAllSettledLimit(items, limit, fn) {
+    var list = Array.isArray(items) ? items : [];
+    var n = Math.max(1, Math.floor(limit) || 1);
+    var out = new Array(list.length);
+    var next = 0;
+    async function worker() {
+        while (next < list.length) {
+            var i = next++;
+            try { out[i] = { status: 'fulfilled', value: await fn(list[i], i) }; }
+            catch (e) { out[i] = { status: 'rejected', reason: e }; }
+        }
+    }
+    var workers = [];
+    for (var w = 0; w < Math.min(n, list.length); w++) workers.push(worker());
+    await Promise.all(workers);
+    return out;
+}
+
+// opts (optional): { ext: '.json' } deploys only files with that suffix; { flat: true } only
+// top-level files of srcPath (the node build's readdirSync parity, e.g. src/locales/*.json).
+async function wsDeploy(wk, srcPath, destSubdir, opts) {
     var handle = await getDeployDirHandle();
     if (!handle) {
         // TB-4: null means no stored folder OR a stored one whose readwrite
@@ -6598,6 +7162,7 @@ async function wsDeploy(wk, srcPath, destSubdir) {
         if (f.content == null) continue; // stub that failed hydration
         var rel = f.path.substring(prefix.length);
         if (!rel) continue;
+        if (!wsDeployIncludes(rel, opts)) continue;
         targets.push({ outPath: dest ? dest + '/' + rel : rel, content: f.content });
     }
 
@@ -6662,7 +7227,11 @@ async function wsDeploy(wk, srcPath, destSubdir) {
 
     // allSettled (not all): a single rejected write must not leave its
     // siblings running untracked, and per-file errors must reach the caller.
-    var outcomes = await Promise.allSettled(targets.map(writeOne));
+    // Bounded (WS_DEPLOY_CONCURRENCY): each writeOne holds a Blob copy, a
+    // full existing.text() read-back and a createWritable() swap file; firing
+    // all ~65 dist files at once (with #1039's docs-locales/*) spiked the
+    // panel renderer heap on Reload (Aw, Snap! code 5). Same allSettled shape.
+    var outcomes = await _wsDeployAllSettledLimit(targets, WS_DEPLOY_CONCURRENCY, writeOne);
     var written = 0, skipped = 0, failedWrites = [];
     for (var oi = 0; oi < outcomes.length; oi++) {
         if (outcomes[oi].status === 'fulfilled') {

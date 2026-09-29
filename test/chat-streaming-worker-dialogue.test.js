@@ -7,6 +7,9 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
     var render = sources['src/js/ui/250-message-render.js'];
     var ui = sources['src/js/ui/175-sub-agent-ui.js'];
     var core = sources['src/js/core/097-sub-agent-registry.js'];
+    // The sliced UI functions call t()/tn()/N_(): every load() sandbox gets the REAL i18n core first
+    // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+    var i18nCore = sources['src/js/core/025-i18n.js'];
     function check(ok, message) { if (!ok) throw new Error(message); }
     function test(name, fn) { try { fn(); results.push({name:name, passed:true}); } catch(e) { results.push({name:name, passed:false, error:e.message}); } }
     function declaration(source, name, indent) {
@@ -16,7 +19,8 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         return source.slice(start, end + (indent || '').length + 2);
     }
     function load(env, parts, names) {
-        return new Function('env', 'with(env){\n' + parts.join('\n') + '\nreturn {' + names.map(function(n){return n+':'+n;}).join(',') + '};}')(env);
+        check(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
+        return new Function('env', 'with(env){\n' + [i18nCore].concat(parts).join('\n') + '\nreturn {' + names.map(function(n){return n+':'+n;}).join(',') + '};}')(env);
     }
     function noop() {}
     function escape(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -357,5 +361,5 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
     return {passed:results.filter(function(r){return r.passed;}).length,total:results.length,domTests:domDocument?'executed in detached browser Document':'not run: pass a browser Document as second argument',results:results};
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/ui/250-message-render.js","src/js/ui/175-sub-agent-ui.js","src/js/core/097-sub-agent-registry.js","src/css/24-sub-agents.css","src/js/ui/200-ui-interactions.js","src/js/ui/120-ui-utils.js","src/js/core/055-emoji-shortcodes.js"];
+var PATHS = ["src/js/ui/250-message-render.js","src/js/ui/175-sub-agent-ui.js","src/js/core/097-sub-agent-registry.js","src/css/24-sub-agents.css","src/js/ui/200-ui-interactions.js","src/js/ui/120-ui-utils.js","src/js/core/055-emoji-shortcodes.js","src/js/core/025-i18n.js"];
 await registerRunner('chat-streaming-worker-dialogue', async function() { return runChatStreamingWorkerDialogueTests(await loadSources(PATHS)); });

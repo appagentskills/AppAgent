@@ -168,6 +168,7 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         var body = s.src + (opts.oracle ? '\n;\n' + s.oldLoader + '\n' : '') + '\n;return {' +
             'load: loadChatsFromStorage,' +
             'hydrated: function() { return _chatsHydrated; },' +
+            'loadStats: function() { return swChatLoadStats; },' +
             'queue: function() { return _legacyPayloadMigrationQueue; },' +
             'setQueue: function(q) { _legacyPayloadMigrationQueue = q; },' +
             'inFlight: function() { return _swChatsLoadInFlight; },' +
@@ -329,9 +330,14 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         assert.deepStrictEqual(Object.keys(env.pausedChats).sort(), paused);
         assert.deepStrictEqual(Object.keys(env.pausedChatIds).sort(), paused);
         assert.strictEqual(env.rebuilds, 1);
-        assert.strictEqual(env.logs.length, 1);
-        assert.match(env.logs[0], new RegExp('loaded ' + loaded.length + ' chats in \\d+ms'));
-        assert.ok(env.logs[0].indexOf('(' + queued.length + ' queued for migration, largest c056 ~') >= 0, 'STORE-ACCT line: ' + env.logs[0]);
+        assert.deepStrictEqual(env.logs, [], 'no debug console output');
+        var st = env.api.loadStats();
+        assert.ok(st, 'STORE-ACCT stats recorded at the commit');
+        assert.strictEqual(st.chats, loaded.length);
+        assert.ok(typeof st.ms === 'number' && st.ms >= 0);
+        assert.strictEqual(st.queued, queued.length);
+        assert.strictEqual(st.largestId, 'c056');
+        assert.ok(st.inlineB64Chars >= st.largestB64Chars && st.largestB64Chars > 0);
     }, { tags: ['unit'], timeout: 10000 });
 
     test('rows written AFTER the key pass beyond the last key, or between two batch bounds, are still loaded (gap-free ranges)', async function() {
@@ -464,7 +470,7 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         assert.strictEqual(env.ops.filter(function(o) { return o.op === 'getAll'; }).length, 2, '30 rows = 2 batches, read once');
         var ids = env.stripCalls.map(function(c) { return c.id; });
         assert.strictEqual(new Set(ids).size, ids.length, 'every row processed once');
-        assert.strictEqual(env.logs.length, 1, 'ONE commit');
+        assert.strictEqual(env.rebuilds, 1, 'ONE commit');
         assert.strictEqual(env.api.inFlight(), null);
         assert.strictEqual(env.api.hydrated(), true);
     }, { tags: ['unit'], timeout: 10000 });
@@ -510,7 +516,7 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         var stripIds = env.stripCalls.map(function(c) { return c.id; });
         assert.ok(stripIds.indexOf('c003') >= 0 && stripIds.indexOf('c051') >= 0, 'both stale rows WERE read and queued locally by their batches');
         assert.strictEqual(env.api.hydrated(), true);
-        assert.strictEqual(env.logs.length, 1, 'ONE commit');
+        assert.strictEqual(env.rebuilds, 1, 'ONE commit');
         assert.ok(!('c003' in env.chats), 'c003 NOT resurrected by the commit');
         assert.ok(!('c051' in env.chats), 'c051 NOT resurrected by the commit');
         assert.ok(!env.db.has('c003') && !env.db.has('c051'), 'both rows gone from disk');
@@ -721,13 +727,7 @@ async function loadChatsFromStorage() {
                     try { rebuildFileIndexAll(); } catch (e) { console.error('[worker-storage] rebuildFileIndexAll failed', e); }
                 }
                 _chatsHydrated = true;
-                console.log('[worker-storage] loaded ' + Object.keys(chats).length + ' chats in '
-                    + (Date.now() - _loadT0) + 'ms — '
-                    + (_acctB64
-                        ? ('~' + Math.round(_acctB64 * 0.75 / 1048576) + 'MB inline base64 still in records ('
-                            + _legacyPayloadMigrationQueue.length + ' queued for migration, largest '
-                            + _acctTopId + ' ~' + Math.round(_acctTopB64 * 0.75 / 1048576) + 'MB)')
-                        : 'records are v16-clean (no inline base64)'));
+                // (boot log line dropped with the product's; parity compares logs = [])
                 resolve();
             };
             request.onerror = function() {

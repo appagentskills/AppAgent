@@ -13,11 +13,14 @@
 .settings-section:last-child { border-bottom: none; }
 .settings-theme-row { display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-5); }
 .settings-theme-row-label { font-size: var(--text-body-sm); color: var(--text-primary); flex-shrink: 0; }
+/* Gear-panel Language picker (#settings-panel-language): fills the row after its label. */
+.settings-panel-language-select { flex: 1; min-width: 0; padding: var(--space-2) var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-body-sm); background: var(--bg-white); color: var(--text-primary); cursor: pointer; }
+.settings-panel-language-select:focus { outline: none; border-color: var(--text-muted); }
 .settings-panel-footer { padding: var(--space-2); display: flex; flex-direction: column; gap: 1px; } /* divider comes from the preceding .settings-section's border-bottom */
 /* Footer navigation rows: leading glyph + label + trailing external-link glyph
    (all four items navigate to the full settings page). Same hover treatment
    as the other header-menu rows. */
-.settings-link-item { display: flex; align-items: center; gap: var(--space-3); width: 100%; text-align: left; background: none; border: none; border-radius: var(--radius-md); cursor: pointer; padding: var(--space-3) var(--space-4); font-size: var(--text-body-sm); color: var(--text-primary); transition: background var(--transition-fast); }
+.settings-link-item { display: flex; align-items: center; gap: var(--space-3); width: 100%; text-align: start; background: none; border: none; border-radius: var(--radius-md); cursor: pointer; padding: var(--space-3) var(--space-4); font-size: var(--text-body-sm); color: var(--text-primary); transition: background var(--transition-fast); }
 .settings-link-item:hover { background: var(--bg-hover); }
 .settings-link-icon { display: inline-flex; align-items: center; color: var(--text-secondary); flex-shrink: 0; }
 .settings-link-icon .ui-icon { width: 15px; height: 15px; }
@@ -30,13 +33,13 @@
    .menu-section-title class (04-header.css) — no overrides here. */
 .section-icon { display: inline-flex; align-items: center; justify-content: center; }
 .section-icon .ui-icon { width: 14px; height: 14px; }
-.data-icon { display: inline-flex; align-items: center; justify-content: center; margin-right: var(--space-3); }
+.data-icon { display: inline-flex; align-items: center; justify-content: center; margin-inline-end: var(--space-3); }
 .data-icon .ui-icon { width: 14px; height: 14px; }
 .settings-model-select { width: 100%; padding: var(--space-5) var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-md); font-size: var(--text-body); background: var(--bg-white); cursor: pointer; }
 .settings-model-select:focus { outline: none; border-color: var(--text-muted); }
 .tool-permissions-list { max-height: 240px; overflow-y: auto; }
 .tool-permission-item { display: flex; align-items: center; padding: var(--space-3) var(--space-5); background: var(--bg-secondary); border-radius: var(--radius-lg); margin-bottom: var(--space-3); gap: var(--space-3); }
-.tool-permission-control { margin-left: auto; }
+.tool-permission-control { margin-inline-start: auto; }
 .tool-permission-name { font-size: var(--text-body-sm); color: var(--text-primary); }
 .tool-permission-select { padding: var(--space-2) var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-caption); background: var(--bg-white); cursor: pointer; }
 .tool-permission-select:focus { outline: none; border-color: var(--text-muted); }
@@ -44,8 +47,8 @@
 .tool-permission-group-title { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-secondary); margin-bottom: var(--space-4); }
 /* Sub-items keep their label aligned with the group title (negative margin
    offsets the inner padding) while the hover highlight gets breathing room. */
-.tool-permission-subitem { padding-left: 0; }
-.settings-page-content .tool-permission-subitem { padding-left: var(--space-4); margin-left: calc(var(--space-4) * -1); }
+.tool-permission-subitem { padding-inline-start: 0; }
+.settings-page-content .tool-permission-subitem { padding-inline-start: var(--space-4); margin-inline-start: calc(var(--space-4) * -1); }
 .tool-permission-item { transition: background-color 0.12s ease; }
 /* Full-width layout: tie the right-aligned control to its label on hover. */
 .tool-permission-item:hover { background: var(--bg-tertiary); }
@@ -107,7 +110,7 @@
 .settings-checkbox input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
 .settings-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); padding: var(--space-3) 0; }
 .settings-label { font-size: var(--text-body); color: var(--text-primary); }
-.settings-input-group { display: flex; align-items: center; gap: var(--space-3); background: var(--bg-secondary); padding: var(--space-2) var(--space-5) var(--space-2) var(--space-2); border-radius: var(--radius-lg); }
+.settings-input-group { display: flex; align-items: center; gap: var(--space-3); background: var(--bg-secondary); padding-block: var(--space-2); padding-inline: var(--space-2) var(--space-5); border-radius: var(--radius-lg); }
 .settings-number-input { width: 44px; padding: var(--space-3) var(--space-4); font-size: var(--text-body); font-weight: var(--font-medium); border: none; border-radius: var(--radius-md); background: var(--bg-primary); color: var(--text-primary); text-align: center; -moz-appearance: textfield; box-shadow: var(--shadow-xs); }
 .settings-number-input::-webkit-outer-spin-button, .settings-number-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .settings-number-input:hover, .settings-number-input:focus { box-shadow: 0 0 0 2px var(--primary-light); outline: none; }
@@ -115,7 +118,7 @@
 .settings-hint { font-size: var(--text-caption); color: var(--text-muted); margin-top: var(--space-2); line-height: var(--leading-normal); }
 
 .data-management-buttons { display: flex; flex-direction: column; gap: var(--space-1); }
-.data-btn { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); background: transparent; border: none; font-size: var(--text-body); color: var(--text-primary); cursor: pointer; transition: all var(--transition-fast); border-radius: var(--radius-sm); text-align: left; width: 100%; }
+.data-btn { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); background: transparent; border: none; font-size: var(--text-body); color: var(--text-primary); cursor: pointer; transition: all var(--transition-fast); border-radius: var(--radius-sm); text-align: start; width: 100%; }
 .data-btn:hover { background: var(--secondary-light); }
 .data-btn .data-icon { display: inline-block; width: 20px; text-align: center; flex-shrink: 0; font-size: var(--text-body); }
 .data-btn.export-btn:hover { color: var(--primary); }
@@ -125,16 +128,16 @@
 .header-controls { display: flex; align-items: center; gap: var(--space-6); position: relative; align-self: center; }
 
 /* Icons inside radio options (API-access + endpoint pickers in the model modal) */
-.radio-option .radio-option-icon { display: inline-flex; vertical-align: -3px; margin-right: var(--space-2); }
+.radio-option .radio-option-icon { display: inline-flex; vertical-align: -3px; margin-inline-end: var(--space-2); }
 .radio-option .radio-option-icon svg { width: 16px; height: 16px; }
 .radio-group-vertical { flex-direction: column; gap: var(--space-2); }
-.radio-group-vertical .radio-option { display: flex; align-items: center; gap: var(--space-3); text-align: left; }
-.radio-group-vertical .radio-option .radio-option-icon { margin-right: 0; vertical-align: baseline; }
+.radio-group-vertical .radio-option { display: flex; align-items: center; gap: var(--space-3); text-align: start; }
+.radio-group-vertical .radio-option .radio-option-icon { margin-inline-end: 0; vertical-align: baseline; }
 .endpoint-radio-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .endpoint-radio-domain { font-size: var(--text-caption); color: var(--text-muted); }
 
 /* Endpoint icon on Settings → LLM Endpoints rows */
-.api-provider-endpoint-icon { display: inline-flex; margin-right: var(--space-2); color: var(--text-secondary); flex-shrink: 0; }
+.api-provider-endpoint-icon { display: inline-flex; margin-inline-end: var(--space-2); color: var(--text-secondary); flex-shrink: 0; }
 .api-provider-endpoint-icon svg { width: 16px; height: 16px; }
 
 /* 6-stop reasoning-effort slider in the add/edit-model modal: same control as

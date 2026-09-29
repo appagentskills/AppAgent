@@ -59,17 +59,17 @@ function formatMetrics(metrics) {
             parts.push('<span class="stats-icon">' + UI_ICONS.model + '</span> ' + modelInfo.join(' · '));
         }
     } else {
-        parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> <strong>Total (' + metrics.callCount + ' calls)</strong>');
+        parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> <strong>' + tn(metrics.callCount, 'Total ({count} call)', 'Total ({count} calls)') + '</strong>');
     }
     
     // Token usage
     if (metrics.input_tokens || metrics.output_tokens) {
         var tokenParts = [];
-        if (metrics.input_tokens) tokenParts.push('In: ' + metrics.input_tokens.toLocaleString());
-        if (metrics.output_tokens) tokenParts.push('Out: ' + metrics.output_tokens.toLocaleString());
+        if (metrics.input_tokens) tokenParts.push(t('In: {tokens}', {tokens: i18nFormatNumber(metrics.input_tokens)}));
+        if (metrics.output_tokens) tokenParts.push(t('Out: {tokens}', {tokens: i18nFormatNumber(metrics.output_tokens)}));
         if (metrics.input_tokens && metrics.output_tokens) {
             var total = metrics.input_tokens + metrics.output_tokens;
-            tokenParts.push('Total: ' + total.toLocaleString());
+            tokenParts.push(t('Total: {tokens}', {tokens: i18nFormatNumber(total)}));
         }
         parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> ' + tokenParts.join(' | '));
     }
@@ -77,15 +77,15 @@ function formatMetrics(metrics) {
     // Cache info for Anthropic
     if (metrics.cache_read_tokens || metrics.cache_creation_tokens || metrics.cache_write_tokens) {
         var cacheParts = [];
-        if (metrics.cache_read_tokens) cacheParts.push('Read: ' + metrics.cache_read_tokens.toLocaleString());
-        if (metrics.cache_write_tokens) cacheParts.push('Write: ' + metrics.cache_write_tokens.toLocaleString());
-        if (metrics.cache_creation_tokens) cacheParts.push('Created: ' + metrics.cache_creation_tokens.toLocaleString());
-        parts.push('<span class="stats-icon">' + UI_ICONS.cache + '</span> Cache: ' + cacheParts.join(' | '));
+        if (metrics.cache_read_tokens) cacheParts.push(t('Read: {tokens}', {tokens: i18nFormatNumber(metrics.cache_read_tokens)}));
+        if (metrics.cache_write_tokens) cacheParts.push(t('Write: {tokens}', {tokens: i18nFormatNumber(metrics.cache_write_tokens)}));
+        if (metrics.cache_creation_tokens) cacheParts.push(t('Created: {tokens}', {tokens: i18nFormatNumber(metrics.cache_creation_tokens)}));
+        parts.push('<span class="stats-icon">' + UI_ICONS.cache + '</span> ' + t('Cache: {details}', {details: cacheParts.join(' | ')}));
     }
     
     // Reasoning tokens
     if (metrics.reasoning_tokens) {
-        parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> Reasoning: ' + metrics.reasoning_tokens.toLocaleString());
+        parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> ' + t('Reasoning: {tokens}', {tokens: i18nFormatNumber(metrics.reasoning_tokens)}));
     }
     
     // Cost
@@ -95,13 +95,13 @@ function formatMetrics(metrics) {
     
     // Performance timing
     if (metrics.duration) {
-        var seconds = (metrics.duration / 1000).toFixed(1);
-        parts.push('<span class="stats-icon">' + UI_ICONS.timer + '</span> ' + seconds + 's');
+        var seconds = i18nFormatNumber(metrics.duration / 1000, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+        parts.push('<span class="stats-icon">' + UI_ICONS.timer + '</span> ' + t('{seconds}s', {seconds: seconds}));
         
         // Tokens per second if we have output tokens
         if (metrics.output_tokens && metrics.duration > 0) {
-            var tps = (metrics.output_tokens / (metrics.duration / 1000)).toFixed(1);
-            parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span>' + tps + ' tok/s');
+            var tps = i18nFormatNumber(metrics.output_tokens / (metrics.duration / 1000), {minimumFractionDigits: 1, maximumFractionDigits: 1});
+            parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span>' + t('{rate} tok/s', {rate: tps}));
         }
     }
     

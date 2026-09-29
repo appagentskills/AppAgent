@@ -25,8 +25,13 @@ function dmFakeStorage() {
 }
 async function dmHarness(seed, confirmAnswer, extra) {
     var src = await loadFile('src/js/ui/130-data-management.js');
+    // ui/130 calls t()/tn()/i18nFormatNumber(): the fixture gets the REAL i18n core
+    // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+    var i18n = new Function(await loadFile('src/js/core/025-i18n.js') +
+        '\nreturn { t: t, tn: tn, N_: N_, i18nFormatNumber: i18nFormatNumber, i18nDir: i18nDir };')();
     var db = dmFakeDb(seed), input, h = { db: db, snacks: [], confirms: [], imports: [], adopted: [], reloads: 0 };
-    var g = { chatStoreName: 'chats', settingsStoreName: 'settings', dashboardWidgetsStoreName: 'dashboardWidgets',
+    var g = { t: i18n.t, tn: i18n.tn, N_: i18n.N_, i18nFormatNumber: i18n.i18nFormatNumber, i18nDir: i18n.i18nDir,
+        chatStoreName: 'chats', settingsStoreName: 'settings', dashboardWidgetsStoreName: 'dashboardWidgets',
         apiProvidersStoreName: 'apiProviders', chatPayloadsStoreName: 'chat_payloads', chrome: undefined,
         openDatabase: async function() { return db; },
         WidgetStore: { validateRecords: function(r) { if (!Array.isArray(r)) throw new Error('Invalid widget backup'); },

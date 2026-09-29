@@ -354,11 +354,11 @@ function getLatestAfterVersion(table, sysId) {
 async function downloadChangesXml() {
     var changedFiles = getAllChangedFiles();
     if (changedFiles.length === 0) {
-        showSnackbar('No changes to download', 'warning');
+        showSnackbar(t('No changes to download'), 'warning');
         return;
     }
     
-    showSpinner('Preparing XML download...');
+    showSpinner(t('Preparing XML download...'));
     
     try {
         // Collect the latest XML of each file: tracked version, then live
@@ -372,17 +372,19 @@ async function downloadChangesXml() {
             // TB-9: a sys_attachment row carries no file bytes (they live in
             // its sys_attachment_doc chunks, which are not exported), so it
             // would import as a broken attachment: list it as not exported.
-            if (file.table === 'sys_attachment') { skipped.push(label + ' (attachment)'); continue; }
+            if (file.table === 'sys_attachment') { skipped.push(t('{name} (attachment)', { name: label })); continue; }
             var xml = await getLatestRecordXml(file.table, file.sysId);
             if (getRecordXmlBody(xml)) recordXmls.push(xml); // TB-8: a record, not any 200 text
             else skipped.push(label);
         }
         
         // The records left out (first 3), for both snackbars below.
-        var notExported = skipped.length ? ' (not exported: ' + skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', …' : '') + ')' : '';
+        var notExportedList = skipped.length ? skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', …' : '') : '';
         if (recordXmls.length === 0) {
             hideSpinner();
-            showSnackbar('Could not retrieve version data for any files' + notExported, 'error');
+            showSnackbar(skipped.length
+                ? t('Could not retrieve version data for any files (not exported: {list})', { list: notExportedList })
+                : t('Could not retrieve version data for any files'), 'error');
             return;
         }
         
@@ -407,11 +409,11 @@ async function downloadChangesXml() {
         URL.revokeObjectURL(url);
         
         hideSpinner();
-        if (skipped.length) showSnackbar('Exported ' + recordXmls.length + ' of ' + changedFiles.length + ' records' + notExported, 'warning');
+        if (skipped.length) showSnackbar(tn(changedFiles.length, 'Exported {done} of {count} record (not exported: {list})', 'Exported {done} of {count} records (not exported: {list})', { done: i18nFormatNumber(recordXmls.length), list: notExportedList }), 'warning');
         
     } catch (e) {
         hideSpinner();
-        showSnackbar('Error downloading XML: ' + e.message, 'error');
+        showSnackbar(t('Error downloading XML: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -507,13 +509,14 @@ function renderInlineChanges(userMsgIdx) {
     
     var totalFiles = activeFiles.length + revertedFiles.length;
     var html = '<div class="inline-changes">';
-    html += '<div class="inline-changes-header">Artifacts' + (totalFiles === 1 ? '' : ' (' + totalFiles + ')');
+    // Exactly one file hides the count (it is not a plural noun form, so t(), not tn()).
+    html += '<div class="inline-changes-header">' + escapeHtml(totalFiles === 1 ? t('Artifacts') : t('Artifacts ({count})', { count: i18nFormatNumber(totalFiles) }));
     // Add Revert All button if there are active files, or Redo All if there are reverted files
     if (activeFiles.length > 0) {
-        html += '<button class="inline-revert-all-btn" onclick="revertAllInlineChanges(' + userMsgIdx + ')" title="Undo all changes from this response"><span class="btn-icon">' + UI_ICONS.undo + '</span>Revert All</button>';
+        html += '<button class="inline-revert-all-btn" onclick="revertAllInlineChanges(' + userMsgIdx + ')" title="' + escapeHtml(t('Undo all changes from this response')) + '"><span class="btn-icon">' + UI_ICONS.undo + '</span>' + escapeHtml(t('Revert All')) + '</button>';
     }
     if (revertedFiles.length > 0) {
-        html += '<button class="inline-redo-all-btn" onclick="redoAllInlineChanges(' + userMsgIdx + ')" title="Redo all reverted changes from this response"><span class="btn-icon">' + UI_ICONS.redo + '</span>Redo All</button>';
+        html += '<button class="inline-redo-all-btn" onclick="redoAllInlineChanges(' + userMsgIdx + ')" title="' + escapeHtml(t('Redo all reverted changes from this response')) + '"><span class="btn-icon">' + UI_ICONS.redo + '</span>' + escapeHtml(t('Redo All')) + '</button>';
     }
     html += '</div>';
     html += '<div class="inline-changes-list">';
@@ -524,8 +527,8 @@ function renderInlineChanges(userMsgIdx) {
         var isNew = file.isNew;
         var hasEdit = file.entries.some(function(e) { return e.action === 'PUT' || e.action === 'PATCH'; });
         var tableIcon = getTableIcon(file.table);
-        var tableDisplayName = getTableDisplayName(file.table);
-        var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">NEW</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">MODIFIED</span>' : '');
+        var tableDisplayName = t(getTableDisplayName(file.table)); // D1: display only
+        var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">' + escapeHtml(t('NEW')) + '</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">' + escapeHtml(t('MODIFIED')) + '</span>' : '');
 
         var jsTable = escapeJsString(file.table);
         var jsSysId = escapeJsString(file.sysId);
@@ -539,19 +542,19 @@ function renderInlineChanges(userMsgIdx) {
         html += '</div>';
         html += '<div class="sn-artifact-actions-row">';
         // View diff button
-        html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="View changes">' + UI_ICONS.eye + '</button>';
+        html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + escapeHtml(t('View changes')) + '">' + UI_ICONS.eye + '</button>';
         // Download button
-        html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="Download XML">' + UI_ICONS.download + '</button>';
+        html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + escapeHtml(t('Download XML')) + '">' + UI_ICONS.download + '</button>';
         // Open in browser for UI pages
         if (file.table === 'sys_ui_page') {
-            html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="Open in Browser">' + UI_ICONS.globe + '</button>';
-            html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="' + escapeHtml(t('Open in Browser')) + '">' + UI_ICONS.globe + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>';
         }
         // Undo/Delete button
         if (isNew) {
-            html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecord(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="Delete">' + UI_ICONS.trash + '</button>';
+            html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecord(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Delete')) + '">' + UI_ICONS.trash + '</button>';
         } else if (beforeVer) {
-            html += '<button class="sn-artifact-icon-btn" onclick="revertInlineChange(\'' + beforeVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="Undo">' + UI_ICONS.undo + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="revertInlineChange(\'' + beforeVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Undo')) + '">' + UI_ICONS.undo + '</button>';
         }
         html += '</div>';
         html += '</div>';
@@ -561,7 +564,7 @@ function renderInlineChanges(userMsgIdx) {
     revertedFiles.forEach(function(file, idx) {
         var afterVer = file.afterVersion;
         var tableIcon = getTableIcon(file.table);
-        var tableDisplayName = getTableDisplayName(file.table);
+        var tableDisplayName = t(getTableDisplayName(file.table)); // D1: display only
 
         var jsTable = escapeJsString(file.table);
         var jsSysId = escapeJsString(file.sysId);
@@ -571,11 +574,11 @@ function renderInlineChanges(userMsgIdx) {
         html += '<div class="sn-artifact-icon sn-icon-reverted">' + tableIcon + '</div>';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">' + escapeHtml(file.displayName) + '</div>';
-        html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') <span class="sn-status-badge sn-status-reverted">REVERTED</span></div>';
+        html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') <span class="sn-status-badge sn-status-reverted">' + escapeHtml(t('REVERTED')) + '</span></div>';
         html += '</div>';
         html += '<div class="sn-artifact-actions-row">';
         if (afterVer) {
-            html += '<button class="sn-artifact-icon-btn" onclick="redoInlineChange(\'' + afterVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="Redo">' + UI_ICONS.redo + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="redoInlineChange(\'' + afterVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Redo')) + '">' + UI_ICONS.redo + '</button>';
         }
         html += '</div>';
         html += '</div>';
@@ -587,7 +590,7 @@ function renderInlineChanges(userMsgIdx) {
 
 // Revert a single inline change (only for changes in a specific user message range)
 async function revertInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Undo Changes', 'Undo changes to "' + escapeHtml(displayName) + '"? This will restore the file to its state before this AI response.')) return;
+    if (!await showConfirmModal(t('Undo Changes'), t('Undo changes to "{name}"? This will restore the file to its state before this AI response.', { name: escapeHtml(displayName) }))) return;
     
     // Find the message range for this user message
     var chat = chats[currentChatId];
@@ -600,12 +603,12 @@ async function revertInlineChange(versionSysId, table, sysId, displayName, userM
     }
     
     try {
-        showSpinner('Reverting ' + displayName + '...');
+        showSpinner(t('Reverting {name}...', { name: displayName }));
         
         var xml = await getVersionXml(versionSysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('Could not get version data', 'error');
+            showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
@@ -636,13 +639,13 @@ async function revertInlineChange(versionSysId, table, sysId, displayName, userM
                 afterVersion: versionSysId
             });
 
-            showSnackbar('Successfully reverted "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully reverted "{name}"', { name: displayName }), 'success');
         } else {
-            showSnackbar('Revert failed: ' + result.error, 'error');
+            showSnackbar(t('Revert failed: {error}', { error: result.error }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Revert failed: ' + e.message, 'error');
+        showSnackbar(t('Revert failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -650,7 +653,7 @@ async function revertInlineChange(versionSysId, table, sysId, displayName, userM
 async function revertAllInlineChanges(userMsgIdx) {
     var allChanges = getAllChangesForUserMessage(userMsgIdx);
     if (allChanges.active.length === 0) {
-        showSnackbar('No active changes to revert', 'warning');
+        showSnackbar(t('No active changes to revert'), 'warning');
         return;
     }
     
@@ -668,7 +671,7 @@ async function revertAllInlineChanges(userMsgIdx) {
     });
     
     var files = Object.values(filesByKey);
-    if (!await showConfirmModal('Revert All', 'Revert all ' + files.length + ' file(s) changed in this response?')) return;
+    if (!await showConfirmModal(t('Revert All'), tn(files.length, 'Revert all {count} file(s) changed in this response?', 'Revert all {count} file(s) changed in this response?'))) return;
     
     var chat = chats[currentChatId];
     var nextUserMsgIdx = chat.messages.length;
@@ -679,7 +682,7 @@ async function revertAllInlineChanges(userMsgIdx) {
         }
     }
     
-    showSpinner('Reverting ' + files.length + ' files...');
+    showSpinner(tn(files.length, 'Reverting {count} file...', 'Reverting {count} files...'));
     var successCount = 0;
     var errors = [];
     
@@ -702,13 +705,13 @@ async function revertAllInlineChanges(userMsgIdx) {
                         if (res.ok || res.status === 204) {
                             successCount++;
                         } else {
-                            errors.push(file.displayName + ': Delete failed ' + res.status);
+                            errors.push(t('{name}: Delete failed {status}', { name: file.displayName, status: res.status }));
                         }
                     } else if (checkRes.status === 404) {
                         // Record already deleted, count as success
                         successCount++;
                     } else {
-                        errors.push(file.displayName + ': Check failed ' + checkRes.status);
+                        errors.push(t('{name}: Check failed {status}', { name: file.displayName, status: checkRes.status }));
                     }
                 } catch (checkErr) {
                     errors.push(file.displayName + ': ' + checkErr.message);
@@ -794,15 +797,15 @@ async function revertAllInlineChanges(userMsgIdx) {
     renderMessages();
     
     if (errors.length > 0) {
-        showSnackbar('Reverted ' + successCount + ' of ' + files.length + ' files.\n\nErrors:\n' + errors.join('\n'), 'warning');
+        showSnackbar(tn(files.length, 'Reverted {done} of {count} file.', 'Reverted {done} of {count} files.', { done: i18nFormatNumber(successCount) }) + '\n\n' + t('Errors:') + '\n' + errors.join('\n'), 'warning');
     } else {
-        showSnackbar('Successfully reverted ' + successCount + ' files', 'success');
+        showSnackbar(tn(successCount, 'Successfully reverted {count} file', 'Successfully reverted {count} files'), 'success');
     }
 }
 
 // Redo an inline change that was reverted
 async function redoInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + escapeHtml(displayName) + '"? This will restore the AI-made changes.')) return;
+    if (!await showConfirmModal(t('Redo Changes'), t('Redo changes to "{name}"? This will restore the AI-made changes.', { name: escapeHtml(displayName) }))) return;
     
     // Find the message range for this user message
     var chat = chats[currentChatId];
@@ -815,12 +818,12 @@ async function redoInlineChange(versionSysId, table, sysId, displayName, userMsg
     }
     
     try {
-        showSpinner('Restoring ' + displayName + '...');
+        showSpinner(t('Restoring {name}...', { name: displayName }));
         
         var xml = await getVersionXml(versionSysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('Could not get version data', 'error');
+            showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
@@ -847,13 +850,13 @@ async function redoInlineChange(versionSysId, table, sysId, displayName, userMsg
             renderVersionSidebar();
             renderMessages();
 
-            showSnackbar('Successfully restored "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully restored "{name}"', { name: displayName }), 'success');
         } else {
-            showSnackbar('Redo failed: ' + result.error, 'error');
+            showSnackbar(t('Redo failed: {error}', { error: result.error }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Redo failed: ' + e.message, 'error');
+        showSnackbar(t('Redo failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -861,7 +864,7 @@ async function redoInlineChange(versionSysId, table, sysId, displayName, userMsg
 async function redoAllInlineChanges(userMsgIdx) {
     var allChanges = getAllChangesForUserMessage(userMsgIdx);
     if (allChanges.reverted.length === 0) {
-        showSnackbar('No reverted changes to redo', 'warning');
+        showSnackbar(t('No reverted changes to redo'), 'warning');
         return;
     }
     
@@ -878,7 +881,7 @@ async function redoAllInlineChanges(userMsgIdx) {
     });
     
     var files = Object.values(filesByKey);
-    if (!await showConfirmModal('Redo All', 'Redo all ' + files.length + ' reverted file(s) from this response?')) return;
+    if (!await showConfirmModal(t('Redo All'), tn(files.length, 'Redo all {count} reverted file(s) from this response?', 'Redo all {count} reverted file(s) from this response?'))) return;
     
     var chat = chats[currentChatId];
     var nextUserMsgIdx = chat.messages.length;
@@ -889,7 +892,7 @@ async function redoAllInlineChanges(userMsgIdx) {
         }
     }
     
-    showSpinner('Restoring ' + files.length + ' files...');
+    showSpinner(tn(files.length, 'Restoring {count} file...', 'Restoring {count} files...'));
     var successCount = 0;
     var errors = [];
     
@@ -906,13 +909,13 @@ async function redoAllInlineChanges(userMsgIdx) {
             });
             
             if (!latestAfterVersion) {
-                errors.push(file.displayName + ': No version to restore');
+                errors.push(t('{name}: No version to restore', { name: file.displayName }));
                 continue;
             }
             
             var xml = await getVersionXml(latestAfterVersion);
             if (!xml) {
-                errors.push(file.displayName + ': Could not get version data');
+                errors.push(t('{name}: Could not get version data', { name: file.displayName }));
                 continue;
             }
             
@@ -946,18 +949,18 @@ async function redoAllInlineChanges(userMsgIdx) {
     renderMessages();
     
     if (errors.length > 0) {
-        showSnackbar('Restored ' + successCount + ' of ' + files.length + ' files.\n\nErrors:\n' + errors.join('\n'), 'warning');
+        showSnackbar(tn(files.length, 'Restored {success} of {count} file.', 'Restored {success} of {count} files.', { success: i18nFormatNumber(successCount) }) + '\n\n' + t('Errors:') + '\n' + errors.join('\n'), 'warning');
     } else {
-        showSnackbar('Successfully restored ' + successCount + ' files', 'success');
+        showSnackbar(tn(successCount, 'Successfully restored {count} file', 'Successfully restored {count} files'), 'success');
     }
 }
 
 // Delete a newly created record
 async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
-    if (!await showConfirmModal('Delete Record', 'Delete "' + escapeHtml(displayName) + '"? This will permanently delete this newly created record.', 'danger')) return;
+    if (!await showConfirmModal(t('Delete Record'), t('Delete "{name}"? This will permanently delete this newly created record.', { name: escapeHtml(displayName) }), 'danger')) return;
 
     try {
-        showSpinner('Deleting ' + displayName + '...');
+        showSpinner(t('Deleting {name}...', { name: displayName }));
 
         var headers = { 
             'X-UserToken': window.sessionToken, 
@@ -1011,14 +1014,14 @@ async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
                 messageIndex: userMsgIdx
             });
 
-            showSnackbar('Successfully deleted "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully deleted "{name}"', { name: displayName }), 'success');
         } else {
             var errData = await res.json().catch(function() { return {}; });
-            showSnackbar('Delete failed: ' + (errData.error?.message || res.status), 'error');
+            showSnackbar(t('Delete failed: {error}', { error: errData.error?.message || res.status }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Delete failed: ' + e.message, 'error');
+        showSnackbar(t('Delete failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -1052,7 +1055,7 @@ function getVersionsForFile(table, sysId) {
                     versions.push({
                         versionId: v.beforeVersion,
                         timestamp: v.timestamp,
-                        label: new Date(v.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + ' - Original',
+                        label: t('{time} - Original', { time: i18nFormatTime(v.timestamp, {hour: '2-digit', minute: '2-digit'}) }),
                         isBefore: true,
                         isFromChat: true
                     });
@@ -1060,11 +1063,11 @@ function getVersionsForFile(table, sysId) {
             }
             if (v.afterVersion) {
                 var statusMsg = v.statusMessage;
-                var actionLabel = statusMsg || (v.action === 'POST' ? 'Created' : (v.action === 'PUT' || v.action === 'PATCH' || v.action === 'EDIT' ? 'Updated' : v.action));
+                var actionLabel = statusMsg || (v.action === 'POST' ? t('Created') : (v.action === 'PUT' || v.action === 'PATCH' || v.action === 'EDIT' ? t('Updated') : v.action));
                 versions.push({
                     versionId: v.afterVersion,
                     timestamp: v.timestamp,
-                    label: new Date(v.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + ' - ' + actionLabel,
+                    label: i18nFormatTime(v.timestamp, {hour: '2-digit', minute: '2-digit'}) + ' - ' + actionLabel,
                     isBefore: false,
                     isFromChat: true
                 });
@@ -1091,7 +1094,7 @@ async function getHistoricalVersions(table, sysId, excludeVersionIds) {
                     return {
                         versionId: v.sys_id,
                         timestamp: ts,
-                        label: new Date(ts).toLocaleDateString([], {month: 'short', day: 'numeric'}) + ' ' + new Date(ts).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + ' - ' + (v.sys_created_by || 'Unknown'),
+                        label: i18nFormatDate(ts, {month: 'short', day: 'numeric'}) + ' ' + i18nFormatTime(ts, {hour: '2-digit', minute: '2-digit'}) + ' - ' + (v.sys_created_by || t('Unknown')),
                         isBefore: true,
                         isFromChat: false
                     };

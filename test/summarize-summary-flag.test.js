@@ -6,7 +6,10 @@
 // page bundle, dispatches to the service worker, or reads/writes a live chat or setting.
 'use strict';
 
-var SSF_PATHS = ['src/js/app/030-agent-loop.js', 'src/js/ui/170-chat-management.js'];
+// The 170 excerpt calls t(): its with (env) sandbox gets the REAL i18n core first
+// (no catalog set = English identity, like the harness auto-include in test/harness.js).
+var SSF_I18N = 'src/js/core/025-i18n.js';
+var SSF_PATHS = [SSF_I18N, 'src/js/app/030-agent-loop.js', 'src/js/ui/170-chat-management.js'];
 var _ssfSources = null;
 async function ssfSources() { return _ssfSources || (_ssfSources = await loadSources(SSF_PATHS)); }
 
@@ -17,6 +20,11 @@ function ssfDeclaration(source, name, prefix) {
     var end = source.indexOf('\n}', start);
     if (!(start >= 0 && end > start)) throw new Error('Missing declaration: ' + name);
     return source.slice(start, end + 2);
+}
+function ssfI18n(sources) {
+    var core = sources[SSF_I18N];
+    if (typeof core !== 'string' || core.indexOf('function t(') < 0) throw new Error('missing i18n core source: ' + SSF_I18N);
+    return core;
 }
 async function ssfStampFn() {
     var src = (await ssfSources())['src/js/app/030-agent-loop.js'];
@@ -60,8 +68,8 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
     }, { tags: ['unit'] });
 
     test('completeSummaryAndCreateNewChat uses an already-stamped reply', async function() {
-        var src = (await ssfSources())['src/js/ui/170-chat-management.js'];
-        var code = ssfDeclaration(src, 'completeSummaryAndCreateNewChat');
+        var all = await ssfSources(), src = all['src/js/ui/170-chat-management.js'];
+        var code = ssfI18n(all) + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat');
         var snacks = [], runs = 0, saves = 0;
         function noop() {}
         var env = {

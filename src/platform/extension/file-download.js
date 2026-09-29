@@ -5,22 +5,117 @@
     var card = document.getElementById('card');
     var log = [];
 
-    if (!fileId) return show('No file ID provided.', true);
-
     var dbNames = ['AppAgentDB', 'iframe_AppAgentDB'];
 
-    tryDatabases(dbNames, 0);
+    // i18n: this standalone page is not part of the app bundle (no core/025-i18n.js),
+    // so it carries a minimal gettext-style lookup over the same catalog. The app
+    // mirrors the RESOLVED UI language to localStorage 'uiLanguage' + 'uiLanguageDir'
+    // (ui/245-i18n-dom.js; 'iframe_' prefix when embedded) and the build copies
+    // src/locales/<code>.json to locales/<code>.json. English is the identity.
+    var i18nCatalog = {};
+    var hasOwn = Object.prototype.hasOwnProperty;
+
+    loadCatalog().then(start, start);
+
+    function start() {
+        applyStaticI18n();
+        if (!fileId) return show(t('No file ID provided.'), true);
+        tryDatabases(dbNames, 0);
+    }
+
+    // Same lookup as core/025-i18n.js t(): own keys only, '' counts as missing,
+    // a plural (tn) object falls back to its 'other' form, and a missing or
+    // null/undefined param keeps its {placeholder} verbatim. Never throws.
+    function t(source, vars) {
+        var key = toStr(source);
+        try {
+            var v = hasOwn.call(i18nCatalog, key) ? i18nCatalog[key] : null;
+            if (!isForm(v) && isPlainObject(v) && hasOwn.call(v, 'other')) v = v.other;
+            var s = isForm(v) ? v : key;
+            if (vars === null || vars === undefined || Object(vars) !== vars) return s;
+            return s.replace(/\{(\w+)\}/g, function(m, k) {
+                return hasOwn.call(vars, k) && vars[k] !== null && vars[k] !== undefined ? toStr(vars[k]) : m;
+            });
+        } catch (e) {
+            return key;
+        }
+    }
+
+    function toStr(v) {
+        if (v === null || v === undefined) return '';
+        try { return String(v); } catch (e) { return ''; }
+    }
+
+    function isForm(v) { return typeof v === 'string' && v !== ''; }
+
+    function isPlainObject(v) { return Object.prototype.toString.call(v) === '[object Object]'; }
+
+    // The panel's key rule (i18nNormalizeKey in ui/245-i18n-dom.js).
+    function normalizeKey(s) { return toStr(s).replace(/\s+/g, ' ').trim(); }
+
+    function mirrored(key) {
+        try { return localStorage.getItem(key) || localStorage.getItem('iframe_' + key) || ''; } catch (e) { return ''; }
+    }
+
+    function setLangDir(code, dir) {
+        try {
+            document.documentElement.setAttribute('lang', code);
+            document.documentElement.setAttribute('dir', dir);
+        } catch (e) {}
+    }
+
+    // <html lang dir> names the language actually shown: en/ltr until a catalog
+    // is in, and on every English fallback (bad or missing code, no fetch, 404,
+    // network error, bad JSON, timeout). A catalog that lands after the timeout
+    // is ignored, so the page never mixes English and translated text.
+    function loadCatalog() {
+        var code = mirrored('uiLanguage');
+        setLangDir('en', 'ltr');
+        if (!code || code === 'en' || !/^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(code) || typeof fetch !== 'function') return Promise.resolve();
+        var dir = mirrored('uiLanguageDir') === 'rtl' ? 'rtl' : 'ltr';
+        var settled = false;
+        function settle(obj) {
+            if (settled) return;
+            settled = true;
+            if (obj) { i18nCatalog = obj; setLangDir(code, dir); }
+        }
+        var load = Promise.resolve()
+            .then(function() { return fetch('locales/' + code + '.json'); })
+            .then(function(res) { return res && res.ok ? res.json() : null; })
+            .then(function(obj) { settle(isPlainObject(obj) ? obj : null); })
+            .catch(function() { settle(null); });
+        // Never let a slow catalog hold the download back for long.
+        return Promise.race([load, new Promise(function(resolve) {
+            setTimeout(function() { settle(null); resolve(); }, 1000);
+        })]);
+    }
+
+    // The panel's applyI18n rule (ui/245-i18n-dom.js): translate each [data-i18n]
+    // element's own non-whitespace text nodes, keyed by normalizeKey(text),
+    // keeping child elements and the surrounding whitespace. Untranslated text
+    // is left untouched.
+    function applyStaticI18n() {
+        var els = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < els.length; i++) {
+            for (var n = els[i].firstChild; n; n = n.nextSibling) {
+                if (n.nodeType !== 3 || !/\S/.test(n.nodeValue)) continue;
+                var orig = n.nodeValue, key = normalizeKey(orig), tr = t(key);
+                if (tr !== key) n.nodeValue = orig.match(/^\s*/)[0] + tr + orig.match(/\s*$/)[0];
+            }
+        }
+    }
 
     function tryDatabases(names, idx) {
         if (idx >= names.length) {
-            return show('File not found: ' + fileId + '<div class="debug">' + log.join('\n') + '</div>', true);
+            // fileId comes from the URL and the log carries error text: both are escaped before innerHTML.
+            return show(t('File not found: {id}', { id: esc(fileId) }) + '<div class="debug">' + esc(log.join('\n')) + '</div>', true);
         }
         var dbName = names[idx];
         log.push('Trying DB: ' + dbName);
         tryDatabase(dbName).then(function(file) {
             if (file) {
                 triggerDownload(file.data, file.mime, fileName);
-                show('Downloaded: <span class="filename">' + esc(fileName) + '</span>');
+                show(t('Downloaded: {name}', { name: '<span class="filename">' + esc(fileName) + '</span>' }));
             } else {
                 tryDatabases(names, idx + 1);
             }

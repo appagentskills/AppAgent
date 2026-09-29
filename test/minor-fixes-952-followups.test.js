@@ -20,7 +20,7 @@ describe('#952 follow-ups (F1-F5)', function() {
         assert.strictEqual(m._pageIsStopPhrase('  Stop  '), true);
         assert.strictEqual(m._pageIsStopPhrase('no thanks.'), true);
         assert.strictEqual(m._pageIsStopPhrase('no problem, go ahead'), false);
-        assert.ok(/_cancelViaChat \? 'Cancelling the pending question/.test(pg), 'cancel spinner text wired');
+        assert.ok(/_cancelViaChat \? t\('Cancelling the pending question/.test(pg), 'cancel spinner text wired');
     }, { tags: ['unit'], timeout: 5000 });
 
     test('F2: send-message re-checks the tombstone after the rehydrate await', async function() {

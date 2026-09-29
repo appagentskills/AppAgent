@@ -292,6 +292,9 @@ async function runWidgetVersioningTests(sources, idb) {
         stripTransientChatFieldsForPut: function(row) { return Object.assign({}, row); },
         console: { error: function() {} }
     });
+    // ui/130 calls t()/tn()/i18nFormatNumber(): add the REAL i18n core (English identity).
+    Object.assign(uiGlobals, new Function(sources['src/js/core/025-i18n.js'] +
+        '\nreturn { t: t, tn: tn, N_: N_, i18nFormatNumber: i18nFormatNumber, i18nDir: i18nDir };')());
     var uiNames = Object.keys(uiGlobals);
     var ui = new Function(uiNames, sources['src/js/ui/130-data-management.js'] + '\nreturn {importAllData:importAllData,deleteAllData:deleteAllData};').apply(null, uiNames.map(function(n) { return uiGlobals[n]; }));
     async function restore(data) { await ui.importAllData(); await fileInput.onchange({ target: { files: [{ text: async function() { return JSON.stringify(data); } }] } }); }
@@ -330,5 +333,5 @@ async function runWidgetVersioningTests(sources, idb) {
 }
 
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/core/135-widget-store.js", "src/js/tools/080-widget-tools.js", "src/js/tools/010-iframe-tool.js", "src/js/ui/130-data-management.js"];
+var PATHS = ["src/js/core/135-widget-store.js", "src/js/tools/080-widget-tools.js", "src/js/tools/010-iframe-tool.js", "src/js/ui/130-data-management.js", "src/js/core/025-i18n.js"];
 await registerRunner('widget-versioning', async function() { return runWidgetVersioningTests(await loadSources(PATHS), createMemoryIdb()); });

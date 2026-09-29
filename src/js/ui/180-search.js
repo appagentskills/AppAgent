@@ -120,9 +120,9 @@ function renderChatList() {
             return name.indexOf(q) !== -1 || desc.indexOf(q) !== -1;
         });
         if (matchingSkills.length > 0) {
-            html += '<div class="search-section-header">' + UI_ICONS.skill + ' Skills</div>';
+            html += '<div class="search-section-header">' + UI_ICONS.skill + ' ' + escapeHtml(t('Skills')) + '</div>';
             matchingSkills.forEach(function(s) {
-                html += '<div class="search-result-item" onclick="toggleSkillsView();setTimeout(function(){openSkillEditor(\'' + escapeJsString(s.id) + '\')},100)">' +
+                html += '<div class="search-result-item" role="button" tabindex="0" data-kbd-click onclick="toggleSkillsView();setTimeout(function(){openSkillEditor(\'' + escapeJsString(s.id) + '\')},100)">' +
                     '<span class="search-result-icon">' + UI_ICONS.skill + '</span>' +
                     '<span class="search-result-text">' + escapeHtml(s.name || s.id) + '</span>' +
                 '</div>';
@@ -130,18 +130,19 @@ function renderChatList() {
         }
         
         // Search tools
-        var matchingTools = TOOLS.filter(function(t) {
-            var name = (t.function.name || '').toLowerCase();
-            var displayName = (TOOL_DISPLAY_NAMES[t.function.name] || '').toLowerCase();
-            var desc = (t.function.description || '').toLowerCase();
+        var matchingTools = TOOLS.filter(function(tool) {
+            var name = (tool.function.name || '').toLowerCase();
+            // Matching stays on the English TOOL_DISPLAY_NAMES value (logic); only the display below is translated.
+            var displayName = (TOOL_DISPLAY_NAMES[tool.function.name] || '').toLowerCase();
+            var desc = (tool.function.description || '').toLowerCase();
             return name.indexOf(q) !== -1 || displayName.indexOf(q) !== -1 || desc.indexOf(q) !== -1;
         });
         if (matchingTools.length > 0) {
-            html += '<div class="search-section-header">' + UI_ICONS.tool + ' Tools</div>';
-            matchingTools.forEach(function(t) {
-                var displayName = TOOL_DISPLAY_NAMES[t.function.name] || t.function.name;
-                html += '<div class="search-result-item" onclick="showToolInspector(\'' + escapeJsString(t.function.name) + '\')">' +
-                    '<span class="search-result-icon">' + getToolIcon(t.function.name) + '</span>' +
+            html += '<div class="search-section-header">' + UI_ICONS.tool + ' ' + escapeHtml(t('Tools')) + '</div>';
+            matchingTools.forEach(function(tool) {
+                var displayName = TOOL_DISPLAY_NAMES[tool.function.name] ? t(TOOL_DISPLAY_NAMES[tool.function.name]) : tool.function.name;
+                html += '<div class="search-result-item" role="button" tabindex="0" data-kbd-click onclick="showToolInspector(\'' + escapeJsString(tool.function.name) + '\')">' +
+                    '<span class="search-result-icon">' + getToolIcon(tool.function.name) + '</span>' +
                     '<span class="search-result-text">' + escapeHtml(displayName) + '</span>' +
                 '</div>';
             });
@@ -153,9 +154,9 @@ function renderChatList() {
             return title.indexOf(q) !== -1;
         });
         if (matchingWidgets.length > 0) {
-            html += '<div class="search-section-header">' + UI_ICONS.widget + ' Widgets</div>';
+            html += '<div class="search-section-header">' + UI_ICONS.widget + ' ' + escapeHtml(t('Widgets')) + '</div>';
             matchingWidgets.forEach(function(w) {
-                html += '<div class="search-result-item" onclick="toggleDashboardView()">' +
+                html += '<div class="search-result-item" role="button" tabindex="0" data-kbd-click onclick="toggleDashboardView()">' +
                     '<span class="search-result-icon">' + UI_ICONS.widget + '</span>' +
                     '<span class="search-result-text">' + escapeHtml(w.title) + '</span>' +
                 '</div>';
@@ -164,7 +165,7 @@ function renderChatList() {
         
         // Add chats header if we have other results
         if (matchingSkills.length > 0 || matchingTools.length > 0 || matchingWidgets.length > 0) {
-            html += '<div class="search-section-header">' + UI_ICONS.chat + ' Chats</div>';
+            html += '<div class="search-section-header">' + UI_ICONS.chat + ' ' + escapeHtml(t('Chats')) + '</div>';
         }
     }
     
@@ -419,8 +420,8 @@ var searchMatchesCache = {};
 function renderChatItem(c) {
     // Don't highlight any chat as active when Dashboard or Skills is open
     var active = (currentView === 'chat' && c.id === currentChatId) ? 'active' : '';
-    var pinIcon = c.pinned ? '<span class="pin-icon" title="Pinned">' + UI_ICONS.pinFilled + '</span>' : '';
-    var pinLabel = c.pinned ? 'Unpin Chat' : 'Pin Chat';
+    var pinIcon = c.pinned ? '<span class="pin-icon" title="' + escapeHtml(t('Pinned')) + '">' + UI_ICONS.pinFilled + '</span>' : '';
+    var pinLabel = escapeHtml(c.pinned ? t('Unpin Chat') : t('Pin Chat'));
     var dropdownId = 'chat-dropdown-' + c.id;
     // R3b-b: a data id so chatItemKeydown can refocus this chat's row after
     // selectChat() re-renders the list. R3b-a: the role="button" row is named by
@@ -448,10 +449,14 @@ function renderChatItem(c) {
         matches.forEach(function(match, idx) {
             var typeIcon = match.type === 'content' ? (match.role === 'user' ? '<span class="snippet-icon">' + UI_ICONS.user + '</span>' : '<span class="snippet-icon">' + UI_ICONS.bot + '</span>') : 
                           (match.type === 'tool_call' ? '<span class="snippet-icon">' + getToolIcon(match.toolName) + '</span>' : '<span class="snippet-icon">' + UI_ICONS.result + '</span>');
-            var typeLabel = match.type === 'content' ? (match.role === 'user' ? 'You' : 'AI') :
-                           (match.type === 'tool_call' ? (TOOL_DISPLAY_NAMES[match.toolName] || match.toolName) : 
-                           (TOOL_DISPLAY_NAMES[match.toolName] || match.toolName) + ' result');
-            snippetsHtml += '<div class="chat-result-snippet-item" onclick="event.stopPropagation(); handleSearchSnippetClick(\'' + c.id + '\', ' + idx + ')">' +
+            // D1: TOOL_DISPLAY_NAMES values are N_()-marked English; translate them only here, for display.
+            var typeLabel;
+            if (match.type === 'content') typeLabel = match.role === 'user' ? t('You') : t('AI');
+            else {
+                var toolLabel = TOOL_DISPLAY_NAMES[match.toolName] ? t(TOOL_DISPLAY_NAMES[match.toolName]) : match.toolName;
+                typeLabel = match.type === 'tool_call' ? toolLabel : t('{name} result', { name: toolLabel });
+            }
+            snippetsHtml += '<div class="chat-result-snippet-item" role="button" tabindex="0" data-kbd-click onclick="event.stopPropagation(); handleSearchSnippetClick(\'' + c.id + '\', ' + idx + ')">' +
                 '<span class="snippet-type">' + typeIcon + ' ' + escapeHtml(typeLabel) + '</span>' +
                 '<span class="snippet-text">' + match.snippet + '</span>' +
             '</div>';
@@ -460,15 +465,15 @@ function renderChatItem(c) {
         // Title row with menu button
         var titleRow = '<div class="chat-result-title-row">' +
             pinIcon +
-            '<div class="chat-result-title">' + escapeHtml(c.title) + ' <span class="match-count">' + (matches.length ? '(' + matches.length + ' match' + (matches.length !== 1 ? 'es' : '') + ')' : (titleHit ? '(title match)' : '')) + '</span></div>' +
+            '<div class="chat-result-title">' + escapeHtml(c.title) + ' <span class="match-count">' + (matches.length ? escapeHtml(tn(matches.length, '({count} match)', '({count} matches)')) : (titleHit ? escapeHtml(t('(title match)')) : '')) + '</span></div>' +
             '<div class="chat-menu-wrapper">' +
-            '<button class="chat-menu-btn" onclick="event.stopPropagation(); toggleChatDropdown(\'' + dropdownId + '\')" title="More options">···</button>' +
+            '<button class="chat-menu-btn" onclick="event.stopPropagation(); toggleChatDropdown(\'' + dropdownId + '\')" title="' + escapeHtml(t('More options')) + '">···</button>' +
             '<div class="chat-dropdown" id="' + dropdownId + '">' +
-            '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); openRenameModal(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.edit + '</span>Rename</button>' +
-            '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); downloadChat(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.download + '</span>Download</button>' +
+            '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); openRenameModal(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.edit + '</span>' + escapeHtml(t('Rename')) + '</button>' +
+            '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); downloadChat(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.download + '</span>' + escapeHtml(t('Download')) + '</button>' +
             '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); togglePinChat(\'' + c.id + '\')"><span class="dropdown-icon">' + (c.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</span>' + pinLabel + '</button>' +
             '<div class="chat-dropdown-divider"></div>' +
-            '<button class="chat-dropdown-item danger" onclick="event.stopPropagation(); closeChatDropdowns(); deleteChat(\'' + c.id + '\', event)"><span class="dropdown-icon">' + UI_ICONS.trash + '</span>Delete</button>' +
+            '<button class="chat-dropdown-item danger" onclick="event.stopPropagation(); closeChatDropdowns(); deleteChat(\'' + c.id + '\', event)"><span class="dropdown-icon">' + UI_ICONS.trash + '</span>' + escapeHtml(t('Delete')) + '</button>' +
             '</div>' +
             '</div>' +
         '</div>';
@@ -490,7 +495,7 @@ function renderChatItem(c) {
         return '<div class="chat-item ' + active + ' searching" role="button" tabindex="0"' + rowAttrs + (active ? ' aria-current="true"' : '') + ' onclick="selectChat(\'' + c.id + '\')" onkeydown="chatItemKeydown(event,this,\'' + c.id + '\')">' + displayContent + '</div>';
     } else {
         var hasApproval = chatHasPendingApproval(c.id);
-        var attentionIndicator = hasApproval ? '<span class="chat-attention-dot" title="Requires permission"></span>' : '';
+        var attentionIndicator = hasApproval ? '<span class="chat-attention-dot" title="' + escapeHtml(t('Requires permission')) + '"></span>' : '';
         // Show streaming indicator while the agent is actively running on this chat,
         // unless the chat is already showing the permission attention dot (avoid stacking)
         // OR the chat is paused (paused chats keep `runningChatIds[id]=true` because the
@@ -500,8 +505,8 @@ function renderChatItem(c) {
         // are invisible work — the user-facing answer already landed, so the
         // dot would lie about "running" for a couple of extra seconds.
         var chatHookSilent = typeof _isChatInSilentHook === 'function' && _isChatInSilentHook(c.id);
-        var streamingIndicator = (!hasApproval && !chatPaused && !chatHookSilent && typeof isChatRunning === 'function' && isChatRunning(c.id)) ? '<span class="chat-streaming-dot" title="Agent is running"></span>' : '';
-        var pendingIndicator = chatHasPendingItems(c.id) ? '<span class="chat-pending-dot" title="Has pending draft"></span>' : '';
+        var streamingIndicator = (!hasApproval && !chatPaused && !chatHookSilent && typeof isChatRunning === 'function' && isChatRunning(c.id)) ? '<span class="chat-streaming-dot" title="' + escapeHtml(t('Agent is running')) + '"></span>' : '';
+        var pendingIndicator = chatHasPendingItems(c.id) ? '<span class="chat-pending-dot" title="' + escapeHtml(t('Has pending draft')) + '"></span>' : '';
         // Sub-agent breadcrumb: "↳ parent-title" pill so the user can see
         // at a glance that this chat is a delegated worker, not a top-level
         // conversation. Rendered AFTER the title so the dots stay first.
@@ -510,7 +515,7 @@ function renderChatItem(c) {
         // Action chats get a small zap badge so they're distinguishable from
         // normal conversations at a glance (isBackground + actionId, never set
         // on sub-agent chats — those get the breadcrumb instead).
-        var actionBadge = (c.actionId && !c.isSubAgent) ? '<span class="chat-action-badge" title="Background action chat">' + UI_ICONS.zap + '</span>' : '';
+        var actionBadge = (c.actionId && !c.isSubAgent) ? '<span class="chat-action-badge" title="' + escapeHtml(t('Background action chat')) + '">' + UI_ICONS.zap + '</span>' : '';
         displayContent = attentionIndicator + streamingIndicator + pendingIndicator + actionBadge + '<span class="chat-title">' + escapeHtml(c.title) + '</span>' + subAgentBreadcrumb;
     }
 
@@ -518,13 +523,13 @@ function renderChatItem(c) {
         pinIcon +
         displayContent +
         '<div class="chat-menu-wrapper">' +
-        '<button class="chat-menu-btn" onclick="event.stopPropagation(); toggleChatDropdown(\'' + dropdownId + '\')" title="More options">···</button>' +
+        '<button class="chat-menu-btn" onclick="event.stopPropagation(); toggleChatDropdown(\'' + dropdownId + '\')" title="' + escapeHtml(t('More options')) + '">···</button>' +
         '<div class="chat-dropdown" id="' + dropdownId + '">' +
-        '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); openRenameModal(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.edit + '</span>Rename</button>' +
-        '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); downloadChat(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.download + '</span>Download</button>' +
+        '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); openRenameModal(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.edit + '</span>' + escapeHtml(t('Rename')) + '</button>' +
+        '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); downloadChat(\'' + c.id + '\')"><span class="dropdown-icon">' + UI_ICONS.download + '</span>' + escapeHtml(t('Download')) + '</button>' +
         '<button class="chat-dropdown-item" onclick="event.stopPropagation(); closeChatDropdowns(); togglePinChat(\'' + c.id + '\')"><span class="dropdown-icon">' + (c.pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</span>' + pinLabel + '</button>' +
         '<div class="chat-dropdown-divider"></div>' +
-        '<button class="chat-dropdown-item danger" onclick="event.stopPropagation(); closeChatDropdowns(); deleteChat(\'' + c.id + '\', event)"><span class="dropdown-icon">' + UI_ICONS.trash + '</span>Delete</button>' +
+        '<button class="chat-dropdown-item danger" onclick="event.stopPropagation(); closeChatDropdowns(); deleteChat(\'' + c.id + '\', event)"><span class="dropdown-icon">' + UI_ICONS.trash + '</span>' + escapeHtml(t('Delete')) + '</button>' +
         '</div>' +
         '</div>' +
     '</div>';

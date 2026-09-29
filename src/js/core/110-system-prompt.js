@@ -50,6 +50,7 @@ var DEFAULT_SYSTEM_PROMPT_TEMPLATE = [
     'You are an AI agent that can execute tools to help users.',
     '',
     'CURRENT DATE: {{CURRENT_DATE}}',
+    '{{RESPONSE_LANGUAGE}}',
     '',
     'CHAT VS TASK:',
     '- A question is a chat: answer from knowledge and context, with at most ONE quick read-only lookup when the answer lives in the instance or repo (say what you checked). Never spawn a worker, research, or edit anything just to answer a question.',
@@ -230,6 +231,17 @@ function expandSystemPromptPlaceholders(template, chatId) {
     var now = new Date();
     var dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     expanded = expanded.replace(/\{\{CURRENT_DATE\}\}/g, dateStr);
+
+    // Replace {{RESPONSE_LANGUAGE}} with the reply-language instruction for the
+    // active UI language (i18nResponseLanguageInstruction, core/025-i18n.js —
+    // shared with the SW bundle). English (or i18n not loaded) renders '': the
+    // placeholder's own line is collapsed as {{INSTANCE_CONTEXT}} below, so no
+    // blank-line artifact is left; any inline occurrence is plain-replaced.
+    var responseLanguage = (typeof i18nResponseLanguageInstruction === 'function') ? (i18nResponseLanguageInstruction() || '') : '';
+    if (!responseLanguage) {
+        expanded = expanded.replace(/\n[ \t]*\{\{RESPONSE_LANGUAGE\}\}[ \t]*(?=\n)/g, '');
+    }
+    expanded = expanded.replace(/\{\{RESPONSE_LANGUAGE\}\}/g, function() { return responseLanguage; });
 
     // {{INSTANCE_CONTEXT}} retired — instance targeting guidance now lives in the
     // servicenow_api / servicenow_diff_edit / iframe_tool descriptions. Collapse any

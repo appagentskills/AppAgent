@@ -294,7 +294,7 @@ function getPushedPRsForChat(chat) {
         }
     });
     // Fallback title when no pr_title was ever passed
-    prs.forEach(function(pr) { if (!pr.title) pr.title = pr.branch || ('PR #' + pr.number); });
+    prs.forEach(function(pr) { if (!pr.title) pr.title = pr.branch || t('PR #{number}', { number: pr.number }); });
     return prs;
 }
 
@@ -531,9 +531,9 @@ async function mergeSidebarPR(event, btn) {
     event.stopPropagation();
     var url = btn.getAttribute('data-pr-url');
     var info = parsePrUrl(url);
-    if (!info) { showSnackbar('Could not parse PR URL: ' + url, 'error'); return; }
-    var ok = await showConfirmModal('Merge PR #' + info.number,
-        'Merge pull request #' + info.number + ' (' + escapeHtml(info.repo) + ') on GitHub and sync the local workspace?', 'warning');
+    if (!info) { showSnackbar(t('Could not parse PR URL: {url}', { url: url }), 'error'); return; }
+    var ok = await showConfirmModal(t('Merge PR #{number}', { number: info.number }),
+        t('Merge pull request #{number} ({repo}) on GitHub and sync the local workspace?', { number: info.number, repo: escapeHtml(info.repo) }), 'warning');
     if (!ok) return;
     _sidebarPRState[url] = 'merging';
     renderVersionSidebar();
@@ -544,11 +544,11 @@ async function mergeSidebarPR(event, btn) {
         var preBody = (pre && pre.ok && pre.body && typeof pre.body === 'object') ? pre.body : null;
         if (preBody && preBody.merged) {
             finalState = 'merged';
-            showSnackbar('PR #' + info.number + ' was already merged \u2014 syncing workspace\u2026', 'success');
+            showSnackbar(t('PR #{number} was already merged \u2014 syncing workspace\u2026', { number: info.number }), 'success');
         } else if (preBody && preBody.state === 'closed') {
             _sidebarPRState[url] = 'closed';
             renderVersionSidebar();
-            showSnackbar('PR #' + info.number + ' is closed and cannot be merged', 'error');
+            showSnackbar(t('PR #{number} is closed and cannot be merged', { number: info.number }), 'error');
             return;
         } else {
             // Squash-merge with the PR title as the commit title: the whole PR
@@ -568,13 +568,13 @@ async function mergeSidebarPR(event, btn) {
             }
             if (res && res.ok && res.body && res.body.merged) {
                 finalState = 'merged';
-                showSnackbar('PR #' + info.number + ' merged \u2014 syncing workspace\u2026', 'success');
+                showSnackbar(t('PR #{number} merged \u2014 syncing workspace\u2026', { number: info.number }), 'success');
             } else {
                 var msg = (res && res.body && res.body.message) ? res.body.message
                     : (res && res.error) ? res.error : ('HTTP ' + (res && res.status));
                 _sidebarPRState[url] = 'open';
                 renderVersionSidebar();
-                showSnackbar('Merge failed: ' + msg, 'error');
+                showSnackbar(t('Merge failed: {error}', { error: msg }), 'error');
                 return;
             }
         }
@@ -605,17 +605,17 @@ async function mergeSidebarPR(event, btn) {
                 }
             } catch (e) { /* cache unavailable — assume synced */ }
             if (_syncOffline) {
-                showSnackbar('PR merged, but workspace sync could not reach GitHub \u2014 it will retry on the next sync', 'error');
+                showSnackbar(t('PR merged, but workspace sync could not reach GitHub \u2014 it will retry on the next sync'), 'error');
             } else {
-                showSnackbar('Workspace synced', 'success');
+                showSnackbar(t('Workspace synced'), 'success');
             }
         } catch (syncErr) {
-            showSnackbar('PR merged, but workspace sync failed: ' + (syncErr && syncErr.message ? syncErr.message : syncErr), 'error');
+            showSnackbar(t('PR merged, but workspace sync failed: {error}', { error: (syncErr && syncErr.message ? syncErr.message : syncErr) }), 'error');
         }
     } catch (e) {
         _sidebarPRState[url] = 'open';
         renderVersionSidebar();
-        showSnackbar('Merge failed: ' + (e && e.message ? e.message : e), 'error');
+        showSnackbar(t('Merge failed: {error}', { error: (e && e.message ? e.message : e) }), 'error');
     }
 }
 
@@ -675,7 +675,7 @@ function renderVersionSidebar() {
     // sub-agent chat. Placeholder only: populated by updateSubAgentSelfCard()
     // (175-sub-agent-ui.js), re-invoked at the end of this function (this
     // innerHTML rebuild wipes it). Hidden for regular chats.
-    html += '<div class="sub-self-parent-host" id="sub-self-parent-host" style="display:none" aria-label="Back to parent chat"></div>';
+    html += '<div class="sub-self-parent-host" id="sub-self-parent-host" style="display:none" aria-label="' + t('Back to parent chat') + '"></div>';
     
     // Pull Requests Section — PRs pushed from this chat via workspace push.
     // Derived from the chat's tool calls/results, so it works retroactively
@@ -771,7 +771,7 @@ function renderVersionSidebar() {
     });
     if (pushedPRs.length > 0) {
         html += '<div class="version-prs-section">';
-        html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' Pull Requests (' + pushedPRs.length + ')</div>';
+        html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' ' + t('Pull Requests ({count})', { count: pushedPRs.length }) + '</div>';
         html += '<div class="pr-sidebar-list">';
         pushedPRs.forEach(function(pr) {
             var prState = _sidebarPRState[pr.url] || 'open';
@@ -779,16 +779,16 @@ function renderVersionSidebar() {
             html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
             html += '<span class="pr-sidebar-info">';
             html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
-            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + (pr.worker ? ' <span class="wsf-ws" title="Pushed by worker ' + escapeHtml(pr.worker) + '">' + escapeHtml(pr.worker) + '</span>' : '') + '</span>';
+            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + (pr.worker ? ' <span class="wsf-ws" title="' + t('Pushed by worker {worker}', { worker: escapeHtml(pr.worker) }) + '">' + escapeHtml(pr.worker) + '</span>' : '') + '</span>';
             html += '</span>';
             if (prState === 'merged') {
-                html += '<span class="pr-sidebar-state merged" title="Merged">' + UI_ICONS.gitMerge + ' Merged</span>';
+                html += '<span class="pr-sidebar-state merged" title="' + t('Merged') + '">' + UI_ICONS.gitMerge + ' ' + t('Merged') + '</span>';
             } else if (prState === 'merging') {
-                html += '<span class="pr-sidebar-state merging" title="Merging\u2026">' + UI_ICONS.spinner + '</span>';
+                html += '<span class="pr-sidebar-state merging" title="' + t('Merging\u2026') + '">' + UI_ICONS.spinner + '</span>';
             } else if (prState === 'closed') {
-                html += '<span class="pr-sidebar-state closed" title="Closed without merging">' + UI_ICONS.close + ' Closed</span>';
+                html += '<span class="pr-sidebar-state closed" title="' + t('Closed without merging') + '">' + UI_ICONS.close + ' ' + t('Closed') + '</span>';
             } else {
-                html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="Merge PR #' + escapeHtml(String(pr.number)) + ' and sync workspace">' + UI_ICONS.gitMerge + '</button>';
+                html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="' + t('Merge PR #{number} and sync workspace', { number: escapeHtml(String(pr.number)) }) + '">' + UI_ICONS.gitMerge + '</button>';
             }
             html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
             html += '</a>';
@@ -815,40 +815,40 @@ function renderVersionSidebar() {
     // by updateSubAgentSelfCard() (175-sub-agent-ui.js), re-invoked at the
     // end of this function because this innerHTML rebuild wipes it (same
     // pattern as the Workers panel below). Hidden for regular chats.
-    html += '<div class="sub-self-card-host" id="sub-self-card-host" style="display:none" aria-label="Sub-agent status"></div>';
+    html += '<div class="sub-self-card-host" id="sub-self-card-host" style="display:none" aria-label="' + t('Sub-agent status') + '"></div>';
     
     // Workers panel placeholder — populated by renderWorkersStrip()
     // (175-sub-agent-ui.js). Lives INSIDE the scrolling sidebar content (below
     // PRs and progress) so all sections share one scrollbar. Because this
     // innerHTML rebuild wipes it, renderWorkersStrip() is re-invoked at the
     // end of this function.
-    html += '<div class="sidebar-workers" id="sidebar-workers" style="display:none;" aria-label="Active sub-agents"></div>';
+    html += '<div class="sidebar-workers" id="sidebar-workers" style="display:none;" aria-label="' + t('Active sub-agents') + '"></div>';
     
     // Actions Section - Group all action buttons together
     var hasActions = lastBrowserUrl || changedFiles.length > 0;
     if (hasActions) {
         html += '<div class="version-actions-section">';
-        html += '<div class="version-section-title">Actions</div>';
+        html += '<div class="version-section-title">' + t('Actions') + '</div>';
         html += '<div class="version-actions-list">';
         
         // Open Browser button
         if (lastBrowserUrl) {
             html += '<button class="version-action-btn" onclick="reopenBrowser()" title="' + escapeHtml(lastBrowserUrl) + '">';
-            html += '<span class="action-icon">' + UI_ICONS.globe + '</span>Open Browser';
+            html += '<span class="action-icon">' + UI_ICONS.globe + '</span>' + t('Open Browser');
             html += '</button>';
         }
         
         // Download XML button
         if (changedFiles.length > 0) {
-            html += '<button class="version-action-btn" onclick="downloadChangesXml()" title="Export all changes as one XML file">';
-            html += '<span class="action-icon">' + UI_ICONS.download + '</span>Download All';
+            html += '<button class="version-action-btn" onclick="downloadChangesXml()" title="' + t('Export all changes as one XML file') + '">';
+            html += '<span class="action-icon">' + UI_ICONS.download + '</span>' + t('Download All');
             html += '</button>';
             
             // Revert All button
             html += '<button class="version-action-btn danger" onclick="revertAllChanges()">';
-            html += '<span class="action-icon">' + UI_ICONS.undo + '</span>Revert All';
+            html += '<span class="action-icon">' + UI_ICONS.undo + '</span>' + t('Revert All');
             html += '</button>';
-            html += '<div class="version-action-hint">' + changedFiles.length + ' file' + (changedFiles.length > 1 ? 's' : '') + ' changed</div>';
+            html += '<div class="version-action-hint">' + tn(changedFiles.length, '{count} file changed', '{count} files changed') + '</div>';
         }
         
         html += '</div>';
@@ -860,20 +860,20 @@ function renderVersionSidebar() {
     var widgets = getSidebarWidgets();
     if (widgets.length > 0) {
         html += '<div class="version-widgets-section">';
-        html += '<div class="version-section-title">' + UI_ICONS.widget + ' Widgets (' + widgets.length + ')</div>';
+        html += '<div class="version-section-title">' + UI_ICONS.widget + ' ' + t('Widgets ({count})', { count: widgets.length }) + '</div>';
         html += '<div id="widget-sidebar-list" class="widget-sidebar-list">';
         widgets.forEach(function(widget) {
             var isOnDashboard = dashboardWidgets && dashboardWidgets[widget.id];
             var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn widget-dashboard-btn on-dashboard' : 'widget-sidebar-btn widget-dashboard-btn';
-            var dashboardBtnTitle = isOnDashboard ? 'Pinned \u2014 click to change' : 'Pin to dashboard\u2026';
+            var dashboardBtnTitle = isOnDashboard ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026');
             var dashboardBtnIcon = isOnDashboard ? UI_ICONS.pinFilled : UI_ICONS.pin;
-            html += '<div class="widget-sidebar-item" onclick="scrollToWidget(\'' + widget.id + '\')">' +
+            html += '<div class="widget-sidebar-item" role="button" tabindex="0" data-kbd-click onclick="scrollToWidget(\'' + widget.id + '\')">' +
                 '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-sidebar-actions">' +
-                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="Open in new tab">' + UI_ICONS.externalLink + '</button>' +
+                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="' + t('Open in new tab') + '">' + UI_ICONS.externalLink + '</button>' +
                 '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
-                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="Fullscreen">' + UI_ICONS.maximize + '</button>' +
+                '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="' + t('Fullscreen') + '">' + UI_ICONS.maximize + '</button>' +
                 '</div>' +
             '</div>';
         });
@@ -902,48 +902,52 @@ function renderVersionSidebar() {
     if (screenshots.length > 0 || pdfAttachments.length > 0 || fileAttachments.length > 0) {
         html += '<div class="version-screenshots-section">';
         var attachTotalCount = screenshots.length + pdfAttachments.length + fileAttachments.length;
-        html += '<div class="version-section-title">' + UI_ICONS.eye + ' Attachments (' + attachTotalCount + ')</div>';
+        html += '<div class="version-section-title">' + UI_ICONS.eye + ' ' + t('Attachments ({count})', { count: attachTotalCount }) + '</div>';
         html += '<div class="screenshot-sidebar-list">';
+        // Row a11y: the row itself is NOT a button (it would nest the thumb button).
+        // The .screenshot-sidebar-info block is the keyboard "go to message" button;
+        // it has no onclick of its own, so Enter/Space (kbdHandleActivation -> click())
+        // and mouse clicks both bubble to the row's scrollToMessage exactly once.
         screenshots.forEach(function(item, i) {
             var screenshot = item.msg;
-            var screenshotName = screenshot.name || screenshot.description || ('Screenshot ' + (i + 1));
+            var screenshotName = screenshot.name || screenshot.description || t('Screenshot {n}', { n: i + 1 });
             html += '<div class="screenshot-sidebar-item" onclick="scrollToMessage(' + item.idx + ')">' +
-                '<img class="screenshot-sidebar-thumb" src="' + screenshot.base64 + '" alt="' + escapeHtml(screenshotName) + '" onclick="event.stopPropagation();openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\')" />' +
-                '<div class="screenshot-sidebar-info">' +
+                '<img class="screenshot-sidebar-thumb" role="button" tabindex="0" data-kbd-click src="' + screenshot.base64 + '" alt="' + escapeHtml(screenshotName) + '" onclick="event.stopPropagation();openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\')" />' +
+                '<div class="screenshot-sidebar-info" role="button" tabindex="0" data-kbd-click>' +
                 '<span class="screenshot-sidebar-title">' + escapeHtml(screenshotName) + '</span>' +
                 '<span class="screenshot-sidebar-size">' + screenshot.width + '×' + screenshot.height + '</span>' +
                 '</div>' +
-                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadScreenshotFromSidebar(\'' + i + '\')" title="Download">' + UI_ICONS.download + '</button>' +
+                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadScreenshotFromSidebar(\'' + i + '\')" title="' + t('Download') + '">' + UI_ICONS.download + '</button>' +
             '</div>';
         });
         pdfAttachments.forEach(function(item, i) {
             var pdfMsg = item.msg;
-            var pdfName = pdfMsg.name || pdfMsg.description || ('Document ' + (i + 1));
+            var pdfName = pdfMsg.name || pdfMsg.description || t('Document {n}', { n: i + 1 });
             html += '<div class="screenshot-sidebar-item" onclick="scrollToMessage(' + item.idx + ')">' +
-                '<div class="screenshot-sidebar-thumb pdf-sidebar-thumb" onclick="event.stopPropagation();openPdfFromMessage(' + item.idx + ')">' +
+                '<div class="screenshot-sidebar-thumb pdf-sidebar-thumb" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('View file')) + '" onclick="event.stopPropagation();openPdfFromMessage(' + item.idx + ')">' +
                 '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:24px;height:24px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' +
                 '</div>' +
-                '<div class="screenshot-sidebar-info">' +
+                '<div class="screenshot-sidebar-info" role="button" tabindex="0" data-kbd-click>' +
                 '<span class="screenshot-sidebar-title">' + escapeHtml(pdfName) + '</span>' +
                 '<span class="screenshot-sidebar-size">PDF</span>' +
                 '</div>' +
-                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadPdfFromSidebar(' + i + ')" title="Download">' + UI_ICONS.download + '</button>' +
+                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadPdfFromSidebar(' + i + ')" title="' + t('Download') + '">' + UI_ICONS.download + '</button>' +
             '</div>';
         });
         fileAttachments.forEach(function(item, i) {
             var fileMsg = item.msg;
-            var fileName = fileMsg.name || ('File ' + (i + 1));
+            var fileName = fileMsg.name || t('File {n}', { n: i + 1 });
             var fileExt = fileName.split('.').pop().toUpperCase();
             var fileSize = fileMsg.size ? formatFileSize(fileMsg.size) : '';
             html += '<div class="screenshot-sidebar-item" onclick="scrollToMessage(' + item.idx + ')">' +
-                '<div class="screenshot-sidebar-thumb" style="background:var(--secondary-lighter);border:1px solid var(--secondary-border);color:var(--success);display:flex;align-items:center;justify-content:center;cursor:pointer;" onclick="event.stopPropagation();openFileFromMessage(' + item.idx + ')">' +
+                '<div class="screenshot-sidebar-thumb" style="background:var(--secondary-lighter);border:1px solid var(--secondary-border);color:var(--success);display:flex;align-items:center;justify-content:center;cursor:pointer;" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('View file')) + '" onclick="event.stopPropagation();openFileFromMessage(' + item.idx + ')">' +
                 '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:24px;height:24px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' +
                 '</div>' +
-                '<div class="screenshot-sidebar-info">' +
+                '<div class="screenshot-sidebar-info" role="button" tabindex="0" data-kbd-click>' +
                 '<span class="screenshot-sidebar-title">' + escapeHtml(fileName) + '</span>' +
                 '<span class="screenshot-sidebar-size">' + fileExt + (fileSize ? ' · ' + fileSize : '') + '</span>' +
                 '</div>' +
-                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadFileFromSidebar(' + i + ')" title="Download">' + UI_ICONS.download + '</button>' +
+                '<button class="screenshot-sidebar-btn" onclick="event.stopPropagation();downloadFileFromSidebar(' + i + ')" title="' + t('Download') + '">' + UI_ICONS.download + '</button>' +
             '</div>';
         });
         html += '</div>';
@@ -953,7 +957,7 @@ function renderVersionSidebar() {
     // Show active changes section
     if (changedFiles.length > 0) {
         // Workspace Artifacts header
-        html += '<div class="version-artifacts-header">Artifacts' + (changedFiles.length === 1 ? '' : ' (' + changedFiles.length + ')') + '</div>';
+        html += '<div class="version-artifacts-header">' + (changedFiles.length === 1 ? t('Artifacts') : t('Artifacts ({count})', { count: changedFiles.length })) + '</div>';
 
         // List each changed file with icon buttons
         html += '<div class="version-files-list">';
@@ -964,9 +968,9 @@ function renderVersionSidebar() {
 
             var firstBeforeVersion = getFirstVersionForRecord(file.table, file.sysId);
             var tableIcon = getTableIcon(file.table);
-            var tableDisplayName = getTableDisplayName(file.table);
-            var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">NEW</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">MODIFIED</span>' : '');
-            var changesBadge = changeCount > 1 ? '<span class="sn-changes-badge">' + changeCount + ' changes</span>' : '';
+            var tableDisplayName = t(getTableDisplayName(file.table));
+            var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">' + t('NEW') + '</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">' + t('MODIFIED') + '</span>' : '');
+            var changesBadge = changeCount > 1 ? '<span class="sn-changes-badge">' + tn(changeCount, '{count} change', '{count} changes') + '</span>' : '';
 
             // Escape values for JS
             var jsTable = escapeJsString(file.table);
@@ -977,23 +981,23 @@ function renderVersionSidebar() {
             html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
             html += '<div class="sn-artifact-content">';
             html += '<div class="sn-artifact-name">' + escapeHtml(file.displayName) + '</div>';
-            html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') ' + statusBadge + changesBadge + (file.worker ? ' <span class="wsf-ws" title="Edited by worker ' + escapeHtml(file.worker) + '">' + escapeHtml(file.worker) + '</span>' : '') + '</div>';
+            html += '<div class="sn-artifact-meta">(' + tableDisplayName + ') ' + statusBadge + changesBadge + (file.worker ? ' <span class="wsf-ws" title="' + t('Edited by worker {worker}', { worker: escapeHtml(file.worker) }) + '">' + escapeHtml(file.worker) + '</span>' : '') + '</div>';
             html += '</div>';
             html += '<div class="sn-artifact-actions-row">';
             // View diff button
-            html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="View changes">' + UI_ICONS.eye + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('View changes') + '">' + UI_ICONS.eye + '</button>';
             // Download button
-            html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="Download XML">' + UI_ICONS.download + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Download XML') + '">' + UI_ICONS.download + '</button>';
             // Open in browser for UI pages
             if (file.table === 'sys_ui_page') {
-                html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="Open in Browser">' + UI_ICONS.globe + '</button>';
-                html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="Screenshot">' + UI_ICONS.camera + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="' + t('Open in Browser') + '">' + UI_ICONS.globe + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="' + t('Screenshot') + '">' + UI_ICONS.camera + '</button>';
             }
             // Revert button (or delete for new files)
             if (isNew) {
-                html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecordFromSidebar(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="Delete">' + UI_ICONS.trash + '</button>';
+                html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecordFromSidebar(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Delete') + '">' + UI_ICONS.trash + '</button>';
             } else if (firstBeforeVersion) {
-                html += '<button class="sn-artifact-icon-btn" onclick="revertFileToBeforeChat(\'' + firstBeforeVersion + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="Revert">' + UI_ICONS.undo + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="revertFileToBeforeChat(\'' + firstBeforeVersion + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Revert') + '">' + UI_ICONS.undo + '</button>';
             }
             html += '</div>';
             html += '</div>';
@@ -1032,13 +1036,13 @@ function renderVersionSidebar() {
     if (chatDocs.length > 0) {
         chatDocs.sort(function(a, b) { return b.updatedAt - a.updatedAt; });
         html += '<div class="version-documents-section">';
-        html += '<div class="version-section-title">' + UI_ICONS.file + ' Documents (' + chatDocs.length + ')</div>';
+        html += '<div class="version-section-title">' + UI_ICONS.file + ' ' + t('Documents ({count})', { count: chatDocs.length }) + '</div>';
         html += '<div class="documents-sidebar-list">';
         chatDocs.forEach(function(doc) {
-            html += '<div class="sdoc-sidebar-item" onclick="sdocOpenPreview(\'' + escapeJsString(doc.id) + '\')" title="' + escapeHtml(doc.title) + '">';
+            html += '<div class="sdoc-sidebar-item" role="button" tabindex="0" data-kbd-click onclick="sdocOpenPreview(\'' + escapeJsString(doc.id) + '\')" title="' + escapeHtml(doc.title) + '">';
             html += '<span class="sdoc-sidebar-icon">' + UI_ICONS.file + '</span>';
             html += '<span class="sdoc-sidebar-name">' + escapeHtml(doc.title) + '</span>';
-            html += '<span class="sdoc-sidebar-ver">v' + doc.currentVersion + '</span>';
+            html += '<span class="sdoc-sidebar-ver">' + t('v{version}', { version: doc.currentVersion }) + '</span>';
             html += '</div>';
         });
         html += '</div>';
@@ -1056,7 +1060,7 @@ function renderVersionSidebar() {
     if (_vsc && !_vsc.querySelector(':scope > :not(#sub-self-parent-host):not(#sub-self-card-host):not(#sidebar-workers)')) {
         var _vsEmpty = document.createElement('div');
         _vsEmpty.className = 'version-sidebar-empty';
-        _vsEmpty.textContent = 'Changes, pull requests and artifacts from this chat will appear here.';
+        _vsEmpty.textContent = t('Changes, pull requests and artifacts from this chat will appear here.');
         _vsc.appendChild(_vsEmpty);
     }
     
@@ -1079,15 +1083,15 @@ function renderVersionSidebar() {
 
 // Redo changes that were previously reverted
 async function redoFileChanges(versionSysId, table, sysId, displayName) {
-    if (!await showConfirmModal('Redo Changes', 'Redo changes to "' + escapeHtml(displayName) + '"? This will restore the AI-made changes.')) return;
+    if (!await showConfirmModal(t('Redo Changes'), t('Redo changes to "{name}"? This will restore the AI-made changes.', { name: escapeHtml(displayName) }))) return;
     
     try {
-        showSpinner('Restoring ' + displayName + '...');
+        showSpinner(t('Restoring {name}...', { name: displayName }));
         
         var xml = await getVersionXml(versionSysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('Could not get version data', 'error');
+            showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
@@ -1105,13 +1109,13 @@ async function redoFileChanges(versionSysId, table, sysId, displayName) {
             renderVersionSidebar();
             renderMessages();
 
-            showSnackbar('Successfully restored "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully restored "{name}"', { name: displayName }), 'success');
         } else {
-            showSnackbar('Redo failed: ' + result.error, 'error');
+            showSnackbar(t('Redo failed: {error}', { error: result.error }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Redo failed: ' + e.message, 'error');
+        showSnackbar(t('Redo failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -1119,13 +1123,13 @@ async function redoFileChanges(versionSysId, table, sysId, displayName) {
 async function redoAllChanges() {
     var revertedFiles = getRevertedFiles();
     if (revertedFiles.length === 0) {
-        showSnackbar('No reverted changes to redo', 'warning');
+        showSnackbar(t('No reverted changes to redo'), 'warning');
         return;
     }
     
-    if (!await showConfirmModal('Redo All', 'Redo all ' + revertedFiles.length + ' reverted file(s)? This will restore all AI-made changes.')) return;
+    if (!await showConfirmModal(t('Redo All'), tn(revertedFiles.length, 'Redo {count} reverted file? This will restore all AI-made changes.', 'Redo all {count} reverted files? This will restore all AI-made changes.'))) return;
     
-    showSpinner('Restoring ' + revertedFiles.length + ' files...');
+    showSpinner(tn(revertedFiles.length, 'Restoring {count} file...', 'Restoring {count} files...'));
     var successCount = 0;
     var errors = [];
     
@@ -1134,13 +1138,13 @@ async function redoAllChanges() {
         try {
             var latestAfterVersion = getLatestAfterVersion(file.table, file.sysId);
             if (!latestAfterVersion) {
-                errors.push(file.displayName + ': No version to restore');
+                errors.push(t('{name}: No version to restore', { name: file.displayName }));
                 continue;
             }
             
             var xml = await getVersionXml(latestAfterVersion);
             if (!xml) {
-                errors.push(file.displayName + ': Could not get version data');
+                errors.push(t('{name}: Could not get version data', { name: file.displayName }));
                 continue;
             }
             
@@ -1165,23 +1169,23 @@ async function redoAllChanges() {
     renderMessages();
     
     if (errors.length > 0) {
-        showSnackbar('Restored ' + successCount + ' of ' + revertedFiles.length + ' files.\n\nErrors:\n' + errors.join('\n'), 'warning');
+        showSnackbar(tn(revertedFiles.length, 'Restored {success} of {count} file.', 'Restored {success} of {count} files.', { success: i18nFormatNumber(successCount) }) + '\n\n' + t('Errors:') + '\n' + errors.join('\n'), 'warning');
     } else {
-        showSnackbar('Successfully restored ' + successCount + ' files', 'success');
+        showSnackbar(tn(successCount, 'Successfully restored {count} file', 'Successfully restored {count} files'), 'success');
     }
 }
 
 // Revert a single file to its state before this chat
 async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
-    if (!await showConfirmModal('Undo All Changes', 'Undo all changes to "' + escapeHtml(displayName) + '"? This will restore the file to how it was before this chat session.')) return;
+    if (!await showConfirmModal(t('Undo All Changes'), t('Undo all changes to "{name}"? This will restore the file to how it was before this chat session.', { name: escapeHtml(displayName) }))) return;
     
     try {
-        showSpinner('Reverting ' + displayName + '...');
+        showSpinner(t('Reverting {name}...', { name: displayName }));
         
         var xml = await getVersionXml(versionSysId);
         if (!xml) {
             hideSpinner();
-            showSnackbar('Could not get version data', 'error');
+            showSnackbar(t('Could not get version data'), 'error');
             return;
         }
         
@@ -1207,13 +1211,13 @@ async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
                 afterVersion: versionSysId
             });
             
-            showSnackbar('Successfully reverted "' + displayName + '"', 'success');
+            showSnackbar(t('Successfully reverted "{name}"', { name: displayName }), 'success');
         } else {
-            showSnackbar('Revert failed: ' + result.error, 'error');
+            showSnackbar(t('Revert failed: {error}', { error: result.error }), 'error');
         }
     } catch (e) {
         hideSpinner();
-        showSnackbar('Revert failed: ' + e.message, 'error');
+        showSnackbar(t('Revert failed: {error}', { error: e.message }), 'error');
     }
 }
 
@@ -1221,17 +1225,17 @@ async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
 async function revertAllChanges() {
     var changedFiles = getAllChangedFiles();
     if (changedFiles.length === 0) {
-        showSnackbar('No changes to revert', 'warning');
+        showSnackbar(t('No changes to revert'), 'warning');
         return;
     }
     
     var fileNames = changedFiles.map(function(f) { return escapeHtml(f.displayName); }).join(', ');
-    if (!await showConfirmModal('Undo All Changes', 'Undo ALL changes made in this chat? This will revert: ' + fileNames + '. You can always redo these changes later.')) return;
+    if (!await showConfirmModal(t('Undo All Changes'), t('Undo ALL changes made in this chat? This will revert: {files}. You can always redo these changes later.', { files: fileNames }))) return;
     
     var successCount = 0;
     var failCount = 0;
     
-    showSpinner('Reverting all changes...');
+    showSpinner(t('Reverting all changes...'));
     
     for (var i = 0; i < changedFiles.length; i++) {
         var file = changedFiles[i];
@@ -1301,8 +1305,8 @@ async function revertAllChanges() {
     hideSpinner();
     
     if (failCount === 0) {
-        showSnackbar('Successfully reverted all ' + successCount + ' file(s)', 'success');
+        showSnackbar(tn(successCount, 'Successfully reverted {count} file', 'Successfully reverted all {count} files'), 'success');
     } else {
-        showSnackbar('Reverted ' + successCount + ' file(s), ' + failCount + ' failed', 'warning');
+        showSnackbar(tn(successCount, 'Reverted {count} file, {failed} failed', 'Reverted {count} files, {failed} failed', { failed: i18nFormatNumber(failCount) }), 'warning');
     }
 }

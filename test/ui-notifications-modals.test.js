@@ -257,7 +257,7 @@ describe('ui notifications › snackbar', function() {
         var sk = await loadFile('src/js/ui/010-skills-ui.js', WS), lay = await loadFile('src/js/ui/240-layout.js', WS);
         assert.strictEqual(sk.split("undefined, { key: 'skill-editor' })").length - 1, 9, 'the 9 skill-editor toasts are keyed');
         assert.strictEqual(/showSnackbar\('Save the skill first', 'error'\)/.test(sk), false, 'no unkeyed "Save the skill first" left');
-        ["'Message copied'", "'Response copied'"].forEach(function(m) {
+        ["t('Message copied')", "t('Response copied')"].forEach(function(m) {
             assert.ok(lay.indexOf('showSnackbar(' + m + ", 'success', undefined, { transient: true })") >= 0, m + ' is transient');
         });
     }, { tags: ['unit'] });

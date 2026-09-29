@@ -89,10 +89,10 @@
 .diff-text .xml-comment, .diff-text .xml-decl { color: var(--text-muted); font-style: italic; }
 
 /* Inline Revert All Button */
-.inline-revert-all-btn { margin-left: auto; padding: var(--space-2) var(--space-5); background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.5); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--success-hover); cursor: pointer; transition: all var(--transition-normal); display: inline-flex; align-items: center; }
+.inline-revert-all-btn { margin-inline-start: auto; padding: var(--space-2) var(--space-5); background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.5); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--success-hover); cursor: pointer; transition: all var(--transition-normal); display: inline-flex; align-items: center; }
 .inline-revert-all-btn:hover { background: var(--bg-white); border-color: var(--success-light); }
-.inline-redo-all-btn { padding: var(--space-2) var(--space-5); background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.5); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--accent-hover); cursor: pointer; transition: all var(--transition-normal); margin-left: var(--space-3); display: inline-flex; align-items: center; }
-.inline-redo-all-btn:not(.inline-revert-all-btn ~ .inline-redo-all-btn) { margin-left: auto; }
+.inline-redo-all-btn { padding: var(--space-2) var(--space-5); background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.5); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--accent-hover); cursor: pointer; transition: all var(--transition-normal); margin-inline-start: var(--space-3); display: inline-flex; align-items: center; }
+.inline-redo-all-btn:not(.inline-revert-all-btn ~ .inline-redo-all-btn) { margin-inline-start: auto; }
 .inline-redo-all-btn:hover { background: var(--bg-white); border-color: var(--accent); }
 
 /* Browser Re-open Section - Legacy (kept for compatibility) */

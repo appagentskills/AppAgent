@@ -53,10 +53,10 @@ function openRenameModal(chatId) {
     var body = document.getElementById('modal-body');
     var actions = document.getElementById('modal-actions');
     
-    header.textContent = 'Rename Chat';
-    body.innerHTML = '<input type="text" id="rename-chat-input" class="modal-input" value="' + escapeHtml(chat.title) + '" placeholder="Enter new name..." style="width:100%;padding: var(--space-5);border:1px solid var(--border);border-radius:var(--radius-md);font-size:var(--text-body-lg);box-sizing:border-box;" />';
-    actions.innerHTML = '<button class="modal-btn secondary" onclick="closeModal()">Cancel</button>' +
-        '<button class="modal-btn primary" onclick="confirmRenameChat(\'' + chatId + '\')">Rename</button>';
+    header.textContent = t('Rename Chat');
+    body.innerHTML = '<input type="text" id="rename-chat-input" class="modal-input" value="' + escapeHtml(chat.title) + '" placeholder="' + escapeHtml(t('Enter new name...')) + '" style="width:100%;padding: var(--space-5);border:1px solid var(--border);border-radius:var(--radius-md);font-size:var(--text-body-lg);box-sizing:border-box;" />';
+    actions.innerHTML = '<button class="modal-btn secondary" onclick="closeModal()">' + escapeHtml(t('Cancel')) + '</button>' +
+        '<button class="modal-btn primary" onclick="confirmRenameChat(\'' + chatId + '\')">' + escapeHtml(t('Rename')) + '</button>';
     
     overlay.classList.add('show');
     
@@ -75,7 +75,7 @@ function confirmRenameChat(chatId) {
     
     var newTitle = input.value.trim();
     if (!newTitle) {
-        showSnackbar('Please enter a valid name', 'error');
+        showSnackbar(t('Please enter a valid name'), 'error');
         return;
     }
     
@@ -106,7 +106,7 @@ function confirmRenameChat(chatId) {
         if (typeof currentView !== 'undefined' && currentView === 'history' && typeof renderHistoryPage === 'function') {
             try { renderHistoryPage(); } catch (e) {} // A7B-02
         }
-        showSnackbar('Chat renamed', 'success');
+        showSnackbar(t('Chat renamed'), 'success');
     }
     
     closeModal();
@@ -147,10 +147,10 @@ async function downloadChat(chatId) {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        if (payloadsOk) showSnackbar('Chat downloaded', 'success');
-        else showSnackbar('Chat downloaded (some attachments could not be restored)', 'warning');
+        if (payloadsOk) showSnackbar(t('Chat downloaded'), 'success');
+        else showSnackbar(t('Chat downloaded (some attachments could not be restored)'), 'warning');
     } catch (e) {
-        showSnackbar('Download failed: ' + ((e && e.message) || e), 'error');
+        showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
     }
 }
 
@@ -169,7 +169,7 @@ function importSingleChat() {
             
             // Validate the import data
             if (data.exportType !== 'single_chat' || !data.chat || typeof data.chat !== 'object') {
-                showSnackbar('Invalid chat file format', 'error');
+                showSnackbar(t('Invalid chat file format'), 'error');
                 return;
             }
             
@@ -179,7 +179,7 @@ function importSingleChat() {
             // consumer (chat.messages.length / .filter) — reject it here
             // with a clear message instead of importing a broken row.
             if (!Array.isArray(importedChat.messages)) {
-                showSnackbar('Invalid chat file: missing messages array', 'error');
+                showSnackbar(t('Invalid chat file: missing messages array'), 'error');
                 return;
             }
             
@@ -204,10 +204,10 @@ function importSingleChat() {
             await saveChatsToStorage();
             renderChatList();
             
-            showSnackbar('Chat imported successfully', 'success');
+            showSnackbar(t('Chat imported successfully'), 'success');
         } catch (err) {
             console.error('Import error:', err);
-            showSnackbar('Failed to import chat: ' + err.message, 'error');
+            showSnackbar(t('Failed to import chat: {error}', { error: String(err && err.message) }), 'error');
         }
     };
     input.click();

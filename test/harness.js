@@ -175,6 +175,7 @@ function _hErr(e) {
 async function run(opts) {
     opts = opts || {};
     if (_hState.aborted) throw new Error('Harness aborted after timeout; use a new host invocation');
+    if (_hI18nOnTarget) await _hI18nOnTarget();   // i18n names on the installed target before any test (see _hInstallI18n)
     var want = Array.isArray(opts.tags) && opts.tags.length ? opts.tags : null;
     var defaultTimeout = Number(opts.timeout_ms) > 0 ? Number(opts.timeout_ms) : HARNESS_DEFAULT_TIMEOUT_MS;
     var devMode = opts.dev_mode === true;
@@ -467,8 +468,87 @@ async function registerRunner(suiteName, runner) {
     });
 }
 
+// ─── i18n auto-include ───────────────────────────────────────────────────────
+// install(target) wraps target.loadModules / target.runFile / target.loadFile so
+// modules calling t()/tn()/N_()/i18nFormat*() load with the REAL i18n core and
+// no stubs (no catalog is set: English identity). Opt out per call with
+// {i18n: false} (loadModules opts / runFile args). Also skipped when the paths
+// already list the core or opts.globals stubs an i18n name. The core source is
+// read once per workspace (unreadable -> no auto-include). runFile and loadFile
+// (hence loadSources) copy the core's names onto the target once (only names
+// still undefined); run() does the same before its first test, so code a test
+// lifts with new Function() (no t/tn deps) finds the global t()/tn() in ANY file
+// order, even when the file runs that code at module eval (before run()).
+var HARNESS_I18N_CORE = 'src/js/core/025-i18n.js';
+var _hI18nOnTarget = null;   // the last runFile-capable install(target)'s names-onto-target step
+var HARNESS_I18N_NAME_RE = /^(t|tn|N_|resolveI18nLanguage|i18n\w*|I18N_\w*|_i18n\w*)$/;
+function _hWantsI18n(paths, opts) {
+    if (opts && opts.i18n === false) return false;
+    if (!Array.isArray(paths) || paths.indexOf(HARNESS_I18N_CORE) >= 0) return false;
+    var g = opts && opts.globals;
+    return !(g && Object.keys(g).some(function(k) { return HARNESS_I18N_NAME_RE.test(k); }));
+}
+function _hInstallI18n(target) {
+    var origLoad = target.loadModules, origRun = target.runFile, origFile = target.loadFile, sources = {}, onTarget = false;
+    if (origLoad && origLoad.__i18nOriginal) origLoad = origLoad.__i18nOriginal;
+    if (origRun && origRun.__i18nOriginal) origRun = origRun.__i18nOriginal;
+    if (origFile && origFile.__i18nOriginal) origFile = origFile.__i18nOriginal;
+    function coreSource(ws) {
+        var key = ws === undefined || ws === null ? '' : String(ws);
+        if (!Object.prototype.hasOwnProperty.call(sources, key)) {
+            sources[key] = Promise.resolve().then(function() { return target.loadFile(HARNESS_I18N_CORE, ws); })
+                .then(function(src) { return typeof src === 'string' && src ? src : null; }, function() { return null; });
+        }
+        return sources[key];
+    }
+    if (typeof origLoad === 'function') {
+        var loadModules = async function(paths, opts) {
+            if (!_hWantsI18n(paths, opts)) return origLoad.apply(this, arguments);
+            var ws = opts ? opts.workspace : undefined, core = await coreSource(ws);
+            if (core === null) return origLoad.apply(this, arguments);
+            if (typeof target.evalModules !== 'function' || typeof target.loadFile !== 'function') return origLoad.call(this, [HARNESS_I18N_CORE].concat(paths), opts);
+            var srcs = [core];
+            for (var i = 0; i < paths.length; i++) srcs.push(await target.loadFile(paths[i], ws));
+            return target.evalModules(srcs, [HARNESS_I18N_CORE].concat(paths), opts || {});
+        };
+        loadModules.__i18nOriginal = origLoad;
+        target.loadModules = loadModules;
+    }
+    async function namesOnTarget(workspace) {
+        if (onTarget || typeof target.evalModule !== 'function') return;
+        var core = await coreSource(workspace);
+        if (core !== null && !onTarget) {
+            try {
+                var ns = await target.evalModule(core, HARNESS_I18N_CORE, {});
+                Object.keys(ns || {}).forEach(function(k) { if (target[k] === undefined) target[k] = ns[k]; });
+                onTarget = true;
+            } catch (e) { /* the caller still runs */ }
+        }
+    }
+    if (typeof origRun === 'function') {
+        var quiet = 0;   // > 0 while an i18n:false runFile starts: its own loadFile read (sandbox runFile -> loadFile) copies nothing either
+        var runFile = async function(path, args, workspace) {
+            if (args && args.i18n === false) { quiet++; try { return origRun.apply(this, arguments); } finally { quiet--; } }
+            if (path !== HARNESS_I18N_CORE) await namesOnTarget(workspace);
+            return origRun.apply(this, arguments);
+        };
+        runFile.__i18nOriginal = origRun;
+        target.runFile = runFile;
+        if (typeof origFile === 'function') {   // tests that read sources (loadFile / loadSources) and run them at module eval
+            var loadFile = async function(path, workspace) {
+                if (!quiet && path !== HARNESS_I18N_CORE) await namesOnTarget(workspace);
+                return origFile.apply(this, arguments);
+            };
+            loadFile.__i18nOriginal = origFile;
+            target.loadFile = loadFile;
+        }
+        _hI18nOnTarget = namesOnTarget;
+    }
+}
+
 function install(target) {
     target = target || (typeof window !== 'undefined' ? window : globalThis);
+    _hInstallI18n(target);
     target.describe = describe; target.test = test; target.it = test;
     target.beforeEach = beforeEach; target.afterEach = afterEach;
     target.assert = assert; target.scratchPath = scratchPath; target.skipTest = skip;
@@ -486,6 +566,7 @@ module.exports = {
     cleanupScratch: cleanupScratch, heartbeat: heartbeat, fakeChrome: fakeChrome, fakeWindow: fakeWindow,
     toolDecision: toolDecision, installToolGuard: installToolGuard,
     registerRunner: registerRunner, loadSources: loadSources,
+    I18N_CORE: HARNESS_I18N_CORE, _wantsI18n: _hWantsI18n,
     _isDeepEqual: _hIsDeepEqual, _matchesExpected: _hMatchesExpected, _state: _hState,
     DEFAULT_TIMEOUT_MS: HARNESS_DEFAULT_TIMEOUT_MS, AFTER_TIMEOUT_MS: HARNESS_AFTER_TIMEOUT_MS, SCRATCH_PREFIX: HARNESS_SCRATCH_PREFIX
 };

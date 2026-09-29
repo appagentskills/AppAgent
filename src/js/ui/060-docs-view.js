@@ -20,19 +20,65 @@ function _decodeB64Markdown(b64, placeholder) {
     }
 }
 
-function _decodeDocsMarkdown() {
-    var docs = _decodeB64Markdown(DOCS_MARKDOWN_B64, '__DOCS_MARKDOWN' + '_B64__');
-    var readme = _decodeB64Markdown(README_MARKDOWN_B64, '__README_MARKDOWN' + '_B64__');
+// ─── Translated Help page ─────────────────────────────────────────────────────────────
+// Translations are NOT embedded: the builds write docs/locales/<code>/{documentation.md,
+// README.md} to docs-locales/<code>/ (build/docs-placeholders.js buildDocsLocaleFiles), and
+// they are fetched here like the UI catalogs (core/025-i18n.js i18nInit). Each file is cached
+// once per session ('' = missing/failed) and falls back to the embedded English per file.
+var DOCS_LOCALE_FILES = ['documentation.md', 'README.md'];
+var _docsLocaleCache = {};
+var _docsLocalePending = {};
+
+// Active UI language when it is a translated locale, else '' (English = embedded copy).
+function _docsLocaleCode() {
+    var code = typeof i18nLang === 'function' ? i18nLang() : 'en';
+    return code && code !== 'en' && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/.test(code) ? code : '';
+}
+
+function _docsLocaleReady(code) {
+    return DOCS_LOCALE_FILES.every(function(name) { return Object.prototype.hasOwnProperty.call(_docsLocaleCache, code + '/' + name); });
+}
+
+// Resolves once every file of `code` is cached; never rejects. Returns true when at
+// least one translated file is available (i.e. a re-render would change the page).
+function loadDocsLocale(code, fetchFn) {
+    if (!code) return Promise.resolve(false);
+    var doFetch = fetchFn || ((typeof fetch === 'function' && typeof chrome !== 'undefined' && chrome && chrome.runtime && chrome.runtime.getURL)
+        ? function(rel) { return fetch(chrome.runtime.getURL(rel)); } : null);
+    if (!_docsLocalePending[code]) {
+        _docsLocalePending[code] = Promise.all(DOCS_LOCALE_FILES.map(function(name) {
+            var key = code + '/' + name;
+            if (Object.prototype.hasOwnProperty.call(_docsLocaleCache, key)) return null;
+            if (!doFetch) { _docsLocaleCache[key] = ''; return null; }
+            return Promise.resolve().then(function() { return doFetch('docs-locales/' + key); })
+                .then(function(res) { return res && res.ok ? res.text() : ''; })
+                .then(function(text) { _docsLocaleCache[key] = typeof text === 'string' ? text : ''; })
+                .catch(function() { _docsLocaleCache[key] = ''; });
+        })).then(function() { delete _docsLocalePending[code]; });
+    }
+    return _docsLocalePending[code].then(function() {
+        return DOCS_LOCALE_FILES.some(function(name) { return !!_docsLocaleCache[code + '/' + name]; });
+    });
+}
+
+// Cached translation of one file for `code` ('' when missing / not loaded yet).
+function _docsLocaleText(code, name) {
+    return code ? (_docsLocaleCache[code + '/' + name] || '') : '';
+}
+
+function _decodeDocsMarkdown(code) {
+    var docs = _docsLocaleText(code, 'documentation.md') || _decodeB64Markdown(DOCS_MARKDOWN_B64, '__DOCS_MARKDOWN' + '_B64__');
+    var readme = _docsLocaleText(code, 'README.md') || _decodeB64Markdown(README_MARKDOWN_B64, '__README_MARKDOWN' + '_B64__');
     if (!docs && !readme) {
-        return '# Documentation\n\nThe documentation bundle was not embedded at build time.';
+        return '# ' + t('Documentation') + '\n\n' + t('The documentation bundle was not embedded at build time.');
     }
     return mergeReadmeIntoDocs(readme, docs, { stripImages: true });
 }
 
-function _getDocsMarkdownRendered() {
-    // __VERSION__ inside the markdown was already substituted at build time
-    // before base64-encoding, so no runtime substitution is needed here.
-    return parseDocsMarkdown(_decodeDocsMarkdown());
+function _getDocsMarkdownRendered(code) {
+    // __VERSION__ / __CHANGELOG__ were already substituted at build time (both
+    // the embedded English and the docs-locales/ files), so none is needed here.
+    return parseDocsMarkdown(_decodeDocsMarkdown(code));
 }
 
 function toggleDocsView() {
@@ -55,7 +101,8 @@ function openDocsView() {
 }
 
 function downloadDocsAsMarkdown() {
-    var md = _decodeDocsMarkdown();
+    var code = _docsLocaleCode();
+    var md = _decodeDocsMarkdown(_docsLocaleReady(code) ? code : '');
     var blob = new Blob([md], { type: 'text/markdown' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
@@ -65,20 +112,34 @@ function downloadDocsAsMarkdown() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    if (typeof showSnackbar === 'function') showSnackbar('Documentation downloaded', 'success');
+    if (typeof showSnackbar === 'function') showSnackbar(t('Documentation downloaded'), 'success');
 }
 
 function renderDocsPage() {
     var container = document.getElementById('docs-content');
     if (!container) return;
 
-    var parsed = _getDocsMarkdownRendered();
+    // Sync render: the cached translation when loaded, else English. A locale not
+    // loaded yet is fetched once, then re-rendered only if the language is still
+    // the same, the Help page is still open and a translation actually exists.
+    var code = _docsLocaleCode();
+    if (code && !_docsLocaleReady(code)) {
+        loadDocsLocale(code).then(function(changed) {
+            if (!changed || _docsLocaleCode() !== code) return;
+            if (typeof currentView !== 'undefined' && currentView !== 'docs') return;
+            renderDocsPage();
+        });
+    }
+    var translated = !!(code && (_docsLocaleText(code, 'documentation.md') || _docsLocaleText(code, 'README.md')));
+    var parsed = _getDocsMarkdownRendered(code);
     var iconHtml = (typeof UI_ICONS !== 'undefined' && UI_ICONS.book) ? UI_ICONS.book : '';
-    var outlineHtml = buildDocsOutlineHtml(parsed.toc, iconHtml);
+    var outlineHtml = buildDocsOutlineHtml(parsed.toc, iconHtml, { title: t('Contents'), ariaLabel: t('Documentation sections') });
+    // English fallback inside an RTL/other-language UI keeps its own lang/dir.
+    var mainAttrs = translated ? ' lang="' + code + '"' : ' lang="en" dir="ltr"';
 
     container.innerHTML =
         '<div class="docs-layout">' +
-            '<div class="docs-main" id="docs-main">' + parsed.html + '</div>' +
+            '<div class="docs-main" id="docs-main"' + mainAttrs + '>' + parsed.html + '</div>' +
             outlineHtml +
         '</div>';
 
@@ -101,7 +162,7 @@ function renderDocsPage() {
     // Toolbar search (ui/046-settings-help-search.js): fill the slot once and
     // re-apply any active query to the freshly rendered topics.
     if (typeof ensurePageSearchToolbar === 'function') {
-        ensurePageSearchToolbar('docs-toolbar-slot', { placeholder: 'Search help\u2026', label: 'Search help', inputClass: 'docs-search-input', onInput: 'docsOnSearchInput', countId: 'docs-search-count' });
+        ensurePageSearchToolbar('docs-toolbar-slot', { placeholder: t('Search help\u2026'), label: t('Search help'), inputClass: 'docs-search-input', onInput: 'docsOnSearchInput', countId: 'docs-search-count' });
         applyDocsPageSearch();
     }
 }
@@ -172,7 +233,7 @@ function renderDashboard(dashboard) {
     var widgetList = dashboardWidgetsFor(dashboard);
     if (widgetList.length === 0) {
         // Home grid has no empty-state hint — the whole section is hidden by renderHomeDashboard.
-        container.innerHTML = dashboard === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>No widgets yet</p><p class="dashboard-empty-hint">Add widgets to your dashboard using prompts.</p></div>';
+        container.innerHTML = dashboard === 'home' ? '' : '<div class="dashboard-empty"><span class="dashboard-empty-icon">' + UI_ICONS.widget + '</span><p>' + escapeHtml(t('No widgets yet')) + '</p><p class="dashboard-empty-hint">' + escapeHtml(t('Add widgets to your dashboard using prompts.')) + '</p></div>';
         return;
     }
 

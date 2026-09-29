@@ -1,0 +1,76 @@
+/* ==========================================================================
+   RTL (Arabic / Hebrew) overrides — active when <html dir="rtl">.
+   Directional box rules elsewhere use logical properties (margin/padding-
+   inline-*, inset-inline-*, border-inline-*, text-align:start/end), so they
+   mirror automatically. This file holds only what logical properties cannot
+   express: slide-in transforms, directional chevrons, and LTR islands.
+   Loaded last (26-) so equal-specificity ties resolve in its favour.
+   ========================================================================== */
+
+/* 1. Slide-in sidebar: park it off the inline-start (right) edge in RTL.
+      .expanded rules are restated because [dir] raises specificity. */
+@media screen and (max-width: 480px) {
+    [dir="rtl"] .sidebar { transform: translateX(100%); }
+    [dir="rtl"] .sidebar.expanded { transform: translateX(0); }
+}
+[dir="rtl"] body.sidepanel-mode .sidebar { transform: translateX(100%); }
+[dir="rtl"] body.sidepanel-mode .sidebar.expanded { transform: translateX(0); }
+
+/* 2. Directional chevrons / back arrows. The individual `scale` property is
+      applied after `transform`, so it mirrors the final rotated glyph and
+      composes with existing rotate() open/expanded states (down stays down). */
+[dir="rtl"] .sidebar-history-chevron,
+[dir="rtl"] .ws-collapse-chevron,
+[dir="rtl"] .model-section-chevron,
+[dir="rtl"] .sub-report-chevron,
+[dir="rtl"] .worker-card-caret,
+[dir="rtl"] .skills-back-btn .back-icon,
+[dir="rtl"] .widget-back-btn svg {
+    scale: -1 1;
+}
+
+/* 3. LTR islands: code, diffs, JSON, file paths, URLs and device codes must
+      never mirror. Their internal paddings / button offsets stay physical. */
+[dir="rtl"] pre,
+[dir="rtl"] code,
+[dir="rtl"] kbd,
+[dir="rtl"] samp,
+[dir="rtl"] .code-block,
+[dir="rtl"] .json-viewer,
+[dir="rtl"] .tool-args,
+[dir="rtl"] .diff-viewer-modal,
+[dir="rtl"] .diff-container,
+[dir="rtl"] .display-code-pre,
+[dir="rtl"] .display-diff,
+[dir="rtl"] .sdoc-diff-body,
+[dir="rtl"] .wsf-code,
+[dir="rtl"] .ws-file-path,
+[dir="rtl"] .skill-asset-editor,
+[dir="rtl"] .docs-code,
+[dir="rtl"] .reload-preflight-file,
+[dir="rtl"] .chatgpt-device-code,
+[dir="rtl"] .browser-url-input,
+[dir="rtl"] input[type="url"] {
+    direction: ltr;
+    unicode-bidi: isolate;
+}
+
+/* 4. Horizontal scroll rows (widgets, attachments): the overflow fade sits on
+      the inline-end edge, i.e. the left in RTL. ui/250 _updateRowShadow sets
+      .has-left-shadow instead of .has-right-shadow when i18nDir() is 'rtl';
+      these mirror the .has-right-shadow rules in 05-tools.css. */
+.widgets-container.has-left-shadow,
+.attachments-row.has-left-shadow {
+    mask-image: linear-gradient(to left, black calc(100% - 40px), transparent);
+    -webkit-mask-image: linear-gradient(to left, black calc(100% - 40px), transparent);
+}
+
+/* 5. Page-level horizontal overflow guard (SECONDARY safeguard). In RTL the
+      root scroller's scrollable overflow extends to the LEFT, so anything
+      parked off-canvas with a physical `left:-Npx` / `translateX(-N)` turns
+      into a page-wide horizontal scrollbar that LTR never shows. The actual
+      cause (the skip link's inline left:-9999px) is fixed at the source in
+      19-dashboard.css; this only stops a future off-canvas element from
+      re-introducing a root-level scrollbar. Inner scroll rows are unaffected
+      (clip applies to the root box only). */
+[dir="rtl"]:root { overflow-x: clip; }

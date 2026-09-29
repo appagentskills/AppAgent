@@ -276,9 +276,14 @@ async function executeGetFile(args) {
         else if (_dlMime.indexOf('text/') === 0) _dlIcon = '\uD83D\uDCDD';
         else if (_dlMime.indexOf('video/') === 0) _dlIcon = '\uD83C\uDFAC';
         else if (_dlMime.indexOf('audio/') === 0) _dlIcon = '\uD83C\uDFB5';
-        var _dlSize = size < 1024 ? size + ' B' : size < 1048576 ? (size / 1024).toFixed(1) + ' KB' : (size / 1048576).toFixed(1) + ' MB';
+        // i18n: the card is a sandboxed widget with no t(), so its UI text is
+        // translated here and HTML-escaped (same chain as _dlNameEsc); the inline
+        // script reads its state labels from the button's data-* attributes.
+        var _dlEsc = function(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); };
+        var _dlNum = function(n, frac) { return i18nFormatNumber(n, frac ? { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false } : { useGrouping: false }); };
+        var _dlSize = size < 1024 ? t('{size} B', { size: _dlNum(size) }) : size < 1048576 ? t('{size} KB', { size: _dlNum(size / 1024, true) }) : t('{size} MB', { size: _dlNum(size / 1048576, true) });
         var _dlNameEsc = fname.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        var _dlMimeEsc = (_dlMime || 'unknown').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+        var _dlMimeEsc = (_dlMime || t('unknown')).replace(/&/g, '&amp;').replace(/</g, '&lt;');
         var _dlIdEsc = id.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/</g, '\\x3c').replace(/\n/g, '\\n');
         var _dlFnEsc = fname.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/</g, '\\x3c').replace(/\n/g, '\\n');
         var _dlMimeSafe = (_dlMime || 'application/octet-stream').replace(/[^a-zA-Z0-9/+.-]/g, '');
@@ -296,22 +301,22 @@ async function executeGetFile(args) {
             '<div class="dl-i">' + _dlIcon + '</div>' +
             '<div class="dl-f">' +
             '<div class="dl-n" title="' + _dlNameEsc + '">' + _dlNameEsc + '</div>' +
-            '<div class="dl-m">' + _dlMimeEsc + ' \u00B7 ' + _dlSize + '</div>' +
+            '<div class="dl-m">' + _dlMimeEsc + ' \u00B7 ' + _dlEsc(_dlSize) + '</div>' +
             '</div>' +
-            '<button class="dl-b" onclick="doDownload()">\u2B07 Download</button>' +
+            '<button class="dl-b" data-opening="' + _dlEsc(t('Opening...')) + '" data-opened="\u2705 ' + _dlEsc(t('Opened')) + '" data-failed="\u26A0 ' + _dlEsc(t('Failed, retry')) + '" data-download="\u2B07 ' + _dlEsc(t('Download')) + '" onclick="doDownload()">\u2B07 ' + _dlEsc(t('Download')) + '</button>' +
             '</div>' +
             '<script>' +
             'function doDownload(){' +
-            'var b=document.querySelector(".dl-b");b.textContent="Opening...";b.disabled=true;' +
+            'var b=document.querySelector(".dl-b"),L=b.dataset||{};b.textContent=L.opening||"Opening...";b.disabled=true;' +
             // The parent (ui/070-dashboard-ui.js) acks {type:"widgetDownloadResult",
             // reqId,ok,error}: show the real outcome, and re-enable the button on
             // failure or when no ack arrives within 5 s.
             'var rq="d"+Date.now(),done=false,t;' +
             'function fin(){done=true;clearTimeout(t);window.removeEventListener("message",onAck);}' +
             'function onAck(e){if(done||!e.data||e.data.type!=="widgetDownloadResult"||e.data.reqId!==rq)return;fin();' +
-            'if(e.data.ok){b.textContent="\u2705 Opened";}else{b.textContent="\u26A0 Failed, retry";b.disabled=false;}}' +
+            'if(e.data.ok){b.textContent=L.opened||"\u2705 Opened";}else{b.textContent=L.failed||"\u26A0 Failed, retry";b.disabled=false;}}' +
             'window.addEventListener("message",onAck);' +
-            't=setTimeout(function(){if(done)return;fin();b.textContent="\u2B07 Download";b.disabled=false;},5000);' +
+            't=setTimeout(function(){if(done)return;fin();b.textContent=L.download||"\u2B07 Download";b.disabled=false;},5000);' +
             'window.parent.postMessage({type:"widgetDownload",reqId:rq,fileId:"' + _dlIdEsc + '",name:"' + _dlFnEsc + '"},"*");' +
             '}' +
             '<\/script>';

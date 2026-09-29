@@ -7,6 +7,9 @@ function runChatNavigationAudit(sources) {
     var results = [];
     var navigation = sources['src/js/ui/170-chat-management.js'];
     var settings = sources['src/js/ui/040-tools-settings.js'];
+    // The excerpts call t()/tn()/N_(): the with (env) sandbox gets the REAL i18n core first
+    // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+    var i18nCore = sources['src/js/core/025-i18n.js'];
     function check(value, message) { if (!value) throw new Error(message); }
     function test(name, fn) {
         try { fn(); results.push({ name: name, passed: true }); }
@@ -22,7 +25,8 @@ function runChatNavigationAudit(sources) {
         new Function(code); // Syntax-check the exact excerpt before executing it.
         return code;
     }
-    var code = [declaration(navigation, 'newChat'), declaration(navigation, 'selectChat'),
+    check(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
+    var code = [i18nCore, declaration(navigation, 'newChat'), declaration(navigation, 'selectChat'),
         declaration(sources['src/js/ui/030-home-view.js'], 'closeHomeView'),
         declaration(settings, 'showChatView'), declaration(settings, 'closeSettingsPageView'),
         declaration(sources['src/js/core/120-init.js'], 'closeSkillsView'),
@@ -241,5 +245,5 @@ function runChatNavigationAudit(sources) {
 }
 
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/app/020-api-messages.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/040-tools-settings.js","src/js/core/120-init.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js","src/js/tools/110-smart-documents.js","src/js/tools/150-start-chat.js"];
+var PATHS = ["src/js/core/025-i18n.js","src/js/app/020-api-messages.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/040-tools-settings.js","src/js/core/120-init.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js","src/js/tools/110-smart-documents.js","src/js/tools/150-start-chat.js"];
 await registerRunner('chat-navigation-state', async function() { return runChatNavigationAudit(await loadSources(PATHS)); });

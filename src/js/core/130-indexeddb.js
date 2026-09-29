@@ -1453,8 +1453,7 @@ function _recordChatDelete(entry) {
 function dumpChatDeleteLedger(limit) {
     var n = (limit > 0) ? limit : _chatDeleteLedger.length;
     var rows = _chatDeleteLedger.slice(-n);
-    try { console.table(rows); } catch (e) { console.log(rows); }
-    return rows;
+    return rows; // the console prints the returned rows
 }
 // FLUX-4/5 (delete-authority proof): does THIS realm's ledger hold a GRANTED
 // user-delete decision for this id? Granted = the entry has no `refused` key
@@ -1796,10 +1795,10 @@ function deleteChatRow(chatId, reason, evidence) {
         // Counts come from deletes ACTUALLY issued, never from the pre-computed
         // payloadIds — the ledger is the forensic record of what left the store.
         _recordChatDelete({ id: chatId, reason: reason, evidence: digest, at: Date.now(), absent: outcome.absent, payloadRows: outcome.reaped, payloadErrors: outcome.payloadErrors });
-        console.log('[chat-delete] ' + (outcome.absent ? 'chat row already absent (idempotent):' : 'deleted chat row')
-            + ' ' + chatId + ' reason=' + reason
-            + (outcome.reaped ? ' (+' + outcome.reaped + ' payload row(s))' : '')
-            + (outcome.payloadErrors ? ' [' + outcome.payloadErrors + ' payload row(s) FAILED]' : ''));
+        if (outcome.payloadErrors) {
+            console.warn('[chat-delete] deleted chat row ' + chatId + ' reason=' + reason
+                + ' but ' + outcome.payloadErrors + ' payload row(s) FAILED to delete');
+        }
         return true;
     }).catch(function(e) {
         console.error('[chat-delete] delete FAILED for chat ' + chatId + ' reason=' + reason, e);
@@ -1818,8 +1817,9 @@ function deleteChatRow(chatId, reason, evidence) {
 // inside each delete transaction. Runs once per SW boot (worker/190-entry.js,
 // beside sweepOrphanChatPayloads), capped per boot so a pathological store
 // cannot turn boot into a mass-delete. Expect a one-off count drop at the
-// first boot after PR 3 ships (RFC addendum §5) — the [chat-delete] log lines
-// name every reaped id.
+// first boot after PR 3 ships (RFC addendum §5) — the delete ledger
+// (dumpChatDeleteLedger) names every reaped id, and getEmptyRowGcLastRun()
+// reports the last pass's {reaped, candidates, capped}.
 //
 // F3 (Boot OOM fix): the candidate scan is a KEY-DIFF, never a value
 // openCursor()/getAll() over the store (that materialised every transcript
@@ -1832,12 +1832,13 @@ function deleteChatRow(chatId, reason, evidence) {
 // rows drain on a later boot.
 var CHAT_EMPTY_ROW_GC_MAX_PER_BOOT = 200;
 var CHAT_EMPTY_ROW_GC_READ_BATCH = 25;
+// Outcome of the last pass that reached phase 2 (null until one does).
+var _emptyRowGcLastRun = null;
+function getEmptyRowGcLastRun() { return _emptyRowGcLastRun; }
 function gcEmptyChatRows() {
     if (typeof deleteChatRow !== 'function') return Promise.resolve(0);
-    if (!(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) {
-        console.log('[chat-delete] empty-row GC: skipped (chats map not hydrated), rows drain on a later boot');
-        return Promise.resolve(0);
-    }
+    // Unhydrated map: skip; the rows drain on a later boot.
+    if (!(typeof _chatsHydrated !== 'undefined' && _chatsHydrated === true)) return Promise.resolve(0);
     if (typeof chats === 'undefined' || !chats) return Promise.resolve(0);
     // Phase 1a (readonly, KEYS ONLY).
     return withStore([chatStoreName], 'readonly', function(transaction) {
@@ -1919,9 +1920,9 @@ function gcEmptyChatRows() {
                 .then(next);
         }
         return next().then(function() {
-            console.log('[chat-delete] empty-row GC: reaped ' + reaped + ' of ' + candidates.length
-                + ' empty candidate row(s)'
-                + (candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT ? ' (per-boot cap hit — the rest drain next boot)' : ''));
+            // capped: the per-boot cap was hit — the rest drain next boot.
+            _emptyRowGcLastRun = { reaped: reaped, candidates: candidates.length,
+                capped: candidates.length >= CHAT_EMPTY_ROW_GC_MAX_PER_BOOT, at: Date.now() };
             return reaped;
         });
     }).catch(function(e) {
@@ -2556,7 +2557,7 @@ async function loadApiProviders() {
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
                     // sonnet-5, gpt-5.2 → gpt-6-sol (chain-collapsed through the
                     // retired gpt-5.5 / gpt-5.6-sol defaults), Gemini 3 Flash Preview →
-                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5, and the
+                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
                     // opus-4.8 (OpenRouter), haiku-4.5 and Proxy defaults were
@@ -2580,17 +2581,18 @@ async function loadApiProviders() {
                         { to: null, from: { name: 'haiku-4.5', apiKey: '', model: 'anthropic/claude-haiku-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 32000 } },
                         { to: null, from: { name: 'Proxy', model: 'anthropic/claude-opus-4-8', endpoint: 'http://localhost:8000/api/v1/chat/completions', apiKey: '----', maxTokens: 100000, context_length: 200000, effort: 'xhigh' } },
                         // Renames — legacy default → its July 2026 successor
-                        // (sonnet-4.5 chain-collapses straight to sonnet-5: the old
-                        // sonnet-4.6 target no longer exists in the defaults)
-                        { to: 'sonnet-5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
-                        { to: 'sonnet-5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
+                        // (sonnet-4.5 / sonnet-4.6 chain-collapse straight to
+                        // sonnet-5.5: the sonnet-4.6 and sonnet-5 targets no longer
+                        // exist in the defaults)
+                        { to: 'sonnet-5.5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
+                        { to: 'sonnet-5.5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
                         { to: 'gpt-6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
                         { to: 'gpt-6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
                         // Sept 2026: GPT-6 Sol supersedes the gpt-5.6-sol OpenRouter default
                         { to: 'gpt-6-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
-                        { to: 'Sonnet 5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
                         // Two Opus snapshots: effort was 'high' before the xhigh
                         // retune below, 'xhigh' after — match both vintages.
@@ -2598,7 +2600,7 @@ async function loadApiProviders() {
                         // default was itself retired in Sept 2026)
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8 OAuth', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
-                        { to: 'Sonnet 5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5 OAuth', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
                         // ChatGPT-subscription seeds shipped with ASSUMED slugs
                         // (gpt-5.1-codex / gpt-5.1) that the Codex backend does
                         // not serve to ChatGPT accounts — retarget onto the
@@ -2618,8 +2620,44 @@ async function loadApiProviders() {
                         { to: 'Opus 5.5', from: { name: 'Opus 5', model: 'claude-opus-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
-                        { to: 'Fable 5.1', from: { name: 'Fable 5', model: 'claude-fable-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } }
-                    ].forEach(function(mig) {
+                        { to: 'Fable 5.1', from: { name: 'Fable 5', model: 'claude-fable-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
+                        // Sept 2026: Sonnet 5.5 supersedes the Sonnet 5 seeds
+                        // (OpenRouter 'sonnet-5' + OAuth 'Sonnet 5'). One row per
+                        // historical seed shape (030-config.js git history):
+                        //   sonnet-5 S5 (adb32f3→now) and S1 (206dddf, inline
+                        //   endpoint + context_length/maxTokens); S2–S4 used
+                        //   endpointId:'openrouter' and are expanded below.
+                        //   Sonnet 5 O3 (8aaa494→now), O1 (36464e9/a60322e:
+                        //   +maxTokens +context_length), O2 (759b9a3: +maxTokens).
+                        { to: 'sonnet-5.5', from: { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'high' } },
+                        { to: 'sonnet-5.5', from: { name: 'sonnet-5', apiKey: '', model: 'anthropic/claude-sonnet-5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, effort: 'high' } },
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, effort: 'high', isClaudeOAuth: true } }
+                    ].concat((function() {
+                        // endpointId-era sonnet-5 seeds (S2 80ea667→a60322e, S3
+                        // 759b9a3, S4 8aaa494→a1a0627). inlineLegacyEndpointProviders
+                        // (above) leaves each in one of THREE stored forms:
+                        //   (a) unmatched      — raw endpointId:'openrouter'
+                        //   (b) matched, canonical id kept — + url/endpoint/apiKey
+                        //   (c) matched, id dropped        — url/endpoint/apiKey only
+                        // The legacy 'openrouter' endpoint is {url: OR, apiKey: ''}
+                        // (030-config.js). apiKey:'' is listed so a user key
+                        // (renames ignore the apiKey VALUE) still matches (b)/(c).
+                        var OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
+                        return [
+                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', context_length: 1000000, maxTokens: 64000, effort: 'high' },
+                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', maxTokens: 64000, effort: 'high' },
+                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', effort: 'high' }
+                        ].reduce(function(rows, seed) {
+                            var inlined = Object.assign({}, seed, { url: OR_URL, endpoint: OR_URL, apiKey: '' });
+                            var dropped = Object.assign({}, inlined);
+                            delete dropped.endpointId;
+                            return rows.concat([seed, inlined, dropped].map(function(from) {
+                                return { to: 'sonnet-5.5', from: from };
+                            }));
+                        }, []);
+                    })()).forEach(function(mig) {
                         var idx = -1;
                         for (var i = 0; i < apiProviders.length; i++) {
                             if (apiProviders[i].name === mig.from.name) { idx = i; break; }
@@ -2722,7 +2760,7 @@ async function loadApiProviders() {
                 if (!_apiProvidersHydrated) {
                     apiProviders = DEFAULT_API_PROVIDERS.slice();
                     if (typeof showSnackbar === 'function') {
-                        try { showSnackbar('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.', 'error'); } catch (e) {}
+                        try { showSnackbar(t('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.'), 'error'); } catch (e) {}
                     }
                 }
                 resolve();
@@ -2734,7 +2772,7 @@ async function loadApiProviders() {
         if (!_apiProvidersHydrated) {
             apiProviders = DEFAULT_API_PROVIDERS.slice();
             if (typeof showSnackbar === 'function') {
-                try { showSnackbar('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.', 'error'); } catch (e2) {}
+                try { showSnackbar(t('Failed to load API providers — showing defaults. Your saved providers are untouched; reload to retry.'), 'error'); } catch (e2) {}
             }
         }
         return Promise.resolve();
@@ -3108,7 +3146,6 @@ async function cleanupStaleWorkspaces() {
                 var rows;
                 try { rows = await _countWorkspaceFileRows(m.repo); } catch (e) { continue; }
                 if (rows !== 0) continue;
-                console.log('Cleaning up old-format workspace:', m.repo);
                 await deleteWorkspaceFiles(m.repo);
                 await deleteWorkspaceMeta(m.repo);
             }
@@ -3889,9 +3926,9 @@ async function pickDeployDir() {
     var ident = await checkDeployDirIdentity(handle, info);
     // R-C4d #3: both names are untrusted text inside the confirm's HTML.
     var esc = function(s) { s = String(s); return typeof escapeHtml === 'function' ? escapeHtml(s) : s.replace(/[&<>"']/g, function(c) { return '&#' + c.charCodeAt(0) + ';'; }); };
-    if (ident === 'foreign' && !(await showConfirmModal('Use this folder?',
-        'The folder "' + esc(handle.name || '?') + '" does not look like an AppAgent build (manifest: "' + esc(info.name || 'none') + '"). ' +
-        'Deploy and Reload overwrite its root files (manifest.json, app.html, ...) and delete files in its icons/ folder that are not part of the build. Use it anyway?',
+    if (ident === 'foreign' && !(await showConfirmModal(t('Use this folder?'),
+        t('The folder "{folder}" does not look like an AppAgent build (manifest: "{manifest}"). Deploy and Reload overwrite its root files (manifest.json, app.html, ...) and delete files in its icons/ folder that are not part of the build. Use it anyway?',
+            { folder: esc(handle.name || '?'), manifest: esc(info.name || t('none')) }),
         'danger'))) return null;
     // R-C4d #1: an EMPTY folder is consented too — the build's icons/ deploy
     // makes it non-empty (still no manifest) before the root deploy re-checks.

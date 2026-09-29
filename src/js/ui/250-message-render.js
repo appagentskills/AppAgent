@@ -31,8 +31,8 @@ function toolResultIsError(result) {
     //     user sent a new message]" (:1213) and "[Tool call abandoned — paused
     //     by user]" (:1282). Note the mix of hyphen and em-dash, so the test
     //     deliberately stops before the dash.
-    function isErrorText(t) {
-        return /^\s*\[Tool call (interrupted|abandoned)\b/i.test(t) || /^\s*error\b/i.test(t);
+    function isErrorText(text) {
+        return /^\s*\[Tool call (interrupted|abandoned)\b/i.test(text) || /^\s*error\b/i.test(text);
     }
     if (isErrorText(s)) return true;
     var parsed = null;
@@ -53,7 +53,7 @@ function toolResultIsError(result) {
 // the set_tldr tool — see executeSetTldr in tools/020-tool-execution.js).
 function renderTldrCard(msg) {
     if (!msg || !msg.tldr) return '';
-    return '<div class="tldr-card"><div class="tldr-card-label">TL;DR</div><div class="tldr-card-text">' + formatContent(msg.tldr) + '</div></div>';
+    return '<div class="tldr-card"><div class="tldr-card-label">' + t('TL;DR') + '</div><div class="tldr-card-text">' + formatContent(msg.tldr) + '</div></div>';
 }
 
 // Caveat card — a MUST-READ warning rendered ABOVE the TL;DR at the end of an
@@ -63,7 +63,7 @@ function renderTldrCard(msg) {
 // work, or a trailing question/requested action the user might miss.
 function renderCaveatCard(msg) {
     if (!msg || !msg.caveat) return '';
-    return '<div class="caveat-card"><div class="caveat-card-label">⚠ Caveat — read this</div><div class="caveat-card-text">' + formatContent(msg.caveat) + '</div></div>';
+    return '<div class="caveat-card"><div class="caveat-card-label">⚠ ' + t('Caveat — read this') + '</div><div class="caveat-card-text">' + formatContent(msg.caveat) + '</div></div>';
 }
 
 // Links card rendered just below the TL;DR at the end of an answer (set by the
@@ -84,7 +84,7 @@ function renderLinksCard(msg) {
             '<span class="links-card-title">' + title + '</span></a></li>';
     }).join('');
     if (!items) return '';
-    return '<div class="links-card"><div class="links-card-label">LINKS</div><ul class="links-card-list">' + items + '</ul></div>';
+    return '<div class="links-card"><div class="links-card-label">' + t('LINKS') + '</div><ul class="links-card-list">' + items + '</ul></div>';
 }
 
 // MEMFIX-ESC (Fix D): attribute-escape for base64 data URLs. escapeHtml
@@ -105,7 +105,7 @@ function escapeDataUrlAttr(s) {
 // Render just the inner content of a single attachment (no group wrapper)
 function renderAttachmentContent(msg, index) {
     if (msg.role === 'screenshot') {
-        var screenshotName = msg.name || msg.description || 'Capture';
+        var screenshotName = msg.name || msg.description || t('Capture');
         // Resolve base64: try msg directly, fallback to chat.screenshots map
         var base64 = msg.base64;
         if (!base64 && msg.screenshot_id) {
@@ -118,33 +118,33 @@ function renderAttachmentContent(msg, index) {
         h += '<div class="screenshot-container">';
         h += '<div class="screenshot-header" title="' + escapeHtml(screenshotName) + '"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + escapeHtml(screenshotName) + '</div>';
         if (base64) {
-            h += '<img class="screenshot-thumbnail" src="' + escapeDataUrlAttr(base64) + '" alt="Screenshot" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
+            h += '<img class="screenshot-thumbnail" role="button" tabindex="0" data-kbd-click src="' + escapeDataUrlAttr(base64) + '" alt="' + escapeHtml(t('Screenshot')) + '" onclick="openScreenshotModal(this.src, \'' + escapeJsString(screenshotName) + '\', ' + (msg.width || 0) + ', ' + (msg.height || 0) + ', \'' + escapeJsString(msg.url || '') + '\')" />';
         } else {
-            h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">Screenshot unavailable</div>';
+            h += '<div class="screenshot-thumbnail" style="display:flex;align-items:center;justify-content:center;height:80px;background:var(--bg-tertiary);color:var(--text-muted);font-size:var(--text-caption);border-radius:var(--radius-sm);">' + t('Screenshot unavailable') + '</div>';
         }
         h += '</div></div>';
         return h;
     } else if (msg.role === 'pdf') {
-        var pdfName = msg.name || msg.description || 'Document';
+        var pdfName = msg.name || msg.description || t('Document');
         var h = '<div class="message screenshot" id="msg-' + index + '">';
         h += '<div class="screenshot-container pdf-attachment-container">';
-        h += '<div class="screenshot-header"><span class="screenshot-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span> PDF: ' + escapeHtml(pdfName) + '</div>';
-        h += '<div class="pdf-attachment-preview" onclick="openPdfFromMessage(' + index + ')">';
+        h += '<div class="screenshot-header"><span class="screenshot-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span> ' + t('PDF: {name}', { name: escapeHtml(pdfName) }) + '</div>';
+        h += '<div class="pdf-attachment-preview" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: pdfName })) + '" onclick="openPdfFromMessage(' + index + ')">';
         h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;opacity:0.5;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
-        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">Click to preview</span>';
+        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">' + t('Click to preview') + '</span>';
         h += '</div>';
         h += '</div></div>';
         return h;
     } else if (msg.role === 'file') {
-        var fileName = msg.name || 'File';
+        var fileName = msg.name || t('File');
         var fileExt = fileName.split('.').pop().toUpperCase();
         var fileSize = msg.size ? ' (' + formatFileSize(msg.size) + ')' : '';
         var h = '<div class="message screenshot" id="msg-' + index + '">';
         h += '<div class="screenshot-container file-attachment-container">';
         h += '<div class="screenshot-header"><span class="screenshot-icon" style="color:var(--success);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span> ' + escapeHtml(fileExt) + ': ' + escapeHtml(fileName) + fileSize + '</div>';
-        h += '<div class="file-attachment-preview" onclick="openFileFromMessage(' + index + ')">';
+        h += '<div class="file-attachment-preview" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: fileName })) + '" onclick="openFileFromMessage(' + index + ')">';
         h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;opacity:0.5;color:var(--success);"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
-        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">Click to preview</span>';
+        h += '<span style="font-size:var(--text-caption);color:var(--text-muted);margin-top: var(--space-2);">' + t('Click to preview') + '</span>';
         h += '</div>';
         h += '</div></div>';
         return h;
@@ -409,12 +409,17 @@ function _sweepOrphanedParkedWidgets() {
     }
 }
 
-// Shared by the full render and the R1 fast path: right-edge fade shadow for
-// horizontally scrollable attachment/widget rows.
+// Shared by the full render and the R1 fast path: end-edge fade shadow for
+// horizontally scrollable attachment/widget rows. Direction-aware (i18n rule
+// 10): an RTL row scrolls toward the left and Chrome reports a negative
+// scrollLeft, so the scrolled distance is Math.abs(scrollLeft) and the fade
+// goes on the left edge (has-left-shadow) instead of the right one.
 function _updateRowShadow(row) {
     var hasOverflow = row.scrollWidth > row.clientWidth + 1;
-    var notAtEnd = row.scrollLeft < row.scrollWidth - row.clientWidth - 5;
-    row.classList.toggle('has-right-shadow', hasOverflow && notAtEnd);
+    var notAtEnd = Math.abs(row.scrollLeft) < row.scrollWidth - row.clientWidth - 5;
+    var rtl = typeof i18nDir === 'function' && i18nDir() === 'rtl';
+    row.classList.toggle('has-right-shadow', !rtl && hasOverflow && notAtEnd);
+    row.classList.toggle('has-left-shadow', rtl && hasOverflow && notAtEnd);
 }
 var _rowShadowResizeBound = false;
 function _attachRowScrollShadow(row) {
@@ -532,11 +537,11 @@ function _tryIncrementalRender(container, isRunning, mappedParts, newSigs, saved
     // Post-render side effects, scoped to the touched nodes.
     var touched = tailChanged ? [newTailEl].concat(appendedNodes) : appendedNodes;
     for (var ti = 0; ti < touched.length; ti++) {
-        var tn = touched[ti];
-        if (!tn.querySelectorAll) continue;
-        var stickies = tn.querySelectorAll('details.tool-call.expanded, details.tool-result.expanded');
+        var touchedNode = touched[ti];
+        if (!touchedNode.querySelectorAll) continue;
+        var stickies = touchedNode.querySelectorAll('details.tool-call.expanded, details.tool-result.expanded');
         for (var si = 0; si < stickies.length; si++) setupStickyObserver(stickies[si]);
-        var rows = tn.querySelectorAll('.attachments-row, .widgets-container');
+        var rows = touchedNode.querySelectorAll('.attachments-row, .widgets-container');
         for (var ri = 0; ri < rows.length; ri++) _attachRowScrollShadow(rows[ri]);
     }
 
@@ -594,7 +599,7 @@ function _renderCompactThinking(msgIdx, thinking, blockIndex, tlIdx, defaultOpen
     return '<details class="thinking" data-thinking-msg="' + msgIdx + '" data-thinking-chat="' + escapeHtml(currentChatId || '_') + '"' +
         (tlIdx != null ? ' data-tl-idx="' + tlIdx + '"' : '') + (expanded ? ' open' : '') +
         ' ontoggle="toggleThinkingState(\'' + key + '\', this)">' +
-        '<summary><span class="thinking-status">Thought process</span></summary>' +
+        '<summary><span class="thinking-status">' + t('Thought process') + '</span></summary>' +
         '<div class="thinking-content">' + escapeHtml(thinking) + '</div></details>';
 }
 
@@ -660,7 +665,7 @@ function renderMessages() {
         if (inputArea && !inputArea.querySelector('.empty-state')) {
             var emptyDiv = document.createElement('div');
             emptyDiv.className = 'empty-state';
-            emptyDiv.textContent = 'Start a conversation';
+            emptyDiv.textContent = t('Start a conversation');
             inputArea.insertBefore(emptyDiv, inputArea.firstChild);
         }
         return;
@@ -916,9 +921,10 @@ function renderMessages() {
             var screenshotCount = groupIndices.filter(function(gIdx) {
                 return chat.messages[gIdx].role === 'screenshot';
             }).length;
-            var groupNoun = screenshotCount === attachCount ? 'Screenshots'
-                : (screenshotCount === 0 ? 'Files' : 'Attachments');
-            var groupLabel = groupNoun + (attachCount > 1 ? ' (' + attachCount + ')' : '');
+            var groupLabel;
+            if (screenshotCount === attachCount) groupLabel = attachCount > 1 ? t('Screenshots ({count})', { count: attachCount }) : t('Screenshots');
+            else if (screenshotCount === 0) groupLabel = attachCount > 1 ? t('Files ({count})', { count: attachCount }) : t('Files');
+            else groupLabel = attachCount > 1 ? t('Attachments ({count})', { count: attachCount }) : t('Attachments');
             var groupOpen = closedAttachmentGroups[index] ? '' : ' open';
             html += '<details class="attachments-details" data-group-idx="' + index + '"' + groupOpen + '><summary class="attachments-summary"><span class="screenshot-icon">' + UI_ICONS.eye + '</span> ' + groupLabel + '</summary><div class="attachments-row">';
             // Render all attachments in the group and close the wrapper
@@ -960,10 +966,11 @@ function renderMessages() {
                 var sizeKB = Math.round((msg.content || '').length / 1024);
                 var lines = (msg.content || '').split('\n').length;
                 var expanded = !!userMsgExpandedState[(currentChatId || '_') + ':' + index];
-                var badge = '<div class="user-cached-badge" title="This long message is cached. The agent reads it via cached_content_read/search/outline (content_id: ' + escapeHtml(msg.cachedContentId) + ').">' + UI_ICONS.cache + ' Cached · ' + sizeKB + 'KB · ' + lines + ' lines</div>';
-                var toggleLabel = expanded ? 'Collapse' : 'Expand';
+                var badge = '<div class="user-cached-badge" title="' + escapeHtml(t('This long message is cached. The agent reads it via cached_content_read/search/outline (content_id: {id}).', { id: msg.cachedContentId })) + '">' + UI_ICONS.cache + ' ' + tn(lines, 'Cached · {size}KB · {count} line', 'Cached · {size}KB · {count} lines', { size: sizeKB }) + '</div>';
+                var toggleLabel = expanded ? t('Collapse') : t('Expand');
+                var toggleTitle = expanded ? t('Collapse full message') : t('Expand full message');
                 var toggleClass = 'user-cached-toggle' + (expanded ? ' expanded' : '');
-                var toggleBtn = '<button class="' + toggleClass + '" onclick="toggleUserMsgExpanded(' + index + ')" title="' + toggleLabel + ' full message">' + UI_ICONS.chevronDown + ' ' + toggleLabel + '</button>';
+                var toggleBtn = '<button class="' + toggleClass + '" onclick="toggleUserMsgExpanded(' + index + ')" title="' + escapeHtml(toggleTitle) + '">' + UI_ICONS.chevronDown + ' ' + toggleLabel + '</button>';
                 var bodyClass = 'user-text user-text-cached' + (expanded ? ' expanded' : '');
                 userBodyHtml = badge + '<div class="' + bodyClass + '">' + escapeHtml(msg.content) + '</div>' + toggleBtn;
             } else {
@@ -992,7 +999,7 @@ function renderMessages() {
                     userBodyHtml = '<div class="user-text user-text-md">' + formatContent(rawUser) + '</div>';
                 }
             }
-            return '<div class="message user' + (isSubNoticeRow ? ' sub-notice-msg' : '') + '" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="Edit and branch">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="Copy message">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
+            return '<div class="message user' + (isSubNoticeRow ? ' sub-notice-msg' : '') + '" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="' + escapeHtml(t('Edit and branch')) + '">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="' + escapeHtml(t('Copy message')) + '">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
         } else if (msg.role === 'assistant') {
             // Hide assistant responses to hook messages unless showHookMessages is enabled
             if (!hooksEnabled.showHookMessages) {
@@ -1062,7 +1069,7 @@ function renderMessages() {
                 // or a plain text answer with API stats on) must not render a
                 // pointless "0 tool calls" expander around just the API-stats row —
                 // that row renders bare via the metrics fallback below (~:902).
-                var hasVisibleTimeline = block && block.timeline.some(function(t) { return t.type !== 'metrics'; });
+                var hasVisibleTimeline = block && block.timeline.some(function(it) { return it.type !== 'metrics'; });
                 if (isFirstAssistant && block && (hasVisibleTimeline || block.isStreaming)) {
                     // Use stored state to preserve expanded state during streaming updates
                     // Fall back to DOM check for backwards compatibility, then default to collapsed
@@ -1094,10 +1101,10 @@ function renderMessages() {
                     // each panel is reading its own block. Pick a phase-specific label so
                     // the user can tell what stage each chat is in.
                     var streamingPlaceholder;
-                    if (block.timeline.some(function(t) { return t.type === 'thinking'; })) {
-                        streamingPlaceholder = 'Thinking…';
+                    if (block.timeline.some(function(it) { return it.type === 'thinking'; })) {
+                        streamingPlaceholder = t('Thinking…');
                     } else {
-                        streamingPlaceholder = 'Awaiting response…';
+                        streamingPlaceholder = t('Awaiting response…');
                     }
                     // Live transport-level status (429/529 backoff, concurrents
                     // park) takes precedence over the generic placeholder while
@@ -1105,7 +1112,7 @@ function renderMessages() {
                     // reset the status line to a bare "Thinking…" and the user
                     // stared at a silent spinner for the whole retry window.
                     var liveTransport = (!agentDone && typeof _transportStatusText === 'function') ? _transportStatusText(currentChatId) : null;
-                    var statusText = agentDone ? (block.toolCalls.length === 1 ? '1 tool call' : block.toolCalls.length + ' tool calls') : (liveTransport || block.lastStatusMessage || block.lastToolName || streamingPlaceholder);
+                    var statusText = agentDone ? tn(block.toolCalls.length, '{count} tool call', '{count} tool calls') : (liveTransport || block.lastStatusMessage || (block.lastToolName && t(block.lastToolName)) || streamingPlaceholder);
                     var spinnerClass = agentDone ? '' : ' streaming';
 
                     html += '<details class="compact-tools-area' + spinnerClass + '"' + (isExpanded ? ' open' : '') + ' ontoggle="toggleCompactAreaState(' + index + ', this)">';
@@ -1147,30 +1154,30 @@ function renderMessages() {
                             if (compactStatusMessage) {
                                 html += '<span class="tool-status-message">' + escapeHtml(compactStatusMessage) + '</span>';
                             }
-                            html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                            html += '<span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>';
                             if (item.hasResult) {
                                 // The badge used to be an unconditional green check, so a
                                 // failed call read as SUCCESS and the error was only
                                 // visible after expanding the panel.
                                 html += toolResultIsError(item.result)
-                                    ? '<span class="tool-result-badge error" style="color: var(--danger);" title="Tool call failed">' + UI_ICONS.alert + '</span>'
-                                    : '<span class="tool-result-badge" title="Tool call succeeded">' + UI_ICONS.check + '</span>';
+                                    ? '<span class="tool-result-badge error" style="color: var(--danger);" title="' + escapeHtml(t('Tool call failed')) + '">' + UI_ICONS.alert + '</span>'
+                                    : '<span class="tool-result-badge" title="' + escapeHtml(t('Tool call succeeded')) + '">' + UI_ICONS.check + '</span>';
                             }
                             html += '</summary>';
                             var argsCopyId = storeRawCopy(tc.function.arguments);
                             html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
-                            html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                            html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>';
                             html += '<pre class="tool-args">' + formatJsonPretty(tc.function.arguments) + '</pre>';
-                            html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+                            html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
 
                             // Render tool result inline within the same panel
                             if (item.hasResult) {
                                 var resultContent = formatJsonPretty(item.result);
                                 var resultCopyId = storeRawCopy(item.result);
                                 html += '<div class="tool-result-section"><div class="tool-result-wrapper" data-copy-id="' + resultCopyId + '">';
-                                html += '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                                html += '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>';
                                 html += '<pre>' + resultContent + '</pre>';
-                                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></div>';
+                                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div></div>';
                             }
                             html += '</details>';
                         } else if (timelineItem.type === 'metrics') {
@@ -1198,7 +1205,7 @@ function renderMessages() {
                     });
                     if (blockWidgetHtml) {
                         var wCount = (blockWidgetHtml.match(/class="widget-inline/g) || []).length;
-                        var wLabel = 'Widgets' + (wCount > 1 ? ' (' + wCount + ')' : '');
+                        var wLabel = wCount > 1 ? t('Widgets ({count})', { count: wCount }) : t('Widgets');
                         var wGroupOpen = closedWidgetGroups[index] ? '' : ' open';
                         html += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + wGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + wLabel + '</summary><div class="widgets-container">' + blockWidgetHtml + '</div></details>';
                     }
@@ -1233,7 +1240,7 @@ function renderMessages() {
                 var agentDone = block && (!_copyChatRunning || !block.isLastBlock || (block.hasFinalAnswer && !block.isStreaming));
                 if (isLastAssistant && agentDone && prevUserMsgIdx >= 0) {
                     html += renderInlineChanges(prevUserMsgIdx);
-                    html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' Copy Answer</button></div>';
+                    html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' ' + t('Copy Answer') + '</button></div>';
                 }
                 
                 html += '</div>';
@@ -1248,9 +1255,9 @@ function renderMessages() {
                 var isCollapsed = msg.thinkingCollapsed === true && !isStreaming;
                 var openAttr = isCollapsed ? '' : 'open';
                 var statusClass = isStreaming ? 'active' : (isCollapsed ? 'collapsed' : '');
-                var statusText = isStreaming ? (hasThinking ? 'Thinking...' : 'Processing...') : (isCollapsed ? 'Thought process (click to expand)' : 'Thought process');
+                var statusText = isStreaming ? (hasThinking ? t('Thinking...') : t('Processing...')) : (isCollapsed ? t('Thought process (click to expand)') : t('Thought process'));
                 var contentClass = isStreaming ? 'thinking-content streaming' : 'thinking-content';
-                var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming ? '<span class="processing-indicator">Waiting for model response...</span>' : '');
+                var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming ? '<span class="processing-indicator">' + t('Waiting for model response...') + '</span>' : '');
                 html += '<details class="thinking ' + statusClass + '" ' + openAttr + '>' +
                     '<summary><span class="thinking-status">' + statusText + '</span>' +
                     (isStreaming ? '<span class="thinking-indicator"></span>' : '') +
@@ -1350,25 +1357,25 @@ function renderMessages() {
                     var expandedClass = tcFullHeight ? ' expanded' : '';
                     
                     html += '<details class="tool-call' + statusClass + expandedClass + '" id="' + tcKey + '" onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)"' + (tcOpen ? ' open' : '') + '>';
-                    html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>';
+                    html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>';
                     if (tcStatusMessage) {
                         html += '<span class="tool-status-message">' + escapeHtml(tcStatusMessage) + '</span>';
                     }
                     if (tcHasResult) {
                         html += toolResultIsError(tcResult)
-                            ? '<span class="tool-result-badge error" style="color: var(--danger);" title="Tool call failed">' + UI_ICONS.alert + '</span>'
-                            : '<span class="tool-result-badge" title="Tool call succeeded">' + UI_ICONS.check + '</span>';
+                            ? '<span class="tool-result-badge error" style="color: var(--danger);" title="' + escapeHtml(t('Tool call failed')) + '">' + UI_ICONS.alert + '</span>'
+                            : '<span class="tool-result-badge" title="' + escapeHtml(t('Tool call succeeded')) + '">' + UI_ICONS.check + '</span>';
                     }
                     if (approval) {
-                        var statusLabel = approval.msg.status === 'pending' ? 'Pending' : (approval.msg.status === 'allowed' ? 'Allowed' : (approval.msg.status === 'always_allowed' ? 'Always' : (approval.msg.status === 'session_allowed' ? 'This chat' : 'Denied')));
+                        var statusLabel = approval.msg.status === 'pending' ? t('Pending') : (approval.msg.status === 'allowed' ? t('Allowed') : (approval.msg.status === 'always_allowed' ? t('Always') : (approval.msg.status === 'session_allowed' ? t('This chat') : t('Denied'))));
                         html += '<span class="tool-status ' + approval.msg.status + '">' + statusLabel + '</span>';
                     }
                     html += '</summary>';
                     var copyId = storeRawCopy(tc.function.arguments);
                     html += '<div class="tool-args-wrapper" data-copy-id="' + copyId + '">';
-                    html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (tcFullHeight ? 'Collapse' : 'Expand') + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
+                    html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(tcFullHeight ? t('Collapse') : t('Expand')) + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
                     html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + formatJsonPretty(tc.function.arguments) + '</pre>';
-                    html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+                    html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
                     html += '</details>';
                 });
             }
@@ -1381,7 +1388,7 @@ function renderMessages() {
             if (isLastBeforeNextUser && prevUserMsgIdx >= 0) {
                 html += renderInlineChanges(prevUserMsgIdx);
                 // Add copy button once at end of complete response
-                html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' Copy Answer</button></div>';
+                html += '<div class="assistant-actions visible"><button class="copy-ai-btn" onclick="copyAiMessage(' + prevUserMsgIdx + ')">' + UI_ICONS.copy + ' ' + t('Copy Answer') + '</button></div>';
             }
             
             html += '</div>';
@@ -1414,18 +1421,18 @@ function renderMessages() {
             var rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
             var resultCopyId = storeRawCopy(rawContent);
             var toolHtml = '<div class="message tool" id="msg-' + index + '"><details class="tool-result' + (toolResultFullHeight ? ' expanded' : '') + '" onclick="toggleToolResultExpanded(' + index + ', this)"' + (toolResultOpen ? ' open' : '') + '>' +
-                '<summary><span class="tool-label">' + getToolIcon(msg.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[msg.name] || msg.name) + ' result</span></summary>' +
+                '<summary><span class="tool-label">' + getToolIcon(msg.name) + ' ' + t('{name} result', { name: escapeHtml(TOOL_DISPLAY_NAMES[msg.name] ? t(TOOL_DISPLAY_NAMES[msg.name]) : msg.name) }) + '</span></summary>' +
                 '<div class="tool-result-wrapper" data-copy-id="' + resultCopyId + '">' +
-                '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (toolResultFullHeight ? 'Collapse' : 'Expand') + '">' + (toolResultFullHeight ? '⤡' : '⤢') + '</button>' +
+                '<button class="tool-result-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(toolResultFullHeight ? t('Collapse') : t('Expand')) + '">' + (toolResultFullHeight ? '⤡' : '⤢') + '</button>' +
                 '<pre' + (toolResultFullHeight ? ' class="expanded"' : '') + '>' + contentHtml + '</pre>' +
-                '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>' +
+                '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>' +
             '</details>';
             
             // Add widgets in a grouped container (matches html_widget results and tools like js_eval/skill tools that create widgets internally)
             var msgWidgetHtml = getWidgetHtmlForMessage(index);
             if (msgWidgetHtml) {
                 var mwCount = (msgWidgetHtml.match(/class="widget-inline/g) || []).length;
-                var mwLabel = 'Widgets' + (mwCount > 1 ? ' (' + mwCount + ')' : '');
+                var mwLabel = mwCount > 1 ? t('Widgets ({count})', { count: mwCount }) : t('Widgets');
                 var mwGroupOpen = closedWidgetGroups[index] ? '' : ' open';
                 toolHtml += '<details class="widgets-details" data-widget-group-idx="' + index + '"' + mwGroupOpen + '><summary class="widgets-summary"><span class="widget-icon">' + UI_ICONS.widget + '</span> ' + mwLabel + '</summary><div class="widgets-container">' + msgWidgetHtml + '</div></details>';
             }
@@ -1474,7 +1481,7 @@ function renderMessages() {
             // when one is opened. The handler removes this row on toolUnparked,
             // so this only ever renders in the genuinely panel-less case (not
             // during a brief SW-restart reconnect flicker).
-            var parkedContent = (typeof msg.content === 'string' && msg.content) ? msg.content : '📌 Tool waiting for a panel — auto-resumes when you open one.';
+            var parkedContent = (typeof msg.content === 'string' && msg.content) ? t(msg.content) : t('📌 Tool waiting for a panel — auto-resumes when you open one.');
             return '<div class="message parked-tool" id="msg-' + index + '">' + escapeHtml(parkedContent) + '</div>';
         }
         return '';
@@ -1490,8 +1497,8 @@ function renderMessages() {
         } catch (e) {
             try { console.warn('[renderMessages] message ' + index + ' failed to render:', e); } catch (_) {}
             var role = (msg && typeof msg.role === 'string') ? msg.role : 'unknown';
-            return '<div class="message render-error" id="msg-' + index + '"><div class="sdoc-error">⚠ Could not render this ' +
-                escapeHtml(role) + ' message: ' + escapeHtml(String((e && e.message) || e).slice(0, 200)) + '</div></div>';
+            return '<div class="message render-error" id="msg-' + index + '"><div class="sdoc-error">⚠ ' +
+                t('Could not render this {role} message: {error}', { role: escapeHtml(role), error: escapeHtml(String((e && e.message) || e).slice(0, 200)) }) + '</div></div>';
         }
     });
     // MEMWIN: "Show earlier messages" notice above the windowed tail. Kept out
@@ -1506,8 +1513,8 @@ function renderMessages() {
             if (chat.messages[hti].role === 'user' && !chat.messages[hti].isHookMessage) hiddenTurns++;
         }
         windowNoticeHtml = '<div class="messages-window-notice" id="messages-window-notice">' +
-            '<button class="show-earlier-btn" onclick="showEarlierMessages()">' + UI_ICONS.chevronDown + ' Show earlier messages' +
-            (hiddenTurns > 0 ? ' (' + hiddenTurns + ' turn' + (hiddenTurns === 1 ? '' : 's') + ' hidden)' : '') +
+            '<button class="show-earlier-btn" onclick="showEarlierMessages()">' + UI_ICONS.chevronDown + ' ' +
+            (hiddenTurns > 0 ? tn(hiddenTurns, 'Show earlier messages ({count} turn hidden)', 'Show earlier messages ({count} turns hidden)') : t('Show earlier messages')) +
             '</button></div>';
     }
     var mappedHtml = windowNoticeHtml + mappedParts.join('');
@@ -1786,7 +1793,7 @@ function _patchStreamingToolRow(row, tc) {
     if (!argsEl) return false;
     var argsText = tc.function.arguments || '';
     if (argsText) argsEl.textContent = argsText;
-    else argsEl.innerHTML = '<span class="tool-args-streaming">Generating arguments...</span>';
+    else argsEl.innerHTML = '<span class="tool-args-streaming">' + t('Generating arguments...') + '</span>';
     var wrapper = row.querySelector('.tool-args-wrapper');
     if (wrapper) {
         var copyId = wrapper.getAttribute('data-copy-id');
@@ -1860,7 +1867,7 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
         if (standardThinking) {
             standardThinking.textContent = msg.thinking || '';
             var standardStatus = msgEl.querySelector('.thinking-status');
-            if (standardStatus) standardStatus.textContent = msg.thinking ? 'Thinking...' : 'Preparing tool call...';
+            if (standardStatus) standardStatus.textContent = msg.thinking ? t('Thinking...') : t('Preparing tool call...');
             if (msg.content) updateStreamingText(msg, index);
             scrollToBottomIfAllowed();
             return;
@@ -1899,14 +1906,14 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
             var statusEl = compactArea.querySelector('.compact-tools-status');
             if (statusEl) {
                 if (lastTc) {
-                    statusEl.textContent = extractStatusMessage(lastTc.function.arguments) || TOOL_DISPLAY_NAMES[lastTc.function.name] || lastTc.function.name || 'Processing...';
+                    statusEl.textContent = extractStatusMessage(lastTc.function.arguments) || (TOOL_DISPLAY_NAMES[lastTc.function.name] ? t(TOOL_DISPLAY_NAMES[lastTc.function.name]) : lastTc.function.name) || t('Processing...');
                 } else {
                     // Text-only streaming (no tool call yet on THIS message): keep
                     // the block's last status_message / tool name that the full
                     // render put here (B9) instead of forcing a bare 'Thinking...'
                     // — only fill in when the line is empty or a generic placeholder.
                     var _cur = (statusEl.textContent || '').trim();
-                    if (!_cur || _cur === 'Awaiting response…' || _cur === 'Processing...') statusEl.textContent = 'Thinking...';
+                    if (!_cur || _cur === t('Awaiting response…') || _cur === t('Processing...')) statusEl.textContent = t('Thinking...');
                 }
             }
             if (hasToolCalls && compactContent) {
@@ -1916,16 +1923,16 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
                     var tcStatusMsg = extractStatusMessage(tc.function.arguments);
                     var statusMsgHtml = tcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(tcStatusMsg) + '</span>' : '';
                     var newTcHtml = '<details class="tool-call" id="' + tcKey + '" open onclick="toggleToolCallExpanded(' + index + ', ' + tcIdx + ', this)">';
-                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + '</summary>';
+                    newTcHtml += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>' + statusMsgHtml + '</summary>';
                     newTcHtml += '<div class="tool-args-wrapper">';
-                    newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="Expand">⤢</button>';
+                    newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>';
                     var argsText = tc.function.arguments || '';
                     if (argsText.length === 0) {
-                        newTcHtml += '<pre class="tool-args"><span class="tool-args-streaming">Generating arguments...</span></pre>';
+                        newTcHtml += '<pre class="tool-args"><span class="tool-args-streaming">' + t('Generating arguments...') + '</span></pre>';
                     } else {
                         newTcHtml += '<pre class="tool-args">' + escapeHtml(argsText) + '</pre>';
                     }
-                    newTcHtml += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+                    newTcHtml += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
                     newTcHtml += '</details>';
 
                     // Insert the new tool call at the end of the content
@@ -1955,14 +1962,14 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
             var statusClass = isStreaming ? 'active' : (isCollapsed ? 'collapsed' : '');
             var statusText;
             if (isStreaming) {
-                if (hasThinking) statusText = 'Thinking...';
-                else if (hasToolCalls) statusText = 'Preparing tool call...';
-                else statusText = 'Waiting for response...';
+                if (hasThinking) statusText = t('Thinking...');
+                else if (hasToolCalls) statusText = t('Preparing tool call...');
+                else statusText = t('Waiting for response...');
             } else {
-                statusText = isCollapsed ? 'Thought process (click to expand)' : 'Thought process';
+                statusText = isCollapsed ? t('Thought process (click to expand)') : t('Thought process');
             }
             var contentClass = isStreaming ? 'thinking-content streaming' : 'thinking-content';
-            var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming && !hasToolCalls ? '<span class="processing-indicator"><span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right: var(--space-4);"></span>Model is processing...</span>' : '');
+            var thinkingContent = hasThinking ? escapeHtml(msg.thinking) : (isStreaming && !hasToolCalls ? '<span class="processing-indicator"><span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-inline-end: var(--space-4);"></span>' + t('Model is processing...') + '</span>' : '');
             var showThinkingIndicator = isStreaming && !hasToolCalls;
             html += '<details class="thinking ' + statusClass + '" ' + openAttr + '>' +
                 '<summary><span class="thinking-status">' + statusText + '</span>' +
@@ -2007,16 +2014,16 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
                 // Add spinner to summary if this tool call is streaming
                 var toolSpinner = (msg.isStreaming && isLastToolCall) ? '<span class="tool-streaming-indicator"></span>' : '';
                 var statusMsgHtml = streamingTcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(streamingTcStatusMsg) + '</span>' : '';
-                html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] || tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
+                html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
                 var argsCopyId = storeRawCopy(tc.function.arguments);
                 html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
-                html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + (tcFullHeight ? 'Collapse' : 'Expand') + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
+                html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(tcFullHeight ? t('Collapse') : t('Expand')) + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
                 var argsHtml = formatJsonPretty(tc.function.arguments);
                 if (window.currentSearchHighlight) {
                     argsHtml = applySearchHighlight(argsHtml, window.currentSearchHighlight);
                 }
                 html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + argsHtml + '</pre>';
-                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div></details>';
+                html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div></details>';
             });
         }
     }
@@ -2139,9 +2146,9 @@ function formatContent(content) {
         var isJS = !lang || lang === 'js' || lang === 'javascript';
         var highlightedCode = isJS ? highlightJS(code) : escapeHtml(code);
         var blockHtml = '<div class="code-block-wrapper" data-copy-id="' + codeCopyId + '">' +
-            '<button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="Expand">⤢</button>' +
+            '<button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>' +
             '<pre class="code-block collapsed"><code>' + highlightedCode + '</code></pre>' +
-            '<button class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">' + UI_ICONS.copy + '</button></div>';
+            '<button class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
         codeBlocks.push(blockHtml);
         return '%%CODEBLOCK' + (codeBlocks.length - 1) + '%%';
     });
@@ -2171,14 +2178,16 @@ function formatContent(content) {
     html = html.replace(/<!--document:([A-Za-z0-9_-]+)-->/g, function(match, docId) {
         var rendered;
         if (_docStack.indexOf(docId) !== -1 || _docStack.length >= 3) {
-            var why = _docStack.indexOf(docId) !== -1 ? 'recursive document reference' : 'document nesting too deep';
-            rendered = '<span class="sdoc-error sdoc-recursive-ref" data-doc-ref="' + escapeHtml(docId) + '">↻ ' + why + ': ' + escapeHtml(docId) + '</span>';
+            var why = _docStack.indexOf(docId) !== -1
+                ? t('recursive document reference: {id}', {id: escapeHtml(docId)})
+                : t('document nesting too deep: {id}', {id: escapeHtml(docId)});
+            rendered = '<span class="sdoc-error sdoc-recursive-ref" data-doc-ref="' + escapeHtml(docId) + '">↻ ' + why + '</span>';
         } else if (typeof renderDocumentPlaceholder === 'function') {
             _docStack.push(docId);
             try { rendered = renderDocumentPlaceholder(docId); }
             finally { _docStack.pop(); }
         } else {
-            rendered = '<div class="sdoc-error">Document: ' + escapeHtml(docId) + '</div>';
+            rendered = '<div class="sdoc-error">' + t('Document: {id}', {id: escapeHtml(docId)}) + '</div>';
         }
         documentBlocks.push(rendered);
         return '%%DOCUMENT' + (documentBlocks.length - 1) + '%%';
@@ -2548,12 +2557,12 @@ function decorateIdMentions(html) {
                 if (w && w.title) name = String(w.title);
             }
         } catch (e) {}
-        var tip = name ? ('Open widget: ' + name) : ('Click to open widget ' + id);
+        var tip = name ? t('Open widget: {name}', {name: name}) : t('Click to open widget {id}', {id: id});
         // stash(), NOT a direct return: the doc pass below scans this pass's output,
         // and a widget title can legitimately contain a doc_ id ("Summary of
         // doc_1784927648803_a1b2c3d") — returning the chip inline let that pass
         // splice a <span> into this chip's own title attribute.
-        return stash('<span class="id-mention id-mention-widget" onclick="openWidgetMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+        return stash('<span class="id-mention id-mention-widget" role="button" tabindex="0" data-kbd-click onclick="openWidgetMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
     });
 
     html = html.replace(/\bdoc_\d{10,}_[a-z0-9]{1,9}\b/g, function(id) {
@@ -2566,11 +2575,11 @@ function decorateIdMentions(html) {
                 name = String(smartDocuments[id].title);
             }
         } catch (e) {}
-        var tip = name ? ('Open document: ' + name) : ('Click to open document ' + id);
+        var tip = name ? t('Open document: {name}', {name: name}) : t('Click to open document {id}', {id: id});
         // Stashed for symmetry — a doc titled with a widget_ id is only safe today
         // because the widget pass happens to run first. Stashing makes both passes
         // order-independent instead of relying on that accident.
-        return stash('<span class="id-mention id-mention-doc" onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+        return stash('<span class="id-mention id-mention-doc" role="button" tabindex="0" data-kbd-click onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
     });
 
     // Slug document ids (human-readable, no prefix): decorate ONLY exact word
@@ -2588,8 +2597,8 @@ function decorateIdMentions(html) {
                     name = String(smartDocuments[id].title);
                 }
             } catch (e) {}
-            var tip = name ? ('Open document: ' + name) : ('Click to open document ' + id);
-            return stash('<span class="id-mention id-mention-doc" onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
+            var tip = name ? t('Open document: {name}', {name: name}) : t('Click to open document {id}', {id: id});
+            return stash('<span class="id-mention id-mention-doc" role="button" tabindex="0" data-kbd-click onclick="openDocumentMention(\'' + id + '\', event)" title="' + escapeAttr(tip) + '">' + id + '</span>');
         });
     }
 
@@ -2672,7 +2681,7 @@ function renderQueuedUserBubble(container) {
             : '<div class="user-text user-text-md">' + (typeof formatContent === 'function' ? formatContent(text) : escapeHtml(text)) + '</div>';
     }
     if (images && images.length > 0) {
-        inner += '<div class="queued-attachments">' + images.length + ' attachment' + (images.length === 1 ? '' : 's') + '</div>';
+        inner += '<div class="queued-attachments">' + tn(images.length, '{count} attachment', '{count} attachments') + '</div>';
     }
     inner += '</div>';
     bubble.innerHTML = inner;

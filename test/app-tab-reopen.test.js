@@ -183,14 +183,26 @@ describe('APP-TAB-REOPEN: reopen after Reload opens exactly one verified tab (ba
             };
         }
         if (opts.noStorage) chrome.storage = undefined;
+        if (opts.alarms) {
+            e.alarms = {}; e.alarmFns = []; e.clearedAlarms = [];
+            chrome.alarms = {
+                create: function(name, info) { e.alarms[name] = info; e.order.push('alarm:' + name); return Promise.resolve(); },
+                clear: function(name) { e.clearedAlarms.push(name); delete e.alarms[name]; return Promise.resolve(true); },
+                onAlarm: { addListener: function(fn) { e.alarmFns.push(fn); } }
+            };
+        }
         var fakeDate = { now: function() { return e.now; } };
         var fakeSetTimeout = function(fn, ms) {
             if (opts.manualTimers) { e.queue.push({ fn: fn, due: e.clock + (ms || 0), seq: ++e.seq }); return e.seq; }
             if ((ms || 0) < 1000) { Promise.resolve().then(fn); return 0; }
             e.timers.push({ fn: fn, ms: ms }); return e.timers.length;
         };
+        // Observe every structured reopen event at the point it is built for
+        // the persisted log (_reopenLogEntry, called synchronously by
+        // _reopenLog) — independent of the async, bounded storage append.
+        var reopenHook = function(ev, data) { e.logs.push({ ev: String(ev), data: data || {}, clock: e.clock }); };
         var fakeConsole = {
-            info: function(msg, data) { var m = /^\[SW\]\[reopen\] (.+)$/.exec(String(msg)); if (m) e.logs.push({ ev: m[1], data: data || {}, clock: e.clock }); },
+            info: function() {},
             warn: function() { e.warns.push([].slice.call(arguments).join(' ')); }, log: function() {}, error: function() {}
         };
         e.ev = function(name) { return e.logs.filter(function(l) { return l.ev === name; }); };
@@ -200,7 +212,10 @@ describe('APP-TAB-REOPEN: reopen after Reload opens exactly one verified tab (ba
         e.flowSets = function() { return e.sets.filter(function(s) { return !(LOG_KEY in s.o); }); }; // every set but the log's
         e.logSets = function() { return e.sets.filter(function(s) { return LOG_KEY in s.o; }); };
         e.stored = function() { return e.store[LOG_KEY] || []; };
-        new Function('chrome', 'Date', 'setTimeout', 'console', await slice())(chrome, fakeDate, fakeSetTimeout, fakeConsole);
+        // Prepended: function declarations are hoisted, so the wrap is in place
+        // before any top-level slice code can emit an event.
+        var hookSrc = 'var __reopenEntry = _reopenLogEntry; _reopenLogEntry = function(ev, data) { __reopenHook(ev, data); return __reopenEntry(ev, data); };\n';
+        new Function('chrome', 'Date', 'setTimeout', 'console', '__reopenHook', hookSrc + await slice())(chrome, fakeDate, fakeSetTimeout, fakeConsole, reopenHook);
         e.runTimers = async function() { var t = e.timers.splice(0); for (var i = 0; i < t.length; i++) { t[i].fn(); await flush(); } };
         // manualTimers: run, in due order, every timer due within the next `ms` of fake time.
         e.advance = async function(ms) {
@@ -221,6 +236,37 @@ describe('APP-TAB-REOPEN: reopen after Reload opens exactly one verified tab (ba
     }
     var OPTS = { tags: ['unit'], timeout: 3000 };
     var LONG = { tags: ['unit'], timeout: 6000 };
+
+    // --- WAKE-AFTER-RELOAD: persisted one-shot alarms wake the new SW ---------
+    test('clean reload arms the wake alarms after the close and before runtime.reload()', async function() {
+        var e = await boot({ alarms: true, existingTabs: [{ id: 7, url: APP, windowId: 1 }] });
+        e.order = [];
+        e.send(cleanMsg(), extSender(7));
+        await flush(3000);
+        var o = e.order.filter(function(x) { return x !== 'set:' + LOG_KEY; });
+        var iWake = o.indexOf('alarm:appagent-reopen-wake-0'), iRemove = o.indexOf('remove:7'), iReload = o.indexOf('reload');
+        assert.ok(iRemove >= 0 && iWake > iRemove && iReload > iWake, 'close -> wake alarms -> reload: ' + o.join(' '));
+        assert.strictEqual(Object.keys(e.alarms).length, 4);
+        Object.keys(e.alarms).forEach(function(k) { assert.ok(e.alarms[k].when > NOW - 1 && e.alarms[k].when <= NOW + 60000, k); });
+        assert.strictEqual(e.reloads, 1);
+    }, OPTS);
+
+    test('a wake alarm in a fresh SW consumes a marker the startup read missed, then clears the wake alarms', async function() {
+        var e = await boot({ alarms: true, store: {} });
+        assert.strictEqual(e.created.length, 0, 'no marker at startup: nothing opened');
+        e.store.reopenAppTab = { at: NOW, attempts: 0, tabId: null };
+        var fn = e.alarmFns[e.alarmFns.length - 1];
+        fn({ name: 'unrelated' });
+        await flush();
+        assert.strictEqual(e.created.length, 0, 'other alarms are ignored');
+        var p = fn({ name: 'appagent-reopen-wake-0' });
+        await flush(); await e.runTimers(); await p;
+        assert.strictEqual(e.created.length, 1, 'the wake alarm reopened exactly one tab');
+        assert.strictEqual(e.ev('wake-alarm').length, 1);
+        assert.strictEqual(e.ev('verified').length, 1);
+        assert.strictEqual('reopenAppTab' in e.store, false);
+        assert.ok(e.clearedAlarms.indexOf('appagent-reopen-wake-3') >= 0, 'remaining wake alarms cleared');
+    }, OPTS);
 
     // --- Reopen after Reload (kept + rewritten) --------------------------------
     test('fresh numeric marker: exactly one tab, verified by its app-tab-ready, marker cleared', async function() {
@@ -1130,7 +1176,7 @@ describe('APP-TAB-REOPEN: reopen after Reload opens exactly one verified tab (ba
         assert.deepStrictEqual(s[49], { at: NOW, event: 'clean-reload-rejected', senderId: 'other', url: 'chrome-extension://other/55' });
         assert.strictEqual(e.logSets().length, 55, 'one set per append');
         assert.ok(e.logSets().every(function(x) { return x.o[LOG_KEY].length <= 50; }), 'never more than 50 stored');
-        assert.strictEqual(e.ev('clean-reload-rejected').length, 55, 'console log unchanged');
+        assert.strictEqual(e.ev('clean-reload-rejected').length, 55, 'event log unchanged');
     }, LONG);
 
     test('reopen log: back-to-back calls are serialized in call order (get, set, get, set ...)', async function() {
@@ -1202,7 +1248,7 @@ describe('APP-TAB-REOPEN: reopen after Reload opens exactly one verified tab (ba
         assert.deepStrictEqual(r.responses, [ACK]);
         await flush(3000);
         assert.strictEqual(e.reloads, 1);
-        assert.strictEqual(e.ev('clean-reload').length, 1, 'console log unchanged');
+        assert.strictEqual(e.ev('clean-reload').length, 1, 'event log unchanged');
         assert.strictEqual(e.ev('clean-reload-marker-failed').length, 1);
         assert.deepStrictEqual(rej(e, 1).responses, []);
         assert.strictEqual(e.ev('clean-reload-rejected').length, 1);

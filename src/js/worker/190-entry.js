@@ -94,6 +94,9 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
     // page calls this from 120-init.js; the SW must do the same or the tool's
     // list/read/update/edit/delete actions all see an empty store and fail.
     var loadDocs = (typeof loadAllDocuments === 'function') ? loadAllDocuments() : Promise.resolve();
+    // i18n (core/025-i18n.js): load the UI-language preference (IDB 'uiLanguage') + catalog so the
+    // SW-built system prompt can resolve {{RESPONSE_LANGUAGE}} and SW-side t() matches the panel.
+    var loadLang = (typeof i18nInit === 'function') ? i18nInit() : Promise.resolve();
     // Sub-agent registry hydration. The SW is the AUTHORITATIVE sub-agent
     // context (every sub loop runs here), but only the page boot
     // (120-init.js) ever called SubAgents.loadAll — so after an MV3 SW
@@ -123,6 +126,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         self._swPermsLoadP,
         safe(loadChatGrants, 'chatPermissionGrants'),
         safe(loadCtxWindow, 'assumedContextTokens'),
+        safe(loadLang, 'uiLanguage'),
         safe(loadDocs, 'smartDocuments'),
         safe(loadSubs, 'subAgents'),
         safe(Platform.ready, 'platform')
@@ -163,9 +167,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // cannot race the resume scan below.
         try {
             if (typeof sweepFinishedAgentCheckpoints === 'function') {
-                sweepFinishedAgentCheckpoints().then(function(n) {
-                    if (n > 0) console.log('[sw-runtime] swept ' + n + ' finished/stale agent_runs checkpoint(s)');
-                }).catch(function(e) {
+                sweepFinishedAgentCheckpoints().then(function(n) {}).catch(function(e) {
                     console.warn('[sw-runtime] agent_runs sweep failed', e);
                 });
             }
@@ -180,9 +182,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // Fire-and-forget, non-fatal.
         try {
             if (typeof sweepOrphanChatPayloads === 'function') {
-                sweepOrphanChatPayloads().then(function(n) {
-                    if (n > 0) console.log('[sw-runtime] swept ' + n + ' orphaned chat payload blob(s)');
-                }).catch(function(e) {
+                sweepOrphanChatPayloads().then(function(n) {}).catch(function(e) {
                     console.warn('[sw-runtime] chat_payloads sweep failed', e);
                 });
             }
@@ -198,9 +198,7 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // Fire-and-forget, non-fatal; capped at 200/boot inside.
         try {
             if (typeof gcEmptyChatRows === 'function') {
-                gcEmptyChatRows().then(function(n) {
-                    if (n > 0) console.log('[sw-runtime] empty-row GC reaped ' + n + ' empty chat row(s)');
-                }).catch(function(e) {
+                gcEmptyChatRows().then(function(n) {}).catch(function(e) {
                     console.warn('[sw-runtime] empty-row GC failed', e);
                 });
             }
@@ -236,7 +234,6 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
             if (typeof self._settleResumeScan === 'function') self._settleResumeScan();
             return;
         }
-        console.log('[sw-runtime] resuming ' + checkpoints.length + ' interrupted run(s)');
         // 130-port-bridge.js exposes resumeRunningCheckpoints on self;
         // call it so the bookkeeping (parked-tool restore) is identical
         // to the alarm-driven resume path.

@@ -127,6 +127,8 @@ Platform.refreshInstances = async function() {
             token: inst.token || '',
             userName: inst.userName || '',
             roles: inst.roles || [],
+            // maint login (not a sys_user; synthetic roles ['maint','admin']) — see background.js snDetectMaint
+            isMaint: !!inst.isMaint || (inst.roles || []).indexOf('maint') !== -1,
             tabs: inst.tabs || [],
             isActive: inst.url === Platform.instanceUrl
         };

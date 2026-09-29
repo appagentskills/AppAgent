@@ -304,7 +304,7 @@ async function deployButton(status) {
     return { btn: dom.btn, disc: dom.disc, handle: handle };
 }
 async function deployNoHandle(status) {
-    var deploy = await fnFrom('src/js/tools/020-tool-execution.js', 'async function wsDeploy(wk, srcPath, destSubdir) {', 'wsDeploy', {
+    var deploy = await fnFrom('src/js/tools/020-tool-execution.js', 'async function wsDeploy(wk, srcPath, destSubdir, opts) {', 'wsDeploy', {
         getDeployDirHandle: function() { return Promise.resolve(null); },
         getDeployDirStatus: typeof status === 'function' ? status : function() { return Promise.resolve(status); }
     });

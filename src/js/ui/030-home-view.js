@@ -157,11 +157,11 @@ function initHomeTrailAnimation() {
             var p2 = points[Math.min(points.length - 1, i + 1)];
             var p3 = points[Math.min(points.length - 1, i + 2)];
             
-            for (var t = 0; t < 1; t += 0.02) {
-                var t2 = t * t;
-                var t3 = t2 * t;
-                var x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
-                var y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+            for (var tt = 0; tt < 1; tt += 0.02) {
+                var t2 = tt * tt;
+                var t3 = t2 * tt;
+                var x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * tt + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+                var y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * tt + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
                 pathPoints.push({ x: x, y: y });
             }
         }
@@ -171,8 +171,8 @@ function initHomeTrailAnimation() {
     function getGroundAt(x) {
         for (var i = 0; i < pathPoints.length - 1; i++) {
             if (pathPoints[i].x <= x && pathPoints[i + 1].x >= x) {
-                var t = (x - pathPoints[i].x) / (pathPoints[i + 1].x - pathPoints[i].x);
-                var y = pathPoints[i].y + (pathPoints[i + 1].y - pathPoints[i].y) * t;
+                var frac = (x - pathPoints[i].x) / (pathPoints[i + 1].x - pathPoints[i].x);
+                var y = pathPoints[i].y + (pathPoints[i + 1].y - pathPoints[i].y) * frac;
                 var angle = Math.atan2(pathPoints[i + 1].y - pathPoints[i].y, pathPoints[i + 1].x - pathPoints[i].x);
                 return { y: y, angle: angle };
             }
@@ -486,41 +486,43 @@ function stopHomeTrailAnimation() {
 // Legacy: free-text example prompts. Shown as a fallback row when no
 // `home`-placement actions are active. Skills with one-click actions render
 // in the home actions row below; this list is just inspiration for new users.
+// Texts are N_() extraction markers: renderHome() translates them with t() at
+// display time (chip label, title and the text the chip fills in).
 var EXAMPLE_SUGGESTIONS = [
     // Auditing & Analysis
-    { text: "Do a full audit on this instance", icon: "search" },
-    { text: "Do a full audit of our incident management process", icon: "search" },
-    { text: "Check the logs for issues or repetitive errors", icon: "file" },
-    { text: "Review all P1 incidents and add context to them in work notes", icon: "edit" },
-    { text: "What can be improved in this application?", icon: "info" },
-    { text: "Are we using all the features of this app?", icon: "search" },
+    { text: N_("Do a full audit on this instance"), icon: "search" },
+    { text: N_("Do a full audit of our incident management process"), icon: "search" },
+    { text: N_("Check the logs for issues or repetitive errors"), icon: "file" },
+    { text: N_("Review all P1 incidents and add context to them in work notes"), icon: "edit" },
+    { text: N_("What can be improved in this application?"), icon: "info" },
+    { text: N_("Are we using all the features of this app?"), icon: "search" },
 
     // Testing & Validation
-    { text: "Test this page and report any issues you find", icon: "browser" },
-    { text: "Check the approval business flow end-to-end", icon: "tool" },
-    { text: "Run a smoke test on the service catalog", icon: "play" },
-    { text: "Once you finish testing, send me the report by email", icon: "send" },
+    { text: N_("Test this page and report any issues you find"), icon: "browser" },
+    { text: N_("Check the approval business flow end-to-end"), icon: "tool" },
+    { text: N_("Run a smoke test on the service catalog"), icon: "play" },
+    { text: N_("Once you finish testing, send me the report by email"), icon: "send" },
 
     // Bug Fixing & Upgrades
-    { text: "There's a bug in this form, can you fix it?", icon: "code" },
-    { text: "Check the upgrade history and fix customization issues", icon: "tool" },
-    { text: "Find and fix any broken scripts after the upgrade", icon: "code" },
+    { text: N_("There's a bug in this form, can you fix it?"), icon: "code" },
+    { text: N_("Check the upgrade history and fix customization issues"), icon: "tool" },
+    { text: N_("Find and fix any broken scripts after the upgrade"), icon: "code" },
 
     // Building & Development
-    { text: "Build me a simple app to track team tasks", icon: "display" },
-    { text: "Create a dashboard widget for my open tickets", icon: "stats" },
-    { text: "Write a business rule to auto-assign incidents", icon: "code" },
+    { text: N_("Build me a simple app to track team tasks"), icon: "display" },
+    { text: N_("Create a dashboard widget for my open tickets"), icon: "stats" },
+    { text: N_("Write a business rule to auto-assign incidents"), icon: "code" },
 
     // Data & Import
-    { text: "Import this Excel file into the user table", icon: "upload" },
-    { text: "Export all incidents from last month to CSV", icon: "download" },
-    { text: "Clean up duplicate records in the contacts table", icon: "database" },
-    { text: "Add tags to this table for better organization", icon: "edit" },
+    { text: N_("Import this Excel file into the user table"), icon: "upload" },
+    { text: N_("Export all incidents from last month to CSV"), icon: "download" },
+    { text: N_("Clean up duplicate records in the contacts table"), icon: "database" },
+    { text: N_("Add tags to this table for better organization"), icon: "edit" },
 
     // Notifications & Automation
-    { text: "Send me an email when the app install finishes", icon: "send" },
-    { text: "Notify the team when a P1 incident is created", icon: "send" },
-    { text: "Set up a daily report of unresolved tickets", icon: "timer" }
+    { text: N_("Send me an email when the app install finishes"), icon: "send" },
+    { text: N_("Notify the team when a P1 incident is created"), icon: "send" },
+    { text: N_("Set up a daily report of unresolved tickets"), icon: "timer" }
 ];
 
 // Memoized chip order: shuffled once per session (page load) so the example
@@ -563,15 +565,15 @@ function renderHome() {
         '<div class="home-search-section">' +
             '<div class="pending-images-container" id="home-pending-images-container" style="display:none;"></div>' +
             '<div class="home-search-container">' +
-                '<textarea id="home-message-input" rows="1" placeholder="Send a message..." onkeydown="handleHomeKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="Message input"></textarea>' +
-                '<button id="home-attach-btn" onclick="document.getElementById(\'home-image-file-input\').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file">' + UI_ICONS.attach + '</button>' +
+                '<textarea id="home-message-input" rows="1" placeholder="' + escapeHtml(t('Send a message...')) + '" onkeydown="handleHomeKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="' + escapeHtml(t('Message input')) + '"></textarea>' +
+                '<button id="home-attach-btn" onclick="document.getElementById(\'home-image-file-input\').click()" title="' + escapeHtml(t('Attach file (image, PDF, CSV, text)')) + '" aria-label="' + escapeHtml(t('Attach file')) + '">' + UI_ICONS.attach + '</button>' +
                 '<input type="file" id="home-image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />' +
-                '<button id="home-send-btn" onclick="sendHomeMessage()" aria-label="Send message">' + UI_ICONS.send + '</button>' +
+                '<button id="home-send-btn" onclick="sendHomeMessage()" aria-label="' + escapeHtml(t('Send message')) + '">' + UI_ICONS.send + '</button>' +
             '</div>' +
             (recentPrompts.length > 0 ? '<div class="home-recent-prompts" id="home-recent-prompts">' +
-                '<span class="home-section-label">Recent</span>' +
+                '<span class="home-section-label">' + escapeHtml(t('Recent')) + '</span>' +
                 recentPrompts.map(function(p) {
-                    return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeJsString(p.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeJsString(p.text) + '\')" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
+                    return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeJsString(p.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();fillHomeInput(\'' + escapeJsString(p.text) + '\')}" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
                 }).join('') +
             '</div>' : '') +
             // Free-text example chips fallback (only when no `home` actions exist).
@@ -579,7 +581,10 @@ function renderHome() {
                 ? '<div class="home-example-chips">' +
                     shuffledExamples.map(function(ex) {
                         var iconHtml = UI_ICONS[ex.icon] ? '<span class="home-example-chip-icon">' + UI_ICONS[ex.icon] + '</span>' : '';
-                        return '<div class="home-example-chip" onclick="fillHomeInput(\'' + escapeJsString(ex.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \')fillHomeInput(\'' + escapeJsString(ex.text) + '\')" title="' + escapeHtml(ex.text) + '" role="button" tabindex="0">' + iconHtml + '<span>' + escapeHtml(ex.text) + '</span></div>';
+                        // Display-time translation of the N_() marker: the chip fills the
+                        // composer with the same text the user sees on it.
+                        var label = t(ex.text);
+                        return '<div class="home-example-chip" onclick="fillHomeInput(\'' + escapeJsString(label) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();fillHomeInput(\'' + escapeJsString(label) + '\')}" title="' + escapeHtml(label) + '" role="button" tabindex="0">' + iconHtml + '<span>' + escapeHtml(label) + '</span></div>';
                     }).join('') +
                   '</div>'
                 : '') +
@@ -594,8 +599,8 @@ function renderHome() {
         // with an expand/collapse toggle (toggleHomeDashboardExpanded).
         '<div class="home-dashboard-section" id="home-dashboard-section" style="display:none;">' +
             '<div class="home-dashboard-bar">' +
-                '<span class="home-section-label">Pinned widgets</span>' +
-                '<button class="home-dashboard-expand-btn" id="home-dashboard-expand-btn" onclick="toggleHomeDashboardExpanded()" title="Expand" aria-label="Expand pinned widgets"></button>' +
+                '<span class="home-section-label">' + escapeHtml(t('Pinned widgets')) + '</span>' +
+                '<button class="home-dashboard-expand-btn" id="home-dashboard-expand-btn" onclick="toggleHomeDashboardExpanded()" title="' + escapeHtml(t('Expand')) + '" aria-label="' + escapeHtml(t('Expand pinned widgets')) + '"></button>' +
             '</div>' +
             '<div class="dashboard-grid home-dashboard-grid" id="home-dashboard-grid" ondragover="handleWidgetDragOver(event)" ondrop="handleWidgetDrop(event)"></div>' +
         '</div>' +
@@ -634,17 +639,19 @@ function renderHome() {
     // provider's cached usage in the Credits stat card.
     var cachedCredits = getBootCachedCredits();
     var systemPromptTokens = getSystemPromptTokenCount();
-    var systemPromptTokensFormatted = systemPromptTokens >= 1000 ? (systemPromptTokens / 1000).toFixed(1) + 'k' : systemPromptTokens.toString();
+    var systemPromptTokensFormatted = systemPromptTokens >= 1000
+        ? t('{value}k', { value: i18nFormatNumber(systemPromptTokens / 1000, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) })
+        : i18nFormatNumber(systemPromptTokens);
     
     // Render stats (credits and storage will be updated async)
     statsContainer.innerHTML = 
-        '<div class="home-stat-card"><div class="home-stat-value">' + chatCount + '</div><div class="home-stat-label">Chats</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value">' + widgetCount + '</div><div class="home-stat-label">Widgets</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value">' + skillCount + '</div><div class="home-stat-label">Skills</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value">' + toolCount + '</div><div class="home-stat-label">Tools</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value">' + systemPromptTokensFormatted + '</div><div class="home-stat-label">System Prompt</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value" id="home-credits-value">' + (cachedCredits ? escapeHtml(cachedCredits) : '—') + '</div><div class="home-stat-label">Credits</div></div>' +
-        '<div class="home-stat-card"><div class="home-stat-value" id="home-storage-value">—</div><div class="home-stat-label">Storage</div></div>';
+        '<div class="home-stat-card"><div class="home-stat-value">' + i18nFormatNumber(chatCount) + '</div><div class="home-stat-label">' + escapeHtml(t('Chats')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value">' + i18nFormatNumber(widgetCount) + '</div><div class="home-stat-label">' + escapeHtml(t('Widgets')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value">' + i18nFormatNumber(skillCount) + '</div><div class="home-stat-label">' + escapeHtml(t('Skills')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value">' + i18nFormatNumber(toolCount) + '</div><div class="home-stat-label">' + escapeHtml(t('Tools')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value">' + escapeHtml(systemPromptTokensFormatted) + '</div><div class="home-stat-label">' + escapeHtml(t('System Prompt')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value" id="home-credits-value">' + (cachedCredits ? escapeHtml(cachedCredits) : '—') + '</div><div class="home-stat-label">' + escapeHtml(t('Credits')) + '</div></div>' +
+        '<div class="home-stat-card"><div class="home-stat-value" id="home-storage-value">—</div><div class="home-stat-label">' + escapeHtml(t('Storage')) + '</div></div>';
     
     // Fetch and update credits
     updateHomeCredits();
@@ -653,25 +660,25 @@ function renderHome() {
     
     // Render feature cards (compact)
     cardsContainer.innerHTML =
-        '<div class="home-card" onclick="toggleSkillsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleSkillsView()" role="button" tabindex="0" aria-label="Open AI Skills">' +
+        '<div class="home-card" onclick="toggleSkillsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleSkillsView()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open AI Skills')) + '">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.skill + '</div>' +
-            '<div class="home-card-title">AI Skills</div>' +
+            '<div class="home-card-title">' + escapeHtml(t('AI Skills')) + '</div>' +
         '</div>' +
-        '<div class="home-card" onclick="toggleDashboardView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleDashboardView()" role="button" tabindex="0" aria-label="Open Dashboard">' +
+        '<div class="home-card" onclick="toggleDashboardView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleDashboardView()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open Dashboard')) + '">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.widget + '</div>' +
-            '<div class="home-card-title">Dashboard</div>' +
+            '<div class="home-card-title">' + escapeHtml(t('Dashboard')) + '</div>' +
         '</div>' +
-        '<div class="home-card" onclick="openBrowser()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')openBrowser()" role="button" tabindex="0" aria-label="Open Browse with AI">' +
+        '<div class="home-card" onclick="openBrowser()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openBrowser()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open Browse with AI')) + '">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.api + '</div>' +
-            '<div class="home-card-title">Browse with AI</div>' +
+            '<div class="home-card-title">' + escapeHtml(t('Browse with AI')) + '</div>' +
         '</div>' +
-        '<div class="home-card" onclick="toggleDocsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleDocsView()" role="button" tabindex="0" aria-label="Open Documentation">' +
+        '<div class="home-card" onclick="toggleDocsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleDocsView()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open Documentation')) + '">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.book + '</div>' +
-            '<div class="home-card-title">Documentation</div>' +
+            '<div class="home-card-title">' + escapeHtml(t('Documentation')) + '</div>' +
         '</div>' +
-        '<div class="home-card" onclick="toggleSettingsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \')toggleSettingsView()" role="button" tabindex="0" aria-label="Open Settings">' +
+        '<div class="home-card" onclick="toggleSettingsView()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleSettingsView()}" role="button" tabindex="0" aria-label="' + escapeHtml(t('Open Settings')) + '">' +
             '<div class="home-card-icon" aria-hidden="true">' + UI_ICONS.settings + '</div>' +
-            '<div class="home-card-title">Settings</div>' +
+            '<div class="home-card-title">' + escapeHtml(t('Settings')) + '</div>' +
         '</div>';
 }
 
@@ -696,16 +703,16 @@ async function updateHomeStorage() {
             var estimate = await navigator.storage.estimate();
             var usedMB = (estimate.usage || 0) / (1024 * 1024);
             if (usedMB < 1) {
-                el.textContent = (usedMB * 1024).toFixed(0) + 'KB';
+                el.textContent = t('{size}KB', { size: i18nFormatNumber(usedMB * 1024, { maximumFractionDigits: 0 }) });
             } else {
-                el.textContent = Math.round(usedMB) + 'MB';
+                el.textContent = t('{size}MB', { size: i18nFormatNumber(usedMB, { maximumFractionDigits: 0 }) });
             }
         } else {
-            el.textContent = 'N/A';
+            el.textContent = t('N/A');
         }
     } catch (e) {
         console.error('Failed to estimate storage:', e);
-        el.textContent = 'N/A';
+        el.textContent = t('N/A');
     }
 }
 

@@ -40,10 +40,10 @@ var VALID_PROGRESS_TASK_STATUSES = ['pending', 'running', 'done', 'error'];
 function normalizeProgressTasks(tasks) {
     if (!Array.isArray(tasks)) return null;
     return tasks.slice(0, 20)
-        .filter(function(t) { return t && typeof t === 'object' && !Array.isArray(t); })
-        .map(function(t) {
-            var status = VALID_PROGRESS_TASK_STATUSES.indexOf(t.status) >= 0 ? t.status : 'pending';
-            return { label: String(t.label == null ? '' : t.label).substring(0, 80), status: status };
+        .filter(function(task) { return task && typeof task === 'object' && !Array.isArray(task); })
+        .map(function(task) {
+            var status = VALID_PROGRESS_TASK_STATUSES.indexOf(task.status) >= 0 ? task.status : 'pending';
+            return { label: String(task.label == null ? '' : task.label).substring(0, 80), status: status };
         });
 }
 // H19a: did a role:'tool' result row report failure? Results are stored as
@@ -76,32 +76,32 @@ function progressToolResultFailed(content) {
 // that live in earlier tiers).
 function progressStateMeta(state) {
     switch (state) {
-        case 'running': return { icon: UI_ICONS.spinner, label: 'Running', cls: 'state-running' };
+        case 'running': return { icon: UI_ICONS.spinner, label: t('Running'), cls: 'state-running' };
         // Non-terminal sibling of running: the agent ended its turn and is idle
         // until dispatched sub-agents report back. Still "in progress".
-        case 'waiting': return { icon: UI_ICONS.hourglass || UI_ICONS.clock, label: 'Waiting for sub-agents', cls: 'state-waiting' };
-        case 'stuck': return { icon: UI_ICONS.alert, label: 'Needs attention', cls: 'state-stuck' };
+        case 'waiting': return { icon: UI_ICONS.hourglass || UI_ICONS.clock, label: t('Waiting for sub-agents'), cls: 'state-waiting' };
+        case 'stuck': return { icon: UI_ICONS.alert, label: t('Needs attention'), cls: 'state-stuck' };
         // User-paused chat (Pause button) — halted mid-run until the user resumes.
-        case 'paused': return { icon: UI_ICONS.pause, label: 'Paused', cls: 'state-paused' };
-        case 'done': return { icon: UI_ICONS.check, label: 'Done', cls: 'state-done' };
-        case 'error': return { icon: UI_ICONS.close, label: 'Failed', cls: 'state-error' };
-        case 'finished': return { icon: UI_ICONS.check, label: 'Finished', cls: 'state-finished' };
-        case 'pr_opened': return { icon: UI_ICONS.rocket, label: 'PR opened', cls: 'state-pr_opened' };
-        case 'pr_merged': return { icon: UI_ICONS.gitMerge || UI_ICONS.git, label: 'PR merged', cls: 'state-pr_merged' };
-        case 'finished_with_caveat': return { icon: UI_ICONS.alert, label: 'Finished with caveat', cls: 'state-finished_with_caveat' };
+        case 'paused': return { icon: UI_ICONS.pause, label: t('Paused'), cls: 'state-paused' };
+        case 'done': return { icon: UI_ICONS.check, label: t('Done'), cls: 'state-done' };
+        case 'error': return { icon: UI_ICONS.close, label: t('Failed'), cls: 'state-error' };
+        case 'finished': return { icon: UI_ICONS.check, label: t('Finished'), cls: 'state-finished' };
+        case 'pr_opened': return { icon: UI_ICONS.rocket, label: t('PR opened'), cls: 'state-pr_opened' };
+        case 'pr_merged': return { icon: UI_ICONS.gitMerge || UI_ICONS.git, label: t('PR merged'), cls: 'state-pr_merged' };
+        case 'finished_with_caveat': return { icon: UI_ICONS.alert, label: t('Finished with caveat'), cls: 'state-finished_with_caveat' };
         // User-stopped run (stopAction sets state='stopped', icon='stop', label
         // 'Stopped'). Without this arm the default returned an ANIMATED SPINNER
         // plus the raw lowercase state for a run that is over — and disagreed
         // with getStateBadgeIcon('stopped') below, which returns UI_ICONS.stop.
-        case 'stopped': return { icon: UI_ICONS.stop, label: 'Stopped', cls: 'state-stopped' };
+        case 'stopped': return { icon: UI_ICONS.stop, label: t('Stopped'), cls: 'state-stopped' };
         // Not started / dismissed back to idle. getStateBadgeIcon returns ''
         // (deliberately no badge) for idle — mirror that instead of a spinner.
-        case 'idle': return { icon: '', label: 'Idle', cls: 'state-idle' };
+        case 'idle': return { icon: '', label: t('Idle'), cls: 'state-idle' };
         // Live waiting states — the chat is blocked on the USER (pending
         // prompt_user form / tool call parked on the approval modal).
-        case 'needs_input': return { icon: UI_ICONS.question || UI_ICONS.bell, label: 'Waiting for input', cls: 'state-needs_input' };
-        case 'needs_permission': return { icon: UI_ICONS.lock || UI_ICONS.shield, label: 'Awaiting approval', cls: 'state-needs_permission' };
-        default: return { icon: UI_ICONS.spinner, label: state || 'Running', cls: 'state-' + (state || 'running') };
+        case 'needs_input': return { icon: UI_ICONS.question || UI_ICONS.bell, label: t('Waiting for input'), cls: 'state-needs_input' };
+        case 'needs_permission': return { icon: UI_ICONS.lock || UI_ICONS.shield, label: t('Awaiting approval'), cls: 'state-needs_permission' };
+        default: return { icon: UI_ICONS.spinner, label: state || t('Running'), cls: 'state-' + (state || 'running') };
     }
 }
 // Icons the agent is allowed to set via update_action_state (matches the tool def enum).
@@ -678,7 +678,7 @@ async function startAction(skillId, actionName, extraContext) {
         sourceChatId: sourceChatId || null,
         state: 'running',
         icon: 'spinner',
-        label: 'Starting…',
+        label: N_('Starting…'),
         tasks: [],
         startedAt: Date.now(),
         updatedAt: Date.now()
@@ -807,7 +807,7 @@ async function stopAction(actionId) {
     if (typeof pushInterruptToOffscreen === 'function') pushInterruptToOffscreen(a.chatId, false);
     a.state = 'stopped';
     a.icon = 'stop';
-    a.label = 'Stopped';
+    a.label = N_('Stopped');
     a._isPaused = false;
     a.updatedAt = Date.now();
     // CHAT-CONTROLS SSOT: re-derive before the persist await, so no Resume lingers.
@@ -914,7 +914,7 @@ async function finishActionIfDone(chatId) {
         if (_chatNeverStarted(chat)) { return _watchdogCheckNeverStarted(chat.actionId); }
         a.state = 'done';
         a.icon = 'check';
-        if (!a.label || a.label === 'Starting…') a.label = 'Complete';
+        if (!a.label || a.label === 'Starting…') a.label = N_('Complete');
         a.updatedAt = Date.now();
         await persistActionState(chat.actionId);
         notifyActionStateChanged(chat.actionId);
@@ -949,7 +949,7 @@ async function _watchdogCheckNeverStarted(actionId, err) {
     a.reloadInterrupted = false;
     if (err) {
         // runAgent itself rejected — the runtime really never picked the chat up.
-        a.label = 'Action never started';
+        a.label = N_('Action never started');
         a.output = 'The agent runtime never picked up this action: ' + String((err && err.message) || err).slice(0, 2000);
     } else {
         // R4 SF2: no error in hand. The chat has 1 user / 0 assistant rows, but the
@@ -957,7 +957,7 @@ async function _watchdogCheckNeverStarted(actionId, err) {
         // retry (030-agent-loop.js) — so this is NOT necessarily "SW unavailable".
         // Word it neutrally and surface the run's API error when the page stamped one.
         var _apiErr = chat._lastApiError && (chat._lastApiError.message || chat._lastApiError);
-        a.label = 'Action did not produce a response';
+        a.label = N_('Action did not produce a response');
         a.output = 'The action chat has no assistant reply (the run ended before the first model response \u2014 API error, stop, or runtime restart).' +
             (_apiErr ? ' Last API error: ' + String(_apiErr).slice(0, 2000) : '') +
             ' Open the chat for details or click the action again to retry.';
@@ -1079,7 +1079,7 @@ function renderActionButton(skillId, skillName, action, extraClass) {
     var badgeIcon = getStateBadgeIcon(d.state, paused ? 'is-paused' : '');
     var badgeHtml = badgeIcon ?
         '<span class="action-btn-badge" aria-hidden="true">' + badgeIcon + '</span>' : '';
-    var label = d.state === 'idle' ? action.name : (d.label || action.name);
+    var label = d.state === 'idle' ? action.name : (d.label ? t(d.label) : action.name);
     // Native title → always shows the action name on hover, even when the
     // button collapses to icon-only mode in the responsive header. The richer
     // tooltip popover (label + tasks) still wins for non-idle states because
@@ -1241,7 +1241,7 @@ window.addEventListener('resize', _scheduleHomeHeaderResponsive);
 function renderInlineActionButton(msg, index) {
     var skill = skills[msg.skillId];
     if (!skill) {
-        return '<div class="message inline-action-button-err" id="msg-' + index + '">Unknown skill: ' + escapeHtml(msg.skillId || '') + '</div>';
+        return '<div class="message inline-action-button-err" id="msg-' + index + '">' + t('Unknown skill: {id}', { id: escapeHtml(msg.skillId || '') }) + '</div>';
     }
     var action = (skill.actions || []).filter(function(a){ return a.name === msg.actionName; })[0];
     if (!action) {
@@ -1250,7 +1250,7 @@ function renderInlineActionButton(msg, index) {
         // {name, icon:'play', show:[]} which looked clickable but did nothing
         // because startAction filters by name and silently returns.
         return '<div class="message inline-action-button-err" id="msg-' + index + '">' +
-            'Unknown action "' + escapeHtml(msg.actionName || '') + '" on skill "' + escapeHtml(skill.name || msg.skillId) + '"' +
+            t('Unknown action "{action}" on skill "{skill}"', { action: escapeHtml(msg.actionName || ''), skill: escapeHtml(skill.name || msg.skillId) }) +
         '</div>';
     }
     var buttonHtml = renderActionButton(msg.skillId, skill.name || msg.skillId, action, 'placement-inline');
@@ -1303,21 +1303,24 @@ function renderActionUpdatesSection(chat) {
     var _stMeta = progressStateMeta(lastState);
     // New terminal display states use the friendly meta label ("PR OPENED");
     // legacy states keep the raw uppercased state for visual continuity.
-    var stateLabel = (['waiting', 'finished', 'pr_opened', 'pr_merged', 'finished_with_caveat'].indexOf(lastState) >= 0 ? _stMeta.label : lastState).toUpperCase();
+    // Legacy states show the raw state word; N_ keeps the English word and t() translates it for display only.
+    var _legacyStateWords = { running: N_('running'), stuck: N_('stuck'), done: N_('done'), error: N_('error') };
+    var _legacyStateWord = Object.prototype.hasOwnProperty.call(_legacyStateWords, lastState) ? t(_legacyStateWords[lastState]) : lastState;
+    var stateLabel = (['waiting', 'finished', 'pr_opened', 'pr_merged', 'finished_with_caveat'].indexOf(lastState) >= 0 ? _stMeta.label : _legacyStateWord).toUpperCase();
     var stateIcon = _stMeta.icon;
 
     var tasksHtml = '';
     if (Array.isArray(current.tasks) && current.tasks.length) {
         tasksHtml = '<ul class="action-update-tasks">' +
-            current.tasks.map(function(t) {
-                t = t || {}; // H19b: defensive — collectAllActionUpdates already normalizes
-                var taskIcon = t.status === 'done' ? UI_ICONS.check :
-                               t.status === 'error' ? UI_ICONS.close :
-                               t.status === 'running' ? UI_ICONS.spinner :
+            current.tasks.map(function(task) {
+                task = task || {}; // H19b: defensive — collectAllActionUpdates already normalizes
+                var taskIcon = task.status === 'done' ? UI_ICONS.check :
+                               task.status === 'error' ? UI_ICONS.close :
+                               task.status === 'running' ? UI_ICONS.spinner :
                                UI_ICONS.clock;
-                return '<li class="action-update-task status-' + escapeHtml(t.status || 'pending') + '">' +
+                return '<li class="action-update-task status-' + escapeHtml(task.status || 'pending') + '">' +
                     '<span class="action-update-task-icon">' + taskIcon + '</span>' +
-                    '<span class="action-update-task-label">' + escapeHtml(t.label || '') + '</span>' +
+                    '<span class="action-update-task-label">' + escapeHtml(task.label || '') + '</span>' +
                     '</li>';
             }).join('') +
             '</ul>';
@@ -1352,7 +1355,7 @@ function renderActionUpdatesSection(chat) {
                 ' ontoggle="onActionHistoryToggle(\'' + escapeJsString(histKey) + '\', this.open)">' +
                 '<summary class="action-update-history-summary">' +
                     '<span class="action-update-history-toggle">▸</span>' +
-                    'Previous steps <span class="action-update-history-count">(' + trail.length + ')</span>' +
+                    escapeHtml(t('Previous steps')) + ' <span class="action-update-history-count">(' + trail.length + ')</span>' +
                 '</summary>' +
                 '<ol class="action-update-history-list">' +
                 trail.map(function(u) {
@@ -1373,7 +1376,7 @@ function renderActionUpdatesSection(chat) {
     var html = '<div class="action-updates sidebar-card state-' + escapeHtml(lastState) + '" data-last-state="' + escapeHtml(lastState) + '">';
     html += '<div class="action-updates-header">' +
         '<span class="action-updates-icon">' + UI_ICONS.zap + '</span>' +
-        '<span class="action-updates-title">Progress</span>' +
+        '<span class="action-updates-title">' + escapeHtml(t('Progress')) + '</span>' +
         '<span class="action-updates-state-badge state-' + escapeHtml(lastState) + '">' +
             '<span class="action-updates-state-icon" aria-hidden="true">' + stateIcon + '</span>' +
             escapeHtml(stateLabel) +
@@ -1521,7 +1524,7 @@ function markChatPrMerged(chatId, prInfo) {
             // the card currently reports).
             if (a.state !== 'pr_opened') return;
             a.state = 'pr_merged';
-            a.label = (prInfo.number ? 'PR #' + prInfo.number + ' merged' : 'PR merged').substring(0, 60);
+            a.label = (prInfo.number ? 'PR #' + prInfo.number + ' merged' : N_('PR merged')).substring(0, 60);
             a.updatedAt = Date.now();
             try { persistActionState(id); } catch (e) {}
             try { notifyActionStateChanged(id); } catch (e) {}
@@ -1592,8 +1595,8 @@ function onChatTitleStatePillClick(pillEl, e) {
     // If a popover is already open for THIS pill (chat-progress) or the matching
     // action, treat the second click as a dismiss — same UX as the action btn.
     if (_resultPopover) {
-        var t = _resultPopover.dataset.popoverType;
-        if (t === 'chat-progress' && _resultPopover.dataset.chatId === currentChatId) {
+        var popType = _resultPopover.dataset.popoverType;
+        if (popType === 'chat-progress' && _resultPopover.dataset.chatId === currentChatId) {
             closeResultPopover(); return;
         }
     }
@@ -1650,14 +1653,14 @@ function openChatProgressPopover(anchor, includeToolCallId, chatId) {
     var tasksHtml = '';
     if (Array.isArray(current.tasks) && current.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
-            current.tasks.map(function(t) {
-                if (!t) return ''; // H19b: defensive — tasks are normalized upstream
-                var icn = t.status === 'done' ? UI_ICONS.check :
-                          (t.status === 'error' ? UI_ICONS.close :
-                          (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + escapeHtml(t.status || 'pending') + '">' +
+            current.tasks.map(function(task) {
+                if (!task) return ''; // H19b: defensive — tasks are normalized upstream
+                var icn = task.status === 'done' ? UI_ICONS.check :
+                          (task.status === 'error' ? UI_ICONS.close :
+                          (task.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
+                return '<div class="action-task status-' + escapeHtml(task.status || 'pending') + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
-                    '<span class="action-task-label">' + escapeHtml(t.label || '') + '</span>' +
+                    '<span class="action-task-label">' + escapeHtml(task.label || '') + '</span>' +
                     '</div>';
             }).join('') +
         '</div>';
@@ -1672,7 +1675,7 @@ function openChatProgressPopover(anchor, includeToolCallId, chatId) {
 
     var nameLine = current.label
         ? '<div class="action-result-name">' + escapeHtml(current.label) + '</div>'
-        : '<div class="action-result-name">Progress — ' + escapeHtml(progressStateMeta(s).label) + '</div>';
+        : '<div class="action-result-name">' + t('Progress — {state}', { state: escapeHtml(progressStateMeta(s).label) }) + '</div>';
     var statusLine = current.status_message
         ? '<div class="action-result-label">' + escapeHtml(current.status_message) + '</div>'
         : '';
@@ -1686,7 +1689,7 @@ function openChatProgressPopover(anchor, includeToolCallId, chatId) {
                 nameLine +
                 statusLine +
             '</div>' +
-            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+            '<button class="action-result-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
         '</div>' +
         outputHtml +
         tasksHtml;
@@ -1781,17 +1784,17 @@ function openPendingApprovalForActionInline(btn, actionId) {
             '<span class="action-result-icon">' + UI_ICONS.lock + '</span>' +
             '<div class="action-result-title">' +
                 '<div class="action-result-name">' + escapeHtml(a.skillName) + ' — ' + escapeHtml(a.actionName) + '</div>' +
-                '<div class="action-result-label">Approval needed: ' + escapeHtml(pendingApproval.toolName || 'tool call') + '</div>' +
+                '<div class="action-result-label">' + t('Approval needed: {tool}', { tool: escapeHtml(pendingApproval.toolName ? t(pendingApproval.toolName) : t('tool call')) }) + '</div>' +
             '</div>' +
-            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+            '<button class="action-result-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
         '</div>' +
         (pendingApproval.args && pendingApproval.args.status_message ?
             '<div class="action-result-output">' + escapeHtml(pendingApproval.args.status_message) + '</div>' : '') +
         argSummary +
         '<div class="action-result-footer">' +
-            '<button class="action-result-btn danger" onclick="handleApproval(' + approvalIdx + ',\'deny\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">Deny</button>' +
-            '<button class="action-result-btn secondary" onclick="handleApproval(' + approvalIdx + ',\'session\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">Allow Session</button>' +
-            '<button class="action-result-btn primary" onclick="handleApproval(' + approvalIdx + ',\'allow\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">Allow</button>' +
+            '<button class="action-result-btn danger" onclick="handleApproval(' + approvalIdx + ',\'deny\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">' + escapeHtml(t('Deny')) + '</button>' +
+            '<button class="action-result-btn secondary" onclick="handleApproval(' + approvalIdx + ',\'session\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">' + escapeHtml(t('Allow Session')) + '</button>' +
+            '<button class="action-result-btn primary" onclick="handleApproval(' + approvalIdx + ',\'allow\',false,\'' + escapeJsString(a.chatId) + '\');closeResultPopover()">' + escapeHtml(t('Allow')) + '</button>' +
         '</div>';
     el.dataset.actionId = actionId;
     el.dataset.popoverType = 'approval';
@@ -1826,7 +1829,9 @@ function _positionPopover(el, anchorRect) {
         left = Math.max(6, (window.innerWidth - popRect.width) / 2);
         top = 60;
     }
-    el.style.left = left + 'px';
+    // Rule 10 (i18n): anchor the popover on its inline-start edge (left in LTR, right in RTL).
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') el.style.right = (window.innerWidth - left - popRect.width) + 'px';
+    else el.style.left = left + 'px';
     el.style.top = top + 'px';
 }
 
@@ -1897,12 +1902,12 @@ function openRunningPopover(btn, actionId) {
     var tasksHtml = '';
     if (Array.isArray(a.tasks) && a.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
-            a.tasks.map(function(t) {
-                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
-                var icn = t.status === 'done' ? UI_ICONS.check : (t.status === 'error' ? UI_ICONS.close : (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
+            a.tasks.map(function(task) {
+                if (!task) return ''; // H19b: persisted/broadcast task rows may be null
+                var icn = task.status === 'done' ? UI_ICONS.check : (task.status === 'error' ? UI_ICONS.close : (task.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
+                return '<div class="action-task status-' + escapeHtml(String(task.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
-                    '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
+                    '<span class="action-task-label">' + escapeHtml(task.label) + '</span>' +
                     '</div>';
             }).join('') +
         '</div>';
@@ -1915,18 +1920,18 @@ function openRunningPopover(btn, actionId) {
             '<span class="action-result-icon">' + iconSvg + '</span>' +
             '<div class="action-result-title">' +
                 '<div class="action-result-name">' + escapeHtml(a.skillName) + ' — ' + escapeHtml(a.actionName) + '</div>' +
-                '<div class="action-result-label">' + escapeHtml(a.label || '') + ' • ' + elapsed + 's</div>' +
+                '<div class="action-result-label">' + t('{label} • {secs}s', { label: escapeHtml(a.label ? t(a.label) : ''), secs: elapsed }) + '</div>' +
             '</div>' +
-            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+            '<button class="action-result-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
         '</div>' +
         tasksHtml +
         '<div class="action-result-footer">' +
-            '<button class="action-result-btn subtle" onclick="viewActionChat(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Show the background chat transcript">' + UI_ICONS.chat + ' Show chat</button>' +
+            '<button class="action-result-btn subtle" onclick="viewActionChat(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Show the background chat transcript')) + '">' + UI_ICONS.chat + ' ' + escapeHtml(t('Show chat')) + '</button>' +
             (isPaused
-                ? '<button class="action-result-btn primary" onclick="resumeAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Resume">' + UI_ICONS.play + ' Resume</button>'
-                : '<button class="action-result-btn secondary" onclick="pauseAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Pause">' + UI_ICONS.pause + ' Pause</button>'
+                ? '<button class="action-result-btn primary" onclick="resumeAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Resume')) + '">' + UI_ICONS.play + ' ' + escapeHtml(t('Resume')) + '</button>'
+                : '<button class="action-result-btn secondary" onclick="pauseAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Pause')) + '">' + UI_ICONS.pause + ' ' + escapeHtml(t('Pause')) + '</button>'
             ) +
-            '<button class="action-result-btn danger" onclick="stopAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Stop">' + UI_ICONS.stop + ' Stop</button>' +
+            '<button class="action-result-btn danger" onclick="stopAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Stop')) + '">' + UI_ICONS.stop + ' ' + escapeHtml(t('Stop')) + '</button>' +
         '</div>';
     el.dataset.actionId = actionId;
     el.dataset.popoverType = 'running';
@@ -1952,12 +1957,12 @@ function openResultPopover(btn, actionId) {
     var tasksHtml = '';
     if (Array.isArray(a.tasks) && a.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
-            a.tasks.map(function(t) {
-                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
-                var icn = t.status === 'done' ? UI_ICONS.check : (t.status === 'error' ? UI_ICONS.close : (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
+            a.tasks.map(function(task) {
+                if (!task) return ''; // H19b: persisted/broadcast task rows may be null
+                var icn = task.status === 'done' ? UI_ICONS.check : (task.status === 'error' ? UI_ICONS.close : (task.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
+                return '<div class="action-task status-' + escapeHtml(String(task.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
-                    '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
+                    '<span class="action-task-label">' + escapeHtml(task.label) + '</span>' +
                     '</div>';
             }).join('') +
         '</div>';
@@ -1976,12 +1981,12 @@ function openResultPopover(btn, actionId) {
     var durationText = '';
     if (a.startedAt && a.updatedAt) {
         var secs = Math.max(1, Math.floor((a.updatedAt - a.startedAt) / 1000));
-        durationText = '<div class="action-result-duration">Took ' + secs + 's</div>';
+        durationText = '<div class="action-result-duration">' + t('Took {secs}s', { secs: secs }) + '</div>';
     }
     // For stuck state, show a Resume button
     var extraBtn = '';
     if (a.state === 'stuck') {
-        extraBtn = '<button class="action-result-btn primary" onclick="resumeAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Resume">' + UI_ICONS.play + ' Resume</button>';
+        extraBtn = '<button class="action-result-btn primary" onclick="resumeAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Resume')) + '">' + UI_ICONS.play + ' ' + escapeHtml(t('Resume')) + '</button>';
     }
     var el = document.createElement('div');
     el.className = 'action-result-popover state-' + a.state;
@@ -1990,16 +1995,16 @@ function openResultPopover(btn, actionId) {
             '<span class="action-result-icon">' + iconSvg + '</span>' +
             '<div class="action-result-title">' +
                 '<div class="action-result-name">' + escapeHtml(a.skillName) + ' — ' + escapeHtml(a.actionName) + '</div>' +
-                '<div class="action-result-label">' + escapeHtml(a.label || '') + '</div>' +
+                '<div class="action-result-label">' + escapeHtml(a.label ? t(a.label) : '') + '</div>' +
             '</div>' +
-            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+            '<button class="action-result-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
         '</div>' +
         outputHtml +
         tasksHtml +
         durationText +
         '<div class="action-result-footer">' +
-            '<button class="action-result-btn subtle" onclick="viewActionChat(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="Show the background chat transcript">' + UI_ICONS.chat + ' Show chat</button>' +
-            '<button class="action-result-btn secondary" onclick="dismissAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()">Dismiss</button>' +
+            '<button class="action-result-btn subtle" onclick="viewActionChat(\'' + escapeJsString(actionId) + '\');closeResultPopover()" title="' + escapeHtml(t('Show the background chat transcript')) + '">' + UI_ICONS.chat + ' ' + escapeHtml(t('Show chat')) + '</button>' +
+            '<button class="action-result-btn secondary" onclick="dismissAction(\'' + escapeJsString(actionId) + '\');closeResultPopover()">' + escapeHtml(t('Dismiss')) + '</button>' +
             extraBtn +
         '</div>';
     el.dataset.actionId = actionId;
@@ -2086,7 +2091,7 @@ function _startRunningPopoverTicker(actionId) {
         var labelEl = _resultPopover.querySelector('.action-result-label');
         if (labelEl) {
             var ela = a.startedAt ? Math.max(0, Math.floor((Date.now() - a.startedAt) / 1000)) : 0;
-            labelEl.textContent = (a.label || '') + ' • ' + ela + 's';
+            labelEl.textContent = t('{label} • {secs}s', { label: a.label ? t(a.label) : '', secs: ela });
         }
     }, 1000);
 }
@@ -2133,23 +2138,23 @@ function showActionTooltip(btn) {
     var html = '';
     if (a && Array.isArray(a.tasks) && a.tasks.length) {
         html += '<div class="action-tooltip-tasks">' +
-            a.tasks.map(function(t) {
-                if (!t) return ''; // H19b: persisted/broadcast task rows may be null
-                var icn = t.status === 'done' ? UI_ICONS.check :
-                          t.status === 'error' ? UI_ICONS.close :
-                          t.status === 'running' ? UI_ICONS.spinner :
+            a.tasks.map(function(task) {
+                if (!task) return ''; // H19b: persisted/broadcast task rows may be null
+                var icn = task.status === 'done' ? UI_ICONS.check :
+                          task.status === 'error' ? UI_ICONS.close :
+                          task.status === 'running' ? UI_ICONS.spinner :
                           UI_ICONS.clock;
-                return '<div class="action-task status-' + escapeHtml(String(t.status)) + '">' +
+                return '<div class="action-task status-' + escapeHtml(String(task.status)) + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
-                    '<span class="action-task-label">' + escapeHtml(t.label) + '</span>' +
+                    '<span class="action-task-label">' + escapeHtml(task.label) + '</span>' +
                     '</div>';
             }).join('') +
         '</div>';
     } else if (a.state === 'running') {
         var elapsed = Math.floor((Date.now() - a.startedAt) / 1000);
-        html += '<div class="action-tooltip-label">' + escapeHtml(a.label || 'Running…') + ' • ' + elapsed + 's</div>';
+        html += '<div class="action-tooltip-label">' + t('{label} • {secs}s', { label: escapeHtml(a.label ? t(a.label) : t('Running…')), secs: elapsed }) + '</div>';
     } else {
-        html += '<div class="action-tooltip-label">' + escapeHtml(a.label || actionName) + '</div>';
+        html += '<div class="action-tooltip-label">' + escapeHtml(a.label ? t(a.label) : actionName) + '</div>';
     }
 
     if (!_actionTooltipEl) {
@@ -2166,7 +2171,10 @@ function showActionTooltip(btn) {
     if (top + ttRect.height > window.innerHeight - 6) {
         top = rect.top - ttRect.height - 6;
     }
-    _actionTooltipEl.style.left = left + 'px';
+    // Rule 10 (i18n): anchor the tooltip on its inline-start edge (left in LTR, right in RTL).
+    // The element is reused across hover ticks, so clear the other side.
+    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') { _actionTooltipEl.style.left = ''; _actionTooltipEl.style.right = (window.innerWidth - left - ttRect.width) + 'px'; }
+    else { _actionTooltipEl.style.right = ''; _actionTooltipEl.style.left = left + 'px'; }
     _actionTooltipEl.style.top = top + 'px';
 }
 
@@ -2186,7 +2194,7 @@ function setActionNeedsInput(actionId, promptId) {
     }
     a.state = 'needs_input';
     a.icon = 'bell';
-    a.label = 'Input needed';
+    a.label = N_('Input needed');
     a.needsInputPromptId = promptId;
     a.updatedAt = Date.now();
     persistActionState(actionId);
@@ -2199,7 +2207,7 @@ function clearActionNeedsInput(actionId) {
     if (a.state === 'needs_input') {
         a.state = 'running';
         a.icon = a._iconBeforeBlock || 'spinner';
-        a.label = a._labelBeforeBlock || 'Running…';
+        a.label = a._labelBeforeBlock || N_('Running…');
         delete a._labelBeforeBlock;
         delete a._iconBeforeBlock;
     }
@@ -2218,7 +2226,7 @@ function setActionNeedsPermission(actionId, approvalRef) {
     }
     a.state = 'needs_permission';
     a.icon = 'lock';
-    a.label = 'Approval needed';
+    a.label = N_('Approval needed');
     a.needsApprovalRef = approvalRef;
     a.updatedAt = Date.now();
     persistActionState(actionId);
@@ -2231,7 +2239,7 @@ function clearActionNeedsPermission(actionId) {
     if (a.state === 'needs_permission') {
         a.state = 'running';
         a.icon = a._iconBeforeBlock || 'spinner';
-        a.label = a._labelBeforeBlock || 'Running…';
+        a.label = a._labelBeforeBlock || N_('Running…');
         delete a._labelBeforeBlock;
         delete a._iconBeforeBlock;
     }
@@ -2374,18 +2382,18 @@ function _isChatInSilentHook(chatId) {
 // keep showing under "Active Chats" (the running list) instead of immediately
 // dropping into Completed Today the instant its run ends.
 function _isChatLingering(chatId) {
-    var t = _recentlyFinishedChats[chatId];
+    var finishedAt = _recentlyFinishedChats[chatId];
     // Fall back to the PERSISTED finish stamp (lastResponseAt) when the in-memory
     // map has no entry. That map is per-page-session, so after a panel reload — or
     // for a finish the page never received a runFinished event for (SW reconnect
     // flap) — it is empty, which is exactly why a just-finished chat sometimes
     // failed to keep showing under Active Chats. lastResponseAt is saved to storage
     // at finish time, so it survives reloads and makes the 5-minute linger reliable.
-    if (!t) {
+    if (!finishedAt) {
         var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
-        if (c && !c.isBackground && !c.isSubAgent && c.lastResponseAt) t = c.lastResponseAt;
+        if (c && !c.isBackground && !c.isSubAgent && c.lastResponseAt) finishedAt = c.lastResponseAt;
     }
-    return !!(t && (Date.now() - t) <= ACTIVE_CHAT_LINGER_MS);
+    return !!(finishedAt && (Date.now() - finishedAt) <= ACTIVE_CHAT_LINGER_MS);
 }
 
 // True when this chat has a FINISHED response the user hasn't opened yet (an
@@ -2556,10 +2564,10 @@ function markChatRecentlyFinished(chatId) {
     }
     _recentlyFinishedChats[chatId] = Date.now();
     setTimeout(function() {
-        var t = _recentlyFinishedChats[chatId];
-        if (!t) return;
+        var finishedAt = _recentlyFinishedChats[chatId];
+        if (!finishedAt) return;
         // Re-stamped by a newer finish (chat ran again) — let the newer timer win.
-        if (Date.now() - t < ACTIVE_CHAT_LINGER_MS) return;
+        if (Date.now() - finishedAt < ACTIVE_CHAT_LINGER_MS) return;
         delete _recentlyFinishedChats[chatId];
         try { if (typeof renderJobsBadge === 'function') renderJobsBadge(); } catch (e) {}
         try {
@@ -2873,11 +2881,16 @@ function renderJobsBadge() {
     // chats that finished while the user was viewing another chat/view and
     // hasn't opened since. Rendered inside this same pill, after the count.
     var unseen = (typeof getUnseenFinishedChatsInfo === 'function') ? getUnseenFinishedChatsInfo() : { count: 0, hasError: false };
-    var titleSuffix = '';
-    if (agg === 'attention')    titleSuffix = ' — needs attention';
-    else if (agg === 'error')   titleSuffix = ' — has errors';
-    else if (agg === 'running') titleSuffix = ' — running';
-    else if (agg === 'done')    titleSuffix = ' — done';
+    var titleState = '';
+    if (agg === 'attention')    titleState = t('needs attention');
+    else if (agg === 'error')   titleState = t('has errors');
+    else if (agg === 'running') titleState = t('running');
+    else if (agg === 'done')    titleState = t('done');
+    // Title segments are whole phrases; the " — " joins are templates so a locale can change them.
+    var jobsTitle = running ? tn(running, '{count} active job', '{count} active jobs') : '';
+    if (jobsTitle && titleState) jobsTitle = t('{jobs} — {state}', { jobs: jobsTitle, state: titleState });
+    var reviewTitle = unseen.count ? tn(unseen.count, '{count} finished chat to review', '{count} finished chats to review') : '';
+    var badgeTitle = (jobsTitle && reviewTitle) ? t('{jobs} — {review}', { jobs: jobsTitle, review: reviewTitle }) : (jobsTitle || reviewTitle);
     // Detect the running→done transition so we can fire a one-shot finish pulse.
     var justFinished = (_prevAggregateState === 'running' && (agg === 'done' || agg === 'idle'));
     _prevAggregateState = agg;
@@ -2898,9 +2911,9 @@ function renderJobsBadge() {
             // the running/active state (see 23-actions.css) so it never greys out.
             badge.setAttribute('data-agg', 'idle');
             badge.classList.remove('pulse', 'finish-pulse');
-            badge.title = 'Active chats';
+            badge.title = t('Active chats');
             badge.innerHTML = '<span class="jobs-badge-icon">' + (UI_ICONS.chat || UI_ICONS.history || UI_ICONS.zap) + '</span>' +
-                '<span class="jobs-badge-label">Active chats</span>';
+                '<span class="jobs-badge-label">' + escapeHtml(t('Active chats')) + '</span>';
             return;
         }
         badge.setAttribute('data-agg', agg);
@@ -2909,11 +2922,10 @@ function renderJobsBadge() {
         // The pill counts only genuinely-running jobs ("Active N"). A finished
         // chat needing review shows the bell; an attention/error state with
         // nothing running shows an alert icon so the coloured pill isn't empty.
-        badge.title = (running ? running + ' active job' + (running === 1 ? '' : 's') + titleSuffix : '') +
-            (unseen.count ? (running ? ' — ' : '') + unseen.count + ' finished chat' + (unseen.count === 1 ? '' : 's') + ' to review' : '');
+        badge.title = badgeTitle;
         badge.innerHTML =
             (running ? '<span class="jobs-badge-icon">' + UI_ICONS.chat + '</span>' +
-                '<span class="jobs-badge-label">Active</span>' +
+                '<span class="jobs-badge-label">' + escapeHtml(t('Active')) + '</span>' +
                 '<span class="jobs-badge-count">' + running + '</span>' +
                 '<span class="jobs-badge-spinner">' + UI_ICONS.spinner + '</span>' : '') +
             (!running && (agg === 'attention' || agg === 'error') ?
@@ -2923,7 +2935,7 @@ function renderJobsBadge() {
             // Nothing is actively running, so the pill is still the "Active chats"
             // launcher: keep the text label. The bell (or alert) rendered above
             // stands in for the icon — the bell replaces the icon, the text stays.
-            (!running ? '<span class="jobs-badge-label">Active chats</span>' : '');
+            (!running ? '<span class="jobs-badge-label">' + escapeHtml(t('Active chats')) + '</span>' : '');
         if (justFinished) {
             // Restart the one-shot animation by toggling the class.
             badge.classList.remove('finish-pulse');
@@ -2972,12 +2984,14 @@ function toggleJobsDropdown(badgeEl) {
     });
     dropdown.style.display = willShow ? 'block' : 'none';
     if (willShow) renderJobsDropdown(dropdown);
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
 function closeJobsDropdown() {
     document.querySelectorAll('.jobs-dropdown').forEach(function(d) {
         d.style.display = 'none';
     });
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
 // Render the rows for `dropdown` (or all dropdowns if omitted).
@@ -2999,7 +3013,7 @@ function renderJobsDropdown(dropdown) {
         (typeof getDoneChatsList === 'function' && getDoneChatsList().length) ||
         (typeof getPinnedChatsList === 'function' && getPinnedChatsList().length);
     if (!list.length && !chatList.length && !_hasTabContent) {
-        dropdown.innerHTML = '<div class="jobs-dropdown-empty">No active jobs</div>';
+        dropdown.innerHTML = '<div class="jobs-dropdown-empty">' + escapeHtml(t('No active jobs')) + '</div>';
         return;
     }
     // Per-row try/catch: one malformed action must not blank the whole list.
@@ -3023,14 +3037,14 @@ function renderJobsDropdown(dropdown) {
             '<span class="jobs-row-icon">' + iconSvg + '</span>' +
             '<div class="jobs-row-main">' +
                 '<div class="jobs-row-title">' + escapeHtml(a.skillName) + ' — ' + escapeHtml(a.actionName) + '</div>' +
-                '<div class="jobs-row-label">' + escapeHtml(a.label || '') + '</div>' +
+                '<div class="jobs-row-label">' + escapeHtml(a.label ? t(a.label) : '') + '</div>' +
             '</div>' +
             (showViewChat ?
-                '<button class="jobs-row-btn" title="Show chat" onclick="event.stopPropagation();viewActionChat(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.chat + '</button>' +
-                '<button class="jobs-row-btn danger" title="Dismiss" onclick="event.stopPropagation();dismissAction(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.close + '</button>'
+                '<button class="jobs-row-btn" title="' + escapeHtml(t('Show chat')) + '" onclick="event.stopPropagation();viewActionChat(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.chat + '</button>' +
+                '<button class="jobs-row-btn danger" title="' + escapeHtml(t('Dismiss')) + '" onclick="event.stopPropagation();dismissAction(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.close + '</button>'
                 :
-                '<button class="jobs-row-btn" title="Show chat" onclick="event.stopPropagation();viewActionChat(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.chat + '</button>' +
-                '<button class="jobs-row-btn danger" title="Stop" onclick="event.stopPropagation();stopAction(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.stop + '</button>'
+                '<button class="jobs-row-btn" title="' + escapeHtml(t('Show chat')) + '" onclick="event.stopPropagation();viewActionChat(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.chat + '</button>' +
+                '<button class="jobs-row-btn danger" title="' + escapeHtml(t('Stop')) + '" onclick="event.stopPropagation();stopAction(\'' + escapeJsString(a.actionId) + '\')">' + UI_ICONS.stop + '</button>'
             ) +
             '<span class="jobs-row-chevron">' + (UI_ICONS.chevronDown || '') + '</span>' +
         '</div>';
@@ -3087,20 +3101,20 @@ function renderJobsDropdown(dropdown) {
         // _jobsRowSignals helper (it reuses _chatHasUnseenActivity, which the
         // narrower _cUnseen already implies, so the old `_cUnseen || ...` OR was
         // redundant). The current chat is never unread (viewing it = read).
-        var _cLabel = _cApproval ? 'Awaiting approval' : (_cState === 'attention' && !_cApproval) ? 'Awaiting input' : (_cPaused ? 'Paused' : (_cRunning ? (_cProgText ? escapeHtml(_cProgText) : 'Running\u2026') : (_cErr ? ('Error: ' + escapeHtml((chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || 'API error')) : (_cUnseen ? 'New response' : 'Finished'))));
+        var _cLabel = _cApproval ? escapeHtml(t('Awaiting approval')) : (_cState === 'attention' && !_cApproval) ? escapeHtml(t('Awaiting input')) : (_cPaused ? escapeHtml(t('Paused')) : (_cRunning ? escapeHtml(_cProgText || t('Running\u2026')) : (_cErr ? escapeHtml(t('Error: {message}', { message: (chats[c.id]._lastApiError && chats[c.id]._lastApiError.message) || t('API error') })) : escapeHtml(_cUnseen ? t('New response') : t('Finished')))));
         var _cSig = _jobsRowSignals(c.id, _cState);
         return '<div class="jobs-dropdown-row state-' + _cState + _cSig.cls + '" ' +
             'data-chat-id="' + escapeHtml(c.id) + '" ' +
             'onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
             '<span class="jobs-row-icon">' + _cIcon + '</span>' +
             '<div class="jobs-row-main">' +
-                '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+                '<div class="jobs-row-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
                 '<div class="jobs-row-label">' + _cLabel + '</div>' +
                 _jobsProgressBadgeHtml(c.id) +
             '</div>' +
             _jobsPinBtnHtml(c) +
             (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
-            (_cErr ? '<button class="jobs-row-btn" title="Retry" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
+            (_cErr ? '<button class="jobs-row-btn" title="' + escapeHtml(t('Retry')) + '" onclick="event.stopPropagation();retryChat(\'' + escapeJsString(c.id) + '\')">' + (UI_ICONS.refresh || UI_ICONS.zap) + '</button>' : '') +
             _jobsRowButtons(c, _cUnseen || _cErr) +
             _cSig.trail +
             '<span class="jobs-row-chevron">' + (UI_ICONS.chevronDown || '') + '</span>' +
@@ -3122,7 +3136,7 @@ function renderJobsDropdown(dropdown) {
     html += _renderJobsChatTabs(rowsHtml + chatRowsHtml, runningChats.length + list.length, _selJobsTab);
     // The badge is always-on, so it can be opened with nothing to show (no
     // actions, no chats yet) — render a friendly empty state, not a blank box.
-    if (!html) html = '<div class="jobs-dropdown-empty">No active or recent chats</div>';
+    if (!html) html = '<div class="jobs-dropdown-empty">' + escapeHtml(t('No active or recent chats')) + '</div>';
     // Preserve any open inline progress accordions across this full re-render, so a
     // running action/chat the user expanded doesn't snap shut on every state tick
     // (and the restored body reflects the latest progress).
@@ -3137,6 +3151,13 @@ function renderJobsDropdown(dropdown) {
     // scroll panel needs its own flex parent with a bounded (100%) height.
     dropdown.innerHTML = '<div class="jobs-dd-inner">' + html + '</div>';
     _reopenJobsAccordions(dropdown, _openAccIds);
+}
+// Display title for a jobs/home chat row. The stored 'New Chat' marker (and a
+// missing title) is shown translated; real titles are user/agent text and stay
+// as-is. The marker itself stays English in storage and comparisons.
+function _jobsChatTitleText(c) {
+    var s = (c && c.title) || 'New Chat';
+    return s === 'New Chat' ? t('New Chat') : s;
 }
 // Escape an id for use inside a double-quoted attribute selector. Prefers
 // CSS.escape; the manual fallback escapes backslash + quote so a hostile id
@@ -3342,18 +3363,18 @@ function getPinnedChatsList() {
 function _jobsPinBtnHtml(c) {
     var idJs = escapeJsString(c.id);
     var pinned = !!c.pinned;
-    return '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + (pinned ? 'Unpin chat' : 'Pin chat') + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
+    return '<button class="jobs-row-btn jobs-pin-btn' + (pinned ? ' pinned' : '') + '" title="' + escapeHtml(pinned ? t('Unpin chat') : t('Pin chat')) + '" onclick="event.stopPropagation();toggleJobsPin(\'' + idJs + '\')">' + (pinned ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
 }
 function _jobsRowButtons(c, hasNotif, noDismiss) {
     var idJs = escapeJsString(c.id);
     var pinned = !!c.pinned;
     var h = '';
     if (hasNotif) {
-        h += '<button class="jobs-row-btn" title="Dismiss notification" onclick="event.stopPropagation();dismissChatNotifications(\'' + idJs + '\')">' + (UI_ICONS.check || UI_ICONS.close) + '</button>';
+        h += '<button class="jobs-row-btn" title="' + escapeHtml(t('Dismiss notification')) + '" onclick="event.stopPropagation();dismissChatNotifications(\'' + idJs + '\')">' + (UI_ICONS.check || UI_ICONS.close) + '</button>';
     }
-    h += '<button class="jobs-row-btn jobs-open-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
+    h += '<button class="jobs-row-btn jobs-open-btn" title="' + escapeHtml(t('Open chat')) + '" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
     if (!pinned && !noDismiss) {
-        h += '<button class="jobs-row-btn danger" title="Remove from list" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
+        h += '<button class="jobs-row-btn danger" title="' + escapeHtml(t('Remove from list')) + '" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
     }
     return h;
 }
@@ -3363,7 +3384,7 @@ function _jobsRowButtons(c, hasNotif, noDismiss) {
 function _jobsTodayRowButtons(c) {
     var idJs = escapeJsString(c.id);
     var h = '';
-    h += '<button class="jobs-row-btn jobs-open-btn" title="Open chat" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
+    h += '<button class="jobs-row-btn jobs-open-btn" title="' + escapeHtml(t('Open chat')) + '" onclick="event.stopPropagation();openChatFromJobsDropdown(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>';
     return h;
 }
 // Time string for a Pinned / History / Recent row (relative time or short date).
@@ -3376,7 +3397,7 @@ function _jobsHistTimeStr(c) {
 function _jobsTodayTimeStr(c) {
     var when = _jobsChatDoneTs(c) || _jobsChatTs(c);
     if (!when) return '';
-    try { return 'Today, ' + new Date(when).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+    try { return t('Today, {time}', { time: i18nFormatTime(when, { hour: 'numeric', minute: '2-digit' }) }); }
     catch (e) { return ''; }
 }
 // Width (px) of the widest time string in a SECTION, so every row in that
@@ -3467,7 +3488,7 @@ function _jobsProgressBadgeHtml(chatId) {
     var st = chatBadgeStateFor(chatId);
     if (!st) return '';
     var meta = progressStateMeta(st);
-    var tip = (st === 'needs_input' || st === 'needs_permission') ? meta.label : ('Progress: ' + meta.label);
+    var tip = (st === 'needs_input' || st === 'needs_permission') ? meta.label : t('Progress: {state}', { state: meta.label });
     return '<span class="jobs-row-state-badge ' + meta.cls + '" title="' + escapeHtml(tip) + '">' +
         '<span class="jobs-row-state-badge-icon" aria-hidden="true">' + meta.icon + '</span>' +
         '<span class="jobs-row-state-badge-label">' + escapeHtml(meta.label) + '</span>' +
@@ -3510,7 +3531,7 @@ function _jobsRowSignals(chatId, st) {
 // can never disagree.
 function _jobsStateIndicatorHtml(st, chatId) {
     var _bell = (chatId && typeof getFinishedChatBell === 'function') ? getFinishedChatBell(chatId) : null;
-    if (_bell) return '<span class="jobs-row-bell' + (_bell.hasError ? ' err' : '') + '" title="Finished \u2014 not viewed yet">' + (UI_ICONS.bell_filled || UI_ICONS.bell || '') + '</span>';
+    if (_bell) return '<span class="jobs-row-bell' + (_bell.hasError ? ' err' : '') + '" title="' + escapeHtml(t('Finished \u2014 not viewed yet')) + '">' + (UI_ICONS.bell_filled || UI_ICONS.bell || '') + '</span>';
     if (st === 'running') return '<span class="jobs-row-spinner">' + (UI_ICONS.spinner || '') + '</span>';
     if (st === 'done' || st === 'unseen') return '<span class="jobs-row-check">' + (UI_ICONS.check || '') + '</span>';
     return '<span class="jobs-row-dot state-' + escapeHtml(st) + '"></span>';
@@ -3527,7 +3548,7 @@ function _jobsPinnedRowHtml(c, timeW) {
     return '<div class="jobs-dropdown-row jobs-chat-row jobs-pinned-row' + sig.cls + '" ' +
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
-        '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' + _jobsProgressBadgeHtml(c.id) + '</div>' +
+        '<div class="jobs-row-main"><div class="jobs-row-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' + _jobsProgressBadgeHtml(c.id) + '</div>' +
         _jobsPinBtnHtml(c) +
         (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
         _jobsRowButtons(c, st === 'unseen' || st === 'error') +
@@ -3549,7 +3570,7 @@ function _jobsChatRowHtml(c, mode, timeW) {
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         indicator +
         '<div class="jobs-row-main">' +
-            '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            '<div class="jobs-row-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
             _jobsProgressBadgeHtml(c.id) +
         '</div>' +
         _jobsPinBtnHtml(c) +
@@ -3572,7 +3593,7 @@ function _jobsTodayRowHtml(c, timeW) {
         'data-chat-id="' + escapeHtml(c.id) + '" onclick="toggleJobsRowAccordion(\'' + escapeJsString(c.id) + '\')">' +
         _todayIndicator +
         '<div class="jobs-row-main">' +
-            '<div class="jobs-row-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            '<div class="jobs-row-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
             _jobsProgressBadgeHtml(c.id) +
         '</div>' +
         _jobsPinBtnHtml(c) +
@@ -3593,7 +3614,7 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount, selectedTab) {
     var pinnedChats = getPinnedChatsList();
     if (!activeCount && !doneChats.length && !pinnedChats.length) return '';
     var activePanel = (activeRowsHtml && activeRowsHtml.length) ? activeRowsHtml
-        : '<div class="jobs-tab-empty">No chats running right now</div>';
+        : '<div class="jobs-tab-empty">' + escapeHtml(t('No chats running right now')) + '</div>';
     var pinnedHtml = '';
     // Don't duplicate a pinned chat that is ALSO in the Active list above — it
     // already shows there (with a filled pin button). #743: use THE section
@@ -3604,14 +3625,14 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount, selectedTab) {
     var pinnedToShow = pinnedChats.filter(function(c) { return !_isChatInActiveSection(c.id); });
     if (pinnedToShow.length) {
         var _pinW = _jobsTimeColWidth(pinnedToShow.map(_jobsHistTimeStr));
-        pinnedHtml = '<div class="jobs-subhead menu-section-title jobs-subhead-pinned"><span class="section-icon">' + UI_ICONS.pin + '</span>Pinned</div>' +
+        pinnedHtml = '<div class="jobs-subhead menu-section-title jobs-subhead-pinned"><span class="section-icon">' + UI_ICONS.pin + '</span>' + escapeHtml(t('Pinned')) + '</div>' +
             // Per-row try/catch: one bad chat must not blank the section.
             pinnedToShow.map(function(c) { try { return _jobsPinnedRowHtml(c, _pinW); } catch (e) { console.warn('jobs: pinned row render failed', e); return ''; } }).join('');
     }
     var todayHtml = '';
     if (todayChats.length) {
         var _todayW = _jobsTimeColWidth(todayChats.map(_jobsTodayTimeStr));
-        todayHtml = '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.check + '</span>Completed Today</div>' +
+        todayHtml = '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.check + '</span>' + escapeHtml(t('Completed Today')) + '</div>' +
             // Per-row try/catch: one bad chat must not blank the section.
             todayChats.map(function(c) { try { return _jobsTodayRowHtml(c, _todayW); } catch (e) { console.warn('jobs: today row render failed', e); return ''; } }).join('');
     }
@@ -3622,9 +3643,9 @@ function _renderJobsChatTabs(activeRowsHtml, activeCount, selectedTab) {
     // reads it from the live DOM and passes it through (defaults to Active).
     var selTab = selectedTab === 'done' ? 'done' : 'active';
     h += '<div class="jobs-tabs" role="tablist">' +
-            '<button class="jobs-tab' + (selTab === 'active' ? ' active' : '') + '" data-tab="active" type="button" role="tab" aria-selected="' + (selTab === 'active') + '" onclick="switchJobsTab(\'active\')">Active<span class="jobs-tab-count">' + activeCount + '</span></button>' +
-            '<button class="jobs-tab' + (selTab === 'done' ? ' active' : '') + '" data-tab="done" type="button" role="tab" aria-selected="' + (selTab === 'done') + '" onclick="switchJobsTab(\'done\')">History<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
-            '<button type="button" class="jobs-expand-btn" onclick="expandJobsDropdown()" title="Expand to full screen" aria-label="Expand to full screen"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>' +
+            '<button class="jobs-tab' + (selTab === 'active' ? ' active' : '') + '" data-tab="active" type="button" role="tab" aria-selected="' + (selTab === 'active') + '" onclick="switchJobsTab(\'active\')">' + escapeHtml(t('Active')) + '<span class="jobs-tab-count">' + activeCount + '</span></button>' +
+            '<button class="jobs-tab' + (selTab === 'done' ? ' active' : '') + '" data-tab="done" type="button" role="tab" aria-selected="' + (selTab === 'done') + '" onclick="switchJobsTab(\'done\')">' + escapeHtml(t('History')) + '<span class="jobs-tab-count">' + doneChats.length + '</span></button>' +
+            '<button type="button" class="jobs-expand-btn" onclick="expandJobsDropdown()" title="' + escapeHtml(t('Expand to full screen')) + '" aria-label="' + escapeHtml(t('Expand to full screen')) + '"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>' +
         '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="active" role="tabpanel"' + (selTab === 'active' ? '' : ' style="display:none"') + '>' + activePanel + pinnedHtml + todayHtml + '</div>';
     h += '<div class="jobs-tab-panel jobs-dropdown-list" data-tab-panel="done" role="tabpanel"' + (selTab === 'done' ? '' : ' style="display:none"') + '>' +
@@ -3643,9 +3664,9 @@ function _renderJobsHistoryPanel(doneChats) {
     var bar = '<div class="jobs-history-search">' +
         '<span class="jobs-history-search-icon">' + (UI_ICONS.search || '') + '</span>' +
         '<input type="text" id="jobs-history-search-input" class="jobs-history-search-input" ' +
-            'placeholder="Search history\u2026" value="' + searchVal + '" ' +
-            'autocomplete="off" aria-label="Search history chats" />' +
-        (searchVal ? '<button type="button" class="jobs-history-search-clear" title="Clear search" aria-label="Clear search">\u00d7</button>' : '') +
+            'placeholder="' + escapeHtml(t('Search history\u2026')) + '" value="' + searchVal + '" ' +
+            'autocomplete="off" aria-label="' + escapeHtml(t('Search history chats')) + '" />' +
+        (searchVal ? '<button type="button" class="jobs-history-search-clear" title="' + escapeHtml(t('Clear search')) + '" aria-label="' + escapeHtml(t('Clear search')) + '">\u00d7</button>' : '') +
     '</div>';
     return bar + '<div class="jobs-history-results">' + _renderJobsHistoryResults(doneChats) + '</div>';
 }
@@ -3657,12 +3678,12 @@ function _ensureJobsHistorySearchBound() {
     if (_jobsHistorySearchBound) return;
     _jobsHistorySearchBound = true;
     document.addEventListener('input', function(e) {
-        var t = e.target;
-        if (t && t.id === 'jobs-history-search-input') onJobsHistorySearch(t.value);
+        var tgt = e.target;
+        if (tgt && tgt.id === 'jobs-history-search-input') onJobsHistorySearch(tgt.value);
     });
     document.addEventListener('click', function(e) {
-        var t = e.target;
-        if (t && t.closest && t.closest('.jobs-history-search-clear')) {
+        var tgt = e.target;
+        if (tgt && tgt.closest && tgt.closest('.jobs-history-search-clear')) {
             e.stopPropagation();
             e.preventDefault();
             clearJobsHistorySearch();
@@ -3679,7 +3700,7 @@ function _renderJobsHistoryResults(doneChats) {
         chatsArr = chatsArr.filter(function(c) { return chatMatchesSearch(c, q); });
     }
     if (!chatsArr.length) {
-        return '<div class="jobs-tab-empty">' + (q ? 'No matching chats' : 'No finished chats') + '</div>';
+        return '<div class="jobs-tab-empty">' + escapeHtml(q ? t('No matching chats') : t('No finished chats')) + '</div>';
     }
     return _renderJobsGroupedRows(chatsArr, 'history');
 }
@@ -3699,7 +3720,7 @@ function _renderJobsGroupedRows(chatsArr, mode) {
         chatsArr.forEach(function(c) {
             if (_jobsChatTs(c) >= t0) groups.today.push(c); else groups.week.push(c);
         });
-        order = [['today', 'Today'], ['week', 'This Week']];
+        order = [['today', t('Today')], ['week', t('This Week')]];
     } else {
         groups = { today: [], week: [], month: [], older: [] };
         chatsArr.forEach(function(c) {
@@ -3709,14 +3730,14 @@ function _renderJobsGroupedRows(chatsArr, mode) {
             else if (ts >= monthAgo) groups.month.push(c);
             else groups.older.push(c);
         });
-        order = [['today', 'Today'], ['week', 'This Week'], ['month', 'This Month'], ['older', 'Older']];
+        order = [['today', t('Today')], ['week', t('This Week')], ['month', t('This Month')], ['older', t('Older')]];
     }
     var h = '';
     order.forEach(function(g) {
         var arr = groups[g[0]];
         if (!arr.length) return;
         var _gw = _jobsTimeColWidth(arr.map(_jobsHistTimeStr));
-        h += '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>' + g[1] + '</div>' +
+        h += '<div class="jobs-subhead menu-section-title"><span class="section-icon">' + UI_ICONS.clock + '</span>' + escapeHtml(g[1]) + '</div>' +
             // Per-row try/catch: one bad chat must not blank the History group.
             arr.map(function(c) { try { return _jobsChatRowHtml(c, 'list', _gw); } catch (e) { console.warn('jobs: history row render failed', e); return ''; } }).join('');
     });
@@ -3738,8 +3759,8 @@ function onJobsHistorySearch(val) {
         clearBtn = document.createElement('button');
         clearBtn.type = 'button';
         clearBtn.className = 'jobs-history-search-clear';
-        clearBtn.title = 'Clear search';
-        clearBtn.setAttribute('aria-label', 'Clear search');
+        clearBtn.title = t('Clear search');
+        clearBtn.setAttribute('aria-label', t('Clear search'));
         clearBtn.textContent = '\u00d7';
         bar.appendChild(clearBtn);
     } else if (!_jobsHistoryQuery && clearBtn) {
@@ -3902,7 +3923,7 @@ function _jobsExpandBodyHtml(buckets) {
         // "+N more" beside the count. Inline style rather than a new class -- the
         // subhead is already a flex row and no CSS file is in scope for this fix.
         var moreHtml = (hidden > 0)
-            ? ' <span class="jobs-expand-more" style="color:var(--text-muted);font-weight:400;text-transform:none;letter-spacing:0;">+' + hidden + ' more</span>'
+            ? ' <span class="jobs-expand-more" style="color:var(--text-muted);font-weight:400;text-transform:none;letter-spacing:0;">' + escapeHtml(tn(hidden, '+{count} more', '+{count} more')) + '</span>'
             : '';
         return '<div class="jobs-expand-section">' +
             '<div class="jobs-expand-subhead">' + escapeHtml(label) +
@@ -3913,9 +3934,9 @@ function _jobsExpandBodyHtml(buckets) {
         '</div>';
     }
     return '<div class="jobs-expand-sections">' +
-        section('Active', activeChats, 0) +
-        section('Completed Today', todayChats, buckets.todayHidden || 0) +
-        section('Pinned', pinnedChats, buckets.pinnedHidden || 0) +
+        section(t('Active'), activeChats, 0) +
+        section(t('Completed Today'), todayChats, buckets.todayHidden || 0) +
+        section(t('Pinned'), pinnedChats, buckets.pinnedHidden || 0) +
     '</div>';
 }
 // ---- Home panel state filter (replaces the old columns/sections toggle) ----
@@ -3933,13 +3954,13 @@ function _jobsExpandBodyHtml(buckets) {
 //   error  -> error (+ chats whose last API call failed)
 // Session-only (deliberately NOT persisted); 'all' is the default.
 var HOME_CHATS_FILTERS = [
-    { key: 'all',    label: 'All' },
-    { key: 'active', label: 'Active' },
-    { key: 'stuck',  label: 'Stuck' },
-    { key: 'pr_opened', label: 'PR opened' },
-    { key: 'pr_merged', label: 'PR merged' },
-    { key: 'done',   label: 'Done' },
-    { key: 'error',  label: 'Errored' }
+    { key: 'all',    label: N_('All') },
+    { key: 'active', label: N_('Active') },
+    { key: 'stuck',  label: N_('Stuck') },
+    { key: 'pr_opened', label: N_('PR opened') },
+    { key: 'pr_merged', label: N_('PR merged') },
+    { key: 'done',   label: N_('Done') },
+    { key: 'error',  label: N_('Errored') }
 ];
 var _homeChatsFilter = 'all';
 function setHomeChatsFilter(key) {
@@ -4054,13 +4075,13 @@ function _homeChatsFilterBarHtml(buckets) {
         counts[k] = (counts[k] || 0) + 1;
     });
     counts.all = all.length;
-    return '<div class="home-chats-filters" role="group" aria-label="Filter chats by state">' +
+    return '<div class="home-chats-filters" role="group" aria-label="' + escapeHtml(t('Filter chats by state')) + '">' +
         HOME_CHATS_FILTERS.map(function(f) {
             var n = counts[f.key] || 0;
             if (!n && f.key !== 'all' && _homeChatsFilter !== f.key) return '';
             return '<button class="home-chats-filter-btn f-' + f.key + (_homeChatsFilter === f.key ? ' active' : '') + '"' +
-                ' title="' + escapeHtml(f.label) + '" onclick="setHomeChatsFilter(\'' + f.key + '\')">' +
-                escapeHtml(f.label) +
+                ' title="' + escapeHtml(t(f.label)) + '" onclick="setHomeChatsFilter(\'' + f.key + '\')">' +
+                escapeHtml(t(f.label)) +
                 (f.key === 'all' ? '' : '<span class="home-chats-filter-count">' + n + '</span>') +
             '</button>';
         }).join('') +
@@ -4236,8 +4257,8 @@ var HOME_CHATS_SCROLL_QUIET_MS = 700;
 var _homeChatsLastScrollAt = 0;
 document.addEventListener('scroll', function(e) {
     var panel = document.getElementById('home-active-chats');
-    var t = e.target;
-    if (panel && t && t.nodeType === 1 && panel.contains(t)) _homeChatsLastScrollAt = Date.now();
+    var tgt = e.target;
+    if (panel && tgt && tgt.nodeType === 1 && panel.contains(tgt)) _homeChatsLastScrollAt = Date.now();
 }, true);
 function renderHomeActiveChats() {
     var container = document.getElementById('home-active-chats');
@@ -4280,13 +4301,13 @@ function renderHomeActiveChats() {
     if (rawTotal) {
         html = '<div class="home-active-chats-inner">' +
             '<div class="home-active-chats-head">' +
-                '<span class="home-active-chats-title">Active chats</span>' +
+                '<span class="home-active-chats-title">' + escapeHtml(t('Active chats')) + '</span>' +
                 '<span class="jobs-expand-count">' + total + '</span>' +
                 filterBar +
             '</div>' +
             '<div class="home-active-chats-body layout-sections">' +
                 (total ? _jobsExpandBodyHtml(shown)
-                       : '<div class="jobs-expand-empty">No chats in this state</div>') +
+                       : '<div class="jobs-expand-empty">' + escapeHtml(t('No chats in this state')) + '</div>') +
             '</div>' +
         '</div>';
     }
@@ -4350,13 +4371,13 @@ function renderJobsExpandModal() {
     var closeIcon = UI_ICONS.close || '\u00d7';
     var body = total
         ? _jobsExpandBodyHtml(buckets)
-        : '<div class="jobs-expand-empty">No active chats right now</div>';
+        : '<div class="jobs-expand-empty">' + escapeHtml(t('No active chats right now')) + '</div>';
     var html =
-        '<div class="jobs-expand-modal" role="dialog" aria-label="Active chats">' +
+        '<div class="jobs-expand-modal" role="dialog" aria-label="' + escapeHtml(t('Active chats')) + '">' +
             '<div class="jobs-expand-head">' +
-                '<span class="jobs-expand-title">Active Chats</span>' +
+                '<span class="jobs-expand-title">' + escapeHtml(t('Active Chats')) + '</span>' +
                 '<span class="jobs-expand-count">' + total + '</span>' +
-                '<button class="jobs-expand-close" aria-label="Close" onclick="closeJobsExpandModal()">' + closeIcon + '</button>' +
+                '<button class="jobs-expand-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeJobsExpandModal()">' + closeIcon + '</button>' +
             '</div>' +
             '<div class="jobs-expand-body layout-sections">' + body + '</div>' +
         '</div>';
@@ -4391,16 +4412,16 @@ function _jobsExpandCardHtml(c) {
     var pinned = !!c.pinned;
     var pinBtn = (typeof _jobsPinBtnHtml === 'function') ? _jobsPinBtnHtml(c) : '';
     var dismissBtn = pinned ? '' :
-        '<button class="jobs-row-btn danger jobs-card-dismiss" title="Remove from list" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
+        '<button class="jobs-row-btn danger jobs-card-dismiss" title="' + escapeHtml(t('Remove from list')) + '" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
     return '<div class="jobs-expand-card state-' + escapeHtml(st) + sig.cls + '" data-chat-id="' + escapeHtml(c.id) + '">' +
         '<div class="jobs-expand-card-head">' +
             indicator +
-            '<div class="jobs-expand-card-title">' + escapeHtml(c.title || 'New Chat') + '</div>' +
+            '<div class="jobs-expand-card-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
             sig.trail +
             _jobsProgressBadgeHtml(c.id) +
             pinBtn +
             (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
-            '<button class="jobs-row-btn" title="Open chat" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
+            '<button class="jobs-row-btn" title="' + escapeHtml(t('Open chat')) + '" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
             dismissBtn +
         '</div>' +
         '<div class="jobs-expand-card-body">' + _jobsAccordionBodyHtml(prog) + '</div>' +
@@ -4499,7 +4520,7 @@ function _jobsAccWorkersHtml(chatId) {
     var subs = subAgentsForChatTree(chatId);
     if (!subs.length) return '';
     return '<div class="jobs-acc-workers-header">' +
-            '<span class="jobs-acc-workers-title">Workers</span>' +
+            '<span class="jobs-acc-workers-title">' + escapeHtml(t('Workers')) + '</span>' +
             '<span class="jobs-acc-workers-count">' + subs.length + '</span>' +
         '</div>' +
         '<div class="jobs-acc-workers-list">' + subs.map(_workerCardHtml).join('') + '</div>';
@@ -4522,7 +4543,7 @@ function _jobsActionAccordionContentHtml(actionId) {
 function _jobsAccEmptyHtml() {
     return '<div class="jobs-acc-empty">' +
         '<span class="jobs-acc-empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 15.5 13.5"></polyline></svg></span>' +
-        '<span class="jobs-acc-empty-text">No progress reported yet</span>' +
+        '<span class="jobs-acc-empty-text">' + escapeHtml(t('No progress reported yet')) + '</span>' +
     '</div>';
 }
 // Shared inline-progress body for chat-row and action-row accordions. `current`
@@ -4535,15 +4556,15 @@ function _jobsAccordionBodyHtml(current) {
     var tasksHtml = '';
     if (Array.isArray(current.tasks) && current.tasks.length) {
         tasksHtml = '<div class="action-result-tasks">' +
-            current.tasks.map(function(t) {
+            current.tasks.map(function(task) {
                 // Task entries come from tool args / persisted state — skip nulls.
-                if (!t) return '';
-                var icn = t.status === 'done' ? UI_ICONS.check :
-                          (t.status === 'error' ? UI_ICONS.close :
-                          (t.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
-                return '<div class="action-task status-' + escapeHtml(t.status || 'pending') + '">' +
+                if (!task) return '';
+                var icn = task.status === 'done' ? UI_ICONS.check :
+                          (task.status === 'error' ? UI_ICONS.close :
+                          (task.status === 'running' ? UI_ICONS.spinner : UI_ICONS.clock));
+                return '<div class="action-task status-' + escapeHtml(task.status || 'pending') + '">' +
                     '<span class="action-task-icon">' + icn + '</span>' +
-                    '<span class="action-task-label">' + escapeHtml(t.label || '') + '</span>' +
+                    '<span class="action-task-label">' + escapeHtml(task.label || '') + '</span>' +
                 '</div>';
             }).join('') +
         '</div>';
@@ -4652,10 +4673,10 @@ function openNoProgressPopover(anchor, chatId) {
         '<div class="action-result-header">' +
             '<span class="action-result-icon">' + (UI_ICONS.list || UI_ICONS.chat || '') + '</span>' +
             '<div class="action-result-title">' +
-                '<div class="action-result-name">' + escapeHtml((c && c.title) || 'New Chat') + '</div>' +
-                '<div class="action-result-label">No progress reported yet</div>' +
+                '<div class="action-result-name">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
+                '<div class="action-result-label">' + escapeHtml(t('No progress reported yet')) + '</div>' +
             '</div>' +
-            '<button class="action-result-close" aria-label="Close" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
+            '<button class="action-result-close" aria-label="' + escapeHtml(t('Close')) + '" onclick="closeResultPopover()">' + UI_ICONS.close + '</button>' +
         '</div>';
     el.dataset.popoverType = 'chat-progress';
     el.dataset.chatId = chatId || '';
@@ -4840,7 +4861,9 @@ function refreshActionButtons(actionId) {
         btn.className = 'action-btn state-' + d.state + (placementCls ? ' ' + placementCls : '') + interruptedCls + pausedCls;
         // The primary icon stays as the action's own icon — don't swap it
         var labelEl = btn.querySelector('.action-btn-label');
-        if (labelEl) labelEl.textContent = d.state === 'idle' ? action.name : d.label;
+        // Same display rule as renderActionButton (:1082): the stored label is an
+        // English N_() default or agent text; translate at display time only.
+        if (labelEl) labelEl.textContent = d.state === 'idle' ? action.name : (d.label ? t(d.label) : action.name);
         // Update or insert the status badge
         var badge = btn.querySelector('.action-btn-badge');
         var badgeIcon = getStateBadgeIcon(d.state, pausedCls ? 'is-paused' : '');
@@ -5119,7 +5142,7 @@ function _buildHeaderMoreButton() {
     var wrap = document.createElement('div');
     wrap.className = 'action-more-wrap';
     wrap.innerHTML =
-        '<button type="button" class="action-btn action-more-btn" aria-label="More" aria-haspopup="true" aria-expanded="false" title="More">' +
+        '<button type="button" class="action-btn action-more-btn" aria-label="' + escapeHtml(t('More')) + '" aria-haspopup="true" aria-expanded="false" title="' + escapeHtml(t('More')) + '">' +
             '<span class="action-btn-primary" aria-hidden="true">' +
                 '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>' +
             '</span>' +
@@ -5153,13 +5176,18 @@ function _positionHeaderMorePanel(wrap) {
     var vh = window.innerHeight;
     var GAP = 6;
     var EDGE = 6;
+    // Rule 10 (i18n): the panel is END-aligned under its trigger -- right-aligned
+    // in LTR, mirrored to left-aligned in RTL (the header controls sit on the
+    // left there). Every horizontal write below is mirrored on this flag, and
+    // each branch clears the opposite side so a stale inline value never wins.
+    var rtl = typeof i18nDir === 'function' && i18nDir() === 'rtl';
 
     // Reset before measuring — otherwise stale max-height/positions skew the
     // natural size we need for clamping below.
     panel.style.position = 'fixed';
     panel.style.top = '0px';
-    panel.style.left = 'auto';
-    panel.style.right = '0px';
+    panel.style.left = rtl ? '0px' : 'auto';
+    panel.style.right = rtl ? 'auto' : '0px';
     panel.style.bottom = 'auto';
     panel.style.maxHeight = (vh - 2 * EDGE) + 'px';
     panel.style.maxWidth = (vw - 2 * EDGE) + 'px';
@@ -5190,17 +5218,31 @@ function _positionHeaderMorePanel(wrap) {
     }
 
     // ---- Horizontal positioning ----
-    // Right-align under the button by default; clamp so left edge >= EDGE.
-    var right = Math.max(EDGE, vw - rect.right);
-    var leftIfRight = vw - right - panelW;
-    if (leftIfRight < EDGE) {
-        // Panel is too wide to right-align cleanly — fall back to a left-aligned
-        // position that fits inside the viewport.
-        panel.style.right = 'auto';
-        panel.style.left = EDGE + 'px';
+    if (rtl) {
+        // RTL mirror: left-align under the button; clamp so right edge >= EDGE.
+        var left = Math.max(EDGE, rect.left);
+        var rightIfLeft = vw - left - panelW;
+        if (rightIfLeft < EDGE) {
+            // Too wide to left-align cleanly — pin to the right (start) edge.
+            panel.style.left = 'auto';
+            panel.style.right = EDGE + 'px';
+        } else {
+            panel.style.right = 'auto';
+            panel.style.left = left + 'px';
+        }
     } else {
-        panel.style.left = 'auto';
-        panel.style.right = right + 'px';
+        // Right-align under the button by default; clamp so left edge >= EDGE.
+        var right = Math.max(EDGE, vw - rect.right);
+        var leftIfRight = vw - right - panelW;
+        if (leftIfRight < EDGE) {
+            // Panel is too wide to right-align cleanly — fall back to a left-aligned
+            // position that fits inside the viewport.
+            panel.style.right = 'auto';
+            panel.style.left = EDGE + 'px';
+        } else {
+            panel.style.left = 'auto';
+            panel.style.right = right + 'px';
+        }
     }
 
     panel.style.top = top + 'px';

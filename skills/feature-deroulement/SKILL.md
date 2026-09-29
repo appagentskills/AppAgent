@@ -32,9 +32,24 @@ Modes:
 6. **Done-gate:** `rep.gate.pass === true` (0 refuted). The final answer must list **every unverified claim** explicitly (`rep.gate.unverified`) with a reason. Never hide them.
 
 ## Executable phase: `deroulement.js`
-It is a plain helper next to this file. It is not a tool. It has no dependencies (only RegExp, Function, DOMParser and CSSStyleSheet), and every result is JSON.
+It is a helper next to this file that is **also the skill tool `deroulement_check`** (active while this skill is active). It has no dependencies (only RegExp and Function; DOMParser and CSSStyleSheet when present), and every result is JSON. The tool runs in the skill sandbox iframe, which has a DOM. In a realm without one, the HTML, CSS and DOM post-condition rows are **unverified** with a reason ("DOMParser unavailable…"). They never throw.
 
-**In-repo (AppAgent workspace, js_eval or tests):**
+**Preferred: the tool call** (JSON args, no code to paste):
+```
+deroulement_check {
+  files: ['<changed-file-1>.js', '<changed-file-2>.css'],   // workspace paths, or sources: {path: text} offline
+  workspace: 'owner/AppAgent::main',                        // live grep/read/diff/ls (omit when corpus is given)
+  prose: DRAFT,                                             // your prose, with backticked symbols
+  functions: ['renderFoo'],
+  probes: [{ file: 'src/js/ui/280-foo.js', fn: 'renderFoo', inputs: [[{ items: [1] }], [{ items: [] }]], edge: true,
+             stubs: { escapeHtml: 'function (s) { return String(s); }' } }],   // stubs = JS source strings
+  mutation: [{ file: 'src/js/ui/280-foo.js', fn: 'fooState', cases: [{ args: ['a'], expect: 1 }, { args: [''], expect: 0 }] }],
+  output: 'ledger'                                          // summary | ledger (default) | full (adds the whole report)
+}
+```
+It returns `{success, summary, gate: {pass, refuted, unverified}, ledger: <D.format markdown>}` (`report` too with `output: 'full'`). The args are the `run()` options below. They differ in three ways: offline source texts go in `sources` (not `files: {...}`); function-valued options (`probes[].stubs`/`post`, `mutation[].check`/`stubs`) are JS **source strings**; `exclude` holds regex sources. `claims[].check` must be `true`/`false`, and the `io` option is JS-only.
+
+**Alternative, in-repo (AppAgent workspace, js_eval or tests), when you need the full API** (`D.branches`, `D.probe`, a custom `io`, function-valued claims):
 ```js
 var D = await runFile('skills/feature-deroulement/deroulement.js');
 var FILES = ['<changed-file-1>.js', '<changed-file-2>.css'];      // PLACEHOLDERS: replace with your changed files
@@ -49,7 +64,7 @@ var rep = await D.run({
 });
 return { summary: rep.summary, refuted: rep.gate.refuted, unverified: rep.gate.unverified, md: D.format(rep) };
 ```
-Alternative: `run_js_file {path:'skills/feature-deroulement/deroulement.js', args:{run:true, files:[...], prose:'...'}}` returns the report directly.
+Alternative: `run_js_file {path:'skills/feature-deroulement/deroulement.js', args:{run:true, files:[...], prose:'...'}}` returns the report directly. `D.tool(args)` is the same entry point as the tool, and `D.toolDefinition` is its schema.
 
 **Generic (any environment, the source never enters your context):**
 ```js

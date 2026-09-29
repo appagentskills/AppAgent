@@ -28,7 +28,8 @@
 // keep in sync.
 // 128000 = model-aware default for Opus 5.5+ (OPUS_5_5_PLUS_RE below): at
 // effort xhigh it thinks far more per turn and 64000 truncates long
-// think+tool turns. Applied ONLY while the user has not set Max Tokens
+// think+tool turns. Sonnet 5.5+ (SONNET_5_5_PLUS_RE) gets the same default —
+// its documented output cap is also 128K, so the value never exceeds it. Applied ONLY while the user has not set Max Tokens
 // explicitly (globalMaxTokensExplicit) — an explicit value, larger or
 // smaller, always wins. See getDefaultMaxTokensForModel / getGlobalMaxTokens.
 var DEFAULT_MAX_TOKENS = 64000;
@@ -44,9 +45,10 @@ var globalMaxTokensExplicit = false;
 var globalThinkingBudget = DEFAULT_THINKING_BUDGET;
 
 // Built-in (non-user) max_tokens default for a model id: 128000 for Opus
-// 5.5+, DEFAULT_MAX_TOKENS for everything else.
+// 5.5+ and Sonnet 5.5+, DEFAULT_MAX_TOKENS for everything else.
 function getDefaultMaxTokensForModel(model) {
-    return OPUS_5_5_PLUS_RE.test(String(model || '').toLowerCase())
+    var m = String(model || '').toLowerCase();
+    return (OPUS_5_5_PLUS_RE.test(m) || SONNET_5_5_PLUS_RE.test(m))
         ? OPUS_5_5_DEFAULT_MAX_TOKENS
         : DEFAULT_MAX_TOKENS;
 }
@@ -150,13 +152,14 @@ var DEFAULT_API_PROVIDERS = [
         provider: 'z-ai'
     },
     {
-        // Sonnet 5 (2026-06-30) is adaptive-thinking-only like Opus 4.7+:
-        // effort replaces thinkingBudget (budget_tokens returns 400), and
-        // adaptive thinking is ON by default. xhigh/max are supported on
-        // Sonnet 5 too, but Opus 4.8 at low/medium generally beats Sonnet 5
-        // at xhigh for the same cost — 'high' is the sane default here.
-        name: 'sonnet-5',
-        model: 'anthropic/claude-sonnet-5',
+        // Sonnet 5.5 (Sept 2026) replaces the sonnet-5 OpenRouter default
+        // (untouched copies are renamed by loadApiProviders,
+        // core/130-indexeddb.js). 1M context, 128K max output, adaptive
+        // thinking only — 'disabled' and budget_tokens are 400s, so
+        // callOpenRouterStreaming never sends reasoning:{enabled:false} for it
+        // (SONNET_5_5_PLUS_RE below). 'high' stays the sane default effort.
+        name: 'sonnet-5.5',
+        model: 'anthropic/claude-sonnet-5.5',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: '',
         effort: 'high'
@@ -207,8 +210,13 @@ var DEFAULT_API_PROVIDERS = [
     // loadApiProviders (core/130-indexeddb.js); stale selections / tier
     // aliases / chat pins follow PROVIDER_RENAMES below.
     {
-        name: 'Sonnet 5',
-        model: 'claude-sonnet-5',
+        // Sonnet 5.5 (Sept 2026) replaces 'Sonnet 5' (claude-sonnet-5) —
+        // dateless id, 1M context, 128K max output. Thinking is adaptive-only
+        // and conversation-bound (THINKING_BINDING_RE); thinking OFF maps to
+        // {type:'between_tools'} (see thinkingOffShapeFor below).
+        // Docs: https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
+        name: 'Sonnet 5.5',
+        model: 'claude-sonnet-5-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
         effort: 'high',
@@ -370,9 +378,46 @@ var OPUS_5_5_PLUS_RE = /claude-opus-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d{2,}
 // two thinking betas and transformToAnthropic sends the unconditional
 // {type:'adaptive', display:'summarized', block_binding:{drop_block}} thinking
 // object for exactly this set (src/platform/extension/background.js).
-var THINKING_BINDING_RE = new RegExp(FABLE_5_1_PLUS_RE.source + '|' + OPUS_5_5_PLUS_RE.source);
+// Sonnet 5.5+ (Sept 2026) — same bound-thinking family as Opus 5.5 (blocks
+// bound to model + conversation prefix; drop_block under the
+// thinking-binding-controls-2026-08-01 beta), PLUS two Sonnet-5.5-only API
+// changes: (1) thinking:{type:'disabled'} and {type:'enabled',budget_tokens}
+// are 400s — the closest "off" is {type:'between_tools'} (no other fields,
+// valid only at effort low/medium/high; adaptive at xhigh/max);
+// (2) tool_choice 'any' / {type:'tool'} are 400s — only 'auto' is accepted
+// (the app only ever sends 'auto'). Same shape as OPUS_5_5_PLUS_RE: matches
+// sonnet-5-5 … sonnet-5-99, sonnet-6+, '.' or '-' separators and dated
+// variants; does NOT match Sonnet 5.0 (claude-sonnet-5,
+// claude-sonnet-5-20260630) or 5.1–5.4, whose behaviour is unchanged.
+// Docs: https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
+//       https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide
+var SONNET_5_5_PLUS_RE = /claude-sonnet-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d{2,})/;
+function isSonnet55Plus(model) {
+    return SONNET_5_5_PLUS_RE.test(String(model || '').toLowerCase());
+}
+// Every model whose thinking blocks are conversation-bound (see above).
+var THINKING_BINDING_RE = new RegExp(FABLE_5_1_PLUS_RE.source + '|' + OPUS_5_5_PLUS_RE.source + '|' + SONNET_5_5_PLUS_RE.source);
 function isThinkingBindingModel(model) {
     return THINKING_BINDING_RE.test(String(model || '').toLowerCase());
+}
+// Efforts at which {type:'between_tools'} is accepted (Sonnet 5.5).
+var BETWEEN_TOOLS_THINKING_EFFORTS = ['low', 'medium', 'high'];
+// The thinking object to send when the user's thinking-OFF switch is on, for
+// models with no accepted 'disabled' shape but a between_tools mode (Sonnet
+// 5.5+). Returns null for every other model (caller keeps its existing
+// behaviour). effort = the request effort, or null for the model default
+// (treated as in-range). Used by transformToAnthropic (background.js).
+// The xhigh/max → {type:'adaptive'} branch is a DEFENSIVE GUARD: the request
+// builder (callOpenRouterStreaming) only sets the off flag when the provider
+// has NO effort and then replaces reasoning with exactly {enabled:false}, so
+// the app never sends off + xhigh/max today. Kept so a future caller that
+// combines them can't produce a between_tools 400.
+function thinkingOffShapeFor(model, effort) {
+    if (!isSonnet55Plus(model)) return null;
+    if (effort && BETWEEN_TOOLS_THINKING_EFFORTS.indexOf(String(effort).toLowerCase()) === -1) {
+        return { type: 'adaptive' };
+    }
+    return { type: 'between_tools' };
 }
 
 var currentProvider = 'Opus 5.5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
@@ -399,9 +444,13 @@ var PROVIDER_RENAMES = {
     'Opus 5': 'Opus 5.5',
     'Opus-4-8': 'Opus 5.5',
     'Fable 5': 'Fable 5.1',
-    // Renamed defaults → their July 2026 successors
-    'sonnet-4.5': 'sonnet-5',
-    'sonnet-4.6': 'sonnet-5',
+    // Sept 2026: Sonnet 5 → Sonnet 5.5 (OpenRouter + OAuth seeds)
+    'sonnet-5': 'sonnet-5.5',
+    'Sonnet 5': 'Sonnet 5.5',
+    // Renamed defaults → their July 2026 successors (chain-collapsed straight
+    // to Sonnet 5.5: the old Sonnet 5 targets were retired in Sept 2026)
+    'sonnet-4.5': 'sonnet-5.5',
+    'sonnet-4.6': 'sonnet-5.5',
     'Kimi K2.5': 'GLM 5.2',
     // (gpt-5.2 / gpt-5.5 chain-collapse straight to gpt-6-sol: the old
     // gpt-5.5 / gpt-5.6-sol targets no longer exist in the defaults)
@@ -409,11 +458,11 @@ var PROVIDER_RENAMES = {
     'gpt-5.5': 'gpt-6-sol',
     'gpt-5.6-sol': 'gpt-6-sol',
     'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
-    'Sonnet 4.6 OAuth': 'Sonnet 5',
+    'Sonnet 4.6 OAuth': 'Sonnet 5.5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
     // default names (same providers, friendlier labels)
     'Opus-4-8 OAuth': 'Opus 5.5',
-    'Sonnet 5 OAuth': 'Sonnet 5',
+    'Sonnet 5 OAuth': 'Sonnet 5.5',
     // ChatGPT-OAuth seeds: the assumed gpt-5.1* slugs never existed on the
     // Codex backend for ChatGPT accounts
     'GPT-5.1 Codex': 'GPT-6 Sol (ChatGPT)',
@@ -457,7 +506,7 @@ var TIER_ALIAS_SAME = '__same__';
 // Users who want a specific large model pick it in Settings → Sub-Agent
 // Model Tiers.
 var DEFAULT_TIER_ALIASES = {
-    small: 'Sonnet 5',
+    small: 'Sonnet 5.5',
     medium: 'Opus 5.5',
     large: TIER_ALIAS_SAME
 };
@@ -500,7 +549,7 @@ async function loadTierAliases() {
             subAgentTierAliasesReadFailed = false;
             subAgentTierAliases = (stored && typeof stored === 'object') ? stored : {};
             // Recover stored aliases that still point at RENAMED default
-            // provider names (e.g. 'Sonnet 5 OAuth' → 'Sonnet 5') — provider
+            // provider names (e.g. 'Sonnet 5' → 'Sonnet 5.5') — provider
             // lookups are exact-string, so a stale name would silently break
             // tier resolution after a default rename. Only rename when the
             // old name no longer exists among the configured providers: the

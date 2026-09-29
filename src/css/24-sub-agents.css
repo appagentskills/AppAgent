@@ -25,19 +25,19 @@
 .message.sub-report {
     background: var(--bg-light);
     border: 1px solid var(--border, #e1e4ea);
-    border-left: 3px solid var(--accent, #6c63ff);
+    border-inline-start: 3px solid var(--accent, #6c63ff);
     border-radius: var(--radius-md, 6px);
     padding: var(--space-3, 6px) var(--space-7, 14px);
     margin: var(--space-5, 10px) 0;
     font-size: var(--text-body, 13px);
 }
-.message.sub-report.sub-report-done    { border-left-color: var(--success, #2da44e); }
-.message.sub-report.sub-report-error   { border-left-color: var(--danger, #cf222e); }
-.message.sub-report.sub-report-need_input { border-left-color: var(--warning, #bf8700); }
-.message.sub-report.sub-report-partial { border-left-color: var(--text-muted, #8a93a6); }
-.message.sub-report.sub-report-cancelled { border-left-color: var(--text-muted, #8a93a6); }
-.message.sub-report.sub-report-running { border-left-color: var(--accent, #6c63ff); }
-.message.sub-report.sub-report-waiting { border-left-color: var(--warning, #bf8700); }
+.message.sub-report.sub-report-done    { border-inline-start-color: var(--success, #2da44e); }
+.message.sub-report.sub-report-error   { border-inline-start-color: var(--danger, #cf222e); }
+.message.sub-report.sub-report-need_input { border-inline-start-color: var(--warning, #bf8700); }
+.message.sub-report.sub-report-partial { border-inline-start-color: var(--text-muted, #8a93a6); }
+.message.sub-report.sub-report-cancelled { border-inline-start-color: var(--text-muted, #8a93a6); }
+.message.sub-report.sub-report-running { border-inline-start-color: var(--accent, #6c63ff); }
+.message.sub-report.sub-report-waiting { border-inline-start-color: var(--warning, #bf8700); }
 
 /* The native ::-webkit-details-marker / ::marker triangle would sit before
    our custom chevron and double up. Hide it; we paint our own chevron that
@@ -206,8 +206,8 @@
 /* Progress stream — one entry per agent_message(to:'parent') update. */
 .sub-report-progress {
     margin-bottom: var(--space-4, 8px);
-    border-left: 2px solid var(--border, #e1e4ea);
-    padding-left: var(--space-5, 10px);
+    border-inline-start: 2px solid var(--border, #e1e4ea);
+    padding-inline-start: var(--space-5, 10px);
 }
 .sub-report-progress-item {
     position: relative;
@@ -217,7 +217,7 @@
 }
 .sub-report-progress-dot {
     position: absolute;
-    left: calc(-1 * var(--space-5, 10px) - 6px);
+    inset-inline-start: calc(-1 * var(--space-5, 10px) - 6px);
     top: 9px;
     width: 7px;
     height: 7px;
@@ -274,7 +274,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    margin-left: auto;
+    margin-inline-start: auto;
     flex-shrink: 0;
     white-space: nowrap;
     font-size: var(--text-caption, 11px);
@@ -315,7 +315,7 @@
    The same `.sub-agent-breadcrumb` block defined just below is reused
    inside the card to show the ancestor chain.  */
 .history-chat-card.subagent {
-    border-left: 3px solid var(--accent, #6c63ff);
+    border-inline-start: 3px solid var(--accent, #6c63ff);
     background: linear-gradient(180deg, rgba(108, 99, 255, 0.04) 0%, var(--bg-white, #fff) 100%);
 }
 .history-chat-card.subagent:hover {
@@ -341,7 +341,7 @@
 /* ---------- Sidebar breadcrumb ---------- */
 .sub-agent-breadcrumb {
     display: inline-block;
-    margin-left: 6px;
+    margin-inline-start: 6px;
     padding: 0 6px;
     font-size: var(--text-caption, 11px);
     color: var(--text-muted, #6b7280);
@@ -361,7 +361,7 @@
    max-width slightly so multi-segment paths (root › … › parent) have
    room before the ellipsis kicks in. */
 .sub-agent-breadcrumb[data-depth] {
-    padding-left: calc(var(--depth, 1) * 8px - 8px);
+    padding-inline-start: calc(var(--depth, 1) * 8px - 8px);
     max-width: 200px;
 }
 .sub-agent-breadcrumb .breadcrumb-link {
@@ -454,12 +454,12 @@
    `::before` line draws a short horizontal connector hinting at the
    parent → child relationship in the tree. */
 .worker-chip[data-depth="2"] {
-    margin-left: 12px;
+    margin-inline-start: 12px;
     border-color: var(--bg-hover, #e7e9ee);
     position: relative;
 }
 .worker-chip[data-depth="3"] {
-    margin-left: 24px;
+    margin-inline-start: 24px;
     border-color: var(--bg-hover, #e7e9ee);
     opacity: 0.92;
     position: relative;
@@ -468,14 +468,14 @@
 .worker-chip[data-depth="3"]::before {
     content: '';
     position: absolute;
-    left: -8px;
+    inset-inline-start: -8px;
     top: 50%;
     width: 6px;
     height: 1px;
     background: var(--border, #e1e4ea);
 }
 .worker-chip[data-depth="3"]::before {
-    left: -10px;
+    inset-inline-start: -10px;
     width: 8px;
 }
 .worker-state-dot {
@@ -542,7 +542,7 @@
     background: var(--bg-white, #fff);
     color: var(--text-primary, #1f2328);
     font-family: inherit;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
@@ -559,8 +559,8 @@
 .worker-card.worker-errored .worker-state { color: var(--danger, #cf222e); }
 .worker-card.worker-queued { border-style: dashed; border-color: var(--text-muted, #8a93a6); }
 .worker-card.worker-queued .worker-state { color: var(--text-muted, #8a93a6); font-style: italic; }
-.worker-card-wrap[data-depth="2"] { margin-left: 10px; }
-.worker-card-wrap[data-depth="3"] { margin-left: 20px; }
+.worker-card-wrap[data-depth="2"] { margin-inline-start: 10px; }
+.worker-card-wrap[data-depth="3"] { margin-inline-start: 20px; }
 .worker-card-icon {
     flex-shrink: 0;
     display: inline-flex;
@@ -636,7 +636,7 @@
 .worker-card-wrap { display: block; }
 .worker-card-caret {
     flex-shrink: 0;
-    margin-left: 2px;
+    margin-inline-start: 2px;
     color: var(--text-muted, #6b7280);
     font-size: 13px;
     line-height: 1;
@@ -682,7 +682,7 @@
 .worker-progress-open:hover { text-decoration: underline; }
 /* Second row action: "chat view" (opens the sub's chat card in a modal) sits
    next to "open chat" on the same line. */
-.worker-progress-chat-view { margin-left: 12px; }
+.worker-progress-chat-view { margin-inline-start: 12px; }
 
 /* ---------- Worker chat-view modal ----------
    Variant class on the global #modal-overlay (same pattern as
@@ -781,7 +781,7 @@
 .chat-title-subagent-pill {
     display: inline-flex;
     align-items: center;
-    margin-left: var(--space-3, 6px);
+    margin-inline-start: var(--space-3, 6px);
     border-radius: 999px;
     font-size: var(--text-caption, 11px);
     font-weight: var(--font-medium, 500);
@@ -825,7 +825,7 @@
 }
 /* .version-action-btn is built for the full-width actions list — keep that
    geometry here (full row, left-aligned label). */
-.sub-self-parent-host .sub-self-parent-link { width: 100%; text-align: left; }
+.sub-self-parent-host .sub-self-parent-link { width: 100%; text-align: start; }
 
 /* ---------- Parked-tool indicator ---------- */
 /* Shown when a UI-required tool is waiting for a panel to attach. The
@@ -957,7 +957,7 @@
     white-space: nowrap;
 }
 .sub-report-model {
-    margin-left: 6px;
+    margin-inline-start: 6px;
     padding: 1px 6px;
     border-radius: var(--radius-sm, 4px);
     font-size: var(--text-caption, 11px);
@@ -994,7 +994,7 @@
 .sub-thread-summary::before {
     content: '\203a';
     display: inline-block;
-    margin-right: 6px;
+    margin-inline-end: 6px;
     transition: transform 0.15s ease;
 }
 .sub-thread[open] > .sub-thread-summary::before { transform: rotate(90deg); }
@@ -1040,7 +1040,7 @@
 }
 .sub-thread-time {
     flex-shrink: 0;
-    margin-left: auto;
+    margin-inline-start: auto;
     font-size: 10px;
     color: var(--text-muted, #6b7280);
     font-variant-numeric: tabular-nums;
@@ -1072,7 +1072,7 @@
 .sub-notice {
     background: var(--bg-light);
     border: 1px solid var(--border, #e1e4ea);
-    border-left: 3px solid var(--text-muted, #8a93a6);
+    border-inline-start: 3px solid var(--text-muted, #8a93a6);
     border-radius: var(--radius-md, 6px);
     padding: var(--space-5, 10px) var(--space-7, 14px);
     margin: var(--space-3, 6px) 0;
@@ -1100,10 +1100,10 @@
    dashed muted left border, no fill. */
 .sub-notice.sub-notice-mid {
     background: transparent;
-    border-left-style: dashed;
+    border-inline-start-style: dashed;
 }
 /* Inbound parent→sub message (rendered in the SUB's transcript). */
-.sub-notice.sub-notice-inbound { border-left-color: var(--accent, #6c63ff); }
+.sub-notice.sub-notice-inbound { border-inline-start-color: var(--accent, #6c63ff); }
 .sub-notice-inbound .sub-report-icon {
     background: rgba(108, 99, 255, 0.15);
     color: var(--accent, #6c63ff);
@@ -1111,16 +1111,16 @@
 /* Outbound sub→parent mid-flight message (rendered in the PARENT's
    transcript as a standalone role:'sub_msg' row — renderSubAgentMessage,
    175-sub-agent-ui.js). Same accent family as inbound, ← icon. */
-.sub-notice.sub-notice-outbound { border-left-color: var(--accent, #6c63ff); }
+.sub-notice.sub-notice-outbound { border-inline-start-color: var(--accent, #6c63ff); }
 .sub-notice-outbound .sub-report-icon {
     background: rgba(108, 99, 255, 0.15);
     color: var(--accent, #6c63ff);
 }
-.sub-notice.sub-report-done       { border-left-color: var(--success, #2da44e); }
-.sub-notice.sub-report-error      { border-left-color: var(--danger, #cf222e); }
-.sub-notice.sub-report-need_input { border-left-color: var(--warning, #bf8700); }
-.sub-notice.sub-report-waiting    { border-left-color: var(--warning, #bf8700); }
-.sub-notice.sub-report-running    { border-left-color: var(--accent, #6c63ff); }
+.sub-notice.sub-report-done       { border-inline-start-color: var(--success, #2da44e); }
+.sub-notice.sub-report-error      { border-inline-start-color: var(--danger, #cf222e); }
+.sub-notice.sub-report-need_input { border-inline-start-color: var(--warning, #bf8700); }
+.sub-notice.sub-report-waiting    { border-inline-start-color: var(--warning, #bf8700); }
+.sub-notice.sub-report-running    { border-inline-start-color: var(--accent, #6c63ff); }
 .sub-notice-header {
     display: flex;
     align-items: center;
@@ -1132,7 +1132,7 @@
 /* Kind badge — FILLED for final reports (status-colored), outline/muted for
    mid-flight progress updates and inbound parent messages. */
 .sub-notice-badge {
-    margin-left: auto;
+    margin-inline-start: auto;
     flex-shrink: 0;
     white-space: nowrap;
     font-size: 10px;
@@ -1163,7 +1163,7 @@
 /* "View agent" button — inherits the .sub-report-open button chrome
    (background/border/hover, 24-sub-agents.css above); the badge already
    carries margin-left:auto, so the button sits flush after it. */
-.sub-notice-header .sub-report-open.sub-notice-view { margin-left: var(--space-3, 6px); }
+.sub-notice-header .sub-report-open.sub-notice-view { margin-inline-start: var(--space-3, 6px); }
 .sub-notice-body {
     margin-top: var(--space-3, 6px);
     padding-top: var(--space-3, 6px);
@@ -1208,7 +1208,7 @@
 .sub-notice-body .section-icon,
 .sub-report-body .section-icon {
     display: inline-block;
-    margin-right: var(--space-3, 6px);
+    margin-inline-end: var(--space-3, 6px);
     filter: grayscale(1);
     opacity: .75;
 }
