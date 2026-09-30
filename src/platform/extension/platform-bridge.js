@@ -352,8 +352,16 @@
     // which renders later inside this IIFE, correctly shows 'Auto').
     window.updateSnStatus = updateSnStatus;
 
+    // Adopt a token recovered from the background (tab g_ck / instanceTokens cache):
+    // the single persist site shared by both recovery arms of validateToken(), so the
+    // stale-tab recovery adds no new chrome.storage.local.set write site (RB-01 ratchet).
+    function _adoptRecoveredToken(token) {
+        window.sessionToken = token;
+        chrome.storage.local.set({ sessionToken: token });
+    }
+
     // Sole authority on connection state — validates and recovers tokens
-    function validateToken() {
+    function validateToken(_recovering) {
         if (!Platform.instanceUrl) {
             _snStatusState = 'disconnected';
             updateSnStatus();
@@ -369,8 +377,7 @@
             chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl }, function(resp) {
                 if (chrome.runtime.lastError) return;
                 if (resp && resp.token) {
-                    window.sessionToken = resp.token;
-                    chrome.storage.local.set({ sessionToken: resp.token });
+                    _adoptRecoveredToken(resp.token);
                     validateToken(); // Now validate the recovered token
                 } else {
                     _snStatusState = 'disconnected';
@@ -385,6 +392,24 @@
             credentials: 'include'
         }).then(function(res) {
             if (res.status === 401) {
+                // Before reporting Disconnected, ask the background for a VALIDATED token
+                // from any OTHER open tab of this instance: a session-timed-out tab may
+                // have handed us its dead g_ck while another tab is signed in. One
+                // recovery attempt per chain (_recovering) so two dead tabs can't ping-pong.
+                var _failed = window.sessionToken;
+                if (!_recovering) {
+                    chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl, excludeToken: _failed, validate: true }, function(resp) {
+                        if (!chrome.runtime.lastError && resp && resp.token && resp.token !== _failed) {
+                            _adoptRecoveredToken(resp.token);
+                            validateToken(true);
+                            return;
+                        }
+                        window.sessionToken = '';
+                        _snStatusState = 'disconnected';
+                        updateSnStatus();
+                    });
+                    return;
+                }
                 window.sessionToken = '';
                 _snStatusState = 'disconnected';
                 updateSnStatus();
@@ -535,7 +560,7 @@
     // Refresh token by extracting g_ck from an open ServiceNow tab
     function _refreshToken() {
         return new Promise(function(resolve) {
-            chrome.runtime.sendMessage({ type: 'refresh-sn-token' }, function(response) {
+            chrome.runtime.sendMessage({ type: 'refresh-sn-token', excludeToken: window.sessionToken || '' }, function(response) {
                 if (chrome.runtime.lastError || !response || !response.token) {
                     resolve(null);
                     return;

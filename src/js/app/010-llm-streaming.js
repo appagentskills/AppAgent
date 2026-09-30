@@ -165,9 +165,13 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     if (thinkingBudget && !isAdaptiveOnly) {
         requestBody.reasoning = { max_tokens: thinkingBudget };
     }
+    // GPT-6 Astra / GPT-6.1 Sol reject 'none' and 'minimal' (OpenAI docs:
+    // use 'low'), and have no off switch (isGpt6ReasoningRequiredModel,
+    // core/030-config.js).
+    var reasoningRequired = typeof isGpt6ReasoningRequiredModel === 'function' && isGpt6ReasoningRequiredModel(modelLower);
     if (provider.effort) {
         if (!requestBody.reasoning) requestBody.reasoning = {};
-        requestBody.reasoning.effort = provider.effort;
+        requestBody.reasoning.effort = (reasoningRequired && /^(none|minimal)$/i.test(provider.effort)) ? 'low' : provider.effort;
     }
     // ONE predicate for "this request goes to the SW Claude OAuth proxy
     // (transformToAnthropic)": used both for the off-signal gate below and
@@ -182,7 +186,10 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // reasoning stays absent (model default adaptive).
     var offSignalOk = !isThinkingBindingModel(modelLower)
         || (routesToClaudeOAuth && typeof isSonnet55Plus === 'function' && isSonnet55Plus(modelLower));
-    if (thinkingOff && offSignalOk) {
+    if (thinkingOff && reasoningRequired) {
+        // No off switch on these models: send the lowest supported effort.
+        requestBody.reasoning = { effort: 'low' };
+    } else if (thinkingOff && offSignalOk) {
         // OpenRouter's documented off switch (reasoning.enabled:false). The
         // OAuth transforms in background.js read the same flag:
         // transformToAnthropic sends no `thinking` object and

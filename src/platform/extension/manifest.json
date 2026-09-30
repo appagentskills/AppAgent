@@ -1,8 +1,9 @@
 {
     "manifest_version": 3,
-    "name": "AppAgent for ServiceNow",
-    "version": "1.1.31",
-    "description": "AI Agent for ServiceNow - natural language interaction with the platform",
+    "name": "__MSG_extName__",
+    "version": "1.1.32",
+    "description": "__MSG_extDescription__",
+    "default_locale": "en",
     "permissions": [
         "storage",
     "unlimitedStorage",
@@ -24,7 +25,7 @@
         "128": "icons/AppAgentIconStarOnly_128.png"
     },
     "action": {
-        "default_title": "Open AppAgent",
+        "default_title": "__MSG_actionTitle__",
         "default_icon": {
             "128": "icons/AppAgentIconStarOnly_128.png"
         }

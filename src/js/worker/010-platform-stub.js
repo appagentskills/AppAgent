@@ -114,6 +114,17 @@ Platform.callOffscreenHelper = function(type, payload, timeoutMs, signal) {
 // =============================================================
 Platform.instances = [];
 
+// Adopt a token as the worker's active-instance session: in-memory + persisted
+// sessionToken (the page bridge follows via storage.onChanged). The SINGLE
+// sessionToken persist site of this file — the 401-retry, open-for-login and
+// probe-adoption paths all share it (RB-01 write-site ratchet).
+function _adoptWorkerToken(token) {
+    if (!token || token === _workerSessionToken) return false;
+    _workerSessionToken = token;
+    chrome.storage.local.set({ sessionToken: token });
+    return true;
+}
+
 Platform.refreshInstances = async function() {
     if (typeof self.snGetInstancesDetailed !== 'function') return Platform.instances;
     var prev = Platform.instances || [];
@@ -130,9 +141,29 @@ Platform.refreshInstances = async function() {
             // maint login (not a sys_user; synthetic roles ['maint','admin']) — see background.js snDetectMaint
             isMaint: !!inst.isMaint || (inst.roles || []).indexOf('maint') !== -1,
             tabs: inst.tabs || [],
+            // the instance ACCEPTED this token on the probe (not 401; see snResolveInstanceSession)
+            sessionOk: !!inst.sessionOk,
             isActive: inst.url === Platform.instanceUrl
         };
     });
+    // Adopt a healthier active-instance token: the probe checks ALL open tabs and
+    // returns the one the instance accepted, while _workerSessionToken may still be
+    // the dead g_ck of a session-timed-out tab. getTokenForInstance() returns
+    // _workerSessionToken for the active instance, so without this every tool that
+    // fetches with it directly (servicenow_api args.instance, servicenow_run_script
+    // + its admin gate, list_instances roles, diff/attachment) kept the dead token.
+    // Adopt when the instance accepted the probed token (sessionOk), OR when the held
+    // worker token was itself 401-rejected by the probe while this one was not. A
+    // 401-rejected token is never adopted.
+    if (Platform.instanceUrl) {
+        var _probedActive = Platform.instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
+        var _rawActive = raw.filter(function(i) { return i && i.url === Platform.instanceUrl; })[0];
+        var _rejected = (_rawActive && _rawActive.rejectedTokens) || [];
+        if (_probedActive && _probedActive.token && _rejected.indexOf(_probedActive.token) === -1 &&
+            (_probedActive.sessionOk || (_workerSessionToken && _rejected.indexOf(_workerSessionToken) !== -1))) {
+            _adoptWorkerToken(_probedActive.token);
+        }
+    }
     // Guard: the active instance is the one this service worker is actively making
     // authenticated API calls against via _workerSessionToken. A tab probe that
     // transiently fails to read g_ck (tab discarded by Chrome Memory Saver, scripting
@@ -271,6 +302,20 @@ Platform.ready.then(function() {
 // URLs the tool already prepended, etc.) pass straight through. On
 // 401 we refresh the token once via the shared SW helper.
 // =============================================================
+// After a 401 on the active instance, re-probe ALL its open tabs for a token
+// other than the one that just failed. Platform.getTokenForInstance() would
+// short-circuit to _workerSessionToken (the dead token) for the active
+// instance, so a healthy sibling tab was never tried and the call fell
+// straight through to the open-for-login flow.
+function _freshTokenAfter401(failedToken) {
+    if (typeof self.snGetTokenForInstance === 'function') {
+        return self.snGetTokenForInstance(Platform.instanceUrl, { excludeToken: failedToken }).then(function(p) {
+            return (p && p.token) || '';
+        });
+    }
+    return Platform.getTokenForInstance(Platform.instanceUrl);
+}
+
 (function installSnFetchShim() {
     var _origFetch = self.fetch.bind(self);
 
@@ -291,11 +336,10 @@ Platform.ready.then(function() {
         return _origFetch(fullUrl, mergedOpts).then(function(res) {
             if (res.status !== 401) return res;
             // Token stale — probe a fresh one from an open tab and retry once.
-            return Platform.getTokenForInstance(Platform.instanceUrl).then(function(freshToken) {
+            return _freshTokenAfter401(mergedOpts.headers['X-UserToken']).then(function(freshToken) {
                 if (freshToken && freshToken !== mergedOpts.headers['X-UserToken']) {
                     // Sync caches so subsequent calls see the new token.
-                    _workerSessionToken = freshToken;
-                    chrome.storage.local.set({ sessionToken: freshToken });
+                    _adoptWorkerToken(freshToken);
                     mergedOpts.headers['X-UserToken'] = freshToken;
                     return _origFetch(fullUrl, mergedOpts).then(function(retryRes) {
                         if (retryRes.status !== 401) return retryRes;
@@ -314,8 +358,7 @@ Platform.ready.then(function() {
             if (typeof self.snOpenForLoginAndWait !== 'function') return failedRes;
             return self.snOpenForLoginAndWait(oldToken).then(function(loginToken) {
                 if (!loginToken || loginToken === oldToken) return failedRes;
-                _workerSessionToken = loginToken;
-                chrome.storage.local.set({ sessionToken: loginToken });
+                _adoptWorkerToken(loginToken);
                 mergedOpts.headers['X-UserToken'] = loginToken;
                 return _origFetch(fullUrl, mergedOpts);
             });

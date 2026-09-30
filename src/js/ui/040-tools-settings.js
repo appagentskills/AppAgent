@@ -2429,7 +2429,7 @@ function onModelIdInput(value) {
     if (effortSlider) {
         var effortHidden = document.getElementById('provider-effort');
         if (effortHidden && /^(none|minimal)$/i.test(effortHidden.value || '')
-            && _selectedModelAuthKind() === 'chatgpt' && isChatGPTAstraModel(value)) {
+            && _selectedModelAuthKind() === 'chatgpt' && isGpt6ReasoningRequiredModel(value)) {
             effortSlider.value = '0';
             onModalEffortSliderInput('0'); // 'low'
         } else {
@@ -2674,7 +2674,7 @@ function showAddApiProviderModal(editingProvider) {
     // Reasoning-effort slider (same control as the model pill menu, plus a
     // trailing 'Default' stop at the high end = the old select's empty option).
     var displayedEffort = provider.effort || '';
-    if (authKind === 'chatgpt' && isChatGPTAstraModel(provider.model) && /^(none|minimal)$/i.test(displayedEffort)) displayedEffort = 'low';
+    if (authKind === 'chatgpt' && isGpt6ReasoningRequiredModel(provider.model) && /^(none|minimal)$/i.test(displayedEffort)) displayedEffort = 'low';
     var effortIdx = _MODAL_EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(displayedEffort);
     if (effortIdx < 0) effortIdx = _MODAL_EFFORT_DEFAULT_IDX;
     var effortDots = '';

@@ -859,6 +859,18 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
     // resident (a few KB per push). Local on purpose: test/sw-chat-load
     // cuts this function's text out and evaluates it standalone.
     var prPushIds = null;
+    // WSF-EVICT: tool_call ids of MUTATING `workspace` calls (write/edit/
+    // delete/copy/discard). The sidebar Workspace Files section
+    // (_wsfScanChat, ui/115-workspace-files-sidebar.js) derives its list from
+    // these calls' arguments (action/path/workspace) + their result's
+    // success flag. A cold chat — in particular every sub-agent chat, which
+    // the parent sidebar rolls up but never hydrates — used to lose both to
+    // eviction (edit args and edit results are routinely > 512 chars), so a
+    // worker's edited files silently vanished from the parent's sidebar.
+    // Evicted rows now keep a tiny stub (_wsArgs on the call, _wsResult on
+    // the result). Local on purpose (see prPushIds).
+    var wsMutIds = null;
+    var WS_MUT_RE = /"action"\s*:\s*"(write|edit|delete|copy|discard)"/;
     if (Array.isArray(chat.messages)) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
@@ -896,6 +908,12 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
                         && msg.content.indexOf('"pr_url"') !== -1)) {
                     bodyClone = bodyClone || Object.assign({}, msg);
                     delete bodyClone.content;
+                    // WSF-EVICT: keep the success/created signal the sidebar reads.
+                    if (wsMutIds && msg.tool_call_id && wsMutIds[msg.tool_call_id]) {
+                        var wsOk = /^\s*\{\s*"success"\s*:\s*true/.test(msg.content);
+                        var wsMsg = msg.content.match(/"message"\s*:\s*"((?:Created|Restored)[^"]{0,80})/);
+                        bodyClone._wsResult = { success: wsOk, message: wsMsg ? wsMsg[1] : '' };
+                    }
                 }
                 if (typeof msg.thinking === 'string' && msg.thinking.length > CHAT_BODY_EVICT_MIN_CHARS) {
                     bodyClone = bodyClone || Object.assign({}, msg);
@@ -913,6 +931,10 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
                             (prPushIds || (prPushIds = {}))[btc.id] = true;
                             continue;
                         }
+                        var isWsMut = !!(btc && btc.id && btc.function && btc.function.name === 'workspace'
+                            && typeof btc.function.arguments === 'string'
+                            && WS_MUT_RE.test(btc.function.arguments));
+                        if (isWsMut) (wsMutIds || (wsMutIds = {}))[btc.id] = true;
                         if (btc && btc.function && typeof btc.function.arguments === 'string'
                             && btc.function.arguments.length > CHAT_BODY_EVICT_MIN_CHARS) {
                             // Keep the array + names (history stats read
@@ -925,6 +947,13 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
                             bodyClone.tool_calls[bt] = Object.assign({}, btc, {
                                 function: Object.assign({}, btc.function, { arguments: '' })
                             });
+                            // WSF-EVICT: compact stub of the addressing args.
+                            if (isWsMut && !btc._wsArgs) {
+                                try {
+                                    var wa = JSON.parse(btc.function.arguments);
+                                    bodyClone.tool_calls[bt]._wsArgs = { action: wa.action, path: wa.path || null, dest: wa.dest || null, workspace: wa.workspace || null };
+                                } catch (e) { /* malformed args — no stub */ }
+                            }
                         }
                     }
                 }
@@ -2555,8 +2584,8 @@ async function loadApiProviders() {
                     if (legacyInline.changed) await saveAllApiProviders();
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
-                    // sonnet-5, gpt-5.2 → gpt-6-sol (chain-collapsed through the
-                    // retired gpt-5.5 / gpt-5.6-sol defaults), Gemini 3 Flash Preview →
+                    // sonnet-5, gpt-5.2 → gpt-6.1-sol (chain-collapsed through the
+                    // retired gpt-5.5 / gpt-5.6-sol / gpt-6-sol defaults), Gemini 3 Flash Preview →
                     // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
@@ -2587,10 +2616,12 @@ async function loadApiProviders() {
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
-                        { to: 'gpt-6-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
-                        { to: 'gpt-6-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
+                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
                         // Sept 2026: GPT-6 Sol supersedes the gpt-5.6-sol OpenRouter default
-                        { to: 'gpt-6-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
+                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
+                        // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
+                        { to: 'gpt-6.1-sol', from: { name: 'gpt-6-sol', model: 'openai/gpt-6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
                         { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5.5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
@@ -2605,13 +2636,16 @@ async function loadApiProviders() {
                         // (gpt-5.1-codex / gpt-5.1) that the Codex backend does
                         // not serve to ChatGPT accounts — retarget onto the
                         // GPT-6 slugs the live catalog actually advertises.
-                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
-                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 22 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds;
                         // GPT-5.6 Terra has no GPT-6 successor and folds into
                         // Sol (same target Codex's own model migration uses).
-                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.6 Sol (ChatGPT)', model: 'gpt-5.6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
-                        { to: 'GPT-6 Sol (ChatGPT)', from: { name: 'GPT-5.6 Terra (ChatGPT)', model: 'gpt-5.6-terra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.6 Sol (ChatGPT)', model: 'gpt-5.6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.6 Terra (ChatGPT)', model: 'gpt-5.6-terra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed
+                        // (5.6 Sol/Terra rows above chain-collapse to it too).
+                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-6 Sol (ChatGPT)', model: 'gpt-6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
                         { to: 'GPT-6 Luna (ChatGPT)', from: { name: 'GPT-5.6 Luna (ChatGPT)', model: 'gpt-5.6-luna', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 2026 model-list tidy-up: Opus 5 and Opus-4-8 retire
                         // into Opus 5.5, Fable 5 into Fable 5.1. Opus-4-8 matches
@@ -3937,10 +3971,49 @@ async function pickDeployDir() {
 }
 
 // S0B3-01: read-only identity probe of a deploy folder (never writes; reads
-// only manifest.json). 'unknown' = no API to tell (callers proceed), 'empty',
+// only manifest.json, plus _locales/<default_locale>/messages.json when the
+// folder manifest name is a __MSG_ placeholder). 'unknown' = no API to tell (callers proceed), 'empty',
 // 'match' (same manifest key, else same name, else — only when manifest.json
 // is missing, unparseable or nameless — the sw-bundle.js + app.html build
-// markers) or 'foreign'. info.name = the folder manifest name.
+// markers) or 'foreign'. info.name = the folder manifest name (localized
+// when it is a __MSG_key__ that resolves from the folder's _locales).
+// __MSG_key__ names (chrome.i18n manifests) on EITHER side are resolved first
+// (running side: chrome.i18n.getMessage; folder side: _locales/<default_locale>/
+// messages.json in the folder, read-only). A name that is — or was — a
+// __MSG_ placeholder never decides 'foreign' on its own: a match still
+// matches, anything else falls through to the build-marker check.
+// `[_]` (not `_`) keeps the SW-bundle scanner from reading `__MSG_(` as a call.
+var _DEPLOY_MSG_NAME_RE = /^__MSG[_](\w+)__$/;
+function _deployMsgLookup(catalog, key) {
+    if (!catalog || typeof catalog !== 'object') return null;
+    var lk = String(key).toLowerCase();
+    for (var k in catalog) {
+        if (Object.prototype.hasOwnProperty.call(catalog, k) && k.toLowerCase() === lk) {
+            var e = catalog[k];
+            return e && typeof e.message === 'string' && e.message ? e.message : null;
+        }
+    }
+    return null;
+}
+async function _resolveDeployDirMsgName(handle, manifest, name) {
+    var mm = _DEPLOY_MSG_NAME_RE.exec(name || '');
+    if (!mm) return name;
+    var loc = manifest && manifest.default_locale;
+    if (typeof loc !== 'string' || !/^[A-Za-z]{2,3}(_[A-Za-z0-9]{2,3})?$/.test(loc) || typeof handle.getDirectoryHandle !== 'function') return null;
+    try {
+        var ld = await (await handle.getDirectoryHandle('_locales')).getDirectoryHandle(loc);
+        var f = await (await ld.getFileHandle('messages.json')).getFile();
+        return _deployMsgLookup(JSON.parse(await f.text()), mm[1]);
+    } catch (e) { return null; }
+}
+function _resolveRunningMsgName(name) {
+    var mm = _DEPLOY_MSG_NAME_RE.exec(name || '');
+    if (!mm) return name;
+    try {
+        var v = (typeof chrome !== 'undefined' && chrome && chrome.i18n && typeof chrome.i18n.getMessage === 'function') ? chrome.i18n.getMessage(mm[1]) : '';
+        return typeof v === 'string' && v ? v : null;
+    } catch (e) { return null; }
+}
 async function checkDeployDirIdentity(handle, info) {
     info = info || {};
     if (!handle || typeof handle.entries !== 'function' || typeof handle.getFileHandle !== 'function') return 'unknown';
@@ -3956,8 +4029,18 @@ async function checkDeployDirIdentity(handle, info) {
     if (theirs && typeof theirs.name === 'string') info.name = theirs.name;
     if (theirs && own.key && theirs.key) return own.key === theirs.key ? 'match' : 'foreign';
     if (theirs && own.name && theirs.name === own.name) return 'match';
-    // R-C4d #2: an explicit manifest-name mismatch stays 'foreign'.
-    if (theirs && typeof theirs.name === 'string' && theirs.name) return 'foreign';
+    var ownMsg = _DEPLOY_MSG_NAME_RE.test(own.name || ''), theirMsg = !!theirs && _DEPLOY_MSG_NAME_RE.test(theirs.name || '');
+    if (ownMsg || theirMsg) {
+        var ownName = _resolveRunningMsgName(own.name);
+        var theirName = theirMsg ? await _resolveDeployDirMsgName(handle, theirs, theirs.name) : theirs && theirs.name;
+        if (theirMsg && theirName) info.name = theirName;
+        if (ownName && theirName && ownName === theirName) return 'match';
+        // Placeholder name unresolved or different: the name is not evidence
+        // either way — fall through to the build markers below.
+    } else if (theirs && typeof theirs.name === 'string' && theirs.name) {
+        // R-C4d #2: an explicit (plain) manifest-name mismatch stays 'foreign'.
+        return 'foreign';
+    }
     async function has(n) { try { await handle.getFileHandle(n); return true; } catch (e) { return false; } }
     if ((await has('sw-bundle.js')) && (await has('app.html'))) return 'match';
     return 'foreign';

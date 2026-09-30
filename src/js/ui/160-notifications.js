@@ -974,7 +974,7 @@ function toggleModelMenu(event) {
     var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>' + escapeHtml(t('Reasoning effort')) + '</div>';
     var defEffort = _providerDefaultEffort(provider);
     var curEffort = (provider && provider.effort) || defEffort;
-    if (provider && provider.isChatGPTOAuth && isChatGPTAstraModel(provider.model) && /^(none|minimal)$/i.test(curEffort)) curEffort = 'low';
+    if (provider && provider.isChatGPTOAuth && isGpt6ReasoningRequiredModel(provider.model) && /^(none|minimal)$/i.test(curEffort)) curEffort = 'low';
     var effortIdx = _EFFORT_LEVELS.map(function(e) { return e.v; }).indexOf(curEffort);
     if (effortIdx < 0) effortIdx = 2; // unknown stored value — show High
     var effortDots = '';

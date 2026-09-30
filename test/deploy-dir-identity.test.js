@@ -170,6 +170,69 @@ describe('deploy dir identity (S0B3-01)', function() {
         assert.strictEqual(await m.checkDeployDirIdentity(dir({ 'sw-bundle.js': 'x', 'app.html': 'y' })), 'match');
     }, { tags: ['unit'] });
 
+    // chrome.i18n manifests (#1047): "name": "__MSG_extName__" + default_locale.
+    var MSG_NAME = '__MSG_extName__';
+    function i18nDir(files, msgs, loc) {
+        var d = dir(files);
+        if (msgs) {
+            var l = d.subs._locales = dir({}, '_locales');
+            l.subs[loc || 'en'] = dir({ 'messages.json': JSON.stringify(msgs) }, loc || 'en');
+        }
+        return d;
+    }
+
+    test('i18n: raw __MSG_ name on disk vs a localized running name', async function() {
+        own = { name: OWN_NAME };
+        // Resolves from the folder's _locales/<default_locale>/messages.json (key is case-insensitive like Chrome).
+        var d = i18nDir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }) }, { extname: { message: OWN_NAME } }), info = {};
+        assert.strictEqual(await m.checkDeployDirIdentity(d, info), 'match');
+        assert.strictEqual(info.name, OWN_NAME, 'info.name is the resolved name');
+        assert.strictEqual(d.writes + d.removes, 0, 'read-only');
+        // Unresolvable placeholder (no _locales): not foreign by name -> build markers decide.
+        assert.strictEqual(await m.checkDeployDirIdentity(dir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }), 'sw-bundle.js': 'x', 'app.html': 'y' })), 'match');
+        // Placeholder resolving to a different name still falls through to the markers (transition: old ext running, new manifest on disk).
+        assert.strictEqual(await m.checkDeployDirIdentity(i18nDir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }), 'sw-bundle.js': 'x', 'app.html': 'y' }, { extName: { message: 'AppAgent pour ServiceNow' } })), 'match');
+        // No name match and no build markers -> still 'foreign' (existing fallback).
+        assert.strictEqual(await m.checkDeployDirIdentity(dir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }), 'notes.txt': 'z' })), 'foreign');
+        // A bogus default_locale is never used as a path.
+        assert.strictEqual(await m.checkDeployDirIdentity(i18nDir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: '../x' }) }, { extName: { message: OWN_NAME } }, '../x')), 'foreign');
+    }, { tags: ['unit'] });
+
+    test('i18n: __MSG_ name on both sides (and running side unlocalized)', async function() {
+        own = { name: MSG_NAME, default_locale: 'en' };
+        var d = dir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }) });
+        assert.strictEqual(await m.checkDeployDirIdentity(d), 'match', 'identical placeholders match');
+        assert.deepStrictEqual(d.reads, ['manifest.json']);
+        // Running placeholder resolved via chrome.i18n.getMessage vs a plain name on disk.
+        chromeObj.i18n = { getMessage: function(k) { return k === 'extName' ? OWN_NAME : ''; } };
+        assert.strictEqual(await m.checkDeployDirIdentity(dir({ 'manifest.json': manifest({ name: OWN_NAME }) })), 'match');
+        // Different placeholder keys, both resolving to the same name.
+        assert.strictEqual(await m.checkDeployDirIdentity(i18nDir({ 'manifest.json': manifest({ name: '__MSG_appName__', default_locale: 'en' }) }, { appName: { message: OWN_NAME } })), 'match');
+        // Running placeholder unresolvable: a plain mismatch is not decided by name -> markers.
+        chromeObj.i18n = undefined;
+        assert.strictEqual(await m.checkDeployDirIdentity(dir({ 'manifest.json': manifest({ name: 'Old Name' }), 'sw-bundle.js': 'x', 'app.html': 'y' })), 'match');
+    }, { tags: ['unit'] });
+
+    test('i18n: a real foreign plain name is still foreign (markers and _locales do not override)', async function() {
+        own = { name: OWN_NAME };
+        var d = i18nDir({ 'manifest.json': manifest({ name: 'Other Extension', default_locale: 'en' }), 'sw-bundle.js': 'x', 'app.html': 'y' }, { extName: { message: OWN_NAME } }), info = {};
+        assert.strictEqual(await m.checkDeployDirIdentity(d, info), 'foreign');
+        assert.strictEqual(info.name, 'Other Extension');
+        assert.deepStrictEqual(d.reads, ['manifest.json'], 'plain names never read _locales');
+        // A foreign __MSG_ manifest resolving to another name, without build markers.
+        assert.strictEqual(await m.checkDeployDirIdentity(i18nDir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }), 'notes.txt': 'z' }, { extName: { message: 'Other Extension' } })), 'foreign');
+    }, { tags: ['unit'] });
+
+    test('i18n: wsDeploy proceeds into a folder whose manifest name is __MSG_extName__', async function() {
+        var w = await load020();
+        own = { name: OWN_NAME };
+        st.handle = i18nDir({ 'manifest.json': manifest({ name: MSG_NAME, default_locale: 'en' }) }, { extName: { message: OWN_NAME } });
+        var r = await w.wsDeploy('example-org/AppAgent::main');
+        assert.strictEqual(st.filesCalls, 1, 'not refused as foreign');
+        assert.match(r.error, /No files in workspace/);
+        assert.strictEqual(st.ok, undefined, 'a matching folder records no consent');
+    }, { tags: ['unit'], timeout: 20000 });
+
     test('S0B3-01 R-C4d#3 the confirm escapes the folder and manifest names', async function() {
         var d = dir({ 'manifest.json': manifest({ name: '<template>x</template>' }) }, '<b>Docs</b>');
         win.showDirectoryPicker = async function() { return d; };

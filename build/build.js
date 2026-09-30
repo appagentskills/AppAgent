@@ -1116,6 +1116,27 @@ ${processedBody}
         const srcPath = path.join(extSrcDir, file);
         if (fs.existsSync(srcPath)) outputFiles[file] = fs.readFileSync(srcPath, 'utf-8');
     }
+    // Chrome i18n: src/platform/extension/_locales/<chromeCode>/messages.json
+    // -> _locales/... (same set as skills/extension-dev/build.js). The manifest's
+    // __MSG_*__ strings resolve from these; with default_locale set Chrome
+    // REFUSES to load the extension if _locales/<default_locale>/messages.json
+    // is missing, so that case aborts the build (dist/ untouched).
+    const chromeLocalesDir = path.join(extSrcDir, '_locales');
+    let chromeLocalesCopied = 0;
+    if (fs.existsSync(chromeLocalesDir)) {
+        for (const code of fs.readdirSync(chromeLocalesDir)) {
+            if (!/^[a-z]{2,3}(_[A-Z0-9]{2,3})?$/.test(code)) continue;
+            const msgPath = path.join(chromeLocalesDir, code, 'messages.json');
+            if (!fs.existsSync(msgPath)) continue;
+            outputFiles['_locales/' + code + '/messages.json'] = fs.readFileSync(msgPath, 'utf-8');
+            chromeLocalesCopied++;
+        }
+    }
+    const defaultLocale = JSON.parse(outputFiles['manifest.json'] || '{}').default_locale;
+    if (defaultLocale && !outputFiles['_locales/' + defaultLocale + '/messages.json']) {
+        throw new Error('Build aborted — manifest default_locale "' + defaultLocale + '" but src/platform/extension/_locales/' + defaultLocale + '/messages.json is missing (Chrome would refuse to load the extension; dist/ untouched).');
+    }
+    console.log(`  Chrome _locales: ${chromeLocalesCopied} messages.json -> _locales/`);
     const testRunPolicySource = readSrcFile('js/core/075-test-run-policy.js');
     outputFiles['test-run-policy.js'] = testRunPolicySource;
     const iconsDir = path.join(extSrcDir, 'icons');

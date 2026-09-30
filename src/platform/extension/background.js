@@ -74,10 +74,8 @@ async function onTabReady(tabId) {
         // Maintain a per-origin token cache so the heartbeat works even when
         // tabs are discarded by Chrome's Memory Saver (no JS context to probe).
         if (info.origin && info.token) {
-            chrome.storage.local.get('instanceTokens', function(d) {
-                var map = (d && d.instanceTokens) || {};
+            snUpdateInstanceTokens(function(map) {
                 map[info.origin] = { token: info.token, userName: info.userName || '', updated: Date.now() };
-                chrome.storage.local.set({ instanceTokens: map });
             });
         }
 
@@ -1318,6 +1316,144 @@ async function snFetchUserRoles(instanceUrl, token) {
     return { roles: roles, responded: false, status: 0 };
 }
 
+// Collect the DISTINCT non-empty g_ck tokens exposed by ALL open tabs of one
+// instance, in tab order, skipping excludeToken (a token the caller just saw
+// rejected with 401). Several tabs of the same host can disagree: a tab left
+// session-timed-out keeps its old (now dead) g_ck in memory while a newer tab
+// the user signed in with holds the live one — so never stop at the first tab.
+// Returns { candidates: [{ token, userName, tabId }], sawOpenTab } where
+// sawOpenTab is true when at least one tab's MAIN world could be read.
+async function snCollectTabTokens(matchTabs, excludeToken) {
+    var candidates = [];
+    var sawOpenTab = false;
+    for (var i = 0; i < matchTabs.length; i++) {
+        var data = await snProbeTabTokenUser(matchTabs[i].id);
+        if (data) sawOpenTab = true;   // page responded (even if g_ck was empty = logged out)
+        if (!data || !data.token || data.token === excludeToken) continue;
+        var dup = false;
+        for (var d = 0; d < candidates.length; d++) { if (candidates[d].token === data.token) dup = true; }
+        if (dup) continue;
+        candidates.push({ token: data.token, userName: data.userName || '', tabId: matchTabs[i].id });
+    }
+    return { candidates: candidates, sawOpenTab: sawOpenTab };
+}
+
+// Pick the HEALTHY token among an instance's open tabs. With a single candidate
+// (the normal one-tab case) it is returned as-is unless opts.validate is set —
+// no extra request. With several distinct candidates (e.g. a timed-out tab + a
+// freshly signed-in one), each is checked against the instance and the first
+// one NOT explicitly rejected (HTTP 401) wins; 403 / network errors are
+// indeterminate and accepted, matching snGetInstancesDetailed.
+// Returns { pick: { token, userName, tabId } | null, sawOpenTab, rejected: [tokens] }.
+async function snPickTabToken(matchTabs, instanceUrl, opts) {
+    opts = opts || {};
+    var col = await snCollectTabTokens(matchTabs, opts.excludeToken);
+    var cands = col.candidates;
+    if (cands.length === 0) return { pick: null, sawOpenTab: col.sawOpenTab, rejected: [] };
+    if (cands.length === 1 && !opts.validate) return { pick: cands[0], sawOpenTab: col.sawOpenTab, rejected: [] };
+    var rejected = [];
+    for (var c = 0; c < cands.length; c++) {
+        var chk = await snFetchUserName(instanceUrl, cands[c].token);
+        if (chk.status === 401) { rejected.push(cands[c].token); continue; }
+        if (!cands[c].userName && chk.name) cands[c].userName = chk.name;
+        return { pick: cands[c], sawOpenTab: col.sawOpenTab, rejected: rejected };
+    }
+    return { pick: null, sawOpenTab: col.sawOpenTab, rejected: rejected };
+}
+
+// Resolve identity + roles (+ maint) for ONE candidate token of an instance.
+// Returns { token, userName, roles, isMaint, authRejected } — token is '' when
+// the instance explicitly rejected it (see the rule below).
+async function snResolveInstanceSession(instanceUrl, token, userName) {
+    // Track whether the instance EXPLICITLY rejected the
+    // session (HTTP 401) — that is the only response that proves the token is dead.
+    var authRejected = false;
+    var _nameOk = false;   // identity probe answered 2xx
+    if (token && !userName) {
+        var _nm = await snFetchUserName(instanceUrl, token);
+        userName = _nm.name;
+        if (_nm.status === 401) authRejected = true;
+        if (_nm.status >= 200 && _nm.status < 300) _nameOk = true;
+    }
+    var roles = [];
+    var _rr = null;
+    if (token) {
+        _rr = await snFetchUserRoles(instanceUrl, token);
+        roles = _rr.roles;
+        if (_rr.status === 401) authRejected = true;
+    }
+    // A token by itself is NOT proof of an authenticated session: a logged-out tab
+    // still exposes an anonymous g_ck, and a cached heartbeat token can outlive its
+    // session. But an EMPTY answer is not proof of a dead one either: low-privilege
+    // (ESS) users get HTTP 200 with zero rows from BOTH probes (ACL-filtered reads
+    // of sys_user / sys_user_has_role), so demoting on "responded but empty" wrongly
+    // flips valid ESS sessions to signed-out. Clear the token only when the instance
+    // EXPLICITLY rejected it (HTTP 401). 403 (authenticated but access denied) and
+    // network failures are indeterminate — keep the token and let the next refresh
+    // or the heartbeat (which deletes the cache entry on a hard 401) re-check.
+    // The rule applies whether or not a user name is known: a session-timed-out tab
+    // still exposes NOW.user_name next to its dead g_ck (so the name probe is
+    // skipped), and only the roles probe's 401 reveals it. maint is unaffected —
+    // it is only detected on a NON-rejected token (see below).
+    if (token && roles.length === 0 && authRejected) {
+        token = '';
+    }
+    // maint: no roles + no user name (maint is not a sys_user) + admin-level read
+    // of the roles table. Synthetic roles ['maint','admin'] so the badge, the
+    // list_instances admin check and the servicenow_run_script gate treat it as admin.
+    // maint: probe ONLY when the roles probe SUCCEEDED (2xx) with 0 roles and no
+    // user name (maint is not a sys_user) — shared snDetectMaint/snMaintEligible in
+    // core/150-record-helpers.js (via sw-bundle), one request, cached per URL+token.
+    var isMaint = false;
+    var _rolesOk = !!(_rr && _rr.responded && _rr.status >= 200 && _rr.status < 300);
+    if (token && !authRejected && typeof snMaintEligible === 'function' && snMaintEligible(roles, _rolesOk, userName)) {
+        isMaint = await snDetectMaint(instanceUrl, token);
+        if (isMaint) { roles = ['maint', 'admin']; if (!userName) userName = 'maint'; }
+    }
+    // sessionOk: the instance ACCEPTED this token — it was NOT rejected with 401 and
+    // a 2xx or 403 roles read, or a 2xx identity (name) read, proves the session
+    // (in ServiceNow a 403 ACL refusal comes after authentication). A 429, a 5xx or
+    // a network error proves nothing: a proxy or rate limiter can answer first.
+    // Those cases reach adoption only through the stub fallback, when the held
+    // worker token was 401'd in this probe (js/worker/010-platform-stub.js ~L163).
+    var _rolesAnswered = !!(_rr && _rr.responded && (_rolesOk || _rr.status === 403));
+    var sessionOk = !!(token && !authRejected && (_rolesAnswered || _nameOk));
+    return { token: token, userName: userName || '', roles: roles, isMaint: isMaint, authRejected: authRejected, sessionOk: sessionOk };
+}
+
+// Remember a token proven usable for an origin in the per-origin heartbeat cache,
+// replacing a stale one (e.g. cached from a tab that later timed out).
+function snRememberInstanceToken(origin, token, userName) {
+    if (!origin || !token) return Promise.resolve();
+    return snUpdateInstanceTokens(function(map) {
+        if (map[origin] && map[origin].token === token) return false;
+        map[origin] = { token: token, userName: userName || (map[origin] && map[origin].userName) || '', updated: Date.now() };
+    });
+}
+
+// Single serialized read-modify-write of the per-origin instanceTokens map.
+// Every writer (tab-ready, snRememberInstanceToken, the heartbeat) goes through
+// this queue, so a writer never saves a map snapshot that predates another
+// writer's update (lost update). mutate(map) edits in place; returning false
+// means "unchanged" and skips the write. chrome.storage.local processes calls in
+// issue order, so the next queued get() observes this set().
+var _snInstanceTokensQueue = Promise.resolve();
+function snUpdateInstanceTokens(mutate) {
+    var run = _snInstanceTokensQueue.then(function() {
+        return new Promise(function(resolve) {
+            chrome.storage.local.get('instanceTokens', function(d) {
+                var map = (d && d.instanceTokens) || {};
+                var changed = true;
+                try { changed = mutate(map) !== false; } catch (e) { changed = false; }
+                if (changed) chrome.storage.local.set({ instanceTokens: map });
+                resolve(map);
+            });
+        });
+    });
+    _snInstanceTokensQueue = run.catch(function() {});
+    return run;
+}
+
 // Build the detailed instance list: probe every SN tab for tokens, group by origin,
 // fill in user/roles per instance. Used by the panel via list-sn-instances-detailed
 // and by the SW Platform stub's refreshInstances.
@@ -1346,78 +1482,58 @@ async function snGetInstancesDetailed() {
     var result = [];
     for (var url in byOrigin) {
         var inst = byOrigin[url];
-        var tokenData = null;
-        var sawOpenTab = false;   // a tab whose MAIN-world context we could actually read
-        for (var t = 0; t < inst.tabs.length; t++) {
-            tokenData = await snProbeTabTokenUser(inst.tabs[t].id);
-            if (tokenData) sawOpenTab = true;          // page responded (even if g_ck was empty = logged out)
-            if (tokenData && tokenData.token) break;
-        }
-        var token = (tokenData && tokenData.token) || '';
-        var userName = (tokenData && tokenData.userName) || '';
+        // Probe EVERY tab of this origin, not just the first one with a g_ck: a
+        // session-timed-out tab still exposes its dead token and used to win just by
+        // being first in snTabs, flipping the whole instance to signed-out even though
+        // another tab is logged in.
+        var col = await snCollectTabTokens(inst.tabs);
+        var candidates = col.candidates;
         // Fall back to the cached heartbeat token ONLY when there is no live tab we could
         // read (all tabs closed, or discarded by Chrome Memory Saver — no JS context), so a
         // tab-less instance still resolves as connected (tabCount:0) for list_instances.
         // If an open tab DID respond with an empty g_ck the user is LOGGED OUT — never
         // resurrect a stale token, or the selector would wrongly show it connected.
-        if (!token && !sawOpenTab && instanceTokenCache[inst.url] && instanceTokenCache[inst.url].token) {
-            token = instanceTokenCache[inst.url].token;
-            if (!userName) userName = instanceTokenCache[inst.url].userName || '';
+        var fromCache = false;
+        if (!candidates.length && !col.sawOpenTab && instanceTokenCache[inst.url] && instanceTokenCache[inst.url].token) {
+            candidates.push({ token: instanceTokenCache[inst.url].token, userName: instanceTokenCache[inst.url].userName || '' });
+            fromCache = true;
         }
-        // Resolve identity + roles. Track whether the instance EXPLICITLY rejected the
-        // session (HTTP 401) — that is the only response that proves the token is dead.
-        var authRejected = false;
-        if (token && !userName) {
-            var _nm = await snFetchUserName(inst.url, token);
-            userName = _nm.name;
-            if (_nm.status === 401) authRejected = true;
+        // Connected if ANY candidate yields a session the instance does not reject:
+        // take the first non-401 one; when every candidate is rejected keep the first
+        // one's result (its token is cleared by snResolveInstanceSession's 401 rule).
+        var session = null;
+        var rejectedTokens = [];   // candidates the instance rejected with 401 (never adoptable)
+        for (var c = 0; c < candidates.length; c++) {
+            var s = await snResolveInstanceSession(inst.url, candidates[c].token, candidates[c].userName);
+            if (!session) session = s;
+            if (s.authRejected) { rejectedTokens.push(candidates[c].token); continue; }
+            session = s; break;
         }
-        var roles = [];
-        var _rr = null;
-        if (token) {
-            _rr = await snFetchUserRoles(inst.url, token);
-            roles = _rr.roles;
-            if (_rr.status === 401) authRejected = true;
+        if (!session) session = { token: '', userName: '', roles: [], isMaint: false, authRejected: false };
+        // A live tab's token that just proved usable while a sibling tab's was rejected:
+        // refresh the per-origin cache so the heartbeat stops pinging the dead one.
+        if (session.token && !session.authRejected && !fromCache && candidates.length > 1) {
+            snRememberInstanceToken(inst.url, session.token, session.userName);
         }
-        // A token by itself is NOT proof of an authenticated session: a logged-out tab
-        // still exposes an anonymous g_ck, and a cached heartbeat token can outlive its
-        // session. But an EMPTY answer is not proof of a dead one either: low-privilege
-        // (ESS) users get HTTP 200 with zero rows from BOTH probes (ACL-filtered reads
-        // of sys_user / sys_user_has_role), so demoting on "responded but empty" wrongly
-        // flips valid ESS sessions to signed-out. Clear the token only when the instance
-        // EXPLICITLY rejected it (HTTP 401). 403 (authenticated but access denied) and
-        // network failures are indeterminate — keep the token and let the next refresh
-        // or the heartbeat (which deletes the cache entry on a hard 401) re-check.
-        if (token && !userName && roles.length === 0 && authRejected) {
-            token = '';
-        }
-        // maint: no roles + no user name (maint is not a sys_user) + admin-level read
-        // of the roles table. Synthetic roles ['maint','admin'] so the badge, the
-        // list_instances admin check and the servicenow_run_script gate treat it as admin.
-        // maint: probe ONLY when the roles probe SUCCEEDED (2xx) with 0 roles and no
-        // user name (maint is not a sys_user) — shared snDetectMaint/snMaintEligible in
-        // core/150-record-helpers.js (via sw-bundle), one request, cached per URL+token.
-        var isMaint = false;
-        var _rolesOk = !!(_rr && _rr.responded && _rr.status >= 200 && _rr.status < 300);
-        if (token && !authRejected && typeof snMaintEligible === 'function' && snMaintEligible(roles, _rolesOk, userName)) {
-            isMaint = await snDetectMaint(inst.url, token);
-            if (isMaint) { roles = ['maint', 'admin']; if (!userName) userName = 'maint'; }
-        }
-        result.push({ url: inst.url, tabs: inst.tabs, token: token, userName: userName, roles: roles, isMaint: isMaint });
+        result.push({ url: inst.url, tabs: inst.tabs, token: session.token, userName: session.userName, roles: session.roles, isMaint: session.isMaint, sessionOk: !!session.sessionOk, rejectedTokens: rejectedTokens });
     }
     return result;
 }
 
-// Probe a fresh g_ck for a specific instance URL by scanning its open tabs.
+// Probe a fresh g_ck for a specific instance URL by scanning ALL its open tabs.
+// opts (optional): { excludeToken, validate } — excludeToken skips a token the
+// caller just saw rejected (401), so a stale sibling tab can never hand it back;
+// validate checks even a single candidate (and the cached fallback) against the
+// instance. Several distinct tab tokens are always checked (snPickTabToken).
 // Returns { token, userName, tabId } or { token: '', error } if nothing available.
-async function snGetTokenForInstance(instanceUrl) {
+async function snGetTokenForInstance(instanceUrl, opts) {
+    opts = opts || {};
     var tabs = await getSnTabList();
     var matchTabs = tabs.filter(function(t) { return t.origin === instanceUrl; });
-    for (var i = 0; i < matchTabs.length; i++) {
-        var data = await snProbeTabTokenUser(matchTabs[i].id);
-        if (data && data.token) {
-            return { token: data.token, userName: data.userName, tabId: matchTabs[i].id };
-        }
+    var picked = await snPickTabToken(matchTabs, instanceUrl, opts);
+    if (picked.pick) {
+        if (picked.rejected.length) snRememberInstanceToken(instanceUrl, picked.pick.token, picked.pick.userName);
+        return { token: picked.pick.token, userName: picked.pick.userName, tabId: picked.pick.tabId };
     }
     // No open tab yielded a token — fall back to the cached heartbeat token
     // (per-origin instanceTokens map), mirroring the switch-sn-instance
@@ -1428,8 +1544,10 @@ async function snGetTokenForInstance(instanceUrl) {
             resolve((d && d.instanceTokens && d.instanceTokens[instanceUrl]) || null);
         });
     });
-    if (cached && cached.token) {
-        return { token: cached.token, userName: cached.userName || '' };
+    if (cached && cached.token && cached.token !== opts.excludeToken && picked.rejected.indexOf(cached.token) === -1) {
+        if (!opts.validate || (await snFetchUserName(instanceUrl, cached.token)).status !== 401) {
+            return { token: cached.token, userName: cached.userName || '' };
+        }
     }
     return { token: '', error: matchTabs.length
         ? 'Could not get token from tabs for ' + instanceUrl
@@ -1746,7 +1864,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Refresh ServiceNow token by extracting g_ck from an open SN tab
     if (message.type === 'refresh-sn-token') {
-        handleRefreshToken(sendResponse);
+        handleRefreshToken(sendResponse, message.excludeToken);
         return true;
     }
 
@@ -1792,7 +1910,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Get a fresh token for a specific instance URL
     if (message.type === 'get-token-for-instance') {
-        snGetTokenForInstance(message.instanceUrl).then(sendResponse);
+        snGetTokenForInstance(message.instanceUrl, { excludeToken: message.excludeToken, validate: !!message.validate }).then(sendResponse);
         return true;
     }
 
@@ -2315,7 +2433,7 @@ self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
     for (var attempt = 0; attempt < 120; attempt++) {
         await new Promise(function(r) { setTimeout(r, 2000); });
         try {
-            var token = await snGetTokenForInstance(instanceUrl);
+            var token = await snGetTokenForInstance(instanceUrl, { excludeToken: oldToken });
             if (token && token.token && token.token !== oldToken) {
                 return token.token;
             }
@@ -2324,12 +2442,27 @@ self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
     return null;
 };
 
-async function handleRefreshToken(sendResponse) {
+async function handleRefreshToken(sendResponse, excludeToken) {
     try {
         var storage = await chrome.storage.local.get('instanceUrl');
         var tabs = await getSnTabList();
         if (tabs.length === 0) {
             sendResponse({ error: 'No ServiceNow tab open. Open a ServiceNow page to authenticate.' });
+            return;
+        }
+
+        // Active instance with open tabs: pick the healthy token across ALL of them
+        // (skipping the one the caller just saw 401), not the first matching tab —
+        // which may be a session-timed-out tab holding a dead g_ck.
+        var matchTabs = storage.instanceUrl ? tabs.filter(function(t) { return t.origin === storage.instanceUrl; }) : [];
+        if (matchTabs.length) {
+            var picked = await snPickTabToken(matchTabs, storage.instanceUrl, { excludeToken: excludeToken });
+            if (picked.pick) {
+                chrome.storage.local.set({ sessionToken: picked.pick.token });
+                sendResponse({ token: picked.pick.token });
+            } else {
+                sendResponse({ error: 'Could not extract token. The ServiceNow page may need to be refreshed.' });
+            }
             return;
         }
 
@@ -3749,7 +3882,9 @@ var _openaiModelQuirks = {};
 // for ChatGPT accounts (codex-rs model-selection popup snapshot, 2026-09-22:
 // GPT-6-Astra / GPT-6-Sol / GPT-6-Luna). GPT-5.6 Terra was dropped (no GPT-6
 // Terra); Codex migrates gpt-5.6-terra/-sol → gpt-6-sol, gpt-5.6-luna → gpt-6-luna.
-var OPENAI_FALLBACK_MODELS = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
+// 2026-09-30: GPT-6.1-Sol is Codex's new default; GPT-6-Sol stays listed as
+// "previous generation" (codex-rs model_selection_popup snapshot).
+var OPENAI_FALLBACK_MODELS = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'];
 var OPENAI_MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
 var _openaiModelCatalog = null;
 var _openaiModelCatalogAt = 0;
@@ -4831,6 +4966,13 @@ function transformToResponses(body) {
         var astraEffort = String(effort || 'high').toLowerCase();
         if (thinkingOff || astraEffort === 'none' || astraEffort === 'minimal') astraEffort = 'low';
         reasoning.effort = ['low', 'medium', 'high', 'xhigh', 'max'].indexOf(astraEffort) >= 0 ? astraEffort : 'high';
+    } else if (isChatGPTGpt61SolModel(body && body.model)) {
+        // GPT-6.1 Sol: low|medium(default)|high|xhigh|max; 'none'/'minimal' are
+        // NOT supported (docs/models/gpt-6.1-sol) → low, incl. thinking off.
+        // No effort → omitted (server default medium); unknown → high.
+        var s61Effort = effort ? String(effort).toLowerCase() : '';
+        if (thinkingOff || s61Effort === 'none' || s61Effort === 'minimal') s61Effort = 'low';
+        if (s61Effort) reasoning.effort = ['low', 'medium', 'high', 'xhigh', 'max'].indexOf(s61Effort) >= 0 ? s61Effort : 'high';
     } else if (isChatGPTGpt6SolLunaModel(body && body.model)) {
         // GPT-6 Sol/Luna accept none|low|medium|high|xhigh|max natively: no
         // legacy xhigh/max clamp. Thinking off maps to the documented 'none'
@@ -4859,7 +5001,7 @@ function transformToResponses(body) {
     // are both this value, and runChatGPTOAuthStream keys the degrade-and-retry
     // memo off responsesBody.model — so key parity is structural, not a
     // convention two call sites have to remember.
-    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-6-sol';
+    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-6.1-sol';
     var quirks = _openaiModelQuirks[modelSlug] || {};
     if (reasoning && quirks.reasoningSummary === 'omit') delete reasoning.summary;
     else if (reasoning && quirks.reasoningSummary === 'auto') reasoning.summary = 'auto';
@@ -4979,7 +5121,7 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
     var created = Math.floor(Date.now() / 1000);
     // Echoed back in every chat.completion.chunk — normalise so the UI shows
     // the slug we actually sent upstream.
-    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-6-sol';
+    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-6.1-sol';
     function emit(payload) {
         sink({ type: 'sse', data: 'data: ' + JSON.stringify(payload) + '\n\n' });
     }
@@ -6125,7 +6267,11 @@ async function heartbeatAllInstances() {
     var tabs = [];
     try { tabs = await getSnTabList(); } catch(e) {}
     var byOrigin = {};
-    (tabs || []).forEach(function(t) { if (!byOrigin[t.origin]) byOrigin[t.origin] = t; });
+    var tabsByOrigin = {};   // ALL tabs per origin — a sibling may hold the live session
+    (tabs || []).forEach(function(t) {
+        if (!byOrigin[t.origin]) byOrigin[t.origin] = t;
+        (tabsByOrigin[t.origin] = tabsByOrigin[t.origin] || []).push(t);
+    });
 
     var cache = await new Promise(function(r) {
         chrome.storage.local.get('instanceTokens', function(d) { r((d && d.instanceTokens) || {}); });
@@ -6136,7 +6282,25 @@ async function heartbeatAllInstances() {
     if (!origins.length) return;
 
     var results = [];
-    var cacheDirty = false;
+    // Per-origin cache changes, merged into a FRESH read of instanceTokens at the
+    // end via snUpdateInstanceTokens (never a whole-map write of the snapshot read
+    // above, which would clobber a concurrent snRememberInstanceToken).
+    //   { set: entry }        — store this token (it just answered non-401)
+    //   { del: [tokens] }     — drop the entry, only if it still holds one of these
+    var cacheOps = {};
+
+    function touchSession(origin, tok) {
+        return fetch(origin + '/api/now/uisession/touch-session', {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': '*/*',
+                'X-UserToken': tok,
+                'X-WantAuthSessionNotifications': 'true'
+            }
+        });
+    }
 
     async function readTokenFromTab(tab) {
         try {
@@ -6155,6 +6319,7 @@ async function heartbeatAllInstances() {
         var cached = cache[origin];
         var token = '';
         var source = '';
+        var liveTokens = [];   // distinct g_ck values held by this origin's open tabs, tab order
 
         // Prefer the LIVE tab's current g_ck over the cached token. After a
         // logoff -> logon, ServiceNow mints a brand-new session + g_ck on the
@@ -6164,15 +6329,26 @@ async function heartbeatAllInstances() {
         // "you have been logged off" notification to the open tab even though
         // the user just signed back in. Reading the tab first keeps the
         // heartbeat on the session's current token and refreshes the cache.
+        //
+        // But read EVERY tab of the origin: a session-timed-out tab keeps its dead
+        // g_ck while a sibling the user signed in with holds the live one. If the
+        // cached token is still held by ANY open tab it is current — ping with it
+        // first and leave the cache alone (never overwrite a good cached token
+        // with whatever the first tab happens to hold). Otherwise the first tab's
+        // token goes first (the logoff -> logon case above) and siblings follow.
         if (tab) {
-            var live = await readTokenFromTab(tab);
-            if (live) {
-                token = live;
-                source = 'tab';
-                if (!cached || cached.token !== live) {
-                    cache[origin] = { token: live, userName: (cached && cached.userName) || '', updated: Date.now() };
-                    cacheDirty = true;
+            var _originTabs = tabsByOrigin[origin] || [tab];
+            for (var lt = 0; lt < _originTabs.length; lt++) {
+                var live = await readTokenFromTab(_originTabs[lt]);
+                if (live && liveTokens.indexOf(live) === -1) liveTokens.push(live);
+            }
+            if (liveTokens.length) {
+                if (cached && cached.token && liveTokens.indexOf(cached.token) !== -1) {
+                    liveTokens.splice(liveTokens.indexOf(cached.token), 1);
+                    liveTokens.unshift(cached.token);
                 }
+                token = liveTokens[0];
+                source = 'tab';
             }
         }
 
@@ -6186,43 +6362,44 @@ async function heartbeatAllInstances() {
 
         if (!token) { results.push({ origin: origin, status: 'no-token' }); continue; }
 
+        var _triedTokens = [token];
         try {
-            var res = await fetch(origin + '/api/now/uisession/touch-session', {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': '*/*',
-                    'X-UserToken': token,
-                    'X-WantAuthSessionNotifications': 'true'
-                }
-            });
+            var res = await touchSession(origin, token);
 
             // 401 = cached token went stale. Re-probe a live tab once and retry.
             if (res.status === 401 && tab && source === 'cache') {
                 var fresh = await readTokenFromTab(tab);
-                if (fresh && fresh !== token) {
+                if (fresh && _triedTokens.indexOf(fresh) === -1) {
                     token = fresh;
-                    cache[origin] = { token: token, userName: (cached && cached.userName) || '', updated: Date.now() };
-                    cacheDirty = true;
-                    res = await fetch(origin + '/api/now/uisession/touch-session', {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Accept': '*/*',
-                            'X-UserToken': token,
-                            'X-WantAuthSessionNotifications': 'true'
-                        }
-                    });
+                    _triedTokens.push(fresh);
+                    res = await touchSession(origin, token);
                     source = 'tab-refresh';
                 }
             }
 
-            // Drop the cache entry if the instance has logged us out for good.
+            // Still 401: the token we led with may belong to a session-timed-out tab
+            // while ANOTHER tab of the same origin is signed in. Try each remaining
+            // distinct tab token (already read above) before declaring logged out.
+            for (var st = 0; st < liveTokens.length && res.status === 401; st++) {
+                var alt = liveTokens[st];
+                if (_triedTokens.indexOf(alt) !== -1) continue;
+                _triedTokens.push(alt);
+                var altRes = await touchSession(origin, alt);
+                if (altRes.status !== 401) {
+                    res = altRes;
+                    token = alt;
+                    source = 'tab-sibling';
+                }
+            }
+
             if (res.status === 401) {
-                delete cache[origin];
-                cacheDirty = true;
+                // Drop the cache entry if the instance has logged us out for good.
+                // Every tab token was rejected, so the browser session is gone: the
+                // cached token (same cookie jar) goes too, even if it was not pinged.
+                if (cached) cacheOps[origin] = { del: _triedTokens.concat([cached.token]) };
+            } else if (!cached || cached.token !== token) {
+                // Cache only a token the instance just ACCEPTED (non-401).
+                cacheOps[origin] = { set: { token: token, userName: (cached && cached.userName) || '', updated: Date.now() } };
             }
 
             results.push({ origin: origin, status: res.status, source: source });
@@ -6231,7 +6408,18 @@ async function heartbeatAllInstances() {
         }
     }
 
-    if (cacheDirty) chrome.storage.local.set({ instanceTokens: cache });
+    if (Object.keys(cacheOps).length) {
+        await snUpdateInstanceTokens(function(map) {
+            var changed = false;
+            Object.keys(cacheOps).forEach(function(o) {
+                var op = cacheOps[o];
+                if (op.set) { map[o] = op.set; changed = true; }
+                // A concurrent writer may have stored a NEWER token meanwhile — keep it.
+                else if (op.del && map[o] && op.del.indexOf(map[o].token) !== -1) { delete map[o]; changed = true; }
+            });
+            return changed;
+        });
+    }
     try {
         chrome.storage.local.set({
             heartbeatLastRun: Date.now(),

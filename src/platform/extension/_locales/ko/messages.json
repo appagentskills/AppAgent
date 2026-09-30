@@ -1,0 +1,14 @@
+{
+    "extName": {
+        "message": "ServiceNow용 AppAgent",
+        "description": "Extension name shown in chrome://extensions and the Chrome Web Store. Keep the product name \"AppAgent\" and the brand \"ServiceNow\" untranslated. Max 75 characters."
+    },
+    "extDescription": {
+        "message": "ServiceNow용 AI 에이전트 - 자연어로 플랫폼과 상호 작용",
+        "description": "Extension description shown in chrome://extensions and the Chrome Web Store. Keep \"ServiceNow\" untranslated. Max 132 characters."
+    },
+    "actionTitle": {
+        "message": "AppAgent 열기",
+        "description": "Tooltip of the toolbar (action) button that opens the AppAgent side panel. Keep the product name \"AppAgent\" untranslated."
+    }
+}

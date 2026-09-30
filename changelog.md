@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.32
+
+### Features
+- GPT-6 Sol is upgraded to GPT-6.1 Sol.
+- The extension name and description are translated in the Chrome Web Store and browser.
+
+### Fixes
+- An expired session in one tab no longer marks the instance as disconnected.
+- Workspace Files now shows edits made by sub-agents.
+
+---
+
 ## v1.1.31
 
 ### Features

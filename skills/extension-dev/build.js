@@ -904,6 +904,30 @@ async function extension_build(args) {
         }
     }
 
+    // 8a. Chrome i18n: src/platform/extension/_locales/<chromeCode>/messages.json
+    // -> dist/extension/_locales/... (same set as build/build.js). The manifest's
+    // __MSG_*__ strings resolve from these; with default_locale set Chrome
+    // REFUSES to load the extension if _locales/<default_locale>/messages.json
+    // is missing, so that case aborts the build (deploy folder untouched).
+    var chromeLocalesLs = await ws("ls", { path: 'src/platform/extension/_locales' });
+    var chromeLocaleCodes = (chromeLocalesLs.success ? chromeLocalesLs.entries : []).map(function(e) { return String(e).split(' ')[0].replace(/\/$/, ''); })
+        .filter(function(n) { return /^[a-z]{2,3}(_[A-Z0-9]{2,3})?$/.test(n); });
+    var chromeLocaleReads = await _mapLimit(chromeLocaleCodes, BUILD_READ_CONCURRENCY, function(code) { return readFile('src/platform/extension/_locales/' + code + '/messages.json'); });
+    var chromeLocalesCopied = 0;
+    chromeLocaleCodes.forEach(function(code, i) {
+        if (chromeLocaleReads[i] === null) return;
+        outputFiles.push({ path: 'dist/extension/_locales/' + code + '/messages.json', content: chromeLocaleReads[i] });
+        chromeLocalesCopied++;
+    });
+    var defaultLocale = manifestRaw ? JSON.parse(manifestRaw).default_locale : null;
+    if (defaultLocale && !outputFiles.some(function(f) { return f.path === 'dist/extension/_locales/' + defaultLocale + '/messages.json'; })) {
+        return {
+            success: false,
+            error: 'Build aborted — manifest default_locale "' + defaultLocale + '" but src/platform/extension/_locales/' + defaultLocale + '/messages.json is missing (Chrome would refuse to load the extension). Workspace outputs and deploy folder untouched.',
+            built_from: defaultWorkspace || null
+        };
+    }
+
     var testRunPolicySource = await readFile('src/js/core/075-test-run-policy.js');
     outputFiles.push({ path: 'dist/extension/test-run-policy.js', content: testRunPolicySource });
 
@@ -1056,6 +1080,7 @@ async function extension_build(args) {
             eventBindings: (headResult.bindingJS.match(/_bindEv/g) || []).length - 1 + (bodyResult.bindingJS.match(/_bindEv/g) || []).length - 1,
             iconsCopied: iconsCopied,
             localesCopied: localesCopied,
+            chromeLocalesCopied: chromeLocalesCopied,
             filesDeployed: filesDeployed
         }
     };

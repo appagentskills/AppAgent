@@ -165,10 +165,14 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high'
     },
     {
-        // GPT-6 Sol (2026-09-22) replaces the gpt-5.6-sol OpenRouter default
-        // (untouched copies are renamed by loadApiProviders, core/130-indexeddb.js)
-        name: 'gpt-6-sol',
-        model: 'openai/gpt-6-sol',
+        // GPT-6.1 Sol (2026-09-30) replaces the gpt-6-sol OpenRouter default
+        // (untouched copies are renamed by loadApiProviders, core/130-indexeddb.js).
+        // 1.05M context, 128K max output (OpenRouter + developers.openai.com/
+        // api/docs/models/gpt-6.1-sol) — both covered by the global defaults.
+        // Effort low|medium|high|xhigh|max only: NO 'none'/'minimal'
+        // (isGpt6ReasoningRequiredModel below).
+        name: 'gpt-6.1-sol',
+        model: 'openai/gpt-6.1-sol',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: '',
         effort: 'low'
@@ -253,6 +257,8 @@ var DEFAULT_API_PROVIDERS = [
     // Terra is dropped (no GPT-6 Terra) — untouched 5.6 copies are migrated by
     // loadApiProviders (core/130-indexeddb.js), mirroring Codex's own
     // gpt-5.6-terra/-sol → gpt-6-sol and gpt-5.6-luna → gpt-6-luna migration.
+    // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed (Codex's model
+    // picker lists GPT-6.1-Sol as default, GPT-6-Sol as previous generation).
     {
         name: 'GPT-6 Astra (ChatGPT)',
         model: 'gpt-6-astra',
@@ -262,8 +268,8 @@ var DEFAULT_API_PROVIDERS = [
         isChatGPTOAuth: true
     },
     {
-        name: 'GPT-6 Sol (ChatGPT)',
-        model: 'gpt-6-sol',
+        name: 'GPT-6.1 Sol (ChatGPT)',
+        model: 'gpt-6.1-sol',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
         effort: 'high',
@@ -286,12 +292,25 @@ function isChatGPTAstraModel(model) {
 // GPT-6 Sol / Luna (2026-09-22): reasoning.effort none|low|medium(default)|
 // high|xhigh|max (developers.openai.com/api/docs/models/gpt-6-sol, gpt-6-luna).
 // Exact slugs only — '-pro' variants are not assumed to share the capability.
+// gpt-6-sol stays here (still served, "previous generation") for custom entries.
 function isChatGPTGpt6SolLunaModel(model) {
     return /^gpt-6-(?:sol|luna)$/.test(String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, ''));
 }
+// GPT-6.1 Sol (2026-09-30): reasoning.effort low|medium(default)|high|xhigh|max;
+// 'none' and 'minimal' are NOT supported (developers.openai.com/api/docs/
+// models/gpt-6.1-sol). Exact slug only (the '-pro' variant is not assumed).
+function isChatGPTGpt61SolModel(model) {
+    return String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, '') === 'gpt-6.1-sol';
+}
+// GPT-6 models that cannot turn reasoning off: none/minimal → low, and the
+// thinking-off switch must not send none / enabled:false (Astra, GPT-6.1 Sol —
+// latest-model guide: "GPT-6 Astra and GPT-6.1 Sol do not support none").
+function isGpt6ReasoningRequiredModel(model) {
+    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model);
+}
 // Models whose Codex request keeps xhigh/max as-is (no legacy clamp to high).
 function chatGPTSupportsExtendedEffort(model) {
-    return isChatGPTAstraModel(model) || isChatGPTGpt6SolLunaModel(model);
+    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model) || isChatGPTGpt6SolLunaModel(model);
 }
 
 // API providers (loaded from IndexedDB, initialized with defaults on first load)
@@ -452,11 +471,14 @@ var PROVIDER_RENAMES = {
     'sonnet-4.5': 'sonnet-5.5',
     'sonnet-4.6': 'sonnet-5.5',
     'Kimi K2.5': 'GLM 5.2',
-    // (gpt-5.2 / gpt-5.5 chain-collapse straight to gpt-6-sol: the old
-    // gpt-5.5 / gpt-5.6-sol targets no longer exist in the defaults)
-    'gpt-5.2': 'gpt-6-sol',
-    'gpt-5.5': 'gpt-6-sol',
-    'gpt-5.6-sol': 'gpt-6-sol',
+    // (gpt-5.2 / gpt-5.5 / gpt-5.6-sol chain-collapse straight to gpt-6.1-sol:
+    // the old gpt-5.5 / gpt-5.6-sol / gpt-6-sol targets no longer exist in the
+    // defaults)
+    'gpt-5.2': 'gpt-6.1-sol',
+    'gpt-5.5': 'gpt-6.1-sol',
+    'gpt-5.6-sol': 'gpt-6.1-sol',
+    // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
+    'gpt-6-sol': 'gpt-6.1-sol',
     'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
     'Sonnet 4.6 OAuth': 'Sonnet 5.5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
@@ -465,12 +487,15 @@ var PROVIDER_RENAMES = {
     'Sonnet 5 OAuth': 'Sonnet 5.5',
     // ChatGPT-OAuth seeds: the assumed gpt-5.1* slugs never existed on the
     // Codex backend for ChatGPT accounts
-    'GPT-5.1 Codex': 'GPT-6 Sol (ChatGPT)',
-    'GPT-5.1': 'GPT-6 Sol (ChatGPT)',
+    // (chain-collapsed to GPT-6.1 Sol: the GPT-6 Sol seed retired 2026-09-30)
+    'GPT-5.1 Codex': 'GPT-6.1 Sol (ChatGPT)',
+    'GPT-5.1': 'GPT-6.1 Sol (ChatGPT)',
     // Sept 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds; Terra has no
     // GPT-6 successor and folds into Sol (Codex's own migration target)
-    'GPT-5.6 Sol (ChatGPT)': 'GPT-6 Sol (ChatGPT)',
-    'GPT-5.6 Terra (ChatGPT)': 'GPT-6 Sol (ChatGPT)',
+    'GPT-5.6 Sol (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
+    'GPT-5.6 Terra (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
+    // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed
+    'GPT-6 Sol (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
     'GPT-5.6 Luna (ChatGPT)': 'GPT-6 Luna (ChatGPT)'
 };
 

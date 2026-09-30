@@ -1,0 +1,14 @@
+{
+    "extName": {
+        "message": "AppAgent a ServiceNow-hoz",
+        "description": "Extension name shown in chrome://extensions and the Chrome Web Store. Keep the product name \"AppAgent\" and the brand \"ServiceNow\" untranslated. Max 75 characters."
+    },
+    "extDescription": {
+        "message": "MI-ügynök a ServiceNow-hoz – természetes nyelvű interakció a platformmal",
+        "description": "Extension description shown in chrome://extensions and the Chrome Web Store. Keep \"ServiceNow\" untranslated. Max 132 characters."
+    },
+    "actionTitle": {
+        "message": "AppAgent megnyitása",
+        "description": "Tooltip of the toolbar (action) button that opens the AppAgent side panel. Keep the product name \"AppAgent\" untranslated."
+    }
+}

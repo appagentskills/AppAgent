@@ -24,12 +24,20 @@ function _wsfScanChat(chat) {
     var out = [];
     if (!chat || !chat.messages) return out;
     var pending = {};
+    var pushIds = {};
+    // WSF-PR: path -> {url, number} of the PR a successful push carried it to.
+    out.pushed = {};
     chat.messages.forEach(function(msg, idx) {
         if (msg.role === 'assistant' && msg.tool_calls) {
             msg.tool_calls.forEach(function(tc, tcIdx) {
                 if (!tc.function || tc.function.name !== 'workspace' || !tc.id) return;
-                var a;
-                try { a = JSON.parse(tc.function.arguments); } catch (e) { return; }
+                var a = null;
+                try { a = JSON.parse(tc.function.arguments); } catch (e) { a = null; }
+                // WSF-EVICT: a cold (evicted) chat keeps only a compact
+                // {action, path, dest, workspace} stub of mutating calls
+                // (stripChatPayloadsInPlace, core/130-indexeddb.js).
+                if (!a && tc._wsArgs) a = tc._wsArgs;
+                if (a && a.action === 'push') { pushIds[tc.id] = true; return; }
                 if (!a || !_wsfMutatingActions[a.action]) return;
                 // copy writes to `dest`; a discard without a path is a bulk
                 // discard we cannot attribute to a single file — skip it.
@@ -37,11 +45,22 @@ function _wsfScanChat(chat) {
                 if (!path) return;
                 pending[tc.id] = { action: a.action, args: a, path: path, wsKey: a.workspace || null, msgIdx: idx, tcIdx: tcIdx };
             });
+        } else if (msg.role === 'tool' && msg.tool_call_id && pushIds[msg.tool_call_id]) {
+            // WSF-PR: push results stay resident (PR-CHIP) and list every
+            // pushed file — attribute each path to its PR.
+            var pr = msg.content;
+            if (typeof pr === 'string') { try { pr = JSON.parse(pr); } catch (e) { pr = null; } }
+            if (pr && pr.success && pr.pr_url && Array.isArray(pr.files)) {
+                pr.files.forEach(function(pf) {
+                    if (pf && pf.path) out.pushed[pf.path] = { url: pr.pr_url, number: pr.pr_number || null, wsKey: pr.workspace || null, isNew: !!pf.isNew, isDeleted: !!pf.isDeleted };
+                });
+            }
         } else if (msg.role === 'tool' && msg.tool_call_id && pending[msg.tool_call_id]) {
             var entry = pending[msg.tool_call_id];
             delete pending[msg.tool_call_id];
             var r = msg.content;
             if (typeof r === 'string') { try { r = JSON.parse(r); } catch (e) { r = null; } }
+            if (!r && msg._wsResult) r = msg._wsResult; // WSF-EVICT stub
             if (!r || !r.success) return;
             entry.created = !!(r.message && /^(Created|Restored)/.test(r.message));
             out.push(entry);
@@ -68,12 +87,24 @@ function getWsEditedFilesForChat(chat) {
         if (ch.wsKey && !byKey[key].wsKey) byKey[key].wsKey = ch.wsKey;
         byKey[key].changes.push(ch);
     });
+    // WSF-PR: files a push listed but whose edit calls are not derivable
+    // (e.g. rows evicted before stubs existed) still surface, with no
+    // change list — the push result itself is the evidence.
+    var pushed = changes.pushed || {};
+    Object.keys(pushed).forEach(function(p) {
+        var key = '::' + p;
+        if (byKey[key]) return;
+        byKey[key] = { path: p, wsKey: pushed[p].wsKey, changes: [], pushOnly: true };
+        order.push(key);
+    });
     return order.map(function(key) {
         var f = byKey[key];
         var last = f.changes[f.changes.length - 1];
-        f.isNew = f.changes.some(function(c) { return c.created; });
-        f.isDeleted = last.action === 'delete';
-        f.isDiscarded = last.action === 'discard';
+        var pp = pushed[f.path];
+        if (pp) f.pushedPr = { url: pp.url, number: pp.number };
+        f.isNew = f.changes.some(function(c) { return c.created; }) || !!(f.pushOnly && pp && pp.isNew);
+        f.isDeleted = last ? last.action === 'delete' : !!(pp && pp.isDeleted);
+        f.isDiscarded = !!last && last.action === 'discard';
         return f;
     });
 }
@@ -181,6 +212,7 @@ function renderWorkspaceFilesSection(chat) {
                 if (own) {
                     own.changes = own.changes.concat(sf.changes);
                     if (sf.isNew) own.isNew = true;
+                    if (sf.pushedPr && !own.pushedPr) own.pushedPr = sf.pushedPr;
                     if (!own.workers) own.workers = [];
                     if (own.workers.indexOf(sc.name) === -1) own.workers.push(sc.name);
                 } else {
@@ -220,7 +252,11 @@ function renderWorkspaceFilesSection(chat) {
         html += '<div class="sn-artifact-card sidebar-card wsf-card" role="button" tabindex="0" data-kbd-click onclick="wsfOpenDiff(' + i + ')" title="' + escapeHtml(f.path) + '">';
         html += '<div class="sn-artifact-content">';
         html += '<div class="sn-artifact-name">' + escapeHtml(name) + '</div>';
-        html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + workerChips + badge + changesBadge + '</div>';
+        // WSF-PR: link the PR the file was pushed to (own or worker push).
+        var prChip = (f.pushedPr && f.pushedPr.url)
+            ? '<a class="wsf-ws wsf-pr" href="' + escapeHtml(f.pushedPr.url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="' + escapeHtml(t('PR #{number}', { number: f.pushedPr.number || '' })) + '">' + escapeHtml('#' + (f.pushedPr.number || 'PR')) + '</a>'
+            : '';
+        html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + workerChips + badge + prChip + changesBadge + '</div>';
         html += '</div>';
         html += '</div>';
     });
@@ -749,6 +785,20 @@ async function wsfDiscardFile(i) {
 
 // Re-render the sidebar when the agent mutates the workspace mid-run so the
 // section stays live. AgentEvents may load after this file — retry briefly.
+var _wsfSubRenderTimer = null;
+function _wsfOnSubMessages(ev) {
+    if (!ev || !ev.chatId || typeof currentChatId === 'undefined' || ev.chatId === currentChatId) return false;
+    if (typeof getSubAgentChatsForChat !== 'function') return false;
+    var isSub = getSubAgentChatsForChat(currentChatId).some(function(sc) { return sc.chatId === ev.chatId; });
+    if (!isSub) return false;
+    if (_wsfSubRenderTimer) clearTimeout(_wsfSubRenderTimer);
+    _wsfSubRenderTimer = setTimeout(function() {
+        _wsfSubRenderTimer = null;
+        if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
+    }, 400);
+    return true;
+}
+
 (function _wsfHookMutations() {
     var tries = 0;
     function hook() {
@@ -773,6 +823,15 @@ async function wsfDiscardFile(i) {
                 try { _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
                 if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
             } catch (e) { /* sidebar not ready */ }
+        });
+        // WSF-SUBREFRESH: workspaceMutated fires when the tool finishes —
+        // BEFORE the sub-agent's tool-result row lands in its chat replica,
+        // and messagesAppended only repaints the CURRENT chat. A worker's
+        // edit therefore stayed hidden in the parent's sidebar until some
+        // unrelated parent render. Re-render (debounced) when a descendant
+        // sub-agent chat of the current chat grows.
+        AgentEvents.on('messagesAppended', function(ev) {
+            try { _wsfOnSubMessages(ev); } catch (e) { /* sidebar not ready */ }
         });
     }
     setTimeout(hook, 0);
