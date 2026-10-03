@@ -972,7 +972,15 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 var editResult = applySearchReplaceEdits(widget.html, args.edits);
                 if (editResult.error) return { success: false, error: 'Edit failed', validationErrors: editResult.messages };
                 var result = await saveWidgetRevision(widget, editResult.content, args.expected_version, await widgetOperationId(args, options));
-                if (result.success) result.appliedEdits = editResult.appliedEdits.length;
+                if (result.success) {
+                    result.appliedEdits = editResult.appliedEdits.length;
+                    // PER-TURN RENDER: show the edited version at this turn of the
+                    // ISSUING chat (core/135-widget-store.js recordWidgetRender).
+                    var _erChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+                    var _er = result.deduplicated ? null : recordWidgetRender(_erChatId, widgetId, result.version, options);
+                    // Durable via the SW mirror (worker/120-tool-routing.js).
+                    if (_er) result._widget_render = Object.assign({ chatId: _erChatId }, _er);
+                }
                 return result;
 
             // Hidden actions (not in tool schema - used by skill tools via executeTool)

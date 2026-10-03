@@ -89,7 +89,7 @@ describe('data management delete all (S8D-02)', function() {
         h.mod.DELETE_ALL_STORES.forEach(function(n) { assert.strictEqual(daCount(h, n), 0, n + ' cleared'); });
         assert.deepStrictEqual(h.mod.DELETE_ALL_KEEP_STORES, ['workspace_meta', 'workspace_files', 'workspace_blobs']);
         h.mod.DELETE_ALL_KEEP_STORES.forEach(function(n) { assert.strictEqual(daCount(h, n), 1, n + ' kept'); });
-        assert.deepStrictEqual(ev.slice(), ['lock:true', 'commit', 'logout:claude-oauth-logout', 'logout:openai-oauth-logout', 'remove', 'reload']);
+        assert.deepStrictEqual(ev.slice(), ['lock:true', 'commit', 'logout:claude-oauth-logout', 'logout:openai-oauth-logout', 'remove', 'lock:false', 'reload']); // M6: page-only reload keeps the SW, so the lock is lifted first
         assert.deepStrictEqual(ev.removed, h.mod.DELETE_ALL_LOCAL_KEYS);
         ['githubToken', 'githubUser', 'sessionToken', 'instanceTokens', 'claudeOAuth', 'openaiOAuth', 'openaiPendingDeviceAuth', 'appagent_chat_index']
             .forEach(function(k) { assert.ok(ev.removed.indexOf(k) >= 0, k); });

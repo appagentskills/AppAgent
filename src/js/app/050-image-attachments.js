@@ -553,7 +553,7 @@ function downloadTextFile() {
 // Open file preview from a chat message by index
 function openFileFromMessage(msgIndex) {
     var chat = chats[currentChatId];
-    if (!chat || !chat.messages[msgIndex]) return;
+    if (!chat || !Array.isArray(chat.messages) || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     if (msg.role !== 'file' || !msg.content) return;
     openFileModal(msg.content, msg.name || t('File'), msg.mimeType);
@@ -562,7 +562,7 @@ function openFileFromMessage(msgIndex) {
 // Open PDF preview from a chat message by index
 function openPdfFromMessage(msgIndex) {
     var chat = chats[currentChatId];
-    if (!chat || !chat.messages[msgIndex]) return;
+    if (!chat || !Array.isArray(chat.messages) || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
     if (msg.role !== 'pdf' || !msg.base64) return;
     openPdfModal(msg.base64, msg.name || msg.description || t('Document'), msgIndex);
@@ -698,7 +698,7 @@ function initImageAttachmentListeners() {
 // Resend a user message in a new chat
 function resendMessage(msgIndex) {
     var chat = chats[currentChatId];
-    if (!chat || !chat.messages[msgIndex]) return;
+    if (!chat || !Array.isArray(chat.messages) || !chat.messages[msgIndex]) return;
     var userMsg = chat.messages[msgIndex];
     if (userMsg.role !== 'user') return;
     
@@ -740,7 +740,7 @@ function getEditedTurnAttachments(messages, msgIndex) {
 // Edit a user message - creates a new chat branch with history up to that point
 function editMessage(msgIndex) {
     var chat = chats[currentChatId];
-    if (!chat || !chat.messages[msgIndex]) return;
+    if (!chat || !Array.isArray(chat.messages) || !chat.messages[msgIndex]) return;
     var userMsg = chat.messages[msgIndex];
     if (userMsg.role !== 'user') return;
     

@@ -566,6 +566,23 @@ function resolvePendingUIToolCall(toolCallId, result, error, sourcePort) {
 // MP-1/MP-2 and app/045-agent-port-bridge-page.js MP-4.
 // =============================================================
 
+// C2-store B: a message-evicted SKELETON (core/130 evictChatMessagesInPlace:
+// `_messagesEvicted`, no `messages` key). Its history lives on disk only, so
+// every `.messages` site below must hydrate first (ensureChatPayloads) and
+// must NEVER seed an empty messages array onto it — a save would then put a
+// 1-row history over the stored one. No-op for a chat with a messages array.
+function _sw120IsMsgSkeleton(c) {
+    return !!c && !Array.isArray(c.messages) && !!c._messagesEvicted;
+}
+// Hydrate chatId then run fn (once). ensureChatPayloads never rejects by
+// contract; fn also runs on a rejection so the caller's work is never lost.
+// Returns false when there is no hydrator in this realm (caller falls back).
+function _sw120HydrateThen(chatId, fn) {
+    if (typeof ensureChatPayloads !== 'function') return false;
+    Promise.resolve().then(function() { return ensureChatPayloads(chatId); }).then(fn, fn);
+    return true;
+}
+
 // MP-1: seed the pending prompt_user row into the SW's authoritative chat
 // copy at DISPATCH time, splicing it before the tool placeholder — the same
 // slot the resolve-time _message_persist mirror uses. Idempotent by promptId
@@ -573,9 +590,14 @@ function resolvePendingUIToolCall(toolCallId, result, error, sourcePort) {
 // the adopted-row path never re-posts anyway). Broadcasts 'messagesAppended'
 // (chat-inlined — see worker/100-agent-event-broadcast.js) so every panel
 // viewing the chat renders the live form immediately.
-function _swSeedPromptRow(chatId, row) {
+function _swSeedPromptRow(chatId, row, _hydrated) {
     var chat = chatId && chats[chatId];
     if (!chat || chat._deleted || !row || !row.promptId) return;
+    if (_sw120IsMsgSkeleton(chat)) {
+        if (!_hydrated && _sw120HydrateThen(chatId, function() { _swSeedPromptRow(chatId, row, true); })) return;
+        console.warn('[tool-routing] prompt row seed skipped: chat ' + chatId + ' still message-evicted');
+        return;
+    }
     if (!Array.isArray(chat.messages)) chat.messages = [];
     for (var i = 0; i < chat.messages.length; i++) {
         var m = chat.messages[i];
@@ -601,11 +623,16 @@ function _swSeedPromptRow(chatId, row) {
 //     the submitting panel itself) → settle the SW promise directly;
 //   • executor closed and the call RE-PARKED (_unregisterPanel) → consume
 //     the parked entry with the submitted values instead of hanging.
-function _swSettleRemotePrompt(msg, fromPort) {
+function _swSettleRemotePrompt(msg, fromPort, _hydrated) {
     if (!msg || !msg.promptId) return;
     var chatId = msg.chatId;
     var result = msg.result || { success: false, cancelled: true, message: 'Prompt settled remotely' };
     var chat = chatId && chats[chatId];
+    // C2-store B: a skeleton would read as "no row" and skip first-submit-wins
+    // + the row flip. Hydrate, then settle; if still evicted, settle row-less.
+    if (!_hydrated && _sw120IsMsgSkeleton(chat)
+        && _sw120HydrateThen(chatId, function() { _swSettleRemotePrompt(msg, fromPort, true); })) return;
+    chat = chatId && chats[chatId];
     var row = null;
     if (chat && Array.isArray(chat.messages)) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -685,7 +712,10 @@ function _swIsStopPhrase(text) {
 function _swAnswerPendingPromptViaChat(chatId, text) {
     if (typeof text !== 'string' || !text.trim()) return false;
     var chat = chatId && chats[chatId];
-    if (!chat || !Array.isArray(chat.messages)) return false;
+    // C2-store B: this lane is synchronous (the caller decides interrupt vs
+    // answer now), so a skeleton cannot be hydrated here — return false and
+    // take the interrupt lane, which never swallows the user's message.
+    if (!chat || _sw120IsMsgSkeleton(chat) || !Array.isArray(chat.messages)) return false;
     var row = null;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         var m = chat.messages[i];
@@ -734,9 +764,14 @@ function _swAnswerPendingPromptViaChat(chatId, text) {
 // late-connecting panels receive the pending approval in their hello /
 // chat-inlined broadcast snapshots (the page merge keeps a non-pending
 // snapshot copy over a pending page one, see _mergePagePendingRows).
-function _swSeedApprovalRow(chatId, row) {
+function _swSeedApprovalRow(chatId, row, _hydrated) {
     var chat = chatId && chats[chatId];
     if (!chat || chat._deleted || !row || !row.toolCallId) return;
+    if (_sw120IsMsgSkeleton(chat)) {
+        if (!_hydrated && _sw120HydrateThen(chatId, function() { _swSeedApprovalRow(chatId, row, true); })) return;
+        console.warn('[tool-routing] approval row seed skipped: chat ' + chatId + ' still message-evicted');
+        return;
+    }
     if (!Array.isArray(chat.messages)) chat.messages = [];
     for (var i = 0; i < chat.messages.length; i++) {
         var m = chat.messages[i];
@@ -753,9 +788,14 @@ function _swSeedApprovalRow(chatId, row) {
 // (chat-inlined, see EVENTS_WITH_CHAT_INLINE) so EVERY panel dismisses its
 // card, drops its local resolver and repaints the row terminal. Late
 // verdicts never reach here — their pending entry is already gone.
-function _swSettleApprovalRow(chatId, toolCallId, status, allowed) {
+function _swSettleApprovalRow(chatId, toolCallId, status, allowed, _hydrated) {
     if (!chatId || !toolCallId) return;
     var chat = chats[chatId];
+    // C2-store B: hydrate a skeleton first so its pending row is flipped
+    // (and persisted) rather than left 'pending' on disk.
+    if (!_hydrated && _sw120IsMsgSkeleton(chat)
+        && _sw120HydrateThen(chatId, function() { _swSettleApprovalRow(chatId, toolCallId, status, allowed, true); })) return;
+    chat = chats[chatId];
     var row = null;
     if (chat && Array.isArray(chat.messages)) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -933,10 +973,16 @@ function abandonPendingUIToolCall(chatId, toolCallId, reason) {
             if (m && m.role === 'prompt_user' && m.toolCallId === toolCallId && m.status === 'pending') { row = m; break; }
         }
     }
+    // C2-store B: a skeleton hides the seeded row. Settle the call NOW (the
+    // resolve must not wait on IDB), then hydrate and do the row-dependent
+    // part (executor forward + row flip) below in _abandonSkeletonRow.
+    var _skel = _sw120IsMsgSkeleton(chat);
+    var _skelPort = null;
     var pending = _pendingUIToolCalls[toolCallId];
     if (pending) {
         if (pending._backstopTimer) { clearTimeout(pending._backstopTimer); pending._backstopTimer = null; }
         delete _pendingUIToolCalls[toolCallId];
+        if (_skel && pending.name === 'prompt_user' && pending.port) _skelPort = pending.port;
         if (pending.name === 'prompt_user' && pending.port && row) {
             // Disarm the executing panel's pendingPromptResolvers entry and
             // dismiss its live form (page: _handleRemotePromptResult).
@@ -954,7 +1000,28 @@ function abandonPendingUIToolCall(chatId, toolCallId, reason) {
         row.abandoned = true;
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-abandoned' });
+    } else if (_skel) {
+        _sw120HydrateThen(chatId, function() { _abandonSkeletonRow(chatId, toolCallId, result, _skelPort); });
     }
+}
+// C2-store B: deferred half of abandonPendingUIToolCall for a skeleton chat,
+// run after hydration. Still evicted (hydrate failed) → nothing to flip.
+function _abandonSkeletonRow(chatId, toolCallId, result, port) {
+    var chat = chatId && chats[chatId];
+    if (!chat || chat._deleted || !Array.isArray(chat.messages)) return;
+    var row = null;
+    for (var i = 0; i < chat.messages.length; i++) {
+        var m = chat.messages[i];
+        if (m && m.role === 'prompt_user' && m.toolCallId === toolCallId && m.status === 'pending') { row = m; break; }
+    }
+    if (!row) return;
+    if (port) {
+        try { port.postMessage({ type: 'prompt-user-remote-result', chatId: chatId, promptId: row.promptId, result: result }); } catch (e) {}
+    }
+    row.status = 'cancelled';
+    row.abandoned = true;
+    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+    AgentEvents.emit('messagesAppended', { chatId: chatId, reason: 'prompt-user-abandoned' });
 }
 
 // =============================================================
@@ -1161,15 +1228,33 @@ async function _routeLiveWidgetToolOnce(args, options) {
     return _widgetEvalPanelCall(owner, chatId, args, options, 90000);
 }
 
+// Re-dispatch a local_folder op to the panel (args._lf_panel_fallback makes
+// isHeadlessTool false, so executeTool takes the UI route). No panel open →
+// a clear error instead of parking.
+async function _lfRouteToPanel(name, args, messageIndex, options, swResult) {
+    var hasPanel = typeof pickExecutorPort === 'function' && !!pickExecutorPort();
+    if (!hasPanel) {
+        return { success: false, code: swResult.code, error: swResult.error + ' Open the AppAgent side panel and retry — this operation must run there.' };
+    }
+    var r = await executeTool(name, Object.assign({}, args, { _lf_panel_fallback: true }), messageIndex, options);
+    return (typeof lfAdoptPanelFallbackResult === 'function') ? lfAdoptPanelFallbackResult(r) : r;
+}
+
 var _executeToolLocal = executeTool;
 executeTool = async function(name, args, messageIndex, options) {
-    var _isHeadless = (typeof isHeadlessTool === 'function') && isHeadlessTool(name);
+    var _isHeadless = (typeof isHeadlessTool === 'function') && isHeadlessTool(name, args);
 
     // Headless tools run in offscreen directly. The original
     // dispatcher already does its own permission check via
     // requestProgrammaticToolApproval (see worker stub below).
     if (_isHeadless) {
-        return await _executeToolLocal(name, args, messageIndex, options);
+        var _headlessResult = await _executeToolLocal(name, args, messageIndex, options);
+        // local_folder SW fallback: a file op the SW cannot perform (local
+        // handle / createWritable unavailable) is re-run in the side panel.
+        if (name === 'local_folder' && _headlessResult && _headlessResult._route_to_panel) {
+            return await _lfRouteToPanel(name, args, messageIndex, options, _headlessResult);
+        }
+        return _headlessResult;
     }
 
     // -------- Sub-agent tool-call counter (UI tools) --------
@@ -1320,6 +1405,18 @@ executeTool = async function(name, args, messageIndex, options) {
     // resurrects on reload. A tombstone must never gain a message, so skip
     // the whole mirror block for it (the other arms — displays, widgets,
     // targetTabId — are equally pointless on a deleted chat).
+    // C2-store B: the `_message_persist` splice and the display msgIndex scan
+    // below read chats[chatId].messages — on a message-evicted skeleton that
+    // would silently drop the row. Hydrate first (executeTool is async;
+    // ensureChatPayloads never rejects). No-op for a non-skeleton chat.
+    if (result && chatId && _sw120IsMsgSkeleton(chats[chatId]) && !chats[chatId]._deleted
+        && (result._message_persist || result._display_persist || result._widget_render)
+        && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (_eH) {}
+        if (result._message_persist && _sw120IsMsgSkeleton(chats[chatId])) {
+            console.warn('[tool-routing] _message_persist mirror skipped: chat ' + chatId + ' still message-evicted');
+        }
+    }
     if (result && chatId && chats[chatId] && !chats[chatId]._deleted) {
         if (result._display_persist) {
             var dp = result._display_persist;
@@ -1348,6 +1445,24 @@ executeTool = async function(name, args, messageIndex, options) {
             }
             chats[chatId].displays[dp.displayId] = dpEntry;
             delete result._display_persist;
+        }
+        if (result._widget_render) {
+            // PER-TURN RENDER ref (core/135-widget-store.js recordWidgetRender):
+            // mirrored onto the ISSUING chat (where the edit turn lives), never
+            // the owning chat. Refs only, no HTML. The SW chat is authoritative
+            // for the slot index, so re-resolve it by tool_call_id like displays.
+            var _wr = result._widget_render;
+            var _wrChat = chats[_wr.chatId || chatId] || chats[chatId];
+            if (_wr.id && _wr.toolCallId && _wrChat && !_wrChat._deleted) {
+                var _wrEntry = { id: _wr.id, version: _wr.version, msgIndex: _wr.msgIndex, toolCallId: _wr.toolCallId, _toggledAt: _wr._toggledAt || Date.now() };
+                var _wrMsgs = Array.isArray(_wrChat.messages) ? _wrChat.messages : [];
+                for (var _wri = _wrMsgs.length - 1; _wri >= 0; _wri--) {
+                    if (_wrMsgs[_wri] && _wrMsgs[_wri].role === 'tool' && _wrMsgs[_wri].tool_call_id === _wr.toolCallId) { _wrEntry.msgIndex = _wri; break; }
+                }
+                if (!_wrChat.widgetRenders) _wrChat.widgetRenders = {};
+                _wrChat.widgetRenders[_wr.key || (_wr.toolCallId + ':' + _wr.id)] = _wrEntry;
+            }
+            delete result._widget_render;
         }
         if (result._widget_persist) {
             var _wp = result._widget_persist;
@@ -1503,6 +1618,9 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             methodOrAction = args.action;
         } else if (toolName === 'workspace' && args && args.action) {
             methodOrAction = args.action;
+        } else if (toolName === 'local_folder' && args && args.action) {
+            // write/mkdir on a REAL folder → 'write_local' (core/070 helper)
+            methodOrAction = localFolderPermissionAction(args);
         } else if ((toolName === 'document' || toolName === 'widget_eval') && args && args.action) {
             // widget_eval {action:'list'} resolves to the read-ish
             // 'widget_eval:list' key (core/070 resolvePermissionKey) — must
@@ -1524,6 +1642,14 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
 
         if (permission === 'disabled') {
             return Object.assign({ allowed: false, error: displayName + ' is disabled by user settings' }, baseResult);
+        }
+        // local_folder write/mkdir/delete on a registered READ-ONLY folder is
+        // refused by the tool (READ_ONLY) — no prompt. Mirrors ui/150.
+        if (toolName === 'local_folder' && (permission === 'ask' || permission === 'auto')
+            && typeof lfIsReadOnlyWriteTarget === 'function'
+            && (await lfIsReadOnlyWriteTarget(args))) {
+            permission = 'allow';
+            baseResult.permission = 'allow';
         }
         // web_fetch to the CONFIGURED GitHub REST base is agent-governed via
         // the `confirm` param (mirrors the page gate in ui/150-tool-approval.js).
@@ -1549,7 +1675,13 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         var toolCallId = options.toolCallId
             || ('prog_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
         var chat = chats[targetChatId];
-        if (chat && chat.messages && toolCallId) {
+        // C2-store B: a skeleton hides earlier approval rows — hydrate so a
+        // recorded verdict for this toolCallId is honoured (not re-prompted).
+        if (_sw120IsMsgSkeleton(chat) && typeof ensureChatPayloads === 'function') {
+            try { await ensureChatPayloads(targetChatId); } catch (_eH) {}
+            chat = chats[targetChatId];
+        }
+        if (chat && Array.isArray(chat.messages) && toolCallId) {
             for (var i = 0; i < chat.messages.length; i++) {
                 var msg = chat.messages[i];
                 if (msg.role === 'approval' && msg.toolCallId === toolCallId) {

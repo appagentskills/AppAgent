@@ -230,6 +230,14 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
     // Store request body in metrics for debugging
     reqMetrics.requestBody = requestBody;
+    // PREFIX-STABILITY diagnostics: cheap per-part fingerprint (pre
+    // cache_control messages, so moving cache breakpoints are not a diff).
+    // Anthropic-format requests only (Claude via OpenRouter or Claude OAuth):
+    // that is where a drifted prefix drops thinking signatures; skip the
+    // per-message hashing cost for every other provider.
+    if (isAnthropic || provider.isClaudeOAuth) {
+        try { reqMetrics.prefixFingerprint = _computePrefixFingerprint(chatId, systemPromptText, requestBody.tools, messages); } catch (eFp) {}
+    }
 
     // Stable per-chat Codex session identity: the chatgpt.com/backend-api/codex
     // Responses endpoint keys its prompt cache off the session/thread headers
@@ -545,6 +553,10 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                     // Capture cache info from OpenRouter (Anthropic models via OpenRouter)
                     if (data.usage.cache_creation_input_tokens) reqMetrics.cache_creation_tokens = data.usage.cache_creation_input_tokens;
                     if (data.usage.cache_read_input_tokens) reqMetrics.cache_read_tokens = data.usage.cache_read_input_tokens;
+                    if (Array.isArray(data.usage.input_transformations) && data.usage.input_transformations.length) {
+                        reqMetrics.inputTransformations = data.usage.input_transformations.slice(0, 30);
+                        _logPrefixDiffOnDrop(chatId, reqMetrics);
+                    }
                     // Also check prompt_tokens_details for cache info
                     if (data.usage.prompt_tokens_details) {
                         if (Number.isFinite(data.usage.prompt_tokens_details.cached_tokens)) reqMetrics.cache_read_tokens = data.usage.prompt_tokens_details.cached_tokens;
@@ -825,6 +837,70 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 // Registry is SW-scope global state keyed by chatId. The body is stored as a
 // JSON string at stamp time so later in-place mutations of message objects
 // elsewhere can never drift the heartbeat body away from what was sent.
+
+// PREFIX-STABILITY diagnostics. _fpPart: 'length.fnv1a32' of a part.
+// _prefixFpMemo[chatId]: per-message fingerprints as last reported (SW
+// memory only; reset when the history shrinks), so a later request can name
+// the first API message whose bytes changed. Indices are PRE-transform
+// apiMsgs indices (before transformToAnthropic merges/reorders blocks).
+// Only computed for Anthropic-format requests (callOpenRouterStreaming
+// gates the call): thinking signatures + the prompt cache are what a drift
+// breaks there. Inline base64 payloads hash as their length (_fpReplacer) —
+// a screenshot is ~1MB of chars and its bytes never drift independently of
+// the block around it.
+var _prefixFpMemo = {};
+function _fpReplacer(k, v) {
+    if (typeof v !== 'string' || v.length < 256) return v;
+    if (v.slice(0, 5) === 'data:' && v.indexOf(';base64,') !== -1) return '[b64 ' + v.length + ']';
+    if (k === 'data' && this && this.type === 'base64') return '[b64 ' + v.length + ']';
+    return v;
+}
+function _fpPart(v) {
+    var s = typeof v === 'string' ? v : (JSON.stringify(v, _fpReplacer) || '');
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return s.length + '.' + (h >>> 0).toString(36);
+}
+// -> {sys, tools, n, firstDiff, part} (firstDiff -1 = no message changed).
+function _computePrefixFingerprint(chatId, systemText, tools, messages) {
+    var sys = _fpPart(systemText || ''), tl = _fpPart(tools || []);
+    var msgs = (Array.isArray(messages) ? messages : []).map(_fpPart);
+    var memo = chatId ? _prefixFpMemo[chatId] : null;
+    var firstDiff = -1, part = null;
+    if (memo) {
+        var n = Math.min(memo.msgs.length, msgs.length);
+        for (var i = 0; i < n; i++) {
+            if (memo.msgs[i] === msgs[i]) continue;
+            if (firstDiff === -1) firstDiff = i;
+            // Re-baseline the changed message: this request reports the
+            // change once; later requests diff against the new bytes instead
+            // of re-logging the same drift on every turn.
+            memo.msgs[i] = msgs[i];
+        }
+        part = memo.sys !== sys ? 'system' : (memo.tools !== tl ? 'tools' : (firstDiff !== -1 ? 'messages' : null));
+    }
+    if (chatId) {
+        if (!memo || msgs.length < memo.msgs.length) {
+            var keys = Object.keys(_prefixFpMemo);
+            if (!memo && keys.length >= 200) delete _prefixFpMemo[keys[0]];
+            _prefixFpMemo[chatId] = { sys: sys, tools: tl, msgs: msgs.slice() };
+        } else {
+            memo.sys = sys; memo.tools = tl; // whole-request parts: report each change once
+            for (var j = memo.msgs.length; j < msgs.length; j++) memo.msgs.push(msgs[j]);
+        }
+    }
+    return { sys: sys, tools: tl, n: msgs.length, firstDiff: firstDiff, part: part };
+}
+function _logPrefixDiffOnDrop(chatId, m) {
+    var tx = m && m.inputTransformations;
+    if (!Array.isArray(tx) || !tx.some(function(t) { return t && t.type === 'thinking_dropped'; })) return null;
+    var fp = m.prefixFingerprint || {};
+    var msg = '[prefix-diff] chat ' + chatId + ': thinking_dropped; first changed part=' + (fp.part || 'unknown')
+        + (fp.firstDiff >= 0 ? ', first differing API message index=' + fp.firstDiff
+            + ' (pre-transform apiMsgs index, not the transformed Anthropic messages[] index)' : '');
+    try { console.warn(msg, tx); } catch (e) {}
+    return msg;
+}
 
 // ─── Codex per-chat session key ─────────────────────────────────────────
 // Deterministic chatId → UUID mapping for the ChatGPT OAuth (Codex) path.

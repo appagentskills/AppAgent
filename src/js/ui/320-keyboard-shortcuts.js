@@ -54,7 +54,9 @@ var KBD_SHORTCUTS = [
         run: function() { togglePause(); } },
     { id: 'focus-input', group: 'composer', label: N_('Focus message input'), keys: ['/'],
         targets: '#message-input, #home-message-input',
-        run: function() { kbdFocusComposer(); } },
+        // On the Documents page "/" focuses the page search (tools/110 sdocFocusPageSearch);
+        // only this shortcut is routed there, focus-restore paths keep using kbdFocusComposer.
+        run: function() { if (typeof sdocFocusPageSearch === 'function' && sdocFocusPageSearch()) return; kbdFocusComposer(); } },
     { id: 'send', group: 'composer', label: N_('Send message'), keys: ['Enter'], info: true },
     { id: 'newline', group: 'composer', label: N_('New line'), keys: ['Shift+Enter'], info: true },
     { id: 'search', group: 'navigation', label: N_('Search chats'), keys: ['Mod+K'], info: true },
@@ -64,7 +66,28 @@ var KBD_SHORTCUTS = [
     { id: 'next-chat', group: 'navigation', label: N_('Next chat'), keys: ['Alt+ArrowDown'], allowInInputs: 'empty', repeatable: true,
         available: function() { return typeof selectChat === 'function'; },
         run: function() { kbdStepChat(1); } },
-    { id: 'back', group: 'navigation', label: N_('Go back'), keys: ['Alt+ArrowLeft'], info: true }
+    { id: 'back', group: 'navigation', label: N_('Go back'), keys: ['Alt+ArrowLeft'], info: true },
+    // Documents page only: cycle Group by (tools/110 sdocCycleGroupBy).
+    { id: 'docs-group-by', group: 'navigation', label: N_('Change document grouping'), keys: ['g'],
+        when: function() { return typeof currentView !== 'undefined' && currentView === 'documents' && typeof sdocCycleGroupBy === 'function'; },
+        run: function() { sdocCycleGroupBy(); } },
+    // Documents page only: bulk selection (tools/110 sdocKbdCan guards view, overlay and state).
+    // "s" toggles selection mode; "x" and Mod+A enter it on their own.
+    { id: 'docs-sel-mode', group: 'navigation', label: N_('Toggle selection mode'), keys: ['s'],
+        when: function() { return typeof sdocKbdCan === 'function' && sdocKbdCan('mode'); },
+        run: function() { sdocToggleSelMode(); } },
+    { id: 'docs-sel-toggle', group: 'navigation', label: N_('Toggle selection'), keys: ['x'],
+        when: function() { return typeof sdocKbdCan === 'function' && sdocKbdCan('toggle'); },
+        run: function() { sdocSelToggleFocused(); } },
+    { id: 'docs-sel-all', group: 'navigation', label: N_('Select all'), keys: ['Mod+A'],
+        when: function() { return typeof sdocKbdCan === 'function' && sdocKbdCan('all'); },
+        run: function() { sdocSelectAllVisible(); } },
+    { id: 'docs-sel-delete', group: 'navigation', label: N_('Delete selected items'), keys: ['Delete'], keysMac: ['Backspace', 'Delete'],
+        when: function() { return typeof sdocKbdCan === 'function' && sdocKbdCan('delete'); },
+        run: function() { sdocBulkDelete(); } },
+    { id: 'docs-sel-clear', group: 'navigation', label: N_('Exit selection mode'), keys: ['Escape'],
+        when: function() { return typeof sdocKbdCan === 'function' && sdocKbdCan('clear'); },
+        run: function() { sdocSelClear(); } }
 ];
 
 // ─── Pure helpers (unit-tested in test/keyboard-shortcuts.test.js) ───────────
@@ -329,6 +352,18 @@ function kbdFocusComposer() {
 
 function kbdCopyLastResponse() {
     var chat = (typeof chats !== 'undefined' && chats && typeof currentChatId !== 'undefined') ? chats[currentChatId] : null;
+    // C2 skeleton (messages evicted to IDB): hydrate once, then retry; a miss
+    // fails closed with a toast instead of claiming there is no response.
+    if (chat && !Array.isArray(chat.messages) && chat._messagesEvicted && typeof ensureChatPayloads === 'function') {
+        var kid = currentChatId;
+        Promise.resolve().then(function() { return ensureChatPayloads(kid); }).catch(function() {}).then(function() {
+            if (kid !== currentChatId) return;
+            var c = chats[kid];
+            if (c && Array.isArray(c.messages)) kbdCopyLastResponse();
+            else if (typeof showSnackbar === 'function') showSnackbar(t('Copy failed'), 'error');
+        });
+        return true;
+    }
     var msgs = (chat && chat.messages) || [];
     var last = -1;
     for (var i = msgs.length - 1; i >= 0; i--) {
@@ -344,18 +379,36 @@ function kbdCopyLastResponse() {
     return true;
 }
 
-function kbdStepChat(dir) {
-    var list = document.getElementById('chat-list');
-    if (!list || typeof selectChat !== 'function') return false;
+function _kbdChatListIds(list) {
     var ids = [];
     Array.prototype.forEach.call(list.querySelectorAll('.chat-item[data-chat-id]'), function(r) {
         var id = r.getAttribute('data-chat-id');
         if (id && ids.indexOf(id) < 0) ids.push(id);
     });
+    return ids;
+}
+
+function kbdStepChat(dir) {
+    var list = document.getElementById('chat-list');
+    if (!list || typeof selectChat !== 'function') return false;
+    var ids = _kbdChatListIds(list);
     if (!ids.length) return false;
     var cur = typeof currentChatId !== 'undefined' ? currentChatId : null;
     var i = ids.indexOf(cur);
     var next = i < 0 ? (dir > 0 ? 0 : ids.length - 1) : i + dir;
+    // The sidebar renders a capped page (ui/180-search.js). Stepping down past
+    // the last rendered row grows it by one page ("View more") and continues.
+    // The active chat may be appended after the cap, so re-resolve and loop
+    // (bounded) until the next row exists or nothing more is hidden.
+    for (var guard = 0; dir > 0 && next >= ids.length && guard < 200; guard++) {
+        if (!list.querySelector('.chat-list-more') || typeof showMoreChatListItems !== 'function') break;
+        var before = ids.length;
+        showMoreChatListItems();
+        ids = _kbdChatListIds(list);
+        if (ids.length <= before) break;
+        i = ids.indexOf(cur);
+        next = i < 0 ? 0 : i + dir;
+    }
     if (next < 0 || next >= ids.length) return false; // no wrap
     selectChat(ids[next]);
     try {

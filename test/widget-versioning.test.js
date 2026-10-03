@@ -23,6 +23,7 @@ function createMemoryIdb() {
                         return {
                             get: function(key) { var r = {}; tx._ops.push(function() { r.result = data.stores[n][key] ? JSON.parse(JSON.stringify(data.stores[n][key])) : undefined; if (r.onsuccess) r.onsuccess(); }); return r; },
                             getAll: function() { var r = {}; tx._ops.push(function() { r.result = Object.values(data.stores[n]).map(function(v) { return JSON.parse(JSON.stringify(v)); }); if (r.onsuccess) r.onsuccess(); }); return r; },
+                            openCursor: function() { var r = {}, keys = null, i = 0; function step() { tx._ops.push(function() { if (!keys) keys = Object.keys(data.stores[n]); if (i >= keys.length) { r.result = null; } else { var k = keys[i++]; r.result = { key: k, value: JSON.parse(JSON.stringify(data.stores[n][k])), continue: step }; } if (r.onsuccess) r.onsuccess(); }); } step(); return r; },
                             put: function(row) { var r = {}; tx._ops.push(function() { data.stores[n][row.id || row.key || row.name] = JSON.parse(JSON.stringify(row)); if (r.onsuccess) r.onsuccess(); }); return r; },
                             clear: function() { var r = {}; tx._ops.push(function() { data.stores[n] = {}; if (r.onsuccess) r.onsuccess(); }); return r; }
                         };
@@ -83,8 +84,11 @@ async function runWidgetVersioningTests(sources, idb) {
         });
     }
     // Legacy rows written BEFORE the canonical store exists: one chat widget with
-    // capped history and a higher legacy contentVersion, one dashboard-only widget.
-    await put('chats', { id: 'chat_a', messages: [], widgets: [{ id: 'widget_legacy', title: 'Legacy', html: '<p>v3</p>', width: '300px', height: '200px', contentVersion: 7, chatId: 'chat_a', msgIndex: 4, history: [{ html: '<p>v1</p>', timestamp: 1 }, { html: '<p>v2</p>', timestamp: 2 }] }] });
+    // capped history and a higher legacy contentVersion (it lives in the
+    // in-memory chat below; load() migrates from memory), one dashboard-only
+    // widget. The chats-store row is an unread decoy: load() never opens it.
+    var legacyChatWidget = { id: 'widget_legacy', title: 'Legacy', html: '<p>v3</p>', width: '300px', height: '200px', contentVersion: 7, chatId: 'chat_a', msgIndex: 4, history: [{ html: '<p>v1</p>', timestamp: 1 }, { html: '<p>v2</p>', timestamp: 2 }] };
+    await put('chats', { id: 'chat_a', messages: [], widgets: [{ id: 'widget_disk_only', title: 'Disk', html: '<p>disk</p>' }] });
     await put('dashboardWidgets', { id: 'widget_dashonly', title: 'Dash', html: '<p>d1</p>', gridX: 2, gridY: 3, width: 4, height: 4, dashboard: 'home' });
 
     var globals = {
@@ -115,7 +119,7 @@ async function runWidgetVersioningTests(sources, idb) {
             .apply(null, names.map(function(n) { return globals[n]; }));
     }
     var storeApi = load(sources['src/js/core/135-widget-store.js'],
-        ['WidgetStore', 'widgetEditTarget', 'consumeWidgetComposerTarget', 'widgetOperationId', 'widgetIdForOperation', 'saveWidgetRevision', 'getSidebarWidgets']);
+        ['WidgetStore', 'widgetEditTarget', 'consumeWidgetComposerTarget', 'widgetOperationId', 'widgetIdForOperation', 'saveWidgetRevision', 'getSidebarWidgets', 'recordWidgetRender']);
     Object.assign(globals, storeApi);
     var toolSource = sources['src/js/tools/080-widget-tools.js'];
     var widgetTool = toolSource.slice(toolSource.indexOf('async function executeHtmlWidget('), toolSource.indexOf('// pin_widget tool'));
@@ -130,8 +134,9 @@ async function runWidgetVersioningTests(sources, idb) {
     var store = globals.WidgetStore;
 
     // --- migration of pre-existing data -------------------------------------
-    chats.chat_a = { id: 'chat_a', messages: [], widgets: [] };
+    chats.chat_a = { id: 'chat_a', messages: [], widgets: [JSON.parse(JSON.stringify(legacyChatWidget))] };
     await store.init();
+    check('legacy widgets come from memory, never from the chats store', store.versions('widget_disk_only').length === 0);
     var legacy = store.versions('widget_legacy');
     check('legacy history migrated in order under the SAME id', legacy.length === 3 && legacy[0].version === 1);
     check('legacy content-version counter never goes backwards', store.view('widget_legacy').contentVersion === 7);
@@ -218,6 +223,46 @@ async function runWidgetVersioningTests(sources, idb) {
     check('edit_html on a stale base conflicts', !staleEdit.success && staleEdit.code === 'VERSION_CONFLICT');
     var noVersion = await globals.editWidgetHtml({ action: 'edit_html', widget_id: id, edits: [] }, { chatId: 'chat_a' });
     check('edit_html demands expected_version', !noVersion.success && noVersion.code === 'VERSION_REQUIRED');
+
+    // --- per-turn renders: every save renders at its own turn, pinned ------
+    check('edit_html stamps a render ref on the issuing chat', edited._widget_render && edited._widget_render.version === 5 && chats.chat_a.widgetRenders['call_9:' + id].version === 5);
+    check('render refs carry no html', !('html' in chats.chat_a.widgetRenders['call_9:' + id]));
+    var savedA = chats.chat_a.messages;
+    chats.chat_a.messages = [];
+    for (var mi = 0; mi < 8; mi++) chats.chat_a.messages.push({ role: 'user', content: 'x' });
+    chats.chat_a.messages[3] = { role: 'tool', tool_call_id: 'pt_1' };
+    chats.chat_a.messages[7] = { role: 'tool', tool_call_id: 'pt_2' };
+    var ptc = await globals.executeHtmlWidget({ title: 'PT', html: '<i>1</i>', create_new: true }, 0, { chatId: 'chat_a', toolCallId: 'pt_1' });
+    var pid = ptc.widget_id;
+    check('creation stamps a v1 render ref at its own turn', ptc._widget_render && ptc._widget_render.msgIndex === 3 && ptc._widget_render.version === 1);
+    var pte = await globals.executeHtmlWidget({ widget_id: pid, expected_version: 1, html: '<i>2</i>' }, 0, { chatId: 'chat_a', toolCallId: 'pt_2' });
+    check('html_widget edit renders at the edit turn', pte.success && chats.chat_a.widgetRenders['pt_2:' + pid].msgIndex === 7 && chats.chat_a.widgetRenders['pt_2:' + pid].version === 2);
+    var ptRetry = await globals.executeHtmlWidget({ widget_id: pid, expected_version: 1, html: '<i>2</i>' }, 0, { chatId: 'chat_a', toolCallId: 'pt_2' });
+    check('a deduplicated replay records no new render', ptRetry.deduplicated && !ptRetry._widget_render);
+    chats.chat_b = { id: 'chat_b', messages: [{ role: 'user', content: 'edit it' }, { role: 'assistant', content: '' }, { role: 'tool', tool_call_id: 'call_b1', content: '' }] };
+    var crossEdit = await globals.editWidgetHtml({ action: 'edit_html', widget_id: pid, expected_version: 2, edits: [{ find: '<i>2</i>', replace: '<i>3</i>' }] }, { chatId: 'chat_b', toolCallId: 'call_b1' });
+    var crossRef = chats.chat_b.widgetRenders && chats.chat_b.widgetRenders['call_b1:' + pid];
+    check('cross-chat edit renders in the ISSUING chat at its tool row', crossEdit.success && crossRef && crossRef.msgIndex === 2 && crossRef.version === 3 && crossEdit._widget_render.chatId === 'chat_b');
+    check('cross-chat edit never adds a card to the issuing chat widget list', !(chats.chat_b.widgets || []).some(function(w) { return w.id === pid; }));
+    var placementSrc = toolSource.slice(toolSource.indexOf('function getWidgetPlacements('), toolSource.indexOf('function getWidgetHtmlForMessage('));
+    var getWidgetPlacements = load(placementSrc, ['getWidgetPlacements']).getWidgetPlacements;
+    var pb = getWidgetPlacements('chat_b').filter(function(p) { return p.id === pid; });
+    check('foreign widget placement is pinned and canonical', pb.length === 1 && pb[0].msgIndex === 2 && pb[0].version === 3 && pb[0].canonical && pb[0].domKey === pid);
+    var pa = getWidgetPlacements('chat_a').filter(function(p) { return p.id === pid; }).sort(function(a, b) { return a.msgIndex - b.msgIndex; });
+    check('creation turn and edit turn each keep their own pinned version', pa.length === 2 && pa[0].version === 1 && pa[0].msgIndex === 3 && pa[1].version === 2 && pa[1].msgIndex === 7);
+    check('only the newest placement owns the canonical DOM ids', pa[1].domKey === pid && pa[0].domKey === pid + '--r3' && !pa[0].canonical);
+    chats.chat_a.widgetRenders['pt_2:' + pid].version = 999;
+    var pruned = getWidgetPlacements('chat_a').find(function(p) { return p.id === pid && p.msgIndex === 7; });
+    check('a pruned/missing pinned version falls back to latest', pruned && pruned.version === null);
+    chats.chat_a.widgetRenders['pt_2:' + pid].version = 2;
+    chats.chat_a.messages[7] = { role: 'user', content: 'rewound' };
+    check('a ref whose tool row is gone renders nowhere', !getWidgetPlacements('chat_a').some(function(p) { return p.id === pid && p.msgIndex === 7; }));
+    var keptRenders = chats.chat_a.widgetRenders; delete chats.chat_a.widgetRenders;
+    var leg = getWidgetPlacements('chat_a').filter(function(p) { return p.id === pid; });
+    check('legacy chat without refs: one follow-latest card at creation', leg.length === 1 && leg[0].version === null && leg[0].canonical && leg[0].msgIndex === 3);
+    chats.chat_a.widgetRenders = keptRenders;
+    check('saves without a tool call record no render', globals.recordWidgetRender('chat_a', pid, 1, {}) === null);
+    chats.chat_a.messages = savedA;
     var manual = await globals.saveWidgetRevision(store.view(id), '<b>manual</b>', 5, 'manual:1');
     check('manual code save appends a version', manual.success && manual.version === 6);
     check('manual save retry with identical content dedupes', (await globals.saveWidgetRevision(store.view(id), '<b>manual</b>', 5, 'manual:1')).deduplicated);

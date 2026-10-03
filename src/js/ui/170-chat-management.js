@@ -1059,10 +1059,29 @@ function selectChat(chatId, options) {
     // immediately (images show placeholders); rehydrate from IDB and re-render
     // once — only if the user is still viewing this chat. No-op for hydrated,
     // running, or new chats. ensureChatPayloads never rejects.
+    // C2-ui MSG-EVICT: a message-evicted SKELETON (no `messages`, core/130)
+    // also carries _payloadsEvicted, so it hydrates here too. The sync pass
+    // above painted it from chat-level fields only (renderMessages shows a
+    // loading row), so once its messages are back re-run every
+    // message-derived surface of this switch — not just the transcript.
+    var _selWasSkeleton = !!(chats[chatId] && chats[chatId]._messagesEvicted && !Array.isArray(chats[chatId].messages));
     if (typeof ensureChatPayloads === 'function' && chats[chatId] && chats[chatId]._payloadsEvicted) {
         ensureChatPayloads(chatId).then(function() {
             if (currentChatId === chatId) {
                 try { renderMessages(); } catch (e) {}
+                var _selNow = chats[chatId];
+                if (_selWasSkeleton && _selNow && Array.isArray(_selNow.messages)) {
+                    // Sweep M1: the sync derive above ran on the skeleton (no
+                    // messages -> isChatInterrupted false), so Continue/Retry
+                    // must be re-derived now that the transcript is back.
+                    try { if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId); } catch (e) {}
+                    try { updateChatTitleHeader(); } catch (e) {}
+                    try { if (typeof renderVersionSidebar === 'function') renderVersionSidebar(); } catch (e) {}
+                    try { if (typeof renderWorkersStrip === 'function') renderWorkersStrip(); } catch (e) {}
+                    if (!options.skipApprovalNotifications) {
+                        try { showPendingApprovalNotifications(chatId); } catch (e) {}
+                    }
+                }
             }
         });
     }

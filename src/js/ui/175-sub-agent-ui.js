@@ -453,7 +453,6 @@ function _subParentMessageState(item, msg) {
     var memoable = !!(memo && item && typeof item === 'object');
     if (memoable && memo.get(item)) return 'injected';
     var chat = typeof chats !== 'undefined' && chats[msg.subChatId];
-    var rows = chat && Array.isArray(chat.messages) ? chat.messages : [];
     if (!item.deliveryText || item.ambiguousDelivery) return 'pending';
     var phases = (Array.isArray(msg.phases) ? msg.phases : []).concat([msg]);
     var ambiguous = phases.some(function(phase) {
@@ -464,15 +463,35 @@ function _subParentMessageState(item, msg) {
         });
     });
     if (ambiguous) return 'pending';
-    for (var i = item.startIndex || 0; i < rows.length; i++) {
-        var row = rows[i];
-        if (!row || row.role !== 'user' || !row.injected || typeof row.content !== 'string') continue;
-        // Delimiters matter: a later longer message with the same prefix is
-        // not evidence that this exact queue segment made it into the chat.
-        if (('\n\n' + row.content + '\n\n').indexOf('\n\n' + item.deliveryText + '\n\n') !== -1) {
-            if (memoable) memo.set(item, true);
-            return 'injected';
+    function found(c) {
+        var rows = c && Array.isArray(c.messages) ? c.messages : [];
+        for (var i = item.startIndex || 0; i < rows.length; i++) {
+            var row = rows[i];
+            if (!row || row.role !== 'user' || !row.injected || typeof row.content !== 'string') continue;
+            // Delimiters matter: a later longer message with the same prefix is
+            // not evidence that this exact queue segment made it into the chat.
+            if (('\n\n' + row.content + '\n\n').indexOf('\n\n' + item.deliveryText + '\n\n') !== -1) return true;
         }
+        return false;
+    }
+    var hit;
+    if (chat && !Array.isArray(chat.messages) && chat._messagesEvicted) {
+        // C2-ui: an evicted (skeleton) sub chat has no `messages` — that is
+        // NOT "no injection". Answer from the stored row via the ui/120
+        // skeleton scan memo (pending until it lands; the next render tick
+        // recomputes _subParentHistoryKey and repaints). No scan helper in
+        // this realm: stay 'pending' and never memoize.
+        if (typeof skeletonScanValue !== 'function') return 'pending';
+        var dt = String(item.deliveryText), h = 5381;
+        for (var k = 0; k < dt.length; k++) h = ((h * 33) ^ dt.charCodeAt(k)) >>> 0;
+        hit = skeletonScanValue('subInj:' + (item.startIndex || 0) + ':' + dt.length + ':' + h.toString(36),
+            msg.subChatId, chat, found, false, null) === true;
+    } else {
+        hit = found(chat);
+    }
+    if (hit) {
+        if (memoable) memo.set(item, true);
+        return 'injected';
     }
     return 'pending';
 }
@@ -1467,10 +1486,29 @@ function _subContextLimit(chatId) {
 // live in the same global `chats` map as the parent, so we read the last
 // non-aggregate assistant message's input_tokens — exactly the value the main
 // context circle uses. Returns { tokens, pct }.
+// C2-ui MSG-EVICT: a cold sub chat may be an evicted skeleton (no `messages`
+// array). Its scans answer from the stored row via skeletonScanValue (ui/120),
+// then the Workers strip re-renders once.
+function _subUiIsSkeleton(c) {
+    return !!c && !Array.isArray(c.messages) && !!c._messagesEvicted && typeof skeletonScanValue === 'function';
+}
+function _subSkelRerender() {
+    if (typeof renderWorkersStrip === 'function') renderWorkersStrip();
+}
+function _subLastInputTokens(c) {
+    if (!c || !Array.isArray(c.messages)) return 0;
+    for (var i = c.messages.length - 1; i >= 0; i--) {
+        var m = c.messages[i];
+        if (m && m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) return m.metrics.input_tokens;
+    }
+    return 0;
+}
 function _subContextInfo(chatId) {
     var tokens = 0;
     var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
-    if (c && c.messages) {
+    if (_subUiIsSkeleton(c)) {
+        tokens = skeletonScanValue('subCtxTokens', chatId, c, _subLastInputTokens, 0, _subSkelRerender) || 0;
+    } else if (c && c.messages) {
         for (var i = c.messages.length - 1; i >= 0; i--) {
             var m = c.messages[i];
             if (m && m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) {
@@ -1499,6 +1537,18 @@ function _fmtTokens(n) {
 var _subWorkStatsCache = Object.create(null);
 function _subWorkStats(chatId) {
     var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (_subUiIsSkeleton(c)) {
+        // Scanned once over the stored row (memo keyed by count:rev:updatedAt);
+        // not put in _subWorkStatsCache so the post-read value replaces the
+        // fallback.
+        var _n = (typeof chatMessageCount === 'function') ? chatMessageCount(c) : (c._msgCount || 0);
+        return skeletonScanValue('subWorkStats', chatId, c, function(like) {
+            var f = 0, p = 0;
+            try { if (typeof getWsEditedFilesForChat === 'function') f = getWsEditedFilesForChat(like).length; } catch (_) {}
+            try { if (typeof getPushedPRsForChat === 'function') p = getPushedPRsForChat(like).length; } catch (_) {}
+            return { n: _n, files: f, prs: p };
+        }, { n: _n, files: 0, prs: 0 }, _subSkelRerender);
+    }
     if (!c || !Array.isArray(c.messages)) return { n: 0, files: 0, prs: 0 };
     var cached = _subWorkStatsCache[chatId];
     if (cached && cached.n === c.messages.length) return cached;
@@ -2220,8 +2270,15 @@ function _reportStatusToWorkerState(status) {
 // chat.messages, so we mine them to keep listing a finished chat's sub-agents.
 // One record per sub — iterate newest-first so the latest report wins.
 function _reconstructSubsFromMessages(chatId) {
-    var out = [];
     var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
+    // C2-ui MSG-EVICT: a skeleton mines its stored row (see _subUiIsSkeleton).
+    if (_subUiIsSkeleton(c)) {
+        return skeletonScanValue('subReports', chatId, c, _reconstructSubsFromChat, [], _subSkelRerender) || [];
+    }
+    return _reconstructSubsFromChat(c);
+}
+function _reconstructSubsFromChat(c) {
+    var out = [];
     if (!c || !Array.isArray(c.messages)) return out;
     var seen = Object.create(null);
     for (var i = c.messages.length - 1; i >= 0; i--) {

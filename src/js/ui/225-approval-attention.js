@@ -90,6 +90,9 @@ function resurfacePendingApprovals() {
         if (!entry) continue;
         if (_dismissedApprovalKeys[entry.chatId + ':' + entry.approvalIndex]) continue;
         var chat = chats[entry.chatId];
+        // C2-ui: a cold-chat SKELETON (`_messagesEvicted`, no `messages`) is
+        // skipped, never scanned as an empty list; the watchdog retries once
+        // the chat is hydrated again.
         if (!chat || !Array.isArray(chat.messages)) continue;
         var row = chat.messages[entry.approvalIndex];
         if (!row || row.role !== 'approval' || row.status !== 'pending') continue;

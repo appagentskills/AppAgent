@@ -363,13 +363,25 @@
 .ws-file-chat .ui-icon { width: 11px; height: 11px; }
 .ws-file-chat:hover { background: hsla(var(--chat-hue), 70%, 50%, 0.3); }
 .ws-file-chat.gone { cursor: default; opacity: 0.45; }
-/* Sub-group label (repo · branch): follows the shared title language (bg-light
-   band, 0.05em tracking) one hierarchy level down — smaller + muted on purpose. */
-.ws-file-group-label { padding: var(--space-2) var(--space-5); font-size: 10px; font-weight: var(--font-semibold); text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); background: var(--bg-light); border-bottom: 1px solid var(--border-light); }
-.ws-this-chat-section { border-bottom: 2px solid var(--border); }
-.ws-this-chat-section .ws-file-group-label { text-transform: none; letter-spacing: 0; font-family: var(--font-mono); }
-.ws-this-chat-section .ws-dd-title { color: var(--primary); }
+/* "Pull requests" section on top of the workspace dropdown — rows reuse the
+   version-sidebar .pr-sidebar-* item (11-version.css); only the expand chrome
+   (chevron / count / file list) and the named chat chip are added here. */
+.ws-pr-section { border-bottom: 1px solid var(--secondary-border); }
+.ws-pr-list { display: flex; flex-direction: column; padding: var(--space-1) 0; }
+.ws-pr-row { margin: 0 var(--space-2); }
+.ws-pr-entry:not(.expandable) .ws-pr-row { cursor: default; }
+.ws-pr-row .ws-collapse-chevron { display: inline-flex; align-items: center; color: var(--text-muted); flex-shrink: 0; transition: transform var(--transition-normal); }
+.ws-pr-row .ws-collapse-chevron .ui-icon { width: 12px; height: 12px; }
+.ws-pr-entry:not(.collapsed) .ws-pr-row .ws-collapse-chevron { transform: rotate(90deg); }
+.ws-pr-entry.collapsed .ws-pr-files { display: none; }
+.ws-pr-row .ws-change-count { font-weight: var(--font-normal); color: var(--text-muted); background: var(--bg-tertiary); padding: 1px var(--space-3); border-radius: var(--radius-sm); font-size: var(--text-caption); flex-shrink: 0; }
+.ws-pr-files { border-top: 1px solid var(--border-light); border-bottom: 1px solid var(--border-light); }
+.ws-file-chat.ws-pr-chat { width: auto; max-width: 140px; height: 16px; gap: 3px; padding: 0 var(--space-2); vertical-align: middle; font-size: 10px; }
+.ws-pr-more { display: block; width: calc(100% - 2 * var(--space-2)); margin: 0 var(--space-2) var(--space-2); padding: var(--space-1) var(--space-2); background: none; border: 1px dashed var(--secondary-border); border-radius: var(--radius-sm); color: var(--text-muted); font-size: 11px; cursor: pointer; text-align: center; }
+.ws-pr-more:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.ws-pr-chat .ws-pr-chat-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-file-pr:hover { text-decoration: underline; }
+.ws-file-pr.ws-file-pr--changed { color: var(--warning, #d97706); }
 .ws-dropdown-empty { padding: var(--space-6); text-align: center; color: var(--text-muted); font-size: var(--text-body-sm); }
 .ws-dropdown-section { border-bottom: 1px solid var(--secondary-border); }
 .ws-dropdown-section:last-child { border-bottom: none; }

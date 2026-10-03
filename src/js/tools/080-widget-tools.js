@@ -8,6 +8,14 @@ async function executeHtmlWidget(args, messageIndex, options) {
     try { await WidgetStore.init(); } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
     if (args.action === 'list') return { success: true, widgets: WidgetStore.list() };
     if (args.create_new && args.widget_id) return { success: false, error: 'Choose widget_id OR create_new, not both' };
+    // MSG-EVICT: a cold skeleton has no messages array. Hydrate it before
+    // widgetEditTarget / the msgIndex scan (both read messages); fail closed
+    // on a miss rather than treating the chat as empty.
+    if (chat && chat._messagesEvicted && !Array.isArray(chat.messages)) {
+        if (typeof ensureChatPayloads === 'function') await ensureChatPayloads(widgetChatId);
+        chat = chats[widgetChatId] || chat;
+        if (!Array.isArray(chat.messages)) return { success: false, code: 'CHAT_UNAVAILABLE', error: 'Chat history could not be loaded from storage; retry.' };
+    }
     var targetId = args.widget_id || (!args.create_new && widgetEditTarget(chat));
     if (args.action === 'read') {
         if (!targetId) return { success: false, error: 'widget_id is required' };
@@ -74,6 +82,8 @@ async function executeHtmlWidget(args, messageIndex, options) {
             { createdAt: Date.now(), msgIndex: toolResultMsgIndex, chatId: widgetChatId });
     } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
     if (!committed.success) return committed;
+    // The eviction sweep copies on evict: re-read the live chat after the await.
+    chat = chats[widgetChatId] || chat;
     var widget = WidgetStore.view(widgetId);
     // A revision never relocates the original card or inserts a foreign one.
     if (!targetId) {
@@ -82,9 +92,14 @@ async function executeHtmlWidget(args, messageIndex, options) {
         chatWidgets[widgetChatId] = chat.widgets;
         delete chat.isTemporary;
     }
+    // PER-TURN RENDER: create AND edit render at THIS turn of the ISSUING chat
+    // (cross-chat edits included), pinned to the committed version. A replayed
+    // (deduplicated) operation already rendered on its first run.
+    var widgetRender = committed.deduplicated ? null
+        : recordWidgetRender(widgetChatId, widgetId, committed.version, Object.assign({}, options, { msgIndex: toolResultMsgIndex }));
     WidgetStore.project(widgetId);
     // Compatibility mirrors are not the durable authority.
-    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') await ensureChatPayloads(widgetChatId);
+    if ((chat._payloadsEvicted || chat._messagesEvicted) && typeof ensureChatPayloads === 'function') await ensureChatPayloads(widgetChatId);
     await saveChatsToStorage();
     // Update sidebar widget list
     renderWidgetSidebar();
@@ -121,7 +136,9 @@ async function executeHtmlWidget(args, messageIndex, options) {
         // SW-side wrapper reads this to persist chat.widgets on its own chat
         // object. Without it, the SW's chat snapshot wipes the page-side
         // mutation on the next save and the widget is lost on reload.
-        _widget_persist: widget
+        _widget_persist: widget,
+        // SW mirrors this ref onto the ISSUING chat's widgetRenders.
+        _widget_render: widgetRender ? Object.assign({ chatId: widgetChatId }, widgetRender) : undefined
     };
 }
 
@@ -224,6 +241,18 @@ function toggleWidgetRunning(widgetId, event) {
     // dashboard card, which then never re-rendered or tore down on toggle.
     var containers = [document.getElementById('widget-content-' + widgetId),
         document.getElementById('dashboard-widget-content-' + widgetId)].filter(Boolean);
+    // m9: older per-turn cards of the same widget are keyed '<id>--r<n>'
+    // (getWidgetPlacements domKey) - toggle those too.
+    if (typeof document.querySelectorAll === 'function') {
+        document.querySelectorAll('.widget-inline[data-widget-id="' + widgetId + '"] .widget-content').forEach(function(c) {
+            if (containers.indexOf(c) < 0) containers.push(c);
+        });
+    }
+    function _cardVersion(container) {
+        var card = typeof container.closest === 'function' ? container.closest('.widget-inline') : null;
+        var v = card && card.getAttribute('data-render-version');
+        return v ? Number(v) : null;
+    }
 
     if (isDeactivated) {
         // Activate: clear deactivated flag and re-render each card
@@ -233,14 +262,26 @@ function toggleWidgetRunning(widgetId, event) {
             container.innerHTML = '';
             // The dashboard grid mounts via renderWidgetContent (.widget-shadow-host);
             // renderWidgetInContainer is the inline-chat renderer.
-            if (String(container.id).indexOf('dashboard-widget-content-') === 0) renderWidgetContent(dw || widget);
-            else renderWidgetInContainer(widget, container);
+            if (String(container.id).indexOf('dashboard-widget-content-') === 0) { renderWidgetContent(dw || widget); return; }
+            // m9: a version-pinned per-turn card keeps its pinned version.
+            var pv = _cardVersion(container);
+            if (!pv) { renderWidgetInContainer(widget, container); return; }
+            var pinned = WidgetStore.view(widgetId, pv);
+            var hasHtml = !!(pinned && typeof pinned.html === 'string');
+            var pIframe = renderWidgetInContainer(widget, container, { version: hasHtml ? pv : undefined, pinnedVersion: pv });
+            if (!hasHtml && pIframe && typeof selectWidgetRenderVersion === 'function') selectWidgetRenderVersion(pIframe, String(pv));
         });
     } else {
         // Deactivate: kill iframe and persist
         widget.deactivated = true;
         if (dw) dw.deactivated = true;
         containers.forEach(function(container) {
+            // M7: the dashboard card mounts inside a .widget-shadow-host and
+            // keeps a lazy IntersectionObserver - fully unmount it, or the
+            // observer re-mounts the widget on the next intersect.
+            if (String(container.id).indexOf('dashboard-widget-content-') === 0 && typeof unmountWidgetContainer === 'function') {
+                try { unmountWidgetContainer(container); } catch (eUm) { /* fall through to the iframe teardown */ }
+            }
             var iframe = container.querySelector('iframe');
             if (iframe) {
                 // Release the onWidgetResize 'message' listener registered by
@@ -349,6 +390,12 @@ function renderWidgetInContainer(widget, container, options) {
     }
 
     container.appendChild(iframe);
+    // Per-turn pinned render (getWidgetPlacements): mark BEFORE writeWidgetHtml
+    // attaches the picker so the badge and picker reflect the pinned version.
+    if (options.pinnedVersion) {
+        iframe.dataset.pinnedWidgetVersion = String(options.pinnedVersion);
+        if (options.version) iframe.dataset.selectedWidgetVersion = String(options.version);
+    }
     iframe.__versionSuffix = heightScript || '';
     // Thumbnails are previews, not live renders: keep them out of the
     // widget_eval instance registry (ui/070-dashboard-ui.js writeWidgetHtml).
@@ -639,7 +686,7 @@ async function saveWidgetCodeEdit(widgetId) {
     var result;
     try { result = await saveWidgetRevision(widget, editor.value, Number(editor.dataset.widgetBaseVersion), editor.dataset.widgetOperationId); }
     catch (e) { showSnackbar(t('Widget save failed: {error}', { error: e.message }), 'error'); return; }
-    if (!result.success) { showSnackbar(result.error, 'error'); return; }
+    if (!result.success) { showSnackbar(typeof widgetSaveErrorText === 'function' ? widgetSaveErrorText(result) : result.error, 'error'); return; }
     closeWidgetCodeEdit();
     renderMessages();
     refreshVisibleDashboards();
@@ -821,15 +868,62 @@ function editWidgetWithAgent(widgetId, event) {
     }
 }
 
+// Every inline placement of a widget in a chat: the creation entry
+// (chat.widgets, msgIndex = creation turn) plus one per per-turn render ref
+// (chat.widgetRenders, recorded by recordWidgetRender). A ref at the creation
+// turn pins that card instead of adding a second one. version: the pinned
+// version, or null = follow latest (legacy chats with no refs keep exactly
+// today's behavior; a version pruned by MAX_WIDGET_VERSIONS falls back to
+// latest). The NEWEST placement per widget owns the canonical DOM ids
+// (widget-<id> / widget-content-<id>) so screenshot / iframe_tool /
+// widget_eval target it; older ones get the `<id>--r<msgIndex>` suffix.
+function getWidgetPlacements(chatId) {
+    var chat = chats[chatId];
+    var byKey = {}, list = [];
+    function add(widget, msgIndex, version) {
+        if (!widget || !Number.isInteger(msgIndex)) return;
+        var key = widget.id + '@' + msgIndex, prev = byKey[key];
+        if (prev) { if (version && (!prev.version || version > prev.version)) prev.version = version; return; }
+        byKey[key] = { id: widget.id, widget: widget, msgIndex: msgIndex, version: version || null };
+        list.push(byKey[key]);
+    }
+    getWidgetsForChat(chatId).forEach(function(w) { add(w, w.msgIndex, null); });
+    var renders = (chat && chat.widgetRenders) || {};
+    var messages = (chat && Array.isArray(chat.messages)) ? chat.messages : null;
+    Object.keys(renders).forEach(function(k) {
+        var ref = renders[k];
+        if (!ref || !ref.id) return;
+        var latest = WidgetStore.view(ref.id);
+        if (!latest) return; // deleted widget: no card
+        var idx = ref.msgIndex;
+        // Indices can shift (approval rows); the tool_call_id is authoritative.
+        // A ref whose tool row is gone (turn rewound/regenerated) renders nowhere.
+        if (messages && ref.toolCallId && !(messages[idx] && messages[idx].tool_call_id === ref.toolCallId)) {
+            idx = -1;
+            for (var i = messages.length - 1; i >= 0; i--) {
+                if (messages[i] && messages[i].role === 'tool' && messages[i].tool_call_id === ref.toolCallId) { idx = i; break; }
+            }
+            if (idx === -1) return;
+        }
+        var version = WidgetStore.view(ref.id, ref.version) ? Number(ref.version) : null;
+        var own = list.find(function(p) { return p.id === ref.id; });
+        add(own ? own.widget : Object.assign({}, latest, { msgIndex: idx }), idx, version);
+    });
+    var newest = {};
+    list.forEach(function(p) { if (!newest[p.id] || p.msgIndex > newest[p.id].msgIndex) newest[p.id] = p; });
+    list.forEach(function(p) { p.canonical = newest[p.id] === p; p.domKey = p.canonical ? p.id : p.id + '--r' + p.msgIndex; });
+    return list;
+}
+
 function getWidgetHtmlForMessage(msgIndex) {
-    var widgets = getWidgetsForChat(currentChatId);
-    var msgWidgets = widgets.filter(function(w) { return w.msgIndex === msgIndex; });
+    var msgWidgets = getWidgetPlacements(currentChatId).filter(function(p) { return p.msgIndex === msgIndex; });
     
     if (msgWidgets.length === 0) return '';
     
     var html = '';
-    msgWidgets.forEach(function(widget) {
-        html += '<div class="widget-inline" id="widget-' + widget.id + '" data-widget-id="' + widget.id + '">' +
+    msgWidgets.forEach(function(p) {
+        var widget = Object.assign({}, p.widget, { title: (p.version && (WidgetStore.view(p.id, p.version) || {}).title) || p.widget.title });
+        html += '<div class="widget-inline" id="widget-' + p.domKey + '" data-widget-id="' + widget.id + '" data-render-msg="' + p.msgIndex + '"' + (p.version ? ' data-render-version="' + p.version + '"' : '') + '>' +
             '<div class="widget-header">' +
                 '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
@@ -839,7 +933,7 @@ function getWidgetHtmlForMessage(msgIndex) {
                     '</button>' +
                 '</div>' +
             '</div>' +
-            '<div class="widget-content" id="widget-content-' + widget.id + '"></div>' +
+            '<div class="widget-content" id="widget-content-' + p.domKey + '"></div>' +
         '</div>';
     });
     
@@ -847,14 +941,33 @@ function getWidgetHtmlForMessage(msgIndex) {
 }
 
 function initializeWidgetsInView() {
-    var widgets = getWidgetsForChat(currentChatId);
-    widgets.forEach(function(widget) {
-        var container = document.getElementById('widget-content-' + widget.id);
+    var placements = getWidgetPlacements(currentChatId);
+    // Incremental renders can leave an older card holding the canonical ids
+    // after a newer turn rendered the same widget: re-key mounted cards by
+    // (widget, turn) so the canonical 'widget-<id>' element id is always the newest.
+    var keyOf = {};
+    placements.forEach(function(p) { keyOf[p.id + '@' + p.msgIndex] = p.domKey; });
+    if (document.querySelectorAll) document.querySelectorAll('.widget-inline[data-render-msg]').forEach(function(el) {
+        var domKey = keyOf[el.getAttribute('data-widget-id') + '@' + el.getAttribute('data-render-msg')];
+        if (!domKey || el.id === 'widget-' + domKey) return;
+        var content = el.querySelector('.widget-content');
+        el.id = 'widget-' + domKey;
+        if (content) content.id = 'widget-content-' + domKey;
+    });
+    placements.forEach(function(p) {
+        var widget = p.widget;
+        var container = document.getElementById('widget-content-' + p.domKey);
         if (container && !container.hasChildNodes()) {
             if (widget.deactivated) {
                 container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
-            } else {
+            } else if (!p.version) {
                 renderWidgetInContainer(widget, container);
+            } else {
+                var pinned = WidgetStore.view(p.id, p.version);
+                var hasHtml = pinned && typeof pinned.html === 'string';
+                var iframe = renderWidgetInContainer(widget, container, { version: hasHtml ? p.version : undefined, pinnedVersion: p.version });
+                // Boot cache evicts non-latest HTML: hydrate, then swap this view.
+                if (!hasHtml && iframe && typeof selectWidgetRenderVersion === 'function') selectWidgetRenderVersion(iframe, String(p.version));
             }
         }
     });

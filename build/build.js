@@ -187,6 +187,10 @@ const WORKER_SHARED_FILES = [
     // runner: reads workspace files, runs them via the js_eval arm) —
     // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
     'js/tools/160-run-tests.js',
+    // 170-local-folders: connected folders (OPFS virtual folder + picked
+    // directory handles) behind the local_folder tool, plus the binary-input
+    // resolver used by servicenow_api attachment upload and web_fetch bodies.
+    'js/tools/170-local-folders.js',
     'js/tools/020-tool-execution.js',
     // app (the agent loop + LLM streaming + API message builder + event bus)
     'js/app/035-agent-events.js',
@@ -280,37 +284,32 @@ const SW_SCANNER_BUILTINS = new Set([
 ]);
 
 function _swScannerStripCommentsAndStrings(src) {
-    // Strip line + block comments and quoted string contents so the
-    // identifier scan only sees real code. We deliberately do NOT try
-    // to skip template literals or regex literals — both can contain
-    // characters that confuse a naive single-pass parser (the codebase
-    // has regex char classes like `/[#*_` + backtick + `\n]/g` that
-    // would otherwise be mistaken for the start of a template literal
-    // and eat the rest of the file).
-    //
-    // Bare identifiers inside template `${...}` interpolations are real
-    // call sites anyway, so leaving them visible is correct. Regex
-    // literals only contain method-name-looking tokens behind `.`, so
-    // they don't trigger the free-identifier call regex below.
+    // Mask non-code before looking for free calls. A slash starts a regex
+    // only where an expression can begin; after a value it is division.
+    // Keep template interpolations visible (as before). Regex bodies must be
+    // consumed before their quotes/backticks can affect the surrounding scan.
     var out = '';
     var i = 0;
     var n = src.length;
+    var regexAllowed = true;
+    var controlParen = false;
+    var memberAccess = false;
+    var parens = [];
     while (i < n) {
         var c = src[i];
         var c2 = src[i + 1];
-        // // line comment
         if (c === '/' && c2 === '/') {
+            out += ' ';
             while (i < n && src[i] !== '\n') i++;
             continue;
         }
-        // /* block comment */
         if (c === '/' && c2 === '*') {
+            out += ' ';
             i += 2;
             while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
             i += 2;
             continue;
         }
-        // "..." or '...' string
         if (c === '"' || c === '\'') {
             var quote = c;
             out += ' ';
@@ -321,10 +320,66 @@ function _swScannerStripCommentsAndStrings(src) {
                 if (src[i] === '\n') break;
                 i++;
             }
+            regexAllowed = false;
+            controlParen = false;
             continue;
+        }
+        if (c === '/' && regexAllowed) {
+            // Escaped slashes and slashes inside [...] do not end a regex.
+            // Do not consume anything unless a closing slash is found on
+            // this line: an uncertain slash must not hide a real call.
+            var end = i + 1;
+            var inClass = false;
+            while (end < n && src[end] !== '\n' && src[end] !== '\r') {
+                var r = src[end];
+                if (r === '\\') { end += 2; continue; }
+                if (r === '[') inClass = true;
+                else if (r === ']') inClass = false;
+                else if (r === '/' && !inClass) break;
+                end++;
+            }
+            if (end < n && src[end] === '/') {
+                i = end + 1;
+                while (i < n && /[a-z]/i.test(src[i])) i++;
+                out += ' ';
+                regexAllowed = false;
+                controlParen = false;
+                continue;
+            }
+        }
+        if (/[a-zA-Z_$]/.test(c)) {
+            var begin = i++;
+            while (i < n && /[\w$]/.test(src[i])) i++;
+            var word = src.slice(begin, i);
+            out += word;
+            var member = memberAccess;
+            memberAccess = false;
+            controlParen = !member && /^(if|while|for|with|switch|catch)$/.test(word);
+            // of/await/yield may be identifiers in valid non-module code.
+            // Without scope parsing, treating them as operators could mask
+            // division operands (of / missing() / 2). Leave that ambiguity
+            // visible; parenthesized regex operands remain unambiguous.
+            regexAllowed = !member && /^(return|throw|case|delete|void|typeof|new|in|else|do)$/.test(word);
+            continue;
+        }
+        if (!/\s/.test(c)) {
+            memberAccess = c === '.';
+            if (c === '(') { parens.push(controlParen); regexAllowed = true; }
+            else if (c === ')') regexAllowed = parens.pop() === true;
+            else if ((c === '+' || c === '-') && c2 === c) {
+                // Postfix operators still end a value; prefix operators still
+                // expect one. Do not mistake x++ / missing() / y for a regex.
+                out += c + c2;
+                i += 2;
+                controlParen = false;
+                continue;
+            } else regexAllowed = /[=(:,;!?&|+*%~^<>\-\[{}]/.test(c) && c !== '}';
+            controlParen = false;
         }
         out += c;
         i++;
+        // Division (including /=) expects an expression on its right.
+        if (c === '/') regexAllowed = true;
     }
     return out;
 }

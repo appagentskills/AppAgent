@@ -267,6 +267,14 @@ function _pruneCompletedResults() {
     });
 }
 
+// Sweep M4: the bus opens at bundle top level, BEFORE init's
+// loadProviderFromStorage — until then currentProvider is the bundle default
+// (core/030), which the SW would adopt (and persist) over the user's choice.
+// Hello carries '' until init flips this; init then pushes the loaded name.
+var _panelProviderLoaded = false;
+function _panelHelloProvider() {
+    return (_panelProviderLoaded && typeof currentProvider !== 'undefined') ? currentProvider : '';
+}
 function _sendPanelHello() {
     if (!_agentBusPort) return;
     _pruneCompletedResults();
@@ -289,7 +297,7 @@ function _sendPanelHello() {
             // checkpoint-resume gate (which waits on the first panel-hello)
             // starts any loop — otherwise a resumed un-pinned chat runs on
             // the SW's stale/default currentProvider.
-            currentProvider: (typeof currentProvider !== 'undefined') ? currentProvider : ''
+            currentProvider: _panelHelloProvider()
         });
     } catch (e) {
         console.error('[agent-bus] panel-hello post failed', e);
@@ -492,8 +500,42 @@ function _openAgentBus() {
 // Resolved rows (status no longer 'pending') are deliberately NOT preserved —
 // the SW snapshot owns them from resolution onward, so a submitted/cancelled
 // form stays dismissed on every later re-render.
+// C2-xctx-page: a message-evicted SKELETON snapshot (no messages array) has
+// no slot to splice a pending row into, so the pending prompt/approval rows
+// of the hydrated prev are STASHED (sparse, at their original indexes — never
+// the whole transcript) per chat and re-merged into the first hydrated copy
+// (adoptChatRow / its ensureChatPayloads kick).
+var _skeletonPendingRows = {};
 function _mergePagePendingRows(prevChat, inChat, chatId) {
-    if (!prevChat || !inChat || !Array.isArray(prevChat.messages) || !Array.isArray(inChat.messages)) return;
+    if (!prevChat || !inChat) return;
+    var _skStash = (typeof _skeletonPendingRows !== 'undefined' && _skeletonPendingRows && chatId) ? _skeletonPendingRows : null;
+    if (_skStash && !Array.isArray(inChat.messages) && inChat._messagesEvicted && Array.isArray(prevChat.messages)) {
+        var _st = _skStash[chatId] || [];
+        for (var si = 0; si < prevChat.messages.length; si++) {
+            var sm = prevChat.messages[si];
+            if (!sm || sm.status !== 'pending') continue;
+            if (sm.role !== 'prompt_user' && sm.role !== 'approval') continue;
+            var _have = false;
+            for (var sk = 0; sk < _st.length; sk++) {
+                var se = _st[sk];
+                if (!se) continue;
+                if (se === sm || (se.role === sm.role && (sm.role === 'prompt_user' ? (se.promptId === sm.promptId)
+                                                                                     : (se.toolCallId && se.toolCallId === sm.toolCallId)))) { _have = true; break; }
+            }
+            if (_have) continue;
+            var _at = si;
+            while (_st[_at]) _at++;
+            _st[_at] = sm;
+        }
+        if (_st.length) _skStash[chatId] = _st;
+        return;
+    }
+    if (_skStash && Array.isArray(inChat.messages) && _skStash[chatId]) {
+        var _flush = _skStash[chatId];
+        delete _skStash[chatId];
+        _mergePagePendingRows({ messages: _flush }, inChat, chatId);
+    }
+    if (!Array.isArray(prevChat.messages) || !Array.isArray(inChat.messages)) return;
     for (var ri = 0; ri < prevChat.messages.length; ri++) {
         var rm = prevChat.messages[ri];
         if (!rm || rm.status !== 'pending') continue;
@@ -613,6 +655,12 @@ function _mergePageChatMeta(prevChat, inChat) {
         var _du = _unionChatDisplaysForPut(inChat.displays, prevChat.displays);
         if (_du) inChat.displays = _du;
     }
+    if (prevChat.widgetRenders) {
+        // Per-turn widget render refs (recordWidgetRender): the page writes
+        // them before the SW mirror lands; same union keeps them.
+        var _wru = _unionChatDisplaysForPut(inChat.widgetRenders, prevChat.widgetRenders);
+        if (_wru) inChat.widgetRenders = _wru;
+    }
 }
 
 // MEMFIX-EVDELTA: heavy-payload graft. SW broadcasts now strip screenshot
@@ -649,8 +697,13 @@ function _chatRowStaler(row, prev) {
     var rRev = (row && typeof row.rev === 'number' && isFinite(row.rev)) ? row.rev : null;
     var pRev = (prev && typeof prev.rev === 'number' && isFinite(prev.rev)) ? prev.rev : null;
     if (rRev !== null && pRev !== null) return rRev < pRev;
-    var rN = (row && Array.isArray(row.messages)) ? row.messages.length : 0;
-    var pN = (prev && Array.isArray(prev.messages)) ? prev.messages.length : 0;
+    // C2-xctx-page: a message-evicted skeleton counts its stamped _msgCount
+    // (identical to messages.length when nothing is evicted).
+    var _cnt = typeof chatMessageCount === 'function' ? chatMessageCount : function(c) {
+        return !c ? 0 : Array.isArray(c.messages) ? c.messages.length : (c._msgCount || 0);
+    };
+    var rN = _cnt(row);
+    var pN = _cnt(prev);
     return rN < pN;
 }
 
@@ -674,13 +727,77 @@ function adoptChatRow(row, opts) {
     if (!row || !id) return false;
     var map = opts.map || chats;
     var prev = map[id];
+    // C2-xctx-page: a message-evicted skeleton row (flag set, no array).
+    var rowSkel = !Array.isArray(row.messages) && !!row._messagesEvicted;
+    var _cnt = typeof chatMessageCount === 'function' ? chatMessageCount : function(c) {
+        return !c ? 0 : Array.isArray(c.messages) ? c.messages.length : (c._msgCount || 0);
+    };
     if (prev && prev !== row) {
         if (!opts.force && _chatRowStaler(row, prev)) return false;
-        _mergePagePendingRows(prev, row, id); // PR383-F3: chatId for approval re-key
+        // Skeleton over a hydrated prev that AGREES (same rev, count within
+        // the prev's pending prompt/approval rows): graft the prev array —
+        // same identity, so its durable stamp survives.
+        var _grafted = false;
+        if (rowSkel && Array.isArray(prev.messages)) {
+            var _gr = (typeof row.rev === 'number' && isFinite(row.rev)) ? row.rev : null;
+            var _gp = (typeof prev.rev === 'number' && isFinite(prev.rev)) ? prev.rev : null;
+            var _gN = prev.messages.length, _gPend = 0;
+            for (var _gi = 0; _gi < _gN; _gi++) {
+                var _gm = prev.messages[_gi];
+                if (_gm && _gm.status === 'pending' && (_gm.role === 'prompt_user' || _gm.role === 'approval')) _gPend++;
+            }
+            var _gC = _cnt(row);
+            if (_gr === _gp && _gC >= _gN - _gPend && _gC <= _gN) {
+                row.messages = prev.messages;
+                delete row._messagesEvicted;
+                delete row._msgCount;
+                delete row._evictedPayloadRefs;
+                _grafted = true;
+            }
+        }
+        // No stash at boot (opts.map): the disk prev's rows return on hydration.
+        if (!_grafted && !(rowSkel && opts.map)) _mergePagePendingRows(prev, row, id); // PR383-F3: chatId for approval re-key
         _mergePageChatMeta(prev, row);
         _mergePageHeavyPayloads(prev, row);
+        if (_grafted) {
+            var _stillEv = !!prev._payloadsEvicted;
+            if (!_stillEv && row.screenshots) {
+                for (var _gs in row.screenshots) { if (row.screenshots[_gs] && row.screenshots[_gs]._b64Evicted) { _stillEv = true; break; } }
+            }
+            if (!_stillEv && row.cachedToolResults) {
+                for (var _gt in row.cachedToolResults) { if (row.cachedToolResults[_gt] && row.cachedToolResults[_gt]._fcEvicted) { _stillEv = true; break; } }
+            }
+            if (_stillEv) row._payloadsEvicted = true; else delete row._payloadsEvicted;
+            // The grafted array may carry an edit made while prev was evicted
+            // (recordToolResult stamp): keep the rescue mark with it (OR-in).
+            if (prev._dirtyWhileEvicted) row._dirtyWhileEvicted = true;
+        }
+    }
+    var _stillSkel = rowSkel && !Array.isArray(row.messages);
+    if (_stillSkel) {
+        row._messagesEvicted = true;
+        row._payloadsEvicted = true;
+        if (!(typeof row._msgCount === 'number' && isFinite(row._msgCount) && row._msgCount >= 0)) {
+            row._msgCount = (prev && prev !== row) ? _cnt(prev) : 0;
+        }
     }
     if (opts.map) { opts.map[id] = row; } else { chats[id] = row; }
+    // Live skeleton: hydrate the current chat (or one holding stashed
+    // pending rows), then flush the stash and repaint. Never at boot.
+    if (_stillSkel && !opts.map && typeof ensureChatPayloads === 'function') {
+        var _isCur = (typeof currentChatId !== 'undefined' && currentChatId === id);
+        var _hasStash = (typeof _skeletonPendingRows !== 'undefined' && _skeletonPendingRows && _skeletonPendingRows[id]);
+        if (_isCur || _hasStash) {
+            Promise.resolve(ensureChatPayloads(id)).then(function() {
+                var live = chats[id];
+                var _ks = (typeof _skeletonPendingRows !== 'undefined' && _skeletonPendingRows) ? _skeletonPendingRows : null;
+                if (!live) { if (_ks) delete _ks[id]; return; }
+                if (!Array.isArray(live.messages)) return;
+                if (_ks && _ks[id]) _mergePagePendingRows({}, live, id);
+                if (typeof currentChatId !== 'undefined' && currentChatId === id && typeof renderMessages === 'function') renderMessages();
+            }, function() {});
+        }
+    }
     return true;
 }
 
@@ -711,6 +828,13 @@ function _synthesizeChatFromDelta(chatId, delta) {
     if (!prev || prev._deleted || !Array.isArray(prev.messages)) return null;
     if (!delta || typeof delta.fromIndex !== 'number' || delta.fromIndex < 0) return null;
     if (prev.messages.length < delta.fromIndex) return null;
+    // C2-xctx-page: an SW skeleton's delta (empty tail) must never rebuild an
+    // EMPTY transcript — synthesize from meta only; adoptChatRow decides.
+    if (delta.meta && delta.meta._messagesEvicted) {
+        var _skSyn = Object.assign({}, prev, delta.meta);
+        delete _skSyn.messages;
+        return _skSyn;
+    }
     var msgs = prev.messages.slice(0, delta.fromIndex);
     var tail = Array.isArray(delta.tail) ? delta.tail : [];
     for (var i = 0; i < tail.length; i++) msgs.push(tail[i]);

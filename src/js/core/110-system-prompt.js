@@ -198,6 +198,55 @@ function _maybeAppendToolCatalog(expanded, chatId) {
 // Replace placeholders with actual values. chatId is optional — it scopes
 // the {{TOOL_CATALOG}} render (deferred tool loading) to the chat's enabled
 // tool list; UI preview callers omit it and get the global list.
+// PREFIX-STABILITY: the system prompt is the first cached/signed part of
+// every request — a date rolling over at midnight mid-chat changed it and
+// invalidated every thinking signature + the whole prompt cache. The date is
+// fixed per chat the first time a prompt is built for it (chat.promptDate,
+// persisted with the chat record by the normal save). No chat -> today.
+function _todayPromptDate() {
+    return new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+}
+function _chatPromptDate(chatId) {
+    var c = null;
+    try { c = (chatId && typeof chats !== 'undefined' && chats) ? chats[chatId] : null; } catch (e) { c = null; }
+    if (!c || typeof c !== 'object') return _todayPromptDate();
+    if (typeof c.promptDate !== 'string' || !c.promptDate) c.promptDate = _todayPromptDate();
+    return c.promptDate;
+}
+// PREFIX-STABILITY: the ACTIVE SKILLS list follows skill load order (page
+// ui/070 and SW worker/020 builders). Re-emit its '- ' entries sorted by
+// id so the same set of skills always renders the same bytes. Anything
+// that does not parse (no header, an entry without '(id: x)') is returned
+// unchanged.
+function _sortSkillsSummary(text) {
+    if (typeof text !== 'string') return text;
+    var HDR = 'ACTIVE SKILLS:\n';
+    var at = text.indexOf(HDR);
+    if (at === -1) return text;
+    var head = text.slice(0, at + HDR.length);
+    var body = text.slice(at + HDR.length);
+    var lines = body.split('\n');
+    var entries = [], tail = '';
+    for (var i = 0; i < lines.length; i++) {
+        var ln = lines[i];
+        if (ln.indexOf('- ') === 0) entries.push([ln]);
+        else if (entries.length) entries[entries.length - 1].push(ln);
+        else return text;
+    }
+    if (entries.length < 2) return text;
+    // The trailing '' after the final '\n' belongs to the layout, not an entry.
+    var last = entries[entries.length - 1];
+    while (last.length > 1 && last[last.length - 1] === '') { last.pop(); tail += '\n'; }
+    var keyed = [];
+    for (var j = 0; j < entries.length; j++) {
+        var mm = /\(id: ([^)]+)\)/.exec(entries[j][0]);
+        if (!mm) return text;
+        keyed.push({ id: mm[1], pos: j, text: entries[j].join('\n') });
+    }
+    keyed.sort(function(a, b) { return a.id < b.id ? -1 : (a.id > b.id ? 1 : a.pos - b.pos); });
+    return head + keyed.map(function(k) { return k.text; }).join('\n') + tail;
+}
+
 function expandSystemPromptPlaceholders(template, chatId) {
     var expanded = template;
     
@@ -227,10 +276,10 @@ function expandSystemPromptPlaceholders(template, chatId) {
     } catch (e) { /* default: include — parent chats are the common case */ }
     expanded = expanded.replace(/\{\{ORCHESTRATOR_POLICY\}\}/g, function() { return orchestratorPolicy; });
 
-    // Replace {{CURRENT_DATE}} with today's date (YYYY-MM-DD, weekday)
-    var now = new Date();
-    var dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    expanded = expanded.replace(/\{\{CURRENT_DATE\}\}/g, dateStr);
+    // Replace {{CURRENT_DATE}} with the chat's FROZEN date (weekday, month
+    // day, year) — see _chatPromptDate.
+    var dateStr = _chatPromptDate(chatId);
+    expanded = expanded.replace(/\{\{CURRENT_DATE\}\}/g, function() { return dateStr; });
 
     // Replace {{RESPONSE_LANGUAGE}} with the reply-language instruction for the
     // active UI language (i18nResponseLanguageInstruction, core/025-i18n.js —
@@ -276,7 +325,7 @@ function expandSystemPromptPlaceholders(template, chatId) {
     expanded = expanded.replace(/\{\{DISABLED_TOOLS\}\}/g, disabledToolsText);
     
     // Replace {{SKILLS_SUMMARY}}
-    var skillsSummary = getSkillsSummaryForPrompt();
+    var skillsSummary = _sortSkillsSummary(getSkillsSummaryForPrompt());
     // Remove leading newlines since template already has newline before placeholder
     skillsSummary = skillsSummary.replace(/^\n+/, '');
     expanded = expanded.replace(/\{\{SKILLS_SUMMARY\}\}/g, skillsSummary);

@@ -339,7 +339,9 @@ describe('ui views › history page', function() {
     afterEach(function() { U.cleanupAll(); });
     async function setup(chatsObj) {
         var g = { window: winStub(), chats: chatsObj, currentChatId: null, historySearchQuery: '', historySearchDebounceTimer: null, appStorage: appStorageStub(),
-            getWidgetsForChat: function() { return []; }, estimateTokens: function(t) { return Math.ceil(String(t || '').length / 4); } };
+            getWidgetsForChat: function() { return []; }, estimateTokens: function(t) { return Math.ceil(String(t || '').length / 4); },
+            // mirrors core 130-indexeddb.js chatMessageCount (live array, else stamped _msgCount)
+            chatMessageCount: function(c) { if (!c) return 0; return Array.isArray(c.messages) ? c.messages.length : (c._msgCount || 0); } };
         var m = await loadLenient(ICONS.concat([ESC, 'src/js/ui/050-history-view.js']), g);
         var dom = await U.mountDom({ body: true, css: ALL_CSS });
         return { m: m, dom: dom };
@@ -522,7 +524,12 @@ describe('ui integrity › body.html wiring', function() {
         'widget-history-modal-overlay': 'core/120-init.js:251,360 — showWidgetHistory now reuses the widget modal',
         'tool-permissions-list': 'ui/140-dropdowns.js:152 — renderToolPermissions returns early (settings page uses its own list)'
     };
-    async function srcFiles() { return (await buildOrder(WS)); }
+    // buildOrder takes an OPTIONS object: buildOrder(WS) passed a bare string, so
+    // opts.workspace was undefined and the `ls` resolved the DEFAULT workspace
+    // (pinned / most-recently-used — can be a sibling fork or another repo),
+    // while loadFile read from WS. Mismatched lists dropped whole modules ->
+    // intermittent "inline handlers must resolve" failures.
+    async function srcFiles() { return (await buildOrder({ workspace: WS })); }
     test('every on* handler in body.html calls a function defined by the real bundle', async function() {
         var order = (await srcFiles()).filter(function(p) { return p !== 'src/js/app/030-agent-loop.js'; }); // 045 redeclares runAgent (async fn dup is a SyntaxError inside one with-block; the real bundle keeps the later one)
         var win = winStub();

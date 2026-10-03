@@ -180,11 +180,18 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // complete); internally gated on _chatsHydrated and a 24h age floor,
         // so a failed/partial chats load can never mass-delete live payloads.
         // Fire-and-forget, non-fatal.
+        // MEM-BOOT: DEFERRED (scheduleDeferredBootCleanup, core/130-indexeddb.js)
+        // so it no longer stacks on the boot chats load + resume scan peak;
+        // idempotent (once per SW lifetime), skipped boots drain later.
         try {
             if (typeof sweepOrphanChatPayloads === 'function') {
-                sweepOrphanChatPayloads().then(function(n) {}).catch(function(e) {
-                    console.warn('[sw-runtime] chat_payloads sweep failed', e);
-                });
+                if (typeof scheduleDeferredBootCleanup === 'function') {
+                    scheduleDeferredBootCleanup('chat_payloads-orphans', sweepOrphanChatPayloads);
+                } else {
+                    sweepOrphanChatPayloads().then(function(n) {}).catch(function(e) {
+                        console.warn('[sw-runtime] chat_payloads sweep failed', e);
+                    });
+                }
             }
         } catch (eSweep2) {
             console.warn('[sw-runtime] chat_payloads sweep failed', eSweep2);
@@ -198,9 +205,14 @@ self._swBootReady = new Promise(function(resolve) { _swBootReadyResolve = resolv
         // Fire-and-forget, non-fatal; capped at 200/boot inside.
         try {
             if (typeof gcEmptyChatRows === 'function') {
-                gcEmptyChatRows().then(function(n) {}).catch(function(e) {
-                    console.warn('[sw-runtime] empty-row GC failed', e);
-                });
+                // MEM-BOOT: deferred like the orphan sweep above.
+                if (typeof scheduleDeferredBootCleanup === 'function') {
+                    scheduleDeferredBootCleanup('chats-empty-rows', gcEmptyChatRows);
+                } else {
+                    gcEmptyChatRows().then(function(n) {}).catch(function(e) {
+                        console.warn('[sw-runtime] empty-row GC failed', e);
+                    });
+                }
             }
         } catch (eSweep3) {
             console.warn('[sw-runtime] empty-row GC failed', eSweep3);

@@ -296,6 +296,23 @@ describe('H9: deleteWorkspaceIfClean — check + delete in ONE tx over files+met
         assert.strictEqual(res2.kept, true);
         assert.deepStrictEqual(res2.dirty, ['dist/x.js']);
     });
+    test('filter receives (path, live row): delete_workspace force can refuse by owner inside the tx', async function() {
+        var t = await seed();
+        await t.s.setWorkspaceFile(frow('a.js', 'base', { content: 'mine', dirty: true, last_modified_by_chat_id: 'chat_A' }));
+        await t.s.setWorkspaceFile(frow('c.js', 'base', { content: 'theirs', dirty: true, last_modified_by_chat_id: 'chat_B' }));
+        var seen = [];
+        var byOwner = function(p, row) { seen.push([p, row && row.last_modified_by_chat_id, row && row.content]); return !(row && row.last_modified_by_chat_id === 'chat_B'); };
+        var res = await t.s.deleteWorkspaceIfClean(FK, byOwner);
+        assert.deepStrictEqual(res, { kept: true, deleted: false, dirty: ['c.js'] });
+        assert.deepStrictEqual(seen.slice().sort(), [['a.js', 'chat_A', 'mine'], ['c.js', 'chat_B', 'theirs']], 'live row passed as 2nd arg');
+        assert.ok(await t.s.getWorkspaceMeta(FK), 'meta kept');
+        assert.strictEqual((await t.s.getWorkspaceFile(FK, 'c.js')).content, 'theirs');
+        // Same filter, foreign owner gone -> everything deletable in one tx.
+        await t.s.setWorkspaceFile(frow('c.js', 'base', { content: 'theirs', dirty: true, last_modified_by_chat_id: 'chat_A' }));
+        var res2 = await t.s.deleteWorkspaceIfClean(FK, byOwner);
+        assert.strictEqual(res2.deleted, true);
+        assert.deepStrictEqual(await t.s.getAllWorkspaceFiles(FK), []);
+    });
 });
 
 describe('H9: wsMaybeAutoDeleteMerged uses the atomic delete (tools/020)', function() {
@@ -328,6 +345,23 @@ describe('H9: wsMaybeAutoDeleteMerged uses the atomic delete (tools/020)', funct
         assert.strictEqual(await w.s.getWorkspaceMeta(FK), null);
         assert.deepStrictEqual(await w.s.getAllWorkspaceFiles(FK), []);
         assert.ok(await w.s.getWorkspaceMeta(WK), 'base kept');
+    });
+    test('step 3.5 via _wsMergePrRecords: merged PR record carried to base, deduped, richer files kept', async function() {
+        var w = await setupMerged(false);
+        var bm = await w.s.getWorkspaceMeta(WK);
+        bm.prs = [{ number: 5, url: 'https://gh/pr/5', state: 'open', files: [{ path: 'keep.js' }] }, { number: 2, url: 'https://gh/pr/2' }];
+        await w.s.setWorkspaceMeta(bm);
+        var fm = await w.s.getWorkspaceMeta(FK);
+        fm.prs = [{ number: 5, url: 'https://gh/pr/5', branch: 'feat', state: 'open', title: 'T' }, { number: 9, url: 'https://gh/pr/9', branch: 'elsewhere' }];
+        await w.s.setWorkspaceMeta(fm);
+        var res = await w.m.wsMaybeAutoDeleteMerged(FK, await w.s.getWorkspaceMeta(FK));
+        assert.strictEqual(res && res.deleted, true, JSON.stringify(res));
+        var prs = (await w.s.getWorkspaceMeta(WK)).prs;
+        assert.deepStrictEqual(prs.map(function(p) { return p.number; }), [5, 2], 'deduped in place; unrelated fork PR #9 not carried');
+        assert.strictEqual(prs[0].state, 'merged');
+        assert.strictEqual(prs[0].merged_at, '2026-09-01T00:00:00Z');
+        assert.strictEqual(prs[0].title, 'T');
+        assert.deepStrictEqual(prs[0].files, [{ path: 'keep.js' }], 'richer files snapshot kept');
     });
     test('BEFORE (legacy non-atomic path): an edit landing after the final re-scan is swept by the delete', async function() {
         var w = await setupMerged(true);
@@ -379,5 +413,80 @@ describe('H9: wsMaybeAutoDeleteMerged uses the atomic delete (tools/020)', funct
         var res = await w.m.wsMaybeAutoDeleteMerged(FK, await w.s.getWorkspaceMeta(FK));
         assert.strictEqual(res.kept, true); assert.ok(/tx aborted/.test(res.warning));
         assert.ok(await w.s.getWorkspaceMeta(FK));
+    });
+
+    // --- delete_workspace hardening (#1113 / #1114) on the real fakeIDB ---
+
+    // Guards _wsOwnerChatRunning: a row owned by a RUNNING chat is a hard
+    // conflict that force must not override.
+    test('delete_workspace force: dirty row owned by a RUNNING chat refuses; meta + rows kept', async function() {
+        var w = await setupMerged(false);
+        // Old stamp: only the owner's RUNNING state can make the conflict hard.
+        await w.s.setWorkspaceFile(frow('c.js', 'base', { content: 'theirs', dirty: true, last_modified_by_chat_id: 'chat_B', last_modified_at: 1 }));
+        w.sc.isChatRunning = function(id) { return id === 'chat_B'; };
+        var r = await w.m.wsDeleteWorkspace(FK, 'chat_A', true);
+        assert.strictEqual(r.success, false, JSON.stringify(r));
+        assert.strictEqual(r.cross_chat_conflict, true);
+        assert.deepStrictEqual(r.conflicts, [{ path: 'c.js', chat: 'chat_B' }]);
+        assert.ok(await w.s.getWorkspaceMeta(FK), 'meta kept');
+        assert.strictEqual((await w.s.getWorkspaceFile(FK, 'c.js')).content, 'theirs');
+        assert.ok(await w.s.getWorkspaceFile(FK, 'a.js'), 'other rows kept');
+        // Control: owner no longer running -> force takes over and deletes.
+        w.sc.isChatRunning = function() { return false; };
+        var r2 = await w.m.wsDeleteWorkspace(FK, 'chat_A', true);
+        assert.strictEqual(r2.success, true, JSON.stringify(r2));
+        assert.deepStrictEqual(r2.files_discarded, ['c.js']);
+        assert.strictEqual(await w.s.getWorkspaceMeta(FK), null);
+    });
+
+    // Guards the shared _wsAutoDelInProgress check in wsMaybeAutoDeleteMerged:
+    // while delete_workspace is mid-flight, auto-delete of the same wk is a no-op.
+    test('delete_workspace in flight: concurrent auto-delete of the same wk returns null, no /pulls lookup', async function() {
+        var w = await setupMerged(false);
+        w.sc.patchWorkspaceMeta = w.s.patchWorkspaceMeta;
+        var fm = await w.s.getWorkspaceMeta(FK); fm.pinned = true; await w.s.setWorkspaceMeta(fm);
+        var api = [], realApi = w.sc.githubApi;
+        w.sc.githubApi = function(method, url) { api.push(method + ' ' + url); return realApi(method, url); };
+        var entered = deferred(), gate = deferred(), calls = 0, realMetas = w.sc.getAllWorkspaceMetas;
+        w.sc.getAllWorkspaceMetas = async function() { if (++calls === 1) { entered.resolve(); await gate.promise; } return realMetas(); };
+        var pDel = w.m.wsDeleteWorkspace(FK, 'chat_A', false), auto;
+        try {
+            await entered.promise;
+            auto = await w.m.wsMaybeAutoDeleteMerged(FK, await w.s.getWorkspaceMeta(FK));
+        } finally { gate.resolve(); }
+        var del = await pDel;
+        assert.strictEqual(auto, null, JSON.stringify(auto));
+        assert.ok(!api.some(function(a) { return /\/pulls\?/.test(a); }), 'no PR lookup: ' + api.join(' | '));
+        assert.strictEqual(del.success, true, JSON.stringify(del));
+        assert.strictEqual(del.pin_moved_to, WK);
+        assert.strictEqual(await w.s.getWorkspaceMeta(FK), null);
+    });
+
+    // Guards _wsHandoffPin -> REAL setWorkspacePin (patchWorkspaceMeta) and the
+    // wsNotifyPrMerged -> markChatPrMerged hop of step 3.5.
+    test('auto-delete of a pinned fork: real setWorkspacePin moves the pin to the base, pin_flipped, markChatPrMerged(chat_X)', async function() {
+        var w = await setupMerged(false);
+        w.sc.patchWorkspaceMeta = w.s.patchWorkspaceMeta;
+        var realApi = w.sc.githubApi;
+        w.sc.githubApi = async function(method, url) {
+            if (/\/git\/ref\/heads\/main$/.test(url)) return { ok: true, body: { object: { sha: 'H' } } };
+            return realApi(method, url);
+        };
+        var marked = [];
+        w.sc.markChatPrMerged = function(id, pr) { marked.push([id, pr && pr.number]); };
+        var fm = await w.s.getWorkspaceMeta(FK);
+        fm.pinned = true;
+        fm.prs = [{ number: 5, url: 'https://gh/pr/5', branch: 'feat', state: 'open', chatId: 'chat_X' }];
+        await w.s.setWorkspaceMeta(fm);
+        var realDel = w.s.deleteWorkspaceIfClean, fkAtDelete;
+        w.sc.deleteWorkspaceIfClean = async function(k, f) { fkAtDelete = await w.s.getWorkspaceMeta(k); return realDel(k, f); };
+        var res = await w.m.wsMaybeAutoDeleteMerged(FK, await w.s.getWorkspaceMeta(FK));
+        assert.strictEqual(res && res.deleted, true, JSON.stringify(res));
+        assert.strictEqual(res.synced, true, 'base synced (pin precondition)');
+        assert.strictEqual(res.pin_flipped, true);
+        assert.strictEqual((await w.s.getWorkspaceMeta(WK)).pinned, true, 'target pinned via patchWorkspaceMeta');
+        assert.strictEqual(fkAtDelete && fkAtDelete.pinned, false, 'fork unpinned by setWorkspacePin before the delete');
+        assert.deepStrictEqual(marked, [['chat_X', 5]]);
+        assert.strictEqual(await w.s.getWorkspaceMeta(FK), null);
     });
 });

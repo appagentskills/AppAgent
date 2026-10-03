@@ -196,6 +196,14 @@ async function saveChatsToStorage() {
         _assertNotWipeLocked();
         var _saveT0 = Date.now();
         var _putRecords = 0, _putBlobs = 0;
+        // SW-EVICT save-race guard: {ref, len} of the LIVE messages array for
+        // every record whose put actually committed in this save. The post-
+        // save body sweep evicts only chats still matching that shape.
+        var _committedShape = {};
+        // C2-store B (bug 11): id -> {ref, wasDurable} of arrays this save
+        // marked durable at capture (flag ON only). Kept across withStore
+        // retries (the first attempt's wasDurable is the truth).
+        var _saveSentinels = {};
         // withStore (core/130-indexeddb.js, shared into this bundle): retries
         // ONCE on a fresh connection if the cached one was force-closed by
         // the browser. Safe to retry: the diff-save re-derives everything
@@ -207,6 +215,7 @@ async function saveChatsToStorage() {
         await withStore([chatStoreName, chatPayloadsStoreName], 'readwrite', function(transaction) {
         // TA-3: a lock set while this save waited for its transaction: no put.
         _assertNotWipeLocked();
+        _committedShape = {}; // withStore may retry: only the final attempt counts
         var store = transaction.objectStore(chatStoreName);
         // UPSERT-ONLY (RFC addendum Invariant D, PR 3): the save NEVER deletes.
         // The absence-diff delete-pass that used to live here — "stored key ∉
@@ -242,6 +251,10 @@ async function saveChatsToStorage() {
                 Object.keys(chats).forEach(function(id) {
                     var c = chats[id];
                     if (c && c.messages && c.messages.length > 0) desired[id] = c;
+                    // MSG-EVICT: a message-evicted skeleton is outside `desired`
+                    // (no messages) — still run the SAVE-DROP RESCUE when it was
+                    // mutated while evicted, so the mutation lands durably.
+                    else if (c && c._messagesEvicted && c._dirtyWhileEvicted) _rescueDirtyEvictedChat(id);
                 });
                 var pending = 0;
                 // B16 semantics preserved: every request (success or error)
@@ -277,6 +290,18 @@ async function saveChatsToStorage() {
                     // the record put is issued from the get's handler, which
                     // bumps `pending` BEFORE settling the get's own slot — so
                     // `pending` cannot zero-cross before the loop finishes.
+                    var _liveMsgs = desired[id].messages;
+                    var _liveLen = Array.isArray(_liveMsgs) ? _liveMsgs.length : -1;
+                    if (typeof CHAT_MESSAGE_EVICTION_ENABLED !== 'undefined' && CHAT_MESSAGE_EVICTION_ENABLED
+                        && Array.isArray(_liveMsgs) && typeof markChatMessagesDurable === 'function'
+                        && typeof chatMessagesDurable === 'function') {
+                        try {
+                            if (!_saveSentinels[id] || _saveSentinels[id].ref !== _liveMsgs) {
+                                _saveSentinels[id] = { ref: _liveMsgs, wasDurable: chatMessagesDurable(desired[id]) };
+                            }
+                            markChatMessagesDurable(desired[id]);
+                        } catch (eMk) {}
+                    }
                     var extracted = extractChatPayloadsForPut(desired[id]);
                     var _nBlobs = queueChatPayloadPuts(transaction, extracted.payloads, settleOne);
                     pending += _nBlobs;
@@ -327,7 +352,10 @@ async function saveChatsToStorage() {
                             // field fill-gap — core/130-indexeddb.js) after the
                             // lane preserver, against the SAME stored row.
                             var putRequest = store.put(_mergeChatRowForPut(_preservePageChatFields(_rec, stored), stored));
-                            putRequest.onsuccess = settleOne;
+                            putRequest.onsuccess = function() {
+                                _committedShape[id] = { ref: _liveMsgs, len: _liveLen };
+                                settleOne();
+                            };
                             putRequest.onerror = settleOne;
                             settleOne(); // settle the get's slot
                         }
@@ -346,13 +374,36 @@ async function saveChatsToStorage() {
         // Committed: clear any armed backoff and surface slow-but-successful
         // saves so future congestion is diagnosable (which realm, how big).
         _workerSaveBackoffUntil = 0;
+        _swRevertSaveSentinels(_saveSentinels, _committedShape);
         // MEMFIX runtime sweep: the commit above made every non-evicted
         // chat's record + payload blobs durable, so re-strip cold chats
         // now (K=0, mirroring this realm's boot strip) — without this,
         // run-adopted hydrated chats stayed hydrated for the SW's whole
         // lifetime. Running chats / cleanup-window chats are skipped
         // inside the sweep (core/130-indexeddb.js).
-        try { if (typeof sweepColdChatPayloads === 'function') sweepColdChatPayloads(0); } catch (eSweep) {}
+        // SW-EVICT: bodies are evicted too (evictBodies) — every SW reader
+        // calls ensureChatPayloads first (guarded by _payloadsEvicted).
+        // bodyGuard: a chat put in THIS save is body-evicted only while its
+        // messages array ref + length still match what was committed (a
+        // mutation after the put would otherwise be marked evicted and never
+        // persisted); a chat not put here must already be _payloadsEvicted
+        // (disk-identical by the flag's contract).
+        try {
+            if (typeof sweepColdChatPayloads === 'function') {
+                sweepColdChatPayloads(0, true, function(cid, c) {
+                    var shp = _committedShape[cid];
+                    if (shp) {
+                        if (!(!!c && c.messages === shp.ref && Array.isArray(c.messages) && c.messages.length === shp.len)) return false;
+                        // C2-store B (bug 11): an edited chat (sentinel cleared
+                        // by an in-place edit since capture) is never evicted.
+                        if (_saveSentinels[cid] && _saveSentinels[cid].ref === shp.ref
+                            && typeof chatMessagesDurable === 'function' && !chatMessagesDurable(c)) return false;
+                        return true;
+                    }
+                    return !!c && c._payloadsEvicted === true;
+                });
+            }
+        } catch (eSweep) {}
         var _saveDur = Date.now() - _saveT0;
         if (_saveDur > 2000) {
             console.warn('[worker-storage] slow save: ' + _saveDur + 'ms ('
@@ -360,6 +411,7 @@ async function saveChatsToStorage() {
         }
     } catch (e) {
         console.error('[worker-storage] save failed', e);
+        try { _swRevertSaveSentinels(_saveSentinels, null); } catch (eRvs) {}
         _saveOutcome = { ok: false, error: String((e && (e.message || e.name)) || e || 'save failed') };
         // CONGESTION-BACKOFF: the timed-out transaction is still queued and
         // will commit in the background — hold the next save back so it
@@ -422,7 +474,7 @@ async function deleteChatFromDB(chatId, chatSnapshot) {
     if (!chatId) return false;
     // Surface (but never act on) payload ids a caller passes — see above.
     try {
-        var _ignored = Object.keys(_chatPayloadIdsFor(chatSnapshot || (typeof chats !== 'undefined' ? chats[chatId] : null))).length;
+        var _ignored = Object.keys(_chatPayloadIdsFor(chatSnapshot || (typeof chats !== 'undefined' ? chats[chatId] : null)) || {}).length;
         if (_ignored) {
             console.warn('[worker-storage] explicit delete: NOT reaping ' + _ignored
                 + ' payload id(s) of chat ' + chatId
@@ -532,7 +584,55 @@ function _attemptPendingChatDelete(chatId, chatSnapshot) {
 
 // Payload ids (file_id / screenshot_id) a chat record references. Ids survive
 // payload eviction, so a stripped record still reports them.
+// C2-store: delegates to core/130 chatReferencedPayloadIds so a skeleton's
+// stamped refs count; NULL = refs unknown — callers must reap nothing.
+// C2-store B (seeding), SW twin of ui/070's _evictChatSeedingFileSum (the
+// bundles are separate): seed the 040 cold file-sum cache (_skelFileSums,
+// tools/040-file-store.js, shared into this bundle) from the messages about
+// to be dropped, then evict; roll the seed back when the eviction refuses.
+// Plain evict when the flag is OFF / no messages / 040 absent.
+function _swEvictChatSeedingFileSum(chat) {
+    if (typeof evictChatMessagesInPlace !== 'function' || !chat) return false;
+    var seeded = false;
+    if (typeof CHAT_MESSAGE_EVICTION_ENABLED !== 'undefined' && CHAT_MESSAGE_EVICTION_ENABLED
+        && chat.id && Array.isArray(chat.messages) && chat.messages.length > 0
+        && typeof _skelFileSums !== 'undefined' && _skelFileSums && typeof _skelFileSums.set === 'function') {
+        try {
+            var files = [];
+            for (var mi = 0; mi < chat.messages.length; mi++) {
+                var m = chat.messages[mi];
+                var fid = m && (m.file_id || m.screenshot_id);
+                if (fid) files.push([fid, mi, m.role || null]);
+            }
+            _skelFileSums.set(chat.id, { mc: chat.messages.length, files: files });
+            seeded = true;
+        } catch (eSeed) { seeded = false; }
+    }
+    var ok = evictChatMessagesInPlace(chat);
+    if (seeded && !ok) { try { _skelFileSums.delete(chat.id); } catch (eDel) {} }
+    return ok;
+}
+
+// C2-store B (bug 11 edit sentinel): with the flag ON, the save marks each
+// captured messages array durable AT CAPTURE; an in-place edit afterwards
+// (unmarkChatMessagesDurable at the edit site) clears it, so the post-save
+// bodyGuard refuses that chat even though ref + length still match. Marks
+// that never reached a committed put are reverted here (only when this save
+// set them: wasDurable false). No-op with the flag OFF (marks is empty).
+function _swRevertSaveSentinels(marks, committed) {
+    if (!marks || typeof unmarkChatMessagesDurable !== 'function') return;
+    Object.keys(marks).forEach(function(id) {
+        var mk = marks[id];
+        if (!mk || mk.wasDurable || (committed && committed[id] && committed[id].ref === mk.ref)) return;
+        try {
+            var c = chats[id];
+            if (c && c.messages === mk.ref) unmarkChatMessagesDurable(c);
+        } catch (eRv) {}
+    });
+}
+
 function _chatPayloadIdsFor(chat) {
+    if (typeof chatReferencedPayloadIds === 'function') return chatReferencedPayloadIds(chat);
     var ids = {};
     if (!chat) return ids;
     if (Array.isArray(chat.messages)) {
@@ -695,7 +795,14 @@ async function _swLoadChatsFromStorageBatched() {
                             _acctB64 += _cb64;
                             if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
                         }
+                        // Legacy-migration signal = the b64/CTR leg ONLY (a
+                        // body strip also returns true, and must not queue
+                        // every text-heavy chat for a hydrate+re-save).
                         if (stripChatPayloadsInPlace(chat)) _localMigrationQueue.push(chat.id);
+                        // SW-EVICT: boot rows ARE the disk records, so heavy
+                        // text bodies are evicted too (restored on demand by
+                        // ensureChatPayloads) — per batch, lowering the peak.
+                        stripChatPayloadsInPlace(chat, true);
                         // WRITE-AMP root fix: strip only sets
                         // _payloadsEvicted when it stripped base64, so a
                         // pure-TEXT chat (most of the store) never got the
@@ -711,6 +818,14 @@ async function _swLoadChatsFromStorageBatched() {
                         // clears the flag (single cheap get for text-only
                         // chats) and re-admits the chat to the put set.
                         chat._payloadsEvicted = true;
+                        // MSG-EVICT (flagged, core/130): the row IS the disk
+                        // record — stamp the proof; with the flag on the SW
+                        // (K=0, no UI) drops every loaded transcript here,
+                        // per batch. ensureChatPayloads restores on demand.
+                        if (typeof markChatMessagesDurable === 'function') {
+                            markChatMessagesDurable(chat);
+                            _swEvictChatSeedingFileSum(chat);
+                        }
                     } catch (e) {}
                 }
                 _loadedRows.push(chat);

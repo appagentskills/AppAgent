@@ -36,7 +36,17 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .message-content h3 { font-size: 1.1em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-heading); line-height: var(--leading-tight); }
 .message-content h4 { font-size: 1em; font-weight: var(--font-semibold); margin: var(--space-6) 0 var(--space-3); color: var(--text-primary); line-height: var(--leading-tight); }
 .message-content h5 { font-size: 0.95em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
-.message-content h2:first-child, .message-content h3:first-child, .message-content h4:first-child, .message-content h5:first-child { margin-top: 0; }
+.message-content h6 { font-size: 0.9em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-secondary); line-height: var(--leading-tight); }
+.message-content h2:first-child, .message-content h3:first-child, .message-content h4:first-child, .message-content h5:first-child, .message-content h6:first-child { margin-top: 0; }
+/* Horizontal rule (---, ***, ___). */
+.md-hr { border: none; border-top: 1px solid var(--border); margin: var(--space-6) 0; height: 0; }
+.md-hr:first-child { margin-top: 0; }
+.md-hr:last-child { margin-bottom: 0; }
+/* Images ![alt](url): never overflow the bubble. */
+.md-img { max-width: 100%; height: auto; border-radius: var(--radius-md, 6px); vertical-align: middle; }
+/* GFM task list items: disabled checkbox replaces the bullet. */
+.message-content li.md-task, .markdown-body li.md-task { list-style: none; }
+.md-task-box { margin: 0 var(--space-2) 0 calc(-1 * var(--space-8)); vertical-align: middle; pointer-events: none; }
 .message-content strong { font-weight: var(--font-semibold); color: var(--text-heading); }
 /* Paragraph spans emitted by formatContent() must be block-level so consecutive
    blank-line-separated paragraphs stack on their own lines. Scope to BOTH the
@@ -50,8 +60,8 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .markdown-body .md-paragraph:first-child { margin-top: 0; }
 .message-content .md-paragraph:last-child,
 .markdown-body .md-paragraph:last-child { margin-bottom: 0; }
-.message-content .md-paragraph + .md-table { margin-top: var(--space-1); }
-.message-content .md-table + .md-paragraph { margin-top: var(--space-1); }
+.message-content .md-paragraph + .md-table-wrap > .md-table { margin-top: var(--space-1); }
+.message-content .md-table-wrap + .md-paragraph { margin-top: var(--space-1); }
 .message-content ul, .message-content ol { margin: var(--space-2) 0; padding-inline-start: var(--space-10); list-style-position: outside; }
 .message-content li { margin: 0; padding: 0; line-height: var(--leading-normal); }
 /* Generic list indent for any markdown-rendered container (popovers, action update outputs, etc.).
@@ -59,6 +69,20 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
    ul/ol padding — without this, bullets fall outside the container and get clipped. */
 .markdown-body ul, .markdown-body ol { margin: var(--space-2) 0; padding-inline-start: var(--space-10); list-style-position: outside; }
 .markdown-body li { margin: 0; padding: 0; line-height: var(--leading-normal); }
+/* Nested lists (formatContent renders sub-lists INSIDE the parent <li>): no
+   extra vertical gap and a slightly smaller indent per level. Bullet glyphs
+   cycle disc -> circle -> square explicitly, because ordered parents would
+   otherwise give a nested <ul> the default disc. */
+.message-content li > ul, .message-content li > ol,
+.markdown-body li > ul, .markdown-body li > ol { margin: var(--space-1) 0; padding-inline-start: var(--space-8); }
+.message-content ul, .markdown-body ul { list-style-type: disc; }
+.message-content li > ul, .markdown-body li > ul { list-style-type: circle; }
+.message-content li > ul li > ul, .markdown-body li > ul li > ul { list-style-type: square; }
+.message-content ol, .markdown-body ol { list-style-type: decimal; }
+.message-content li > ol, .markdown-body li > ol { list-style-type: lower-alpha; }
+.message-content li > ol li > ol, .markdown-body li > ol li > ol { list-style-type: lower-roman; }
+/* Continuation paragraph inside an item (indented text after a blank line). */
+.message-content li > .md-li-paragraph, .markdown-body li > .md-li-paragraph { margin: var(--space-2) 0 0; }
 
 /* JSON formatting styles */
 .json-key { color: var(--text-link); font-weight: var(--font-medium); }
@@ -71,7 +95,14 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .json-preview { color: var(--text-muted); font-style: italic; font-size: 0.9em; }
 .json-collapsible, .json-collapsed { }
 .md-table { border-collapse: separate; border-spacing: 0; margin: var(--space-1) 0; width: auto; max-width: 100%; display: table; border: 1px solid var(--border-dark); border-radius: var(--radius-md); }
-.message-content .md-table:first-child { margin-top: 0; }
+.message-content .md-table-wrap:first-child > .md-table { margin-top: 0; }
+/* Wide tables scroll horizontally instead of overflowing the bubble. */
+.md-table-wrap { overflow-x: auto; max-width: 100%; }
+/* Column alignment from the delimiter row (:--- / :---: / ---:). Classes,
+   not inline style, because of the extension CSP. */
+.md-table .md-align-left { text-align: left; }
+.md-table .md-align-center { text-align: center; }
+.md-table .md-align-right { text-align: right; }
 .md-table td, .md-table th { border-bottom: 1px solid var(--border); border-inline-end: 1px solid var(--border); padding: var(--space-5) var(--space-7); text-align: start; }
 .md-table td:last-child, .md-table th:last-child { border-inline-end: none; }
 .md-table tr:last-child td { border-bottom: none; }

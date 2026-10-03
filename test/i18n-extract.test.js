@@ -7,6 +7,31 @@ function byKey(r, k) { return r.filter(function(e) { return e.source === k; })[0
 var SC = '<' + '/script>';
 
 describe('i18n extractor: t / tn / N_ calls', function() {
+    test('nested smart-document marker extracts the access message and preserves translation input', async function() {
+        var X = await ix();
+        var key = 'Access needs to be re-granted.';
+        var source = await loadFile('src/js/tools/110-smart-documents.js');
+        var ex = X.extractI18nStrings({ 'src/js/tools/110-smart-documents.js': source });
+        var entry = byKey(ex, key);
+        assert.ok(entry, 'the folder-access message is extractable');
+        assert.strictEqual(entry.refs.length, 2, 'both access-warning call sites are marked');
+        var m = await loadModules(['src/js/core/025-i18n.js'], { globals: {} });
+        var wrapper = source.match(/function _sdsT\(s, p\) \{[^\n]+\}/);
+        assert.ok(wrapper, 'use the real smart-document translation wrapper');
+        var seen = [];
+        var translate = new Function('t', wrapper[0] + '; return _sdsT;')(function(s, p) {
+            seen.push({ source: s, params: p });
+            return 'translated access warning';
+        });
+        var params = { folder: 'Example' };
+        assert.strictEqual(m.N_(key), key, 'the extraction marker is an identity function');
+        assert.strictEqual(translate(m.N_(key), params), 'translated access warning');
+        assert.deepStrictEqual(seen, [{ source: key, params: params }]);
+        var fallback = new Function('t', wrapper[0] + '; return _sdsT;')(undefined);
+        assert.strictEqual(fallback(m.N_(key)), key, 'English fallback is unchanged');
+        assert.deepStrictEqual(srcs(X.extractI18nStrings({ 'fixture.js': "_sdsT(N_('Access needs to be re-granted.'));" })), [key]);
+    });
+
     test('literals (escapes decoded), sorted unique sources, refs, plural pairs', async function() {
         var X = await ix();
         var r = X.extractI18nStrings({

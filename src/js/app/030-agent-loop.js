@@ -294,6 +294,13 @@ function recordToolResult(chat, toolCallId, name, content) {
         delete m._widgetEvalDispatched;
         delete m._widgetEvalRun;
         delete m._widgetEvalIds;
+        // C2 (chat eviction): this in-place rewrite keeps the array identity
+        // AND length, so the durability proof (core/130) would still read
+        // durable and the eviction sweep could drop the unsaved result. Clear
+        // the proof; the next committed save re-marks it.
+        if (typeof unmarkChatMessagesDurable === 'function') {
+            try { unmarkChatMessagesDurable(chat); } catch (_) { /* best-effort */ }
+        }
         return m;
     }
     var newMsg = { role: 'tool', tool_call_id: toolCallId, name: name || 'unknown', content: content };
@@ -606,9 +613,12 @@ function sweepStrandedPlaceholders(resumedIds) {
         });
         var ids = Object.keys(chats);
         var rewrittenIds = [];
+        var skelIds = [];
         for (var ci = 0; ci < ids.length; ci++) {
             var id = ids[ci];
             var chat = chats[id];
+            // C2 (chat eviction): message-evicted skeletons go to the async pass.
+            if (chat && chat._deleted !== true && chat._messagesEvicted && !Array.isArray(chat.messages) && (chat._msgCount || 0) > 0) { skelIds.push(id); continue; }
             if (!chat || chat._deleted === true || !chat.messages || !chat.messages.length) continue;
             if (resumed[id] || running[id]) continue;
             var rec = null;
@@ -653,8 +663,88 @@ function sweepStrandedPlaceholders(resumedIds) {
                 } catch (eEmit) { /* broadcast is best-effort */ }
             }
         }
+        if (skelIds.length) sweepStrandedPlaceholders.skeletonPass = sweepStrandedSkeletons(skelIds, resumed, payload);
     } catch (e) {
         console.warn('[sweep] sweepStrandedPlaceholders failed', e && e.message);
+    }
+    return rewritten;
+}
+
+// C2 (chat eviction): async pass for the message-evicted skeletons the sync
+// sweep above cannot read. Each skeleton's STORED row is scanned read-only
+// (loadChatRowFromDB); only a chat whose last turn really holds a stranded
+// placeholder is hydrated (ensureChatPayloads) and rewritten exactly like the
+// sync pass, with every skip guard re-checked after the awaits. A read or
+// hydrate miss skips the chat (fail closed: a skeleton is never rewritten or
+// saved, nothing throws). One save + one broadcast per rewritten chat.
+// Resolves to the number of rows rewritten; never rejects.
+function _sweepStrandedTail(messages) {
+    var stranded = [];
+    if (!Array.isArray(messages)) return stranded;
+    for (var mi = messages.length - 1; mi >= 0; mi--) {
+        var row = messages[mi];
+        if (!row) continue;
+        if (row.role === 'user') break;
+        if (row.role === 'tool' && row._placeholder && row.tool_call_id) stranded.push(row);
+    }
+    return stranded;
+}
+function _sweepSkipChat(id, chat, resumed) {
+    if (!chat || chat._deleted === true) return true;
+    var running = (typeof runningChatIds !== 'undefined' && runningChatIds) || {};
+    if (resumed[id] || running[id]) return true;
+    var rec = null;
+    if (chat.isSubAgent && typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.getByChatId === 'function') {
+        try { rec = SubAgents.getByChatId(id); } catch (eRec) { rec = null; }
+        if (rec && rec.state === 'running') return true;
+    }
+    return _sweepIsPausedChat(id, chat, rec);
+}
+async function sweepStrandedSkeletons(ids, resumedIds, payload) {
+    var rewritten = 0;
+    var rewrittenIds = [];
+    var resumed = resumedIds || {};
+    var list = ids || [];
+    for (var i = 0; i < list.length; i++) {
+        var id = list[i];
+        try {
+            var chat = (typeof chats !== 'undefined' && chats) ? chats[id] : null;
+            if (_sweepSkipChat(id, chat, resumed)) continue;
+            if (!Array.isArray(chat.messages)) {
+                if (typeof loadChatRowFromDB !== 'function' || typeof ensureChatPayloads !== 'function') continue;
+                var stored = await loadChatRowFromDB(id);
+                if (!stored || !_sweepStrandedTail(stored.messages).length) continue;
+                await ensureChatPayloads(id);
+                chat = chats[id];
+                if (_sweepSkipChat(id, chat, resumed)) continue;
+                if (!Array.isArray(chat.messages)) {
+                    console.warn('[sweep] evicted chat ' + id + ' could not be restored — stranded placeholders left for its next hydration');
+                    continue;
+                }
+            }
+            var stranded = _sweepStrandedTail(chat.messages);
+            var before = rewritten;
+            for (var si = 0; si < stranded.length; si++) {
+                if (recordToolResult(chat, stranded[si].tool_call_id, stranded[si].name, payload)) rewritten++;
+            }
+            if (rewritten > before) {
+                rewrittenIds.push(id);
+                console.warn('[sweep] rewrote ' + (rewritten - before) + ' stranded placeholder row(s) in evicted chat ' + id + ' (runtime_restarted)');
+            }
+        } catch (e) {
+            console.warn('[sweep] skeleton pass failed for ' + id, e && e.message);
+        }
+    }
+    if (rewritten && typeof saveChatsToStorage === 'function') {
+        try { await saveChatsToStorage(); } catch (eSave) {}
+    }
+    if (rewrittenIds.length && typeof AgentEvents !== 'undefined' && AgentEvents && typeof AgentEvents.emit === 'function') {
+        for (var bi = 0; bi < rewrittenIds.length; bi++) {
+            try {
+                if (typeof _chatDeltaSync !== 'undefined' && _chatDeltaSync) delete _chatDeltaSync[rewrittenIds[bi]];
+                AgentEvents.emit('messagesAppended', { chatId: rewrittenIds[bi], reason: 'stranded_placeholder_sweep' });
+            } catch (eEmit) { /* broadcast is best-effort */ }
+        }
     }
     return rewritten;
 }
@@ -1056,10 +1146,26 @@ async function runAgent(overrideChatId) {
     // (resume scan, send lane, wake drain) but any missed or future lane
     // re-opens the hole — close it at the funnel. No-op when not evicted;
     // never throws (a hydration failure falls back to today's behavior).
-    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+    // C2 (chat eviction): a message-evicted skeleton (`_messagesEvicted`, no
+    // array) is hydrated here too; ensureChatPayloads restores IN PLACE on
+    // chats[id], so re-read the entry. A skeleton that is still not restored
+    // fails closed BEFORE runStarted (same crash path as the guard above)
+    // instead of TypeError-ing downstream or saving an empty transcript.
+    if ((chat._payloadsEvicted || chat._messagesEvicted) && typeof ensureChatPayloads === 'function') {
         try { await ensureChatPayloads(streamingChatId); } catch (eHyd) {
             console.warn('[agent-loop] entry hydration failed for ' + streamingChatId, eHyd);
         }
+        chat = chats[streamingChatId] || chat;
+        if (chat._deleted) throw new Error('runAgent: chat ' + streamingChatId + ' is deleted (tombstone) — refusing to start');
+    }
+    // PREFIX-STABILITY: the SW dev-mode flag (tools / ACTIVE SKILLS gates) is
+    // restored from chrome.storage.session at boot (worker/130
+    // _restoreSwDevMode) — wait for it (bounded) before the first request.
+    if (typeof self !== 'undefined' && self && self._swDevModeRestored && typeof self._swDevModeRestored.then === 'function') {
+        try { await Promise.race([self._swDevModeRestored, new Promise(function(r) { setTimeout(r, 500); })]); } catch (eDmR) {}
+    }
+    if (chat._messagesEvicted && !Array.isArray(chat.messages)) {
+        throw new Error('runAgent: chat ' + streamingChatId + ' transcript is evicted and could not be restored — refusing to start');
     }
     isBackgroundRun = !!(chat && chat.isBackground);
     // Clear any stale API error left from a PREVIOUS run of THIS chat so the

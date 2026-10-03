@@ -205,7 +205,8 @@ function createStreamingTextEl() {
 function updateStreamingText(msg, index, streamingChatId) {
     if (streamingChatId && streamingChatId !== currentChatId) return;
     var chat = chats[currentChatId];
-    if (!chat) return;
+    // MSG-EVICT: a skeleton (messages dropped) has nothing to paint.
+    if (!chat || !Array.isArray(chat.messages)) return;
     // Find last user message to scope to current response
     var lastUserIdx = -1;
     for (var i = chat.messages.length - 1; i >= 0; i--) {

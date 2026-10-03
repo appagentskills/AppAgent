@@ -368,7 +368,26 @@ async function _riScreenshot() {
     canvas.width = Math.round(img.width * scale);
     canvas.height = Math.round(img.height * scale);
     canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-    return { success: true, width: canvas.width, height: canvas.height, base64: canvas.toDataURL('image/jpeg', 0.85) };
+    return await _riRegisterScreenshot(canvas.toDataURL('image/jpeg', 0.85), canvas.width, canvas.height);
+}
+
+// Register a runtime_inspect capture in the unified file store so it gets a
+// file_id (get_file / screenshot_by_id / upload / local_folder write all
+// resolve it, and it survives a service-worker restart). The MIME comes from
+// the bytes (JPEG), not the data-URL label. base64 stays for back-compat.
+async function _riRegisterScreenshot(dataUrl, width, height) {
+    var out = { success: true, width: width, height: height, base64: dataUrl };
+    if (typeof registerFileAsync !== 'function') { out.file_id = null; out.file_store_error = 'file store unavailable'; return out; }
+    try {
+        var ts = new Date().toISOString().replace(/[:.]/g, '-');
+        out.file_id = await registerFileAsync({ data: dataUrl, name: 'runtime-panel-' + ts + '.jpg', width: width, height: height, source: 'runtime_inspect' });
+        var r = (typeof resolveFile === 'function') ? await resolveFile(out.file_id) : null;
+        out.mime = (r && r.mime) || (typeof dataUrlMime === 'function' ? dataUrlMime(dataUrl) : null);
+    } catch (e) {
+        out.file_id = null;
+        out.file_store_error = String((e && e.message) || e);
+    }
+    return out;
 }
 
 function _riUiState() {
@@ -379,7 +398,7 @@ function _riUiState() {
         .sort(function(a, b) { return (b.createdAt || 0) - (a.createdAt || 0); })
         .slice(0, 50)
         .map(function(c) {
-            return { id: c.id, title: c.title, msgCount: (c.messages || []).length, running: !!running[c.id], isSubAgent: !!c.isSubAgent };
+            return { id: c.id, title: c.title, msgCount: (typeof chatMessageCount === 'function') ? chatMessageCount(c) : (c.messages || []).length, running: !!running[c.id], isSubAgent: !!c.isSubAgent };
         });
     var approvals = Object.keys(g('pendingToolApprovals') || {}).map(function(k) {
         var v = (g('pendingToolApprovals') || {})[k] || {};

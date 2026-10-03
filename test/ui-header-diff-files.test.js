@@ -23,7 +23,10 @@ function winStub(extra) {
     var mq = { matches: false, addEventListener: function() {}, addListener: function() {} };
     return fakeWindow(Object.assign({ document: document, _rawCopyStore: {}, isRunning: false, open: U.recorder(), matchMedia: function() { return mq; } }, extra || {}));
 }
+// Mirrors core/130-indexeddb.js chatMessageCount (skeleton-aware count; module not loaded here).
+function chatMsgCount(c) { return !c ? 0 : (Array.isArray(c.messages) ? c.messages.length : (c._msgCount || 0)); }
 function loadLenient(paths, globals) {
+    if (!('chatMessageCount' in globals)) globals.chatMessageCount = chatMsgCount;
     return U.loadUi(paths, { globals: globals, lenient: true, allowUnstubbed: ANY_UNSTUBBED, window: globals.window });
 }
 // Modules like 210/230 register ANONYMOUS document listeners at load time —

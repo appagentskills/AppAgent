@@ -55,7 +55,12 @@ var GLOBAL_READ_KEYS = [
     'document:list',
     'document:list_versions',
     'document:read_version',
-    'list_instances'
+    'list_instances',
+    'local_folder:list',
+    'local_folder:ls',
+    'local_folder:read',
+    'local_folder:grep',
+    'local_folder:request'
 ];
 
 // Modifying: default 'auto'
@@ -105,6 +110,10 @@ var GLOBAL_WRITE_KEYS = [
     'document:update',
     'document:edit',
     'document:delete',
+    'local_folder:write',
+    'local_folder:mkdir',
+    'local_folder:delete',
+    'local_folder:write_local',
     'update_action_state',
     'show_action_button',
     'github_setup',
@@ -113,6 +122,42 @@ var GLOBAL_WRITE_KEYS = [
 ];
 
 var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);
+
+// Global write keys whose DEFAULT is 'ask' (prompt every time) instead of the
+// generic write default 'auto'. Single source of truth for every place that
+// hardcodes defaults: worker/025-permissions-helpers.js getToolPermission,
+// ui/140-dropdowns.js (render + getToolPermission), ui/070-dashboard-ui.js
+// (seed, _getGlobalDefault, reset) and ui/040-tools-settings.js (render).
+// local_folder:delete / local_folder:write_local touch the user's REAL disk.
+var GLOBAL_ASK_DEFAULT_KEYS = [
+    'web_fetch',
+    'local_folder:delete',
+    'local_folder:write_local'
+];
+
+// Default permission of a GLOBAL key when the user has stored nothing.
+function getGlobalDefaultPermission(permKey) {
+    if (isReadPermissionKey(permKey)) return 'allow';
+    if (permKey === 'manage_skill:activate') return 'disabled';
+    if (GLOBAL_ASK_DEFAULT_KEYS.indexOf(permKey) !== -1) return 'ask';
+    // workspace:push / get_cookie run silently unless the user lowers them.
+    if (permKey === 'workspace:push' || permKey === 'get_cookie') return 'allow';
+    return 'auto';
+}
+
+// local_folder permission action: write/mkdir on a REAL (non-virtual) folder
+// resolve to the stricter 'write_local' key (default 'ask'); the virtual
+// "Agent Files" folder (folder null/''/'virtual'/'Agent Files') keeps the
+// plain action key. Shared by both approval gates (ui/150-tool-approval.js,
+// worker/120-tool-routing.js).
+function localFolderPermissionAction(args) {
+    if (!args || !args.action) return null;
+    var action = args.action;
+    if (action !== 'write' && action !== 'mkdir') return action;
+    var f = args.folder;
+    var isVirtual = f === undefined || f === null || f === '' || f === 'virtual' || f === 'Agent Files';
+    return isVirtual ? action : 'write_local';
+}
 
 // Map tool name + method/action to permission key
 function resolvePermissionKey(toolName, methodOrAction) {
@@ -135,7 +180,7 @@ function resolvePermissionKey(toolName, methodOrAction) {
         return 'browser:' + methodOrAction;
     }
     // manage_skill, workspace, document → toolName:action
-    if ((toolName === 'manage_skill' || toolName === 'workspace' || toolName === 'document') && methodOrAction) {
+    if ((toolName === 'manage_skill' || toolName === 'workspace' || toolName === 'document' || toolName === 'local_folder') && methodOrAction) {
         return toolName + ':' + methodOrAction;
     }
     if (toolName === 'widget_eval' && methodOrAction === 'list') return 'widget_eval:list';

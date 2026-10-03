@@ -122,6 +122,8 @@ function updateChatTitle(chat) {
     // with a model-generated title — `titleProvisional` tells the hook the
     // title still needs upgrading (see executeAfterResponseHooks).
     if (chat.title && chat.title !== 'New Chat' && !chat.titleProvisional) return;
+    // C2 skeleton (messages evicted to IDB): no transcript in memory, keep the title.
+    if (!Array.isArray(chat.messages)) return;
 
     var userMsgs = chat.messages.filter(function(m) { return m.role === 'user' && !m.isHookMessage; });
     if (userMsgs.length === 1) {

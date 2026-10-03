@@ -174,7 +174,13 @@ describe('#6a boot placeholder sweep (app/030-agent-loop.js)', function() {
         assert.ok(iForEach > 0 && iMark > iForEach && iSweep > iMark && iSettle > iSweep, '130 order: forEach < mark < sweep < settle');
         var gate130 = body.slice(body.lastIndexOf('if (', iSweep), iSweep);
         assert.ok(/getP4Flag\('P4_BOOT_PLACEHOLDER_SWEEP'\)/.test(gate130) && /typeof sweepStrandedPlaceholders === 'function'/.test(gate130) && /_chatsHydrated/.test(gate130), gate130);
-        assert.ok(body.indexOf('runAgent(cp.chatId)', iMark) > iMark, 'mark precedes the runAgent chains');
+        // C2 (chat eviction): the resume chains now start the loop through
+        // _swResumeRunAgent (skeleton hydrate gate), which must itself funnel
+        // into runAgent(id) on both arms.
+        assert.ok(body.indexOf('_swResumeRunAgent(cp.chatId)', iMark) > iMark, 'mark precedes the runAgent chains');
+        var iWrap = bridge.indexOf('function _swResumeRunAgent(');
+        var wrap = bridge.slice(iWrap, bridge.indexOf('\n}', iWrap));
+        assert.ok(iWrap > 0 && wrap.split('return runAgent(id)').length === 3, '_swResumeRunAgent funnels both arms into runAgent(id)');
         var entry = await loadFile('src/js/worker/190-entry.js');
         var iEmpty = entry.indexOf('if (!checkpoints || checkpoints.length === 0) {');
         var iSweepE = entry.indexOf('sweepStrandedPlaceholders({})', iEmpty);

@@ -275,7 +275,7 @@ describe('chat boot load: per-batch payload strip (F1)', function() {
             { phase: 'pre-chats', extra: { n: 63 } },
             { phase: 'post-strip', extra: { n: 62, kept: 8 } }
         ]);
-        assert.deepStrictEqual(r.ns.__unstubbed.slice().sort(), ['sweepColdChatPayloads']);
+        assert.deepStrictEqual(r.ns.__unstubbed.slice().sort(), ['CHAT_MESSAGE_EVICTION_ENABLED', 'markChatMessagesDurable', 'sweepColdChatPayloads']);
     }, { tags: ['unit'], timeout: 15000 });
 
     test('re-hydrates the newest 8 chats; final map equals the pre-F1 post-swap oracle', async function() {

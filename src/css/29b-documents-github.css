@@ -1,0 +1,30 @@
+/* Documents page: add-source popover GitHub mode (tools/110 _sdocAddPopHtml) + repo preview loading. */
+.sdoc-gh-input { width: 100%; box-sizing: border-box; min-width: 0; padding-block: var(--space-2); padding-inline: var(--space-4); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); color: var(--text-primary); font-family: inherit; font-size: var(--text-caption); }
+.sdoc-gh-input::placeholder { color: var(--text-secondary); opacity: 1; } /* --text-muted is ~3.9:1 on the dark card; secondary passes AA in both themes */
+.sdoc-gh-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+/* Repo popup (listbox + hint): overlays the popover under the repo input. .sdoc-gh-combo is its containing
+   block (top:100%, full input width), pure CSS; z-index 4 keeps it above the popover's own controls. */
+.sdoc-gh-combo { position: relative; min-width: 0; }
+.sdoc-gh-pop { --sdoc-gh-opt-h: 24px; --sdoc-gh-rows: 8; position: absolute; top: calc(100% + 2px); inset-inline: 0; z-index: 4; display: flex; flex-direction: column; box-sizing: border-box; min-width: 0; padding: 2px; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); box-shadow: var(--shadow-lg); cursor: default; }
+.sdoc-gh-pop[hidden] { display: none; }
+/* max-height = a whole number of option rows (+ the 1px gaps), so no option is cut in half */
+.sdoc-gh-list { display: flex; flex-direction: column; gap: 1px; max-height: calc(var(--sdoc-gh-rows) * var(--sdoc-gh-opt-h) + (var(--sdoc-gh-rows) - 1) * 1px); overflow-y: auto; overscroll-behavior: contain; min-width: 0; }
+.sdoc-gh-hint { padding: var(--space-2) var(--space-3); font-size: var(--text-caption); color: var(--text-secondary); overflow-wrap: anywhere; }
+.sdoc-gh-hint:empty { display: none; }
+.sdoc-gh-opt { flex: none; height: var(--sdoc-gh-opt-h); box-sizing: border-box; line-height: 20px; appearance: none; display: flex; align-items: center; gap: var(--space-2); width: 100%; min-width: 0; margin: 0; padding-block: 2px; padding-inline: var(--space-3); border: none; border-radius: var(--radius-sm); background: none; color: var(--text-primary); font-family: inherit; font-size: var(--text-caption); text-align: start; cursor: pointer; }
+.sdoc-gh-list[hidden], .sdoc-gh-list:empty { display: none; }
+.sdoc-gh-opt:hover { background: var(--secondary-light, var(--secondary-border)); }
+/* Combobox highlight (aria-activedescendant): tint + inset ring, not colour-only */
+.sdoc-gh-opt.active { background: var(--secondary-light, var(--secondary-border)); box-shadow: inset 0 0 0 2px var(--primary); }
+.sdoc-gh-opt.selected { color: var(--primary); font-weight: var(--font-medium); }
+.sdoc-gh-opt-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdoc-gh-opt-priv { flex: 0 0 auto; display: inline-flex; color: var(--text-secondary); }
+/* Empty note: rendered [hidden] (tools/110 _sdocGhNoteBoxHtml); both rules keep it out of the card flow */
+.sdoc-gh-note:empty, .sdoc-gh-note[hidden] { display: none; }
+.sdoc-gh-note-acts { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin-block-start: var(--space-2); }
+.sdoc-gh-note { padding: var(--space-2) var(--space-3); font-size: var(--text-caption); color: var(--text-secondary); overflow-wrap: anywhere; }
+.sdoc-gh-status { min-height: 0; font-size: var(--text-caption); color: var(--text-secondary); overflow-wrap: anywhere; }
+.sdoc-gh-status:empty { display: none; }
+.sdoc-gh-link { appearance: none; display: inline-flex; align-items: center; gap: var(--space-2); margin: 0; padding: 0; border: none; background: none; color: var(--primary); font-family: inherit; font-size: var(--text-caption); text-align: start; text-decoration: underline; cursor: pointer; }
+.sdoc-gh-link:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; border-radius: var(--radius-sm); }
+.sdoc-ws-load-err .widget-library-btn { margin-block-start: var(--space-3); }

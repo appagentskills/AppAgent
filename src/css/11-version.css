@@ -39,7 +39,7 @@
 .version-prs-section .version-section-title { display: flex; align-items: center; gap: var(--space-3); font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--space-4); }
 .version-prs-section .version-section-title svg { width: 14px; height: 14px; color: var(--primary); }
 .pr-sidebar-list { display: flex; flex-direction: column; gap: var(--space-1); }
-.pr-sidebar-item { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); cursor: pointer; text-decoration: none; color: var(--text-primary); transition: all var(--transition-fast); }
+.pr-sidebar-item { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); cursor: pointer; text-decoration: none; color: var(--text-primary); transition: background-color var(--transition-fast); }
 .pr-sidebar-item:hover { background: var(--bg-hover); text-decoration: none; }
 .pr-sidebar-icon { display: inline-flex; align-items: center; justify-content: center; width: 20px; flex-shrink: 0; color: var(--primary); }
 .pr-sidebar-icon .ui-icon { width: 14px; height: 14px; }

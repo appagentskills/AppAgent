@@ -22,12 +22,14 @@ function rec(impl) { return U.recorder(impl); }
 function noop() {}
 // Test-local stand-in for tools/120-actions.js escapeJsString (not under test here).
 function escJs(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+// Mirrors core/130-indexeddb.js chatMessageCount (skeleton-aware count; module not loaded here).
+function chatMsgCount(c) { return !c ? 0 : (Array.isArray(c.messages) ? c.messages.length : (c._msgCount || 0)); }
 
 function sidebarGlobals(chats, extra) {
     var s = U.stubs();
     return Object.assign({
         chats: chats, currentChatId: null, currentView: 'chat', chatSearchQuery: '', skills: {}, TOOLS: [], dashboardWidgets: {},
-        escapeJsString: escJs, chatActivityTs: function(c) { return c.updatedAt || 0; },
+        escapeJsString: escJs, chatActivityTs: function(c) { return c.updatedAt || 0; }, chatMessageCount: chatMsgCount,
         chatHasPendingApproval: function() { return false; }, chatHasPendingItems: function() { return false; },
         // NOTE: no downloadChat stub — 210-chat-menus.js declares the real one, and a
         // module's own function declaration always shadows a scope stub.
@@ -50,7 +52,7 @@ function composerGlobals(extra) {
     var s = U.stubs();
     return Object.assign({
         chats: { c1: { id: 'c1', title: 'C1', messages: [] } }, currentChatId: 'c1', currentView: 'chat', chatSearchQuery: '', skills: {}, TOOLS: [], dashboardWidgets: {},
-        escapeJsString: escJs, chatActivityTs: function() { return 0; }, chatHasPendingApproval: function() { return false; }, chatHasPendingItems: function() { return false; },
+        escapeJsString: escJs, chatActivityTs: function() { return 0; }, chatMessageCount: chatMsgCount, chatHasPendingApproval: function() { return false; }, chatHasPendingItems: function() { return false; },
         pendingImageAttachments: [], chatPendingImages: {}, chatPendingTexts: {}, runningChatIds: {}, pausedChats: {}, paused: false,
         pendingInjection: null, pendingInjectionImages: null, pendingInjectionsByChatId: {}, userInterruptedChats: {},
         currentStreamAbortControllers: {}, interruptResolversByChatId: {}, currentEditingWidget: null, stickToBottom: false,

@@ -3,7 +3,7 @@ var screenshotNav = { list: [], index: -1 };
 
 function getScreenshotList() {
     var chat = chats[currentChatId];
-    if (!chat || !chat.messages) return [];
+    if (!chat || !Array.isArray(chat.messages)) return [];
     var list = [];
     chat.messages.forEach(function(msg) {
         if (msg.role === 'screenshot') list.push(msg);
@@ -106,8 +106,13 @@ async function _sidebarPayload(role, index, field) {
     }
     // An empty text file (content '') is a real payload: only null/undefined content is missing.
     function missing(x) { return field === 'content' ? x[field] == null : !x[field]; }
+    // C2: a skeleton (messages evicted to IDB) has no rows to pick yet.
+    function skeleton() {
+        var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        return !!(c && !Array.isArray(c.messages) && c._messagesEvicted);
+    }
     var m = pick();
-    if (m && missing(m) && typeof ensureChatPayloads === 'function') {
+    if ((m ? missing(m) : skeleton()) && typeof ensureChatPayloads === 'function') {
         try { await ensureChatPayloads(chatId); } catch (e) {}
         m = pick();
     }

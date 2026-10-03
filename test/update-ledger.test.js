@@ -98,7 +98,11 @@ describe('C2 update ledger + C2b reminder dedupe (app/020 buildAPIMessages)', fu
             '- [passive report, not sent to you before] Beta (b) \u2014 done: B found 3 issues',
             '- [lifecycle] Alpha (a) \u2014 running: STUCK \u2014 no progress'
         ]);
-        assert.strictEqual(snap(msgs()), before, 'input chat not mutated (nothing persisted)');
+        // PREFIX-STABILITY: only the anchor gains ledgerBlock = the sent block.
+        assert.strictEqual(anchor.ledgerBlock, block.slice(2), 'anchor stores the exact sent block');
+        var _lb = anchor.ledgerBlock; delete anchor.ledgerBlock;
+        assert.strictEqual(snap(msgs()), before, 'no other row field is mutated');
+        anchor.ledgerBlock = _lb;
         assert.ok(!msgs().some(function(r) { return r.role === 'context'; }), 'no context row added');
         assert.strictEqual(snap(m.buildAPIMessages(msgs(), 'root')), snap(out), 'deterministic (prefix-cache stable)');
     }, T);

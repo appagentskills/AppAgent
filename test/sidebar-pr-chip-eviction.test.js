@@ -10,8 +10,12 @@
 // every fake settles on microtasks.
 describe('sidebar PR chip: push rows survive eviction + meta.prs union', function() {
     var UI = 'src/js/ui/120-ui-utils.js';
-    var UI_FNS = ['getPushedPRsForChat', 'getSubAgentChatsForChat', '_sidebarMetaPRsUnion', '_refreshSidebarMetaPRs'];
-    var UI_VARS = ['_sidebarMetaPRs', '_sidebarMetaPRsLoading', '_sidebarMetaPRsDirty'];
+    // getPushedPRsForChat routes through the C2 skeleton scan (skeletonScanValue +
+    // its private helpers/state), cut out of the same source alongside it.
+    var SKEL_FNS = ['_isSkeletonChat', '_skelScanSig', '_skelClone', 'skeletonScanValue', '_skelScanPump', '_getPushedPRsLive'];
+    var SKEL_VARS = ['_skelScanMemo', '_skelScanWant', '_skelScanQueue', '_skelScanBusy', '_skelScanRerenders', '_skelScanTimer'];
+    var UI_FNS = ['getPushedPRsForChat', 'getSubAgentChatsForChat', '_sidebarMetaPRsUnion', '_refreshSidebarMetaPRs'].concat(SKEL_FNS);
+    var UI_VARS = ['_sidebarMetaPRs', '_sidebarMetaPRsLoading', '_sidebarMetaPRsDirty'].concat(SKEL_VARS);
     var PR_URL = 'https://github.com/example-org/AppAgent/pull/901';
     var PR2 = 'https://github.com/example-org/AppAgent/pull/902';
     var PR3 = 'https://github.com/example-org/AppAgent/pull/903';

@@ -45,8 +45,88 @@
 // runtime-inspect, so openDatabase() is in scope.
 // =============================================================
 
+// Per-chat cache (key -> { sig, calls }) so repeat calls (a pinned home
+// widget polls every 60 s) skip re-walking every chat's `messages`. `calls`
+// holds one compact tuple per counted LLM call, in message order:
+//   [input, output, cache_read, cache_write, cost, model, m.timestamp, realTs]
+// model is resolved with rec.model and the ts fallbacks are applied at replay
+// time from the live record, so replaying yields byte-identical output.
+// sig covers every record field the walk depends on; entries for chats no
+// longer in the store are dropped after each full pass.
+//
+// NO-FULL-SCAN (memory): a cursor over `chats` deserializes EVERY full record
+// (~1 GB with thousands of chats) on every 60 s poll, even when all are cache
+// hits. So a warm call enumerates keys only (getAllKeys) and replays a chat
+// from the cache when the page's in-memory row `chats[key]` still matches the
+// record pre-signature captured at the last full read (_riUsagePre: rev,
+// updatedAt, createdAt, model, message COUNT, title; never message bodies,
+// which the page strips/evicts). A page row may be an evicted skeleton (no
+// `messages` at all, count kept in `_msgCount`), so a row's count is read ONLY
+// through core's chatMessageCount() — never `.messages` — and without it no
+// row is trusted (exact full pass). Only mismatches, chats missing from the
+// page map and re-verify picks are read with a single store.get(key).
+// Stale-meta trade-off: memory AHEAD of disk (unsaved append) mismatches the
+// record-derived pre, so the chat is re-read each poll until the save lands.
+// Disk AHEAD of memory (a write this page never heard of) cannot be seen
+// without reading, so each entry carries a trust stamp `at` and a hit is DUE
+// once now - at >= RI_USAGE_REVERIFY_MS (R):
+//   • due hits are re-read oldest-first, at most max(8, ceil(n*elapsed/R)) per
+//     call (n = chats, elapsed = time since the last completed cached call),
+//     so re-read capacity keeps pace with expiry at any poll cadence;
+//   • every batch read in one call has its stamps spread evenly over the span
+//     it covers (R for a full pass, min(elapsed, R) for re-verify picks), so
+//     expiries never bunch (e.g. after a gap >= R that re-read everything).
+// Guarantee, for a stable chat count: a served hit was read from disk less
+// than R + one call interval ago. Only a burst of CHANGED chats re-read in the
+// same call (stamped together) can lag behind that, and no hit is ever served
+// 2R or more after its read (FIFO: the entries ahead of a due one never
+// increase, and the caps summed over (due, t] are >= n*(t-due)/R).
+// A cold cache, no page map, or opts.noCache:true take the original exact
+// full cursor pass.
+var _riUsageCache = new Map();
+var RI_USAGE_REVERIFY_MS = 3600000;
+var _riUsageLastCall = 0; // nowTs of the last completed cached call
+// Page rows reach this only past the guarded hit check, so the `.messages`
+// fallback (core not loaded: test harness) only ever counts disk records.
+function _riUsageMsgCount(c) {
+    return typeof chatMessageCount === 'function' ? chatMessageCount(c) : (c.messages || []).length;
+}
+function _riUsagePre(c) {
+    return JSON.stringify([c.rev === undefined ? null : c.rev, c.updatedAt || 0, c.createdAt || 0,
+        c.model || '', _riUsageMsgCount(c), String(c.title || '')]);
+}
+// Spread the trust stamps of `keys` (oldest first) evenly over (now - span, now].
+function _riUsageStagger(keys, now, span) {
+    for (var i = 0; i < keys.length; i++) {
+        var e = _riUsageCache.get(keys[i]);
+        if (e) e.at = now - Math.floor(span * (keys.length - 1 - i) / keys.length);
+    }
+}
+function _riUsageSig(rec, msgs) {
+    var last = msgs.length ? msgs[msgs.length - 1] : null;
+    var lm = last && last.metrics;
+    return [rec.updatedAt || 0, rec.createdAt || 0, rec.model || '', msgs.length,
+        last ? (last.role || '') + ':' + (last.timestamp || 0) : '',
+        lm ? (lm.input_tokens || 0) + ',' + (lm.output_tokens || 0) + ',' + (lm.isAggregate ? 1 : 0) + ',' + (lm.endTime || 0) : ''].join('|');
+}
+function _riUsageCalls(rec, msgs) {
+    var calls = [];
+    for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (!m || m.role !== 'assistant' || !m.metrics || m.metrics.isAggregate) continue;
+        var t = m.metrics;
+        if (!t.input_tokens && !t.output_tokens) continue;
+        calls.push([t.input_tokens || 0, t.output_tokens || 0, t.cache_read_tokens || 0,
+            (t.cache_write_tokens || 0) + (t.cache_creation_tokens || 0), t.cost || 0,
+            t.actualModel || rec.model || 'unknown', m.timestamp, t.endTime || t.startTime || m.timestamp || 0]);
+    }
+    return calls;
+}
+
 async function riUsageRollup(opts) {
     opts = opts || {};
+    var useCache = opts.noCache !== true, seenKeys = useCache ? new Set() : null, completed = false;
+    var fullPass = false, picks = null;
     var db = await openDatabase();
     var tx = db.transaction(['chats'], 'readonly');
     var store = tx.objectStore('chats');
@@ -56,6 +136,7 @@ async function riUsageRollup(opts) {
     var seriesKind = (opts.series === 'hourly' || opts.series === 'daily' || opts.series === 'monthly') ? opts.series : null;
     var HOUR_MS = 3600000, DAY_MS = 86400000;
     var nowTs = Date.now();
+    var elapsed = nowTs - _riUsageLastCall;
     var seriesCutoff = seriesKind === 'hourly' ? nowTs - 72 * HOUR_MS :
                        seriesKind === 'daily'  ? nowTs - 100 * DAY_MS : 0;
     var seriesMax = nowTs + HOUR_MS; // ignore clock-skewed future stamps
@@ -77,64 +158,57 @@ async function riUsageRollup(opts) {
         if (ts < minSeriesTs) minSeriesTs = ts;
         return buckets[k];
     }
-    await new Promise(function (resolve, reject) {
-        var rq = store.openCursor();
-        rq.onerror = function () { reject(rq.error || new Error('IDB cursor failed')); };
-        rq.onsuccess = function () {
-            var cur = rq.result;
-            if (!cur) { resolve(); return; }
-            var rec = cur.value || {};
-            var msgs = rec.messages || [];
-            var row = { key: String(cur.key), title: String(rec.title || '').slice(0, 80),
-                        updatedAt: rec.updatedAt || rec.createdAt || 0, msgs: msgs.length,
+    // Aggregate one chat. `info` holds the only record fields the rollup
+    // reads besides messages: { title (80-char slice), msgs, u, c } (raw
+    // updatedAt / createdAt), so a cache replay needs no record.
+    function addChat(ck, info, calls) {
+            var row = { key: ck, title: info.title,
+                        updatedAt: info.u || info.c || 0, msgs: info.msgs,
                         calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0,
                         cost: 0, models: {} };
-            for (var i = 0; i < msgs.length; i++) {
-                var m = msgs[i];
-                if (!m || m.role !== 'assistant' || !m.metrics || m.metrics.isAggregate) continue;
-                var t = m.metrics;
-                if (!t.input_tokens && !t.output_tokens) continue;
+            for (var i = 0; i < calls.length; i++) {
+                var c = calls[i];
                 row.calls++;
-                row.input += t.input_tokens || 0;
-                row.output += t.output_tokens || 0;
-                row.cache_read += t.cache_read_tokens || 0;
-                row.cache_write += (t.cache_write_tokens || 0) + (t.cache_creation_tokens || 0);
-                row.cost += t.cost || 0;
-                var model = t.actualModel || rec.model || 'unknown';
+                row.input += c[0];
+                row.output += c[1];
+                row.cache_read += c[2];
+                row.cache_write += c[3];
+                row.cost += c[4];
+                var model = c[5];
                 row.models[model] = (row.models[model] || 0) + 1;
                 var pm = perModel[model] || (perModel[model] = { calls: 0, input: 0, output: 0, cost: 0 });
-                pm.calls++; pm.input += t.input_tokens || 0; pm.output += t.output_tokens || 0; pm.cost += t.cost || 0;
-                var ts = m.timestamp || rec.updatedAt || rec.createdAt;
+                pm.calls++; pm.input += c[0]; pm.output += c[1]; pm.cost += c[4];
+                var ts = c[6] || info.u || info.c;
                 var mo = ts ? new Date(ts).toISOString().slice(0, 7) : 'unknown';
                 var mb = monthly[mo] || (monthly[mo] = { calls: 0, input: 0, output: 0, cost: 0 });
-                mb.calls++; mb.input += t.input_tokens || 0; mb.output += t.output_tokens || 0; mb.cost += t.cost || 0;
+                mb.calls++; mb.input += c[0]; mb.output += c[1]; mb.cost += c[4];
                 if (seriesKind) {
-                    var realTs = t.endTime || t.startTime || m.timestamp || 0;
+                    var realTs = c[7];
                     tsTotal++;
                     if (realTs) tsReal++;
-                    var sts = realTs || rec.updatedAt || rec.createdAt || 0;
+                    var sts = realTs || info.u || info.c || 0;
                     if (sts && sts >= seriesCutoff && sts <= seriesMax) {
                         var bk = bucketAt(sts);
                         bk.calls++;
-                        bk.input += t.input_tokens || 0;
-                        bk.output += t.output_tokens || 0;
-                        bk.cache_read += t.cache_read_tokens || 0;
-                        bk.cache_write += (t.cache_write_tokens || 0) + (t.cache_creation_tokens || 0);
-                        bk.cost += t.cost || 0;
-                        bucketChats[bucketKey(sts)][String(cur.key)] = 1;
+                        bk.input += c[0];
+                        bk.output += c[1];
+                        bk.cache_read += c[2];
+                        bk.cache_write += c[3];
+                        bk.cost += c[4];
+                        bucketChats[bucketKey(sts)][ck] = 1;
                         if (byModel) {
                             var bmk = bucketKey(sts);
                             var bmRow = bucketModels[bmk] || (bucketModels[bmk] = {});
                             var bmCell = bmRow[model] || (bmRow[model] = [0, 0, 0]);
-                            bmCell[0] += t.input_tokens || 0;
-                            bmCell[1] += t.output_tokens || 0;
+                            bmCell[0] += c[0];
+                            bmCell[1] += c[1];
                             bmCell[2]++;
                         }
                     }
                 }
             }
-            if (seriesKind && rec.createdAt && rec.createdAt >= seriesCutoff && rec.createdAt <= seriesMax) {
-                bucketAt(rec.createdAt).chats_created++;
+            if (seriesKind && info.c && info.c >= seriesCutoff && info.c <= seriesMax) {
+                bucketAt(info.c).chats_created++;
             }
             g.chats++;
             if (row.calls > 0) {
@@ -144,9 +218,77 @@ async function riUsageRollup(opts) {
                 row.models = Object.keys(row.models);
                 perChat.push(row);
             }
-            cur.continue();
+    }
+    // Full record -> calls (exact sig check as before) -> aggregate; with the
+    // cache on, (re)stamps the entry with the record pre-signature + read time
+    // (a bulk re-read is spread afterwards, see _riUsageStagger).
+    function addRecord(ck, rec) {
+        var msgs = rec.messages || [], calls;
+        var info = { title: String(rec.title || '').slice(0, 80), msgs: msgs.length, u: rec.updatedAt, c: rec.createdAt };
+        if (useCache) {
+            var sig = _riUsageSig(rec, msgs), hit = _riUsageCache.get(ck);
+            calls = (hit && hit.sig === sig) ? hit.calls : _riUsageCalls(rec, msgs);
+            _riUsageCache.set(ck, { sig: sig, calls: calls, pre: _riUsagePre(rec), at: nowTs, info: info });
+        } else {
+            calls = _riUsageCalls(rec, msgs);
+        }
+        addChat(ck, info, calls);
+    }
+    var meta = (useCache && typeof chats === 'object' && chats) ? chats : null;
+    await new Promise(function (resolve, reject) {
+        function fail(rq, what) { return function () { reject(rq.error || new Error('IDB ' + what + ' failed')); }; }
+        function fullScan() {
+            fullPass = true;
+            var rq = store.openCursor();
+            rq.onerror = fail(rq, 'cursor');
+            rq.onsuccess = function () {
+                var cur = rq.result;
+                if (!cur) { completed = true; resolve(); return; }
+                var ck = String(cur.key);
+                if (useCache) seenKeys.add(ck);
+                addRecord(ck, cur.value || {});
+                cur.continue();
+            };
+        }
+        if (!meta || typeof store.getAllKeys !== 'function') { fullScan(); return; }
+        var kq = store.getAllKeys();
+        kq.onerror = fail(kq, 'getAllKeys');
+        kq.onsuccess = function () {
+            var keys = kq.result || [], hits = new Array(keys.length), nHit = 0, due = [];
+            for (var i = 0; i < keys.length; i++) {
+                var ck = String(keys[i]), e = _riUsageCache.get(ck);
+                seenKeys.add(ck);
+                var m = Object.prototype.hasOwnProperty.call(meta, ck) ? meta[ck] : null;
+                if (e && m && typeof chatMessageCount === 'function' && _riUsagePre(m) === e.pre) {
+                    hits[i] = e; nHit++;
+                    if (nowTs - e.at >= RI_USAGE_REVERIFY_MS) due.push(i);
+                }
+            }
+            if (!nHit) { fullScan(); return; } // cold cache: one cursor pass
+            due.sort(function (a, b) { return (hits[a].at - hits[b].at) || (a - b); });
+            picks = due.slice(0, Math.max(8, Math.ceil(keys.length * elapsed / RI_USAGE_REVERIFY_MS)))
+                .map(function (j) { hits[j] = null; return String(keys[j]); });
+            var idx = 0;
+            // Key order == cursor order, so rows/series/models aggregate in the
+            // same order; misses are read one at a time (one record live).
+            (function next() {
+                while (idx < keys.length && hits[idx]) { addChat(String(keys[idx]), hits[idx].info, hits[idx].calls); idx++; }
+                if (idx >= keys.length) { completed = true; resolve(); return; }
+                var k = keys[idx++], gq = store.get(k);
+                gq.onerror = fail(gq, 'get');
+                gq.onsuccess = function () {
+                    if (gq.result) addRecord(String(k), gq.result); else _riUsageCache.delete(String(k));
+                    next();
+                };
+            })();
         };
     });
+    if (useCache && completed) {
+        _riUsageCache.forEach(function (_, k) { if (!seenKeys.has(k)) _riUsageCache.delete(k); });
+        if (fullPass) _riUsageStagger(Array.from(seenKeys), nowTs, RI_USAGE_REVERIFY_MS);
+        else if (picks && picks.length) _riUsageStagger(picks, nowTs, Math.max(0, Math.min(elapsed, RI_USAGE_REVERIFY_MS)));
+        _riUsageLastCall = nowTs;
+    }
     perChat.sort(function (a, b) { return b.input - a.input; });
     var page = (typeof opts.page === 'number' && opts.page > 0) ? Math.floor(opts.page) : 0;
     var size = (typeof opts.pageSize === 'number' && opts.pageSize > 0) ? Math.min(Math.floor(opts.pageSize), 60) : 40;

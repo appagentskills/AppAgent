@@ -10,7 +10,8 @@
 /* An idle (empty) slot must not reserve its 320px basis, or it would push the
    Dashboard actions onto a second row at mid widths for nothing. */
 .page-toolbar-slot.slot-idle { flex: 1 1 0; }
-.page-toolbar-slot .widget-library-search { flex: 1 1 220px; max-width: 480px; }
+/* min-width:0: the search shrinks below its input's intrinsic width, so count + Rows/Gallery fit a ~420px side panel */
+.page-toolbar-slot .widget-library-search { flex: 1 1 220px; max-width: 480px; min-width: 0; }
 .page-toolbar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-4); margin-inline-start: auto; }
 .page-toolbar .dashboard-actions { margin-inline-start: auto; }
 .page-toolbar-layout { display: inline-flex; }
@@ -33,5 +34,17 @@
 .layout-gallery .history-chat-card { min-width: 0; box-sizing: border-box; }
 .history-list.layout-gallery { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
 
-/* Shared New Chat header when hosted by another page */
-.home-header.shared-page-header { position: relative; z-index: 11; }
+/* Shared New Chat header when hosted by another page (ui/045-page-layout.js mountSharedPageHeader).
+   Documents, Help, History and Settings scroll the WHOLE panel (overflow-y:auto on the panel), so a
+   position:relative header scrolled away with the content; Dashboard/Skills/Home only kept it
+   because their panel is overflow:hidden with an inner scroller. Make it sticky on every page
+   (a no-op where the panel does not scroll) and stack the page toolbar + nested sticky elements
+   below it. .home-header has a fixed height (18-panels.css:4), so the offset is a constant. */
+.home-header.shared-page-header { position: sticky; top: 0; z-index: 11; }
+.home-header.shared-page-header ~ * { --shared-page-header-h: 48px; }
+/* Only toolbars that share the scroll container with the header (sibling of it); the Skills toolbar
+   lives in .skills-list-panel (its own scroller, header outside) and keeps top:0. */
+.home-header.shared-page-header ~ .page-toolbar { top: var(--shared-page-header-h); }
+.home-header.shared-page-header ~ .docs-content .docs-outline,
+.home-header.shared-page-header ~ .documents-list .sdoc-rail { top: var(--shared-page-header-h); }
+.home-header.shared-page-header ~ .documents-list .sdoc-page-toolbar { top: calc(48px + var(--shared-page-header-h)); }

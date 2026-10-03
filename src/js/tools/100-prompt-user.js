@@ -73,6 +73,9 @@ function sanitizePromptFields(fields) {
     return out;
 }
 
+// promptId -> sync submit hook (see GESTURE HOOK in executePromptUser).
+var promptSubmitHooks = {};
+
 async function executePromptUser(args, options) {
     options = options || {};
     args = args || {};
@@ -105,6 +108,14 @@ async function executePromptUser(args, options) {
     var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
     if (!chat) return { success: false, error: 'No active chat' };
+    // Cold-chat eviction: a replayed prompt can target a skeleton (no
+    // messages array). Hydrate it, re-read chats[chatId] (the sweep copies on
+    // evict), and fail closed if it is still a skeleton.
+    if (!Array.isArray(chat.messages)) {
+        if (typeof ensureChatPayloads === 'function') { try { await ensureChatPayloads(chatId); } catch (e) {} }
+        chat = chats[chatId];
+        if (!chat || !Array.isArray(chat.messages)) return { success: false, error: 'Chat transcript not loaded' };
+    }
 
     // Idempotency on reload/reconnect: when the panel reloads, the SW re-dispatches
     // a still-parked prompt_user to the reconnecting panel (see worker/120-tool-routing.js
@@ -171,10 +182,17 @@ async function executePromptUser(args, options) {
     // both the fresh push above and the adopted-row replay path.
     if (typeof _refreshWaitingBadges === 'function') { try { _refreshWaitingBadges(chatId); } catch (e) {} }
 
+    // GESTURE HOOK: options.onSubmitSync(values) runs SYNCHRONOUSLY inside the
+    // Submit click (submitPromptUser), so it can open showDirectoryPicker /
+    // requestPermission while the user activation is live. Its return value
+    // comes back as result.gesture (local_folder request, tools/170).
+    if (typeof options.onSubmitSync === 'function') promptSubmitHooks[promptId] = options.onSubmitSync;
+
     // Block until PM submits or cancels
     var result = await new Promise(function(resolve) {
         pendingPromptResolvers[promptId] = resolve;
     });
+    delete promptSubmitHooks[promptId];
 
     // Mirror the prompt message to the SW so its chat snapshot doesn't wipe
     // it on the next agent-event. submitPromptUser/cancelPromptUser mutated
@@ -194,6 +212,16 @@ async function executePromptUser(args, options) {
 function openBackgroundPromptPopup(chatId, promptId) {
     var chat = chats[chatId];
     if (!chat) return;
+    // Cold-chat eviction: the bell on a cold action chat. Hydrate, then
+    // re-invoke only if the transcript actually came back.
+    if (!Array.isArray(chat.messages)) {
+        if (typeof ensureChatPayloads !== 'function') return;
+        Promise.resolve(ensureChatPayloads(chatId)).then(function() {
+            var c2 = chats[chatId];
+            if (c2 && Array.isArray(c2.messages)) openBackgroundPromptPopup(chatId, promptId);
+        }, function() {});
+        return;
+    }
     var msg = null;
     for (var i = 0; i < chat.messages.length; i++) {
         if (chat.messages[i].role === 'prompt_user' && chat.messages[i].promptId === promptId) {
@@ -235,6 +263,7 @@ function openBackgroundPromptPopup(chatId, promptId) {
     var host = document.createElement('div');
     host.id = 'bg-popup-host';
     host.setAttribute('data-prompt-id', promptId);
+    host.setAttribute('data-chat-id', chatId);
     host.innerHTML =
         '<div class="modal-backdrop bg-popup-backdrop" onclick="closeBackgroundPromptPopup(event)">' +
             '<div class="modal bg-popup-modal" onclick="event.stopPropagation()">' +
@@ -381,6 +410,15 @@ function submitPromptUser(promptId, chatId, formEl) {
 
     // Update message status
     chatId = chatId || currentChatId;
+    // Cold-chat eviction: a skeleton chat has no messages array. Hydrate
+    // first (single-flight per prompt), then run the unchanged tail on the
+    // re-read chat; fail closed if it is still a skeleton.
+    if (_promptChatIsSkeleton(chatId)) {
+        return _promptHydrateThen(promptId, chatId, _submitTail, 'submit');
+    }
+    return _submitTail();
+
+    function _submitTail() {
     var chat = chats[chatId];
     if (chat) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -410,7 +448,13 @@ function submitPromptUser(promptId, chatId, formEl) {
 
     // Resolve the blocking promise (live agent loop)
     if (pendingPromptResolvers[promptId]) {
-        pendingPromptResolvers[promptId]({ success: true, values: values });
+        var submitResult = { success: true, values: values };
+        var hook = promptSubmitHooks[promptId];
+        if (hook) {
+            delete promptSubmitHooks[promptId];
+            try { submitResult.gesture = hook(values); } catch (e) { submitResult.gesture = Promise.reject(e); }
+        }
+        pendingPromptResolvers[promptId](submitResult);
         delete pendingPromptResolvers[promptId];
     } else if (typeof _promptResultViaSW === 'function' && _promptResultViaSW(chatId, promptId, { success: true, values: values })) {
         // MP-2 (multi-panel): no LOCAL resolver, but the run is still live —
@@ -435,12 +479,49 @@ function submitPromptUser(promptId, chatId, formEl) {
         scrollToBottomIfAllowed();
     }
     return true;
+    } // end _submitTail
+}
+
+// Cold-chat eviction helpers for submit/cancel: a chat whose transcript was
+// evicted (`_messagesEvicted`, no messages array) must be hydrated before the
+// prompt row can be updated. Never fabricate an empty transcript.
+var _promptTailInFlight = {};
+function _promptChatIsSkeleton(chatId) {
+    var c = chats[chatId];
+    return !!(c && !Array.isArray(c.messages));
+}
+function _promptHydrateThen(promptId, chatId, tail, kind) {
+    if (typeof ensureChatPayloads !== 'function') {
+        console.warn('[prompt-user] ' + kind + ': chat transcript not loaded', chatId);
+        return false;
+    }
+    var key = kind + ':' + promptId;
+    if (_promptTailInFlight[key]) return true;
+    _promptTailInFlight[key] = true;
+    var done = function() {
+        delete _promptTailInFlight[key];
+        if (_promptChatIsSkeleton(chatId)) {
+            console.warn('[prompt-user] ' + kind + ': hydrate failed, chat still evicted', chatId);
+            return;
+        }
+        tail();
+    };
+    Promise.resolve().then(function() { return ensureChatPayloads(chatId); }).then(done, done);
+    return true;
 }
 
 // Called when PM cancels the form. `chatId` optional — see submitPromptUser.
 function cancelPromptUser(promptId, chatId) {
     // Update message status
     chatId = chatId || currentChatId;
+    // Cold-chat eviction: same hydrate-first gate as submitPromptUser.
+    if (_promptChatIsSkeleton(chatId)) {
+        _promptHydrateThen(promptId, chatId, _cancelTail, 'cancel');
+        return;
+    }
+    _cancelTail();
+
+    function _cancelTail() {
     var chat = chats[chatId];
     if (chat) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -463,6 +544,7 @@ function cancelPromptUser(promptId, chatId) {
 
     // Resolve with cancelled
     if (pendingPromptResolvers[promptId]) {
+        delete promptSubmitHooks[promptId];
         pendingPromptResolvers[promptId]({ success: false, cancelled: true, message: 'User cancelled the form' });
         delete pendingPromptResolvers[promptId];
     } else if (typeof _promptResultViaSW === 'function' && _promptResultViaSW(chatId, promptId, { success: false, cancelled: true, message: 'User cancelled the form' })) {
@@ -479,6 +561,7 @@ function cancelPromptUser(promptId, chatId) {
         renderMessages();
         scrollToBottomIfAllowed();
     }
+    } // end _cancelTail
 }
 
 // After page reload: write a proper tool_result matching the orphaned tool_use.
@@ -497,13 +580,20 @@ function injectPromptToolResult(chat, promptId, result) {
     // silent transcript loss on the next SW death / reload. Hydrate first
     // (mirrors the run-agent gate at worker/130-port-bridge.js), then inject
     // + resume. ensureChatPayloads never rejects; both arms chained anyway.
-    if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+    if ((chat._payloadsEvicted || !Array.isArray(chat.messages)) && typeof ensureChatPayloads === 'function') {
         ensureChatPayloads(chat.id || currentChatId).then(_doInject, _doInject);
         return;
     }
     _doInject();
 
     function _doInject() {
+    // Cold-chat eviction: the sweep copies on evict and the hydrate restores
+    // in place on chats[id], so re-read; bail if still a skeleton.
+    chat = (chat.id && chats[chat.id]) || chat;
+    if (!Array.isArray(chat.messages)) {
+        console.warn('[prompt-user] inject: chat transcript not loaded', chat.id);
+        return;
+    }
     var toolCallId = null;
     for (var i = 0; i < chat.messages.length; i++) {
         if (chat.messages[i].role === 'prompt_user' && chat.messages[i].promptId === promptId) {
@@ -783,7 +873,7 @@ function promptToggleChip(btn) {
 // per-type logic, minus validation. Works for the inline form and the
 // background popup (both build fields via renderPromptField). No-ops once the
 // prompt is no longer pending.
-function promptCaptureDraft(el) {
+function promptCaptureDraft(el, _retried) {
     var form = (el && el.tagName === 'FORM') ? el : (el && el.closest ? el.closest('form') : null);
     if (!form || !form.id || form.id.indexOf('prompt-form-') !== 0) return;
     var promptId = form.id.slice('prompt-form-'.length);
@@ -803,6 +893,17 @@ function promptCaptureDraft(el) {
                 if (c.messages[j].role === 'prompt_user' && c.messages[j].promptId === promptId) { msg = c.messages[j]; break; }
             }
             if (msg) break;
+        }
+    }
+    if (!msg && !_retried) {
+        // Cold-chat eviction: the popup's own chat (data-chat-id) may have
+        // been evicted to a skeleton; hydrate just that chat and retry once.
+        var _host = form.closest ? form.closest('#bg-popup-host') : null;
+        var _hcid = _host && _host.getAttribute ? _host.getAttribute('data-chat-id') : null;
+        if (_hcid && _promptChatIsSkeleton(_hcid) && typeof ensureChatPayloads === 'function') {
+            var _retry = function() { if (!_promptChatIsSkeleton(_hcid)) promptCaptureDraft(form, true); };
+            Promise.resolve().then(function() { return ensureChatPayloads(_hcid); }).then(_retry, function() {});
+            return;
         }
     }
     if (!msg || msg.status !== 'pending' || !Array.isArray(msg.fields)) return;

@@ -1,0 +1,321 @@
+/* Documents page, design C: a sources rail (nav#documents-sources) beside a pane with the selected
+   source's title bar (#sdoc-pane-head), breadcrumb and file rows (tools/110-smart-documents.js
+   sdocRenderSourcesStrip / _sdocPaneHeadHtml / buildDocumentsFileItem).
+   Design-system reuse: buttons = .widget-library-btn (19b), access = .radio-group/.radio-option (09-settings)
+   restyled as a .segmented-toggle (19b), inline padding = the .page-list token --space-8 (19c-page-layout.css:23).
+   Logical properties only (RTL-safe); colours via tokens only (light + dark theme). */
+.documents-panel { container-type: inline-size; }
+.documents-list { min-width: 0; }
+
+/* Icons (UI_ICONS inside an aria-hidden span, see _sdsIco) */
+.sdoc-src-ico { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-secondary); line-height: 0; }
+.sdoc-src-ico .ui-icon, .sdoc-src-ico > svg { width: 14px; height: 14px; }
+.sdoc-src-dirty { color: var(--warning-text); }
+.sdoc-sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+.sdoc-src-branch, .sdoc-src-warn { display: inline-flex; align-items: center; gap: var(--space-1); flex: 0 1 auto; }
+.sdoc-src-warn { color: var(--danger); }
+
+/* Layout: rail | pane. The rail is sticky and positioned (z-index 2) so the add-source popover
+   overlays the pane; only .sdoc-rail-groups scrolls, so the popover is never clipped. */
+.sdoc-rail-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: start; }
+.sdoc-rail { position: sticky; top: 0; z-index: 2; display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; max-height: 100vh; box-sizing: border-box; padding-block: var(--space-8); padding-inline: var(--space-4); border-inline-end: 1px solid var(--secondary-border); }
+/* While the popover is open lift the rail above the sticky fallback toolbar (21c, 5), below the page header (10) */
+.sdoc-rail-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 28px; padding-inline-start: var(--space-3); }
+.sdoc-rail-title { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-primary); }
+.sdoc-rail-add { appearance: none; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 28px; height: 28px; margin: 0; padding: 0; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); color: var(--text-secondary); cursor: pointer; line-height: 0; }
+.sdoc-rail-add:hover, .sdoc-rail-add[aria-expanded="true"] { color: var(--primary); border-color: var(--primary-light); background: var(--primary-lighter); }
+.sdoc-rail-add .ui-icon, .sdoc-rail-add > svg { width: 14px; height: 14px; }
+/* Narrow-panel source picker (shown by the container query below instead of the item list) */
+.sdoc-rail-select { display: none; width: 100%; min-width: 0; box-sizing: border-box; padding-block: var(--space-2); padding-inline: var(--space-3); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); color: var(--text-primary); font-family: inherit; font-size: var(--text-body-sm); }
+.sdoc-rail-groups { display: flex; flex-direction: column; gap: var(--space-1); min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.sdoc-rail-group { display: flex; flex-direction: column; gap: var(--space-1); margin-block-start: var(--space-4); }
+.sdoc-rail-label { padding-block: var(--space-1); padding-inline: var(--space-3); font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
+.sdoc-rail-item { appearance: none; display: flex; align-items: center; gap: var(--space-3); width: 100%; min-width: 0; box-sizing: border-box; margin: 0; padding-block: var(--space-2); padding-inline: var(--space-3); border: none; border-radius: var(--radius-md); background: none; color: var(--text-primary); font-family: inherit; font-size: var(--text-body-sm); text-align: start; cursor: pointer; }
+.sdoc-rail-item:hover { background: var(--bg-hover); }
+/* Selected: tint + primary text + inset ring (not colour-only); --primary-lighter is the tint used by the
+   other selected states on this page (access radio, crumbs) and keeps primary text readable in dark mode */
+.sdoc-rail-item.active { background: var(--primary-lighter); color: var(--primary); font-weight: var(--font-medium); box-shadow: inset 0 0 0 1px var(--primary-light); }
+.sdoc-rail-item.sdoc-src-drop.dragover { background: var(--primary-lighter); box-shadow: inset 0 0 0 1px var(--primary); outline: 1px dashed var(--primary); outline-offset: 1px; }
+.sdoc-rail-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdoc-rail-count { flex: 0 0 auto; font-size: var(--text-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.sdoc-rail-item.active .sdoc-rail-count { color: inherit; }
+.sdoc-rail-count.sdoc-src-warn { color: var(--danger); line-height: 0; }
+.sdoc-rail-count .ui-icon, .sdoc-rail-count > svg { width: 14px; height: 14px; }
+.sdoc-rail-loading { padding-block: var(--space-2); padding-inline: var(--space-3); font-size: var(--text-body-sm); color: var(--text-muted); }
+
+/* Type tiles: tinted square behind the source icon (13% of the type colour, the icon in full colour) */
+.sdoc-type-tile { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: var(--radius-md); line-height: 0; color: var(--text-secondary); background: var(--secondary-light, var(--bg-hover)); }
+.sdoc-type-tile .ui-icon, .sdoc-type-tile > svg { width: 14px; height: 14px; }
+.sdoc-type-tile-lg { width: 36px; height: 36px; border-radius: var(--radius-lg); }
+.sdoc-type-tile-lg .ui-icon, .sdoc-type-tile-lg > svg { width: 20px; height: 20px; }
+.sdoc-type-tile.t-sdocs { color: var(--primary); background: color-mix(in srgb, var(--primary) 13%, transparent); }
+.sdoc-type-tile.t-files { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+.sdoc-type-tile.t-local { color: var(--warning); background: color-mix(in srgb, var(--warning) 13%, transparent); }
+.sdoc-type-tile.t-gh { color: var(--success); background: color-mix(in srgb, var(--success) 13%, transparent); }
+
+/* Pane + title bar (_sdocPaneHeadHtml): tile, name, "<Type> · <count>" meta + badge, actions at the end */
+.sdoc-pane { display: flex; flex-direction: column; min-width: 0; }
+.sdoc-pane.sdoc-src-drop.dragover { background: var(--primary-lighter); outline: 2px dashed var(--primary); outline-offset: -4px; }
+.sdoc-pane.sdoc-src-drop:focus-within .sdoc-pane-head [data-fk^="upload:"]:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sdoc-pane-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); min-width: 0; padding-block: var(--space-8) var(--space-4); padding-inline: var(--space-8); }
+.sdoc-pane-head:empty { display: none; }
+.sdoc-pane-id { display: flex; align-items: center; gap: var(--space-4); flex: 1 1 220px; min-width: 0; }
+.sdoc-pane-info { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.sdoc-pane-title { margin: 0; font-size: var(--text-h3, 1.0625rem); font-weight: var(--font-semibold); line-height: 1.3; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdoc-pane-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; font-size: var(--text-caption); color: var(--text-muted); }
+/* Group headers in the unified list (sdocGroupedHtml); span the whole gallery grid. */
+.sdoc-group-head { display: flex; align-items: center; gap: var(--space-2); margin-block-start: var(--space-4); padding-block: var(--space-1); padding-inline: var(--space-3); border-block-end: 1px solid var(--secondary-border); font-size: var(--text-caption); font-weight: var(--font-semibold); letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-secondary); }
+.sdoc-group-head:first-child { margin-block-start: 0; }
+.widget-library-items.layout-gallery > .sdoc-group-head, .widget-library-items.layout-gallery > .sdoc-src-more { grid-column: 1 / -1; }
+.sdoc-group-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdoc-group-count { flex: 0 0 auto; font-weight: var(--font-medium); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.sdoc-pane-meta .sdoc-src-ico { color: inherit; }
+.sdoc-pane-meta .sdoc-src-ico .ui-icon, .sdoc-pane-meta .sdoc-src-ico > svg { width: 12px; height: 12px; }
+.sdoc-pane-badge { display: inline-flex; align-items: center; gap: var(--space-1); margin-inline-start: var(--space-2); padding-block: 1px; padding-inline: var(--space-3); border: 1px solid var(--secondary-border); border-radius: 999px; color: var(--text-secondary); }
+.sdoc-pane-acts { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-inline-start: auto; }
+
+/* Add-source modal (#sdoc-add-modal.modal-overlay on <body>, tools/110 _sdocAddModalRender) */
+.sdoc-add-dialog { display: flex; flex-direction: column; width: 640px; max-width: 90vw; max-height: 90vh; overflow: visible; }
+.sdoc-add-head { gap: var(--space-4); justify-content: space-between; align-items: flex-start; }
+.sdoc-add-head-text { min-width: 0; }
+.sdoc-add-title { margin: 0; font-size: var(--text-body-lg); font-weight: var(--font-semibold); color: var(--text-primary); }
+.sdoc-add-sub { margin: var(--space-1) 0 0; font-size: var(--text-caption); font-weight: var(--font-normal); color: var(--text-secondary); }
+.sdoc-add-x { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: var(--radius-md); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.sdoc-add-x:hover { background: var(--secondary-light); color: var(--text-primary); }
+.sdoc-add-x:focus-visible, .sdoc-add-card-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sdoc-add-x .ui-icon { width: 16px; height: 16px; }
+.sdoc-add-body { display: flex; flex-direction: column; gap: var(--space-6); padding: var(--space-8); overflow-y: auto; font-size: var(--text-body); }
+.sdoc-add-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-4); margin: 0; padding: 0; list-style: none; }
+.sdoc-add-card { display: flex; flex-direction: column; justify-content: space-between; gap: var(--space-4); padding: var(--space-6); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); background: var(--bg-white); transition: border-color var(--transition-fast), background var(--transition-fast); }
+.sdoc-add-card:hover { border-color: var(--primary-light); }
+.sdoc-add-card.is-active { border-color: var(--primary); background: var(--primary-lighter); }
+.sdoc-add-card-head { display: flex; align-items: flex-start; gap: var(--space-4); min-width: 0; }
+.sdoc-add-card-text { min-width: 0; }
+.sdoc-add-card-title { display: flex; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); }
+.sdoc-add-card-title .sdoc-src-ico { color: var(--text-secondary); }
+.sdoc-add-card-desc { margin: var(--space-1) 0 0; font-size: var(--text-caption); line-height: var(--leading-relaxed); color: var(--text-secondary); }
+.sdoc-add-card-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
+.sdoc-add-card-status { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--text-caption); color: var(--success); }
+.sdoc-add-card-btn[aria-busy="true"] { cursor: progress; }
+.sdoc-add-err { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-4) var(--space-6); border: 1px solid var(--danger); border-radius: var(--radius-md); background: var(--danger-light); color: var(--danger); font-size: var(--text-caption); }
+.sdoc-add-details { display: flex; flex-direction: column; gap: var(--space-4); padding-block-start: var(--space-6); border-top: 1px solid var(--secondary-border); }
+.sdoc-add-details > .sdoc-add-label { margin: 0; }
+.sdoc-add-label { margin-block-end: calc(-1 * var(--space-2)); font-size: var(--text-caption); font-weight: var(--font-medium); color: var(--text-secondary); }
+.sdoc-add-hint { margin: 0; font-size: var(--text-caption); color: var(--text-secondary); }
+.sdoc-add-foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--space-2); }
+
+/* Buttons: .widget-library-btn (19b-widget-library.css:62) + variants */
+.widget-library-btn.sdoc-src-btn { line-height: 1.4; font-family: inherit; }
+.widget-library-btn.sdoc-src-btn .ui-icon, .widget-library-btn.sdoc-src-btn svg { width: 12px; height: 12px; flex: 0 0 auto; }
+.widget-library-btn.sdoc-src-btn-primary { color: var(--primary); border-color: var(--primary-light); background: var(--primary-lighter); }
+.widget-library-btn.sdoc-src-btn-primary:hover { border-color: var(--primary); }
+.widget-library-btn.sdoc-src-icon-btn { padding: var(--space-2); background: transparent; border-color: transparent; color: var(--text-secondary); }
+.widget-library-btn.sdoc-src-icon-btn:hover { background: var(--secondary-light); border-color: var(--secondary-border); color: var(--text-primary); }
+.widget-library-btn.sdoc-src-icon-btn.danger:hover { background: var(--danger-light); border-color: var(--danger-light); color: var(--danger); }
+
+/* Read only / Read & write: the .radio-group roles restyled as a compact .segmented-toggle.
+   White track: --text-secondary inactive labels read at ~4.8:1 (light) / ~7.6:1 (dark); on the grey
+   --secondary-light track they were ~4.3:1. Selected = tint + primary text + 1px inset ring (not colour-only). */
+.sdoc-access-radio { display: flex; gap: 0; width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); overflow: hidden; }
+.sdoc-access-radio .radio-option { flex: 1 1 0; min-width: 0; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2); padding-block: var(--space-1); padding-inline: var(--space-2); border: none; border-radius: 0; background: none; color: var(--text-secondary); font-size: var(--text-caption); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; text-align: center; }
+.sdoc-access-radio .radio-option + .radio-option { border-inline-start: 1px solid var(--secondary-border); }
+.sdoc-access-radio .radio-option:hover { background: var(--secondary-light); color: var(--text-primary); }
+.sdoc-access-radio .radio-option.selected { background: var(--primary-lighter); color: var(--primary); font-weight: var(--font-medium); box-shadow: inset 0 0 0 1px var(--primary); }
+.sdoc-access-radio .radio-option > span:last-child { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sdoc-access-radio .radio-option .radio-option-icon { margin-inline-end: 0; vertical-align: baseline; line-height: 0; flex: 0 0 auto; }
+.sdoc-access-radio .radio-option .radio-option-icon svg { width: 12px; height: 12px; }
+
+/* Breadcrumbs: flush with the rows (the first crumb's hover padding hangs into the gutter) */
+.sdoc-src-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1); padding: 0; font-size: var(--text-body-sm); color: var(--text-muted); }
+.sdoc-src-crumb { display: inline-flex; align-items: center; gap: var(--space-3); background: none; border: none; padding-block: var(--space-1); padding-inline: var(--space-2); color: var(--primary); cursor: pointer; border-radius: var(--radius-sm); font-size: inherit; font-family: inherit; }
+.sdoc-src-crumb:first-child { margin-inline-start: calc(-1 * var(--space-2)); }
+.sdoc-src-crumb:hover { background: var(--bg-hover); }
+.sdoc-src-crumb[aria-current="page"], .sdoc-src-crumb[aria-current="location"] { color: var(--text-primary); font-weight: var(--font-semibold); cursor: default; }
+.sdoc-src-crumb-sep { color: var(--text-muted); user-select: none; }
+[dir="rtl"] .sdoc-src-crumb-sep { display: inline-block; transform: scaleX(-1); }
+/* Gallery grid: breadcrumb and notes span the whole row instead of taking a card cell (same pattern as 19c-page-layout.css:24) */
+.page-list.layout-gallery > .sdoc-src-crumbs, .page-list.layout-gallery > .sdoc-src-notes, .page-list.layout-gallery > .sdoc-src-note { grid-column: 1 / -1; }
+
+/* Notes */
+.sdoc-src-notes:empty { display: none; }
+.sdoc-src-note { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding-block: var(--space-4); font-size: var(--text-body-sm); color: var(--text-muted); }
+.sdoc-src-note.warn { color: var(--danger); }
+
+/* File rows: same .widget-library-item / .sdoc-lib-item row as the Smart Docs list (21c-smart-documents.css:130) */
+.sdoc-file-item { cursor: pointer; min-width: 0; }
+.sdoc-file-item .sdoc-lib-stat { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sdoc-file-item:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+/* Gallery: folder and file cards share one anatomy (meta right under the title, actions at the bottom);
+   .sdoc-lib-info's flex: 1 would otherwise hand the stretched height to the title and push a folder's meta down */
+.layout-gallery .sdoc-file-item .sdoc-lib-info { flex: 0 0 auto; }
+.layout-gallery .sdoc-file-item .sdoc-lib-actions { margin-block-start: auto; }
+.sdoc-file-icon { display: inline-flex; align-items: center; line-height: 0; }
+
+/* Bulk selection: per-item checkbox, Select all, bulk bar (tools/110 sdocSyncBulkUi) */
+.sdoc-sel { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.sdoc-sel-check, .sdoc-selall-check { inline-size: var(--space-6); block-size: var(--space-6); margin: 0; accent-color: var(--primary); cursor: pointer; }
+.sdoc-sel-check:focus-visible, .sdoc-selall-check:focus-visible, .sdoc-bulk-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+/* Selection mode (#documents-list.sdoc-selecting, toolbar .sdoc-selmode-btn / "s"): checkboxes and selected styling only while on */
+#documents-list:not(.sdoc-selecting) .sdoc-sel { display: none; }
+.sdoc-selecting .sdoc-lib-item.is-selected { background: var(--primary-lighter); box-shadow: inset 0 0 0 1px var(--primary-light); }
+.sdoc-selecting .sdoc-lib-item.is-selected:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+/* The checkbox is an in-flow item at the start of the row (before the icon), never an absolute
+   corner overlay over the title. Rows: the item is already a centered flex row with a gap.
+   Gallery (selecting): checkbox column + title/meta column, actions spanning the footer. */
+.sdoc-sel { align-self: center; padding-inline-end: var(--space-1); }
+.sdoc-selecting.layout-gallery .sdoc-lib-item, .sdoc-selecting .layout-gallery .sdoc-lib-item { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: 1fr auto; column-gap: var(--space-4); row-gap: var(--space-4); align-items: start; }
+.layout-gallery .sdoc-sel { grid-column: 1; grid-row: 1; align-self: start; padding-block-start: var(--space-1); }
+.layout-gallery .sdoc-lib-item > .sdoc-lib-info { grid-column: 2; grid-row: 1; }
+.layout-gallery .sdoc-lib-item > .sdoc-lib-actions { grid-column: 1 / -1; grid-row: 2; }
+.sdoc-selall { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-body-sm); color: var(--text-muted); cursor: pointer; white-space: nowrap; }
+.sdoc-bulk-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding-block: var(--space-3); padding-inline: var(--space-4); margin-block-end: var(--space-3); border: 1px solid var(--primary-light); border-radius: var(--radius-md); background: var(--primary-lighter); }
+.sdoc-bulk-bar[hidden], .sdoc-selall[hidden] { display: none; }
+.sdoc-selmode-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sdoc-bulk-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sdoc-bulk-count { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--primary); margin-inline-end: auto; }
+.sdoc-bulk-btn { display: inline-flex; align-items: center; gap: var(--space-2); }
+.sdoc-file-icon .ui-icon, .sdoc-file-icon > svg { width: 18px; height: 18px; }
+/* File-type icons (tools/110 sdocFileTypeInfo -> .sdoc-ft-<kind>): every tile is tinted with its type color
+   (--ft; CSP forbids inline styles) and the glyph uses it; badge SVGs keep their own per-extension color. */
+.sdoc-file-icon { --ft: #90a4ae; background: color-mix(in srgb, var(--ft) 14%, transparent); color: var(--ft); }
+.sdoc-file-icon.sdoc-ft-code { --ft: #3178c6; }
+.sdoc-file-icon.sdoc-ft-data { --ft: #1e8e3e; }
+.sdoc-file-icon.sdoc-ft-config { --ft: #8e7cc3; }
+.sdoc-file-icon.sdoc-ft-text { --ft: #519aba; }
+.sdoc-file-icon.sdoc-ft-archive { --ft: #8d6e63; }
+.sdoc-file-icon.sdoc-ft-file { --ft: #90a4ae; }
+.sdoc-file-icon > svg.sdoc-ft-svg { width: 24px; height: 24px; }
+.sdoc-file-item { --sdoc-folder-color: #c09553; }
+:root[data-theme="dark"] .sdoc-file-item { --sdoc-folder-color: #dcb67a; }
+.sdoc-file-icon.sdoc-ft-image { --ft: #a074c4; }
+.sdoc-file-icon.sdoc-ft-video { --ft: #ec407a; }
+.sdoc-file-icon.sdoc-ft-audio { --ft: #26a69a; }
+.sdoc-file-icon.sdoc-ft-pdf { --ft: #e53935; }
+/* Folders: amber tile + icon and an amber-tinted semibold name. (0,3,0) beats every generic tile/title rule
+   (21c .sdoc-lib-icon / .widget-library-title, the .sdoc-ft-<kind> rules above). */
+.sdoc-file-item .sdoc-file-icon.sdoc-ft-folder { --ft: var(--sdoc-folder-color); background: color-mix(in srgb, var(--sdoc-folder-color) 22%, transparent); color: var(--sdoc-folder-color); }
+.sdoc-file-item.is-folder .sdoc-lib-title { font-weight: var(--font-semibold, 600); color: color-mix(in srgb, var(--sdoc-folder-color) 65%, var(--text-primary)); }
+/* Gallery: 21c hides .sdoc-lib-icon on cards; file/folder type icons stay visible (thumbnails still take over
+   via .has-thumb below). Selecting gallery grid: icon row on top, checkbox + info, then actions. */
+.layout-gallery .sdoc-file-item .sdoc-lib-icon { display: flex; }
+.layout-gallery .sdoc-file-item > .sdoc-file-icon:not(.has-thumb) { align-self: flex-start; }
+.sdoc-selecting.layout-gallery .sdoc-file-item, .sdoc-selecting .layout-gallery .sdoc-file-item { grid-template-rows: auto 1fr auto; }
+.layout-gallery .sdoc-file-item > .sdoc-file-icon { grid-column: 1 / -1; grid-row: 1; }
+.layout-gallery .sdoc-file-item > .sdoc-sel, .layout-gallery .sdoc-file-item > .sdoc-lib-info { grid-row: 2; }
+.layout-gallery .sdoc-file-item > .sdoc-lib-actions { grid-row: 3; }
+/* mtime is its own stat: never ellipsized away next to the size, it wraps to a new meta line instead. */
+.sdoc-file-item .sdoc-lib-stat.sdoc-file-mtime { flex-shrink: 0; overflow: visible; }
+/* Image thumbnails (tools/110 sdocThumbsAttach): the type icon shows until the <img> loads, then a cover-cropped tile.
+   Gallery hides icon tiles (21c), so a loaded thumb becomes a full-width cover strip at the top of the card. */
+.sdoc-file-icon > .sdoc-thumb-img { display: none; }
+.sdoc-file-icon.has-thumb { overflow: hidden; padding: 0; background: var(--bg-secondary, transparent); }
+.sdoc-file-icon.has-thumb > :not(.sdoc-thumb-img) { display: none; }
+.sdoc-file-icon.has-thumb > .sdoc-thumb-img { display: block; inline-size: 100%; block-size: 100%; object-fit: cover; }
+.layout-gallery .sdoc-file-icon.has-thumb { display: flex; flex: 0 0 auto; inline-size: 100%; block-size: 120px; }
+.sdoc-selecting.layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb), .sdoc-selecting .layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb) { grid-template-rows: auto 1fr auto; }
+.layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb) > .sdoc-file-icon { grid-column: 1 / -1; grid-row: 1; }
+.layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb) > .sdoc-sel, .layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb) > .sdoc-lib-info { grid-row: 2; }
+.layout-gallery .sdoc-lib-item:has(> .sdoc-file-icon.has-thumb) > .sdoc-lib-actions { grid-row: 3; }
+.sdoc-file-item:not(.is-folder) .sdoc-lib-title { font-weight: var(--font-normal, 400); color: var(--text-primary); }
+.sdoc-file-mtime { font-size: 0.92em; color: var(--text-muted); white-space: nowrap; }
+.sdoc-file-preview-img { max-width: 100%; height: auto; display: block; margin-block: var(--space-4); margin-inline: auto; }
+.sdoc-ws-load .sdoc-file-preview-img { background: var(--bg-hover); border: 1px solid var(--secondary-border); }
+.sdoc-file-preview-media { display: block; max-width: 100%; max-height: 70vh; margin-block: var(--space-4); margin-inline: auto; }
+.sdoc-file-preview-audio { display: block; width: 100%; margin-block: var(--space-4); }
+.sdoc-file-preview-pdf { display: block; width: 100%; height: 75vh; border: none; margin-block-start: var(--space-4); }
+.sdoc-file-nopreview .sdoc-file-dl { display: inline-flex; align-items: center; gap: var(--space-2); text-decoration: none; }
+
+/* Keyboard focus */
+.sdoc-rail-item:focus-visible,
+.sdoc-rail-add:focus-visible,
+.sdoc-rail-select:focus-visible,
+.sdoc-src-btn:focus-visible,
+.sdoc-src-crumb:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.sdoc-rail-item:focus-visible { outline-offset: -2px; }
+.sdoc-access-radio .radio-option:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
+/* Narrow panel (side panel ~400px): container queries so they follow the panel, not the viewport.
+   Below 560px the rail collapses to its head + a <select>, above the pane. */
+@container (max-width: 559px) {
+    .sdoc-rail-layout { grid-template-columns: minmax(0, 1fr); }
+    .sdoc-rail { position: relative; max-height: none; padding-block-end: 0; padding-inline: var(--space-8); border-inline-end: none; }
+    .sdoc-rail-groups { display: none; }
+    .sdoc-rail-select { display: block; }
+    .sdoc-pane-head { padding-block-start: var(--space-4); }
+    .sdoc-add-cards { grid-template-columns: 1fr; }
+    /* Side panel: row actions (folder download / delete) stay visible instead of hover-only (21c .layout-rows). */
+    .layout-rows .sdoc-file-item .sdoc-lib-actions { opacity: 1; }
+}
+@media (hover: none) {
+    .layout-rows .sdoc-file-item .sdoc-lib-actions { opacity: 1; }
+}
+@container (max-width: 480px) {
+    .sdoc-access-radio .radio-option { gap: var(--space-1); padding-inline: var(--space-1); }
+}
+
+/* Workspace status info (same data as the chat header pill) + colored diffs */
+.sdoc-rail-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.sdoc-ws-info { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
+.sdoc-ws-info--compact { font-size: var(--text-caption); }
+.sdoc-ws-infobar { display: flex; align-items: center; padding: var(--space-2) 0 var(--space-3); grid-column: 1 / -1; }
+.sdoc-ws-chip { display: inline-flex; align-items: center; gap: var(--space-1); padding: 1px var(--space-3); border-radius: var(--radius-sm); font-size: var(--text-caption); color: var(--text-muted); background: var(--bg-tertiary); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; text-decoration: none; }
+.sdoc-ws-info--compact .sdoc-ws-chip { padding: 0 var(--space-2); }
+.sdoc-ws-chip .ui-icon { width: 12px; height: 12px; flex: none; }
+.sdoc-ws-changed { color: var(--warning-hover); background: var(--warning-lighter); }
+.sdoc-ws-clean { color: var(--success-hover); background: var(--success-lighter); }
+.sdoc-ws-pr--open { color: var(--success-hover); background: var(--success-lighter); }
+.sdoc-ws-pr--changed { color: var(--warning-hover); background: var(--warning-lighter); }
+.sdoc-ws-pr--merged { color: var(--text-muted); background: var(--bg-tertiary); }
+.sdoc-ws-pr--closed { color: var(--danger-hover); background: var(--danger-lighter); }
+a.sdoc-ws-pr:hover, a.sdoc-ws-pr:focus-visible { text-decoration: underline; }
+.sdoc-ws-change { display: inline-block; padding: 0 var(--space-2); border-radius: var(--radius-sm); font-size: var(--text-caption); }
+.sdoc-ws-change--new { color: var(--success-hover); background: var(--success-lighter); }
+.sdoc-ws-change--modified { color: var(--warning-hover); background: var(--warning-lighter); }
+.sdoc-ws-change--deleted { color: var(--danger-hover); background: var(--danger-lighter); }
+.sdoc-ws-change--renamed { color: var(--info, #2563eb); background: var(--info-light, #dbeafe); }
+.sdoc-file-item.sdoc-ws-change-renamed { box-shadow: inset 3px 0 0 var(--info, #2563eb); }
+/* PR folders (workspace root) + their changed-file rows */
+.sdoc-pr-status { font-family: var(--font-mono); font-weight: var(--font-semibold); min-width: 2ch; text-align: center; }
+.sdoc-file-icon.sdoc-pr-icon { --ft: #8250df; }
+.sdoc-pr-folder--open .sdoc-file-icon.sdoc-pr-icon { --ft: var(--success-hover); }
+.sdoc-pr-folder--closed .sdoc-file-icon.sdoc-pr-icon { --ft: var(--danger-hover); }
+/* Rail PR entries: top-level siblings right after their workspace, indented, state-colored tile */
+.sdoc-rail-item.sdoc-rail-pr { padding-inline-start: var(--space-8); font-size: var(--text-body-sm); }
+.sdoc-rail-pr .sdoc-type-tile { color: #8250df; background: color-mix(in srgb, #8250df 14%, transparent); }
+.sdoc-rail-pr--open .sdoc-type-tile { color: var(--success-hover); background: var(--success-lighter); }
+.sdoc-rail-pr--closed .sdoc-type-tile { color: var(--danger-hover); background: var(--danger-lighter); }
+.sdoc-pr-dir { color: var(--text-muted); }
+.sdoc-pr-link { font-size: var(--text-caption); margin-inline-start: var(--space-2); }
+.sdoc-diff .sdoc-diff-hunk { display: block; color: var(--info, #2563eb); background: var(--bg-tertiary); }
+.sdoc-file-item.sdoc-ws-change-new { box-shadow: inset 3px 0 0 var(--success-hover); }
+.sdoc-file-item.sdoc-ws-change-modified { box-shadow: inset 3px 0 0 var(--warning-hover); }
+.sdoc-file-item.sdoc-ws-change-deleted { box-shadow: inset 3px 0 0 var(--danger-hover); }
+.sdoc-file-item.sdoc-ws-change-deleted .sdoc-lib-title { text-decoration: line-through; }
+.sdoc-diff-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+.sdoc-diff-tabs { display: inline-flex; border: 1px solid var(--secondary-border); border-radius: var(--radius-sm); overflow: hidden; }
+.sdoc-diff-tab { border: 0; background: transparent; color: var(--text-muted); padding: var(--space-1) var(--space-4); font-size: var(--text-caption); cursor: pointer; }
+.sdoc-diff-tab[aria-pressed="true"] { background: var(--bg-tertiary); color: var(--text-primary); font-weight: var(--font-semibold); }
+.sdoc-diff-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sdoc-diff-stat { font-size: var(--text-caption); font-family: var(--font-mono); }
+.sdoc-diff-stat-add { color: var(--success-hover); }
+.sdoc-diff-stat-del { color: var(--danger-hover); }
+.sdoc-diff-wrap [hidden] { display: none; }
+.sdoc-diff .sdoc-diff-line { display: block; text-decoration: none; white-space: pre-wrap; }
+.sdoc-diff ins.sdoc-diff-line { color: var(--success-hover); background: var(--success-lighter); }
+.sdoc-diff del.sdoc-diff-line { color: var(--danger-hover); background: var(--danger-lighter); }
+.sdoc-diff .sdoc-diff-sign { display: inline-block; width: 1.5ch; user-select: none; color: var(--text-muted); }
+
+/* Group-by menu (tools/110 _sdocGroupBySelectHtml): compact .custom-dropdown with icon trigger + icon options */
+.sdoc-page-toolbar .sdoc-groupby { width: auto; flex: 0 0 auto; }
+.sdoc-groupby .sdoc-groupby-btn { width: auto; gap: var(--space-3); padding: var(--space-2) var(--space-4); font-family: inherit; font-size: var(--text-body-sm); color: var(--text-primary); background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); justify-content: flex-start; min-height: 30px; }
+.sdoc-groupby .sdoc-groupby-btn:hover { border-color: var(--primary-light); background: var(--bg-hover); }
+.sdoc-groupby .sdoc-groupby-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sdoc-groupby-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex-shrink: 0; color: var(--text-secondary); }
+.sdoc-groupby-icon svg, .sdoc-groupby .dropdown-arrow svg { width: 16px; height: 16px; }
+.sdoc-groupby .dropdown-arrow { display: inline-flex; color: var(--text-muted); margin-inline-start: var(--space-1); }
+.sdoc-groupby .sdoc-groupby-menu { left: auto; right: 0; inset-inline-start: auto; inset-inline-end: 0; min-width: 180px; max-height: none; padding: var(--space-2); z-index: 210; }
+.sdoc-groupby .sdoc-groupby-option { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); border-radius: var(--radius-md); font-size: var(--text-body-sm); color: var(--text-primary); }
+.sdoc-groupby .sdoc-groupby-option:hover, .sdoc-groupby .sdoc-groupby-option:focus { background: var(--bg-hover); outline: none; }
+.sdoc-groupby .sdoc-groupby-option:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sdoc-groupby .sdoc-groupby-option.selected { background: var(--primary-lighter); color: var(--text-link); font-weight: var(--font-medium); }
+.sdoc-groupby .sdoc-groupby-option.selected .sdoc-groupby-icon { color: var(--text-link); }

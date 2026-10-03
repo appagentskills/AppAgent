@@ -111,8 +111,9 @@ describe('keyboard shortcuts', function() {
         assert.strictEqual(M.matchShortcut(ev('ArrowDown', { alt: true }, input('q')), false), null);
     });
 
-    test('Esc: only the capture phase maps it, to pause; info rows never dispatch', function() {
-        assert.strictEqual(M.matchShortcut(ev('Escape'), false), null);
+    test('Esc: capture phase maps it to pause; bubble only to the Documents clear-selection; info rows never dispatch', function() {
+        var bub = M.matchShortcut(ev('Escape'), false);
+        assert.strictEqual(bub && bub.id, 'docs-sel-clear', 'bubble Esc is only the guarded Documents clear-selection');
         assert.strictEqual(id(M.matchShortcut(ev('Escape'), false, { phase: 'capture' })), 'pause');
         assert.strictEqual(id(M.matchShortcut(ev('Escape', {}, textarea('x')), true, { phase: 'capture' })), 'pause');
         assert.strictEqual(M.matchShortcut(ev('o', { ctrl: true, shift: true }), false, { phase: 'capture' }), null);

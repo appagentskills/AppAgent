@@ -902,8 +902,12 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
             // are idempotent no-ops on fields that are already stripped.
             if (evictBodies && msg) {
                 var bodyClone = null;
+                // SW-EVICT (PR #1093 follow-up): report_to_parent RESULT rows
+                // stay resident — _subToolResultOk (core/097) reads them raw
+                // for lost-report recovery without hydrating the chat.
                 if (msg.role === 'tool' && typeof msg.content === 'string'
                     && msg.content.length > CHAT_BODY_EVICT_MIN_CHARS
+                    && msg.name !== 'report_to_parent'
                     && !(prPushIds && msg.tool_call_id && prPushIds[msg.tool_call_id]
                         && msg.content.indexOf('"pr_url"') !== -1)) {
                     bodyClone = bodyClone || Object.assign({}, msg);
@@ -922,6 +926,13 @@ function stripChatPayloadsInPlace(chat, evictBodies) {
                 if (Array.isArray(msg.tool_calls)) {
                     for (var bt = 0; bt < msg.tool_calls.length; bt++) {
                         var btc = msg.tool_calls[bt];
+                        // SW-EVICT: sub-agent report/progress calls keep their
+                        // arguments — _subFindToolCallArgs /
+                        // _subBootTranscriptEpisode / _queuePrLinksToParent
+                        // (core/097-sub-agent-registry.js) and the tool layer
+                        // read them raw, without hydrating the chat first.
+                        if (btc && btc.function && (btc.function.name === 'report_to_parent'
+                            || btc.function.name === 'update_action_state')) continue;
                         // PR-CHIP (PR-1): a workspace push call keeps its
                         // arguments whatever their length, and registers its
                         // id so the matching pr_url result row is kept too.
@@ -1027,6 +1038,132 @@ var CHAT_KEEP_HYDRATED = 8;
 // when a recovery pass re-runs the loader). Unused in the SW bundle.
 var _coldSweepTimer = null;
 
+// ═══ MSG-EVICT: whole-message eviction for cold chats (memory round 2) ═══
+// Behind CHAT_MESSAGE_EVICTION_ENABLED (ON since C2-final: every `.messages`
+// consumer is adapted). When on, a COLD chat whose in-memory messages are
+// PROVEN identical to its stored record drops the whole `messages` array:
+//   chat._messagesEvicted = true   (no `messages` key at all)
+//   chat._msgCount        = stored messages.length
+//   chat._payloadsEvicted = true   (so every existing put-skip / rescue path
+//                                   applies; a message-less chat is also
+//                                   outside both save loops' `desired` set)
+// Every chat-level field (title, widgets, displays, timestamps…) stays.
+// ensureChatPayloads (below) restores `messages` from the stored row.
+// `_messagesEvicted` / `_msgCount` are '_' transients: the put record sheds
+// them (stripTransientChatFieldsForPut), and _mergeChatRowForPut keeps the
+// stored messages whenever a put record has none (save guard, always on).
+var CHAT_MESSAGE_EVICTION_ENABLED = true;
+
+// Message count that works on evicted skeletons (B's usage roll-up, sidebar
+// counts): the live array when present, else the count stamped at eviction.
+function chatMessageCount(chat) {
+    if (!chat) return 0;
+    return Array.isArray(chat.messages) ? chat.messages.length : (chat._msgCount || 0);
+}
+
+// Durability proof, realm-local: messages ARRAY -> length it had when it was
+// known identical to the stored row (read from disk at load / restored by
+// ensureChatPayloads / committed by a save). Any append changes the length;
+// any replacement (snapshot adoption, copy-on-evict) is a new array without a
+// stamp — both refuse eviction until the next proof. Never crosses realms
+// (structured clones are new arrays), never persisted.
+var _durableChatMsgArrays = (typeof WeakMap === 'function') ? new WeakMap() : null;
+function markChatMessagesDurable(chat) {
+    if (!_durableChatMsgArrays || !chat || !Array.isArray(chat.messages)) return false;
+    _durableChatMsgArrays.set(chat.messages, chat.messages.length);
+    return true;
+}
+function chatMessagesDurable(chat) {
+    if (!_durableChatMsgArrays || !chat || !Array.isArray(chat.messages)) return false;
+    return _durableChatMsgArrays.get(chat.messages) === chat.messages.length;
+}
+// C2-store (bug 11): a SAME-LENGTH in-place edit (e.g. a sub_report card
+// rewritten in place) keeps the array identity and length, so the proof
+// above would still read durable while the edit is unsaved. Callers that
+// mutate a message in place clear the proof here; the next committed save
+// (or restore) re-marks it, and the sweep cannot evict in between.
+function unmarkChatMessagesDurable(chat) {
+    if (!_durableChatMsgArrays || !chat || !Array.isArray(chat.messages)) return false;
+    return _durableChatMsgArrays.delete(chat.messages);
+}
+
+// C2-store: the chat_payloads ids a chat references — message
+// file_id/screenshot_id ∪ the ids stamped at message eviction
+// (_evictedPayloadRefs) ∪ screenshots keys. Returns NULL when the refs are
+// UNKNOWN: a message-less skeleton (evicted flags set) with no stamp. Every
+// blob-reaping caller must treat null as "reap nothing" (fail closed).
+function chatReferencedPayloadIds(chat) {
+    var ids = {};
+    if (!chat) return ids;
+    var hasMsgs = Array.isArray(chat.messages);
+    var stamp = chat._evictedPayloadRefs;
+    if (!hasMsgs && (chat._messagesEvicted || chat._payloadsEvicted) && !(stamp && typeof stamp === 'object')) return null;
+    if (hasMsgs) {
+        for (var i = 0; i < chat.messages.length; i++) {
+            var m = chat.messages[i];
+            if (!m) continue;
+            if (m.file_id) ids[m.file_id] = true;
+            if (m.screenshot_id) ids[m.screenshot_id] = true;
+        }
+    }
+    if (stamp && typeof stamp === 'object') Object.keys(stamp).forEach(function(k) { ids[k] = true; });
+    if (chat.screenshots) Object.keys(chat.screenshots).forEach(function(k) { ids[k] = true; });
+    return ids;
+}
+
+// Drop a cold chat's messages IN PLACE. Callers own the proof (durable, cold)
+// and, when a pending save may hold `chat` as its put record, pass a shallow
+// COPY and swap it into the map (copy-on-evict, as sweepColdChatPayloads
+// does). Never evicts with the flag off, a temporary chat (never persisted),
+// a chat with unsaved mutations, or an empty one (nothing to restore).
+function evictChatMessagesInPlace(chat) {
+    if (!CHAT_MESSAGE_EVICTION_ENABLED || !chat) return false;
+    if (!Array.isArray(chat.messages) || chat.messages.length === 0) return false;
+    if (chat.isTemporary || chat._dirtyWhileEvicted) return false;
+    // C2-store A: stamp the blob ids the dropped messages reference, so the
+    // orphan sweep / deleteChatRow still see them on the skeleton ('_'
+    // transient: shed by stripTransientChatFieldsForPut, never persisted).
+    var refs = {};
+    for (var ri = 0; ri < chat.messages.length; ri++) {
+        var rm = chat.messages[ri];
+        if (!rm) continue;
+        if (rm.file_id) refs[rm.file_id] = true;
+        if (rm.screenshot_id) refs[rm.screenshot_id] = true;
+    }
+    chat._evictedPayloadRefs = refs;
+    chat._msgCount = chat.messages.length;
+    delete chat.messages;
+    chat._messagesEvicted = true;
+    chat._payloadsEvicted = true;
+    return true;
+}
+
+// Restore an evicted chat's messages from its stored row, in place. Only the
+// messages come from disk: in-memory chat-level fields are never regressed.
+// When the stored row is NEWER (higher rev) its chat-level fields fill the
+// in-memory gaps and its rev is adopted; an in-memory defined value still
+// wins (lane fields are SW-arbitrated and may be ahead of disk).
+// Returns true when messages were restored.
+function _restoreEvictedChatMessages(chat, stored) {
+    if (!chat || Array.isArray(chat.messages)) return false;
+    if (!stored || !Array.isArray(stored.messages)) return false;
+    var sRev = (typeof stored.rev === 'number' && isFinite(stored.rev)) ? stored.rev : null;
+    var mRev = (typeof chat.rev === 'number' && isFinite(chat.rev)) ? chat.rev : null;
+    if (sRev !== null && (mRev === null || sRev > mRev)) {
+        Object.keys(stored).forEach(function(k) {
+            if (k === 'messages' || k.charAt(0) === '_') return;
+            if (chat[k] === undefined) chat[k] = stored[k];
+        });
+        chat.rev = sRev;
+    }
+    chat.messages = stored.messages;
+    delete chat._messagesEvicted;
+    delete chat._msgCount;
+    delete chat._evictedPayloadRefs;
+    markChatMessagesDurable(chat);
+    return true;
+}
+
 // MEMFIX runtime sweep: the boot-time eviction above runs ONCE per realm,
 // so the maps regrow for the realm's whole lifetime — the page adopts full
 // hydrated chat snapshots on every SW event (app/045-agent-port-bridge-page.js)
@@ -1056,6 +1193,7 @@ function chatHasEvictableBodies(chat) {
         if (!m) continue;
         if (m.role === 'tool' && typeof m.content === 'string'
             && m.content.length > CHAT_BODY_EVICT_MIN_CHARS
+            && m.name !== 'report_to_parent' // SW-EVICT: same exemption as the strip
             && !(prPushIds && m.tool_call_id && prPushIds[m.tool_call_id]
                 && m.content.indexOf('"pr_url"') !== -1)) return true;
         if (typeof m.thinking === 'string' && m.thinking.length > CHAT_BODY_EVICT_MIN_CHARS) return true;
@@ -1063,6 +1201,10 @@ function chatHasEvictableBodies(chat) {
         if (Array.isArray(m.tool_calls)) {
             for (var t = 0; t < m.tool_calls.length; t++) {
                 var tc = m.tool_calls[t];
+                // SW-EVICT: same report_to_parent / update_action_state
+                // exemption as the strip.
+                if (tc && tc.function && (tc.function.name === 'report_to_parent'
+                    || tc.function.name === 'update_action_state')) continue;
                 if (tc && tc.id && tc.function && tc.function.name === 'workspace'
                     && typeof tc.function.arguments === 'string'
                     && /"action"\s*:\s*"push"/.test(tc.function.arguments)) {
@@ -1077,7 +1219,11 @@ function chatHasEvictableBodies(chat) {
     return false;
 }
 
-function sweepColdChatPayloads(keepHydrated, evictBodies) {
+// bodyGuard (optional, SW save path — worker/115-storage.js): called as
+// bodyGuard(id, chat) before a BODY eviction; false = the in-memory chat
+// may differ from the committed record, so only the b64/CTR leg runs.
+// Page callers pass none (unchanged behavior).
+function sweepColdChatPayloads(keepHydrated, evictBodies, bodyGuard) {
     if (typeof chats === 'undefined' || !chats) return 0;
     if (typeof _chatsHydrated !== 'undefined' && !_chatsHydrated) return 0;
     var swept = 0;
@@ -1105,15 +1251,71 @@ function sweepColdChatPayloads(keepHydrated, evictBodies) {
             // flagged chats when the cheap pre-scan finds something
             // evictable; the b64/CTR legs stay settled by the flag exactly
             // as before.
-            if (c._payloadsEvicted && (!evictBodies || !chatHasEvictableBodies(c))) continue;
+            // MSG-EVICT: with the flag on, a chat still holding messages stays
+            // a candidate even when already _payloadsEvicted (boot-flagged rows).
+            var msgCand = CHAT_MESSAGE_EVICTION_ENABLED && Array.isArray(c.messages) && c.messages.length > 0;
+            if (c._payloadsEvicted && !msgCand && (!evictBodies || !chatHasEvictableBodies(c))) continue;
             if (typeof currentChatId !== 'undefined' && ids[i] === currentChatId) continue;
             if (typeof isChatRunning === 'function' && isChatRunning(ids[i])) continue;
             if (typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard[ids[i]]) continue;
+            // Hydration in flight (ensureChatPayloads): it restores messages,
+            // marks them durable, then awaits a second IDB tx — a sweep in that
+            // gap would re-evict the chat and hand the caller a skeleton.
+            if (typeof _chatHydrationPromises !== 'undefined' && _chatHydrationPromises
+                && _chatHydrationPromises[ids[i]]) continue;
+            // Queued sub-agent chat op (core/097 _subWithChat): between its
+            // hydrate settling and the queued fn(live) running, a sweep would
+            // swap chats[id] and fn would write to a detached object.
+            if (typeof _subChatOpQueue !== 'undefined' && _subChatOpQueue
+                && _subChatOpQueue[ids[i]]) continue;
             // Temporary chats never persist — stripping would lose payloads.
             if (c.isTemporary) continue;
             // MEMFIX-BODY dirty guard: a chat mutated while evicted is waiting
             // for the _rescueDirtyEvictedChat save — never strip MORE from it.
             if (c._dirtyWhileEvicted) continue;
+            // SW-EVICT: chats with parked tool calls (worker/120-tool-routing.js)
+            // are read raw by the routing layer — never strip them.
+            if (typeof parkedToolCallsByChatId !== 'undefined' && parkedToolCallsByChatId
+                && parkedToolCallsByChatId[ids[i]] && parkedToolCallsByChatId[ids[i]].length) continue;
+            // C2-final: the bodyGuard verdict for THIS chat, asked at most once
+            // per sweep (msg leg and bodies leg share it; null = not asked).
+            var guardVerdict = null;
+            if (msgCand) {
+                // MSG-EVICT: whole-message leg. Needs PROOF the in-memory
+                // messages equal the stored row: this realm's durability
+                // stamp (disk read / restore / commit) or, in the SW, the
+                // save's committed-shape bodyGuard. No proof = no eviction.
+                var proven = chatMessagesDurable(c);
+                if (!proven && typeof bodyGuard === 'function') {
+                    try { guardVerdict = bodyGuard(ids[i], c) === true; } catch (eMg) { guardVerdict = false; }
+                    proven = guardVerdict;
+                }
+                if (proven) {
+                    // COPY-ON-EVICT (chat level): a pending save may hold `c`
+                    // itself as its put record — never delete its messages.
+                    var mCopy = Object.assign({}, c);
+                    if (evictChatMessagesInPlace(mCopy)) {
+                        // Screenshots + cached tool results (chat level) go
+                        // too; the message rows left with the array.
+                        try { stripChatPayloadsInPlace(mCopy); } catch (eMs) {}
+                        chats[ids[i]] = mCopy;
+                        swept++;
+                        continue;
+                    }
+                }
+                if (c._payloadsEvicted && (!evictBodies || !chatHasEvictableBodies(c))) continue;
+            }
+            var bodiesOk = !!evictBodies;
+            if (bodiesOk && typeof bodyGuard === 'function') {
+                if (guardVerdict !== null) bodiesOk = guardVerdict;
+                else { try { bodiesOk = bodyGuard(ids[i], c) === true; } catch (eG) { bodiesOk = false; } }
+            }
+            if (evictBodies && !bodiesOk) {
+                // Guard refused: fall back to the b64/CTR leg only (the
+                // pre-SW-EVICT behavior of this call site).
+                if (!c._payloadsEvicted && stripChatPayloadsInPlace(c)) swept++;
+                continue;
+            }
             if (evictBodies) {
                 // COPY-ON-EVICT, chat level (PR #805 review, Issue 1): a
                 // pending save may hold THIS very object as its put record —
@@ -1389,26 +1591,26 @@ function sweepOrphanChatPayloads() {
     if (typeof _chatsHydrated === 'undefined' || !_chatsHydrated) return Promise.resolve(0);
     if (typeof chats === 'undefined' || !chats) return Promise.resolve(0);
     var referenced = {};
+    var unknownRefs = [];
     Object.keys(chats).forEach(function(cid) {
         var c = chats[cid];
         if (!c) return;
-        if (Array.isArray(c.messages)) {
-            for (var i = 0; i < c.messages.length; i++) {
-                var m = c.messages[i];
-                if (!m) continue;
-                if (m.file_id) referenced[m.file_id] = true;
-                if (m.screenshot_id) referenced[m.screenshot_id] = true;
-            }
-        }
-        if (c.screenshots) {
-            Object.keys(c.screenshots).forEach(function(k) { referenced[k] = true; });
-        }
+        // C2-store D: a message-evicted skeleton has no `messages` — its refs
+        // come from the eviction stamp; UNKNOWN refs (null) abort the pass.
+        var ids = chatReferencedPayloadIds(c);
+        if (ids === null) { unknownRefs.push(cid); return; }
+        Object.keys(ids).forEach(function(k) { referenced[k] = true; });
         // MEMFIX-CTR: cached-tool-result blobs are keyed by contentId —
         // count them or the sweep reaps every evicted fullContent after 24h.
         if (c.cachedToolResults) {
             Object.keys(c.cachedToolResults).forEach(function(k) { referenced[k] = true; });
         }
     });
+    if (unknownRefs.length) {
+        console.warn('[indexeddb] chat_payloads orphan sweep skipped: payload refs unknown for '
+            + unknownRefs.length + ' evicted chat(s)', unknownRefs.slice(0, 5));
+        return Promise.resolve(0);
+    }
     var cutoff = Date.now() - DB_PAYLOAD_GC_MIN_AGE_MS;
     return withStore([chatPayloadsStoreName], 'readwrite', function(transaction) {
         return new Promise(function(resolve) {
@@ -1439,6 +1641,39 @@ function sweepOrphanChatPayloads() {
         console.warn('[indexeddb] chat_payloads orphan sweep failed', e);
         return 0;
     });
+}
+
+// MEM-BOOT: deferred, idempotent scheduler for boot-time GC passes
+// (orphan blob sweep, empty-row GC). Running them right at boot stacked
+// their IDB cursors + reference maps on top of the full chats load and the
+// resume scan — the startup memory peak. Each named task is scheduled at
+// most ONCE per realm lifetime (a second call is a no-op returning false);
+// it runs after `delayMs`, then on an idle slot where requestIdleCallback
+// exists (page realm). All callers' tasks are already safe to skip: they
+// are re-gated on _chatsHydrated and drain on a later boot if the realm
+// dies first (MV3 SW idle termination).
+var DB_DEFERRED_BOOT_CLEANUP_MS = 20000;
+var _deferredBootCleanupScheduled = {};
+function scheduleDeferredBootCleanup(name, fn, delayMs) {
+    if (typeof fn !== 'function' || _deferredBootCleanupScheduled[name]) return false;
+    _deferredBootCleanupScheduled[name] = true;
+    var delay = (typeof delayMs === 'number' && delayMs >= 0) ? delayMs : DB_DEFERRED_BOOT_CLEANUP_MS;
+    function run() {
+        try {
+            Promise.resolve(fn()).catch(function(e) {
+                console.warn('[indexeddb] deferred boot cleanup "' + name + '" failed', e);
+            });
+        } catch (e) {
+            console.warn('[indexeddb] deferred boot cleanup "' + name + '" failed', e);
+        }
+    }
+    setTimeout(function() {
+        if (typeof requestIdleCallback === 'function') {
+            try { requestIdleCallback(run, { timeout: 10000 }); return; } catch (eIdle) {}
+        }
+        run();
+    }, delay);
+    return true;
 }
 
 // ─── Deletion authority for chat rows (RFC addendum §2.3, Invariant D) ───
@@ -1602,6 +1837,12 @@ var CHAT_ROW_DELETE_PRECONDITIONS = {
         if (stored.messages && stored.messages.length > 0) {
             return 'stored record has ' + stored.messages.length + ' message(s) on disk';
         }
+        // C2-store F: a message-less row carrying the persisted eviction flag
+        // is the fingerprint of a skeleton put that bypassed the save guards
+        // — not a genuinely empty chat. Never reap it (fail closed).
+        if (stored._payloadsEvicted === true) {
+            return 'message-less row is flagged _payloadsEvicted (skeleton write fingerprint) — refusing to reap';
+        }
         if (_chatRowIsRunning(chatId)) return 'chat is currently running';
         // Recency must consider EVERY chat-meta timestamp this codebase
         // maintains (worker/115-storage.js:122 lists all four): a row the user
@@ -1686,6 +1927,11 @@ function deleteChatRow(chatId, reason, evidence) {
         // sweepOrphanChatPayloads, without its 24h age gate: an explicit
         // delete is not a speculative sweep).
         var _mine = (typeof _chatPayloadIdsFor === 'function') ? _chatPayloadIdsFor(evidence.record) : {};
+        // C2-store E: union the eviction stamp; a skeleton record whose refs
+        // are UNKNOWN reaps nothing (its blobs drain via the orphan sweep).
+        var _recRefs = chatReferencedPayloadIds(evidence.record);
+        if (_recRefs === null) _mine = {};
+        else Object.keys(_recRefs).forEach(function(k) { _mine[k] = true; });
         payloadIds = Object.keys(_mine);
         // HYDRATION GATE — the same precondition sweepOrphanChatPayloads
         // enforces. The "minus every blob a SURVIVING chat still references"
@@ -1703,16 +1949,33 @@ function deleteChatRow(chatId, reason, evidence) {
         }
         if (payloadIds.length) {
             var _stillReferenced = {};
+            var _refsUnknown = false;
             try {
                 Object.keys(chats).forEach(function(cid) {
-                    if (cid === chatId) return;
-                    var _other = _chatPayloadIdsFor(chats[cid]);
-                    Object.keys(_other).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
+                    if (cid === chatId || _refsUnknown) return;
+                    // C2-store B: explicit checks instead of relying on a
+                    // caught TypeError. A null/undefined slot references
+                    // nothing (skip it, the other survivors still count);
+                    // _chatPayloadIdsFor only sees a real messages array.
+                    var _oc = chats[cid];
+                    if (_oc === null || _oc === undefined) return;
+                    if (typeof _chatPayloadIdsFor === 'function' && Array.isArray(_oc.messages)) {
+                        var _other = _chatPayloadIdsFor(_oc);
+                        if (_other && typeof _other === 'object') {
+                            Object.keys(_other).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
+                        }
+                    }
+                    // C2-store E: a skeleton survivor protects its stamped
+                    // blobs; unknown survivor refs → reap nothing.
+                    var _oRefs = chatReferencedPayloadIds(_oc);
+                    if (_oRefs === null) { _refsUnknown = true; return; }
+                    Object.keys(_oRefs).forEach(function(k) { if (_mine[k]) _stillReferenced[k] = true; });
                 });
             } catch (eRef) {
                 // Unreadable map → cannot prove anything unreferenced → reap nothing.
-                _stillReferenced = _mine;
+                _refsUnknown = true;
             }
+            if (_refsUnknown) _stillReferenced = _mine;
             payloadIds = payloadIds.filter(function(pid) { return !_stillReferenced[pid]; });
         }
     }
@@ -2001,10 +2264,31 @@ var _chatHydrationPromises = {};
 // since v16 (migration is lazy, at save time) or imported from a backup.
 async function ensureChatPayloads(chatId) {
     var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
-    if (!chat || !chat._payloadsEvicted) return;
+    if (!chat || (!chat._payloadsEvicted && !chat._messagesEvicted)) return;
     if (_chatHydrationPromises[chatId]) return _chatHydrationPromises[chatId];
     var p = (async function() {
         try {
+            // MSG-EVICT: a message-evicted skeleton first gets its messages
+            // back from the stored row (loadChatRowFromDB never rejects), so
+            // the payload pass below sees — and fetches — their blob ids. A
+            // miss/error keeps every flag (the chat stays out of the put set)
+            // and resolves; the next caller retries.
+            if (chat._messagesEvicted && !Array.isArray(chat.messages)) {
+                var mRec = await loadChatRowFromDB(chatId);
+                chat = chats[chatId];
+                if (!chat) return;
+                if (chat._messagesEvicted && !Array.isArray(chat.messages)) {
+                    if (!_restoreEvictedChatMessages(chat, mRec)) {
+                        console.warn('[indexeddb] ensureChatPayloads: no stored messages for evicted chat', chatId);
+                        return;
+                    }
+                } else if (Array.isArray(chat.messages)) {
+                    // A fuller copy replaced the skeleton mid-read: stale flag.
+                    delete chat._messagesEvicted;
+                    delete chat._msgCount;
+                    delete chat._evictedPayloadRefs;
+                }
+            }
             // Collect the flagged payload ids BEFORE the async fetch, from the
             // live chat object (ids are stable across realms; message indexes
             // can drift during a run).
@@ -3201,6 +3485,43 @@ function _countWorkspaceFileRows(repo) {
     });
 }
 
+// Lightweight, failure-distinguishing ownership snapshot for the chat sidebar.
+// One readonly transaction keeps metadata and rows consistent. Cursor projection
+// never resolves workspace_blobs or retains inline file bodies. Reject on request
+// errors AND transaction aborts; [] means a successfully committed empty scan.
+async function getWorkspaceOwnedFileSummaries() {
+    var database = await openDatabase();
+    return new Promise(function(resolve, reject) {
+        var tx = database.transaction([workspaceMetaStoreName, workspaceFilesStoreName], 'readonly');
+        var keys = null, rows = [], cursorDone = false;
+        var metaRequest = tx.objectStore(workspaceMetaStoreName).getAllKeys();
+        var fileRequest = tx.objectStore(workspaceFilesStoreName).openCursor();
+        function failed() { reject(tx.error || new Error('Workspace ownership scan failed')); }
+        tx.onerror = failed;
+        tx.onabort = failed;
+        metaRequest.onerror = failed;
+        fileRequest.onerror = failed;
+        metaRequest.onsuccess = function() { keys = metaRequest.result; };
+        fileRequest.onsuccess = function() {
+            var cursor = fileRequest.result;
+            if (!cursor) { cursorDone = true; return; }
+            var f = cursor.value;
+            var owner = f.last_modified_by_chat_id || f.pushed_by_chat_id;
+            if (owner && f.repo && f.path && (f.dirty || f.pushed_pr)) {
+                rows.push({ path: f.path, wsKey: f.repo, owner: owner,
+                    isNew: !f.sha && !f.deleted, isDeleted: !!f.deleted,
+                    pushedPr: f.pushed_pr ? { url: f.pushed_pr.url, number: f.pushed_pr.number } : null });
+            }
+            cursor.continue();
+        };
+        tx.oncomplete = function() {
+            if (!Array.isArray(keys) || !cursorDone) { failed(); return; }
+            var valid = new Set(keys);
+            resolve(rows.filter(function(row) { return valid.has(row.wsKey); }));
+        };
+    });
+}
+
 // Get all workspace metas
 async function getAllWorkspaceMetas() {
     try {
@@ -3262,7 +3583,13 @@ async function githubApi(method, path, body) {
         var text = await res.text();
         var parsed = null;
         try { parsed = JSON.parse(text); } catch (e) { /* not JSON */ }
-        return { status: res.status, ok: res.ok, body: parsed || text };
+        // headers (additive): the Link header drives pagination and
+        // x-ratelimit-remaining tells a rate-limit 403 from a permission 403.
+        var rh = res.headers && typeof res.headers.get === 'function' ? res.headers : null;
+        return {
+            status: res.status, ok: res.ok, body: parsed || text,
+            headers: { link: rh ? rh.get('link') : null, 'x-ratelimit-remaining': rh ? rh.get('x-ratelimit-remaining') : null }
+        };
     } catch (e) {
         return { error: e && e.message ? e.message : String(e) };
     }
@@ -3591,7 +3918,12 @@ function _wsRowRevision(row) {
     if (!row) return null;
     return JSON.stringify([row.dirty ? 1 : 0, row.deleted ? 1 : 0, row.sha || null,
         row.last_modified_at || null, row.last_modified_by_chat_id || null,
-        row.dirty ? (row.content == null ? null : String(row.content)) : null]);
+        row.dirty ? (row.content == null ? null : String(row.content)) : null,
+        // Rm4 (#959): push-tracking stamps (H7 push-retry) must be CAS-visible,
+        // or a stale-snapshot writer silently restores old pushed_shas.
+        row.pushed_pr == null ? null : row.pushed_pr,
+        Array.isArray(row.pushed_shas) ? row.pushed_shas.slice() : (row.pushed_shas == null ? null : row.pushed_shas),
+        row.changed_since_push == null ? null : !!row.changed_since_push]);
 }
 
 // Delete one workspace_files row by primary key. The single delete call site
@@ -3799,7 +4131,8 @@ async function deleteLocalWorkspaceData(repo) {
 // auto-delete). ONE readwrite transaction over workspace_files +
 // workspace_meta: read every file row of `repo` via the 'repo' index; if any
 // row is dirty (tombstones are dirty too) and not ignored by `isIgnoredFn`
-// (gitignored build output etc.), write NOTHING and resolve
+// (gitignored build output etc.; called as isIgnoredFn(path, row) — must be
+// synchronous), write NOTHING and resolve
 // {kept:true, dirty:[paths]}; otherwise queue the deletes of all file rows AND
 // the meta row on the same tx and resolve {kept:false, deleted:true, count}
 // after commit. Because the check and the deletes share one transaction, a
@@ -3822,7 +4155,9 @@ async function deleteWorkspaceIfClean(repo, isIgnoredFn) {
                     if (!r || !r.dirty) return;
                     var ign = false;
                     // A throwing filter is treated as NOT ignored (keep = safe).
-                    try { ign = typeof isIgnoredFn === 'function' && !!isIgnoredFn(r.path); } catch (e) { ign = false; }
+                    // The live row is passed too, so a caller (delete_workspace
+                    // force) can refuse rows by owner inside this transaction.
+                    try { ign = typeof isIgnoredFn === 'function' && !!isIgnoredFn(r.path, r); } catch (e) { ign = false; }
                     if (!ign) dirty.push(r.path);
                 });
                 if (dirty.length > 0) { outcome = { kept: true, deleted: false, dirty: dirty }; return; }
@@ -4118,7 +4453,7 @@ async function checkDeployDirIdentity(handle, info) {
 // realm-specific preservers. Reads the CHAT_META_* twins of WHICHEVER
 // bundle this runs in, at call time (both bundles declare them).
 function _chatRowPutHandledFields() {
-    var h = { id: 1, messages: 1, displays: 1, title: 1, titleProvisional: 1 };
+    var h = { id: 1, messages: 1, displays: 1, widgetRenders: 1, title: 1, titleProvisional: 1 };
     // DELETE-AS-CLEAR fields (see ownership table): absence on the put record
     // IS the authored clear — the fill-gap would resurrect the deleted value
     // on the very save meant to clear it. Not lane fields; listed here solely
@@ -4244,6 +4579,10 @@ function _mergeChatRowForPut(rec, stored) {
     if (!rec || !stored) return rec;
     var out = rec;
     function claim() { if (out === rec) out = Object.assign({}, rec); return out; }
+    // MSG-EVICT save guard (always on): a put record WITHOUT a messages
+    // array (an evicted skeleton, or any partial row) never erases the stored
+    // transcript — absence is never an authored clear for messages.
+    if (!Array.isArray(rec.messages) && Array.isArray(stored.messages)) claim().messages = stored.messages;
     var mm = _mergeChatMessagesForPut(rec.messages, stored.messages);
     if (mm) claim().messages = mm;
     if (rec.id && rec.id === stored.id) {
@@ -4252,6 +4591,10 @@ function _mergeChatRowForPut(rec, stored) {
     }
     var md = _unionChatDisplaysForPut(rec.displays, stored.displays);
     if (md) claim().displays = md;
+    // Per-turn widget render refs: same per-key union as displays (refs carry
+    // _toggledAt), so a stale snapshot never drops an edit-turn render.
+    var mr = _unionChatDisplaysForPut(rec.widgetRenders, stored.widgetRenders);
+    if (mr) claim().widgetRenders = mr;
     // Omission safety for future fields: carry forward stored fields the
     // record lacks entirely (fill-gap only — a DEFINED record value wins).
     var handled = _chatRowPutHandledFields();

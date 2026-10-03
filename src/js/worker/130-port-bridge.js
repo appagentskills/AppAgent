@@ -1,3 +1,21 @@
+// PREFIX-STABILITY: restore the runtime_inspect dev-mode flag persisted by
+// the 'dev-mode' handler below (chrome.storage.session) at SW boot, so the
+// first request after a SW restart builds the same tools / ACTIVE SKILLS
+// as before it (gates: worker/025 getEnabledTools, core/140
+// _devModeActiveSync). A value already pushed by the page wins. runAgent
+// (app/030) awaits self._swDevModeRestored before its first request.
+function _restoreSwDevMode() {
+    try {
+        if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) return Promise.resolve();
+        var p = chrome.storage.session.get('swDevModeActive');
+        if (!p || typeof p.then !== 'function') return Promise.resolve();
+        return p.then(function(r) {
+            if (typeof self._swDevModeActive === 'undefined' && r && typeof r.swDevModeActive === 'boolean') self._swDevModeActive = r.swDevModeActive;
+        }, function() {});
+    } catch (e) { return Promise.resolve(); }
+}
+if (typeof self !== 'undefined' && self && !self._swDevModeRestored) self._swDevModeRestored = _restoreSwDevMode();
+
 // =============================================================
 // AppAgent SW runtime — direct panel ↔ SW port bridge.
 //
@@ -185,6 +203,43 @@ function _swOverlayChatMeta(prev, incoming) {
     CHAT_META_FLAG_FIELDS.forEach(function(f) {
         if (prev[f] !== undefined) incoming[f] = prev[f];
     });
+    return incoming;
+}
+// PREFIX-STABILITY (#1109 follow-up): request-time stamps the SW writes on
+// rows while a run is going (app/020: ledgerBlock, sentApiContent +
+// sentApiSrcLen/sentApiSrcHash) and on the chat (core/110: promptDate). A
+// PAGE snapshot that replaces chats[id] (run-agent adopt, update-chat) may
+// predate them; without this carry the next rebuild re-synthesizes those
+// bytes, which invalidates Anthropic thinking signatures and the prompt
+// cache. Only fills a field the incoming row LACKS, and only on the same
+// row (_swSamePrefixRow). promptDate: SW wins when the snapshot has none.
+var PREFIX_STAMP_ROW_FIELDS = ['ledgerBlock', 'sentApiContent', 'sentApiSrcLen', 'sentApiSrcHash'];
+// Same row at the same index: same role, and same id when both rows carry
+// one, else the same content (=== for strings, JSON equality for block
+// arrays — only reached for the few rows that carry a stamp to give).
+function _swSamePrefixRow(a, b) {
+    if (!a || !b || a.role !== b.role) return false;
+    if (a.id != null && b.id != null) return a.id === b.id;
+    if (a.content === b.content) return true;
+    if (typeof a.content !== 'object' || typeof b.content !== 'object' || !a.content || !b.content) return false;
+    try { return JSON.stringify(a.content) === JSON.stringify(b.content); } catch (e) { return false; }
+}
+// Mutates and returns `incoming`; never throws on null input. `prev` is the
+// SW's own pre-replace chat record (a tombstone is skipped).
+function _swCarryPrefixStamps(prev, incoming) {
+    if (!prev || !incoming || prev === incoming || prev._deleted) return incoming;
+    if (typeof prev.promptDate === 'string' && prev.promptDate
+        && !(typeof incoming.promptDate === 'string' && incoming.promptDate)) incoming.promptDate = prev.promptDate;
+    var pm = prev.messages, im = incoming.messages;
+    if (!Array.isArray(pm) || !Array.isArray(im) || pm === im) return incoming;
+    var n = Math.min(pm.length, im.length);
+    for (var i = 0; i < n; i++) {
+        var p = pm[i], r = im[i];
+        if (!p || !r || p === r || typeof p !== 'object' || typeof r !== 'object') continue;
+        var missing = PREFIX_STAMP_ROW_FIELDS.filter(function(f) { return p[f] !== undefined && r[f] === undefined; });
+        if (!missing.length || !_swSamePrefixRow(p, r)) continue;
+        missing.forEach(function(f) { r[f] = p[f]; });
+    }
     return incoming;
 }
 // Lane state for chats this SW does NOT hold in memory (created page-side
@@ -793,49 +848,10 @@ function _handlePanelMessage(port, msg) {
                 // (append at the end when their original index is gone — the
                 // run starts on a user turn either way). Content-equality
                 // dedup keeps rows the panel already has from duplicating.
+                var _raAdoptP = null;
                 if (msg.chat && !isRunning) {
-                    try {
-                        var _swPrev = chats[msg.chatId];
-                        if (_swPrev && Array.isArray(_swPrev.messages) && Array.isArray(msg.chat.messages)) {
-                            var _incomingMsgs = msg.chat.messages;
-                            // PR384-FIX-7: COUNT-BASED dedup. The old matcher treated
-                            // ONE content match as full presence, so a second
-                            // byte-identical lifecycle notice (e.g. the same sub
-                            // crashing twice with the same headline) was silently
-                            // dropped. Consume each incoming copy at most once so
-                            // surplus SW copies are carried over instead of collapsed.
-                            var _consumed = {};
-                            for (var _ci = 0; _ci < _swPrev.messages.length; _ci++) {
-                                var _cm = _swPrev.messages[_ci];
-                                if (!_cm || _cm.role !== 'user' || !_cm.injected || typeof _cm.content !== 'string') continue;
-                                var _present = false;
-                                for (var _cj = 0; _cj < _incomingMsgs.length; _cj++) {
-                                    if (_consumed[_cj]) continue; // already matched by an earlier SW row
-                                    var _im = _incomingMsgs[_cj];
-                                    if (_im && _im.role === 'user' && _im.injected && _im.content === _cm.content) { _consumed[_cj] = true; _present = true; break; }
-                                }
-                                if (!_present) _incomingMsgs.push(_cm);
-                            }
-                        }
-                    } catch (e) { console.warn('[port-bridge] injected-row carry-over failed', msg.chatId, e); }
-                    // FLUX-4C (F3 close): the SW is canonical for the chat-meta
-                    // lane fields — overlay them from the SW's own pre-adopt
-                    // copy (boot-hydrated or prior adopt), falling back to lane
-                    // dispatches buffered for a chat this SW never held
-                    // (_swChatMetaPendingByChatId). Without this, a panel whose
-                    // replica carried a stale DEFINED flag (e.g. pinned:false
-                    // from before another panel's pin) laundered it wholesale
-                    // into SW memory here; inline snapshots then re-poisoned
-                    // every panel and the next page save persisted it.
-                    // Timestamps max-win (any-panel-latest); flags: the SW copy
-                    // wins whenever it has an opinion. A brand-new chat (no SW
-                    // copy, no pending dispatches) keeps the panel's values —
-                    // the page is the creator-writer exactly once.
-                    try {
-                        _swOverlayChatMeta(chats[msg.chatId] || _swChatMetaPendingByChatId[msg.chatId], msg.chat);
-                        delete _swChatMetaPendingByChatId[msg.chatId];
-                    } catch (e) { console.warn('[port-bridge] chat-meta adopt overlay failed', msg.chatId, e); }
-                    chats[msg.chatId] = msg.chat;
+                    if (_swIsMsgSkeleton(chats[msg.chatId]) && typeof ensureChatPayloads === 'function') _raAdoptP = _swRunAgentAdoptDeferred(msg);
+                    else _swRunAgentAdopt(msg);
                 }
                 // SWM-S1 (flap message loss): a run-agent for a chat the SW is STILL
                 // running means the page took its IDLE send path during a port-flap
@@ -847,46 +863,7 @@ function _handlePanelMessage(port, msg) {
                 // present in msg.chat but absent from the SW's own copy, and route
                 // them through the existing mid-run injection path exactly as if the
                 // page had posted send-message to a running chat.
-                if (msg.chat && isRunning) {
-                    try {
-                        // REG376-1: also dedup against the un-flushed pending
-                        // injection queue (third arg) — a second flap arriving
-                        // BEFORE the loop's flushPendingInjection consumed a
-                        // previous flap's recovery re-extracted the same block
-                        // (it is absent from the SW chat rows) and the merge
-                        // below / in _handlePanelSendMessage concatenated a
-                        // duplicate of the user's text.
-                        var _unseen = _extractUnseenTrailingUserInput(msg.chat, chats[msg.chatId], pendingInjectionsByChatId[msg.chatId]);
-                        if (_unseen) {
-                            console.warn('[port-bridge] run-agent arrived for running chat', msg.chatId,
-                                '— recovering', _unseen.count, 'unseen trailing user message(s) via mid-run injection');
-                            if (runningChatIds[msg.chatId]) {
-                                // Running branch of _handlePanelSendMessage: merge into
-                                // pendingInjectionsByChatId + interrupt/abort — the loop's
-                                // flushPendingInjection pushes it next iteration.
-                                _swDispatchPanelSendMessage({ chatId: msg.chatId, text: _unseen.text, images: _unseen.images });
-                            } else {
-                                // _runCleanupGuard window (finish→hook-rerun): the loop is
-                                // between iterations — queue the injection WITHOUT firing an
-                                // interrupt (same merge semantics as _handlePanelSendMessage's
-                                // running branch); the re-run's flushPendingInjection flushes it.
-                                var _exInj = pendingInjectionsByChatId[msg.chatId];
-                                if (_exInj) {
-                                    var _mTxt;
-                                    if (_exInj.text && _unseen.text) _mTxt = _exInj.text + '\n\n' + _unseen.text;
-                                    else _mTxt = _exInj.text || _unseen.text || null;
-                                    var _mImgs;
-                                    if (_exInj.images && _unseen.images) _mImgs = _exInj.images.concat(_unseen.images);
-                                    else _mImgs = _exInj.images || _unseen.images || null;
-                                    // SUB-NOTICE-META: keep subNotices & co.
-                                    pendingInjectionsByChatId[msg.chatId] = Object.assign({}, _exInj, { text: _mTxt, images: _mImgs }, _unseen.text ? { hasUserText: true } : {});
-                                } else {
-                                    pendingInjectionsByChatId[msg.chatId] = Object.assign({ text: _unseen.text, images: _unseen.images }, _unseen.text ? { hasUserText: true } : {});
-                                }
-                            }
-                        }
-                    } catch (e) { console.error('[port-bridge] flap-recovery injection failed', msg.chatId, e); }
-                }
+                if (msg.chat && isRunning) _swRunAgentFlapRecover(msg);
                 _swAdoptProvider(msg.currentProvider);
                 // SWM1F-1: a run-agent means the user intends this chat to run
                 // now, so clear any stale SW-side pause flag. Post-SW-move the
@@ -906,7 +883,7 @@ function _handlePanelMessage(port, msg) {
                 // and the session token aren't — without these gates a panel
                 // posting run-agent during a cold-boot race could fire the
                 // loop before ServiceNow tools have an authenticated session.
-                (self._swBootReady || Promise.resolve())
+                (_raAdoptP ? _raAdoptP.then(function() { return self._swBootReady; }) : (self._swBootReady || Promise.resolve()))
                     .then(function() { return Platform.ready; })
                     .then(function() { return loadApiProviders(); })
                     // Orchestrator §1: refresh the sub-agent tier-alias map
@@ -932,19 +909,7 @@ function _handlePanelMessage(port, msg) {
                     // skipped put here would lose the run's new messages on SW
                     // death. ensureChatPayloads never rejects.
                     .then(function() { return (typeof ensureChatPayloads === 'function') ? ensureChatPayloads(msg.chatId) : null; })
-                    .then(function() {
-                        if (!runningChatIds[msg.chatId]) {
-                            // Not returned into the gate chain (the panel's
-                            // _pendingRunAgents settles on events, not on this
-                            // promise) — but the rejection must be handled
-                            // here: runAgent is async, so the old sync
-                            // try/catch let a loop crash surface as an
-                            // uncaught promise rejection.
-                            runAgent(msg.chatId).catch(function(e) {
-                                console.error('[port-bridge] runAgent failed', msg.chatId, e);
-                            });
-                        }
-                    })
+                    .then(function() { return _swRunAgentAfterGate(msg.chatId); })
                     .catch(function(e) {
                         // A gate failure (IDB/provider load) must surface — without
                         // this the user's run is silently dropped with no diagnostic.
@@ -1190,65 +1155,7 @@ function _handlePanelMessage(port, msg) {
             // 'chat-snapshot') with no _deleted guard, resurrecting a ghost row.
             // Mirrors _serializeChatsSnapshot and broadcastAgentEvent filters.
             if (!msg.chatId) return;
-            // Tombstone: never resurrect a soft-deleted chat, and never "heal"
-            // it from a doomed disk row either — the delete lane owns it.
-            if (chats[msg.chatId] && chats[msg.chatId]._deleted) return;
-            if (chats[msg.chatId] && chats[msg.chatId].messages && chats[msg.chatId].messages.length > 0) {
-                // MEMFIX: the SW's copy may be payload-evicted (worker loader
-                // strips all chats). The page assigns this snapshot WHOLESALE
-                // (app/045), which would clobber a hydrated page copy with an
-                // evicted one — rehydrate before replying. ensureChatPayloads
-                // never rejects and is a fast no-op for hydrated chats.
-                var _pcSend = function() {
-                    if (!chats[msg.chatId] || chats[msg.chatId]._deleted) return;
-                    try {
-                        port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: chats[msg.chatId] });
-                    } catch (e) {}
-                };
-                if (chats[msg.chatId]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-                    ensureChatPayloads(msg.chatId).then(_pcSend);
-                } else {
-                    _pcSend();
-                }
-                return;
-            }
-            // STUB-HEAL (root cause A): the SW map lacks the chat entirely
-            // (MV3 restart before/without a boot row for it, or a sub-agent
-            // transcript reclaimed from memory) or only holds an EMPTY stub
-            // (e.g. the spawn-time chats[chat_id] seed in core/097, or an
-            // empty panel snapshot adopted via FLUX-H2). Previously this lane
-            // went silent (map miss) or replied with the empty stub — the
-            // panel could NEVER hydrate a transcript that is sitting whole in
-            // IDB. Fall back to the disk row and reply with it when it is a
-            // real transcript. Rare miss/empty path only — a populated SW
-            // copy takes the fast path above with zero extra reads.
-            if (typeof loadChatRowFromDB === 'function') {
-                loadChatRowFromDB(msg.chatId).then(function(row) {
-                    var live = chats[msg.chatId];
-                    if (live && live._deleted) return; // deleted while reading
-                    // The SW copy gained messages while the read was in
-                    // flight (a run started / a snapshot was adopted) — the
-                    // LIVE copy is now the authority, not the disk row.
-                    if (live && live.messages && live.messages.length > 0) {
-                        try {
-                            port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: live });
-                        } catch (e) {}
-                        return;
-                    }
-                    if (!row || row._deleted || !(row.messages && row.messages.length > 0)) return;
-                    // v16 rows keep heavy payloads in the chat_payloads store
-                    // — flag the reply so the page save put-loop skips this
-                    // copy (identical to disk) and selectChat's
-                    // ensureChatPayloads gate rehydrates images lazily.
-                    row._payloadsEvicted = true;
-                    // Reply WITHOUT adopting the row into the SW map: the
-                    // sub-agent GC / boot loader own SW residency; this lane
-                    // only exists to feed the asking panel.
-                    try {
-                        port.postMessage({ type: 'chat-snapshot', chatId: msg.chatId, chat: row });
-                    } catch (e) {}
-                });
-            }
+            _swPullChatReply(port, msg.chatId, false);
             return;
 
         case 'query-running':
@@ -1274,6 +1181,15 @@ function _handlePanelMessage(port, msg) {
             // Consumed by getEnabledTools (worker/025-permissions-helpers.js)
             // and the devOnly skill gate (_devModeActiveSync).
             self._swDevModeActive = !!msg.active;
+            // PREFIX-STABILITY: persist for the SW's lifetime-spanning
+            // session so a restarted SW builds the same tools / skills list
+            // before the page re-pushes (_restoreSwDevMode).
+            try {
+                if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.session) {
+                    var _dmP = chrome.storage.session.set({ swDevModeActive: self._swDevModeActive });
+                    if (_dmP && typeof _dmP.catch === 'function') _dmP.catch(function() {});
+                }
+            } catch (eDm) {}
             return;
 
         case 'pull-debug-state':
@@ -1398,6 +1314,9 @@ function _handlePanelMessage(port, msg) {
                 // DEFINED flag in the panel replica overwrote the SW's canonical
                 // value here and then won over disk (record-defined-wins in
                 // worker/115-storage.js) — worse than pre-lane behaviour.
+                try { _swGraftSkeletonAdopt(chats[msg.chatId], msg.chat); } catch (e) {}
+                try { _swCarryPrefixStamps(chats[msg.chatId], msg.chat); }
+                catch (e) { console.warn('[port-bridge] prefix-stamp update-chat carry failed', msg.chatId, e); }
                 try {
                     _swOverlayChatMeta(chats[msg.chatId] || _swChatMetaPendingByChatId[msg.chatId], msg.chat);
                     delete _swChatMetaPendingByChatId[msg.chatId];
@@ -2056,6 +1975,287 @@ function _swDispatchPanelSendMessage(msg) {
     }
 }
 
+// C2-xctx-sw (cold-chat eviction): with CHAT_MESSAGE_EVICTION_ENABLED the SW
+// loader / post-save sweep can leave a chat as a message-less SKELETON
+// (`_messagesEvicted`, no `messages` array — core/130 evictChatMessagesInPlace).
+// The helpers below keep every SW lane skeleton-safe: hydrate before use,
+// never treat a skeleton as an empty transcript, never write `messages: []`
+// over a stored one (fail closed). With no skeletons they are no-ops.
+function _swIsMsgSkeleton(c) {
+    return !!c && !Array.isArray(c.messages) && !!c._messagesEvicted;
+}
+
+// Restore a skeleton via ensureChatPayloads (up to 2 tries: it is
+// single-flight per id, so a retry after a settled miss is a fresh read).
+// Resolves true when chats[id] is no longer a skeleton. Never rejects.
+function _swHydrateSkeleton(id) {
+    var tries = 0;
+    function step() {
+        if (!_swIsMsgSkeleton(chats[id])) return true;
+        if (tries >= 2 || typeof ensureChatPayloads !== 'function') return false;
+        tries++;
+        return Promise.resolve().then(function() { return ensureChatPayloads(id); })
+            .catch(function() {}).then(step);
+    }
+    if (!_swIsMsgSkeleton(chats[id])) return Promise.resolve(true);
+    return Promise.resolve().then(step);
+}
+
+// Same liveness guard as the run-agent gate-chain catch: settle a panel
+// spinner for a run that never started, never for a live chat.
+function _swEmitRunCrashedIfIdle(id) {
+    try {
+        if (id && typeof AgentEvents !== 'undefined' && AgentEvents.emit
+            && !runningChatIds[id]
+            && !(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[id])) {
+            AgentEvents.emit('runCrashed', { chatId: id });
+        }
+    } catch (e) {}
+}
+
+// A panel snapshot that is itself a skeleton (page-side eviction) must not
+// replace a hydrated SW copy wholesale: graft the SW messages array (its
+// durability proof travels with it) and drop the skeleton markers.
+function _swGraftSkeletonAdopt(prev, inc) {
+    if (!prev || !inc || prev === inc) return false;
+    if (!_swIsMsgSkeleton(inc) || !Array.isArray(prev.messages)) return false;
+    inc.messages = prev.messages;
+    delete inc._messagesEvicted;
+    delete inc._msgCount;
+    delete inc._evictedPayloadRefs;
+    if (prev._payloadsEvicted) inc._payloadsEvicted = true;
+    if (prev._dirtyWhileEvicted) inc._dirtyWhileEvicted = true;
+    return true;
+}
+
+// 'run-agent' adopt for an idle chat (moved out of the switch): PR383-R4
+// injected-row carry-over, FLUX-4C chat-meta overlay, then the adopt.
+function _swRunAgentAdopt(msg) {
+    try {
+        var _swPrev = chats[msg.chatId];
+        if (_swPrev && Array.isArray(_swPrev.messages) && Array.isArray(msg.chat.messages)) {
+            var _incomingMsgs = msg.chat.messages;
+            // PR384-FIX-7: COUNT-BASED dedup. The old matcher treated
+            // ONE content match as full presence, so a second
+            // byte-identical lifecycle notice (e.g. the same sub
+            // crashing twice with the same headline) was silently
+            // dropped. Consume each incoming copy at most once so
+            // surplus SW copies are carried over instead of collapsed.
+            var _consumed = {};
+            for (var _ci = 0; _ci < _swPrev.messages.length; _ci++) {
+                var _cm = _swPrev.messages[_ci];
+                if (!_cm || _cm.role !== 'user' || !_cm.injected || typeof _cm.content !== 'string') continue;
+                var _present = false;
+                for (var _cj = 0; _cj < _incomingMsgs.length; _cj++) {
+                    if (_consumed[_cj]) continue; // already matched by an earlier SW row
+                    var _im = _incomingMsgs[_cj];
+                    if (_im && _im.role === 'user' && _im.injected && _im.content === _cm.content) { _consumed[_cj] = true; _present = true; break; }
+                }
+                if (!_present) _incomingMsgs.push(_cm);
+            }
+        }
+    } catch (e) { console.warn('[port-bridge] injected-row carry-over failed', msg.chatId, e); }
+// C2-xctx-sw: a messages-evicted SKELETON snapshot must never replace a
+// hydrated SW transcript wholesale — graft the SW array onto it first.
+try { _swGraftSkeletonAdopt(chats[msg.chatId], msg.chat); } catch (e) {}
+    // PREFIX-STABILITY: keep the SW-stamped row/chat stamps (see
+    // _swCarryPrefixStamps) across the wholesale replace below.
+    try { _swCarryPrefixStamps(chats[msg.chatId], msg.chat); }
+    catch (e) { console.warn('[port-bridge] prefix-stamp adopt carry failed', msg.chatId, e); }
+    // FLUX-4C (F3 close): the SW is canonical for the chat-meta
+    // lane fields — overlay them from the SW's own pre-adopt
+    // copy (boot-hydrated or prior adopt), falling back to lane
+    // dispatches buffered for a chat this SW never held
+    // (_swChatMetaPendingByChatId). Without this, a panel whose
+    // replica carried a stale DEFINED flag (e.g. pinned:false
+    // from before another panel's pin) laundered it wholesale
+    // into SW memory here; inline snapshots then re-poisoned
+    // every panel and the next page save persisted it.
+    // Timestamps max-win (any-panel-latest); flags: the SW copy
+    // wins whenever it has an opinion. A brand-new chat (no SW
+    // copy, no pending dispatches) keeps the panel's values —
+    // the page is the creator-writer exactly once.
+    try {
+        _swOverlayChatMeta(chats[msg.chatId] || _swChatMetaPendingByChatId[msg.chatId], msg.chat);
+        delete _swChatMetaPendingByChatId[msg.chatId];
+    } catch (e) { console.warn('[port-bridge] chat-meta adopt overlay failed', msg.chatId, e); }
+    chats[msg.chatId] = msg.chat;
+}
+
+// 'run-agent' SWM-S1 flap recovery for a live chat (moved out of the switch).
+function _swRunAgentFlapRecover(msg) {
+    try {
+        // REG376-1: also dedup against the un-flushed pending
+        // injection queue (third arg) — a second flap arriving
+        // BEFORE the loop's flushPendingInjection consumed a
+        // previous flap's recovery re-extracted the same block
+        // (it is absent from the SW chat rows) and the merge
+        // below / in _handlePanelSendMessage concatenated a
+        // duplicate of the user's text.
+        var _unseen = _extractUnseenTrailingUserInput(msg.chat, chats[msg.chatId], pendingInjectionsByChatId[msg.chatId]);
+        if (_unseen) {
+            console.warn('[port-bridge] run-agent arrived for running chat', msg.chatId,
+                '— recovering', _unseen.count, 'unseen trailing user message(s) via mid-run injection');
+            if (runningChatIds[msg.chatId]) {
+                // Running branch of _handlePanelSendMessage: merge into
+                // pendingInjectionsByChatId + interrupt/abort — the loop's
+                // flushPendingInjection pushes it next iteration.
+                _swDispatchPanelSendMessage({ chatId: msg.chatId, text: _unseen.text, images: _unseen.images });
+            } else {
+                // _runCleanupGuard window (finish→hook-rerun): the loop is
+                // between iterations — queue the injection WITHOUT firing an
+                // interrupt (same merge semantics as _handlePanelSendMessage's
+                // running branch); the re-run's flushPendingInjection flushes it.
+                var _exInj = pendingInjectionsByChatId[msg.chatId];
+                if (_exInj) {
+                    var _mTxt;
+                    if (_exInj.text && _unseen.text) _mTxt = _exInj.text + '\n\n' + _unseen.text;
+                    else _mTxt = _exInj.text || _unseen.text || null;
+                    var _mImgs;
+                    if (_exInj.images && _unseen.images) _mImgs = _exInj.images.concat(_unseen.images);
+                    else _mImgs = _exInj.images || _unseen.images || null;
+                    // SUB-NOTICE-META: keep subNotices & co.
+                    pendingInjectionsByChatId[msg.chatId] = Object.assign({}, _exInj, { text: _mTxt, images: _mImgs }, _unseen.text ? { hasUserText: true } : {});
+                } else {
+                    pendingInjectionsByChatId[msg.chatId] = Object.assign({ text: _unseen.text, images: _unseen.images }, _unseen.text ? { hasUserText: true } : {});
+                }
+            }
+        }
+    } catch (e) { console.error('[port-bridge] flap-recovery injection failed', msg.chatId, e); }
+}
+
+// The SW copy is a skeleton: the carry-over needs its messages, so hydrate
+// first and adopt after. A run that went live during the read routes to
+// flap recovery instead; a chat deleted meanwhile is left alone. On a miss
+// the adopt runs without carry-over (pre-eviction behaviour for a bare
+// prev). Never rejects.
+function _swRunAgentAdoptDeferred(msg) {
+    var id = msg.chatId;
+    return Promise.resolve().then(function() { return ensureChatPayloads(id); })
+        .catch(function() {})
+        .then(function() {
+            var live = !!runningChatIds[id]
+                || !!(typeof _runCleanupGuard !== 'undefined' && _runCleanupGuard && _runCleanupGuard[id]);
+            if (live) { _swRunAgentFlapRecover(msg); return; }
+            if (!chats[id] || chats[id]._deleted) return;
+            _swRunAgentAdopt(msg);
+        })
+        .catch(function(e) { console.warn('[port-bridge] deferred run-agent adopt failed', id, e); });
+}
+
+// Tail of the run-agent gate chain. A chat that is still a skeleton after
+// the gate hydration would start the loop on no transcript: retry once,
+// then settle the panel with runCrashed instead of running.
+function _swRunAgentAfterGate(id) {
+    if (_swIsMsgSkeleton(chats[id])) {
+        return _swHydrateSkeleton(id).then(function(ok) { _swRunAgentStart(id, ok); });
+    }
+    _swRunAgentStart(id, true);
+}
+function _swRunAgentStart(id, ok) {
+    if (runningChatIds[id]) return;
+    if (!ok) {
+        console.warn('[port-bridge] run-agent skipped: chat ' + id + ' transcript is evicted and could not be restored');
+        _swEmitRunCrashedIfIdle(id);
+        return;
+    }
+    // Not returned into the gate chain (the panel's _pendingRunAgents
+    // settles on events, not on this promise) — but the rejection must be
+    // handled here: runAgent is async, so a loop crash would otherwise
+    // surface as an uncaught promise rejection.
+    runAgent(id).catch(function(e) {
+        console.error('[port-bridge] runAgent failed', id, e);
+    });
+}
+
+// Checkpoint resume: a skeleton whose hydration missed must not reach
+// runAgent — throw into the caller's existing failure handling instead.
+function _swResumeRunAgent(id) {
+    if (!_swIsMsgSkeleton(typeof chats !== 'undefined' ? chats[id] : null)) return runAgent(id);
+    return _swHydrateSkeleton(id).then(function(ok) {
+        if (!ok) throw new Error('chat ' + id + ' transcript is evicted and could not be restored');
+        return runAgent(id);
+    });
+}
+
+// 'pull-chat' reply (moved out of the switch; see the case comments).
+function _swPullChatReply(port, id, hydrated) {
+    if (chats[id] && chats[id]._deleted) return;
+    // C2-xctx-sw: a messages-evicted skeleton is NOT an empty stub — restore
+    // its transcript first, then answer from the live (hydrated) copy.
+    if (!hydrated && _swIsMsgSkeleton(chats[id]) && typeof ensureChatPayloads === 'function') {
+        return Promise.resolve().then(function() { return ensureChatPayloads(id); })
+            .catch(function() {})
+            .then(function() { return _swPullChatReply(port, id, true); });
+    }
+    if (chats[id] && chats[id].messages && chats[id].messages.length > 0) {
+        // MEMFIX: the SW's copy may be payload-evicted (worker loader
+        // strips all chats). The page assigns this snapshot WHOLESALE
+        // (app/045), which would clobber a hydrated page copy with an
+        // evicted one — rehydrate before replying. ensureChatPayloads
+        // never rejects and is a fast no-op for hydrated chats.
+        var _pcSend = function() {
+            if (!chats[id] || chats[id]._deleted) return;
+            // C2-xctx-sw: re-evicted meanwhile — answer via the disk path.
+            if (_swIsMsgSkeleton(chats[id])) return _swPullChatReply(port, id, true);
+            try {
+                port.postMessage({ type: 'chat-snapshot', chatId: id, chat: chats[id] });
+            } catch (e) {}
+        };
+        if (chats[id]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            return ensureChatPayloads(id).then(_pcSend);
+        } else {
+            _pcSend();
+        }
+        return;
+    }
+    // STUB-HEAL (root cause A): the SW map lacks the chat entirely
+    // (MV3 restart before/without a boot row for it, or a sub-agent
+    // transcript reclaimed from memory) or only holds an EMPTY stub
+    // (e.g. the spawn-time chats[chat_id] seed in core/097, or an
+    // empty panel snapshot adopted via FLUX-H2). Previously this lane
+    // went silent (map miss) or replied with the empty stub — the
+    // panel could NEVER hydrate a transcript that is sitting whole in
+    // IDB. Fall back to the disk row and reply with it when it is a
+    // real transcript. Rare miss/empty path only — a populated SW
+    // copy takes the fast path above with zero extra reads.
+    if (typeof loadChatRowFromDB === 'function') {
+        return loadChatRowFromDB(id).then(function(row) {
+            var live = chats[id];
+            if (live && live._deleted) return; // deleted while reading
+            // The SW copy gained messages while the read was in
+            // flight (a run started / a snapshot was adopted) — the
+            // LIVE copy is now the authority, not the disk row.
+            if (live && live.messages && live.messages.length > 0) {
+                try {
+                    port.postMessage({ type: 'chat-snapshot', chatId: id, chat: live });
+                } catch (e) {}
+                return;
+            }
+            if (!row || row._deleted || !(row.messages && row.messages.length > 0)) return;
+            // v16 rows keep heavy payloads in the chat_payloads store
+            // — flag the reply so the page save put-loop skips this
+            // copy (identical to disk) and selectChat's
+            // ensureChatPayloads gate rehydrates images lazily.
+            // C2-xctx-sw: the SW holds a skeleton (hydration missed) — overlay
+            // the disk messages onto a COPY of the live row so the reply keeps
+            // the SW-canonical chat-level fields (title, lane flags, rev).
+            var reply = row;
+            if (_swIsMsgSkeleton(live) && typeof _restoreEvictedChatMessages === 'function') {
+                reply = Object.assign({}, live);
+                if (!_restoreEvictedChatMessages(reply, row)) reply = row;
+            }
+            reply._payloadsEvicted = true;
+            // Reply WITHOUT adopting the row into the SW map: the
+            // sub-agent GC / boot loader own SW residency; this lane
+            // only exists to feed the asking panel.
+            try {
+                port.postMessage({ type: 'chat-snapshot', chatId: id, chat: reply });
+            } catch (e) {}
+        });
+    }
+}
+
 // F2: true when the send target was deleted (tombstone) or purged from the map.
 function _swSendTargetDeleted(chatId) {
     var c = chats[chatId];
@@ -2094,7 +2294,7 @@ async function _handlePanelSendMessage(msg) {
         // without a messages array would make the idle-branch push below throw
         // (message lost). Done here, on the not-yet-adopted object, rather than
         // as a chats[chatId].messages poke after adoption (write-site ratchet).
-        if (!Array.isArray(_smChat.messages)) _smChat.messages = [];
+        if (!Array.isArray(_smChat.messages) && !_swIsMsgSkeleton(_smChat)) _smChat.messages = [];
         try {
             _swOverlayChatMeta(_swChatMetaPendingByChatId[chatId], _smChat);
             delete _swChatMetaPendingByChatId[chatId];
@@ -2194,6 +2394,18 @@ async function _handlePanelSendMessage(msg) {
     if (_swSendTargetDeleted(chatId)) {
         console.warn('[port-bridge] send-message dropped: chat ' + chatId + ' was deleted during rehydrate');
         return;
+    }
+    // C2-xctx-sw: the chat may still be a messages-evicted skeleton (the read
+    // above missed) — retry once, then bail WITHOUT writing: a `messages: []`
+    // stand-in would win the save merge and erase the stored transcript.
+    if (_swIsMsgSkeleton(chats[chatId])) {
+        var _smHydrated = await _swHydrateSkeleton(chatId);
+        if (_swSendTargetDeleted(chatId)) return;
+        if (!_smHydrated || !Array.isArray(chats[chatId].messages)) {
+            console.warn('[port-bridge] send-message dropped: chat ' + chatId + ' transcript is evicted and could not be restored');
+            _swEmitRunCrashedIfIdle(chatId);
+            return;
+        }
     }
     if (msg.text || (msg.images && msg.images.length)) {
         if (msg.text) chats[chatId].messages.push({ role: 'user', content: msg.text });
@@ -2446,7 +2658,7 @@ function resumeRunningCheckpoints(checkpoints) {
                                 }
                                 return null;
                             })
-                            .then(function() { return runAgent(cp.chatId); })
+                            .then(function() { return _swResumeRunAgent(cp.chatId); })
                             .catch(function(err) {
                                 console.error('[port-bridge] resume runAgent failed for sub chat', cp.chatId, err);
                                 try {
@@ -2492,7 +2704,7 @@ function resumeRunningCheckpoints(checkpoints) {
                                 }
                                 return null;
                             })
-                            .then(function() { return runAgent(cp.chatId); })
+                            .then(function() { return _swResumeRunAgent(cp.chatId); })
                             .catch(function(e) { console.error('[port-bridge] resume runAgent failed', cp.chatId, e); });
                     }
                 }

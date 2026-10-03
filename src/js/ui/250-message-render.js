@@ -398,6 +398,29 @@ function _restoreTranscriptFocus(snap) {
 // under body (a render that threw mid-way, a container wiped by another code
 // path) is an orphan whose iframe would otherwise run its bridge + resize
 // machinery forever, invisible. Clean it up.
+// M2 (#1130): park key for a live .widget-inline card = widget id + render
+// turn (data-render-msg); cards without a render turn fall back to the id.
+function _parkedWidgetKey(wi) {
+    var wid = wi.getAttribute('data-widget-id') || '';
+    var rm = wi.getAttribute('data-render-msg');
+    return (rm === null || rm === '') ? wid : wid + '@' + rm;
+}
+
+// M2: the rebuilt placeholder for a parked card — same widget AND same render
+// turn when the card carries one, so per-turn cards never swap or collide.
+function _findWidgetPlaceholder(root, wi) {
+    var wid = wi.getAttribute('data-widget-id') || '';
+    var rm = wi.getAttribute('data-render-msg');
+    var esc = (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') ? CSS.escape : function(s) { return String(s).replace(/["\\]/g, '\\$&'); };
+    var sel = '.widget-inline[data-widget-id="' + esc(wid) + '"]';
+    if (rm !== null && rm !== '') sel += '[data-render-msg="' + esc(rm) + '"]';
+    var cands = root.querySelectorAll(sel);
+    for (var i = 0; i < cands.length; i++) {
+        if (cands[i] !== wi && !cands[i].querySelector('iframe.widget-iframe')) return cands[i];
+    }
+    return null;
+}
+
 function _sweepOrphanedParkedWidgets() {
     var parked = document.querySelectorAll('body > .widget-inline[data-widget-id]');
     for (var i = 0; i < parked.length; i++) {
@@ -656,6 +679,52 @@ function renderMessages() {
     updateInputPosition();
     
     if (!container) return; // Guard against null container
+
+    // C2-ui MSG-EVICT: the viewed chat can still be an evicted skeleton (no
+    // `messages`, core/130) in the window between selectChat and its
+    // hydration. Show a loading row instead of throwing (or showing the
+    // misleading empty state), hydrate, and re-render once — only while it
+    // is still the viewed chat and only if the messages actually came back
+    // (ensureChatPayloads never rejects; a miss keeps the skeleton, so no loop).
+    if (chat && !Array.isArray(chat.messages)) {
+        var _skId = currentChatId;
+        container.innerHTML = '<div class="messages-loading" role="status">' + escapeHtml(t('Loading messages…')) + '</div>';
+        _lastRenderState = { chatId: _skId, count: 0, sigs: [] }; // R1: container wiped
+        var _skInput = document.getElementById('input-area');
+        var _skEmpty = _skInput && _skInput.querySelector('.empty-state');
+        if (_skEmpty) _skEmpty.remove();
+        if (chat._messagesEvicted && typeof ensureChatPayloads === 'function') {
+            Promise.resolve(ensureChatPayloads(_skId)).then(function() {
+                var _skNow = chats[_skId];
+                if (currentChatId === _skId && _skNow && Array.isArray(_skNow.messages)) {
+                    try { renderMessages(); } catch (e) {}
+                } else if (currentChatId === _skId && _skNow && !Array.isArray(_skNow.messages)) {
+                    // Load failed (chat stays a skeleton): replace the
+                    // otherwise-permanent loading row with an error + Retry
+                    // that re-enters this same path (ensureChatPayloads retries).
+                    var _skBox = document.getElementById('messages');
+                    if (!_skBox) return;
+                    var _skErr = document.createElement('div');
+                    _skErr.className = 'messages-loading';
+                    _skErr.setAttribute('role', 'alert');
+                    var _skMsg = document.createElement('span');
+                    _skMsg.textContent = t('Storage unavailable — chat history could not be loaded. Try restarting Chrome.');
+                    var _skBtn = document.createElement('button');
+                    _skBtn.type = 'button';
+                    _skBtn.style.marginLeft = '8px';
+                    _skBtn.textContent = t('Retry');
+                    _skBtn.addEventListener('click', function() {
+                        if (currentChatId === _skId) { try { renderMessages(); } catch (e) {} }
+                    });
+                    _skErr.appendChild(_skMsg);
+                    _skErr.appendChild(_skBtn);
+                    _skBox.innerHTML = '';
+                    _skBox.appendChild(_skErr);
+                }
+            }, function() {});
+        }
+        return;
+    }
 
     if (!chat || chat.messages.length === 0) {
         container.innerHTML = '';
@@ -1563,10 +1632,15 @@ function renderMessages() {
         var liveWidgets = searchRoot.querySelectorAll('.widget-inline[data-widget-id]');
         liveWidgets.forEach(function(wi) {
             var wid = wi.getAttribute('data-widget-id');
-            if (wid && wi.querySelector('iframe.widget-iframe')) {
+            // M2 (#1130): one widget can have several per-turn cards (creation
+            // turn + widgetRenders refs, `<id>--r<n>`). Key the park by
+            // (widget, render turn) so each card is reclaimed into ITS own
+            // placeholder instead of the newest one landing in the first.
+            var key = _parkedWidgetKey(wi);
+            if (wid && !savedWidgets[key] && wi.querySelector('iframe.widget-iframe')) {
                 wi.style.display = 'none';
                 document.body.moveBefore(wi, null); // park on body — iframe stays alive
-                savedWidgets[wid] = wi;
+                savedWidgets[key] = wi;
             }
         });
     }
@@ -1631,7 +1705,7 @@ function renderMessages() {
         var rebuildRoot = container.querySelector('#messages-inner') || container;
         for (var swi = 0; swi < savedWidgetIds.length; swi++) {
             var swid = savedWidgetIds[swi];
-            var placeholder = rebuildRoot.querySelector('.widget-inline[data-widget-id="' + swid + '"]');
+            var placeholder = _findWidgetPlaceholder(rebuildRoot, savedWidgets[swid]);
             if (placeholder && canMoveBefore) {
                 savedWidgets[swid].style.display = '';
                 placeholder.parentNode.moveBefore(savedWidgets[swid], placeholder);
@@ -2164,6 +2238,17 @@ function formatContent(content) {
         return inlinePrefix + (inlineCode.length - 1) + '\u0000';
     });
 
+    // Images ![alt](url) — on RAW text (alt/src escaped here), stashed in the
+    // inline-code list so no later pass (links, autolinker, emoji, bold) can
+    // touch the markup; a stashed image inside [..](link) still becomes a
+    // linked image. Only http(s):// and data:image/ sources are accepted, so
+    // javascript:/vbscript:/data:text/html stay literal text. \u0000 is
+    // excluded so an inline-code placeholder can't end up inside an attribute.
+    html = html.replace(/!\[([^\]\n\u0000]*)\]\(\s*((?:https?:\/\/|data:image\/)[^)\s\u0000]+)\s*\)/g, function(match, alt, src) {
+        inlineCode.push('<img class="md-img" alt="' + escapeHtml(alt) + '" src="' + escapeHtml(src) + '">');
+        return inlinePrefix + (inlineCode.length - 1) + '\u0000';
+    });
+
     // Extract document placeholders BEFORE escaping
     var documentBlocks = [];
     // Accept BOTH legacy ids (doc_<epoch>_<rand>) and human-readable slug ids
@@ -2217,8 +2302,16 @@ function formatContent(content) {
     // Now escape the rest of the HTML
     html = escapeHtml(html);
     
-    // Bold
-    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // Bold. MUST NOT span a newline: this pass runs before block splitting,
+    // so a cross-line match put <strong> in one block and </strong> in another
+    // (e.g. `src/**/x.js` ... `| lib/** |`). A </strong> landing in a table
+    // cell is a parser no-op (cell formatting marker), leaving <strong> in the
+    // active-formatting list, so it re-opened in every later chat turn of the
+    // joined transcript innerHTML (bold bleeding across the whole chat UI).
+    html = html.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+
+    // Strikethrough ~~text~~ (no inner-edge spaces; code is still stashed).
+    html = html.replace(/~~(?=\S)([^~\n]*?\S)~~/g, '<del>$1</del>');
 
     // Markdown links [text](url) — supports http(s) and chrome-extension:// URLs
     html = html.replace(/\[([^\]]+)\]\(((?:https?|chrome-extension):\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -2265,51 +2358,136 @@ function formatContent(content) {
     // silently skip the pass, hiding a wiring bug instead of surfacing it.
     html = replaceEmojiShortcodes(html);
 
-    // Headers (process in order from most # to fewest)
-    html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
-    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-    html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-    
-    // Process line by line for tables, lists, and blockquotes
-    var lines = html.split('\n');
+    // Block structure (headings, hr, tables, lists, blockquotes, paragraphs)
+    // is rendered by renderBlocks(); a blockquote's lines (minus `&gt; `) and
+    // a quote nested under a list item are rendered by a recursive call, so
+    // lists/headings/quotes nest inside quotes and quotes inside list items.
+    html = renderBlocks(html.split('\n'), 0);
+
+    function renderBlocks(lines, depth) {
+    var html; // local: recursive calls must not clobber the caller's html
     var out = [];
     var inTable = false;
-    var tableClose = '</table>'; // '</tbody></table>' once a <thead> was emitted
-    var listTag = ''; // '' | 'ul' | 'ol': the open list's tag
-    var inBlockquote = false;
+    var tableClose = '</table></div>'; // '</tbody></table></div>' once a <thead> was emitted
+    var tableAligns = [];
+    var QUOTE_RE = /^&gt;(\s|$)/;
+    var canNest = depth < 16; // bound recursion on pathological > > > … input
+    var HR_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+    var HEADING_RE = /^(#{1,6}) (.+)$/;
+    function alignAttr(idx) {
+        var a = tableAligns[idx];
+        return a ? ' class="md-align-' + a + '"' : '';
+    }
+    // Nested lists. A list item is `-`, `*`, `+` or `N.` / `N)` followed by
+    // whitespace; its leading indentation (tab = 4 columns) decides nesting.
+    // The whole list (all levels) is accumulated in listHtml and pushed to
+    // `out` as ONE line on close, so the paragraph pass below treats it as a
+    // single block. listStack holds one {tag, indent} per open level; the
+    // innermost <li> of every level stays open until a sibling/parent item
+    // (or the end of the list) closes it, so a sub-list lands INSIDE its
+    // parent <li> and an ordered parent keeps counting (1. 2. - sub 3.).
+    var LIST_ITEM_RE = /^([ \t]*)([-*+]|\d+[.)])[ \t]+(\S.*)$/;
+    var listStack = [];
+    var listHtml = '';
+    var listBlankPending = false;
+    function listIndentOf(ws) { return ws.replace(/\t/g, '    ').length; }
+    function openListLevel(tag, num, indent) {
+        var startNum = (tag === 'ol' && num && num.length <= 9) ? parseInt(num, 10) : 1;
+        listHtml += (tag === 'ol' && startNum !== 1) ? '<ol start="' + startNum + '">' : '<' + tag + '>';
+        listStack.push({ tag: tag, indent: indent });
+    }
+    function closeList() {
+        if (!listStack.length) return;
+        while (listStack.length) listHtml += '</li></' + listStack.pop().tag + '>';
+        out.push(listHtml);
+        listHtml = '';
+        listBlankPending = false;
+    }
+    function addListItem(m) {
+        var indent = listIndentOf(m[1]);
+        var numM = /^(\d+)[.)]$/.exec(m[2]);
+        var tag = numM ? 'ol' : 'ul';
+        var num = numM ? numM[1] : null;
+        listBlankPending = false;
+        if (!listStack.length) { openListLevel(tag, num, indent); listHtml += openItem(m[3]); return; }
+        // Dedent: close deeper levels (1 column of jitter tolerated).
+        while (listStack.length > 1 && indent < listStack[listStack.length - 1].indent - 1) {
+            listHtml += '</li></' + listStack.pop().tag + '>';
+        }
+        var top = listStack[listStack.length - 1];
+        if (indent >= top.indent + 2) {
+            // Deeper by 2+ columns: a sub-list inside the still-open <li>.
+            openListLevel(tag, num, indent);
+        } else if (top.tag !== tag) {
+            // Same level, different kind (- vs 1.): close this list, start a new one.
+            listHtml += '</li></' + listStack.pop().tag + '>';
+            openListLevel(tag, num, top.indent);
+        } else {
+            listHtml += '</li>';
+        }
+        listHtml += openItem(m[3]);
+    }
+    // `[ ] text` / `[x] text` items become GFM task items with a disabled
+    // checkbox. No space after the <input>: the `>\s+<` cleanup would eat it.
+    function openItem(text) {
+        var task = /^\[([ xX])\](?:\s+(.*))?$/.exec(text);
+        if (!task) return '<li>' + text;
+        return '<li class="md-task"><input type="checkbox" class="md-task-box" disabled' +
+            (task[1] === ' ' ? '' : ' checked') + '>' + (task[2] || '');
+    }
 
     for (var i = 0; i < lines.length; i++) {
         var ln = lines[i];
         var trimmedLn = ln.trim();
 
-        // Check if this is a list item (starts with - or number.)
-        var isListItem = /^- .+/.test(trimmedLn) || /^\d+\. .+/.test(trimmedLn);
+        // Check if this is a list item (-, *, + or number. / number) marker)
+        var listMatch = LIST_ITEM_RE.exec(ln);
+        var isListItem = !!listMatch;
+        // An INDENTED non-item line right under an open list continues the
+        // current item (multi-line item / continuation paragraph).
+        var isListContinuation = !isListItem && listStack.length > 0 && trimmedLn !== '' &&
+            /^[ \t]+\S/.test(ln) && !/^\|.+\|$/.test(ln);
         // Check if this is a blockquote line. NOTE: > has already been escaped to &gt; above.
         // Match `&gt;` followed by either whitespace or end-of-line (so a bare `>` line is
         // treated as an empty blockquote paragraph separator).
-        var isBlockquote = /^&gt;(\s|$)/.test(trimmedLn);
-        // Check next non-empty line for list/blockquote continuation.
+        var isBlockquote = canNest && QUOTE_RE.test(trimmedLn);
+        // An INDENTED `&gt;` line under an open list is a quote inside the item.
+        var isListQuote = canNest && listStack.length > 0 && /^[ \t]+&gt;(\s|$)/.test(ln);
+        var headingMatch = HEADING_RE.exec(ln);
+        // Check next non-empty line for list continuation.
         var nextIsListItem = false;
-        var nextIsBlockquote = false;
+        var nextIsListContinuation = false;
         for (var j = i + 1; j < lines.length; j++) {
             var nextTrimmed = lines[j].trim();
             if (nextTrimmed === '') continue;
-            nextIsListItem = /^- .+/.test(nextTrimmed) || /^\d+\. .+/.test(nextTrimmed);
-            nextIsBlockquote = /^&gt;(\s|$)/.test(nextTrimmed);
+            nextIsListItem = LIST_ITEM_RE.test(lines[j]);
+            nextIsListContinuation = !nextIsListItem && /^[ \t]+\S/.test(lines[j]) && !/^\|.+\|$/.test(lines[j]);
             break;
         }
 
-        if (ln.match(/^\|.+\|$/)) {
-            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
-            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+        if (HR_RE.test(ln)) {
+            // Thematic break: checked before the list test so `- - -` / `* * *`
+            // aren't list items, and `---` under text is an hr (no setext).
+            if (inTable) { out.push(tableClose); inTable = false; }
+            closeList();
+            out.push('<hr class="md-hr">');
+        } else if (headingMatch) {
+            // # .. ###### -> h2 .. h6 (h1 is reserved for the page chrome).
+            if (inTable) { out.push(tableClose); inTable = false; }
+            closeList();
+            var hLevel = Math.min(headingMatch[1].length + 1, 6);
+            out.push('<h' + hLevel + '>' + headingMatch[2] + '</h' + hLevel + '>');
+        } else if (ln.match(/^\|.+\|$/)) {
+            closeList();
             var tableOpened = false;
             if (!inTable) {
                 while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
                 inTable = true;
                 tableOpened = true;
-                tableClose = '</table>';
-                out.push('<table class="md-table">');
+                tableClose = '</table></div>';
+                tableAligns = [];
+                // Wrapper scrolls wide tables horizontally inside the bubble.
+                out.push('<div class="md-table-wrap"><table class="md-table">');
             }
             if (ln.match(/^\|[\s\-:|]+\|$/)) continue;
             var cells = ln.split('|').slice(1, -1);
@@ -2317,44 +2495,70 @@ function formatContent(content) {
                 // GFM header: the table's FIRST row followed by a delimiter row
                 // (| --- | :-: |) becomes <thead>/<th>; the body goes in <tbody>.
                 // Tables without that delimiter keep the plain <tr><td> rows.
-                out.push('<thead><tr>' + cells.map(function(c) { return '<th>' + c.trim() + '</th>'; }).join('') + '</tr></thead><tbody>');
-                tableClose = '</tbody></table>';
+                // :--- / :---: / ---: set per-column alignment CLASSES (no
+                // inline style: CSP).
+                tableAligns = lines[i + 1].split('|').slice(1, -1).map(function(d) {
+                    d = d.trim();
+                    var l = d.charAt(0) === ':', r = d.charAt(d.length - 1) === ':';
+                    return l && r && d.length > 1 ? 'center' : l ? 'left' : r ? 'right' : '';
+                });
+                out.push('<thead><tr>' + cells.map(function(c, ci) { return '<th' + alignAttr(ci) + '>' + c.trim() + '</th>'; }).join('') + '</tr></thead><tbody>');
+                tableClose = '</tbody></table></div>';
             } else {
-                out.push('<tr>' + cells.map(function(c) { return '<td>' + c.trim() + '</td>'; }).join('') + '</tr>');
+                out.push('<tr>' + cells.map(function(c, ci) { return '<td' + alignAttr(ci) + '>' + c.trim() + '</td>'; }).join('') + '</tr>');
             }
+        } else if (isListQuote) {
+            // Gather the item's consecutive indented `&gt;` lines and render
+            // them (recursively) as a blockquote INSIDE the open <li>.
+            var liq = [];
+            while (i < lines.length && /^[ \t]+&gt;(\s|$)/.test(lines[i])) {
+                liq.push(lines[i].replace(/^[ \t]+&gt;\s?/, ''));
+                i++;
+            }
+            i--;
+            listHtml += '<blockquote class="md-blockquote">' + renderBlocks(liq, depth + 1) + '</blockquote>';
+            listBlankPending = false;
         } else if (isBlockquote) {
             if (inTable) { out.push(tableClose); inTable = false; }
-            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
-            if (!inBlockquote) { out.push('<blockquote class="md-blockquote">'); inBlockquote = true; }
-            // Strip the leading `&gt;` plus optional single space; everything after is
-            // pushed as a normal line so the paragraph pass below wraps it.
-            var bqContent = trimmedLn.replace(/^&gt;\s?/, '');
-            out.push(bqContent);
+            closeList();
+            // Gather the whole quote (a blank line followed by another `&gt;`
+            // line keeps it open as a paragraph break), strip the leading
+            // `&gt;` plus one optional space, and render the inner lines
+            // recursively: lists, headings, tables and nested quotes work.
+            var bq = [];
+            while (i < lines.length) {
+                var bqT = lines[i].trim();
+                if (QUOTE_RE.test(bqT)) { bq.push(bqT.replace(/^&gt;\s?/, '')); i++; continue; }
+                if (bqT === '') {
+                    var bqN = i + 1;
+                    while (bqN < lines.length && lines[bqN].trim() === '') bqN++;
+                    if (bqN < lines.length && QUOTE_RE.test(lines[bqN].trim())) { bq.push(''); i = bqN; continue; }
+                }
+                break;
+            }
+            i--;
+            out.push('<blockquote class="md-blockquote">' + renderBlocks(bq, depth + 1) + '</blockquote>');
         } else if (isListItem) {
             if (inTable) { out.push(tableClose); inTable = false; }
-            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
-            // "1. " items render in an <ol>, "- " items in a <ul>; a change of
-            // kind closes the open list and starts a new one. An <ol> whose
-            // first number isn't 1 keeps it via start= (e.g. steps split by a
-            // code block continue at 2.). Numbers over 9 digits are ignored.
-            var itemNum = /^(\d+)\. /.exec(trimmedLn);
-            var itemTag = itemNum ? 'ol' : 'ul';
-            if (listTag && listTag !== itemTag) { out.push('</' + listTag + '>'); listTag = ''; }
-            if (!listTag) {
-                var startNum = (itemNum && itemNum[1].length <= 9) ? parseInt(itemNum[1], 10) : 1;
-                out.push(startNum !== 1 ? '<ol start="' + startNum + '">' : '<' + itemTag + '>');
-                listTag = itemTag;
-            }
-            // Convert to li tag
-            var liContent = trimmedLn.replace(/^- /, '').replace(/^\d+\. /, '');
-            out.push('<li>' + liContent + '</li>');
-        } else if (trimmedLn === '' && listTag && nextIsListItem) {
-            // Empty line between list items - keep list open
-            continue;
-        } else if (trimmedLn === '' && inBlockquote && nextIsBlockquote) {
-            // Empty line within a blockquote - keep blockquote open and emit
-            // an empty line so the paragraph pass starts a new paragraph inside.
-            out.push('');
+            // "1. " items render in an <ol>, "- "/"* "/"+ " items in a <ul>;
+            // deeper indentation nests, a change of kind at the same level
+            // starts a new list. An <ol> whose first number isn't 1 keeps it
+            // via start= (e.g. steps split by a code block continue at 2.).
+            // Numbers over 9 digits are ignored.
+            addListItem(listMatch);
+        } else if (isListContinuation) {
+            // After a blank line it is a new paragraph inside the item;
+            // otherwise a soft line break within the item's text.
+            listHtml += /^%%(CODEBLOCK|DISPLAY|DOCUMENT)\d+%%$/.test(trimmedLn)
+                ? trimmedLn // indented fence/display: block content, no <br>
+                : listBlankPending
+                ? '<span class="md-paragraph md-li-paragraph">' + trimmedLn + '</span>'
+                : '<br>' + trimmedLn;
+            listBlankPending = false;
+        } else if (trimmedLn === '' && listStack.length && (nextIsListItem || nextIsListContinuation)) {
+            // Empty line between list items / before an indented continuation
+            // paragraph - keep the list open (rendered tight, no stray <br>).
+            listBlankPending = true;
             continue;
         } else if (trimmedLn === '') {
             // Preserve the blank line as a PARAGRAPH SEPARATOR. The paragraph
@@ -2365,17 +2569,18 @@ function formatContent(content) {
             // (<br>){2,} cleanup. Blank lines inside lists/blockquotes are
             // handled by the branches above; stray blanks around block
             // elements are swallowed by the cleanup regexes further down.
+            // A list still open here ends at this blank line - flush it
+            // first so its HTML precedes the separator.
+            closeList();
             out.push('');
         } else {
             if (inTable) { out.push(tableClose); inTable = false; }
-            if (listTag) { out.push('</' + listTag + '>'); listTag = ''; }
-            if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; }
+            closeList();
             out.push(ln);
         }
     }
     if (inTable) out.push(tableClose);
-    if (listTag) out.push('</' + listTag + '>');
-    if (inBlockquote) out.push('</blockquote>');
+    closeList();
     
     // Join and clean up - remove newlines between list items
     html = out.join('\n');
@@ -2403,7 +2608,7 @@ function formatContent(content) {
         var trimmed = line.trim();
         
         // Check if this is a block element (including table parts, list items, blockquotes)
-        if (trimmed.match(/^<(h[234]|pre|table|tbody|tr|td|th|ul|ol|li|div|blockquote|\/)/) || trimmed.match(/^%%(DOCUMENT|DISPLAY|CODEBLOCK)\d+%%$/)) {
+        if (trimmed.match(/^<(h[2-6]|hr|pre|table|tbody|tr|td|th|ul|ol|li|div|blockquote|\/)/) || trimmed.match(/^%%(DOCUMENT|DISPLAY|CODEBLOCK)\d+%%$/)) {
             flushParagraph();
             result.push(trimmed);
         } else if (trimmed === '') {
@@ -2416,8 +2621,9 @@ function formatContent(content) {
         }
     }
     flushParagraph();
-    
-    html = result.join('');
+
+    return result.join('');
+    } // end renderBlocks
     
     // Aggressive cleanup of spacing issues (BEFORE restoring code blocks)
     html = html.replace(/>\s+</g, '><');
@@ -2426,11 +2632,11 @@ function formatContent(content) {
     // Remove multiple consecutive br tags (keep just one if needed)
     html = html.replace(/(<br>\s*){2,}/g, '<br>');
     // Remove anything between closing header and opening table/list/blockquote
-    html = html.replace(/(<\/h[234]>)(\s|<br>|<span[^>]*>(\s|<br>)*<\/span>)*(<table|<ul|<ol|<blockquote)/g, '$1$4');
+    html = html.replace(/(<\/h[2-6]>)(\s|<br>|<span[^>]*>(\s|<br>)*<\/span>)*(<table|<ul|<ol|<blockquote)/g, '$1$4');
     // Remove br/empty content right before any block element
-    html = html.replace(/(\s|<br>|<span class="md-paragraph">(\s|<br>)*<\/span>)+(<table|<ul|<ol|<h[234]|<div|<pre|<blockquote)/g, '$3');
+    html = html.replace(/(\s|<br>|<span class="md-paragraph">(\s|<br>)*<\/span>)+(<table|<ul|<ol|<h[2-6]|<hr|<div|<pre|<blockquote)/g, '$3');
     // Remove br tags right after block elements
-    html = html.replace(/(<\/table>|<\/ul>|<\/ol>|<\/h[234]>|<\/div>|<\/pre>|<\/blockquote>)(\s|<br>)+/g, '$1');
+    html = html.replace(/(<\/table>|<\/ul>|<\/ol>|<\/h[2-6]>|<hr class="md-hr">|<\/div>|<\/pre>|<\/blockquote>)(\s|<br>)+/g, '$1');
     
     // Restore code blocks AFTER cleanup to preserve their whitespace.
     // Function replacement (not a string) so $-patterns ($$, $&, $`, $') in
@@ -2453,6 +2659,36 @@ function formatContent(content) {
     
     for (var i = 0; i < inlineCode.length; i++) {
         html = html.replace(inlinePrefix + i + '\u0000', function() { return inlineCode[i]; });
+    }
+
+    // Defence in depth: re-serialise output carrying inline formatting tags
+    // through an inert <template> so every element is closed INSIDE this
+    // fragment. Callers join many messages' HTML into ONE innerHTML /
+    // insertAdjacentHTML (renderMessages, _tryIncrementalRender); a mis-nested
+    // <strong>/<del>/<a> there is reconstructed by the HTML parser in every
+    // following message. Inlined (not a helper) because tests and the worker
+    // slice formatContent on its own. A cheap tag-stack scan runs first: only
+    // output that is actually mis-nested/unclosed is re-parsed, so well-formed
+    // output stays byte-identical and plain messages pay no parse cost.
+    var _balNeeded = false;
+    if (/<(strong|del|a)\b/.test(html)) {
+        var _balStack = [], _balM, _balRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(\/?)>/g;
+        var _balVoid = /^(br|hr|img|input|wbr|meta|link|col|source|area|base|embed|param|track)$/i;
+        while ((_balM = _balRe.exec(html)) !== null) {
+            var _balTag = _balM[2].toLowerCase();
+            if (_balM[3] || _balVoid.test(_balTag)) continue;
+            if (!_balM[1]) { _balStack.push(_balTag); continue; }
+            if (_balStack.length && _balStack[_balStack.length - 1] === _balTag) { _balStack.pop(); continue; }
+            _balNeeded = true; break;
+        }
+        if (_balStack.length) _balNeeded = true;
+    }
+    if (_balNeeded && typeof document !== 'undefined' && document &&
+        typeof document.createElement === 'function') {
+        try {
+            var _balTpl = document.createElement('template');
+            if ('content' in _balTpl) { _balTpl.innerHTML = html; html = _balTpl.innerHTML; }
+        } catch (_balErr) { /* keep the unbalanced-but-rendered html */ }
     }
 
     // Apply search highlighting if active

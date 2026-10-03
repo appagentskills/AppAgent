@@ -3442,6 +3442,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
         var toolIdx = 0;
         var currentToolId = null;
         var anthropicUsage = {};
+        var _inputTxCompact = null; // message_start input_transformations -> final usage chunk
         var model = anthropicBody.model;
 
         streamKeepAlive = setInterval(function() {
@@ -3493,6 +3494,12 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                             return (t && t.type || '?') + '@' + (t && t.path || '?') + ' (' + (t && t.reason || 'no reason') + ')';
                         }).join(', ');
                         console.warn('[AppAgent] ' + model + ': ' + _inputTx.length + ' input_transformations reported by the API — ' + _txSummary, _inputTx);
+                        // PREFIX-STABILITY diagnostics: forwarded (compact, max 30)
+                        // on the final usage chunk -> metrics.inputTransformations
+                        // on the assistant row (app/010-llm-streaming.js).
+                        _inputTxCompact = _inputTx.slice(0, 30).map(function(t) {
+                            return { type: String(t && t.type || ''), path: String(t && t.path || ''), reason: String(t && t.reason || '') };
+                        });
                     }
                     sink({ type: 'sse', data: 'data: ' + JSON.stringify({
                         id: 'chatcmpl-' + msgId, object: 'chat.completion.chunk', created: ts, model: model,
@@ -3621,7 +3628,8 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                                 prompt_tokens: promptTokens, completion_tokens: completionTokens,
                                 total_tokens: promptTokens + completionTokens,
                                 cache_read_input_tokens: anthropicUsage.cache_read_input_tokens || 0,
-                                cache_creation_input_tokens: anthropicUsage.cache_creation_input_tokens || 0
+                                cache_creation_input_tokens: anthropicUsage.cache_creation_input_tokens || 0,
+                                input_transformations: _inputTxCompact || undefined
                             }
                         }) + '\n\n' });
                     }
@@ -5736,6 +5744,21 @@ chrome.runtime.onConnect.addListener(function(port) {
 
 // Transform OpenAI-format request body to Anthropic Messages API format
 
+// Magic-byte image sniff on a base64 payload (decodes ~24 bytes). Mirrors
+// sniffMime in tools/040-file-store.js for the image types the API accepts.
+function _bgSniffImageMime(b64) {
+    try {
+        var p = String(b64 || '').slice(0, 32).replace(/[^A-Za-z0-9+/]/g, '');
+        var bin = atob(p.slice(0, p.length - (p.length % 4)));
+        var c = function(i) { return bin.charCodeAt(i); };
+        if (c(0) === 0x89 && bin.substr(1, 3) === 'PNG') return 'image/png';
+        if (c(0) === 0xFF && c(1) === 0xD8 && c(2) === 0xFF) return 'image/jpeg';
+        if (bin.substr(0, 4) === 'GIF8') return 'image/gif';
+        if (bin.substr(0, 4) === 'RIFF' && bin.substr(8, 4) === 'WEBP') return 'image/webp';
+    } catch (e) {}
+    return null;
+}
+
 function convertContentPart(part) {
     if (typeof part === 'string') return { type: 'text', text: part };
     var cc = part.cache_control;
@@ -5749,7 +5772,18 @@ function convertContentPart(part) {
                 var commaIdx = url.indexOf(',');
                 var header = url.substring(0, commaIdx);
                 var imgData = url.substring(commaIdx + 1);
-                result = { type: 'image', source: { type: 'base64', media_type: header.split(':')[1].split(';')[0], data: imgData } };
+                // Last line of defence: the media_type comes from the MAGIC
+                // BYTES, not the data-URL prefix (JPEG bytes declared as
+                // image/png are a hard API 400).
+                var _declMt = header.split(':')[1].split(';')[0].trim().toLowerCase();
+                var _mt = _bgSniffImageMime(imgData);
+                // Only bytes that sniff as png/jpeg/gif/webp may go out as an
+                // image block — an empty `data:,` (0x0 canvas), SVG, BMP,
+                // octet-stream... is a hard 400 that bricks the chat on every
+                // later send (the row stays in history). Mirrors
+                // sanitizeModelImageUrl (tools/040-file-store.js).
+                if (_mt) result = { type: 'image', source: { type: 'base64', media_type: _mt, data: imgData } };
+                else result = { type: 'text', text: '[image omitted: unsupported type ' + (_declMt || 'empty') + ']' };
             } catch(e) { result = { type: 'text', text: '[Invalid image]' }; }
         } else if (url.indexOf('https://') === 0) {
             result = { type: 'image', source: { type: 'url', url: url } };
@@ -6822,12 +6856,25 @@ function waitForOffscreenReady(timeoutMs) {
                 // Publish the close via _swOffscreenClosing so a concurrent
                 // ensureOffscreenDocument waits for it instead of racing a create
                 // against the teardown (same contract as maybeCloseOffscreenIfIdle).
+                // M5: identity-checked port reset (a close settling late must
+                // not null a fresh document's port) and a bounded close wait
+                // (B2, same 5s cap as recreateOffscreenDocument) so a wedged
+                // closeDocument cannot leave _swOffscreenHealing stuck forever.
+                var portAtClose = _swOffscreenKeepAlivePort;
                 var closing = (async function() {
                     try { await chrome.offscreen.closeDocument(); } catch (e) { /* already gone */ }
-                    _swOffscreenKeepAlivePort = null;
+                    if (_swOffscreenKeepAlivePort === portAtClose) _swOffscreenKeepAlivePort = null;
                 })();
                 _swOffscreenClosing = closing;
-                try { await closing; } finally { if (_swOffscreenClosing === closing) _swOffscreenClosing = null; }
+                try {
+                    var cw = (typeof _swOffscreenWithin === 'function') ? await _swOffscreenWithin(function() { return closing; }, 5000) : (await closing, {});
+                    if (cw && cw.timedOut) {
+                        if (_swOffscreenKeepAlivePort === portAtClose) _swOffscreenKeepAlivePort = null;
+                        var _ctMsg = 'OFFSCREEN_CLOSE_TIMEOUT: chrome.offscreen.closeDocument did not settle within 5000ms (self-heal); dropped it and recreating';
+                        _swOffscreenLastError = { code: 'OFFSCREEN_CLOSE_TIMEOUT', message: _ctMsg, at: Date.now() };
+                        console.warn('[SW] ' + _ctMsg);
+                    }
+                } finally { if (_swOffscreenClosing === closing) _swOffscreenClosing = null; }
                 console.warn('[SW] offscreen self-heal: zombie document (no keep-alive port within ' + cap + 'ms) closed; recreating');
                 try { await ensureOffscreenDocument(); } catch (e) { /* creation errors are logged there */ }
                 return true;

@@ -15,6 +15,8 @@ var HEADER = "Updates since the user's last message:";
 var REMINDER = "Reminder: your final message must be a cumulative digest of everything since the user's last message.";
 var NOT_SENT = 'not sent to you before';
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {} };
+// PREFIX-STABILITY: buildAPIMessages freezes the sent block on the anchor row.
+function noLedgerStamp(r) { var c = Object.assign({}, r); delete c.ledgerBlock; return c; }
 function snap(x) { return JSON.stringify(x); }
 // Pre-#968 core/097 agentMessage(to:'parent') notice: no meta, no reminder,
 // newlines flattened, capped at 3800.
@@ -110,7 +112,7 @@ describe('update ledger: legacy agent_message notices count as sent (app/020 _le
         var tail = out[out.length - 1].content;
         assert.ok(tail.indexOf('\n\n' + got.block) !== -1, 'block appended to the anchor');
         assert.strictEqual(tail.indexOf(NOT_SENT), -1);
-        assert.strictEqual(snap(msgs()), before, 'chat rows not mutated');
+        assert.strictEqual(snap(msgs().map(noLedgerStamp)), before, 'chat rows not mutated (beyond the frozen ledgerBlock stamp)');
         assert.strictEqual(snap(m._buildUpdateLedger(msgs())), snap(got), 'deterministic');
     }, T);
 
@@ -240,7 +242,7 @@ describe('update ledger: legacy agent_message notices count as sent (app/020 _le
             '- [lifecycle] Alpha (a) \u2014 running: STUCK \u2014 no progress']);
         var out = m.buildAPIMessages(msgs(), 'root');
         assert.ok(out[out.length - 1].content.indexOf('\n\n' + got.block) !== -1);
-        assert.strictEqual(snap(msgs()), before, 'chat rows not mutated');
+        assert.strictEqual(snap(msgs().map(noLedgerStamp)), before, 'chat rows not mutated (beyond the frozen ledgerBlock stamp)');
         // Every prefix window ending on an injected row matches the reference too.
         for (var n = 1; n <= msgs().length; n++) {
             var w = msgs().slice(0, n);

@@ -938,6 +938,17 @@ AgentEvents.on('workspaceMutated', function(e) {
     if (e && e.action === 'auto_delete_merged' && typeof _resetBaseCacheAfterAutoDelete === 'function') {
         try { _resetBaseCacheAfterAutoDelete({ base_workspace: e.base_workspace, base_synced: e.synced }); } catch (err) {}
     }
+    // delete_workspace: drop the deleted workspace's cached terminal state and
+    // rebuild the workspace dropdown (same cleanup as deleteGitHubRepo in
+    // ui/040-tools-settings.js).
+    if (e && e.action === 'delete_workspace') {
+        if (typeof _deleteWsTerminalCache === 'function') {
+            try { _deleteWsTerminalCache(null, e.repo); } catch (err) {}
+        }
+        if (typeof _reconcileDropdownSections === 'function') {
+            try { _reconcileDropdownSections(); } catch (err) {}
+        }
+    }
     if (typeof updateWorkspaceHeaderStatus === 'function') updateWorkspaceHeaderStatus();
 });
 
@@ -999,10 +1010,33 @@ AgentEvents.on('chatTitleChanged', function(e) {
 // the tools use in tools/020-tool-execution.js, so target search + same-turn
 // dedupe stay identical) then re-render so the card appears immediately in
 // the currently viewed chat.
+// C2 (chat eviction): a message-evicted SKELETON page copy (no messages
+// array, `_messagesEvicted`) has no row to attach to — never fabricate an
+// array on it (an empty `messages` would read as a real, empty transcript).
+// Hydrate first, then attach to the restored array and repaint; on a
+// hydration miss skip (the SW copy / disk row already carries the card).
+// Non-skeleton chats take the synchronous path unchanged.
+function _isPageMsgSkeleton(c) {
+    return !!c && !Array.isArray(c.messages) && !!c._messagesEvicted;
+}
+function _mirrorAnswerCard(chatId, kind, value) {
+    var c = chats[chatId];
+    if (!c) return;
+    if (Array.isArray(c.messages)) { attachAnswerCard(c, kind, value); return; }
+    if (!_isPageMsgSkeleton(c) || typeof ensureChatPayloads !== 'function') return;
+    Promise.resolve(ensureChatPayloads(chatId)).catch(function() {}).then(function() {
+        var h = chats[chatId];
+        if (!h || h._deleted || !Array.isArray(h.messages)) return;
+        attachAnswerCard(h, kind, value);
+        if (chatId === currentChatId && typeof renderMessages === 'function') {
+            try { renderMessages(); } catch (err) {}
+        }
+    });
+}
+
 AgentEvents.on('tldrChanged', function(e) {
     if (!e || !e.chatId || !e.tldr) return;
-    var chat = chats[e.chatId];
-    if (chat && chat.messages) attachAnswerCard(chat, 'tldr', e.tldr);
+    _mirrorAnswerCard(e.chatId, 'tldr', e.tldr);
     if (e.chatId === currentChatId && typeof renderMessages === 'function') {
         try { renderMessages(); } catch (err) {}
     }
@@ -1010,8 +1044,7 @@ AgentEvents.on('tldrChanged', function(e) {
 
 AgentEvents.on('linksChanged', function(e) {
     if (!e || !e.chatId || !Array.isArray(e.links)) return;
-    var chat = chats[e.chatId];
-    if (chat && chat.messages) attachAnswerCard(chat, 'links', e.links);
+    _mirrorAnswerCard(e.chatId, 'links', e.links);
     if (e.chatId === currentChatId && typeof renderMessages === 'function') {
         try { renderMessages(); } catch (err) {}
     }
@@ -1023,8 +1056,7 @@ AgentEvents.on('linksChanged', function(e) {
 // amber caveat card appears immediately in the currently viewed chat.
 AgentEvents.on('caveatChanged', function(e) {
     if (!e || !e.chatId || !e.caveat) return;
-    var chat = chats[e.chatId];
-    if (chat && chat.messages) attachAnswerCard(chat, 'caveat', e.caveat);
+    _mirrorAnswerCard(e.chatId, 'caveat', e.caveat);
     if (e.chatId === currentChatId && typeof renderMessages === 'function') {
         try { renderMessages(); } catch (err) {}
     }
@@ -1088,6 +1120,18 @@ AgentEvents.on('approvalSettled', function(e) {
                 rowIndex = i;
                 if (m.status === 'pending') m.status = e.status || (e.allowed ? 'allowed' : 'denied');
                 break;
+            }
+        }
+    } else if (_isPageMsgSkeleton(chat) && typeof _skeletonPendingRows !== 'undefined' && _skeletonPendingRows
+               && Array.isArray(_skeletonPendingRows[chatId])) {
+        // C2: a skeleton has no rows to flip, but app/045 may have STASHED the
+        // pending approval row for re-merge on hydration — flip it there so
+        // the flush never resurrects a settled approval as pending.
+        var _stRows = _skeletonPendingRows[chatId];
+        for (var _sr = 0; _sr < _stRows.length; _sr++) {
+            var _sm = _stRows[_sr];
+            if (_sm && _sm.role === 'approval' && _sm.toolCallId === toolCallId && _sm.status === 'pending') {
+                _sm.status = e.status || (e.allowed ? 'allowed' : 'denied');
             }
         }
     }

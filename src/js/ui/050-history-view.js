@@ -42,6 +42,33 @@ function _historyChatVisible(c) {
     return !(c.isBackground && !c._revealed);
 }
 
+// C2-ui: an evicted skeleton (core/130 MSG-EVICT) has no `messages` array;
+// its full row lives in IndexedDB. History cards/stats read it lazily via
+// skeletonScanValue (ui/120: one transient row read, memoized small values,
+// one debounced re-render). Hydrated chats are scanned live, as before.
+function _historyIsSkeleton(c) {
+    return !!c && !Array.isArray(c.messages) && !!(c._messagesEvicted || c._payloadsEvicted);
+}
+function _historyRerender() {
+    if (typeof currentView === 'undefined' || currentView === 'history') renderHistoryPage();
+}
+function _historyScan(slot, chatId, chat, fn, fallback) {
+    if (!chat || typeof skeletonScanValue !== 'function') return fn(chat);
+    return skeletonScanValue(slot, chatId, chat, fn, fallback, _historyRerender);
+}
+function _historyChatCostLive(chat) {
+    if (!chat || !chat.messages) return 0;
+    return chat.messages.reduce(function(chatSum, msg) {
+        return chatSum + ((msg.metrics && msg.metrics.cost) || 0);
+    }, 0);
+}
+// After exporting a chat that was a skeleton, sweep its hydrated copy back
+// out so a bulk export never holds every chat's messages at once.
+function _historySweepAfterExport(wasSkeleton) {
+    if (!wasSkeleton || typeof sweepColdChatPayloads !== 'function') return;
+    try { sweepColdChatPayloads(typeof CHAT_KEEP_HYDRATED !== 'undefined' ? CHAT_KEEP_HYDRATED : 8, true); } catch (e) {}
+}
+
 function renderHistoryPage() {
     var historyList = document.getElementById('history-list');
     var layoutSlot = document.getElementById('history-layout-toggle');
@@ -86,10 +113,8 @@ function renderHistoryPage() {
     var pinnedCount = visibleChatIds.filter(function(id) { return chats[id].pinned; }).length;
     var totalCost = visibleChatIds.reduce(function(sum, id) {
         var chat = chats[id];
-        if (!chat || !chat.messages) return sum;
-        return sum + chat.messages.reduce(function(chatSum, msg) {
-            return chatSum + ((msg.metrics && msg.metrics.cost) || 0);
-        }, 0);
+        if (!chat) return sum;
+        return sum + (_historyScan('hcost', id, chat, _historyChatCostLive, 0) || 0);
     }, 0);
     
     // Update stats
@@ -150,7 +175,7 @@ function renderHistoryPage() {
 function getChatStats(chatId) {
     var chat = chats[chatId];
     var stats = { toolCalls: 0, fileChanges: [], fileTables: [], widgetNames: [], hasDashboardWidget: false, model: '', cost: 0 };
-    if (!chat || !chat.messages) return stats;
+    if (!chat || (!chat.messages && !_historyIsSkeleton(chat))) return stats;
     
     // Get widgets from chat.widgets (persisted) or getWidgetsForChat
     var widgetList = getWidgetsForChat(chatId);
@@ -180,24 +205,36 @@ function getChatStats(chatId) {
     stats.fileTables = filesArr.map(function(f) { return f.table; });
     
     // Loop through messages for tool calls, model and cost from metrics
+    var ms = _historyScan('hstats', chatId, chat, _historyMsgStatsLive, null);
+    if (ms) {
+        stats.toolCalls = ms.toolCalls || 0;
+        stats.model = ms.model || '';
+        stats.cost = ms.cost || 0;
+    }
+    
+    return stats;
+}
+
+function _historyMsgStatsLive(chat) {
+    var out = { toolCalls: 0, model: '', cost: 0 };
+    if (!chat || !chat.messages) return out;
     chat.messages.forEach(function(msg) {
         if (msg.role === 'assistant') {
             if (msg.tool_calls) {
-                stats.toolCalls += msg.tool_calls.length;
+                out.toolCalls += msg.tool_calls.length;
             }
             // Get model and cost from metrics
             if (msg.metrics) {
-                if (msg.metrics.actualModel && !stats.model) {
-                    stats.model = msg.metrics.actualModel;
+                if (msg.metrics.actualModel && !out.model) {
+                    out.model = msg.metrics.actualModel;
                 }
                 if (msg.metrics.cost) {
-                    stats.cost += msg.metrics.cost;
+                    out.cost += msg.metrics.cost;
                 }
             }
         }
     });
-    
-    return stats;
+    return out;
 }
 
 function renderHistoryChatCard(chatId) {
@@ -207,7 +244,7 @@ function renderHistoryChatCard(chatId) {
     // 'New Chat' is the stored English marker; translate it only for display.
     var title = chat.title ? (chat.title === 'New Chat' ? t('New Chat') : chat.title) : t('Untitled Chat');
     var preview = getHistoryChatPreview(chat);
-    var messageCount = chat.messages ? chat.messages.length : 0;
+    var messageCount = chatMessageCount(chat);
     var dateStr = formatHistoryDate(chatActivityTs(chat));
     var isActive = chatId === currentChatId;
     var stats = getChatStats(chatId);
@@ -299,6 +336,17 @@ function renderHistoryChatCard(chatId) {
 }
 
 function getHistoryChatPreview(chat) {
+    // A skeleton memoizes a clipped preview (keeps the memo small).
+    var skel = typeof _isSkeletonChat === 'function' ? _isSkeletonChat(chat) : _historyIsSkeleton(chat);
+    return _historyScan('hpreview', chat && chat.id, chat, skel ? _historyPreviewClipped : _historyPreviewLive, { user: '', assistant: '' });
+}
+
+function _historyPreviewClipped(chat) {
+    var p = _historyPreviewLive(chat);
+    return { user: String(p.user || '').slice(0, 500), assistant: String(p.assistant || '').slice(0, 500) };
+}
+
+function _historyPreviewLive(chat) {
     if (!chat.messages || chat.messages.length === 0) return { user: '', assistant: '' };
     
     var userMsg = '';
@@ -326,6 +374,10 @@ function getHistoryChatPreview(chat) {
 }
 
 function getContextLength(chat) {
+    return _historyScan('hctx', chat && chat.id, chat, _historyContextLengthLive, 0);
+}
+
+function _historyContextLengthLive(chat) {
     if (!chat.messages) return 0;
     var total = 0;
     chat.messages.forEach(function(msg) {
@@ -494,7 +546,7 @@ function filterHistoryChats(query) {
     }
     return Object.keys(chats).filter(function(id) {
         var chat = chats[id];
-        return _vis(chat) && chatMatchesSearch(chat, q);
+        return _vis(chat) && chatMatchesSearch(chat, q, _historyRerender);
     });
 }
 
@@ -526,8 +578,16 @@ async function exportChatFromHistory(chatId) {
         // MEMFIX: rehydrate evicted base64 payloads so the export contains the
         // full messages, not stripped ones. Never rejects.
         var payloadsOk = true;
+        var wasSkeleton = _historyIsSkeleton(chat);
         if (typeof ensureChatPayloads === 'function') {
             try { await ensureChatPayloads(chatId); } catch (e) { payloadsOk = false; }
+        }
+        chat = chats[chatId] || chat; // re-read: hydration may swap the object
+        // C2-ui: a skeleton whose stored messages could not be loaded is NOT
+        // exported as an empty chat — fail closed with an error.
+        if (_historyIsSkeleton(chat)) {
+            showSnackbar(t('Chat export failed: {error}', { error: 'messages could not be loaded' }), 'error');
+            return;
         }
         if (chat._payloadsEvicted) payloadsOk = false; // A7B2-01
         var exportData = {
@@ -547,6 +607,7 @@ async function exportChatFromHistory(chatId) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        _historySweepAfterExport(wasSkeleton);
         if (payloadsOk) showSnackbar(t('Chat exported'), 'success');
         else showSnackbar(t('Chat exported (some attachments could not be restored)'), 'warning');
     } catch (e) {
@@ -567,11 +628,19 @@ async function downloadChatHistory() {
             // and clears chat._payloadsEvicted only on a full restore, so a chat
             // still flagged afterwards is exported incomplete.
             var failed = false;
+            var wasSkeleton = _historyIsSkeleton(chats[ids[i]]);
             if (typeof ensureChatPayloads === 'function') {
                 try { await ensureChatPayloads(ids[i]); } catch (e) { failed = true; }
             }
             var c = chats[ids[i]];
             if (!c) continue; // deleted while exporting
+            // C2-ui: never export `messages: []` for a skeleton whose stored
+            // row could not be loaded — skip it and count it as incomplete.
+            if (_historyIsSkeleton(c)) {
+                console.warn('[history] export skipped: messages could not be loaded for', ids[i]);
+                bad++;
+                continue;
+            }
             if (failed || c._payloadsEvicted) bad++;
             parts.push((n ? ',' : '') + JSON.stringify(ids[i]) + ':' + JSON.stringify({
                 title: c.title || 'Untitled Chat',
@@ -583,6 +652,8 @@ async function downloadChatHistory() {
                 pinned: c.pinned
             }));
             n++;
+            c = null;
+            _historySweepAfterExport(wasSkeleton);
         }
         // Header last, from the exported count, so a chat deleted mid-export
         // does not skew totalChats.

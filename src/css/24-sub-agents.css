@@ -910,11 +910,13 @@
 .sub-report-body .sub-md h2 { font-size: 1.15em; font-weight: var(--font-semibold, 600); margin: var(--space-5, 10px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
 .sub-report-body .sub-md h3 { font-size: 1.05em; font-weight: var(--font-semibold, 600); margin: var(--space-5, 10px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
 .sub-report-body .sub-md h4,
-.sub-report-body .sub-md h5 { font-size: 1em; font-weight: var(--font-semibold, 600); margin: var(--space-4, 8px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
+.sub-report-body .sub-md h5,
+.sub-report-body .sub-md h6 { font-size: 1em; font-weight: var(--font-semibold, 600); margin: var(--space-4, 8px) 0 var(--space-2, 4px); color: var(--text-heading, inherit); line-height: var(--leading-tight, 1.25); }
 .sub-report-body .sub-md h2:first-child,
 .sub-report-body .sub-md h3:first-child,
 .sub-report-body .sub-md h4:first-child,
-.sub-report-body .sub-md h5:first-child { margin-top: 0; }
+.sub-report-body .sub-md h5:first-child,
+.sub-report-body .sub-md h6:first-child { margin-top: 0; }
 
 /* ── Orchestrator §6: per-sub model provenance ──
    .worker-model — own row on a worker card (sidebar Workers panel / jobs
@@ -1190,7 +1192,7 @@
     word-break: break-word;
 }
 /* ── Section headings in sub-agent markdown surfaces ──
-   formatContent (250-message-render.js) emits <h2>–<h5> for #–####, but
+   formatContent (250-message-render.js) emits <h2>–<h6> for #–######, but
    heading styles exist only under .message-content (07-markdown.css:17-21) —
    in the notice body and the collapsible report/task bodies (pre.sub-md,
    renderSubReport) headings rendered as bare body text. Same recipe
@@ -1200,8 +1202,9 @@
 .sub-notice-body h3, .sub-report-body .sub-md h3 { font-size: 1.05em; font-weight: var(--font-semibold); margin: var(--space-5) 0 var(--space-2); color: var(--text-heading); line-height: var(--leading-tight); }
 .sub-notice-body h4, .sub-report-body .sub-md h4 { font-size: 1em; font-weight: var(--font-semibold); margin: var(--space-4) 0 var(--space-2); color: var(--text-primary); line-height: var(--leading-tight); }
 .sub-notice-body h5, .sub-report-body .sub-md h5 { font-size: 0.95em; font-weight: var(--font-semibold); margin: var(--space-4) 0 var(--space-1); color: var(--text-heading); line-height: var(--leading-tight); }
-.sub-notice-body h2:first-child, .sub-notice-body h3:first-child, .sub-notice-body h4:first-child, .sub-notice-body h5:first-child,
-.sub-report-body .sub-md h2:first-child, .sub-report-body .sub-md h3:first-child, .sub-report-body .sub-md h4:first-child, .sub-report-body .sub-md h5:first-child { margin-top: 0; }
+.sub-notice-body h6, .sub-report-body .sub-md h6 { font-size: 0.9em; font-weight: var(--font-semibold); margin: var(--space-4) 0 var(--space-1); color: var(--text-secondary); line-height: var(--leading-tight); }
+.sub-notice-body h2:first-child, .sub-notice-body h3:first-child, .sub-notice-body h4:first-child, .sub-notice-body h5:first-child, .sub-notice-body h6:first-child,
+.sub-report-body .sub-md h2:first-child, .sub-report-body .sub-md h3:first-child, .sub-report-body .sub-md h4:first-child, .sub-report-body .sub-md h5:first-child, .sub-report-body .sub-md h6:first-child { margin-top: 0; }
 /* Leading section icon (emoji or GitHub :shortcode:) lifted into a span by
    _applySectionIcons (175-sub-agent-ui.js). Grayscale + reduced opacity for
    the muted line-icon look — reads well on both light and dark themes. */

@@ -7,10 +7,9 @@
 // from the chat's recorded tool calls — no extra persistence), restore a
 // version, and discard uncommitted changes.
 //
-// The file LIST is derived synchronously from chat.messages (same retroactive
-// pattern as getPushedPRsForChat), so it works for old chats and survives
-// push/discard. Live workspace state (dirty/deleted/content) is only fetched
-// when a modal opens.
+// Recorded calls supply history; an async ownership cache supplements the list
+// for nested tool writes whose calls are not recorded individually. File bodies
+// are fetched only when a modal opens.
 
 var _wsfMutatingActions = { write: 1, edit: 1, delete: 1, copy: 1, discard: 1 };
 var _wsfSectionFiles = [];   // render-time registry so onclick handlers use indexes, not escaped paths
@@ -20,7 +19,33 @@ var _wsfVersionState = null; // state backing the currently open versions modal
 
 // Scan one chat's messages for SUCCESSFUL mutating workspace tool calls.
 // Returns [{action, args, path, wsKey, msgIdx, created}]
+// C2-ui SKEL-SCAN: a skeleton (no messages array, _messagesEvicted) answers
+// from its stored row via skeletonScanValue (slot 'wsf'), then the sidebar
+// re-renders. The memo is small JSON: args slimmed to the WSF-EVICT
+// {action, path, dest, workspace} stub and `pushed` carried beside the list
+// (a JSON clone drops array properties). A hydrated chat scans live, as before.
 function _wsfScanChat(chat) {
+    if (!chat || Array.isArray(chat.messages) || !chat._messagesEvicted || typeof skeletonScanValue !== 'function') return _wsfScanChatLive(chat);
+    var packed = skeletonScanValue('wsf', chat.id, chat, _wsfScanPacked, null, _wsfSkelRerender);
+    var out = (packed && Array.isArray(packed.list)) ? packed.list : [];
+    out.pushed = (packed && packed.pushed) || {};
+    return out;
+}
+function _wsfScanPacked(chat) {
+    var live = _wsfScanChatLive(chat);
+    return {
+        list: live.map(function(ch) {
+            var a = ch.args || {};
+            var slim = { action: a.action, path: a.path, dest: a.dest, workspace: a.workspace };
+            return { action: ch.action, args: slim, path: ch.path, wsKey: ch.wsKey, msgIdx: ch.msgIdx, tcIdx: ch.tcIdx, created: !!ch.created };
+        }),
+        pushed: live.pushed || {}
+    };
+}
+function _wsfSkelRerender() {
+    if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
+}
+function _wsfScanChatLive(chat) {
     var out = [];
     if (!chat || !chat.messages) return out;
     var pending = {};
@@ -52,7 +77,13 @@ function _wsfScanChat(chat) {
             if (typeof pr === 'string') { try { pr = JSON.parse(pr); } catch (e) { pr = null; } }
             if (pr && pr.success && pr.pr_url && Array.isArray(pr.files)) {
                 pr.files.forEach(function(pf) {
-                    if (pf && pf.path) out.pushed[pf.path] = { url: pr.pr_url, number: pr.pr_number || null, wsKey: pr.workspace || null, isNew: !!pf.isNew, isDeleted: !!pf.isDeleted };
+                    if (!pf || !pf.path) return;
+                    // Keep the legacy path slot for packed skeleton consumers; retain
+                    // additional workspaces separately rather than overwriting that slot.
+                    var prior = out.pushed[pf.path];
+                    var pushKey = prior && prior.wsKey !== (pr.workspace || null)
+                        ? JSON.stringify([pr.workspace || null, pf.path]) : pf.path;
+                    out.pushed[pushKey] = { path: pf.path, url: pr.pr_url, number: pr.pr_number || null, wsKey: pr.workspace || null, isNew: !!pf.isNew, isDeleted: !!pf.isDeleted };
                 });
             }
         } else if (msg.role === 'tool' && msg.tool_call_id && pending[msg.tool_call_id]) {
@@ -62,6 +93,7 @@ function _wsfScanChat(chat) {
             if (typeof r === 'string') { try { r = JSON.parse(r); } catch (e) { r = null; } }
             if (!r && msg._wsResult) r = msg._wsResult; // WSF-EVICT stub
             if (!r || !r.success) return;
+            entry.wsKey = r.workspace || entry.wsKey;
             entry.created = !!(r.message && /^(Created|Restored)/.test(r.message));
             out.push(entry);
         }
@@ -71,42 +103,80 @@ function _wsfScanChat(chat) {
 
 // Group the current chat's workspace changes by file.
 // Returns [{path, wsKey, changes: [...], isNew, isDeleted, isDiscarded}]
+// Persist only lightweight ownership metadata in this page cache, never file bodies.
+var _wsfOwnedRows = null;
+var _wsfOwnedLoading = null;
+var _wsfOwnedRerun = false;
+function _wsfRefreshOwnedRows() {
+    if (_wsfOwnedLoading) { _wsfOwnedRerun = true; return _wsfOwnedLoading; }
+    if (typeof getWorkspaceOwnedFileSummaries !== 'function') return Promise.resolve();
+    _wsfOwnedLoading = Promise.resolve().then(async function() {
+        do {
+            _wsfOwnedRerun = false;
+            try {
+                var rows = await getWorkspaceOwnedFileSummaries();
+                if (!Array.isArray(rows)) throw new Error('Workspace ownership snapshot unavailable');
+                var changed = JSON.stringify(rows) !== JSON.stringify(_wsfOwnedRows);
+                _wsfOwnedRows = rows;
+                if (changed && typeof renderVersionSidebar === 'function') renderVersionSidebar();
+            } catch (e) { /* Retain the last good cache on a failed or partial read. */ }
+        } while (_wsfOwnedRerun);
+    }).finally(function() { _wsfOwnedLoading = null; });
+    return _wsfOwnedLoading;
+}
+function _wsfOwnedForChat(chat) {
+    if (_wsfOwnedRows === null && !_wsfOwnedLoading) _wsfRefreshOwnedRows();
+    return (_wsfOwnedRows || []).filter(function(r) { return chat && chat.id && r.owner === chat.id; });
+}
 function getWsEditedFilesForChat(chat) {
     var changes = _wsfScanChat(chat);
-    var byKey = {};
-    var order = [];
-    changes.forEach(function(ch) {
-        // Group by PATH only: the same file is often addressed both with and
-        // without an explicit `workspace` arg within one chat — one card each
-        // would be confusing. The first explicit wsKey seen is backfilled.
-        var key = '::' + ch.path;
+    var owned = typeof _wsfOwnedForChat === 'function' ? _wsfOwnedForChat(chat) : [];
+    var pushed = changes.pushed || {};
+    var pushes = Object.keys(pushed).map(function(k) {
+        return Object.assign({ path: k }, pushed[k]);
+    });
+    var candidates = changes.concat(owned, pushes);
+    // An omitted workspace can only be backfilled when the evidence is unique.
+    function workspaceFor(item) {
+        if (item.wsKey) return item.wsKey;
+        var keys = [];
+        candidates.forEach(function(c) {
+            if (c.path === item.path && c.wsKey && keys.indexOf(c.wsKey) < 0) keys.push(c.wsKey);
+        });
+        return keys.length === 1 ? keys[0] : null;
+    }
+    var byKey = Object.create(null), order = [];
+    function entry(item) {
+        var wk = workspaceFor(item), key = JSON.stringify([wk, item.path]);
         if (!byKey[key]) {
-            byKey[key] = { path: ch.path, wsKey: ch.wsKey, changes: [] };
+            byKey[key] = { path: item.path, wsKey: wk, changes: [] };
             order.push(key);
         }
-        if (ch.wsKey && !byKey[key].wsKey) byKey[key].wsKey = ch.wsKey;
-        byKey[key].changes.push(ch);
+        return byKey[key];
+    }
+    changes.forEach(function(ch) { entry(ch).changes.push(ch); });
+    pushes.forEach(function(pp) {
+        var f = entry(pp);
+        f.pushOnly = !f.changes.length;
+        f.pushedPr = { url: pp.url, number: pp.number };
+        f.isNew = !!pp.isNew;
+        f.isDeleted = !!pp.isDeleted;
     });
-    // WSF-PR: files a push listed but whose edit calls are not derivable
-    // (e.g. rows evicted before stubs existed) still surface, with no
-    // change list — the push result itself is the evidence.
-    var pushed = changes.pushed || {};
-    Object.keys(pushed).forEach(function(p) {
-        var key = '::' + p;
-        if (byKey[key]) return;
-        byKey[key] = { path: p, wsKey: pushed[p].wsKey, changes: [], pushOnly: true };
-        order.push(key);
-    });
-    return order.map(function(key) {
-        var f = byKey[key];
-        var last = f.changes[f.changes.length - 1];
-        var pp = pushed[f.path];
-        if (pp) f.pushedPr = { url: pp.url, number: pp.number };
-        f.isNew = f.changes.some(function(c) { return c.created; }) || !!(f.pushOnly && pp && pp.isNew);
-        f.isDeleted = last ? last.action === 'delete' : !!(pp && pp.isDeleted);
+    order.forEach(function(key) {
+        var f = byKey[key], last = f.changes[f.changes.length - 1];
+        f.isNew = !!f.isNew || f.changes.some(function(c) { return c.created; });
+        if (last) f.isDeleted = last.action === 'delete';
         f.isDiscarded = !!last && last.action === 'discard';
-        return f;
     });
+    owned.forEach(function(row) {
+        var f = entry(row);
+        // Ownership is file-list evidence, NOT a recorded edit/version.
+        f.isNew = row.isNew;
+        f.isDeleted = row.isDeleted;
+        f.isDiscarded = false;
+        if (row.pushedPr) f.pushedPr = row.pushedPr;
+    });
+    return order.map(function(key) { return byKey[key]; });
 }
 
 // --- Merged-PR diff snapshots -------------------------------------------------
@@ -194,21 +264,28 @@ function renderWorkspaceFilesSection(chat) {
     var files = getWsEditedFilesForChat(chat);
     // Sub-agent aggregation: files edited from this chat's sub-agent chats
     // surface in the parent sidebar too, attributed with a worker-name chip
-    // (f.workers). De-duped by path — when both the parent and a worker
-    // touched the same file the change lists are merged (change-count badge
+    // (f.workers). De-duped by workspace and path — when both the parent and a worker
+    // touched the same workspace/path the change lists are merged (change-count badge
     // includes both) but the parent's status flags win: cross-chat ordering
     // is not derivable from per-chat message indexes. Uses the global
     // currentChatId (renderVersionSidebar always passes chats[currentChatId]);
     // getSubAgentChatsForChat (120-ui-utils.js) never returns siblings, so
     // sibling chats cannot leak into each other.
-    var _subChats = (chat && typeof currentChatId !== 'undefined' && typeof getSubAgentChatsForChat === 'function')
-        ? getSubAgentChatsForChat(currentChatId) : [];
+    var _subChats = (chat && typeof getSubAgentChatsForChat === 'function')
+        ? getSubAgentChatsForChat(chat.id) : [];
+    // Registry records outlive evicted/missing chat bodies; keep their owned files visible.
+    if (chat && typeof subAgentsForChatTree === 'function') {
+        (subAgentsForChatTree(chat.id) || []).forEach(function(r) {
+            if (!r.chat_id || r.chat_id === chat.id || _subChats.some(function(sc) { return sc.chatId === r.chat_id; })) return;
+            _subChats.push({ chatId: r.chat_id, name: r.name || r.agent_id || 'worker', chat: { id: r.chat_id } });
+        });
+    }
     if (_subChats.length) {
-        var _byPath = {};
-        files.forEach(function(f) { _byPath[f.path] = f; });
+        var _byPath = Object.create(null);
+        files.forEach(function(f) { _byPath[JSON.stringify([f.wsKey, f.path])] = f; });
         _subChats.forEach(function(sc) {
             getWsEditedFilesForChat(sc.chat).forEach(function(sf) {
-                var own = _byPath[sf.path];
+                var own = _byPath[JSON.stringify([sf.wsKey, sf.path])];
                 if (own) {
                     own.changes = own.changes.concat(sf.changes);
                     if (sf.isNew) own.isNew = true;
@@ -217,7 +294,7 @@ function renderWorkspaceFilesSection(chat) {
                     if (own.workers.indexOf(sc.name) === -1) own.workers.push(sc.name);
                 } else {
                     sf.workers = [sc.name];
-                    _byPath[sf.path] = sf;
+                    _byPath[JSON.stringify([sf.wsKey, sf.path])] = sf;
                     files.push(sf);
                 }
             });
@@ -268,7 +345,7 @@ function renderWorkspaceFilesSection(chat) {
 // --- Live file resolution ----------------------------------------------------
 
 // Resolve the live workspace file record for a section entry. When the tool
-// call omitted `workspace`, probe all local workspaces (pinned first).
+// call omitted `workspace`, accept only a unique local match (never guess a branch).
 // Returns { wsKey, rec } or null.
 async function _wsfResolve(f) {
     try {
@@ -277,11 +354,14 @@ async function _wsfResolve(f) {
             return rec ? { wsKey: f.wsKey, rec: rec } : null;
         }
         var metas = await getAllWorkspaceMetas();
-        metas.sort(function(a, b) { return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0); });
+        var match = null;
         for (var i = 0; i < metas.length; i++) {
             var r = await getWorkspaceFile(metas[i].repo, f.path);
-            if (r) return { wsKey: metas[i].repo, rec: r };
+            if (!r) continue;
+            if (match) return null; // ambiguous legacy call: fail closed
+            match = { wsKey: metas[i].repo, rec: r };
         }
+        return match;
     } catch (e) {
         console.error('wsf resolve failed', e);
     }
@@ -350,7 +430,19 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
             wsfNavFile(opts.fileIndex + (e.key === 'ArrowRight' ? 1 : -1), (opts.active || 'view'));
         }
     }
-    function close() { overlay.remove(); document.removeEventListener('keydown', onKey, true); }
+    var closed = false;
+    function close() {
+        if (closed) return;
+        closed = true;
+        overlay.remove(); document.removeEventListener('keydown', onKey, true);
+        // opts.onClose: release resources (the Documents page revokes its blob: URLs).
+        if (opts && typeof opts.onClose === 'function') { try { opts.onClose(); } catch (_) {} }
+        // opts.returnFocus (element, or fn -> element): hand focus back to the opener.
+        if (opts && opts.returnFocus) {
+            var rf = typeof opts.returnFocus === 'function' ? opts.returnFocus() : opts.returnFocus;
+            if (rf && rf.isConnected !== false && typeof rf.focus === 'function') rf.focus();
+        }
+    }
     overlay.addEventListener('click', function(e) { if (e.target === overlay) close(); });
     overlay.querySelector('.wsf-modal-close').addEventListener('click', close);
     document.addEventListener('keydown', onKey, true); // capture: runs before the Esc ladder (see onKey)
@@ -358,6 +450,14 @@ function _wsfOverlay(titleHtml, bodyHtml, opts) {
     // detach the document keydown listener instead of leaking it.
     overlay._wsfClose = close;
     document.body.appendChild(overlay);
+    // Opt-in (callers that pass returnFocus): announce as a modal dialog and
+    // move focus into it; close() returns focus to the opener.
+    if (opts && opts.returnFocus) {
+        var dlg = overlay.querySelector('.wsf-modal');
+        dlg.setAttribute('role', 'dialog'); dlg.setAttribute('aria-modal', 'true');
+        var cb = overlay.querySelector('.wsf-modal-close');
+        if (cb && typeof cb.focus === 'function') cb.focus();
+    }
     return overlay;
 }
 
@@ -570,9 +670,26 @@ async function wsfOpenVersions(i) {
     var res = await _wsfResolve(f);
 
     // Gather changes for this path across all chats.
+    // C2-ui SKEL-SCAN: replay needs the FULL recorded args, which a skeleton's
+    // slim memo does not keep — scan the stored row of each skeleton that may
+    // touch this path, one transient read at a time (never attached to chats).
+    var _skelFull = {};
+    var _cids = Object.keys(chats);
+    for (var _ci = 0; _ci < _cids.length; _ci++) {
+        var _sc = chats[_cids[_ci]];
+        if (!_sc || Array.isArray(_sc.messages) || !_sc._messagesEvicted || typeof loadChatRowFromDB !== 'function') continue;
+        // A known memo without this path skips the read; unknown (null) reads.
+        var _pk = (typeof skeletonScanValue === 'function') ? skeletonScanValue('wsf', _cids[_ci], _sc, _wsfScanPacked, null, _wsfSkelRerender) : null;
+        if (_pk && Array.isArray(_pk.list) && !_pk.list.some(function(ch) { return ch.path === f.path; })) continue;
+        var _row = null;
+        try { _row = await loadChatRowFromDB(_cids[_ci]); } catch (e) { _row = null; }
+        if (_row && Array.isArray(_row.messages)) _skelFull[_cids[_ci]] = _wsfScanChatLive(_row);
+        _row = null;
+    }
     var entries = [];
     Object.keys(chats).forEach(function(cid) {
-        _wsfScanChat(chats[cid]).forEach(function(ch) {
+        if (!chats[cid]) return;
+        (_skelFull[cid] || _wsfScanChat(chats[cid])).forEach(function(ch) {
             if (ch.path !== f.path) return;
             if (ch.wsKey && f.wsKey && ch.wsKey !== f.wsKey) return;
             ch.chatId = cid;
@@ -820,7 +937,7 @@ function _wsfOnSubMessages(ev) {
                 // sync/merge stamps state:'merged'). Async — the render below
                 // uses the current cache; a refresh that changes the map
                 // re-renders once more by itself.
-                try { _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
+                try { _wsfRefreshOwnedRows(); _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
                 if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
             } catch (e) { /* sidebar not ready */ }
         });

@@ -174,8 +174,10 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
             _subPool:{running:live?{sub_a:true}:{},queue:[]},runningChatIds:{},pendingInjectionsByChatId:{},pausedChats:{},SUBAGENT_INBOX_CAP:50,
             _findSubAgentCard:function(){return card;},_repaintParent:noop,_subAgentsPersist:noop,saveChatsToStorage:noop,_notifyListeners:noop,
             _callerOwnsTarget:function(){return true;},_drainPool:noop,_mintNewSpawnHandle:function(){return 'h';},_saturationWarning:function(){return null;},
-            _escalationSuggestion:function(){return null;},_applyChatModelStamp:noop,_notifySubLifecycle:noop,_providerToTier:function(){return 'same';},console:console};
-        var names=['agentMessage','_withWakeFinalReminder','_wakeSubAgentImpl','_recordSubParentMessage','_formatInboxDrain','_subNormalizeNewlines','_subNoticeMeta','_subNoticeList','_queueNoticeInjection','_noticeRow','_inboxDrainMeta'];
+            _escalationSuggestion:function(){return null;},_applyChatModelStamp:noop,_notifySubLifecycle:noop,_providerToTier:function(){return 'same';},console:console,
+            _subChatOpQueue:{}};
+        // C2 cold-chat eviction helpers are loaded REAL (hot chats here, so _subWithChat runs sync).
+        var names=['_subIsSkeleton','_subHydrateChat','_subWithChat','_subAppendRows','agentMessage','_withWakeFinalReminder','_wakeSubAgentImpl','_recordSubParentMessage','_formatInboxDrain','_subNormalizeNewlines','_subNoticeMeta','_subNoticeList','_queueNoticeInjection','_noticeRow','_inboxDrainMeta'];
         var api=load(env,names.map(function(n){return declaration(core,n);}),names);
         return {env:env,api:api,card:card,rec:rec,ui:uiFixture(env.chats)};
     }

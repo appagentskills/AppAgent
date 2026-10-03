@@ -206,6 +206,51 @@ function _buildUpdateLedger(msgs) {
     if (items.length < 2 && !unsent) return null;
     return { anchorIdx: ai, block: _formatUpdateLedger(items), count: items.length };
 }
+// PREFIX-STABILITY: a row field written once at request time (ledgerBlock,
+// sentApiContent) must reach IndexedDB. chatMessages IS chat.messages here
+// (callLLMStreaming <- runAgent, app/030), so the stamp lands on the stored
+// row; saveChatsToStorage copies rows with Object.assign (unknown fields
+// kept). An evicted chat's put is skipped by the evicted-put guard
+// (worker/115-storage.js) -> flag it dirty so the guard re-saves it.
+function _persistPrefixStamp(chatId) {
+    try {
+        var c = (chatId && typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        if (c && c._payloadsEvicted) c._dirtyWhileEvicted = true;
+        if (typeof saveChatsToStorage === 'function') {
+            var p = saveChatsToStorage();
+            if (p && typeof p.catch === 'function') p.catch(function() {});
+        }
+    } catch (e) {}
+}
+// PREFIX-STABILITY: content hash of a pasted row's source text, stored as
+// row.sentApiSrcHash next to sentApiSrcLen ('length.fnv1a32', the same shape
+// as app/010 _fpPart) so a same-length in-place edit is caught too.
+function _sentSrcHash(s) {
+    s = typeof s === 'string' ? s : '';
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return s.length + '.' + (h >>> 0).toString(36);
+}
+// Does the row's frozen sentApiContent still belong to `content`? Hash rows
+// compare the hash. Legacy rows (sentApiSrcLen only, written before the
+// hash) are accepted once on a length match and upgraded to the hash, so
+// every later check is a real content check.
+function _sentSrcMatches(row, content, chatId) {
+    if (!row || typeof content !== 'string') return false;
+    if (typeof row.sentApiSrcHash === 'string' && row.sentApiSrcHash) return row.sentApiSrcHash === _sentSrcHash(content);
+    if (row.sentApiSrcLen !== content.length) return false;
+    row.sentApiSrcHash = _sentSrcHash(content);
+    _persistPrefixStamp(chatId);
+    return true;
+}
+// The ledger block a request sends for a row: the frozen copy on the row
+// (ledgerBlock, written the first time a block was sent on it) wins; a
+// fresh block is computed only for the current anchor when it has none.
+function _ledgerBlockForRow(row, idx, ledger) {
+    if (row && typeof row.ledgerBlock === 'string' && row.ledgerBlock) return row.ledgerBlock;
+    if (ledger && idx === ledger.anchorIdx) return ledger.block;
+    return null;
+}
 function _appendLedgerBlock(content, block) {
     if (!block) return content;
     if (typeof content === 'string') return content + '\n\n' + block;
@@ -253,6 +298,15 @@ function buildAPIMessages(chatMessages, chatId) {
     // C2: request-time update ledger (null on normal runs).
     // typeof-guarded: some tests extract buildAPIMessages standalone.
     var _ledger = (typeof _buildUpdateLedger === 'function') ? _buildUpdateLedger(chatMessages) : null;
+    // PREFIX-STABILITY: freeze the first block sent on an anchor row ON the
+    // stored row. Later builds replay exactly that string (even after the
+    // anchor moved to a newer wake row or a real user row), so every earlier
+    // message keeps its bytes and the thinking signatures / prompt cache
+    // bound to them stay valid. Never recomputed, never removed.
+    if (_ledger && chatMessages[_ledger.anchorIdx] && typeof chatMessages[_ledger.anchorIdx].ledgerBlock !== 'string') {
+        chatMessages[_ledger.anchorIdx].ledgerBlock = _ledger.block;
+        if (typeof _persistPrefixStamp === 'function') _persistPrefixStamp(chatId);
+    }
 
     // Helper: substitute a cache reference for any user message content that exceeds
     // the cache limit. Mirrors how oversized tool results are cached. Mutates the
@@ -267,37 +321,65 @@ function buildAPIMessages(chatMessages, chatId) {
         // pasted a long message]"). Typed-text rows, normal user rows and
         // context rows are untouched.
         if (originalMsg && originalMsg.role === 'user' && typeof _isInjectedSubNoticeRow === 'function' && _isInjectedSubNoticeRow(originalMsg)) return content;
+        // PREFIX-STABILITY: replay the exact string the first request sent
+        // (sentApiContent). Re-synthesizing it changed the bytes (different
+        // description/preview) and a missing cache entry minted a NEW id.
+        // Guarded by a source content hash (_sentSrcMatches) so an in-place
+        // content edit re-caches, even a same-length one.
+        var _stampStale = false;
+        if (originalMsg && typeof originalMsg.sentApiContent === 'string' && originalMsg.sentApiContent) {
+            if (_sentSrcMatches(originalMsg, content, chatId)) return originalMsg.sentApiContent;
+            // The source changed since the stamp: the cached entry holds the
+            // OLD text, so re-cache below instead of reusing its id.
+            _stampStale = true;
+        }
         // Already cached on a previous turn? Reuse the existing reference.
-        if (originalMsg && originalMsg.cachedContentId) {
+        // (Legacy rows without sentApiContent: the synthesized text is
+        // frozen on the row below so it is stable from now on.)
+        if (originalMsg && originalMsg.cachedContentId && !_stampStale) {
             var chat = chats[chatId];
             if (chat && chat.cachedToolResults && chat.cachedToolResults[originalMsg.cachedContentId]) {
                 var existing = chat.cachedToolResults[originalMsg.cachedContentId];
                 var sizeKB = Math.round((existing.size || content.length) / 1024);
                 var limitKB = Math.round((typeof getCacheCharLimit === 'function' ? getCacheCharLimit() : 16000) / 1024);
                 var totalLines = (existing.fullContent || content).split('\n').length;
-                return '[User pasted a long message — cached]\n' + JSON.stringify({
+                return _freezeSent(originalMsg, '[User pasted a long message — cached]\n' + JSON.stringify({
                     _cached_user_message: {
                         message: 'USER MESSAGE CACHED: ' + sizeKB + 'KB, ' + totalLines + ' lines (limit: ' + limitKB + 'KB). Use cached_content_read/search/outline with content_id "' + originalMsg.cachedContentId + '".',
                         content_id: originalMsg.cachedContentId,
                         size: sizeKB + 'KB',
                         totalLines: totalLines
                     }
-                }, null, 2);
+                }, null, 2));
             }
         }
         var cached = processUserMessageForCache(chatId, content);
         if (!cached) return content;
         if (originalMsg) originalMsg.cachedContentId = cached.contentId;
-        // Persist the new cachedContentId on the chat
-        try { if (typeof saveChatsToStorage === 'function') saveChatsToStorage(); } catch (e) {}
-        return cached.apiContent;
+        // Persist the new cachedContentId + the exact sent string on the row
+        // (_freezeSent -> _persistPrefixStamp flags an evicted chat dirty so
+        // the evicted-put guard does not drop the stamp).
+        return _freezeSent(originalMsg, cached.apiContent);
+    }
+    function _freezeSent(originalMsg, apiContent) {
+        if (originalMsg && typeof apiContent === 'string') {
+            originalMsg.sentApiContent = apiContent;
+            originalMsg.sentApiSrcLen = typeof originalMsg.content === 'string' ? originalMsg.content.length : -1;
+            if (typeof originalMsg.content === 'string') originalMsg.sentApiSrcHash = _sentSrcHash(originalMsg.content);
+            else delete originalMsg.sentApiSrcHash;
+            if (typeof _persistPrefixStamp === 'function') _persistPrefixStamp(chatId);
+        }
+        return apiContent;
     }
 
     var result = cloned.map(function(m, idx) {
         var original = chatMessages[idx];
         if (m.role === 'user') {
             var _uc = maybeCacheUserContent(original, m.content);
-            if (_ledger && idx === _ledger.anchorIdx) _uc = _appendLedgerBlock(_uc, _ledger.block);
+            // typeof-guarded: some tests extract buildAPIMessages standalone.
+            var _lb = (typeof _ledgerBlockForRow === 'function') ? _ledgerBlockForRow(original, idx, _ledger)
+                : (_ledger && idx === _ledger.anchorIdx ? _ledger.block : null);
+            if (_lb) _uc = _appendLedgerBlock(_uc, _lb);
             return { role: 'user', content: _uc };
         }
         if (m.role === 'assistant') {
@@ -364,11 +446,24 @@ function buildAPIMessages(chatMessages, chatId) {
             if (_ssSrc.indexOf('data:') !== 0 && _ssSrc.indexOf('https://') !== 0) {
                 return { role: 'user', content: '[image no longer available: ' + screenshotLabel + ']' };
             }
+            // Media-type gate (sanitizeModelImageUrl, tools/040-file-store.js):
+            // the type is taken from the magic bytes and must be png/jpeg/gif/
+            // webp. Anything else (`data:,` from a 0x0 canvas, SVG, BMP,
+            // octet-stream, garbage) is a provider 400 that would re-fire on
+            // EVERY later send because the row stays in history — degrade it
+            // to a text placeholder. Runs at send time, so already-stored bad
+            // rows in existing chats are repaired too.
+            var _ssUrl = (typeof fixDataUrlMime === 'function') ? fixDataUrlMime(_ssSrc) : _ssSrc;
+            if (typeof sanitizeModelImageUrl === 'function') {
+                var _ssSan = sanitizeModelImageUrl(_ssSrc);
+                if (!_ssSan.ok) return { role: 'user', content: '[image omitted: ' + _ssSan.reason + ' \u2014 ' + screenshotLabel + ']' };
+                _ssUrl = _ssSan.url;
+            }
             return {
                 role: 'user',
                 content: [
                     { type: 'text', text: '[Screenshot captured: ' + screenshotLabel + (m.width && m.height ? ' (' + m.width + 'x' + m.height + ')' : '') + ']\nAnalyze this image to help the user. Describe what you see and identify any issues, UI elements, or relevant details.' },
-                    { type: 'image_url', image_url: { url: _ssSrc } }
+                    { type: 'image_url', image_url: { url: _ssUrl } }
                 ]
             };
         }
@@ -731,10 +826,16 @@ function rejectPendingApprovalsForChat(chatId) {
     var keys = Object.keys(pendingToolApprovals);
     var chat = chats[chatId];
     var changed = false;
+    // C2 (chat eviction): a message-evicted skeleton has no `messages` here;
+    // its approval rows are flipped after one hydrate (see below).
+    var skelIdx = null;
     for (var i = 0; i < keys.length; i++) {
         var k = keys[i];
         var entry = pendingToolApprovals[k];
         if (!entry || entry.chatId !== chatId) continue;
+        if (chat && chat._messagesEvicted && !Array.isArray(chat.messages) && typeof entry.approvalIndex === 'number') {
+            (skelIdx = skelIdx || []).push(entry.approvalIndex);
+        }
         // Mark the inline message denied (with a marker so we can distinguish
         // pause-driven denials from explicit user denials in future code).
         if (chat && chat.messages && chat.messages[entry.approvalIndex]) {
@@ -751,6 +852,40 @@ function rejectPendingApprovalsForChat(chatId) {
     if (changed && typeof saveChatsToStorage === 'function') {
         try { saveChatsToStorage(); } catch (e) {}
     }
+    if (skelIdx) _denySkeletonApprovalRows(chatId, skelIdx);
+}
+
+// C2: hydrate the skeleton once, re-read chats[chatId] (the sweep copies on
+// evict), then flip the same pending rows. A hydrate miss leaves the stored
+// row untouched (fail closed: never save a messageless skeleton).
+function _denySkeletonApprovalRows(chatId, idxs) {
+    if (typeof ensureChatPayloads !== 'function') {
+        console.warn('[approvals] skeleton chat not hydrated; pending rows left as stored', chatId);
+        return Promise.resolve(false);
+    }
+    return Promise.resolve().then(function() { return ensureChatPayloads(chatId); }).then(function() {
+        var c = chats[chatId];
+        if (!c || !Array.isArray(c.messages)) {
+            console.warn('[approvals] skeleton hydrate miss; pending rows left as stored', chatId);
+            return false;
+        }
+        var ch = false;
+        for (var j = 0; j < idxs.length; j++) {
+            var m = c.messages[idxs[j]];
+            if (m && m.role === 'approval' && m.status === 'pending') {
+                m.status = 'denied';
+                m.deniedByPause = true;
+                ch = true;
+            }
+        }
+        if (ch && typeof saveChatsToStorage === 'function') {
+            try { saveChatsToStorage(); } catch (e) {}
+        }
+        return ch;
+    }).catch(function(err) {
+        console.warn('[approvals] skeleton hydrate failed', chatId, err);
+        return false;
+    });
 }
 
 // Detect whether a chat looks like it was interrupted mid-stream.

@@ -33,6 +33,9 @@ function runChatNavigationAudit(sources) {
         declaration(sources['src/js/ui/060-docs-view.js'], 'closeDashboardView'),
         declaration(sources['src/js/tools/110-smart-documents.js'], 'editDocumentWithAgent'),
         declaration(sources['src/js/tools/110-smart-documents.js'], 'sdocStartChat'),
+        declaration(sources['src/js/tools/110-smart-documents.js'], '_sdocOpenFreshChat'),
+        declaration(sources['src/js/tools/110-smart-documents.js'], '_sdocFlat'),
+        declaration(sources['src/js/tools/110-smart-documents.js'], 'sdocDocRefText'),
         // A5A3-01 (PM30): tools/150 start_chat. declaration() slices from `function`, so the
         // real `async` is re-added; executeStartChat has no await, so a call finishes synchronously.
         declaration(sources['src/js/tools/150-start-chat.js'], '_startChatResolveWidgetId'),

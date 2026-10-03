@@ -66,7 +66,7 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         var s = await sources();
         var env = {
             db: new Map(), ops: [], txs: [], logs: [], warns: [], errors: [],
-            stripCalls: [], overlayCalls: [], applyCalls: [], rebuilds: 0, deleteCalls: [],
+            stripCalls: [], bodyStripCalls: [], overlayCalls: [], applyCalls: [], rebuilds: 0, deleteCalls: [],
             chats: clone(opts.chats || {}), pending: clone(opts.pending || {}),
             pausedChats: {}, pausedChatIds: {},
             failOp: opts.failOp || null, afterOp: opts.afterOp || null
@@ -128,11 +128,14 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
             }).then(function(v) { txRec.outcome = 'resolved'; return v; },
                 function(e) { txRec.outcome = 'rejected'; txRec.error = e; throw e; });
         }
-        // REAL strip (CHAT_BODY_EVICT_MIN_CHARS only matters with evictBodies,
-        // which the SW must never pass: the long bodies below would be evicted).
+        // REAL strip. SW-EVICT: the SW boot load now calls it TWICE per row —
+        // one-arg (b64/CTR leg; its return value drives the legacy-migration
+        // queue) then (chat, true) for heavy-body eviction. The spy records
+        // the two legs separately so the per-row once checks stay exact.
         var realStrip = new Function('CHAT_BODY_EVICT_MIN_CHARS', s.strip + '\n;return stripChatPayloadsInPlace;')(1024);
         function stripSpy(c) {
-            env.stripCalls.push({ id: c && c.id, argc: arguments.length });
+            if (arguments.length >= 2 && arguments[1] === true) env.bodyStripCalls.push({ id: c && c.id, argc: arguments.length });
+            else env.stripCalls.push({ id: c && c.id, argc: arguments.length });
             return realStrip.apply(null, arguments);
         }
         function overlay(prev, next) {
@@ -301,7 +304,7 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         }
     }, { tags: ['unit'], timeout: 20000 });
 
-    test('strip semantics unchanged: ONE-arg strip (no body eviction), every loaded record _payloadsEvicted, legacy rows queued in key order', async function() {
+    test('strip semantics: b64 strip + evictBodies strip per row, every loaded record _payloadsEvicted, legacy rows queued in key order', async function() {
         var rows = makeRows(57);
         var env = await makeEnv({ rows: rows });
         await env.api.load();
@@ -309,7 +312,8 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         assert.deepStrictEqual(Object.keys(env.chats), loaded, 'rows without messages are not loaded; key order kept');
         assert.ok(!env.chats.c004 && !env.chats.c007, 'empty / missing history filtered');
         assert.deepStrictEqual(env.stripCalls.map(function(c) { return c.id; }), loaded, 'strip exactly once per loaded row');
-        env.stripCalls.forEach(function(c) { assert.strictEqual(c.argc, 1, 'strip called with ONE arg (no evictBodies) for ' + c.id); });
+        env.stripCalls.forEach(function(c) { assert.strictEqual(c.argc, 1, 'b64 leg called with ONE arg for ' + c.id); });
+        assert.deepStrictEqual(env.bodyStripCalls.map(function(c) { return c.id; }), loaded, 'SW-EVICT: evictBodies strip exactly once per loaded row');
         loaded.forEach(function(id) { assert.strictEqual(env.chats[id]._payloadsEvicted, true, id + ' marked _payloadsEvicted'); });
         var queued = loaded.filter(function(id) { return idx(id) % 8 <= 2; });
         assert.deepStrictEqual(env.api.queue(), queued, 'records that held inline payloads queued for migration, key order');
@@ -321,11 +325,14 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
         assert.strictEqual(t2.fullContent, undefined); assert.strictEqual(t2._fcEvicted, true);
         assert.strictEqual(env.chats.c003.messages[1].base64.length, 50, 'no pointer: base64 kept');
         var b5 = env.chats.c005.messages;
-        assert.strictEqual(b5[1].content.length, 5000);
-        assert.strictEqual(b5[2].thinking.length, 5000);
-        assert.strictEqual(b5[2].tool_calls[0].function.arguments.length, 5000);
-        assert.strictEqual(b5[2].reasoning_details.length, 1);
-        assert.ok(JSON.stringify(env.chats).indexOf('_bodyEvicted') < 0, 'no body eviction in the SW');
+        assert.strictEqual(b5[1].content, undefined, 'SW-EVICT: heavy tool body evicted');
+        assert.strictEqual(b5[1]._bodyEvicted, true);
+        assert.strictEqual(b5[2].thinking, undefined, 'thinking evicted');
+        assert.strictEqual(b5[2].tool_calls[0].function.arguments, '', 'tool-call args evicted');
+        assert.strictEqual(b5[2].tool_calls[0].function.name, 'x', 'tool-call name kept');
+        assert.strictEqual(b5[2].reasoning_details, undefined, 'reasoning_details evicted');
+        assert.strictEqual(b5[2]._bodyEvicted, true);
+        assert.strictEqual(env.chats.c005._payloadsEvicted, true);
         var paused = loaded.filter(function(id) { return idx(id) % 8 === 6; });
         assert.deepStrictEqual(Object.keys(env.pausedChats).sort(), paused);
         assert.deepStrictEqual(Object.keys(env.pausedChatIds).sort(), paused);
@@ -639,6 +646,7 @@ async function loadChatsFromStorage() {
                                     if (_cb64 > _acctTopB64) { _acctTopB64 = _cb64; _acctTopId = chat.id; }
                                 }
                                 if (stripChatPayloadsInPlace(chat)) _legacyPayloadMigrationQueue.push(chat.id);
+                                stripChatPayloadsInPlace(chat, true); // SW-EVICT (oracle kept in step)
                                 // WRITE-AMP root fix: strip only sets
                                 // _payloadsEvicted when it stripped base64, so a
                                 // pure-TEXT chat (most of the store) never got the

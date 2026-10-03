@@ -56,7 +56,10 @@ describe('C-gate: update ledger ignores after-response hook rows', function() {
         assert.ok(ledger.indexOf('Alpha found 3 bugs') !== -1, 'earlier wake-run report (before the hook row) is listed');
         assert.ok(ledger.indexOf('Beta found nothing') !== -1, 'current report is listed');
         assert.strictEqual(count(ledger, '\n- [final]'), 2, 'two items, hook rows contribute none');
-        assert.strictEqual(JSON.stringify(rows), before, 'chat rows are not mutated (ledger never persisted)');
+        // PREFIX-STABILITY: the sent block is frozen on the anchor row (only).
+        assert.strictEqual(rows[rows.length - 1].ledgerBlock, ledger, 'anchor row stores the exact sent block');
+        delete rows[rows.length - 1].ledgerBlock;
+        assert.strictEqual(JSON.stringify(rows), before, 'no other row field is mutated');
     }, T);
 
     test('hook run after a wake run keeps the wake anchor block: payload prefix byte-identical', function() {

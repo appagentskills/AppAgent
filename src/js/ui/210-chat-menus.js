@@ -95,7 +95,9 @@ function confirmRenameChat(chatId) {
             // Legacy fallback (no lane in this realm): direct write + save.
             chat.title = newTitle;
             delete chat.titleProvisional;
-            if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+            // C2-ui: a message-evicted skeleton hydrates first too (the save
+            // guard skips a chat still evicted after a miss).
+            if ((chat._payloadsEvicted || chat._messagesEvicted) && typeof ensureChatPayloads === 'function') {
                 ensureChatPayloads(chatId).then(function() { saveChatsToStorage(); });
             } else {
                 saveChatsToStorage();
@@ -122,6 +124,7 @@ async function downloadChat(chatId) {
     // '_' fields (the record shape a put would persist).
     try {
         var payloadsOk = true;
+        var wasSkeleton = !Array.isArray(chat.messages) && !!(chat._messagesEvicted || chat._payloadsEvicted);
         // MEMFIX: rehydrate evicted base64 payloads so the export is complete.
         if (typeof ensureChatPayloads === 'function') {
             try { await ensureChatPayloads(chatId); } catch (e) { payloadsOk = false; }
@@ -129,6 +132,12 @@ async function downloadChat(chatId) {
         // TB-6: the await can swap in a fresh record for this id, so export the
         // object in the map now, not the one captured before the await.
         chat = chats[chatId] || chat;
+        // C2-ui: a skeleton whose stored messages could not be loaded is not
+        // downloaded as a message-less chat — fail closed with an error.
+        if (!Array.isArray(chat.messages) && (wasSkeleton || chat._messagesEvicted || chat._payloadsEvicted)) {
+            showSnackbar(t('Download failed: {error}', { error: 'messages could not be loaded' }), 'error');
+            return;
+        }
         if (chat._payloadsEvicted) payloadsOk = false;
 
         var exportData = {
@@ -146,6 +155,10 @@ async function downloadChat(chatId) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        // C2-ui: put a hydrated cold chat back to its skeleton shape.
+        if (wasSkeleton && typeof sweepColdChatPayloads === 'function') {
+            try { sweepColdChatPayloads(typeof CHAT_KEEP_HYDRATED !== 'undefined' ? CHAT_KEEP_HYDRATED : 8, true); } catch (eSweep) {}
+        }
 
         if (payloadsOk) showSnackbar(t('Chat downloaded'), 'success');
         else showSnackbar(t('Chat downloaded (some attachments could not be restored)'), 'warning');

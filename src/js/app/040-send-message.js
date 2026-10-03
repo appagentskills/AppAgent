@@ -175,8 +175,14 @@ async function sendMessage() {
                 // Attachments: same split — live pending list vs. per-chat map
                 // (restorePendingImagesForContext reads chatPendingImages).
                 if (_images && _images.length > 0) {
-                    if (_onThisChat) {
+                    // Rm1 (#952): the live list belongs to its OWNER context, not
+                    // the visible one (chat A -> Home -> History leaves the live
+                    // list = Home's draft while the visible context still says A).
+                    var _ownsLive = (typeof getPendingImagesOwnerContext === 'function')
+                        ? (getPendingImagesOwnerContext() === _chatId) : _onThisChat;
+                    if (_ownsLive) {
                         pendingImageAttachments = _images.concat(pendingImageAttachments || []);
+                        if (typeof setPendingImagesOwner === 'function') setPendingImagesOwner(_chatId);
                         renderPendingImages();
                     } else {
                         chatPendingImages[_chatId] = _images.concat(chatPendingImages[_chatId] || []);
@@ -249,7 +255,35 @@ async function sendMessage() {
         return;
     }
 
-    // Clear any stale injection from a previous paused run — this new message supersedes it
+    // MSG-EVICT send guard: the current chat can still be an evicted skeleton
+    // (no `messages` array, core/130) — send right after selectChat before
+    // the hydration lands, or after a failed load. injectInterruptedToolResults
+    // / chat.messages.push below would throw a TypeError AFTER the draft was
+    // already deleted. Hydrate first; if it stays a skeleton, tell the user and
+    // return WITHOUT clearing the input or the saved draft.
+    // RE-ENTRY: this await is the ONLY one between reading `message` /
+    // the runningChatIds check above and clearing the input below. Continuing
+    // after it would act on stale state (double Enter → two sends + two
+    // runAgent; text typed during the load lost). So once hydrated, restart
+    // from the top: the fresh call re-reads input + running state and runs to
+    // the input clear with no await. Bounded: re-entry only when `messages` is
+    // now an array, so the inner call never takes this branch again.
+    var _sendChatId = currentChatId;
+    var chat = chats[_sendChatId];
+    if (chat && !Array.isArray(chat.messages) && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(_sendChatId); } catch (e) {}
+        if (currentChatId !== _sendChatId) return; // user switched chats mid-load
+        chat = chats[_sendChatId];
+        if (chat && Array.isArray(chat.messages)) return sendMessage();
+    }
+    if (chat && !Array.isArray(chat.messages)) {
+        showSnackbar(t('Storage unavailable — chat history could not be loaded. Try restarting Chrome.'), 'error');
+        return;
+    }
+
+    // Clear any stale injection from a previous paused run — this new message
+    // supersedes it. m4: only AFTER the skeleton guard, so a refused send (or
+    // a chat switch mid-hydration) keeps the queued injection.
     pendingInjection = null;
     pendingInjectionImages = null;
 
@@ -265,8 +299,6 @@ async function sendMessage() {
     // Clear pending input since we're sending it
     delete chatPendingTexts[getCurrentPendingContext()];
     persistPendingTextsToStorage();
-
-    var chat = chats[currentChatId];
 
     // Add user message (even if empty when attachments present, provide context)
     var imageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;

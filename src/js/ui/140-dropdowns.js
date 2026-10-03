@@ -307,8 +307,7 @@ function renderToolPermissions() {
     // Render radio groups for global permissions
     GLOBAL_PERMISSION_KEYS.concat(skillToolKeys).forEach(function(key) {
         var containerId = 'perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
-        var perm = toolPermissions[key] || (isReadPermissionKey(key)
-            || key === 'workspace:push' || key === 'get_cookie' ? 'allow' : 'auto');
+        var perm = toolPermissions[key] || getGlobalDefaultPermission(key);
         _renderPermRadio(containerId, perm, key, false, false);
     });
 }
@@ -595,12 +594,10 @@ function getToolPermission(toolName, methodOrAction, chatId) {
 
     // Defaults: read → allow, write → auto
     // (workspace:push → allow, get_cookie → allow)
-    if (permKey === 'workspace:push') return 'allow';
     // get_cookie is allowed by default and runs without prompting, like
-    // workspace:push. The values it returns ARE session credentials; a user who
-    // wants to be asked can set it to 'Ask' (or 'Off') in Settings.
-    if (permKey === 'get_cookie') return 'allow';
-    return isReadPermissionKey(permKey) ? 'allow' : 'auto';
+    // workspace:push; GLOBAL_ASK_DEFAULT_KEYS (web_fetch, local_folder:delete,
+    // local_folder:write_local) default to 'ask'. Shared helper in core/070.
+    return getGlobalDefaultPermission(permKey);
 }
 
 // Get effective permission for an instance-scoped tool

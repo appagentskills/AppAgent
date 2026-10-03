@@ -297,6 +297,8 @@ async function executeTakeScreenshot(args, options) {
                         function _onSnap(ev) {
                             var d = ev && ev.data;
                             if (!d || d.type !== '__appagentSerializedDom' || String(d.reqId) !== String(_wssTs)) return;
+                            // Rm2 (#998): only the widget we asked may answer.
+                            if (ev.source !== widgetIframe.contentWindow) return;
                             if (_snDone) return; _snDone = true;
                             clearTimeout(_snTimer);
                             try { window.removeEventListener('message', _onSnap); } catch (e) {}

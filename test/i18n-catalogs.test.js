@@ -9,7 +9,7 @@ var CAT_DIR = 'src/locales';
 
 function lsNames(ls) {
     return (ls && (ls.entries || ls.files) || []).map(function(e) {
-        return String(typeof e === 'string' ? e : (e && (e.path || e.name)) || '').replace(/ \*$/, '').replace(/ \(\d+ files?\)$/, '').replace(/^.*\/(?=[^/]+\/?$)/, '');
+        return String(typeof e === 'string' ? e : (e && (e.path || e.name)) || '').replace(/ \*.*$/, '').replace(/ \(\d+ files?\)$/, '').replace(/^.*\/(?=[^/]+\/?$)/, '');
     }).filter(Boolean);
 }
 var _src = null;

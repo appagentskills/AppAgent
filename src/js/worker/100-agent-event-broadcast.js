@@ -191,6 +191,10 @@ function _slimChatSnapshot(chat) {
 function _buildChatDelta(chat, detail) {
     var sync = _chatDeltaSync[chat.id];
     if (!sync) return null;
+    // C2-xctx-sw: a messages-evicted skeleton has no array — a fromIndex-0
+    // delta with an empty tail would EMPTY the page mirror. Force the slim
+    // snapshot fallback (it ships the skeleton shape + flags instead).
+    if (chat._messagesEvicted && !Array.isArray(chat.messages)) return null;
     var msgs = Array.isArray(chat.messages) ? chat.messages : [];
     if (sync.len > msgs.length) return null;
     if (sync.len > 0 && msgs[sync.len - 1] !== sync.lastRef) return null;
@@ -263,11 +267,17 @@ function broadcastAgentEvent(type, detail) {
         }
         // Advance the watermark: after this envelope every connected panel
         // has (delta-merged or wholesale) the current messages array.
-        var _wmMsgs = Array.isArray(_chat.messages) ? _chat.messages : [];
-        _chatDeltaSync[_chat.id] = {
-            len: _wmMsgs.length,
-            lastRef: _wmMsgs.length ? _wmMsgs[_wmMsgs.length - 1] : null
-        };
+        // C2-xctx-sw: a skeleton envelope does not give panels the messages —
+        // drop the watermark so the next envelope re-baselines.
+        if (_chat._messagesEvicted && !Array.isArray(_chat.messages)) {
+            delete _chatDeltaSync[_chat.id];
+        } else {
+            var _wmMsgs = Array.isArray(_chat.messages) ? _chat.messages : [];
+            _chatDeltaSync[_chat.id] = {
+                len: _wmMsgs.length,
+                lastRef: _wmMsgs.length ? _wmMsgs[_wmMsgs.length - 1] : null
+            };
+        }
     } else if (payload.chatId && chats[payload.chatId] && chats[payload.chatId]._deleted) {
         // Tombstoned chat — drop its watermark so the map can't grow stale
         // entries across delete/recreate cycles.

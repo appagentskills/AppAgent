@@ -152,6 +152,9 @@ async function compressBase64Image(base64, maxBytes) {
 // the LONG edge (no caller passes one today).
 // Returns Promise<{ base64, width, height }>. No-op if already within limits.
 async function resizeImageIfNeeded(base64, maxDim) {
+    // Correct the declared type from the magic bytes first (JPEG bytes in a
+    // data:image/png URL -> Anthropic 400). fixDataUrlMime: tools/040-file-store.js.
+    if (typeof fixDataUrlMime === 'function') base64 = fixDataUrlMime(base64);
     try {
         var blob = _b64DataUrlToBlob(base64);
         var bitmap = await createImageBitmap(blob);
@@ -194,6 +197,29 @@ async function resizeImageIfNeeded(base64, maxDim) {
     } catch (e) {
         return { base64: base64, width: 0, height: 0 };
     }
+}
+
+// Producer-side media-type gate for js_eval `_images` rows: a row whose
+// payload is not png/jpeg/gif/webp (e.g. `data:,` from toDataURL on a 0x0
+// canvas, an SVG data URL) is converted to PNG when decodable, otherwise
+// dropped and reported on the tool result as `_images_rejected` so the model
+// learns why — instead of persisting a row that 400s every later request.
+// sanitizeModelImageUrl / convertImageDataUrlToPng: tools/040-file-store.js.
+async function _validModelImageRows(rows, resultObj) {
+    if (typeof sanitizeModelImageUrl !== 'function') return rows;
+    var out = [], rejected = [];
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var san = sanitizeModelImageUrl(row.base64);
+        if (!san.ok && typeof convertImageDataUrlToPng === 'function') {
+            var png = await convertImageDataUrlToPng(row.base64);
+            if (png) { row.base64 = png; san = sanitizeModelImageUrl(png); }
+        }
+        if (san.ok) { row.base64 = san.url; out.push(row); }
+        else rejected.push({ name: row.name || null, reason: san.reason });
+    }
+    if (rejected.length && resultObj && typeof resultObj === 'object') resultObj._images_rejected = rejected;
+    return out;
 }
 
 // Execute set_chat_title tool
@@ -380,6 +406,26 @@ function relocateAnswerCard(chat, prop, anchorUserIdx) {
     return null;
 }
 
+// MSG-EVICT: set_tldr / set_links / set_caveat aimed at a cold (skeleton)
+// chat — a widget executeTool or a non-running options.chatId — is hydrated
+// first by the dispatcher (_hookToolColdChatId + _hydrateColdHookChat). A
+// hydrate miss keeps the skeleton and the executor fails closed with a clear
+// error (never writes onto, or saves, a message-less chat).
+function _hookToolColdChatId(options) {
+    var id = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    var c = (typeof chats !== 'undefined' && chats) ? chats[id] : null;
+    if (!c || Array.isArray(c.messages) || !c._messagesEvicted) return null;
+    return typeof ensureChatPayloads === 'function' ? id : null;
+}
+async function _hydrateColdHookChat(id) {
+    try { await ensureChatPayloads(id); } catch (e) { /* never rejects; fail closed below */ }
+}
+function _hookChatMissingError(chat) {
+    return (chat && chat._messagesEvicted && !Array.isArray(chat.messages))
+        ? 'Chat history is not loaded (cold chat could not be hydrated) \u2014 nothing attached'
+        : 'No active chat';
+}
+
 // Execute set_tldr tool (TLDR hook). Headless — runs in the SW. Attaches the
 // TLDR to the final-answer assistant message of the last REAL (non-hook) turn.
 function executeSetTldr(args, options) {
@@ -388,7 +434,7 @@ function executeSetTldr(args, options) {
     if (!text) return { success: false, error: 'tldr cannot be empty' };
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
-    if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
+    if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
     var attached = attachAnswerCard(chat, 'tldr', text);
     if (!attached.success) return attached;
     // Success — reset the per-turn TLDR hook retry cap (mirrors how a
@@ -549,7 +595,7 @@ function executeSetLinks(args, options) {
     var links = sanitizeHookLinks(args.links);
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
-    if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
+    if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
     var attached = attachAnswerCard(chat, 'links', links);
     if (!attached.success) return attached;
     // Success — reset the per-turn Links hook retry cap (mirrors executeSetTldr).
@@ -574,7 +620,7 @@ function executeSetCaveat(args, options) {
     if (!text) return { success: false, error: 'caveat cannot be empty' };
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
-    if (!chat || !chat.messages) return { success: false, error: 'No active chat' };
+    if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
     var attached = attachAnswerCard(chat, 'caveat', text);
     if (!attached.success) return attached;
     // Success — reset the per-turn caveat hook retry cap (mirrors executeSetTldr).
@@ -1835,8 +1881,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
                             file_id: ssId
                         };
                     }));
+                    ssMsgsSw = await _validModelImageRows(ssMsgsSw, swEvalResult);
                     if (ssMsgsSw.length === 1) jsEvalResultSw._screenshotMessage = ssMsgsSw[0];
-                    else jsEvalResultSw._screenshotMessages = ssMsgsSw;
+                    else if (ssMsgsSw.length > 1) jsEvalResultSw._screenshotMessages = ssMsgsSw;
                 }
                 return jsEvalResultSw;
             }
@@ -2043,9 +2090,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
                         file_id: ssId
                     };
                 }));
+                screenshotMsgs = await _validModelImageRows(screenshotMsgs, result);
                 if (screenshotMsgs.length === 1) {
                     jsEvalResult._screenshotMessage = screenshotMsgs[0];
-                } else {
+                } else if (screenshotMsgs.length > 1) {
                     jsEvalResult._screenshotMessages = screenshotMsgs;
                 }
             }
@@ -2159,9 +2207,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return { success: false, error: 'Invalid table name: must be alphanumeric/underscores only' };
     } else if (name === 'servicenow_api' && args.sys_id && args.sys_id !== '-1' && !(/^[0-9a-fA-F]{32}$/.test(args.sys_id))) {
         return { success: false, error: 'Invalid sys_id: must be a 32-character hex string or -1' };
-    } else if (name === 'servicenow_api' && args.table === 'attachment' && args.method === 'POST' && args.attachment_data) {
-        // Attachment upload via /api/now/attachment/file
+    } else if (name === 'servicenow_api' && args.table === 'attachment' && args.method === 'POST' && (args.attachment_data || args.attachment_file_id || args.attachment_source)) {
+        // Attachment upload via /api/now/attachment/file. Bytes come from ONE of
+        // attachment_data (base64/data URL), attachment_file_id (file store, e.g.
+        // local_folder read) or attachment_source {folder, path} (connected folder)
+        // — resolved by lfResolveBinaryInput (tools/170-local-folders.js).
         try {
+            var _attachBin = null;
+            if (args.attachment_file_id || args.attachment_source) {
+                if (typeof lfResolveBinaryInput !== 'function') return { success: false, error: 'attachment_file_id/attachment_source need the local folders module' };
+                // options: attachment_source reads are gated by local_folder:read.
+                _attachBin = await lfResolveBinaryInput({ file_id: args.attachment_file_id, source: args.attachment_source }, options);
+                if (!args.attachment_file_name && _attachBin.name) args = Object.assign({}, args, { attachment_file_name: _attachBin.name });
+                if (!args.attachment_content_type && _attachBin.mime && _attachBin.mime !== 'application/octet-stream') args = Object.assign({}, args, { attachment_content_type: _attachBin.mime });
+            }
             if (!args.attachment_file_name) return { success: false, error: 'attachment_file_name is required for attachment upload' };
             if (!args.attachment_table_name) return { success: false, error: 'attachment_table_name is required for attachment upload' };
             if (!args.attachment_table_sys_id) return { success: false, error: 'attachment_table_sys_id is required for attachment upload' };
@@ -2188,15 +2247,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 contentType = mimeMap[ext] || 'application/octet-stream';
             }
 
-            // Decode base64 data (handle data URL prefix)
-            var base64Raw = args.attachment_data;
-            if (base64Raw.indexOf(',') !== -1) {
-                base64Raw = base64Raw.split(',')[1];
-            }
-            var binaryStr = atob(base64Raw);
-            var bytes = new Uint8Array(binaryStr.length);
-            for (var bi = 0; bi < binaryStr.length; bi++) {
-                bytes[bi] = binaryStr.charCodeAt(bi);
+            var bytes;
+            if (_attachBin) {
+                bytes = _attachBin.bytes;
+            } else {
+                // Decode base64 data (handle data URL prefix)
+                var base64Raw = args.attachment_data;
+                if (base64Raw.indexOf(',') !== -1) {
+                    base64Raw = base64Raw.split(',')[1];
+                }
+                var binaryStr = atob(base64Raw);
+                bytes = new Uint8Array(binaryStr.length);
+                for (var bi = 0; bi < binaryStr.length; bi++) {
+                    bytes[bi] = binaryStr.charCodeAt(bi);
+                }
             }
 
             var attachUrl = '/api/now/attachment/file?table_name=' + encodeURIComponent(args.attachment_table_name) +
@@ -2211,7 +2275,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     'Accept': 'application/json',
                     'X-UserToken': _attachApiToken
                 },
-                body: bytes.buffer
+                body: (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer
             };
             var res = await _toolFetch(attachUrl, attachOpts, options && options._sfCtx, 30000);
             var _attachRespText = await res.text();
@@ -2565,10 +2629,13 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'set_chat_title') {
         return executeSetChatTitle(args, options);
     } else if (name === 'set_tldr') {
+        var _hkCold = _hookToolColdChatId(options); if (_hkCold) await _hydrateColdHookChat(_hkCold);
         return executeSetTldr(args, options);
     } else if (name === 'set_links') {
+        var _hkCold = _hookToolColdChatId(options); if (_hkCold) await _hydrateColdHookChat(_hkCold);
         return executeSetLinks(args, options);
     } else if (name === 'set_caveat') {
+        var _hkCold = _hookToolColdChatId(options); if (_hkCold) await _hydrateColdHookChat(_hkCold);
         return executeSetCaveat(args, options);
     } else if (name === 'cached_content_outline') {
         var ccoChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
@@ -2608,11 +2675,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'take_screenshot') {
         return await executeTakeScreenshot(args, options);
     } else if (name === 'screenshot_by_id') {
-        return executeScreenshotById(args);
+        return await executeScreenshotById(args);
     } else if (name === 'get_file') {
         return await executeGetFile(args);
     } else if (name === 'read_attached_file') {
-        return executeReadAttachedFile(args, options);
+        return await executeReadAttachedFile(args, options);
     } else if (name === 'get_cookie') {
         // Impl: executeGetCookie at the bottom of this file. Headless
         // (HEADLESS_TOOLS.get_cookie = true) so it executes in the SW — the only
@@ -2632,6 +2699,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // routing as js_eval (HEADLESS_TOOLS.run_tests = true).
         if (typeof executeRunTests !== 'function') return _runTestsImplMissing('run_tests');
         return await executeRunTests(args, messageIndex, options);
+    } else if (name === 'local_folder') {
+        // Impl: executeLocalFolder in tools/170-local-folders.js (WORKER_SHARED_FILES).
+        // Headless except action 'request' (isHeadlessTool routes it to the panel).
+        if (typeof executeLocalFolder !== 'function') return { success: false, error: 'local_folder is not available in this context' };
+        return await executeLocalFolder(args, options);
     } else if (name === 'web_fetch') {
         try {
             var _wfSaveFile = args.save_file;
@@ -2647,8 +2719,23 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 headers: Object.assign({}, args.headers || {}),
                 cache: 'no-store'
             };
+            // Conflicting bodies (form/body_* with GET/DELETE, or with body)
+            // → clear error instead of silently dropping one (170 helper).
+            var _wfConflict = (typeof lfFetchBodyConflict === 'function') ? lfFetchBodyConflict(args) : null;
+            if (_wfConflict) return { success: false, error: _wfConflict };
             if (args.body && ['POST', 'PUT', 'PATCH'].includes(_wfOpts.method)) {
                 _wfOpts.body = args.body;
+            } else if (['POST', 'PUT', 'PATCH'].includes(_wfOpts.method) && (args.form || args.body_file_id || args.body_source || args.body_base64)) {
+                // Binary / multipart body (tools/170-local-folders.js lfBuildFetchBody).
+                if (typeof lfBuildFetchBody !== 'function') return { success: false, error: 'binary/form bodies need the local folders module' };
+                var _wfBin = await lfBuildFetchBody(args, options);
+                if (_wfBin) {
+                    _wfOpts.body = _wfBin.body;
+                    var _wfCtKeys = Object.keys(_wfOpts.headers).filter(function(k) { return k.toLowerCase() === 'content-type'; });
+                    // multipart: fetch must generate the boundary — drop any caller Content-Type.
+                    if (_wfBin.multipart) _wfCtKeys.forEach(function(k) { delete _wfOpts.headers[k]; });
+                    else if (!_wfCtKeys.length && _wfBin.contentType) _wfOpts.headers['Content-Type'] = _wfBin.contentType;
+                }
             }
             // --- GitHub REST API auth injection -------------------------------
             // Reuse the GitHub token the workspace tool stores in chrome.storage
@@ -2676,24 +2763,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
             var _wfRes = await _toolFetch(args.url, _wfOpts, options && options._sfCtx, 30000);
             var _wfCT = _wfRes.headers.get('content-type') || '';
             var _wfBody;
+            var _wfBlob = null;
             if (_wfSaveFile) {
-                var _wfBlob = await _wfRes.blob();
-                _wfBody = await new Promise(function(resolve) {
-                    var reader = new FileReader();
-                    reader.onload = function() { resolve(reader.result); };
-                    reader.readAsDataURL(_wfBlob);
-                });
+                _wfBlob = await _wfRes.blob();
             } else {
                 _wfBody = await _wfRes.text();
             }
             var _wfResult = { success: true, status: _wfRes.status, content_type: _wfCT };
             if (_wfSaveFile) {
-                var _wfFileId = newFileId();
                 var _wfName = args.url.split('/').pop().split('?')[0] || 'download';
-                registerFile(_wfFileId, { type: 'memory', data: _wfBody, name: _wfName, mime: _wfCT || 'application/octet-stream' });
+                // Unified store: the Blob itself (no base64 copy), MIME sniffed.
+                var _wfFileId = await registerFileAsync({ blob: _wfBlob, name: _wfName, mime: _wfCT || 'application/octet-stream', source: 'web_fetch' });
                 _wfResult.file_id = _wfFileId;
                 _wfResult.file_name = _wfName;
-                _wfResult.file_size = _wfBody ? _wfBody.length : 0;
+                _wfResult.file_size = _wfBlob ? _wfBlob.size : 0;
             } else {
                 // --- HTML text extraction ------------------------------------
                 // For HTML responses, surface page_title, meta_description and
@@ -3342,6 +3425,28 @@ async function executeWorkspaceTool(args, options) {
             }
             return { success: true, workspaces: workspaces, total: workspaces.length };
         }
+        if (action === 'delete_workspace') {
+            // Removes a whole LOCAL workspace. Deliberately handled BEFORE
+            // resolveWorkspace: it must never fall back to the default/pinned
+            // workspace — the caller has to name the target explicitly.
+            if (!args.workspace || typeof args.workspace !== 'string') {
+                return { success: false, error: 'delete_workspace requires an explicit workspace (owner/repo::branch)' };
+            }
+            var _dwRes = await wsDeleteWorkspace(args.workspace, chatId, force);
+            if (_dwRes && _dwRes.success) {
+                try {
+                    AgentEvents.emit('workspaceMutated', {
+                        chatId: chatId,
+                        action: 'delete_workspace',
+                        repo: args.workspace,
+                        branch: parseWsKey(args.workspace).branch || null,
+                        path: null,
+                        pin_moved_to: _dwRes.pin_moved_to || null
+                    });
+                } catch (e) {}
+            }
+            return _dwRes;
+        }
         // All other actions resolve workspace from optional workspace param or default
         var wk = await resolveWorkspace(args.workspace);
         if (wk && wk.error) return { success: false, error: wk.error };
@@ -3354,8 +3459,9 @@ async function executeWorkspaceTool(args, options) {
         } else if (action === 'write') {
             var _wsContent = args.content;
             if (args.file_id && !_wsContent) {
+                // getFileAsync covers the unified store + every location pointer
+                // (and itself falls back to the chat scan), so no sync retry.
                 var _wsFile = await getFileAsync(args.file_id);
-                if (!_wsFile) _wsFile = getFile(args.file_id);
                 if (!_wsFile) return { success: false, error: 'File not found: ' + args.file_id };
                 _wsContent = _wsFile.data;
                 // Convert data URLs to workspace binary format (::binary::<raw_base64>)
@@ -3672,10 +3778,18 @@ async function wsHydrate(wk, matcher) {
             return;
         }
         if (!rec.stub || rec.content != null) { hydrated++; return; }
+        // Rm3 (#959): CAS against the pre-mutation snapshot so a concurrent
+        // wsDelete tombstone / wsWrite / pull repoint is never overwritten.
+        var _hydExpected = Object.assign({}, rec);
         rec.content = content;
         rec.original_content = content;
         rec.stub = false;
-        await setWorkspaceFile(rec);
+        var _hydCas = await _wsCasWrite(wk, stub.path, _hydExpected, rec);
+        if (!_hydCas || !_hydCas.ok) {
+            // Row changed under us: skip; the next read re-hydrates if needed.
+            if (_hydCas && _hydCas.error) { failed.push(stub.path); lastError = 'hydration write failed: ' + _hydCas.error; }
+            return;
+        }
         if (rec.file_id && !fileIndex.has(rec.file_id)) {
             registerFile(rec.file_id, { type: 'workspace', workspace: wk, path: rec.path });
         } else if (rec.file_id && typeof invalidateWorkspaceFilePointer === 'function') {
@@ -3929,6 +4043,10 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         file_id: _wrFileId,
         pushed_pr: (existing && !wasDeleted) ? existing.pushed_pr : null,
         pushed_shas: (existing && !wasDeleted) ? existing.pushed_shas : null,
+        pushed_pr_merged: (existing && !wasDeleted && existing.pushed_pr && existing.pushed_pr_merged) ? true : null,
+        // #1079: a write after a push leaves the PR stamp but flags the row
+        // as diverged from what was pushed (badge "changed since push").
+        changed_since_push: (existing && !wasDeleted && existing.pushed_pr) ? ((existing.changed_since_push || content !== existing.content) ? true : null) : null,
         last_modified_by_chat_id: _isDirty ? (chatId || null) : null,
         last_modified_by_chat_title: _isDirty ? (chatTitle || null) : null,
         last_modified_at: _isDirty ? Date.now() : null,
@@ -3981,6 +4099,7 @@ async function wsEdit(repo, filePath, edits, chatId, chatTitle, force) {
     if (result.error) return { success: false, error: 'All edits failed', validationErrors: result.messages };
 
     var _eExpected = Object.assign({}, file);
+    if (file.pushed_pr && result.content !== file.content) file.changed_since_push = true; // #1079
     file.content = result.content;
     // Net-zero edits (content matches original after rollback) should not be marked dirty.
     // A never-committed new file (original_content === null) stays dirty.
@@ -4090,6 +4209,7 @@ async function wsDelete(wk, filePath, chatId, chatTitle, force) {
         file.content = '';
         file.dirty = true;
         file.deleted = true;
+        if (file.pushed_pr) file.changed_since_push = true; // #1079
         file.last_modified_by_chat_id = chatId || null;
         file.last_modified_by_chat_title = chatTitle || null;
         file.last_modified_at = Date.now();
@@ -4174,7 +4294,10 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
         _dRemote = null;
         try {
             var _dRepo = meta.github_repo || parseWsKey(wk).repo;
-            var _dRef = await githubApi('GET', '/repos/' + _dRepo + '/git/ref/heads/' + encodeURIComponent(meta.branch));
+            // A never-pushed local fork has no remote branch yet — read the
+            // base branch it was cut from instead of 404ing on its own name.
+            var _dBranch = (_wsForkNeverPushed(meta) && meta.base_branch) ? meta.base_branch : meta.branch;
+            var _dRef = await githubApi('GET', '/repos/' + _dRepo + '/git/ref/heads/' + encodeURIComponent(_dBranch));
             if (!_dRef || !_dRef.ok || !_dRef.body || !_dRef.body.object || !_dRef.body.object.sha) return null;
             // No up-to-date shortcut: even at our own head the path may be gone
             // upstream (a pre-fix sync moved HEAD past the deletion), so the
@@ -4224,6 +4347,22 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
                     continue;
                 }
                 var _dRs = _dRt.tree[f.path] || null;
+                if (!_dRs && f.deleted) {
+                    // m14: deleted locally AND on the remote — both sides agree,
+                    // so drop the row (CAS) instead of refusing as remote_deleted.
+                    var _dBoth;
+                    try { _dBoth = await _wsCasWrite(wk, f.path, _dSnap, null); } catch (e) { _dBoth = { ok: false, error: e && e.message }; }
+                    if (!_dBoth || !_dBoth.ok) {
+                        if (_dBoth && _dBoth.conflict) {
+                            _dRaced.push(f.path);
+                            if (filePath) return { success: false, conflict: true, path: f.path, error: 'File changed concurrently — not discarded: ' + f.path };
+                        }
+                        continue;
+                    }
+                    if (f.file_id) unregisterFile(f.file_id);
+                    discarded.push({ path: f.path, action: 'removed' });
+                    continue;
+                }
                 if (!_dRs) {
                     if (filePath) return { success: false, remote_deleted: true, path: f.path, error: 'Discard refused — ' + f.path + ' no longer exists on the remote branch (deleted upstream), so its stale base was NOT restored. To drop your local copy use workspace delete on it; to keep your edits, leave it (sync reports it as a remote_deleted conflict).' };
                     _dRemoteDeleted.push(f.path);
@@ -4318,7 +4457,10 @@ async function setWorkspacePin(wk, unpin) {
         }
     }
     // S8B-01: patch only `pinned` on the fresh row, never the stale `meta` snapshot.
-    await patchWorkspaceMeta(wk, function(c) { c.pinned = !unpin; });
+    // m6: the row can vanish between the read above and this patch (concurrent
+    // delete) — patchWorkspaceMeta then resolves false; never report success.
+    var _pinWritten = await patchWorkspaceMeta(wk, function(c) { c.pinned = !unpin; });
+    if (_pinWritten === false) return { success: false, error: 'Workspace "' + wk + '" disappeared before the pin could be written.', unpinned: cleared.length ? cleared : undefined };
     try { AgentEvents.emit('workspaceMutated', { action: 'pin', repo: wk, pinned: !unpin }); } catch (e) {}
     var res = { success: true, workspace: wk, pinned: !unpin };
     if (cleared.length) res.unpinned = cleared;
@@ -4593,10 +4735,24 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
     }
 
     // Pass 2 — execute: write onto target, then discard the source row.
+    // RM1 (#959): every write is compare-and-swap against the pass-1 plan
+    // rows. A source edited after planning is NOT moved (its newer edit stays
+    // in the source; reported in changed_during_move); a target row changed
+    // after planning is NOT overwritten (reported in target_changed).
     var moved = [];
+    var changedDuringMove = [];
+    var targetChanged = [];
+    var _mvRev = (typeof _wsRowRevision === 'function') ? _wsRowRevision : function(r) { return r ? JSON.stringify([!!r.dirty, !!r.deleted, r.sha || null, r.last_modified_at || null, r.dirty ? r.content : null]) : null; };
     for (var mi = 0; mi < plan.length; mi++) {
         var src = plan[mi].src;
         var tgt = plan[mi].tgt;
+        // Pre-check: the source row must still be the planned snapshot.
+        var _mvCur = null;
+        try { _mvCur = await getWorkspaceFile(wk, src.path); } catch (e) { _mvCur = null; }
+        if (_mvRev(_mvCur) !== _mvRev(src)) { changedDuringMove.push(src.path); continue; }
+        // Snapshot the planned target BEFORE the in-place mutation below.
+        var _tgtSnap = tgt ? Object.assign({}, tgt) : null;
+        var _tgtWrite;
         if (src.deleted) {
             // Move a deletion: tombstone the target row (its own original is
             // kept for restore-on-discard).
@@ -4605,7 +4761,7 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
             tgt.last_modified_by_chat_id = src.last_modified_by_chat_id || chatId || null;
             tgt.last_modified_by_chat_title = src.last_modified_by_chat_title || chatTitle || null;
             tgt.last_modified_at = Date.now();
-            await setWorkspaceFile(tgt);
+            _tgtWrite = tgt;
         } else if (tgt) {
             // Recompute dirty against the TARGET's own original.
             var clean = false;
@@ -4635,11 +4791,11 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
                 tgt.last_modified_by_chat_title = src.last_modified_by_chat_title || chatTitle || null;
                 tgt.last_modified_at = Date.now();
             }
-            await setWorkspaceFile(tgt);
+            _tgtWrite = tgt;
         } else {
             // No target row — becomes a new file in the target workspace.
             var nfId = newFileId();
-            await setWorkspaceFile({
+            _tgtWrite = {
                 id: targetWk + '::' + src.path,
                 repo: targetWk,
                 path: src.path,
@@ -4655,12 +4811,24 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
                 last_modified_by_chat_id: src.last_modified_by_chat_id || chatId || null,
                 last_modified_by_chat_title: src.last_modified_by_chat_title || chatTitle || null,
                 last_modified_at: Date.now()
-            });
-            registerFile(nfId, { type: 'workspace', workspace: targetWk, path: src.path });
+            };
         }
+        var _tw;
+        try { _tw = await _wsCasWrite(targetWk, src.path, _tgtSnap, _tgtWrite); } catch (e) { _tw = { ok: false, error: e && e.message }; }
+        if (!_tw || !_tw.ok) {
+            // Target changed since planning (or write failed): leave both
+            // rows as they are — the source keeps its edit.
+            targetChanged.push(src.path);
+            continue;
+        }
+        if (!tgt) registerFile(nfId, { type: 'workspace', workspace: targetWk, path: src.path });
         // Discard the source row — restores clean content, releases ownership
         // stamps, removes never-committed new files (+ unregisters file_id).
-        try { await wsDiscard(wk, src.path, chatId, chatTitle, true); } catch (e) {}
+        // CAS'd against the planned snapshot: a source edit that lands after
+        // the pre-check is kept on the source (target holds the earlier one).
+        var _disc = null;
+        try { _disc = await wsDiscard(wk, src.path, chatId, chatTitle, true, { expected: src }); } catch (e) { _disc = null; }
+        if (_disc && !_disc.success && _disc.conflict) { changedDuringMove.push(src.path); continue; }
         moved.push(src.path);
     }
 
@@ -4675,6 +4843,18 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
     };
     if (baseDiverged.length > 0) {
         result.warning = 'Base diverged for ' + baseDiverged.length + ' file(s) — the target\'s original differs from the source\'s; review the diff in the target workspace.';
+    }
+    if (changedDuringMove.length > 0) {
+        result.changed_during_move = changedDuringMove;
+        var _cdw = changedDuringMove.length + ' source file(s) changed while moving and were NOT discarded from the source (it keeps the newer edit; the target may hold the earlier version): ' + changedDuringMove.join(', ') + '.';
+        result.warning = (result.warning ? result.warning + ' ' : '') + _cdw;
+        result.message += ' WARNING: ' + _cdw;
+    }
+    if (targetChanged.length > 0) {
+        result.target_changed = targetChanged;
+        var _tcw = targetChanged.length + ' target file(s) changed concurrently and were NOT overwritten (source left as is): ' + targetChanged.join(', ') + '.';
+        result.warning = (result.warning ? result.warning + ' ' : '') + _tcw;
+        result.message += ' WARNING: ' + _tcw;
     }
     return result;
 }
@@ -4963,6 +5143,8 @@ async function wsStatus(wk, includeIgnored, chatId, includePrs) {
     var foreignRecentCount = 0;
     var dirty = files.filter(function(f) { return f.dirty && !isIgnored(f.path); }).map(function(f) {
         var entry = { path: f.path, isNew: !f.sha && !f.deleted, isDeleted: !!f.deleted, size: f.deleted ? 0 : (f.content != null ? f.content.length : (f.size || 0)), pushed_pr: f.pushed_pr || null };
+        if (f.pushed_pr && f.changed_since_push) entry.changed_since_push = true;
+        if (f.pushed_pr && f.pushed_pr_merged) entry.pushed_pr_merged = true;
         if (f.last_modified_by_chat_id) {
             entry.last_modified_by_chat_id = f.last_modified_by_chat_id;
             entry.last_modified_by_chat_title = f.last_modified_by_chat_title || null;
@@ -5025,6 +5207,19 @@ async function wsStatus(wk, includeIgnored, chatId, includePrs) {
         if (syncResult.conflictFiles && syncResult.conflictFiles.length > 0) result.conflict_files = syncResult.conflictFiles;
         if (syncResult.merge_warning) result.merge_warning = syncResult.merge_warning;
         if (syncResult.pending_rebase && syncResult.pending_rebase.length > 0) result.pending_rebase = syncResult.pending_rebase;
+        // #1079: readOnly sync detected GitHub-merged PRs — annotate only.
+        var _sm = syncResult.merged_prs;
+        if (_sm && typeof _sm === 'object') {
+            result.prs = (result.prs || []).map(function(p) {
+                var n = p && _wsPrRefNumber(p);
+                if (!n || !_sm.hasOwnProperty(n) || p.state === 'merged') return p;
+                return Object.assign({}, p, { state: 'merged', merged_at: p.merged_at || _sm[n] });
+            });
+            result.dirty_files.forEach(function(e) {
+                var n = e.pushed_pr && _wsPrRefNumber(e.pushed_pr);
+                if (n && _sm.hasOwnProperty(n)) e.pushed_pr_merged = true;
+            });
+        }
     }
     // Pin state: expose this workspace's pin, and a short notice when a
     // SIBLING workspace of the same repo holds the pin (it — not this one —
@@ -5393,10 +5588,7 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
         var anyPin = wasPinned || _sameRepoOthers.some(function(m) { return !!(m && m.pinned); });
         var pinFlipped = false;
         if ((wasPinned || !anyPin) && baseSynced) {
-            try {
-                var pinRes = await setWorkspacePin(baseWk, false);
-                pinFlipped = !!(pinRes && pinRes.success);
-            } catch (e) {}
+            pinFlipped = await _wsHandoffPin(baseWk);
         }
 
         // 3.5 Preserve this fork's PR records (incl. their per-file diff
@@ -5410,32 +5602,15 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
                 return p && (p.number === mergedPr.number || p.url === mergedPr.html_url || p.branch === branch);
             });
             if (_forkPrs.length) {
-                var _baseMeta = await getWorkspaceMeta(baseWk);
-                if (_baseMeta) {
-                    if (!_baseMeta.prs) _baseMeta.prs = [];
-                    _forkPrs.forEach(function(p) {
-                        // Flip the originating chat's progress card to 'pr_merged'
-                        // (context-safe — works in both SW and page bundles, see
-                        // wsNotifyPrMerged).
-                        if (p.chatId) {
-                            try { wsNotifyPrMerged(p.chatId, p); } catch (e) {}
-                        }
-                        var _copy = Object.assign({}, p, { state: 'merged', merged_at: mergedPr.merged_at || new Date().toISOString() });
-                        var _dupIdx = -1;
-                        for (var _d = 0; _d < _baseMeta.prs.length; _d++) {
-                            var _bp = _baseMeta.prs[_d];
-                            if (_bp && ((_bp.url && _bp.url === p.url) || (_bp.number && _bp.number === p.number))) { _dupIdx = _d; break; }
-                        }
-                        if (_dupIdx >= 0) {
-                            // Keep the richer record — never lose an existing files snapshot.
-                            if (!_copy.files && _baseMeta.prs[_dupIdx].files) _copy.files = _baseMeta.prs[_dupIdx].files;
-                            _baseMeta.prs[_dupIdx] = _copy;
-                        } else {
-                            _baseMeta.prs.push(_copy);
-                        }
-                    });
-                    await setWorkspaceMeta(_baseMeta);
-                }
+                await _wsMergePrRecords(baseWk, _forkPrs, function(p) {
+                    // Flip the originating chat's progress card to 'pr_merged'
+                    // (context-safe — works in both SW and page bundles, see
+                    // wsNotifyPrMerged).
+                    if (p.chatId) {
+                        try { wsNotifyPrMerged(p.chatId, p); } catch (e) {}
+                    }
+                    return Object.assign({}, p, { state: 'merged', merged_at: mergedPr.merged_at || new Date().toISOString() });
+                });
             }
         } catch (e) {}
 
@@ -5471,6 +5646,219 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
     }
 }
 
+// Merge PR records into `targetWk`'s meta.prs (dedupe by url/number; on a
+// duplicate keep the richer record — never lose an existing files snapshot).
+// `mapFn(p)` returns the record to store (default: a shallow copy). Resolves
+// the number of records written, 0 when the target meta is missing. Shared by
+// merge-lifecycle auto-delete (step 3.5) and the delete_workspace action.
+async function _wsMergePrRecords(targetWk, prs, mapFn) {
+    if (!targetWk || !prs || !prs.length) return 0;
+    var tm = await getWorkspaceMeta(targetWk);
+    if (!tm) return 0;
+    if (!tm.prs) tm.prs = [];
+    prs.forEach(function(p) {
+        if (!p) return;
+        var copy = mapFn ? mapFn(p) : Object.assign({}, p);
+        var dupIdx = -1;
+        for (var d = 0; d < tm.prs.length; d++) {
+            var bp = tm.prs[d];
+            if (bp && ((bp.url && bp.url === p.url) || (bp.number && bp.number === p.number))) { dupIdx = d; break; }
+        }
+        if (dupIdx >= 0) {
+            if (!copy.files && tm.prs[dupIdx].files) copy.files = tm.prs[dupIdx].files;
+            tm.prs[dupIdx] = copy;
+        } else {
+            tm.prs.push(copy);
+        }
+    });
+    await setWorkspaceMeta(tm);
+    return prs.length;
+}
+
+// Move the pin onto `targetWk` (setWorkspacePin clears every sibling pin of
+// the same owner/repo). Best-effort: resolves true when the pin landed.
+// Shared by merge-lifecycle auto-delete and the delete_workspace action.
+async function _wsHandoffPin(targetWk) {
+    if (!targetWk) return false;
+    try {
+        var pinRes = await setWorkspacePin(targetWk, false);
+        return !!(pinRes && pinRes.success);
+    } catch (e) {
+        return false;
+    }
+}
+
+// Upper bound for the default-branch GitHub lookup in _wsPinHandoffTarget.
+var _WS_PIN_LOOKUP_TIMEOUT_MS = 5000;
+
+// Pick the workspace that inherits the pin / PR records when `wk` is deleted:
+// its forked_from parent if cloned, else a locally cloned same-repo ::main or
+// ::master (no network), else the same-repo workspace on the repo's default
+// branch (GitHub lookup, capped at _WS_PIN_LOOKUP_TIMEOUT_MS), else any other
+// same-repo workspace. null = none.
+async function _wsPinHandoffTarget(wk, meta) {
+    var githubRepo = meta.github_repo || parseWsKey(wk).repo;
+    var allMetas = (await getAllWorkspaceMetas()) || [];
+    var others = allMetas.filter(function(m) {
+        return m && m.repo !== wk && (m.github_repo || parseWsKey(m.repo).repo) === githubRepo;
+    });
+    if (!others.length) return null;
+    if (meta.forked_from) {
+        for (var i = 0; i < others.length; i++) if (others[i].repo === meta.forked_from) return others[i].repo;
+    }
+    function byBranch(b) {
+        for (var j = 0; j < others.length; j++) {
+            if ((others[j].branch || parseWsKey(others[j].repo).branch) === b) return others[j].repo;
+        }
+        return null;
+    }
+    var local = byBranch('main') || byBranch('master');
+    if (local) return local;
+    var defBranch = null;
+    if (typeof githubApi === 'function') {
+        var timer = null;
+        try {
+            var repoRes = await Promise.race([
+                githubApi('GET', '/repos/' + githubRepo),
+                new Promise(function(resolve) { timer = setTimeout(function() { resolve(null); }, _WS_PIN_LOOKUP_TIMEOUT_MS); })
+            ]);
+            if (repoRes && repoRes.ok && repoRes.body) defBranch = repoRes.body.default_branch || null;
+        } catch (e) {
+        } finally {
+            if (timer !== null) { try { clearTimeout(timer); } catch (e) {} }
+        }
+    }
+    return (defBranch && byBranch(defBranch)) || others[0].repo;
+}
+
+// workspace action `delete_workspace`: remove a LOCAL workspace (file rows,
+// meta, then blob GC). Never touches the GitHub branch or PRs.
+//  - dirty (non-ignored) rows owned by another RUNNING chat (hard conflict)
+//    always refuse, even with force;
+//  - other dirty rows refuse unless force (force discards them);
+//  - a pinned workspace hands its pin to _wsPinHandoffTarget (forked_from,
+//    else local main/master, else default branch, else any same-repo ws);
+//  - meta.prs records are carried over to that target (prs_dropped if none);
+//  - mutually exclusive with merge-lifecycle auto-delete of the same wk
+//    (shared _wsAutoDelInProgress guard).
+async function wsDeleteWorkspace(wk, chatId, force) {
+    if (_wsAutoDelInProgress[wk]) {
+        return { success: false, auto_delete_in_progress: true,
+            error: 'Refusing to delete workspace ' + wk + ': auto-delete in progress (merge lifecycle). Retry once it finishes.' };
+    }
+    _wsAutoDelInProgress[wk] = true;
+    try {
+        return await _wsDeleteWorkspaceGuarded(wk, chatId, force);
+    } finally {
+        delete _wsAutoDelInProgress[wk];
+    }
+}
+
+// Dirty / hard-conflict scan of a workspace's file rows (synchronous).
+function _wsDeleteScan(files, isIgnored, chatId) {
+    var dirty = files.filter(function(f) { return f && f.dirty && !isIgnored(f.path); });
+    var hard = [];
+    dirty.forEach(function(f) {
+        var c = _wsCheckCrossChatConflict(f, chatId);
+        if (c && c.hard) hard.push({ path: f.path, chat: c.last_modified_by_chat_id || null });
+    });
+    return { dirtyPaths: dirty.map(function(f) { return f.path; }), hardConflicts: hard };
+}
+
+function _wsDeleteConflictError(wk, hardConflicts) {
+    return { success: false, cross_chat_conflict: true, conflicts: hardConflicts,
+        error: 'Refusing to delete workspace ' + wk + ': ' + hardConflicts.length + ' uncommitted file(s) belong to another chat that is still running (force does not override this): ' + hardConflicts.map(function(h) { return h.path; }).join(', ') };
+}
+
+async function _wsDeleteWorkspaceGuarded(wk, chatId, force) {
+    var meta = await getWorkspaceMeta(wk);
+    if (!meta) return { success: false, error: 'Workspace not found: ' + wk };
+    var isIgnored = await wsGetIgnoreFilter(wk);
+    var files = (await getAllWorkspaceFiles(wk)) || [];
+
+    // 1. Early scan: refuse fast, before any (possibly networked) lookup.
+    var scan = _wsDeleteScan(files, isIgnored, chatId);
+    if (scan.hardConflicts.length) return _wsDeleteConflictError(wk, scan.hardConflicts);
+    if (scan.dirtyPaths.length && !force) {
+        return { success: false, dirty: scan.dirtyPaths,
+            error: 'Refusing to delete workspace ' + wk + ': ' + scan.dirtyPaths.length + ' file(s) have uncommitted changes: ' + scan.dirtyPaths.join(', ') + '. Push or move them first, or pass force:true to discard them.' };
+    }
+
+    // 2. Resolve the pin / PR-record target now — it may await GitHub, so it
+    //    must come BEFORE the final scan, never between it and the delete.
+    var wasPinned = !!meta.pinned;
+    var prs = (meta.prs || []).filter(Boolean);
+    var target = (wasPinned || prs.length) ? await _wsPinHandoffTarget(wk, meta) : null;
+
+    // 2.5 Carry PR records to the target BEFORE the delete (same order as
+    //     auto-delete step 3.5). Records are copied, not moved, so a refused
+    //     delete below loses nothing. Kept before the final re-scan so no
+    //     await separates that scan from the delete.
+    var carried = 0;
+    if (prs.length && target) { try { carried = await _wsMergePrRecords(target, prs); } catch (e) { carried = 0; } }
+
+    // 3. Final re-scan on fresh rows (catches writes that landed during the
+    //    lookup). No await between this check and the delete call below.
+    files = (await getAllWorkspaceFiles(wk)) || [];
+    scan = _wsDeleteScan(files, isIgnored, chatId);
+    if (scan.hardConflicts.length) return _wsDeleteConflictError(wk, scan.hardConflicts);
+    if (scan.dirtyPaths.length && !force) {
+        return { success: false, dirty: scan.dirtyPaths,
+            error: 'Workspace ' + wk + ' was NOT deleted: ' + scan.dirtyPaths.length + ' file(s) became dirty during the delete: ' + scan.dirtyPaths.join(', ') + '. Pass force:true to discard them.' };
+    }
+    var dirtyPaths = scan.dirtyPaths;
+    // Collect file-store registrations BEFORE the rows are gone.
+    var fileIds = files.filter(function(f) { return f && f.file_id; }).map(function(f) { return f.file_id; });
+
+    // 4. Atomic delete (core/130 deleteWorkspaceIfClean: check + delete in ONE
+    //    IDB transaction). Without force any non-ignored dirty row keeps the
+    //    workspace; with force only rows owned by another RUNNING chat (hard
+    //    conflict, re-evaluated inside the transaction on the live row) do.
+    var txOwners = {};
+    var keepFilter = force
+        ? function(path, row) {
+            if (isIgnored(path)) return true;
+            var c = row ? _wsCheckCrossChatConflict(row, chatId) : null;
+            if (c && c.hard) { txOwners[path] = (row && row.last_modified_by_chat_id) || null; return false; }
+            return true;
+        }
+        : isIgnored;
+    var delRes;
+    try {
+        delRes = await deleteWorkspaceIfClean(wk, keepFilter);
+    } catch (e) {
+        return { success: false, error: String(e) };
+    }
+    if (!delRes || delRes.kept) {
+        var late = (delRes && delRes.dirty) || [];
+        if (force) {
+            return _wsDeleteConflictError(wk, late.map(function(p) { return { path: p, chat: Object.prototype.hasOwnProperty.call(txOwners, p) ? txOwners[p] : null }; }));
+        }
+        return { success: false, dirty: late,
+            error: 'Workspace ' + wk + ' was NOT deleted: ' + late.length + ' file(s) became dirty during the delete: ' + late.join(', ') + '. Pass force:true to discard them.' };
+    }
+    try { gcWorkspaceBlobs(); } catch (e) {}
+    if (typeof unregisterFile === 'function') {
+        fileIds.forEach(function(id) { try { unregisterFile(id); } catch (e) {} });
+    }
+
+    var pinMovedTo = null;
+    if (wasPinned && target && await _wsHandoffPin(target)) pinMovedTo = target;
+
+    var result = {
+        success: true,
+        deleted: wk,
+        files_discarded: force ? dirtyPaths : [],
+        pin_moved_to: pinMovedTo,
+        note: 'Local only \u2014 the GitHub branch and any PRs are untouched.'
+    };
+    if (prs.length) {
+        if (carried) result.prs_carried_to = target;
+        else result.prs_dropped = prs.length;
+    }
+    return result;
+}
+
 // Notify the originating chat that its pushed PR merged — flips the chat's
 // progress card from 'pr_opened' to the internal 'pr_merged' display state.
 //
@@ -5498,6 +5886,19 @@ function wsNotifyPrMerged(chatId, prRef) {
     try {
         var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
         if (!chat) return;
+        // MSG-EVICT: a cold (skeleton) chat has no messages to derive its card
+        // state from — hydrate it, then re-run once it has messages
+        // (ensureChatPayloads never rejects; a miss leaves the skeleton → no
+        // flip, fail closed). A persisted override needs no messages.
+        if (!(chat.progressStateOverride && chat.progressStateOverride.state)
+            && !Array.isArray(chat.messages) && chat._messagesEvicted) {
+            if (typeof ensureChatPayloads !== 'function') return;
+            Promise.resolve(ensureChatPayloads(chatId)).then(function() {
+                var _hc = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+                if (_hc && Array.isArray(_hc.messages)) wsNotifyPrMerged(chatId, prRef);
+            }, function() {});
+            return;
+        }
         // Conservative guard (mirrors markChatPrMerged): only a chat currently
         // showing 'pr_opened' flips — done/error/running cards keep their state.
         if (_wsChatProgressState(chat) !== 'pr_opened') return;
@@ -5661,13 +6062,149 @@ async function _wsPrConfirmedMerged(githubRepo, prRef, cache) {
     var num = prRef && (prRef.number || (String(prRef.url || '').match(/\/pulls?\/(\d+)/) || [])[1]);
     if (!num || !githubRepo) return false;
     if (cache && cache[num] !== undefined) return cache[num];
+    // Shares the module memo with _wsReconcileMergedPrs (#1079): one GET per PR.
     var merged = false;
-    try {
-        var r = await githubApi('GET', '/repos/' + githubRepo + '/pulls/' + num);
-        merged = !!(r && r.ok && r.body && (r.body.merged === true || r.body.merged_at));
-    } catch (e) { merged = false; }
+    try { merged = !!(await _wsPrMergeInfo(githubRepo, num)).merged; } catch (e) { merged = false; }
     if (cache) cache[num] = merged;
     return merged;
+}
+
+// #1079: {merged, merged_at, closed} for PR `num` from GET /pulls/N.
+// Fail-closed (an API error reads as not merged, not closed). Memoized per
+// module: merged AND closed-without-merge results are final and cached for
+// good (a closed PR is never polled again); open / failed results expire
+// after 60 s so a sync loop costs at most one GET per PR per minute. `cache`
+// (optional) is a per-call memo on top.
+var _WS_PR_MERGE_MEMO = {};
+var WS_PR_OPEN_TTL_MS = 60000;
+async function _wsPrMergeInfo(githubRepo, num, cache) {
+    num = Number(num);
+    var none = { merged: false, merged_at: null };
+    if (!num || !githubRepo) return none;
+    var key = githubRepo + '#' + num;
+    if (cache && cache[key]) return cache[key];
+    var hit = _WS_PR_MERGE_MEMO[key];
+    if (hit && (hit.info.merged || hit.info.closed || (Date.now() - hit.at) < WS_PR_OPEN_TTL_MS)) {
+        if (cache) cache[key] = hit.info;
+        return hit.info;
+    }
+    var info = none;
+    try {
+        var r = await githubApi('GET', '/repos/' + githubRepo + '/pulls/' + num);
+        if (r && r.ok && r.body && (r.body.merged === true || r.body.merged_at)) {
+            info = { merged: true, merged_at: r.body.merged_at || new Date().toISOString() };
+        } else if (r && r.ok && r.body && r.body.state === 'closed') {
+            // Closed WITHOUT merge: final for our purposes (a later push to the
+            // branch re-tracks a fresh meta.prs entry without this state).
+            info = { merged: false, merged_at: null, closed: true };
+        }
+    } catch (e) { info = none; }
+    _WS_PR_MERGE_MEMO[key] = { info: info, at: Date.now() };
+    if (cache) cache[key] = info;
+    return info;
+}
+
+function _wsPrRefNumber(ref) {
+    if (!ref) return null;
+    var n = ref.number || (String(ref.url || '').match(/\/pulls?\/(\d+)/) || [])[1];
+    n = Number(n);
+    return n || null;
+}
+
+// #1079: detect PRs merged on GitHub for a workspace that is NOT their head
+// branch (typically the base ::main workspace that pushed via branch_name) and
+// drop their stale "PR #N" stamps. Candidates: pushed_pr of dirty rows, then
+// unmerged meta.prs entries (newest first), capped at 10; PRs whose head is
+// meta.branch are left to the head-branch lifecycle (wsMaybeAutoDeleteMerged).
+// opts.readOnly: detect only (returns {merged:{num:merged_at}}), no writes.
+// Otherwise: stamp state merged/closed on a FRESH meta (closed PRs then drop
+// out of the candidate list), and for rows stamped with a merged PR:
+//  - content equals original_content (nothing local left) -> mark clean and
+//    clear the stamps;
+//  - otherwise only set pushed_pr_merged:true (hides the UI badge) and KEEP
+//    pushed_pr / pushed_shas. This reconcile does not know whether the row's
+//    content has landed in the base yet (raced rows, blobFetchFailed
+//    conflicts, HEAD not advanced): the sync's _isOurWork match, the
+//    '::deleted::' sentinel and the _m3PrMerged 3-way path all need that
+//    evidence and clear it themselves once the content actually lands.
+// Divergent content always stays dirty (never discarded).
+async function _wsReconcileMergedPrs(wk, meta, githubRepo, opts) {
+    opts = opts || {};
+    var out = { merged: {}, cleared: [], cleaned: [] };
+    if (!meta || !githubRepo) return out;
+    var files;
+    try { files = (await getAllWorkspaceFiles(wk)) || []; } catch (e) { return out; }
+    var seen = {}, order = [];
+    function add(ref) {
+        var num = _wsPrRefNumber(ref);
+        if (!num || seen[num] || order.length >= 10) return;
+        if (ref.branch && ref.branch === meta.branch) return;
+        seen[num] = true; order.push(num);
+    }
+    files.forEach(function(f) { if (f && f.dirty && f.pushed_pr && !f.pushed_pr_merged) add(f.pushed_pr); });
+    var _mp = Array.isArray(meta.prs) ? meta.prs : [];
+    for (var i = _mp.length - 1; i >= 0; i--) {
+        if (_mp[i] && _mp[i].state !== 'merged' && _mp[i].state !== 'closed' && !_mp[i].merged_at) add(_mp[i]);
+    }
+    if (!order.length) return out;
+    var cache = {}, any = false, closed = {}, anyClosed = false;
+    for (var j = 0; j < order.length; j++) {
+        var info = await _wsPrMergeInfo(githubRepo, order[j], cache);
+        if (info && info.merged) { out.merged[order[j]] = info.merged_at; any = true; }
+        else if (info && info.closed) { closed[order[j]] = true; anyClosed = true; }
+    }
+    if ((!any && !anyClosed) || opts.readOnly) return out;
+
+    // meta.prs state on a freshly read meta (never clobber concurrent writes).
+    try {
+        var fresh = await getWorkspaceMeta(wk);
+        if (fresh && Array.isArray(fresh.prs)) {
+            var changed = false;
+            fresh.prs.forEach(function(p) {
+                var n = _wsPrRefNumber(p);
+                if (p && n && closed[n] && !p.state) { p.state = 'closed'; changed = true; return; }
+                if (!p || !n || !out.merged.hasOwnProperty(n) || p.state === 'merged') return;
+                p.state = 'merged';
+                if (!p.merged_at) p.merged_at = out.merged[n];
+                changed = true;
+                if (p.chatId && typeof wsNotifyPrMerged === 'function') { try { wsNotifyPrMerged(p.chatId, p); } catch (e) {} }
+            });
+            if (changed) await setWorkspaceMeta(fresh);
+        }
+    } catch (e) { /* best-effort */ }
+    if (!any) return out;
+
+    for (var k = 0; k < files.length; k++) {
+        var f = files[k];
+        var fn = f && f.pushed_pr ? _wsPrRefNumber(f.pushed_pr) : null;
+        if (!fn || !out.merged.hasOwnProperty(fn)) continue;
+        var clean = !f.deleted && f.original_content != null && f.content === f.original_content;
+        if (!clean && f.pushed_pr_merged) continue;
+        // Dirty row: badge-only marker, merge evidence kept (see header).
+        var next = clean
+            ? Object.assign({}, f, { pushed_pr: null, pushed_shas: null, changed_since_push: null, pushed_pr_merged: null })
+            : Object.assign({}, f, { pushed_pr_merged: true });
+        if (clean) {
+            next.dirty = false;
+            next.last_modified_by_chat_id = null;
+            next.last_modified_by_chat_title = null;
+            next.last_modified_at = null;
+            next.force_taken_from = null;
+        }
+        var cas = null;
+        try { cas = await _wsCasWrite(wk, f.path, f, next); } catch (e) { cas = null; }
+        if (cas && cas.ok) { out.cleared.push(f.path); if (clean) out.cleaned.push(f.path); }
+    }
+    return out;
+}
+
+// True for a LOCAL fork workspace (branch action) whose branch has never been
+// pushed: it does not exist on GitHub yet, so ref/pulls lookups would only 404.
+// wsPush upserts {branch: branch_name} into meta.prs, which flips this to false.
+function _wsForkNeverPushed(meta) {
+    if (!meta || !meta.forked_from) return false;
+    var prs = Array.isArray(meta.prs) ? meta.prs : [];
+    return !prs.some(function (p) { return p && p.branch === meta.branch; });
 }
 
 // opts.autoPull: after syncing, fast-forward clean behind files via wsPull
@@ -5680,6 +6217,10 @@ async function wsSyncWithRemote(wk, opts) {
     var _ro = !!opts.readOnly;
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return null;
+    // Never-pushed local fork: the branch is not on GitHub yet, so skip the
+    // merged-PR lookup and the ref GET (both would only 404 on every sync).
+    // Same shape as the 404 branchGone return below; callers already handle it.
+    if (_wsForkNeverPushed(meta)) return { branchGone: true, branch: meta.branch, local_fork_unpushed: true };
     var githubRepo = meta.github_repo || parseWsKey(wk).repo;
 
     // Auto-delete this workspace when its branch is the head of a MERGED PR whose
@@ -5720,6 +6261,11 @@ async function wsSyncWithRemote(wk, opts) {
     if (remoteHead === meta.head_sha) {
         var _upToDate = { synced: 0, behind: false, remoteHead: remoteHead, dirty_remaining: -1 };
         if (_mergeWarning) _upToDate.merge_warning = _mergeWarning;
+        // #1079: PRs pushed from here may have merged without moving HEAD.
+        try {
+            var _recU = await _wsReconcileMergedPrs(wk, meta, githubRepo, { readOnly: _ro });
+            if (Object.keys(_recU.merged).length) _upToDate.merged_prs = _recU.merged;
+        } catch (e) { /* best-effort */ }
         return _upToDate;
     }
 
@@ -5871,7 +6417,7 @@ async function wsSyncWithRemote(wk, opts) {
                             var _idx = cf.pushed_shas.indexOf(_remoteSha);
                             if (_idx !== -1) cf.pushed_shas = cf.pushed_shas.slice(_idx + 1);
                             if (!cf.pushed_shas.length) {
-                                cf.pushed_shas = null; cf.pushed_pr = null;
+                                cf.pushed_shas = null; cf.pushed_pr = null; cf.pushed_pr_merged = null;
                                 // The FINAL pushed content landed on the cloned branch
                                 // — the PR merged. Pushes made from the base workspace
                                 // itself have no fork to auto-delete, so THIS is where
@@ -5934,7 +6480,7 @@ async function wsSyncWithRemote(wk, opts) {
                                     cf.content = _m3.content;
                                     cf.stub = false;
                                     // Unconfirmed exact match: base adopted, PR link kept.
-                                    if (_m3PrMerged || !_m3PrRef) { cf.pushed_pr = null; cf.pushed_shas = null; }
+                                    if (_m3PrMerged || !_m3PrRef) { cf.pushed_pr = null; cf.pushed_shas = null; cf.pushed_pr_merged = null; }
                                     if (_m3Clean) {
                                         cf.dirty = false;
                                         cf.last_modified_by_chat_id = null;
@@ -6048,6 +6594,12 @@ async function wsSyncWithRemote(wk, opts) {
     } else if (_metaPrsDirty) {
         await setWorkspaceMeta(meta);
     }
+    // #1079: GitHub-confirmed merges not caught by the content evidence above.
+    var _recMerged = null;
+    try {
+        var _recE = await _wsReconcileMergedPrs(wk, meta, githubRepo, { readOnly: _ro });
+        if (Object.keys(_recE.merged).length) _recMerged = _recE.merged;
+    } catch (e) { /* best-effort */ }
 
     // Count remaining dirty files
     var remaining = (await getAllWorkspaceFiles(wk)).filter(function(f) { return f.dirty && !isIgnored(f.path); }).length;
@@ -6057,6 +6609,7 @@ async function wsSyncWithRemote(wk, opts) {
     if (_rebasedList.length) _syncRet.rebased = _rebasedList;
     if (_mergeWarning) _syncRet.merge_warning = _mergeWarning;
     if (_roPending.length) _syncRet.pending_rebase = _roPending;
+    if (_recMerged) _syncRet.merged_prs = _recMerged;
     // Fast-forward clean behind files (opt-in; the ↻/auto-sync UI path only).
     // wsPull reuses THIS sync's result (no extra sync of its own) and only
     // ever writes rows that are still clean (per-row CAS); then exactly ONE
@@ -6869,7 +7422,9 @@ async function wsPush(wk, args, chatId, chatTitle) {
             entry.message = 'No recorded owner (the editing chat was not recorded for this file).';
         }
         var _prevPr = f.pushed_pr;
-        if (_prevPr && (_prevPr.number !== prNumber || _prevPr.branch !== args.branch_name)) {
+        // #1079: a stamp kept only as merge evidence (pushed_pr_merged) is not
+        // a competing open PR — no warning.
+        if (_prevPr && !f.pushed_pr_merged && (_prevPr.number !== prNumber || _prevPr.branch !== args.branch_name)) {
             _pushCrossChatWarnings.push({
                 path: f.path,
                 other_pr_number: _prevPr.number || null,
@@ -6893,7 +7448,13 @@ async function wsPush(wk, args, chatId, chatTitle) {
         // failed snapshot never fails the push bookkeeping.
         var _prFiles = [];
         for (var k = 0; k < dirtyFiles.length; k++) {
+            // #1079: stamp ONLY rows actually in this commit (a blob was
+            // created for it, or it is a tree deletion).
+            if (!blobShas[dirtyFiles[k].path] && !dirtyFiles[k].deleted) continue;
             dirtyFiles[k].pushed_pr = prInfo;
+            // The row now matches what was pushed (and the new PR is open).
+            dirtyFiles[k].changed_since_push = null;
+            dirtyFiles[k].pushed_pr_merged = null;
             // Preserve the pushing chat for DISPLAY (workspace dropdown chat chip)
             // before the blocking ownership stamp is released below. An append push
             // from a chat that didn't re-edit keeps the earlier pushed_by stamp.
@@ -6910,7 +7471,9 @@ async function wsPush(wk, args, chatId, chatTitle) {
             }
             // Track pushed blob shas so sync can distinguish "my PR merged" from "someone else changed it"
             // For deleted files, track '::deleted::' sentinel since no blob is created
-            if (!dirtyFiles[k].pushed_shas) dirtyFiles[k].pushed_shas = [];
+            // Copy before appending: _pushSnap is shallow and its CAS fingerprint
+            // must keep the pre-push array, not observe our new stamp.
+            dirtyFiles[k].pushed_shas = Array.isArray(dirtyFiles[k].pushed_shas) ? dirtyFiles[k].pushed_shas.slice() : [];
             var _pushSha = blobShas[dirtyFiles[k].path] || (dirtyFiles[k].deleted ? '::deleted::' : null);
             if (_pushSha && dirtyFiles[k].pushed_shas.indexOf(_pushSha) === -1) {
                 dirtyFiles[k].pushed_shas.push(_pushSha);
@@ -6940,6 +7503,9 @@ async function wsPush(wk, args, chatId, chatTitle) {
                     var _curSnap = Object.assign({}, _cur);
                     var _stamped = Object.assign({}, _cur);
                     _stamped.pushed_pr = prInfo;
+                    _stamped.pushed_pr_merged = null;
+                    // Edited mid-push: the current content is NOT what was pushed.
+                    _stamped.changed_since_push = true;
                     var _shas = Array.isArray(_cur.pushed_shas) ? _cur.pushed_shas.slice() : [];
                     if (_pushSha && _shas.indexOf(_pushSha) === -1) _shas.push(_pushSha);
                     if (_shas.length > 20) _shas = _shas.slice(-20);
@@ -6974,6 +7540,31 @@ async function wsPush(wk, args, chatId, chatTitle) {
         // keeping per-file rows light (blobs + meta.prs carry the snapshots).
         if (_prFiles.length) prInfo.files = _prFiles;
 
+        // #1079: a recreated (force-reset) branch no longer carries the
+        // earlier pushes' commits, so rows stamped for this branch/PR that are
+        // NOT in this commit must lose the stamp (their badge would lie).
+        if (staleBranchRecreated) {
+            try {
+                var _inCommit = {};
+                dirtyFiles.forEach(function(f) { _inCommit[f.path] = true; });
+                var _allRows = await getAllWorkspaceFiles(wk);
+                for (var _sr = 0; _sr < _allRows.length; _sr++) {
+                    var _row = _allRows[_sr];
+                    var _rp = _row && _row.pushed_pr;
+                    if (!_rp || _inCommit[_row.path]) continue;
+                    if (_rp.branch !== args.branch_name && _rp.number !== prNumber) continue;
+                    // Previous PR MERGED: its content may not have reached this
+                    // workspace's base yet — keep the merge evidence (pushed_shas /
+                    // '::deleted::' / pushed_pr for the 3-way path) and only hide
+                    // the badge. Closed unmerged: nothing landed, drop the stamps.
+                    var _rowNext = _previousPrMerged
+                        ? Object.assign({}, _row, { pushed_pr_merged: true })
+                        : Object.assign({}, _row, { pushed_pr: null, pushed_shas: null, changed_since_push: null, pushed_pr_merged: null });
+                    try { await _wsCasWrite(wk, _row.path, _row, _rowNext); } catch (e) { /* best-effort */ }
+                }
+            } catch (e) { /* best-effort */ }
+        }
+
         // Add (or refresh) the PR in the workspace meta prs list. When we appended to an
         // existing PR branch we update the tracked entry instead of pushing a duplicate.
         // The entry now carries a title (see prInfo above) so other chats show the real
@@ -6997,7 +7588,8 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // snapshots for paths NOT in this commit (a scoped args.files push
             // would otherwise drop earlier files from the PR's diff record);
             // paths pushed again are replaced by their latest snapshot.
-            var _prevPrFiles = meta.prs[_trackedIdx] && meta.prs[_trackedIdx].files;
+            // Not after a force-reset: the earlier files are no longer in the PR.
+            var _prevPrFiles = staleBranchRecreated ? null : (meta.prs[_trackedIdx] && meta.prs[_trackedIdx].files);
             if (Array.isArray(_prevPrFiles) && _prevPrFiles.length) {
                 var _nowPaths = {};
                 (prInfo.files || []).forEach(function(pf) { if (pf) _nowPaths[pf.path] = true; });

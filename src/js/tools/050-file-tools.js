@@ -1,7 +1,13 @@
 // READ ATTACHED FILE TOOL - Read user-attached text files (CSV, etc.)
 // =============================================
 
-function executeReadAttachedFile(args, options) {
+// Text-like MIME types whose resolved bytes may replace the message content.
+function _rafIsTextMime(m) {
+    m = String(m || '').toLowerCase();
+    return m.indexOf('text/') === 0 || /^application\/(json|xml|javascript|x-ndjson|csv|x-yaml|yaml)\b/.test(m) || /\+(json|xml)$/.test(m);
+}
+
+async function executeReadAttachedFile(args, options) {
     var filename = args.filename;
     if (!filename) {
         return { success: false, error: 'filename is required' };
@@ -11,6 +17,11 @@ function executeReadAttachedFile(args, options) {
     // authoritative — currentChatId is permanently null in the SW context.
     var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
+    // MSG-EVICT: a skeleton chat (messages evicted) is restored first.
+    if (chat && !Array.isArray(chat.messages) && chat._messagesEvicted && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+        chat = chats[chatId];
+    }
     if (!chat || !chat.messages) {
         return { success: false, error: 'No active chat found' };
     }
@@ -56,12 +67,17 @@ function executeReadAttachedFile(args, options) {
         return { success: false, error: 'File not found: ' + filename + '. Available files: ' + availableFiles.join(', ') };
     }
 
-    // Use getFile if file_id is available, else fall back to direct content
+    // Resolve through the unified store (resolveFile) when a file_id exists;
+    // fall back to the message's inline content. Only text-like payloads
+    // replace the content — this tool never returns binary as text.
     var content = fileMsg.content;
     var fileId = fileMsg.file_id;
-    if (fileId) {
-        var file = getFile(fileId);
-        if (file) content = file.data;
+    if (fileId && typeof resolveFile === 'function') {
+        var file = null;
+        try { file = await resolveFile(fileId); } catch (e) { file = null; }
+        if (file && file.blob && typeof file.blob.text === 'function' && _rafIsTextMime(file.mime)) {
+            try { content = await file.blob.text(); } catch (e) { /* keep inline content */ }
+        }
     }
 
     return {

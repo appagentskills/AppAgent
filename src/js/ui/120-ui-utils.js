@@ -10,6 +10,15 @@ function toggleToolCallExpanded(msgIndex, tcIdx, details) {
     var chat = chats[currentChatId];
     if (!chat || !chat.messages[msgIndex]) return;
     var msg = chat.messages[msgIndex];
+    // m12: the inline onclick sits on the whole <details>, so clicks INSIDE
+    // the body (text selection, links, nested tool cards) bubble here too.
+    // Only a click on THIS details' own <summary> toggles it — anything else
+    // must not flip the stored state (the card would collapse on re-render).
+    var _ev = (typeof window !== 'undefined' && window.event) || null;
+    if (_ev && _ev.type === 'click' && details && _ev.target && typeof _ev.target.closest === 'function') {
+        var _sum = _ev.target.closest('summary');
+        if (!_sum || _sum.parentNode !== details) return;
+    }
     if (!msg.toolCallsExpanded) msg.toolCallsExpanded = {};
     // onclick fires before browser toggle - use opposite of PREVIOUS stored state,
     // or of the current (pre-toggle) open state when nothing is stored yet
@@ -250,11 +259,123 @@ function reopenBrowser() {
     }
 }
 
+// ═══ C2-ui SKEL-SCAN: skeleton-safe message scans for UI consumers ═══
+// With CHAT_MESSAGE_EVICTION_ENABLED on, a cold chat in `chats` can be a
+// SKELETON: no `messages` key, `_messagesEvicted` + `_msgCount` kept
+// (core/130 MSG-EVICT). Lists, badges, previews and stats must give the same
+// answer for a skeleton as for the hydrated chat WITHOUT hydrating every chat
+// into the live map. skeletonScanValue(slot, chatId, chat, fn, fallback,
+// rerender): a hydrated chat is scanned live by fn(chat), exactly as before
+// (and drops any memo, so a later re-eviction re-reads). A skeleton returns
+// the memoized fn(stored row) for its signature; on a miss it queues ONE
+// transient read of the stored row (loadChatRowFromDB: a structured clone,
+// never attached to chats[]), runs every slot wanted for that chat, keeps
+// only the small JSON results, and calls the requesters' re-render hooks once
+// (debounced). Until then the caller gets `fallback`. A missing row memoizes
+// fn over [] (no retry loop until the signature changes).
+var _skelScanMemo = {};   // chatId -> { sig, vals: { slot: value } }
+var _skelScanWant = {};   // chatId -> { slot: fn }
+var _skelScanQueue = [];
+var _skelScanBusy = false;
+var _skelScanRerenders = []; // hooks to call after the queue drains
+var _skelScanTimer = null;
+function _isSkeletonChat(chat) {
+    return !!chat && !Array.isArray(chat.messages) && !!chat._messagesEvicted;
+}
+function _skelScanSig(chat) {
+    var n = (typeof chatMessageCount === 'function') ? chatMessageCount(chat) : (chat._msgCount || 0);
+    return n + ':' + (chat.rev != null ? chat.rev : '-') + ':' + (chat.updatedAt != null ? chat.updatedAt : '-');
+}
+function _skelClone(v) {
+    return (v === null || typeof v !== 'object') ? v : JSON.parse(JSON.stringify(v));
+}
+function skeletonScanValue(slot, chatId, chat, fn, fallback, rerender) {
+    if (!_isSkeletonChat(chat)) {
+        if (chatId && _skelScanMemo[chatId]) delete _skelScanMemo[chatId];
+        return fn(chat);
+    }
+    var m = _skelScanMemo[chatId];
+    if (m && m.sig === _skelScanSig(chat) && Object.prototype.hasOwnProperty.call(m.vals, slot)) {
+        var v = m.vals[slot];
+        return (v === null || v === undefined) ? fallback : _skelClone(v);
+    }
+    // Callers often pass a fresh closure per call: dedupe by identity OR
+    // source so N same-tick requests still cause ONE re-render.
+    if (typeof rerender === 'function' && !_skelScanRerenders.some(function(h) {
+        return h === rerender || String(h) === String(rerender);
+    })) _skelScanRerenders.push(rerender);
+    // Same-tick dedupe: a read for this chat (same signature) is already in
+    // flight — join its slot set instead of queueing a second row read.
+    var fl = _skelScanPump._inflight && _skelScanPump._inflight[chatId];
+    if (fl && fl.sig === _skelScanSig(chat)) {
+        if (!fl.want[slot]) fl.want[slot] = fn;
+        return fallback;
+    }
+    var want = _skelScanWant[chatId];
+    if (!want) { want = _skelScanWant[chatId] = {}; _skelScanQueue.push(chatId); }
+    want[slot] = fn;
+    if (!_skelScanBusy) _skelScanPump();
+    return fallback;
+}
+async function _skelScanPump() {
+    _skelScanBusy = true;
+    try {
+        while (_skelScanQueue.length) {
+            var id = _skelScanQueue.shift();
+            var want = _skelScanWant[id];
+            delete _skelScanWant[id];
+            var chat = (typeof chats !== 'undefined' && chats) ? chats[id] : null;
+            if (!want || !_isSkeletonChat(chat)) continue; // hydrated/deleted meanwhile: live scans apply
+            var sig = _skelScanSig(chat);
+            // Slots answered by an earlier read for this signature need no re-read.
+            var m0 = _skelScanMemo[id];
+            if (m0 && m0.sig === sig) Object.keys(want).forEach(function(s) {
+                if (Object.prototype.hasOwnProperty.call(m0.vals, s)) delete want[s];
+            });
+            if (!Object.keys(want).length) continue;
+            var inflight = _skelScanPump._inflight || (_skelScanPump._inflight = {});
+            inflight[id] = { sig: sig, want: want }; // later requests join `want` (see skeletonScanValue)
+            var row = null;
+            try { row = (typeof loadChatRowFromDB === 'function') ? await loadChatRowFromDB(id) : null; } catch (e) { row = null; }
+            finally { if (inflight[id] && inflight[id].want === want) delete inflight[id]; }
+            chat = chats[id];
+            if (!_isSkeletonChat(chat)) continue;
+            // Chat-level fields come from the in-memory skeleton (never
+            // regressed by disk); only the messages come from the row.
+            var like = {};
+            Object.keys(chat).forEach(function(k) { like[k] = chat[k]; });
+            like.messages = (row && Array.isArray(row.messages)) ? row.messages : [];
+            var m = _skelScanMemo[id];
+            if (!m || m.sig !== sig) m = _skelScanMemo[id] = { sig: sig, vals: {} };
+            Object.keys(want).forEach(function(slot) {
+                try { m.vals[slot] = _skelClone(want[slot](like)); } catch (e) { m.vals[slot] = null; }
+            });
+            row = null; like = null;
+        }
+    } finally {
+        _skelScanBusy = false;
+    }
+    if (_skelScanTimer) clearTimeout(_skelScanTimer);
+    _skelScanTimer = setTimeout(function() {
+        _skelScanTimer = null;
+        var hooks = _skelScanRerenders.splice(0);
+        hooks.forEach(function(h) { try { h(); } catch (e) {} });
+    }, 120);
+}
+
 // Collect PRs pushed from this chat (workspace push tool calls + their results).
 // Returns [{url, number, title, branch, base}] deduped by URL. A later push to the
 // same PR (append) replaces the tracked entry, but only overwrites the title
 // when the later push actually passed a pr_title (it is optional on append).
 function getPushedPRsForChat(chat) {
+    if (!chat) return [];
+    // C2-ui SKEL-SCAN: a skeleton (sub-agent roll-up, cold chat) answers
+    // from its stored row, then the sidebar re-renders.
+    return skeletonScanValue('prs', chat.id, chat, _getPushedPRsLive, [], function() {
+        if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
+    });
+}
+function _getPushedPRsLive(chat) {
     if (!chat || !chat.messages) return [];
     var pushArgs = {}; // tool_call_id -> { title, branch }
     var prs = [];
@@ -426,7 +547,12 @@ function _sidebarMetaPRsUnion(all) {
             if (byUrl[p.url] === undefined) { byUrl[p.url] = out.length; out.push(p); return; }
             var kept = out[byUrl[p.url]];
             if (!kept.state && (p.state === 'merged' || p.state === 'closed')) {
-                out[byUrl[p.url]] = Object.assign({}, kept, { state: p.state });
+                kept = out[byUrl[p.url]] = Object.assign({}, kept, { state: p.state });
+            }
+            // Carry the merge timestamp from any duplicate (the header PR list
+            // shows merged PRs only when merged today).
+            if (!kept.merged_at && p.merged_at) {
+                out[byUrl[p.url]] = Object.assign({}, kept, { merged_at: p.merged_at });
             }
         });
     });
@@ -477,6 +603,9 @@ function _refreshSidebarMetaPRs() {
 // GitHub in the background, so state survives reloads without extra storage.
 var _sidebarPRState = {};
 var _sidebarPRCheckedAt = {}; // url -> last background state check (throttle)
+// url -> ISO merged_at learned live (GitHub GET /pulls/N or the merge button).
+// Read by the header dropdown PR filter (merged today only, 040-tools-settings.js).
+var _sidebarPRMergedAt = {};
 
 // Parse "https://<host>/owner/repo/pull/123" (github.com and GHE) into
 // { repo: 'owner/repo', number: 123 }. Returns null on anything else.
@@ -514,6 +643,7 @@ function _refreshSidebarPRStates(prs) {
             if (cur === 'merging' || cur === 'merged') return;
             if (res && res.ok && res.body && typeof res.body === 'object') {
                 var st = res.body.merged ? 'merged' : (res.body.state === 'closed' ? 'closed' : 'open');
+                if (st === 'merged' && !_sidebarPRMergedAt[pr.url]) _sidebarPRMergedAt[pr.url] = res.body.merged_at || new Date().toISOString();
                 if (_sidebarPRState[pr.url] !== st) { _sidebarPRState[pr.url] = st; changed = true; }
             }
         }).catch(function() {});
@@ -544,6 +674,7 @@ async function mergeSidebarPR(event, btn) {
         var preBody = (pre && pre.ok && pre.body && typeof pre.body === 'object') ? pre.body : null;
         if (preBody && preBody.merged) {
             finalState = 'merged';
+            if (!_sidebarPRMergedAt[url]) _sidebarPRMergedAt[url] = preBody.merged_at || new Date().toISOString();
             showSnackbar(t('PR #{number} was already merged \u2014 syncing workspace\u2026', { number: info.number }), 'success');
         } else if (preBody && preBody.state === 'closed') {
             _sidebarPRState[url] = 'closed';
@@ -568,6 +699,8 @@ async function mergeSidebarPR(event, btn) {
             }
             if (res && res.ok && res.body && res.body.merged) {
                 finalState = 'merged';
+                // PUT /merge returns {sha, merged, message} — no merged_at; it merged just now.
+                _sidebarPRMergedAt[url] = new Date().toISOString();
                 showSnackbar(t('PR #{number} merged \u2014 syncing workspace\u2026', { number: info.number }), 'success');
             } else {
                 var msg = (res && res.body && res.body.message) ? res.body.message
@@ -1051,13 +1184,22 @@ function renderVersionSidebar() {
 
     html += '</div>'; // end version-sidebar-content
     
-    container.innerHTML = html;
+    // Skip the rebuild when the markup is unchanged and our root is still in
+    // place: replacing identical nodes under the pointer restarts hover
+    // transitions and makes the PR chip flash on every message render.
+    // Compared against the generated html (before the workers strip / self
+    // card refills below mutate the live DOM).
+    var _vsUnchanged = container.__lastHtml === html && !!container.querySelector('.version-sidebar-content');
+    if (!_vsUnchanged) {
+        container.innerHTML = html;
+        container.__lastHtml = html;
+    }
 
     // Brand-new chat: no PRs, progress, changes, widgets, screenshots or
     // documents yet — only the hidden placeholder hosts are present. Show a
     // friendly empty state instead of a blank rail.
     var _vsc = container.querySelector('.version-sidebar-content');
-    if (_vsc && !_vsc.querySelector(':scope > :not(#sub-self-parent-host):not(#sub-self-card-host):not(#sidebar-workers)')) {
+    if (!_vsUnchanged && _vsc && !_vsc.querySelector(':scope > :not(#sub-self-parent-host):not(#sub-self-card-host):not(#sidebar-workers)')) {
         var _vsEmpty = document.createElement('div');
         _vsEmpty.className = 'version-sidebar-empty';
         _vsEmpty.textContent = t('Changes, pull requests and artifacts from this chat will appear here.');

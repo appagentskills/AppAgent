@@ -155,3 +155,10 @@ details.tool-call.highlight-flash, details.tool-result.highlight-flash { animati
 .widget-version-picker:hover { border-color: var(--primary-light); color: var(--primary); }
 .widget-version-picker:focus-visible { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-lighter); }
 .dashboard-widget-controls .widget-version-picker { height: 26px; border-radius: var(--radius-sm); }
+/* Per-turn pinned render badge (updateWidgetVersionBadge, core/135-widget-store.js). */
+.widget-version-badge { display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; flex-shrink: 1; font-size: var(--text-caption); color: var(--text-secondary); white-space: nowrap; overflow: hidden; }
+.widget-version-badge-label { overflow: hidden; text-overflow: ellipsis; }
+.widget-version-badge.is-stale .widget-version-badge-label { color: var(--warning, var(--text-secondary)); }
+.widget-version-show-latest { height: 24px; padding: 0 var(--space-3); font: inherit; font-size: var(--text-caption); color: var(--primary); background: transparent; border: 1px solid var(--primary-light); border-radius: var(--radius-sm); cursor: pointer; flex-shrink: 0; }
+.widget-version-show-latest:hover { background: var(--primary-lighter); }
+.widget-version-show-latest:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--primary-lighter); }

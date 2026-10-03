@@ -911,7 +911,13 @@ async function finishActionIfDone(chatId) {
     if (a.state === 'running' && !a._isPaused && !(typeof isChatPaused === 'function' && isChatPaused(a.chatId))) {
         // #6b: a run that ended with the chat still at its seed user row never
         // actually started — report that honestly instead of a false 'Complete'.
-        if (_chatNeverStarted(chat)) { return _watchdogCheckNeverStarted(chat.actionId); }
+        if (chat && !Array.isArray(chat.messages)) {
+            // Cold-chat eviction: a skeleton has no messages array; read the
+            // stored row instead of treating it as empty. Re-check after await.
+            var _nsCold = await _chatNeverStartedAsync(chat);
+            if (a.state !== 'running' || a._isPaused) return;
+            if (_nsCold) { return _watchdogCheckNeverStarted(chat.actionId); }
+        } else if (_chatNeverStarted(chat)) { return _watchdogCheckNeverStarted(chat.actionId); }
         a.state = 'done';
         a.icon = 'check';
         if (!a.label || a.label === 'Starting…') a.label = N_('Complete');
@@ -934,6 +940,21 @@ function _chatNeverStarted(chat) {
     });
     return users === 1 && assistants === 0;
 }
+// Cold-chat eviction twin of _chatNeverStarted: a skeleton (messages evicted)
+// is answered from the stored row (read-only, never hydrates into chats[]).
+// Hydrated chats get the exact sync result. Fails closed (false) on a miss.
+async function _chatNeverStartedAsync(chat) {
+    if (!chat || Array.isArray(chat.messages)) return _chatNeverStarted(chat);
+    var n = (typeof chatMessageCount === 'function') ? chatMessageCount(chat) : (chat._msgCount || 0);
+    if (n < 1) return false;
+    if (typeof loadChatRowFromDB !== 'function') return false;
+    var row = null;
+    try { row = await loadChatRowFromDB(chat.id); } catch (e) { row = null; }
+    var live = (typeof chats !== 'undefined' && chats) ? chats[chat.id] : null;
+    if (live && Array.isArray(live.messages)) return _chatNeverStarted(live);
+    if (!row || !Array.isArray(row.messages)) return false;
+    return _chatNeverStarted(row);
+}
 // Flip a still-'running', never-started action to an honest error. No-op when
 // the action already left 'running', is paused, the chat progressed, or a run
 // is live (runningChatIds) / pending (_pendingRunAgents) for its chat.
@@ -941,7 +962,14 @@ async function _watchdogCheckNeverStarted(actionId, err) {
     var a = activeActions[actionId];
     if (!a || a.state !== 'running' || a._isPaused) return false;
     var chat = (typeof chats !== 'undefined' && chats) ? chats[a.chatId] : null;
-    if (!chat || !_chatNeverStarted(chat)) return false;
+    if (!chat) return false;
+    if (!Array.isArray(chat.messages)) {
+        // Cold-chat eviction: skeleton -> stored-row check, then re-check state.
+        if (!(await _chatNeverStartedAsync(chat))) return false;
+        a = activeActions[actionId];
+        if (!a || a.state !== 'running' || a._isPaused) return false;
+        chat = chats[a.chatId] || chat;
+    } else if (!_chatNeverStarted(chat)) return false;
     if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[a.chatId]) return false;
     if (typeof _pendingRunAgents !== 'undefined' && _pendingRunAgents && _pendingRunAgents[a.chatId]) return false;
     a.state = 'error';
@@ -1020,7 +1048,25 @@ function reconcileNeverStartedActions() {
         var a = activeActions[id];
         if (!a || a.state !== 'running' || !a.reloadInterrupted || a._isPaused) return;
         var chat = chats[a.chatId];
-        if (!chat || !_chatNeverStarted(chat)) return;
+        if (!chat) return;
+        if (!Array.isArray(chat.messages)) {
+            // Cold-chat eviction: a cold action chat at boot is a skeleton.
+            // Check the stored row, then re-check the action's live state.
+            Promise.resolve(_chatNeverStartedAsync(chat)).then(function(ns) {
+                if (!ns) return;
+                var a2 = activeActions[id];
+                if (!a2 || a2.state !== 'running' || !a2.reloadInterrupted || a2._isPaused) return;
+                _neverStartedSweepOne(id, a2, rekick);
+            }).catch(function() {});
+            return;
+        }
+        if (!_chatNeverStarted(chat)) return;
+        _neverStartedSweepOne(id, a, rekick);
+    });
+}
+// Per-action body of reconcileNeverStartedActions (shared by the sync
+// hydrated path and the async skeleton path).
+function _neverStartedSweepOne(id, a, rekick) {
         if (typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[a.chatId]) return;
         if (typeof _pendingRunAgents !== 'undefined' && _pendingRunAgents && _pendingRunAgents[a.chatId]) return;
         if (rekick) {
@@ -1033,7 +1079,6 @@ function reconcileNeverStartedActions() {
         } else {
             Promise.resolve(_watchdogCheckNeverStarted(id)).catch(function() {});
         }
-    });
 }
 // B11: page bridge hook (app/045-agent-port-bridge-page.js) — the SW just
 // reported its resume scan settled. Run the DEFERRED sweep now (only when a
@@ -1413,8 +1458,16 @@ function getCurrentChatProgressState(includeToolCallId) {
 function getChatProgressStateFor(chatId, includeToolCallId) {
     var chat = (typeof chats !== 'undefined') ? chats[chatId] : null;
     if (!chat) return null;
+    var latest;
+    if (!Array.isArray(chat.messages)) {
+        // Cold-chat eviction: skeleton -> derived cache (filled async from
+        // the stored row when stale), never a hydrate of chats[].
+        latest = _progressLatestForSkeleton(chat);
+    } else {
     var updates = collectAllActionUpdates(chat, includeToolCallId);
-    var latest = updates.length ? updates[updates.length - 1] : null;
+    latest = updates.length ? updates[updates.length - 1] : null;
+    if (!includeToolCallId) _progressLatestByChat[chatId] = { len: chat.messages.length, latest: latest };
+    }
     // INTERNAL display override (chat.progressStateOverride — e.g. 'pr_merged'
     // set by markChatPrMerged when the chat's pushed PR is detected as merged).
     // Wins over the derived state; cleared by the next executeUpdateActionState.
@@ -1426,6 +1479,38 @@ function getChatProgressStateFor(chatId, includeToolCallId) {
         return merged;
     }
     return latest;
+}
+
+// Cold-chat eviction: per-chat {len, latest} derived from the last hydrated
+// compute; a skeleton uses it only when len matches its stamped count.
+var _progressLatestByChat = {};
+var _progressFillTried = {};
+// Message count that also works on an evicted skeleton (chatMessageCount,
+// core/130); identical to messages.length for hydrated chats.
+function _actChatMsgN(c) {
+    if (!c) return 0;
+    if (Array.isArray(c.messages)) return c.messages.length;
+    return (typeof chatMessageCount === 'function') ? chatMessageCount(c) : (c._msgCount || 0);
+}
+function _progressLatestForSkeleton(chat) {
+    var id = chat && chat.id;
+    if (!id) return null;
+    var n = (typeof chatMessageCount === 'function') ? chatMessageCount(chat) : (chat._msgCount || 0);
+    var c = _progressLatestByChat[id];
+    if (c && c.len === n) return c.latest;
+    if (_progressFillTried[id] !== n && typeof loadChatRowFromDB === 'function') {
+        _progressFillTried[id] = n;
+        Promise.resolve().then(function() { return loadChatRowFromDB(id); }).then(function(row) {
+            var live = chats[id];
+            if (!live || Array.isArray(live.messages)) return; // hydrated meanwhile: the next compute stamps
+            if (!row || !Array.isArray(row.messages)) return;
+            var ups = collectAllActionUpdates(row);
+            _progressLatestByChat[id] = { len: n, latest: ups.length ? ups[ups.length - 1] : null };
+            if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+            if (typeof renderChatList === 'function') { try { renderChatList(); } catch (e) {} }
+        }).catch(function() {});
+    }
+    return null;
 }
 
 // Walk the messages and collect the arguments of every update_action_state tool
@@ -1743,7 +1828,7 @@ function onInlineActionButtonClick(btn, msgIndex) {
 // =============================================
 // APPROVAL POPOVER (needs_permission state)
 // =============================================
-function openPendingApprovalForActionInline(btn, actionId) {
+function openPendingApprovalForActionInline(btn, actionId, _retried) {
     // See openRunningPopover — capture rect BEFORE any DOM mutation.
     // We do NOT close the jobs dropdown here: when this popover is opened
     // from a dropdown row, keeping the dropdown open lets the user pick
@@ -1755,6 +1840,16 @@ function openPendingApprovalForActionInline(btn, actionId) {
     if (!a) return;
     var chat = chats[a.chatId];
     if (!chat) return;
+    if (!Array.isArray(chat.messages)) {
+        // Cold-chat eviction: hydrate the skeleton, then re-invoke once.
+        if (_retried || typeof ensureChatPayloads !== 'function') return;
+        var _apChatId = a.chatId;
+        Promise.resolve().then(function() { return ensureChatPayloads(_apChatId); }).then(function() {
+            var c2 = chats[_apChatId];
+            if (c2 && Array.isArray(c2.messages)) openPendingApprovalForActionInline(btn, actionId, true);
+        }).catch(function() {});
+        return;
+    }
     // Find the pending approval message in the chat
     var pendingApproval = null;
     var approvalIdx = -1;
@@ -2667,7 +2762,7 @@ function getActiveChatsList() {
     if (typeof chats !== 'undefined' && chats) {
         Object.keys(chats).forEach(function(cid) {
             var c = chats[cid];
-            if (!c || !Array.isArray(c.messages) || !c.messages.length) return;
+            if (!c || !_actChatMsgN(c)) return; // cold-chat eviction: skeleton count
             if (_isChatUnseen(cid)) consider(cid);
         });
     }
@@ -2727,8 +2822,11 @@ function getActiveChatsList() {
             // #743 PERF: reuse the memoized state while the invalidation key
             // matches (see _progressStateMemo above for why these inputs).
             var _ov = _pc.progressStateOverride;
-            var _mk = (Array.isArray(_pc.messages) ? _pc.messages.length : 0) + ':'
-                + _chatActivityTs(_pc) + ':' + ((_ov && _ov.state) || '');
+            var _mk = _actChatMsgN(_pc) + ':'
+                + _chatActivityTs(_pc) + ':' + ((_ov && _ov.state) || '')
+                // Cold-chat eviction: a skeleton's state flips when its derived
+                // progress cache fills; hydrated chats keep the exact old key.
+                + (Array.isArray(_pc.messages) ? '' : ':sk' + ((_progressLatestByChat[cid] && _progressLatestByChat[cid].len === _actChatMsgN(_pc)) ? '1' : '0'));
             var _me = _progressStateMemo[cid];
             var _ps = null;
             if (_me && _me.key === _mk) {
@@ -3208,7 +3306,7 @@ function _jobsAllUserChats() {
         // removed from the list (_jobsHidden) is skipped unless it's pinned.
         if (!c || c.isSubAgent) return;
         if (c._jobsHidden && !c.pinned) return;
-        if (!Array.isArray(c.messages) || !c.messages.length) return;
+        if (!_actChatMsgN(c)) return; // cold-chat eviction: skeleton count
         arr.push(c);
     });
     return arr;
@@ -3330,9 +3428,16 @@ function _jobsChatDoneTs(c) {
         // lastViewedAt and made this fallback report a stale chat as done
         // just now. Fall back to updatedAt/createdAt only.
         if (!t && _sawAssistant) t = c.updatedAt || c.createdAt || 0;
+        if (c.id) _jobsDoneTsByChat[c.id] = { len: c.messages.length, t: t };
+    } else if (!t && c.id && !Array.isArray(c.messages)) {
+        // Cold-chat eviction: a skeleton reuses the walk's last hydrated
+        // result while its message count is unchanged (else 0, as before).
+        var _dc = _jobsDoneTsByChat[c.id];
+        if (_dc && _dc.len === _actChatMsgN(c)) t = _dc.t;
     }
     return t;
 }
+var _jobsDoneTsByChat = {};
 // Completed today = finished (not-running) chats whose last run FINISHED since
 // midnight (_jobsChatDoneTs). Deliberately NOT _jobsChatTs — its createdAt
 // fallback put chats that only STARTED today in this list.
@@ -3697,7 +3802,7 @@ function _renderJobsHistoryResults(doneChats) {
     var chatsArr = doneChats || (typeof getDoneChatsList === 'function' ? getDoneChatsList() : []);
     var q = (_jobsHistoryQuery || '').trim();
     if (q.length >= 2 && typeof chatMatchesSearch === 'function') {
-        chatsArr = chatsArr.filter(function(c) { return chatMatchesSearch(c, q); });
+        chatsArr = chatsArr.filter(function(c) { return chatMatchesSearch(c, q, function() { if ((_jobsHistoryQuery || '').trim() === q) onJobsHistorySearch(_jobsHistoryQuery); }); });
     }
     if (!chatsArr.length) {
         return '<div class="jobs-tab-empty">' + escapeHtml(q ? t('No matching chats') : t('No finished chats')) + '</div>';
@@ -4750,8 +4855,35 @@ function _clearChatApprovalRows(c) {
                 changed = true;
             }
         });
+    } else if (c && c.id && !Array.isArray(c.messages)) {
+        // Cold-chat eviction: the rows live only in the stored transcript.
+        _coldChatApprovalFix(c.id, null, _clearChatApprovalRows);
     }
     return changed;
+}
+
+// Cold-chat eviction: apply an approval-row fix to a SKELETON chat. Reads the
+// stored row first (read-only) and hydrates only when it actually holds a
+// pending approval; after the hydrate it re-reads chats[cid], re-checks
+// `guard` (may veto), runs `fix(chat)` and saves only if it changed. Never
+// writes over a transcript it could not load.
+function _coldChatApprovalFix(cid, guard, fix) {
+    if (typeof loadChatRowFromDB !== 'function' || typeof ensureChatPayloads !== 'function') return;
+    Promise.resolve().then(function() { return loadChatRowFromDB(cid); }).then(function(row) {
+        var has = !!(row && Array.isArray(row.messages) && row.messages.some(function(m) {
+            return m && m.role === 'approval' && m.status === 'pending';
+        }));
+        if (!has) return;
+        return Promise.resolve(ensureChatPayloads(cid)).then(function() {
+            var live = chats[cid];
+            if (!live || !Array.isArray(live.messages)) return;
+            if (guard && !guard(cid)) return;
+            if (!fix(live)) return;
+            if (typeof saveChatsToStorage === 'function') { try { saveChatsToStorage(); } catch (e) {} }
+            if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
+            _rerenderOpenJobsDropdown();
+        });
+    }).catch(function() {});
 }
 
 // Per-chat 'dismiss notification': clears the unseen bell, the error flag, and
@@ -4809,6 +4941,21 @@ function _chatHasLiveApprovalEntry(cid) {
         return e && e.chatId === cid;
     });
 }
+function _staleApprovalGuard(cid) {
+    if (typeof isChatActivelyRunning === 'function' && isChatActivelyRunning(cid)) return false;
+    return !_chatHasLiveApprovalEntry(cid);
+}
+function _staleApprovalFlip(c) {
+    var ch = false;
+    c.messages.forEach(function(m) {
+        if (m && m.role === 'approval' && m.status === 'pending') {
+            m.status = 'denied';
+            m.staleSweep = true;
+            ch = true;
+        }
+    });
+    return ch;
+}
 function reconcileStaleApprovals() {
     if (_staleApprovalSweepDone) return;
     _staleApprovalSweepDone = true;
@@ -4816,7 +4963,14 @@ function reconcileStaleApprovals() {
     var changed = false;
     Object.keys(chats).forEach(function(cid) {
         var c = chats[cid];
-        if (!c || !Array.isArray(c.messages)) return;
+        if (!c) return;
+        if (!Array.isArray(c.messages)) {
+            // Cold-chat eviction: a skeleton at boot. Check its stored row;
+            // hydrate + flip only if it holds a pending approval and is idle.
+            if (!_staleApprovalGuard(cid)) return;
+            _coldChatApprovalFix(cid, _staleApprovalGuard, _staleApprovalFlip);
+            return;
+        }
         if (typeof isChatActivelyRunning === 'function' && isChatActivelyRunning(cid)) return;
         if (_chatHasLiveApprovalEntry(cid)) return;
         c.messages.forEach(function(m) {

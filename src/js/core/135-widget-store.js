@@ -14,24 +14,45 @@ var WidgetStore = (function() {
     // Delete tombstones: ids removed via remove(). Stale chat/dashboard
     // projections (an SW chat snapshot re-put after the delete, an evicted
     // chat row) must never re-migrate them in load()/read(). localStorage
-    // (page-only, per-origin, survives reload); capped; cleared when the id
-    // is committed/imported again. Missing localStorage = in-memory only.
+    // (page-only, per-origin, survives reload); capped. A delete is permanent
+    // (no undo): commit() refuses a tombstoned id and only importRecords()
+    // clears one. Missing/throwing localStorage = in-memory only, so a failed
+    // read keeps this tab's list instead of wiping it.
     var TOMBSTONE_KEY = 'appagent-widget-tombstones-' + dbName, MAX_TOMBSTONES = 500;
+    // Tombstone ops (id -> on/off) whose localStorage write failed (quota,
+    // denied storage): re-applied over every fresh read and retried by the
+    // next write, so a failed setItem never drops a delete in this tab.
+    var pendingTombstones = Object.create(null);
+    function withPending(list) {
+        Object.keys(pendingTombstones).forEach(function(id) {
+            var i = list.indexOf(id);
+            if (pendingTombstones[id] && i === -1) list.push(id);
+            else if (!pendingTombstones[id] && i !== -1) list.splice(i, 1);
+        });
+        return list;
+    }
     function readTombstones() {
-        try { var v = JSON.parse(localStorage.getItem(TOMBSTONE_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+        try { var v = JSON.parse(localStorage.getItem(TOMBSTONE_KEY) || '[]'); return withPending(Array.isArray(v) ? v : []); } catch (e) { return tombstones || []; }
     }
     var tombstones = readTombstones();
     function writeTombstones() {
         if (tombstones.length > MAX_TOMBSTONES) tombstones.splice(0, tombstones.length - MAX_TOMBSTONES);
-        try { localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(tombstones)); } catch (e) {}
+        try { localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(tombstones)); pendingTombstones = Object.create(null); }
+        catch (e) { console.warn('Widget tombstones: localStorage write failed; kept in memory and retried on the next write', e); }
     }
     function isTombstoned(id) { return tombstones.indexOf(id) !== -1; }
+    // Fresh check for every read-modify-write that could (re)create a row:
+    // this tab's copy is refreshed only on its own writes and channel
+    // notices, so another tab's delete may be missing from it (lost or late
+    // notice, or a remove() still in flight with the row not yet gone).
+    function tombstonedNow(id) { tombstones = readTombstones(); return isTombstoned(id); }
     function setTombstone(id, on) {
         tombstones = readTombstones();
         var i = tombstones.indexOf(id);
         if (on && i === -1) tombstones.push(id);
         else if (!on && i !== -1) tombstones.splice(i, 1);
         else return;
+        pendingTombstones[id] = !!on;
         writeTombstones();
     }
     // Tell the SW (authoritative chats[*].widgets) to drop the id; no-op when
@@ -114,9 +135,19 @@ var WidgetStore = (function() {
             });
         });
     }
-    function migrate(candidates) {
+    // gen: the legacy pass generation (migrateLegacy only). A clearCache()
+    // since the pass started orphans it: nothing collected before the reset
+    // is written into the cleared store.
+    function migrate(candidates, gen) {
         return candidates.reduce(function(chain, group) {
             return chain.then(function() { return transact(group.id, function(existing) {
+                if (gen !== undefined && gen !== legacyGen) return { result: null };
+                // Deleted after the candidates were collected (remove() landing
+                // mid deferred pass / mid read(), in this tab or in another one
+                // whose notice never arrived, or still in flight with the row
+                // present): the tombstone wins, so the widget is never written
+                // back or re-cached.
+                if (tombstonedNow(group.id)) return { result: null };
                 if (existing) return { record: existing, result: existing };
                 var versions = [], seen = new Set(), maxVersion = 0;
                 group.items.forEach(function(w) {
@@ -151,12 +182,67 @@ var WidgetStore = (function() {
             }); });
         }, Promise.resolve());
     }
+    // BOOT-MEM: legacy chat `widgets` projections come from the page's
+    // in-memory `chats` map, NOT from a cursor over the chats store, which
+    // deserialised every full chat record (+1.2-1.4 GB heap on big
+    // histories) on every boot just to find ids add() then skipped.
+    // loadChatsFromStorage (ui/070) keeps only chats with messages.length > 0
+    // (stripChatPayloadsInPlace, core/130, never touches `widgets`), so the
+    // legacy widgets of a chat with NO messages are not migrated (a dashboard
+    // row for the same id still is). Never read `messages` here: cold chats
+    // may drop them after load but keep `widgets`. The map must be FULLY loaded:
+    //  - chat load settled + hydrated -> scan inline (part of `ready`);
+    //  - chat load in flight (_chatsLoadInFlight, e.g. boot deadline hit) ->
+    //    defer the scan until it settles; boot never waits for it, so list()
+    //    omits not-yet-migrated legacy ids until the deferred pass finishes;
+    //  - chat load failed (_chatsHydrated false) -> skip; next init() retries.
+    // Chats are visited by ascending id (= the old cursor's key order), so the
+    // origin.chatId of an id shared by several chats is unchanged.
+    // legacyGen: bumped by clearCache(); a pass started under an older value
+    // is orphaned (writes nothing, leaves the legacy flags to the new pass).
+    var legacyDone = false, legacyDeferred = null, legacyDashRows = [], legacyGen = 0;
+    function chatsReady() { return typeof _chatsHydrated === 'undefined' || _chatsHydrated === true; }
+    function migrateLegacy(gen) {
+        if (gen !== legacyGen || !chatsReady()) return Promise.resolve(null);
+        var groups = Object.create(null);
+        function add(w, chatId) {
+            if (!w || !w.id || records[w.id] || isTombstoned(w.id)) return;
+            if (!groups[w.id]) groups[w.id] = { id: w.id, items: [] };
+            groups[w.id].items.push(Object.assign({}, w, { chatId: w.chatId || chatId }));
+        }
+        // Same candidate order as before: chat projections, then dashboard rows.
+        Object.keys(chats).sort().forEach(function(cid) {
+            var c = chats[cid];
+            if (c && Array.isArray(c.widgets)) c.widgets.forEach(function(w) { add(w, cid); });
+        });
+        legacyDashRows.forEach(function(w) { add(w, w.chatId); });
+        var list = Object.values(groups);
+        return migrate(list, gen).then(function() {
+            if (gen !== legacyGen) return null;
+            legacyDone = true;
+            // The getAll copy (history HTML included) is only needed until a
+            // pass completes; skipped/failed passes keep it for the retry.
+            legacyDashRows = [];
+            return list.map(function(g) { return g.id; });
+        });
+    }
+    function scheduleLegacy() {
+        if (legacyDone || legacyDeferred) return Promise.resolve();
+        var gen = legacyGen;
+        var inflight = typeof _chatsLoadInFlight !== 'undefined' ? _chatsLoadInFlight : null;
+        if (!inflight) return migrateLegacy(gen);
+        legacyDeferred = Promise.resolve(inflight).catch(function() {}).then(function() { return migrateLegacy(gen); })
+            .then(function(ids) { (ids || []).forEach(project); }, function(e) { console.warn('Legacy widget migration failed', e); })
+            .then(function() { if (gen === legacyGen) legacyDeferred = null; });
+        return Promise.resolve();
+    }
     async function load() {
+        legacyDone = false;
         var database = await openDatabase();
         var data = await new Promise(function(resolve, reject) {
-            var tx = database.transaction([widgetStoreName, chatStoreName, dashboardWidgetsStoreName], 'readonly');
+            var tx = database.transaction([widgetStoreName, dashboardWidgetsStoreName], 'readonly');
             var result = {};
-            [widgetStoreName, chatStoreName, dashboardWidgetsStoreName].forEach(function(name) {
+            [widgetStoreName, dashboardWidgetsStoreName].forEach(function(name) {
                 var req = tx.objectStore(name).getAll();
                 req.onsuccess = function() { result[name] = req.result || []; };
             });
@@ -164,24 +250,28 @@ var WidgetStore = (function() {
             tx.onerror = tx.onabort = function() { reject(tx.error || new Error('Widget load failed')); };
         });
         data[widgetStoreName].forEach(function(r) { records[r.id] = compactForBoot(r); });
-        var groups = Object.create(null);
-        function add(w, chatId) {
-            if (!w || !w.id || records[w.id] || isTombstoned(w.id)) return;
-            if (!groups[w.id]) groups[w.id] = { id: w.id, items: [] };
-            groups[w.id].items.push(Object.assign({}, w, { chatId: w.chatId || chatId }));
-        }
-        data[chatStoreName].forEach(function(c) { (c.widgets || []).forEach(function(w) { add(w, c.id); }); });
-        data[dashboardWidgetsStoreName].forEach(function(w) { add(w, w.chatId); });
-        await migrate(Object.values(groups));
+        // Dashboard placement rows keep their legacy history[] in memory:
+        // saveDashboardWidgetImpl persists the whole in-memory row, so
+        // stripping it here would silently drop it from IDB on the next save.
+        legacyDashRows = data[dashboardWidgetsStoreName];
+        data = null;
+        await scheduleLegacy();
     }
     function init() {
         if (!ready) ready = load().catch(function(e) { ready = null; throw e; });
-        return ready;
+        // Retry a skipped/failed legacy pass (chat load failed earlier) and
+        // project what it migrated, like the deferred path does.
+        return ready.then(function() {
+            if (!legacyDone && !legacyDeferred) return scheduleLegacy().then(function(ids) { (ids || []).forEach(project); })
+                .catch(function(e) { console.warn('Legacy widget migration failed', e); });
+        });
     }
     async function read(id) {
         await init();
         var record = await fetchRecord(id);
-        if (!record && !isTombstoned(id)) {
+        // Fresh check: a stale tab must not re-migrate a widget another tab
+        // deleted (migrate() re-checks inside its transaction as well).
+        if (!record && !tombstonedNow(id)) {
             var items = [];
             Object.keys(chats).forEach(function(cid) { (chats[cid].widgets || []).forEach(function(w) { if (w.id === id) items.push(Object.assign({}, w, { chatId: w.chatId || cid })); }); });
             if (dashboardWidgets[id]) items.push(dashboardWidgets[id]);
@@ -196,6 +286,11 @@ var WidgetStore = (function() {
         await init();
         var payload = snapshot(data), fingerprint = fingerprintOf(payload);
         var result = await transact(id, function(record) {
+            // Delete is permanent (no undo): a replayed create (same
+            // operation-derived id, expected_version 0), an edit, or a save
+            // racing remove() never resurrects the id, from any tab. Only
+            // importRecords() revives a deleted id.
+            if (tombstonedNow(id)) return { result: { success: false, code: 'WIDGET_DELETED', error: 'Widget was deleted and cannot be saved again: ' + id + '. Create a new widget instead (with a new operation_id: reusing this one derives the same deleted id).' } };
             if (record) {
                 var retry = record.versions.find(function(v) { return v.operationId === operationId; });
                 if (retry) return { record: record, result: sameContent(retry, fingerprint, payload)
@@ -216,7 +311,6 @@ var WidgetStore = (function() {
             return { record: record, result: { success: true, id: id, version: version, latest_version: version } };
         });
         if (result.success) {
-            setTombstone(id, false);
             if (channel) channel.postMessage({ id: id });
             project(id);
         }
@@ -389,6 +483,15 @@ var WidgetStore = (function() {
     function clearCache(broadcast) {
         records = Object.create(null);
         ready = null;
+        // Orphan a pending deferred legacy pass (its pre-reset dashboard rows
+        // must not be written back into the cleared store) and let the next
+        // init() schedule a fresh one. Re-read the tombstones too: another
+        // tab's delete may be missing from this copy.
+        legacyGen++;
+        legacyDone = false;
+        legacyDeferred = null;
+        legacyDashRows = [];
+        tombstones = readTombstones();
         // Drop compatibility projections too: read() must not remigrate deleted
         // widgets from a still-open panel after a successful full reset.
         Object.keys(chats).forEach(function(cid) {
@@ -453,6 +556,40 @@ async function saveWidgetRevision(widget, html, expectedVersion, operationId) {
     return Object.assign(result, { widget_id: saved.id, widgetId: saved.id, _widget_persist: saved });
 }
 
+// PER-TURN RENDERS: every agent save renders inline in the ISSUING chat at the
+// turn of that save (even for a widget owned by another chat), pinned to the
+// version that save produced. chat.widgetRenders holds REFS only, keyed
+// `<toolCallId>:<widgetId>` (several saves in one tool call collapse to the
+// last); the HTML stays in WidgetStore. `_toggledAt` lets the shared per-id
+// union (_unionChatDisplaysForPut) keep the newest ref across stale snapshots.
+// Saves without a tool call (code editor, widget bridge) record nothing: they
+// own no turn. The SW mirrors the returned ref (worker/120-tool-routing.js).
+function recordWidgetRender(chatId, widgetId, version, options) {
+    options = options || {};
+    var chat = typeof chats !== 'undefined' ? chats[chatId] : null;
+    var toolCallId = (options.fromSandbox && options.parentToolCallId) ? options.parentToolCallId : options.toolCallId;
+    if (!chat || !widgetId || !toolCallId || !Number.isInteger(Number(version)) || !Number(version)) return null;
+    var msgIndex = -1, messages = Array.isArray(chat.messages) ? chat.messages : [];
+    for (var i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === 'tool' && messages[i].tool_call_id === toolCallId) { msgIndex = i; break; }
+    }
+    if (msgIndex === -1) msgIndex = Number.isInteger(options.msgIndex) && options.msgIndex >= 0 ? options.msgIndex : messages.length;
+    var ref = { id: widgetId, version: Number(version), msgIndex: msgIndex, toolCallId: toolCallId, _toggledAt: Date.now() };
+    if (!chat.widgetRenders) chat.widgetRenders = {};
+    chat.widgetRenders[toolCallId + ':' + widgetId] = ref;
+    delete chat.isTemporary;
+    return Object.assign({ key: toolCallId + ':' + widgetId }, ref);
+}
+// User-facing (translated) text for a failed saveWidgetRevision result, for
+// the code editor's snackbar. result.error stays English: it is the tool
+// result the model reads.
+function widgetSaveErrorText(result) {
+    var code = result && result.code;
+    if (code === 'WIDGET_DELETED') return t('This widget was deleted and cannot be saved again.');
+    if (code === 'VERSION_CONFLICT') return t('This widget changed since the editor opened. Reopen the editor and try again.');
+    return t('Widget save failed: {error}', { error: (result && result.error) || t('unknown error') });
+}
+
 // Mount-local history selection: nothing is written when viewing a revision.
 // Rewriting a saved version invalidates the old widget_eval instance through the
 // existing cleanup/registration lifecycle. Latest views follow committed saves.
@@ -485,6 +622,42 @@ function attachWidgetVersionPicker(iframe, widgetId) {
         option.textContent = t('v{version} · {date}', { version: v.version, date: i18nFormatDateTime(new Date(v.createdAt)) }); picker.appendChild(option);
     });
     picker.value = iframe.dataset.selectedWidgetVersion || '';
+    updateWidgetVersionBadge(iframe, widgetId, versions[versions.length - 1].version);
+}
+// Pinned per-turn render badge: "vN (latest)" or "vN · latest is vM" plus a
+// per-view "Show latest" (mount-local, nothing persisted). Only renders
+// pinned by a per-turn ref (dataset.pinnedWidgetVersion) get one; legacy
+// follow-latest renders, dashboard cards and previews never do.
+function updateWidgetVersionBadge(iframe, widgetId, latestVersion) {
+    var badge = iframe.__versionBadge;
+    if (!iframe.dataset.pinnedWidgetVersion) { if (badge) badge.remove(); iframe.__versionBadge = null; return; }
+    if (!badge) {
+        var slot = iframe.__versionPicker && iframe.__versionPicker.parentNode;
+        if (!slot) return;
+        badge = document.createElement('span');
+        badge.className = 'widget-version-badge';
+        slot.insertBefore(badge, iframe.__versionPicker);
+        iframe.__versionBadge = badge;
+        ['click', 'mousedown'].forEach(function(type) { badge.addEventListener(type, function(e) { if (e && e.stopPropagation) e.stopPropagation(); }); });
+    }
+    var shown = Number(iframe.dataset.selectedWidgetVersion) || latestVersion;
+    badge.replaceChildren();
+    var label = document.createElement('span');
+    label.className = 'widget-version-badge-label';
+    badge.appendChild(label);
+    if (shown === latestVersion) {
+        badge.classList.remove('is-stale');
+        label.textContent = t('v{version} (latest)', { version: shown });
+        return;
+    }
+    badge.classList.add('is-stale');
+    label.textContent = t('v{version} · latest is v{latest}', { version: shown, latest: latestVersion });
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'widget-version-show-latest';
+    btn.textContent = t('Show latest');
+    btn.addEventListener('click', function() { selectWidgetRenderVersion(iframe, ''); });
+    badge.appendChild(btn);
 }
 function selectWidgetRenderVersion(iframe, version, hydrated) {
     var id = iframe.dataset.savedWidgetId;
@@ -505,6 +678,7 @@ function selectWidgetRenderVersion(iframe, version, hydrated) {
     fresh.__versionPreview = iframe.__versionPreview;
     if (iframe.__widgetCleanup) iframe.__widgetCleanup();
     if (iframe.__versionPicker) iframe.__versionPicker.remove();
+    if (iframe.__versionBadge) iframe.__versionBadge.remove();
     iframe.replaceWith(fresh);
     var html = injectWidgetBridge(saved.html, saved.title, id);
     if (fresh.__versionSuffix) html = _appendWidgetScript(html, fresh.__versionSuffix);

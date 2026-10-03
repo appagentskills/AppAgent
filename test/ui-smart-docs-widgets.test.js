@@ -334,7 +334,8 @@ describe('ui smart documents › documents page and preview modal', function() {
         assert.match(cards[1].querySelector('.sdoc-lib-date').textContent, /5h ago/);
         assert.strictEqual(cards[0].querySelector('.sdoc-scope-badge').textContent, 'Shared');
         var acts = Array.prototype.map.call(cards[0].querySelectorAll('.sdoc-lib-actions .widget-library-btn'), function(x) { return x.title; });
-        assert.deepStrictEqual(acts, ['New chat', 'Export', 'Delete']);
+        assert.deepStrictEqual(acts.slice(-2), ['Export', 'Delete']);
+        assert.match(cards[0].querySelector('.sdoc-start-chat-btn').title, /^Start a chat about /);
         assert.ok(cards[0].querySelector('.widget-library-btn.danger[title="Delete"]'));
         assert.strictEqual(dom.$('#documents-count').textContent, '2 documents');
         m.sdocDeleteFromPage = U.recorder();
@@ -452,7 +453,7 @@ describe('ui smart documents › documents page and preview modal', function() {
         // actions still wired in gallery
         m.sdocStartChat = U.recorder();
         var card = dom.$('.sdoc-lib-item');
-        var info = U.fireInline(card.querySelector('[title="New chat"]'), 'click', m);
+        var info = U.fireInline(card.querySelector('.sdoc-start-chat-btn'), 'click', m);
         assert.ok(info.stopped); assert.deepStrictEqual(m.sdocStartChat.calls[0], ['doc_ui']);
         // sdocOpenPreview is called from inside the module, so observe the real modal
         U.fireInline(card, 'keydown', m, { key: 'Enter', target: card.querySelector('[title="Export"]') });
@@ -681,6 +682,89 @@ describe('ui html_widget › inline frame chrome', function() {
         assert.strictEqual(pickers[0].value, '1');
         assert.ok(pickers[0].parentNode.classList.contains('widget-controls'), 'replacement picker stays in the header');
         assert.strictEqual(x.win.count('message'), x.base + 2, 'old listeners released, new ones bound');
+    }, { tags: ['unit'] });
+
+    // Per-turn edit renders: chat.widgetRenders refs (recordWidgetRender) put one
+    // card per (widget, turn), each pinned to the version its save produced.
+    async function loadPerTurn() {
+        var x = await loadWidgets();
+        var chat = x.m.__scope.chats.c1;
+        chat.messages = [{ role: 'user' }, { role: 'tool', tool_call_id: 'tc1' }, { role: 'assistant' }, { role: 'tool', tool_call_id: 'tc2' }];
+        chat.widgetRenders = {
+            'tc1:widget_a': { id: 'widget_a', version: 1, msgIndex: 1, toolCallId: 'tc1' },
+            'tc2:widget_a': { id: 'widget_a', version: 2, msgIndex: 3, toolCallId: 'tc2' }
+        };
+        var dom = await U.mountDom({ html: x.m.getWidgetHtmlForMessage(1) + x.m.getWidgetHtmlForMessage(3) });
+        x.m.initializeWidgetsInView();
+        return { x: x, dom: dom, chat: chat };
+    }
+    function cardFrame(dom, msg) { return dom.$('.widget-inline[data-render-msg="' + msg + '"] iframe.widget-iframe'); }
+    function cardBadge(dom, msg) { return dom.$('.widget-inline[data-render-msg="' + msg + '"] .widget-version-badge'); }
+
+    test('per-turn renders: one card per edit turn, newest keeps the canonical ids', async function() {
+        var p = await loadPerTurn();
+        var places = p.x.m.getWidgetPlacements('c1');
+        assert.deepStrictEqual(places.map(function(q) { return [q.msgIndex, q.version, q.canonical, q.domKey]; }),
+            [[3, 2, true, 'widget_a'], [1, 1, false, 'widget_a--r1']]);
+        var cards = p.dom.$$('.widget-inline');
+        assert.strictEqual(cards.length, 2);
+        assert.deepStrictEqual(cards.map(function(c) { return [c.id, c.getAttribute('data-render-version')]; }),
+            [['widget-widget_a--r1', '1'], ['widget-widget_a', '2']]);
+        assert.ok(p.dom.$('#widget-content-widget_a--r1 iframe.widget-iframe'), 'older turn rendered');
+        assert.ok(p.dom.$('#widget-content-widget_a iframe.widget-iframe'), 'newest turn rendered');
+        // A ref whose tool row is gone (rewound turn) renders nowhere.
+        p.chat.messages[1] = { role: 'user' };
+        assert.deepStrictEqual(p.x.m.getWidgetPlacements('c1').map(function(q) { return q.msgIndex; }), [3]);
+    }, { tags: ['unit'] });
+
+    test('per-turn renders: each card stays pinned to its own version', async function() {
+        var p = await loadPerTurn();
+        var old = cardFrame(p.dom, 1), cur = cardFrame(p.dom, 3);
+        assert.strictEqual(old.dataset.pinnedWidgetVersion, '1');
+        assert.strictEqual(old.dataset.selectedWidgetVersion, '1');
+        assert.strictEqual(old.dataset.savedWidgetVersion, '1', 'older turn shows v1 content');
+        assert.strictEqual(cur.dataset.pinnedWidgetVersion, '2');
+        assert.strictEqual(cur.dataset.savedWidgetVersion, '2');
+        assert.strictEqual(p.dom.$('.widget-inline[data-render-msg="1"] select.widget-version-picker').value, '1');
+    }, { tags: ['unit'] });
+
+    test('per-turn renders: a legacy follow-latest render (no per-turn ref) gets no badge', async function() {
+        var x = await loadWidgets();
+        var dom = await U.mountDom({ html: x.m.getWidgetHtmlForMessage(3) });
+        x.m.initializeWidgetsInView();
+        assert.ok(dom.$('select.widget-version-picker'));
+        assert.strictEqual(dom.$('.widget-version-badge'), null, 'unpinned render has no badge');
+    }, { tags: ['unit'] });
+
+    test('per-turn renders: badge text for latest vs stale', async function() {
+        var p = await loadPerTurn();
+        var cur = cardBadge(p.dom, 3), old = cardBadge(p.dom, 1);
+        assert.strictEqual(cur.textContent, 'v2 (latest)');
+        assert.ok(!cur.classList.contains('is-stale'));
+        assert.strictEqual(cur.querySelector('.widget-version-show-latest'), null, 'no Show latest on the latest render');
+        assert.strictEqual(old.querySelector('.widget-version-badge-label').textContent, 'v1 \u00b7 latest is v2');
+        assert.ok(old.classList.contains('is-stale'));
+        var btn = old.querySelector('button.widget-version-show-latest');
+        assert.strictEqual(btn.textContent, 'Show latest');
+        assert.strictEqual(btn.type, 'button');
+        assert.strictEqual(old.nextElementSibling.tagName, 'SELECT', 'badge sits before the picker in the header');
+    }, { tags: ['unit'] });
+
+    test('per-turn renders: Show latest switches only that view', async function() {
+        var p = await loadPerTurn();
+        var old = cardFrame(p.dom, 1), cur = cardFrame(p.dom, 3);
+        cardBadge(p.dom, 1).querySelector('.widget-version-show-latest').click();
+        var swapped = cardFrame(p.dom, 1);
+        assert.notStrictEqual(swapped, old, 'older turn frame replaced');
+        assert.strictEqual(swapped.dataset.selectedWidgetVersion, '');
+        assert.strictEqual(swapped.dataset.savedWidgetVersion, '2', 'now shows the latest content');
+        assert.strictEqual(swapped.dataset.pinnedWidgetVersion, '1', 'pin kept (mount-local view only)');
+        assert.strictEqual(cardBadge(p.dom, 1).textContent, 'v2 (latest)');
+        assert.strictEqual(p.dom.$$('.widget-inline[data-render-msg="1"] .widget-version-badge').length, 1, 'old badge removed');
+        assert.strictEqual(cardFrame(p.dom, 3), cur, 'other turn untouched');
+        assert.strictEqual(cur.dataset.selectedWidgetVersion, '2');
+        assert.strictEqual(cardBadge(p.dom, 3).textContent, 'v2 (latest)');
+        assert.strictEqual(p.chat.widgetRenders['tc1:widget_a'].version, 1, 'nothing persisted');
     }, { tags: ['unit'] });
 
     test('headerless mount renders no version picker at all', async function() {
@@ -1166,5 +1250,38 @@ describe('A6B-01 dashboard expanded-modal remove', function() {
         assert.deepStrictEqual(x.lastSnack(), ['Removed from Home', 'success']);
         assert.strictEqual(x.dom.$('.dashboard-widget'), null, 'home card removed');
         assert.strictEqual(x.grid.innerHTML, '', 'home grid emptied (no dashboard empty-state card)');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    // The expanded modal of a pinned widget shows a direct Unpin button that
+    // reuses pinWidgetTo(id, 'none') (no confirm, like the pin menu's Unpin),
+    // closes the modal and refreshes the grid / pin buttons / sidebar.
+    test('expanded modal of a pinned widget shows an Unpin button that unpins and closes', async function() {
+        var x = await setup({ widget_a: { id: 'widget_a', title: 'T' } }, 'main');
+        x.m.expandDashboardWidget('widget_a');
+        var btn = document.querySelector('#widget-fullscreen-overlay .widget-unpin-btn');
+        assert.ok(btn, 'Unpin button rendered for a pinned widget');
+        assert.strictEqual(btn.title, 'Unpin');
+        assert.strictEqual(btn.getAttribute('aria-label'), 'Unpin');
+        assert.ok(!btn.classList.contains('danger'), 'not the destructive control');
+        U.fireInline(btn, 'click', x.m);
+        await U.flush(); await U.flush();
+        assert.strictEqual(document.getElementById('widget-fullscreen-overlay'), null, 'modal closed');
+        assert.strictEqual(x.confirms.length, 0, 'no confirm (same as pin-menu Unpin)');
+        assert.deepStrictEqual(x.dels, ['widget_a'], 'unpinned via deleteDashboardWidget');
+        assert.deepStrictEqual(x.removes, [], 'WidgetStore.remove never called');
+        assert.deepStrictEqual(x.lastSnack(), ['Removed from dashboard', 'success']);
+        assert.strictEqual(x.dom.$('.dashboard-widget'), null, 'grid card removed');
+        assert.strictEqual(x.dom.$('.widget-dashboard-btn').classList.contains('on-dashboard'), false, 'chat pin button refreshed');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('Unpin on a Home widget says Removed from Home', async function() {
+        var x = await setup({ widget_h: { id: 'widget_h', title: 'H', dashboard: 'home' } }, 'home');
+        x.m.expandDashboardWidget('widget_h');
+        var btn = document.querySelector('#widget-fullscreen-overlay .widget-unpin-btn');
+        assert.ok(btn);
+        U.fireInline(btn, 'click', x.m);
+        await U.flush(); await U.flush();
+        assert.deepStrictEqual(x.dels, ['widget_h']);
+        assert.deepStrictEqual(x.lastSnack(), ['Removed from Home', 'success']);
     }, { tags: ['unit'], timeout: 5000 });
 });

@@ -272,9 +272,13 @@ function _importConflictNames(list) {
 // _reloadExtensionLocked (ui/270-iframe-panel.js), so it cannot be reused here.
 // No extension runtime (web preview/tests) or a build still writing files:
 // plain page reload, synchronously.
+// True when _restartAfterImport will only reload the page (the SW survives).
+function _restartIsPageOnly() {
+    return typeof chrome === 'undefined' || !chrome || !chrome.runtime || typeof chrome.runtime.reload !== 'function' ||
+        (typeof _reloadBuildInFlight !== 'undefined' && !!_reloadBuildInFlight);
+}
 async function _restartAfterImport() {
-    if (typeof chrome === 'undefined' || !chrome || !chrome.runtime || typeof chrome.runtime.reload !== 'function' ||
-        (typeof _reloadBuildInFlight !== 'undefined' && _reloadBuildInFlight)) {
+    if (_restartIsPageOnly()) {
         window.location.reload();
         return;
     }
@@ -658,6 +662,24 @@ function _deleteAllLocalSecrets() {
     });
 }
 
+// Rm7 (#1007): remove every appStorage key (window.localStorage entries under
+// STORAGE_PREFIX) except the post-restart notice slot. Best-effort, never throws.
+function _deleteAllAppStorage() {
+    try {
+        var ls = (typeof window !== 'undefined' && window.localStorage) || null;
+        if (!ls) return 0;
+        var prefix = (typeof STORAGE_PREFIX === 'string') ? STORAGE_PREFIX : '';
+        if (!prefix) return 0; // Never erase unrelated origin data without an app namespace.
+        var keep = prefix + POST_IMPORT_NOTICE_KEY, doomed = [];
+        for (var i = 0; i < ls.length; i++) {
+            var k = ls.key(i);
+            if (k != null && k !== keep && k.indexOf(prefix) === 0) doomed.push(k);
+        }
+        doomed.forEach(function(k) { try { ls.removeItem(k); } catch (e) {} });
+        return doomed.length;
+    } catch (e) { return 0; }
+}
+
 async function deleteAllData() {
     // S8D-01: Delete All restarts the whole extension (below), which stops every
     // in-flight agent run - warn in the FIRST confirm (import's count loop).
@@ -716,6 +738,9 @@ async function deleteAllData() {
         WidgetStore.clearCache(true);
         // Sign-ins and tokens live in chrome.storage.local: removed only after the commit.
         var secretsRemoved = await _deleteAllLocalSecrets();
+        // Rm7 (#1007): UI prefs live in appStorage (localStorage, STORAGE_PREFIX)
+        // - the dialog promises settings are deleted, so clear them too.
+        _deleteAllAppStorage();
 
         // S8D-01: the SW keeps enforcing its in-memory permission maps and writes
         // them back to IDB on the next delta - hand it the cleared (empty) maps.
@@ -730,6 +755,13 @@ async function deleteAllData() {
         try {
             if (typeof appStorage !== 'undefined') appStorage.setItem(POST_IMPORT_NOTICE_KEY, JSON.stringify({ msg: _delResult, type: _delKind, at: Date.now() }));
         } catch (eNotice) { /* best-effort; never blocks the restart */ }
+        // M6: a page-only reload keeps the SW (and its in-memory save lock)
+        // alive - lift the lock first or every later chat save throws until
+        // the SW restarts. The runs were interrupted above and the page wipe
+        // guard stays closed until the reload.
+        if (_delLockSent && _restartIsPageOnly()) {
+            await _deleteAllCall(function(done) { _delRt.sendMessage({ type: 'delete-all-save-lock', locked: false }, done); });
+        }
         // Only now, with the delete committed: restart the SW too, like import.
         await _restartAfterImport();
     } catch (e) {

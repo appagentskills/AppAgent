@@ -376,6 +376,7 @@ function renderSettingsPage() {
     // Render GitHub settings
     renderGitHubSettings();
 
+
     // Toolbar search (ui/046-settings-help-search.js): fill the slot once and
     // re-apply any active query to the freshly rendered sections.
     if (typeof ensurePageSearchToolbar === 'function') {
@@ -902,7 +903,9 @@ async function renderGitHubReposList() {
         for (var fi = 0; fi < repoData.length; fi++) {
             var fillEl = document.getElementById('repo-detail-' + fi);
             if (!fillEl) continue;
-            repoData[fi].dirtyFiles.forEach(function(f) { fillEl.appendChild(_dirtyFileRow(f)); });
+            (function(rdMeta) {
+                repoData[fi].dirtyFiles.forEach(function(f) { fillEl.appendChild(_dirtyFileRow(f, rdMeta)); });
+            })(repoData[fi].meta);
         }
 
         // Only the five most-recent workspaces used in the rolling last 7 days
@@ -946,7 +949,10 @@ async function renderGitHubReposList() {
                     }
                     // Re-render file list after sync
                     wsGetIgnoreFilterLocal(rd.wk).then(function(isIgnored) {
-                        getAllWorkspaceFiles(rd.wk).then(function(freshFiles) {
+                        // #1079: fresh meta (the sync may have stamped PRs merged).
+                        Promise.all([getAllWorkspaceFiles(rd.wk), getWorkspaceMeta(rd.wk).catch(function() { return null; })]).then(function(_fm) {
+                            var freshFiles = _fm[0] || [];
+                            var freshMeta = _fm[1] || rd.meta;
                             var freshDirty = freshFiles.filter(function(f) { return f.dirty && !isIgnored(f.path); });
                             var countEl = document.getElementById('repo-dirty-' + idx);
                             if (countEl) {
@@ -957,7 +963,7 @@ async function renderGitHubReposList() {
                                 // Same shared DOM row builder as the initial render —
                                 // keeps the owning-chat chip on refreshed rows too.
                                 detailEl.innerHTML = '';
-                                freshDirty.forEach(function(f) { detailEl.appendChild(_dirtyFileRow(f)); });
+                                freshDirty.forEach(function(f) { detailEl.appendChild(_dirtyFileRow(f, freshMeta)); });
                                 var rows = '';
                                 // Add behind/conflict files
                                 if (syncResult.behindFiles) {
@@ -1052,7 +1058,7 @@ async function deleteGitHubRepo(repo) {
     if (_wsDropdown) {
         var section = _wsDropdown.querySelector('[data-ws="' + CSS.escape(repo) + '"]');
         if (section) section.remove();
-        _reconcileThisChatSection();
+        _reconcileWsPrSection();
         if (Object.keys(_wsHeaderCaches).length === 0) hideWorkspaceDropdown();
     }
     _renderWsHeaderBadge();
@@ -1391,7 +1397,7 @@ async function _applyWsRefreshResult(session, wk, syncResult) {
     });
     _renderWsHeaderBadge();
     _renderWsDropdownKey(wk);
-    if (_wsDropdown) _reconcileThisChatSection();
+    if (_wsDropdown) _reconcileWsPrSection();
 }
 
 function _refreshWsKeyInSession(session, wk) {
@@ -1533,6 +1539,7 @@ function _syncDropdownBatch(session, keys) {
 }
 
 function hideWorkspaceDropdown() {
+    if (_wsPrPollTimer) { clearInterval(_wsPrPollTimer); _wsPrPollTimer = null; }
     if (_wsDropdown) {
         _wsDropdown.remove();
         _wsDropdown = null;
@@ -1771,22 +1778,39 @@ function _wsPrChatLookup(prUrl) {
         var idx = {};
         Object.keys(chats).forEach(function(cid) {
             var chat = chats[cid];
-            if (!chat || !chat.messages) return;
-            chat.messages.forEach(function(msg) {
-                if (msg.role !== 'tool' || typeof msg.content !== 'string') return;
-                if (msg.content.indexOf('pr_url') === -1) return; // cheap prefilter
-                try {
-                    var r = JSON.parse(msg.content);
-                    // Later pushes overwrite — the LAST pusher owns the chip.
-                    // Only actual pushes — workspace-status auto-delete results
-                    // also carry pr_url/pr_number but are NOT this chat's push.
-                    if (r && r.success && r.pr_url && r.pr_number && !r.auto_deleted) idx[r.pr_url] = { chatId: cid, chatTitle: chat.title || '' };
-                } catch (e) { /* not JSON — skip */ }
-            });
+            if (!chat) return;
+            // C2-ui SKEL-SCAN: a skeleton (no messages array) answers from its
+            // stored row (slot 'prUrls'), then the PR chips re-render.
+            var urls = (typeof skeletonScanValue === 'function')
+                ? skeletonScanValue('prUrls', cid, chat, _wsPushedPrUrlsLive, [], _wsPrChatIdxRerender)
+                : _wsPushedPrUrlsLive(chat);
+            // Later pushes overwrite — the LAST pusher owns the chip.
+            (urls || []).forEach(function(u) { idx[u] = { chatId: cid, chatTitle: chat.title || '' }; });
         });
         _wsPrChatIdx = idx;
     }
     return _wsPrChatIdx[prUrl] || null;
+}
+// PR urls pushed by one chat, in message order (small JSON: memoizable).
+function _wsPushedPrUrlsLive(chat) {
+    var urls = [];
+    if (!chat || !chat.messages) return urls;
+    chat.messages.forEach(function(msg) {
+        if (msg.role !== 'tool' || typeof msg.content !== 'string') return;
+        if (msg.content.indexOf('pr_url') === -1) return; // cheap prefilter
+        try {
+            var r = JSON.parse(msg.content);
+            // Only actual pushes — workspace-status auto-delete results
+            // also carry pr_url/pr_number but are NOT this chat's push.
+            if (r && r.success && r.pr_url && r.pr_number && !r.auto_deleted) urls.push(r.pr_url);
+        } catch (e) { /* not JSON — skip */ }
+    });
+    return urls;
+}
+// Skeleton scan landed: drop the index so the next lookup rebuilds with it.
+function _wsPrChatIdxRerender() {
+    _wsPrChatIdx = null;
+    if (typeof _reconcileWsPrSection === 'function') { try { _reconcileWsPrSection(); } catch (e) { /* best effort */ } }
 }
 
 // Small color-coded chat chip for a dirty file row whose changes are tied to
@@ -1794,8 +1818,8 @@ function _wsPrChatLookup(prUrl) {
 // ownership in 020-tool-execution.js), or — after a push released that stamp —
 // the pushing chat (pushed_by_chat_id, with a retroactive scan of recorded
 // push results as last resort). Click → open that chat. No chip is rendered
-// for the CURRENT chat (its files are already grouped under the "This chat"
-// section); a chip for an unresolvable chat renders muted/inert.
+// for the CURRENT chat (its own edits need no attribution); a chip for an
+// unresolvable chat renders muted/inert.
 //
 // COLOR encodes the MAIN (root/parent) chat of the attributed chat's lineage,
 // not the individual worker: files touched by different sub-agents of the
@@ -1818,19 +1842,6 @@ function _wsResolveChatRef(cid) {
         }
     } catch (e) { /* registry unavailable — treat as unknown */ }
     return null;
-}
-
-// UI-side same-lineage check (current chat ↔ its own subs / sibling subs of
-// one root). Reuses the tool-layer _wsSameChatLineage when the bundle has it
-// (the page bundle includes tools/020-tool-execution.js); otherwise falls
-// back to exact equality.
-function _wsUiSameLineage(a, b) {
-    if (!a || !b) return false;
-    if (a === b) return true;
-    try {
-        if (typeof _wsSameChatLineage === 'function') return _wsSameChatLineage(a, b);
-    } catch (e) { /* fall through */ }
-    return false;
 }
 
 function _wsChatChip(f) {
@@ -1886,13 +1897,27 @@ function _wsChatChip(f) {
 
 // Shared row builder for a dirty file (status badge + optional PR link +
 // color-coded owning-chat chip).
-function _dirtyFileRow(f) {
+// `meta` (optional): the workspace meta — a pushed_pr whose meta.prs entry is
+// merged gets no badge (#1079: the stamp is stale until the next sync clears it).
+function _wsPushedPrMerged(f, meta) {
+    if (!f || !f.pushed_pr) return false;
+    if (f.pushed_pr_merged || f.pushed_pr.state === 'merged') return true;
+    var prs = meta && Array.isArray(meta.prs) ? meta.prs : [];
+    for (var i = 0; i < prs.length; i++) {
+        var p = prs[i];
+        if (p && p.number === f.pushed_pr.number && (p.state === 'merged' || p.merged_at)) return true;
+    }
+    return false;
+}
+
+function _dirtyFileRow(f, meta) {
     var badge = f.deleted ? '<span class="ws-file-badge deleted">' + t('deleted') + '</span>' :
         (!f.sha && !f.deleted) ? '<span class="ws-file-badge new">' + t('new') + '</span>' :
         '<span class="ws-file-badge modified">' + t('modified') + '</span>';
     var prLink = '';
-    if (f.pushed_pr && f.pushed_pr.url) {
-        prLink = '<a class="ws-file-pr" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank" onclick="event.stopPropagation()">PR #' + f.pushed_pr.number + '</a>';
+    if (f.pushed_pr && f.pushed_pr.url && !_wsPushedPrMerged(f, meta)) {
+        var _csp = !!f.changed_since_push;
+        prLink = '<a class="ws-file-pr' + (_csp ? ' ws-file-pr--changed' : '') + '" href="' + escapeHtml(f.pushed_pr.url) + '" target="_blank" onclick="event.stopPropagation()"' + (_csp ? ' title="Edited after it was pushed \u2014 push again to update the PR"' : '') + '>PR #' + f.pushed_pr.number + (_csp ? ' \u00b7 changed since push' : '') + '</a>';
     }
     var row = document.createElement('div');
     row.className = 'ws-file-row';
@@ -1902,68 +1927,225 @@ function _dirtyFileRow(f) {
     return row;
 }
 
-// Small uppercase group label used inside dropdown bodies.
-function _wsGroupLabel(text) {
-    var el = document.createElement('div');
-    el.className = 'ws-file-group-label';
-    el.textContent = text;
-    return el;
+// ---- "Pull requests" section (top of the workspace dropdown) ----
+// Lists PRs known to the extension (not just this chat's): the union of
+// all workspaces' durable meta.prs (written by wsPush / _wfMaybeTrackGitHubPr,
+// tools/020-tool-execution.js), read synchronously from _wsHeaderCaches, plus
+// any extra entries from the sidebar's async IDB union (_sidebarMetaPRs,
+// 120-ui-utils.js; its loader is kicked when the dropdown opens). Filter
+// (_wsFilterDropdownPRs): every non-merged PR (open / merging / closed) is
+// shown; merged PRs only when merged TODAY (local calendar day) — merged_at
+// comes from _sidebarPRMergedAt (GitHub refresh / merge button) or the meta
+// stamp; a merged PR with no timestamp is hidden. Rows reuse the
+// version-sidebar PR item markup (.pr-sidebar-*, 11-version.css). Open PRs
+// with pushed files expand to the workspace files whose pushed_pr points at them.
+var _wsPrExpanded = {}; // PR url -> true while the user keeps it expanded
+// At most _WS_PR_LIMIT rows render; a "View more (N)" button at the end of
+// the section reveals the rest ("Collapse" folds back). _wsPrShowAll survives
+// the poll re-renders and resets each time the dropdown opens.
+var _WS_PR_LIMIT = 7;
+var _wsPrShowAll = false;
+// While the dropdown is open, a light poll re-renders the PR section when a
+// PR state (_sidebarPRState: merge / background GitHub refresh), a merge
+// timestamp or the async meta union changes — those paths only call
+// renderVersionSidebar, which does NOT touch this section.
+var _wsPrPollTimer = null;
+var _wsPrPollSig = '';
+function _wsPrSectionSig() {
+    return _wsDropdownPRs().map(function(p) { return p.url + '=' + _wsPrState(p) + ':' + p.files.length; }).join('|');
 }
 
-// Aggregate dirty files whose uncommitted changes were stamped by the CURRENT
-// chat OR one of its own sub-agents (same lineage — mirrors the cross-chat
-// ownership rules in 020-tool-execution.js), grouped by workspace. Files
-// stamped by a lineage sub still get a worker chip via _dirtyFileRow (only
-// the exact current chat is chip-less). Returns [{wk, files:[...]}] in
-// _wsHeaderCaches order.
-function _thisChatChanges() {
-    var cid = (typeof currentChatId !== 'undefined' && currentChatId) ? currentChatId : null;
-    if (!cid) return [];
-    var out = [];
-    Object.keys(_wsHeaderCaches).forEach(function(wk) {
-        var c = _wsHeaderCaches[wk];
-        var files = ((c && c.dirtyFiles) || []).filter(function(f) { return _wsUiSameLineage(f.last_modified_by_chat_id, cid); });
-        if (files.length > 0) out.push({ wk: wk, files: files });
+function _wsPrRepoFromUrl(url) {
+    var m = /^https?:\/\/[^\/]+\/(.+?\/.+?)\/pull\/(\d+)(\/|$|[?#])/.exec(String(url || ''));
+    return m ? m[1] : null;
+}
+
+// Pure: collect PRs + their pushed files from header caches. extraPRs
+// (optional) = additional meta.prs-shaped entries (deduped by url).
+// Returns [{url, number, title, branch, base, chatId, metaState, files:[{f, meta}]}]
+// sorted newest first (meta.prs carries no timestamp: highest PR number
+// first, which is creation order within a repo).
+function _wsCollectDropdownPRs(caches, extraPRs) {
+    caches = caches || {};
+    var out = [], byUrl = {};
+    function add(p, base) {
+        if (!p || !p.url) return;
+        var cur = byUrl[p.url];
+        var st = (p.state === 'merged' || p.merged_at) ? 'merged' : (p.state === 'closed' ? 'closed' : '');
+        if (cur) {
+            if (!cur.metaState && st) cur.metaState = st;
+            if (!cur.mergedAt && p.merged_at) cur.mergedAt = p.merged_at;
+            if (!cur.base && (p.base || base)) cur.base = p.base || base;
+            if (!cur.chatId && p.chatId) cur.chatId = p.chatId;
+            return;
+        }
+        cur = { url: p.url, number: p.number, title: p.title || p.branch || '', branch: p.branch || '',
+            base: p.base || base || '', chatId: p.chatId || null, metaState: st, mergedAt: p.merged_at || null, files: [] };
+        byUrl[p.url] = cur;
+        out.push(cur);
+    }
+    var keys = Object.keys(caches);
+    keys.forEach(function(wk) {
+        var c = caches[wk], meta = c && c.meta;
+        if (!meta || !Array.isArray(meta.prs)) return;
+        var base = meta.branch || (wk.indexOf('::') >= 0 ? wk.slice(wk.lastIndexOf('::') + 2) : '');
+        meta.prs.forEach(function(p) { add(p, base); });
     });
+    (extraPRs || []).forEach(function(p) { add(p, ''); });
+    keys.forEach(function(wk) {
+        var c = caches[wk];
+        var repo = (c && c.meta && c.meta.github_repo) || (wk.indexOf('::') >= 0 ? wk.slice(0, wk.lastIndexOf('::')) : wk);
+        ((c && c.dirtyFiles) || []).forEach(function(f) {
+            var pp = f && f.pushed_pr;
+            if (!pp) return;
+            var hit = (pp.url && byUrl[pp.url]) || null;
+            if (!hit && pp.number) {
+                for (var i = 0; i < out.length; i++) {
+                    if (out[i].number === pp.number && _wsPrRepoFromUrl(out[i].url) === repo) { hit = out[i]; break; }
+                }
+            }
+            if (hit) hit.files.push({ f: f, meta: (c && c.meta) || null });
+        });
+    });
+    out.sort(function(a, b) { return (Number(b.number) || 0) - (Number(a.number) || 0) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0); });
     return out;
 }
 
-// Create/refresh/remove the "This chat" section pinned to the TOP of the
-// dropdown: lists each workspace this chat has touched with its dirty files.
-// Rendered only when the current chat owns at least one uncommitted change.
-function _reconcileThisChatSection() {
+// Pure: true when `ts` (ISO string / ms / Date) falls on the same LOCAL
+// calendar day as `now` (ms or Date). Unparseable / missing ts → false.
+function _wsIsSameLocalDay(ts, now) {
+    if (!ts) return false;
+    var d = new Date(ts), n = new Date(now);
+    if (isNaN(d.getTime()) || isNaN(n.getTime())) return false;
+    return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+}
+
+// Pure filter for the dropdown PR list: keep every PR that is not merged
+// (open / merging / closed); keep a merged PR only when it was merged today
+// (local day of `now`). A merged PR without a timestamp is hidden.
+// opts: { now (ms|Date, default Date.now()), stateOf(pr), mergedAtOf(pr) }
+// — defaults read pr.metaState / pr.mergedAt (the _wsCollectDropdownPRs shape).
+function _wsFilterDropdownPRs(prs, opts) {
+    opts = opts || {};
+    var now = opts.now != null ? opts.now : Date.now();
+    var stateOf = opts.stateOf || function(p) { return p.metaState || 'open'; };
+    var mergedAtOf = opts.mergedAtOf || function(p) { return p.mergedAt || null; };
+    return (prs || []).filter(function(p) {
+        if (stateOf(p) !== 'merged') return true;
+        return _wsIsSameLocalDay(mergedAtOf(p), now);
+    });
+}
+
+// Live merge timestamp (_sidebarPRMergedAt, 120-ui-utils.js) wins over the
+// durable meta stamp.
+function _wsPrMergedAt(pr) {
+    var live = (typeof _sidebarPRMergedAt !== 'undefined' && _sidebarPRMergedAt) ? _sidebarPRMergedAt[pr.url] : null;
+    return live || pr.mergedAt || null;
+}
+
+function _wsDropdownPRs(now) {
+    var extra = (typeof _sidebarMetaPRs !== 'undefined' && Array.isArray(_sidebarMetaPRs)) ? _sidebarMetaPRs : [];
+    return _wsFilterDropdownPRs(_wsCollectDropdownPRs(_wsHeaderCaches, extra),
+        { now: now, stateOf: _wsPrState, mergedAtOf: _wsPrMergedAt });
+}
+
+// Live state wins (_sidebarPRState, kept by the sidebar refresh/merge
+// flow); else the durable meta stamp; else open.
+function _wsPrState(pr) {
+    var live = (typeof _sidebarPRState !== 'undefined' && _sidebarPRState) ? _sidebarPRState[pr.url] : null;
+    return live || pr.metaState || 'open';
+}
+
+function _wsPrChatChipHtml(pr) {
+    var cid = pr.chatId, stampTitle = '';
+    if (!cid) {
+        var hit = _wsPrChatLookup(pr.url);
+        if (hit) { cid = hit.chatId; stampTitle = hit.chatTitle; }
+    }
+    if (!cid) return '';
+    var ref = _wsResolveChatRef(cid);
+    var mine = (typeof currentChatId !== 'undefined' && currentChatId === cid);
+    var title = (ref && ref.title) || stampTitle || t('Untitled chat');
+    var label = mine ? t('This chat') : title;
+    var tip = mine ? t('This chat') :
+        (ref && ref.isSub ? t('Pushed by worker \u201c{title}\u201d', { title: title }) : t('Pushed by chat \u201c{title}\u201d', { title: title })) +
+        ' \u2014 ' + (ref ? t('click to open') : t('chat not loaded (may be deleted or a background worker)'));
+    var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '';
+    return ' <button type="button" class="ws-file-chat ws-pr-chat' + (ref ? '' : ' gone') + '" style="--chat-hue:' + _wsChatHueRoot(cid) + '"' +
+        (ref ? ' data-pr-chat="' + escapeHtml(cid) + '"' : '') + ' title="' + escapeHtml(tip) + '">' + icon +
+        '<span class="ws-pr-chat-name">' + escapeHtml(label) + '</span></button>';
+}
+
+function _wsPrRowHtml(pr) {
+    var I = (typeof UI_ICONS !== 'undefined') ? UI_ICONS : {};
+    var st = _wsPrState(pr);
+    var isOpen = st === 'open';
+    var expandable = isOpen && pr.files.length > 0; // nothing to expand without pushed files
+    var num = escapeHtml(String(pr.number));
+    var title = pr.title || t('PR #{number}', { number: pr.number });
+    var h = '<div class="pr-sidebar-item ws-pr-row">';
+    if (expandable) h += '<span class="ws-collapse-chevron" aria-hidden="true">' + (I.chevronRight || '') + '</span>';
+    h += '<span class="pr-sidebar-icon">' + (I.gitBranch || '') + '</span>';
+    h += '<span class="pr-sidebar-info"><span class="pr-sidebar-title" title="' + escapeHtml(title) + '">' + escapeHtml(title) + '</span>';
+    h += '<span class="pr-sidebar-meta">#' + num + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + _wsPrChatChipHtml(pr) + '</span></span>';
+    if (isOpen) {
+        h += '<span class="ws-change-count" title="' + tn(pr.files.length, '{count} file', '{count} files') + '">' + pr.files.length + '</span>';
+        h += '<button type="button" class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" title="' + t('Merge PR #{number} and sync workspace', { number: num }) + '">' + (I.gitMerge || '') + '</button>';
+    } else if (st === 'merged') {
+        h += '<span class="pr-sidebar-state merged" title="' + t('Merged') + '">' + (I.gitMerge || '') + ' ' + t('Merged') + '</span>';
+    } else if (st === 'merging') {
+        h += '<span class="pr-sidebar-state merging" title="' + t('Merging\u2026') + '">' + (I.spinner || '') + '</span>';
+    } else {
+        h += '<span class="pr-sidebar-state closed" title="' + t('Closed without merging') + '">' + (I.close || '') + ' ' + t('Closed') + '</span>';
+    }
+    h += '<a class="pr-sidebar-open" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '">' + (I.externalLink || '') + '</a>';
+    h += '</div>';
+    return h;
+}
+
+// Create/refresh/remove the PR section pinned to the TOP of the dropdown
+// (before the "Repositories" band). Hidden when no PR is known. Re-rendered
+// on every cache reconcile and on PR state changes (_wsPrPollTimer while the
+// dropdown is open). Expand state survives re-renders.
+function _reconcileWsPrSection() {
     if (!_wsDropdown) return;
-    var groups = _thisChatChanges();
-    var sec = _wsDropdown.querySelector('.ws-this-chat-section');
-    if (groups.length === 0) { if (sec) sec.remove(); return; }
+    var prs = _wsDropdownPRs();
+    var sec = _wsDropdown.querySelector('.ws-pr-section');
+    if (prs.length === 0) { if (sec) sec.remove(); return; }
     if (!sec) {
         sec = document.createElement('div');
-        sec.className = 'ws-dropdown-section ws-this-chat-section';
-        var hdr = document.createElement('div');
-        hdr.className = 'ws-dropdown-header';
-        sec.appendChild(hdr);
-        var bdy = document.createElement('div');
-        bdy.className = 'ws-dropdown-body';
-        sec.appendChild(bdy);
-        // Pin below the "Repositories" title band (the band stays the first
-        // child of the dropdown; "This chat" leads the section list).
-        var band = _wsDropdown.querySelector('.ws-menu-title');
-        _wsDropdown.insertBefore(sec, band ? band.nextSibling : _wsDropdown.firstChild);
+        sec.className = 'ws-pr-section';
+        _wsDropdown.insertBefore(sec, _wsDropdown.firstChild);
     }
-    var total = 0;
-    groups.forEach(function(g) { total += g.files.length; });
-    var chevron = '<span class="ws-collapse-chevron" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) ? UI_ICONS.chevronRight : '') + '</span>';
-    var countChip = '<span class="ws-change-count" title="' + tn(total, '{count} uncommitted change by this chat', '{count} uncommitted changes by this chat') + '">' + total + '</span>';
-    var header = sec.querySelector('.ws-dropdown-header');
-    var chatIcon = '<span class="section-icon">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chat) ? UI_ICONS.chat : '') + '</span>';
-    header.innerHTML = '<span class="ws-dd-title">' + chevron + chatIcon + t('This chat') + countChip + '</span><span class="ws-sync">' + t('uncommitted') + '</span>';
-    var body = sec.querySelector('.ws-dropdown-body');
-    body.innerHTML = '';
-    groups.forEach(function(g) {
-        var parsed = parseWsKey(g.wk);
-        body.appendChild(_wsGroupLabel(parsed.repo + ' \u00b7 ' + parsed.branch));
-        g.files.forEach(function(f) { body.appendChild(_dirtyFileRow(f)); });
+    var icon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.gitBranch) ? UI_ICONS.gitBranch : '';
+    sec.innerHTML = '<div class="menu-section-title ws-menu-title ws-pr-title"><span class="section-icon">' + icon + '</span>' + t('Pull Requests ({count})', { count: prs.length }) + '</div>';
+    var list = document.createElement('div');
+    list.className = 'ws-pr-list';
+    var hiddenCount = Math.max(0, prs.length - _WS_PR_LIMIT);
+    var shown = (hiddenCount > 0 && !_wsPrShowAll) ? prs.slice(0, _WS_PR_LIMIT) : prs;
+    shown.forEach(function(pr) {
+        var entry = document.createElement('div');
+        var expandable = _wsPrState(pr) === 'open' && pr.files.length > 0;
+        entry.className = 'ws-pr-entry' + (expandable ? ' expandable' : '') + (expandable && _wsPrExpanded[pr.url] ? '' : ' collapsed');
+        entry.setAttribute('data-pr-url', pr.url);
+        entry.innerHTML = _wsPrRowHtml(pr);
+        if (expandable) {
+            var files = document.createElement('div');
+            files.className = 'ws-pr-files';
+            pr.files.forEach(function(x) { files.appendChild(_dirtyFileRow(x.f, x.meta)); });
+            entry.appendChild(files);
+        }
+        list.appendChild(entry);
     });
+    sec.appendChild(list);
+    if (hiddenCount > 0) {
+        var more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'ws-pr-more';
+        more.setAttribute('aria-expanded', _wsPrShowAll ? 'true' : 'false');
+        more.textContent = _wsPrShowAll ? t('Collapse') : t('View more') + ' (' + hiddenCount + ')';
+        sec.appendChild(more);
+    }
 }
 
 function _renderDropdownSection(section, cache) {
@@ -1987,7 +2169,7 @@ function _renderDropdownSection(section, cache) {
 
     // Dirty files
     if (cache.dirtyFiles && cache.dirtyFiles.length > 0) {
-        cache.dirtyFiles.forEach(function(f) { body.appendChild(_dirtyFileRow(f)); });
+        cache.dirtyFiles.forEach(function(f) { body.appendChild(_dirtyFileRow(f, cache.meta)); });
     }
 
     // Conflict files
@@ -2039,9 +2221,7 @@ function _renderDropdownSection(section, cache) {
 }
 
 // Build one workspace section (header + collapsible body) from the current
-// cache. Default expand state: when the CURRENT chat owns uncommitted changes
-// (a "This chat" section is pinned on top), every workspace section starts
-// collapsed so the this-chat files get the focus. Otherwise only the top 3
+// cache. Default expand state: only the top 3
 // workspaces (idx) start expanded, and even a top-3 workspace starts collapsed
 // when it has more than 5 changes. User toggles and background re-renders
 // preserve the class afterwards.
@@ -2050,8 +2230,7 @@ function _createDropdownSection(wk, idx) {
     var section = document.createElement('div');
     section.className = 'ws-dropdown-section';
     section.setAttribute('data-ws', wk);
-    var thisChatHasChanges = _thisChatChanges().length > 0;
-    if (thisChatHasChanges || idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
+    if (idx >= 3 || _wsSectionChangeCount(cache) > 5) section.classList.add('collapsed');
     var header = document.createElement('div');
     header.className = 'ws-dropdown-header';
     section.appendChild(header);
@@ -2080,7 +2259,7 @@ function _reconcileDropdownSections() {
             _wsDropdown.appendChild(_createDropdownSection(wk, idx));
         }
     });
-    _reconcileThisChatSection();
+    _reconcileWsPrSection();
 }
 
 async function showWorkspaceDropdown() {
@@ -2120,6 +2299,40 @@ async function showWorkspaceDropdown() {
     // Delegated action handler — header innerHTML is re-rendered on every sync,
     // so per-button listeners would be lost; delegation survives it.
     dd.addEventListener('click', function(e) {
+        // PR rows (top section): merge / open / chat chip never toggle or close.
+        var prMerge = e.target.closest('.ws-pr-row .pr-sidebar-merge-btn');
+        if (prMerge) {
+            e.stopPropagation();
+            if (typeof mergeSidebarPR === 'function') mergeSidebarPR(e, prMerge);
+            return;
+        }
+        if (e.target.closest('.ws-pr-row .pr-sidebar-open')) { e.stopPropagation(); return; } // default: new tab
+        var prChat = e.target.closest('[data-pr-chat]');
+        if (prChat) {
+            e.stopPropagation();
+            e.preventDefault();
+            var chatId = prChat.getAttribute('data-pr-chat');
+            hideWorkspaceDropdown();
+            if (typeof selectChat === 'function') selectChat(chatId);
+            return;
+        }
+        if (e.target.closest('.ws-pr-chat')) { e.stopPropagation(); return; } // unresolvable chip: inert
+        if (e.target.closest('.ws-pr-more')) {
+            e.stopPropagation();
+            _wsPrShowAll = !_wsPrShowAll;
+            _reconcileWsPrSection();
+            return;
+        }
+        var prRow = e.target.closest('.ws-pr-row');
+        if (prRow) {
+            var entry = prRow.closest('.ws-pr-entry');
+            if (entry && entry.classList.contains('expandable')) {
+                var nowCollapsed = entry.classList.toggle('collapsed');
+                var u = entry.getAttribute('data-pr-url');
+                if (nowCollapsed) delete _wsPrExpanded[u]; else _wsPrExpanded[u] = true;
+            }
+            return;
+        }
         var deleteBtn = e.target.closest('[data-delete-ws]');
         if (deleteBtn) {
             e.stopPropagation();
@@ -2157,7 +2370,27 @@ async function showWorkspaceDropdown() {
     document.body.appendChild(dd);
     _wsDropdown = dd;
     if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
-    _reconcileThisChatSection();
+    _wsPrShowAll = false; // every fresh open starts with the first 7 PRs
+    // The async IDB meta union may not be loaded yet (null = never loaded):
+    // kick its loader so the list is complete; the poll below picks it up.
+    if ((typeof _sidebarMetaPRs === 'undefined' || !Array.isArray(_sidebarMetaPRs)) && typeof _refreshSidebarMetaPRs === 'function') {
+        try { _refreshSidebarMetaPRs(); } catch (e) { /* best effort */ }
+    }
+    _reconcileWsPrSection();
+    _wsPrPollSig = _wsPrSectionSig();
+    _wsPrPollTimer = setInterval(function() {
+        if (!_wsDropdown) { clearInterval(_wsPrPollTimer); _wsPrPollTimer = null; return; }
+        try {
+            var sig = _wsPrSectionSig();
+            if (sig !== _wsPrPollSig) { _wsPrPollSig = sig; _reconcileWsPrSection(); }
+        } catch (e) { /* best effort */ }
+    }, 1500);
+    // Freshen open PR states in the background (throttled per URL inside).
+    // The refresh only re-renders the version sidebar; the dropdown section
+    // picks the new state / merged_at up through the 1.5s poll above.
+    if (typeof _refreshSidebarPRStates === 'function') {
+        try { _refreshSidebarPRStates(_wsDropdownPRs().filter(function(p) { return _wsPrState(p) === 'open'; })); } catch (e) { /* best effort */ }
+    }
 
     setTimeout(function() {
         document.addEventListener('click', _onClickOutsideWsDropdown, true);
@@ -3326,7 +3559,7 @@ function renderSettingsToolPermissions() {
         var containerId = 'settings-perm-' + key.replace(/[^a-zA-Z0-9]/g, '-');
         // Keep in sync with ui/140-dropdowns.js:281 and the worker default in
         // worker/025-permissions-helpers.js (get_cookie → 'allow').
-        var perm = toolPermissions[key] || (isReadPermissionKey(key) || key === 'workspace:push' || key === 'get_cookie' ? 'allow' : 'auto');
+        var perm = toolPermissions[key] || getGlobalDefaultPermission(key);
         _renderPermRadio(containerId, perm, key, false, false);
     });
 }

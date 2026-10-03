@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.33
+
+### Features
+- Documents brings local folders, Agent Files and GitHub repositories together, with previews and bulk actions.
+- Widget edits now appear at their own chat turn, pinned to that version.
+
+### Fixes
+- Chats and widgets use less memory.
+- Markdown lists, tables and formatting render correctly.
+
+---
+
 ## v1.1.32
 
 ### Features

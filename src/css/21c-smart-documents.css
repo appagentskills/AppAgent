@@ -151,11 +151,7 @@ textarea.sdoc-prompt-input { min-height: 60px; resize: vertical; }
 .sdoc-sidebar-ver { font-size: var(--text-xs); color: var(--text-muted); flex-shrink: 0; }
 
 /* ─── Responsive ─── */
-@media (max-width: 768px) {
-    .documents-list { width: 90%; }
-}
 @media (max-width: 480px) {
-    .documents-list { width: 100%; padding: var(--space-6); }
     .documents-header { padding: var(--space-5) var(--space-6); }
     .sdoc-header { flex-direction: column; align-items: flex-start; }
     .sdoc-header-actions { width: 100%; justify-content: flex-end; }

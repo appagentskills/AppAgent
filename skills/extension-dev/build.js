@@ -601,6 +601,8 @@ async function extension_build(args) {
         // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
         // Keep in sync with build/build.js WORKER_SHARED_FILES.
         'src/js/tools/160-run-tests.js',
+        // 170-local-folders: local_folder tool + lfResolveBinaryInput (servicenow_api / web_fetch).
+        'src/js/tools/170-local-folders.js',
         'src/js/tools/020-tool-execution.js',
         'src/js/app/035-agent-events.js',
         'src/js/app/020-api-messages.js',

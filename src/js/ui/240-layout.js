@@ -211,12 +211,28 @@ function estimateTokens(text) {
 }
 
 // Calculate current system prompt token count (includes tools and skills)
+// MEMORY: the tool list JSON is large (hundreds of KB with skill tools) and
+// was re-serialized on every home render. Its length is memoized on a cheap
+// signature (tool count + names) and recomputed only when the tool set changes.
+var _toolsJsonLenCache = { sig: null, len: 0 };
+function _getToolsJsonLength(tools) {
+    tools = tools || [];
+    var names = [];
+    for (var i = 0; i < tools.length; i++) {
+        var fn = tools[i] && tools[i].function;
+        names.push(fn && fn.name ? fn.name : (tools[i] && tools[i].name) || '');
+    }
+    var sig = tools.length + ':' + names.join(',');
+    if (_toolsJsonLenCache.sig !== sig) {
+        _toolsJsonLenCache = { sig: sig, len: JSON.stringify(tools).length };
+    }
+    return _toolsJsonLenCache.len;
+}
+
 function getSystemPromptTokenCount() {
-    var systemPrompt = getSystemPromptWithContext();
-    var tools = getEnabledTools();
-    var toolsJson = JSON.stringify(tools);
-    var totalText = systemPrompt + toolsJson;
-    return estimateTokens(totalText);
+    var systemPrompt = getSystemPromptWithContext() || '';
+    var totalLen = systemPrompt.length + _getToolsJsonLength(getEnabledTools());
+    return totalLen > 0 ? Math.ceil(totalLen / 4) : 0;
 }
 
 // Update context usage indicator using actual token count from API metrics
@@ -371,7 +387,12 @@ function updateInputPosition() {
     var messages = document.getElementById('messages');
     if (!inputArea || !messages) return;
 
-    if (!chat || chat.messages.length === 0) {
+    // C2-ui MSG-EVICT: an evicted skeleton has no `messages` array (core/130);
+    // chatMessageCount reads its stamped _msgCount, so a skeleton is laid out
+    // like the non-empty chat it is instead of throwing here.
+    var _ipCount = (typeof chatMessageCount === 'function') ? chatMessageCount(chat)
+        : ((chat && Array.isArray(chat.messages)) ? chat.messages.length : 0);
+    if (!chat || _ipCount === 0) {
         inputArea.classList.add('centered');
         messages.classList.add('centered');
     } else {

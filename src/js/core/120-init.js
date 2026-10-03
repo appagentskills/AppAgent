@@ -601,6 +601,12 @@ async function init() {
     try { setTimeout(function() { try { if (typeof reconcileNeverStartedActions === 'function') reconcileNeverStartedActions(); } catch (e) {} }, 4000); } catch (e) {}
     await loadApiProviders();
     await loadProviderFromStorage();
+    // Sweep M4: hello sent '' before this point; now hand the SW the user's
+    // stored selection (null chatId = pure adopt, no run is aborted).
+    try {
+        if (typeof _panelProviderLoaded !== 'undefined') _panelProviderLoaded = true;
+        if (typeof pushProviderChangeToOffscreen === 'function' && typeof currentProvider !== 'undefined') pushProviderChangeToOffscreen(currentProvider);
+    } catch (e) {}
     await loadToolPermissions();
     await loadCacheTokenLimit();
     await loadAssumedContextTokens();
@@ -620,8 +626,12 @@ async function init() {
     await loadDashboardWidgets();
     await WidgetStore.init();
     WidgetStore.list().forEach(function(w) { WidgetStore.project(w.id); });
+    // Heap-attribution crumbs between post-strip and post-subagents (typeof-guarded, never awaited).
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('post-widgetstore'); } catch (e) {} }
     await loadAllDocuments();
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('post-documents'); } catch (e) {} }
     await loadAllActionStates(); // restore in-flight action states from IDB
+    if (typeof appBootCrumb === 'function') { try { appBootCrumb('post-actionstates'); } catch (e) {} }
     // Restore sub-agent records from IDB. Subs that were `running` at
     // crash/reload time get re-queued in the worker pool so their loop
     // resumes from the persisted chat history. See SubAgents.loadAll.
@@ -861,7 +871,9 @@ async function init() {
             if (urlParams.get('snap') === '1') {
                 try {
                     var _dlSnap = await new Promise(function(res){
-                        try { chrome.storage.local.get('__appagent_widget_snapshot__', function(o){ res(o && o['__appagent_widget_snapshot__']); }); }
+                        // Rm2 (#998): single-use — drop the snapshot once read so serialized
+                        // widget DOM never lingers in chrome.storage.local.
+                        try { chrome.storage.local.get('__appagent_widget_snapshot__', function(o){ try { chrome.storage.local.remove('__appagent_widget_snapshot__'); } catch (_rmE) {} res(o && o['__appagent_widget_snapshot__']); }); }
                         catch (e) { res(null); }
                     });
                     if (_dlSnap && _dlSnap.widgetId === deepLinkWidgetId && _dlSnap.html) {

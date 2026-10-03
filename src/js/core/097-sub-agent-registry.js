@@ -741,7 +741,14 @@ function _resumeOrOrphanSubAtBoot(rec) {
         // (bounded) for the chats map, then re-check the ZR1-R2 stand-down.
         return _subBootWaitForChats().then(function() {
             if (rec.state !== 'running' || _subPool.running[rec.agent_id] || _subAgents[rec.agent_id] !== rec) return;
-            _subBootDecideNonResumable(rec, cp);
+            // C2: a cold (skeleton) sub/parent chat reads as an empty
+            // transcript / missing card — hydrate both first, then re-check.
+            var _bh = _subBootHydrateChats(rec);
+            if (!_bh) { _subBootDecideNonResumable(rec, cp); return; }
+            return _bh.then(function() {
+                if (rec.state !== 'running' || _subPool.running[rec.agent_id] || _subAgents[rec.agent_id] !== rec) return;
+                _subBootDecideNonResumable(rec, cp);
+            });
         });
     });
 }
@@ -762,6 +769,24 @@ function _subBootWaitForChats(maxMs) {
             setTimeout(tick, 50);
         })();
     });
+}
+
+// C2 cold-chat eviction: hydrate the sub + parent chats a boot decision
+// reads (_subBootTranscriptEpisode, _subRecoverReportFromTranscript, the
+// parent card in _subBootRecoverableReport). Returns null — NO extra hop,
+// flag-off byte-identical — when neither is a skeleton, else
+// Promise<void> (never rejects). A hydrate miss is logged; the caller's
+// decision then sees the same empty transcript it did before C2.
+function _subBootHydrateChats(rec) {
+    var ids = [rec && rec.chat_id, rec && rec.parent_chat_id].filter(function(id) {
+        return id && typeof chats !== 'undefined' && _subIsSkeleton(chats[id]);
+    });
+    if (!ids.length) return null;
+    return Promise.all(ids.map(function(id) {
+        return _subHydrateChat(id).then(function(live) {
+            if (_subIsSkeleton(live)) console.warn('[sub-agents] boot: chat still evicted after hydrate', id, rec.agent_id);
+        });
+    })).then(function() {});
 }
 
 // Boot decision for a 'running' sub WITHOUT a live checkpoint.
@@ -1050,6 +1075,10 @@ function _rehydrateSubAgentRecordById(agentId) {
             } catch (e) { resolve(null); }
         });
     }).then(function(rec) {
+        // C2: the orphan branch below reads the sub transcript + parent card.
+        var _bh = (rec && rec.state === 'running') ? _subBootHydrateChats(rec) : null;
+        return _bh ? _bh.then(function() { return rec; }) : rec;
+    }).then(function(rec) {
         if (!rec) return null;
         // Raced with a concurrent loadAll()/rehydrate — in-memory record wins
         // (it may carry newer live state than the persisted row we just read).
@@ -1307,16 +1336,37 @@ function _drainPool() {
                         // ensureChatPayloads never rejects by contract
                         // (core/130-indexeddb.js) — the catch arm is purely
                         // defensive and still starts the run.
+                        // C2 (core-097 C): a deferred skeleton op queued for
+                        // this chat (e.g. a wake's inbox-drain row) must land
+                        // before runAgent reads the transcript. The tail never
+                        // rejects; with no queue the tick count is unchanged.
                         .then(function() {
-                            var _dpChat = (typeof chats !== 'undefined') ? chats[capturedChatId] : null;
-                            if (_dpChat && _dpChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
-                                return ensureChatPayloads(capturedChatId).catch(function(e) {
-                                    console.warn('[sub-agents] pool-start hydration failed for', capturedChatId, e);
-                                });
-                            }
-                            return null;
+                            var _poolHydrate = function() {
+                                var _dpChat = (typeof chats !== 'undefined') ? chats[capturedChatId] : null;
+                                if (_dpChat && _dpChat._payloadsEvicted && typeof ensureChatPayloads === 'function') {
+                                    return ensureChatPayloads(capturedChatId).catch(function(e) {
+                                        console.warn('[sub-agents] pool-start hydration failed for', capturedChatId, e);
+                                    });
+                                }
+                                return null;
+                            };
+                            var _poolQ = (typeof _subChatOpQueue !== 'undefined') ? _subChatOpQueue[capturedChatId] : null;
+                            return _poolQ ? _poolQ.then(_poolHydrate) : _poolHydrate();
                         })
-                        .then(function() { return runAgent(capturedChatId); })
+                        .then(function() {
+                            // A wake whose inbox delivery missed (skeleton
+                            // chat could not be hydrated — _wDeliver put the
+                            // inbox back) must NOT start a run: the transcript
+                            // has no trailing user row, so the finish hook
+                            // would auto-report with the message unread.
+                            if (typeof _subWakeDeliverFailed !== 'undefined' && _subWakeDeliverFailed
+                                    && _subWakeDeliverFailed[capturedAid]) {
+                                delete _subWakeDeliverFailed[capturedAid];
+                                _subAbortUndeliveredWakeRun(capturedAid);
+                                return null;
+                            }
+                            return runAgent(capturedChatId);
+                        })
                         .catch(function(err) {
                             _markErrored(capturedAid, 'agent loop crashed: ' + (err && err.message || err));
                         });
@@ -1345,6 +1395,38 @@ function _releasePoolSlot(agentId) {
         delete _subPool.running[agentId];
         _drainPool();
     }
+}
+
+// Fix 4: a wake's inbox delivery failed (hydrate miss — _wDeliver in
+// _wakeSubAgentImpl restored rec.inbox). Instead of starting a run on a
+// transcript without the parent's message, park the sub back to sleeping with
+// the inbox intact (the next wake retries delivery) and settle the freshly
+// minted wake handle with a synthetic need_input (mirrors sleepSelf) so the
+// parent's await_handle does not hang.
+function _subAbortUndeliveredWakeRun(aid) {
+    var rec = _subAgents[aid];
+    console.warn('[sub-agents] wake delivery failed (chat could not be hydrated) — run not started, inbox kept for the next wake', aid);
+    try {
+        if (rec && rec.state === 'running') {
+            rec.state = 'sleeping';
+            rec.last_activity_at = Date.now();
+            if (typeof pausedChats !== 'undefined') pausedChats[rec.chat_id] = true;
+            if (_spawnDeferreds[rec.spawn_handle_id]) {
+                var _uwSummary = 'wake not delivered: the sub-agent\'s chat could not be loaded from storage. Its inbox is kept — wake it again to retry.';
+                rec.last_report = { status: 'need_input', summary: _uwSummary, from: rec.agent_id, from_name: rec.name, at: Date.now(), _synthesized: true };
+                rec.report_collected = false;
+                var _uwHadAwaiters = _spawnHandleHasAwaiters(rec);
+                _resolveSpawnHandle(rec.agent_id, { status: 'need_input', summary: _uwSummary, from: rec.agent_id, _synthesized: true });
+                _wakeParentOnReport(rec, rec.last_report, { hadAwaiters: _uwHadAwaiters });
+            }
+            _reconcileSubActionState(rec, 'need_input');
+            _subAgentsPersist(rec);
+        }
+    } catch (e) {
+        console.warn('[sub-agents] undelivered-wake park failed for', aid, e);
+    }
+    _releasePoolSlot(aid);
+    _notifyListeners();
 }
 
 // ---------- Tombstone GC sweep ----------
@@ -2360,7 +2442,10 @@ function spawnSubAgent(args, ctx) {
     // finalized by report_to_parent / onSubAgentRunFinished / stop_sub_agent.
     // sub_report rows are UI-only (stripped from the API payload in
     // 020-api-messages.js), so pushing one into a mid-turn parent chat is safe.
-    if (chats[parentChatId] && Array.isArray(chats[parentChatId].messages)) {
+    // C2: an idle parent may be a cold skeleton — _subWithChat hydrates it
+    // first (sync, unchanged, for a resident parent).
+    _subWithChat(parentChatId, function(_spc) {
+    if (_spc && Array.isArray(_spc.messages)) {
         var _cardInstr = String(instructions || '');
         // Store the FULL instructions on the card: the input panel in
         // 175-sub-agent-ui.js already has collapse (−/+ preview) and expand (⤢)
@@ -2370,7 +2455,7 @@ function spawnSubAgent(args, ctx) {
         // generous 64KB safety cap purely as a runaway-payload guard (a
         // megabyte instruction would bloat every saveChatsToStorage cycle).
         if (_cardInstr.length > 65536) _cardInstr = _cardInstr.slice(0, 65536) + '\n…[truncated]';
-        chats[parentChatId].messages.push({
+        _spc.messages.push({
             role: 'sub_report',
             subAgentId: agent_id,
             subAgentName: record.name,
@@ -2386,7 +2471,10 @@ function spawnSubAgent(args, ctx) {
             createdAt: now
         });
         _repaintParent(parentChatId);
+    } else if (_subIsSkeleton(_spc)) {
+        console.warn('[sub-agents] spawn: parent chat still evicted — live card skipped', parentChatId, agent_id);
     }
+    });
 
     // Queue for the pool. If there's a slot free, runAgent fires immediately.
     _subPool.queue.push(agent_id);
@@ -3082,16 +3170,79 @@ function _inboxDrainMeta(items, combined) {
         (items || []).map(function(it) { return String((it && it.content) || ''); }).join('\n\n'), combined);
 }
 
+// C2 cold-chat eviction: a SKELETON is a chat whose messages were evicted to
+// IDB (core/130 evictChatMessagesInPlace) — `messages` is absent and
+// `_messagesEvicted` is set. Writing `messages = []` onto one makes
+// ensureChatPayloads skip the restore and the next put overwrites the stored
+// transcript, so every write site below refuses a skeleton (fail closed).
+function _subIsSkeleton(c) {
+    return !!(c && !Array.isArray(c.messages) && c._messagesEvicted);
+}
+
+// Promise<liveChat|null>: hydrates a skeleton through ensureChatPayloads,
+// otherwise resolves the current chat. Never rejects. Re-reads chats[id]
+// after the await (the cold sweep can swap / re-evict across the gap); on a
+// hydrate miss the resolved chat is STILL a skeleton — callers re-check.
+function _subHydrateChat(id) {
+    var c = (typeof chats !== 'undefined') ? chats[id] : null;
+    if (!_subIsSkeleton(c) || typeof ensureChatPayloads !== 'function') return Promise.resolve(c || null);
+    var p;
+    try { p = ensureChatPayloads(id); } catch (e) { p = Promise.reject(e); }
+    return Promise.resolve(p).catch(function(e) {
+        console.warn('[sub-agents] chat hydration failed for', id, e);
+    }).then(function() {
+        return ((typeof chats !== 'undefined') && chats[id]) || null;
+    });
+}
+
+// Per-chat FIFO for chat mutations. SYNC (returns fn's value, exceptions
+// propagate) when the chat is not a skeleton and nothing is queued for id —
+// byte-identical to a direct call while eviction is off. Otherwise chains
+// behind the queued ops, hydrates, and calls fn(liveChat) (possibly still a
+// skeleton on a hydrate miss, or null); returns a Promise, catches + warns.
+var _subChatOpQueue = {};
+// agent_id -> true while a wake's deferred inbox delivery missed; consumed by
+// the pool start in _drainPool (Fix 4). In-memory only.
+var _subWakeDeliverFailed = {};
+function _subWithChat(id, fn) {
+    var c = (typeof chats !== 'undefined') ? chats[id] : null;
+    if (!_subChatOpQueue[id] && !_subIsSkeleton(c)) return fn(c || null);
+    var prev = _subChatOpQueue[id] || Promise.resolve();
+    var run = prev.then(function() { return _subHydrateChat(id); })
+        .then(function(live) { return fn(live); })
+        .catch(function(e) { console.warn('[sub-agents] deferred chat op failed for', id, e); });
+    var tail = run.then(function() { if (_subChatOpQueue[id] === tail) delete _subChatOpQueue[id]; });
+    _subChatOpQueue[id] = tail;
+    return run;
+}
+
+// Append rows to a chat transcript. Never creates `messages` on a skeleton:
+// returns false (caller keeps its durable copy / skips the save), else true.
+function _subAppendRows(chat, rows) {
+    if (!chat || _subIsSkeleton(chat)) return false;
+    if (!Array.isArray(chat.messages)) chat.messages = [];
+    (rows || []).forEach(function(r) { chat.messages.push(r); });
+    return true;
+}
+
 // Push undelivered notice rows into the parent transcript and persist.
 // Same row shape as _wakeParentOnReport's idle arm / flushPendingInjection.
 // items: strings (legacy) or {text, subNotices?, hasUserText?}.
-function _pushPendingWakeRows(pchat, texts) {
-    if (!pchat || !texts || !texts.length) return Promise.resolve();
-    if (!Array.isArray(pchat.messages)) pchat.messages = [];
+// C2: resolves false (no push, no save, onPushed NOT called) when pchat is a
+// skeleton; onPushed runs synchronously once the rows are in the transcript.
+function _pushPendingWakeRows(pchat, texts, onPushed) {
+    if (_subIsSkeleton(pchat)) return Promise.resolve(false);
+    if (!pchat || !texts || !texts.length) {
+        if (pchat && typeof onPushed === 'function') onPushed();
+        return Promise.resolve();
+    }
+    var rows = [];
     texts.forEach(function(t) {
-        if (typeof t === 'string') pchat.messages.push(_noticeRow(t));
-        else if (t && t.text) pchat.messages.push(_noticeRow(t.text, t.subNotices, t.hasUserText));
+        if (typeof t === 'string') rows.push(_noticeRow(t));
+        else if (t && t.text) rows.push(_noticeRow(t.text, t.subNotices, t.hasUserText));
     });
+    _subAppendRows(pchat, rows);
+    if (typeof onPushed === 'function') onPushed();
     var saved = (typeof saveChatsToStorage === 'function') ? saveChatsToStorage() : null;
     return Promise.resolve(saved).catch(function(e) {
         console.warn('[sub-agents] pending-wake row persist failed', e);
@@ -3129,6 +3280,14 @@ function _drainOnePendingWake(rec) {
     try {
         if (typeof isChatPaused === 'function' && isChatPaused(pcid)) return _notePendingWakePaused(pcid, rec);
     } catch (_) { /* unreadable pause state — proceed */ }
+    // C2: a skeleton reads as an empty transcript — scanning it would re-push
+    // delivered notices and never clear an answered record. Hydrate first and
+    // re-enter; a hydrate miss keeps the record for the next tick.
+    if (_subIsSkeleton(pchat)) {
+        return _subHydrateChat(pcid).then(function(live) {
+            return _subIsSkeleton(live) ? undefined : _drainOnePendingWake(rec);
+        });
+    }
     var msgs = Array.isArray(pchat.messages) ? pchat.messages : [];
     var notices = Array.isArray(rec.notices) ? rec.notices : [];
     var toPush = [];
@@ -3184,9 +3343,12 @@ function _drainOnePendingWake(rec) {
     // a stale duplicate — drop it instead of pushing a second copy. Images (a
     // queued user message coalesced into the entry) can't ride a bare text
     // row — re-queue them alone for flushPendingInjection to deliver.
+    // C2: two-phase — returns { texts, commit }; the in-memory entry is only
+    // consumed by commit(), which _pushPendingWakeRows calls once the rows
+    // are actually in the transcript (never on a refused skeleton push).
     function _consumeMemEntry(texts) {
         var entry = (typeof pendingInjectionsByChatId !== 'undefined') ? pendingInjectionsByChatId[pcid] : null;
-        if (!entry) return texts;
+        if (!entry) return { texts: texts, commit: null };
         if (entry.text) {
             var c = chats[pcid];
             var ms = (c && Array.isArray(c.messages)) ? c.messages : [];
@@ -3202,17 +3364,24 @@ function _drainOnePendingWake(rec) {
                 texts.push({ text: entry.text, subNotices: entry.subNotices, hasUserText: entry.hasUserText });
             }
         }
-        if (entry.images && entry.images.length) {
-            // Keep every other field; the text-bound metadata rode the row.
-            var rest = {};
-            Object.keys(entry).forEach(function(k) { if (k !== 'subNotices' && k !== 'hasUserText') rest[k] = entry[k]; });
-            rest.text = null;
-            rest.images = entry.images;
-            pendingInjectionsByChatId[pcid] = rest;
-        } else {
-            delete pendingInjectionsByChatId[pcid];
-        }
-        return texts;
+        var commit = function() {
+            if (pendingInjectionsByChatId[pcid] !== entry) return; // replaced meanwhile
+            if (entry.images && entry.images.length) {
+                // Keep every other field; the text-bound metadata rode the row.
+                var rest = {};
+                Object.keys(entry).forEach(function(k) { if (k !== 'subNotices' && k !== 'hasUserText') rest[k] = entry[k]; });
+                rest.text = null;
+                rest.images = entry.images;
+                pendingInjectionsByChatId[pcid] = rest;
+            } else {
+                delete pendingInjectionsByChatId[pcid];
+            }
+        };
+        return { texts: texts, commit: commit };
+    }
+    function _pushConsumed() {
+        var plan = _consumeMemEntry(toPush);
+        return _pushPendingWakeRows(chats[pcid], plan.texts, plan.commit);
     }
     if (attempts >= PENDING_WAKE_MAX_ATTEMPTS) {
         console.error('[sub-agents] pending wake for', pcid, 'dropped after', attempts, 'delivery attempts — notice rows stay in the transcript for the next manual run');
@@ -3236,7 +3405,10 @@ function _drainOnePendingWake(rec) {
             // runningChatIds yet while queued).
             if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return;
             if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return;
-            return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return _markPendingWakeExhausted(pcid, attempts); });
+            return _pushConsumed().then(function(pushed) {
+                if (pushed === false) return; // C2: re-evicted skeleton — keep record + entry
+                return _markPendingWakeExhausted(pcid, attempts);
+            });
         });
     }
     // Bump BEFORE attempting so a crash mid-delivery still counts toward the cap.
@@ -3262,7 +3434,8 @@ function _drainOnePendingWake(rec) {
         if (typeof chats === 'undefined' || !chats[pcid] || chats[pcid]._deleted === true) { clearPendingWake(pcid); return true; }
         if (typeof runningChatIds !== 'undefined' && runningChatIds[pcid]) return true;
         if (pchat.isSubAgent && pchat.subAgentId && _subPool.running[pchat.subAgentId]) return true;
-        return _pushPendingWakeRows(chats[pcid], _consumeMemEntry(toPush)).then(function() { return false; });
+        // C2: a refused push (re-evicted skeleton) aborts — record kept, no run.
+        return _pushConsumed().then(function(pushed) { return pushed === false; });
     }).then(function(aborted) {
         if (aborted) return;
         if (pchat.isSubAgent) {
@@ -3465,8 +3638,11 @@ function _postPassiveReportNotice(rec, report, opts) {
         var _ppDeliver = function() {
             var pchat = chats[pcid];
             if (!pchat) return;
-            if (!Array.isArray(pchat.messages)) pchat.messages = [];
-            pchat.messages.push(row);
+            // C2: never seed a 1-row array over an un-hydrated skeleton.
+            if (!_subAppendRows(pchat, [row])) {
+                console.warn('[sub-agents] passive report notice skipped — parent still evicted', pcid);
+                return;
+            }
             _repaintParent(pcid); // persists + repaints/broadcasts
         };
         if (chats[pcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
@@ -3596,7 +3772,7 @@ function _wakeParentOnReport(rec, report, opts) {
             } catch (_) { _npPaused = false; }
             if (_npPaused) {
                 if (!opts.noticeDelivered) {
-                    if (parentSubRec.state === 'running' && Array.isArray(chats[pcid].messages)) {
+                    if (parentSubRec.state === 'running' && (Array.isArray(chats[pcid].messages) || _subIsSkeleton(chats[pcid]))) {
                         // Sanctioned push + persist (_pushPendingWakeRows — same
                         // row shape as the idle arm below). The evicted-put guard
                         // (worker/115-storage.js) skips a payload-evicted chat, so
@@ -3607,7 +3783,12 @@ function _wakeParentOnReport(rec, report, opts) {
                         // Flux Phase 1: no ad-hoc save / chat-field poke here.)
                         var _npDeliver = function() {
                             var _npChat = chats[pcid];
-                            if (_npChat) _pushPendingWakeRows(_npChat, [{ text: notice, subNotices: [_meta] }]);
+                            if (!_npChat) return;
+                            _pushPendingWakeRows(_npChat, [{ text: notice, subNotices: [_meta] }]).then(function(pushed) {
+                                // C2: hydrate miss — park the notice durably (heartbeat drain)
+                                // instead of losing it.
+                                if (pushed === false) persistPendingWake(pcid, notice, rec.agent_id, { subNotices: [_meta] });
+                            });
                         };
                         if (chats[pcid]._payloadsEvicted && typeof ensureChatPayloads === 'function') {
                             ensureChatPayloads(pcid).then(_npDeliver, _npDeliver);
@@ -3791,7 +3972,25 @@ function _findSubAgentCard(parentChatId, agentId) {
     }
     return null;
 }
+// C2: a same-length IN-PLACE card edit passes core/130's ref+len durable
+// proof, so the cold sweep could evict the chat before the save commits and
+// drop the edit. Clear the proof before saving (no-op without the helper).
+function _subCardEdited(parentChatId) {
+    try {
+        var pc = (typeof chats !== 'undefined' && chats) ? chats[parentChatId] : null;
+        if (pc && typeof unmarkChatMessagesDurable === 'function') unmarkChatMessagesDurable(pc);
+    } catch (_) { /* ignore */ }
+}
 function _repaintParent(parentChatId) {
+    // SW-EVICT (PR #1093 review): every caller mutated the parent's sub_report
+    // card IN PLACE. An evicted parent (_payloadsEvicted — now the norm for an
+    // idle parent after the SW post-save sweep) is skipped by the save's
+    // put-loop, so the mutation was silently dropped. Stamp it dirty so the
+    // save routes it through _rescueDirtyEvictedChat (hydrate -> save).
+    try {
+        var _rpc = (typeof chats !== 'undefined' && chats) ? chats[parentChatId] : null;
+        if (_rpc && _rpc._payloadsEvicted) _rpc._dirtyWhileEvicted = true;
+    } catch (_) { /* ignore */ }
     if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
     // Single render path (flux QW5): no direct renderMessages() here. The
     // emit below reaches app/036's 'messagesAppended' handler synchronously
@@ -3820,6 +4019,9 @@ function _finalizeSubAgentCard(rec, report) {
     // even when the sub never issued a final update_action_state.
     _reconcileSubActionState(rec, report.status);
     try {
+        // C2: a skeleton parent is hydrated first (deferred → Promise; no
+        // caller reads the result). A hydrate miss finds no card → no write.
+        return _subWithChat(rec.parent_chat_id, function() {
         var card = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
         if (!card) return false;
         var st = card.report && card.report.status;
@@ -3827,8 +4029,10 @@ function _finalizeSubAgentCard(rec, report) {
         card.report = report;
         if (rec.chat_id) card.subChatId = rec.chat_id;
         if (rec.name) card.subAgentName = rec.name;
+        _subCardEdited(rec.parent_chat_id);
         _repaintParent(rec.parent_chat_id);
         return true;
+        });
     } catch (_) { return false; }
 }
 
@@ -3850,12 +4054,17 @@ function _reconcileSubActionState(rec, reportStatus) {
         rec.action_state.state = next;
         rec.action_state.at = Date.now();
         _subAgentsPersist(rec);
+        var _asAt = rec.action_state.at;
+        // C2: card part via _subWithChat (sync for a resident parent).
+        _subWithChat(rec.parent_chat_id, function() {
         var card = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
         if (card && card.actionState && !_AS_TERMINAL[card.actionState.state]) {
             card.actionState.state = next;
-            card.actionState.at = rec.action_state.at;
+            card.actionState.at = _asAt;
+            _subCardEdited(rec.parent_chat_id);
             _repaintParent(rec.parent_chat_id);
         }
+        });
         return true;
     } catch (_) { return false; }
 }
@@ -3983,6 +4192,10 @@ function _notifySubLifecycle(rec, headline) {
         // stream (UI-only) keeps the bare line.
         var _lcNotice = _withWakeFinalReminder(text, pcid);
         var _lcMeta = _subNoticeMeta('lifecycle', rec.agent_id, rec.name, rec.state, headline, _lcNotice);
+        // C2: a cold (skeleton) parent is hydrated first — sync and unchanged
+        // for a resident parent; deferred (Promise) otherwise.
+        var _lcRes = _subWithChat(pcid, function() {
+        if (!chats[pcid]) return false;
         // (1) inline callout on the live card (bounded like agentMessage's stream).
         var card = _findSubAgentCard(pcid, rec.agent_id);
         if (card) {
@@ -3992,6 +4205,7 @@ function _notifySubLifecycle(rec, headline) {
                 card.progress.shift();
                 card.progressDropped = (card.progressDropped || 0) + 1;
             }
+            _subCardEdited(pcid);
         }
         // (2) model-visible delivery. 'Live' mirrors agentMessage's check:
         // runningChatIds for any chat, plus the pool flag when the parent is
@@ -4014,9 +4228,19 @@ function _notifySubLifecycle(rec, headline) {
             if (typeof persistPendingWake === 'function') persistPendingWake(pcid, _lcNotice, rec.agent_id, { subNotices: [_lcMeta] });
         } else if (Array.isArray(chats[pcid].messages)) {
             chats[pcid].messages.push(_noticeRow(_lcNotice, [_lcMeta]));
+        } else if (_subIsSkeleton(chats[pcid])) {
+            // Hydrate miss: never create messages=[] on a skeleton. Keep the
+            // notice DURABLE (same fallback as agentMessage's _amDeliver) so
+            // the heartbeat drain (drainPendingWakes) delivers it once the
+            // parent can be hydrated — instead of dropping it.
+            console.warn('[sub-agents] lifecycle notice deferred to pending-wake — parent chat still evicted', pcid, rec.agent_id);
+            if (typeof persistPendingWake === 'function') persistPendingWake(pcid, _lcNotice, rec.agent_id, { subNotices: [_lcMeta] });
+            return false;
         }
         _repaintParent(pcid); // persists (saveChatsToStorage) + repaints/broadcasts
         return true;
+        });
+        return _lcRes !== false;
     } catch (e) {
         console.warn('[sub-agents] lifecycle notify failed for', rec && rec.agent_id, e);
         return false;
@@ -4147,11 +4371,15 @@ function recordSubActionState(subChatId, snap) {
     if (next.state === 'stuck' && prev.state !== 'stuck') {
         _notifySubLifecycle(rec, 'reported STUCK — ' + (next.label || 'needs attention') + ' (wake_sub_agent or agent_message can unblock it)');
     }
+    // C2: card update via _subWithChat (sync for a resident parent).
+    _subWithChat(rec.parent_chat_id, function() {
     var card = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
     if (card) {
         card.actionState = next;
+        _subCardEdited(rec.parent_chat_id);
         _repaintParent(rec.parent_chat_id);
     }
+    });
     _notifyListeners();
     return true;
 }
@@ -4178,6 +4406,10 @@ function _queuePrLinksToParent(rec, text) {
     try {
         if (!rec || typeof queueChatAutoLinks !== 'function' || typeof extractPrUrls !== 'function') return;
         if (typeof chats === 'undefined' || !chats[rec.parent_chat_id]) return;
+        // C2: a cold (skeleton) sub transcript is hydrated before the scan
+        // (sync and unchanged for a resident sub).
+        _subWithChat(rec.chat_id, function() {
+        if (!chats[rec.parent_chat_id]) return;
         var urls = extractPrUrls(String(text || ''));
         var seen = {};
         for (var s = 0; s < urls.length; s++) seen[urls[s]] = true;
@@ -4217,6 +4449,7 @@ function _queuePrLinksToParent(rec, text) {
             }
         }
         if (urls.length) queueChatAutoLinks(chats[rec.parent_chat_id], urls);
+        });
     } catch (e) { /* non-fatal — settlement must never fail on link extraction */ }
 }
 
@@ -4336,7 +4569,9 @@ function reportToParent(args, ctx) {
 
     // Push a styled callout row into the parent chat so the human reading
     // the parent transcript can see the report inline.
-    if (chats[rec.parent_chat_id]) {
+    // C2: a cold (skeleton) parent is hydrated first (sync for a resident one).
+    _subWithChat(rec.parent_chat_id, function(_rpc) {
+    if (_rpc && chats[rec.parent_chat_id]) {
         // subChatId is persisted on the message so the UI "open transcript →"
         // link keeps working even after the registry GCs the settled
         // sub-agent record (SUBAGENT_TOMBSTONE_TTL_MS, ~1h). Without it the
@@ -4353,8 +4588,8 @@ function reportToParent(args, ctx) {
             // depth) after the registry GCs this sub's live record (~1h).
             _rcard.toolCallsUsed = rec.tool_calls_used || 0;
             _rcard.subDepth = rec.depth || 1;
-        } else {
-            chats[rec.parent_chat_id].messages.push({
+            _subCardEdited(rec.parent_chat_id);
+        } else if (!_subAppendRows(chats[rec.parent_chat_id], [{
                 role: 'sub_report',
                 subAgentId: rec.agent_id,
                 subAgentName: rec.name,
@@ -4363,10 +4598,14 @@ function reportToParent(args, ctx) {
                 toolCallsUsed: rec.tool_calls_used || 0,
                 subDepth: rec.depth || 1,
                 createdAt: report.at
-            });
+            }])) {
+            // Hydrate miss: never create `messages` on a skeleton (fail closed).
+            console.warn('[sub-agents] report card skipped — parent chat still evicted', rec.parent_chat_id, rec.agent_id);
+            return;
         }
         _repaintParent(rec.parent_chat_id);
     }
+    });
 
     // Every report settles the spawn handle (if still pending) and parks the
     // sub. _resolveSpawnHandle is a no-op on subsequent calls after a wake
@@ -4477,7 +4716,12 @@ function sleepSelf(args, ctx) {
         var _reason = (args.reason ? String(args.reason).slice(0, 200) : 'sub-agent parked via sleep_self without report_to_parent');
         // #1038: never keep a pre-fix boot's card placeholder ('running') as
         // this settle's report — replace it with the synthetic sleep report.
-        rec.last_report = (rec.last_report && rec.last_report.status !== 'running') ? rec.last_report : {
+        // M8: wake paths only stamp woken_at (they keep the prior episode's
+        // last_report), so also reject a report older than this episode —
+        // otherwise the parent would receive the STALE previous report.
+        var _ssLr = rec.last_report;
+        var _ssKeep = !!(_ssLr && _ssLr.status !== 'running' && (_ssLr.at || 0) >= (rec.woken_at || 0));
+        rec.last_report = _ssKeep ? _ssLr : {
             status: 'need_input',
             summary: _reason,
             from: rec.agent_id,
@@ -4722,6 +4966,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             at: Date.now()
         });
     }
+    if (typeof _subWakeDeliverFailed !== 'undefined' && _subWakeDeliverFailed) delete _subWakeDeliverFailed[rec.agent_id]; // a fresh wake re-evaluates delivery
     if (pendingMsgs.length > 0 && chats[rec.chat_id]) {
         // FIX #7: delivery is guaranteed here (chat row present), so it is now
         // safe to clear the inbox we snapshotted into pendingMsgs above. This
@@ -4738,20 +4983,45 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         // at a safe point. Only push directly when no loop is live.
         var _wakeLive = !!(_subPool.running[rec.agent_id]
             || (typeof runningChatIds !== 'undefined' && runningChatIds[rec.chat_id]));
-        if (_wakeLive && typeof pendingInjectionsByChatId !== 'undefined') {
-            var _wHistoryStart = chats[rec.chat_id].messages.length;
-            _queueNoticeInjection(rec.chat_id, combined, [_inboxDrainMeta(pendingMsgs, combined)]);
-            if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'pending', _wHistoryStart);
-        } else {
-            // injected:true is a RENDER gate (250-message-render.js) — it lets
-            // renderSubReportNotices upgrade this parent→sub row to the
-            // .sub-notice-inbound card. Content is unchanged; the live-loop
-            // branch above gets the same flag from flushPendingInjection.
-            var _wDirectStart = chats[rec.chat_id].messages.length;
-            chats[rec.chat_id].messages.push(_noticeRow(combined, [_inboxDrainMeta(pendingMsgs, combined)]));
-            if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'injected', _wDirectStart);
-        }
-        if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+        // C2 (core-097 C): a sleeping sub's chat may be a SKELETON (messages
+        // evicted to IDB). _subWithChat runs this SYNC for a hot chat (flag-
+        // OFF behavior unchanged); for a skeleton it hydrates first and the
+        // pool start (_drainPool) waits on _subChatOpQueue, so the delivery
+        // row lands in the restored transcript before runAgent reads it.
+        // _wakeLive is captured NOW — the pool claims the slot below, which
+        // would otherwise misroute a deferred delivery to the injection arm.
+        var _wDeliver = function(sc) {
+            if (!sc || _subIsSkeleton(sc)) {
+                // Hydrate miss: never create messages=[] on a skeleton. Put
+                // the drained items back (ahead of anything newer) so a later
+                // wake delivers them — the inbox is not lost.
+                rec.inbox = pendingMsgs.concat(rec.inbox || []);
+                _subAgentsPersist(rec);
+                // Fix 4: the pool start (_drainPool) waits on this op — flag it
+                // so it parks the sub instead of running without the message.
+                // A live loop (_wakeLive) was not started by this wake: no flag.
+                if (!_wakeLive && typeof _subWakeDeliverFailed !== 'undefined' && _subWakeDeliverFailed) _subWakeDeliverFailed[rec.agent_id] = true;
+                console.warn('[sub-agents] wake inbox delivery failed — chat still evicted', rec.chat_id, rec.agent_id);
+                return false;
+            }
+            if (!Array.isArray(sc.messages)) sc.messages = [];
+            if (_wakeLive && typeof pendingInjectionsByChatId !== 'undefined') {
+                var _wHistoryStart = sc.messages.length;
+                _queueNoticeInjection(rec.chat_id, combined, [_inboxDrainMeta(pendingMsgs, combined)]);
+                if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'pending', _wHistoryStart);
+            } else {
+                // injected:true is a RENDER gate (250-message-render.js) — it lets
+                // renderSubReportNotices upgrade this parent→sub row to the
+                // .sub-notice-inbound card. Content is unchanged; the live-loop
+                // branch above gets the same flag from flushPendingInjection.
+                var _wDirectStart = sc.messages.length;
+                sc.messages.push(_noticeRow(combined, [_inboxDrainMeta(pendingMsgs, combined)]));
+                if (_wakeWasRunning) _recordSubParentMessage(rec, pendingMsgs, combined, 'injected', _wDirectStart);
+            }
+            if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+            return true;
+        };
+        _subWithChat(rec.chat_id, _wDeliver);
     }
 
     // PR383-R2: a SW killed mid-approval strands the persisted
@@ -4799,6 +5069,9 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
     // so the renderer (renderSubReport, 175-sub-agent-ui.js) can show per-
     // phase input→output pairs, then flip the card back to running (spinner
     // resumes) with the wake instruction as the new current input.
+    // C2 (core-097 C): the parent may be an idle skeleton (wake from a widget
+    // / js_eval) — _subWithChat hydrates it first; SYNC for a hot parent.
+    _subWithChat(rec.parent_chat_id, function() {
     try {
         var _wkCard = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
         if (_wkCard && _wkCard.report && _wkCard.report.status !== 'running') {
@@ -4867,6 +5140,7 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
             _repaintParent(rec.parent_chat_id);
         }
     } catch (_) { /* ignore */ }
+    });
     // Registry-side counterpart of the card reset above: a woken sub starts a
     // fresh phase, so agent_status must not keep reporting the previous run's
     // progress card. Unconditional (the card may be missing/GC'd) and
@@ -5022,7 +5296,6 @@ function agentMessage(args, ctx, _regMissRetried) {
             // Append to the live card's progress stream (created at spawn) so
             // mid-flight updates accumulate in ONE evolving row instead of
             // spawning a fresh callout per message. Legacy fallback: append a row.
-            var _pcard = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
             // Bound the persisted progress stream: each entry is capped at 4KB
             // and the array at 50 entries. A chatty sub pushing huge updates
             // used to grow the parent chat's storage without bound AND make
@@ -5033,6 +5306,13 @@ function agentMessage(args, ctx, _regMissRetried) {
             var _ptext = _subNormalizeNewlines(content); // item 6
             if (_ptext.length > 4096) _ptext = _ptext.slice(0, 4096) + '… [truncated]';
             var _entry = { text: _ptext, at: Date.now() };
+            // C2 (core-097 C): the parent may be an idle SKELETON — hydrate
+            // before touching the card / transcript (SYNC for a hot parent).
+            // A hydrate miss drops only these UI-only rows; the model-visible
+            // notice below still goes out through the durable wake path.
+            _subWithChat(rec.parent_chat_id, function(_amPc) {
+            if (!_amPc || _subIsSkeleton(_amPc)) return;
+            var _pcard = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
             if (_pcard) {
                 if (!Array.isArray(_pcard.progress)) _pcard.progress = [];
                 _pcard.progress.push(_entry);
@@ -5072,6 +5352,7 @@ function agentMessage(args, ctx, _regMissRetried) {
                 createdAt: Date.now()
             });
             _repaintParent(rec.parent_chat_id);
+            });
             // WAKE-FIX (Arm B): everything above is UI-only — role:'sub_msg'
             // rows are dropped from API payloads and the progress entry lives
             // inside the (often collapsed) card, so the parent MODEL never saw
@@ -5130,6 +5411,13 @@ function agentMessage(args, ctx, _regMissRetried) {
                         } catch (_) { /* unreadable pause state — treat as not paused */ }
                         var _amDeliver = function() {
                             var _amChat = chats[_amPcid];
+                            // C2: a skeleton after a hydrate miss must not
+                            // silently drop the notice — keep it durable so
+                            // the heartbeat drain delivers it once hydrated.
+                            if (_subIsSkeleton(_amChat)) {
+                                if (typeof persistPendingWake === 'function') persistPendingWake(_amPcid, _amNotice, rec.agent_id, { subNotices: [_amMeta] });
+                                return;
+                            }
                             if (!_amChat || !Array.isArray(_amChat.messages)) return;
                             _amChat.messages.push(_noticeRow(_amNotice, [_amMeta]));
                             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -5228,10 +5516,26 @@ function agentMessage(args, ctx, _regMissRetried) {
             // No live loop — queued or idle. Direct push is safe. injected:true
             // is the render gate that upgrades the row to the inbound notice
             // card (renderSubReportNotices, ui/175) — content is unchanged.
+            // C2 (core-097 C): a queued recipient's chat may be a SKELETON.
+            // _subWithChat hydrates first (SYNC for a hot chat) and the pool
+            // start waits on the op queue, so the row lands before runAgent.
+            // Hydrate miss: fall back to the injection queue (never lost,
+            // never messages=[] on a skeleton).
             if (chats[dst.chat_id]) {
-                chats[dst.chat_id].messages.push(_noticeRow(combined, [_inboxDrainMeta([item], combined)]));
-                _recordSubParentMessage(dst, [item], combined, 'injected', historyStart);
-                if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                _subWithChat(dst.chat_id, function(_dc) {
+                    if (!_dc) return;
+                    if (_subIsSkeleton(_dc)) {
+                        if (typeof pendingInjectionsByChatId !== 'undefined') {
+                            _queueNoticeInjection(dst.chat_id, combined, [_inboxDrainMeta([item], combined)]);
+                        }
+                        return;
+                    }
+                    var _dcStart = Array.isArray(_dc.messages) ? _dc.messages.length : historyStart;
+                    if (!Array.isArray(_dc.messages)) _dc.messages = [];
+                    _dc.messages.push(_noticeRow(combined, [_inboxDrainMeta([item], combined)]));
+                    _recordSubParentMessage(dst, [item], combined, 'injected', _dcStart);
+                    if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
+                });
             }
         }
         // Always queue (dedup) so the pool starts a loop if none is running.
@@ -5517,14 +5821,19 @@ function _queueTransientRetry(rec, errMsg) {
     }
     rec.retries_used = (rec.retries_used || 0) + 1;
     rec.last_error = { message: errMsg || 'transient run error', at: Date.now(), transient: true, retried: true };
+    // C2 (core-097 C): _subWithChat hydrates a SKELETON sub chat first (SYNC
+    // for a hot chat); the pool start waits on the op queue so the retry row
+    // lands before the re-run. A hydrate miss skips the row (best-effort).
     try {
-        if (chats[rec.chat_id] && Array.isArray(chats[rec.chat_id].messages)) {
-            chats[rec.chat_id].messages.push({
+        _subWithChat(rec.chat_id, function(_trc) {
+        if (_trc && Array.isArray(_trc.messages)) {
+            _trc.messages.push({
                 role: 'user', injected: true,
                 content: '[sub-agent lifecycle] The previous turn crashed with a transient error ("' + (errMsg || 'network error') + '"). Automatic retry ' + attemptNo + '/' + attemptMax + ' — resume the task from where you left off; do not redo completed work.'
             });
             if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
         }
+        });
     } catch (_) { /* best-effort log — the re-queue below still retries */ }
     rec.state = 'running';
     rec.woken_at = Date.now(); // A1: new episode — an older last_report is not this episode's report
@@ -6267,6 +6576,20 @@ function onSubAgentRunFinished(chatId, finishCtx) {
     // user message OR a non-empty pendingInjection) and re-queue the
     // sub instead of settling, so the pool starts a fresh turn that
     // actually reads the new input.
+    // C2 (core-097 C): a SKELETON (re-evicted across the finish) reads as an
+    // empty transcript, and a deferred op queued for this chat (e.g. an
+    // agent_message row awaiting hydration) is not visible yet — both would
+    // mis-settle the trailing-user / auto_report checks below. Hydrate +
+    // drain the op queue, then re-enter ONCE (_c2Deferred latch). Never
+    // taken while eviction is off (no skeletons, no queue).
+    if (!(finishCtx && finishCtx._c2Deferred)
+            && (_subIsSkeleton(chats[chatId]) || _subChatOpQueue[chatId])) {
+        var _c2Fc = {};
+        if (finishCtx) Object.keys(finishCtx).forEach(function(k) { _c2Fc[k] = finishCtx[k]; });
+        _c2Fc._c2Deferred = true;
+        _subWithChat(chatId, function() { onSubAgentRunFinished(chatId, _c2Fc); });
+        return;
+    }
     var _msgs = (chats[chatId] && chats[chatId].messages) || [];
     var _lastMsg = _msgs.length ? _msgs[_msgs.length - 1] : null;
     var _hasTrailingUser = !!(_lastMsg && _lastMsg.role === 'user');
@@ -6469,9 +6792,18 @@ function notifyChatOfBackgroundResult(chatId, text, sourceId) {
             if (typeof pausedChatIds !== 'undefined' && pausedChatIds[chatId] === true) paused = true;
         } catch (_) {}
         if (!paused) _cancelAgentMessageWake(chatId);
-        var deliver = function() {
+        var deliver = function(_ncAttempt) {
             var c = chats[chatId];
             if (!c) return;
+            // C2 (core-097 C): _pushPendingWakeRows refuses a SKELETON (hydrate
+            // miss, or re-evicted across the gap). Re-hydrate ONCE and retry;
+            // if it is still a skeleton keep the notice durable (heartbeat
+            // drain delivers it) and do NOT start a run on a skeleton.
+            if (_subIsSkeleton(c)) {
+                if (!_ncAttempt) { _subHydrateChat(chatId).then(function() { deliver(1); }); return; }
+                persistPendingWake(chatId, notice, null, null);
+                return;
+            }
             // Sanctioned push + persist (write-site ratchet).
             _pushPendingWakeRows(c, [notice]);
             persistPendingWake(chatId, notice, null, null);
@@ -6480,8 +6812,8 @@ function notifyChatOfBackgroundResult(chatId, text, sourceId) {
                 console.warn('[sub-agents] notifyChat run failed for', chatId, err);
             });
         };
-        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') ensureChatPayloads(chatId).then(deliver, deliver);
-        else deliver();
+        if (chat._payloadsEvicted && typeof ensureChatPayloads === 'function') ensureChatPayloads(chatId).then(function() { deliver(0); }, function() { deliver(0); });
+        else deliver(0);
         return !paused;
     } catch (e) {
         console.warn('[sub-agents] notifyChatOfBackgroundResult failed for', chatId, e);

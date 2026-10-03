@@ -612,12 +612,49 @@ var TOOLS = [
                     method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP method. Default: GET.' },
                     headers: { type: 'object', description: 'Extra HTTP headers (key-value pairs).' },
                     body: { type: 'string', description: 'Request body (POST/PUT).' },
+                    body_file_id: { type: 'string', description: 'Binary request body from a file-store file_id (e.g. from local_folder read). Alternative to body.' },
+                    body_base64: { type: 'string', description: 'Binary request body as raw base64 or a data URL. Alternative to body.' },
+                    body_source: { type: 'object', description: 'Binary request body read from a connected folder: {folder, path}. Alternative to body.' },
+                    content_type: { type: 'string', description: 'Content-Type for body_file_id/body_base64/body_source (default: the file\'s MIME type). Ignored for form.' },
+                    form: { type: 'object', description: 'multipart/form-data body: {field: "text" | {file_id} | {folder, path} | {base64}, each file part optionally with filename and content_type}. Content-Type/boundary is set automatically.' },
                     save_file: { type: 'boolean', description: 'If true, saves the response as a file and returns a file_id instead of the body — for binary content (images, PDFs, archives) or files to reference later, copy into a workspace, or offer as a download.' },
                     timeout_ms: { type: 'number', description: 'Hard timeout in ms (default 30000). After 5s returns {pending:true, handle} and keeps running; await_handle to wait or cancel.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Note: web_fetch normally prompts on every call EXCEPT requests to the connected GitHub REST API base, which this flag governs — reads run silently; set confirm:true for writes such as merging a PR or posting a comment.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['url']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'local_folder',
+            description: 'Read/write files in the user\'s CONNECTED FOLDERS: the built-in virtual folder "virtual" ("Agent Files", always read/write — your scratch space, and where the user uploads files for you) plus local folders the user connected as read-only ("read") or read/write ("readwrite"). Paths are relative to the folder root (".." is rejected); folder defaults to "virtual".\nActions: list (folders + access + permission), ls {path?, recursive?}, read {path, encoding?:"base64"}, grep {pattern, path?}, write {path, content | base64 | file_id | source:{folder,path}, append?}, mkdir {path}, delete {path, recursive?}, request {reason, access?, folder?} (asks the user to connect a new folder, or re-grant permission for folder).\nread of a BINARY file (images, PDFs…) returns a file_id instead of content (encoding:"base64" also returns data_url). Use that file_id directly: servicenow_api attachment upload (attachment_file_id, or attachment_source:{folder,path}), web_fetch (body_file_id, or form:{file:{file_id}}), get_file {attach:true} to view it. write is refused on read-only folders.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    action: { type: 'string', enum: ['list', 'ls', 'read', 'grep', 'write', 'mkdir', 'delete', 'request'] },
+                    folder: { type: 'string', description: 'Folder id or label from list. Default "virtual" (Agent Files).' },
+                    path: { type: 'string', description: 'Path relative to the folder root, e.g. "images/logo.png". Empty = root.' },
+                    recursive: { type: 'boolean', description: 'ls: walk sub-folders (skips .git/node_modules). delete: remove a non-empty directory.' },
+                    encoding: { type: 'string', enum: ['text', 'base64'], description: 'read: "base64" also returns data_url (and a file_id) for any file.' },
+                    save_file: { type: 'boolean', description: 'read: also register a text file in the file store and return file_id.' },
+                    pattern: { type: 'string', description: 'grep: regex (case-insensitive by default).' },
+                    ignore_case: { type: 'boolean', description: 'grep: default true.' },
+                    limit: { type: 'number', description: 'ls: max entries (<=1000). grep: max matches (default 50, max 500).' },
+                    content: { type: 'string', description: 'write: text content.' },
+                    base64: { type: 'string', description: 'write: binary content as raw base64 or a data URL.' },
+                    file_id: { type: 'string', description: 'write: copy a file-store file (screenshot, web_fetch save_file, read result, attachment).' },
+                    source: { type: 'object', description: 'write: copy from another folder file {folder, path}.' },
+                    append: { type: 'boolean', description: 'write: append instead of overwrite.' },
+                    access: { type: 'string', enum: ['read', 'readwrite'], description: 'request: access to suggest for the new folder (user can change it).' },
+                    label: { type: 'string', description: 'request: suggested label for the new folder.' },
+                    reason: { type: 'string', description: 'request: why you need the folder (shown to the user).' },
+                    confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (e.g. overwriting or deleting important files). Writes/deletes on real (non-virtual) folders already prompt by default.' },
+                    status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
+                },
+                required: ['action']
             }
         }
     },
@@ -681,17 +718,17 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'workspace',
-            description: 'Work with GitHub repositories stored locally in IndexedDB: clone → browse/read/edit → push as a PR.\n\nActions:\n- clone: clone a repo (replaces an existing clone); fetches full tree + blobs.\n- list: all cloned workspaces (branches, dirty counts, pinned/forked_from) plus a lean PR summary {number, title, state, url, branch, merged_at?}: all open PRs, merged PRs capped to the 3 most recent (merged_prs_omitted counts the rest).\n- ls / read (offset/limit for large files) / write / copy (path → dest) / delete.\n- edit: search-and-replace; each find must be unique (same shape as servicenow_diff_edit).\n- grep: regex search; 5 matches by default, pass limit (max 100) for more.\n- status: dirty_files with per-file ownership + pushed_pr, the same lean prs summary as list, and a pin_notice when a sibling workspace holds the pin; include_prs:\'full\' returns every stored PR entry with files[].\n- diff: diffs of modified files.\n- push: commit dirty files to a PR — see branch_name / files. Returns pr_reused, a per-file files list with ownership fields (who edited each file, prior pushed_pr), and prominent cross_chat_warnings when a committed file belonged to ANOTHER chat or was already pushed to a DIFFERENT PR. Each commit contains the full current changes against the base; files stay modified locally on the base branch.\n- discard: reset a file (or all files if no path) to the cloned content; new files are removed, deleted files restored.\n- pin: pin a workspace ({unpin:true} clears). At most ONE pin per owner/repo (pinning clears sibling pins). The pin wins default-workspace resolution (over most-recently-used) and extension_build auto-detect, so Reload builds it.\n- branch: LOCAL fork into owner/repo::<branch> (cheap copy; see move_dirty). The remote branch is created on the first push from the fork, cut from the fork base. The fork is pinned automatically. Only for deliberately starting a SEPARATE line of work — never to append to an existing PR.\n- move: move dirty edits to another workspace (to, optional files; content written against the target\'s own base, then the source is discarded). A target file that is itself dirty with different content blocks the WHOLE move unless force; differing bases are reported in base_diverged.\n- hydrate: bulk-prefetch lazy-clone contents (optional path prefix); read/grep/edit hydrate on demand, so use it only before many reads.\n\nMerge lifecycle: when a workspace\'s branch is the head of a MERGED PR and its base is cloned locally, sync auto-deletes the workspace — dirty files move to the base first (a blocked move keeps the workspace, with a warning), the base is synced, and the pin follows onto the base if the deleted workspace held it.\n\nCross-chat safety: mutations (write/edit/delete/copy/discard) are stamped with the chat id. If a *currently running* chat has uncommitted changes on the same file, a mutation from another chat fails with cross_chat_conflict; if the other chat is dormant/closed it proceeds with a cross_chat_warning. On a conflict: if the file is one you already pushed to YOUR PR, or the other chat is dormant/closed, pass force:true (and files:[...] on push) and keep pushing to the same branch_name from the current workspace. Forking with branch is a LAST resort and needs a NEW branch name that is not an existing PR head; files hard-locked by other chats stay in the source (listed in left_behind). Gitignored paths (dist/, .env, ...) are exempt from the lock. Ownership stamps are released after a successful push. read/status include ownership metadata; ls/grep/diff flag files with uncommitted changes owned by another chat.',
+            description: 'Work with GitHub repositories stored locally in IndexedDB: clone → browse/read/edit → push as a PR.\n\nActions:\n- clone: clone a repo (replaces an existing clone); fetches full tree + blobs.\n- list: all cloned workspaces (branches, dirty counts, pinned/forked_from) plus a lean PR summary {number, title, state, url, branch, merged_at?}: all open PRs, merged PRs capped to the 3 most recent (merged_prs_omitted counts the rest).\n- ls / read (offset/limit for large files) / write / copy (path → dest) / delete.\n- edit: search-and-replace; each find must be unique (same shape as servicenow_diff_edit).\n- grep: regex search; 5 matches by default, pass limit (max 100) for more.\n- status: dirty_files with per-file ownership + pushed_pr, the same lean prs summary as list, and a pin_notice when a sibling workspace holds the pin; include_prs:\'full\' returns every stored PR entry with files[].\n- diff: diffs of modified files.\n- push: commit dirty files to a PR — see branch_name / files. Returns pr_reused, a per-file files list with ownership fields (who edited each file, prior pushed_pr), and prominent cross_chat_warnings when a committed file belonged to ANOTHER chat or was already pushed to a DIFFERENT PR. Each commit contains the full current changes against the base; files stay modified locally on the base branch.\n- discard: reset a file (or all files if no path) to the cloned content; new files are removed, deleted files restored.\n- pin: pin a workspace ({unpin:true} clears). At most ONE pin per owner/repo (pinning clears sibling pins). The pin wins default-workspace resolution (over most-recently-used) and extension_build auto-detect, so Reload builds it.\n- branch: LOCAL fork into owner/repo::<branch> (cheap copy; see move_dirty). The remote branch is created on the first push from the fork, cut from the fork base. The fork is pinned automatically. Only for deliberately starting a SEPARATE line of work — never to append to an existing PR.\n- move: move dirty edits to another workspace (to, optional files; content written against the target\'s own base, then the source is discarded). A target file that is itself dirty with different content blocks the WHOLE move unless force; differing bases are reported in base_diverged.\n- hydrate: bulk-prefetch lazy-clone contents (optional path prefix); read/grep/edit hydrate on demand, so use it only before many reads.\n- delete_workspace {workspace (required, explicit), force?}: remove a LOCAL workspace (tree, blobs, metadata). Refuses on dirty files unless force; always refuses if another running chat owns uncommitted files; if pinned, moves the pin to its forked_from parent, else the repo\'s main/master/default-branch workspace, else any same-repo workspace (an unpinned repo stays unpinned); carries its PR records to that workspace (prs_dropped when there is none). Refused while a merge auto-delete of the same workspace runs. Never deletes the GitHub branch or PRs. (delete removes a FILE.)\n\nMerge lifecycle: when a workspace\'s branch is the head of a MERGED PR and its base is cloned locally, sync auto-deletes the workspace — dirty files move to the base first (a blocked move keeps the workspace, with a warning), the base is synced, and the pin follows onto the base if the deleted workspace held it.\n\nCross-chat safety: mutations (write/edit/delete/copy/discard) are stamped with the chat id. If a *currently running* chat has uncommitted changes on the same file, a mutation from another chat fails with cross_chat_conflict; if the other chat is dormant/closed it proceeds with a cross_chat_warning. On a conflict: if the file is one you already pushed to YOUR PR, or the other chat is dormant/closed, pass force:true (and files:[...] on push) and keep pushing to the same branch_name from the current workspace. Forking with branch is a LAST resort and needs a NEW branch name that is not an existing PR head; files hard-locked by other chats stay in the source (listed in left_behind). Gitignored paths (dist/, .env, ...) are exempt from the lock. Ownership stamps are released after a successful push. read/status include ownership metadata; ls/grep/diff flag files with uncommitted changes owned by another chat.',
             parameters: {
                 type: 'object',
                 properties: {
                     action: {
                         type: 'string',
-                        enum: ['clone', 'list', 'ls', 'read', 'write', 'edit', 'copy', 'delete', 'grep', 'status', 'diff', 'push', 'discard', 'pin', 'branch', 'move', 'hydrate'],
+                        enum: ['clone', 'list', 'ls', 'read', 'write', 'edit', 'copy', 'delete', 'grep', 'status', 'diff', 'push', 'discard', 'pin', 'branch', 'move', 'hydrate', 'delete_workspace'],
                         description: 'Action to perform.'
                     },
                     repo: { type: 'string', description: 'Repository as "owner/repo" (clone).' },
-                    workspace: { type: 'string', description: 'Workspace identifier (owner/repo::branch). Default: the current workspace. Never point it at a PR head branch to append to that PR (see branch_name).' },
+                    workspace: { type: 'string', description: 'Workspace identifier (owner/repo::branch). Default: the current workspace (delete_workspace REQUIRES it explicitly — no default). Never point it at a PR head branch to append to that PR (see branch_name).' },
                     branch: { type: 'string', description: 'clone: branch to clone. branch action: the NEW local branch to fork to (never an existing PR head). Ignored by push — use branch_name.' },
                     to: { type: 'string', description: 'For move: target workspace key (owner/repo::branch).' },
                     unpin: { type: 'boolean', description: 'For pin: true clears the pin on the given workspace. Default: false.' },
@@ -730,7 +767,7 @@ var TOOLS = [
                     include_git_ignored: { type: 'boolean', description: 'If true, includes gitignored files (e.g. dist/) in ls, grep, status, diff. Default: false.' },
                     include_prs: { type: 'string', enum: ['lean', 'full'], description: 'For status: \'lean\' (default) = {number,title,state,url,branch,merged_at?} per PR, merged capped to the 3 most recent; \'full\' = every stored PR entry with files[] (large).' },
                     ignore_case: { type: 'boolean', description: 'For grep: case-insensitive (default true; a leading (?i) is also accepted and stripped). false = case-sensitive.' },
-                    force: { type: 'boolean', description: 'Mutations (write, edit, delete, copy, discard): override the cross-chat conflict block and clobber another chat\'s uncommitted changes — only when intentionally taking over the file. grep: bypass the slow-hydration guard (a grep whose lazy-clone fetch is estimated > 60s is refused with a scope_breakdown; prefer narrowing path). Default: false.' },
+                    force: { type: 'boolean', description: 'Mutations (write, edit, delete, copy, discard): override the cross-chat conflict block and clobber another chat\'s uncommitted changes — only when intentionally taking over the file. delete_workspace: discard dirty files and delete anyway (never overrides files owned by another RUNNING chat). grep: bypass the slow-hydration guard (a grep whose lazy-clone fetch is estimated > 60s is refused with a scope_breakdown; prefer narrowing path). Default: false.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
@@ -860,7 +897,7 @@ var TOOLS = [
             parameters: {
                 type: 'object',
                 properties: {
-                    instructions: { type: 'string', description: 'The task, sent as the sub\'s first user message (markdown; rendered in the parent\'s sub-agent panel). Be specific about what to return (e.g. "only sys_ids and names, no script bodies"). Name any relevant active skills and tell the sub to read them with get_skill first.' },
+                    instructions: { type: 'string', description: 'The task, sent as the sub\'s first user message (markdown; rendered in the parent\'s sub-agent panel). Write actual Markdown, not a single prose paragraph: use ## Objective, ## Context, ## Boundaries, and ## Deliverable headings, with bullet lists under each heading. Do not wrap the brief in a code fence. Be specific about what to return (e.g. "only sys_ids and names, no script bodies"). Name any relevant active skills and tell the sub to read them with get_skill first.' },
                     name: { type: 'string', description: 'Short label for the sidebar / Workers strip. Defaults to a generated id.' },
                     allow_nested: { type: 'boolean', description: 'If true, the sub may spawn/stop/wake its own subs (default false) — only for genuine further delegation (multi-stage research, recursive audits). Max nesting depth 5. With profiles, include "orchestrator" or the spawn/await tools are filtered out before this flag applies.' },
                     context_seed: { type: 'object', description: 'Small JSON blob copied into the sub\'s first message (record ids, queries, etc.).' },
@@ -1123,6 +1160,10 @@ var HEADLESS_TOOLS = {
     update_action_state: false,
     show_action_button: false,
     web_fetch: true,
+    // local_folder runs in the SW so its file_ids share the SW fileIndex with
+    // servicenow_api / web_fetch / get_file — EXCEPT action 'request', which
+    // needs prompt_user + showDirectoryPicker in the panel (isHeadlessTool).
+    local_folder: true,
     // get_cookie calls chrome.cookies in the SW (background) context - the
     // ONLY context where that API exists. Impl: executeGetCookie at the end of
     // tools/020-tool-execution.js, which is in WORKER_SHARED_FILES, so the
@@ -1210,6 +1251,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     show_action_button: 'Render a one-click skill Action button inline in chat.',
     prompt_user: 'Show a blocking inline form to collect structured user input or confirm a plan.',
     web_fetch: 'Fetch a URL (GET/POST); for HTML pages, fetch and parse via js_eval instead.',
+    local_folder: 'List/read/grep/write files in connected folders (Agent Files virtual folder + user folders) — load images for upload or fetch.',
     get_cookie: 'Read browser cookies for a URL (chrome.cookies) so js_eval can do authenticated, cookie-gated fetches (browser/research profiles).',
     workspace: 'Clone, browse, edit, and push GitHub repos — the code-editing workspace.',
     run_js_file: 'Load (source) or run (module/script) a workspace JS file inside the js_eval sandbox; loadFile/runFile inside js_eval.',
@@ -1238,7 +1280,13 @@ for (var _ti = 0; _ti < TOOLS.length; _ti++) {
     TOOLS[_ti].headless = !!HEADLESS_TOOLS[_tn];
     TOOLS[_ti].short = TOOL_SHORT_DESCRIPTIONS[_tn] || '';
 }
-function isHeadlessTool(name) { return !!HEADLESS_TOOLS[name]; }
+function isHeadlessTool(name, args) {
+    // local_folder {action:'request'} shows prompt_user + the directory picker → panel.
+    if (name === 'local_folder' && args && args.action === 'request') return false;
+    // SW fallback re-dispatch (tools/170 lfShouldRouteToPanel): run in the panel.
+    if (name === 'local_folder' && args && args._lf_panel_fallback) return false;
+    return !!HEADLESS_TOOLS[name];
+}
 
 // ─── Deferred tool loading (tools-as-skills) ─────────────────────────────────
 // Shared by BOTH getEnabledTools twins (page: ui/140-dropdowns.js, worker:

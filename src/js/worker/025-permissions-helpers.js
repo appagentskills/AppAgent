@@ -166,8 +166,9 @@ function getToolPermission(toolName, methodOrAction, chatId) {
     // cleared, resolves to 'allow'. The values returned ARE session
     // credentials. Keep this in sync with ui/140-dropdowns.js
     // getToolPermission and ui/070-dashboard-ui.js _getGlobalDefault.
-    if (permKey === 'get_cookie') return 'allow';
-    return isReadPermissionKey(permKey) ? 'allow' : 'auto';
+    // Defaults (incl. GLOBAL_ASK_DEFAULT_KEYS → 'ask') come from the shared
+    // core/070-permissions.js getGlobalDefaultPermission.
+    return getGlobalDefaultPermission(permKey);
 }
 
 function getInstanceToolPermission(permKey, chatId) {

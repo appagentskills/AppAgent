@@ -40,7 +40,7 @@ function assertBalanced(html) {
    ['ul', /<ul>/g, /<\/ul>/g], ['ol', /<ol\b/g, /<\/ol>/g], ['blockquote', /<blockquote\b/g, /<\/blockquote>/g]
   ].forEach(function(p) { assert.strictEqual(count(html, p[1]), count(html, p[2]), p[0] + ' open/close balance in: ' + html); });
 }
-var HDR = '<table class="md-table"><thead><tr><th>H</th></tr></thead><tbody><tr><td>v</td></tr></tbody></table>';
+var HDR = '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>H</th></tr></thead><tbody><tr><td>v</td></tr></tbody></table></div>';
 var BQ = '<blockquote class="md-blockquote"><span class="md-paragraph">q</span></blockquote>';
 
 describe('rg-b9 ordered lists (NEW-T11-1)', function() {
@@ -69,7 +69,8 @@ describe('rg-b9 ordered lists (NEW-T11-1)', function() {
   }, T);
   test('numbered steps with indented sub-bullets keep their numbering', function() {
     assert.strictEqual(fc('1. **Step one**\n   - detail a\n2. Step two'),
-      '<ol><li><strong>Step one</strong></li></ol><ul><li>detail a</li></ul><ol start="2"><li>Step two</li></ol>');
+      // Sub-bullets now nest INSIDE the step's <li>, so the single <ol> keeps counting.
+      '<ol><li><strong>Step one</strong><ul><li>detail a</li></ul></li><li>Step two</li></ol>');
   }, T);
   test('lazy 1. numbering and 01. add no start; a >9-digit first number is not used as start', function() {
     assert.strictEqual(fc('1. a\n1. b\n1. c'), '<ol><li>a</li><li>b</li><li>c</li></ol>');
@@ -78,7 +79,7 @@ describe('rg-b9 ordered lists (NEW-T11-1)', function() {
   }, T);
   test('all 4 list close sites emit the matching </ol> (table, blockquote, text, end of input)', function() {
     var cases = [
-      [fc('1. a\n| x | y |'), '<ol><li>a</li></ol><table class="md-table"><tr><td>x</td><td>y</td></tr></table>'],
+      [fc('1. a\n| x | y |'), '<ol><li>a</li></ol><div class="md-table-wrap"><table class="md-table"><tr><td>x</td><td>y</td></tr></table></div>'],
       [fc('1. a\n> q'), '<ol><li>a</li></ol>' + BQ],
       [fc('1. a\ntext'), '<ol><li>a</li></ol><span class="md-paragraph">text</span>'],
       [fc('1. a'), '<ol><li>a</li></ol>']
@@ -90,24 +91,24 @@ describe('rg-b9 ordered lists (NEW-T11-1)', function() {
 describe('rg-b9 table header (NEW-T11-2)', function() {
   test('first row + delimiter row renders <thead>/<th>, body rows in <tbody>', function() {
     var html = fc('| H1 | H2 |\n| --- | --- |\n| a | b |');
-    assert.strictEqual(html, '<table class="md-table"><thead><tr><th>H1</th><th>H2</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr></tbody></table>');
+    assert.strictEqual(html, '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>H1</th><th>H2</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr></tbody></table></div>');
     assert.strictEqual(html.indexOf('<td>H1</td>'), -1);
   }, T);
-  test('alignment delimiters (:---, ---:) also mark the header', function() {
+  test('alignment delimiters (:---, ---:) mark the header and set column align classes', function() {
     assert.strictEqual(fc('| L | R |\n|:---|---:|\n| 1 | 2 |'),
-      '<table class="md-table"><thead><tr><th>L</th><th>R</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>');
+      '<div class="md-table-wrap"><table class="md-table"><thead><tr><th class="md-align-left">L</th><th class="md-align-right">R</th></tr></thead><tbody><tr><td class="md-align-left">1</td><td class="md-align-right">2</td></tr></tbody></table></div>');
   }, T);
   test('a header-only table gets an empty <tbody>', function() {
-    assert.strictEqual(fc('| H1 | H2 |\n| --- | --- |'), '<table class="md-table"><thead><tr><th>H1</th><th>H2</th></tr></thead><tbody></tbody></table>');
+    assert.strictEqual(fc('| H1 | H2 |\n| --- | --- |'), '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>H1</th><th>H2</th></tr></thead><tbody></tbody></table></div>');
   }, T);
   test('a table without a delimiter row keeps the old <tr><td> markup', function() {
-    assert.strictEqual(fc('| a | b |\n| c | d |'), '<table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>');
+    assert.strictEqual(fc('| a | b |\n| c | d |'), '<div class="md-table-wrap"><table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>');
   }, T);
   test('a later delimiter row does not turn a body row into a header', function() {
     var html = fc('| a | b |\n| c | d |\n| --- | --- |\n| e | f |');
-    assert.strictEqual(html, '<table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr><tr><td>e</td><td>f</td></tr></table>');
+    assert.strictEqual(html, '<div class="md-table-wrap"><table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr><tr><td>e</td><td>f</td></tr></table></div>');
   }, T);
-  test('all 4 table close sites emit </tbody></table> after a header (blockquote, list, text, end)', function() {
+  test('all 4 table close sites emit </tbody></table></div> after a header (blockquote, list, text, end)', function() {
     var t = '| H |\n| - |\n| v |\n';
     var cases = [
       [fc(t + '> q'), HDR + BQ],
@@ -129,20 +130,20 @@ describe('rg-b9 goldens: other markdown paths are byte-identical to the pre-fix 
     ['fenced code block', 'Intro\n\n```js\nvar a = 1 < 2;\nvar b = "x";\n```\n\nOutro',
       '<span class="md-paragraph">Intro</span>' + codeBlockHtml('var a = 1 &lt; 2;\nvar b = &quot;x&quot;;\n') + '<span class="md-paragraph">Outro</span>'],
     ['inline marks', '**bold** *em* `code` ~~gone~~ _u_',
-      '<span class="md-paragraph"><strong>bold</strong> *em* <code class="inline-code">code</code> ~~gone~~ _u_</span>'],
+      '<span class="md-paragraph"><strong>bold</strong> *em* <code class="inline-code">code</code> <del>gone</del> _u_</span>'],
     ['links', 'See [docs](https://example.com/a?b=1&c=2) and https://example.org/x.',
       '<span class="md-paragraph">See <a href="https://example.com/a?b=1&amp;c=2" target="_blank" rel="noopener">docs</a> and <a href="https://example.org/x" target="_blank" rel="noopener">https://example.org/x</a>.</span>'],
     ['bullets', '- one\n- two\n\n- three\n\nafter',
       '<ul><li>one</li><li>two</li><li>three</li></ul><span class="md-paragraph">after</span>'],
     ['header-less table', '| a | b |\n| c | d |',
-      '<table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>'],
+      '<div class="md-table-wrap"><table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>'],
     ['blockquote', '> quote line\n> more\n>\n> second para\n\ntext',
       '<blockquote class="md-blockquote"><span class="md-paragraph">quote line<br>more</span><span class="md-paragraph">second para</span></blockquote><span class="md-paragraph">text</span>'],
     ['headings', '# H1\n## H2\n### H3\n#### H4\n\nbody',
-      '<h2>H1</h2><h3>H2</h3><h4>H3</h4><span class="md-paragraph"><h5>H4</h5></span><span class="md-paragraph">body</span>'],
+      '<h2>H1</h2><h3>H2</h3><h4>H3</h4><h5>H4</h5><span class="md-paragraph">body</span>'],
     ['mixed document', '## Title\n\nPara one\nline two\n\n- a\n- b\n\n| x | y |\n| z | w |\n\n> q\n\n```\ncode\n```\n\nEnd **b** [l](https://e.com)',
       '<h3>Title</h3><span class="md-paragraph">Para one<br>line two</span><ul><li>a</li><li>b</li></ul>' +
-      '<table class="md-table"><tr><td>x</td><td>y</td></tr><tr><td>z</td><td>w</td></tr></table>' + BQ + codeBlockHtml('code\n') +
+      '<div class="md-table-wrap"><table class="md-table"><tr><td>x</td><td>y</td></tr><tr><td>z</td><td>w</td></tr></table></div>' + BQ + codeBlockHtml('code\n') +
       '<span class="md-paragraph">End <strong>b</strong><a href="https://e.com" target="_blank" rel="noopener">l</a></span>']
   ];
   GOLDENS.forEach(function(g) {

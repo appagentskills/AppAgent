@@ -581,12 +581,14 @@ describe('ui settings › workspace header dropdown', function() {
     }
     async function open(opts) {
         opts = opts || {};
-        var L = await load({ currentChatId: 'me', chats: { other: { title: 'Other <chat>' } }, selectChat: U.recorder(),
+        var L = await load(Object.assign({ currentChatId: 'me', chats: { other: { title: 'Other <chat>' } }, selectChat: U.recorder(),
             showConfirmModal: U.recorder(function() { return Promise.resolve(false); }), wsClone: U.recorder(function() { return Promise.resolve({ success: false, error: 'nope' }); }),
             // S8C-01: the re-clone / delete wrappers now read a fresh dirty count; these fixtures are clean.
-            getAllWorkspaceFiles: function() { return Promise.resolve([]); }, wsGetIgnoreFilterLocal: function() { return Promise.resolve(function() { return false; }); } });
+            getAllWorkspaceFiles: function() { return Promise.resolve([]); }, wsGetIgnoreFilterLocal: function() { return Promise.resolve(function() { return false; }); } }, opts.globals || {}));
         cur = L;
         L.m.__scope._wsHeaderCaches = caches(opts.mine);
+        if (opts.prs) L.m.__scope._wsHeaderCaches['o/b::dev'].meta.prs = opts.prs;
+        if (opts.prState) L.m.__scope._sidebarPRState = opts.prState;
         L.m.__scope._wsExtDevMode = !!opts.dev;
         await U.mountDom({ html: '<div id="ws-header-status"></div><div id="home-ws-header-status"></div>' });
         await L.m.showWorkspaceDropdown();
@@ -602,6 +604,7 @@ describe('ui settings › workspace header dropdown', function() {
         var secs = Array.prototype.map.call(L.dd.querySelectorAll('.ws-dropdown-section[data-ws]'), function(s) { return s.getAttribute('data-ws'); });
         assert.deepStrictEqual(secs, ['o/b::dev', 'o/a::main']);
         assert.strictEqual(L.dd.querySelector('.ws-this-chat-section'), null);
+        assert.strictEqual(L.dd.querySelector('.ws-pr-section'), null, 'no PRs known → no PR section');
     }, { tags: ['unit'] });
     test('section header: repo, branch, change count, sync label, collapse rule (>5 changes)', async function() {
         var L = await open(), b = sec(L, 'o/b::dev'), a = sec(L, 'o/a::main');
@@ -666,16 +669,155 @@ describe('ui settings › workspace header dropdown', function() {
         assert.match(pins[0].title, /^Pin this workspace/);
         assert.strictEqual(pins[0].getAttribute('data-pin-ws'), 'o/b::dev');
     }, { tags: ['unit'] });
-    test('"This chat" section pinned under the title; all repo sections start collapsed; no chip for own files', async function() {
+    test('no "This chat" section; own changes no longer force repo sections collapsed', async function() {
         var L = await open({ mine: true });
-        var tc = L.dd.children[1];
-        assert.ok(tc.classList.contains('ws-this-chat-section'));
-        assert.match(tc.querySelector('.ws-dd-title').textContent, /This chat1$/);
-        assert.strictEqual(tc.querySelector('.ws-file-group-label').textContent, 'o/a \u00b7 main');
-        assert.strictEqual(tc.querySelector('.ws-file-path').textContent, 'mine.js');
-        assert.strictEqual(tc.querySelector('.ws-file-chat'), null);
-        assert.ok(sec(L, 'o/a::main').classList.contains('collapsed'));
-        assert.ok(sec(L, 'o/b::dev').classList.contains('collapsed'));
+        assert.strictEqual(L.dd.querySelector('.ws-this-chat-section'), null);
+        assert.strictEqual(L.dd.firstElementChild.textContent, 'Repositories');
+        assert.strictEqual(sec(L, 'o/a::main').classList.contains('collapsed'), false);
+    }, { tags: ['unit'] });
+    var PRS = [{ url: 'https://github.com/o/b/pull/7', number: 7, title: 'Seven <b>', branch: 'f7', chatId: 'other' },
+        { url: 'https://github.com/o/b/pull/9', number: 9, title: 'Nine', branch: 'f9', state: 'merged', merged_at: new Date().toISOString() },
+        { url: 'https://github.com/o/b/pull/8', number: 8, title: 'Eight', branch: 'f8' }];
+    test('PR section on top: band, newest first, meta, states, file count, chat chip', async function() {
+        var L = await open({ prs: PRS, prState: { 'https://github.com/o/b/pull/8': 'closed' } });
+        var ps = L.dd.firstElementChild;
+        assert.ok(ps.classList.contains('ws-pr-section'));
+        var band = ps.querySelector('.menu-section-title.ws-menu-title');
+        assert.strictEqual(band.textContent, 'Pull Requests (3)');
+        assert.ok(band.querySelector('.section-icon svg'), 'gitBranch icon');
+        assert.strictEqual(L.dd.children[1].textContent, 'Repositories');
+        var entries = ps.querySelectorAll('.ws-pr-entry');
+        assert.deepStrictEqual(Array.prototype.map.call(entries, function(e) { return e.getAttribute('data-pr-url').split('/').pop(); }), ['9', '8', '7']);
+        assert.ok(entries[0].querySelector('.pr-sidebar-state.merged'));
+        assert.strictEqual(entries[0].querySelector('.ws-collapse-chevron'), null);
+        assert.strictEqual(entries[0].querySelector('.ws-pr-files'), null);
+        assert.ok(entries[1].querySelector('.pr-sidebar-state.closed'));
+        var open7 = entries[2];
+        assert.strictEqual(open7.querySelector('.pr-sidebar-title').textContent, 'Seven <b>');
+        assert.match(open7.querySelector('.pr-sidebar-meta').textContent, /^#7 \u00b7 \u2192 dev/);
+        assert.ok(open7.querySelector('.ws-collapse-chevron'));
+        assert.strictEqual(open7.querySelector('.ws-change-count').textContent, '1');
+        assert.ok(open7.classList.contains('expandable'));
+        var mb = open7.querySelector('.pr-sidebar-merge-btn');
+        assert.strictEqual(mb.title, 'Merge PR #7 and sync workspace');
+        var ob = open7.querySelector('a.pr-sidebar-open');
+        assert.strictEqual(ob.getAttribute('href'), 'https://github.com/o/b/pull/7'); assert.strictEqual(ob.target, '_blank');
+        var chip = open7.querySelector('.ws-pr-chat');
+        assert.strictEqual(chip.textContent, 'Other <chat>');
+        assert.ok(open7.classList.contains('collapsed'));
+        assert.strictEqual(open7.querySelector('.ws-pr-files .ws-file-path').textContent, 'd.js');
+    }, { tags: ['unit'] });
+    test('PR row clicks: row toggles + survives re-render; merge/open/chip do not toggle or close', async function() {
+        var merge = U.recorder();
+        var L = await open({ prs: PRS });
+        L.m.__scope.mergeSidebarPR = merge;
+        var entry = function() { return L.dd.querySelector('.ws-pr-entry[data-pr-url="https://github.com/o/b/pull/7"]'); };
+        U.click(entry().querySelector('.pr-sidebar-title'));
+        assert.strictEqual(entry().classList.contains('collapsed'), false, 'expanded');
+        L.m._reconcileDropdownSections();
+        assert.strictEqual(entry().classList.contains('collapsed'), false, 'expand state kept across re-render');
+        U.click(entry().querySelector('.pr-sidebar-merge-btn'));
+        assert.strictEqual(merge.calls.length, 1);
+        assert.strictEqual(entry().classList.contains('collapsed'), false, 'merge did not toggle');
+        // Open PR with 0 pushed files: no chevron, not expandable, clicks do not toggle.
+        var e8 = function() { return L.dd.querySelector('.ws-pr-entry[data-pr-url="https://github.com/o/b/pull/8"]'); };
+        assert.ok(e8().querySelector('.pr-sidebar-merge-btn'), '#8 is open');
+        assert.strictEqual(e8().querySelector('.ws-collapse-chevron'), null, 'no chevron with 0 files');
+        assert.strictEqual(e8().classList.contains('expandable'), false);
+        assert.strictEqual(e8().querySelector('.ws-pr-files'), null);
+        U.click(e8().querySelector('.pr-sidebar-title'));
+        assert.ok(e8().classList.contains('collapsed'), '0-file PR does not expand');
+        L.m._onClickOutsideWsDropdown({ target: entry().querySelector('.pr-sidebar-open') });
+        assert.ok(document.querySelector('body > .ws-dropdown'), 'inside click keeps dropdown');
+        U.click(entry().querySelector('.ws-pr-chat'));
+        assert.deepStrictEqual(L.g.selectChat.calls, [['other']]);
+        assert.strictEqual(document.querySelector('body > .ws-dropdown'), null, 'chip opens the chat');
+    }, { tags: ['unit'] });
+    test('_wsCollectDropdownPRs: union dedup, newest first, files matched by url or repo+number', async function() {
+        var L = await load({});
+        var out = L.m._wsCollectDropdownPRs({
+            'o/r::main': { meta: { prs: [{ url: 'https://github.com/o/r/pull/2', number: 2 }, { url: 'https://github.com/o/r/pull/5', number: 5, title: 'Five' }] },
+                dirtyFiles: [{ path: 'a', pushed_pr: { url: 'https://github.com/o/r/pull/5', number: 5 }, changed_since_push: true }, { path: 'b', pushed_pr: { number: 2 } }, { path: 'c' }] },
+            'o/r::feat': { meta: { prs: [{ url: 'https://github.com/o/r/pull/5', number: 5, state: 'merged' }] }, dirtyFiles: [] },
+            'x/y::main': { meta: { prs: [] }, dirtyFiles: [{ path: 'z', pushed_pr: { number: 2 } }] }
+        }, [{ url: 'https://github.com/q/q/pull/40', number: 40 }]);
+        assert.deepStrictEqual(out.map(function(p) { return p.number; }), [40, 5, 2]);
+        assert.strictEqual(out[1].base, 'main');
+        assert.strictEqual(out[1].metaState, 'merged', 'duplicate lends merged state');
+        assert.deepStrictEqual(out[1].files.map(function(x) { return x.f.path; }), ['a']);
+        assert.deepStrictEqual(out[2].files.map(function(x) { return x.f.path; }), ['b'], 'number match only within the same repo');
+        assert.strictEqual(out[0].files.length, 0);
+    }, { tags: ['unit'] });
+    test('_wsFilterDropdownPRs: merged only when merged today (local); non-merged always kept', async function() {
+        var L = await load({});
+        var now = new Date(2026, 9, 1, 12, 0, 0).getTime();
+        var prs = [
+            { url: 'u/1', metaState: 'merged', mergedAt: new Date(2026, 9, 1, 0, 5).toISOString() },
+            { url: 'u/2', metaState: 'merged', mergedAt: new Date(2026, 8, 30, 23, 59).toISOString() },
+            { url: 'u/3', metaState: 'merged', mergedAt: null },
+            { url: 'u/4', metaState: '' },
+            { url: 'u/5', metaState: 'closed' },
+            { url: 'u/6', metaState: 'merged', mergedAt: new Date(2026, 9, 1, 23, 59).getTime() },
+            { url: 'u/7', metaState: 'merged', mergedAt: 'garbage' }
+        ];
+        var keep = L.m._wsFilterDropdownPRs(prs, { now: now }).map(function(p) { return p.url; });
+        assert.deepStrictEqual(keep, ['u/1', 'u/4', 'u/5', 'u/6'], 'today kept; yesterday / no ts / bad ts hidden; open + closed kept');
+        // Injected state/merged_at accessors (live state wins over meta).
+        var live = L.m._wsFilterDropdownPRs([{ url: 'a' }, { url: 'b' }, { url: 'c' }], { now: now,
+            stateOf: function(p) { return { a: 'merged', b: 'merging', c: 'merged' }[p.url]; },
+            mergedAtOf: function(p) { return p.url === 'a' ? new Date(now - 3600e3).toISOString() : null; } });
+        assert.deepStrictEqual(live.map(function(p) { return p.url; }), ['a', 'b'], 'merging kept; live-merged without ts hidden');
+        assert.strictEqual(L.m._wsIsSameLocalDay(null, now), false);
+    }, { tags: ['unit'] });
+    test('PR section: merged-yesterday / untimestamped merged hidden and not counted; live merged_at wins', async function() {
+        var yest = new Date(); yest.setDate(yest.getDate() - 1);
+        var prs = [{ url: 'https://github.com/o/b/pull/7', number: 7, title: 'Seven' },
+            { url: 'https://github.com/o/b/pull/9', number: 9, title: 'Nine', state: 'merged', merged_at: yest.toISOString() },
+            { url: 'https://github.com/o/b/pull/8', number: 8, title: 'Eight', state: 'merged' },
+            { url: 'https://github.com/o/b/pull/6', number: 6, title: 'Six', state: 'closed' }];
+        var L = await open({ prs: prs, prState: { 'https://github.com/o/b/pull/5': 'merged' } });
+        var nums = function() { return Array.prototype.map.call(L.dd.querySelectorAll('.ws-pr-entry'), function(e) { return e.getAttribute('data-pr-url').split('/').pop(); }); };
+        assert.deepStrictEqual(nums(), ['7', '6']);
+        assert.strictEqual(L.dd.querySelector('.ws-pr-title').textContent, 'Pull Requests (2)', 'count reflects the filtered list');
+        // Live merge timestamp (merge button / GitHub refresh) makes #8 visible today.
+        L.m.__scope._sidebarPRMergedAt = { 'https://github.com/o/b/pull/8': new Date().toISOString() };
+        L.m._reconcileWsPrSection();
+        assert.deepStrictEqual(nums(), ['8', '7', '6']);
+        assert.strictEqual(L.dd.querySelector('.ws-pr-title').textContent, 'Pull Requests (3)');
+    }, { tags: ['unit'] });
+    test('PR section: 7 rows by default, "View more (N)" reveals the rest, survives re-render, Collapse folds back', async function() {
+        var prs = [];
+        for (var i = 1; i <= 10; i++) prs.push({ url: 'https://github.com/o/b/pull/' + (100 + i), number: 100 + i, title: 'P' + i });
+        var L = await open({ prs: prs });
+        var rows = function() { return L.dd.querySelectorAll('.ws-pr-entry').length; };
+        var btn = function() { return L.dd.querySelector('.ws-pr-section .ws-pr-more'); };
+        assert.strictEqual(rows(), 7);
+        assert.strictEqual(L.dd.querySelector('.ws-pr-title').textContent, 'Pull Requests (10)', 'header counts all filtered PRs');
+        assert.strictEqual(btn().textContent, 'View more (3)');
+        assert.strictEqual(L.dd.querySelector('.ws-pr-section').lastElementChild, btn(), 'button at the end of the section');
+        L.m._onClickOutsideWsDropdown({ target: btn() });
+        U.click(btn());
+        assert.ok(document.querySelector('body > .ws-dropdown'), 'dropdown stays open');
+        assert.strictEqual(rows(), 10);
+        assert.strictEqual(btn().textContent, 'Collapse');
+        L.m._reconcileWsPrSection();
+        assert.strictEqual(rows(), 10, 'expanded state survives re-render');
+        U.click(btn());
+        assert.strictEqual(rows(), 7);
+        // <= 7 PRs: no button.
+        L.m.__scope._wsHeaderCaches['o/b::dev'].meta.prs = prs.slice(0, 7);
+        L.m._reconcileWsPrSection();
+        assert.strictEqual(rows(), 7);
+        assert.strictEqual(btn(), null);
+    }, { tags: ['unit'] });
+    test('opening the dropdown kicks the meta-PR loader only when _sidebarMetaPRs is not loaded', async function() {
+        var kick = U.recorder();
+        var L = await open({ globals: { _sidebarMetaPRs: null, _refreshSidebarMetaPRs: kick } });
+        assert.strictEqual(kick.calls.length, 1, 'null (never loaded) → loader kicked');
+        L.m.hideWorkspaceDropdown(); U.cleanupAll();
+        var kick2 = U.recorder();
+        await open({ globals: { _sidebarMetaPRs: [], _refreshSidebarMetaPRs: kick2 } });
+        assert.strictEqual(kick2.calls.length, 0, 'already loaded → not kicked');
     }, { tags: ['unit'] });
     test('outside click closes; inside / anchor clicks keep it open; hide is idempotent', async function() {
         var L = await open();

@@ -241,6 +241,7 @@ async function realReset(getHost, confirmResult) {
     var run = new Function('S',
         'var toolPermissions = {}, instancePermissions = S.inst, sessionPermissions = { c1: { w: "allow" } };\n' +
         'var GLOBAL_READ_KEYS = ["r"], GLOBAL_WRITE_KEYS = ["w"], INSTANCE_READ_KEYS = ["ir"], INSTANCE_WRITE_KEYS = ["iw"];\n' +
+        'function getGlobalDefaultPermission(k) { return k === "web_fetch" ? "ask" : "auto"; }\n' +
         'function saveToolPermissions() {} function saveInstancePermissions() { S.saves++; } function pushPermissionsToOffscreen() {}\n' +
         'function renderToolPermissions() {} function renderSettingsToolPermissions() {} function updateSnStatus() {} function showSnackbar() {}\n' +
         'function escapeHtml(s) { return String(s); }\n' +

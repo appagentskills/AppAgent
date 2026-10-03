@@ -59,6 +59,13 @@ function closeHomeView() {
     var homePanel = document.getElementById('home-panel');
     var mainArea = document.getElementById('main-area');
     if (homePanel) homePanel.style.display = 'none';
+    // MEMORY: a hidden home panel kept its pinned-widget iframes (and their
+    // setInterval polls) alive. Unmount them and empty #home-dashboard-grid;
+    // openHomeView -> renderHome -> renderHomeDashboard -> renderDashboard('home')
+    // rebuilds the grid on the way back. Exits that skip closeHomeView
+    // (hideAllPanels) are covered by the lazy-mount observer in
+    // renderWidgetContent (ui/070-dashboard-ui.js), which unmounts hidden home cards.
+    if (typeof unmountDashboardWidgets === 'function') { try { unmountDashboardWidgets('home'); } catch (e) {} }
     showChatView();
     updateAllButtonStates();
 }
@@ -570,12 +577,7 @@ function renderHome() {
                 '<input type="file" id="home-image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />' +
                 '<button id="home-send-btn" onclick="sendHomeMessage()" aria-label="' + escapeHtml(t('Send message')) + '">' + UI_ICONS.send + '</button>' +
             '</div>' +
-            (recentPrompts.length > 0 ? '<div class="home-recent-prompts" id="home-recent-prompts">' +
-                '<span class="home-section-label">' + escapeHtml(t('Recent')) + '</span>' +
-                recentPrompts.map(function(p) {
-                    return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeJsString(p.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();fillHomeInput(\'' + escapeJsString(p.text) + '\')}" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
-                }).join('') +
-            '</div>' : '') +
+            _homeRecentPromptsHtml(recentPrompts) +
             // Free-text example chips fallback (only when no `home` actions exist).
             (shuffledExamples.length
                 ? '<div class="home-example-chips">' +
@@ -717,13 +719,21 @@ async function updateHomeStorage() {
 }
 
 // Get recent user prompts from all chats
+// MEMORY/CPU: single pass over `chats` with a bounded top-N buffer (newest
+// createdAt first, distinct prompt text) instead of copying + fully sorting
+// every chat. Same result as "sort all by createdAt desc, take the first
+// `count` distinct first-user-prompts" (ties keep insertion order).
 function getRecentUserPrompts(count) {
-    var prompts = [];
-    var chatList = Object.values(chats).sort(function(a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
-
-    for (var i = 0; i < chatList.length && prompts.length < count; i++) {
-        var chat = chatList[i];
-        if (!chat.messages) continue;
+    var top = []; // [{text, chatId, ts}] sorted by ts desc, length <= count
+    if (!(count > 0)) return [];
+    for (var id in chats) {
+        if (!Object.prototype.hasOwnProperty.call(chats, id)) continue;
+        var chat = chats[id];
+        // C2 skeleton (messages evicted to IDB): answered from the stored row.
+        if (!chat || (!chat.messages && !chat._messagesEvicted)) continue;
+        var ts = chat.createdAt || 0;
+        // Cheap reject before scanning messages: buffer full and not newer.
+        if (top.length >= count && ts <= top[top.length - 1].ts) continue;
         // Skip sub-agent / background chats — their "first user message" is the
         // synthetic spawn instruction (e.g. "You are a focused bug scout for the
         // AppAgent...") which the PM never typed. Leaking these into the Recent
@@ -732,20 +742,64 @@ function getRecentUserPrompts(count) {
         // model. `chat.isSubAgent` is stamped at sub-agent creation in
         // 097-sub-agent-registry.js; `isBackground` covers action chats too.
         if (chat.isSubAgent || chat.isBackground) continue;
-        // Only get the first user message from each chat
-        for (var j = 0; j < chat.messages.length; j++) {
-            var msg = chat.messages[j];
-            if (msg.role === 'user' && msg.content && msg.content.trim()) {
-                var text = msg.content.trim();
-                // Avoid duplicates
-                if (!prompts.some(function(p) { return p.text === text; })) {
-                    prompts.push({ text: text, chatId: chat.id });
-                }
-                break; // Only take the first user message per chat
-            }
+        // Only get the first user message from each chat. A skeleton gets the
+        // memoized value from its stored row (null until the one transient
+        // read lands, then the Recent strip refreshes in place).
+        var first = (typeof skeletonScanValue === 'function')
+            ? skeletonScanValue('firstPrompt', id, chat, _firstUserPromptText, null, _refreshHomeRecentPrompts)
+            : _firstUserPromptText(chat);
+        if (first) _insertRecentPrompt(top, { text: first, chatId: chat.id, ts: ts }, count);
+    }
+    return top.map(function(p) { return { text: p.text, chatId: p.chatId }; });
+}
+
+// First non-empty user prompt of a chat (trimmed), or null.
+function _firstUserPromptText(chat) {
+    var msgs = (chat && Array.isArray(chat.messages)) ? chat.messages : [];
+    for (var j = 0; j < msgs.length; j++) {
+        var msg = msgs[j];
+        if (msg && msg.role === 'user' && typeof msg.content === 'string' && msg.content.trim()) {
+            return msg.content.trim(); // Only take the first user message per chat
         }
     }
-    return prompts;
+    return null;
+}
+
+function _homeRecentPromptsHtml(recentPrompts) {
+    return recentPrompts.length > 0 ? '<div class="home-recent-prompts" id="home-recent-prompts">' +
+        '<span class="home-section-label">' + escapeHtml(t('Recent')) + '</span>' +
+        recentPrompts.map(function(p) {
+            return '<div class="home-prompt-chip" onclick="fillHomeInput(\'' + escapeJsString(p.text) + '\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();fillHomeInput(\'' + escapeJsString(p.text) + '\')}" title="' + escapeHtml(p.text) + '" role="button" tabindex="0">' + escapeHtml(truncateText(p.text, 35)) + '</div>';
+        }).join('') +
+    '</div>' : '';
+}
+
+// Skeleton scan landed: refresh ONLY the Recent strip (a full renderHome
+// would reset the home composer). No-op when the home view is not mounted.
+function _refreshHomeRecentPrompts() {
+    var section = document.querySelector('#home-content .home-search-section');
+    if (!section) return;
+    var html = _homeRecentPromptsHtml(getRecentUserPrompts(4));
+    var old = document.getElementById('home-recent-prompts');
+    if (old) { if (html) old.outerHTML = html; else old.remove(); return; }
+    var anchor = html && section.querySelector('.home-search-container');
+    if (anchor) anchor.insertAdjacentHTML('afterend', html);
+}
+
+// Insert into the bounded, ts-desc buffer keeping one entry (the newest) per text.
+function _insertRecentPrompt(top, cand, count) {
+    for (var k = 0; k < top.length; k++) {
+        if (top[k].text === cand.text) {
+            if (top[k].ts >= cand.ts) return; // an equal/newer copy already wins
+            top.splice(k, 1);
+            break;
+        }
+    }
+    var pos = top.length;
+    while (pos > 0 && top[pos - 1].ts < cand.ts) pos--;
+    if (pos >= count) return;
+    top.splice(pos, 0, cand);
+    if (top.length > count) top.length = count;
 }
 
 // Truncate text with ellipsis

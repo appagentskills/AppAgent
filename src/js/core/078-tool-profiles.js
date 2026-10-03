@@ -38,7 +38,7 @@
 // =============================================================
 
 var TOOL_PROFILES = {
-    core:        { description: 'Base tools every agent needs (eval/chaining, cached results, files, skills, progress card)', tools: ['js_eval', 'cached_content_outline', 'cached_content_search', 'cached_content_read', 'get_file', 'get_tool_schema', 'get_skill', 'update_action_state'] },
+    core:        { description: 'Base tools every agent needs (eval/chaining, cached results, files, skills, progress card)', tools: ['js_eval', 'cached_content_outline', 'cached_content_search', 'cached_content_read', 'get_file', 'local_folder', 'get_tool_schema', 'get_skill', 'update_action_state'] },
     'sub-agent': { description: 'Tools every spawned sub-agent needs to report back, communicate, and stage scratchpad docs', tools: ['report_to_parent', 'agent_message', 'sleep_self', 'document'] },
     orchestrator: { description: 'Main-agent orchestration and user-facing I/O: spawning/managing subs, async handles, prompts, rendering, answer cards', tools: ['spawn_sub_agent', 'agent_status', 'wake_sub_agent', 'stop_sub_agent', 'agent_message', 'await_handle', 'await_any', 'await_all', 'prompt_user', 'show_action_button', 'set_chat_title', 'set_tldr', 'set_links', 'set_caveat', 'display', 'html_widget', 'widget_eval', 'document', 'screenshot_by_id', 'read_attached_file', 'start_chat'] },
     'skill-manager': { description: 'Create/update/manage AI skills (live runtime copies)', tools: ['manage_skill'] },

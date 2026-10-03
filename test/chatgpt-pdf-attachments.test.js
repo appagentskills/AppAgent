@@ -88,38 +88,41 @@ async function runPDFTests(sources) {
     check('get_file attached PDF reaches native Responses input', partsOf(convert([attached._screenshotMessage])).some(function(p) { return p.type === 'input_file' && p.file_data === data; }));
     // Text reader diagnostics must use owning chat, never send binary as text.
     function reader(chats, active, current, lookup) {
-        return new Function('chats','activeStreamingChatId','currentChatId','getFile', sources.fileTools + '\nreturn executeReadAttachedFile;')(chats, active, current, lookup || function() { return null; });
+        // The consumer resolves through the unified store: resolveFile(id) -> {blob, mime}.
+        var resolve = async function(id) { var f = lookup ? lookup(id) : null; return f ? { blob: new Blob([f.data], { type: 'text/csv' }), mime: 'text/csv' } : null; };
+        return new Function('chats','activeStreamingChatId','currentChatId','resolveFile', sources.fileTools + '\nreturn executeReadAttachedFile;')(chats, active, current, resolve);
     }
     var chats = {own:{messages:[pdf]},other:{messages:[]},mixed:{messages:[pdf,csv]},legacy:{messages:[{role:'pdf',name:'legacy.pdf'}]},text:{messages:[{role:'file',name:'note.txt',content:'hello'}]}};
     var read = reader(chats, 'other', null);
-    var diagnosed = read({filename:name.toUpperCase()}, {chatId:'own'});
+    var diagnosed = await read({filename:name.toUpperCase()}, {chatId:'own'});
     check('PDF found in explicit owning chat despite unrelated active chat', !diagnosed.success && diagnosed.file_id === 'fixture_pdf' && diagnosed.error.indexOf('A PDF attachment entry exists') === 0);
     check('PDF diagnostic contains no binary content or text format', !('content' in diagnosed) && !('format' in diagnosed) && JSON.stringify(diagnosed).indexOf(data) < 0);
     check('PDF diagnostic provides valid get_file guidance', diagnosed.error.indexOf('attach: true') >= 0);
-    var legacy = read({filename:'legacy.pdf'},{chatId:'legacy'});
+    var legacy = await read({filename:'legacy.pdf'},{chatId:'legacy'});
     check('Legacy PDF without bytes/id asks for reattachment without claiming delivery', legacy.file_id === null && legacy.error.indexOf('A PDF attachment entry exists') === 0 && legacy.error.indexOf('content and file_id are unavailable') >= 0 && legacy.error.indexOf('Ask the user to reattach') >= 0 && legacy.error.indexOf('get_file') < 0);
-    [undefined, '', null, {}, 42, 'not a PDF data URL'].forEach(function(bytes, i) {
-        var evicted = reader({own:{messages:[{role:'pdf',name:'evicted.pdf',base64:bytes}]}},'own',null)({filename:'evicted.pdf'});
+    var _evBytes = [undefined, '', null, {}, 42, 'not a PDF data URL'];
+    for (var i = 0; i < _evBytes.length; i++) { var bytes = _evBytes[i];
+        var evicted = await reader({own:{messages:[{role:'pdf',name:'evicted.pdf',base64:bytes}]}},'own',null)({filename:'evicted.pdf'});
         check('Evicted/malformed PDF does not claim native delivery #' + i, !evicted.success && evicted.file_id === null && !('content' in evicted) && evicted.error.indexOf('reattach the PDF') >= 0 && evicted.error.indexOf('supplied in the conversation') < 0 && evicted.error.indexOf('can now') < 0);
-    });
-    var recoverable = reader({own:{messages:[{role:'pdf',name:'evicted.pdf',file_id:'maybe_available'}]}},'own',null)({filename:'evicted.pdf'});
+    }
+    var recoverable = await reader({own:{messages:[{role:'pdf',name:'evicted.pdf',file_id:'maybe_available'}]}},'own',null)({filename:'evicted.pdf'});
     check('Evicted PDF id suggests lookup without promising it resolves', recoverable.file_id === 'maybe_available' && recoverable.error.indexOf('Try get_file') >= 0 && recoverable.error.indexOf('If its content is unavailable') >= 0);
-    var storedLegacy = reader({own:{messages:[{role:'pdf',name:'legacy.pdf',base64:data}]}},'own',null)({filename:'legacy.pdf'});
+    var storedLegacy = await reader({own:{messages:[{role:'pdf',name:'legacy.pdf',base64:data}]}},'own',null)({filename:'legacy.pdf'});
     check('Stored PDF without id is neutral about provider delivery', storedLegacy.file_id === null && storedLegacy.error.indexOf('If you cannot access its native content') >= 0 && storedLegacy.error.indexOf('get_file') < 0);
-    var typo = read({filename:'typo.pdf'},{chatId:'own'});
+    var typo = await read({filename:'typo.pdf'},{chatId:'own'});
     check('PDF filename typo lists available PDF rather than claiming none', typo.error.indexOf('Available files: ' + name) >= 0);
-    check('Mixed CSV/PDF list includes both', read({filename:'missing'},{chatId:'mixed'}).error.indexOf(name + ', rows.csv') >= 0);
-    check('Mixed CSV still reads original text when file store missing', read({filename:'ROWS.CSV'},{chatId:'mixed'}).content === csv.content);
-    check('Existing file-store text lookup retained', reader(chats,'other',null,function(id) { return id === 'fixture_csv' ? {data:'stored CSV'} : null; })({filename:'rows.csv'},{chatId:'mixed'}).content === 'stored CSV');
-    check('Legacy text without file_id retained', read({filename:'note.txt'},{chatId:'text'}).content === 'hello');
-    check('Genuinely empty conversation keeps original no-files error', read({filename:name},{chatId:'other'}).error === 'No files attached in this conversation. Ask the user to attach a file first.');
-    check('Missing filename validation retained', read({}, {chatId:'own'}).error === 'filename is required');
-    check('Missing chat validation retained', read({filename:name},{chatId:'missing'}).error === 'No active chat found');
-    check('Active chat fallback retained', reader(chats,'own',null)({filename:name}).file_id === 'fixture_pdf');
-    check('Current chat fallback retained', reader(chats,null,'own')({filename:name}).file_id === 'fixture_pdf');
-    check('Explicit empty owning chat never borrows another chat attachment', reader(chats,'own','own')({filename:name},{chatId:'other'}).error.indexOf('No files attached') === 0);
-    check('Nameless/nonattachment rows ignored while finding PDFs', reader({own:{messages:[{role:'user',name:name},{role:'pdf'},pdf]}},'own',null)({filename:name}).file_id === 'fixture_pdf');
-    check('Existing text-file priority retained for same-name PDF', reader({own:{messages:[pdf,{role:'file',name:name,content:'text fixture'}]}},'own',null)({filename:name}).content === 'text fixture');
+    check('Mixed CSV/PDF list includes both', (await read({filename:'missing'},{chatId:'mixed'})).error.indexOf(name + ', rows.csv') >= 0);
+    check('Mixed CSV still reads original text when file store missing', (await read({filename:'ROWS.CSV'},{chatId:'mixed'})).content === csv.content);
+    check('Existing file-store text lookup retained', (await reader(chats,'other',null,function(id) { return id === 'fixture_csv' ? {data:'stored CSV'} : null; })({filename:'rows.csv'},{chatId:'mixed'})).content === 'stored CSV');
+    check('Legacy text without file_id retained', (await read({filename:'note.txt'},{chatId:'text'})).content === 'hello');
+    check('Genuinely empty conversation keeps original no-files error', (await read({filename:name},{chatId:'other'})).error === 'No files attached in this conversation. Ask the user to attach a file first.');
+    check('Missing filename validation retained', (await read({}, {chatId:'own'})).error === 'filename is required');
+    check('Missing chat validation retained', (await read({filename:name},{chatId:'missing'})).error === 'No active chat found');
+    check('Active chat fallback retained', (await reader(chats,'own',null)({filename:name})).file_id === 'fixture_pdf');
+    check('Current chat fallback retained', (await reader(chats,null,'own')({filename:name})).file_id === 'fixture_pdf');
+    check('Explicit empty owning chat never borrows another chat attachment', (await reader(chats,'own','own')({filename:name},{chatId:'other'})).error.indexOf('No files attached') === 0);
+    check('Nameless/nonattachment rows ignored while finding PDFs', (await reader({own:{messages:[{role:'user',name:name},{role:'pdf'},pdf]}},'own',null)({filename:name})).file_id === 'fixture_pdf');
+    check('Existing text-file priority retained for same-name PDF', (await reader({own:{messages:[pdf,{role:'file',name:name,content:'text fixture'}]}},'own',null)({filename:name})).content === 'text fixture');
     return checks;
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────

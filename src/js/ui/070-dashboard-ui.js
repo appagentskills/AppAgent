@@ -88,6 +88,12 @@ function expandDashboardWidget(widgetId) {
         // the raw HTML editor. Same title/icon pair the chat fullscreen uses, so
         // the two surfaces stay learnable.
         '<button class="widget-modal-btn widget-code-btn" data-widget-id="' + widgetId + '" onclick="editDashboardWidgetCode(\'' + widgetId + '\', event)" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
+        // Direct Unpin (same path as the pin menu's Unpin: pinWidgetTo(id, 'none')
+        // -> removeWidgetFromDashboard, which drops the grid card, refreshes the
+        // home section, chat pin buttons and sidebar, then toasts). Only rendered
+        // while the widget is actually pinned. Deliberately NOT .danger so the
+        // trash button below stays the modal's single destructive control.
+        (dashboardWidgets[widgetId] ? '<button class="widget-modal-btn widget-unpin-btn" data-widget-id="' + widgetId + '" onclick="closeExpandedWidget();pinWidgetTo(\'' + widgetId + '\', \'none\')" title="' + escapeHtml(t('Unpin')) + '" aria-label="' + escapeHtml(t('Unpin')) + '">' + UI_ICONS.pinFilled + '</button>' : '') +
         '<button class="widget-modal-btn danger" onclick="closeExpandedWidget();confirmDeleteDashboardWidget(\'' + widgetId + '\')" title="' + escapeHtml(t('Remove from dashboard')) + '" aria-label="' + escapeHtml(t('Remove from dashboard')) + '">' + UI_ICONS.trash + '</button>' +
         '<button class="widget-close-btn" onclick="closeExpandedWidget()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
@@ -674,6 +680,17 @@ function injectWidgetBridge(html, widgetTitle, widgetId) {
             'if(e.data&&e.data.type==="__appagentSerializeForCapture"){' +
                 'try{' +
                     'var _scH="<!doctype html>"+document.documentElement.outerHTML;' +
+                    // Rm2 (#998): same S0C4-03b / TA3-6 secret redaction as get_dom before the DOM leaves the sandbox.
+                    'var _scS=function(n){return !!n&&String(n.localName||n.tagName||"").toLowerCase()==="input"&&!!n.getAttribute("value")&&(String(n.type).toLowerCase()==="password"||' +
+                        '/(^|\\s)(current-password|new-password|one-time-code)(\\s|$)/.test(String((n.getAttribute&&n.getAttribute("autocomplete"))||"").toLowerCase()));};' +
+                    'var _scL=Array.prototype.filter.call(document.documentElement.getElementsByTagName("input"),_scS);' +
+                    'if(_scL.length){' +
+                        'var _scD=new DOMParser().parseFromString(_scH,"text/html");' +
+                        'Array.prototype.forEach.call(_scD.querySelectorAll("input"),function(n){if(_scS(n))n.setAttribute("value","[redacted]");});' +
+                        '_scH="<!doctype html>"+_scD.documentElement.outerHTML;' +
+                        '_scL.forEach(function(n){var _s=n.getAttribute("value"),_a=_s.split("&").join("&amp;").split(String.fromCharCode(160)).join("&nbsp;"),_q=_a.split(String.fromCharCode(34)).join("&quot;");' +
+                            '[_s,_q,_a.split("<").join("&lt;").split(">").join("&gt;"),_q.split("<").join("&lt;").split(">").join("&gt;")].forEach(function(v,i,all){if(v!=="[redacted]"&&all.indexOf(v)===i&&_scH.indexOf(v)!==-1)_scH=_scH.split(v).join("[redacted]");});});' +
+                    '}' +
                     'var _scW=document.documentElement.scrollWidth;' +
                     'var _scHt=(document.body?document.body.scrollHeight:document.documentElement.scrollHeight);' +
                     'window.parent.postMessage({type:"__appagentSerializedDom",reqId:e.data.reqId,html:_scH,width:_scW,height:_scHt},"*");' +
@@ -996,6 +1013,9 @@ function renderWidgetContent(widget) {
         console.warn('Dashboard widget container not found:', 'dashboard-widget-content-' + widget.id);
         return;
     }
+    // Release any previous mount/lazy observer on this container first (a
+    // stale observer must not re-mount a now-deactivated widget).
+    unmountWidgetContainer(container);
     // A6A3-01: honour the persisted deactivated flag on every grid (re-)render.
     if (widget.deactivated || (typeof isWidgetDeactivated === 'function' ? isWidgetDeactivated(widget.id) : (dashboardWidgets[widget.id] || {}).deactivated)) {
         container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-secondary);text-align:center;font-size:var(--text-body);">' + escapeHtml(t('Widget deactivated.')) + '</div>';
@@ -1006,7 +1026,58 @@ function renderWidgetContent(widget) {
         container.innerHTML = '<div style="padding: var(--space-9);color:var(--text-muted);text-align:center;">' + escapeHtml(t('No content available. Try regenerating.')) + '</div>';
         return;
     }
-    
+
+    // MEMORY (lazy mount): a widget iframe is a full sandboxed document with
+    // its own timers (a pinned home widget polled riUsageRollup every 60s,
+    // reading every chat). Mount it only once its card scrolls into view;
+    // without IntersectionObserver, mount immediately (old behaviour).
+    if (typeof IntersectionObserver !== 'function') {
+        _mountWidgetIframe(container, widget);
+        return;
+    }
+    var obs = new IntersectionObserver(function(entries) {
+        var entry = entries[entries.length - 1];
+        if (!container.isConnected) { _disconnectWidgetLazyMount(container, obs); return; }
+        var mounted = !!container.querySelector('.widget-shadow-host');
+        if (entry && entry.isIntersecting) {
+            if (!mounted) _mountWidgetIframe(container, widget);
+            if (container.getClientRects().length) container.__widgetMountedVisible = true;
+        } else if (mounted && container.__widgetMountedVisible && container.closest && container.closest('#home-dashboard-grid') && !container.getClientRects().length) {
+            // Home was hidden (hideAllPanels: selectChat / popstate / view
+            // toggles never call closeHomeView): tear the iframe down so its
+            // timers stop. Keep observing — it re-mounts when shown again.
+            // Only cards that were mounted while visible: a container that
+            // never had layout (hidden at render, or a layout-less sandbox)
+            // is never torn down here, so no mount/unmount loop.
+            _unmountWidgetIframe(container);
+            container.__widgetMountedVisible = false;
+        }
+    }, { rootMargin: '200px' });
+    container.__widgetLazyObs = obs;
+    obs.observe(container);
+    // Mount synchronously (as before) unless the card is PROVABLY off-screen:
+    // callers that read the iframe right after renderWidgetContent keep
+    // working, and a container without layout (hidden / no layout) mounts
+    // now. Off-screen cards wait for the observer.
+    if (!_widgetContainerProvablyOffscreen(container)) {
+        _mountWidgetIframe(container, widget);
+        if (container.getClientRects && container.getClientRects().length) container.__widgetMountedVisible = true;
+    }
+}
+
+// True only when the container has layout (client rects) AND its bounding
+// rect lies entirely outside the viewport ±200px. No client rects => false.
+function _widgetContainerProvablyOffscreen(container) {
+    if (!container || !container.getClientRects || !container.getClientRects().length) return false;
+    var r = container.getBoundingClientRect();
+    var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 0;
+    var vw = window.innerWidth || (document.documentElement && document.documentElement.clientWidth) || 0;
+    if (!vh || !vw) return false;
+    return r.bottom < -200 || r.top > vh + 200 || r.right < -200 || r.left > vw + 200;
+}
+
+// Create the shadow host + sandboxed iframe for a dashboard/home widget.
+function _mountWidgetIframe(container, widget) {
     // Create shadow DOM for isolation
     var shadowHost = document.createElement('div');
     shadowHost.className = 'widget-shadow-host';
@@ -1021,6 +1092,54 @@ function renderWidgetContent(widget) {
 
     shadow.appendChild(iframe);
     writeWidgetHtml(iframe, injectWidgetBridge(widget.html, widget.title, widget.id), widget.id);
+}
+
+function _disconnectWidgetLazyMount(container, obs) {
+    var o = obs || (container && container.__widgetLazyObs);
+    if (o) { try { o.disconnect(); } catch (e) {} }
+    if (container && (!obs || container.__widgetLazyObs === obs)) container.__widgetLazyObs = null;
+}
+
+// Tear down the iframe mounted by _mountWidgetIframe: runs the __widgetCleanup
+// chain (ready-listener removal + unregisterWidgetInstance, so
+// listWidgetInstances drops it), blanks the document so its timers die now,
+// and empties the container.
+function _unmountWidgetIframe(container) {
+    if (!container) return;
+    var hosts = container.querySelectorAll ? container.querySelectorAll('.widget-shadow-host') : [];
+    for (var i = 0; i < hosts.length; i++) {
+        var root = hosts[i].shadowRoot;
+        var frames = root ? root.querySelectorAll('iframe') : [];
+        for (var j = 0; j < frames.length; j++) {
+            var f = frames[j];
+            if (f.__widgetCleanup) { try { f.__widgetCleanup(); } catch (e) {} }
+            try { f.src = 'about:blank'; } catch (e) {}
+            if (f.remove) f.remove();
+        }
+    }
+    container.innerHTML = '';
+    container.__widgetMountedVisible = false;
+}
+
+// Full unmount of one widget container: lazy observer + iframe.
+function unmountWidgetContainer(container) {
+    _disconnectWidgetLazyMount(container);
+    _unmountWidgetIframe(container);
+}
+
+// Unmount every widget on a dashboard grid ('home' | 'main') and empty it.
+// Called by closeHomeView (ui/030-home-view.js); renderDashboard() rebuilds
+// the grid when the view is opened again.
+function unmountDashboardWidgets(dashboard) {
+    dashboard = dashboard === 'home' ? 'home' : 'main';
+    // Cancel a pending rAF content render (renderDashboard, ui/060-docs-view.js).
+    if (typeof dashboardRenderGeneration !== 'undefined' && dashboardRenderGeneration) dashboardRenderGeneration[dashboard]++;
+    var grid = typeof dashboardGridEl === 'function' ? dashboardGridEl(dashboard) : null;
+    if (!grid) return 0;
+    var containers = grid.querySelectorAll('.dashboard-widget-content');
+    for (var i = 0; i < containers.length; i++) unmountWidgetContainer(containers[i]);
+    grid.innerHTML = '';
+    return containers.length;
 }
 
 // Add a chat widget to a dashboard ('main' = dashboard page, 'home' = home page)
@@ -1052,7 +1171,7 @@ async function addWidgetToDashboard(widgetId, event, dashboard) {
     var prompt = null;
     var chatId = chatWidget.chatId || currentChatId;
     var msgIndex = chatWidget.msgIndex;
-    if (chatId && chats[chatId] && msgIndex !== undefined) {
+    if (chatId && chats[chatId] && Array.isArray(chats[chatId].messages) && msgIndex !== undefined) {
         var chat = chats[chatId];
         // Find the last user message before the widget
         for (var i = msgIndex - 1; i >= 0; i--) {
@@ -1205,6 +1324,10 @@ async function removeWidgetFromDashboard(widgetId, event) {
         // Clean up widget iframe event listeners to prevent memory leaks
         var iframe = dashboardWidgetEl.querySelector('iframe');
         if (iframe && iframe.__widgetCleanup) iframe.__widgetCleanup();
+        // The grid iframe lives in a shadow root (querySelector above can't
+        // reach it) and may have a pending lazy-mount observer.
+        var _rmContent = dashboardWidgetEl.querySelector('.dashboard-widget-content');
+        if (_rmContent) unmountWidgetContainer(_rmContent);
         dashboardWidgetEl.remove();
         
         // Show empty state if no widgets left on the dashboard it was removed from
@@ -1465,7 +1588,11 @@ async function runWidgetPrompt(widget, prompt) {
     var historyMessages = [];
     var sourceChatTitle = widget.title || 'Widget Regeneration';
 
-    if (widget.chatId && chats[widget.chatId]) {
+    if (widget.chatId && chats[widget.chatId] && typeof ensureChatPayloads === 'function'
+        && !Array.isArray(chats[widget.chatId].messages)) {
+        try { await ensureChatPayloads(widget.chatId); } catch (eHyd) {}
+    }
+    if (widget.chatId && chats[widget.chatId] && Array.isArray(chats[widget.chatId].messages)) {
         var sourceChat = chats[widget.chatId];
         if (sourceChat.title && sourceChat.title !== 'New Chat') {
             sourceChatTitle = sourceChat.title;
@@ -1758,7 +1885,8 @@ function mirrorChatIndexToLocal() {
         var idx = [];
         Object.keys(chats).forEach(function(id) {
             var c = chats[id];
-            if (!c || !c.messages || c.messages.length === 0) return;
+            // C2-store: a message-evicted skeleton is a persisted chat too.
+            if (!c || (typeof chatMessageCount === 'function' ? chatMessageCount(c) : (c.messages ? c.messages.length : 0)) === 0) return;
             if (c.isSubAgent) return;
             if (c.isBackground && !c._revealed && !c.actionId) return;
             idx.push({
@@ -1895,6 +2023,60 @@ function _bootStripLoadedChat(chat) {
     catch (e) { console.error('chat payload eviction failed during hydration:', e); return false; }
 }
 
+// C2-store B (seeding): evict a chat's messages AFTER seeding the 040 cold
+// file-sum cache (_skelFileSums, tools/040-file-store.js) from the messages
+// about to be dropped, so file listings / fileIndex of the new skeleton stay
+// correct without a row re-read. The seed is rolled back when the eviction
+// refuses (the chat stays hydrated). No-op (plain evict) when the flag is OFF,
+// the chat has no messages, or 040 is not loaded in this realm.
+function _evictChatSeedingFileSum(chat) {
+    if (typeof evictChatMessagesInPlace !== 'function' || !chat) return false;
+    var seeded = false;
+    if (typeof CHAT_MESSAGE_EVICTION_ENABLED !== 'undefined' && CHAT_MESSAGE_EVICTION_ENABLED
+        && chat.id && Array.isArray(chat.messages) && chat.messages.length > 0
+        && typeof _skelFileSums !== 'undefined' && _skelFileSums && typeof _skelFileSums.set === 'function') {
+        try {
+            var files = [];
+            for (var mi = 0; mi < chat.messages.length; mi++) {
+                var m = chat.messages[mi];
+                var fid = m && (m.file_id || m.screenshot_id);
+                if (fid) files.push([fid, mi, m.role || null]);
+            }
+            _skelFileSums.set(chat.id, { mc: chat.messages.length, files: files });
+            seeded = true;
+        } catch (eSeed) { seeded = false; }
+    }
+    var ok = evictChatMessagesInPlace(chat);
+    if (seeded) {
+        try {
+            if (!ok) _skelFileSums.delete(chat.id);
+            else if (typeof _indexSkelSummary === 'function') _indexSkelSummary(chat.id);
+        } catch (eIdx) {}
+    }
+    return ok;
+}
+
+// MSG-EVICT (flagged, CHAT_MESSAGE_EVICTION_ENABLED in core/130): offer one
+// freshly read row to the running newest-K window (non-retired rows; the
+// current chat is always resident). The row that falls out of the window —
+// or a row that never enters it — drops its messages NOW, so the boot load
+// never holds every transcript at once. Rows ARE disk records (proof by
+// construction); ensureChatPayloads restores them on demand.
+function _bootMsgWindowOffer(win, chat) {
+    if (!chat || typeof evictChatMessagesInPlace !== 'function') return;
+    if (typeof currentChatId !== 'undefined' && chat.id === currentChatId) return;
+    var out = chat;
+    if (chat.retiredSubAgent !== true) {
+        var ts = chatPayloadRecencyTs(chat), pos = win.length;
+        while (pos > 0 && chatPayloadRecencyTs(win[pos - 1]) < ts) pos--;
+        if (pos < CHAT_KEEP_HYDRATED) {
+            win.splice(pos, 0, chat);
+            out = win.length > CHAT_KEEP_HYDRATED ? win.pop() : null;
+        }
+    }
+    if (out) _evictChatSeedingFileSum(out);
+}
+
 // Boot breadcrumb for the chat load (appBootCrumb is optional; never throws).
 function _chatsLoadCrumb(phase, extra) {
     if (typeof appBootCrumb === 'function') { try { appBootCrumb(phase, extra); } catch (e) {} }
@@ -1934,6 +2116,7 @@ async function _loadChatsFromStorageImpl() {
         // BOOT-OOM (F1): ids whose in-loop strip failed. They are never kept
         // hydrated: the post-swap pass flags them evicted before re-stripping.
         var _bootStripFailed = {};
+        var _bootMsgWin = []; // MSG-EVICT: running newest-K window
         // At most 5 progress crumbs per load (every max(500, n/5) records).
         var _crumbEvery = Math.max(500, Math.ceil(allKeys.length / 5));
         var _nextCrumbAt = _crumbEvery;
@@ -1953,6 +2136,8 @@ async function _loadChatsFromStorageImpl() {
             for (var _bi = 0; _bi < batch.length; _bi++) {
                 var chat = batch[_bi];
                 if (chat && chat.messages && chat.messages.length > 0) {
+                    // Disk rows never carry eviction transients, but be exact.
+                    delete chat._messagesEvicted; delete chat._msgCount;
                     loaded[chat.id] = chat;
                     var _cb64 = 0;
                     for (var _ci = 0; _ci < chat.messages.length; _ci++) {
@@ -1971,6 +2156,12 @@ async function _loadChatsFromStorageImpl() {
                     // only this batch's bodies are live. The newest K chats are
                     // re-hydrated after the swap by _hydrateRecent.
                     if (!_bootStripLoadedChat(chat)) _bootStripFailed[chat.id] = true;
+                    // MSG-EVICT: the row is the disk record — stamp the proof
+                    // (after the strip, which may swap the array), then window.
+                    else if (typeof markChatMessagesDurable === 'function') {
+                        markChatMessagesDurable(chat);
+                        if (typeof CHAT_MESSAGE_EVICTION_ENABLED !== 'undefined' && CHAT_MESSAGE_EVICTION_ENABLED) _bootMsgWindowOffer(_bootMsgWin, chat);
+                    }
                 }
             }
             var _doneKeys = _start + batchKeys.length;
@@ -2076,6 +2267,10 @@ async function _loadChatsFromStorageImpl() {
                     // tool_calls args) of non-recent chats at boot; restored
                     // with the payloads by ensureChatPayloads on open.
                     _bootStripLoadedChat(chats[_ids[_si]]);
+                    // MSG-EVICT: only PROVEN disk-identical rows (stamped in
+                    // the batch loop) — never an in-memory carry-over.
+                    if (typeof CHAT_MESSAGE_EVICTION_ENABLED !== 'undefined' && CHAT_MESSAGE_EVICTION_ENABLED
+                        && chatMessagesDurable(chats[_ids[_si]])) _evictChatSeedingFileSum(chats[_ids[_si]]);
                 }
                 _chatsLoadCrumb('post-strip', { n: _ids.length, kept: _keepIds.length });
                 if (typeof ensureChatPayloads === 'function') {
@@ -2335,6 +2530,14 @@ async function saveChatsToStorage() {
                         };
                         _metaGet.onerror = function() {
                             try {
+                                // MSG-EVICT save guard: the blind put has no
+                                // stored row to merge against — never write a
+                                // record lacking a non-empty transcript.
+                                if (!_putRec || !Array.isArray(_putRec.messages) || _putRec.messages.length === 0) {
+                                    console.warn('[storage] blind put skipped: record has no messages', _putId);
+                                    settleOne();
+                                    return;
+                                }
                                 var putRequest = store.put(_putRec);
                                 putRequest.onsuccess = settleOne;
                                 putRequest.onerror = settleOne;
@@ -2439,7 +2642,10 @@ async function deleteChatFromDB(chatId, chatSnapshot) {
 
 // Payload ids (file_id / screenshot_id) a chat record references. Ids survive
 // payload eviction, so a stripped record still reports them.
+// C2-store: delegates to core/130 chatReferencedPayloadIds so a skeleton's
+// stamped refs count; NULL = refs unknown — callers must reap nothing.
 function _chatPayloadIdsFor(chat) {
+    if (typeof chatReferencedPayloadIds === 'function') return chatReferencedPayloadIds(chat);
     var ids = {};
     if (!chat) return ids;
     if (Array.isArray(chat.messages)) {
@@ -2573,17 +2779,10 @@ function initDefaultToolPermissions() {
     // Global write tools → auto (with exceptions)
     GLOBAL_WRITE_KEYS.forEach(function(key) {
         if (!toolPermissions[key]) {
-            if (key === 'manage_skill:activate') {
-                toolPermissions[key] = 'disabled';
-            } else if (key === 'web_fetch') {
-                toolPermissions[key] = 'ask';
-            } else if (key === 'workspace:push' || key === 'get_cookie') {
-                // get_cookie runs silently by default; the user can lower it
-                // to 'ask'/'Off' in Settings > Tool permissions.
-                toolPermissions[key] = 'allow';
-            } else {
-                toolPermissions[key] = 'auto';
-            }
+            // Shared defaults (core/070 getGlobalDefaultPermission):
+            // manage_skill:activate → disabled, GLOBAL_ASK_DEFAULT_KEYS → ask,
+            // workspace:push/get_cookie → allow, else auto.
+            toolPermissions[key] = getGlobalDefaultPermission(key);
             changed = true;
         }
     });
@@ -2596,10 +2795,7 @@ function initDefaultToolPermissions() {
 
 function _getGlobalDefault(key) {
     if (GLOBAL_READ_KEYS.indexOf(key) !== -1) return 'allow';
-    if (key === 'manage_skill:activate') return 'disabled';
-    if (key === 'web_fetch') return 'ask';
-    if (key === 'workspace:push' || key === 'get_cookie') return 'allow';
-    return 'auto';
+    return getGlobalDefaultPermission(key);
 }
 
 function hasNonDefaultPermissions() {
@@ -2643,15 +2839,7 @@ async function resetAllPermissionsToDefaults() {
         toolPermissions[key] = 'allow';
     });
     GLOBAL_WRITE_KEYS.forEach(function(key) {
-        if (key === 'manage_skill:activate') {
-            toolPermissions[key] = 'disabled';
-        } else if (key === 'web_fetch') {
-            toolPermissions[key] = 'ask';
-        } else if (key === 'workspace:push' || key === 'get_cookie') {
-            toolPermissions[key] = 'allow';
-        } else {
-            toolPermissions[key] = 'auto';
-        }
+        toolPermissions[key] = getGlobalDefaultPermission(key);
     });
     saveToolPermissions();
 

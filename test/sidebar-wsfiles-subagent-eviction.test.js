@@ -40,7 +40,7 @@ describe('sidebar workspace files: sub-agent edits survive eviction', function()
         if (!_src) _src = await loadFile(UI);
         env = env || {};
         var body = cutVar(_src, '_wsfMutatingActions') + '\n' + cutVar(_src, '_wsfSubRenderTimer') + '\n'
-            + ['_wsfScanChat', 'getWsEditedFilesForChat', '_wsfOnSubMessages'].map(function(n) { return cutDecl(_src, n); }).join('\n')
+            + ['_wsfScanChat', '_wsfScanPacked', '_wsfSkelRerender', '_wsfScanChatLive', 'getWsEditedFilesForChat', '_wsfOnSubMessages'].map(function(n) { return cutDecl(_src, n); }).join('\n')
             + '\nreturn { files: getWsEditedFilesForChat, onSub: _wsfOnSubMessages };';
         return new Function('currentChatId', 'getSubAgentChatsForChat', 'renderVersionSidebar', 'setTimeout', 'clearTimeout', body)(
             env.currentChatId || null, env.getSubAgentChatsForChat, env.renderVersionSidebar || function() {},

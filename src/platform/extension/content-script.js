@@ -479,13 +479,14 @@
         return el.isContentEditable ? el : ((el.closest && el.closest('[contenteditable]:not([contenteditable="false"])')) || null);
     }
     function isEditableTarget(el) {
-        var t = (el && el.nodeType === 1) ? el.tagName : '';
+        // m10: uppercase like TB-2 — XHTML documents report lowercase tagName.
+        var t = (el && el.nodeType === 1) ? String(el.tagName || '').toUpperCase() : '';
         // `value` hosts: custom elements only (hyphenated tag, e.g. now-*). Built-ins such as
         // button/li/option/output/meter/progress/data/param also expose `value` but are not editable.
         return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || !!editableHost(el) || (t.indexOf('-') > 0 && ('value' in el));
     }
     function setEditableValue(el, value) {   // caller already checked isEditableTarget(el)
-        var t = el.tagName, host = (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') ? null : editableHost(el);
+        var t = String(el.tagName || '').toUpperCase(), host = (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') ? null : editableHost(el);
         if (t === 'INPUT' || t === 'TEXTAREA') {
             try { var desc = Object.getOwnPropertyDescriptor((t === 'TEXTAREA' ? window.HTMLTextAreaElement : window.HTMLInputElement).prototype, 'value');
                   if (desc && desc.set) desc.set.call(el, value); else el.value = value; } catch(e) { el.value = value; }

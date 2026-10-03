@@ -686,8 +686,12 @@ async function approveFromNotification(approvalIndex, chatId, action) {
     // Check if this was a programmatic tool call (widget/js_eval bridge)
     // Programmatic calls handle their own flow via promise resolution - don't trigger runAgent
     var chat = chats[chatId];
-    var approvalMsg = chat && chat.messages[approvalIndex];
-    var isProgrammatic = approvalMsg && approvalMsg.toolCallId && approvalMsg.toolCallId.startsWith('prog_');
+    // C2-ui MSG-EVICT: handleApproval hydrates a skeleton; if its rows are
+    // still not in memory (restore miss) the verdict was not applied, so
+    // never read chat.messages and never kick runAgent (fail closed).
+    var _noRows = !!chat && !Array.isArray(chat.messages);
+    var approvalMsg = chat && !_noRows && chat.messages[approvalIndex];
+    var isProgrammatic = _noRows || (approvalMsg && approvalMsg.toolCallId && approvalMsg.toolCallId.startsWith('prog_'));
 
     // Remove this notification from currentApprovalNotification array
     if (Array.isArray(currentApprovalNotification)) {
@@ -731,7 +735,9 @@ async function approveAllFromNotification(approvalIndices, chatId, action) {
 
     // Check if any of these were programmatic tool calls
     var chat = chats[chatId];
-    var hasProgrammatic = approvalIndices.some(function(idx) {
+    // C2-ui MSG-EVICT: same fail-closed rule as approveFromNotification.
+    var _noRowsAll = !!chat && !Array.isArray(chat.messages);
+    var hasProgrammatic = _noRowsAll || approvalIndices.some(function(idx) {
         var msg = chat && chat.messages[idx];
         return msg && msg.toolCallId && msg.toolCallId.startsWith('prog_');
     });

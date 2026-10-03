@@ -34,6 +34,9 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
         methodOrAction = args.action;
     } else if (toolName === 'workspace' && args && args.action) {
         methodOrAction = args.action;
+    } else if (toolName === 'local_folder' && args && args.action) {
+        // write/mkdir on a REAL folder → 'write_local' (core/070 helper)
+        methodOrAction = localFolderPermissionAction(args);
     } else if ((toolName === 'document' || toolName === 'widget_eval') && args && args.action) {
         methodOrAction = args.action;
     }
@@ -49,6 +52,18 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
 
     if (permission === 'disabled') {
         return Object.assign({ allowed: false, error: displayName + ' is disabled by user settings' }, baseResult);
+    }
+
+    // local_folder write/mkdir/delete on a registered READ-ONLY folder: the
+    // tool refuses it with READ_ONLY, so skip the prompt. Only a known
+    // access:'read' folder qualifies (tools/170 lfIsReadOnlyWriteTarget);
+    // readwrite/unknown folders keep their 'ask'.
+    if (toolName === 'local_folder' && (permission === 'ask' || permission === 'auto')
+        && typeof lfIsReadOnlyWriteTarget === 'function'
+        && (await lfIsReadOnlyWriteTarget(args))) {
+        // 'allow' (not 'auto'): even confirm:true must not prompt for a refusal.
+        permission = 'allow';
+        baseResult.permission = 'allow';
     }
 
     // web_fetch to the CONFIGURED GitHub REST base is agent-governed via the

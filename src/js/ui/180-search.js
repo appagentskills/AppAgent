@@ -1,10 +1,18 @@
 // Search chats by title and content (including tool calls and results)
 // Uses indexOf for fast matching - returns true on first match (early exit)
-function chatMatchesSearch(chat, query) {
+function chatMatchesSearch(chat, query, onLate) {
     if (!query || query.length < 2) return true; // Require at least 2 chars
     var q = query.toLowerCase();
     // Check title first (fast check)
     if (chat.title && chat.title.toLowerCase().indexOf(q) !== -1) return true;
+    // C2-ui SKEL-SCAN: an evicted skeleton is matched against its stored row
+    // (one transient read at a time, see skeletonScanValue in ui/120); until
+    // that lands it reports no match and the list re-renders once (onLate,
+    // default: the sidebar chat list).
+    if (_isSkelSearchChat(chat)) {
+        var _sv = _skelSearchValue(chat, query, onLate);
+        return !!(_sv && _sv.hit);
+    }
     // Check all messages for complete results
     if (chat.messages) {
         for (var i = 0; i < chat.messages.length; i++) {
@@ -27,6 +35,37 @@ function chatMatchesSearch(chat, query) {
         }
     }
     return false;
+}
+
+// C2-ui SKEL-SCAN helpers. ONE memo slot per query ('search:' + q) holds
+// {hit, snips}, so a match and its snippets land from a single row read.
+// Slots are kept for the last few queries only, so typing does not grow
+// the memo.
+var _SKEL_SEARCH_KEEP = 3;
+var _skelSearchQs = [];
+function _isSkelSearchChat(chat) {
+    return !!chat && !Array.isArray(chat.messages) && !!chat._messagesEvicted && typeof skeletonScanValue === 'function';
+}
+function _skelSearchRerender() {
+    if (typeof renderChatList === 'function') renderChatList();
+}
+function _skelSearchValue(chat, query, onLate) {
+    var q = query.toLowerCase();
+    if (_skelSearchQs.indexOf(q) === -1) {
+        _skelSearchQs.push(q);
+        if (_skelSearchQs.length > _SKEL_SEARCH_KEEP) _pruneSkelSearchSlots(_skelSearchQs.shift());
+    }
+    return skeletonScanValue('search:' + q, chat.id, chat, function(c) {
+        return { hit: chatMatchesSearch(c, query), snips: findAllSearchMatches(c, query) };
+    }, null, typeof onLate === 'function' ? onLate : _skelSearchRerender);
+}
+function _pruneSkelSearchSlots(oldQ) {
+    if (typeof _skelScanMemo === 'undefined' || !_skelScanMemo) return;
+    Object.keys(_skelScanMemo).forEach(function(id) {
+        var vals = _skelScanMemo[id] && _skelScanMemo[id].vals;
+        if (!vals) return;
+        delete vals['search:' + oldQ];
+    });
 }
 
 var chatSearchDebounceTimer = null;
@@ -87,7 +126,70 @@ function clearGlobalSearch() {
     renderMessages(); // Re-render to remove highlights
 }
 
+// Sidebar render cap + incremental "load more" (memory footprint).
+var CHAT_LIST_PAGE_SIZE = 50;
+var _chatListLimit = CHAT_LIST_PAGE_SIZE;
+var _chatListLimitQuery = '';
+var _chatListLimitChatId = null; // active chat at the last limit check
+
+// "View more" growth used to be permanent for the session. Shrink back to one
+// page when the active chat changes to one that sits inside the first page
+// (or to a new/unlisted chat). Switching to a chat deep in the expanded list
+// keeps the expansion, so the list never collapses under the user's click
+// and kbdStepChat (ui/320-keyboard-shortcuts.js) can keep stepping down.
+function _maybeResetChatListLimit(sorted, activeId) {
+    if (activeId === _chatListLimitChatId) return false;
+    _chatListLimitChatId = activeId;
+    if (_chatListLimit <= CHAT_LIST_PAGE_SIZE) return false;
+    var idx = -1;
+    for (var i = 0; i < sorted.length; i++) { if (sorted[i].id === activeId) { idx = i; break; } }
+    if (idx >= CHAT_LIST_PAGE_SIZE) return false;
+    _chatListLimit = CHAT_LIST_PAGE_SIZE;
+    return true;
+}
+
+function showMoreChatListItems() {
+    _chatListLimit += CHAT_LIST_PAGE_SIZE;
+    _renderChatListNow();
+}
+
+// Load the next page when the user scrolls near the bottom of the list.
+function _attachChatListScrollLoader(list) {
+    if (!list || list._aaScrollLoader || typeof list.addEventListener !== 'function') return;
+    list._aaScrollLoader = true;
+    list.addEventListener('scroll', function() {
+        if (!list.querySelector || !list.querySelector('.chat-list-more')) return;
+        if (list.scrollTop + list.clientHeight >= list.scrollHeight - 200) showMoreChatListItems();
+    }, { passive: true });
+}
+
+// Coalescing: bursts of live events (background runs, streaming title/state
+// updates) call renderChatList() many times per second. The first
+// CHAT_LIST_BURST_SYNC calls in a CHAT_LIST_COALESCE_MS window render
+// synchronously (callers that read the DOM right after still work); further
+// calls in the same window collapse into ONE trailing render.
+var CHAT_LIST_COALESCE_MS = 150;
+var CHAT_LIST_BURST_SYNC = 4;
+var _chatListWindowStart = 0;
+var _chatListWindowCount = 0;
+var _chatListTrailingTimer = null;
+
 function renderChatList() {
+    var now = Date.now();
+    if (now - _chatListWindowStart > CHAT_LIST_COALESCE_MS) { _chatListWindowStart = now; _chatListWindowCount = 0; }
+    _chatListWindowCount++;
+    if (_chatListWindowCount <= CHAT_LIST_BURST_SYNC) { _renderChatListNow(); return; }
+    if (_chatListTrailingTimer) return;
+    _chatListTrailingTimer = setTimeout(function() {
+        _chatListTrailingTimer = null;
+        _chatListWindowStart = Date.now();
+        _chatListWindowCount = 1;
+        _renderChatListNow();
+    }, Math.max(16, CHAT_LIST_COALESCE_MS - (now - _chatListWindowStart)));
+}
+
+function _renderChatListNow() {
+    if (_chatListTrailingTimer) { clearTimeout(_chatListTrailingTimer); _chatListTrailingTimer = null; }
     var list = document.getElementById('chat-list');
     if (!list) return;
 
@@ -98,6 +200,7 @@ function renderChatList() {
     // ui/070-dashboard-ui.js.
     if (typeof _storageDegraded !== 'undefined' && _storageDegraded && typeof buildDegradedChatListHtml === 'function') {
         list.innerHTML = buildDegradedChatListHtml();
+        list._aaLastHtml = null;
         return;
     }
     
@@ -175,7 +278,9 @@ function renderChatList() {
     // small zap badge. Sub-agent chats are hidden from the sidebar
     // unconditionally (they are delegated workers, not user-facing runs).
     var sorted = Object.values(chats)
-        .filter(function(c) { return c.messages && c.messages.length > 0 && chatMatchesSearch(c, chatSearchQuery) && (!(c.isBackground && !c._revealed) || (c.actionId && !c.isSubAgent)) && !c.isSubAgent; })
+        // C2-ui MSG-EVICT: chatMessageCount keeps evicted skeletons (no
+        // `messages`, stamped _msgCount) listed like their hydrated selves.
+        .filter(function(c) { return chatMessageCount(c) > 0 && chatMatchesSearch(c, chatSearchQuery) && (!(c.isBackground && !c._revealed) || (c.actionId && !c.isSubAgent)) && !c.isSubAgent; })
         .sort(function(a, b) {
             // Pinned chats first, then by last activity (chatActivityTs,
             // ui/050-history-view.js) so a chat continued today resurfaces.
@@ -184,9 +289,25 @@ function renderChatList() {
             return chatActivityTs(b) - chatActivityTs(a);
         });
 
+    // MEMORY: render only the first _chatListLimit rows (search/sort/filter
+    // still run over ALL chats above, so any chat stays findable). With
+    // thousands of chats a full render produced a >1 MB HTML string and ~46k
+    // DOM nodes on every live event. The active chat is always rendered, even
+    // when it sits beyond the cap, so its highlight is never lost.
+    var _q = chatSearchQuery || '';
+    if (_q !== _chatListLimitQuery) { _chatListLimitQuery = _q; _chatListLimit = CHAT_LIST_PAGE_SIZE; }
+    _maybeResetChatListLimit(sorted, typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var visible = sorted.length > _chatListLimit ? sorted.slice(0, _chatListLimit) : sorted;
+    var hiddenCount = sorted.length - visible.length;
+    if (hiddenCount > 0 && typeof currentChatId !== 'undefined' && currentChatId) {
+        for (var _ai = _chatListLimit; _ai < sorted.length; _ai++) {
+            if (sorted[_ai].id === currentChatId) { visible.push(sorted[_ai]); hiddenCount--; break; }
+        }
+    }
+
     // Separate pinned and unpinned for divider
-    var pinned = sorted.filter(function(c) { return c.pinned; });
-    var unpinned = sorted.filter(function(c) { return !c.pinned; });
+    var pinned = visible.filter(function(c) { return c.pinned; });
+    var unpinned = visible.filter(function(c) { return !c.pinned; });
     
     // Render pinned chats
     pinned.forEach(function(c) {
@@ -202,8 +323,21 @@ function renderChatList() {
     unpinned.forEach(function(c) {
         html += renderChatItem(c);
     });
-    
+
+    if (hiddenCount > 0) {
+        html += '<div class="search-result-item chat-list-more" role="button" tabindex="0" data-kbd-click onclick="showMoreChatListItems()">' +
+            '<span class="search-result-text">' + escapeHtml(t('View more')) + ' (' + hiddenCount + ')</span>' +
+        '</div>';
+    }
+
+    _attachChatListScrollLoader(list);
+
+    // Skip the DOM swap when nothing changed (common for live events that do
+    // not affect the sidebar) — avoids discarding/re-creating every row node.
+    if (list._aaLastHtml === html && list.childElementCount === list._aaLastCount) return;
     list.innerHTML = html;
+    list._aaLastHtml = html;
+    list._aaLastCount = list.childElementCount;
 
     // Re-open the dropdown that was open before the rebuild (if its chat is
     // still rendered in the list).
@@ -220,6 +354,11 @@ var MAX_MATCHES_PER_CHAT = 50; // Limit displayed matches per chat
 function findAllSearchMatches(chat, query) {
     if (!query || query.length < 2) return []; // Require at least 2 chars
     var q = query.toLowerCase();
+    // C2-ui SKEL-SCAN: snippets of an evicted skeleton come from its stored row.
+    if (_isSkelSearchChat(chat)) {
+        var _sv = _skelSearchValue(chat, query);
+        return (_sv && Array.isArray(_sv.snips)) ? _sv.snips : [];
+    }
     var snippetLength = 40; // chars before and after match
     var matches = [];
     
@@ -544,11 +683,16 @@ function chatItemKeydown(e, row, id) {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
     selectChat(id);
+    // Rm5 (#1009): during a render burst renderChatList() DEFERS to a trailing
+    // timer — the old row would still hold focus here and be detached later,
+    // dropping focus to BODY. Flush the pending render now so the refocus below
+    // targets the final DOM.
+    if (_chatListTrailingTimer) _renderChatListNow();
     // R3b-b: selectChat() rebuilds #chat-list (innerHTML), detaching this row and
     // dropping focus to BODY. Refocus the re-rendered row for this chat unless focus
     // moved elsewhere (focus() is a no-op while the list is display:none).
     var ae = document.activeElement;
-    if (ae && ae !== document.body) return;
+    if (ae && ae !== document.body && ae !== row) return;
     var list = document.getElementById('chat-list');
     var rows = list ? list.querySelectorAll('.chat-item[data-chat-id]') : [];
     for (var i = 0; i < rows.length; i++) {

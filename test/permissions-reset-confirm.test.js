@@ -58,6 +58,8 @@ async function makeReset(opts) {
         '    sessionPermissions = stubs.init.sessionPermissions;\n' +
         'var GLOBAL_READ_KEYS = stubs.GLOBAL_READ_KEYS, GLOBAL_WRITE_KEYS = stubs.GLOBAL_WRITE_KEYS,\n' +
         '    INSTANCE_READ_KEYS = stubs.INSTANCE_READ_KEYS, INSTANCE_WRITE_KEYS = stubs.INSTANCE_WRITE_KEYS;\n' +
+        // core/070 shared default helper (web_fetch is a GLOBAL_ASK_DEFAULT_KEYS entry).
+        'function getGlobalDefaultPermission(k) { return k === "web_fetch" ? "ask" : "auto"; }\n' +
         'var saveToolPermissions = stubs.saveToolPermissions, saveInstancePermissions = stubs.saveInstancePermissions,\n' +
         '    pushPermissionsToOffscreen = stubs.pushPermissionsToOffscreen, renderToolPermissions = stubs.renderToolPermissions,\n' +
         '    renderSettingsToolPermissions = stubs.renderSettingsToolPermissions, updateSnStatus = stubs.updateSnStatus,\n' +

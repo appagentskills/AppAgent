@@ -10,9 +10,32 @@ function updateHomePendingIndicator() {
     if (dot) dot.style.display = chatHasPendingItems('home') ? 'inline-block' : 'none';
 }
 
+// C2-ui MSG-EVICT: an evicted skeleton has no `messages` array (the full row
+// is in IndexedDB). The pending scans answer from the stored row via
+// skeletonScanValue (ui/120) and re-render the sidebar once it is read.
+function _isApprovalSkeleton(chat) {
+    return !!chat && !Array.isArray(chat.messages) && !!chat._messagesEvicted;
+}
+function _pendingScanRerender() {
+    if (typeof renderChatList === 'function') renderChatList();
+}
+function _pendingRowScan(chatId, chat, slot, role) {
+    var fn = function(c) {
+        return !!(c && Array.isArray(c.messages) && c.messages.some(function(m) {
+            return m && m.role === role && m.status === 'pending';
+        }));
+    };
+    if (_isApprovalSkeleton(chat) && typeof skeletonScanValue === 'function') {
+        return !!skeletonScanValue(slot, chatId, chat, fn, false, _pendingScanRerender);
+    }
+    return null;
+}
+
 // Check if a chat has any pending tool approvals
 function chatHasPendingApproval(chatId) {
     var chat = chats[chatId];
+    var _skel = _pendingRowScan(chatId, chat, 'pendingApproval', 'approval');
+    if (_skel !== null) return _skel;
     if (!chat || !chat.messages) return false;
     return chat.messages.some(function(m) {
         return m.role === 'approval' && m.status === 'pending';
@@ -25,6 +48,8 @@ function chatHasPendingApproval(chatId) {
 // to 'submitted' / 'cancelled' by submitPromptUser / cancelPromptUser.
 function chatHasPendingPrompt(chatId) {
     var chat = chats[chatId];
+    var _skel = _pendingRowScan(chatId, chat, 'pendingPrompt', 'prompt_user');
+    if (_skel !== null) return _skel;
     if (!chat || !chat.messages) return false;
     return chat.messages.some(function(m) {
         return m.role === 'prompt_user' && m.status === 'pending';
@@ -121,6 +146,21 @@ function _retryApprovalWhenChatLoads(chatId, retryFn, giveUpFn) {
     }, 250);
 }
 
+// C2-ui MSG-EVICT: hydrate a skeleton (ensureChatPayloads never rejects)
+// before an approval row is looked up / appended, then re-run against the
+// CURRENT chats[chatId] (it may have been replaced or deleted meanwhile).
+// Still no messages array = the stored row could not be restored: fail
+// closed (giveUpFn denies) instead of a TypeError on chat.messages.
+function _hydrateApprovalChatThen(chatId, retryFn, giveUpFn) {
+    var p = (typeof ensureChatPayloads === 'function') ? ensureChatPayloads(chatId) : null;
+    Promise.resolve(p).catch(function() {}).then(function() {
+        var c = chats[chatId];
+        if (!c || Array.isArray(c.messages)) { retryFn(); return; }
+        console.warn('[approval] chat ' + chatId + ' messages could not be restored — denying tool approval');
+        giveUpFn();
+    });
+}
+
 function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, targetChatId, options) {
     options = options || {};
     return new Promise(function(resolve) {
@@ -141,6 +181,12 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
                 options._gaveUp = true;
                 resolve(false);
             });
+            return;
+        }
+        if (_isApprovalSkeleton(chat)) {
+            _hydrateApprovalChatThen(chatId, function() {
+                showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, chatId, options).then(resolve);
+            }, function() { options._gaveUp = true; resolve(false); });
             return;
         }
 
@@ -256,6 +302,12 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
             }, function() { resolve(false); });
             return;
         }
+        if (_isApprovalSkeleton(chat)) {
+            _hydrateApprovalChatThen(chatId, function() {
+                showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallId, actualToolName, chatId, options).then(resolve);
+            }, function() { resolve(false); });
+            return;
+        }
 
         // DOUBLE-APPROVAL FIX (batch mirror): reuse/short-circuit an existing
         // approval row for this toolCallId instead of appending a duplicate.
@@ -324,6 +376,11 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     // approval at the same array index. Only fall back to the unscoped scan when
     // no targetChatId is available (legacy inline-from-current-chat path).
     var chatId = targetChatId || currentChatId;
+    // C2-ui MSG-EVICT: restore a skeleton's messages BEFORE the stale-row /
+    // in-range checks below read them (no await for a hydrated chat).
+    if (_isApprovalSkeleton(chats[chatId]) && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+    }
     var approvalKey = null;
     if (targetChatId) {
         var directKey = targetChatId + ':' + approvalIndex;
@@ -388,6 +445,16 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
     }
 
     var chat = chats[chatId];
+    // C2-ui MSG-EVICT: the scan above may have picked another chat; hydrate
+    // it too and re-read (hydration window). A miss fails closed (no-op).
+    if (_isApprovalSkeleton(chat) && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(chatId); } catch (e) {}
+        chat = chats[chatId];
+        if (_isApprovalSkeleton(chat)) {
+            console.warn('[approval] handleApproval: chat ' + chatId + ' messages could not be restored — ignoring');
+            return;
+        }
+    }
     if (!chat || chat._deleted || !Array.isArray(chat.messages)) return;
 
     // PR383-F3: the pending entry holds the authoritative row index (kept
@@ -934,10 +1001,20 @@ function _tierMenuRowsHtml() {
 // setTierAlias (ui/040-tools-settings.js) writes the same IDB setting the
 // settings page uses. Menu stays open so several tiers can be set at once.
 function setTierAliasFromMenu(tier, providerName) {
-    if (typeof setTierAlias === 'function') setTierAlias(tier, providerName);
     var _tierLabel = (typeof TIER_ALIAS_SAME !== 'undefined' && providerName === TIER_ALIAS_SAME)
         ? t('Same (follows current model)') : providerName;
-    showSnackbar(t('Sub-agent {tier} tier: {model}', { tier: tier, model: _tierLabel }), 'info');
+    var _ok = function() { showSnackbar(t('Sub-agent {tier} tier: {model}', { tier: tier, model: _tierLabel }), 'info'); };
+    if (typeof setTierAlias !== 'function') return Promise.resolve(false);
+    // Rm8 (#1007): setTierAlias is async and may resolve false (TA-7 refusal,
+    // which shows its own error) or reject - only confirm a real save.
+    return Promise.resolve().then(function() { return setTierAlias(tier, providerName); }).then(function(res) {
+        if (res === false) return false;
+        _ok();
+        return true;
+    }).catch(function(e) {
+        showSnackbar(t('Error: {message}', { message: (e && e.message) || String(e) }), 'error');
+        return false;
+    });
 }
 
 // Session-scoped collapse state for the pill menu's model sections — kept
