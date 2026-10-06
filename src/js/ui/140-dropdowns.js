@@ -571,12 +571,15 @@ function getEnabledTools(chatId, opts) {
 
 // `chatId` (optional): the calling chat — "Allow for this chat" grants are
 // keyed by ROOT chat (core/070-permissions.js chatPermKey) and checked FIRST.
-function getToolPermission(toolName, methodOrAction, chatId) {
+// `targetHost` (optional): host the call targets (core/070
+// resolvePermissionTargetHost(args)); undefined → the connected instance,
+// null → unresolvable explicit args.instance (no-instance defaults).
+function getToolPermission(toolName, methodOrAction, chatId, targetHost) {
     var permKey = resolvePermissionKey(toolName, methodOrAction);
 
     // Instance-scoped permissions
     if (isInstancePermissionKey(permKey)) {
-        return getInstanceToolPermission(permKey, chatId);
+        return getInstanceToolPermission(permKey, chatId, targetHost);
     }
 
     // Global permissions
@@ -601,9 +604,9 @@ function getToolPermission(toolName, methodOrAction, chatId) {
 }
 
 // Get effective permission for an instance-scoped tool
-function getInstanceToolPermission(permKey, chatId) {
-    var host = getConnectedInstanceHost();
-    var instPerms = host ? instancePermissions[host] : null;
+function getInstanceToolPermission(permKey, chatId, targetHost) {
+    var host = (targetHost === undefined) ? getConnectedInstanceHost() : targetHost;
+    var instPerms = host ? getInstancePermissionsForHost(host) : null;
     if (!instPerms) instPerms = { tier: 'manual', tools: {} };
     // Dev tier: EVERY instance-scoped call is 'allow' — no prompt, confirm:true
     // ignored, per-tool settings incl. 'disabled' ignored (like auto). Mirrors

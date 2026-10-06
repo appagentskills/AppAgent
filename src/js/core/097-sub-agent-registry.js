@@ -5310,7 +5310,8 @@ function agentMessage(args, ctx, _regMissRetried) {
             // before touching the card / transcript (SYNC for a hot parent).
             // A hydrate miss drops only these UI-only rows; the model-visible
             // notice below still goes out through the durable wake path.
-            _subWithChat(rec.parent_chat_id, function(_amPc) {
+            var _amDeliveryId = rec.agent_id + ':' + Date.now() + ':' + Math.random().toString(36).slice(2);
+            var _amUiDelivery = _subWithChat(rec.parent_chat_id, function(_amPc) {
             if (!_amPc || _subIsSkeleton(_amPc)) return;
             var _pcard = _findSubAgentCard(rec.parent_chat_id, rec.agent_id);
             if (_pcard) {
@@ -5349,6 +5350,7 @@ function agentMessage(args, ctx, _regMissRetried) {
                 subAgentName: rec.name,
                 subChatId: rec.chat_id,
                 text: _ptext,
+                deliveryId: _amDeliveryId,
                 createdAt: Date.now()
             });
             _repaintParent(rec.parent_chat_id);
@@ -5365,6 +5367,7 @@ function agentMessage(args, ctx, _regMissRetried) {
             // plain bubble; newlines are flattened because that regex is
             // single-line ([^\n]) — the full text stays in the card's
             // progress stream above.
+            var _amWakeDelivery = function() {
             try {
                 if (rec.wake_parent !== false) {
                     var _amPcid = rec.parent_chat_id;
@@ -5373,6 +5376,7 @@ function agentMessage(args, ctx, _regMissRetried) {
                     // kind:'message' summary = the FULL multi-line _ptext (the
                     // model text above stays flattened).
                     var _amMeta = _subNoticeMeta('message', rec.agent_id, rec.name, rec.state, _ptext, _amNotice);
+                    _amMeta.deliveryId = _amDeliveryId;
                     var _amLive = !!(typeof runningChatIds !== 'undefined' && runningChatIds[_amPcid]);
                     var _amParentSub = null;
                     if (chats[_amPcid].isSubAgent && chats[_amPcid].subAgentId) {
@@ -5443,6 +5447,14 @@ function agentMessage(args, ctx, _regMissRetried) {
                 }
             } catch (_amErr) {
                 console.warn('[sub-agents] agent_message(parent): wake delivery failed', _amErr);
+            }
+            };
+            // Preserve hot-chat synchronous delivery; queued/hydrated UI rows
+            // finish first. A hydrate miss still reaches the durable wake arm.
+            if (_amUiDelivery && typeof _amUiDelivery.then === 'function') {
+                _amUiDelivery.then(_amWakeDelivery, _amWakeDelivery);
+            } else {
+                _amWakeDelivery();
             }
         }
         rec.last_activity_at = Date.now();

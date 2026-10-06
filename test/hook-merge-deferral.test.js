@@ -59,6 +59,7 @@ describe('hook-run injection deferral (HOOK-MERGE)', function() {
             chats: { c1: { messages: [] }, c2: { messages: [] } }, runningChatIds: { c1: true, c2: true }, pendingInjectionsByChatId: pend,
             setChatPausedPersistent: function() {}, userInterruptedChats: interrupted,
             interruptResolversByChatId: { c1: function() { resolverCalls++; }, c2: function() { resolverCalls++; } },
+            providerChangeBackoffResolversByChatId: {},
             currentStreamAbortControllers: {}, pausedChats: {}, _hookRunDeferInjectionByChat: { c1: true }
         }});
         await _settle(m._handlePanelSendMessage({ chatId: 'c1', text: 'Or search online.' }));

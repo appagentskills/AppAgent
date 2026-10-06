@@ -784,9 +784,11 @@ function setToolPermission(toolName, permission) {
 }
 
 // Set permission by resolved key — routes to instance or global storage
-function setToolPermissionByKey(permKey, value) {
+// `targetHost` (optional): the instance host the approved call targeted;
+// undefined → connected host, null → unresolved target (nothing saved).
+function setToolPermissionByKey(permKey, value, targetHost) {
     if (isInstancePermissionKey(permKey)) {
-        var host = getConnectedInstanceHost();
+        var host = (targetHost === undefined) ? getConnectedInstanceHost() : targetHost;
         if (host) {
             if (!instancePermissions[host]) instancePermissions[host] = { tier: 'manual', tools: {} };
             if (!instancePermissions[host].tools) instancePermissions[host].tools = {};

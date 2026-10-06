@@ -1480,6 +1480,8 @@ async function _handleApprovalPromptFromOffscreen(msg) {
             // originated from a widget) so the notification is labeled
             // with the widget's title instead of the chat title.
             widgetName: msg.widgetName || undefined,
+            // Target instance host stamped by the SW gate ("Always allow").
+            permissionHost: msg.permissionHost,
             osNotify: msg.osNotify !== false
         };
         if (typeof showToolApprovalPrompt === 'function') {

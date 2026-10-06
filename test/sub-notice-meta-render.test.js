@@ -34,6 +34,14 @@ describe('sub-notice metadata rendering (175)', function() {
         assert.ok(html.indexOf(u._subNoticeCardHtml('Beta', 'sub_b', 'need_input', 'STUCK \u2014 no progress', 'mid')) >= 0, 'legacy lifecycle in leftover still a card');
         assert.strictEqual(count(html, /class="sub-notice /g), 2);
     });
+    test('adjacent legacy repair rejects passive cards and truncated-prefix collisions', async function() {
+        var u=await load(),summary='x'.repeat(3800)+' first',text='[sub-agent lifecycle] Alpha (sub_a): sent a message: '+'x'.repeat(3800);
+        var meta={kind:'message',agentId:'sub_a',name:'Alpha',summary:summary,text:text};
+        var candidates=[];candidates.nextRow={role:'sub_msg',subAgentId:'sub_a',text:'x'.repeat(3800)+' second'};
+        assert.ok(u.renderSubReportNotices(text,candidates,[],[meta]).indexOf('first')>=0,'different full bodies preserved');
+        candidates.nextRow={role:'sub_msg',kind:'passive_report',subAgentId:'sub_a',text:summary};
+        assert.ok(u.renderSubReportNotices(text,candidates,[],[meta]).indexOf('first')>=0,'passive report is not a message delivery');
+    });
     test('legacy row (no subNotices) renders exactly as before', async function() {
         var u = await load();
         var text = 'pre\n\n' + FINAL + '\n\n' + LIFE_B;
@@ -118,6 +126,22 @@ describe('250 renders real rows: cached pill vs notice cards', function() {
         assert.strictEqual(cards.length, 1);
         assert.ok(cards[0].textContent.indexOf('Alpha META') >= 0, 'name from the meta: ' + cards[0].textContent);
         assert.ok(row.textContent.indexOf('there') >= 0, 'user remainder kept');
+    });
+    [false,true].forEach(function(reverse) {
+        [false,true].forEach(function(identified) {
+            test('mounted transcript renders one parent card per delivery, reverse='+reverse+', ID='+identified, async function() {
+                var meta=metaMsg(),sub={role:'sub_msg',subAgentId:'sub_a',subAgentName:'Alpha',text:MSG_SUM};
+                if(identified){meta.deliveryId='delivery-1';sub.deliveryId='delivery-1';}
+                var notice={role:'user',injected:true,content:MSG,subNotices:[meta]},rows=reverse?[notice,sub]:[sub,notice];
+                var snapshot=JSON.stringify(rows), t=await mountChat(rows);
+                t.m.renderMessages();
+                assert.strictEqual(t.dom.$$('.sub-notice-outbound').length,1);
+                assert.strictEqual(t.dom.$$('.sub-notice').length,1,'one actual card');
+                t.m.renderMessages();
+                assert.strictEqual(t.dom.$$('.sub-notice').length,1,'re-render preserves one card');
+                assert.strictEqual(JSON.stringify(rows),snapshot,'model transcript unchanged');
+            });
+        });
     });
     test('a cached typed row over 16 KB shows the pill', async function() {
         var t = await mountChat([{ role: 'user', injected: true, hasUserText: true, content: BIG + '\n\n' + FINAL, subNotices: [metaFinal()], cachedContentId: 'old' }]);

@@ -505,6 +505,7 @@ function _unregisterPanel(port) {
                         displayName: _apIn.displayName,
                         args: _apIn.args,
                         permissionKey: _apIn.permissionKey,
+                        permissionHost: _apIn.permissionHost,
                         toolCallId: _apIn.toolCallId || entry.toolCallId,
                         toolName: _apIn.toolName,
                         widgetName: _apIn.widgetName || null
@@ -1059,6 +1060,11 @@ function _handlePanelMessage(port, msg) {
                 if (!msg.fromUserMessage && pendingInjectionsByChatId[icid]) {
                     delete pendingInjectionsByChatId[icid];
                 }
+                // Interrupts must also release an in-loop throttle retry sleep.
+                if (providerChangeBackoffResolversByChatId[icid]) {
+                    try { providerChangeBackoffResolversByChatId[icid](); } catch (e) {}
+                    delete providerChangeBackoffResolversByChatId[icid];
+                }
                 if (interruptResolversByChatId[icid]) {
                     try { interruptResolversByChatId[icid](); } catch (e) {}
                 }
@@ -1519,16 +1525,22 @@ function _handlePanelMessage(port, msg) {
             return;
 
         case 'skills-refresh':
-            // Panel finished importEmbeddedSkills() (or activated/deactivated a
-            // skill). Re-run loadActiveSkills so the SW's `skillTools` registry
-            // picks up skills that did not exist in IDB when the SW booted.
-            // Without this, a freshly shipped embedded skill's tools stay
+            // Panel finished importEmbeddedSkills() (or activated/deactivated/
+            // edited a skill). First reload the skill DEFINITIONS from IDB
+            // (loadSkillsFromStorage rebuilds the SW's in-memory `skills` map,
+            // e.g. skills[id].devOnly read by core/140-skills-engine.js), THEN
+            // re-run loadActiveSkills so the SW's `skillTools` registry picks up
+            // skills that did not exist in IDB when the SW booted. Without this,
+            // stale definitions and a freshly shipped embedded skill's tools stay
             // invisible to isSkillTool() / getActiveSkillTools() in the SW until
             // the next service-worker restart.
-            if (typeof loadActiveSkills === 'function') {
-                Promise.resolve(loadActiveSkills()).catch(function(e) {
-                    console.warn('[sw-runtime] skills-refresh failed', e);
-                });
+            // Definitions and tool assets must come from the same refreshed store.
+            var refreshSkillDefs = (typeof loadSkillsFromStorage === 'function') ? loadSkillsFromStorage : null;
+            var refreshActiveSkills = (typeof loadActiveSkills === 'function') ? loadActiveSkills : null;
+            if (refreshSkillDefs || refreshActiveSkills) {
+                Promise.resolve().then(function() { return refreshSkillDefs ? refreshSkillDefs() : undefined; })
+                    .then(function() { return refreshActiveSkills ? refreshActiveSkills() : undefined; })
+                    .catch(function(e) { console.warn('[sw-runtime] skills-refresh failed', e); });
             }
             return;
 
@@ -2368,6 +2380,11 @@ async function _handlePanelSendMessage(msg) {
         if (typeof _hookRunDeferInjectionByChat !== 'undefined' && _hookRunDeferInjectionByChat[chatId]) return;
         if (typeof _swAnswerPendingPromptViaChat === 'function' && _swAnswerPendingPromptViaChat(chatId, msg.text)) return;
         userInterruptedChats[chatId] = true;
+        // Wake the retry sleep only after hook/prompt answers have opted out.
+        if (providerChangeBackoffResolversByChatId[chatId]) {
+            try { providerChangeBackoffResolversByChatId[chatId](); } catch (e) {}
+            delete providerChangeBackoffResolversByChatId[chatId];
+        }
         if (interruptResolversByChatId[chatId]) {
             try { interruptResolversByChatId[chatId](); } catch (e) {}
         }

@@ -2173,6 +2173,27 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         })();
         return true;
     }
+    // Permission gate (core/070 resolvePermissionTargetHosts): the tab an
+    // iframe_tool action will drive — explicit id, or the active tab exactly as
+    // getActiveTabId resolves it — plus the stored instanceUrl handleNavigate
+    // uses for relative URLs. tab:null = unknown (gate treats it as manual).
+    if (message.type === 'perm-target-info') {
+        (async function() {
+            var out = { ok: true, tab: null, instanceUrl: null };
+            try { var _pd = await chrome.storage.local.get('instanceUrl'); out.instanceUrl = (_pd && _pd.instanceUrl) || null; } catch (e) {}
+            if (message.activeTab) {
+                try {
+                    var _pid = message.tabId != null ? message.tabId : await getActiveTabId();
+                    if (_pid != null) {
+                        var _pt = await chrome.tabs.get(_pid);
+                        if (_pt) out.tab = { url: _pt.url || null, pendingUrl: _pt.pendingUrl || null };
+                    }
+                } catch (e) { out.tab = null; }
+            }
+            sendResponse(out);
+        })();
+        return true;
+    }
 });
 
 // --- Navigation handlers ---

@@ -239,6 +239,7 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
             actualToolName: actualToolName || displayName,
             args: args,
             permissionKey: permissionKey,
+            permissionHost: options.permissionHost,
             toolCallId: toolCallId,
             status: 'pending'
         });
@@ -337,6 +338,7 @@ function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallI
             actualToolName: actualToolName || displayName,
             args: args,
             permissionKey: permissionKey,
+            permissionHost: options.permissionHost,
             toolCallId: toolCallId,
             status: 'pending'
         });
@@ -529,13 +531,26 @@ async function handleApproval(approvalIndex, action, skipNotificationClear, targ
                 }
             }
         }
+    } else if (action === 'auto' && msg.permissionKey && msg.permissionHost === null
+        && typeof isInstancePermissionKey === 'function' && isInstancePermissionKey(msg.permissionKey)) {
+        // The call's target host is unknown (gate stamped permissionHost:null),
+        // so there is no instance to save "Always allow" on: allow ONCE and say
+        // so, instead of showing a rule that was never stored.
+        msg.status = 'allowed';
+        if (typeof showSnackbar === 'function') {
+            var _l2msg = 'Allowed once: the target is not a known instance, so "Always allow" was not saved.';
+            showSnackbar(typeof t === 'function' ? t(_l2msg) : _l2msg, 'info');
+        }
     } else if (action === 'auto') {
         msg.status = 'always_allowed';
         if (msg.permissionKey) {
             // setToolPermissionByKey → saveToolPermissions / saveInstance-
             // Permissions → pushPermissionsToOffscreen, so the SW mirror is
             // updated transitively. No extra push needed here.
-            setToolPermissionByKey(msg.permissionKey, 'allow');
+            // Save to the instance the call TARGETED (row.permissionHost,
+            // stamped by the gate); legacy rows without it → connected host.
+            if (msg.permissionHost !== undefined) setToolPermissionByKey(msg.permissionKey, 'allow', msg.permissionHost);
+            else setToolPermissionByKey(msg.permissionKey, 'allow');
         }
     } else if (action === 'deny') {
         msg.status = 'denied';

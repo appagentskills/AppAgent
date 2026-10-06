@@ -145,10 +145,13 @@ function getEnabledTools(chatId, opts) {
 
 // `chatId` (optional): the calling chat — "Allow for this chat" grants are
 // keyed by ROOT chat (core/070-permissions.js chatPermKey) and checked FIRST.
-function getToolPermission(toolName, methodOrAction, chatId) {
+// `targetHost` (optional): host the call targets (core/070
+// resolvePermissionTargetHost(args)); undefined → the connected instance,
+// null → unresolvable explicit args.instance (no-instance defaults).
+function getToolPermission(toolName, methodOrAction, chatId, targetHost) {
     var permKey = resolvePermissionKey(toolName, methodOrAction);
     if (isInstancePermissionKey(permKey)) {
-        return getInstanceToolPermission(permKey, chatId);
+        return getInstanceToolPermission(permKey, chatId, targetHost);
     }
     // An explicit 'disabled' (Settings > Tool permissions) is the user's hard
     // stop and wins over any "Allow for this chat" grant — the grant may have
@@ -171,9 +174,9 @@ function getToolPermission(toolName, methodOrAction, chatId) {
     return getGlobalDefaultPermission(permKey);
 }
 
-function getInstanceToolPermission(permKey, chatId) {
-    var host = getConnectedInstanceHost();
-    var instPerms = host ? instancePermissions[host] : null;
+function getInstanceToolPermission(permKey, chatId, targetHost) {
+    var host = (targetHost === undefined) ? getConnectedInstanceHost() : targetHost;
+    var instPerms = host ? getInstancePermissionsForHost(host) : null;
     if (!instPerms) instPerms = { tier: 'manual', tools: {} };
     // Dev tier: EVERY instance-scoped call is 'allow' — no prompt, confirm:true
     // ignored (requestProgrammaticToolApproval returns on 'allow' before the

@@ -45,7 +45,17 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     // root chat, so the permission lookup needs the calling chat id.
     var targetChatId = options.chatId || activeStreamingChatId || currentChatId;
     var permissionKey = resolvePermissionKey(toolName, methodOrAction);
-    var permission = getToolPermission(toolName, methodOrAction, targetChatId);
+    // Instance tier is looked up for the host the call TARGETS (core/070
+    // getTargetedToolPermission). Fail safe if core/070 isn't loaded: an
+    // explicit args.instance gets null (no-instance defaults), never the
+    // active instance's tier.
+    var _tp = (typeof getTargetedToolPermission === 'function')
+        ? await getTargetedToolPermission(toolName, methodOrAction, targetChatId, args)
+        : { permission: getToolPermission(toolName, methodOrAction, targetChatId,
+            (args && args.instance != null && args.instance !== '') ? null : undefined), host: undefined };
+    var permission = _tp.permission;
+    // Concrete host for "Always allow" (undefined → connected at gate time).
+    var permissionHost = (_tp.host === undefined && typeof getConnectedInstanceHost === 'function') ? getConnectedInstanceHost() : _tp.host;
     var displayName = getToolDisplayName(toolName, methodOrAction);
 
     var baseResult = { permission: permission, displayName: displayName, permissionKey: permissionKey };
@@ -134,7 +144,8 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     }
     var approved;
     try {
-        approved = await promptFn(displayName, args, permissionKey, toolCallId, toolName, targetChatId, options);
+        approved = await promptFn(displayName, args, permissionKey, toolCallId, toolName, targetChatId,
+            Object.assign({}, options, { permissionHost: permissionHost }));
     } finally {
         if (options._handleId && typeof Handles !== 'undefined' && Handles.markAwaitingApproval) {
             Handles.markAwaitingApproval(options._handleChatId, options._handleId, false);

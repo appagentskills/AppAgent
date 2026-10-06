@@ -643,6 +643,69 @@ describe('ui settings › workspace header dropdown', function() {
         assert.deepStrictEqual(L.g.selectChat.calls, [['other']]);
         assert.strictEqual(document.querySelector('body > .ws-dropdown'), null);
     }, { tags: ['unit'] });
+    ['modified', 'new', 'deleted'].forEach(function(status) {
+        test('selected-chat attribution stays visible on ' + status + ' rows and opens its chat', async function() {
+            var L = await open({ globals: { chats: { me: { title: 'Selected chat' } } } });
+            var f = { path: 'mine.js', last_modified_by_chat_id: 'me' };
+            if (status !== 'new') f.sha = 'base';
+            if (status === 'deleted') f.deleted = true;
+            var row = L.m._dirtyFileRow(f), bubbled = 0;
+            L.dd.appendChild(row);
+            row.addEventListener('click', function() { bubbled++; });
+            var chip = row.querySelector('.ws-file-chat');
+            assert.ok(chip, 'selected owner must have an attribution icon');
+            assert.strictEqual(row.querySelector('.ws-file-badge').textContent, status);
+            assert.match(chip.title, /Edited by chat.*Selected chat.*click to open/);
+            assert.strictEqual(chip.classList.contains('gone'), false);
+            U.click(chip);
+            assert.deepStrictEqual(L.g.selectChat.calls, [['me']]);
+            assert.strictEqual(bubbled, 0, 'chip click must not trigger row handlers');
+            assert.strictEqual(document.querySelector('body > .ws-dropdown'), null);
+        }, { tags: ['unit'] });
+    });
+    test('foreign worker keeps worker provenance and root hue across chat selection', async function() {
+        var L = await open({ globals: { chats: { me: { title: 'Root' }, worker: { title: 'Worker', isSubAgent: true } },
+            _wsRootChatId: function(cid) { return cid === 'worker' ? 'me' : cid; } } });
+        var worker = L.m._dirtyFileRow({ path: 'worker.js', last_modified_by_chat_id: 'worker' }).querySelector('.ws-file-chat');
+        var root = L.m._dirtyFileRow({ path: 'root.js', last_modified_by_chat_id: 'me' }).querySelector('.ws-file-chat');
+        assert.ok(worker); assert.ok(root);
+        assert.match(worker.title, /Edited by worker.*Worker/);
+        assert.strictEqual(worker.style.getPropertyValue('--chat-hue'), root.style.getPropertyValue('--chat-hue'));
+        L.m.__scope.currentChatId = 'worker';
+        var selectedWorker = L.m._wsChatChip({ last_modified_by_chat_id: 'worker' });
+        assert.strictEqual(selectedWorker.title, worker.title);
+        U.click(selectedWorker);
+        assert.deepStrictEqual(L.g.selectChat.calls, [['worker']]);
+    }, { tags: ['unit'] });
+    test('selected-chat pushed stamps and legacy PR lookup retain attribution', async function() {
+        var url = 'https://github.com/o/a/pull/91';
+        var L = await open({ globals: { chats: { me: { title: 'Selected chat', messages: [
+            { role: 'tool', content: JSON.stringify({ success: true, pr_url: url, pr_number: 91 }) }
+        ] } } } });
+        [{ pushed_by_chat_id: 'me' }, {}].forEach(function(stamp) {
+            var row = L.m._dirtyFileRow(Object.assign({ path: 'pushed.js', sha: 'base',
+                pushed_pr: { url: url, number: 91, chatId: 'me' } }, stamp));
+            var chip = row.querySelector('.ws-file-chat');
+            assert.ok(chip);
+            assert.match(chip.title, /Pushed \(PR #91\) by chat.*Selected chat/);
+            assert.strictEqual(chip.classList.contains('gone'), false);
+            assert.strictEqual(row.querySelector('.ws-file-pr').textContent, 'PR #91');
+        });
+    }, { tags: ['unit'] });
+    test('no provenance gives no icon; unresolved selected owner stays muted and inert', async function() {
+        var L = await open({ globals: { chats: {}, SubAgents: { getByChatId: function() { return null; } } } });
+        assert.strictEqual(L.m._dirtyFileRow({ path: 'unknown.js' }).querySelector('.ws-file-chat'), null);
+        var row = L.m._dirtyFileRow({ path: 'missing.js', last_modified_by_chat_id: 'me', last_modified_by_chat_title: 'Missing chat' });
+        L.dd.appendChild(row);
+        var bubbled = 0; row.addEventListener('click', function() { bubbled++; });
+        var chip = row.querySelector('.ws-file-chat');
+        assert.ok(chip.classList.contains('gone'));
+        assert.match(chip.title, /Missing chat.*chat not loaded/);
+        U.click(chip);
+        assert.deepStrictEqual(L.g.selectChat.calls, []);
+        assert.strictEqual(bubbled, 0);
+        assert.strictEqual(document.querySelector('body > .ws-dropdown'), L.dd, 'inert chip leaves dropdown open');
+    }, { tags: ['unit'] });
     test('header click toggles collapse; delete/pin/clone buttons are delegated', async function() {
         var L = await open(), a = sec(L, 'o/a::main');
         U.click(a.querySelector('.ws-dd-title'));

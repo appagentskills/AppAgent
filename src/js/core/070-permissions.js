@@ -188,6 +188,214 @@ function resolvePermissionKey(toolName, methodOrAction) {
     return toolName;
 }
 
+// Normalise an instance URL/host to the instancePermissions key shape
+// ('dev1.service-now.com'): lowercase, no scheme, path, query or trailing slash.
+function normalizeInstanceHost(urlOrHost) {
+    if (!urlOrHost || typeof urlOrHost !== 'string') return null;
+    var h = urlOrHost.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[\/?#].*$/, '');
+    return h || null;
+}
+
+// The instance a call ACTUALLY targets, for the instance-tier permission
+// lookup. Tools resolve args.instance via Platform.resolveInstanceUrl (both
+// the page Platform in platform-bridge.js and the SW stub in
+// worker/010-platform-stub.js — same short-name lookup over
+// Platform.instances), so the gate must use the same host — otherwise a Dev
+// mark on the ACTIVE instance would leak onto calls to another instance, and
+// a Dev-marked target would prompt while a non-Dev instance is active.
+// Returns the target host string, or null when args.instance is given but
+// cannot be resolved (fail safe: null → no-instance defaults, writes ask;
+// NEVER the active instance's tier). No args.instance → undefined, which
+// getInstanceToolPermission treats as "the connected host".
+// Shared by both gates (ui/150-tool-approval.js, worker/120-tool-routing.js).
+function resolvePermissionTargetHost(args) {
+    var inst = args && args.instance;
+    if (inst === undefined || inst === null || inst === '') return undefined;
+    if (typeof inst !== 'string') return null;
+    var url = null;
+    try {
+        if (typeof Platform !== 'undefined' && Platform && typeof Platform.resolveInstanceUrl === 'function') {
+            url = Platform.resolveInstanceUrl(inst.trim());
+        }
+    } catch (e) { url = null; }
+    return normalizeInstanceHost(url);
+}
+
+// A host the instance-tier table can meaningfully key on: has a stored
+// tier, is a known Platform instance, or is a *.service-now.com host.
+function _permIsKnownInstanceHost(h) {
+    if (!h) return false;
+    if (getInstancePermissionsForHost(h)) return true;
+    if (/\.service-now\.com$/.test(h)) return true;
+    var list = (typeof Platform !== 'undefined' && Platform && Array.isArray(Platform.instances)) ? Platform.instances : [];
+    for (var i = 0; i < list.length; i++) {
+        if (list[i] && normalizeInstanceHost(list[i].url) === h) return true;
+    }
+    return false;
+}
+
+// One SW round trip for the facts iframe_tool routing depends on, resolved
+// by background.js exactly as the tool resolves them: the tab (explicit id,
+// or the ACTIVE tab via getActiveTabId — currentWindow of the SW) and the
+// stored instanceUrl (sidepanel relative navigate, background.js
+// handleNavigate). The offscreen worker has no chrome.tabs, so the message is
+// the only path there; the page falls back to chrome.tabs/storage directly.
+// Returns {tab:{url,pendingUrl}|null, instanceUrl} — null fields mean UNKNOWN.
+function _permSendMessage(msg) {
+    return new Promise(function(resolve) {
+        try {
+            chrome.runtime.sendMessage(msg, function(resp) {
+                try { void chrome.runtime.lastError; } catch (e) {}
+                resolve(resp || null);
+            });
+        } catch (e) { resolve(null); }
+    });
+}
+async function _permTargetInfo(tabId, wantTab) {
+    var hasChrome = typeof chrome !== 'undefined' && chrome;
+    if (hasChrome && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        var r = await _permSendMessage({ type: 'perm-target-info', tabId: tabId, activeTab: !!wantTab });
+        if (r && r.ok) return { tab: r.tab || null, instanceUrl: r.instanceUrl || null };
+    }
+    var out = { tab: null, instanceUrl: null };
+    if (!hasChrome) return out;
+    try {
+        if (chrome.storage && chrome.storage.local && typeof chrome.storage.local.get === 'function') {
+            var d = await chrome.storage.local.get('instanceUrl');
+            out.instanceUrl = (d && d.instanceUrl) || null;
+        }
+    } catch (e) { /* unknown */ }
+    if (wantTab && chrome.tabs) {
+        try {
+            var tab = null;
+            if (tabId != null) tab = await chrome.tabs.get(tabId);
+            else {
+                var ts = await chrome.tabs.query({ active: true, currentWindow: true });
+                tab = ts && ts[0];
+            }
+            if (tab) out.tab = { url: tab.url || null, pendingUrl: tab.pendingUrl || null };
+        } catch (e) { /* closed / unknown tab → unknown */ }
+    }
+    return out;
+}
+
+// Host for the tier lookup, or null (manual) when it is not a known instance.
+function _permKnownHostOrNull(urlOrHost) {
+    var h = normalizeInstanceHost(urlOrHost);
+    return _permIsKnownInstanceHost(h) ? h : null;
+}
+
+// Which iframe_tool routing applies here: 'sidepanel' (body class, set by
+// core/120-init.js), 'tab' (?mode=tab full-tab page), or null when unknown —
+// e.g. the offscreen worker gate, where the call is later run by whichever
+// panel/tab executes it — and then BOTH modes' candidates are considered.
+function _permIframeMode() {
+    try {
+        if (typeof document !== 'undefined' && document && document.body && document.body.classList &&
+            document.body.classList.contains('sidepanel-mode')) return 'sidepanel';
+        if (typeof location !== 'undefined' && location && /[?&]mode=tab(&|$)/.test(location.search || '')) return 'tab';
+    } catch (e) {}
+    return null;
+}
+
+var _PERM_SN_INSTANCE_TOOLS = ['servicenow_api', 'servicenow_run_script', 'servicenow_diff_edit'];
+
+// Candidate hosts whose tier governs this call; the STRICTEST wins
+// (getTargetedToolPermission), so Dev applies only when EVERY candidate is a
+// Dev instance. null = unknown host / failed lookup → manual defaults.
+// servicenow_api / run_script / diff_edit route by args.instance, so that
+// host alone decides. iframe_tool (every action) unions everything it might
+// touch, resolved the way tools/010-iframe-tool.js + background.js route:
+//  - the active instance host;
+//  - the tab it drives — full-tab: tab_id → chat-pinned targetTabId → active
+//    tab; sidepanel: tab_id is IGNORED (010:113-115, 177-178), pinned → active
+//    tab (platform-bridge.js sendBrowserAction, background.js getActiveTabId);
+//    both tab.url and tab.pendingUrl; unknown mode → both modes' candidates;
+//  - navigate: an absolute URL's host; a relative URL's base (full-tab:
+//    args.instance or the active instance; sidepanel: the STORED instanceUrl,
+//    background.js handleNavigate, which ignores args.instance);
+//  - args.instance when given (it can only add strictness here).
+// Pins of BOTH the gate's chat and currentChatId are considered: the tool
+// falls back to currentChatId when options.chatId is unknown (010:109-111),
+// while the gate may have used activeStreamingChatId.
+async function resolvePermissionTargetHosts(toolName, args, chatId) {
+    var connected = (typeof getConnectedInstanceHost === 'function') ? getConnectedInstanceHost() : null;
+    var explicit = resolvePermissionTargetHost(args); // undefined | host | null
+    if (_PERM_SN_INSTANCE_TOOLS.indexOf(toolName) !== -1) return [explicit === undefined ? connected : explicit];
+    if (toolName !== 'iframe_tool' || !args) return explicit === undefined ? [connected] : [connected, explicit];
+    var hosts = [connected ? normalizeInstanceHost(connected) : null];
+    if (explicit !== undefined) hosts.push(explicit);
+    var mode = _permIframeMode();
+    var isNav = args.action === 'navigate';
+    var navUrl = isNav && typeof args.url === 'string' ? args.url : null;
+    var relNav = !!(navUrl && navUrl.charAt(0) === '/');
+    if (isNav && !relNav) hosts.push(navUrl && /^https?:\/\//i.test(navUrl) ? _permKnownHostOrNull(navUrl) : null);
+    // Tabs the action may drive (null entry = the active tab).
+    var tabIds = [];
+    if (!args.widget_id) {
+        if (args.tab_id != null && mode !== 'sidepanel') tabIds.push(args.tab_id);
+        if (args.tab_id == null || mode !== 'tab') {
+            var chatIds = [chatId];
+            if (typeof currentChatId !== 'undefined' && currentChatId && currentChatId !== chatId) chatIds.push(currentChatId);
+            for (var ci = 0; ci < chatIds.length; ci++) {
+                var c = (typeof chats !== 'undefined' && chats && chatIds[ci]) ? chats[chatIds[ci]] : null;
+                var pin = c && c.targetTabId != null ? c.targetTabId : null;
+                if (tabIds.indexOf(pin) === -1) tabIds.push(pin);
+            }
+        }
+    }
+    var needStored = relNav && mode !== 'tab';
+    if (!tabIds.length && needStored) tabIds.push(undefined); // storage only
+    for (var ti = 0; ti < tabIds.length; ti++) {
+        var wantTab = tabIds[ti] !== undefined;
+        var info = await _permTargetInfo(wantTab ? tabIds[ti] : null, wantTab);
+        if (wantTab) {
+            var t = info.tab;
+            if (!t || (!t.url && !t.pendingUrl)) hosts.push(null);
+            else {
+                if (t.url) hosts.push(_permKnownHostOrNull(t.url));
+                if (t.pendingUrl) hosts.push(_permKnownHostOrNull(t.pendingUrl));
+            }
+        }
+        if (needStored && ti === 0) hosts.push(info.instanceUrl ? _permKnownHostOrNull(info.instanceUrl) : null);
+    }
+    return hosts;
+}
+
+var _PERM_RANK = { allow: 0, auto: 1, ask: 2, disabled: 3 };
+// Gate entry point (ui/150, worker/120): {permission, host} where host is the
+// concrete instance host whose tier decided (stamped on approval rows so
+// "Always allow" saves there). Non-instance keys: plain getToolPermission.
+async function getTargetedToolPermission(toolName, methodOrAction, chatId, args) {
+    var permKey = resolvePermissionKey(toolName, methodOrAction);
+    if (!isInstancePermissionKey(permKey)) {
+        return { permission: getToolPermission(toolName, methodOrAction, chatId), host: undefined };
+    }
+    var hosts = await resolvePermissionTargetHosts(toolName, args, chatId);
+    var best = null;
+    for (var i = 0; i < hosts.length; i++) {
+        var p = getToolPermission(toolName, methodOrAction, chatId, hosts[i]);
+        var r = Object.prototype.hasOwnProperty.call(_PERM_RANK, p) ? _PERM_RANK[p] : 2;
+        // Ties prefer a null host: "Always allow" can't save there (L2) and
+        // saving to a sibling host would not stop the next prompt anyway.
+        if (!best || r > best.rank || (r === best.rank && hosts[i] === null && best.host !== null)) best = { permission: p, host: hosts[i], rank: r };
+    }
+    return { permission: best.permission, host: best.host };
+}
+
+// instancePermissions entry for a host; keys are stored un-lowercased by
+// setInstanceTier (getConnectedInstanceHost), so fall back to a
+// case-insensitive match.
+function getInstancePermissionsForHost(host) {
+    if (!host || typeof instancePermissions === 'undefined' || !instancePermissions) return null;
+    if (instancePermissions[host]) return instancePermissions[host];
+    var lc = String(host).toLowerCase();
+    for (var k in instancePermissions) {
+        if (Object.prototype.hasOwnProperty.call(instancePermissions, k) && String(k).toLowerCase() === lc) return instancePermissions[k];
+    }
+    return null;
+}
+
 // ── "Allow for this chat" grants (sessionPermissions) ─────────────────────
 // sessionPermissions is keyed by ROOT chat + permission key:
 //   chatPermKey(rootChatId, permKey) === rootChatId + '::' + permKey

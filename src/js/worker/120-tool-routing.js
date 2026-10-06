@@ -398,6 +398,7 @@ function replayParkedToolCalls(port) {
                         displayName: _ap.displayName,
                         args: _ap.args,
                         permissionKey: _ap.permissionKey,
+                        permissionHost: _ap.permissionHost,
                         toolName: _ap.toolName,
                         widgetName: _ap.widgetName || null
                     };
@@ -423,6 +424,7 @@ function replayParkedToolCalls(port) {
                             actualToolName: _ap.toolName || _ap.displayName,
                             args: _ap.args,
                             permissionKey: _ap.permissionKey,
+                            permissionHost: _ap.permissionHost,
                             toolCallId: _ap.toolCallId,
                             status: 'pending'
                         });
@@ -1635,7 +1637,17 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         // by widget/sandbox dispatches; activeStreamingChatId is the fallback.
         var targetChatId = options.chatId || activeStreamingChatId;
         var permissionKey = resolvePermissionKey(toolName, methodOrAction);
-        var permission = getToolPermission(toolName, methodOrAction, targetChatId);
+        // Instance tier is looked up for the host the call TARGETS (core/070
+        // getTargetedToolPermission). Fail safe if core/070 isn't loaded: an
+        // explicit args.instance gets null (no-instance defaults), never the
+        // active instance's tier.
+        var _tp = (typeof getTargetedToolPermission === 'function')
+            ? await getTargetedToolPermission(toolName, methodOrAction, targetChatId, args)
+            : { permission: getToolPermission(toolName, methodOrAction, targetChatId,
+                (args && args.instance != null && args.instance !== '') ? null : undefined), host: undefined };
+        var permission = _tp.permission;
+        // Concrete host for "Always allow" (undefined → connected at gate time).
+        var permissionHost = (_tp.host === undefined && typeof getConnectedInstanceHost === 'function') ? getConnectedInstanceHost() : _tp.host;
         var displayName = getToolDisplayName(toolName, methodOrAction);
 
         var baseResult = { permission: permission, displayName: displayName, permissionKey: permissionKey };
@@ -1721,6 +1733,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 // (see SWM3F-2).
                 parkUIToolCall(targetChatId, approvalRequestId, '__approval_prompt__', {
                     displayName: displayName, args: args, permissionKey: permissionKey,
+                    permissionHost: permissionHost,
                     toolCallId: toolCallId, toolName: toolName,
                     widgetName: options.widgetName || null
                 }, resolve, reject);
@@ -1741,6 +1754,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 displayName: displayName,
                 args: args,
                 permissionKey: permissionKey,
+                permissionHost: permissionHost,
                 toolName: toolName,
                 // Forward the originating widget's name so the panel-side prompt
                 // labels the notification correctly (mirrors the page-side path
@@ -1771,6 +1785,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 actualToolName: toolName || displayName,
                 args: args,
                 permissionKey: permissionKey,
+                permissionHost: permissionHost,
                 toolCallId: toolCallId,
                 status: 'pending'
             });

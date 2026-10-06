@@ -1157,13 +1157,15 @@ var PARENT_INBOX_RE = /\[(\d{1,3}) message\(s\) from parent \/ inbox\]\n?/g;
 // Match the producer's exact normalization (agentMessage in core/097).
 // Only the redundant lifecycle segment disappears; the standalone sub_msg
 // retains full markdown and the original user row still reaches the model.
-// `messages` is ONLY the visible prefix before this lifecycle row, never future
-// rows: an old unmatched notice cannot consume a later standalone occurrence.
-function _hasStandaloneSubMessage(messages, agentId, headline, used) {
+// `messages` contains the visible prefix. Its optional deliveryRows window is
+// searched only with a shared delivery ID; legacy text matching stays prefix-only.
+function _hasStandaloneSubMessage(messages, agentId, headline, used, deliveryId) {
     if (!Array.isArray(messages) || headline.indexOf('sent a message: ') !== 0) return false;
     var normalized = headline.slice('sent a message: '.length);
-    return messages.some(function(row) {
-        if (!row || row.role !== 'sub_msg' || row.subAgentId !== agentId || used.indexOf(row) !== -1) return false;
+    var candidates = deliveryId ? (messages.deliveryRows || messages) : messages;
+    return candidates.some(function(row) {
+        if (!row || row.role !== 'sub_msg' || row.kind === 'passive_report' || row.subAgentId !== agentId || used.indexOf(row) !== -1) return false;
+        if (deliveryId && row.deliveryId !== deliveryId) return false;
         if (String(row.text || '').replace(/\s*\n+\s*/g, ' ').slice(0, 3800) !== normalized) return false;
         used.push(row);
         return true;
@@ -1361,7 +1363,15 @@ function _subNoticeMetaCardHtml(meta, messages, used) {
         // the legacy 'sent a message: ' lifecycle segment), else the FULL
         // multi-line markdown (the model notice text is flattened).
         var norm = summary.replace(/\s*\n+\s*/g, ' ').slice(0, 3800);
-        if (_hasStandaloneSubMessage(messages, agentId, 'sent a message: ' + norm, used)) return '';
+        if (_hasStandaloneSubMessage(messages, agentId, 'sent a message: ' + norm, used, meta.deliveryId)) return '';
+        // Legacy hydration reversal: only an adjacent, structured message pair.
+        // Never consume an arbitrary future same-text row or an ambiguous repeat
+        // whose matching standalone already appears in the prefix.
+        if (!meta.deliveryId && messages && messages.nextRow && !messages.nextRow.deliveryId &&
+            String(messages.nextRow.text || '') === summary &&
+            !_hasStandaloneSubMessage(messages, agentId, 'sent a message: ' + norm, [])) {
+            if (_hasStandaloneSubMessage([messages.nextRow], agentId, 'sent a message: ' + norm, used)) return '';
+        }
         return _subMessageNoticeCardHtml(name, agentId, summary);
     }
     // Unknown kind: the legacy path renders this span.

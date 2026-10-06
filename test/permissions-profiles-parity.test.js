@@ -80,6 +80,184 @@ describe('permissions and profiles parity', function() {
             assert.strictEqual(f.m.getToolPermission('servicenow_api','POST'), 'ask', 'disconnected stays ask');
         }
     });
+    test('instance tier follows the call TARGET (args.instance), not just the active instance', async function() {
+        for (var worker of [false,true]) {
+            var w = worker ? 'worker ' : 'page ';
+            var plat = {instanceUrl:'https://active.test/', instances:[{shortName:'devb',url:'https://devb.test'},{shortName:'prodc',url:'https://prodc.test'}]};
+            plat.resolveInstanceUrl = function(n) {
+                if (!n) return plat.instanceUrl;
+                if (n.startsWith('http')) return n.replace(/\/$/, '');
+                if (n.indexOf('.') !== -1) return 'https://' + n.replace(/\/$/, '');
+                for (var i = 0; i < plat.instances.length; i++) if (plat.instances[i].shortName === n) return plat.instances[i].url;
+                return null;
+            };
+            var f = await fixture(worker, {Platform:plat, instancePermissions:{'active.test':{tier:'dev',tools:{}},'devb.test':{tier:'dev',tools:{}},'prodc.test':{tier:'manual',tools:{}}}});
+            var gp = function(method, args) { return f.m.getToolPermission('servicenow_api', method, 'other', f.m.resolvePermissionTargetHost(args)); };
+            // Dev active, no instance arg → allow (unchanged).
+            assert.strictEqual(gp('DELETE', {}), 'allow', w+'dev active, no arg');
+            assert.strictEqual(gp('DELETE', {instance:''}), 'allow', w+'empty instance = active');
+            // Non-Dev target while Dev is active → must NOT allow.
+            assert.strictEqual(gp('DELETE', {instance:'prodc'}), 'ask', w+'manual target under dev active');
+            assert.strictEqual(gp('POST', {instance:'https://prodc.test/'}), 'ask', w+'full URL target');
+            assert.strictEqual(gp('GET', {instance:'prodc'}), 'allow', w+'reads still allow');
+            // Unknown short name → fail safe ask (never the active Dev).
+            assert.strictEqual(gp('PATCH', {instance:'nosuch'}), 'ask', w+'unresolvable short name');
+            assert.strictEqual(f.m.resolvePermissionTargetHost({instance:'nosuch'}), null);
+            // Dev target while a non-Dev instance is active → allow, even with confirm:true args.
+            f.g.instancePermissions['active.test'].tier = 'manual';
+            assert.strictEqual(gp('DELETE', {}), 'ask', w+'manual active, no arg');
+            assert.strictEqual(gp('DELETE', {instance:'devb', confirm:true}), 'allow', w+'dev target short name');
+            assert.strictEqual(gp('DELETE', {instance:'DEVB.test'}), 'allow', w+'host is case-insensitive');
+            assert.strictEqual(f.m.getToolPermission('iframe_tool','click','other', f.m.resolvePermissionTargetHost({instance:'devb'})), 'allow', w+'browser keys too');
+            // Auto target under a manual active instance.
+            f.g.instancePermissions['prodc.test'].tier = 'auto';
+            assert.strictEqual(gp('DELETE', {instance:'prodc'}), 'auto', w+'auto target');
+            // Global keys ignore the instance target.
+            f.g.toolPermissions['workspace:write'] = 'ask';
+            assert.strictEqual(f.m.getToolPermission('workspace','write','other', f.m.resolvePermissionTargetHost({instance:'devb'})), 'ask', w+'global keys untouched');
+            // Legacy 3-arg callers keep using the connected host.
+            f.g.instancePermissions['active.test'].tier = 'dev';
+            assert.strictEqual(f.m.getToolPermission('servicenow_api','DELETE','other'), 'allow', w+'3-arg = connected');
+        }
+    });
+test('getTargetedToolPermission: iframe_tool unions every host it may hit; strictest wins', async function() {
+        for (var worker of [false,true]) {
+            var w = worker ? 'worker ' : 'page ';
+            var plat = {instanceUrl:'https://prod.service-now.com', instances:[{shortName:'dev1',url:'https://dev1.service-now.com'}]};
+            plat.resolveInstanceUrl = function(n) { if (!n) return plat.instanceUrl; if (n.startsWith('http')) return n; if (n.indexOf('.')!==-1) return 'https://'+n; for (var i=0;i<plat.instances.length;i++) if (plat.instances[i].shortName===n) return plat.instances[i].url; return null; };
+            var tabs = {7:{url:'https://prod.service-now.com/x'}, 8:{url:'https://dev1.service-now.com/y'},
+                9:{url:'https://dev1.service-now.com/y', pendingUrl:'https://prod.service-now.com/z'},
+                10:{url:'https://www.google.com/'}, 11:{url:'', pendingUrl:'https://dev1.service-now.com/p'}};
+            var active = {id:7}, stored = {instanceUrl:'https://prod.service-now.com'};
+            var doc = {addEventListener:function(){}, body:{classList:{contains:function(){ return false; }}}};
+            var loc = {search:''};
+            var chromeStub = {tabs:{get:async function(id){ if (!tabs[id]) throw new Error('no tab'); return tabs[id]; },
+                    query:async function(q){ return active.id == null ? [] : [Object.assign({id:active.id}, tabs[active.id])]; }},
+                    storage:{local:{get:async function(){ return stored; }}}};
+            var f = await fixture(worker, {Platform:plat, chats:{root:{targetTabId:8},other:{}}, document:doc, location:loc, chrome:chromeStub,
+                instancePermissions:{'dev1.service-now.com':{tier:'dev',tools:{}},'prod.service-now.com':{tier:'manual',tools:{}}}});
+            var T = function(tool, m, args, chat) { return f.m.getTargetedToolPermission(tool, m, chat || 'other', args); };
+            var H = function(args, chat) { return f.m.resolvePermissionTargetHosts('iframe_tool', args, chat || 'other'); };
+            // Prod active: no iframe write is Dev-allowed, whatever tab/instance is named.
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',instance:'dev1',tab_id:7})).permission, 'ask', w+'fake instance on prod tab');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'ask', w+'dev tab, prod active');
+            assert.strictEqual((await T('iframe_tool','fill',{action:'fill'},'root')).permission, 'ask', w+'pinned dev tab, prod active');
+            assert.strictEqual((await T('iframe_tool','navigate',{action:'navigate',url:'/x',instance:'dev1'})).permission, 'allow', w+'navigate is a read');
+            // servicenow_api routes by instance (unchanged).
+            var r = await T('servicenow_api','DELETE',{instance:'dev1',confirm:true});
+            assert.strictEqual(r.permission, 'allow', w+'sn dev target'); assert.strictEqual(r.host, 'dev1.service-now.com');
+            r = await T('servicenow_api','POST',{instance:{x:1}});
+            assert.strictEqual(r.permission, 'ask', w+'non-string'); assert.strictEqual(r.host, null);
+            // ── Dev active from here on ──
+            plat.instanceUrl = 'https://dev1.service-now.com';
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'ask', w+'prod tab under dev active');
+            // H1: unpinned action runs on the ACTIVE tab — prod active tab → ask.
+            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'ask', w+'H1 no tab, dev active, prod active tab');
+            active.id = 8;
+            r = await T('iframe_tool','click',{action:'click'});
+            assert.strictEqual(r.permission, 'allow', w+'H1 no tab, dev active tab'); assert.strictEqual(r.host, 'dev1.service-now.com');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',instance:'prod.service-now.com'})).permission, 'ask', w+'instance only adds strictness');
+            // M2: url OR pendingUrl on prod → ask; url empty but pendingUrl dev → allow.
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:9})).permission, 'ask', w+'M2 pendingUrl prod');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:11})).permission, 'allow', w+'M2 pendingUrl only');
+            // M1: unknown host / failed lookup → null (manual).
+            r = await T('iframe_tool','click',{action:'click',tab_id:10});
+            assert.strictEqual(r.permission, 'ask', w+'M1 unknown tab host'); assert.strictEqual(r.host, null, w+'M1 host null (L2)');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:99})).permission, 'ask', w+'closed tab');
+            assert.ok((await H({action:'navigate',url:'https://evil.example/x'})).indexOf(null) !== -1, w+'M1 absolute unknown → null');
+            assert.ok((await H({action:'navigate',url:'https://dev1.service-now.com/x'})).indexOf('dev1.service-now.com') !== -1);
+            // H2 sidepanel: tab_id is IGNORED (tool routes to pinned/active), relative
+            // navigate uses the STORED instanceUrl, not args.instance.
+            doc.body.classList.contains = function(c){ return c === 'sidepanel-mode'; };
+            active.id = 7;
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'ask', w+'H2 sidepanel ignores dev tab_id; active tab prod');
+            active.id = 8;
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'allow', w+'H2 sidepanel ignores prod tab_id');
+            var hs = await H({action:'navigate',url:'/x',instance:'dev1'});
+            assert.ok(hs.indexOf('prod.service-now.com') !== -1, w+'H2 sidepanel relative → stored base');
+            stored.instanceUrl = null;
+            assert.ok((await H({action:'navigate',url:'/x'})).indexOf(null) !== -1, w+'no stored base → null');
+            stored.instanceUrl = 'https://prod.service-now.com';
+            // H2 full-tab: tab_id wins over the pin and the active tab.
+            doc.body.classList.contains = function(){ return false; }; loc.search = '?mode=tab';
+            active.id = 7;
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8},'root')).permission, 'allow', w+'full-tab tab_id dev');
+            assert.ok((await H({action:'navigate',url:'/x',instance:'dev1'},'root')).indexOf('prod.service-now.com') === -1, w+'full-tab relative ignores stored base');
+            // L1: the tool falls back to currentChatId — its pin counts too.
+            f.m.__scope.currentChatId = 'pinprod'; f.g.chats.pinprod = {targetTabId:7}; active.id = 8;
+            assert.strictEqual((await T('iframe_tool','click',{action:'click'},'root')).permission, 'ask', w+'L1 currentChatId pin on prod');
+            f.m.__scope.currentChatId = undefined; delete f.g.chats.pinprod;
+            loc.search = '';
+            // Offscreen worker path: no chrome.tabs → SW message (background perm-target-info).
+            delete chromeStub.tabs; delete chromeStub.storage;
+            chromeStub.runtime = {sendMessage:function(msg, cb){ var t = msg.activeTab ? tabs[msg.tabId != null ? msg.tabId : active.id] : null; cb({ok:true, tab: t ? {url:t.url||null, pendingUrl:t.pendingUrl||null} : null, instanceUrl: stored.instanceUrl}); }};
+            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'allow', w+'msg path dev active tab');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'ask', w+'msg path prod tab');
+            chromeStub.runtime = {sendMessage:function(msg, cb){ cb(undefined); }};
+            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'ask', w+'no tab info → manual');
+        }
+    });
+    test('page gate: fake instance on iframe write prompts; host stamped; Always allow saves to target host', async function() {
+        var prompts = [], saved = 0;
+        var plat = {instanceUrl:'https://prod.service-now.com', instances:[{shortName:'dev1',url:'https://dev1.service-now.com'}]};
+        plat.resolveInstanceUrl = function(n) { if (!n) return plat.instanceUrl; for (var i=0;i<plat.instances.length;i++) if (plat.instances[i].shortName===n) return plat.instances[i].url; return null; };
+        var f = await fixture(false, {Platform:plat, activeStreamingChatId:null, currentChatId:'other',
+            instancePermissions:{'dev1.service-now.com':{tier:'dev',tools:{}},'prod.service-now.com':{tier:'manual',tools:{}}},
+            showToolApprovalPrompt:async function(d,a,k,id,t,c,o){ prompts.push(o.permissionHost); return true; },
+            saveInstancePermissions:function(){ saved++; }, saveToolPermissions:function(){}, renderToolPermissions:function(){}});
+        var gate = await loadModules(['src/js/ui/150-tool-approval.js','src/js/ui/130-data-management.js'], {lenient:true, globals:Object.assign(f.g, f.m,
+            {saveInstancePermissions:function(){ saved++; }, saveToolPermissions:function(){}, renderToolPermissions:function(){}})});
+        var res = await gate.requestProgrammaticToolApproval('iframe_tool', {action:'click', instance:'dev1'}, {chatId:'other'});
+        assert.strictEqual(prompts.length, 1, 'fake dev instance on iframe write still prompts');
+        assert.strictEqual(prompts[0], null, 'active tab unknown (no chrome) → null host, nothing to save');
+        res = await gate.requestProgrammaticToolApproval('servicenow_api', {method:'DELETE', instance:'dev1', confirm:true}, {chatId:'other'});
+        assert.strictEqual(res.allowed, true); assert.strictEqual(prompts.length, 1, 'dev target never prompts');
+        f.g.instancePermissions['dev1.service-now.com'].tier = 'manual';
+        await gate.requestProgrammaticToolApproval('servicenow_api', {method:'POST', instance:'dev1'}, {chatId:'other'});
+        assert.strictEqual(prompts[1], 'dev1.service-now.com', 'row host = target');
+        gate.setToolPermissionByKey('sn:create', 'allow', prompts[1]);
+        assert.strictEqual(f.g.instancePermissions['dev1.service-now.com'].tools['sn:create'], 'allow');
+        assert.strictEqual(f.g.instancePermissions['prod.service-now.com'].tools['sn:create'], undefined, 'not saved to active');
+        gate.setToolPermissionByKey('sn:update', 'allow', null);
+        assert.strictEqual(Object.keys(f.g.instancePermissions).length, 2, 'null host saves nothing');
+        assert.strictEqual(saved, 1);
+    });
+    test('L2: Always allow on a null-host row allows once and saves nothing', async function() {
+        var f = await fixture(false), saves = [], snacks = [];
+        var row = {role:'approval', status:'pending', toolCallId:'tc1', permissionKey:'browser:click', permissionHost:null};
+        var row2 = {role:'approval', status:'pending', toolCallId:'tc2', permissionKey:'browser:click', permissionHost:'dev1.service-now.com'};
+        var g = Object.assign({}, f.g, f.m, {chats:{c1:{messages:[row,row2]}}, currentChatId:'c1', pendingToolApprovals:{},
+            saveChatsToStorage:function(){}, showSnackbar:function(m){ snacks.push(m); },
+            setToolPermissionByKey:function(k,v,h){ saves.push([k,v,h]); }, renderMessages:function(){}});
+        var n = await loadModules(['src/js/ui/160-notifications.js'], {lenient:true, globals:g});
+        try { await n.handleApproval(0, 'auto', true, 'c1'); } catch (e) { /* post-status UI plumbing not stubbed */ }
+        assert.strictEqual(row.status, 'allowed', 'null host → allowed once, not always_allowed');
+        assert.strictEqual(saves.length, 0, 'nothing saved');
+        assert.strictEqual(snacks.length, 1, 'user told why');
+        try { await n.handleApproval(1, 'auto', true, 'c1'); } catch (e) {}
+        assert.strictEqual(row2.status, 'always_allowed');
+        assert.deepStrictEqual(saves[0], ['browser:click','allow','dev1.service-now.com']);
+    });
+    test('worker gate (worker/120): iframe_tool on Dev auto-allows only when the active tab is Dev', async function() {
+        var tabs = {7:{url:'https://prod.service-now.com/x'}, 8:{url:'https://dev1.service-now.com/y'}}, active = {id:8};
+        var plat = {instanceUrl:'https://dev1.service-now.com', instances:[{shortName:'dev1',url:'https://dev1.service-now.com'}]};
+        plat.resolveInstanceUrl = function(n){ return n === 'dev1' ? 'https://dev1.service-now.com' : null; };
+        var f = await fixture(true, {Platform:plat, chats:{root:{},other:{}},
+            instancePermissions:{'dev1.service-now.com':{tier:'dev',tools:{}},'prod.service-now.com':{tier:'manual',tools:{}}}});
+        var chromeStub = fakeChrome();
+        chromeStub.runtime = Object.assign({}, chromeStub.runtime || {}, {sendMessage:function(msg, cb){ var t = msg.activeTab ? tabs[msg.tabId != null ? msg.tabId : active.id] : null; if (cb) cb({ok:true, tab:t ? {url:t.url, pendingUrl:null} : null, instanceUrl:null}); }});
+        var m = await loadModules(['src/js/core/070-permissions.js','src/js/worker/025-permissions-helpers.js','src/js/worker/120-tool-routing.js'],
+            {lenient:true, globals:Object.assign({}, f.g, {window:fakeWindow(), chrome:chromeStub, requestProgrammaticToolApproval:null,
+                activeStreamingChatId:null, _swPermsDirty:{}, parkedToolCallsByChatId:{}, getToolDisplayName:function(t){ return t; }})});
+        var gate = m.__scope.requestProgrammaticToolApproval;
+        assert.strictEqual(typeof gate, 'function', 'worker gate installed');
+        var res = await gate('iframe_tool', {action:'click', confirm:true}, {chatId:'other'});
+        assert.strictEqual(res.allowed, true, 'dev active + dev active tab → allowed even with confirm:true');
+        active.id = 7;
+        var settled = await Promise.race([gate('iframe_tool', {action:'click'}, {chatId:'other'}).then(function(r){ return r; }, function(){ return {allowed:false}; }),
+            new Promise(function(r){ setTimeout(function(){ r('pending'); }, 50); })]);
+        assert.ok(settled === 'pending' || settled.allowed !== true, 'prod active tab → not auto-allowed');
+    });
     test('profile union is core-first, stable, deduplicated, and ignores unknown names', async function() {
         var f = await fixture(true), m=f.m;
         assert.deepStrictEqual(m.getToolNamesForProfiles(null),m.TOOL_PROFILES.core.tools);

@@ -1817,9 +1817,9 @@ function _wsPrChatIdxRerender() {
 // a chat: live uncommitted ownership (last_modified_by_chat_id, see cross-chat
 // ownership in 020-tool-execution.js), or — after a push released that stamp —
 // the pushing chat (pushed_by_chat_id, with a retroactive scan of recorded
-// push results as last resort). Click → open that chat. No chip is rendered
-// for the CURRENT chat (its own edits need no attribution); a chip for an
-// unresolvable chat renders muted/inert.
+// push results as last resort). Click → open that chat. Include the current
+// chat so attribution stays consistent across file statuses and chat selection;
+// a chip for an unresolvable chat renders muted/inert.
 //
 // COLOR encodes the MAIN (root/parent) chat of the attributed chat's lineage,
 // not the individual worker: files touched by different sub-agents of the
@@ -1858,7 +1858,6 @@ function _wsChatChip(f) {
         if (hit) { cid = hit.chatId; stampTitle = hit.chatTitle; pushed = true; }
     }
     if (!cid) return null;
-    if (typeof currentChatId !== 'undefined' && currentChatId === cid) return null;
     var ref = _wsResolveChatRef(cid);
     var known = !!ref;
     var isWorker = !!(ref && ref.isSub);

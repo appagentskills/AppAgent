@@ -1058,8 +1058,12 @@ function renderMessages() {
                 // msg.injected so a USER quoting a notice keeps the normal
                 // bubble; mixed injected rows (notice coalesced with other
                 // queued text) keep non-notice segments on the normal path.
+                var noticeCandidates = chat.messages.slice(winStart, index);
+                // Identity matching may look forward, but only within this render window.
+                noticeCandidates.deliveryRows = chat.messages.slice(winStart);
+                noticeCandidates.nextRow = chat.messages[index + 1];
                 var subNoticeHtml = (msg.injected && typeof renderSubReportNotices === 'function')
-                    ? renderSubReportNotices(rawUser, chat.messages.slice(winStart, index), usedSubMessages, msg.subNotices) : null;
+                    ? renderSubReportNotices(rawUser, noticeCandidates, usedSubMessages, msg.subNotices) : null;
                 if (subNoticeHtml === '') return '<div id="msg-' + index + '" hidden></div>';
                 if (subNoticeHtml != null) {
                     isSubNoticeRow = true;

@@ -112,7 +112,7 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         var f=fixture(false,1),m=message(1);f.env.chats.A.messages=[m];f.api.updateStreamingMessage(0,message(1),'A');m.isStreaming=false;f.frames.shift()();
         m.isStreaming=true;f.api.updateStreamingMessage(0,m,'A');f.env.currentChatId='B';f.frames.shift()();check(f.paints.length===0,'stale frame painted');
     });
-    var uiNames=['_subActionStateHtml','_subParentMessageState','_subParentHistoryKey','_subThreadEntries','_workerModalContentKey','_hasStandaloneSubMessage','renderSubReportNotices','renderSubAgentMessage','_subRenderNewlines','renderSubMarkdown','_applySectionIcons','_liftSectionIcon'];
+    var uiNames=['_subActionStateHtml','_subParentMessageState','_subParentHistoryKey','_subThreadEntries','_workerModalContentKey','_hasStandaloneSubMessage','_renderSubNoticesFromMeta','_subNoticeLeftoverHtml','_subNoticeFmt','_subNoticeMetaCardHtml','_subMessageNoticeCardHtml','renderSubReportNotices','renderSubAgentMessage','_subRenderNewlines','renderSubMarkdown','_applySectionIcons','_liftSectionIcon'];
     function uiFixture(chats, realMarkdown) {
         var env={chats:chats||{},escapeHtml:escape,formatContent:function(s){return '<md>'+escape(s)+'</md>';},
             SUB_NOTICE_VIEW_ICON:'eye',_subNoticeCardHtml:function(name,id,state,text){return '<notice>'+escape(text)+'</notice>';},_parentMsgCardHtml:function(n,text){return '<inbox>'+escape(text)+'</inbox>';}};
@@ -237,6 +237,33 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         var mixed=paint(rows[4],4);check(mixed.indexOf('same')<0 && mixed.indexOf('keep before')>=0 && mixed.indexOf('keep after')>=0,'coalesced unrelated segments lost');
         var windowed=noticeRenderFixture(rows,1);check(windowed(rows[1],1).indexOf('same')>=0,'off-window standalone suppressed visible history');
         var fresh=noticeRenderFixture(rows);check(fresh(rows[1],1).indexOf('hidden')>=0,'re-render retained stale consumed candidates');
+    });
+    test('delivery identity pairs both orders within window without hiding distinct deliveries',function(){
+        var life='[sub-agent lifecycle] Alpha (sub_a): sent a message: same';
+        function sub(id){return {role:'sub_msg',subAgentId:'sub_a',text:'same',deliveryId:id};}
+        function notice(id){return {role:'user',injected:true,content:life,subNotices:[{kind:'message',agentId:'sub_a',name:'Alpha',summary:'same',text:life,deliveryId:id}]};}
+        [false,true].forEach(function(reverse){
+            var n=notice('d1'),s=sub('d1'),rows=reverse?[n,s]:[s,n],index=reverse?0:1;
+            check(noticeRenderFixture(rows)(n,index).indexOf('hidden')>=0,'pair not hidden');
+            check(noticeRenderFixture(rows)(n,index).indexOf('hidden')>=0,'fresh render differs');
+        });
+        var n1=notice('d1'),n2=notice('d2'),rows=[n1,sub('d2'),n2,sub('d1')],paint=noticeRenderFixture(rows);
+        check(paint(n1,0).indexOf('hidden')>=0 && paint(n2,2).indexOf('hidden')>=0,'distinct pairs not rendered once each');
+        var unmatched=notice('other');check(noticeRenderFixture([unmatched,sub('d1')])(unmatched,0).indexOf('same')>=0,'distinct delivery hidden');
+        var old=sub('d1'),n=notice('d1');check(noticeRenderFixture([old,n],1)(n,1).indexOf('same')>=0,'off-window ID twin consumed');
+        var repeated=notice('d1'),once=noticeRenderFixture([old,n,repeated]);
+        check(once(n,1).indexOf('hidden')>=0 && once(repeated,2).indexOf('same')>=0,'one standalone consumed twice');
+    });
+    test('structured legacy reversed pair repairs only adjacent unambiguous delivery',function(){
+        var life='[sub-agent lifecycle] Alpha (sub_a): sent a message: same';
+        function sub(){return {role:'sub_msg',subAgentId:'sub_a',text:'same'};}
+        function notice(){return {role:'user',injected:true,content:'keep before\n\n'+life+'\n\nkeep after',subNotices:[{kind:'message',agentId:'sub_a',name:'Alpha',summary:'same',text:life}]};}
+        var n=notice(),s=sub(),rows=[n,s],html=noticeRenderFixture(rows)(n,0);
+        check(html.indexOf('same')<0 && html.indexOf('keep before')>=0 && html.indexOf('keep after')>=0,'adjacent legacy or mixed text broken');
+        rows=[n,{role:'assistant',content:'unrelated'},s];check(noticeRenderFixture(rows)(n,0).indexOf('same')>=0,'unrelated future twin consumed');
+        var n2=notice();rows=[sub(),n,n2,sub()];var paint=noticeRenderFixture(rows);
+        check(paint(n,1).indexOf('same')<0,'first pair visible');
+        check(paint(n2,2).indexOf('same')>=0,'ambiguous legacy repeat consumed future twin');
     });
     test('identical resend after queue loss never confirms two attempts from one transcript row',function(){
         var f=registryFixture('running',true);

@@ -16,7 +16,7 @@ function _cutFns(src, names) {
 }
 
 var FNS = ['_subIsSkeleton', '_subHydrateChat', '_subWithChat', '_subAppendRows', '_pushPendingWakeRows',
-    '_queueNoticeInjection', '_noticeRow', '_findSubAgentCard', '_wakeSubAgentImpl', 'agentMessage',
+    '_queueNoticeInjection', '_subNoticeMeta', '_noticeRow', '_findSubAgentCard', '_wakeSubAgentImpl', 'agentMessage',
     'notifyChatOfBackgroundResult'];
 
 var _REAL_GLOBALS = { Promise: 1, Object: 1, Array: 1, JSON: 1, Date: 1, Math: 1, String: 1, Number: 1,
@@ -342,4 +342,39 @@ describe('C2 core/097 part C: wake / agent_message / notices on skeleton chats',
         assert.ok(/_c2Deferred/.test(src), 'onSubAgentRunFinished re-enters once after hydration');
         assert.ok(/_subWithChat\(rec\.chat_id, function\(_trc\)/.test(src), '_queueTransientRetry routes through _subWithChat');
     }, { tags: ['unit'] });
+});
+
+describe('parent-message delivery identity and ordering', function() {
+    [false,true].forEach(function(cold) {
+        test('shared unique identity and UI-before-notice, cold=' + cold, async function() {
+            var chats={p:cold?_skel('p'):{id:'p',messages:[]},s:{id:'s',isSubAgent:true,subAgentId:'a1',messages:[]}};
+            var rec={agent_id:'a1',chat_id:'s',parent_chat_id:'p',state:'running'};
+            var m=await _env({chats:chats,subAgents:{a1:rec},stored:{p:[]}});
+            m.agentMessage({to:'parent',content:'same'},{chatId:'s'});
+            m.agentMessage({to:'parent',content:'same'},{chatId:'s'});
+            await m.finish();
+            var rows=chats.p.messages, subs=rows.filter(function(r){return r.role==='sub_msg';}), notices=rows.filter(function(r){return r.injected;});
+            assert.strictEqual(subs.length,2);assert.strictEqual(notices.length,2);
+            assert.ok(subs[0].deliveryId && subs[0].deliveryId!==subs[1].deliveryId);
+            notices.forEach(function(n,i){assert.strictEqual(n.subNotices[0].deliveryId,subs[i].deliveryId);assert.ok(rows.indexOf(subs[i])<rows.indexOf(n));});
+        });
+    });
+    test('wake_parent:false creates only UI row and never durable wake',async function(){
+        var chats={p:_skel('p'),s:{id:'s',isSubAgent:true,subAgentId:'a1',messages:[]}};
+        var rec={agent_id:'a1',chat_id:'s',parent_chat_id:'p',state:'running',wake_parent:false};
+        var m=await _env({chats:chats,subAgents:{a1:rec},stored:{p:[]}});
+        m.agentMessage({to:'parent',content:'quiet'},{chatId:'s'});await m.finish();
+        assert.strictEqual(chats.p.messages.filter(function(r){return r.role==='sub_msg';}).length,1);
+        assert.strictEqual(chats.p.messages.filter(function(r){return r.injected;}).length,0);
+        assert.strictEqual(m.log.durable.length,0);assert.strictEqual(m.log.runs.length,0);
+    });
+    test('rejected parent hydration preserves durable notice metadata without seeding skeleton',async function(){
+        var chats={p:_skel('p'),s:{id:'s',isSubAgent:true,subAgentId:'a1',messages:[]}},durable=[];
+        var rec={agent_id:'a1',chat_id:'s',parent_chat_id:'p',state:'running'};
+        var m=await _env({chats:chats,subAgents:{a1:rec},stubs:{ensureChatPayloads:function(){return Promise.reject(new Error('hydrate unavailable'));},persistPendingWake:function(id,text,from,meta){durable.push(meta);}}});
+        m.agentMessage({to:'parent',content:'retain me'},{chatId:'s'});await m.finish();
+        assert.strictEqual(chats.p.messages,undefined);assert.strictEqual(durable.length,1);
+        assert.strictEqual(durable[0].subNotices[0].summary,'retain me');assert.ok(durable[0].subNotices[0].deliveryId);
+        assert.strictEqual(m.log.runs.length,0);
+    });
 });
