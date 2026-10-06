@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.35
+
+### Fixes
+- Dev-tier instances no longer prompt for approval on calls targeting them.
+- Skill changes apply right away after a refresh.
+- Stopping or redirecting the agent takes effect immediately during retries.
+- Workspace changes show the correct chat icons, including edits from nested sub-agents.
+- No more duplicate sub-agent message cards.
+
+---
+
 ## v1.1.33
 
 ### Features
